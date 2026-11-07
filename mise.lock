@@ -2,6 +2,23 @@
 
 lockfile_version = 4
 
+[[tools.argocd]]
+version = "3.6.1"
+backend = "aqua:argoproj/argo-cd"
+specifiers = ["3.6.1"]
+
+[tools.argocd."platforms.linux-x64"]
+checksum = "sha256:46d2fc941071f0a0c36326a67a431d34b1479e1a24737f7b367abc93968beadc"
+checksum_source = "mise-versions"
+url = "https://github.com/argoproj/argo-cd/releases/download/v3.6.1/argocd-linux-amd64"
+url_api = "https://api.github.com/repos/argoproj/argo-cd/releases/assets/709772491"
+
+[tools.argocd."platforms.macos-arm64"]
+checksum = "sha256:2e4a88082bfcb25dd56369ed9fe807d941ce1d916efb5a080eea6ac00347dfdf"
+checksum_source = "mise-versions"
+url = "https://github.com/argoproj/argo-cd/releases/download/v3.6.1/argocd-darwin-arm64"
+url_api = "https://api.github.com/repos/argoproj/argo-cd/releases/assets/709773168"
+
 [[tools.helm]]
 version = "4.3.1"
 backend = "aqua:helm/helm"

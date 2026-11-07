@@ -13,6 +13,7 @@
 | Check the cell | `mise run cell:verify` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
+| Argo CD UI on localhost:8080 | `mise run cell:ui` |
 | Delete the cell | `mise run cell:down` |
 | Fetch upstream files for review | `mise run vendor:fetch` |
 

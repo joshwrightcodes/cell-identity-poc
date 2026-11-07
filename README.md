@@ -49,7 +49,12 @@ If its pod restarts, run `mise run cell:publish` again.
 
 ## Look at the cell
 
+The cell runs the Argo CD core install, which has no UI. `mise run cell:ui` serves the UI
+from your Mac at <http://localhost:8080> and reads the cluster through your kubeconfig.
+It needs no login, and it stops when you press Ctrl-C.
+
 ```sh
+mise run cell:ui
 kubectl --context cell-a-1 -n argocd get applications
 kubectl --context cell-a-1 -n otel logs deploy/otel-collector
 ```

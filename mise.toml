@@ -12,6 +12,8 @@ kustomize = "5.8.3"
 oras = "1.3.6"
 yq = "4.54.2"
 jq = "1.8.2"
+# Keep the same version as ARGOCD_VERSION in cell.env.
+argocd = "3.6.1"
 
 [env]
 _.file = "cell.env"
@@ -31,6 +33,10 @@ run = "scripts/publish.sh"
 [tasks."cell:verify"]
 description = "Run the base cell checks and print PASS or FAIL for each"
 run = "scripts/verify.sh"
+
+[tasks."cell:ui"]
+description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
+run = 'argocd admin dashboard --context "$CELL_NAME" --namespace argocd --address 127.0.0.1 --port 8080'
 
 [tasks."cell:down"]
 description = "Delete the cluster"
