@@ -46,7 +46,12 @@ wait_for() {
 
 # Start a port-forward to the bundle store. Sets STORE_PF_PID.
 store_forward() {
-  k -n cell-system port-forward svc/registry "${CELL_STORE_LOCAL_PORT}:5000" >/dev/null 2>&1 &
+  if curl -fsS "http://127.0.0.1:${CELL_STORE_LOCAL_PORT}/v2/" >/dev/null 2>&1; then
+    die "port ${CELL_STORE_LOCAL_PORT} already serves a registry. Stop the old port-forward first."
+  fi
+  # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
+  kubectl --context "$CELL_NAME" -n cell-system port-forward svc/registry "${CELL_STORE_LOCAL_PORT}:5000" \
+    >/dev/null 2>&1 &
   STORE_PF_PID=$!
   trap 'kill "$STORE_PF_PID" 2>/dev/null || true' EXIT
   wait_for "port-forward to the bundle store" 30 curl -fsS "http://127.0.0.1:${CELL_STORE_LOCAL_PORT}/v2/"
