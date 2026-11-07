@@ -35,11 +35,11 @@ expect_code() {
 }
 
 expect_no_connection() {
+  # curl prints 000 when it cannot connect. Any other output, including none from a failed
+  # kubectl exec, is a failure.
   local from="$1" url="$2" got
-  if got="$(http_code "$from" "$url")" && [[ "$got" != "000" ]]; then
-    echo "$from -> $url: got HTTP $got, want no connection"
-    return 1
-  fi
+  got="$(http_code "$from" "$url")"
+  [[ "$got" == "000" ]] || { echo "$from -> $url: got '${got:-no output}', want no connection (000)"; return 1; }
 }
 
 has_proxy() {
@@ -126,6 +126,7 @@ check_traces_received() {
 }
 
 log "checking cell $CELL_NAME"
+k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
 check "argocd, cell-system and otel run without mesh proxies" check_platform_outside_mesh

@@ -10,7 +10,9 @@ OpenTelemetry collector. Every later plane starts from this base.
 ## What you need
 
 - A Mac with Apple silicon and macOS 26 or later.
-- Apple `container` 1.6.1 or later, with `container system start` done.
+- Apple `container` 1.7.1 or later, with `container system start` done. Install the signed
+  release, for example with `mise use -g container@1.7.1`. The Homebrew build of 1.7.1 has no
+  cluster plugins, so `container cluster` fails with it.
 - mise. It installs every other tool at the version that `mise.toml` pins.
 - About 6 CPUs and 12 GB of memory free for the cell.
 

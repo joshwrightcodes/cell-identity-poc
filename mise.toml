@@ -1,5 +1,6 @@
 # Tools and tasks for the cell PoC. `mise run <task>` puts these versions first on PATH.
-# Tools that Homebrew provides: mise itself and Apple `container` 1.6.1 or later.
+# Tools from outside this file: mise itself, and Apple `container` 1.7.1 or later from the
+# signed GitHub release. The Homebrew build of 1.7.1 has no cluster plugins.
 
 [settings]
 # mise.lock pins each tool with its checksum. Run `mise lock` after a version change.

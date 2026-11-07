@@ -3,7 +3,8 @@
 # Application as Synced and Healthy.
 source "$(dirname "$0")/lib.sh"
 
-if container cluster list | awk 'NR > 1 { print $1 }' | grep -qx "$CELL_NAME"; then
+clusters="$(container cluster list)" || die "container cluster list failed. Is the container system running?"
+if awk 'NR > 1 { print $1 }' <<<"$clusters" | grep -qx "$CELL_NAME"; then
   log "cluster $CELL_NAME exists"
 else
   log "creating cluster $CELL_NAME"

@@ -123,7 +123,9 @@ plaintext. Strict mTLS on the collector would reject them.
 
 ## Findings from the first run (2026-11-07)
 
-- All checks pass on `container` 1.6.1, Kubernetes v1.37.0, Argo CD v3.6.1 and Istio 1.30.8.
+- All checks pass on `container` 1.6.1 and 1.7.1, Kubernetes v1.37.0, Argo CD v3.6.1 and
+  Istio 1.30.8. The 1.7.1 run uses the signed GitHub release, because the Homebrew build of
+  1.7.1 has no cluster plugins.
 - kindnet enforces NetworkPolicy. With the `apps-demo` policies removed, `plaintext` reached
   `example.com`. With the policies back, the request timed out.
 - Argo CD self-heal restored the deleted policies, once automated sync was back on.
