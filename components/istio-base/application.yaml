@@ -1,0 +1,8 @@
+# istiod sets the webhook failure policy at run time, so Argo CD must not reset it.
+spec:
+  ignoreDifferences:
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+      jqPathExpressions:
+        - .webhooks[]?.failurePolicy
+        - .webhooks[]?.clientConfig.caBundle

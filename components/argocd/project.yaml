@@ -1,0 +1,16 @@
+# The only project that Applications use. Sources are the local store only, and the only
+# destination is this cluster.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: cell
+spec:
+  description: Base cell components, applied from the in-cluster bundle store
+  sourceRepos:
+    - oci://registry.cell-system.svc.cluster.local:5000/bundles/*
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "*"
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"

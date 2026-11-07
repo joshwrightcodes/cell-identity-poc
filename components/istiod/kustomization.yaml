@@ -1,0 +1,11 @@
+# The mesh control plane. Its CA is self-signed and belongs to this cluster only.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+helmGlobals:
+  chartHome: ../../vendor/charts/istio-1.30.8
+helmCharts:
+  - name: istiod
+    releaseName: istiod
+    namespace: istio-system
+    kubeVersion: "1.37.0"
+    valuesFile: values.yaml

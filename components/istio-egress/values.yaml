@@ -1,0 +1,25 @@
+service:
+  type: ClusterIP
+  ports:
+    - name: status-port
+      port: 15021
+      targetPort: 15021
+      protocol: TCP
+    - name: tls
+      port: 443
+      targetPort: 443
+      protocol: TCP
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+# The restricted Pod Security level needs a seccomp profile. The sysctl lets Envoy bind 443.
+securityContext:
+  seccompProfile:
+    type: RuntimeDefault
+  sysctls:
+    - name: net.ipv4.ip_unprivileged_port_start
+      value: "0"
+# One replica. The cluster has no metrics API for a CPU autoscaler.
+autoscaling:
+  enabled: false
