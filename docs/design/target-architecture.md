@@ -1,7 +1,10 @@
-# Cell identity PoC: design
+# Cell identity: target architecture
 
-Status: draft for owner review, revision 4. Date: 2026-11-08. Facts that can change are as of
+Status: draft for owner review, revision 5. Date: 2026-11-08. Facts that can change are as of
 this date.
+
+This is the reference design. `docs/design/poc-scope.md` says what the first build proves, and
+which parts of this design it simplifies or defers.
 
 Source markers: **[owner]** means the project owner decided it. **[call]** means the author
 chose it, and the owner can overrule it. **[canon]** means the Kiln design canon in the
@@ -10,7 +13,7 @@ chose it, and the owner can overrule it. **[canon]** means the Kiln design canon
 `docs/design/base-cell.md` describes the cluster template that every cluster uses. That
 document is built and verified. This document builds on it.
 
-Revision 4 applies a second round of security, network, DevOps and infrastructure reviews.
+Revision 5 applies a third round of security, network, DevOps and infrastructure reviews.
 Each finding that depends on upstream behaviour was checked against upstream source or
 documentation on 2026-11-08.
 
@@ -45,12 +48,8 @@ Kiln (management plane, decides)                                      [owner, ca
 
 ## Phases **[owner]**
 
-| Phase | Covers |
-| --- | --- |
-| 1 | Attestation, Kiln-signed work, `kiln-celld`, bundles and safe updates, island mode and revocation, the read-only central view, customer-data operations and encrypted exports |
-| 2 | Exploration sessions, cross-environment requests, HPA fan-out, rebuild-from-empty recovery, root rotation, and EKS |
-
-Phase 2 sections are marked. A builder plans phase 1 first.
+`docs/design/poc-scope.md` defines the first build. Sections marked **[phase 2]** come in later
+increments, listed under "Milestones".
 
 ## Acceptance checks
 
@@ -61,14 +60,14 @@ Phase 2 sections are marked. A builder plans phase 1 first.
 3. Both cells appear in Kiln as valid.
 4. A third, malicious cell starts, and it is rejected.
 
-Phase 1 also covers these behaviours:
+The design also covers these behaviours:
 
 - Kiln sends operations to a cell and reads information from it, through the environment control plane.
 - Kiln shows every cell in one Argo CD view, with live manifests. The view cannot change a cell.
 - An environment cut off from Kiln, and a cell cut off from its environment control plane, continue on their last known state.
 - A customer-data operation runs inside the cell, and an export leaves only as ciphertext, after approvers sign it.
 - A bad `kiln-celld`, Argo CD or platform bundle rolls back with no step in the cell, and no rollback deletes a provider resource.
-- Each phase 1 case in "Rejection tests" fails with the stated result.
+- Each case in "Rejection tests" fails with the stated result.
 
 ## Goals, non-goals and anti-goals
 
@@ -130,15 +129,15 @@ Local instances use `dev` as `<env>`: the clusters are `kiln`, `dev-cp`, `dev-ce
 
 | Class | Members | Where it lives |
 | --- | --- | --- |
-| Offline roots | Each trust domain's root CA, the recovery key | Offline. Used only to sign intermediates and key set changes |
+| Offline roots | Each trust domain's root CA, the five recovery keys | Offline. Used only to sign intermediates and the changes in the signer matrix |
 | Online intermediates | Each SPIRE server's upstream intermediate, valid 30 days | The secret store, delivered to that SPIRE server |
 | Kiln signing keys | Spec, record, platform bundle, application bundle and operation keys | Kiln's secret store |
 | Approver keys | One signing key per approver, held on the approver's device | Never in a cluster. Public keys travel in signed approver directories |
 | Rebuildable keys | SPIRE server CAs, the Argo CD Agent JWT key, mesh CAs | Generated inside the cluster |
 
-- Locally, `mise run keys:seed` reads each key from the secret manager CLI on standard input, and creates the Kubernetes Secret directly. CI generates throwaway roots per run, passed on standard input.
+- Locally, `mise run keys:seed` reads each key from the secret manager CLI on standard input, and creates the Kubernetes Secret directly. Unit tests generate throwaway keys in memory.
 - On EKS, an external store holds the online keys. A provider-neutral sync delivers them, and each key rotates with one command.
-- A key set change needs signatures from the current key and from the recovery key.
+- Key set changes follow the signer matrix in "Key rotation and recovery".
 
 ## Topology and trust boundaries
 
@@ -178,13 +177,19 @@ telemetry gateway. It has no developer portal, catalog or workflow engine.
 
 ### Second proof for traffic to Kiln **[call]**
 
-The environment's SPIRE server can mint any identity in its environment. Traffic that a cell
+The environment's SPIRE server can mint any identity in its environment. Everything a cell
 sends up to Kiln therefore carries a second proof that the environment control plane cannot
 mint:
 
-- Each upward stream also presents a projected service account token from the cell, with the audience `kiln`.
-- Kiln verifies that token against the cluster keys in the Kiln-signed cell record, and checks that its subject matches the SVID.
-- A compromised environment control plane can still drop or delay traffic, but it cannot pose as a cell to Kiln.
+- Each upward stream, and each result, acknowledgement and high-water mark that `kiln-celld` reports through kiln-envd, carries a projected service account token from the cell.
+- The token's audience names Kiln and the item, for example `kiln-result/<cell>/<operation-id>`.
+- Kiln verifies the token against the cluster keys in the Kiln-signed cell record, and checks that its subject matches the reported cell.
+- Kiln's root is pinned in each cell at bootstrap and read from a static file, never from the Workload API. The environment control plane therefore cannot pose as Kiln to a cell.
+
+A compromised environment control plane can still drop or delay traffic. It cannot pose as a
+cell to Kiln, or as Kiln to a cell. The issuer binding is trust on first use: the environment
+control plane chooses which cluster it creates, and the nonce token proves only that the
+cluster answers.
 
 ### Network flows
 
@@ -201,7 +206,7 @@ Every connection goes up a layer. **[owner, canon]**
 | Bootstrap actor, operators | A cell's Kubernetes API, over the tailnet | Bootstrap and break-glass only |
 
 - Each Kiln listener serves one environment and trusts that environment's root only.
-- Cross-cluster TLS ends only at the two endpoints, never at a load balancer, an ingress or the relay.
+- Cross-cluster TLS never ends at a load balancer or an ingress. At the relay, only the outer layer ends; the inner layer ends at its two endpoints.
 - No flow goes from one cell to another.
 
 Zero trust rule: the identity check decides every access. Network controls only reduce exposure.
@@ -211,40 +216,47 @@ Zero trust rule: the identity check decides every access. Network controls only 
 The relay carries agent and telemetry streams from cells to Kiln. Each stream has two TLS
 layers:
 
-1. An outer mTLS layer from the cell to the relay, with the cell's SVID, and from the relay to Kiln, with the relay's SVID.
-2. An inner TLS layer from the cell's `cell-proxy` to Kiln's `cell-proxy`, end to end. The relay cannot read it.
+1. An outer mTLS layer, which ends at the relay: the cell presents its SVID, and the relay presents `cp/relay` to Kiln.
+2. An inner TLS layer from the cell's `cell-proxy` to Kiln's `cell-proxy`, which ends only at those two endpoints.
 
-Because the relay sees the outer identity, it:
+The cell's `cell-proxy` expects the relay's ID on the outer layer and Kiln's ID on the inner
+layer. Because the relay sees the outer identity, it:
 
+- routes by the inner SNI, checked against the endpoints in the cell's signed record;
 - authorizes each cell against the current spec, and closes its streams when the cell is revoked;
-- caps connections per cell, and enforces handshake and first-byte timeouts;
-- uses separate ports for agent and telemetry streams, so a telemetry flush cannot starve the live view.
+- caps connections and bytes per cell, and enforces handshake and first-byte timeouts;
+- ends each downstream stream when its upstream connection ends.
 
-Kiln's listener admits only relays.
+Agent and telemetry streams use separate relay deployments, so a telemetry backlog after an
+island cannot starve the live view. Kiln's listener admits only relays.
 
 ### Plane endpoints **[call]**
 
-- The signed cell record carries an endpoint set for the environment control plane. During a move, the set holds the old and the new endpoints together.
-- The endpoints outlive the environment control plane. Locally, pf on the Mac forwards fixed ports at the vmnet gateway address. On EKS, Elastic IPs are allocated outside the control plane's lifecycle and recorded in the spec.
-- NodePort values are pinned, in the range 30000–32767.
-- The NLBs have no source allow-list. Identity decides access.
+- The signed cell record carries an endpoint set for the environment control plane. During a move, the set holds the old and the new endpoints together. Every client tries each address in the set.
+- The SPIRE agent takes one server address, so each sidecar connects through a small local forwarder that tries the endpoint set.
+- The endpoints outlive the environment control plane. On EKS, the provider backend owns each NLB and its target groups outside `<env>-cp`, with cross-zone load balancing on. TargetGroupBinding binds them to the cluster. A PrivateLink endpoint service is the alternative if internet exposure is not wanted.
+- Locally, pf forwards fixed ports at the vmnet gateway address. The rules live in a scoped anchor under `com.apple/` and apply only to the vmnet bridge interface.
+- NodePort values are pinned, in the range 30000–32767. Plane listeners use `externalTrafficPolicy: Local`, and each platform has its own ingress rule for them.
+- The NLBs have no source allow-list. A pre-authentication limiter in front of each plane listener bounds handshakes and connections.
 
 ### Kubernetes API access **[owner]**
 
 - A cluster's Kubernetes API is reachable only from the operators' tailnet. On EKS, each cluster has a private API endpoint only.
-- Tailnet tags are per environment and per cell. The bootstrap actor reaches only a cell with the bootstrap tag. Kiln removes that tag at the end of bootstrap, and the gate checks the removal.
-- Each cell's subnet router joins with a single-use, short-lived key. Routes are approved only for the CIDR allocated to that cell.
+- Tailnet access to a cell uses grants whose destination is that cell's CIDR, through that cell's router tag. Tags alone do not control subnet routes.
+- The bootstrap actor has its own grant, which Kiln deletes at the end of bootstrap. The gate tests that a connection then fails, not only that the grant is gone.
+- Each cell has two subnet routers outside its cluster, with persisted state, so break-glass does not depend on the cell's cluster or on Kiln. Operators re-enrol a router with their own tailnet admin role.
+- Each cell has a unique CIDR allocation, recorded in the signed record. Routes are approved only for that CIDR.
 - Locally, vmnet stands in for the tailnet, so the local run cannot prove this property. The EKS run proves it.
 
 ### Network isolation **[call]**
 
 - Each cluster gets its own VPC on EKS, with no peering between cluster VPCs.
-- Every namespace has default deny, `kube-system` included.
-- Traffic from nodes is allowed only to probe and webhook ports, per workload. On EKS, webhook calls come from the cluster subnets, so those CIDRs are allowed for webhook ports.
-- A ValidatingAdmissionPolicy in each cell denies `NodePort` and `LoadBalancer` Services, `hostPort` and `hostNetwork`, except for named platform components.
-- Kiln signs a network policy template. `kiln-celld` fills in only typed fact fields under a schema: subnet CIDRs, never single node addresses. A static egress rule lets `kiln-celld` reach the plane endpoints without rendered facts.
-- On EKS, VPC CNI runs network policy in strict mode. Any cluster-wide policy type stays inside the provider backend.
-- Each upward flow has its own egress rule from the namespace that needs it, listed with the component in the bundles.
+- Every namespace has default deny, `kube-system` included. `kiln-celld` refuses a bundle that creates a namespace without the platform default deny, and an admission policy denies pods in a namespace that has none.
+- Traffic from nodes is allowed only to probe and webhook ports, per workload. Locally, rules name each node by its own address. On EKS, pods use a secondary CIDR through custom networking, so node and control-plane subnets stay separate from pods. Webhook ports admit only the control-plane subnets.
+- An admission policy in each cell denies `NodePort` and `LoadBalancer` Services, `externalIPs`, writes to `status.loadBalancer`, `hostPort` and `hostNetwork`. Exemptions name a service account and an exact object.
+- Kiln signs a network policy template. `kiln-celld` fills in only typed facts: node addresses, subnet CIDRs and named endpoints such as the DNS resolver. Each fact must fall inside the cell's allocation in the signed record. A static egress rule lets `kiln-celld` reach the plane endpoints without rendered facts.
+- On EKS, VPC CNI runs network policy in strict mode, so every add-on needs its own policy. Any cluster-wide policy type stays inside the provider backend.
+- Each upward flow has its own egress rule from the namespace that needs it.
 
 ## Identity
 
@@ -259,30 +271,36 @@ same. Read both before the attestor is written.
 ### SPIRE CAs **[call]**
 
 - Each environment's root CA stays offline. It signs an upstream intermediate valid for 30 days, which the SPIRE server loads through the `disk` UpstreamAuthority with `bundle_file_path`.
-- Rotating the intermediate is one command, and cells notice nothing, because they pin the root.
-- Every sidecar pins the root. `insecure_bootstrap` stays off.
-- Root rotation is a key set change delivered in platform bundles, with the old and new roots trusted together. **[phase 2]**
+- The next intermediate is signed ahead, with overlapping validity, and staged in the secret store. The server switches at half the current intermediate's life. An alert fires at half life if no next intermediate is staged.
+- Cells pin the root, so a planned intermediate change is invisible to them.
+- A compromised intermediate is denied by its subject key ID. The deny-list reaches cells as a narrowing key set, and `cell-proxy` and `kiln-celld` check it during verification. Revoking the root itself would also drop every good identity.
+- Root rotation adds the next root to every cell's key set, and retires the old root only after every cell that is not decommissioned acknowledges. **[phase 2]**
 
 ### Attestation
 
 The SPIRE agent runs as a sidecar in each pod that needs an identity, with no DaemonSet, host
 path, CSI driver or kubelet access. The sidecar verifies the exact server ID before it sends a
-projected token with the audience `spire-<env>`.
+token.
 
 The server plugin takes these steps. Any error denies:
 
 1. It loads the cell record from the current signed spec, with any local revocation overlay. It refuses a revoked cell.
-2. It verifies the token signature against the cluster keys in that record, never against keys chosen by the `iss` claim.
-3. It checks audience, namespace and service account against the record.
+2. It rejects an unknown key ID before any signature work, then verifies the token signature against the cluster keys in the record. It never uses keys chosen by the `iss` claim.
+3. It checks namespace and service account against the record.
 4. It requires a token bound to a pod, with the pod UID and node claims.
 5. It requires a lifetime of 15 minutes or less, and an `iat` no older than 15 minutes.
-6. It refuses a token ID (`jti`) already used by a different pod UID. The same pod may retry with the same token, because kubelet reuses tokens until 80% of their lifetime.
-7. It limits attestation per cell, after the signature check.
-8. It returns `can_reattest = true`, so a sidecar whose SVID expired attests again with a fresh token.
+6. It requires the audience `spire-<env>/<nonce>`, where the nonce comes from the server for this attestation. The sidecar requests that token through TokenRequest for its own service account. A copied token therefore works only once, and only for the attestation it was made for.
+7. It limits attestation per cell.
+8. It returns `can_reattest = false`, and an agent ID that includes the nonce's hash: `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>`.
 
-- SPIRE's built-in rate limit of one attestation per second per IP is turned off, because cells share NAT and relay addresses. Step 7 replaces it.
+Because agents do not re-attest, a running agent renews its SVID without a new token. SPIRE
+re-attests a re-attestable agent on every rotation (verified in `pkg/agent/svid/rotator.go`),
+which would fail during an island after a cluster key rotation. A sidecar whose SVID has
+expired attests again as a new agent, with a new nonce.
+
+- The server prunes old agents with `prune_tofu_nodes = true` and `prune_attested_nodes_expired_for`.
+- SPIRE's built-in per-IP limit is turned off, because cells share addresses. The nonce cache and the per-cell limits live in the SPIRE datastore, so a second server shares them.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
-- The server prunes expired agents with `prune_attested_nodes_expired_for`.
 
 ### Independent key check **[call]**
 
@@ -307,7 +325,7 @@ An island is an incident. While it lasts, no trust changes:
 - No cell record, key set, approver directory or SPIRE root changes.
 - An attestor does not accept a cluster key that is not in the last signed record.
 - EKS rotates each cluster's signing key every 7 days, and that rotation cannot be paused. After a rotation during an environment island, new pods that need an identity in that cell cannot attest until Kiln confirms the new key.
-- Running SPIRE agents renew over their current connection, without a new token, so running workloads keep their identities.
+- Running SPIRE agents renew without a new token, because they do not re-attest, so running workloads keep their identities.
 
 The incident response is a change freeze. The HPA holds its current size, rollouts wait, and
 alerts fire at once. Customer traffic is never affected.
@@ -316,24 +334,41 @@ alerts fire at once. Customer traffic is never affected.
 
 Every trust change follows the same rules, whatever the key:
 
-1. **Signed key sets.** A change to what a component trusts arrives as a key set with a version and an epoch. The receiver verifies it with the current key and the recovery key, whatever channel carried it. A compromised channel can delay a key set, but cannot forge or alter one.
-2. **Overlap.** The next key is published before it is used. The old key retires only after every valid receiver acknowledges the new set, or after a fixed maximum time.
+1. **Signed key sets.** A change to what a component trusts arrives as a key set with a version and an epoch, signed as the matrix below requires. The receiver verifies it, whatever channel carried it. Kiln keeps every key set, and delivers them in order.
+2. **Overlap.** The next key is published before it is used. The old key retires only after every receiver that is not decommissioned acknowledges the new set. Time alone never retires a key.
 3. **No downgrade.** A receiver refuses a key set with a lower version.
-4. **Narrow freely, widen only when connected.** Removing trust is allowed at any time, also locally during an island. Adding trust needs Kiln and the recovery key, so it never happens during an island.
+4. **Narrow freely, widen only when connected.** Removing trust is allowed at any time, also locally during an island. A narrowing can never remove the recovery keys or the last path that widens trust. Adding trust never happens during an island.
 5. **Key sets first on reconnect.** After an island, a component applies pending key sets before any other work. Only then does Kiln confirm rotated cluster keys, and only then does queued work run.
 
-| Key | Planned rotation | Emergency rotation, after a suspected compromise | Recovery from loss |
-| --- | --- | --- | --- |
-| Cell cluster signing key, rotated by the provider | Kiln fetches the new key from the bound issuer, adds it, and keeps the old one until its tokens expire. More than two new keys since the last check needs an approver signature, because it may mean a compromised issuer | Kiln removes the key in a new record. On EKS the provider rotates; locally an operator rotates with two `--service-account-key-file` values | The provider holds it. Kiln confirms the next key from the issuer |
-| SPIRE intermediate CA | Replaced at half its 30-day life. Cells notice nothing, because they pin the root | The offline root signs a new intermediate. The environment's SVIDs reissue within one lifetime | Load a new intermediate from the offline root |
-| SPIRE root CA | Next root added to every cell's key set, then the old root retired after acknowledgement. **[phase 2]** | A recovery-signed key set removes the root. Islands trust it until they reconnect | Key set signed by the recovery key |
-| Kiln signing keys | Current and next in each key set | A recovery-signed key set removes the key. Sensitive items still need approver signatures, which bounds the damage | Key set signed by the recovery key |
-| Approver keys | Directory change, signed by Kiln and the recovery key | Removal from the directory, which narrows trust and needs only the recovery key | The approver enrols a new device key |
-| Export recipient keys | Next recipient added to the allow-list. Old private keys stay in the recipient's store until the exports' retention ends | Removal from the allow-list | Exports to a lost key cannot be read. Retention of recipient private keys is the recipient's duty |
-| Recovery key | A ceremony: the old key signs the new one | Split into shares, so no single holder can use it. M of N holders replace it | If fewer than M shares remain, cells re-bootstrap through break-glass. This is the last resort |
-| Mesh CA, Argo CD Agent JWT key | Rebuildable, regenerated inside the cluster | Regenerate, then restart the affected workloads | Regenerate |
+Who signs each change:
 
-The recovery key uses 3 of 5 shares, and its public key is pinned in every cell at bootstrap.
+| Change | Signed by |
+| --- | --- |
+| Add a cell cluster key from the bound issuer | Kiln, in the cell record. More than two new keys between checks also needs an approver, because it may mean a compromised issuer |
+| Planned rotation of a Kiln key: add the next key, retire the old one | The current Kiln key and two approvers |
+| Add an approver | Kiln and two approvers. A Data Protection role needs a Data Protection approver |
+| Remove an approver | Two approvers, or the recovery quorum |
+| Add an export recipient or store | Kiln and a Data Protection approver |
+| Remove a Kiln key after a compromise | The recovery quorum |
+| Replace a root, or bump the epoch after a restore | The recovery quorum |
+| Revoke a cell, or deny an intermediate | Kiln, or a local operator during an island |
+
+The recovery quorum is 3 of 5 recovery keys, each held offline by a different holder. Every
+cell pins all five public keys, and a change needs three separate signatures, so no key is
+ever put back together on one device. Three holders together replace a lost or departing
+holder. A runbook names the holders, the meeting process, the tool, and a drill every
+quarter.
+
+| Key | Planned rotation | Emergency rotation | Recovery from loss |
+| --- | --- | --- | --- |
+| Cell cluster signing key, rotated by the provider | Kiln adds the new key from the bound issuer, and keeps the old one until its tokens expire | Kiln removes the key in a new record. Locally, an operator rotates it with two `--service-account-key-file` values | The provider holds it. Kiln confirms the next key from the issuer |
+| SPIRE intermediate CA | Next intermediate staged ahead, switched at half life | Deny by subject key ID, then switch to the staged intermediate | Sign a new intermediate with the offline root |
+| SPIRE root CA | Next root added, old root retired after every acknowledgement. **[phase 2]** | Recovery quorum replaces the root. Islands trust the old root until they reconnect | Recovery quorum |
+| Kiln signing keys | Current and next in each key set | Recovery quorum removes the key. Sensitive items still need approver signatures, which bounds the damage | Recovery quorum adds a new key |
+| Approver keys | The approver enrols a new device key | Removal, which narrows trust | The approver enrols a new device key |
+| Export recipient keys | Next recipient added. Old private keys stay with the recipient until the exports' retention ends | Removal from the allow-list | Exports to a lost key cannot be read |
+| Recovery keys | Three holders sign a replacement | Three holders remove the compromised key | Three holders replace a lost key. With fewer than three, cells re-bootstrap through break-glass, the last resort |
+| Mesh CA, Argo CD Agent JWT key | Regenerated inside the cluster | Regenerate, then restart the affected workloads | Regenerate |
 
 ### Revocation **[call]**
 
@@ -400,27 +435,30 @@ seconds. Reconnects use jittered backoff.
 
 - The stream hello negotiates a version. Servers support the last three versions.
 - One fixed message, "accept an upgrade bundle", never changes, so a cell that returns from a long island can always be upgraded.
-- SPIRE servers upgrade one minor version at a time, and never while any cell of the environment is an island.
+- SPIRE servers upgrade one minor version at a time. They wait while any cell of the environment is an island, unless an operator overrides the hold, which is audited.
 
 ### Signed work and idempotency **[call]**
 
-- Kiln signs every operation, bundle and session grant. The DSSE payload binds the target cell, kind, operation ID, expiry and approver signatures.
+- Kiln signs every operation, bundle and session grant. The DSSE payload binds the target cell, kind, operation ID, expiry, version and approver signatures.
 - `kiln-celld` refuses an unsigned item or an item for another cell.
-- Each operation applies at most once, by its 128-bit operation ID. `kiln-celld` records each applied ID with a create-only object, kept until the operation's expiry. A second application fails to create the record.
+- Each operation applies at most once, by its 128-bit operation ID. Before it applies, `kiln-celld` creates a record for the operation in state `claimed`. It moves the record to `applied` with the result, then to `reported`.
+- A second claim of the same operation returns the stored result. It never applies the operation again, even after a lease expired during a partition.
 - An operation past its expiry is reported as `expired`, never applied late. Expiry is shorter than record retention, so an old operation cannot be replayed.
-- Bundles carry a component version with an epoch. `kiln-celld` refuses a lower version, and treats a resend with the same digest as a no-op.
+- Bundles carry a component version with an epoch, kept in an object in the cell. `kiln-celld` refuses a lower version, and treats a resend with the same digest as a no-op.
 
 ### Approvals in the cell **[owner: cells check approvers; details are a call]**
 
-- Each signed record carries an approver directory: approvers' public keys and roles. A change to the directory is a key set change.
-- Kiln forwards each approval as the approver's own signature over the item's digest.
+- Each signed record carries an approver directory: approvers' public keys and roles. Changes follow the signer matrix.
+- An approval is the approver's own signature over the decoded item. The approver's client shows what it signs: the target, the kind, the version, and for an export the recipient key fingerprint and the store. A compromised Kiln therefore cannot get a signature for a different item than the one shown.
 - `kiln-celld` checks the policy itself: the author never approves, deletion, unmasking and exports need a Data Protection approver, and platform bundles need a platform approver.
-- Because of this, a compromised Kiln alone cannot export data, unmask it, or remove a cell's guards.
+- Application bundles need an independent second signature: an approver, or a build-provenance signer pinned in the record.
+- Approvers also sign a security floor version for platform components. `kiln-celld` refuses a bundle below that floor, so an old approved bundle cannot bring back a state without a newer guard.
+- Because of this, a compromised Kiln alone cannot export data, unmask it, ship a workload, or remove a cell's guards.
 
 ### Bundles, Argo CD and safe updates **[owner: Argo CD per cell; details are a call]**
 
 1. An operation delivers a signed, hydrated bundle to `kiln-celld`.
-2. `kiln-celld` verifies the signatures, the version and the target. It checks every object against the key's allow-list, by kind and namespace.
+2. `kiln-celld` verifies the signatures, the version, the floor and the target. It checks every object against the key's allow-list, by kind and namespace.
 3. It pushes the bundle by digest to the bundle store, and composes the root bundle under a cell-wide Lease.
 4. Argo CD applies it, within an AppProject for each key. Each AppProject repeats the kind and namespace limits.
 
@@ -428,21 +466,28 @@ Key allow-lists:
 
 | Key | May change |
 | --- | --- |
-| Platform bundle key | Platform components, network policy, mesh policy, Argo CD, `cell-system`, `ack-system`, `observability-system` |
-| Application bundle key | Product namespaces only. Not `ServiceEntry` with `exportTo: "*"`, `EnvoyFilter`, `PeerAuthentication`, `Service` of type `NodePort` or `LoadBalancer` |
+| Platform bundle key | Platform components, network policy, mesh policy, `ack-system`, `observability-system`, and Argo CD configuration |
+| Application bundle key | Product namespaces only. Never `NetworkPolicy`, `ServiceEntry`, `Sidecar`, `AuthorizationPolicy`, `PeerAuthentication`, `EnvoyFilter`, Gateway API kinds, the sidecar injection opt-out, or a `Service` that is not `ClusterIP` |
+
+No bundle may change `kiln-celld`, its watchdog, the Argo CD workloads, or the pinned roots and
+recovery keys. Those objects are outside every Argo CD Application, and an admission policy
+refuses bundles that name them.
 
 Rollback and health **[call]**:
 
-- A rollback is a roll-forward. Kiln, or the cell on its own, publishes the previous content as a new version. It never removes an Application, so nothing is pruned.
-- The health check uses in-cell signals only: Argo CD Synced and Healthy at the digest, a reply from the bundle store, and the updated workloads ready. A network partition alone never triggers a rollback.
-- The bundle store keeps the last two good roots and the bundles they pin, safe from garbage collection.
+- A rollback points the root back at the last good root that Kiln signed, by digest. It creates no new version, so it never collides with Kiln's next one. `kiln-celld` reports `rolled_back`, and Kiln issues its next version above the failed one.
+- A rollback never removes an Application, so nothing is pruned.
+- The health check uses in-cell signals only. It needs Argo CD Synced and Healthy at the digest, a reply from the bundle store, and the updated workloads ready. A partition alone never triggers a rollback.
+- The bundle store runs on a persistent volume. `kiln-celld` also keeps the last two signed bundle sets in its own durable state. It can refill a lost store without the environment control plane.
+- Registry garbage collection runs offline, under the cell-wide Lease, and keeps the last two good roots.
 - Platform bundles go to the canary cell named in the spec first.
 
-`kiln-celld` and Argo CD update through their own path, because they run the normal one:
+`kiln-celld` and Argo CD update through their own path:
 
-- `kiln-celld` updates blue/green. The new version starts beside the old one, and the old one stops only after the new one holds its stream and passes its checks.
-- A small static watchdog in `cell-system` reverts a `kiln-celld` or Argo CD rollout that does not become healthy within its deadline. Bundles cannot change the watchdog.
-- Argo CD upgrades are applied by `kiln-celld` directly, under the same watchdog, not by Argo CD itself.
+- An update is an operation that `kiln-celld` applies directly, outside Argo CD.
+- `kiln-celld` updates blue/green. The record allows the replica cap plus one per version during an update. The old version stops only after the new one passes in-cell checks. A missing stream keeps both versions running.
+- A small static watchdog in `cell-system` reverts a rollout that does not become healthy within its deadline. For Argo CD, healthy means it reconciles a canary Application at the expected digest. The watchdog itself changes only through break-glass.
+- The plane clusters `kiln` and `<env>-cp` update the same way, under their own watchdogs.
 
 ### Customer-data operations **[owner; details follow the canon]**
 
@@ -463,7 +508,7 @@ Rollback and health **[call]**:
 
 | Kind | Path |
 | --- | --- |
-| Metadata discovery | An ordinary read operation, in phase 1 |
+| Metadata discovery | An ordinary read operation |
 | Queries over customer rows | An interactive session through an in-cell explore gateway |
 
 A session works like this:
@@ -515,22 +560,26 @@ The agent name is `<env>-<cell>`, so names never collide across environments.
 ### The view cannot change a cell **[call]**
 
 Argo CD Agent v0.10.0 lets the principal replace every annotation of an autonomous
-Application, not only `.operation` (verified in `internal/manager/application`). The guard
-therefore sits in the cell:
+Application, not only `.operation` (verified in `internal/manager/application`). Its resource
+proxy also forwards creates, patches and deletes, and its terminal path runs exec in pods
+(verified in `agent/resource.go` and `agent/terminal.go`). The guard therefore sits in the
+cell:
 
-- A ValidatingAdmissionPolicy lets the agent's service account change only the `argocd.argoproj.io/refresh` annotation. It denies every other annotation, `.operation`, and every create, update or delete.
-- The agent's Applications live in a namespace that holds no Secrets. The agent may list and watch Secrets there, because its informer requires it, and never get them elsewhere.
-- The agent's read access is bound per namespace. It excludes `ops-runs`, so Job logs never reach the view.
+- The agent's service account has an explicit Role in each namespace it may read. It has no wildcard resources, and none of `pods/exec`, `pods/attach`, `pods/portforward`, `*/proxy` or `serviceaccounts/token`.
+- A ValidatingAdmissionPolicy lets that service account change only the `argocd.argoproj.io/refresh` annotation. It denies every other annotation, `.operation`, and every create, update, delete and connect.
+- The agent's Applications live in a namespace that holds no Secrets. The agent may list and watch Secrets there, because its informer requires it.
+- The agent's read access excludes `ops-runs`, so Job logs never reach the view.
 - Argo CD RBAC at Kiln also denies sync, terminate, delete and exec, as defence in depth.
+- Tests drive real principal events: resource requests, terminal requests and annotation updates. They do not call the API as the agent's service account.
 
 ### Upgrades **[call]**
 
 The principal refuses any agent with a different version (verified in
-`principal/apis/auth/auth.go`). The cell record lists a principal endpoint for each version,
-and principals split agents by namespace. An upgrade starts a new principal, moves cells as
-their bundles update, and stops the old one when no cell uses it. Kiln's Argo CD, the cell's
-Argo CD, the agent and the principal upgrade as one tested set. An alert fires on any version
-mismatch.
+`principal/apis/auth/auth.go`). Kiln runs a principal and its Argo CD for each supported
+version. The cell record names the principal endpoint for the cell's agent version, and the
+relay routes to it by inner SNI. An upgrade moves cells as their updates land, and stops an
+old principal when no cell uses it. Each cell's Argo CD, agent and principal upgrade as one
+tested set. An alert fires on any version mismatch.
 
 ## `cell-proxy` **[call]**
 
@@ -546,10 +595,12 @@ go-spiffe follows bundle and SVID changes at run time, so a CA rotation needs no
 
 ## Telemetry **[owner: no personal data in signals; details are a call]**
 
-- Each cell's collector sends OTLP through the relay to Kiln.
+- Each cell's collector sends OTLP through the telemetry relay to Kiln.
 - The collector forwards only allow-listed attributes, span names and event names. Log bodies come only from fixed message templates.
+- The collector runs as a StatefulSet with the Recreate strategy, with a persistent queue sized in bytes for 24 hours. It filters before it queues, and the relay limits the rate at which a backlog drains after an island.
+- `kiln-celld` status messages carry a health summary for the cell: Argo CD health, root digest, SVID expiry and collector drops. The environment control plane can therefore see its cells during an island with Kiln.
+- Each `<env>-cp` runs an alert evaluator, chosen after third-party review, and sends notifications through its own declared egress flow.
 - A test injects a canary personal-data string into a cell, and asserts that it never reaches Kiln.
-- Each `<env>-cp` evaluates local alert rules, so an island is visible without Kiln.
 
 | Signal | Alert when |
 | --- | --- |
@@ -558,25 +609,31 @@ go-spiffe follows bundle and SVID changes at run time, so a CA rotation needs no
 | Attestation denials, by code | Any denial for a valid cell |
 | Root digest compared with the intended digest | Different for 10 minutes |
 | Argo CD health | Not Healthy for 10 minutes |
-| Spec revision lag | A cell more than one revision behind |
-| Intermediate CA expiry | Less than 7 days |
+| Record revision lag, per cell | More than one revision behind |
+| Intermediate CA | Half life reached with no next intermediate staged |
 | Agent version mismatch | Any |
 | Collector drops | Any |
+| Backup age | Older than its schedule |
 
 ## State and recovery **[call]**
 
 | State | Lives in | After the loss of its cluster |
 | --- | --- | --- |
-| Intent, specs, approvals, registry, revocation mirror | Kiln database | Restore Kiln, bump the epoch. Environments keep running meanwhile |
-| Operation queue, fencing epochs | `<env>-cp` queue database | Restore, bump the queue epoch |
-| SPIRE datastore | Its own database, separate from the queue | Rebuild from the spec. Agents attest again |
-| Provider resource IDs | Kiln record | Adopt by ID |
+| Intent, records, approvals, registry, revocation mirror | Kiln database | Restore Kiln, bump the epoch. Environments keep running meanwhile |
+| Operation queue, fencing epochs, provider resource IDs | `<env>-cp` queue database | Restore, bump the queue epoch, merge provider IDs to Kiln |
+| SPIRE datastore, nonce cache, attestation limits | Its own database | Rebuild from the records. Agents attest again |
+| Local revocation overlays | A signed log on the operator side, outside `<env>-cp` | Reapply on restore. A restore that crosses an island needs operator confirmation |
 | Online keys | Secret store | Load again |
-| Bundles, applied operation IDs, sender state | The cell's bundle store and objects | kiln-envd resends; operation records survive in the cell |
+| Bundles, operation records, versions | The cell: persistent bundle store, `kiln-celld` durable state, objects | Survive. kiln-envd resends what the hello reports missing |
 
-- If its database stalls, the cell gateway keeps its open streams and cached cap state. It refuses only new streams.
-- Locally, Postgres runs on a persistent volume, and `mise run plane:backup` streams a backup to the Mac with no secret in it.
-- The HA path for a SPIRE server is a second server in another zone, with the same root and its own intermediate. **[phase 2]**
+- Each cell record has its own version. The environment spec is a signed index of record digests. A key rotation in one cell then changes one record, and lag is measured per record.
+- The cell controller writes each provider resource ID to the queue database before it calls the provider. It looks up resources by deterministic tags before every create, so a retry never duplicates.
+- A rebuilt environment control plane adopts resources with ACK's strict `adopt` and an empty spec, so adoption never changes live infrastructure.
+- The sweeper only reports. Deleting a provider resource needs an approver-signed operation that lists explicit IDs, after a quarantine period.
+- A cell that fails during creation reuses its account on retry. AWS accounts close only after a wait, and count against the limit while closed.
+- The organisation policy denies the cell controller's roles access-entry and IAM changes in cell accounts. It does not deny adoption, upgrade or decommission.
+- If its database stalls, the cell gateway keeps open streams and cached cap state, and refuses only new streams.
+- The HA path for a SPIRE server is a second server in another zone, with the same root, its own intermediate, and the shared datastore. **[phase 2]**
 
 ## Break-glass access **[call]**
 
@@ -599,21 +656,21 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 5 | Expired token | Attestor | `token_expired` | 1 |
 | 6 | Token requested with a lifetime of 1 year | Attestor | `token_lifetime` | 1 |
 | 7 | Token not bound to a pod | Attestor | `token_unbound` | 1 |
-| 8 | Token reused by another pod | Attestor | `token_replayed` | 1 |
-| 9 | Rogue serves its own JWKS for a real cell, or reaches the host service | Kiln pinned TLS; Mac packet filter | `issuer_untrusted` | 1 |
+| 8 | Copied token used again, or for another attestation | Attestor nonce check | `token_replayed` | 1 |
+| 9 | Rogue serves its own JWKS for a real cell, or calls the host service | Kiln pinned TLS; host service mTLS | `issuer_untrusted` | 1 |
 | 10 | Pod beyond the replica cap, or claiming another pod's UID | Cell gateway | `replica_cap` | 1 |
 | 11 | `kiln-celld` in cell A claims cell B | ID from verified claims | `cell_mismatch` | 1 |
 | 12 | Environment control plane forges or changes an operation or bundle | `kiln-celld` signature check | `signature_invalid` | 1 |
 | 13 | Operation applied twice, or replayed after its expiry | Operation record; expiry | `already_applied`, or `expired` | 1 |
 | 14 | Bundle with a lower version | `kiln-celld` | `version_old` | 1 |
 | 15 | Item signed for cell A presented in cell B | `kiln-celld` target check | `wrong_target` | 1 |
-| 16 | Export, unmask or platform bundle signed by Kiln without valid approver signatures | `kiln-celld` approval policy | `approval_missing` | 1 |
+| 16 | Export, unmask, platform bundle or application bundle signed by Kiln without the required second signature | `kiln-celld` approval policy | `approval_missing` | 1 |
 | 17 | Export to a recipient or store not on the allow-list | `kiln-celld` | `export_refused` | 1 |
 | 18 | Application-key bundle with a forbidden kind or namespace | `kiln-celld` allow-list and AppProject | `component_not_allowed` | 1 |
 | 19 | Network policy bundle that blocks the plane endpoints | `kiln-celld` | `policy_blocks_planes` | 1 |
 | 20 | Spec with a lower revision, no Kiln signature, or invalidating several cells | kiln-envd | `spec_invalid` | 1 |
 | 21 | Cell controller step without a Kiln signature, or with a modified bootstrap set | Cell controller; bootstrap actor | `step_invalid` | 1 |
-| 22 | Environment control plane poses as a cell to Kiln with an SVID it minted | Kiln second proof | `proof_missing` | 1 |
+| 22 | Environment control plane poses as a cell to Kiln, on a stream or in a reported result | Kiln second proof | `proof_missing` | 1 |
 | 23 | TLS interception, `kiln-celld` to the cell gateway | `kiln-celld` | `peer_untrusted`, or `peer_not_allowed` | 1 |
 | 24 | TLS interception, sidecar to SPIRE server | Sidecar | Connection refused | 1 |
 | 25 | Relay or Kiln impostor between agent and principal, with an environment-minted SVID | `cell-proxy` exact ID | `peer_not_allowed` | 1 |
@@ -632,7 +689,9 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 38 | Operation Job reaches a host that is not its target | Run NetworkPolicy | Connection fails | 1 |
 | 39 | Canary personal-data string logged in a cell | Collector allow-list; view RBAC | Never reaches Kiln | 1 |
 | 40 | Rollback of a bundle that created an ACK resource | Retain policy; no prune | The provider resource remains | 1 |
-| 40a | Key set without the recovery signature, with a lower version, or that widens trust during an island | Receiver | `keyset_invalid` | 1 |
+| 40a | Key set without the signers the matrix requires, with a lower version, that widens trust during an island, or that removes the recovery keys | Receiver | `keyset_invalid` | 1 |
+| 40c | Environment's SPIRE server serves a fake Kiln bundle to a cell | Static Kiln root in the cell | `peer_untrusted` | 1 |
+| 40d | Platform bundle below the signed security floor | `kiln-celld` | `version_old` | 1 |
 | 40b | Item signed by a retired or removed key | `kiln-celld` | `signature_invalid` | 1 |
 | 41 | Session broker with a valid gateway SVID relays a person's grant | Person-bound mTLS | `session_denied` | 2 |
 | 42 | Session used by another person, after its time limit, or for writes | Explore gateway; database role | `session_denied` | 2 |
@@ -658,7 +717,7 @@ SPIRE's limits. The Mac gate has a fast tier and a slow tier.
 | Local revocation in island mode | The cell stays refused after the next Kiln revision | 1 |
 | Planned rotation of a Kiln signing key and the SPIRE intermediate, under load | No operation fails and no identity lapses | 1 |
 | Emergency removal of a Kiln key while one cell is an island | Connected cells refuse the key at once. The island cell applies the key set before any work on reconnect | 1 |
-| Recovery key replaced from 3 of 5 shares | Cells accept the new recovery key, and refuse key sets signed by the old one | 2 |
+| One recovery key replaced by three holders | Cells accept the new key, and refuse key sets signed by the old one | 2 |
 | Kiln restored from a backup one hour old | Environments accept the next spec, and cells accept the next operation | 2 |
 | `dev-cp` deleted, rebuilt from empty, then restored | Every cell reconnects with no step in any cell, at the same endpoints | 2 |
 | Attestation burst after an outage, with a rogue flood | Every real sidecar attests within 5 minutes | 2 |
@@ -669,7 +728,7 @@ Every random choice in a test records its seed.
 ## Residual risks
 
 - A cell's cluster token signing key is the root of trust for that cell. A cluster admin who can request tokens can act as that cell's `kiln-celld`.
-- The environment control plane is trusted on first use for the cells it creates. After bootstrap, it can mint identities in its environment and stop work on its way to cells. It cannot forge Kiln-signed work, pose as a cell to Kiln, or change a cell's access.
+- The environment control plane is trusted on first use for the cells it creates, because it chooses which cluster the issuer binding proves. After bootstrap, it can mint identities in its environment and stop work on its way to cells. It cannot forge Kiln-signed work, pose as a cell to Kiln, or change a cell's access.
 - Kiln and its approvers together can change any cell. Kiln alone cannot export, unmask or remove guards.
 - During an environment island, a rotated cell key blocks new pods that need an identity in that cell until Kiln reconnects.
 - During an island, a cell that Kiln revoked continues until an operator revokes it locally.
@@ -682,11 +741,17 @@ Every random choice in a test records its seed.
 
 | Tier | Runs on | Covers |
 | --- | --- | --- |
-| Unit and component tests | GitHub CI | Go packages, the attestor, `cell-proxy`, signature, approval and idempotency checks |
-| Linux gate | GitHub CI, 4 CPUs and 16 GB | `kiln`, `dev-cp`, one cell and `rogue`, with Istio off where a test does not need it. Throwaway roots. Does not test how roots load from the secret store |
-| Mac gate, fast | The owner's Mac | Phase 1 acceptance and rejection tests |
+| Unit and component tests | GitHub-hosted runners | Go packages, the attestor, `cell-proxy`, signature, approval and idempotency checks |
+| Mac gate, fast | The owner's Mac | Acceptance and rejection tests of the build in progress |
 | Mac gate, slow | The owner's Mac | Survivability tests |
-| EKS gate | EKS, phase 2 | Everything, plus tests 43–45 and latency bounds |
+| EKS gate | EKS, phase 2 | Everything, plus the provider, tailnet and isolation tests that need AWS |
+
+Hosted runners for private repositories have 2 CPUs, 8 GB and 14 GB of disk (verified), so they
+run no clusters. A larger runner is an option later, and needs no design change.
+
+Some tests cannot pass on the Mac by design. Locally, clusters share vmnet, so isolation tests
+target the pod network only. Tests of ACK deletion policy and per-request IAM credentials need
+AWS, so they run in the EKS gate.
 
 ## Prior art
 
@@ -700,26 +765,15 @@ Every random choice in a test records its seed.
 
 ## Milestones
 
-Phase 1:
+`docs/design/poc-scope.md` defines the first build and its milestones. Later increments follow
+this order, each with its own scope document:
 
-| # | Milestone | Done when |
-| --- | --- | --- |
-| M0 | Base cell | Done on 2026-11-07, renamed on 2026-11-08 |
-| M1 | Harness and provisioning path | The `local` backend and host service create `kiln`, `dev-cp`, two cells and `rogue` twice from clean, with storage and keys. The Linux gate runs. Test 35 passes |
-| M2 | Attestor | `kiln-celld` gets an SVID, against a test-signed record. Tests 1–8, 10, 11 and 24 pass |
-| M3 | Kiln stand-in, specs and records | Specs and records come from Kiln, with the key check and the issuer bound to each cell. Tests 9, 20, 22 and 26 pass |
-| M4 | Streams and signed work | Operations, status and cell-to-cell requests work, with idempotency and approvals. Tests 12–17, 23, 34 and 36 pass |
-| M5 | Provisioning end to end | Checks 1–3 pass from one Kiln request. Test 21 passes |
-| M6 | Malicious cell and MITM | Check 4 and tests 25 and 27 pass |
-| M7 | Bundles and safe updates | Tests 18, 19, 33 and 40 pass, and the bad-bundle tests pass |
-| M8 | Central view | Kiln shows every cell. Tests 28–32 and 39 pass |
-| M9 | Customer-data operations and exports | Jobs and encrypted exports work. Test 38 passes |
-| M10 | Island mode, revocation and key rotation | Tests 37, 40a and 40b and the phase 1 survivability tests pass |
-
-Phase 2: exploration sessions, cross-environment requests, HPA fan-out, Kiln and `dev-cp`
-restore and rebuild, root rotation, the HA SPIRE server, and EKS with the `aws` backend. EKS
-touches a real AWS account, so it starts only after the owner approves the account and the
-spend.
+1. Approvals in the cell, key sets and the recovery quorum.
+2. Customer-data operations and encrypted exports.
+3. Relay hardening, the watchdog and blue/green updates.
+4. Restore, rebuild from empty, and provider inventory.
+5. Exploration sessions, cross-environment requests and HPA fan-out.
+6. EKS with the `aws` backend, the tailnet and AWS isolation rules. This touches a real AWS account, so it starts only after the owner approves the account and the spend.
 
 ## To verify at the milestone
 
@@ -728,9 +782,8 @@ spend.
 | Pod-to-NodePort traffic across `container cluster` clusters through pf | M1 | Stop and report |
 | `--shared-image-store` serves ko images to cluster nodes | M1 | A registry container on vmnet |
 | A storage provisioner that passes review | M1 | Stop and report |
-| The Linux gate fits in 4 CPUs and 16 GB | M1 | Fewer components per run |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
-| `can_reattest` with a per-pod agent ID, and agent behaviour after SVID expiry | M2 | Report and redesign |
+| Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
 | Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |
 | Service account key rotation on `container cluster` nodes | M2 | Run that test in the Linux gate only |
 | Approver signatures from device-held keys in the PoC | M4 | Software keys per test approver |
