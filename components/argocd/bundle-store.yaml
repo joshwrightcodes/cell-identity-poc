@@ -8,5 +8,5 @@ metadata:
     argocd.argoproj.io/secret-type: repo-creds
 stringData:
   type: oci
-  url: oci://registry.cell-system.svc.cluster.local:5000/bundles
+  url: oci://bundle-store.cell-system.svc.cluster.local:5000/bundles
   insecureOCIForceHttp: "true"

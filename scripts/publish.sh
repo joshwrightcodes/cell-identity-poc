@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Push each hydrated bundle to the in-cluster store, then push a root bundle with one
+# Push each hydrated bundle to the in-cluster bundle store, then push a root bundle with one
 # Argo CD Application per component. Each Application pins its bundle by digest.
 # This script stands in for the worker, which publishes bundles in later milestones.
 source "$(dirname "$0")/lib.sh"
 
 [[ -d "$BUNDLES" ]] || die "no hydrated bundles: run mise run cell:hydrate first"
-store_forward
-local_store="127.0.0.1:${CELL_STORE_LOCAL_PORT}"
+bundle_store_forward
+local_store="127.0.0.1:${CELL_BUNDLE_STORE_PORT}"
 
 root_dir="$BUILD/root"
 rm -rf "$root_dir"
@@ -30,7 +30,7 @@ metadata:
 spec:
   project: cell
   source:
-    repoURL: oci://$STORE_HOST/bundles/$c
+    repoURL: oci://$BUNDLE_STORE_HOST/bundles/$c
     targetRevision: $digest
     path: .
   destination:

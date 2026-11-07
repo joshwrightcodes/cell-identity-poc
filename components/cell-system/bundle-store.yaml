@@ -4,26 +4,26 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: registry
+  name: bundle-store
 automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: registry
+  name: bundle-store
   labels:
-    app.kubernetes.io/name: registry
+    app.kubernetes.io/name: bundle-store
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: registry
+      app.kubernetes.io/name: bundle-store
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: registry
+        app.kubernetes.io/name: bundle-store
     spec:
-      serviceAccountName: registry
+      serviceAccountName: bundle-store
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
@@ -32,7 +32,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - name: registry
+        - name: bundle-store
           image: docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c
           ports:
             - name: http
@@ -41,7 +41,7 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: bundle-store
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: http://otel-collector.otel.svc.cluster.local:4318
+              value: http://otel-collector.observability-system.svc.cluster.local:4318
           readinessProbe:
             httpGet:
               path: /v2/
@@ -68,12 +68,12 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: registry
+  name: bundle-store
   labels:
-    app.kubernetes.io/name: registry
+    app.kubernetes.io/name: bundle-store
 spec:
   selector:
-    app.kubernetes.io/name: registry
+    app.kubernetes.io/name: bundle-store
   ports:
     - name: http
       port: 5000

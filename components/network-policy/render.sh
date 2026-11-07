@@ -8,7 +8,7 @@
 set -euo pipefail
 : "${NODE_IPS:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
-NAMESPACES=(argocd cell-system istio-system istio-egress otel apps-demo)
+NAMESPACES=(argocd cell-system istio-system istio-egress observability-system apps-demo)
 
 # Private and link-local ranges. The egress gateway may reach any public address on 443, but
 # no private address, so it cannot reach other clusters or the host network.
@@ -107,12 +107,12 @@ spec:
 $(namespace_peer cell-system)
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: registry
+              app.kubernetes.io/name: bundle-store
       ports:
         - protocol: TCP
           port: 5000
     - to:
-$(namespace_peer otel)
+$(namespace_peer observability-system)
       ports:
         - protocol: TCP
           port: 4317
@@ -126,7 +126,7 @@ metadata:
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: registry
+      app.kubernetes.io/name: bundle-store
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
@@ -136,7 +136,7 @@ $(namespace_peer argocd)
           port: 5000
   egress:
     - to:
-$(namespace_peer otel)
+$(namespace_peer observability-system)
       ports:
         - protocol: TCP
           port: 4318
@@ -189,7 +189,7 @@ $(namespace_peer istio-system)
         - protocol: TCP
           port: 15012
     - to:
-$(namespace_peer otel)
+$(namespace_peer observability-system)
       ports:
         - protocol: TCP
           port: 4317
@@ -206,7 +206,7 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: collector
-  namespace: otel
+  namespace: observability-system
 spec:
   podSelector: {}
   policyTypes: [Ingress]
@@ -244,7 +244,7 @@ $(namespace_peer istio-egress)
         - protocol: TCP
           port: 443
     - to:
-$(namespace_peer otel)
+$(namespace_peer observability-system)
       ports:
         - protocol: TCP
           port: 4317

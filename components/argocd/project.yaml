@@ -7,7 +7,7 @@ metadata:
 spec:
   description: Base cell components, applied from the in-cluster bundle store
   sourceRepos:
-    - oci://registry.cell-system.svc.cluster.local:5000/bundles/*
+    - oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/*
   destinations:
     - server: https://kubernetes.default.svc
       namespace: "*"

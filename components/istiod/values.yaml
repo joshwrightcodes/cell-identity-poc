@@ -20,11 +20,11 @@ meshConfig:
   extensionProviders:
     - name: otel-tracing
       opentelemetry:
-        service: otel-collector.otel.svc.cluster.local
+        service: otel-collector.observability-system.svc.cluster.local
         port: 4317
     - name: otel-access-log
       envoyOtelAls:
-        service: otel-collector.otel.svc.cluster.local
+        service: otel-collector.observability-system.svc.cluster.local
         port: 4317
 telemetry:
   v2:

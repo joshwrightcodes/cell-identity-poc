@@ -47,7 +47,7 @@ The demo workloads in `apps-demo` stand in for the role set in this milestone.
 | `cell-system` | Bundle store; later the worker and SPIRE agent sidecars | No | restricted |
 | `istio-system` | istiod, istio-cni | Control plane | privileged |
 | `istio-egress` | Egress gateway | Yes | restricted |
-| `otel` | OpenTelemetry collector | No | restricted |
+| `observability-system` | OpenTelemetry collector | No | restricted |
 | `apps-demo` | Demo workloads | Yes | restricted |
 
 Argo CD stays out of the mesh because Argo CD installs Istio. If Istio fails, Argo CD can
@@ -62,7 +62,7 @@ plaintext. Strict mTLS on the collector would reject them.
 
 - Argo CD runs as a core install, with no UI and no API server.
 - Argo CD has no remote cluster secrets. The only destination is `https://kubernetes.default.svc`.
-- The only source is the in-cluster bundle store, under `oci://registry.cell-system.svc.cluster.local:5000/bundles/`.
+- The only source is the in-cluster bundle store, under `oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/`.
 - A root Application follows the `current` tag of the root bundle.
 - Bootstrap applies the root Application once. It is the only object that Argo CD does not manage, because a self-managed root waits on itself.
 - Each child Application pins its bundle by digest.
@@ -108,7 +108,7 @@ plaintext. Strict mTLS on the collector would reject them.
 | --- | --- |
 | Every Application is Synced and Healthy | Argo CD manages every component |
 | No remote clusters, and only the local store as a source | Argo CD stays local |
-| `argocd`, `cell-system` and `otel` have no mesh proxies | Platform stays out of the mesh |
+| `argocd`, `cell-system` and `observability-system` have no mesh proxies | Platform stays out of the mesh |
 | Demo workloads have mesh proxies, except `plaintext` | Workloads join the mesh |
 | Mesh certificates use the cell trust domain | Cell CA and trust domain |
 | `client` reaches `echo` | mTLS and allow rule |

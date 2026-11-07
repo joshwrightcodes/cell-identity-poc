@@ -28,7 +28,7 @@ metadata:
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: otel
+  name: observability-system
   labels:
     # Envoy sends traces and access logs to the collector in plaintext, so strict mTLS would reject them.
     istio-injection: disabled

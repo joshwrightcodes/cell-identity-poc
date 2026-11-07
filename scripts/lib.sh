@@ -17,7 +17,7 @@ COMPONENTS=(
   "istio-base:1:istio-system"
   "istio-cni:2:istio-system"
   "istiod:3:istio-system"
-  "otel:3:otel"
+  "observability-system:3:observability-system"
   "istio-egress:4:istio-egress"
   "mesh-policy:4:istio-system"
   "apps-demo:5:apps-demo"
@@ -26,7 +26,7 @@ COMPONENTS=(
 # The bootstrap set. Bootstrap applies these bundles once, before Argo CD takes over.
 BOOTSTRAP=(namespaces argocd cell-system)
 
-STORE_HOST="registry.cell-system.svc.cluster.local:5000"
+BUNDLE_STORE_HOST="bundle-store.cell-system.svc.cluster.local:5000"
 
 k() { kubectl --context "$CELL_NAME" "$@"; }
 
@@ -44,15 +44,15 @@ wait_for() {
   done
 }
 
-# Start a port-forward to the bundle store. Sets STORE_PF_PID.
-store_forward() {
-  if curl -fsS "http://127.0.0.1:${CELL_STORE_LOCAL_PORT}/v2/" >/dev/null 2>&1; then
-    die "port ${CELL_STORE_LOCAL_PORT} already serves a registry. Stop the old port-forward first."
+# Start a port-forward to the bundle store. Sets BUNDLE_BUNDLE_STORE_PF_PID.
+bundle_store_forward() {
+  if curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/" >/dev/null 2>&1; then
+    die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store. Stop the old port-forward first."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
-  kubectl --context "$CELL_NAME" -n cell-system port-forward svc/registry "${CELL_STORE_LOCAL_PORT}:5000" \
+  kubectl --context "$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
     >/dev/null 2>&1 &
-  STORE_PF_PID=$!
-  trap 'kill "$STORE_PF_PID" 2>/dev/null || true' EXIT
-  wait_for "port-forward to the bundle store" 30 curl -fsS "http://127.0.0.1:${CELL_STORE_LOCAL_PORT}/v2/"
+  BUNDLE_STORE_PF_PID=$!
+  trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
+  wait_for "port-forward to the bundle store" 30 curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/"
 }

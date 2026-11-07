@@ -32,10 +32,10 @@ bundles and waits until Argo CD reports every Application as Synced and Healthy.
 
 1. Change a component under `components/`.
 2. Run `mise run cell:hydrate` to render every component into `build/bundles/`.
-3. Run `mise run cell:publish` to push the bundles to the store in the cluster.
+3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
-The store keeps bundles in an `emptyDir` volume, because the cluster has no StorageClass.
+The bundle store keeps bundles in an `emptyDir` volume, because the cluster has no StorageClass.
 If its pod restarts, run `mise run cell:publish` again.
 
 ## Layout
@@ -58,7 +58,7 @@ It needs no login, and it stops when you press Ctrl-C.
 ```sh
 mise run cell:ui
 kubectl --context cell-a-1 -n argocd get applications
-kubectl --context cell-a-1 -n otel logs deploy/otel-collector
+kubectl --context cell-a-1 -n observability-system logs deploy/otel-collector
 ```
 
 ## Remove the cell

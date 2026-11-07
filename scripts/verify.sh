@@ -59,7 +59,7 @@ check_argocd_local_only() {
   local clusters
   clusters="$(k -n argocd get secrets -l argocd.argoproj.io/secret-type=cluster -o name)"
   [[ -z "$clusters" ]] || { echo "remote cluster secrets: $clusters"; return 1; }
-  k -n argocd get applications -o json | jq -e --arg store "oci://$STORE_HOST/bundles/" '
+  k -n argocd get applications -o json | jq -e --arg store "oci://$BUNDLE_STORE_HOST/bundles/" '
     all(.items[]; .spec.destination.server == "https://kubernetes.default.svc"
       and (.spec.source.repoURL | startswith($store)))' >/dev/null \
     || { echo "an Application has another destination or source"; return 1; }
@@ -67,7 +67,7 @@ check_argocd_local_only() {
 
 check_platform_outside_mesh() {
   local ns
-  for ns in argocd cell-system otel; do
+  for ns in argocd cell-system observability-system; do
     k -n "$ns" get pods -o json | jq -e '
       [.items[].spec | (.initContainers // []) + .containers | .[].name] | index("istio-proxy") == null' >/dev/null \
       || { echo "$ns has a pod with istio-proxy"; return 1; }
@@ -119,7 +119,7 @@ check_traces_received() {
   # Read the logs into a variable first. With pipefail, grep -q would close the pipe early
   # and turn a match into a failure.
   local logs
-  until logs="$(k -n otel logs deploy/otel-collector --since=5m)" && grep -q 'echo.apps-demo' <<<"$logs"; do
+  until logs="$(k -n observability-system logs deploy/otel-collector --since=5m)" && grep -q 'echo.apps-demo' <<<"$logs"; do
     ((SECONDS < end)) || { echo "no span or access log for echo.apps-demo in the collector output"; return 1; }
     sleep 5
   done
@@ -129,7 +129,7 @@ log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
-check "argocd, cell-system and otel run without mesh proxies" check_platform_outside_mesh
+check "argocd, cell-system and observability-system run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh
 check "Mesh certificates use the cell trust domain" check_trust_domain
 check "client reaches echo over mesh mTLS" expect_code client http://echo/hostname 200
@@ -138,8 +138,8 @@ check "plaintext cannot reach echo, because mTLS is strict" expect_no_connection
 check "client reaches the allowed host through the egress gateway" check_egress_through_gateway
 check "client cannot reach a host that is not allowed" expect_no_connection client https://example.org/
 check "plaintext cannot reach the internet, because of NetworkPolicy" expect_no_connection plaintext https://example.com/
-check "client cannot reach the bundle store" expect_no_connection client "http://$STORE_HOST/v2/"
-check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$STORE_HOST/v2/"
+check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_HOST/v2/"
+check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_HOST/v2/"
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
 check "The collector receives telemetry for echo" check_traces_received
 
