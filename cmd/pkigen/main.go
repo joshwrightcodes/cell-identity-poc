@@ -4,12 +4,16 @@
 //	pkigen intermediate [--trust-domain <td>] [--days 30] < root bundle
 //	pkigen cert < bundle
 //	pkigen key < bundle
+//	pkigen trust-bundle [--trust-domain <td>] < PEM certificates
 //
 // root prints a bundle for a new self-signed root CA. intermediate reads a root bundle on stdin and
 // prints a bundle for a new intermediate CA that the root signs. A bundle is two PEM blocks in this
 // order: "EC PRIVATE KEY" (SEC 1), then "CERTIFICATE". cert and key read a bundle on stdin and print
 // only its certificate or only its key. Every key is ECDSA P-256 and every certificate has the URI SAN spiffe://<td>.
 // The intermediate has no path length limit, because the SPIRE server CA sits below it.
+// trust-bundle reads the PEM certificates of a trust bundle on stdin and prints them again. It fails
+// when the input holds anything else, or when a certificate is not a CA, is not valid now, or has a
+// URI SAN other than spiffe://<td>.
 // NotBefore is one minute before the current time. intermediate refuses a root whose URI SAN is not
 // spiffe://<td> for the --trust-domain value.
 //
@@ -69,10 +73,10 @@ func execute(args []string, stdin io.Reader, stdout io.Writer, now func() time.T
 
 func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) error {
 	if len(args) == 0 {
-		return errors.New("usage: pkigen root|intermediate|cert|key [--trust-domain <td>] [--days <n>]")
+		return errors.New("usage: pkigen root|intermediate|cert|key|trust-bundle [--trust-domain <td>] [--days <n>]")
 	}
 	cmd := args[0]
-	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0, "key": 0}
+	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0, "key": 0, "trust-bundle": 0}
 	days, known := defaultDays[cmd]
 	if !known {
 		return fmt.Errorf("unknown command %q", cmd)
@@ -81,8 +85,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 	fs.SetOutput(io.Discard)
 	td := defaultTrustDomain
 	issues := cmd == "root" || cmd == "intermediate"
-	if issues {
+	if issues || cmd == "trust-bundle" {
 		fs.StringVar(&td, "trust-domain", defaultTrustDomain, "SPIFFE trust domain")
+	}
+	if issues {
 		fs.IntVar(&days, "days", days, "validity in days")
 	}
 	if err := fs.Parse(args[1:]); err != nil {
@@ -91,13 +97,11 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 	if fs.NArg() != 0 {
 		return fmt.Errorf("%s: unexpected argument %q", cmd, fs.Arg(0))
 	}
-	if issues {
-		if days < 1 {
-			return errors.New("--days must be at least 1")
-		}
-		if !trustDomainRE.MatchString(td) {
-			return fmt.Errorf("trust domain %q is not a valid SPIFFE trust domain", td)
-		}
+	if issues && days < 1 {
+		return errors.New("--days must be at least 1")
+	}
+	if !trustDomainRE.MatchString(td) {
+		return fmt.Errorf("trust domain %q is not a valid SPIFFE trust domain", td)
 	}
 
 	switch cmd {
@@ -120,6 +124,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 			return err
 		}
 		return writeBundle(stdout, key, cert)
+	case "trust-bundle":
+		return checkTrustBundle(stdin, stdout, td, now())
 	case "cert":
 		_, cert, err := readBundle(stdin)
 		if err != nil {
@@ -243,4 +249,56 @@ func readBundle(r io.Reader) (*ecdsa.PrivateKey, *x509.Certificate, error) {
 		return nil, nil, errors.New("the certificate is not a CA")
 	}
 	return key, cert, nil
+}
+
+// checkTrustBundle copies the CA certificates on r to w, and fails on any other input.
+func checkTrustBundle(r io.Reader, w io.Writer, td string, now time.Time) error {
+	data, err := io.ReadAll(io.LimitReader(r, maxInput+1))
+	if err != nil {
+		return fmt.Errorf("read trust bundle: %w", err)
+	}
+	if len(data) > maxInput {
+		return errors.New("trust bundle is larger than 1 MiB")
+	}
+	want := "spiffe://" + td
+	var certs []*x509.Certificate
+	for rest := data; ; {
+		start := bytes.Index(rest, []byte("-----BEGIN "))
+		if start < 0 {
+			if len(bytes.TrimSpace(rest)) != 0 {
+				return errors.New("trust bundle holds text other than PEM certificates")
+			}
+			break
+		}
+		if len(bytes.TrimSpace(rest[:start])) != 0 {
+			return errors.New("trust bundle holds text other than PEM certificates")
+		}
+		block, next := pem.Decode(rest[start:])
+		if block == nil || block.Type != certBlock || len(block.Headers) != 0 {
+			return errors.New("trust bundle holds a block other than PEM certificates")
+		}
+		n := len(certs) + 1
+		cert, err := x509.ParseCertificate(block.Bytes)
+		switch {
+		case err != nil:
+			return fmt.Errorf("parse certificate %d: %w", n, err)
+		case !cert.BasicConstraintsValid || !cert.IsCA || cert.KeyUsage&x509.KeyUsageCertSign == 0:
+			return fmt.Errorf("certificate %d is not a CA", n)
+		case len(cert.URIs) != 1 || cert.URIs[0].String() != want:
+			return fmt.Errorf("certificate %d has URI SAN %v, want %s", n, cert.URIs, want)
+		case now.Before(cert.NotBefore) || now.After(cert.NotAfter):
+			return fmt.Errorf("certificate %d is not valid at %s", n, now.UTC().Format(time.RFC3339))
+		}
+		certs = append(certs, cert)
+		rest = next
+	}
+	if len(certs) == 0 {
+		return errors.New("trust bundle holds no certificate")
+	}
+	for _, c := range certs {
+		if err := pem.Encode(w, &pem.Block{Type: certBlock, Bytes: c.Raw}); err != nil {
+			return err
+		}
+	}
+	return nil
 }

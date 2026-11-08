@@ -41,6 +41,9 @@ the full design.
 
 ## Set up the cell
 
+Before the first `harness:up`, create the keys and `.envrc.local` as [Keys](#keys) describes.
+The SPIRE server in `dev-cp` cannot start without them.
+
 ```sh
 mise install
 mise run harness:up
@@ -50,15 +53,64 @@ CELL=dev-cell-1 mise run cell:verify
 `harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions. It then creates all five clusters through the host service.
 After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
-`cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy.
+`cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
+Last, `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
+Harness components stay outside every Argo CD Application, so no bundle can change them.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
+
+`harness:up` stops at the first cluster that fails, so a failure in `dev-cp` also stops the cells.
+To resume, fix the cause and run the remaining clusters in topology order:
+
+```sh
+CELL=dev-cp mise run cell:up
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
+```
+
+Each `cell:up` of `dev-cp` signs the test records of the cells again, with a new key.
+The server config changes because of this, so the SPIRE server pod restarts. M4 replaces the test records.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
 An unknown name fails with a list of the known cells. For example, `CELL=management mise run cell:up` sets up the base cell on `management` only.
 
+## Rebuild one cluster
+
+A rebuilt cluster can get a new node address from Docker, and a rebuilt cell gets a new service account key.
+Renders read both facts once, so the other clusters keep the old values until they render again.
+`cell:verify` compares the deployed values with the host service, and it prints the command to run when they differ.
+
+To rebuild a cell, for example `dev-cell-1`, create the cluster first.
+Then `dev-cp` can sign a record with the new key before the cell agent attests:
+
+```sh
+CELL=dev-cell-1 mise run cell:down
+mise run hostsvc -- up --only dev-cell-1
+CELL=dev-cp mise run cell:up
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cp mise run cell:verify
+CELL=dev-cell-1 mise run cell:verify
+```
+
+To rebuild `dev-cp`, set it up first. Its `cell:up` waits for the SPIRE server, which needs Secret `spire-upstream`.
+Run `secrets:connect` in a second shell while that `cell:up` waits, as [Keys](#keys) describes.
+Then render each cell again, because each cell holds the `dev-cp` node address.
+The new server has an empty datastore, so it knows no earlier agent.
+`cell:restart` restarts `celld` in a cell, so that its agent attests again:
+
+```sh
+CELL=dev-cp mise run cell:down
+CELL=dev-cp mise run cell:up            # first shell
+CELL=dev-cp mise run secrets:connect    # second shell, while cell:up waits
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
+CELL=dev-cell-1 mise run cell:restart
+CELL=dev-cell-2 mise run cell:restart
+```
+
 ## Size and time
 
-`harness/versions.env` holds the expected tool versions and the time budget of `gate:m1`.
+`gate:m1` and `gate:m2` run only on this Mac, against the local clusters. CI runs `mise run test` and `mise run lint`.
+`harness/versions.env` holds the expected tool versions and the time budget of `gate:m1`. It sets no time budget for `gate:m2` yet.
 `harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
 `harness:size` prints the memory and CPU of every node container and of `registry-mirror`.
 
@@ -99,12 +151,18 @@ Run `mise run harness:down` and `mise run harness:up` after it.
 
 ## How a change reaches the cell
 
-1. Change a component under `components/`.
+1. Change a component under `components/`. After a change under `cmd/` or `internal/`, run `mise run images` first.
+   Renders fail while `build/images.env` is older than the Go sources.
 2. Run `mise run cell:hydrate` to render every component into `build/<cluster>/bundles/`.
 3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
 The bundle store keeps bundles on a persistent volume, so they survive a pod restart.
+
+A harness component, for example `cell-identity`, reaches a cell only through `CELL=<cell> mise run cell:up`.
+`cell:publish` does not push it. `cell:up` applies it with server-side apply and does not prune.
+An object that leaves the bundle therefore stays in the cluster until you delete it.
+`cell:verify` compares the live objects with the bundle, and it reports a NetworkPolicy that the bundle does not hold.
 
 ## Keys
 
@@ -184,6 +242,8 @@ Because of this, run `secrets:connect` in a second shell while `cell:up` waits.
 
 `secrets:connect` creates Secret `poc-secrets-token` in the namespace `external-secrets`.
 It then applies ClusterSecretStore `poc-secrets` and waits until the store is Ready.
+Last, it forces a sync of each ExternalSecret that uses the store, and waits until each target Secret exists.
+An ExternalSecret that failed before the store existed would otherwise wait for its retry delay.
 Only the namespaces in `SECRET_STORE_NAMESPACES` of `cells/<cluster>.env` can use the store.
 The token reaches `kubectl` through a pipe, and the script never prints it.
 The Secret and the store live outside every bundle, so Argo CD never deletes them.

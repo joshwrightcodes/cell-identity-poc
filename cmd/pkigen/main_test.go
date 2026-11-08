@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"math/big"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -295,4 +296,61 @@ func mustMarshal(t *testing.T, k *ecdsa.PrivateKey) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+func TestTrustBundleAcceptsCACertificates(t *testing.T) {
+	root := certOnly(t, runOK(t, []string{"root"}, ""))
+	inter := certOnly(t, runOK(t, []string{"intermediate"}, runOK(t, []string{"root"}, "")))
+	out := runOK(t, []string{"trust-bundle"}, root+"\n"+inter)
+	if strings.Count(out, "-----BEGIN CERTIFICATE-----") != 2 || out != root+inter {
+		t.Fatalf("output is %q, want both certificates in order", out)
+	}
+}
+
+func TestTrustBundleRejects(t *testing.T) {
+	root := certOnly(t, runOK(t, []string{"root"}, ""))
+	other := certOnly(t, runOK(t, []string{"root", "--trust-domain", "rogue.example"}, ""))
+	bundle := runOK(t, []string{"root"}, "")
+	expired := certOnly(t, runOK(t, []string{"root", "--days", "1"}, ""))
+	cases := []struct {
+		name, args, stdin, want string
+	}{
+		{"empty input", "", "", "no certificate"},
+		{"other text", "", root + "not a certificate\n", "other than PEM certificates"},
+		{"private key block", "", bundle, "other than PEM certificates"},
+		{"other trust domain", "", other, "want spiffe://dev.env.poc.internal"},
+		{"trust domain flag", "--trust-domain rogue.example", root, "want spiffe://rogue.example"},
+		{"garbage certificate", "", "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n", "parse certificate"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"trust-bundle"}, strings.Fields(tc.args)...)
+			if out := runFail(t, args, tc.stdin); !strings.Contains(out, tc.want) {
+				t.Fatalf("error %q does not contain %q", out, tc.want)
+			}
+		})
+	}
+	t.Run("expired", func(t *testing.T) {
+		var out strings.Builder
+		later := func() time.Time { return testNow.Add(48 * time.Hour) }
+		if code := execute([]string{"trust-bundle"}, strings.NewReader(expired), &out, later); code == 0 || !strings.Contains(out.String(), "not valid at") {
+			t.Fatalf("exit %d, output %q", code, out.String())
+		}
+	})
+	t.Run("not a CA", func(t *testing.T) {
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		td, _ := url.Parse("spiffe://dev.env.poc.internal")
+		tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: testNow.Add(-time.Hour), NotAfter: testNow.Add(time.Hour), URIs: []*url.URL{td}}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+		if out := runFail(t, []string{"trust-bundle"}, leaf); !strings.Contains(out, "not a CA") {
+			t.Fatalf("error %q", out)
+		}
+	})
 }

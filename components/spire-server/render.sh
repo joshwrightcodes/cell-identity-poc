@@ -6,8 +6,9 @@
 # NetworkPolicy admits only those node addresses, and the plugin trusts only those records.
 # ConfigMap spire-entries gets two ClusterStaticEntry manifests for each cell: a node alias that
 # matches the attested agents of the cell, and the celld ID under that alias.
-# The plugin image comes from the local registry, pinned by digest. The server config carries the
-# SHA-256 of the plugin binary from that image, so the server checks the binary before it runs it.
+# The plugin image is the one that `mise run images` built on this Mac, pinned by the digest in
+# build/images.env. The server config carries the SHA-256 of the plugin binary from that image,
+# so the server checks the binary before it runs it.
 # Inputs come from cells/<cluster>.env: SPIRE_AGENT_CELLS and SPIRE_AGENT_SUBJECT.
 set -euo pipefail
 : "${SPIRE_AGENT_CELLS:?}" "${SPIRE_AGENT_SUBJECT:?}"
@@ -15,7 +16,6 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 namespace=spire-system
-plugin_repo=localhost:5001/cluster-jwt-server
 plugin_binary=/ko-app/cluster-jwt-server
 
 die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
@@ -23,8 +23,8 @@ die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
 source "$root/scripts/ko-image.sh"
 
 # The plugin image and the checksum of the binary in it.
-digest="$(ko_digest "$plugin_repo")" || die "no plugin image"
-checksum="$(ko_binary_sha256 "$plugin_repo" "$digest" "$plugin_binary")" || die "no plugin checksum"
+plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
+checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no plugin checksum"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$SPIRE_AGENT_SUBJECT" =~ ^[a-z0-9-]+/[a-z0-9-]+$ ]] || die "SPIRE_AGENT_SUBJECT '$SPIRE_AGENT_SUBJECT' is not <namespace>/<service account>"
@@ -92,7 +92,7 @@ PEERS="$peers" SOURCES="$sources" ENTRIES="$entries" yq "
   | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-agents\") | .spec.ingress[0].from) = (env(PEERS) | ... style=\"\")
   | (select(.kind == \"ConfigMap\" and .metadata.name == \"spire-entries\") | .data) = (env(ENTRIES) | ... style=\"\" | map_values(to_yaml) | .[] style=\"literal\")
 " "$here/manifests.yaml" \
-  | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_repo@$digest|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|"
+  | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_image|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|"
 echo "---"
 echo "$config_maps"
 printf '%s' "$records"

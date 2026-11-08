@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Stand up the cell: create the cluster through the host service, apply the bootstrap set,
-# publish the bundles, then wait until Argo CD reports every Application as Synced and Healthy.
+# publish the bundles, then wait until Argo CD reports every Application as Synced and Healthy at
+# the published revision. Last, apply the harness components and wait for their rollouts.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
@@ -19,7 +20,7 @@ apply_bundle() {
     k wait --for=condition=Established crd --all --timeout=120s >/dev/null
     k apply --server-side --force-conflicts -f "$file" >/dev/null
   fi
-  log "applied bootstrap bundle $1"
+  log "applied bundle $1"
 }
 
 for c in "${BOOTSTRAP[@]}"; do
@@ -33,20 +34,64 @@ log "applied the root Application"
 
 "$ROOT/scripts/publish.sh"
 
+# Every Application must report the revision that publish.sh pushed, so a check that runs before
+# Argo CD reads the new root bundle cannot pass.
 expected=$((${#COMPONENTS[@]} + 1))
+published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")"
 apps_ready() {
-  k -n argocd get applications -o json | jq -e --argjson n "$expected" '
+  k -n argocd get applications -o json | jq -e --argjson n "$expected" --argjson pub "$published_json" '
     (.items | length) == $n and
-    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")'
+    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
+      and .status.sync.revision == $pub[.metadata.name])'
 }
-log "waiting for $expected Applications to be Synced and Healthy"
+log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
 end=$((SECONDS + 900))
 until apps_ready >/dev/null 2>&1; do
   if ((SECONDS >= end)); then
     k -n argocd get applications
-    die "Applications did not become Synced and Healthy in 900s"
+    die "Applications did not reach the published revisions, Synced and Healthy, in 900s"
   fi
   sleep 10
 done
 k -n argocd get applications
+
+# release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD
+# Application managed before: the tracking annotation and the argocd-controller field manager.
+# The harness apply then owns every field. Objects without these leftovers stay unchanged.
+release_from_argocd() {
+  local obj kind name ns live patch scope
+  while read -r obj; do
+    kind="$(jq -r .kind <<<"$obj")" name="$(jq -r .name <<<"$obj")" ns="$(jq -r .ns <<<"$obj")"
+    scope=()
+    [[ -n "$ns" ]] && scope=(-n "$ns")
+    live="$(k "${scope[@]}" get "$kind/$name" -o json --show-managed-fields 2>/dev/null)" || continue
+    if jq -e '.metadata.annotations["argocd.argoproj.io/tracking-id"] != null' <<<"$live" >/dev/null; then
+      k "${scope[@]}" annotate "$kind/$name" argocd.argoproj.io/tracking-id- >/dev/null
+      log "removed the Argo CD tracking annotation from $kind/$name"
+    fi
+    if jq -e 'any(.metadata.managedFields[]?; .manager == "argocd-controller")' <<<"$live" >/dev/null; then
+      patch="$(jq -c '[{op: "replace", path: "/metadata/managedFields",
+        value: [.metadata.managedFields[] | select(.manager != "argocd-controller")]}]' <<<"$live")"
+      k "${scope[@]}" patch "$kind/$name" --type=json -p "$patch" >/dev/null
+      log "removed the argocd-controller field manager from $kind/$name"
+    fi
+  done < <(yq -o=json -I=0 'select(.kind != null) | {"kind": .kind, "name": .metadata.name, "ns": (.metadata.namespace // "")}' "$1")
+}
+
+# Harness components stay outside Argo CD. The harness applies them after the root bundle syncs,
+# so no Application from an older root bundle still claims their objects. The apply does not
+# prune: an object that leaves the bundle stays in the cluster. cell:verify reports a
+# NetworkPolicy that the bundle does not hold.
+for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+  apply_bundle "${entry%%:*}"
+  release_from_argocd "$BUNDLES/${entry%%:*}/manifests.yaml"
+done
+for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+  ns="${entry#*:}"
+  for deployment in $(k -n "$ns" get deployments -o name); do
+    k -n "$ns" rollout status "$deployment" --timeout=300s >/dev/null \
+      || die "$deployment in $ns did not finish its rollout in 300s"
+  done
+  log "harness component ${entry%%:*} is rolled out"
+done
 log "cell $CELL_NAME is up. Run mise run cell:verify."

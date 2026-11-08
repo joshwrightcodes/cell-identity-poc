@@ -5,28 +5,35 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
+	"fmt"
+	"math/big"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/hcl"
 	"sigs.k8s.io/yaml"
 )
 
-const (
-	stubDigest = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-	stubLayer  = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-	stubBinary = "stub plugin binary"
-)
+const stubBinary = "stub plugin binary"
 
-// stubMise answers "mise run hostsvc -- facts" and "mise run record:fixture" for the cells below.
-// The cell bad-facts fails the way hostsvc fails, and no-ip has no node address.
+// stubMise answers "mise run hostsvc -- facts" and "mise run record:fixture" for the cells below,
+// and runs the real pkigen for "mise run pki". The cell bad-facts fails the way hostsvc fails, and
+// no-ip has no node address.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
@@ -52,23 +59,35 @@ data:
   signer.pub: "stubkey${cell##*-}="
 EOF
     ;;
+  pki) shift 3; exec "$STUB_PKIGEN" "$@" ;;
   *) exit 2 ;;
 esac
 `
 
-// stubOras serves one image from the local registry, unless STUB_NO_IMAGE is set.
+// stubOras serves one image manifest and its last layer. STUB_NO_REGISTRY makes every fetch fail.
+// STUB_BAD_MANIFEST serves a manifest, and STUB_BAD_LAYER a layer, whose digest does not match.
 const stubOras = `#!/usr/bin/env bash
 set -euo pipefail
-case "$1" in
-  resolve) [[ -z "${STUB_NO_IMAGE:-}" ]] || exit 1; echo "` + stubDigest + `" ;;
-  manifest) echo '{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{"digest":"sha256:0000"},{"digest":"` + stubLayer + `"}]}' ;;
-  blob) cat "$STUB_LAYER_FILE" ;;
+[[ -z "${STUB_NO_REGISTRY:-}" ]] || exit 1
+out=-
+args=()
+while (($#)); do
+  case "$1" in
+    --output) out="$2"; shift 2 ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+case "${args[0]} ${args[1]}" in
+  "manifest fetch") src="$STUB_MANIFEST_FILE"; [[ -z "${STUB_BAD_MANIFEST:-}" ]] || src="$STUB_MANIFEST_FILE.bad" ;;
+  "blob fetch") src="$STUB_LAYER_FILE"; [[ -z "${STUB_BAD_LAYER:-}" ]] || src="$STUB_MANIFEST_FILE" ;;
   *) exit 2 ;;
 esac
+if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 `
 
-// stubKubectl answers "spire-server bundle show" with one PEM certificate. STUB_NO_SERVER makes it
-// fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line that is not PEM.
+// stubKubectl answers "spire-server bundle show" with the file STUB_BUNDLE_FILE. STUB_NO_SERVER
+// makes it fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line
+// that is not PEM.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
@@ -76,16 +95,76 @@ if [[ -n "${STUB_NO_SERVER:-}" ]]; then
   echo 'Error from server (NotFound): pods "spire-server-0" not found' >&2
   exit 1
 fi
-echo "` + stubPEM + `"
+cat "$STUB_BUNDLE_FILE"
 [[ -z "${STUB_BAD_BUNDLE:-}" ]] || echo "not a certificate"
 `
-
-const stubPEM = "-----BEGIN CERTIFICATE-----\nMIIBstubstubstub\nc3R1Yg==\n-----END CERTIFICATE-----"
 
 type result struct {
 	stdout, stderr string
 	err            error
 	log            string
+	// digest is the manifest digest of the stub image that the render must pin.
+	digest string
+	// bundle is the PEM trust bundle that the stub server prints.
+	bundle string
+}
+
+var (
+	pkigenOnce sync.Once
+	pkigenPath string
+	pkigenErr  error
+)
+
+// pkigen builds cmd/pkigen once for every test in the package.
+func pkigen(t *testing.T) string {
+	t.Helper()
+	pkigenOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "render-pkigen")
+		if err != nil {
+			pkigenErr = err
+			return
+		}
+		pkigenPath = filepath.Join(dir, "pkigen")
+		out, err := exec.Command("go", "build", "-o", pkigenPath, "../../cmd/pkigen").CombinedOutput()
+		if err != nil {
+			pkigenErr = fmt.Errorf("build pkigen: %v: %s", err, out)
+		}
+	})
+	if pkigenErr != nil {
+		t.Fatal(pkigenErr)
+	}
+	return pkigenPath
+}
+
+var caCache sync.Map
+
+// caPEM returns a self-signed CA certificate with the URI SAN spiffe://<td>. Every render in the
+// package gets the same certificate for one trust domain, so renders differ only by their inputs.
+func caPEM(t *testing.T, td string) string {
+	t.Helper()
+	if v, ok := caCache.Load(td); ok {
+		return v.(string)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uri, _ := url.Parse("spiffe://" + td)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, URIs: []*url.URL{uri},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := caCache.LoadOrStore(td, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})))
+	return v.(string)
+}
+
+func digestOf(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func render(t *testing.T, env ...string) result {
@@ -94,10 +173,12 @@ func render(t *testing.T, env ...string) result {
 }
 
 // renderScript runs the render script of a component with stub host commands. The stub image
-// holds one file at binary.
+// holds one file at binary, and every image in images.env pins that stub image. STUB_IMAGES=missing
+// and STUB_IMAGES=stale make images.env missing or older than the Go sources. STUB_TRUST_DOMAIN
+// sets the trust domain of the bundle that the stub server prints.
 func renderScript(t *testing.T, component, binary string, env ...string) result {
 	t.Helper()
-	for _, tool := range []string{"yq", "jq", "tar", "bash"} {
+	for _, tool := range []string{"yq", "jq", "tar", "bash", "go"} {
 		if _, err := exec.LookPath(tool); err != nil {
 			t.Skipf("%s is not on PATH; run the test through mise run test", tool)
 		}
@@ -110,10 +191,41 @@ func renderScript(t *testing.T, component, binary string, env ...string) result 
 		}
 		return p
 	}
+	opts := map[string]string{}
+	for _, e := range env {
+		if k, v, ok := strings.Cut(e, "="); ok && strings.HasPrefix(k, "STUB_") {
+			opts[k] = v
+		}
+	}
 	write("mise", stubMise, 0o755)
 	write("oras", stubOras, 0o755)
 	write("kubectl", stubKubectl, 0o755)
-	layer := write("layer.tar.gz", string(layerTarGz(t, binary)), 0o644)
+	layerBytes := layerTarGz(t, binary)
+	layer := write("layer.tar.gz", string(layerBytes), 0o644)
+	manifestBytes := []byte(`{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{"digest":"sha256:0000"},{"digest":"` + digestOf(layerBytes) + `"}]}`)
+	manifest := write("manifest.json", string(manifestBytes), 0o644)
+	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
+	digest := digestOf(manifestBytes)
+	var images strings.Builder
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld"} {
+		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
+	}
+	imagesFile := write("images.env", images.String(), 0o644)
+	switch opts["STUB_IMAGES"] {
+	case "missing":
+		imagesFile = filepath.Join(dir, "no-images.env")
+	case "stale":
+		old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+		if err := os.Chtimes(imagesFile, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	td := "dev.env.poc.internal"
+	if v := opts["STUB_TRUST_DOMAIN"]; v != "" {
+		td = v
+	}
+	bundle := caPEM(t, td)
+	bundleFile := write("bundle.pem", bundle, 0o644)
 	logFile := filepath.Join(dir, "mise.log")
 
 	script, err := filepath.Abs("../../components/" + component + "/render.sh")
@@ -123,14 +235,15 @@ func renderScript(t *testing.T, component, binary string, env ...string) result 
 	cmd := exec.Command(script)
 	cmd.Env = append(os.Environ(),
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer,
+		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
+		"STUB_BUNDLE_FILE="+bundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"SPIRE_AGENT_SUBJECT=cell-identity-system/celld")
 	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
 	logData, _ := os.ReadFile(logFile)
-	return result{stdout.String(), stderr.String(), err, string(logData)}
+	return result{stdout.String(), stderr.String(), err, string(logData), digest, bundle}
 }
 
 func layerTarGz(t *testing.T, binary string) []byte {
@@ -325,7 +438,7 @@ func TestRenderSpireServer(t *testing.T) {
 				t.Fatalf("%s declares ports", name)
 			}
 		}
-		if got := get[string](t, containers[0], "image"); got != "localhost:5001/cluster-jwt-server@"+stubDigest {
+		if got := get[string](t, containers[0], "image"); got != "localhost:5001/cluster-jwt-server@"+r.digest {
 			t.Fatalf("plugin image is %q", got)
 		}
 		if ann := get[string](t, objs["StatefulSet/spire-server"], "spec", "template", "metadata", "annotations", "cell.poc.internal/config-checksum"); !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(ann) {
@@ -536,7 +649,11 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"cell without node address", []string{"SPIRE_AGENT_CELLS=no-ip"}, "node address of no-ip"},
 		{"no cells", []string{"SPIRE_AGENT_CELLS= "}, "names no cell"},
 		{"unset cells", []string{"SPIRE_AGENT_CELLS="}, "SPIRE_AGENT_CELLS"},
-		{"no plugin image", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_NO_IMAGE=1"}, "mise run images"},
+		{"no images file", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_IMAGES=missing"}, "Run mise run images first"},
+		{"stale images file", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_IMAGES=stale"}, "Run mise run images again"},
+		{"image not in the registry", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_NO_REGISTRY=1"}, "the registry has no localhost:5001/cluster-jwt-server@sha256:"},
+		{"layer with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_LAYER=1"}, "could not fetch layer"},
+		{"manifest with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_MANIFEST=1"}, "could not fetch the manifest of localhost:5001/cluster-jwt-server@sha256:"},
 		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_AGENT_SUBJECT=celld"}, "is not <namespace>/<service account>"},
 	}
 	for _, tc := range cases {

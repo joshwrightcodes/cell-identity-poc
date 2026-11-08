@@ -64,7 +64,7 @@ spec:
     seccompProfile: {type: RuntimeDefault}
   containers:
   - name: server
-    image: localhost:5001/netprobe:latest
+    image: @PROBE_IMAGE@
     args: ["serve", "--addr", ":8080"]
     ports: [{containerPort: 8080}]
     securityContext:
@@ -90,7 +90,9 @@ spec:
 func TestM1NodePortAcrossClusters(t *testing.T) {
 	createNamespace(t, "dev-cp", "m1-server")
 	createNamespace(t, "dev-cell-1", "m1-client")
-	if _, err := kubectl(t, "dev-cp", serverManifest, "-n", "m1-server", "apply", "-f", "-"); err != nil {
+	needProbeImage(t)
+	manifest := strings.ReplaceAll(serverManifest, "@PROBE_IMAGE@", probeImage)
+	if _, err := kubectl(t, "dev-cp", manifest, "-n", "m1-server", "apply", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := kubectl(t, "dev-cp", "", "-n", "m1-server", "wait", "--for=condition=Ready",

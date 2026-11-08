@@ -73,13 +73,14 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       initContainers:
-        # The plugin image copies its static binary into the shared plugin volume.
+        # The plugin image copies its static binary into the shared plugin volume, read-only for
+        # every user. User 1001 matches neither the agent nor the celld entry.
         - name: install-agent-plugin
           image: "@SPIRE_AGENT_PLUGIN_IMAGE@"
           args: ["install", "/run/spire/plugins"]
           securityContext:
-            runAsUser: 65532
-            runAsGroup: 65532
+            runAsUser: 1001
+            runAsGroup: 1001
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities:
@@ -217,7 +218,7 @@ spec:
             sources:
               - serviceAccountToken:
                   path: token
-                  expirationSeconds: 3600
+                  expirationSeconds: 600
               - configMap:
                   name: kube-root-ca.crt
                   items:
@@ -296,6 +297,9 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
       ports:
         - protocol: TCP
           port: 4317

@@ -17,7 +17,9 @@ const (
 	celldContainer  = "celld"
 	// The brief allows two minutes from the start of a new pod to the first SVID.
 	celldSVIDWait = 2 * time.Minute
-	newPodWait    = 2 * time.Minute
+	// SPIRE v1.15.5 logs this line after a successful AttestAgent call (pkg/server/api/agent/v1/service.go).
+	attestDone = "Agent attestation request completed"
+	newPodWait = 2 * time.Minute
 )
 
 // TestM2CelldGetsSVID replaces the celld pod in each cell. The new pod must log its X.509 SVID
@@ -26,6 +28,9 @@ func TestM2CelldGetsSVID(t *testing.T) {
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 		t.Run(cell, func(t *testing.T) {
 			t.Parallel()
+			// Every live pod at this point is old. A pod that is already terminating never counts as
+			// new, because celldPods skips pods with a deletion timestamp. So only a pod that the
+			// ReplicaSet creates after this listing can pass the wait below.
 			old := map[string]bool{}
 			for _, p := range celldPods(t, cell) {
 				old[p.Metadata.UID] = true
@@ -64,16 +69,20 @@ func TestM2CelldGetsSVID(t *testing.T) {
 
 			agentID := regexp.MustCompile(`spiffe://` + regexp.QuoteMeta(spireTD) + `/spire/agent/cluster_jwt/` +
 				regexp.QuoteMeta(cell) + `/` + regexp.QuoteMeta(pod.Metadata.UID) + `/[0-9a-f]{32}`)
-			waitFor(t, "SPIRE server log line with agent ID "+agentID.String(), forwardWait, func() (bool, string) {
+			waitFor(t, "SPIRE server line "+attestDone+" for an agent ID like "+agentID.String(), forwardWait, func() (bool, string) {
 				logs, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=10m")
 				if err != nil {
 					return false, err.Error()
 				}
-				if id := agentID.FindString(logs); id != "" {
+				// A server container restart moves the earlier lines to the previous log.
+				if prev, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--previous", "--since=10m"); err == nil {
+					logs = prev + logs
+				}
+				if id := attestedAgentID(logs, agentID); id != "" {
 					t.Logf("server issued agent ID %s", id)
 					return true, ""
 				}
-				return false, fmt.Sprintf("no match in %d log bytes", len(logs))
+				return false, fmt.Sprintf("no %q line with a matching agent_id in %d log bytes", attestDone, len(logs))
 			})
 		})
 	}
@@ -110,6 +119,22 @@ func celldPods(t *testing.T, cell string) []podInfo {
 		}
 	}
 	return live
+}
+
+// attestedAgentID returns the agent_id of the first JSON log line that reports a completed
+// attestation and whose agent_id matches re in full.
+func attestedAgentID(logs string, re *regexp.Regexp) string {
+	full := regexp.MustCompile("^" + re.String() + "$")
+	for line := range strings.SplitSeq(logs, "\n") {
+		var rec struct {
+			Msg     string `json:"msg"`
+			AgentID string `json:"agent_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.Msg == attestDone && full.MatchString(rec.AgentID) {
+			return rec.AgentID
+		}
+	}
+	return ""
 }
 
 // celldSPIFFEIDs returns the spiffe_id of every JSON log line that has one.

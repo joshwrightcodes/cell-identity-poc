@@ -43,7 +43,7 @@ description = "Stop the Colima VM. kind clusters stop with it"
 run = "colima stop --profile poc"
 
 [tasks."cell:up"]
-description = "Create the cluster through the host service, apply the bootstrap set, publish every bundle and wait for Argo CD"
+description = "Create the cluster through the host service, apply the bootstrap set, publish every bundle, wait for Argo CD at the published revisions, then apply the harness components"
 depends = ["vm:up"]
 run = "scripts/up.sh"
 
@@ -62,6 +62,10 @@ run = "scripts/verify.sh"
 [tasks."cell:ui"]
 description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
 run = "scripts/ui.sh"
+
+[tasks."cell:restart"]
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again"
+run = "scripts/restart.sh"
 
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
@@ -98,10 +102,10 @@ description = "Delete all five clusters through the host service"
 run = "scripts/harness.sh down"
 
 [tasks.images]
-description = "Build and push the in-cluster images to the local registry at localhost:5001"
+description = "Build and push the in-cluster images to the local registry at localhost:5001, and record their digests in build/images.env"
 depends = ["vm:up"]
 env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
-run = "ko build --base-import-paths --tags latest ./cmd/netprobe ./cmd/cluster-jwt-server ./cmd/cluster-jwt-agent ./cmd/celld"
+run = "scripts/images.sh"
 
 [tasks."gate:m1"]
 description = "Run the M1 end-to-end tests, plus the go test arguments after --"

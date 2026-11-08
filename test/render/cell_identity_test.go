@@ -13,6 +13,7 @@ import (
 )
 
 var cellIdentityFacts = []string{
+	"CELL_NAME=dev-cell-1",
 	"SPIRE_SERVER_CLUSTER=dev-cp",
 	"API_SERVER_IPS=172.18.0.5",
 	"API_SERVER_PORT=6443",
@@ -96,13 +97,23 @@ func TestRenderCellIdentity(t *testing.T) {
 				t.Fatalf("%s declares ports", name)
 			}
 		}
-		if users["celld"] != 65532 || users["spire-agent"] == 65532 || users["spire-agent"] == 0 {
-			t.Fatalf("container users are %v; celld must be 65532 and the agent another non-root user", users)
+		if users["celld"] != 65532 || users["spire-agent"] == 65532 || users["spire-agent"] == 0 ||
+			users["install-agent-plugin"] == 0 || users["install-agent-plugin"] == 65532 || users["install-agent-plugin"] == users["spire-agent"] {
+			t.Fatalf("container users are %v; celld must be 65532, and the agent and the installer two other non-root users", users)
 		}
-		if got := get[string](t, inits[0], "image"); got != "localhost:5001/cluster-jwt-agent@"+stubDigest {
+		var ttl float64
+		for _, v := range get[[]any](t, pod, "volumes") {
+			if e, ok := lookup(v, "projected", "sources", 0, "serviceAccountToken", "expirationSeconds"); ok {
+				ttl = e.(float64)
+			}
+		}
+		if ttl != 600 {
+			t.Fatalf("API token lifetime is %v seconds, want 600", ttl)
+		}
+		if got := get[string](t, inits[0], "image"); got != "localhost:5001/cluster-jwt-agent@"+r.digest {
 			t.Fatalf("plugin image is %q", got)
 		}
-		if got := get[string](t, named(t, mains, "celld"), "image"); got != "localhost:5001/celld@"+stubDigest {
+		if got := get[string](t, named(t, mains, "celld"), "image"); got != "localhost:5001/celld@"+r.digest {
 			t.Fatalf("celld image is %q", got)
 		}
 		if ann := get[string](t, dep, "spec", "template", "metadata", "annotations", "cell.poc.internal/config-checksum"); !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(ann) {
@@ -185,15 +196,28 @@ func TestRenderCellIdentity(t *testing.T) {
 				t.Fatalf("agent.conf lacks %q", want)
 			}
 		}
-		if got := get[string](t, objs["ConfigMap/spire-trust-bundle"], "data", "bundle.crt"); strings.TrimSpace(got) != stubPEM {
+		if got := get[string](t, objs["ConfigMap/spire-trust-bundle"], "data", "bundle.crt"); strings.TrimSpace(got) != strings.TrimSpace(r.bundle) {
 			t.Fatalf("trust bundle is %q", got)
 		}
 	})
 
 	t.Run("network policy allows only the SPIRE node port, the API server and the collector", func(t *testing.T) {
+		var names []string
+		for key := range objs {
+			if name, ok := strings.CutPrefix(key, "NetworkPolicy/"); ok {
+				names = append(names, name)
+			}
+		}
+		slices.Sort(names)
+		if !slices.Equal(names, []string{"allow-dns", "celld", "default-deny"}) {
+			t.Fatalf("NetworkPolicies are %v", names)
+		}
 		deny := objs["NetworkPolicy/default-deny"]
 		if types := get[[]any](t, deny, "spec", "policyTypes"); len(types) != 2 || len(get[map[string]any](t, deny, "spec", "podSelector")) != 0 {
 			t.Fatalf("default-deny spec is %v", deny["spec"])
+		}
+		if spec := get[map[string]any](t, deny, "spec"); len(spec) != 2 {
+			t.Fatalf("default-deny has rules: %v", spec)
 		}
 		np := objs["NetworkPolicy/celld"]
 		if _, ok := lookup(np, "spec", "ingress"); ok {
@@ -206,7 +230,11 @@ func TestRenderCellIdentity(t *testing.T) {
 				if cidr, ok := lookup(p, "ipBlock", "cidr"); ok {
 					peers = append(peers, cidr.(string))
 				} else {
-					peers = append(peers, "ns="+get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name"))
+					peer := "ns=" + get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")
+					if app, ok := lookup(p, "podSelector", "matchLabels", "app.kubernetes.io/name"); ok {
+						peer += "/app=" + app.(string)
+					}
+					peers = append(peers, peer)
 				}
 			}
 			var ports []string
@@ -215,7 +243,7 @@ func TestRenderCellIdentity(t *testing.T) {
 			}
 			rules = append(rules, strings.Join(peers, ",")+" "+strings.Join(ports, ","))
 		}
-		want := []string{"10.9.0.9/32 TCP/30081", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system TCP/4317"}
+		want := []string{"10.9.0.9/32 TCP/30081", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system/app=otel-collector TCP/4317"}
 		if !slices.Equal(rules, want) {
 			t.Fatalf("egress rules are %v, want %v", rules, want)
 		}
@@ -226,6 +254,24 @@ func TestRenderCellIdentity(t *testing.T) {
 	})
 }
 
+func TestRenderCellIdentityChecksumDiffersByCell(t *testing.T) {
+	sums := map[string]string{}
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2", "dev-cell-1 again"} {
+		r := renderCellIdentity(t, "CELL_NAME="+strings.TrimSuffix(cell, " again"))
+		if r.err != nil {
+			t.Fatalf("render for %s failed: %v\n%s", cell, r.err, r.stderr)
+		}
+		sums[cell] = get[string](t, docsIn(t, r.stdout, "cell-identity-system")["Deployment/celld"],
+			"spec", "template", "metadata", "annotations", "cell.poc.internal/config-checksum")
+	}
+	if sums["dev-cell-1"] == sums["dev-cell-2"] {
+		t.Fatalf("both cells have config checksum %s", sums["dev-cell-1"])
+	}
+	if sums["dev-cell-1"] != sums["dev-cell-1 again"] {
+		t.Fatalf("two renders of dev-cell-1 have checksums %s and %s", sums["dev-cell-1"], sums["dev-cell-1 again"])
+	}
+}
+
 func TestRenderCellIdentityFailsClosed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -233,10 +279,12 @@ func TestRenderCellIdentityFailsClosed(t *testing.T) {
 		want string
 	}{
 		{"no SPIRE server", []string{"STUB_NO_SERVER=1"}, "could not read the trust bundle from spire-server-0 in dev-cp. Run CELL=dev-cp mise run cell:up first"},
-		{"bundle with other text", []string{"STUB_BAD_BUNDLE=1"}, "holds more than PEM certificates"},
+		{"bundle with other text", []string{"STUB_BAD_BUNDLE=1"}, "trust bundle holds text other than PEM certificates"},
+		{"bundle of another trust domain", []string{"STUB_TRUST_DOMAIN=rogue.example"}, "want spiffe://dev.env.poc.internal"},
 		{"server cluster without facts", []string{"SPIRE_SERVER_CLUSTER=bad-facts"}, "no host service facts for bad-facts"},
 		{"server cluster without node address", []string{"SPIRE_SERVER_CLUSTER=no-ip"}, "node address of no-ip"},
-		{"no images", []string{"STUB_NO_IMAGE=1"}, "mise run images"},
+		{"no images file", []string{"STUB_IMAGES=missing"}, "Run mise run images first"},
+		{"stale images file", []string{"STUB_IMAGES=stale"}, "Run mise run images again"},
 		{"bad API server address", []string{"API_SERVER_IPS=api.example"}, "not IPv4"},
 	}
 	for _, tc := range cases {

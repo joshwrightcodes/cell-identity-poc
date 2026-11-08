@@ -674,7 +674,9 @@ Searches over the 400 non-test Go files of the 102 third-party packages in the c
   `baggage.go` writes for invalid UTF-8.
 - No `sudo`, `Setuid` or `Setgid`.
 
-The build also adds or raises these modules. The review read them only through the searches above.
+The module also adds or raises the modules below. The searches above covered only the packages
+in the celld build. `x/term`, `go.yaml.in/yaml/v3` and the swag modules are not in that build.
+The next subsection reviews their diffs for the binaries that contain them.
 
 | Module | Version | Date | Note |
 | --- | --- | --- | --- |
@@ -698,6 +700,34 @@ these non-test, non-generated changes: `internal/encoding/defval/default.go`,
 `internal/genid/descriptor_gen.go`, `internal/version/version.go` and
 `reflect/protoreflect/source_gen.go`. The generated descriptor types also changed. The review did
 not read the changed logic line by line.
+
+### Raised modules outside the celld build (2026-11-09)
+
+The review read the diff of each module between the two versions in the Go module cache, which
+`go mod verify` checks. Nothing ran. The review looked for process starts, network calls, file
+writes, `unsafe`, environment reads, `init` side effects and hidden Unicode in the changed lines.
+
+| Module | Change | In the binaries | Result |
+| --- | --- | --- | --- |
+| `github.com/go-openapi/swag` and its 11 submodules | v0.27.1 to v0.28.0 | `cluster-jwt-agent`, `cluster-jwt-server` | Benign. See below. |
+| `go.yaml.in/yaml/v3` | v3.0.4 to v3.0.5 | `cluster-jwt-agent`, `cluster-jwt-server`, `hostsvc`, `recordgen` | Benign. Every changed Go line is a comment. `go.mod` retracts v3.0.0 and v3.0.1 and drops a test dependency. |
+| `golang.org/x/term` | v0.45.0 to v0.46.0 | `cluster-jwt-agent`, `cluster-jwt-server` | Benign. `Terminal.ReadLine` now keeps a read error until it has processed the data of that read. `go.mod` raises `x/sys`. |
+
+The swag diff:
+
+- Seven submodules have identical files outside tests: `cmdutils`, `fileutils`, `mangling`,
+  `netutils`, `pools`, `stringutils` and `typeutils`.
+- `jsonutils` and `yamlutils` change only in `go.mod`, where the versions of the sibling submodules rise.
+- `conv` adds `AppendInteger`, `AppendUinteger`, `AppendFloat` and `AppendBool`, which call `strconv` only.
+- `loading` adds `rootRelative`, `toOSPath` and `stripLeadingDriveSlash` to the loader for an `os.Root`.
+  An absolute path now moves onto the root before `os.Root` opens it, and `os.Root` still rejects
+  a path that leaves the root. The change adds imports of `path/filepath` and `runtime` only.
+- The root module changes `go.mod` and the pinned commits of its CI workflows.
+- The changed lines add no process start, network call, file write, `unsafe`, environment read or
+  `init` function. The only non-ASCII characters are em dashes in comments.
+
+The review did not read the unchanged code of these modules again, and it did not check which
+swag functions the plugins call.
 
 The review did not read these items:
 

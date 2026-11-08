@@ -43,7 +43,7 @@ func run(name string, args []string, executable func() (string, error)) error {
 	return install(name, src, fs.Arg(0))
 }
 
-// install copies src to dir/name with mode 0755. It writes a temporary file in dir and renames it,
+// install copies src to dir/name with mode 0555. It writes a temporary file in dir and renames it,
 // so a reader never sees a partial binary. It fails when dir is not writable.
 func install(name, src, dir string) (err error) {
 	in, err := os.Open(src)
@@ -64,7 +64,7 @@ func install(name, src, dir string) (err error) {
 		_ = tmp.Close()
 		return fmt.Errorf("copy binary: %w", err)
 	}
-	if err = tmp.Chmod(0o755); err != nil {
+	if err = tmp.Chmod(0o555); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("make binary executable: %w", err)
 	}

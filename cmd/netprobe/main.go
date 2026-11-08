@@ -1,5 +1,8 @@
 // Command netprobe is the network probe for the harness tests. It scans TCP ports, reports the
-// peer address of each request, and fetches URLs.
+// peer address of each request, fetches URLs, and reports the result of one TCP connect.
+//
+// dial prints {"addr", "result", "error"} with result connected, refused, timeout or error. A
+// NetworkPolicy that drops packets gives timeout. A host that answers with a reset gives refused.
 package main
 
 import (
@@ -18,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -42,7 +46,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: netprobe scan|serve|get")
+		return errors.New("usage: netprobe scan|serve|get|dial")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -92,6 +96,30 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			return errors.New("get needs --url")
 		}
 		return get(ctx, *url, stdout, *timeout)
+	case "dial":
+		addr := fs.String("addr", "", "IP address and port")
+		timeout := fs.Duration("timeout", 3*time.Second, "connect timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		host, _, err := net.SplitHostPort(*addr)
+		if err != nil || net.ParseIP(host) == nil {
+			return fmt.Errorf("dial needs --addr <IP address>:<port>, got %q", *addr)
+		}
+		d := net.Dialer{Timeout: *timeout}
+		c, err := d.DialContext(ctx, "tcp", *addr)
+		if c != nil {
+			_ = c.Close()
+		}
+		out := struct {
+			Addr   string `json:"addr"`
+			Result string `json:"result"`
+			Error  string `json:"error,omitempty"`
+		}{Addr: *addr, Result: dialClass(err)}
+		if err != nil {
+			out.Error = err.Error()
+		}
+		return json.NewEncoder(stdout).Encode(out)
 	}
 	return fmt.Errorf("unknown command %q", args[0])
 }
@@ -174,4 +202,19 @@ func get(ctx context.Context, url string, out io.Writer, timeout time.Duration) 
 	}
 	_, err = io.Copy(out, resp.Body)
 	return err
+}
+
+// dialClass names the outcome of one TCP connect.
+func dialClass(err error) string {
+	var ne net.Error
+	switch {
+	case err == nil:
+		return "connected"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	default:
+		return "error"
+	}
 }

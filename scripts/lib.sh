@@ -20,6 +20,8 @@ set +a
 BUILD="$BUILD_ROOT/$CELL"
 BUNDLES="$BUILD/bundles"
 FACTS="$BUILD/facts.env"
+# publish.sh writes the digest of each bundle that it pushed here, one <name>=<digest> line each.
+PUBLISHED="$BUILD/published.env"
 
 # Component sets. Each set name in harness/topology.yaml maps to a list of bundles.
 # Each entry is <component>:<sync wave>:<destination namespace>.
@@ -47,20 +49,24 @@ SPIRE_SERVER_COMPONENTS=(
   "spire-server:7:spire-system"
 )
 
-# celld with its SPIRE agent sidecar. It attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
-CELL_IDENTITY_COMPONENTS=(
-  "cell-identity:6:cell-identity-system"
+# Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
+# out of the root bundle and out of every Argo CD Application, so no bundle can change them.
+# Each entry is <component>:<namespace>.
+# celld with its SPIRE agent sidecar attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
+CELL_IDENTITY_HARNESS=(
+  "cell-identity:cell-identity-system"
 )
 
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
+HARNESS_COMPONENTS=()
 set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$ROOT/harness/topology.yaml")"
 for set_name in $set_names; do
   case "$set_name" in
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
     external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
-    cell-identity) COMPONENTS+=("${CELL_IDENTITY_COMPONENTS[@]}") ;;
+    cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done

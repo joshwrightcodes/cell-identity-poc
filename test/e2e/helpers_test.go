@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync/atomic"
@@ -17,12 +18,36 @@ import (
 )
 
 const (
-	probeImage   = "localhost:5001/netprobe:latest"
+	imagesEnv    = "../../build/images.env"
 	topologyPath = "../../harness/topology.yaml"
 	podTimeout   = 5 * time.Minute
 )
 
 var podCounter atomic.Int64
+
+// probeImage is the netprobe reference that `mise run images` recorded in build/images.env, pinned
+// by digest. It is empty when the file or the line is missing. needProbeImage then fails the test.
+var probeImage = readProbeImage()
+
+func readProbeImage() string {
+	data, err := os.ReadFile(imagesEnv)
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if ref, ok := strings.CutPrefix(line, "IMAGE_NETPROBE="); ok && strings.Contains(ref, "@sha256:") {
+			return ref
+		}
+	}
+	return ""
+}
+
+func needProbeImage(t *testing.T) {
+	t.Helper()
+	if probeImage == "" {
+		t.Fatalf("%s has no IMAGE_NETPROBE pinned by digest. Run mise run images.", imagesEnv)
+	}
+}
 
 // clusterFacts returns the host service facts of a running cluster.
 func clusterFacts(t *testing.T, name string) hostsvc.Facts {
@@ -40,11 +65,17 @@ func clusterFacts(t *testing.T, name string) hostsvc.Facts {
 	return f
 }
 
+// kubectlTimeout bounds one kubectl call, so a hung call cannot hold a wait past its deadline.
+// The longest call, a namespace delete, waits up to 180 seconds itself.
+const kubectlTimeout = 4 * time.Minute
+
 // kubectl runs kubectl against a cluster and returns standard output.
 func kubectl(t *testing.T, cluster, stdin string, args ...string) (string, error) {
 	t.Helper()
 	full := append([]string{"--context", "kind-" + cluster}, args...)
-	cmd := exec.Command("kubectl", full...)
+	ctx, cancel := context.WithTimeout(context.Background(), kubectlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", full...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
@@ -130,6 +161,7 @@ func restrictedOverridesWithPull(name string, args []string, pullPolicy string) 
 // runPod runs the probe image with args to completion in a cluster and returns its standard output.
 func runPod(t *testing.T, cluster, ns string, args []string) string {
 	t.Helper()
+	needProbeImage(t)
 	name := fmt.Sprintf("probe-%d", podCounter.Add(1))
 	runArgs := []string{"-n", ns, "run", name, "--image", probeImage, "--restart=Never",
 		"--overrides", restrictedOverrides(name, args)}
@@ -164,6 +196,7 @@ func runPod(t *testing.T, cluster, ns string, args []string) string {
 // the pod is Running or Succeeded. It returns an error that describes the pod when the wait ends.
 func startPod(t *testing.T, cluster, ns string, args []string) error {
 	t.Helper()
+	needProbeImage(t)
 	name := fmt.Sprintf("probe-%d", podCounter.Add(1))
 	runArgs := []string{"-n", ns, "run", name, "--image", probeImage, "--restart=Never",
 		"--overrides", restrictedOverridesWithPull(name, args, "Always")}

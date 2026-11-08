@@ -55,8 +55,8 @@ func TestInstallCopiesExecutable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm()&0o111 != 0o111 {
-		t.Fatalf("mode = %v, want executable", fi.Mode())
+	if fi.Mode().Perm() != 0o555 {
+		t.Fatalf("mode = %v, want 0555: executable and read-only for every user", fi.Mode())
 	}
 	if out.Len() != 0 || stderr() != "" {
 		t.Fatalf("stdout %q, stderr %q", out.String(), stderr())

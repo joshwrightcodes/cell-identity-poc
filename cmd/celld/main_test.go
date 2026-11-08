@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math/big"
@@ -16,14 +17,20 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	workloadpb "github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"go.opentelemetry.io/otel/metric/noop"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 )
 
@@ -71,7 +78,7 @@ func testTelemetry(otlp slog.Handler) telemetryStarter {
 			log:      newLogger(stdout, otlp),
 			tracer:   tp.Tracer("test"),
 			meter:    noop.NewMeterProvider().Meter("test"),
-			shutdown: tp.Shutdown,
+			shutdown: func(timeout time.Duration) error { return withTimeout(timeout, tp.Shutdown) },
 		}, nil
 	}
 }
@@ -297,5 +304,141 @@ func TestLogsEachNewSVIDOnce(t *testing.T) {
 	defer mu.Unlock()
 	if n := strings.Count(strings.Join(exported, "\n"), "x509 svid updated"); n != 2 {
 		t.Fatalf("OTLP handler got %d update records, want 2: %v", n, exported)
+	}
+}
+
+// captureStderr runs f with file descriptor 2 on a pipe and returns what f wrote there. Loggers
+// that kept the original os.Stderr at package init write to that descriptor too.
+func captureStderr(t *testing.T, f func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved, err := unix.Dup(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Dup2(int(w.Fd()), 2); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan string, 1)
+	go func() {
+		b, _ := io.ReadAll(r)
+		done <- string(b)
+	}()
+	restore := func() {
+		_ = unix.Dup2(saved, 2)
+		_ = unix.Close(saved)
+		_ = w.Close()
+	}
+	defer func() {
+		if w != nil {
+			restore()
+		}
+	}()
+	f()
+	restore()
+	w = nil
+	return <-done
+}
+
+func TestTelemetryErrorsStayJSONOnStdout(t *testing.T) {
+	// Port 1 on the loopback address refuses connections, so every export fails.
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	out := &syncBuffer{}
+	stderr := captureStderr(t, func() {
+		tel, err := startTelemetry(t.Context(), out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, span := tel.tracer.Start(context.Background(), "op")
+		tel.log.InfoContext(ctx, "before shutdown")
+		span.End()
+		if err := tel.shutdown(2 * time.Second); err != nil {
+			slog.New(slog.NewJSONHandler(out, nil)).Warn("telemetry shutdown", "error", err.Error())
+		}
+	})
+	if stderr != "" {
+		t.Fatalf("telemetry wrote to stderr: %q", stderr)
+	}
+	lines := jsonLines(t, out.String())
+	var sdkErrors int
+	for _, l := range lines {
+		if l["msg"] == "telemetry error" || l["msg"] == "telemetry shutdown" {
+			sdkErrors++
+		}
+	}
+	if sdkErrors == 0 {
+		t.Fatalf("no JSON line reports the failed export:\n%s", out.String())
+	}
+}
+
+// TestSVIDAgainAfterAGap logs the same SVID again after a gap, as held and not as new. Only a new
+// SVID adds to the counter, so celld.svid.updates counts new SVIDs.
+func TestSVIDAgainAfterAGap(t *testing.T) {
+	ca := newCA(t)
+	resp := ca.svid(t, 8).Svids[0]
+	svid, err := x509svid.ParseRaw(resp.X509Svid, resp.X509SvidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rotated := ca.svid(t, 9).Svids[0]
+	next, err := x509svid.ParseRaw(rotated.X509Svid, rotated.X509SvidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gaps := map[string]func(w *svidWatcher){
+		"watch error": func(w *svidWatcher) {
+			w.OnX509ContextWatchError(errors.New("rpc error: code = PermissionDenied desc = no identity issued"))
+		},
+		"empty update": func(w *svidWatcher) { w.OnX509ContextUpdate(&workloadapi.X509Context{}) },
+	}
+	for name, gap := range gaps {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			reader := sdkmetric.NewManualReader()
+			tel, err := testTelemetry(discard())(t.Context(), &out)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tel.meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+			w, err := newSVIDWatcher(tel)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{svid}})
+			gap(w)
+			w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{svid}})
+			w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{svid}})
+			w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{next}})
+			var msgs []string
+			for _, l := range jsonLines(t, out.String()) {
+				msgs = append(msgs, l["msg"].(string))
+			}
+			gapMsg := map[string]string{"watch error": "workload api watch failed", "empty update": "workload api update without an svid"}[name]
+			want := []string{"x509 svid updated", gapMsg, "x509 svid held", "x509 svid updated"}
+			if !slices.Equal(msgs, want) {
+				t.Fatalf("messages are %v, want %v", msgs, want)
+			}
+			var rm metricdata.ResourceMetrics
+			if err := reader.Collect(t.Context(), &rm); err != nil {
+				t.Fatal(err)
+			}
+			var total int64
+			for _, sm := range rm.ScopeMetrics {
+				for _, m := range sm.Metrics {
+					if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == "celld.svid.updates" {
+						for _, dp := range sum.DataPoints {
+							total += dp.Value
+						}
+					}
+				}
+			}
+			if total != 2 {
+				t.Fatalf("celld.svid.updates is %d, want 2: one for each new SVID", total)
+			}
+		})
 	}
 }

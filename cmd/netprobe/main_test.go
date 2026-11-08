@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -245,5 +247,68 @@ func captureStderr(t *testing.T) func() string {
 		b, _ := io.ReadAll(r)
 		_ = r.Close()
 		return string(b)
+	}
+}
+
+func dialResult(t *testing.T, args ...string) map[string]any {
+	t.Helper()
+	var out bytes.Buffer
+	if code := execute(t.Context(), append([]string{"dial"}, args...), &out); code != 0 {
+		t.Fatalf("dial %v: exit %d: %s", args, code, out.String())
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out.Bytes(), &m); err != nil || strings.Count(out.String(), "\n") != 1 {
+		t.Fatalf("dial output is not one JSON line: %q", out.String())
+	}
+	return m
+}
+
+func TestDialReportsConnectedAndRefused(t *testing.T) {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	if r := dialResult(t, "--addr", lis.Addr().String()); r["result"] != "connected" {
+		t.Fatalf("open port: %v", r)
+	}
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := closed.Addr().String()
+	_ = closed.Close()
+	if r := dialResult(t, "--addr", addr, "--timeout", "1s"); r["result"] != "refused" || r["addr"] != addr {
+		t.Fatalf("closed port: %v", r)
+	}
+}
+
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "dial tcp 10.0.0.1:1: i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }
+
+func TestDialClassifiesErrors(t *testing.T) {
+	cases := map[string]error{
+		"connected": nil,
+		"refused":   &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)},
+		"timeout":   &net.OpError{Op: "dial", Err: timeoutError{}},
+		"error":     &net.OpError{Op: "dial", Err: os.NewSyscallError("connect", syscall.EHOSTUNREACH)},
+	}
+	for want, err := range cases {
+		if got := dialClass(err); got != want {
+			t.Errorf("dialClass(%v) = %q, want %q", err, got, want)
+		}
+	}
+	if got := dialClass(context.DeadlineExceeded); got != "timeout" {
+		t.Errorf("dialClass(context.DeadlineExceeded) = %q, want timeout", got)
+	}
+}
+
+func TestDialRejectsHostName(t *testing.T) {
+	var out bytes.Buffer
+	if code := execute(t.Context(), []string{"dial", "--addr", "example.com:80"}, &out); code != 1 || !strings.Contains(out.String(), "IP address") {
+		t.Fatalf("exit %d, output %q", code, out.String())
 	}
 }

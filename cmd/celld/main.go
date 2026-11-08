@@ -1,9 +1,15 @@
 // Command celld is the cell daemon. This version is a stub: it watches the SPIFFE Workload API
 // and logs the SPIFFE ID of its X.509 SVID once for each new SVID.
 //
-// Every log line is compact JSON on stdout. Logs, traces and metrics also go out as OTLP. The
-// standard OTEL_* variables configure the exporters, for example OTEL_EXPORTER_OTLP_ENDPOINT.
-// SPIFFE_ENDPOINT_SOCKET names the Workload API socket.
+// Every log line is compact JSON on stdout, including errors from the telemetry SDK. Logs,
+// traces and metrics also go out as OTLP over gRPC. SPIFFE_ENDPOINT_SOCKET names the Workload API
+// socket.
+//
+// The OTLP gRPC exporters read the standard OTEL_EXPORTER_OTLP_* variables, for example the
+// endpoint, headers, timeout and certificates. The SDK reads OTEL_SERVICE_NAME,
+// OTEL_RESOURCE_ATTRIBUTES, the sampler, batch and limit variables. celld always uses the three
+// gRPC exporters, so OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_TRACES_EXPORTER, OTEL_METRICS_EXPORTER,
+// OTEL_LOGS_EXPORTER and OTEL_SDK_DISABLED have no effect.
 package main
 
 import (
@@ -18,8 +24,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
@@ -41,17 +50,20 @@ const (
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// After the first signal, a second signal ends the process at once, also during the flush.
+	context.AfterFunc(ctx, stop)
 	code := execute(ctx, os.Args[1:], os.Stdout, startTelemetry)
 	stop()
 	os.Exit(code)
 }
 
 // telemetry holds the logger, tracer and meter of the process, and a function that flushes them.
+// shutdown gives each provider its own timeout.
 type telemetry struct {
 	log      *slog.Logger
 	tracer   trace.Tracer
 	meter    metric.Meter
-	shutdown func(context.Context) error
+	shutdown func(timeout time.Duration) error
 }
 
 type telemetryStarter func(ctx context.Context, stdout io.Writer) (*telemetry, error)
@@ -70,9 +82,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, start telemet
 		return 1
 	}
 	defer func() {
-		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := tel.shutdown(sctx); err != nil {
+		if err := tel.shutdown(shutdownTimeout); err != nil {
 			boot.Warn("telemetry shutdown", "error", err.Error())
 		}
 	}()
@@ -91,13 +101,17 @@ func execute(ctx context.Context, args []string, stdout io.Writer, start telemet
 	return 0
 }
 
-// svidWatcher logs each new default X.509 SVID once. The Workload API also sends an update when
-// only the bundle changes, so the watcher compares the SPIFFE ID and the serial number.
+// svidWatcher logs each new default X.509 SVID once, as "x509 svid updated", and counts it. The
+// Workload API also sends an update when only the bundle changes, so the watcher compares the
+// SPIFFE ID and the serial number. After a gap, a watch error or an update without an SVID, the
+// watcher logs the next SVID again. A known SVID then logs as "x509 svid held", with no count and
+// no span, so the log always shows whether celld holds an SVID now.
 type svidWatcher struct {
 	tel     *telemetry
 	updates metric.Int64Counter
 	mu      sync.Mutex
 	last    string
+	gap     bool
 }
 
 func newSVIDWatcher(tel *telemetry) (*svidWatcher, error) {
@@ -110,40 +124,63 @@ func newSVIDWatcher(tel *telemetry) (*svidWatcher, error) {
 }
 
 func (w *svidWatcher) OnX509ContextUpdate(c *workloadapi.X509Context) {
-	svid := c.DefaultSVID()
+	// DefaultSVID panics on an empty list.
+	var svid *x509svid.SVID
+	if c != nil && len(c.SVIDs) > 0 {
+		svid = c.DefaultSVID()
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if svid == nil || len(svid.Certificates) == 0 {
+		w.gap = true
 		w.tel.log.Warn("workload api update without an svid")
 		return
 	}
 	leaf := svid.Certificates[0]
 	id := svid.ID.String()
 	key := id + "/" + leaf.SerialNumber.String()
-
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if key == w.last {
+	attrs := []any{"spiffe_id", id, "serial", leaf.SerialNumber.Text(16), "not_after", leaf.NotAfter.UTC().Format(time.RFC3339)}
+	switch {
+	case key == w.last && !w.gap:
+		return
+	case key == w.last:
+		w.gap = false
+		w.tel.log.Info("x509 svid held", attrs...)
 		return
 	}
-	w.last = key
+	w.last, w.gap = key, false
 
 	ctx, span := w.tel.tracer.Start(context.Background(), "x509 svid update",
 		trace.WithAttributes(attribute.String("spiffe.id", id)))
 	defer span.End()
 	w.updates.Add(ctx, 1, metric.WithAttributes(attribute.String("spiffe.id", id)))
-	w.tel.log.InfoContext(ctx, "x509 svid updated", "spiffe_id", id,
-		"serial", leaf.SerialNumber.Text(16), "not_after", leaf.NotAfter.UTC().Format(time.RFC3339))
+	w.tel.log.InfoContext(ctx, "x509 svid updated", attrs...)
 }
 
+// OnX509ContextWatchError logs the error and marks a gap, so the next SVID logs again.
 func (w *svidWatcher) OnX509ContextWatchError(err error) {
 	if errors.Is(err, context.Canceled) || status.Code(err) == codes.Canceled {
 		return
 	}
+	w.mu.Lock()
+	w.gap = true
+	w.mu.Unlock()
 	w.tel.log.Warn("workload api watch failed", "error", err.Error())
 }
 
 // startTelemetry sets up OTLP export of logs, traces and metrics over gRPC. The exporters read
-// the standard OTEL_EXPORTER_OTLP_* variables and connect only when they first export.
+// the standard OTEL_EXPORTER_OTLP_* variables and connect only when they first export. SDK errors
+// and SDK log lines go to stdout as JSON, and not through the OTLP bridge, so a failed export
+// cannot feed itself.
 func startTelemetry(ctx context.Context, stdout io.Writer) (*telemetry, error) {
+	sdkHandler := slog.NewJSONHandler(stdout, nil)
+	sdkLog := slog.New(sdkHandler)
+	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) {
+		sdkLog.Warn("telemetry error", "error", err.Error())
+	}))
+	otel.SetLogger(logr.FromSlogHandler(sdkHandler))
+
 	res, err := resource.New(ctx,
 		resource.WithAttributes(attribute.String("service.name", serviceName)),
 		resource.WithTelemetrySDK(),
@@ -171,10 +208,17 @@ func startTelemetry(ctx context.Context, stdout io.Writer) (*telemetry, error) {
 		log:    newLogger(stdout, otelslog.NewHandler(serviceName, otelslog.WithLoggerProvider(lp))),
 		tracer: tp.Tracer(serviceName),
 		meter:  mp.Meter(serviceName),
-		shutdown: func(ctx context.Context) error {
-			return errors.Join(tp.Shutdown(ctx), mp.Shutdown(ctx), lp.Shutdown(ctx))
+		// Logs go last, so the records that the other shutdowns cause still reach the exporter.
+		shutdown: func(timeout time.Duration) error {
+			return errors.Join(withTimeout(timeout, tp.Shutdown), withTimeout(timeout, mp.Shutdown), withTimeout(timeout, lp.Shutdown))
 		},
 	}, nil
+}
+
+func withTimeout(timeout time.Duration, f func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return f(ctx)
 }
 
 // newLogger writes each record as JSON to stdout, with the trace and span IDs of its context, and

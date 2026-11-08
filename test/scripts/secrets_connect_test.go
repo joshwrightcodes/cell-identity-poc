@@ -23,7 +23,10 @@ const (
 
 // stubKubectl logs each call, answers the install checks and saves each applied manifest.
 // STUB_NO_ESO makes the install checks fail. STUB_APPLY_FAIL makes apply fail and echo its input,
-// the way a server error can quote a request.
+// the way a server error can quote a request. Two ExternalSecrets exist in spire-system: one uses
+// the store poc-secrets, and one uses another store. STUB_NO_ES lists none. The ExternalSecret
+// reports Ready with a refresh time of now. STUB_NO_TARGET makes it fail to sync and the target
+// Secret missing, and STUB_STALE_REFRESH gives it a refresh time from before the force sync.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_DIR/kubectl.log"
@@ -43,6 +46,24 @@ case " $* " in
     echo "condition met" ;;
   *" get clustersecretstore "*)
     echo "unable to access the vault" ;;
+  *" get externalsecrets.external-secrets.io -o json "*)
+    [[ -z "${STUB_NO_ES:-}" ]] || { echo '{"items":[]}'; exit 0; }
+    echo '{"items":[
+      {"metadata":{"name":"spire-upstream"},"spec":{"secretStoreRef":{"kind":"ClusterSecretStore","name":"poc-secrets"},"target":{"name":"spire-upstream"}}},
+      {"metadata":{"name":"other"},"spec":{"secretStoreRef":{"kind":"ClusterSecretStore","name":"other-store"}}}]}' ;;
+  *" annotate "*)
+    echo "annotated" ;;
+  *" get externalsecret "*)
+    if [[ -n "${STUB_NO_TARGET:-}" ]]; then
+      echo '{"status":{"refreshTime":"2000-01-01T00:00:00Z","conditions":[{"type":"Ready","status":"False","message":"could not get secret data from provider"}]}}'
+    elif [[ -n "${STUB_STALE_REFRESH:-}" ]]; then
+      echo '{"status":{"refreshTime":"2000-01-01T00:00:00Z","conditions":[{"type":"Ready","status":"True","message":"secret synced"}]}}'
+    else
+      echo "{\"status\":{\"refreshTime\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"conditions\":[{\"type\":\"Ready\",\"status\":\"True\",\"message\":\"secret synced\"}]}}"
+    fi ;;
+  *" get secret "*)
+    [[ -z "${STUB_NO_TARGET:-}" ]] || { echo 'Error from server (NotFound): secrets not found' >&2; exit 1; }
+    echo "found" ;;
   *" get "*)
     [[ -z "${STUB_NO_ESO:-}" ]] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }
     echo "found" ;;
@@ -161,8 +182,22 @@ func TestSecretsConnect(t *testing.T) {
 	if len(r.applied) != 2 {
 		t.Fatalf("got %d applied manifests, want the token Secret and the store", len(r.applied))
 	}
-	if last := r.calls[len(r.calls)-1]; !strings.Contains(last, " wait ") || !strings.Contains(last, "clustersecretstore/poc-secrets") {
-		t.Fatalf("last kubectl call is %q, want a wait for the store to be Ready", last)
+	waitAt, annotateAt, secretAt := -1, -1, -1
+	for i, c := range r.calls {
+		switch {
+		case strings.Contains(c, " wait ") && strings.Contains(c, "clustersecretstore/poc-secrets"):
+			waitAt = i
+		case strings.Contains(c, " annotate "):
+			if !strings.Contains(c, "-n spire-system annotate externalsecret spire-upstream force-sync=") || !strings.HasSuffix(c, " --overwrite") {
+				t.Fatalf("annotate call %q, want a force sync of spire-upstream in spire-system only", c)
+			}
+			annotateAt = i
+		case strings.Contains(c, "-n spire-system get secret spire-upstream"):
+			secretAt = i
+		}
+	}
+	if waitAt < 0 || annotateAt < waitAt || secretAt < annotateAt {
+		t.Fatalf("calls %v: want the store wait, then the force sync, then the check for Secret spire-upstream", r.calls)
 	}
 
 	t.Run("token secret comes first and holds the command output", func(t *testing.T) {
@@ -207,6 +242,16 @@ func TestSecretsConnect(t *testing.T) {
 	})
 }
 
+func TestSecretsConnectWithoutExternalSecrets(t *testing.T) {
+	r := run(t, append(both(), "STUB_NO_ES=1")...)
+	if r.err != nil {
+		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
+	}
+	if !strings.Contains(r.stderr, "no ExternalSecret in spire-system uses ClusterSecretStore poc-secrets") {
+		t.Fatalf("stderr %q does not say that no ExternalSecret uses the store", r.stderr)
+	}
+}
+
 func TestSecretsConnectFailsClosed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -239,6 +284,27 @@ func TestSecretsConnectFailsClosed(t *testing.T) {
 			assertNoToken(t, r)
 		})
 	}
+
+	t.Run("target secret does not appear", func(t *testing.T) {
+		r := run(t, append(both(), "STUB_NO_TARGET=1", "SECRETS_CONNECT_SYNC_WAIT=1")...)
+		if r.err == nil {
+			t.Fatal("secrets-connect succeeded")
+		}
+		if !strings.Contains(r.stderr, "Secret spire-system/spire-upstream") || !strings.Contains(r.stderr, "could not get secret data from provider") {
+			t.Fatalf("stderr %q does not name the missing Secret and the ExternalSecret condition", r.stderr)
+		}
+		assertNoToken(t, r)
+	})
+
+	t.Run("refresh from before the force sync", func(t *testing.T) {
+		r := run(t, append(both(), "STUB_STALE_REFRESH=1", "SECRETS_CONNECT_SYNC_WAIT=1")...)
+		if r.err == nil {
+			t.Fatal("secrets-connect succeeded with a refresh time from before the force sync")
+		}
+		if !strings.Contains(r.stderr, "did not sync") {
+			t.Fatalf("stderr %q does not say that the ExternalSecret did not sync", r.stderr)
+		}
+	})
 
 	t.Run("store does not become ready", func(t *testing.T) {
 		r := run(t, append(both(), "STUB_NOT_READY=1")...)

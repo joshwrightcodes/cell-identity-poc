@@ -5,7 +5,8 @@
 #   POC_SECRET_STORE_PROVIDER  the provider block of the ClusterSecretStore, as JSON
 # The script applies Secret poc-secrets-token (key token) in external-secrets, then
 # ClusterSecretStore poc-secrets. Only the namespaces in SECRET_STORE_NAMESPACES from
-# cells/$CELL.env may use the store. The token stays in memory and reaches kubectl through a pipe.
+# cells/$CELL.env may use the store. Last, it forces a sync of each ExternalSecret there that uses
+# the store, and waits until each target Secret exists. The token stays in memory and reaches kubectl through a pipe.
 # These two objects live outside every bundle, so Argo CD never prunes them.
 source "$(dirname "$0")/lib.sh"
 
@@ -76,3 +77,46 @@ if ! k wait --for=condition=Ready "clustersecretstore/$store" --timeout=60s >/de
   die "ClusterSecretStore $store is not Ready after 60s: $(redact "${reason:-no condition}")"
 fi
 log "ClusterSecretStore $store is Ready"
+
+# An ExternalSecret that failed before the store existed waits out its retry backoff. A new
+# force-sync value makes ESO sync it now. Each ExternalSecret must then report Ready with a refresh
+# time at or after the force sync, and its target Secret must exist, in a bounded time.
+sync_wait="${SECRETS_CONNECT_SYNC_WAIT:-120}"
+at="$(date +%s)"
+targets=()
+for ns in $store_namespaces; do
+  list="$(k -n "$ns" get externalsecrets.external-secrets.io -o json)" || die "could not list the ExternalSecrets in $ns"
+  found=0
+  while read -r es target; do
+    [[ -n "$es" ]] || continue
+    found=1
+    k -n "$ns" annotate externalsecret "$es" "force-sync=$at" --overwrite >/dev/null \
+      || die "could not force a sync of ExternalSecret $ns/$es"
+    log "forced a sync of ExternalSecret $ns/$es"
+    targets+=("$ns/$es/$target")
+  done < <(jq -r --arg store "$store" '.items[]
+    | select(.spec.secretStoreRef.kind == "ClusterSecretStore" and .spec.secretStoreRef.name == $store)
+    | "\(.metadata.name) \(.spec.target.name // .metadata.name)"' <<<"$list")
+  ((found)) || log "no ExternalSecret in $ns uses ClusterSecretStore $store"
+done
+
+# synced <namespace> <ExternalSecret> succeeds when the ExternalSecret is Ready and refreshed at or
+# after the force sync.
+synced() {
+  k -n "$1" get externalsecret "$2" -o json 2>/dev/null | jq -e --argjson at "$at" '
+    any(.status.conditions[]?; .type == "Ready" and .status == "True")
+    and ((.status.refreshTime // "1970-01-01T00:00:00Z") | fromdateiso8601) >= $at' >/dev/null
+}
+for entry in ${targets[@]+"${targets[@]}"}; do
+  IFS=/ read -r ns es target <<<"$entry"
+  end=$((SECONDS + sync_wait))
+  until synced "$ns" "$es" && k -n "$ns" get secret "$target" >/dev/null 2>&1; do
+    if ((SECONDS >= end)); then
+      reason="$(k -n "$ns" get externalsecret "$es" -o json 2>/dev/null \
+        | jq -r '"refreshTime \(.status.refreshTime // "none"), Ready: \([.status.conditions[]? | select(.type == "Ready") | .message] | join("; "))"' || true)"
+      die "ExternalSecret $ns/$es did not sync within ${sync_wait}s of the force sync, or Secret $ns/$target is missing: $(redact "${reason:-no status}")"
+    fi
+    sleep 2
+  done
+  log "ExternalSecret $ns/$es synced, and Secret $ns/$target exists"
+done

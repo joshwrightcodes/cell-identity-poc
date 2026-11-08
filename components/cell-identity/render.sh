@@ -6,28 +6,28 @@
 #     and the NetworkPolicy allows only that address on the SPIRE node port.
 #   - the trust bundle of the SPIRE server, from the server in SPIRE_SERVER_CLUSTER. It becomes
 #     ConfigMap spire-trust-bundle. The bundle holds only public certificates.
-#   - the plugin and celld images from the local registry, pinned by digest. The agent config
-#     carries the SHA-256 of the plugin binary, so the agent checks the binary before it runs it.
+#   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
+#     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
+#     checks the binary before it runs it.
 # Inputs: SPIRE_SERVER_CLUSTER from cells/<cluster>.env, and the cluster facts from build/facts.env.
 set -euo pipefail
-: "${SPIRE_SERVER_CLUSTER:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
+: "${CELL_NAME:?}" "${SPIRE_SERVER_CLUSTER:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 namespace=cell-identity-system
-plugin_repo=localhost:5001/cluster-jwt-agent
 plugin_binary=/ko-app/cluster-jwt-agent
-celld_repo=localhost:5001/celld
 server_namespace=spire-system
 server_pod=spire-server-0
+trust_domain=dev.env.poc.internal
 
 die() { printf 'error: cell-identity render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
 
-plugin_digest="$(ko_digest "$plugin_repo")" || die "no agent plugin image"
-checksum="$(ko_binary_sha256 "$plugin_repo" "$plugin_digest" "$plugin_binary")" || die "no agent plugin checksum"
-celld_digest="$(ko_digest "$celld_repo")" || die "no celld image"
+plugin_image="$(ko_image cluster-jwt-agent)" || die "no agent plugin image"
+checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no agent plugin checksum"
+celld_image="$(ko_image celld)" || die "no celld image"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$SPIRE_SERVER_CLUSTER" 2>/dev/null)"; then
@@ -36,15 +36,19 @@ fi
 server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 [[ "$server_ip" =~ $ipv4 ]] || die "node address of $SPIRE_SERVER_CLUSTER is '$server_ip', not an IPv4 address"
 
-# The server prints its X.509 roots as PEM. The output must hold certificates and nothing else.
+# The server prints its X.509 roots as PEM.
+kubectl_err="$(mktemp)"
+trap 'rm -f "$kubectl_err"' EXIT
 if ! bundle="$(kubectl --context "kind-$SPIRE_SERVER_CLUSTER" -n "$server_namespace" exec "$server_pod" -c spire-server -- \
-  /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>&1)"; then
-  die "could not read the trust bundle from $server_pod in $SPIRE_SERVER_CLUSTER. Run CELL=$SPIRE_SERVER_CLUSTER mise run cell:up first. kubectl: $(tail -n 1 <<<"$bundle")"
+  /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>"$kubectl_err")"; then
+  die "could not read the trust bundle from $server_pod in $SPIRE_SERVER_CLUSTER. Run CELL=$SPIRE_SERVER_CLUSTER mise run cell:up first. kubectl: $(tail -n 1 "$kubectl_err")"
 fi
-grep -q '^-----BEGIN CERTIFICATE-----$' <<<"$bundle" || die "the trust bundle from $SPIRE_SERVER_CLUSTER holds no certificate"
-if grep -vqE '^(-----(BEGIN|END) CERTIFICATE-----|[A-Za-z0-9+/=]*)$' <<<"$bundle"; then
-  die "the trust bundle from $SPIRE_SERVER_CLUSTER holds more than PEM certificates"
+# pkigen checks that each certificate is a CA of the trust domain and valid now, and prints the
+# certificates again. It prints one JSON error line instead when a check fails.
+if ! checked="$(cd "$root" && mise run pki -- trust-bundle --trust-domain "$trust_domain" <<<"$bundle" 2>/dev/null)"; then
+  die "the trust bundle from $SPIRE_SERVER_CLUSTER failed the check: ${checked:-no output}"
 fi
+bundle="$checked"
 
 api_peers="$(for ip in $API_SERVER_IPS; do [[ "$ip" =~ $ipv4 ]] || exit 1; printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)" \
   || die "API_SERVER_IPS '$API_SERVER_IPS' holds an address that is not IPv4"
@@ -59,14 +63,15 @@ config_map() {
     | .data[strenv(KEY)] = strenv(VALUE) | .data[strenv(KEY)] style="literal"'
 }
 config_maps="$(config_map spire-agent agent.conf "$agent_conf"; echo "---"; config_map spire-trust-bundle bundle.crt "$bundle")"
-config_checksum="$(printf '%s' "$config_maps" | sha256)"
+# The checksum covers the config after hydrate replaces @CELL_NAME@, so it differs for each cell.
+config_checksum="$(printf '%s' "${config_maps//@CELL_NAME@/$CELL_NAME}" | sha256)"
 
 PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
   (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
     .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
 ' "$here/manifests.yaml" \
-  | sed -e "s|@SPIRE_AGENT_PLUGIN_IMAGE@|$plugin_repo@$plugin_digest|" \
-    -e "s|@CELLD_IMAGE@|$celld_repo@$celld_digest|" \
+  | sed -e "s|@SPIRE_AGENT_PLUGIN_IMAGE@|$plugin_image|" \
+    -e "s|@CELLD_IMAGE@|$celld_image|" \
     -e "s|@SPIRE_AGENT_CONFIG_CHECKSUM@|$config_checksum|" \
     -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
     -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
