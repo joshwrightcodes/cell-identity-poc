@@ -12,8 +12,10 @@ import (
 
 // Registry settings. Nodes pull localhost:5001 images from the registry container by name.
 const (
-	RegistryName   = "kiln-registry"
-	RegistryVolume = "kiln-registry-data"
+	RegistryName   = "registry-mirror"
+	RegistryVolume = "registry-mirror-data"
+	legacyName     = "kiln-registry"
+	legacyVolume   = "kiln-registry-data"
 	registryUser   = "65534:65534"
 	RegistryImage  = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
 	// HostsDir is the containerd registry configuration directory for localhost:5001 on a node.
@@ -49,6 +51,9 @@ func (s *Service) EnsureRegistry(ctx context.Context) error {
 		return fmt.Errorf("inspect %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 	}
 	state := strings.Fields(string(out))
+	if err := s.removeLegacyContainer(ctx); err != nil {
+		return err
+	}
 	switch {
 	case err != nil:
 		if err := s.runRegistry(ctx); err != nil {
@@ -67,6 +72,9 @@ func (s *Service) EnsureRegistry(ctx context.Context) error {
 			return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 		}
 	}
+	if err := s.removeLegacyVolume(ctx); err != nil {
+		return err
+	}
 	if out, err := s.Docker(ctx, "network", "inspect", kindNetwork); err != nil {
 		if strings.Contains(string(out), "No such network") {
 			return nil
@@ -76,6 +84,24 @@ func (s *Service) EnsureRegistry(ctx context.Context) error {
 	out, err = s.Docker(ctx, "network", "connect", kindNetwork, RegistryName)
 	if err != nil && !strings.Contains(string(out), "already exists") {
 		return fmt.Errorf("connect %s to %s: %w: %s", RegistryName, kindNetwork, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// removeLegacyContainer removes the container that earlier versions created, because it holds port 5001.
+func (s *Service) removeLegacyContainer(ctx context.Context) error {
+	out, err := s.Docker(ctx, "rm", "-f", legacyName)
+	if err != nil && !strings.Contains(string(out), "No such container") {
+		return fmt.Errorf("remove %s: %w: %s", legacyName, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// removeLegacyVolume removes the volume that earlier versions created. It runs after the new container runs.
+func (s *Service) removeLegacyVolume(ctx context.Context) error {
+	out, err := s.Docker(ctx, "volume", "rm", legacyVolume)
+	if err != nil && !strings.Contains(strings.ToLower(string(out)), "no such volume") {
+		return fmt.Errorf("remove volume %s: %w: %s", legacyVolume, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

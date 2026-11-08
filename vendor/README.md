@@ -113,7 +113,7 @@ The review did not inspect the image contents.
 ## Registry image (2026-11-08)
 
 The image `docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c`
-runs as `kiln-registry` on the Mac and as the bundle store in each base cell. The review read the
+runs as `registry-mirror` on the Mac and as the bundle store in each base cell. The review read the
 image configuration and history with `docker image inspect` and `docker history`, and copied
 `/entrypoint.sh` and `/etc/distribution/config.yml` out of a container that the review created and never started.
 
@@ -121,13 +121,13 @@ image configuration and history with `docker image inspect` and `docker history`
 - The build downloads the `registry` binary from the `distribution/distribution` release `v3.1.2`.
   The build checks a pinned SHA-256 for each architecture, and the digest above pins the result.
 - Entrypoint `/entrypoint.sh`, default command `/etc/distribution/config.yml`. The user is not set,
-  so the image runs as root by default. `kiln-registry` runs as user 65534 and the bundle store pod sets the same user. Exposed port 5000. Volume `/var/lib/registry`.
+  so the image runs as root by default. `registry-mirror` runs as user 65534 and the bundle store pod sets the same user. Exposed port 5000. Volume `/var/lib/registry`.
 - Environment: `PATH` and `OTEL_TRACES_EXPORTER=none`.
 - `entrypoint.sh` is eight lines of shell. It prepends `registry serve` or `registry` to the
   arguments and runs `exec`. It has no network call, no `sudo` and no credential access.
 - The default configuration stores blobs on the local filesystem and enables delete. It also opens a
   debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
-  `kiln-registry` and the bundle store set `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in each
+  `registry-mirror` and the bundle store set `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in each
   container then shows only port 5000.
 - Setuid and setgid: `docker run --rm --entrypoint find <image> / -xdev ( -perm -4000 -o -perm -2000 ) -type f`
   printed nothing. The entrypoint override runs only `find`, not the registry.
@@ -138,15 +138,15 @@ image configuration and history with `docker image inspect` and `docker history`
   The entrypoint runs no `init` and no login shell, so `/etc/inittab` and `/etc/profile.d` take no effect.
   Whether these two paths hold only Alpine defaults is not verified, because no package check ran.
 - Volume: `docker image inspect` shows the declared volume `/var/lib/registry`. `internal/hostsvc/registry.go`
-  mounts the named volume `kiln-registry-data` at that path. Blobs should persist after a container restart because of this named volume. This is not verified, because no restart test ran.
+  mounts the named volume `registry-mirror-data` at that path. Blobs should persist after a container restart because of this named volume. This is not verified, because no restart test ran.
 - The scripts and configuration contain no non-ASCII characters.
 - The review did not decompile the `registry` binary, which is 52 MB and owned by root.
 - The review did not check that binary against the upstream source tag.
 - The review did not read the Alpine packages or any file outside the paths named above.
 - The review did not observe the network behaviour of the binary at run time.
-- The `kiln-registry` container has no credentials and no authentication. Docker publishes it on
+- The `registry-mirror` container has no credentials and no authentication. Docker publishes it on
   `127.0.0.1:5001` on the Mac. It also joins the `kind` network, where the nodes pull from
-  `http://kiln-registry:5000`. Any pod in any cluster, including `rogue`, can reach it without
+  `http://registry-mirror:5000`. Any pod in any cluster, including `rogue`, can reach it without
   authentication. The default configuration allows deletes, so such a pod can also push to it and
   delete from it.
 

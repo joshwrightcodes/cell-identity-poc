@@ -59,7 +59,7 @@ An unknown name fails with a list of the known cells. For example, `CELL=managem
 
 `harness/versions.env` holds the expected tool versions and the time budget of `gate:m1`.
 `harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
-`harness:size` prints the memory and CPU of every node container and of `kiln-registry`.
+`harness:size` prints the memory and CPU of every node container and of `registry-mirror`.
 
 Two runs from clean, each with `harness:down` and `harness:up`, gave these `harness:up` durations on 2026-11-08:
 
@@ -78,7 +78,7 @@ After the clusters were healthy, the five node containers used about 8 GiB of me
 | --- | --- | --- |
 | `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` (each) | 1.7 to 1.8 GiB | 6 to 10 percent |
 | `rogue` | 0.6 GiB | 5 percent |
-| `kiln-registry` | 32 MiB | 0 percent |
+| `registry-mirror` | 32 MiB | 0 percent |
 
 The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 
