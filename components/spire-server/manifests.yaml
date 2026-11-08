@@ -220,7 +220,7 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Only the node addresses of the agent cells may reach the server API. The server needs no egress.
+# Only the node addresses of the agent cells may reach the server API.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
