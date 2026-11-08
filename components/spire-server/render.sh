@@ -2,7 +2,7 @@
 # Render the SPIRE server of the environment trust domain.
 #
 # For each cell in SPIRE_AGENT_CELLS, the render reads the node address from the host service and
-# signs a test record of the cell for the agent ServiceAccount SPIRE_AGENT_SUBJECT. The
+# signs a test record of the cell for the ServiceAccount SPIRE_AGENT_SUBJECT of the agent pod. The
 # NetworkPolicy admits only those node addresses, and the plugin trusts only those records.
 # The plugin image comes from the local registry, pinned by digest. The server config carries the
 # SHA-256 of the plugin binary from that image, so the server checks the binary before it runs it.

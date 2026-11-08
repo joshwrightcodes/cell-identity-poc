@@ -100,7 +100,7 @@ func render(t *testing.T, env ...string) result {
 	cmd.Env = append(os.Environ(),
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer,
-		"SPIRE_AGENT_SUBJECT=spire-system/spire-agent")
+		"SPIRE_AGENT_SUBJECT=cell-identity-system/celld")
 	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -221,7 +221,7 @@ func TestRenderSpireServer(t *testing.T) {
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
 		t.Fatalf("render left tokens %v", left)
 	}
-	for _, want := range []string{"run hostsvc -- facts --cluster dev-cell-1", "run record:fixture -- --cluster dev-cell-2 --subject spire-system/spire-agent"} {
+	for _, want := range []string{"run hostsvc -- facts --cluster dev-cell-1", "run record:fixture -- --cluster dev-cell-2 --subject cell-identity-system/celld"} {
 		if !strings.Contains(r.log, want) {
 			t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
 		}
