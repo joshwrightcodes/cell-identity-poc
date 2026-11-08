@@ -127,8 +127,9 @@ image configuration and history with `docker image inspect` and `docker history`
 - Persistence: no `/etc/init.d`, `/etc/rc.d` or `/etc/cron.d`. The Alpine default root crontab exists,
   but all five `/etc/periodic` directories are empty, and the entrypoint starts no `crond`.
   The only startup file is `/entrypoint.sh`. Blobs persist in the `/var/lib/registry` volume, by design.
-  The accounts are the Alpine defaults, and `/etc/shadow` came from the base build.
 - The scripts and configuration contain no non-ASCII characters.
-- The review did not decompile the `registry` binary (52 MB, root-owned), did not read the Alpine packages or the layers' file contents beyond the paths above, did not check it against the upstream
-  source tag, and did not inspect its network behaviour at run time. The `kiln-registry`
-  container has no credentials and serves HTTP without authentication on 127.0.0.1 only.
+- The review did not decompile the `registry` binary, which is 52 MB and owned by root.
+- The review did not check that binary against the upstream source tag.
+- The review did not read the Alpine packages or any file outside the paths named above.
+- The review did not observe the network behaviour of the binary at run time.
+- The `kiln-registry` container has no credentials. It serves HTTP without authentication on 127.0.0.1 only.
