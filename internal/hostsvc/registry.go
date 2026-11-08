@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -76,8 +77,25 @@ func (s *Service) configureNode(ctx context.Context, node string) error {
 	if out, err := s.Docker(ctx, "exec", node, "sh", "-c", script); err != nil {
 		return fmt.Errorf("write hosts.toml on %s: %w: %s", node, err, strings.TrimSpace(string(out)))
 	}
-	if _, err := s.Docker(ctx, "exec", node, "grep", "-q", `config_path = "`+certsDir+`"`, "/etc/containerd/config.toml"); err != nil {
+	out, err := s.Docker(ctx, "exec", node, "containerd", "config", "dump")
+	if err != nil {
+		return fmt.Errorf("read containerd configuration on %s: %w: %s", node, err, strings.TrimSpace(string(out)))
+	}
+	if !certsDirSet(string(out)) {
 		return fmt.Errorf("%w: %s; recreate it with the harness down and up tasks", ErrNodeStale, node)
 	}
 	return nil
+}
+
+var configPathLine = regexp.MustCompile(`(?m)^\s*config_path\s*=\s*(?:'([^']*)'|"([^"]*)")\s*$`)
+
+// certsDirSet reports whether the effective containerd configuration sets config_path to the
+// registry configuration directory, in either TOML string style.
+func certsDirSet(dump string) bool {
+	for _, m := range configPathLine.FindAllStringSubmatch(dump, -1) {
+		if m[1] == certsDir || m[2] == certsDir {
+			return true
+		}
+	}
+	return false
 }

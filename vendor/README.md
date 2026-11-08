@@ -102,3 +102,27 @@ It does not use `client-go`.
 
 Base image `gcr.io/distroless/static-debian13:nonroot` is pinned by digest in `.ko.yaml`. The
 review did not inspect the image contents.
+
+## Registry image (2026-11-08)
+
+The image `docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c`
+runs as `kiln-registry` on the Mac and as the bundle store in each base cell. The review read the
+image configuration and history with `docker image inspect` and `docker history`, and copied
+`/entrypoint.sh` and `/etc/distribution/config.yml` out of a container that was created and never started.
+
+- Base: Alpine 3.24.4 minirootfs. The build adds `ca-certificates` from `apk`.
+- The build downloads the `registry` binary from the `distribution/distribution` release `v3.1.2`.
+  The build checks a pinned SHA-256 for each architecture, and the digest above pins the result.
+- Entrypoint `/entrypoint.sh`, default command `/etc/distribution/config.yml`. The user is not set,
+  so `kiln-registry` runs as root. The bundle store pod sets user 65534. Exposed port 5000. Volume `/var/lib/registry`.
+- Environment: `PATH` and `OTEL_TRACES_EXPORTER=none`.
+- `entrypoint.sh` is eight lines of shell. It prepends `registry serve` or `registry` to the
+  arguments and runs `exec`. It has no network call, no `sudo` and no credential access.
+- The default configuration stores blobs on the local filesystem and enables delete. It also opens a
+  debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
+  Neither `kiln-registry` nor the bundle store publishes that port, but the listener runs in both.
+  Telemetry for the PoC goes through OTLP, so this listener is a known exception.
+- The scripts and configuration contain no non-ASCII characters.
+- The review did not decompile the `registry` binary, did not check it against the upstream
+  source tag, and did not inspect its network behaviour at run time. The `kiln-registry`
+  container has no credentials and serves HTTP without authentication on 127.0.0.1 only.

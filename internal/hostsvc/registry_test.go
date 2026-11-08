@@ -26,8 +26,10 @@ func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 		return []byte("Error: No such network"), errors.New("exit 1")
 	case strings.HasPrefix(line, "network inspect"):
 		return []byte(""), nil
-	case strings.HasPrefix(line, "exec") && strings.Contains(line, "grep") && f.stale:
-		return nil, errors.New("exit 1")
+	case strings.HasPrefix(line, "exec") && strings.Contains(line, "config dump") && f.stale:
+		return []byte("[plugins.'io.containerd.cri.v1.images'.registry]\n  config_path = ''\n"), nil
+	case strings.HasPrefix(line, "exec") && strings.Contains(line, "config dump"):
+		return []byte("time=x level=warning msg=migrated\n    config_path = '" + certsDir + "'\n"), nil
 	}
 	return nil, nil
 }
@@ -127,5 +129,24 @@ func TestUpRejectsNodeWithoutCertsDir(t *testing.T) {
 	s.Docker = d.run
 	if _, err := s.Up(context.Background(), "rogue"); !errors.Is(err, ErrNodeStale) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestCertsDirSet(t *testing.T) {
+	for _, tc := range []struct {
+		name, dump string
+		want       bool
+	}{
+		{"single quotes", "  config_path = '/etc/containerd/certs.d'\n", true},
+		{"double quotes", "config_path = \"/etc/containerd/certs.d\"\n", true},
+		{"empty single", "config_path = ''\n", false},
+		{"empty double", "config_path = \"\"\n", false},
+		{"other directory", "config_path = '/etc/other'\n", false},
+		{"one set among empty", "config_path = ''\n  config_path = '/etc/containerd/certs.d'\n", true},
+		{"absent", "plugin_config_path = '/etc/nri/conf.d'\n", false},
+	} {
+		if got := certsDirSet(tc.dump); got != tc.want {
+			t.Errorf("%s: got %v", tc.name, got)
+		}
 	}
 }
