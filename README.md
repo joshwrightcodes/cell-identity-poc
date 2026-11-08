@@ -105,6 +105,60 @@ Run `mise run harness:down` and `mise run harness:up` after it.
 
 The bundle store keeps bundles on a persistent volume, so they survive a pod restart.
 
+## Keys
+
+The SPIRE server in `dev-cp` gets its CA from an intermediate CA, and a root CA signs the intermediate.
+The keys live in your secret manager. A secret sync operator in `dev-cp` copies them into Secret
+`spire-upstream` in the namespace `spire-system`. No step in this repository writes a key to disk.
+
+| Secret key | Contents |
+| --- | --- |
+| `intermediate-key` | The private key of the intermediate CA, as one PEM block `EC PRIVATE KEY` |
+| `intermediate-cert` | The certificate of the intermediate CA |
+| `root-cert` | The certificate of the root CA |
+
+The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
+
+`mise run pki` prints PEM on standard output. `root` and `intermediate` print a bundle: the key, then the certificate.
+`key` and `cert` read a bundle on standard input and print one part of it.
+The steps below use placeholders in angle brackets.
+Replace `<read>` and `<write>` with the read and write commands of your secret manager.
+Each item name is a placeholder too.
+Put settings for your secret manager in `.envrc.local`.
+Git ignores this file, and direnv loads it through `.envrc`.
+
+1. Create the root CA, and store its bundle:
+
+   ```sh
+   mise run pki -- root | <write> <root-ca-bundle>
+   ```
+
+2. Create the intermediate CA from the root bundle, and store its key and certificate as separate items:
+
+   ```sh
+   inter="$(<read> <root-ca-bundle> | mise run pki -- intermediate --days 30)"
+   printf '%s\n' "$inter" | mise run pki -- key | <write> <intermediate-key>
+   printf '%s\n' "$inter" | mise run pki -- cert | <write> <intermediate-cert>
+   unset inter
+   ```
+
+3. Store the root certificate on its own:
+
+   ```sh
+   <read> <root-ca-bundle> | mise run pki -- cert | <write> <root-cert>
+   ```
+
+4. Give the operator its access token from standard input:
+
+   ```sh
+   <read> <operator-token> | mise x -- kubectl --context kind-dev-cp -n <operator-namespace> \
+     create secret generic <operator-token-secret> --from-file=token=/dev/stdin
+   ```
+
+The intermediate is valid for 30 days, and the root for one year.
+Create a new intermediate before the old one expires.
+The SPIRE server reads the new files when it signs its next CA.
+
 ## Layout
 
 | Path | Contents |

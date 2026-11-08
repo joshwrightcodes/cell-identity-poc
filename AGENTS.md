@@ -25,6 +25,7 @@
 | Run the Go unit tests | `mise run test`, or `mise run test -- ./internal/topology/...` |
 | Check the Go code | `mise run lint` |
 | Run the M1 end-to-end gate | `mise run gate:m1` |
+| Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References
 
