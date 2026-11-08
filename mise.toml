@@ -63,7 +63,8 @@ run = "scripts/down.sh"
 
 [tasks.test]
 description = "Run the Go unit tests, or the packages given after --"
-run = 'go test "${@:-./...}"'
+usage = 'arg "[packages]..." var=#true default="./..."'
+run = 'eval go test ${usage_packages?}'
 
 [tasks.lint]
 description = "Run go vet on every package"
