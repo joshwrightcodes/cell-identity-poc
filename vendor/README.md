@@ -98,6 +98,7 @@ It does not use `client-go`.
 | `go.yaml.in/yaml/v3` | v3.0.4 | Same result. |
 | `golang.org/x/sys` | v0.6.0 | Same result. `execabs` and platform files use process calls, as expected. |
 | `github.com/mattn/go-isatty` | v0.0.20 | Same result. |
+| `github.com/inconshreveable/mousetrap` | v1.1.0 | Same result. Two small files: a no-op for non-Windows builds, and a Windows-only check of the parent process (`explorer.exe`) through `syscall`. No network, no `os/exec`. Cobra needs it only on Windows, so it is not in the macOS build. |
 
 Base image `gcr.io/distroless/static-debian13:nonroot` is pinned by digest in `.ko.yaml`. The
 review did not inspect the image contents.
