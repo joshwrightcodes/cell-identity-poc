@@ -146,5 +146,4 @@ plaintext. Strict mTLS on the collector would reject them.
 
 ## Open questions
 
-- Where the management cluster gets its own bundles, because no plane sits above it.
 - Whether clusters in the same cell call each other directly, or only through management.
