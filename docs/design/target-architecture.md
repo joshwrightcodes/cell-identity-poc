@@ -305,6 +305,7 @@ expired attests again as a new agent, with a new nonce.
 - SPIRE's built-in per-IP limit is turned off, because cells share addresses. The server makes each nonce inside one attestation stream, so a token copied into another stream fails, and no nonce cache is needed.
 - Plugins have no datastore access: SPIRE offers server plugins only the `identityprovider`, `agentstore` and `metrics` host services (as of 2026-11-08). Each server keeps the in-flight cap and the rate budget in memory, so a second server divides the budget.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
+- Registration entries are `ClusterStaticEntry` manifests that spire-controller-manager reconciles in static manifest mode.
 
 ### Independent key check **[call]**
 
@@ -815,7 +816,7 @@ this order, each with its own scope document:
 | kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery. Result 2026-11-08: they do not survive, so this fallback applies |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
-| Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |
+| Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier. Result 2026-11-08, SPIRE v1.15.5: `ca_ttl` 1m, `default_x509_svid_ttl` 10s and `agent_ttl` 10s, with `default_jwt_svid_ttl` 10s. SPIRE sets no lower bound, but it warns when an SVID lifetime exceeds `ca_ttl` divided by 6. The CA rotator runs every 10 seconds, so with a `ca_ttl` of 30s the CA expires before the next rotation. With the default JWT lifetime of 5 minutes, the shortest values are `ca_ttl` 30m and 5m for both SVID lifetimes. `spire-server validate` hides these warnings, so the check used `spire-server run` with no agent. Agent renewal at these lifetimes is not verified yet. No fallback applies |
 | Service account key rotation on kind nodes | M2 | Stop and report |
 | Approver signatures from device-held keys in the PoC | M5 | Software keys per test approver |
 | Argo CD OCI source through a localhost proxy that adds a token | M8 | Local TLS on the proxy |

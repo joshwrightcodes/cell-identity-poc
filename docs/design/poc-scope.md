@@ -120,3 +120,4 @@ for M9. Each tier has a time budget, set at M1.
 - Keys are fixed for the life of a run.
 - One shared vault and one access token serve every PoC cluster. Because of this, a compromised cluster can read every PoC secret, including the SPIRE intermediate key. Production uses a vault and a token for each cluster.
 - The relay cannot close a revoked cell's streams. The management plane closes them.
+- Up to 8 held attestation streams for one cell (`per_cell_inflight`) can delay the attestation of that cell for up to `challenge_timeout`. The SPIRE port admits only cell node addresses, so this attack needs a foothold in a cell.
