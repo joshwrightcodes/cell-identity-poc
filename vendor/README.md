@@ -302,7 +302,7 @@ Unicode, `os/exec`, `sudo` and `net/http` in non-test code.
 | `github.com/oklog/run` | v1.1.0 | Goroutine group helper. No hidden Unicode and no process or network code. |
 | `github.com/fatih/color`, `github.com/mattn/go-colorable` | v1.15.0, v0.1.13 | Terminal colour for hclog. No hidden Unicode and no process or network code. |
 | `google.golang.org/grpc` | v1.84.0 (2026-09-17) | Matches the SPIRE pin. Only the server side is relevant to the plugin, and the listener is a local socket. `os/exec` appears only in a Windows file and in a test tool that the build does not import. No hidden Unicode. |
-| `google.golang.org/protobuf`, `github.com/golang/protobuf` | v1.36.11, v1.5.4 | `os/exec` appears only in code generators that the build does not import. No hidden Unicode. |
+| `google.golang.org/protobuf`, `github.com/golang/protobuf` | v1.36.11, v1.5.4 | This row covers the server plugin at the time of its review. The agent build uses a newer protobuf version, described in the Kubernetes client section. `os/exec` appears only in code generators that the build does not import. No hidden Unicode. |
 | `golang.org/x/net`, `golang.org/x/text`, `golang.org/x/sys` | v0.57.0 (2026-07-08), v0.40.0 (2026-07-08), v0.47.0 (2026-06-30) | Standard extension modules. `os/exec` appears only in generators and test helpers. The word `sudo` appears once, in a language name table in `x/text`. No hidden Unicode. The upgrade of `x/sys` from v0.6.0 also reaches the other modules that use it. |
 | `google.golang.org/genproto/googleapis/rpc` | v0.0.0-20260706201446-f0a921348800 | Generated status types. The review read only its entry in the module list. |
 
@@ -335,10 +335,50 @@ The build also adds these modules: `go-restful`, `go-openapi/*`, `gnostic-models
 `munnerz/goautoneg` and `go-spew`. They are transitive. The review matched their code only
 against the searches above.
 
-The upgrade raises `google.golang.org/protobuf` to v1.36.12-0.20260120151049-f2248ac996af,
-`spf13/pflag` to v1.0.10 and `go.yaml.in/yaml/v2` to v2.4.4. SPIRE v1.15.5 pins protobuf v1.36.11.
-A plugin does not need the same protobuf version as SPIRE, because they share only the wire format.
-The effect of this difference is not verified.
+Protobuf. The go.mod files of `client-go` v0.37.1 and `apimachinery` v0.37.1 require
+`google.golang.org/protobuf` v1.36.12-0.20260120151049-f2248ac996af, so the build uses this version
+for the server plugin and the agent plugin. SPIRE v1.15.5 pins v1.36.11, and the earlier rows of
+this file describe that version. The commit date is 2026-01-20, which is more than two weeks old.
+The tag v1.36.12 exists and is dated 2026-08-10. The review did not verify that the tag contains
+this commit, and `go.mod` does not use the tag. The review compared the module cache copies of
+v1.36.11 and this version. Nine non-generated, non-test Go files differ: `protogen`, `protodelim`,
+`protojson` (two files), `prototext`, `generate-protos`, `descfmt`, `internal/version` and
+`protodesc`. The added lines hold no `os/exec`, `net/http`, `net`, `sudo`, `syscall` or `unsafe`
+reference and no hidden Unicode. The review did not read the changed logic line by line, and it
+did not review the generated files or tests. A plugin does not need the same protobuf version as
+SPIRE, because they share only the wire format. The effect of this difference is not verified.
+
+Release dates from the Go proxy (the `.info` files, read 2026-11-08):
+
+| Module | Version | Date |
+| --- | --- | --- |
+| `github.com/spf13/pflag` | v1.0.10 | 2025-09-02 |
+| `go.yaml.in/yaml/v2` | v2.4.4 | 2026-03-06 |
+| `github.com/go-openapi/swag` | v0.27.1 | 2026-07-19 |
+| `k8s.io/kube-openapi` | v0.0.0-20260721132016-d427ff9ee9ad | 2026-07-21 |
+| `k8s.io/api`, `k8s.io/apimachinery` | v0.37.1 | 2026-09-23 |
+| `k8s.io/klog/v2` | v2.140.0 | 2026-03-03 |
+| `k8s.io/utils` | v0.0.0-20260626114624-be93311217bd | 2026-06-26 |
+| `sigs.k8s.io/structured-merge-diff/v6` | v6.4.2 | 2026-07-07 |
+| `sigs.k8s.io/randfill` | v1.0.0 | 2025-03-04 |
+| `github.com/emicklei/go-restful/v3` | v3.13.0 | 2025-08-14 |
+| `github.com/fxamacker/cbor/v2` | v2.9.1 | 2026-03-30 |
+| `github.com/google/gnostic-models` | v0.7.0 | 2025-06-26 |
+| `golang.org/x/oauth2`, `x/time` | v0.36.0, v0.15.0 | 2026-02-11 |
+| `golang.org/x/term` | v0.45.0 | 2026-07-08 |
+| `github.com/go-logr/logr` | v1.4.3 | 2025-05-19 |
+| `github.com/google/uuid` | v1.6.0 | 2024-01-23 |
+| `gopkg.in/evanphx/json-patch.v4` | v4.13.0 | 2025-01-28 |
+| `github.com/json-iterator/go` | v1.1.12 | 2021-09-11 |
+| `github.com/x448/float16` | v0.8.4 | 2020-01-17 |
+
+Every date is more than two weeks before 2026-11-08. The upgrade also raises `spf13/pflag` from
+v1.0.5 and `go.yaml.in/yaml/v2` from v2.4.2, because the three Kubernetes modules require the new
+versions.
+
+The agent binary links the whole `internal/clusterjwt` package. Because of this, it also contains
+the server code and its go-jose and hcl imports, although it never calls the server code.
+
 
 The review did not read the other client-go packages, the generated clientset for other API
 groups, or the test files. It did not compare any module with its upstream repository. Because of

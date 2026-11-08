@@ -1,4 +1,4 @@
-package main
+package install
 
 import (
 	"bytes"
@@ -27,13 +27,15 @@ func captureStderr(t *testing.T) func() string {
 	}
 }
 
+const binaryName = "demo-plugin"
+
 func fakeExe(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "plugin-binary")
 	if err := os.WriteFile(p, []byte("binary bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return func() string { return p }()
+	return p
 }
 
 func TestInstallCopiesExecutable(t *testing.T) {
@@ -41,10 +43,10 @@ func TestInstallCopiesExecutable(t *testing.T) {
 	dir := t.TempDir()
 	stderr := captureStderr(t)
 	var out bytes.Buffer
-	if code := runCLI([]string{"install", dir}, &out, func() (string, error) { return src, nil }); code != 0 {
+	if code := Run(binaryName, []string{"install", dir}, &out, func() (string, error) { return src, nil }); code != 0 {
 		t.Fatalf("code = %d, stdout %q", code, out.String())
 	}
-	dst := filepath.Join(dir, "cluster-jwt-server")
+	dst := filepath.Join(dir, "demo-plugin")
 	got, err := os.ReadFile(dst)
 	if err != nil || string(got) != "binary bytes" {
 		t.Fatalf("copy = %q, err %v", got, err)
@@ -68,13 +70,13 @@ func TestInstallCopiesExecutable(t *testing.T) {
 func TestInstallReplacesExistingFile(t *testing.T) {
 	src := fakeExe(t)
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "cluster-jwt-server"), []byte("old"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "demo-plugin"), []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code := runCLI([]string{"install", dir}, &bytes.Buffer{}, func() (string, error) { return src, nil }); code != 0 {
+	if code := Run(binaryName, []string{"install", dir}, &bytes.Buffer{}, func() (string, error) { return src, nil }); code != 0 {
 		t.Fatalf("code = %d", code)
 	}
-	got, _ := os.ReadFile(filepath.Join(dir, "cluster-jwt-server"))
+	got, _ := os.ReadFile(filepath.Join(dir, "demo-plugin"))
 	if string(got) != "binary bytes" {
 		t.Fatalf("copy = %q", got)
 	}
@@ -104,7 +106,7 @@ func TestFailuresAreOneJSONLineOnStdout(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			stderr := captureStderr(t)
 			var out bytes.Buffer
-			if code := runCLI(args, &out, exe); code == 0 {
+			if code := Run(binaryName, args, &out, exe); code == 0 {
 				t.Fatal("expected a non-zero exit code")
 			}
 			lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")

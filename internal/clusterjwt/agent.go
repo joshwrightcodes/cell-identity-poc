@@ -152,13 +152,17 @@ func (a *Agent) build(text string, withClient bool) (*agentState, error) {
 		return nil, errors.New("env holds characters that an audience cannot carry")
 	}
 	ttl, err := time.ParseDuration(cfg.TokenTTL)
-	if err != nil || ttl < MinTokenTTL {
-		return nil, fmt.Errorf("token_ttl must be a duration of at least %s", MinTokenTTL)
+	if err != nil || ttl < MinTokenTTL || ttl > MaxTokenLifetime {
+		return nil, fmt.Errorf("token_ttl must be a duration from %s to %s", MinTokenTTL, MaxTokenLifetime)
 	}
 	st := &agentState{cell: cfg.Cell, env: cfg.Env, ttl: ttl}
-	for name, dst := range map[string]*string{
-		envPodName: &st.podName, envPodUID: &st.podUID, envPodNamespace: &st.namespace, envServiceAcct: &st.serviceAccount,
+	for _, e := range []struct {
+		name string
+		dst  *string
+	}{
+		{envPodName, &st.podName}, {envPodUID, &st.podUID}, {envPodNamespace, &st.namespace}, {envServiceAcct, &st.serviceAccount},
 	} {
+		name, dst := e.name, e.dst
 		v, ok := a.lookupEnv(name)
 		if !ok || v == "" {
 			return nil, fmt.Errorf("environment variable %s is required", name)

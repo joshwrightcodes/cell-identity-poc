@@ -259,6 +259,7 @@ func TestAgentConfigure(t *testing.T) {
 		"no env":         {`cell = "dev-cell-1"`, "env is required"},
 		"env with slash": {"cell = \"dev-cell-1\"\nenv = \"a/b\"", "env"},
 		"ttl too small":  {goodAgentHCL + `token_ttl = "9m59s"`, "token_ttl"},
+		"ttl too large":  {goodAgentHCL + `token_ttl = "15m1s"`, "token_ttl"},
 		"ttl bad":        {goodAgentHCL + `token_ttl = "soon"`, "token_ttl"},
 		"unknown":        {goodAgentHCL + `extra = 1`, "unknown setting"},
 	}
@@ -270,6 +271,13 @@ func TestAgentConfigure(t *testing.T) {
 				t.Fatalf("Configure: %v, want InvalidArgument containing %q", err, c.want)
 			}
 		})
+	}
+}
+
+func TestAgentAcceptsMaximumTTL(t *testing.T) {
+	f := newAgentFixture(t, podEnv(), func(*authenticationv1.TokenRequest) string { return "x" })
+	if err := f.configure(goodAgentHCL + `token_ttl = "15m"`); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -295,8 +303,11 @@ func TestAgentTokenTTL(t *testing.T) {
 // each run behind their own plugin harness. This test plays the part of SPIRE between them.
 func TestAgentAgainstServer(t *testing.T) {
 	s := newFixture(t, fixtureOptions{})
-	a := newAgentFixture(t, podEnv(), func(tr *authenticationv1.TokenRequest) string {
+	env := podEnv()
+	env["POD_UID"] = "bound-uid"
+	a := newAgentFixture(t, env, func(tr *authenticationv1.TokenRequest) string {
 		sp := s.keys.good()
+		sp.K8s.Pod = &ref{Name: tr.Spec.BoundObjectRef.Name, UID: string(tr.Spec.BoundObjectRef.UID)}
 		sp.Audience = tr.Spec.Audiences
 		return sp.token(t)
 	})
@@ -339,7 +350,7 @@ func TestAgentAgainstServer(t *testing.T) {
 		t.Fatalf("server refused the agent: %v", err)
 	}
 	id := done.GetAgentAttributes().GetSpiffeId()
-	wantPrefix := "spiffe://" + testTrustDomain + "/spire/agent/cluster_jwt/dev-cell-1/pod-uid/" + nonceHash(string(ch.GetChallenge()))
+	wantPrefix := "spiffe://" + testTrustDomain + "/spire/agent/cluster_jwt/dev-cell-1/bound-uid/" + nonceHash(string(ch.GetChallenge()))
 	if id != wantPrefix {
 		t.Fatalf("agent id = %q, want %q", id, wantPrefix)
 	}

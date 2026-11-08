@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	maxLifetime = 15 * time.Minute
-	maxIATAge   = 15 * time.Minute
-	skew        = 30 * time.Second
-	minRSABits  = 2048
+	// MaxTokenLifetime is the longest lifetime that the server accepts for a token.
+	MaxTokenLifetime = 15 * time.Minute
+	maxIATAge        = 15 * time.Minute
+	skew             = 30 * time.Second
+	minRSABits       = 2048
 )
 
 var allowedAlgs = []jose.SignatureAlgorithm{jose.RS256, jose.ES256}
@@ -107,7 +108,7 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if !exp.After(iat) {
 		return Claims{}, fail(Malformed)
 	}
-	if exp.Sub(iat) > maxLifetime {
+	if exp.Sub(iat) > MaxTokenLifetime {
 		return Claims{}, fail(LifetimeTooLong)
 	}
 	if now.Sub(iat) > maxIATAge {
