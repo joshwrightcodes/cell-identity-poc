@@ -29,7 +29,7 @@ It also shows three properties that the owner set:
 | Clusters | `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` and `rogue`, as kind clusters in one Colima VM | Topology |
 | Provisioning | The cell controller in `dev-cp` sends a step that the management plane signs to a host service on the Mac. The host service creates the cluster and applies the pinned bootstrap set | Cell controller |
 | Cluster keys | The host service serves each cluster's JWKS over TLS with a certificate that the management plane pins. The management plane binds the issuer with a nonce token at first start | Independent key check |
-| Identity | SPIRE server in `dev-cp`. Its intermediate CA comes from the secret manager CLI on standard input, signed by a root kept off every cluster | SPIRE CAs |
+| Identity | SPIRE server in `dev-cp`. The External Secrets Operator copies its intermediate CA from the secret manager. A root that no cluster can read signs the intermediate | SPIRE CAs |
 | Management plane identities | A second SPIRE server in `management` issues `mgmt.poc.internal` identities to local workloads, through the `k8s_psat` attestor. The management plane and `dev` pin each other's root CA | Identities |
 | Attestation | `cluster_jwt` with pod-bound tokens of 15 minutes or less. Agents do not re-attest: each attestation gets a fresh agent ID, and running agents renew without a new token | Attestation |
 | Specs | The management plane stand-in signs specs and cell records with one key. envd pulls them, and refuses unsigned or older ones | Signed specs and records |
@@ -70,6 +70,7 @@ These stay in the target architecture, and come in later increments:
 - Observability uses the `otel-lgtm` all-in-one image, with local storage and no HA.
 - Until M4, the test-signed record from M2 is the management plane's registry of cells.
 - Upstream components keep their Prometheus endpoints. Only the collector in the same cluster scrapes them, and signals leave a cluster only as OTLP.
+- The External Secrets Operator is the provider-neutral sync from the secret manager into each cluster. A cluster gets its own install when it first needs a secret. In M2, only `dev-cp` has one.
 
 ## Bespoke components
 
@@ -86,7 +87,7 @@ These stay in the target architecture, and come in later increments:
 | Cell controller | Turns spec steps into host service calls |
 
 Third-party components that need a review before they run: SPIRE, spire-controller-manager,
-Argo CD Agent, the `otel-lgtm` image, Kiali, kind's local-path provisioner, the registry image, and
+the External Secrets Operator, Argo CD Agent, the `otel-lgtm` image, Kiali, kind's local-path provisioner, the registry image, and
 SQLite drivers.
 
 ## Milestones
@@ -117,4 +118,5 @@ for M9. Each tier has a time budget, set at M1.
 - Every pod, including those in `rogue`, reaches every listener on the loopback interface of the Mac through `host.docker.internal`, not only the host service.
 - A compromised management plane can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run.
+- One shared vault and one access token serve every PoC cluster. Because of this, a compromised cluster can read every PoC secret, including the SPIRE intermediate key. Production uses a vault and a token for each cluster.
 - The relay cannot close a revoked cell's streams. The management plane closes them.

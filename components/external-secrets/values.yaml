@@ -1,0 +1,51 @@
+# Values for the vendored External Secrets Operator chart. The cell runs only the controller,
+# and only for ExternalSecret and ClusterSecretStore. vendor/README.md records the review.
+global:
+  compatibility:
+    openshift:
+      adaptSecurityContext: disabled
+
+image:
+  tag: v2.14.0@sha256:10608eb53e636e744903d5f3657a4d9c44e28d9d9c181b73e07bc7dd2e6884dc
+
+installCRDs: true
+crds:
+  createClusterExternalSecret: false
+  createClusterGenerator: false
+  createClusterPushSecret: false
+  createPushSecret: false
+# The chart installs the SecretStore CRD in every case. Its reconciler stays off.
+processClusterExternalSecret: false
+processClusterGenerator: false
+processClusterPushSecret: false
+processPushSecret: false
+processSecretStore: false
+openshiftFinalizers: false
+
+rbac:
+  serviceAccountTokenCreate: false
+  leaderElection:
+    create: false
+  servicebindings:
+    create: false
+  aggregateToView: false
+  aggregateToEdit: false
+  aggregateToAdmin: false
+
+# The webhook only validates objects, and the cert controller only serves the webhook. The
+# controller does not need either of them.
+webhook:
+  create: false
+certController:
+  create: false
+
+# Address 0 closes the health listener, which no probe uses.
+extraArgs:
+  live-addr: "0"
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 128Mi
+  limits:
+    memory: 512Mi

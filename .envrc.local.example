@@ -1,0 +1,12 @@
+# Copy this file to .envrc.local, then replace each placeholder. Git ignores .envrc.local, and
+# direnv loads it through .envrc. `mise run secrets:connect` reads both settings.
+
+# A command that prints the read-only access token of your secret manager on standard output.
+export POC_SECRET_TOKEN_CMD='<your secret CLI> read <reference to the access token>'
+
+# The provider block of ClusterSecretStore poc-secrets, as one JSON object with one key: the
+# External Secrets Operator name of your provider. The block must refer to key "token" of
+# Secret "poc-secrets-token" in namespace "external-secrets". The general form is:
+#   {"<provider>": {"<vault field>": "<vault>", "auth": {"<secret ref field>":
+#     {"name": "poc-secrets-token", "key": "token", "namespace": "external-secrets"}}}}
+export POC_SECRET_STORE_PROVIDER='<provider block JSON for your secret manager>'

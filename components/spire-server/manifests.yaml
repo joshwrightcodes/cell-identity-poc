@@ -15,6 +15,43 @@ metadata:
   namespace: spire-system
 automountServiceAccountToken: false
 ---
+# The External Secrets Operator copies the upstream CA from the secret manager into Secret
+# spire-upstream. Remote keys follow <cluster>/<service>/<key>. secrets:connect applies the
+# ClusterSecretStore. The CRD comes from the external-secrets bundle in an earlier sync wave.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: spire-upstream
+  namespace: spire-system
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: ClusterSecretStore
+    name: poc-secrets
+  target:
+    name: spire-upstream
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    # With a template, ESO does not copy the labels and annotations of this object, Argo CD
+    # tracking included, to the Secret. The template has no data, so the keys pass through.
+    template:
+      type: Opaque
+      metadata:
+        labels:
+          app.kubernetes.io/name: spire-server
+  data:
+    - secretKey: intermediate-key
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/intermediate-key"
+    - secretKey: intermediate-cert
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/intermediate-cert"
+    - secretKey: root-cert
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/root-cert"
+---
 # One ClusterStaticEntry per key. Each key name ends in .yaml.
 apiVersion: v1
 kind: ConfigMap

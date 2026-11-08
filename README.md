@@ -108,14 +108,21 @@ The bundle store keeps bundles on a persistent volume, so they survive a pod res
 ## Keys
 
 The SPIRE server in `dev-cp` gets its CA from an intermediate CA, and a root CA signs the intermediate.
-The keys live in your secret manager. A secret sync operator in `dev-cp` copies them into Secret
+The keys live in your secret manager. The External Secrets Operator in `dev-cp` copies them into Secret
 `spire-upstream` in the namespace `spire-system`. No step in this repository writes a key to disk.
 
-| Secret key | Contents |
-| --- | --- |
-| `intermediate-key` | The private key of the intermediate CA, as one PEM block `EC PRIVATE KEY` |
-| `intermediate-cert` | The certificate of the intermediate CA |
-| `root-cert` | The certificate of the root CA |
+A cluster reads each key from the remote key `<cluster>/<service>/<key>`.
+The ExternalSecret `spire-upstream` reads these three keys:
+
+| Remote key | Secret key | Contents |
+| --- | --- | --- |
+| `dev-cp/spire-server/intermediate-key` | `intermediate-key` | The private key of the intermediate CA, as one PEM block `EC PRIVATE KEY` |
+| `dev-cp/spire-server/intermediate-cert` | `intermediate-cert` | The certificate of the intermediate CA |
+| `dev-cp/spire-server/root-cert` | `root-cert` | The certificate of the root CA |
+
+Each provider of the operator maps a remote key to its own structure.
+For example, a provider can read the first part as an item name and the rest as a field.
+The operator documentation for your provider says how it reads a remote key.
 
 The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
 
@@ -123,9 +130,12 @@ The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
 `key` and `cert` read a bundle on standard input and print one part of it.
 The steps below use placeholders in angle brackets.
 Replace `<read>` and `<write>` with the read and write commands of your secret manager.
-Each item name is a placeholder too.
-Put settings for your secret manager in `.envrc.local`.
-Git ignores this file, and direnv loads it through `.envrc`.
+`<write> <dev-cp/spire-server/root-cert>` stores standard input at the place that this remote key names.
+`<root-ca-bundle>` is a placeholder for an item name.
+
+The root CA bundle holds the root private key.
+Keep it in a vault that the cluster access token cannot read.
+Then no cluster can read the root key.
 
 A failed `mise run pki` prints one JSON error line and exits with a non-zero status.
 Each step keeps the output in a shell variable, and `&&` runs a write only after success.
@@ -144,20 +154,44 @@ Because of this, an error line never reaches your secret manager.
    inter="$(<read> <root-ca-bundle> | mise run pki -- intermediate --days 30)" &&
      key="$(printf '%s\n' "$inter" | mise run pki -- key)" &&
      cert="$(printf '%s\n' "$inter" | mise run pki -- cert)" &&
-     printf '%s\n' "$key" | <write> <intermediate-key> &&
-     printf '%s\n' "$cert" | <write> <intermediate-cert>
+     printf '%s\n' "$key" | <write> <dev-cp/spire-server/intermediate-key> &&
+     printf '%s\n' "$cert" | <write> <dev-cp/spire-server/intermediate-cert>
    unset inter key cert
    ```
 
 3. Store the root certificate on its own:
 
    ```sh
-   cert="$(<read> <root-ca-bundle> | mise run pki -- cert)" && printf '%s\n' "$cert" | <write> <root-cert>
+   cert="$(<read> <root-ca-bundle> | mise run pki -- cert)" &&
+     printf '%s\n' "$cert" | <write> <dev-cp/spire-server/root-cert>
    unset cert
    ```
 
+4. Copy `.envrc.local.example` to `.envrc.local`, and replace each placeholder.
+   Git ignores `.envrc.local`, and direnv loads it through `.envrc`.
+   `POC_SECRET_TOKEN_CMD` prints the read-only access token.
+   `POC_SECRET_STORE_PROVIDER` holds the provider block of the store, as JSON.
+
+5. Connect the operator in `dev-cp` to your secret manager:
+
+   ```sh
+   CELL=dev-cp mise run secrets:connect
+   ```
+
+`secrets:connect` needs the operator in the cluster, so run it after the `external-secrets` Application is Healthy.
+`cell:up` for `dev-cp` waits until the SPIRE server is healthy, and the server needs Secret `spire-upstream`.
+Because of this, run `secrets:connect` in a second shell while `cell:up` waits.
+
+`secrets:connect` creates Secret `poc-secrets-token` in the namespace `external-secrets`.
+It then applies ClusterSecretStore `poc-secrets` and waits until the store is Ready.
+Only the namespaces in `SECRET_STORE_NAMESPACES` of `cells/<cluster>.env` can use the store.
+The token reaches `kubectl` through a pipe, and the script never prints it.
+The Secret and the store live outside every bundle, so Argo CD never deletes them.
+Run `secrets:connect` again after a change of the access token.
+
 The intermediate is valid for 30 days, and the root for one year.
 Create a new intermediate before the old one expires.
+The operator reads the keys again every hour.
 The SPIRE server reads the new files when it signs its next CA.
 
 ## Layout
@@ -169,7 +203,7 @@ The SPIRE server reads the new files when it signs its next CA.
 | `bootstrap/` | The root Application, applied once |
 | `components/` | One directory for each bundle |
 | `scripts/` | The scripts behind the mise tasks |
-| `vendor/` | Reviewed upstream files: the Argo CD install and the Istio charts |
+| `vendor/` | Reviewed upstream files: the Argo CD install, the Istio charts and the External Secrets Operator chart |
 | `docs/design/` | Design documents |
 
 ## Look at the cell

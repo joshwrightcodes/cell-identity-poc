@@ -397,6 +397,45 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
+	t.Run("external secret fills the upstream Secret from the cluster store", func(t *testing.T) {
+		es, ok := objs["ExternalSecret/spire-upstream"]
+		if !ok {
+			t.Fatal("render prints no ExternalSecret spire-upstream")
+		}
+		if get[string](t, es, "apiVersion") != "external-secrets.io/v1" {
+			t.Fatalf("apiVersion is %v", es["apiVersion"])
+		}
+		if opts := get[string](t, es, "metadata", "annotations", "argocd.argoproj.io/sync-options"); !strings.Contains(opts, "SkipDryRunOnMissingResource=true") {
+			t.Fatalf("sync options are %q", opts)
+		}
+		spec := get[map[string]any](t, es, "spec")
+		if get[string](t, spec, "secretStoreRef", "kind") != "ClusterSecretStore" || get[string](t, spec, "secretStoreRef", "name") != "poc-secrets" {
+			t.Fatalf("secretStoreRef is %v", spec["secretStoreRef"])
+		}
+		if get[string](t, spec, "target", "name") != "spire-upstream" || get[string](t, spec, "target", "creationPolicy") != "Owner" {
+			t.Fatalf("target is %v", spec["target"])
+		}
+		// A template stops ESO from copying the Argo CD annotations of the ExternalSecret to the Secret.
+		tpl := get[map[string]any](t, spec, "target", "template")
+		if _, ok := tpl["metadata"]; !ok {
+			t.Fatal("target template has no metadata")
+		}
+		if _, ok := tpl["data"]; ok {
+			t.Fatal("target template rewrites the data")
+		}
+		var pairs []string
+		for _, d := range get[[]any](t, spec, "data") {
+			pairs = append(pairs, get[string](t, d, "secretKey")+"<-"+get[string](t, d, "remoteRef", "key"))
+		}
+		if !slices.Equal(pairs, []string{
+			"intermediate-key<-@CELL_NAME@/spire-server/intermediate-key",
+			"intermediate-cert<-@CELL_NAME@/spire-server/intermediate-cert",
+			"root-cert<-@CELL_NAME@/spire-server/root-cert",
+		}) {
+			t.Fatalf("data is %v", pairs)
+		}
+	})
+
 	t.Run("pod mounts only rendered config maps", func(t *testing.T) {
 		pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
 		for _, v := range get[[]any](t, pod, "volumes") {

@@ -37,9 +37,14 @@ BASE_CELL_COMPONENTS=(
   "apps-demo:5:apps-demo"
 )
 
+# The External Secrets Operator. It must be healthy, with its CRDs, before a later wave applies an ExternalSecret.
+EXTERNAL_SECRETS_COMPONENTS=(
+  "external-secrets:6:external-secrets"
+)
+
 # The SPIRE server of the environment trust domain. It comes last, after the base cell is healthy.
 SPIRE_SERVER_COMPONENTS=(
-  "spire-server:6:spire-system"
+  "spire-server:7:spire-system"
 )
 
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
@@ -48,6 +53,7 @@ set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$
 for set_name in $set_names; do
   case "$set_name" in
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
+    external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
