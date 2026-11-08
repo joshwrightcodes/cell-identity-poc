@@ -17,7 +17,7 @@ markers match this list:
 
 1. Kiln requests two new cells, and `dev-cp` creates them. The cell controller acts only on a
    step that Kiln signs.
-2. Each cell's `kiln-celld` registers and authenticates. The `cluster_jwt` attestor checks a
+2. Each cell's `celld` registers and authenticates. The `cluster_jwt` attestor checks a
    pod-bound token against the cell's keys in a signed record.
 3. Both cells appear valid in Kiln. Kiln reads each cluster's keys itself, and checks a second
    proof that `dev-cp` cannot make.

@@ -60,17 +60,17 @@
       <text class="n" x="456" y="262">dev-cp</text>
       <text class="k" x="514" y="262">environment control plane</text>
       <text class="t" x="456" y="288">SPIRE server with the cluster_jwt attestor</text>
-      <text class="t" x="456" y="310">kiln-envd · cell gateway · relay</text>
+      <text class="t" x="456" y="310">envd · cell gateway · relay</text>
       <text class="t" x="456" y="332">cell controller</text>
 
       <rect class="b cell" x="310" y="424" width="230" height="96" rx="8"/>
       <text class="n" x="324" y="450">dev-cell-1</text>
-      <text class="t" x="324" y="474">kiln-celld + SPIRE sidecar</text>
+      <text class="t" x="324" y="474">celld + SPIRE sidecar</text>
       <text class="t" x="324" y="496">Argo CD, last good state</text>
 
       <rect class="b cell" x="560" y="424" width="230" height="96" rx="8"/>
       <text class="n" x="574" y="450">dev-cell-2</text>
-      <text class="t" x="574" y="474">kiln-celld + SPIRE sidecar</text>
+      <text class="t" x="574" y="474">celld + SPIRE sidecar</text>
       <text class="t" x="574" y="496">Argo CD, last good state</text>
 
       <rect class="b rogue" x="830" y="424" width="230" height="96" rx="8"/>
