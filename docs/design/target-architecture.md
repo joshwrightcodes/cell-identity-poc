@@ -781,11 +781,11 @@ this order, each with its own scope document:
 
 | Item | Milestone | Fallback |
 | --- | --- | --- |
-| Pod-to-NodePort traffic between kind clusters on the `kind` network | M1 | Stop and report |
-| Pod traffic to another cluster leaves with its own node address | M1 | Tests key on SVIDs only |
-| Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config |
-| Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster |
-| kind's local-path provisioner passes review | M1 | Stop and report |
+| Pod-to-NodePort traffic between kind clusters on the `kind` network | M1 | Stop and report. Result 2026-11-08: it works, so no fallback applies |
+| Pod traffic to another cluster leaves with its own node address | M1 | Tests key on SVIDs only. Result 2026-11-08: it does, when the server Service uses `externalTrafficPolicy: Local`, so no fallback applies |
+| Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config. Result 2026-11-08: they do, so no fallback applies |
+| Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster. Result 2026-11-08: every node of all five clusters pulls through the mirror, so no fallback applies |
+| kind's local-path provisioner passes review | M1 | Stop and report. Result 2026-11-08: the review in `vendor/README.md` found nothing that blocks its use |
 | kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery. Result 2026-11-08: they do not survive, so this fallback applies |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |

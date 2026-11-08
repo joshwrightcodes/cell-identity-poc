@@ -48,7 +48,7 @@ depends = ["vm:up"]
 run = "scripts/up.sh"
 
 [tasks."cell:hydrate"]
-description = "Render every component into build/bundles/<component>/manifests.yaml"
+description = "Render every component into build/<cluster>/bundles/<component>/manifests.yaml"
 run = "scripts/hydrate.sh"
 
 [tasks."cell:publish"]
@@ -85,7 +85,7 @@ description = "Run the host service: up, down or facts, with the arguments after
 run = "go run ./cmd/hostsvc"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create all five clusters through the host service, then stand up the base cell on each cluster that has components"
+description = "Check the tool versions, create all five clusters through the host service, then set up the base cell on each cluster that has components"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 
@@ -114,5 +114,5 @@ description = "Print the memory and CPU of every kind node container and the reg
 run = "scripts/size.sh"
 
 [tasks."harness:restart-check"]
-description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate"
+description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
 run = "scripts/restart-check.sh"

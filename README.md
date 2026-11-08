@@ -12,7 +12,7 @@ OpenTelemetry collector. Every later plane starts from this base.
 ![The management cluster, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
 
 Five kind clusters run in one Colima VM on a Mac. Each connection goes up a layer, and Kiln
-connects to no cluster. A host service on the Mac stands in for the cloud provider. The
+connects to no cluster. A host service on the Mac acts as the cloud provider. The
 markers match this list:
 
 1. Kiln requests two new cells, and `dev-cp` creates them. The cell controller acts only on a
@@ -39,7 +39,7 @@ the full design.
   CLI included.
 - 14 CPUs, 40 GB of memory and 120 GB of disk for the Colima VM `poc`.
 
-## Stand up the cell
+## Set up the cell
 
 ```sh
 mise install
@@ -53,7 +53,7 @@ After that it runs `cell:up` for each cluster that has the `base-cell` component
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
-An unknown name fails with a list of the known cells. For example, `CELL=management mise run cell:up` stands up the base cell on `management` only.
+An unknown name fails with a list of the known cells. For example, `CELL=management mise run cell:up` sets up the base cell on `management` only.
 
 ## Size and time
 

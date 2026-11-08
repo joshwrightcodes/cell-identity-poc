@@ -104,7 +104,9 @@ for M9. Each tier has a time budget, set at M1.
 
 ## Residual limits of the PoC
 
-- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The residual ports are 2379, 2380, 6443, 10250 and 10256. On 2026-11-08 a scan of ports 1 to 65535 from `rogue` found exactly these ports open on each node of `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The M1 test fails if any other port opens. It also fails if port 6443 or 10250 is closed, because then the scan did not work.
+- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The residual ports are 2379, 2380, 6443, 10250 and 10256. On 2026-11-08 a scan of ports 1 to 65535 from `rogue` found exactly these ports open on each node of `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The M1 test fails if any other port opens. It also fails if port 6443 or 10250 is closed, because then the scan did not work. The scan covers TCP only. A NodePort Service with no ready endpoint does not show as open.
+- Every cluster shares the registry `kiln-registry`. Every pod in every cluster, including `rogue`, can push to it or delete from it without authentication. Before M6 runs attack tools, images must be referenced by digest and registry deletes must be turned off.
+- Every pod, including those in `rogue`, reaches every listener on the loopback interface of the Mac through `host.docker.internal`, not only the host service.
 - A compromised Kiln can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run.
 - The relay cannot close a revoked cell's streams. Kiln closes them.

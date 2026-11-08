@@ -12,9 +12,9 @@
 | Task | Command |
 | --- | --- |
 | Start or stop the Colima VM | `mise run vm:up`, `mise run vm:down` |
-| Stand up all five clusters | `mise run harness:up` |
+| Create all five clusters and set up their base cells | `mise run harness:up` |
 | Delete all five clusters | `mise run harness:down` |
-| Stand up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
+| Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |

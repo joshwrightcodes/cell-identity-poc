@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render every component into build/bundles/<component>/manifests.yaml.
+# Render every component into build/<cluster>/bundles/<component>/manifests.yaml.
 # A component with an executable render.sh renders itself. Every other component is a kustomization.
 source "$(dirname "$0")/lib.sh"
 
