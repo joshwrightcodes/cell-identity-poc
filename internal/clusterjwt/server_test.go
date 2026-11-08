@@ -54,6 +54,8 @@ type fixture struct {
 	keys   keys
 	pub    ed25519.PublicKey
 	priv   ed25519.PrivateKey
+	cfg    *configv1.ConfigServiceClient
+	base   string
 }
 
 type fixtureOptions struct {
@@ -97,6 +99,7 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 	p.now = func() time.Time { return testNow }
 	f := &fixture{t: t, plugin: p, client: new(nodeattestorv1.NodeAttestorPluginClient), logs: logs, keys: k, pub: pub, priv: priv}
 	cfg := new(configv1.ConfigServiceClient)
+	f.cfg = cfg
 	plugintest.ServeInBackground(t, plugintest.Config{
 		PluginServer:   nodeattestorv1.NodeAttestorPluginServer(p),
 		PluginClient:   f.client,
@@ -109,8 +112,9 @@ env = "dev"
 trust_domain = %q
 records_dir = %q
 record_public_keys = [%q]
-%s
-`, testTrustDomain, dir, base64.StdEncoding.EncodeToString(pub), o.extraHCL)
+`, testTrustDomain, dir, base64.StdEncoding.EncodeToString(pub))
+	f.base = hcl
+	hcl += o.extraHCL + "\n"
 	_, err = cfg.Configure(context.Background(), &configv1.ConfigureRequest{
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain},
 		HclConfiguration:  hcl,
@@ -322,37 +326,229 @@ func TestRateLimitPerCell(t *testing.T) {
 			t.Fatalf("attempt %d: %v", i+1, err)
 		}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	stream, err := f.client.Attest(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload, _ := json.Marshal(Payload{Cell: "dev-cell-1"})
-	_ = stream.Send(&nodeattestorv1.AttestRequest{Request: &nodeattestorv1.AttestRequest_Payload{Payload: payload}})
-	_, err = stream.Recv()
+	_, err := f.attest("dev-cell-1", f.goodToken)
 	wantDenied(t, err, RateLimited)
 	if _, err := f.attest("dev-cell-2", f.goodToken); err != nil {
 		t.Fatalf("other cell: %v", err)
 	}
 }
 
-func TestFailedAttemptFreesNoSlot(t *testing.T) {
-	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_burst = 2\nper_cell_rate = 0.001"})
-	for i := 0; i < 2; i++ {
-		_, err := f.attest("dev-cell-1", func(string) string { return "garbage" })
-		wantDenied(t, err, Malformed)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	stream, err := f.client.Attest(ctx)
+func (f *fixture) reconfigure(t *testing.T, extra string) *state {
+	t.Helper()
+	_, err := f.cfg.Configure(context.Background(), &configv1.ConfigureRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain},
+		HclConfiguration:  f.base + extra + "\n",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, _ := json.Marshal(Payload{Cell: "dev-cell-1"})
-	_ = stream.Send(&nodeattestorv1.AttestRequest{Request: &nodeattestorv1.AttestRequest_Payload{Payload: payload}})
-	_, err = stream.Recv()
+	return f.plugin.st.Load()
+}
+
+func (f *fixture) openChallenge(cell string) (nodeattestorv1.NodeAttestor_AttestClient, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := f.client.Attest(ctx)
+	if err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	payload, _ := json.Marshal(Payload{Cell: cell})
+	if err := stream.Send(&nodeattestorv1.AttestRequest{Request: &nodeattestorv1.AttestRequest_Payload{Payload: payload}}); err != nil {
+		cancel()
+		return nil, nil, err
+	}
+	if _, err := stream.Recv(); err != nil {
+		cancel()
+		return stream, func() {}, err
+	}
+	return stream, cancel, nil
+}
+
+func TestJunkAttemptsDoNotConsumeSuccessBudget(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_burst = 2\nper_cell_rate = 0.001"})
+	for i := 0; i < 6; i++ {
+		_, err := f.attest("dev-cell-1", func(string) string { return "garbage" })
+		wantDenied(t, err, Malformed)
+	}
+	_, err := f.attest("dev-cell-1", func(string) string { return f.goodToken("an-earlier-challenge") })
+	wantDenied(t, err, WrongAudience)
+	for i := 0; i < 2; i++ {
+		if _, err := f.attest("dev-cell-1", f.goodToken); err != nil {
+			t.Fatalf("success %d: %v", i+1, err)
+		}
+	}
+	_, err = f.attest("dev-cell-1", f.goodToken)
 	wantDenied(t, err, RateLimited)
+}
+
+func TestInflightCapRefusesNinthChallenge(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: `challenge_timeout = "30s"`})
+	var cancels []context.CancelFunc
+	for i := 0; i < 8; i++ {
+		_, cancel, err := f.openChallenge("dev-cell-1")
+		if err != nil {
+			t.Fatalf("challenge %d: %v", i+1, err)
+		}
+		cancels = append(cancels, cancel)
+	}
+	_, cancel, err := f.openChallenge("dev-cell-1")
+	if cancel != nil {
+		defer cancel()
+	}
+	wantDenied(t, err, TooManyPending)
+	if _, err := f.attest("dev-cell-2", f.goodToken); err != nil {
+		t.Fatalf("other cell: %v", err)
+	}
+	for _, c := range cancels {
+		c()
+	}
+	waitIdle(t, f.plugin)
+	if n := f.plugin.st.Load().gate.count("dev-cell-1"); n != 0 {
+		t.Fatalf("%d in-flight slots left", n)
+	}
+	if _, err := f.attest("dev-cell-1", f.goodToken); err != nil {
+		t.Fatalf("after abandon: %v", err)
+	}
+}
+
+func TestAbandonedStreamsFreeInflightSlot(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_inflight = 1\nchallenge_timeout = \"200ms\""})
+	for i := 0; i < 3; i++ {
+		_, cancel, err := f.openChallenge("dev-cell-1")
+		if err != nil {
+			t.Fatalf("round %d: %v", i+1, err)
+		}
+		cancel()
+		waitIdle(t, f.plugin)
+	}
+	// A silent client frees the slot through the challenge timeout.
+	stream, cancel, err := f.openChallenge("dev-cell-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	_, err = stream.Recv()
+	wantDenied(t, err, ChallengeTimeout)
+	if n := f.plugin.st.Load().gate.count("dev-cell-1"); n != 0 {
+		t.Fatalf("%d slots left", n)
+	}
+}
+
+func TestRealCellAttestsDuringAbandonedFlood(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_inflight = 4\nchallenge_timeout = \"150ms\""})
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, cancel, err := f.openChallenge("dev-cell-1"); err == nil {
+					time.Sleep(10 * time.Millisecond)
+					cancel()
+				}
+			}
+		}()
+	}
+	defer func() { close(stop); wg.Wait() }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := f.attest("dev-cell-1", f.goodToken)
+		if err == nil {
+			return
+		}
+		if status.Convert(err).Message() != "cluster_jwt: "+string(TooManyPending) || time.Now().After(deadline) {
+			t.Fatalf("real attestation failed: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestParallelAttestations(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_burst = 100\nper_cell_inflight = 16"})
+	var wg sync.WaitGroup
+	errs := make(chan error, 16)
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			cell := "dev-cell-1"
+			if i%2 == 1 {
+				cell = "dev-cell-2"
+			}
+			_, err := f.attest(cell, f.goodToken)
+			errs <- err
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitIdle(t, f.plugin)
+}
+
+func TestReconfigureKeepsLimiterState(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: "per_cell_burst = 2\nper_cell_rate = 0.001"})
+	for i := 0; i < 2; i++ {
+		if _, err := f.attest("dev-cell-1", f.goodToken); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := f.plugin.st.Load()
+	same := f.reconfigure(t, "per_cell_burst = 2\nper_cell_rate = 0.001")
+	if same == old || same.limit != old.limit || same.gate != old.gate {
+		t.Fatal("limiter state must carry over when the settings are unchanged")
+	}
+	_, err := f.attest("dev-cell-1", f.goodToken)
+	wantDenied(t, err, RateLimited)
+	changed := f.reconfigure(t, "per_cell_burst = 3\nper_cell_rate = 0.001")
+	if changed.limit == old.limit {
+		t.Fatal("changed settings must start new buckets")
+	}
+	if _, err := f.attest("dev-cell-1", f.goodToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRevokedRecordWinsATie(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	k := newKeys(t)
+	for _, order := range [][2]string{{"a", "b"}, {"b", "a"}} {
+		dir := t.TempDir()
+		for i, rev := range []bool{false, true} {
+			rec := k.record(t)
+			rec.Revoked, rec.Epoch, rec.Counter = rev, 1, 1
+			env, _ := record.Sign(rec, priv)
+			name := order[i] + ".dsse.json"
+			if err := os.WriteFile(filepath.Join(dir, name), env, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		recs, err := New().loadRecords(dir, "dev", []ed25519.PublicKey{pub})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !recs["dev-cell-1"].Revoked {
+			t.Fatalf("order %v: revoked record lost the tie", order)
+		}
+	}
+}
+
+func TestBadRecordFileLogsAtError(t *testing.T) {
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	f := newFixture(t, fixtureOptions{signRecordWith: other})
+	logs := f.logs.String()
+	if !strings.Contains(logs, `"@level":"error"`) || !strings.Contains(logs, "dev-cell-1.dsse.json") {
+		t.Fatalf("log lacks the error line:\n%s", logs)
+	}
 }
 
 func waitIdle(t *testing.T, p *Plugin) {
@@ -475,6 +671,7 @@ func TestConfigureRejectsBadConfig(t *testing.T) {
 		"bad timeout":       with("challenge_timeout", `"soon"`),
 		"zero rate":         with("per_cell_rate", "0"),
 		"zero burst":        with("per_cell_burst", "0"),
+		"zero inflight":     with("per_cell_inflight", "0"),
 		"unknown attribute": with("surprise", "1"),
 	}
 	for name, hcl := range cases {

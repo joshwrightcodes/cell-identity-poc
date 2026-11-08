@@ -293,8 +293,8 @@ The server plugin takes these steps. Any error denies:
 4. It requires a token bound to a pod, with the pod UID and node claims.
 5. It requires a lifetime of 15 minutes or less, and an `iat` no older than 15 minutes.
 6. It requires the audience `spire-<env>/<nonce>`, where the nonce comes from the server for this attestation. The sidecar requests that token through TokenRequest for its own service account. A copied token therefore works only once, and only for the attestation it was made for.
-7. It limits attestation per cell.
-8. It returns `can_reattest = false`, and an agent ID that includes the nonce's hash: `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>`.
+7. It caps the challenges in flight for each cell (default 8). After a token validates, it charges a per-cell rate budget (default 2 each second, burst 10). Failed attempts use none of the budget.
+8. It returns `can_reattest = false`, and an agent ID that includes the nonce's hash: `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>`. The nonce hash is the first 16 bytes of SHA-256 over the base64url nonce string, in hex.
 
 Because agents do not re-attest, a running agent renews its SVID without a new token. SPIRE
 re-attests a re-attestable agent on every rotation (verified in `pkg/agent/svid/rotator.go`),
@@ -303,7 +303,7 @@ expired attests again as a new agent, with a new nonce.
 
 - The server prunes old agents with `prune_tofu_nodes = true` and `prune_attested_nodes_expired_for`.
 - SPIRE's built-in per-IP limit is turned off, because cells share addresses. The server makes each nonce inside one attestation stream, so a token copied into another stream fails, and no nonce cache is needed.
-- Plugins have no datastore access: SPIRE offers server plugins only the `identityprovider`, `agentstore` and `metrics` host services (as of 2026-11-08). Each server keeps its own per-cell limit in memory, so a second server divides the limit.
+- Plugins have no datastore access: SPIRE offers server plugins only the `identityprovider`, `agentstore` and `metrics` host services (as of 2026-11-08). Each server keeps the in-flight cap and the rate budget in memory, so a second server divides the budget.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
 
 ### Independent key check **[call]**

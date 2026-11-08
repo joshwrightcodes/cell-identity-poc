@@ -32,6 +32,7 @@ const PluginName = "cluster_jwt"
 const (
 	UnknownCell      Reason = "unknown_cell"
 	RateLimited      Reason = "rate_limited"
+	TooManyPending   Reason = "too_many_pending"
 	ChallengeTimeout Reason = "challenge_timeout"
 	Abandoned        Reason = "challenge_abandoned"
 	NotConfigured    Reason = "not_configured"
@@ -40,6 +41,7 @@ const (
 const (
 	defaultRate      = 2.0
 	defaultBurst     = 10
+	defaultInflight  = 8
 	defaultTimeout   = "30s"
 	recordSuffix     = ".dsse.json"
 	nonceBytes       = 32
@@ -60,12 +62,13 @@ type pluginConfig struct {
 	RecordPublicKeys []string `hcl:"record_public_keys"`
 	PerCellRate      float64  `hcl:"per_cell_rate"`
 	PerCellBurst     int      `hcl:"per_cell_burst"`
+	PerCellInflight  int      `hcl:"per_cell_inflight"`
 	ChallengeTimeout string   `hcl:"challenge_timeout"`
 }
 
 var configKeys = map[string]bool{
 	"env": true, "trust_domain": true, "records_dir": true, "record_public_keys": true,
-	"per_cell_rate": true, "per_cell_burst": true, "challenge_timeout": true,
+	"per_cell_rate": true, "per_cell_burst": true, "per_cell_inflight": true, "challenge_timeout": true,
 }
 
 // state is the immutable result of one Configure call.
@@ -74,7 +77,11 @@ type state struct {
 	trustDomain string
 	timeout     time.Duration
 	records     map[string]record.Cell
+	rate        float64
+	burst       int
+	maxInflight int
 	limit       *limiter
+	gate        *gate
 }
 
 // Plugin is the SPIRE server NodeAttestor of type cluster_jwt.
@@ -110,13 +117,16 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "cluster_jwt: %v", err)
 	}
+	if old := p.st.Load(); old != nil && old.rate == st.rate && old.burst == st.burst && old.maxInflight == st.maxInflight {
+		st.limit, st.gate = old.limit, old.gate
+	}
 	p.st.Store(st)
 	p.log.Info("configured", "env", st.env, "records", len(st.records))
 	return &configv1.ConfigureResponse{}, nil
 }
 
 func (p *Plugin) build(text, coreTrustDomain string) (*state, error) {
-	cfg := pluginConfig{PerCellRate: defaultRate, PerCellBurst: defaultBurst, ChallengeTimeout: defaultTimeout}
+	cfg := pluginConfig{PerCellRate: defaultRate, PerCellBurst: defaultBurst, PerCellInflight: defaultInflight, ChallengeTimeout: defaultTimeout}
 	if err := hcl.Decode(&cfg, text); err != nil {
 		return nil, fmt.Errorf("parse configuration: %w", err)
 	}
@@ -145,6 +155,8 @@ func (p *Plugin) build(text, coreTrustDomain string) (*state, error) {
 		return nil, errors.New("per_cell_rate must be above zero")
 	case cfg.PerCellBurst < 1:
 		return nil, errors.New("per_cell_burst must be at least 1")
+	case cfg.PerCellInflight < 1:
+		return nil, errors.New("per_cell_inflight must be at least 1")
 	}
 	timeout, err := time.ParseDuration(cfg.ChallengeTimeout)
 	if err != nil || timeout <= 0 {
@@ -160,7 +172,9 @@ func (p *Plugin) build(text, coreTrustDomain string) (*state, error) {
 	}
 	return &state{
 		env: cfg.Env, trustDomain: cfg.TrustDomain, timeout: timeout, records: records,
+		rate: cfg.PerCellRate, burst: cfg.PerCellBurst, maxInflight: cfg.PerCellInflight,
 		limit: newLimiter(cfg.PerCellRate, cfg.PerCellBurst, p.now),
+		gate:  newGate(cfg.PerCellInflight),
 	}, nil
 }
 
@@ -181,7 +195,7 @@ func parseKeys(in []string) ([]ed25519.PublicKey, error) {
 
 // loadRecords reads every *.dsse.json file in dir. A file that fails verification, names another
 // environment or holds an unusable cell name is logged and skipped, so that its cell stays unknown.
-// For one cell name, the record with the higher epoch and counter wins.
+// For one cell name, supersedes picks the record.
 func (p *Plugin) loadRecords(dir, env string, keys []ed25519.PublicKey) (map[string]record.Cell, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -206,7 +220,7 @@ func (p *Plugin) loadRecords(dir, env string, keys []ed25519.PublicKey) (map[str
 		rec, err := record.Verify(data, keys)
 		switch {
 		case err != nil:
-			p.log.Warn("skipped record file", "file", name, "reason", err.Error())
+			p.log.Error("record file failed verification", "file", name, "file_cell", strings.TrimSuffix(name, recordSuffix), "reason", err.Error())
 			continue
 		case rec.Env != env:
 			p.log.Warn("skipped record file", "file", name, "reason", "other environment", "record_env", rec.Env)
@@ -215,12 +229,24 @@ func (p *Plugin) loadRecords(dir, env string, keys []ed25519.PublicKey) (map[str
 			p.log.Warn("skipped record file", "file", name, "reason", "cell name is not a DNS label")
 			continue
 		}
-		if old, ok := out[rec.Name]; ok && (old.Epoch > rec.Epoch || (old.Epoch == rec.Epoch && old.Counter >= rec.Counter)) {
+		if old, ok := out[rec.Name]; ok && !supersedes(rec, old) {
 			continue
 		}
 		out[rec.Name] = rec
 	}
 	return out, nil
+}
+
+// supersedes reports whether a replaces b for one cell. A higher epoch and counter wins. At the same
+// epoch and counter, the revoked record wins, whatever the order of the files.
+func supersedes(a, b record.Cell) bool {
+	if a.Epoch != b.Epoch {
+		return a.Epoch > b.Epoch
+	}
+	if a.Counter != b.Counter {
+		return a.Counter > b.Counter
+	}
+	return a.Revoked && !b.Revoked
 }
 
 // Attest challenges the agent with a fresh nonce and checks the token that answers it.
@@ -247,9 +273,10 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	if rec.Revoked {
 		return p.deny(rec.Name, "", Revoked)
 	}
-	if !st.limit.allow(rec.Name) {
-		return p.deny(rec.Name, "", RateLimited)
+	if !st.gate.acquire(rec.Name) {
+		return p.deny(rec.Name, "", TooManyPending)
 	}
+	defer st.gate.release(rec.Name)
 
 	nonce, err := newNonce()
 	if err != nil {
@@ -274,6 +301,9 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	}
 	if !podUIDRE.MatchString(claims.PodUID) {
 		return p.deny(rec.Name, kid, Malformed)
+	}
+	if !st.limit.allow(rec.Name) {
+		return p.deny(rec.Name, kid, RateLimited)
 	}
 
 	id := fmt.Sprintf("spiffe://%s/spire/agent/%s/%s/%s/%s", st.trustDomain, PluginName, rec.Name, claims.PodUID, nonceHash(nonce))

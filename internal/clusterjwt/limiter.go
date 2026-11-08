@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// limiter is an in-memory token bucket for each key. It holds one bucket for each known cell.
+// limiter is an in-memory token bucket for each key. Attest charges it only after a token validates.
 type limiter struct {
 	mu      sync.Mutex
 	rate    float64
@@ -42,4 +42,38 @@ func (l *limiter) allow(key string) bool {
 	}
 	b.tokens--
 	return true
+}
+
+// gate caps the challenges in flight for each key.
+type gate struct {
+	mu  sync.Mutex
+	max int
+	n   map[string]int
+}
+
+func newGate(max int) *gate { return &gate{max: max, n: map[string]int{}} }
+
+// acquire takes one in-flight slot for key. It returns false at the cap.
+func (g *gate) acquire(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.n[key] >= g.max {
+		return false
+	}
+	g.n[key]++
+	return true
+}
+
+func (g *gate) release(key string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.n[key]--; g.n[key] <= 0 {
+		delete(g.n, key)
+	}
+}
+
+func (g *gate) count(key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.n[key]
 }
