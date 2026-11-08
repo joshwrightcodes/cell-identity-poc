@@ -8,10 +8,11 @@ import (
 )
 
 type fakeDocker struct {
-	calls   []string
-	missing bool
-	noNet   bool
-	stale   bool
+	calls    []string
+	missing  bool
+	noNet    bool
+	stale    bool
+	rootUser bool
 }
 
 func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
@@ -20,8 +21,10 @@ func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 	switch {
 	case strings.HasPrefix(line, "container inspect") && f.missing:
 		return []byte("Error: No such container"), errors.New("exit 1")
+	case strings.HasPrefix(line, "container inspect") && f.rootUser:
+		return []byte("true "), nil
 	case strings.HasPrefix(line, "container inspect"):
-		return []byte("true"), nil
+		return []byte("true 65534:65534"), nil
 	case strings.HasPrefix(line, "network inspect") && f.noNet:
 		return []byte("Error: No such network"), errors.New("exit 1")
 	case strings.HasPrefix(line, "network inspect"):
@@ -70,7 +73,9 @@ func TestEnsureRegistryStartsAbsentContainer(t *testing.T) {
 	if err := s.EnsureRegistry(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !d.has("run -d --restart=always --name kiln-registry -p 127.0.0.1:5001:5000 " + RegistryImage) {
+	want := "run -d --restart=always --name kiln-registry --user 65534:65534 " +
+		"-v kiln-registry-data:/var/lib/registry -e REGISTRY_HTTP_DEBUG_ADDR= -p 127.0.0.1:5001:5000 " + RegistryImage
+	if !d.has(want) {
 		t.Errorf("calls = %q", d.calls)
 	}
 	if !d.has("network connect kind kiln-registry") {
@@ -148,5 +153,29 @@ func TestCertsDirSet(t *testing.T) {
 		if got := certsDirSet(tc.dump); got != tc.want {
 			t.Errorf("%s: got %v", tc.name, got)
 		}
+	}
+}
+
+func TestEnsureRegistryPreparesVolumeForUnprivilegedUser(t *testing.T) {
+	d := &fakeDocker{missing: true}
+	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
+	s.Docker = d.run
+	if err := s.EnsureRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !d.has("run --rm --user 0 --entrypoint chown -v kiln-registry-data:/var/lib/registry " + RegistryImage + " 65534:65534 /var/lib/registry") {
+		t.Errorf("calls = %q", d.calls)
+	}
+}
+
+func TestEnsureRegistryReplacesRootContainer(t *testing.T) {
+	d := &fakeDocker{rootUser: true}
+	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
+	s.Docker = d.run
+	if err := s.EnsureRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !d.has("rm -f kiln-registry") || !d.has("run -d ") {
+		t.Errorf("calls = %q", d.calls)
 	}
 }

@@ -12,8 +12,10 @@ import (
 
 // Registry settings. Nodes pull localhost:5001 images from the registry container by name.
 const (
-	RegistryName  = "kiln-registry"
-	RegistryImage = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
+	RegistryName   = "kiln-registry"
+	RegistryVolume = "kiln-registry-data"
+	registryUser   = "65534:65534"
+	RegistryImage  = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
 	// HostsDir is the containerd registry configuration directory for localhost:5001 on a node.
 	HostsDir = "/etc/containerd/certs.d/localhost:5001"
 	certsDir = "/etc/containerd/certs.d"
@@ -42,17 +44,25 @@ func HostsTOML() string {
 // EnsureRegistry starts the registry container and attaches it to the kind network.
 // It is idempotent. The kind network is absent before the first cluster, so the attach is skipped then.
 func (s *Service) EnsureRegistry(ctx context.Context) error {
-	out, err := s.Docker(ctx, "container", "inspect", "-f", "{{.State.Running}}", RegistryName)
-	switch {
-	case err != nil && !strings.Contains(string(out), "No such container"):
+	out, err := s.Docker(ctx, "container", "inspect", "-f", "{{.State.Running}} {{.Config.User}}", RegistryName)
+	if err != nil && !strings.Contains(string(out), "No such container") {
 		return fmt.Errorf("inspect %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
+	}
+	state := strings.Fields(string(out))
+	switch {
 	case err != nil:
-		slog.Info("starting registry", "container", RegistryName)
-		if out, err := s.Docker(ctx, "run", "-d", "--restart=always", "--name", RegistryName,
-			"-p", "127.0.0.1:5001:5000", RegistryImage); err != nil {
-			return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
+		if err := s.runRegistry(ctx); err != nil {
+			return err
 		}
-	case strings.TrimSpace(string(out)) != "true":
+	case len(state) < 2 || state[1] != registryUser:
+		slog.Info("replacing registry that does not run as the expected user", "container", RegistryName)
+		if out, err := s.Docker(ctx, "rm", "-f", RegistryName); err != nil {
+			return fmt.Errorf("remove %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
+		}
+		if err := s.runRegistry(ctx); err != nil {
+			return err
+		}
+	case state[0] != "true":
 		if out, err := s.Docker(ctx, "start", RegistryName); err != nil {
 			return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 		}
@@ -66,6 +76,23 @@ func (s *Service) EnsureRegistry(ctx context.Context) error {
 	out, err = s.Docker(ctx, "network", "connect", kindNetwork, RegistryName)
 	if err != nil && !strings.Contains(string(out), "already exists") {
 		return fmt.Errorf("connect %s to %s: %w: %s", RegistryName, kindNetwork, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// runRegistry creates the registry container. The image runs as root by default, and it opens a
+// Prometheus debug listener on port 5001. The container runs as an unprivileged user with a
+// named volume that this user owns, and the debug address is empty so that nothing listens on it.
+func (s *Service) runRegistry(ctx context.Context) error {
+	slog.Info("starting registry", "container", RegistryName)
+	if out, err := s.Docker(ctx, "run", "--rm", "--user", "0", "--entrypoint", "chown",
+		"-v", RegistryVolume+":/var/lib/registry", RegistryImage, registryUser, "/var/lib/registry"); err != nil {
+		return fmt.Errorf("prepare volume %s: %w: %s", RegistryVolume, err, strings.TrimSpace(string(out)))
+	}
+	if out, err := s.Docker(ctx, "run", "-d", "--restart=always", "--name", RegistryName,
+		"--user", registryUser, "-v", RegistryVolume+":/var/lib/registry",
+		"-e", "REGISTRY_HTTP_DEBUG_ADDR=", "-p", "127.0.0.1:5001:5000", RegistryImage); err != nil {
+		return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

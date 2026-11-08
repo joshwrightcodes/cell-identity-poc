@@ -114,14 +114,14 @@ image configuration and history with `docker image inspect` and `docker history`
 - The build downloads the `registry` binary from the `distribution/distribution` release `v3.1.2`.
   The build checks a pinned SHA-256 for each architecture, and the digest above pins the result.
 - Entrypoint `/entrypoint.sh`, default command `/etc/distribution/config.yml`. The user is not set,
-  so `kiln-registry` runs as root. The bundle store pod sets user 65534. Exposed port 5000. Volume `/var/lib/registry`.
+  so the image runs as root by default. `kiln-registry` runs as user 65534 and the bundle store pod sets the same user. Exposed port 5000. Volume `/var/lib/registry`.
 - Environment: `PATH` and `OTEL_TRACES_EXPORTER=none`.
 - `entrypoint.sh` is eight lines of shell. It prepends `registry serve` or `registry` to the
   arguments and runs `exec`. It has no network call, no `sudo` and no credential access.
 - The default configuration stores blobs on the local filesystem and enables delete. It also opens a
   debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
-  Neither `kiln-registry` nor the bundle store publishes that port, but the listener runs in both.
-  Telemetry for the PoC goes through OTLP, so this listener is a known exception.
+  `kiln-registry` sets `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in the container then shows
+  only port 5000. The bundle store keeps the default listener until its own change.
 - The scripts and configuration contain no non-ASCII characters.
 - The review did not decompile the `registry` binary, did not check it against the upstream
   source tag, and did not inspect its network behaviour at run time. The `kiln-registry`
