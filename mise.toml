@@ -92,3 +92,9 @@ run = "scripts/harness.sh up"
 [tasks."harness:down"]
 description = "Delete all five clusters through the host service"
 run = "scripts/harness.sh down"
+
+[tasks.images]
+description = "Build and push the in-cluster images to the local registry at localhost:5001"
+depends = ["vm:up"]
+env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
+run = "ko build --base-import-paths --tags latest ./cmd/netprobe"

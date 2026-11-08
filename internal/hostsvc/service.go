@@ -61,11 +61,12 @@ type Service struct {
 	topo     *topology.Topology
 	Prober   Prober
 	Reserved ReservedFunc
+	Docker   DockerFunc
 }
 
 // New returns a Service that uses the real prober and the Docker reserved prefixes.
 func New(rt Runtime, t *topology.Topology) *Service {
-	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved}
+	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker}
 }
 
 func (s *Service) lookup(name string) (topology.Cluster, error) {
@@ -98,6 +99,9 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 	if err := s.topo.Validate(reserved); err != nil {
 		return Facts{}, fmt.Errorf("validate topology: %w", err)
 	}
+	if err := s.EnsureRegistry(ctx); err != nil {
+		return Facts{}, err
+	}
 	found, err := s.exists(name)
 	if err != nil {
 		return Facts{}, err
@@ -111,12 +115,24 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 			return Facts{}, fmt.Errorf("%w: %s has pod subnet %s, service subnet %s and issuer %s",
 				ErrSpecMismatch, name, f.PodSubnet, f.ServiceSubnet, f.Issuer)
 		}
+		if err := s.EnsureRegistry(ctx); err != nil {
+			return Facts{}, err
+		}
+		if err := s.configureNode(ctx, f.NodeName); err != nil {
+			return Facts{}, err
+		}
 		slog.Info("cluster already matches the topology", "cluster", name)
 		return f, nil
 	}
 	slog.Info("creating cluster", "cluster", name)
 	if err := s.rt.Create(KindConfig(c, s.topo.NodeImage)); err != nil {
 		return Facts{}, fmt.Errorf("create cluster %s: %w", name, err)
+	}
+	if err := s.EnsureRegistry(ctx); err != nil {
+		return Facts{}, err
+	}
+	if err := s.configureNode(ctx, name+"-control-plane"); err != nil {
+		return Facts{}, err
 	}
 	return s.Facts(ctx, name)
 }

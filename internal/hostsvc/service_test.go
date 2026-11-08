@@ -57,6 +57,7 @@ var testCluster = topology.Cluster{
 func newTestService(rt *fakeRuntime, obs Observed) *Service {
 	topo := &topology.Topology{NodeImage: "kindest/node:test", Clusters: []topology.Cluster{testCluster}}
 	s := New(rt, topo)
+	s.Docker = (&fakeDocker{}).run
 	s.Prober = fakeProber{obs: obs}
 	s.Reserved = func(context.Context) ([]netip.Prefix, error) {
 		return []netip.Prefix{netip.MustParsePrefix("192.168.5.0/24")}, nil

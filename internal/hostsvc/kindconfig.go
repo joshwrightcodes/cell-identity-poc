@@ -35,5 +35,8 @@ apiServer:
 			Image: nodeImage,
 		}},
 		KubeadmConfigPatches: []string{patch},
+		ContainerdConfigPatches: []string{`[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "` + certsDir + `"
+`},
 	}
 }
