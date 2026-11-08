@@ -149,7 +149,7 @@ func TestVerifyRejectsIncompleteRecords(t *testing.T) {
 	}
 }
 
-func TestVerifyRejectsInvalidJWKSJSON(t *testing.T) {
+func TestVerifyRejectsJWKSThatIsNotAnObject(t *testing.T) {
 	pub, priv := testKey(t)
 	body := []byte(`{"name":"a","env":"dev","issuer":"i","jwks":"notjson"}`)
 	env, _ := signPayload(body, priv)
@@ -161,9 +161,20 @@ func TestVerifyRejectsInvalidJWKSJSON(t *testing.T) {
 func TestVerifyRejectsTrailingData(t *testing.T) {
 	pub, priv := testKey(t)
 	good, _ := json.Marshal(testCell())
-	env, _ := signPayload(append(good, []byte(` {"x":1}`)...), priv)
-	if _, err := Verify(env, []ed25519.PublicKey{pub}); err == nil {
-		t.Fatal("expected an error")
+	for _, tail := range []string{"}", "]", ` {"x":1}`, " x"} {
+		env, _ := signPayload(append(append([]byte{}, good...), tail...), priv)
+		if _, err := Verify(env, []ed25519.PublicKey{pub}); err == nil {
+			t.Fatalf("expected an error for tail %q", tail)
+		}
+	}
+}
+
+func TestVerifyAcceptsTrailingWhitespace(t *testing.T) {
+	pub, priv := testKey(t)
+	good, _ := json.Marshal(testCell())
+	env, _ := signPayload(append(good, '\n'), priv)
+	if _, err := Verify(env, []ed25519.PublicKey{pub}); err != nil {
+		t.Fatalf("trailing whitespace must pass: %v", err)
 	}
 }
 

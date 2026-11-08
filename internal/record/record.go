@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 )
 
 // PayloadType is the DSSE payload type of a cell record.
@@ -52,7 +53,7 @@ func Verify(envelope []byte, keys []ed25519.PublicKey) (Cell, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Cell{}, fmt.Errorf("decode record: %w", err)
 	}
-	if dec.More() {
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		return Cell{}, errors.New("decode record: trailing data after object")
 	}
 	if err := c.validate(); err != nil {
