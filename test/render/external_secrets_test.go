@@ -164,6 +164,7 @@ func TestRenderExternalSecrets(t *testing.T) {
 			"--enable-cluster-external-secret-reconciler=false",
 			"--enable-push-secret-reconciler=false",
 			"--enable-cluster-push-secret-reconciler=false",
+			"--zap-time-encoding=iso8601",
 		} {
 			if !slices.Contains(args, want) {
 				t.Fatalf("args %v lack %s", args, want)
@@ -230,6 +231,20 @@ func TestRenderExternalSecrets(t *testing.T) {
 						t.Fatalf("%s can change namespaces", key)
 					}
 				}
+			}
+		}
+	})
+
+	// The chart renders the view and edit ClusterRoles whenever rbac.create is true. They grant
+	// nothing while no binding and no aggregation label refers to them.
+	t.Run("no binding refers to the view or edit ClusterRole", func(t *testing.T) {
+		for key, o := range objs {
+			kind := strings.Split(key, "/")[0]
+			if kind != "ClusterRoleBinding" && kind != "RoleBinding" {
+				continue
+			}
+			if role := get[string](t, o, "roleRef", "name"); role == "external-secrets-view" || role == "external-secrets-edit" {
+				t.Fatalf("%s binds %s", key, role)
 			}
 		}
 	})

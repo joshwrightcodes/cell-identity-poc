@@ -12,7 +12,7 @@ source "$(dirname "$0")/lib.sh"
 namespace=external-secrets
 secret=poc-secrets-token
 store=poc-secrets
-example="Copy .envrc.local.example to .envrc.local and fill it in"
+example="Copy .envrc.local.example to .envrc.local and complete it"
 
 [[ -n "${POC_SECRET_TOKEN_CMD:-}" ]] || die "POC_SECRET_TOKEN_CMD is not set. $example."
 [[ -n "${POC_SECRET_STORE_PROVIDER:-}" ]] || die "POC_SECRET_STORE_PROVIDER is not set. $example."

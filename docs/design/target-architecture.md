@@ -135,7 +135,7 @@ Local instances use `dev` as `<env>`: the clusters are `management`, `dev-cp`, `
 | Approver keys | One signing key per approver, held on the approver's device | Never in a cluster. Public keys travel in signed approver directories |
 | Rebuildable keys | SPIRE server CAs, the Argo CD Agent JWT key, mesh CAs | Generated inside the cluster |
 
-- Locally, `mise run keys:seed` reads each key from the secret manager CLI on standard input, and creates the Kubernetes Secret directly. Unit tests generate throwaway keys in memory.
+- Locally, the secret manager holds each key at `<cluster>/<service>/<key>`. The External Secrets Operator syncs the keys into a Kubernetes Secret in the cluster. Unit tests generate throwaway keys in memory.
 - On EKS, an external store holds the online keys. A provider-neutral sync delivers them, and each key rotates with one command.
 - Key set changes follow the signer matrix in "Key rotation and recovery".
 

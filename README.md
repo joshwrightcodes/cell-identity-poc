@@ -120,8 +120,7 @@ The ExternalSecret `spire-upstream` reads these three keys:
 | `dev-cp/spire-server/intermediate-cert` | `intermediate-cert` | The certificate of the intermediate CA |
 | `dev-cp/spire-server/root-cert` | `root-cert` | The certificate of the root CA |
 
-Each provider of the operator maps a remote key to its own structure.
-For example, a provider can read the first part as an item name and the rest as a field.
+Each provider of the operator maps the key at path `<cluster>/<service>/<key>` to its own structure.
 The operator documentation for your provider says how it reads a remote key.
 
 The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
@@ -131,7 +130,7 @@ The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
 The steps below use placeholders in angle brackets.
 Replace `<read>` and `<write>` with the read and write commands of your secret manager.
 `<write> <dev-cp/spire-server/root-cert>` stores standard input at the place that this remote key names.
-`<root-ca-bundle>` is a placeholder for an item name.
+`<root-ca-bundle>` is a placeholder for the name of the root CA bundle in your secret manager.
 
 The root CA bundle holds the root private key.
 Keep it in a vault that the cluster access token cannot read.

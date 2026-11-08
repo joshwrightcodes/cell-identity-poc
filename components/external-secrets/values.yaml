@@ -39,6 +39,9 @@ webhook:
 certController:
   create: false
 
+log:
+  timeEncoding: iso8601
+
 # Address 0 closes the health listener, which no probe uses.
 extraArgs:
   live-addr: "0"
