@@ -234,8 +234,10 @@ Findings that the cell relies on:
   banned. It overwrites the stored certificate. Because of this, the one-time property comes
   from the nonce hash in the agent ID, and not from SPIRE.
 - A plugin error reaches the agent with the gRPC code and the message
-  `nodeattestor(<plugin name>): <message>`. The server also logs the message. A plugin must put no
-  token contents in a message.
+  `nodeattestor(<plugin name>): <message>`. SPIRE first removes a leading `<plugin name>: ` from
+  the plugin message (`pkg/common/plugin/facade.go`). On 2026-11-09 the M2 rejection tests got
+  `nodeattestor(cluster_jwt): not_pod_bound` at the client. The server also logs the message. A
+  plugin must put no token contents in a message.
 - The rotator attests again on every rotation when the agent is re-attestable. The plugin
   returns `can_reattest` as false, so rotation uses `RenewAgent` and needs no new token.
 - The server prunes non-reattestable nodes only when `prune_tofu_nodes = true`. It prunes
@@ -393,6 +395,35 @@ Unicode, `os/exec`, `sudo` and `net/http` in non-test code.
 
 The review compared no module with its upstream repository. Because of this, the result rests
 on the module checksums in `go.sum` and on the read of the cache.
+
+## SPIRE API SDK for attestprobe (2026-11-09)
+
+`cmd/attestprobe` calls `AttestAgent` on the SPIRE server, as an agent does. It imports
+`github.com/spiffe/spire-api-sdk` at the version that the SPIRE v1.15.5 go.mod pins:
+`v1.2.5-0.20260428072036-00f73a61093a`. This is commit `00f73a61093a26a3f676563386abdd2218619101`,
+dated 2026-04-28, so it meets the two-week rule. The probe and the server then share one wire contract.
+
+The review read the module cache copy, which `go mod verify` checks, before any test ran. Nothing
+ran during the review.
+
+- The module holds 36 Go files. Each file is `protoc-gen-go` or `protoc-gen-go-grpc` output for the
+  server and agent APIs and their types. The module has no hand-written Go code.
+- The files import only `context`, `reflect`, `sync`, `unsafe`, gRPC, protobuf and the module's own
+  `types` package. `unsafe` appears only in the generated descriptor code.
+- No file has `os/exec`, `net/http`, a raw network dial or `sudo`. Each `init` function only
+  registers the file's message types with the protobuf runtime.
+- No file has a non-ASCII character, so the module has no hidden Unicode.
+- `go.mod` requires gRPC v1.74.2 and protobuf v1.36.7. The cell already pins newer versions, so the
+  module raises no other module.
+- The review read `proto/spire/api/server/agent/v1/agent.proto` and the field numbers of the
+  `AttestAgent` messages and of `types.X509SVID`.
+
+The probe also uses the go-spiffe package `spiffetls/tlsconfig`, which the celld build does not hold.
+The package has three files and imports only `crypto/tls`, `crypto/x509` and other go-spiffe packages.
+The client configuration sets `InsecureSkipVerify` and puts a `VerifyPeerCertificate` callback in
+its place. The callback verifies the chain against the bundle, and then checks the server ID.
+
+The review did not read the `Makefile`, the CI files or the generated code beyond the agent API.
 
 ## Kubernetes client modules (2026-11-08)
 

@@ -114,6 +114,7 @@ run = "scripts/gate.sh m1"
 
 [tasks."gate:m2"]
 description = "Run the M2 end-to-end tests against the SPIRE server in dev-cp, plus the go test arguments after --"
+depends = ["images"]
 run = "scripts/gate.sh m2"
 
 [tasks."harness:preflight"]

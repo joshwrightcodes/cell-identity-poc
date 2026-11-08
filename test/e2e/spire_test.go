@@ -347,12 +347,20 @@ func forwardBundleStore(t *testing.T) string {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start the port-forward to the bundle store: %v", err)
 	}
+	// Wait closes the pipe, so it may run only after the reader has seen the end of the output.
+	readDone := make(chan struct{})
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
+		select {
+		case <-readDone:
+		case <-time.After(forwardWait):
+			t.Logf("the port-forward output did not end within %s of the kill", forwardWait)
+		}
 		_ = cmd.Wait()
 	})
 	port := make(chan string, 1)
 	go func() {
+		defer close(readDone)
 		s := bufio.NewScanner(stdout)
 		for s.Scan() {
 			if m := forwardLine.FindStringSubmatch(s.Text()); m != nil {

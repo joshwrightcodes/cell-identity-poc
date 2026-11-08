@@ -25,17 +25,21 @@ const (
 
 var podCounter atomic.Int64
 
-// probeImage is the netprobe reference that `mise run images` recorded in build/images.env, pinned
-// by digest. It is empty when the file or the line is missing. needProbeImage then fails the test.
-var probeImage = readProbeImage()
+// probeImage and attestprobeImage are the references that `mise run images` recorded in
+// build/images.env, pinned by digest. Each is empty when the file or the line is missing.
+// needProbeImage and needAttestprobeImage then fail the test.
+var (
+	probeImage       = readImage("IMAGE_NETPROBE")
+	attestprobeImage = readImage("IMAGE_ATTESTPROBE")
+)
 
-func readProbeImage() string {
+func readImage(variable string) string {
 	data, err := os.ReadFile(imagesEnv)
 	if err != nil {
 		return ""
 	}
 	for line := range strings.SplitSeq(string(data), "\n") {
-		if ref, ok := strings.CutPrefix(line, "IMAGE_NETPROBE="); ok && strings.Contains(ref, "@sha256:") {
+		if ref, ok := strings.CutPrefix(line, variable+"="); ok && strings.Contains(ref, "@sha256:") {
 			return ref
 		}
 	}
@@ -46,6 +50,13 @@ func needProbeImage(t *testing.T) {
 	t.Helper()
 	if probeImage == "" {
 		t.Fatalf("%s has no IMAGE_NETPROBE pinned by digest. Run mise run images.", imagesEnv)
+	}
+}
+
+func needAttestprobeImage(t *testing.T) {
+	t.Helper()
+	if attestprobeImage == "" {
+		t.Fatalf("%s has no IMAGE_ATTESTPROBE pinned by digest. Run mise run images.", imagesEnv)
 	}
 }
 

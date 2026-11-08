@@ -28,44 +28,8 @@ func TestM2CelldGetsSVID(t *testing.T) {
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 		t.Run(cell, func(t *testing.T) {
 			t.Parallel()
-			// Every live pod at this point is old. A pod that is already terminating never counts as
-			// new, because celldPods skips pods with a deletion timestamp. So only a pod that the
-			// ReplicaSet creates after this listing can pass the wait below.
-			old := map[string]bool{}
-			for _, p := range celldPods(t, cell) {
-				old[p.Metadata.UID] = true
-				if _, err := kubectl(t, cell, "", "-n", celldNamespace, "delete", "pod", p.Metadata.Name, "--wait=false"); err != nil {
-					t.Fatal(err)
-				}
-			}
-			var pod podInfo
-			waitFor(t, "a new Running celld pod in "+cell, newPodWait, func() (bool, string) {
-				var seen []string
-				for _, p := range celldPods(t, cell) {
-					if !old[p.Metadata.UID] && p.Status.Phase == "Running" {
-						pod = p
-						return true, ""
-					}
-					seen = append(seen, fmt.Sprintf("%s %s (old %t)", p.Metadata.Name, p.Status.Phase, old[p.Metadata.UID]))
-				}
-				return false, fmt.Sprintf("pods: %v", seen)
-			})
-			t.Logf("new celld pod %s, UID %s", pod.Metadata.Name, pod.Metadata.UID)
-
-			want := fmt.Sprintf("spiffe://%s/cell/%s/celld", spireTD, cell)
-			waitFor(t, "celld log line with SPIFFE ID "+want, celldSVIDWait, func() (bool, string) {
-				logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
-				if err != nil {
-					return false, err.Error()
-				}
-				ids := celldSPIFFEIDs(logs)
-				for _, id := range ids {
-					if id == want {
-						return true, ""
-					}
-				}
-				return false, fmt.Sprintf("SPIFFE IDs %v in %d log bytes: %s", ids, len(logs), lastLines(logs, 5))
-			})
+			pod := replaceCelldPod(t, cell)
+			waitCelldSVID(t, cell, pod)
 
 			agentID := regexp.MustCompile(`spiffe://` + regexp.QuoteMeta(spireTD) + `/spire/agent/cluster_jwt/` +
 				regexp.QuoteMeta(cell) + `/` + regexp.QuoteMeta(pod.Metadata.UID) + `/[0-9a-f]{32}`)
@@ -92,11 +56,69 @@ type podInfo struct {
 	Metadata struct {
 		Name              string  `json:"name"`
 		UID               string  `json:"uid"`
+		CreationTimestamp string  `json:"creationTimestamp"`
 		DeletionTimestamp *string `json:"deletionTimestamp"`
 	} `json:"metadata"`
+	Spec struct {
+		NodeName string `json:"nodeName"`
+	} `json:"spec"`
 	Status struct {
-		Phase string `json:"phase"`
+		Phase             string `json:"phase"`
+		ContainerStatuses []struct {
+			Name         string `json:"name"`
+			ContainerID  string `json:"containerID"`
+			RestartCount int    `json:"restartCount"`
+			Ready        bool   `json:"ready"`
+		} `json:"containerStatuses"`
 	} `json:"status"`
+}
+
+// replaceCelldPod deletes every celld pod in a cell and returns the new Running pod.
+func replaceCelldPod(t *testing.T, cell string) podInfo {
+	t.Helper()
+	// Every live pod at this point is old. A pod that is already terminating never counts as new,
+	// because celldPods skips pods with a deletion timestamp. So only a pod that the ReplicaSet
+	// creates after this listing can pass the wait below.
+	old := map[string]bool{}
+	for _, p := range celldPods(t, cell) {
+		old[p.Metadata.UID] = true
+		if _, err := kubectl(t, cell, "", "-n", celldNamespace, "delete", "pod", p.Metadata.Name, "--wait=false"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var pod podInfo
+	waitFor(t, "a new Running celld pod in "+cell, newPodWait, func() (bool, string) {
+		var seen []string
+		for _, p := range celldPods(t, cell) {
+			if !old[p.Metadata.UID] && p.Status.Phase == "Running" {
+				pod = p
+				return true, ""
+			}
+			seen = append(seen, fmt.Sprintf("%s %s (old %t)", p.Metadata.Name, p.Status.Phase, old[p.Metadata.UID]))
+		}
+		return false, fmt.Sprintf("pods: %v", seen)
+	})
+	t.Logf("new celld pod %s, UID %s", pod.Metadata.Name, pod.Metadata.UID)
+	return pod
+}
+
+// waitCelldSVID waits until the celld container of the pod logs its X.509 SVID.
+func waitCelldSVID(t *testing.T, cell string, pod podInfo) {
+	t.Helper()
+	want := fmt.Sprintf("spiffe://%s/cell/%s/celld", spireTD, cell)
+	waitFor(t, "celld log line with SPIFFE ID "+want, celldSVIDWait, func() (bool, string) {
+		logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
+		if err != nil {
+			return false, err.Error()
+		}
+		ids := celldSPIFFEIDs(logs)
+		for _, id := range ids {
+			if id == want {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("SPIFFE IDs %v in %d log bytes: %s", ids, len(logs), lastLines(logs, 5))
+	})
 }
 
 // celldPods returns the celld pods that are not being deleted.

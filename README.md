@@ -113,7 +113,7 @@ CELL=dev-cell-2 mise run cell:verify
 ## Size and time
 
 `gate:m1` and `gate:m2` run only on this Mac, against the local clusters. CI runs `mise run test` and `mise run lint`.
-`harness/versions.env` holds the expected tool versions and the time budget of `gate:m1`. It sets no time budget for `gate:m2` yet.
+`harness/versions.env` holds the expected tool versions and the time budgets of `gate:m1` and `gate:m2`.
 `harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
 `harness:size` prints the memory and CPU of every node container and of `registry-mirror`.
 
@@ -140,7 +140,10 @@ The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slower run of 103 seconds, rounded up to the next minute.
-The budget does not cover `harness:up`.
+`gate:m2` fails when the run takes longer than `GATE_M2_BUDGET_MINUTES`.
+The budget is 8 minutes. This is 1.5 times the slower run of 312 seconds, rounded up to the next minute.
+The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes about two minutes of that time.
+The budgets do not cover `harness:up`.
 
 ## Restart of the VM
 
@@ -177,11 +180,12 @@ Each image reaches its cluster through one command:
 | `cluster-jwt-server` | The init container of the SPIRE server in `dev-cp` | `CELL=dev-cp mise run cell:up`, through the `spire-server` bundle and Argo CD |
 | `cluster-jwt-agent` | The init container of the `celld` pod in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
 | `celld` | The `celld` container in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
+| `attestprobe` | Test Jobs of `gate:m2` in `dev-cell-1` | `mise run gate:m2` |
 
-`mise run images` builds all four and records their digests in `build/images.env`.
+`mise run images` builds all five and records their digests in `build/images.env`.
 `cell:verify` fails when a running image differs from that file.
 ko stamps the commit of the checkout into each binary, so a new commit gives new digests.
-`gate:m1` runs `mise run images` first. After a new commit or a `gate:m1` run, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
+`gate:m1` and `gate:m2` run `mise run images` first. After a new commit or a gate run, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
 
 ## Keys
 

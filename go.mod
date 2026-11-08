@@ -8,6 +8,7 @@ require (
 	github.com/hashicorp/go-hclog v1.6.3
 	github.com/hashicorp/hcl v1.0.1-vault-7
 	github.com/spiffe/go-spiffe/v2 v2.9.0
+	github.com/spiffe/spire-api-sdk v1.2.5-0.20260428072036-00f73a61093a
 	github.com/spiffe/spire-plugin-sdk v1.4.4-0.20260617144146-5dcde407c4d1
 	go.opentelemetry.io/contrib/bridges/otelslog v0.21.0
 	go.opentelemetry.io/otel v1.47.0
