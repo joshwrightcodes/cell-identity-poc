@@ -4,6 +4,8 @@
 # For each cell in SPIRE_AGENT_CELLS, the render reads the node address from the host service and
 # signs a test record of the cell for the ServiceAccount SPIRE_AGENT_SUBJECT of the agent pod. The
 # NetworkPolicy admits only those node addresses, and the plugin trusts only those records.
+# ConfigMap spire-entries gets two ClusterStaticEntry manifests for each cell: a node alias that
+# matches the attested agents of the cell, and the celld ID under that alias.
 # The plugin image comes from the local registry, pinned by digest. The server config carries the
 # SHA-256 of the plugin binary from that image, so the server checks the binary before it runs it.
 # Inputs come from cells/<cluster>.env: SPIRE_AGENT_CELLS and SPIRE_AGENT_SUBJECT.
@@ -18,27 +20,18 @@ plugin_binary=/ko-app/cluster-jwt-server
 
 die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
 
-sha256() {
-  if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
-}
+source "$root/scripts/ko-image.sh"
 
-# The plugin image and the checksum of the binary in it. ko puts the binary in the last layer.
-digest="$(oras resolve --plain-http "$plugin_repo:latest" 2>/dev/null)" \
-  || die "no image $plugin_repo:latest. Run mise run images first."
-[[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "image $plugin_repo:latest resolved to '$digest'"
-manifest="$(oras manifest fetch --plain-http "$plugin_repo@$digest")"
-jq -e '.mediaType == "application/vnd.oci.image.manifest.v1+json"' <<<"$manifest" >/dev/null \
-  || die "$plugin_repo@$digest is not a single-platform image manifest"
-layer="$(jq -r '.layers[-1].digest' <<<"$manifest")"
-checksum="$(oras blob fetch --plain-http --output - "$plugin_repo@$layer" | tar -xzOf - "$plugin_binary" 2>/dev/null | sha256)" \
-  || die "could not read $plugin_binary from $plugin_repo@$digest"
-# The second value is the SHA-256 of empty input.
-[[ "$checksum" =~ ^[0-9a-f]{64}$ && "$checksum" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]] \
-  || die "no $plugin_binary in the last layer of $plugin_repo@$digest"
+# The plugin image and the checksum of the binary in it.
+digest="$(ko_digest "$plugin_repo")" || die "no plugin image"
+checksum="$(ko_binary_sha256 "$plugin_repo" "$digest" "$plugin_binary")" || die "no plugin checksum"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+[[ "$SPIRE_AGENT_SUBJECT" =~ ^[a-z0-9-]+/[a-z0-9-]+$ ]] || die "SPIRE_AGENT_SUBJECT '$SPIRE_AGENT_SUBJECT' is not <namespace>/<service account>"
+trust_domain=dev.env.poc.internal
 peers='[]'
 sources='[]'
+entries='{}'
 keys=()
 records=""
 for cell in $SPIRE_AGENT_CELLS; do
@@ -61,6 +54,21 @@ for cell in $SPIRE_AGENT_CELLS; do
   records+="---"$'\n'"$(yq ".metadata.namespace = \"$namespace\"" <<<"$record")"$'\n'
   sources="$(jq -c --arg name "$name" --arg path "$cell.dsse.json" \
     '. + [{configMap: {name: $name, items: [{key: "record.dsse.json", path: $path}]}}]' <<<"$sources")"
+
+  # The cluster_jwt plugin gives an attested agent the selectors cluster_jwt:cell:<cell> and
+  # cluster_jwt:sa:<namespace>:<service account>. The alias matches both. A celld process runs as uid 65532.
+  alias_id="spiffe://$trust_domain/cell/$cell/nodes"
+  entries="$(jq -c --arg cell "$cell" --arg td "$trust_domain" --arg alias "$alias_id" --arg sa "${SPIRE_AGENT_SUBJECT/\//:}" '
+    . + {
+      ($cell + "-nodes.yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
+        metadata: {name: ($cell + "-nodes")},
+        spec: {spiffeID: $alias, parentID: ("spiffe://" + $td + "/spire/server"),
+          selectors: ["cluster_jwt:cell:" + $cell, "cluster_jwt:sa:" + $sa]}},
+      ($cell + "-celld.yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
+        metadata: {name: ($cell + "-celld")},
+        spec: {spiffeID: ("spiffe://" + $td + "/cell/" + $cell + "/celld"), parentID: $alias,
+          selectors: ["unix:uid:65532"]}}
+    }' <<<"$entries")"
 done
 ((${#keys[@]} > 0)) || die "SPIRE_AGENT_CELLS names no cell"
 
@@ -78,9 +86,11 @@ config_map() {
 config_maps="$(config_map spire-server server.conf "$server_conf"; echo "---"; config_map spire-controller-manager config.yaml "$controller_conf")"
 config_checksum="$(printf '%s\n%s' "$config_maps" "$records" | sha256)"
 
-PEERS="$peers" SOURCES="$sources" yq "
+# Each entry becomes one YAML file in the ConfigMap, as spire-controller-manager expects.
+PEERS="$peers" SOURCES="$sources" ENTRIES="$entries" yq "
   (select(.kind == \"StatefulSet\") | .spec.template.spec.volumes[] | select(.name == \"records\") | .projected.sources) = (env(SOURCES) | ... style=\"\")
   | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-agents\") | .spec.ingress[0].from) = (env(PEERS) | ... style=\"\")
+  | (select(.kind == \"ConfigMap\" and .metadata.name == \"spire-entries\") | .data) = (env(ENTRIES) | ... style=\"\" | map_values(to_yaml) | .[] style=\"literal\")
 " "$here/manifests.yaml" \
   | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_repo@$digest|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|"
 echo "---"

@@ -620,3 +620,101 @@ The review did not read these items:
 Result: medium concern. The controller can write Secrets in every namespace. SDK code that the
 review could not read holds the token, and its allowed hosts include vendor test domains. The
 NetworkPolicy and the namespace condition on the store limit the effect.
+
+## celld modules (2026-11-08)
+
+`cmd/celld` gets its X.509 SVID through go-spiffe and exports logs, traces and metrics through the
+OpenTelemetry Go SDK. The review cloned each item at its tag into a scratch directory and read it.
+Nothing ran during the review. The module cache copies match the clones, apart from a `LICENSE`
+file that each OpenTelemetry submodule archive adds. `go mod verify` passes.
+
+The unit tests of `cmd/celld` ran once before this review was complete. Those tests start the
+go-spiffe client and the OpenTelemetry SDK in the test process. They export nothing and connect only
+to a local test socket.
+
+| Module | Version | Commit | Date |
+| --- | --- | --- | --- |
+| `github.com/spiffe/go-spiffe/v2` | v2.9.0 | `77c6d2e0c1203e36804e26a02faa8f893d72e7e5` | 2026-10-05 |
+| `go.opentelemetry.io/otel` and the `sdk`, `sdk/metric`, `sdk/log`, `trace`, `metric`, `log` submodules | v1.47.0 | `66cfc9520e205b7d450183532772401bc2b6674c` | 2026-10-02 |
+| `go.opentelemetry.io/otel/exporters/otlp/otlptrace` and `otlptrace/otlptracegrpc` | v1.47.0 | same commit | 2026-10-02 |
+| `go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc` | v1.47.0 | same commit | 2026-10-02 |
+| `go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc` | v0.23.0 | same commit | 2026-10-02 |
+| `go.opentelemetry.io/contrib/bridges/otelslog` | v0.21.0 | `0c76f6137a2ceea80984d55e3de165924d823f71` | 2026-10-02 |
+
+SPIRE v1.15.5 pins go-spiffe v2.8.1. The cell uses v2.9.0, the newest release at least two weeks
+old. go-spiffe is a client library, so it does not need the SPIRE version.
+
+go-spiffe:
+
+- It reads one variable, `SPIFFE_ENDPOINT_SOCKET`, in `workloadapi/addr.go`.
+- It connects only to that address. The address must be a `unix` path or a `tcp` IP address and
+  port, so it has no DNS lookup. The client dials plaintext gRPC and adds the `workload.spiffe.io`
+  header (`workloadapi/client.go`).
+- The 15 packages in the build have no `os/exec`, `net/http`, `sudo` or file writes.
+
+OpenTelemetry:
+
+- The SDK and the exporters read the standard `OTEL_*` variables. These cover the exporter
+  endpoints, headers, timeouts, compression and certificate paths. They also cover the resource
+  attributes, the service name, the sampler and the limits.
+- The exporters connect only to the OTLP endpoint. The default is `localhost:4317`, and the pod
+  sets the collector address. Each exporter creates its gRPC client lazily, so it connects at its
+  first export.
+- `sdk/resource/host_id_exec.go` uses `os/exec` to read a host ID. The file builds only for
+  Darwin and BSD, and celld does not ask for a host ID.
+- `net/http` appears in the propagation types, in exporter option types and in the gateway files of
+  `go.opentelemetry.io/proto/otlp`. No package in the build creates an HTTP client.
+- The build has no Prometheus package. celld does not use the `autoexport` module, because that
+  module brings a Prometheus exporter.
+
+Searches over the 400 non-test Go files of the 102 third-party packages in the celld build:
+
+- No hidden Unicode: no bidirectional controls, zero-width characters or other format characters.
+- Other non-ASCII characters appear only in comments, apart from the replacement character that
+  `baggage.go` writes for invalid UTF-8.
+- No `sudo`, `Setuid` or `Setgid`.
+
+The build also adds or raises these modules. The review read them only through the searches above.
+
+| Module | Version | Date | Note |
+| --- | --- | --- | --- |
+| `go.opentelemetry.io/proto/otlp` | v1.11.0 | 2026-07-22 | Generated OTLP types |
+| `github.com/grpc-ecosystem/grpc-gateway/v2` | v2.30.0 | 2026-08-05 | Required by the OTLP types |
+| `go.opentelemetry.io/auto/sdk` | v1.2.1 | 2025-09-15 | Required by `otel/trace` |
+| `github.com/cenkalti/backoff/v5` | v5.0.3 | 2025-07-23 | Exporter retries |
+| `github.com/cespare/xxhash/v2` | v2.3.0 | 2024-04-04 | Hashes in the metric SDK |
+| `github.com/go-logr/logr`, `github.com/go-logr/stdr` | v1.4.4, v1.2.2 | 2026-07-20, 2021-12-14 | Internal SDK logger |
+| `github.com/Microsoft/go-winio` | v0.6.2 | not checked | Windows only, so not in the build |
+| `golang.org/x/net`, `x/sys`, `x/text`, `x/term` | v0.59.0, v0.48.0, v0.42.0, v0.46.0 | 2026-09-08, 2026-08-31, 2026-09-08, 2026-09-08 | Raised from v0.57.0, v0.47.0, v0.40.0, v0.45.0 |
+| `google.golang.org/genproto/googleapis/rpc` and `api` | v0.0.0-20260928230214-8a89bd6388cc | 2026-09-28 | Raised from the July version |
+| `google.golang.org/protobuf` | v1.36.12 | 2026-08-10 | See below |
+| `go.yaml.in/yaml/v3` | v3.0.5 | 2026-07-26 | Raised from v3.0.4 |
+| `github.com/go-openapi/swag` and its 11 submodules | v0.28.0 | 2026-07-27 | Raised from v0.27.1, because grpc-gateway requires it |
+
+Every binary of the Go module shares these modules, so the plugin binaries also get the raised
+versions. go-spiffe v2.9.0 and the exporters require protobuf v1.36.12, so `go.mod` now
+pins the tag instead of the earlier pseudo-version. A diff of the two module cache copies shows
+these non-test, non-generated changes: `internal/encoding/defval/default.go`,
+`internal/genid/descriptor_gen.go`, `internal/version/version.go` and
+`reflect/protoreflect/source_gen.go`. The generated descriptor types also changed. The review did
+not read the changed logic line by line.
+
+The review did not read these items:
+
+- The OpenTelemetry packages outside the celld build, the contrib repository outside `otelslog`,
+  and the test files.
+- The full exporter retry and transform code. The review read the configuration and connection code.
+- Any module compared with a source build of its binary.
+
+### SPIRE agent image
+
+The celld pod runs `ghcr.io/spiffe/spire-agent:1.15.5` by its index digest. The arm64 manifest is
+`sha256:1a249242cd1020ee632e50bbb4f44625e014c072f8e9871adc6a79c694191f76`. These facts come from the
+registry, read on 2026-11-08. The review listed the layer files and ran nothing from the image.
+
+- The config has user `0:0`, the entrypoint `/opt/spire/bin/spire-agent run`, the working directory
+  `/opt/spire` and no exposed port.
+- Four layers: the CA bundle, empty directories, and one static binary of 62 MB with mode 0755.
+  No file is setuid or setgid.
+- The pod runs the sidecar as user 1000, with a read-only root file system and no capabilities.
+- The review did not compare the binary with a source build, and did not check image signatures.

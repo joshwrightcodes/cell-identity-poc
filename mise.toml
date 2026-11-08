@@ -101,7 +101,7 @@ run = "scripts/harness.sh down"
 description = "Build and push the in-cluster images to the local registry at localhost:5001"
 depends = ["vm:up"]
 env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
-run = "ko build --base-import-paths --tags latest ./cmd/netprobe ./cmd/cluster-jwt-server ./cmd/cluster-jwt-agent"
+run = "ko build --base-import-paths --tags latest ./cmd/netprobe ./cmd/cluster-jwt-server ./cmd/cluster-jwt-agent ./cmd/celld"
 
 [tasks."gate:m1"]
 description = "Run the M1 end-to-end tests, plus the go test arguments after --"

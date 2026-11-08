@@ -47,6 +47,11 @@ SPIRE_SERVER_COMPONENTS=(
   "spire-server:7:spire-system"
 )
 
+# celld with its SPIRE agent sidecar. It attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
+CELL_IDENTITY_COMPONENTS=(
+  "cell-identity:6:cell-identity-system"
+)
+
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
 set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$ROOT/harness/topology.yaml")"
@@ -55,6 +60,7 @@ for set_name in $set_names; do
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
     external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
+    cell-identity) COMPONENTS+=("${CELL_IDENTITY_COMPONENTS[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done

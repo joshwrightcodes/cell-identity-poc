@@ -49,6 +49,7 @@ CELL=dev-cell-1 mise run cell:verify
 
 `harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions. It then creates all five clusters through the host service.
 After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
+`harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 

@@ -1,0 +1,135 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+)
+
+const (
+	celldNamespace  = "cell-identity-system"
+	celldDeployment = "celld"
+	celldContainer  = "celld"
+	// The brief allows two minutes from the start of a new pod to the first SVID.
+	celldSVIDWait = 2 * time.Minute
+	newPodWait    = 2 * time.Minute
+)
+
+// TestM2CelldGetsSVID replaces the celld pod in each cell. The new pod must log its X.509 SVID
+// within two minutes, and the SPIRE server log must hold an agent ID with the UID of that pod.
+func TestM2CelldGetsSVID(t *testing.T) {
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		t.Run(cell, func(t *testing.T) {
+			t.Parallel()
+			old := map[string]bool{}
+			for _, p := range celldPods(t, cell) {
+				old[p.Metadata.UID] = true
+				if _, err := kubectl(t, cell, "", "-n", celldNamespace, "delete", "pod", p.Metadata.Name, "--wait=false"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var pod podInfo
+			waitFor(t, "a new Running celld pod in "+cell, newPodWait, func() (bool, string) {
+				var seen []string
+				for _, p := range celldPods(t, cell) {
+					if !old[p.Metadata.UID] && p.Status.Phase == "Running" {
+						pod = p
+						return true, ""
+					}
+					seen = append(seen, fmt.Sprintf("%s %s (old %t)", p.Metadata.Name, p.Status.Phase, old[p.Metadata.UID]))
+				}
+				return false, fmt.Sprintf("pods: %v", seen)
+			})
+			t.Logf("new celld pod %s, UID %s", pod.Metadata.Name, pod.Metadata.UID)
+
+			want := fmt.Sprintf("spiffe://%s/cell/%s/celld", spireTD, cell)
+			waitFor(t, "celld log line with SPIFFE ID "+want, celldSVIDWait, func() (bool, string) {
+				logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
+				if err != nil {
+					return false, err.Error()
+				}
+				ids := celldSPIFFEIDs(logs)
+				for _, id := range ids {
+					if id == want {
+						return true, ""
+					}
+				}
+				return false, fmt.Sprintf("SPIFFE IDs %v in %d log bytes: %s", ids, len(logs), lastLines(logs, 5))
+			})
+
+			agentID := regexp.MustCompile(`spiffe://` + regexp.QuoteMeta(spireTD) + `/spire/agent/cluster_jwt/` +
+				regexp.QuoteMeta(cell) + `/` + regexp.QuoteMeta(pod.Metadata.UID) + `/[0-9a-f]{32}`)
+			waitFor(t, "SPIRE server log line with agent ID "+agentID.String(), forwardWait, func() (bool, string) {
+				logs, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=10m")
+				if err != nil {
+					return false, err.Error()
+				}
+				if id := agentID.FindString(logs); id != "" {
+					t.Logf("server issued agent ID %s", id)
+					return true, ""
+				}
+				return false, fmt.Sprintf("no match in %d log bytes", len(logs))
+			})
+		})
+	}
+}
+
+type podInfo struct {
+	Metadata struct {
+		Name              string  `json:"name"`
+		UID               string  `json:"uid"`
+		DeletionTimestamp *string `json:"deletionTimestamp"`
+	} `json:"metadata"`
+	Status struct {
+		Phase string `json:"phase"`
+	} `json:"status"`
+}
+
+// celldPods returns the celld pods that are not being deleted.
+func celldPods(t *testing.T, cell string) []podInfo {
+	t.Helper()
+	out, err := kubectl(t, cell, "", "-n", celldNamespace, "get", "pods", "-l", "app.kubernetes.io/name="+celldDeployment, "-o", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var list struct {
+		Items []podInfo `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		t.Fatalf("decode pods: %v", err)
+	}
+	var live []podInfo
+	for _, p := range list.Items {
+		if p.Metadata.DeletionTimestamp == nil {
+			live = append(live, p)
+		}
+	}
+	return live
+}
+
+// celldSPIFFEIDs returns the spiffe_id of every JSON log line that has one.
+func celldSPIFFEIDs(logs string) []string {
+	var ids []string
+	for line := range strings.SplitSeq(logs, "\n") {
+		var rec struct {
+			SPIFFEID string `json:"spiffe_id"`
+		}
+		if json.Unmarshal([]byte(line), &rec) == nil && rec.SPIFFEID != "" {
+			ids = append(ids, rec.SPIFFEID)
+		}
+	}
+	return ids
+}
+
+func lastLines(s string, n int) string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, " | ")
+}

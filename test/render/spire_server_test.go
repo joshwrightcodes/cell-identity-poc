@@ -36,6 +36,7 @@ case "$2" in
     case "$cell" in
       dev-cell-1) echo '{"name":"dev-cell-1","nodeIP":"10.9.0.1"}' ;;
       dev-cell-2) echo '{"name":"dev-cell-2","nodeIP":"10.9.0.2"}' ;;
+      dev-cp) echo '{"name":"dev-cp","nodeIP":"10.9.0.9"}' ;;
       no-ip) echo '{"name":"no-ip","nodeIP":""}' ;;
       *) echo '{"level":"ERROR","msg":"hostsvc failed","error":"cluster does not exist"}'; exit 1 ;;
     esac ;;
@@ -66,6 +67,21 @@ case "$1" in
 esac
 `
 
+// stubKubectl answers "spire-server bundle show" with one PEM certificate. STUB_NO_SERVER makes it
+// fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line that is not PEM.
+const stubKubectl = `#!/usr/bin/env bash
+set -euo pipefail
+echo "kubectl $*" >>"$STUB_LOG"
+if [[ -n "${STUB_NO_SERVER:-}" ]]; then
+  echo 'Error from server (NotFound): pods "spire-server-0" not found' >&2
+  exit 1
+fi
+echo "` + stubPEM + `"
+[[ -z "${STUB_BAD_BUNDLE:-}" ]] || echo "not a certificate"
+`
+
+const stubPEM = "-----BEGIN CERTIFICATE-----\nMIIBstubstubstub\nc3R1Yg==\n-----END CERTIFICATE-----"
+
 type result struct {
 	stdout, stderr string
 	err            error
@@ -73,6 +89,13 @@ type result struct {
 }
 
 func render(t *testing.T, env ...string) result {
+	t.Helper()
+	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", env...)
+}
+
+// renderScript runs the render script of a component with stub host commands. The stub image
+// holds one file at binary.
+func renderScript(t *testing.T, component, binary string, env ...string) result {
 	t.Helper()
 	for _, tool := range []string{"yq", "jq", "tar", "bash"} {
 		if _, err := exec.LookPath(tool); err != nil {
@@ -89,10 +112,11 @@ func render(t *testing.T, env ...string) result {
 	}
 	write("mise", stubMise, 0o755)
 	write("oras", stubOras, 0o755)
-	layer := write("layer.tar.gz", string(layerTarGz(t)), 0o644)
+	write("kubectl", stubKubectl, 0o755)
+	layer := write("layer.tar.gz", string(layerTarGz(t, binary)), 0o644)
 	logFile := filepath.Join(dir, "mise.log")
 
-	script, err := filepath.Abs("../../components/spire-server/render.sh")
+	script, err := filepath.Abs("../../components/" + component + "/render.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +133,7 @@ func render(t *testing.T, env ...string) result {
 	return result{stdout.String(), stderr.String(), err, string(logData)}
 }
 
-func layerTarGz(t *testing.T) []byte {
+func layerTarGz(t *testing.T, binary string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -117,7 +141,7 @@ func layerTarGz(t *testing.T) []byte {
 	if err := tw.WriteHeader(&tar.Header{Name: "ko-app", Typeflag: tar.TypeDir, Mode: 0o555}); err != nil {
 		t.Fatal(err)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: "/ko-app/cluster-jwt-server", Mode: 0o555, Size: int64(len(stubBinary))}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: binary, Mode: 0o555, Size: int64(len(stubBinary))}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tw.Write([]byte(stubBinary)); err != nil {
@@ -136,6 +160,12 @@ type object map[string]any
 
 func docs(t *testing.T, out string) map[string]object {
 	t.Helper()
+	return docsIn(t, out, "spire-system")
+}
+
+// docsIn parses the render output by kind and name. Every object except the Namespace must be in ns.
+func docsIn(t *testing.T, out, ns string) map[string]object {
+	t.Helper()
 	byKey := map[string]object{}
 	for _, d := range regexp.MustCompile(`(?m)^---$`).Split(out, -1) {
 		if strings.TrimSpace(d) == "" {
@@ -152,8 +182,8 @@ func docs(t *testing.T, out string) map[string]object {
 		if _, dup := byKey[key]; dup {
 			t.Fatalf("%s appears twice", key)
 		}
-		if ns, _ := lookup(o, "metadata", "namespace"); key != "Namespace/spire-system" && ns != "spire-system" {
-			t.Fatalf("%s has namespace %v, want spire-system", key, ns)
+		if got, _ := lookup(o, "metadata", "namespace"); key != "Namespace/"+ns && got != ns {
+			t.Fatalf("%s has namespace %v, want %s", key, got, ns)
 		}
 		byKey[key] = o
 	}
@@ -436,6 +466,39 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
+	t.Run("entries declare a node alias and the celld ID for each cell", func(t *testing.T) {
+		data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
+		if got := keysOf(data); !slices.Equal(got, []string{"dev-cell-1-celld.yaml", "dev-cell-1-nodes.yaml", "dev-cell-2-celld.yaml", "dev-cell-2-nodes.yaml"}) {
+			t.Fatalf("spire-entries keys are %v", got)
+		}
+		type entry struct {
+			APIVersion string `json:"apiVersion"`
+			Kind       string `json:"kind"`
+			Metadata   struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Spec entrySpec `json:"spec"`
+		}
+		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+			alias := "spiffe://dev.env.poc.internal/cell/" + cell + "/nodes"
+			for file, want := range map[string]entry{
+				cell + "-nodes.yaml": {Spec: entrySpec{alias, "spiffe://dev.env.poc.internal/spire/server", []string{"cluster_jwt:cell:" + cell, "cluster_jwt:sa:cell-identity-system:celld"}}},
+				cell + "-celld.yaml": {Spec: entrySpec{"spiffe://dev.env.poc.internal/cell/" + cell + "/celld", alias, []string{"unix:uid:65532"}}},
+			} {
+				var got entry
+				if err := yaml.UnmarshalStrict([]byte(get[string](t, data, file)), &got); err != nil {
+					t.Fatalf("%s: %v", file, err)
+				}
+				if got.APIVersion != "spire.spiffe.io/v1alpha1" || got.Kind != "ClusterStaticEntry" || got.Metadata.Name+".yaml" != file {
+					t.Fatalf("%s header is %+v", file, got)
+				}
+				if got.Spec.SPIFFEID != want.Spec.SPIFFEID || got.Spec.ParentID != want.Spec.ParentID || !slices.Equal(got.Spec.Selectors, want.Spec.Selectors) {
+					t.Fatalf("%s spec is %+v, want %+v", file, got.Spec, want.Spec)
+				}
+			}
+		}
+	})
+
 	t.Run("pod mounts only rendered config maps", func(t *testing.T) {
 		pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
 		for _, v := range get[[]any](t, pod, "volumes") {
@@ -446,6 +509,12 @@ func TestRenderSpireServer(t *testing.T) {
 			}
 		}
 	})
+}
+
+type entrySpec struct {
+	SPIFFEID  string   `json:"spiffeID"`
+	ParentID  string   `json:"parentID"`
+	Selectors []string `json:"selectors"`
 }
 
 func keysOf(m map[string]any) []string {
@@ -468,6 +537,7 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"no cells", []string{"SPIRE_AGENT_CELLS= "}, "names no cell"},
 		{"unset cells", []string{"SPIRE_AGENT_CELLS="}, "SPIRE_AGENT_CELLS"},
 		{"no plugin image", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_NO_IMAGE=1"}, "mise run images"},
+		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_AGENT_SUBJECT=celld"}, "is not <namespace>/<service account>"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
