@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
 
 var residualPorts = []int{2379, 2380, 6443, 10250, 10256}
@@ -83,9 +85,9 @@ spec:
     nodePort: 30090
 `
 
-// fetchAcrossClusters starts the NodePort server in dev-cp and fetches it from dev-cell-1.
-func fetchAcrossClusters(t *testing.T) (body, clientIP string) {
-	t.Helper()
+// TestM1NodePortAcrossClusters starts the NodePort server in dev-cp, fetches it once from
+// dev-cell-1, and checks the reply in two named subtests.
+func TestM1NodePortAcrossClusters(t *testing.T) {
 	createNamespace(t, "dev-cp", "m1-server")
 	createNamespace(t, "dev-cell-1", "m1-client")
 	if _, err := kubectl(t, "dev-cp", serverManifest, "-n", "m1-server", "apply", "-f", "-"); err != nil {
@@ -98,35 +100,26 @@ func fetchAcrossClusters(t *testing.T) (body, clientIP string) {
 	server := clusterFacts(t, "dev-cp")
 	client := clusterFacts(t, "dev-cell-1")
 	url := fmt.Sprintf("http://%s:%d/", server.NodeIP, nodePortServer)
-	return runPod(t, "dev-cell-1", "m1-client", []string{"get", "--url", url}), client.NodeIP
-}
+	body := runPod(t, "dev-cell-1", "m1-client", []string{"get", "--url", url})
 
-func TestM1NodePortAcrossClusters(t *testing.T) {
-	body, _ := fetchAcrossClusters(t)
 	var got struct {
 		Remote string `json:"remote"`
 	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil || got.Remote == "" {
-		t.Fatalf("unexpected body %q: %v", body, err)
-	}
-}
-
-func TestM1SourceIsOwnNode(t *testing.T) {
-	body, clientIP := fetchAcrossClusters(t)
-	var got struct {
-		Remote string `json:"remote"`
-	}
-	if err := json.Unmarshal([]byte(body), &got); err != nil {
-		t.Fatalf("decode body %q: %v", body, err)
-	}
-	host, _, err := net.SplitHostPort(got.Remote)
-	if err != nil {
-		t.Fatalf("remote %q: %v", got.Remote, err)
-	}
-	if host != clientIP {
-		t.Fatalf("server saw source %s, want the dev-cell-1 node IP %s", host, clientIP)
-	}
-	t.Logf("server saw source %s, the dev-cell-1 node IP", host)
+	t.Run("Reachable", func(t *testing.T) {
+		if err := json.Unmarshal([]byte(body), &got); err != nil || got.Remote == "" {
+			t.Fatalf("unexpected body %q: %v", body, err)
+		}
+	})
+	t.Run("TestM1SourceIsOwnNode", func(t *testing.T) {
+		host, _, err := net.SplitHostPort(got.Remote)
+		if err != nil {
+			t.Fatalf("remote %q: %v", got.Remote, err)
+		}
+		if host != client.NodeIP {
+			t.Fatalf("server saw source %s, want the dev-cell-1 node IP %s", host, client.NodeIP)
+		}
+		t.Logf("server saw source %s, the dev-cell-1 node IP", host)
+	})
 }
 
 func TestM1PodsReachHostService(t *testing.T) {
@@ -146,5 +139,21 @@ func TestM1PodsReachHostService(t *testing.T) {
 	got := runPod(t, "dev-cell-1", "m1-host", []string{"get", "--url", fmt.Sprintf("http://host.docker.internal:%d/", port)})
 	if strings.TrimSpace(got) != want {
 		t.Fatalf("body %q, want %q", got, want)
+	}
+}
+
+func TestM1MirrorOnEveryCluster(t *testing.T) {
+	topo, err := topology.Load(topologyPath)
+	if err != nil {
+		t.Fatalf("load topology: %v", err)
+	}
+	for _, c := range topo.Clusters {
+		t.Run(c.Name, func(t *testing.T) {
+			createNamespace(t, c.Name, "m1-mirror")
+			err := startPod(t, c.Name, "m1-mirror", []string{"serve", "--addr", ":8080"})
+			if err != nil {
+				t.Fatalf("cluster %s: a pod could not run %s through the registry mirror: %v", c.Name, probeImage, err)
+			}
+		})
 	}
 }
