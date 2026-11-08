@@ -10,10 +10,9 @@ OpenTelemetry collector. Every later plane starts from this base.
 ## What you need
 
 - A Mac with Apple silicon and macOS 26 or later.
-- Colima, Lima and the Docker CLI, from your global mise config, with a Colima VM running. For
-  example: `colima start --profile poc --vm-type vz --cpu 14 --memory 40 --disk 120`.
-- mise. It installs every other tool at the version that `mise.toml` pins.
-- About 6 CPUs and 12 GB of memory free for the cell.
+- mise. It installs every tool at the version that `mise.toml` pins, Colima, Lima and the Docker
+  CLI included.
+- 14 CPUs, 40 GB of memory and 120 GB of disk for the Colima VM `poc`.
 
 ## Stand up the cell
 
@@ -23,7 +22,7 @@ mise run cell:up
 mise run cell:verify
 ```
 
-`cell:up` creates the `cell-a-1` cluster and applies the bootstrap set. It then publishes the
+`cell:up` first starts the Colima VM, through `vm:up`. It then creates the `cell-a-1` cluster and applies the bootstrap set. It then publishes the
 bundles and waits until Argo CD reports every Application as Synced and Healthy.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 

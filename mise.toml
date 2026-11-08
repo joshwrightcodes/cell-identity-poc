@@ -1,12 +1,14 @@
-# Tools and tasks for the cell PoC. `mise run <task>` puts these versions first on PATH.
-# Tools from outside this file: mise itself, and Colima, Lima and the Docker CLI from the global
-# mise config. kind runs its clusters on the Colima VM.
+# Tools and tasks for the cell PoC. `mise install` installs every tool, and `mise run <task>`
+# puts these versions first on PATH. kind runs its clusters in the Colima VM that `vm:up` starts.
 
 [settings]
 # mise.lock pins each tool with its checksum. Run `mise lock` after a version change.
 lockfile_platforms = ["macos-arm64", "linux-x64"]
 
 [tools]
+colima = "0.10.3"
+lima = "2.3.0"
+docker-cli = "29.9.3"
 kubectl = "1.37.2"
 helm = "4.3.1"
 kustomize = "5.8.3"
@@ -19,9 +21,20 @@ argocd = "3.6.1"
 
 [env]
 _.file = "cell.env"
+# Every Docker and kind command talks to the PoC VM, whatever the current Docker context is.
+DOCKER_HOST = "unix://{{env.HOME}}/.colima/poc/docker.sock"
+
+[tasks."vm:up"]
+description = "Start the Colima VM that runs the kind clusters"
+run = "colima start --profile poc --vm-type vz --cpu 14 --memory 40 --disk 120 --runtime docker"
+
+[tasks."vm:down"]
+description = "Stop the Colima VM. kind clusters stop with it"
+run = "colima stop --profile poc"
 
 [tasks."cell:up"]
 description = "Create the cluster, apply the bootstrap set, publish every bundle and wait for Argo CD"
+depends = ["vm:up"]
 run = "scripts/up.sh"
 
 [tasks."cell:hydrate"]

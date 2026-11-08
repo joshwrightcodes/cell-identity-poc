@@ -4,11 +4,13 @@
 
 - Run every tool through `mise run <task>` or `mise x -- <tool>`, because `mise.toml` pins the versions.
 - Use the kubeconfig context that kind writes, `kind-<cluster>`. Do not write another kubeconfig file.
+- Every Docker command uses the PoC VM through `DOCKER_HOST` in `mise.toml`. Do not change the Docker context.
 
 ## Commands
 
 | Task | Command |
 | --- | --- |
+| Start or stop the Colima VM | `mise run vm:up`, `mise run vm:down` |
 | Stand up the cell | `mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
 | Render bundles only | `mise run cell:hydrate` |
