@@ -13,21 +13,12 @@ type fakeDocker struct {
 	noNet    bool
 	stale    bool
 	rootUser bool
-	// runFails makes docker run -d fail. noLegacy makes legacy removals report absence.
-	runFails bool
-	noLegacy bool
 }
 
 func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 	line := strings.Join(args, " ")
 	f.calls = append(f.calls, line)
 	switch {
-	case strings.HasPrefix(line, "run -d ") && f.runFails:
-		return []byte("boom"), errors.New("exit 1")
-	case line == "rm -f kiln-registry" && f.noLegacy:
-		return []byte("Error: No such container: kiln-registry"), errors.New("exit 1")
-	case line == "volume rm kiln-registry-data" && f.noLegacy:
-		return []byte("Error response from daemon: get kiln-registry-data: no such volume"), errors.New("exit 1")
 	case strings.HasPrefix(line, "container inspect") && f.missing:
 		return []byte("Error: No such container"), errors.New("exit 1")
 	case strings.HasPrefix(line, "container inspect") && f.rootUser:
@@ -53,15 +44,6 @@ func (f *fakeDocker) has(prefix string) bool {
 		}
 	}
 	return false
-}
-
-func (f *fakeDocker) index(prefix string) int {
-	for i, c := range f.calls {
-		if strings.HasPrefix(c, prefix) {
-			return i
-		}
-	}
-	return -1
 }
 
 func TestHostsTOMLPointsAtRegistry(t *testing.T) {
@@ -195,57 +177,5 @@ func TestEnsureRegistryReplacesRootContainer(t *testing.T) {
 	}
 	if !d.has("rm -f registry-mirror") || !d.has("run -d ") {
 		t.Errorf("calls = %q", d.calls)
-	}
-}
-
-func TestEnsureRegistryRemovesLegacyContainerBeforeRun(t *testing.T) {
-	d := &fakeDocker{missing: true}
-	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
-	s.Docker = d.run
-	if err := s.EnsureRegistry(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	rm, run := d.index("rm -f kiln-registry"), d.index("run -d ")
-	if rm < 0 || run < 0 || rm > run {
-		t.Errorf("legacy removal at %d, run at %d: %q", rm, run, d.calls)
-	}
-}
-
-func TestEnsureRegistryRemovesLegacyVolumeAfterRun(t *testing.T) {
-	d := &fakeDocker{missing: true}
-	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
-	s.Docker = d.run
-	if err := s.EnsureRegistry(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	vol, run := d.index("volume rm kiln-registry-data"), d.index("run -d ")
-	if vol < 0 || run < 0 || vol < run {
-		t.Errorf("volume removal at %d, run at %d: %q", vol, run, d.calls)
-	}
-	for _, c := range d.calls {
-		if strings.HasPrefix(c, "volume rm") && c != "volume rm kiln-registry-data" {
-			t.Errorf("unexpected volume removal %q", c)
-		}
-	}
-}
-
-func TestEnsureRegistryKeepsLegacyVolumeWhenRunFails(t *testing.T) {
-	d := &fakeDocker{missing: true, runFails: true}
-	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
-	s.Docker = d.run
-	if err := s.EnsureRegistry(context.Background()); err == nil {
-		t.Fatal("want error")
-	}
-	if d.has("volume rm") {
-		t.Errorf("calls = %q", d.calls)
-	}
-}
-
-func TestEnsureRegistryToleratesAbsentLegacyResources(t *testing.T) {
-	d := &fakeDocker{missing: true, noLegacy: true}
-	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
-	s.Docker = d.run
-	if err := s.EnsureRegistry(context.Background()); err != nil {
-		t.Fatal(err)
 	}
 }
