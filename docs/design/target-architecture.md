@@ -24,7 +24,7 @@ each other with SPIFFE identities. No credential is copied between clusters. An 
 cell is rejected, and that includes a cell that attempts a man-in-the-middle (MITM) attack.
 **[owner]**
 
-The PoC runs on one Mac with `container cluster`. The same design then deploys to EKS. Nothing
+The PoC runs on one Mac, with kind clusters in a Colima VM. The same design then deploys to EKS. Nothing
 above the cell controller's provider backend depends on AWS. **[owner]**
 
 ## Domain model
@@ -100,11 +100,11 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 
 ## Constraints
 
-- Local runtime: Apple `container` 1.7.1, from the signed GitHub release, pinned in the global mise config. **[owner]** The harness asserts the exact version.
+- Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository pins kind, and the global mise config pins Colima, Lima and the Docker CLI. The harness asserts the exact versions.
 - Kubernetes v1.37.0 node image, pinned by digest.
-- `container` clusters cannot be stopped and started again, so a Mac restart is a disaster recovery event. The gate runs under `caffeinate`.
+- Until M1 shows that kind clusters survive a restart of the Colima VM, a Mac restart is a disaster recovery event. The gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
-- Images: locally, ko builds into the `container` image store, and clusters use `--shared-image-store`. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
+- Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
 - Telemetry goes through OpenTelemetry (OTLP). Do not add Prometheus client libraries, `/metrics` endpoints or ServiceMonitors. Upstream metrics listeners are turned off.
 - Upstream SPIRE and Argo CD Agent stay unforked. Fixes needed upstream are offered as contributions, after the owner approves each one.
 - Read each third-party component before it runs, and report the result.
@@ -235,7 +235,7 @@ island cannot starve the live view. Kiln's listener admits only relays.
 - The signed cell record carries an endpoint set for the environment control plane. During a move, the set holds the old and the new endpoints together. Every client tries each address in the set.
 - The SPIRE agent takes one server address, so each sidecar connects through a small local forwarder that tries the endpoint set.
 - The endpoints outlive the environment control plane. On EKS, the provider backend owns each NLB and its target groups outside `<env>-cp`, with cross-zone load balancing on. TargetGroupBinding binds them to the cluster. A PrivateLink endpoint service is the alternative if internet exposure is not wanted.
-- Locally, pf forwards fixed ports at the vmnet gateway address. The rules live in a scoped anchor under `com.apple/` and apply only to the vmnet bridge interface.
+- Locally, every node is a container on the shared `kind` network in the Colima VM. The endpoint set holds node addresses on that network, so no relay on the Mac is needed.
 - NodePort values are pinned, in the range 30000–32767. Plane listeners use `externalTrafficPolicy: Local`, and each platform has its own ingress rule for them.
 - The NLBs have no source allow-list. A pre-authentication limiter in front of each plane listener bounds handshakes and connections.
 
@@ -246,7 +246,7 @@ island cannot starve the live view. Kiln's listener admits only relays.
 - The bootstrap actor has its own grant, which Kiln deletes at the end of bootstrap. The gate tests that a connection then fails, not only that the grant is gone.
 - Each cell has two subnet routers outside its cluster, with persisted state, so break-glass does not depend on the cell's cluster or on Kiln. Operators re-enrol a router with their own tailnet admin role.
 - Each cell has a unique CIDR allocation, recorded in the signed record. Routes are approved only for that CIDR.
-- Locally, vmnet stands in for the tailnet, so the local run cannot prove this property. The EKS run proves it.
+- Locally, the shared `kind` network stands in for the tailnet, so the local run cannot prove this property. The EKS run proves it.
 
 ### Network isolation **[call]**
 
@@ -299,7 +299,8 @@ which would fail during an island after a cluster key rotation. A sidecar whose 
 expired attests again as a new agent, with a new nonce.
 
 - The server prunes old agents with `prune_tofu_nodes = true` and `prune_attested_nodes_expired_for`.
-- SPIRE's built-in per-IP limit is turned off, because cells share addresses. The nonce cache and the per-cell limits live in the SPIRE datastore, so a second server shares them.
+- SPIRE's built-in per-IP limit is turned off, because cells share addresses. The server makes each nonce inside one attestation stream, so a token copied into another stream fails, and no nonce cache is needed.
+- Plugins have no datastore access: the plugin SDK offers only the `agentstore` and `identityprovider` host services (as of 2026-11-08). Each server keeps its own per-cell limit in memory, so a second server divides the limit.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
 
 ### Independent key check **[call]**
@@ -399,11 +400,12 @@ quarter.
 
 | Backend | Use | Creates clusters with | Keys from |
 | --- | --- | --- | --- |
-| `local` | Mac demo and every local milestone | `container cluster`, through the host service | Host service, over pinned TLS |
-| `kind` | Linux CI | kind, through a runner-side service | The same, on the runner |
+| `kind` | Mac demo, every local milestone, and any Linux host with Docker | kind, through the host service | Host service, over pinned TLS |
 | `aws` | EKS, phase 2 | ACK controllers | Public issuer JWKS |
 
-- The `local` backend is the only way the harness creates cells from M1, so there is one provisioning path.
+- The `kind` backend is the only way the harness creates cells from M1, so there is one provisioning path.
+- The host service runs on the Mac, outside every cluster, and listens on the loopback address only. Clusters reach it through `host.docker.internal`, which Colima forwards to the Mac's loopback address.
+- Each cluster gets its own pod and service subnets, recorded in the signed record. The harness refuses an overlap.
 - The cell controller acts only on steps of a Kiln-signed spec, for cells of its own environment.
 - On EKS, an organisation-level policy that the environment cannot change denies the cell controller's roles any access or IAM change in cell accounts after bootstrap. Accounts come from a narrow provisioner in the management account, triggered only by Kiln-signed steps. **[phase 2]**
 - A cell that fails part way is left tagged. A sweeper compares tags with the spec, and a decommission step removes what the spec does not hold.
@@ -734,7 +736,7 @@ Every random choice in a test records its seed.
 - During an island, a cell that Kiln revoked continues until an operator revokes it locally.
 - An emergency key removal cannot reach a cell in island mode until it reconnects. Until then, approver signatures bound what a stolen Kiln key can do there.
 - Live-view pod logs outside `ops-runs` rest on the rule that services log no personal data.
-- Locally, any cluster can reach another cluster's Kubernetes API on vmnet, and every cluster shares one source address. EKS removes both.
+- Locally, any cluster can reach another cluster's Kubernetes API on the shared `kind` network. EKS removes this.
 - Argo CD Agent is a v0.x project, and its principal HA is beta.
 
 ## Testing tiers **[call]**
@@ -749,7 +751,7 @@ Every random choice in a test records its seed.
 Hosted runners for private repositories have 2 CPUs, 8 GB and 14 GB of disk (verified), so they
 run no clusters. A larger runner is an option later, and needs no design change.
 
-Some tests cannot pass on the Mac by design. Locally, clusters share vmnet, so isolation tests
+Some tests cannot pass on the Mac by design. Locally, clusters share the `kind` network, so isolation tests
 target the pod network only. Tests of ACK deletion policy and per-request IAM credentials need
 AWS, so they run in the EKS gate.
 
@@ -779,13 +781,16 @@ this order, each with its own scope document:
 
 | Item | Milestone | Fallback |
 | --- | --- | --- |
-| Pod-to-NodePort traffic across `container cluster` clusters through pf | M1 | Stop and report |
-| `--shared-image-store` serves ko images to cluster nodes | M1 | A registry container on vmnet |
-| A storage provisioner that passes review | M1 | Stop and report |
+| Pod-to-NodePort traffic between kind clusters on the `kind` network | M1 | Stop and report |
+| Pod traffic to another cluster leaves with its own node address | M1 | Tests key on SVIDs only |
+| Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config |
+| Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster |
+| kind's local-path provisioner passes review | M1 | Stop and report |
+| kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
 | Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |
-| Service account key rotation on `container cluster` nodes | M2 | Run that test in the Linux gate only |
+| Service account key rotation on kind nodes | M2 | Stop and report |
 | Approver signatures from device-held keys in the PoC | M4 | Software keys per test approver |
 | Argo CD OCI source through a localhost proxy that adds a token | M7 | Local TLS on the proxy |
 | Argo CD Agent v0.10.0 with Argo CD v3.6.1, header auth behind `cell-proxy` | M8 | The newest v3.5 release |
