@@ -1,0 +1,21 @@
+# The root Application. It follows the root bundle's current tag, and each child Application
+# in that bundle pins its own bundle by digest. Bootstrap applies it once. It is not in a
+# bundle, because the argocd Application would then wait for the root, which waits for argocd.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: cell
+  source:
+    repoURL: oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/root
+    targetRevision: current
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

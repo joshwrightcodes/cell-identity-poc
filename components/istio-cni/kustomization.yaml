@@ -1,0 +1,11 @@
+# The Istio CNI node agent. It sets up traffic redirection, so app pods need no NET_ADMIN init container.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+helmGlobals:
+  chartHome: ../../vendor/charts/istio-1.30.8
+helmCharts:
+  - name: cni
+    releaseName: istio-cni
+    namespace: istio-system
+    kubeVersion: "1.37.0"
+    valuesFile: values.yaml

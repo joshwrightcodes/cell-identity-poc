@@ -1,0 +1,65 @@
+# One allowed external host, example.com, so the checks can prove the egress path.
+# The gateway passes TLS through, so the client still checks the server certificate itself.
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata:
+  name: example-com
+  namespace: istio-egress
+spec:
+  hosts:
+    - example.com
+  ports:
+    - number: 443
+      name: tls
+      protocol: TLS
+  resolution: DNS
+  location: MESH_EXTERNAL
+---
+apiVersion: networking.istio.io/v1
+kind: Gateway
+metadata:
+  name: egress
+  namespace: istio-egress
+spec:
+  selector:
+    istio: egressgateway
+  servers:
+    - port:
+        number: 443
+        name: tls
+        protocol: TLS
+      hosts:
+        - example.com
+      tls:
+        mode: PASSTHROUGH
+---
+apiVersion: networking.istio.io/v1
+kind: VirtualService
+metadata:
+  name: example-com
+  namespace: istio-egress
+spec:
+  hosts:
+    - example.com
+  gateways:
+    - mesh
+    - egress
+  tls:
+    - match:
+        - gateways: [mesh]
+          port: 443
+          sniHosts: [example.com]
+      route:
+        - destination:
+            host: istio-egressgateway.istio-egress.svc.cluster.local
+            port:
+              number: 443
+    - match:
+        - gateways: [egress]
+          port: 443
+          sniHosts: [example.com]
+      route:
+        - destination:
+            host: example.com
+            port:
+              number: 443

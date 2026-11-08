@@ -1,0 +1,32 @@
+# Mesh-wide rules. Policies in the root namespace istio-system apply to the whole mesh.
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: telemetry.istio.io/v1
+kind: Telemetry
+metadata:
+  name: mesh-default
+  namespace: istio-system
+spec:
+  tracing:
+    - providers:
+        - name: otel-tracing
+      randomSamplingPercentage: 100
+  accessLogging:
+    - providers:
+        - name: otel-access-log
+---
+# Each workload namespace starts with no allowed requests. An AuthorizationPolicy with
+# an empty spec denies every request to the workloads in its namespace.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: apps-demo
+spec: {}

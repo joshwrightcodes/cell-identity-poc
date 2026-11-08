@@ -1,0 +1,32 @@
+pilot:
+  cni:
+    enabled: true
+  autoscaleEnabled: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+global:
+  proxy:
+    resources:
+      requests:
+        cpu: 20m
+        memory: 64Mi
+meshConfig:
+  trustDomain: "@CELL_MESH_TRUST_DOMAIN@"
+  outboundTrafficPolicy:
+    mode: REGISTRY_ONLY
+  enablePrometheusMerge: false
+  extensionProviders:
+    - name: otel-tracing
+      opentelemetry:
+        service: otel-collector.observability-system.svc.cluster.local
+        port: 4317
+    - name: otel-access-log
+      envoyOtelAls:
+        service: otel-collector.observability-system.svc.cluster.local
+        port: 4317
+telemetry:
+  v2:
+    prometheus:
+      enabled: false

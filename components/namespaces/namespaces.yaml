@@ -1,0 +1,52 @@
+# Every namespace that the base cell owns. Mesh membership and Pod Security level are set here.
+# Platform namespaces stay out of the mesh, so Argo CD can repair Istio and SPIRE does not depend on it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cell-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+  labels:
+    istio-injection: disabled
+    # istio-cni installs the CNI plugin on each node, so it needs host access.
+    pod-security.kubernetes.io/enforce: privileged
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability-system
+  labels:
+    # Envoy sends traces and access logs to the collector in plaintext, so strict mTLS would reject them.
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-egress
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps-demo
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted
+    cell.poc.internal/workloads: "true"

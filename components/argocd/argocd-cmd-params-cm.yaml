@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cmd-params-cm
+data:
+  # Argo CD sends traces to the in-cluster collector over OTLP.
+  otlp.address: otel-collector.observability-system.svc.cluster.local:4317
+  otlp.insecure: "true"
