@@ -308,3 +308,38 @@ Unicode, `os/exec`, `sudo` and `net/http` in non-test code.
 
 The review compared no module with its upstream repository. Because of this, the result rests
 on the module checksums in `go.sum` and on the read of the cache.
+
+## Kubernetes client modules (2026-11-08)
+
+The agent plugin requests a service account token through the Kubernetes API. It imports
+`k8s.io/client-go`, `k8s.io/api` and `k8s.io/apimachinery` at v0.37.1, which matches Kubernetes
+1.37. The tag date is 2026-09-23. Version v0.37.2 is dated 2026-10-28 and is too new.
+
+The plugin uses only the typed core client (`kubernetes/typed/core/v1`) and `rest.InClusterConfig`.
+The tests also import the fake clientset and `testing` package. The review searched the packages
+in the build of `cmd/cluster-jwt-agent` in the Go module cache. It ran nothing from them. The
+search covered 218 packages from the Kubernetes, `sigs.k8s.io`, OpenAPI, YAML and OAuth modules
+in the table below, and found no hidden Unicode.
+
+| Finding | Detail |
+| --- | --- |
+| Network | The client dials the API server only. `rest.InClusterConfig` reads `KUBERNETES_SERVICE_HOST`, `KUBERNETES_SERVICE_PORT` and the mounted service account files. The plugin sets no other address. |
+| Process start | `client-go/plugin/pkg/client/auth/exec` uses `os/exec` to run a credential helper. The plugin never sets that option, because an in-cluster configuration has none. The code stays in the binary. |
+| `sudo` | No match in the searched packages. |
+| Credentials | The client reads the pod token file. The plugin never logs a token. |
+
+The build also adds these modules: `go-restful`, `go-openapi/*`, `gnostic-models`,
+`kube-openapi`, `json-iterator`, `modern-go/*`, `fxamacker/cbor`, `x448/float16`, `klog`,
+`go-logr`, `golang.org/x/oauth2`, `x/term`, `x/time`, `gopkg.in/inf.v0`, `json-patch.v4`,
+`structured-merge-diff`, `sigs.k8s.io/json`, `sigs.k8s.io/randfill`, `google/uuid`,
+`munnerz/goautoneg` and `go-spew`. They are transitive. The review matched their code only
+against the searches above.
+
+The upgrade raises `google.golang.org/protobuf` to v1.36.12-0.20260120151049-f2248ac996af,
+`spf13/pflag` to v1.0.10 and `go.yaml.in/yaml/v2` to v2.4.4. SPIRE v1.15.5 pins protobuf v1.36.11.
+A plugin does not need the same protobuf version as SPIRE, because they share only the wire format.
+The effect of this difference is not verified.
+
+The review did not read the other client-go packages, the generated clientset for other API
+groups, or the test files. It did not compare any module with its upstream repository. Because of
+this, the result rests on the checksums in `go.sum` and on the read of the cache.
