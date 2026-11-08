@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -34,10 +35,16 @@ func (s *subjects) Set(v string) error {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, nil); err != nil {
-		fmt.Fprintln(os.Stderr, "recordgen failed:", err)
-		os.Exit(1)
+	os.Exit(execute(os.Args[1:], os.Stdout, nil))
+}
+
+// execute runs the command. On failure it writes one compact JSON error line to w and returns 1.
+func execute(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) int {
+	if err := run(args, w, facts); err != nil {
+		slog.New(slog.NewJSONHandler(w, nil)).Error("recordgen failed", "error", err.Error())
+		return 1
 	}
+	return 0
 }
 
 func hostsvcFacts(topologyPath string) func(string) (hostsvc.Facts, error) {
@@ -52,6 +59,7 @@ func hostsvcFacts(topologyPath string) func(string) (hostsvc.Facts, error) {
 
 func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) error {
 	fs := flag.NewFlagSet("recordgen", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	cluster := fs.String("cluster", "", "cluster to read facts from")
 	topologyPath := fs.String("topology", "harness/topology.yaml", "topology file")
 	var subs subjects
