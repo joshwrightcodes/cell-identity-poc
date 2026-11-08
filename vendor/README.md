@@ -124,9 +124,14 @@ image configuration and history with `docker image inspect` and `docker history`
   only port 5000. The bundle store keeps the default listener until its own change.
 - Setuid and setgid: `docker run --rm --entrypoint find <image> / -xdev ( -perm -4000 -o -perm -2000 ) -type f`
   printed nothing. The entrypoint override runs only `find`, not the registry.
-- Persistence: no `/etc/init.d`, `/etc/rc.d` or `/etc/cron.d`. The Alpine default root crontab exists,
-  but all five `/etc/periodic` directories are empty, and the entrypoint starts no `crond`.
-  The only startup file is `/entrypoint.sh`. Blobs persist in the `/var/lib/registry` volume, by design.
+- Persistence: a shell with the entrypoint overridden checked the usual startup paths. The image has no
+  `/etc/init.d`, `/etc/rc.d`, `/etc/cron.d`, `/etc/local.d`, `/etc/conf.d` or `/etc/rc.local`.
+  The default Alpine crontab for root exists, but all five `/etc/periodic` directories are empty.
+  The entrypoint starts no `crond`.
+  `/etc/inittab` and `/etc/profile.d` hold Alpine defaults. The entrypoint runs no `init` and no login
+  shell, so neither file takes effect.
+- Volume: `docker image inspect` shows the declared volume `/var/lib/registry`. `internal/hostsvc/registry.go`
+  mounts the named volume `kiln-registry-data` at that path. Blobs persist after a container restart, by design.
 - The scripts and configuration contain no non-ASCII characters.
 - The review did not decompile the `registry` binary, which is 52 MB and owned by root.
 - The review did not check that binary against the upstream source tag.
