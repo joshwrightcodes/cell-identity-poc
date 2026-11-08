@@ -50,7 +50,8 @@ SPIRE_SERVER_COMPONENTS=(
 )
 
 # Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
-# out of the root bundle and out of every Argo CD Application, so no bundle can change them.
+# out of the root bundle and out of every Argo CD Application. A bundle can still write to their
+# namespace, as the residual limits in docs/design/poc-scope.md say.
 # Each entry is <component>:<namespace>.
 # celld with its SPIRE agent sidecar attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
 CELL_IDENTITY_HARNESS=(

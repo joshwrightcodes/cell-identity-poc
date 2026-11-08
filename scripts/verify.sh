@@ -198,7 +198,8 @@ check_celld_svid() {
   fi
   echo "the last identity event of celld is ${line:-missing}, want an SVID for $want with a not_after in the future."
   echo "Read the agent log: mise x -- kubectl --context kind-$CELL_NAME -n cell-identity-system logs deploy/celld -c spire-agent"
-  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify. Then run: CELL=$CELL_NAME mise run cell:up"
+  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify runs the check 'The SPIRE server holds the node alias and celld entries'."
+  echo "Then run: CELL=$CELL_NAME mise run cell:up"
   return 1
 }
 
@@ -225,7 +226,7 @@ max_first_block=10
 # max_first_block seconds of Ready, and three more dials over about six seconds must also time
 # out. The time to the first block goes to build/<cluster>/verify-probes.log.
 expect_dial_blocked() {
-  local cluster="$1" ns="$2" addr="$3" image name overrides out="" dialed="" result=1 ready_at first="" i
+  local cluster="$1" ns="$2" addr="$3" image name overrides out="" dialed="" result=1 ready_at dial_start first="" i
   local kc=(kubectl --context "kind-$cluster" -n "$ns")
   image="$(sed -n 's/^IMAGE_NETPROBE=//p' "$BUILD_ROOT/images.env" 2>/dev/null)"
   [[ -n "$image" ]] || { echo "build/images.env has no IMAGE_NETPROBE. Run mise run images."; return 1; }
@@ -245,12 +246,16 @@ expect_dial_blocked() {
   }
   if "${kc[@]}" wait --for=condition=Ready "pod/$name" --timeout=120s >/dev/null 2>&1; then
     ready_at=$SECONDS
+    # first is the time from Ready to the start of the first dial that timed out.
     while ((SECONDS - ready_at <= max_first_block)); do
+      dial_start=$SECONDS
       dial
-      if [[ "$dialed" == timeout ]]; then first=$((SECONDS - ready_at)); break; fi
+      if [[ "$dialed" == timeout ]]; then first=$((dial_start - ready_at)); break; fi
       sleep 1
     done
-    if [[ -z "$first" ]]; then
+    if [[ -n "$first" ]] && ((first > max_first_block)); then
+      echo "a probe pod in $cluster/$ns was first blocked ${first}s after Ready, over the limit of ${max_first_block}s"
+    elif [[ -z "$first" ]]; then
       echo "a probe pod in $cluster/$ns still reached $addr ${max_first_block}s after Ready: $out"
     else
       result=0
@@ -286,16 +291,85 @@ check_harness_drift() {
   esac
 }
 
-# The harness apply does not prune, so a NetworkPolicy that left the bundle would stay in force.
-check_harness_policies() {
-  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" want got
-  want="$(yq -o=json -I=0 "select(.kind == \"NetworkPolicy\") | .metadata.name" "$bundle" | jq -rs 'sort | join(" ")')"
-  got="$(k -n "$ns" get networkpolicies -o json | jq -r '[.items[].metadata.name] | sort | join(" ")')"
-  [[ "$got" == "$want" ]] || {
-    echo "$ns has the NetworkPolicies '$got', and the bundle $comp has '$want'."
-    echo "Delete each extra NetworkPolicy, then run: CELL=$CELL_NAME mise run cell:up"
+# The harness apply does not prune, and kubectl diff sees only the fields of its own field manager.
+# So for each kind in the bundle, the namespace must hold exactly the objects of the bundle, apart
+# from objects that only system controllers write, for example kube-root-ca.crt. Each object of
+# the bundle must have only the field manager kubectl, and kube-controller-manager for status.
+check_harness_objects() {
+  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad problems=()
+  for kind in $(yq -N -r 'select(.kind != null and .kind != "Namespace") | .kind' "$bundle" | sort -u); do
+    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
+    live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
+    got="$(jq -r --arg label "cell.poc.internal/harness" '[.items[]
+      | select((.metadata.labels[$label] // "") != ""
+        or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
+      | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
+    [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' that the harness or a person wrote, and the bundle $comp has '$want'")
+    bad="$(jq -r --arg want " $want " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
+      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
+        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
+      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$live")" \
+      || { echo "could not read the field managers of $kind in $ns"; return 1; }
+    [[ -z "$bad" ]] || problems+=("$bad")
+  done
+  live="$(k get namespace "$ns" -o json --show-managed-fields)" || { echo "no namespace $ns"; return 1; }
+  bad="$(jq -r --arg ns "$ns" '.metadata.managedFields[]? | select(.manager == "kubectl" and .operation == "Apply" | not)
+    | "Namespace/\($ns) has the field manager \(.manager)"' <<<"$live")" \
+    || { echo "could not read the field managers of $ns"; return 1; }
+  [[ -z "$bad" ]] || problems+=("$bad")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Delete each extra object, and each field that another manager added. Then run: CELL=$CELL_NAME mise run cell:up"
     return 1
-  }
+  fi
+}
+
+# image_ref <name> prints the reference of cmd/<name> in build/images.env.
+image_ref() {
+  sed -n "s/^IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$1")=//p" "$BUILD_ROOT/images.env" 2>/dev/null
+}
+
+# check_live_images <namespace> <kind/name> <command>: every local image of the workload must be the
+# one that build/images.env records for it.
+check_live_images() {
+  local ns="$1" workload="$2" next="$3" image name want bad=()
+  for image in $(k -n "$ns" get "$workload" -o json \
+      | jq -r '.spec.template.spec | ((.initContainers // []) + .containers)[].image | select(startswith("localhost:5001/"))'); do
+    name="${image#localhost:5001/}"
+    name="${name%%@*}"
+    want="$(image_ref "$name")"
+    [[ -n "$want" && "$image" == "$want" ]] || bad+=("$workload runs $image, and build/images.env has '${want:-nothing}' for $name")
+  done
+  if ((${#bad[@]} > 0)); then
+    printf '%s\n' "${bad[@]}"
+    echo "Run: $next"
+    return 1
+  fi
+}
+
+# The SPIRE server must hold the node alias and the celld entry of each agent cell, with the
+# parents and selectors that the render declares.
+check_agent_entries() {
+  local entries cell sa missing=()
+  entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not read the entries from spire-server-0"; return 1; }
+  sa="${SPIRE_AGENT_SUBJECT/\//:}"
+  for cell in $SPIRE_AGENT_CELLS; do
+    jq -e --arg cell "$cell" --arg sa "$sa" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/nodes"
+      and .parent_id.path == "/spire/server"
+      and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
+      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://dev.env.poc.internal/cell/$cell/nodes with the selectors of $cell")
+    jq -e --arg cell "$cell" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/celld"
+      and .parent_id.path == "/cell/\($cell)/nodes"
+      and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
+      <<<"$entries" >/dev/null || missing+=("no celld entry spiffe://dev.env.poc.internal/cell/$cell/celld with selector unix:uid:65532")
+  done
+  if ((${#missing[@]} > 0)); then
+    printf '%s\n' "${missing[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
 }
 
 check_traces_received() {
@@ -336,7 +410,10 @@ if has_harness cell-identity; then
   check "The agent config and the NetworkPolicy use the current $SPIRE_SERVER_CLUSTER node address" check_spire_server_address
   check "celld holds a current X.509 SVID for spiffe://dev.env.poc.internal/cell/$CELL_NAME/celld" check_celld_svid
   check "The cell-identity objects match the bundle" check_harness_drift cell-identity
-  check "cell-identity-system has exactly the NetworkPolicies of the bundle" check_harness_policies cell-identity cell-identity-system
+  check "cell-identity-system has exactly the objects of the bundle, with no other field manager" \
+    check_harness_objects cell-identity cell-identity-system
+  check "celld runs the images that build/images.env records" \
+    check_live_images cell-identity-system deployment/celld "CELL=$CELL_NAME mise run cell:up"
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the SPIRE node port (steady state)" \
     expect_dial_blocked "$CELL_NAME" cell-identity-system "${spire_ip:-unknown}:30081"
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the collector (steady state)" \
@@ -346,6 +423,9 @@ if has_harness cell-identity; then
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
+  check "The SPIRE server holds the node alias and celld entries of $SPIRE_AGENT_CELLS" check_agent_entries
+  check "The SPIRE server runs the plugin image that build/images.env records" \
+    check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.
   probe_targets+=("rogue/default")
   own_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"

@@ -28,10 +28,21 @@ jq -e --arg name "$secret" --arg ns "$namespace" \
 store_namespaces="${SECRET_STORE_NAMESPACES:-}"
 [[ -n "${store_namespaces// /}" ]] || die "cells/$CELL.env sets no SECRET_STORE_NAMESPACES"
 
-if ! k get crd clustersecretstores.external-secrets.io >/dev/null 2>&1 \
-  || ! k -n "$namespace" get deployment external-secrets >/dev/null 2>&1; then
-  die "the External Secrets Operator is not installed in kind-$CELL_NAME. Run CELL=$CELL mise run cell:up first."
-fi
+# In a second shell during cell:up, the operator can still be on its way. Wait for its CRD and for
+# an available controller, for up to SECRETS_CONNECT_ESO_WAIT seconds.
+eso_wait="${SECRETS_CONNECT_ESO_WAIT:-300}"
+eso_ready() {
+  k get crd clustersecretstores.external-secrets.io >/dev/null 2>&1 \
+    && k -n "$namespace" get deployment external-secrets -o json 2>/dev/null | jq -e '(.status.availableReplicas // 0) >= 1' >/dev/null
+}
+end=$((SECONDS + eso_wait))
+until eso_ready; do
+  if ((SECONDS >= end)); then
+    log "check the operator: mise x -- kubectl --context kind-$CELL_NAME -n argocd get application external-secrets"
+    die "the External Secrets Operator in kind-$CELL_NAME is not ready after ${eso_wait}s. Run CELL=$CELL mise run secrets:connect again when it is Healthy."
+  fi
+  sleep 5
+done
 
 # The command runs in a child shell. Its standard error still reaches the terminal.
 token="$(bash -c "$POC_SECRET_TOKEN_CMD")" || die "POC_SECRET_TOKEN_CMD failed"

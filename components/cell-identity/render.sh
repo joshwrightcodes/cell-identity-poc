@@ -66,15 +66,18 @@ config_maps="$(config_map spire-agent agent.conf "$agent_conf"; echo "---"; conf
 # The checksum covers the config after hydrate replaces @CELL_NAME@, so it differs for each cell.
 config_checksum="$(printf '%s' "${config_maps//@CELL_NAME@/$CELL_NAME}" | sha256)"
 
-PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
-  (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
-    .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
-' "$here/manifests.yaml" \
-  | sed -e "s|@SPIRE_AGENT_PLUGIN_IMAGE@|$plugin_image|" \
-    -e "s|@CELLD_IMAGE@|$celld_image|" \
-    -e "s|@SPIRE_AGENT_CONFIG_CHECKSUM@|$config_checksum|" \
-    -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
-    -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
-    -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|"
-echo "---"
-echo "$config_maps"
+# Every object carries the harness label, so cell:verify can find the objects of the component.
+{
+  PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
+    (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
+      .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
+  ' "$here/manifests.yaml" \
+    | sed -e "s|@SPIRE_AGENT_PLUGIN_IMAGE@|$plugin_image|" \
+      -e "s|@CELLD_IMAGE@|$celld_image|" \
+      -e "s|@SPIRE_AGENT_CONFIG_CHECKSUM@|$config_checksum|" \
+      -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
+      -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
+      -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|"
+  echo "---"
+  echo "$config_maps"
+} | yq '.metadata.labels["cell.poc.internal/harness"] = "cell-identity"'

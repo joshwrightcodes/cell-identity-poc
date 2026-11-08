@@ -55,7 +55,7 @@ After that it runs `cell:up` for each cluster that has the `base-cell` component
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
 Last, `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
-Harness components stay outside every Argo CD Application, so no bundle can change them.
+Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 
 `harness:up` stops at the first cluster that fails, so a failure in `dev-cp` also stops the cells.
@@ -105,6 +105,9 @@ CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
 CELL=dev-cell-1 mise run cell:restart
 CELL=dev-cell-2 mise run cell:restart
+CELL=dev-cp mise run cell:verify
+CELL=dev-cell-1 mise run cell:verify
+CELL=dev-cell-2 mise run cell:verify
 ```
 
 ## Size and time
@@ -162,7 +165,23 @@ The bundle store keeps bundles on a persistent volume, so they survive a pod res
 A harness component, for example `cell-identity`, reaches a cell only through `CELL=<cell> mise run cell:up`.
 `cell:publish` does not push it. `cell:up` applies it with server-side apply and does not prune.
 An object that leaves the bundle therefore stays in the cluster until you delete it.
-`cell:verify` compares the live objects with the bundle, and it reports a NetworkPolicy that the bundle does not hold.
+`cell:verify` compares the live objects with the bundle.
+It checks the field values, the objects of each kind that the bundle holds, and the field managers of those objects.
+It does not report an extra object of a kind that the bundle does not hold.
+
+Each image reaches its cluster through one command:
+
+| Image | Runs in | Reaches the cluster through |
+| --- | --- | --- |
+| `netprobe` | Test pods of the gates and `cell:verify` probes in every cluster | `mise run gate:m1`, `mise run gate:m2` and `mise run cell:verify` |
+| `cluster-jwt-server` | The init container of the SPIRE server in `dev-cp` | `CELL=dev-cp mise run cell:up`, through the `spire-server` bundle and Argo CD |
+| `cluster-jwt-agent` | The init container of the `celld` pod in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
+| `celld` | The `celld` container in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
+
+`mise run images` builds all four and records their digests in `build/images.env`.
+`cell:verify` fails when a running image differs from that file.
+ko stamps the commit of the checkout into each binary, so a new commit gives new digests.
+`gate:m1` runs `mise run images` first. After a new commit or a `gate:m1` run, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
 
 ## Keys
 

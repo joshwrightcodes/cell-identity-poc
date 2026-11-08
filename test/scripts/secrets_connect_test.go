@@ -46,6 +46,9 @@ case " $* " in
     echo "condition met" ;;
   *" get clustersecretstore "*)
     echo "unable to access the vault" ;;
+  *" -n external-secrets get deployment external-secrets -o json "*)
+    [[ -z "${STUB_NO_ESO:-}" ]] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }
+    echo '{"status":{"availableReplicas":1}}' ;;
   *" get externalsecrets.external-secrets.io -o json "*)
     [[ -z "${STUB_NO_ES:-}" ]] || { echo '{"items":[]}'; exit 0; }
     echo '{"items":[
@@ -265,7 +268,7 @@ func TestSecretsConnectFailsClosed(t *testing.T) {
 			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"poc-secrets-token","key":"token","namespace":"external-secrets"}},"b":{}}`}, "one provider"},
 		{"provider does not use the token secret", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token,
 			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"other","key":"token","namespace":"external-secrets"}}}`}, "poc-secrets-token"},
-		{"operator not installed", append(both(), "STUB_NO_ESO=1"), "External Secrets Operator"},
+		{"operator not installed", append(both(), "STUB_NO_ESO=1", "SECRETS_CONNECT_ESO_WAIT=1"), "Run CELL=dev-cp mise run secrets:connect again when it is Healthy"},
 		{"token command fails", []string{"POC_SECRET_TOKEN_CMD=echo partial; exit 3", "POC_SECRET_STORE_PROVIDER=" + provider}, "POC_SECRET_TOKEN_CMD"},
 		{"token command prints nothing", []string{"POC_SECRET_TOKEN_CMD=true", "POC_SECRET_STORE_PROVIDER=" + provider}, "no token"},
 	}

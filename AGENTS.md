@@ -40,8 +40,8 @@
 ## Key Conventions
 
 - Add a component as `components/<name>/`, then add it to a component set in `scripts/lib.sh`.
-  An Argo CD component goes in a set that `COMPONENTS` takes. A harness component, which no bundle may
-  change, goes in a set that `HARNESS_COMPONENTS` takes. `cell:up` applies harness components itself.
+  An Argo CD component goes in a set that `COMPONENTS` takes. A harness component, which stays outside
+  Argo CD, goes in a set that `HARNESS_COMPONENTS` takes. `cell:up` applies harness components itself.
 - A component is a kustomization, or an executable `render.sh` that prints YAML.
 - `@CELL_NAME@` and `@CELL_MESH_TRUST_DOMAIN@` in rendered output are replaced by `scripts/hydrate.sh`.
 - Extra Application fields for a component go in `components/<name>/application.yaml`.

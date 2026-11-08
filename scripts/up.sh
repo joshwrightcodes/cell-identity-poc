@@ -89,8 +89,11 @@ done
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   ns="${entry#*:}"
   for deployment in $(k -n "$ns" get deployments -o name); do
-    k -n "$ns" rollout status "$deployment" --timeout=300s >/dev/null \
-      || die "$deployment in $ns did not finish its rollout in 300s"
+    if ! k -n "$ns" rollout status "$deployment" --timeout=300s >/dev/null; then
+      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $ns describe $deployment"
+      log "read the logs: mise x -- kubectl --context kind-$CELL_NAME -n $ns logs $deployment --all-containers"
+      die "$deployment in $ns did not finish its rollout in 300s"
+    fi
   done
   log "harness component ${entry%%:*} is rolled out"
 done

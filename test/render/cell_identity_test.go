@@ -44,6 +44,14 @@ func TestRenderCellIdentity(t *testing.T) {
 		}
 	}
 
+	t.Run("every object carries the harness label", func(t *testing.T) {
+		for key, o := range objs {
+			if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
+				t.Errorf("%s has harness label %v, want cell-identity", key, v)
+			}
+		}
+	})
+
 	t.Run("namespace is restricted and outside the mesh", func(t *testing.T) {
 		labels := get[map[string]any](t, objs["Namespace/cell-identity-system"], "metadata", "labels")
 		if labels["pod-security.kubernetes.io/enforce"] != "restricted" || labels["istio-injection"] != "disabled" {
