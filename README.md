@@ -43,18 +43,22 @@ the full design.
 
 ```sh
 mise install
-mise run cell:up
-mise run cell:verify
+mise run harness:up
+CELL=dev-cell-1 mise run cell:verify
 ```
 
-`cell:up` first starts the Colima VM, through `vm:up`. It then creates the `cell-a-1` cluster and applies the bootstrap set. It then publishes the
-bundles and waits until Argo CD reports every Application as Synced and Healthy.
+`harness:up` starts the Colima VM, through `vm:up`. It then creates all five clusters through the host service.
+After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
+`cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
+
+The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
+An unknown name fails with a list of the known cells. For example, `CELL=kiln mise run cell:up` stands up the base cell on `kiln` only.
 
 ## How a change reaches the cell
 
 1. Change a component under `components/`.
-2. Run `mise run cell:hydrate` to render every component into `build/bundles/`.
+2. Run `mise run cell:hydrate` to render every component into `build/<cluster>/bundles/`.
 3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
@@ -65,7 +69,8 @@ If its pod restarts, run `mise run cell:publish` again.
 
 | Path | Contents |
 | --- | --- |
-| `cell.env` | Cell name, size, trust domain and upstream versions |
+| `cells/` | `common.env` holds upstream versions. `<cluster>.env` holds the name, trust domain and bundle store port |
+| `harness/` | The topology of the five clusters |
 | `bootstrap/` | The root Application, applied once |
 | `components/` | One directory for each bundle |
 | `scripts/` | The scripts behind the mise tasks |
@@ -80,12 +85,15 @@ It needs no login, and it stops when you press Ctrl-C.
 
 ```sh
 mise run cell:ui
-kubectl --context kind-cell-a-1 -n argocd get applications
-kubectl --context kind-cell-a-1 -n observability-system logs deploy/otel-collector
+kubectl --context kind-dev-cell-1 -n argocd get applications
+kubectl --context kind-dev-cell-1 -n observability-system logs deploy/otel-collector
 ```
 
 ## Remove the cell
 
 ```sh
-mise run cell:down
+CELL=dev-cell-1 mise run cell:down
+mise run harness:down
 ```
+
+`cell:down` deletes one cluster. `harness:down` deletes all five.

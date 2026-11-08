@@ -9,7 +9,7 @@ Every cluster in the PoC has the same base: a Kubernetes cluster, Argo CD, Istio
 policy and an OpenTelemetry collector. Each role then adds its own services. A shared base
 lets one set of checks prove the base once, for every role.
 
-This milestone stands up one cell, `cell-a-1`, with no SPIRE, worker or other planes. It
+This milestone stands up the base cell on four clusters: `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. It adds no SPIRE, worker or other planes. It
 proves that the base works before identity work starts.
 
 ## Goals
@@ -79,7 +79,7 @@ plaintext. Strict mTLS on the collector would reject them.
 ### Mesh
 
 - The mesh runs in sidecar mode with istio-cni, so workload pods meet the restricted Pod Security level.
-- istiod uses its own self-signed CA. The trust domain is `cell-a-1.mesh.poc.internal`.
+- istiod uses its own self-signed CA. The trust domain is `<cluster>.mesh.poc.internal`, for example `dev-cell-1.mesh.poc.internal`.
 - The mesh trust domain is never federated, and it never chains to a shared root.
 - This CA is a signing key inside the cell. The design allows it because nothing outside the cell trusts it.
 - Peer authentication is strict for the whole mesh.
@@ -136,6 +136,12 @@ plaintext. Strict mTLS on the collector would reject them.
 - The gateway chart adds a CPU autoscaler by default. The cluster has no metrics API, so the
   values turn the autoscaler off.
 - Istio trims most Envoy stats. The egress check reads per-host counters from `/clusters` instead.
+- On 2026-11-08, the cluster `cell-a-1` was the M0 base cell. M1 replaced it with `dev-cell-1` and three more clusters.
+- On 2026-11-08, the fourth kind cluster failed to start. systemd in the node container reported
+  "Too many open files" because the VM allows 128 inotify instances. `vm:up` now raises the limit to 1024.
+  The setting resets when the VM restarts, and `vm:up` sets it again.
+- On 2026-11-08, all 15 checks pass on `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The per-cluster issuer
+  that the host service sets changes no check result.
 
 ## Differences on EKS
 

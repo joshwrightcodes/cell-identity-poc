@@ -1,27 +1,11 @@
 #!/usr/bin/env bash
-# Stand up the cell: cluster, bootstrap set, bundles, then wait until Argo CD reports every
-# Application as Synced and Healthy.
+# Stand up the cell: create the cluster through the host service, apply the bootstrap set,
+# publish the bundles, then wait until Argo CD reports every Application as Synced and Healthy.
 source "$(dirname "$0")/lib.sh"
 
-clusters="$(kind get clusters 2>/dev/null)" || die "kind get clusters failed. Is the Colima VM running?"
-if grep -qx "$CELL_NAME" <<<"$clusters"; then
-  log "cluster $CELL_NAME exists"
-else
-  log "creating cluster $CELL_NAME"
-  mkdir -p "$BUILD"
-  cat >"$BUILD/kind.yaml" <<EOF
-kind: Cluster
-apiVersion: kind.x-k8s.io/v1alpha4
-name: $CELL_NAME
-networking:
-  podSubnet: $CELL_POD_SUBNET
-  serviceSubnet: $CELL_SERVICE_SUBNET
-nodes:
-  - role: control-plane
-    image: $CELL_NODE_IMAGE
-EOF
-  kind create cluster --config "$BUILD/kind.yaml" --wait 300s
-fi
+((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
+log "creating cluster $CELL_NAME through the host service"
+(cd "$ROOT" && mise run hostsvc -- up --only "$CELL_NAME")
 k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
 
 "$ROOT/scripts/facts.sh"
