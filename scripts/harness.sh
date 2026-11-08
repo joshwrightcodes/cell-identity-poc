@@ -9,6 +9,8 @@ topology="$ROOT/harness/topology.yaml"
 case "${1:-}" in
   up)
     mise run hostsvc -- up
+    # The dev-cp render reads the plugin images from the local registry.
+    mise run images
     names="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology has components"
     for name in $names; do
