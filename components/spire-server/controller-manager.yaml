@@ -1,0 +1,25 @@
+# spire-controller-manager in static manifest mode. It reads ClusterStaticEntry files from
+# ConfigMap spire-entries and reconciles them through the admin socket of the server.
+# It never calls the Kubernetes API, so it needs no RBAC, webhook or CRD.
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ControllerManagerConfig
+metrics:
+  bindAddress: "0"
+health:
+  healthProbeBindAddress: "0"
+clusterName: "@CELL_NAME@"
+# Without a value, the controller looks up the cluster domain in DNS.
+clusterDomain: cluster.local
+trustDomain: dev.env.poc.internal
+spireServerSocketPath: /run/spire/sockets/api.sock
+staticManifestPath: /run/spire/entries
+# The controller creates, updates and deletes only the entries whose ID starts with "poc.".
+# Leave entryIDPrefixCleanup unset: an empty value deletes every entry without a prefix.
+entryIDPrefix: poc
+logLevel: info
+logEncoding: json
+# Federation relationships have no prefix. With reconciliation on, the controller would delete them all.
+reconcile:
+  clusterSPIFFEIDs: false
+  clusterFederatedTrustDomains: false
+  clusterStaticEntries: true

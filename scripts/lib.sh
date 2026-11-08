@@ -37,12 +37,18 @@ BASE_CELL_COMPONENTS=(
   "apps-demo:5:apps-demo"
 )
 
+# The SPIRE server of the environment trust domain. It comes last, after the base cell is healthy.
+SPIRE_SERVER_COMPONENTS=(
+  "spire-server:6:spire-system"
+)
+
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
 set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$ROOT/harness/topology.yaml")"
 for set_name in $set_names; do
   case "$set_name" in
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
+    spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done

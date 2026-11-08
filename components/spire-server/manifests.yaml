@@ -1,0 +1,238 @@
+# The SPIRE server of the environment trust domain. render.sh fills in the plugin image, the
+# config checksum, the record volume and the agent node addresses.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire-system
+automountServiceAccountToken: false
+---
+# One ClusterStaticEntry per key. Each key name ends in .yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-entries
+  namespace: spire-system
+data: {}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire-system
+  labels:
+    app.kubernetes.io/name: spire-server
+spec:
+  serviceName: spire-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spire-server
+      annotations:
+        # SPIRE reads its configuration and the cell records only at start. A change restarts the pod.
+        cell.poc.internal/config-checksum: "@SPIRE_CONFIG_CHECKSUM@"
+    spec:
+      serviceAccountName: spire-server
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # The plugin image copies its static binary into the shared plugin volume.
+        - name: install-plugin
+          image: "@SPIRE_PLUGIN_IMAGE@"
+          args: ["install", "/run/spire/plugins"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: plugins
+              mountPath: /run/spire/plugins
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.15.5@sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384
+          args: ["-config", "/run/spire/config/server.conf"]
+          ports:
+            - name: grpc
+              containerPort: 8081
+          # The image has no shell. The probes run the server binary against the admin socket.
+          readinessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/run/spire/sockets/api.sock"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck", "-shallow", "-socketPath", "/run/spire/sockets/api.sock"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: data
+              mountPath: /run/spire/data
+            - name: sockets
+              mountPath: /run/spire/sockets
+            - name: plugins
+              mountPath: /run/spire/plugins
+              readOnly: true
+            - name: upstream
+              mountPath: /run/spire/upstream
+              readOnly: true
+            - name: records
+              mountPath: /run/spire/records
+              readOnly: true
+            # go-plugin creates the plugin socket in the temporary directory.
+            - name: tmp
+              mountPath: /tmp
+        - name: spire-controller-manager
+          image: ghcr.io/spiffe/spire-controller-manager:0.8.0@sha256:19e418e9d7f23fe82cbabccdc3e71861590f69a1fa8451bfdb267d7371b2b73e
+          args: ["--config", "/run/spire/controller-manager/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: controller-manager-config
+              mountPath: /run/spire/controller-manager
+              readOnly: true
+            - name: entries
+              mountPath: /run/spire/entries
+              readOnly: true
+            - name: sockets
+              mountPath: /run/spire/sockets
+      volumes:
+        - name: config
+          configMap:
+            name: spire-server
+        - name: controller-manager-config
+          configMap:
+            name: spire-controller-manager
+        - name: entries
+          configMap:
+            name: spire-entries
+        - name: sockets
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: plugins
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        # The disk UpstreamAuthority reads the intermediate key, the intermediate certificate and the root.
+        - name: upstream
+          secret:
+            secretName: spire-upstream
+            defaultMode: 0440
+            items:
+              - key: intermediate-key
+                path: intermediate.key
+              - key: intermediate-cert
+                path: intermediate.crt
+              - key: root-cert
+                path: root.crt
+        # Every record ConfigMap uses the key record.dsse.json, so each item gets the file name <cell>.dsse.json.
+        - name: records
+          projected:
+            sources: "@SPIRE_RECORD_SOURCES@"
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Agents in the cell clusters reach the server API on node port 30081. Local traffic policy keeps
+# the client address, so the NetworkPolicy can match the agent node addresses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire-system
+  labels:
+    app.kubernetes.io/name: spire-server
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: grpc
+      nodePort: 30081
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: spire-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Only the node addresses of the agent cells may reach the server API. The server needs no egress.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-agents
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Ingress]
+  ingress:
+    - from: "@SPIRE_AGENT_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8081
