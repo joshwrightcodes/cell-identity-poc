@@ -614,7 +614,16 @@ Kiali runs in the `management` cluster. It shows the mesh of each cell, and it c
 
 - Each cell's collector sends OTLP through the telemetry relay to Kiln. The `<env>-cp` collector sends OTLP to Kiln directly, with its own SVID.
 - Each collector also scrapes the Prometheus endpoints of upstream components in its own cluster: Argo CD, Argo CD Agent, istiod and Envoy. A NetworkPolicy admits only the collector to those endpoints.
-- Locally, Kiln's telemetry gateway feeds the `otel-lgtm` image, which runs Grafana, Loki, Tempo and Prometheus. Grafana shows every cluster, and the `cluster` resource attribute tells them apart.
+- Locally, Kiln's telemetry gateway feeds the `otel-lgtm` image, which runs Grafana, Loki, Tempo and Prometheus.
+- Every collector tags every log, span and metric with the source attributes in the table below. **[owner]** The attributes become Prometheus labels, Loki index labels and Tempo search fields, so every view can filter by cluster, plane, environment and cell.
+- The telemetry gateway does not trust the attributes that a cell sends. It sets them again from the verified SPIFFE ID of the stream. A cell therefore cannot label its signals as another cell's. The gateway counts each overwrite that changes a value, and an alert fires on any such change.
+
+| Attribute | Value | Set on |
+| --- | --- | --- |
+| `k8s.cluster.name` | The cluster name, for example `dev-cell-1` | Every cluster |
+| `platform.plane` | `management`, `environment` or `cell` | Every cluster |
+| `deployment.environment.name` | The environment, for example `dev` | Environment and cell clusters |
+| `platform.cell` | The cell name, for example `dev-cell-1` | Cell clusters |
 - The collector forwards only allow-listed attributes, span names and event names. Log bodies come only from fixed message templates.
 - The collector runs as a StatefulSet with the Recreate strategy, with a persistent queue sized in bytes for 24 hours. It filters before it queues, and the relay limits the rate at which a backlog drains after an island.
 - `celld` status messages carry a health summary for the cell: Argo CD health, root digest, SVID expiry and collector drops. The environment control plane can therefore see its cells during an island with Kiln.
