@@ -124,3 +124,61 @@ func TestPAEMatchesSpecVector(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestVerifyRejectsIncompleteRecords(t *testing.T) {
+	pub, priv := testKey(t)
+	cases := map[string]func(c *Cell){
+		"empty name":   func(c *Cell) { c.Name = "" },
+		"empty env":    func(c *Cell) { c.Env = "" },
+		"empty issuer": func(c *Cell) { c.Issuer = "" },
+		"empty keys":   func(c *Cell) { c.JWKS = json.RawMessage(`{"keys":[]}`) },
+		"not a set":    func(c *Cell) { c.JWKS = json.RawMessage(`[1]`) },
+	}
+	for name, f := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := testCell()
+			f(&c)
+			env, err := Sign(c, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Verify(env, []ed25519.PublicKey{pub}); err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsInvalidJWKSJSON(t *testing.T) {
+	pub, priv := testKey(t)
+	body := []byte(`{"name":"a","env":"dev","issuer":"i","jwks":"notjson"}`)
+	env, _ := signPayload(body, priv)
+	if _, err := Verify(env, []ed25519.PublicKey{pub}); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestVerifyRejectsTrailingData(t *testing.T) {
+	pub, priv := testKey(t)
+	good, _ := json.Marshal(testCell())
+	env, _ := signPayload(append(good, []byte(` {"x":1}`)...), priv)
+	if _, err := Verify(env, []ed25519.PublicKey{pub}); err == nil {
+		t.Fatal("expected an error")
+	}
+}
+
+func TestVerifyMultiSignatureRule(t *testing.T) {
+	pub, priv := testKey(t)
+	env, _ := Sign(testCell(), priv)
+	garbage := map[string]any{"sig": base64.StdEncoding.EncodeToString([]byte("garbage"))}
+	withGarbage := func(m map[string]any) {
+		m["signatures"] = append([]any{garbage}, m["signatures"].([]any)...)
+	}
+	if _, err := Verify(mutate(t, env, withGarbage), []ed25519.PublicKey{pub}); err != nil {
+		t.Fatalf("one valid plus garbage must pass: %v", err)
+	}
+	onlyGarbage := func(m map[string]any) { m["signatures"] = []any{garbage, garbage} }
+	if _, err := Verify(mutate(t, env, onlyGarbage), []ed25519.PublicKey{pub}); err == nil {
+		t.Fatal("only invalid signatures must fail")
+	}
+}
