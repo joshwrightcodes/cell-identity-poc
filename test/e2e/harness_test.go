@@ -14,6 +14,8 @@ import (
 
 var residualPorts = []int{2379, 2380, 6443, 10250, 10256}
 
+var alwaysOpenPorts = []int{6443, 10250}
+
 const nodePortServer = 30090
 
 func TestM1RogueReachesOnlyResidualPorts(t *testing.T) {
@@ -28,6 +30,12 @@ func TestM1RogueReachesOnlyResidualPorts(t *testing.T) {
 				t.Fatalf("decode scan output %q: %v", out, err)
 			}
 			t.Logf("open ports on %s (%s): %v", target, ip, open)
+			for _, p := range alwaysOpenPorts {
+				if !slices.Contains(open, p) {
+					t.Fatalf("cluster %s: the scan did not work, because port %d is always open on a node but is missing from the result %v",
+						target, p, open)
+				}
+			}
 			var extra []string
 			for _, p := range open {
 				if !slices.Contains(residualPorts, p) {
