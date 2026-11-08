@@ -1,0 +1,142 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"slices"
+	"strings"
+	"testing"
+)
+
+var residualPorts = []int{2379, 2380, 6443, 10250, 10256}
+
+const nodePortServer = 30090
+
+func TestM1RogueReachesOnlyResidualPorts(t *testing.T) {
+	createNamespace(t, "rogue", "m1-scan")
+	for _, target := range []string{"kiln", "dev-cp", "dev-cell-1", "dev-cell-2"} {
+		t.Run(target, func(t *testing.T) {
+			ip := clusterFacts(t, target).NodeIP
+			out := runPod(t, "rogue", "m1-scan", []string{"scan", "--host", ip, "--ports", "1-65535",
+				"--timeout", "300ms", "--concurrency", "256"})
+			var open []int
+			if err := json.Unmarshal([]byte(out), &open); err != nil {
+				t.Fatalf("decode scan output %q: %v", out, err)
+			}
+			t.Logf("open ports on %s (%s): %v", target, ip, open)
+			var extra []string
+			for _, p := range open {
+				if !slices.Contains(residualPorts, p) {
+					extra = append(extra, fmt.Sprint(p))
+				}
+			}
+			if len(extra) > 0 {
+				t.Errorf("cluster %s: rogue reaches extra ports %s beyond the residual set %v",
+					target, strings.Join(extra, ", "), residualPorts)
+			}
+		})
+	}
+}
+
+const serverManifest = `
+apiVersion: v1
+kind: Pod
+metadata:
+  name: probe-server
+  labels: {app: probe-server}
+spec:
+  securityContext:
+    runAsNonRoot: true
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+  - name: server
+    image: localhost:5001/netprobe:latest
+    args: ["serve", "--addr", ":8080"]
+    ports: [{containerPort: 8080}]
+    securityContext:
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: probe-server
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector: {app: probe-server}
+  ports:
+  - port: 8080
+    targetPort: 8080
+    nodePort: 30090
+`
+
+// fetchAcrossClusters starts the NodePort server in dev-cp and fetches it from dev-cell-1.
+func fetchAcrossClusters(t *testing.T) (body, clientIP string) {
+	t.Helper()
+	createNamespace(t, "dev-cp", "m1-server")
+	createNamespace(t, "dev-cell-1", "m1-client")
+	if _, err := kubectl(t, "dev-cp", serverManifest, "-n", "m1-server", "apply", "-f", "-"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kubectl(t, "dev-cp", "", "-n", "m1-server", "wait", "--for=condition=Ready",
+		"pod/probe-server", "--timeout=180s"); err != nil {
+		t.Fatal(err)
+	}
+	server := clusterFacts(t, "dev-cp")
+	client := clusterFacts(t, "dev-cell-1")
+	url := fmt.Sprintf("http://%s:%d/", server.NodeIP, nodePortServer)
+	return runPod(t, "dev-cell-1", "m1-client", []string{"get", "--url", url}), client.NodeIP
+}
+
+func TestM1NodePortAcrossClusters(t *testing.T) {
+	body, _ := fetchAcrossClusters(t)
+	var got struct {
+		Remote string `json:"remote"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil || got.Remote == "" {
+		t.Fatalf("unexpected body %q: %v", body, err)
+	}
+}
+
+func TestM1SourceIsOwnNode(t *testing.T) {
+	body, clientIP := fetchAcrossClusters(t)
+	var got struct {
+		Remote string `json:"remote"`
+	}
+	if err := json.Unmarshal([]byte(body), &got); err != nil {
+		t.Fatalf("decode body %q: %v", body, err)
+	}
+	host, _, err := net.SplitHostPort(got.Remote)
+	if err != nil {
+		t.Fatalf("remote %q: %v", got.Remote, err)
+	}
+	if host != clientIP {
+		t.Fatalf("server saw source %s, want the dev-cell-1 node IP %s", host, clientIP)
+	}
+	t.Logf("server saw source %s, the dev-cell-1 node IP", host)
+}
+
+func TestM1PodsReachHostService(t *testing.T) {
+	const want = "hello from the Mac"
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(want))
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	createNamespace(t, "dev-cell-1", "m1-host")
+	got := runPod(t, "dev-cell-1", "m1-host", []string{"get", "--url", fmt.Sprintf("http://host.docker.internal:%d/", port)})
+	if strings.TrimSpace(got) != want {
+		t.Fatalf("body %q, want %q", got, want)
+	}
+}

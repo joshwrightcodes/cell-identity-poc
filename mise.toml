@@ -98,3 +98,8 @@ description = "Build and push the in-cluster images to the local registry at loc
 depends = ["vm:up"]
 env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
 run = "ko build --base-import-paths --tags latest ./cmd/netprobe"
+
+[tasks."gate:m1"]
+description = "Run the M1 end-to-end tests, plus the go test arguments after --"
+depends = ["images"]
+run = "scripts/gate.sh m1"

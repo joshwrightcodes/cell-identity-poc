@@ -89,7 +89,7 @@ it exists.
 | # | Milestone | Done when |
 | --- | --- | --- |
 | M0 | Base cell | Done |
-| M1 | Harness | The host service creates all five clusters twice from clean, with storage and one registry mirror. A pod in `rogue` reaches no port on a cell's node except the listed residual ports |
+| M1 | Harness | The host service creates all five clusters twice from clean, with storage and one registry mirror. A pod in `rogue` reaches no port on a cell's node except the residual ports 2379, 2380, 6443, 10250 and 10256 |
 | M2 | Attestor | Against a test-signed record, `kiln-celld` gets an SVID. Pod-bound, lifetime, audience, subject and unknown-key tests fail as expected. A sidecar renews without a new token |
 | M3 | Kiln stand-in and specs | kiln-envd pulls signed specs, and refuses unsigned or older ones. Kiln binds issuers and checks keys. The test-signed record fixture is deleted |
 | M4 | Signed work | `kiln-celld` claims, verifies and applies operations once. Forged, replayed, expired and wrong-target items fail. `dev-cp` cannot pose as a cell to Kiln |
@@ -104,7 +104,7 @@ for M9. Each tier has a time budget, set at M1.
 
 ## Residual limits of the PoC
 
-- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The PoC lists these as residual ports, and tests that nothing else is reachable.
+- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The residual ports are 2379, 2380, 6443, 10250 and 10256. On 2026-11-08 a scan of ports 1 to 65535 from `rogue` found exactly these ports open on each node of `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The M1 test fails if any other port opens.
 - A compromised Kiln can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run.
 - The relay cannot close a revoked cell's streams. Kiln closes them.
