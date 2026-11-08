@@ -258,6 +258,90 @@ The review did not read these items:
   path by reading, and did not run it.
 - The effect on registration entries when pruning removes their parent agent.
 
+### The server image in dev-cp
+
+`components/spire-server` runs the server image by its index digest. The arm64 manifest is
+`sha256:567e088a6995705d540a126bc8fdab64a0e3df2dc43153b6d30d97216e2ec259`. The image config for
+arm64 has user `1000:1000`, the entrypoint `/opt/spire/bin/spire-server run`, no command and
+no exposed port. These facts were read from the registry on 2026-11-08.
+
+The cell depends on these facts from the source:
+
+- The `disk` UpstreamAuthority loads a key in `PRIVATE KEY`, `EC PRIVATE KEY` or `RSA PRIVATE KEY`
+  PEM form. It checks that the certificate matches the key.
+- With `bundle_file_path`, the plugin verifies the certificate against the bundle with the
+  default Go key usage. A CA certificate with no extended key usage passes this check.
+- The plugin reads the three files again for each new CA. It keeps the last good copy when a read fails.
+- `spire-server healthcheck -socketPath <path>` calls the gRPC health service on the admin socket.
+  The probes use it, because the image has no shell. The health listener is off by default.
+- go-plugin v1.8.0 creates the plugin socket in the temporary directory. Because of this, the
+  server container needs a writable `/tmp` with a read-only root file system.
+- The flag `-expandEnv` is off by default, so the server does not expand variables in its config.
+
+## spire-controller-manager v0.8.0 (2026-11-08)
+
+The SPIRE server pod runs spire-controller-manager as a sidecar in static manifest mode. The tag is
+`v0.8.0` at commit `d24609e816d4bf0dfaa6383fc4f94b14edb19b1f`, published 2026-09-29. The review
+read a scratch clone and ran nothing from it.
+
+| Image | Digest |
+| --- | --- |
+| `ghcr.io/spiffe/spire-controller-manager:0.8.0` index | `sha256:19e418e9d7f23fe82cbabccdc3e71861590f69a1fa8451bfdb267d7371b2b73e` |
+| amd64 manifest | `sha256:191261f33581f44885e0b9851112059ea09a2690760df0b2ad69c9ca118a0d88` |
+| arm64 manifest | `sha256:5ebd15e0e166ece42122ecfda968e903dde703b5aff99fdbfaf2e0ead7ebfedd` |
+
+The image runs as user `1000:1000` with the entrypoint `/spire-controller-manager`. Its base is
+Debian 13 with only a CA bundle, passwd, group and time zone files. The build history shows one
+copied binary. The change log says that 0.8.0 is the first release that runs as user 1000.
+
+The review read `cmd/main.go`, the config types and loader, the ClusterStaticEntry loader, the
+entry and federation reconcilers, the SPIRE API client, the config and CRD documents, the static
+example and the change log.
+
+Findings that the cell relies on:
+
+- Static mode passes no Kubernetes client to the reconcilers, and it builds the manager from an
+  empty REST config. Because of this, it needs no RBAC, ServiceAccount token, webhook or CRD.
+- The controller reads every file that ends in `.yaml` in `staticManifestPath`, with no recursion.
+  It decodes one object for each file, and it skips other kinds.
+- A file that fails to parse stops the reconcile before any delete. A missing directory also stops it.
+  An empty directory declares no entries, so the controller deletes every entry with its prefix.
+- With `entryIDPrefix: poc`, the controller gives new entries the ID `poc.<uuid>`. It ignores
+  every entry outside the prefix.
+- With no prefix, the controller deletes every undeclared entry on the server. An empty
+  `entryIDPrefixCleanup` deletes every entry with no dot in its ID. The cell sets the prefix
+  and leaves the cleanup setting unset.
+- Federation relationships have no prefix. The cell turns off their reconciliation, because the
+  controller would otherwise delete every relationship on the server.
+- With an explicit `reconcile` block, the defaults do not apply. The cell lists all three values.
+- Without `clusterDomain`, the controller looks up the default Kubernetes service name in DNS.
+  The cell sets `clusterDomain`, so the controller needs no egress.
+- The controller requires controller-runtime v0.25.1. With an empty metrics address, that version
+  listens on `:8080` (`pkg/metrics/server/server.go`). The cell sets the metrics and health
+  addresses to `"0"`, so the sidecar opens no port.
+- The program talks only to the SPIRE server socket in static mode. No `net/http` client,
+  `os/exec`, `sudo`, credential read, persistence or hidden Unicode appeared in the files above.
+- After `staticRun` returns, `main` goes on to the Kubernetes mode. A clean shutdown therefore
+  likely ends with an error and a non-zero exit. This comes from the code, not from a run.
+
+API compatibility with SPIRE v1.15.5. The controller requires `spire-api-sdk` v1.15.3 at commit
+`adb81b3b0fb87a881693d1d42eaf8b2fa1223e42`. SPIRE v1.15.5 requires the pseudo-version
+`v1.2.5-0.20260428072036-00f73a61093a`, commit `00f73a61093a26a3f676563386abdd2218619101` on
+the `next` branch. The `proto/` trees of the two commits are identical (`git diff --quiet` on
+`proto/`). The tag carries the same two proto changes as cherry-picks. The controller calls only
+the entry, trust domain and bundle services of the v1 API. Because of this, the server serves
+every message and field that the controller sends.
+
+The review did not read these items:
+
+- The Kubernetes mode: the webhook manager, the ClusterSPIFFEID reconciler and the RBAC manifests.
+- The `demo/` tree, the Dockerfile, the Makefile, the test files, and the server handling of
+  fields that the controller marks as unsupported.
+- The image signature. The review did not compare the binary with a source build or run the image.
+
+Result: low concern. The cell sets the prefix, leaves the cleanup unset, turns off federation
+reconciliation and sets `clusterDomain`.
+
 ## SPIRE plugin SDK and plugin modules (2026-11-08)
 
 The plugin imports `github.com/spiffe/spire-plugin-sdk` at the exact version that the SPIRE
