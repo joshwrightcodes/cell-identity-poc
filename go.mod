@@ -3,6 +3,7 @@ module github.com/joshwrightcodes/cell-identity-poc
 go 1.27.3
 
 require (
+	github.com/go-jose/go-jose/v4 v4.1.6
 	sigs.k8s.io/kind v0.33.0
 	sigs.k8s.io/yaml v1.6.0
 )
