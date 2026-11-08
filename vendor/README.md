@@ -122,7 +122,13 @@ image configuration and history with `docker image inspect` and `docker history`
   debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
   `kiln-registry` sets `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in the container then shows
   only port 5000. The bundle store keeps the default listener until its own change.
+- Setuid and setgid: `docker run --rm --entrypoint find <image> / -xdev ( -perm -4000 -o -perm -2000 ) -type f`
+  printed nothing. The entrypoint override runs only `find`, not the registry.
+- Persistence: no `/etc/init.d`, `/etc/rc.d` or `/etc/cron.d`. The Alpine default root crontab exists,
+  but all five `/etc/periodic` directories are empty, and the entrypoint starts no `crond`.
+  The only startup file is `/entrypoint.sh`. Blobs persist in the `/var/lib/registry` volume, by design.
+  The accounts are the Alpine defaults, and `/etc/shadow` came from the base build.
 - The scripts and configuration contain no non-ASCII characters.
-- The review did not decompile the `registry` binary, did not check it against the upstream
+- The review did not decompile the `registry` binary (52 MB, root-owned), did not read the Alpine packages or the layers' file contents beyond the paths above, did not check it against the upstream
   source tag, and did not inspect its network behaviour at run time. The `kiln-registry`
   container has no credentials and serves HTTP without authentication on 127.0.0.1 only.
