@@ -10,6 +10,8 @@
 // order: "EC PRIVATE KEY" (SEC 1), then "CERTIFICATE". cert and key read a bundle on stdin and print
 // only its certificate or only its key. Every key is ECDSA P-256 and every certificate has the URI SAN spiffe://<td>.
 // The intermediate has no path length limit, because the SPIRE server CA sits below it.
+// NotBefore is one minute before the current time. intermediate refuses a root whose URI SAN is not
+// spiffe://<td> for the --trust-domain value.
 //
 // Keys exist only in memory and on stdout. On failure the command prints one JSON error line on
 // stdout and exits 1. No error message carries key material.
@@ -39,8 +41,10 @@ const (
 	defaultTrustDomain = "dev.env.poc.internal"
 	organization       = "cell-identity-poc"
 	maxInput           = 1 << 20
-	keyBlock           = "EC PRIVATE KEY"
-	certBlock          = "CERTIFICATE"
+	// backdate moves NotBefore into the past, so a peer with a slightly slow clock accepts a new certificate.
+	backdate  = time.Minute
+	keyBlock  = "EC PRIVATE KEY"
+	certBlock = "CERTIFICATE"
 )
 
 // trustDomainRE is the SPIFFE trust domain grammar: lowercase letters, digits, dots, dashes and underscores.
@@ -108,6 +112,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 		if err != nil {
 			return err
 		}
+		if want := "spiffe://" + td; len(parent.URIs) != 1 || parent.URIs[0].String() != want {
+			return fmt.Errorf("the root URI SAN is %v, want %s from --trust-domain", parent.URIs, want)
+		}
 		key, cert, err := issue(td, days, now(), parentKey, parent)
 		if err != nil {
 			return err
@@ -142,7 +149,7 @@ func issue(td string, days int, now time.Time, parentKey *ecdsa.PrivateKey, pare
 	if err != nil {
 		return nil, nil, fmt.Errorf("generate serial number: %w", err)
 	}
-	notBefore := now.UTC().Truncate(time.Second)
+	start := now.UTC().Truncate(time.Second)
 	name := td + " root CA"
 	if parent != nil {
 		name = td + " intermediate CA"
@@ -150,8 +157,8 @@ func issue(td string, days int, now time.Time, parentKey *ecdsa.PrivateKey, pare
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{Organization: []string{organization}, CommonName: name},
-		NotBefore:             notBefore,
-		NotAfter:              notBefore.Add(time.Duration(days) * 24 * time.Hour),
+		NotBefore:             start.Add(-backdate),
+		NotAfter:              start.Add(time.Duration(days) * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,

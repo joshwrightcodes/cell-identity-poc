@@ -111,8 +111,8 @@ func checkCA(t *testing.T, c *x509.Certificate, trustDomain string, days int) {
 	if c.SignatureAlgorithm != x509.ECDSAWithSHA256 {
 		t.Fatalf("signature algorithm is %v", c.SignatureAlgorithm)
 	}
-	if !c.NotBefore.Equal(testNow) {
-		t.Fatalf("NotBefore is %v, want %v", c.NotBefore, testNow)
+	if want := testNow.Add(-time.Minute); !c.NotBefore.Equal(want) {
+		t.Fatalf("NotBefore is %v, want %v", c.NotBefore, want)
 	}
 	if want := testNow.Add(time.Duration(days) * 24 * time.Hour); !c.NotAfter.Equal(want) {
 		t.Fatalf("NotAfter is %v, want %v", c.NotAfter, want)
@@ -232,6 +232,7 @@ func TestFailures(t *testing.T) {
 	otherKeyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: mustMarshal(t, otherKey)}))
 	keyOnly := root[:strings.Index(root, "-----BEGIN CERTIFICATE-----")]
 	rootKeyB64 := strings.Split(keyOnly, "\n")[1]
+	mgmtRoot := runOK(t, []string{"root", "--trust-domain", "mgmt.poc.internal"}, "")
 
 	cases := []struct {
 		name  string
@@ -255,6 +256,8 @@ func TestFailures(t *testing.T) {
 		{"trailing data", []string{"intermediate"}, root + "junk", "trailing"},
 		{"three blocks", []string{"intermediate"}, root + certOnly(t, root), "two PEM blocks"},
 		{"cert from empty stdin", []string{"cert"}, "", "no PEM"},
+		{"root of another trust domain", []string{"intermediate", "--days", "10"}, mgmtRoot, "URI SAN"},
+		{"intermediate trust domain differs from root", []string{"intermediate", "--days", "10", "--trust-domain", "mgmt.poc.internal"}, root, "URI SAN"},
 		{"key from cert only", []string{"key"}, certOnly(t, root), "EC PRIVATE KEY"},
 		{"cert takes no flags", []string{"cert", "--days", "3"}, root, "flag"},
 	}
