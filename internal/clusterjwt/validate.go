@@ -18,6 +18,7 @@ const (
 	maxLifetime = 15 * time.Minute
 	maxIATAge   = 15 * time.Minute
 	skew        = 30 * time.Second
+	minRSABits  = 2048
 )
 
 var allowedAlgs = []jose.SignatureAlgorithm{jose.RS256, jose.ES256}
@@ -93,7 +94,8 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if tc.Issuer != rec.Issuer {
 		return Claims{}, fail(IssuerMismatch)
 	}
-	if !subjectAllowed(rec, tc.Kube.Namespace, tc.Kube.Svcacct.Name) {
+	if !subjectAllowed(rec, tc.Kube.Namespace, tc.Kube.Svcacct.Name) ||
+		tc.Subject != "system:serviceaccount:"+tc.Kube.Namespace+":"+tc.Kube.Svcacct.Name {
 		return Claims{}, fail(SubjectNotAllowed)
 	}
 	if tc.Kube.Pod == nil || tc.Kube.Pod.UID == "" || tc.Kube.Pod.Name == "" ||
@@ -114,10 +116,13 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if iat.Sub(now) > skew {
 		return Claims{}, fail(IATInFuture)
 	}
+	if tc.NotBefore != nil && tc.NotBefore.Time().Sub(now) > skew {
+		return Claims{}, fail(IATInFuture)
+	}
 	if now.Sub(exp) > skew {
 		return Claims{}, fail(Expired)
 	}
-	if len(tc.Audience) != 1 || tc.Audience[0] != "spire-"+env+"/"+nonce {
+	if env == "" || nonce == "" || rec.Env != env || len(tc.Audience) != 1 || tc.Audience[0] != "spire-"+env+"/"+nonce {
 		return Claims{}, fail(WrongAudience)
 	}
 
@@ -132,7 +137,8 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	}, nil
 }
 
-// keysWithID returns the public keys in the key set with the given ID. An empty ID matches nothing.
+// keysWithID returns the usable public keys in the key set with the given ID. An empty ID
+// matches nothing, and RSA keys under 2048 bits are not usable.
 func keysWithID(jwks json.RawMessage, kid string) []jose.JSONWebKey {
 	if kid == "" {
 		return nil
@@ -147,6 +153,9 @@ func keysWithID(jwks json.RawMessage, kid string) []jose.JSONWebKey {
 	for _, raw := range set.Keys {
 		var k jose.JSONWebKey
 		if err := k.UnmarshalJSON(raw); err != nil || !k.Valid() || !k.IsPublic() || k.KeyID != kid {
+			continue
+		}
+		if pub, ok := k.Key.(*rsa.PublicKey); ok && pub.N.BitLen() < minRSABits {
 			continue
 		}
 		out = append(out, k)

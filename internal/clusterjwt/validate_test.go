@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -85,6 +86,8 @@ type spec struct {
 	KID      string
 	Key      any
 	Omit     []string
+	Sub      string
+	NBF      int64
 }
 
 func (k keys) good() spec {
@@ -109,6 +112,12 @@ func (s spec) token(t *testing.T) string {
 		"iss": s.Issuer, "aud": s.Audience, "iat": s.IAT, "exp": s.EXP,
 		"sub":           "system:serviceaccount:" + s.K8s.Namespace + ":" + s.K8s.Svcacct.Name,
 		"kubernetes.io": s.K8s,
+	}
+	if s.Sub != "" {
+		claims["sub"] = s.Sub
+	}
+	if s.NBF != 0 {
+		claims["nbf"] = s.NBF
 	}
 	for _, name := range s.Omit {
 		delete(claims, name)
@@ -269,10 +278,18 @@ func TestAlgNoneAndHMAC(t *testing.T) {
 	check(t, rec, none, AlgNotAllowed)
 
 	head := b64(map[string]string{"alg": "HS256", "kid": rsaKID})
-	mac := hmac.New(sha256.New, []byte("secret"))
-	mac.Write([]byte(head + "." + payload))
-	hs := head + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	check(t, rec, hs, AlgNotAllowed)
+	pkix, err := x509.MarshalPKIXPublicKey(&k.rsa.PublicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, secret := range map[string][]byte{
+		"pkix": pkix, "pkcs1": x509.MarshalPKCS1PublicKey(&k.rsa.PublicKey), "plain": []byte("secret"),
+	} {
+		mac := hmac.New(sha256.New, secret)
+		mac.Write([]byte(head + "." + payload))
+		hs := head + "." + payload + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+		t.Run("hs256_"+name, func(t *testing.T) { check(t, rec, hs, AlgNotAllowed) })
+	}
 }
 
 func TestSkew(t *testing.T) {
@@ -345,4 +362,116 @@ func TestMissingAudience(t *testing.T) {
 	s := k.good()
 	s.Omit = []string{"aud"}
 	check(t, k.record(t), s.token(t), WrongAudience)
+}
+
+func TestPodBinding(t *testing.T) {
+	k := newKeys(t)
+	cases := map[string]func(*k8s){
+		"no_node":        func(c *k8s) { c.Node = nil },
+		"no_node_name":   func(c *k8s) { c.Node.Name = "" },
+		"no_pod_uid":     func(c *k8s) { c.Pod.UID = "" },
+		"no_pod_name":    func(c *k8s) { c.Pod.Name = "" },
+		"no_pod":         func(c *k8s) { c.Pod = nil },
+		"empty_node_ref": func(c *k8s) { c.Node = &ref{} },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			s := k.good()
+			mutate(&s.K8s)
+			check(t, k.record(t), s.token(t), NotPodBound)
+		})
+	}
+}
+
+func TestClockBoundaries(t *testing.T) {
+	k := newKeys(t)
+	for _, tc := range []struct {
+		name     string
+		iatAge   time.Duration
+		expAfter time.Duration
+		want     Reason
+	}{
+		{"exp_30s_past_passes", 10 * time.Minute, -30 * time.Second, ""},
+		{"exp_31s_past_expired", 10 * time.Minute, -31 * time.Second, Expired},
+		{"iat_900s_old_passes", 900 * time.Second, 0, ""},
+		{"iat_901s_old_stale", 901 * time.Second, -time.Second, StaleIAT},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := k.good()
+			s.IAT = testNow.Add(-tc.iatAge).Unix()
+			s.EXP = testNow.Add(tc.expAfter).Unix()
+			check(t, k.record(t), s.token(t), tc.want)
+		})
+	}
+}
+
+func TestEnvAndNonceRequired(t *testing.T) {
+	k := newKeys(t)
+	rec := k.record(t)
+	tok := k.good().token(t)
+	for name, tc := range map[string]struct{ env, nonce string }{
+		"empty_env": {"", testNonce}, "empty_nonce": {testEnv, ""}, "both_empty": {"", ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Validate(rec, tok, tc.env, tc.nonce, testNow)
+			if got := ReasonOf(err); got != WrongAudience {
+				t.Fatalf("reason = %q, want wrong_audience", got)
+			}
+		})
+	}
+	t.Run("empty_audience_matches_empty_inputs", func(t *testing.T) {
+		s := k.good()
+		s.Audience = []string{"spire-/"}
+		_, err := Validate(rec, s.token(t), "", "", testNow)
+		if ReasonOf(err) != WrongAudience {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("record_env_mismatch", func(t *testing.T) {
+		rec := k.record(t)
+		rec.Env = "prod"
+		check(t, rec, tok, WrongAudience)
+	})
+}
+
+func TestSubjectClaimMustMatch(t *testing.T) {
+	k := newKeys(t)
+	for name, sub := range map[string]string{
+		"other_sa":    "system:serviceaccount:celld:other",
+		"other_ns":    "system:serviceaccount:other:celld",
+		"not_sa_form": "admin",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := k.good()
+			s.Sub = sub
+			check(t, k.record(t), s.token(t), SubjectNotAllowed)
+		})
+	}
+}
+
+func TestNotBefore(t *testing.T) {
+	k := newKeys(t)
+	for _, tc := range []struct {
+		ahead time.Duration
+		want  Reason
+	}{{30 * time.Second, ""}, {31 * time.Second, IATInFuture}, {-time.Hour, ""}} {
+		s := k.good()
+		s.NBF = testNow.Add(tc.ahead).Unix()
+		check(t, k.record(t), s.token(t), tc.want)
+	}
+}
+
+func TestSmallRSAKeyNotUsable(t *testing.T) {
+	k := newKeys(t)
+	small, err := rsa.GenerateKey(rand.Reader, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &small.PublicKey, KeyID: "small"}}}
+	raw, _ := json.Marshal(set)
+	rec := k.record(t)
+	rec.JWKS = raw
+	s := k.good()
+	s.Key, s.KID = small, "small"
+	check(t, rec, s.token(t), UnknownKID)
 }
