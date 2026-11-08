@@ -3,11 +3,12 @@
 //	pkigen root [--trust-domain <td>] [--days 365]
 //	pkigen intermediate [--trust-domain <td>] [--days 30] < root bundle
 //	pkigen cert < bundle
+//	pkigen key < bundle
 //
 // root prints a bundle for a new self-signed root CA. intermediate reads a root bundle on stdin and
 // prints a bundle for a new intermediate CA that the root signs. A bundle is two PEM blocks in this
-// order: "EC PRIVATE KEY" (SEC 1), then "CERTIFICATE". cert reads a bundle on stdin and prints only
-// its certificate. Every key is ECDSA P-256 and every certificate has the URI SAN spiffe://<td>.
+// order: "EC PRIVATE KEY" (SEC 1), then "CERTIFICATE". cert and key read a bundle on stdin and print
+// only its certificate or only its key. Every key is ECDSA P-256 and every certificate has the URI SAN spiffe://<td>.
 // The intermediate has no path length limit, because the SPIRE server CA sits below it.
 //
 // Keys exist only in memory and on stdout. On failure the command prints one JSON error line on
@@ -64,10 +65,10 @@ func execute(args []string, stdin io.Reader, stdout io.Writer, now func() time.T
 
 func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) error {
 	if len(args) == 0 {
-		return errors.New("usage: pkigen root|intermediate|cert [--trust-domain <td>] [--days <n>]")
+		return errors.New("usage: pkigen root|intermediate|cert|key [--trust-domain <td>] [--days <n>]")
 	}
 	cmd := args[0]
-	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0}
+	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0, "key": 0}
 	days, known := defaultDays[cmd]
 	if !known {
 		return fmt.Errorf("unknown command %q", cmd)
@@ -75,7 +76,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	td := defaultTrustDomain
-	if cmd != "cert" {
+	issues := cmd == "root" || cmd == "intermediate"
+	if issues {
 		fs.StringVar(&td, "trust-domain", defaultTrustDomain, "SPIFFE trust domain")
 		fs.IntVar(&days, "days", days, "validity in days")
 	}
@@ -85,7 +87,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 	if fs.NArg() != 0 {
 		return fmt.Errorf("%s: unexpected argument %q", cmd, fs.Arg(0))
 	}
-	if cmd != "cert" {
+	if issues {
 		if days < 1 {
 			return errors.New("--days must be at least 1")
 		}
@@ -111,12 +113,22 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 			return err
 		}
 		return writeBundle(stdout, key, cert)
-	default:
+	case "cert":
 		_, cert, err := readBundle(stdin)
 		if err != nil {
 			return err
 		}
 		return pem.Encode(stdout, &pem.Block{Type: certBlock, Bytes: cert.Raw})
+	default:
+		key, _, err := readBundle(stdin)
+		if err != nil {
+			return err
+		}
+		der, err := x509.MarshalECPrivateKey(key)
+		if err != nil {
+			return errors.New("encode private key")
+		}
+		return pem.Encode(stdout, &pem.Block{Type: keyBlock, Bytes: der})
 	}
 }
 

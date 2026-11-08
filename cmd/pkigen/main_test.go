@@ -212,6 +212,20 @@ func TestCertPrintsOnlyTheCertificate(t *testing.T) {
 	}
 }
 
+func TestKeyPrintsOnlyTheKey(t *testing.T) {
+	root := runOK(t, []string{"root"}, "")
+	want, _ := parseBundle(t, root)
+	got := runOK(t, []string{"key"}, root)
+	b, rest := pem.Decode([]byte(got))
+	if b == nil || b.Type != "EC PRIVATE KEY" || strings.TrimSpace(string(rest)) != "" {
+		t.Fatalf("key printed %q", got)
+	}
+	k, err := x509.ParseECPrivateKey(b.Bytes)
+	if err != nil || !k.Equal(want) {
+		t.Fatalf("key printed another key: %v", err)
+	}
+}
+
 func TestFailures(t *testing.T) {
 	root := runOK(t, []string{"root", "--days", "20"}, "")
 	otherKey, _ := parseBundle(t, runOK(t, []string{"root"}, ""))
@@ -241,6 +255,8 @@ func TestFailures(t *testing.T) {
 		{"trailing data", []string{"intermediate"}, root + "junk", "trailing"},
 		{"three blocks", []string{"intermediate"}, root + certOnly(t, root), "two PEM blocks"},
 		{"cert from empty stdin", []string{"cert"}, "", "no PEM"},
+		{"key from cert only", []string{"key"}, certOnly(t, root), "EC PRIVATE KEY"},
+		{"cert takes no flags", []string{"cert", "--days", "3"}, root, "flag"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
