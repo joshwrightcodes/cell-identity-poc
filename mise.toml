@@ -2,7 +2,7 @@
 # puts these versions first on PATH. kind runs its clusters in the Colima VM that `vm:up` starts.
 
 [settings]
-# mise.lock pins each tool with its checksum. Run `mise run lock` after a version change.
+# mise.lock pins each tool with its checksum. Run `mise lock` after a version change.
 lockfile_platforms = ["macos-arm64", "linux-x64"]
 
 [tools]
@@ -116,7 +116,3 @@ run = "scripts/size.sh"
 [tasks."harness:restart-check"]
 description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
 run = "scripts/restart-check.sh"
-
-[tasks.lock]
-description = "Rewrite mise.lock with the mise version that CI pins, so CI can read the lockfile format"
-run = ["rm -f mise.lock", "mise x aqua:jdx/mise@2026.10.19 -- mise lock"]
