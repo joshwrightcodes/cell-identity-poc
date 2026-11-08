@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" class="d" viewBox="0 0 1100 560" width="1100" height="560" role="img" aria-label="Kiln at the top, dev-cp in the middle, and dev-cell-1, dev-cell-2 and rogue at the bottom, all inside a Colima VM. Cells dial up to dev-cp, and dev-cp dials up to Kiln. The rogue cell's connection is rejected. A host service on the Mac creates clusters and serves their keys. Markers 1 to 4, I and V show what the PoC validates.">
+<svg xmlns="http://www.w3.org/2000/svg" class="d" viewBox="0 0 1100 560" width="1100" height="560" role="img" aria-label="The management cluster, which runs Kiln, at the top, dev-cp in the middle, and dev-cell-1, dev-cell-2 and rogue at the bottom, all inside a Colima VM. Cells dial up to dev-cp, and dev-cp dials up to Kiln. The rogue cell's connection is rejected. A host service on the Mac creates clusters and serves their keys. Markers 1 to 4, I and V show what the PoC validates.">
       <style>
   svg { --bg: #ffffff; --ink: #17212b; --muted: #55636f; --kiln: #3346b3; --env: #0b7a65; --cell: #17212b; --ext: #6b7680; --check: #a15c00; --rogue: #b3261e; --on-check: #ffffff;
     --f-kiln: #e6e9f8; --f-env: #e2f3ef; --f-cell: #f4f6f8; --f-ext: #eceff1; --f-rogue: #fbeaea; --f-vm: #f7f9fa; }
@@ -51,8 +51,8 @@
       <text class="bn" x="306" y="46">Colima VM · one kind cluster per box</text>
 
       <rect class="b kiln" x="440" y="66" width="460" height="104" rx="8"/>
-      <text class="n" x="456" y="92">kiln</text>
-      <text class="k" x="496" y="92">management plane</text>
+      <text class="n" x="456" y="92">management</text>
+      <text class="k" x="566" y="92">runs Kiln</text>
       <text class="t" x="456" y="118">Kiln stand-in: signs specs, checks each cell's proof</text>
       <text class="t" x="456" y="140">Argo CD central view, read-only</text>
 

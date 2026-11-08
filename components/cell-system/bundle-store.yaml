@@ -1,6 +1,5 @@
 # The in-cluster bundle store. Argo CD reads hydrated bundles from it, and nothing else.
-# Bundles live in an emptyDir. After a restart, run
-# mise run cell:publish to push them again.
+# Bundles live on a PersistentVolumeClaim from the default StorageClass, so they survive a pod restart.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -8,12 +7,13 @@ metadata:
 automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: bundle-store
   labels:
     app.kubernetes.io/name: bundle-store
 spec:
+  serviceName: bundle-store
   replicas: 1
   selector:
     matchLabels:
@@ -42,6 +42,8 @@ spec:
               value: bundle-store
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4318
+            - name: REGISTRY_HTTP_DEBUG_ADDR
+              value: ""
           readinessProbe:
             httpGet:
               path: /v2/
@@ -60,10 +62,14 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
-      volumes:
-        - name: data
-          emptyDir:
-            sizeLimit: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
 ---
 apiVersion: v1
 kind: Service

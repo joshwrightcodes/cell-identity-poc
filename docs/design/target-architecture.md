@@ -102,7 +102,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 
 - Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository's `mise.toml` pins every tool, and mise tasks are the only entry points. The harness asserts the exact versions.
 - Kubernetes v1.37.0 node image, pinned by digest.
-- Until M1 shows that kind clusters survive a restart of the Colima VM, a Mac restart is a disaster recovery event. The gate runs under `caffeinate`.
+- kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
 - Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
 - Telemetry goes through OpenTelemetry (OTLP). Do not add Prometheus client libraries, `/metrics` endpoints or ServiceMonitors. Upstream metrics listeners are turned off.
@@ -123,7 +123,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 | Kiln executors | `kiln-<scope>d` | `kiln-envd`, `kiln-celld` |
 | Agent names | `<env>-<cell>` | `dev-dev-cell-1` |
 
-Local instances use `dev` as `<env>`: the clusters are `kiln`, `dev-cp`, `dev-cell-1`, `dev-cell-2` and `rogue`. M1 renames the base cell from `cell-a-1`.
+Local instances use `dev` as `<env>`: the clusters are `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` and `rogue`. M1 renames the base cell from `cell-a-1`.
 
 ### Keys and roots of trust **[call]**
 
@@ -143,7 +143,7 @@ Local instances use `dev` as `<env>`: the clusters are `kiln`, `dev-cp`, `dev-ce
 
 | Cluster | Runs | Trust domain |
 | --- | --- | --- |
-| `kiln` | Kiln stand-in: intent, approvals, signed specs, key checks, Argo CD Agent principal, telemetry gateway | `kiln.poc.internal` |
+| `management` | Kiln stand-in: intent, approvals, signed specs, key checks, Argo CD Agent principal, telemetry gateway | `kiln.poc.internal` |
 | `dev-cp` | kiln-envd, SPIRE server, cell gateway, relay, cell controller with ACK, local alert rules | `dev.env.poc.internal` |
 | `dev-cell-1`, `dev-cell-2` | The base cell, plus `kiln-celld`, its watchdog, `ops-runs`, `ack-system` controllers | Identities from `dev.env.poc.internal`; mesh in `<cell>.mesh.poc.internal` |
 | `rogue` | Genuine `kiln-celld` and agent images, plus attack tools | Unregistered |
@@ -489,7 +489,7 @@ Rollback and health **[call]**:
 - An update is an operation that `kiln-celld` applies directly, outside Argo CD.
 - `kiln-celld` updates blue/green. The record allows the replica cap plus one per version during an update. The old version stops only after the new one passes in-cell checks. A missing stream keeps both versions running.
 - A small static watchdog in `cell-system` reverts a rollout that does not become healthy within its deadline. For Argo CD, healthy means it reconciles a canary Application at the expected digest. The watchdog itself changes only through break-glass.
-- The plane clusters `kiln` and `<env>-cp` update the same way, under their own watchdogs.
+- The plane clusters `management` and `<env>-cp` update the same way, under their own watchdogs.
 
 ### Customer-data operations **[owner; details follow the canon]**
 
@@ -781,12 +781,12 @@ this order, each with its own scope document:
 
 | Item | Milestone | Fallback |
 | --- | --- | --- |
-| Pod-to-NodePort traffic between kind clusters on the `kind` network | M1 | Stop and report |
-| Pod traffic to another cluster leaves with its own node address | M1 | Tests key on SVIDs only |
-| Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config |
-| Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster |
-| kind's local-path provisioner passes review | M1 | Stop and report |
-| kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery |
+| Pod-to-NodePort traffic between kind clusters on the `kind` network | M1 | Stop and report. Result 2026-11-08: it works, so no fallback applies |
+| Pod traffic to another cluster leaves with its own node address | M1 | Tests key on SVIDs only. Result 2026-11-08: it does, when the server Service uses `externalTrafficPolicy: Local`, so no fallback applies |
+| Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config. Result 2026-11-08: they do, so no fallback applies |
+| Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster. Result 2026-11-08: every node of all five clusters pulls through the mirror, so no fallback applies |
+| kind's local-path provisioner passes review | M1 | Stop and report. Result 2026-11-08: the review in `vendor/README.md` found nothing that blocks its use |
+| kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery. Result 2026-11-08: they do not survive, so this fallback applies |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
 | Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |

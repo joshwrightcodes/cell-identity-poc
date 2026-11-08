@@ -49,6 +49,19 @@ url = "https://download.docker.com/linux/static/stable/x86_64/docker-29.9.3.tgz"
 checksum = "sha256:79145e169bca0b9571d02de8e1cd311a36e0e8fdb4599b6661a87b1bb3afbe13"
 url = "https://download.docker.com/mac/static/stable/aarch64/docker-29.9.3.tgz"
 
+[[tools.go]]
+version = "1.27.3"
+backend = "core:go"
+specifiers = ["1.27.3"]
+
+[tools.go."platforms.linux-x64"]
+checksum = "sha256:65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40"
+url = "https://dl.google.com/go/go1.27.3.linux-amd64.tar.gz"
+
+[tools.go."platforms.macos-arm64"]
+checksum = "sha256:dd3908cf20959d798c1e06ebe5b72213f0505ce01373b40ce3110975a6cd99c2"
+url = "https://dl.google.com/go/go1.27.3.darwin-arm64.tar.gz"
+
 [[tools.helm]]
 version = "4.3.1"
 backend = "aqua:helm/helm"
@@ -95,6 +108,23 @@ checksum = "sha256:0c8c7dbe5e23594a198b786c4bc13dacc101fa6196b0cb0b23a1ca44e61f4
 checksum_source = "mise-versions"
 url = "https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-darwin-arm64"
 url_api = "https://api.github.com/repos/kubernetes-sigs/kind/releases/assets/531396417"
+
+[[tools.ko]]
+version = "0.19.1"
+backend = "aqua:ko-build/ko"
+specifiers = ["0.19.1"]
+
+[tools.ko."platforms.linux-x64"]
+checksum = "sha256:635ac6ea3fd376c935fee597fbb29ab2c2449f49ef1655085fe3aa9c25fed7a5"
+checksum_source = "mise-versions"
+url = "https://github.com/ko-build/ko/releases/download/v0.19.1/ko_0.19.1_Linux_x86_64.tar.gz"
+url_api = "https://api.github.com/repos/ko-build/ko/releases/assets/461171792"
+
+[tools.ko."platforms.macos-arm64"]
+checksum = "sha256:a1338c4140c8c94e789733e21b161a3de177b467cd3c388b634fe1a869574509"
+checksum_source = "mise-versions"
+url = "https://github.com/ko-build/ko/releases/download/v0.19.1/ko_0.19.1_Darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/ko-build/ko/releases/assets/461171820"
 
 [[tools.kubectl]]
 version = "1.37.2"

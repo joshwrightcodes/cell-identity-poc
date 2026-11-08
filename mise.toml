@@ -16,29 +16,39 @@ oras = "1.3.6"
 yq = "4.54.2"
 jq = "1.8.2"
 kind = "0.33.0"
-# Keep the same version as ARGOCD_VERSION in cell.env.
+# Keep the same version as ARGOCD_VERSION in cells/common.env.
 argocd = "3.6.1"
+go = "1.27.3"
+ko = "0.19.1"
 
 [env]
-_.file = "cell.env"
+# CELL picks the cluster. The default is dev-cell-1. An unknown name fails in scripts/lib.sh.
+CELL = "{{get_env(name='CELL', default='dev-cell-1')}}"
+_.file = ["cells/common.env", "cells/{{get_env(name='CELL', default='dev-cell-1')}}.env"]
+# vendor/ holds reviewed third-party manifests, not Go modules. Make Go ignore it.
+GOFLAGS = "-mod=readonly"
 # Every Docker and kind command talks to the PoC VM, whatever the current Docker context is.
 DOCKER_HOST = "unix://{{env.HOME}}/.colima/poc/docker.sock"
 
 [tasks."vm:up"]
 description = "Start the Colima VM that runs the kind clusters"
-run = "colima start --profile poc --vm-type vz --cpu 14 --memory 40 --disk 120 --runtime docker"
+run = [
+  "colima start --profile poc --vm-type vz --cpu 14 --memory 40 --disk 120 --runtime docker",
+  # Five kind nodes need more inotify instances than the default of 128. The setting resets on VM restart.
+  "colima ssh --profile poc -- sudo sysctl -w fs.inotify.max_user_instances=1024 fs.inotify.max_user_watches=1048576",
+]
 
 [tasks."vm:down"]
 description = "Stop the Colima VM. kind clusters stop with it"
 run = "colima stop --profile poc"
 
 [tasks."cell:up"]
-description = "Create the cluster, apply the bootstrap set, publish every bundle and wait for Argo CD"
+description = "Create the cluster through the host service, apply the bootstrap set, publish every bundle and wait for Argo CD"
 depends = ["vm:up"]
 run = "scripts/up.sh"
 
 [tasks."cell:hydrate"]
-description = "Render every component into build/bundles/<component>/manifests.yaml"
+description = "Render every component into build/<cluster>/bundles/<component>/manifests.yaml"
 run = "scripts/hydrate.sh"
 
 [tasks."cell:publish"]
@@ -51,12 +61,58 @@ run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
 description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
-run = 'argocd admin dashboard --context "kind-$CELL_NAME" --namespace argocd --address 127.0.0.1 --port 8080'
+run = "scripts/ui.sh"
 
 [tasks."cell:down"]
-description = "Delete the cluster"
+description = "Delete the cluster through the host service"
 run = "scripts/down.sh"
+
+[tasks.test]
+description = "Run the Go unit tests, or the packages given after --"
+usage = 'arg "[packages]..." var=#true default="./..."'
+run = 'eval go test ${usage_packages?}'
+
+[tasks.lint]
+description = "Run go vet on every package"
+run = "go vet ./..."
 
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest and Istio charts into vendor/ for review"
 run = "scripts/vendor-fetch.sh"
+
+[tasks.hostsvc]
+description = "Run the host service: up, down or facts, with the arguments after --"
+run = "go run ./cmd/hostsvc"
+
+[tasks."harness:up"]
+description = "Check the tool versions, create all five clusters through the host service, then set up the base cell on each cluster that has components"
+depends = ["harness:preflight"]
+run = "scripts/harness.sh up"
+
+[tasks."harness:down"]
+description = "Delete all five clusters through the host service"
+run = "scripts/harness.sh down"
+
+[tasks.images]
+description = "Build and push the in-cluster images to the local registry at localhost:5001"
+depends = ["vm:up"]
+env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
+run = "ko build --base-import-paths --tags latest ./cmd/netprobe"
+
+[tasks."gate:m1"]
+description = "Run the M1 end-to-end tests, plus the go test arguments after --"
+depends = ["images"]
+run = "scripts/gate.sh m1"
+
+[tasks."harness:preflight"]
+description = "Check the tool versions and the Colima profile against harness/versions.env"
+depends = ["vm:up"]
+run = "scripts/preflight.sh"
+
+[tasks."harness:size"]
+description = "Print the memory and CPU of every kind node container and the registry"
+run = "scripts/size.sh"
+
+[tasks."harness:restart-check"]
+description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
+run = "scripts/restart-check.sh"

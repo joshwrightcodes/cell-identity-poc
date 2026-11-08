@@ -1,7 +1,7 @@
 # Vendored upstream files
 
 This directory holds third-party files that the cell applies. Each file is reviewed before
-it is committed. `mise run vendor:fetch` downloads the versions that `cell.env` pins.
+it is committed. `mise run vendor:fetch` downloads the versions that `cells/common.env` pins.
 
 | Path | Source | Version |
 | --- | --- | --- |
@@ -42,3 +42,151 @@ Run these checks on each new version, and record the result here.
 - v3.6.1 adds one object compared with v3.5.6: a headless Service for the application controller.
 - Images: `quay.io/argoproj/argocd:v3.6.1`, `public.ecr.aws/docker/library/redis:8.10.1-alpine`,
   and Istio images from `registry.istio.io/release`. The review did not inspect image contents.
+
+## Go module, tools and CI actions (2026-11-08)
+
+The review cloned each item at the tagged commit into a scratch directory and read it. Nothing ran
+during the review. The checks above apply, with these results.
+
+| Item | Version | Commit | Result |
+| --- | --- | --- | --- |
+| `sigs.k8s.io/yaml` | v1.6.0 | `048d724aca2d37ddb5b03c90b5b4550a3a48766d` | No hidden Unicode. No `net`, `net/http` or `os/exec` import outside tests. It depends on `go.yaml.in/yaml/v2` v2.4.2. |
+| `go.yaml.in/yaml/v2` | v2.4.2 | not cloned | Indirect module from the YAML fork that Kubernetes maintains. The review read it in the Go module cache, which `go mod verify` checked. No hidden Unicode: the only non-ASCII characters are curly quotes in a comment in `scannerc.go` and text fixtures in tests. No long encoded strings. The non-test files import no `os`, `net`, `net/http`, `os/exec`, `log`, `syscall` or `unsafe` package, and they contain no `sudo`. The module has no file or environment access, so it has no path to persistence or credentials. Only test files import `os`, `net` and `log`. The module compiles into `hostsvc` and the end-to-end tests. |
+| `ko` | v0.19.1 | `e388f65a1f036f19703b8aff13e1aa5521bc6988` | No hidden Unicode. `curl` and `sudo` appear only in `pkg/caps/gen.sh`, a developer script that ko does not run. mise pins the binary checksum in `mise.lock`. |
+| `go` | 1.27.3 | not cloned | Official toolchain from mise. mise pins the archive checksum in `mise.lock`. The review did not read its source. |
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | No hidden Unicode. `curl` appears only in a developer script under `src/misc`. The workflow sets `persist-credentials: false`. |
+| `jdx/mise-action` | v5.2.3 | `82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e` | See below. |
+
+`jdx/mise-action` downloads the mise binary from `github.com/jdx/mise` releases. A pinned
+version comes only from GitHub. The action checks the signed checksums and, from mise 2026.9.3, a
+signed release attestation. It runs `chmod`, `tar` and `mv`, and it writes only to the mise data
+directory, `GITHUB_ENV` and `GITHUB_PATH`. It does not use `sudo`. By default it keeps the GitHub
+token local to the action. The file `dist/index.js` contains the libraries of the action, and ten
+zero-width characters sit inside character tables of those libraries. The review did not rebuild
+`dist/index.js` from source. v5.2.4 to v5.2.7 are less than two weeks old as of 2026-11-08.
+
+The workflow `.github/workflows/unit.yml` sets the `version` input of the action to mise
+2026.10.19, released on 2026-10-24. That release is the newest one that is at least two weeks old as
+of 2026-11-08. The action also has a `sha256` input, a checksum of the mise binary for one
+platform. The workflow does not set it, because the action already checks the signed checksums of
+a pinned version, and the review found no use of that input in `dist/index.js`.
+
+## kind library and its modules (2026-11-08)
+
+The host service imports `sigs.k8s.io/kind` v0.33.0 as a Go library: `pkg/cluster`,
+`pkg/apis/config/v1alpha4` and the Docker provider. The review read a scratch clone at the
+tagged commit `407a9675e6d9af1200b5f57f9ca52ec6cdacce74` and ran nothing from it.
+
+- No hidden Unicode in `pkg/`. One emoji appears in a comment in `pkg/internal/env/term.go`.
+- `net/http` appears only in `pkg/build/nodeimage`, which the host service does not import.
+- `os/exec` appears only in `pkg/exec`, the wrapper that all providers use.
+- No `sudo`, `curl` or `wget`. No access to credentials. The Docker provider reads the Docker
+  CLI proxy settings from `~/.docker/config.json` and the `KIND_EXPERIMENTAL_DOCKER_NETWORK` variable.
+- The Docker provider runs the `docker` command line: `docker run`, `inspect`, `network`,
+  `ps`, `rm`, `exec`, `logs`, `pull` and `info`. The host service depends on `docker` on `PATH`
+  and on `DOCKER_HOST`. mise provides both.
+- kind creates containers from the node image, which has a digest pin in `harness/topology.yaml`.
+  The review did not inspect the image contents. Node containers run privileged, as kind requires.
+
+The host service reads cluster facts with the Go standard library and the kubeconfig from kind.
+It does not use `client-go`.
+
+| Module | Version | Result |
+| --- | --- | --- |
+| `sigs.k8s.io/kind` | v0.33.0 | See above. |
+| `al.essio.dev/pkg/shellescape` | v1.5.1 | Read from the Go module cache, which `go mod verify` checked. No hidden Unicode, no network or process code. |
+| `github.com/BurntSushi/toml` | v1.4.0 | Same result. A test runner outside the build uses `os/exec`. |
+| `github.com/evanphx/json-patch/v5` | v5.6.0 | Same result. |
+| `github.com/pelletier/go-toml` | v1.9.5 | Same result. A code generator outside the build uses `os/exec`. |
+| `github.com/pkg/errors` | v0.9.1 | Same result. |
+| `github.com/spf13/cobra` | v1.8.0 | Same result. |
+| `github.com/spf13/pflag` | v1.0.5 | Same result. It imports `net` only to parse IP flags. |
+| `go.yaml.in/yaml/v3` | v3.0.4 | Same result. |
+| `golang.org/x/sys` | v0.6.0 | Same result. `execabs` and platform files use process calls, as expected. |
+| `github.com/mattn/go-isatty` | v0.0.20 | Same result. |
+| `github.com/inconshreveable/mousetrap` | v1.1.0 | Same result. Two small files: a no-op for non-Windows builds, and a Windows-only check of the parent process (`explorer.exe`) through `syscall`. No network, no `os/exec`. Cobra needs it only on Windows, so it is not in the macOS build. |
+
+The file `.ko.yaml` pins the base image `gcr.io/distroless/static-debian13:nonroot` by digest.
+The review did not inspect the image contents.
+
+## Registry image (2026-11-08)
+
+The image `docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c`
+runs as `kiln-registry` on the Mac and as the bundle store in each base cell. The review read the
+image configuration and history with `docker image inspect` and `docker history`, and copied
+`/entrypoint.sh` and `/etc/distribution/config.yml` out of a container that the review created and never started.
+
+- Base: Alpine 3.24.4 minirootfs. The build adds `ca-certificates` from `apk`.
+- The build downloads the `registry` binary from the `distribution/distribution` release `v3.1.2`.
+  The build checks a pinned SHA-256 for each architecture, and the digest above pins the result.
+- Entrypoint `/entrypoint.sh`, default command `/etc/distribution/config.yml`. The user is not set,
+  so the image runs as root by default. `kiln-registry` runs as user 65534 and the bundle store pod sets the same user. Exposed port 5000. Volume `/var/lib/registry`.
+- Environment: `PATH` and `OTEL_TRACES_EXPORTER=none`.
+- `entrypoint.sh` is eight lines of shell. It prepends `registry serve` or `registry` to the
+  arguments and runs `exec`. It has no network call, no `sudo` and no credential access.
+- The default configuration stores blobs on the local filesystem and enables delete. It also opens a
+  debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
+  `kiln-registry` and the bundle store set `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in each
+  container then shows only port 5000.
+- Setuid and setgid: `docker run --rm --entrypoint find <image> / -xdev ( -perm -4000 -o -perm -2000 ) -type f`
+  printed nothing. The entrypoint override runs only `find`, not the registry.
+- Persistence: a shell with the entrypoint overridden checked the usual startup paths. The image has no
+  `/etc/init.d`, `/etc/rc.d`, `/etc/cron.d`, `/etc/local.d`, `/etc/conf.d` or `/etc/rc.local`.
+  The default Alpine crontab for root exists, but all five `/etc/periodic` directories are empty.
+  The entrypoint starts no `crond`.
+  The entrypoint runs no `init` and no login shell, so `/etc/inittab` and `/etc/profile.d` take no effect.
+  Whether these two paths hold only Alpine defaults is not verified, because no package check ran.
+- Volume: `docker image inspect` shows the declared volume `/var/lib/registry`. `internal/hostsvc/registry.go`
+  mounts the named volume `kiln-registry-data` at that path. Blobs should persist after a container restart because of this named volume. This is not verified, because no restart test ran.
+- The scripts and configuration contain no non-ASCII characters.
+- The review did not decompile the `registry` binary, which is 52 MB and owned by root.
+- The review did not check that binary against the upstream source tag.
+- The review did not read the Alpine packages or any file outside the paths named above.
+- The review did not observe the network behaviour of the binary at run time.
+- The `kiln-registry` container has no credentials and no authentication. Docker publishes it on
+  `127.0.0.1:5001` on the Mac. It also joins the `kind` network, where the nodes pull from
+  `http://kiln-registry:5000`. Any pod in any cluster, including `rogue`, can reach it without
+  authentication. The default configuration allows deletes, so such a pod can also push to it and
+  delete from it.
+
+## Local-path provisioner (2026-11-08)
+
+The image `docker.io/kindest/local-path-provisioner:v20260820-69b56db7` provides the `standard`
+StorageClass in every kind cluster. The bundle store uses it for its volume. The provisioner has run in all
+five clusters since M0, so this review took place after its first run. The kind node image starts the provisioner at cluster
+creation, from the manifest `/kind/manifests/default-storage.yaml`, and the nodes pull the provisioner image.
+The review did not run any code from the sources.
+
+- The kind v0.33.0 source holds the image definition in `images/local-path-provisioner`. The `Makefile`
+  pins the upstream `rancher/local-path-provisioner` at `v0.0.34`.
+  The upstream tag resolves to commit `af49f3fdf69e2e5ad790d295b6005ba3767ec991`.
+  The `Dockerfile` builds that tag with the Go toolchain and copies the binary into `gcr.io/distroless/static-debian13`.
+  The build also runs `go install github.com/google/go-licenses@latest` in the build stage. The final image does not contain that tool.
+- The upstream source has three Go files, `main.go`, `provisioner.go` and `util.go`, with 1778 lines in
+  all Go files outside `vendor/`. The files contain no non-ASCII characters.
+- The files contain no `net/http` client, no `net.Dial`, no `os/exec` and no `sudo`.
+  The only network peer is the Kubernetes API server, through `client-go`.
+  The only environment reads are `HOME`, `KUBECONFIG` and the settings that the manifest passes.
+- The provisioner creates a short-lived helper pod for each volume setup and teardown.
+  The helper pod mounts the parent directory of the volume as a `hostPath` on the node.
+  It runs the `setup` and `teardown` scripts from the `local-path-config` ConfigMap.
+  The helper image is `docker.io/kindest/local-path-helper:v20260131-7181c60a`.
+  The scripts are `mkdir -m 0777 -p "$VOL_DIR"` and `rm -rf "$VOL_DIR"`.
+  The helper pod has no `privileged` setting in the provisioner source or in the manifest.
+  It runs as the image user, which is root, and it tolerates every taint.
+- The provisioner creates each PersistentVolume as a `hostPath` volume under `/var/local-path-provisioner`
+  on the node. The directory mode is 0777, so every pod user can write to the volume.
+- The RBAC comes from `/kind/manifests/default-storage.yaml` in the node image.
+  A Role in `local-path-storage` allows create, update and delete on `pods`.
+  A ClusterRole reads nodes, claims, ConfigMaps, pods and pod logs.
+  The ClusterRole also manages PersistentVolumes, creates events and reads StorageClasses.
+  The account cannot read Secrets.
+- The provisioner pod has no `securityContext`, no `privileged` setting and no `hostPath` of its own.
+  It mounts only the `local-path-config` ConfigMap.
+- The ConfigMap `local-path-config` holds only the node path map, the two scripts and the helper pod template.
+- The review did not read the vendored Go modules under `vendor/` in the upstream source.
+- The review did not check the published image against a build of the source.
+- The review did not observe the network behaviour of the image at run time.
+- Result: no obfuscation, hidden Unicode, unexpected network call, `sudo`, persistence or credential
+  access. The root helper pod with a node `hostPath` is the main exposure. It is the normal design of this provisioner and
+  stays inside the kind node.
