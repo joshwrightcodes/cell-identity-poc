@@ -61,12 +61,16 @@ An unknown name fails with a list of the known cells. For example, `CELL=managem
 `harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
 `harness:size` prints the memory and CPU of every node container and of `kiln-registry`.
 
-Two runs from clean, each with `harness:down`, `harness:up` and `gate:m1`, gave these results on 2026-11-08:
+Two runs from clean, each with `harness:down` and `harness:up`, gave these `harness:up` durations on 2026-11-08:
 
-| Run | `harness:up` | `gate:m1` |
-| --- | --- | --- |
-| 1 | 17 minutes 2 seconds | 65 seconds |
-| 2 | 17 minutes 13 seconds | 64 seconds |
+| Run | `harness:up` |
+| --- | --- |
+| 1 | 17 minutes 2 seconds |
+| 2 | 17 minutes 13 seconds |
+
+The final `gate:m1`, with five tests, ran after the last fixes on the healthy clusters.
+It took about 102 seconds in one run and 103 seconds in the slower run.
+An earlier version of the gate took 65 and 64 seconds, so those numbers no longer apply.
 
 After the clusters were healthy, the five node containers used about 8 GiB of memory in total:
 
@@ -79,7 +83,7 @@ After the clusters were healthy, the five node containers used about 8 GiB of me
 The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
-The budget is 2 minutes. This is 1.5 times the slower run of 65 seconds, rounded up to the next minute.
+The budget is 3 minutes. This is 1.5 times the slower run of 103 seconds, rounded up to the next minute.
 The budget does not cover `harness:up`.
 
 ## Restart of the VM

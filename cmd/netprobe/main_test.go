@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,5 +96,39 @@ func TestGetPrintsBodyAndFailsOnStatus(t *testing.T) {
 	}
 	if err := get(context.Background(), srv.URL+"/bad", &sb, time.Second); err == nil {
 		t.Error("want error on 403")
+	}
+}
+
+func TestScanPrintsOnlyJSON(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+	var out strings.Builder
+	args := []string{"scan", "--host", "127.0.0.1", "--ports", strconv.Itoa(port)}
+	if err := run(context.Background(), args, &out); err != nil {
+		t.Fatal(err)
+	}
+	var got []int
+	if err := json.Unmarshal([]byte(out.String()), &got); err != nil {
+		t.Fatalf("stdout is not pure JSON: %q: %v", out.String(), err)
+	}
+	if !slices.Equal(got, []int{port}) {
+		t.Errorf("open = %v, want [%d]", got, port)
+	}
+}
+
+func TestNewLoggerWritesServeLogsToStdout(t *testing.T) {
+	var out strings.Builder
+	newLogger([]string{"serve"}, &out).Info("serving")
+	if !strings.Contains(out.String(), "serving") {
+		t.Errorf("serve log missing from stdout: %q", out.String())
+	}
+	out.Reset()
+	newLogger([]string{"scan"}, &out).Info("scanning")
+	if out.Len() != 0 {
+		t.Errorf("scan log reached stdout: %q", out.String())
 	}
 }

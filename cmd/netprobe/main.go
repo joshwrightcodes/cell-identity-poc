@@ -22,13 +22,22 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	slog.SetDefault(newLogger(os.Args[1:], os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
-		slog.Error("netprobe failed", "error", err)
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("netprobe failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// newLogger sends the logs of the long-running serve mode to stdout. The data commands keep
+// stdout for their data, so their logs go to stderr.
+func newLogger(args []string, stdout io.Writer) *slog.Logger {
+	if len(args) > 0 && args[0] == "serve" {
+		return slog.New(slog.NewTextHandler(stdout, nil))
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
@@ -62,6 +71,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
+		slog.Info("serving", "addr", *addr)
 		srv := &http.Server{Addr: *addr, Handler: handler(), ReadHeaderTimeout: 5 * time.Second}
 		go func() {
 			<-ctx.Done()

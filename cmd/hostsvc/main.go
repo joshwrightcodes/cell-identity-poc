@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -15,13 +16,22 @@ import (
 )
 
 func main() {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	slog.SetDefault(newLogger(os.Args[1:], os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	if err := run(ctx, os.Args[1:]); err != nil {
-		slog.Error("hostsvc failed", "error", err)
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("hostsvc failed", "error", err)
 		os.Exit(1)
 	}
+}
+
+// newLogger sends the progress logs of up and down to stdout. The facts command keeps stdout
+// for its JSON, so its logs go to stderr.
+func newLogger(args []string, stdout io.Writer) *slog.Logger {
+	if len(args) > 0 && (args[0] == "up" || args[0] == "down") {
+		return slog.New(slog.NewTextHandler(stdout, nil))
+	}
+	return slog.New(slog.NewTextHandler(os.Stderr, nil))
 }
 
 func run(ctx context.Context, args []string) error {
