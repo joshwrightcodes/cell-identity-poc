@@ -25,7 +25,7 @@ It also shows two properties that the owner set:
 
 | Area | PoC form | Target architecture section |
 | --- | --- | --- |
-| Clusters | `kiln`, `dev-cp`, `dev-cell-1`, `dev-cell-2` and `rogue`, as kind clusters in one Colima VM | Topology |
+| Clusters | `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` and `rogue`, as kind clusters in one Colima VM | Topology |
 | Provisioning | The cell controller in `dev-cp` sends a Kiln-signed step to a host service on the Mac. The host service creates the cluster and applies the pinned bootstrap set | Cell controller |
 | Cluster keys | The host service serves each cluster's JWKS over TLS with a certificate that Kiln pins. Kiln binds the issuer with a nonce token at first start | Independent key check |
 | Identity | SPIRE server in `dev-cp`. Its intermediate CA comes from the secret manager CLI on standard input, signed by a root kept off every cluster | SPIRE CAs |
@@ -104,7 +104,7 @@ for M9. Each tier has a time budget, set at M1.
 
 ## Residual limits of the PoC
 
-- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The residual ports are 2379, 2380, 6443, 10250 and 10256. On 2026-11-08 a scan of ports 1 to 65535 from `rogue` found exactly these ports open on each node of `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The M1 test fails if any other port opens. It also fails if port 6443 or 10250 is closed, because then the scan did not work.
+- Locally, every cluster shares the `kind` network, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The residual ports are 2379, 2380, 6443, 10250 and 10256. On 2026-11-08 a scan of ports 1 to 65535 from `rogue` found exactly these ports open on each node of `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The M1 test fails if any other port opens. It also fails if port 6443 or 10250 is closed, because then the scan did not work.
 - A compromised Kiln can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run.
 - The relay cannot close a revoked cell's streams. Kiln closes them.

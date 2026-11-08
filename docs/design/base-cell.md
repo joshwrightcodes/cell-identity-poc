@@ -9,7 +9,7 @@ Every cluster in the PoC has the same base: a Kubernetes cluster, Argo CD, Istio
 policy and an OpenTelemetry collector. Each role then adds its own services. A shared base
 lets one set of checks prove the base once, for every role.
 
-This milestone stands up the base cell on four clusters: `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. It adds no SPIRE, worker or other planes. It
+This milestone stands up the base cell on four clusters: `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. It adds no SPIRE, worker or other planes. It
 proves that the base works before identity work starts.
 
 ## Goals
@@ -140,7 +140,7 @@ plaintext. Strict mTLS on the collector would reject them.
 - On 2026-11-08, the fourth kind cluster failed to start. systemd in the node container reported
   "Too many open files" because the VM allows 128 inotify instances. `vm:up` now raises the limit to 1024.
   The setting resets when the VM restarts, and `vm:up` sets it again.
-- On 2026-11-08, all 15 checks pass on `kiln`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The per-cluster issuer
+- On 2026-11-08, all 15 checks pass on `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. The per-cluster issuer
   that the host service sets changes no check result.
 
 ## Differences on EKS

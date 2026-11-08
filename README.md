@@ -9,7 +9,7 @@ OpenTelemetry collector. Every later plane starts from this base.
 
 ## What the PoC shows
 
-![Kiln, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
+![The management cluster, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
 
 Five kind clusters run in one Colima VM on a Mac. Each connection goes up a layer, and Kiln
 connects to no cluster. A host service on the Mac stands in for the cloud provider. The
@@ -53,7 +53,7 @@ After that it runs `cell:up` for each cluster that has the `base-cell` component
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
-An unknown name fails with a list of the known cells. For example, `CELL=kiln mise run cell:up` stands up the base cell on `kiln` only.
+An unknown name fails with a list of the known cells. For example, `CELL=management mise run cell:up` stands up the base cell on `management` only.
 
 ## Size and time
 
@@ -72,7 +72,7 @@ After the clusters were healthy, the five node containers used about 8 GiB of me
 
 | Container | Memory | CPU |
 | --- | --- | --- |
-| `kiln`, `dev-cp`, `dev-cell-1`, `dev-cell-2` (each) | 1.7 to 1.8 GiB | 6 to 10 percent |
+| `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` (each) | 1.7 to 1.8 GiB | 6 to 10 percent |
 | `rogue` | 0.6 GiB | 5 percent |
 | `kiln-registry` | 32 MiB | 0 percent |
 

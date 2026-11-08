@@ -2,10 +2,10 @@
 # the kind network or the Lima host network. See internal/topology.
 nodeImage: docker.io/kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 clusters:
-  - name: kiln
+  - name: management
     podSubnet: 10.10.0.0/16
     serviceSubnet: 10.110.0.0/16
-    issuer: https://kiln.issuer.poc.internal
+    issuer: https://management.issuer.poc.internal
     components: [base-cell]
   - name: dev-cp
     podSubnet: 10.11.0.0/16
