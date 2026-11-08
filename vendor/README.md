@@ -192,3 +192,119 @@ The review did not run any code from the sources.
 - Result: no obfuscation, hidden Unicode, unexpected network call, `sudo`, persistence or credential
   access. The root helper pod with a node `hostPath` is the main exposure. It is the normal design of this provisioner and
   stays inside the kind node.
+
+## SPIRE v1.15.5 (2026-11-08)
+
+The cell runs SPIRE v1.15.5 with the external plugin `cluster-jwt-server`. The tag is
+`v1.15.5` at commit `f62d747d56e9caa6a38ad4bcbc32dbcc3dc1399a`. It was published on 2026-10-20,
+so it meets the two-week rule. SPIRE v1.16.0 is too new. The review read a scratch clone and
+ran nothing from it.
+
+| Image | Index digest |
+| --- | --- |
+| `ghcr.io/spiffe/spire-server:1.15.5` | `sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384` |
+| `ghcr.io/spiffe/spire-agent:1.15.5` | `sha256:3652c732b0f0d36f4dd78394230a1b1cd0ddcc29548a46c67a996b1a78c14481` |
+
+The manifests pin the index digest. Each index also holds attestation manifests for the build.
+The server image runs as user 1000 and the agent image runs as root. Both images hold only a CA
+bundle, empty directories and one static binary, with no shell and no package manager.
+Because of this, a plugin binary must be static and must be readable by user 1000.
+
+The go.mod of the tag pins these versions: go-jose v4.1.4, go-spiffe v2.8.1,
+plugin SDK `v1.4.4-0.20260617144146-5dcde407c4d1`, hcl `v1.0.1-vault-7`, go-plugin v1.8.0,
+go-hclog v1.6.3 and grpc v1.84.0.
+
+The review read these paths:
+
+- The server API for agent attestation and renewal, and the server NodeAttestor plugin wrapper.
+- The error mapping that carries a plugin error to the agent.
+- The agent attestor and the SVID rotator.
+- The rate limit middleware and the server limits.
+- The node manager and the datastore queries that prune nodes.
+- The external plugin loader, the plugin configuration code and the host service wiring.
+- The `disk` UpstreamAuthority plugin and its documentation.
+
+Findings that the cell relies on:
+
+- The server applies the attestation rate limit first. The default is one attestation each
+  second for each source IP, and the limit queues requests. The setting `attestation = false`
+  turns it off.
+- The server does not reject a repeat attestation for an agent ID that exists and is not
+  banned. It overwrites the stored certificate. Because of this, the one-time property comes
+  from the nonce hash in the agent ID, and not from SPIRE.
+- A plugin error reaches the agent with the gRPC code and the message
+  `nodeattestor(<plugin name>): <message>`. The server also logs the message. A plugin must put no
+  token contents in a message.
+- The rotator attests again on every rotation when the agent is re-attestable. The plugin
+  returns `can_reattest` as false, so rotation uses `RenewAgent` and needs no new token.
+- The server prunes non-reattestable nodes only when `prune_tofu_nodes = true`. It prunes
+  about every hour. It never prunes a banned node.
+- The loader runs `plugin_cmd` directly, with no search of `PATH`. The setting `plugin_checksum`
+  is optional and needs 64 hex characters. The example in the SPIRE documentation shows 40 characters,
+  and that value fails the load. SPIRE logs a notice and runs the binary when no checksum is set.
+- SPIRE offers server plugins three host services: `identityprovider`, `agentstore` and
+  `metrics`. Agent plugins get only `metrics`. The plugin uses none of them.
+- Plugin logs written through the SDK logger appear in the SPIRE log.
+
+The review found no obfuscation and no hidden Unicode in `pkg/` and `cmd/`. That search did not
+cover files that are not Go source.
+
+The review did not read these items:
+
+- The rest of the SPIRE tree: other plugins, the datastore, federation and the Windows paths.
+- The release binaries in the images. The review did not compare them with a source build.
+- Image signatures and build attestations.
+- The text of the final agent log line for a plugin error. The review confirmed the code
+  path by reading, and did not run it.
+- The effect on registration entries when pruning removes their parent agent.
+
+## SPIRE plugin SDK and plugin modules (2026-11-08)
+
+The plugin imports `github.com/spiffe/spire-plugin-sdk` at the exact version that the SPIRE
+v1.15.5 go.mod pins: `v1.4.4-0.20260617144146-5dcde407c4d1`. A plugin and the server share one
+wire contract only when they use the same version. This version is commit
+`5dcde407c4d1a35478487926526db4d26dc5845e` on the `next` branch, dated 2026-06-17. It has no tag.
+The repository tags `v1.4.3` to `v1.4.7` and later do not point at this commit. How these tags
+relate to the `next` branch is not verified. `go.mod` requires the pseudo-version, and the review
+confirmed it against the go.mod of SPIRE at the tag.
+
+The review read these SDK paths: `pluginmain`, `plugintest`, `internal` (serve and handshake),
+`private`, `pluginsdk`, the server and agent NodeAttestor protos with their generated stubs,
+the config service, the host service protos and `go.mod`.
+
+- The server NodeAttestor service has one stream RPC, `Attest`. The first request holds the
+  payload and later requests hold challenge responses. The last response holds the agent
+  attributes: ID, selector values and `can_reattest`.
+- A service implementation must embed `UnimplementedNodeAttestorServer` by value.
+- The SDK calls `SetLogger` on an implementation that has it. Logs then reach the SPIRE log.
+- `pluginmain.Serve` runs go-plugin with a magic cookie that equals the plugin type, protocol
+  version 1 and gRPC only.
+- `plugintest.ServeInBackground` serves the plugin inside the test process through go-plugin
+  reattach. It needs a `*testing.T` and dials only an in-process listener.
+- Non-test, non-generated SDK code has no `net/http`, `os/exec`, `sudo` or raw network dial.
+  The review found no hidden Unicode in `.go` and `.proto` files.
+- The SDK requires go-jose v3 for `pluginsdk/support/bundleformat`. The plugin does not import
+  that package, so go-jose v3 does not enter the build.
+
+The review did not read the generated `.pb.go` files beyond the stubs above, the test files,
+`cmd/protoc-gen-go-spire`, or the Makefile and CI workflow. It did not build the SDK or run its tests.
+
+The plugin also adds these modules to the build. The review searched each version in the Go
+module cache, which `go mod verify` checks, and ran nothing from it. The search covered hidden
+Unicode, `os/exec`, `sudo` and `net/http` in non-test code.
+
+| Module | Version | Result |
+| --- | --- | --- |
+| `github.com/hashicorp/hcl` | v1.0.1-vault-7 | Parses the plugin configuration. SPIRE pins the same version. No hidden Unicode. Only `hcl/fmtcmd`, which the build does not import, uses `os/exec`. |
+| `github.com/hashicorp/go-plugin` | v1.8.0 | Matches the SPIRE pin. It runs a plugin as a child process on the host side. The plugin side only serves gRPC and reads the handshake variables. `client.go` imports `os/exec`, and the plugin never starts a child. No hidden Unicode. |
+| `github.com/hashicorp/go-hclog` | v1.6.3 | Matches the SPIRE pin. No hidden Unicode and no process or network code. |
+| `github.com/hashicorp/yamux` | v0.1.2 | Stream multiplexer for go-plugin. No hidden Unicode and no process or network code beyond `net.Conn` use. |
+| `github.com/oklog/run` | v1.1.0 | Goroutine group helper. No hidden Unicode and no process or network code. |
+| `github.com/fatih/color`, `github.com/mattn/go-colorable` | v1.15.0, v0.1.13 | Terminal colour for hclog. No hidden Unicode and no process or network code. |
+| `google.golang.org/grpc` | v1.84.0 | Matches the SPIRE pin. Only the server side is relevant to the plugin, and the listener is a local socket. `os/exec` appears only in a Windows file and in a test tool that the build does not import. No hidden Unicode. |
+| `google.golang.org/protobuf`, `github.com/golang/protobuf` | v1.36.11, v1.5.4 | `os/exec` appears only in code generators that the build does not import. No hidden Unicode. |
+| `golang.org/x/net`, `golang.org/x/text`, `golang.org/x/sys` | v0.57.0, v0.40.0, v0.47.0 | Standard extension modules. `os/exec` appears only in generators and test helpers. The word `sudo` appears once, in a language name table in `x/text`. No hidden Unicode. The upgrade of `x/sys` from v0.6.0 also reaches the other modules that use it. |
+| `google.golang.org/genproto/googleapis/rpc` | v0.0.0-20260706201446-f0a921348800 | Generated status types. The review did not read it beyond the module listing. |
+
+The review compared no module with its upstream repository. Because of this, the result rests
+on the module checksums in `go.sum` and on the read of the cache.

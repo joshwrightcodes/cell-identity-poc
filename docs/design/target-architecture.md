@@ -303,7 +303,7 @@ expired attests again as a new agent, with a new nonce.
 
 - The server prunes old agents with `prune_tofu_nodes = true` and `prune_attested_nodes_expired_for`.
 - SPIRE's built-in per-IP limit is turned off, because cells share addresses. The server makes each nonce inside one attestation stream, so a token copied into another stream fails, and no nonce cache is needed.
-- Plugins have no datastore access: the plugin SDK offers only the `agentstore` and `identityprovider` host services (as of 2026-11-08). Each server keeps its own per-cell limit in memory, so a second server divides the limit.
+- Plugins have no datastore access: SPIRE offers server plugins only the `identityprovider`, `agentstore` and `metrics` host services (as of 2026-11-08). Each server keeps its own per-cell limit in memory, so a second server divides the limit.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
 
 ### Independent key check **[call]**
