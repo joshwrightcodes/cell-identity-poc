@@ -22,22 +22,22 @@ import (
 )
 
 func main() {
-	slog.SetDefault(newLogger(os.Args[1:], os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
-		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("netprobe failed", "error", err)
-		os.Exit(1)
-	}
+	code := execute(ctx, os.Args[1:], os.Stdout)
+	stop()
+	os.Exit(code)
 }
 
-// newLogger sends the logs of the long-running serve mode to stdout. The data commands keep
-// stdout for their data, so their logs go to stderr.
-func newLogger(args []string, stdout io.Writer) *slog.Logger {
-	if len(args) > 0 && args[0] == "serve" {
-		return slog.New(slog.NewTextHandler(stdout, nil))
+// execute runs one command and returns the exit code. Every log line is compact JSON on stdout.
+// A failure is one JSON error line on stdout, so the data commands print only data on success.
+func execute(ctx context.Context, args []string, stdout io.Writer) int {
+	logger := slog.New(slog.NewJSONHandler(stdout, nil))
+	slog.SetDefault(logger)
+	if err := run(ctx, args, stdout); err != nil {
+		logger.Error("netprobe failed", "error", err)
+		return 1
 	}
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+	return 0
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
@@ -168,11 +168,9 @@ func get(ctx context.Context, url string, out io.Writer, timeout time.Duration) 
 		return err
 	}
 	defer resp.Body.Close()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	return nil
+	_, err = io.Copy(out, resp.Body)
+	return err
 }

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -120,15 +121,86 @@ func TestScanPrintsOnlyJSON(t *testing.T) {
 	}
 }
 
-func TestNewLoggerWritesServeLogsToStdout(t *testing.T) {
+func TestFailureIsOneJSONErrorLine(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusForbidden)
+	}))
+	defer srv.Close()
+	for _, args := range [][]string{
+		nil,
+		{"bogus"},
+		{"scan"},
+		{"scan", "--host", "not-an-ip"},
+		{"get"},
+		{"get", "--url", srv.URL},
+	} {
+		var out strings.Builder
+		if code := execute(context.Background(), args, &out); code == 0 {
+			t.Errorf("%v: exit code 0, want non-zero", args)
+		}
+		lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("%v: %d lines, want 1: %q", args, len(lines), out.String())
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
+			t.Fatalf("%v: not JSON: %q: %v", args, lines[0], err)
+		}
+		if msg, _ := m["error"].(string); msg == "" {
+			t.Errorf("%v: no error field: %v", args, m)
+		}
+	}
+}
+
+func TestSuccessPrintsOnlyData(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("hello"))
+	}))
+	defer srv.Close()
 	var out strings.Builder
-	newLogger([]string{"serve"}, &out).Info("serving")
-	if !strings.Contains(out.String(), "serving") {
-		t.Errorf("serve log missing from stdout: %q", out.String())
+	if code := execute(context.Background(), []string{"get", "--url", srv.URL}, &out); code != 0 || out.String() != "hello" {
+		t.Errorf("get: code %d, stdout %q", code, out.String())
 	}
 	out.Reset()
-	newLogger([]string{"scan"}, &out).Info("scanning")
-	if out.Len() != 0 {
-		t.Errorf("scan log reached stdout: %q", out.String())
+	if code := execute(context.Background(), []string{"scan", "--host", "127.0.0.1", "--ports", "1"}, &out); code != 0 || out.String() != "[]\n" {
+		t.Errorf("scan: code %d, stdout %q", code, out.String())
 	}
+}
+
+func TestServeLogsAreJSON(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var out syncBuffer
+	done := make(chan int)
+	go func() { done <- execute(ctx, []string{"serve", "--addr", "127.0.0.1:0"}, &out) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out.String(), "\n") && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("serve exit code %d, output %q", code, out.String())
+	}
+	for _, l := range strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Errorf("serve log is not JSON: %q: %v", l, err)
+		}
+	}
+}
+
+type syncBuffer struct {
+	mu sync.Mutex
+	sb strings.Builder
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.String()
 }
