@@ -126,3 +126,29 @@ func TestFailuresAreOneJSONLineOnStdout(t *testing.T) {
 		})
 	}
 }
+
+func TestInstallReplacesSymlinkWithoutFollowing(t *testing.T) {
+	src := fakeExe(t)
+	dir := t.TempDir()
+	victim := filepath.Join(t.TempDir(), "victim")
+	if err := os.WriteFile(victim, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, binaryName)
+	if err := os.Symlink(victim, dst); err != nil {
+		t.Fatal(err)
+	}
+	if code := Run(binaryName, []string{"install", dir}, &bytes.Buffer{}, func() (string, error) { return src, nil }); code != 0 {
+		t.Fatalf("code = %d", code)
+	}
+	if got, _ := os.ReadFile(victim); string(got) != "keep" {
+		t.Fatalf("symlink target changed to %q", got)
+	}
+	fi, err := os.Lstat(dst)
+	if err != nil || fi.Mode()&os.ModeSymlink != 0 {
+		t.Fatalf("destination is still a symlink: %v, %v", fi, err)
+	}
+	if got, _ := os.ReadFile(dst); string(got) != "binary bytes" {
+		t.Fatalf("copy = %q", got)
+	}
+}

@@ -339,8 +339,9 @@ Protobuf. The go.mod files of `client-go` v0.37.1 and `apimachinery` v0.37.1 req
 `google.golang.org/protobuf` v1.36.12-0.20260120151049-f2248ac996af, so the build uses this version
 for the server plugin and the agent plugin. SPIRE v1.15.5 pins v1.36.11, and the earlier rows of
 this file describe that version. The commit date is 2026-01-20, which is more than two weeks old.
-The tag v1.36.12 exists and is dated 2026-08-10. The review did not verify that the tag contains
-this commit, and `go.mod` does not use the tag. The review compared the module cache copies of
+The tag v1.36.12 exists and is dated 2026-08-10. The tag contains this commit and three later
+commits (GitHub compare: ahead by 3, behind by 0). `go.mod` keeps the pseudo-version, because
+`client-go` v0.37.1 requires exactly this version. The review compared the module cache copies of
 v1.36.11 and this version. Nine non-generated, non-test Go files differ: `protogen`, `protodelim`,
 `protojson` (two files), `prototext`, `generate-protos`, `descfmt`, `internal/version` and
 `protodesc`. The added lines hold no `os/exec`, `net/http`, `net`, `sudo`, `syscall` or `unsafe`
@@ -371,6 +372,26 @@ Release dates from the Go proxy (the `.info` files, read 2026-11-08):
 | `gopkg.in/evanphx/json-patch.v4` | v4.13.0 | 2025-01-28 |
 | `github.com/json-iterator/go` | v1.1.12 | 2021-09-11 |
 | `github.com/x448/float16` | v0.8.4 | 2020-01-17 |
+| `k8s.io/client-go` | v0.37.1 | 2026-09-23 |
+| `github.com/go-openapi/jsonpointer` | v1.0.0 | 2026-07-07 |
+| `github.com/go-openapi/jsonreference` | v1.0.0 | 2026-07-07 |
+| `github.com/go-openapi/swag/cmdutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/conv` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/fileutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/jsonutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/loading` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/mangling` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/netutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/pools` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/stringutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/typeutils` | v0.27.1 | 2026-07-19 |
+| `github.com/go-openapi/swag/yamlutils` | v0.27.1 | 2026-07-19 |
+| `github.com/modern-go/concurrent` | v0.0.0-20180306012644-bacd9c7ef1dd | 2018-03-06 |
+| `github.com/modern-go/reflect2` | v1.0.3-0.20250322232337-35a7c28c31ee | 2025-03-22 |
+| `github.com/munnerz/goautoneg` | v0.0.0-20191010083416-a7dc8b61c822 | 2019-10-10 |
+| `github.com/davecgh/go-spew` | v1.1.2-0.20180830191138-d8f796af33cc | 2018-08-30 |
+| `sigs.k8s.io/json` | v0.0.0-20250730193827-2d320260d730 | 2025-07-30 |
+| `gopkg.in/inf.v0` | v0.9.1 | 2018-03-26 |
 
 Every date is more than two weeks before 2026-11-08. The upgrade also raises `spf13/pflag` from
 v1.0.5 and `go.yaml.in/yaml/v2` from v2.4.2, because the three Kubernetes modules require the new
@@ -378,7 +399,6 @@ versions.
 
 The agent binary links the whole `internal/clusterjwt` package. Because of this, it also contains
 the server code and its go-jose and hcl imports, although it never calls the server code.
-
 
 The review did not read the other client-go packages, the generated clientset for other API
 groups, or the test files. It did not compare any module with its upstream repository. Because of
