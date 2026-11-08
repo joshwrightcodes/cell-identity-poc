@@ -45,6 +45,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		return errors.New("usage: netprobe scan|serve|get")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	switch args[0] {
 	case "scan":
 		host := fs.String("host", "", "IP address to scan")

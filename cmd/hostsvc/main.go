@@ -40,6 +40,7 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	cmd := args[0]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	topoPath := fs.String("topology", "harness/topology.yaml", "topology file")
 	only := fs.String("only", "", "act on this cluster only (up, down)")
 	name := fs.String("cluster", "", "cluster name (facts)")

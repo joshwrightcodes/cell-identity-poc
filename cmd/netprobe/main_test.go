@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -133,9 +135,19 @@ func TestFailureIsOneJSONErrorLine(t *testing.T) {
 		{"scan", "--host", "not-an-ip"},
 		{"get"},
 		{"get", "--url", srv.URL},
+		{"get", "--bogus"},
+		{"get", "-h"},
+		{"scan", "-h"},
+		{"scan", "--bogus"},
+		{"serve", "--bogus"},
 	} {
 		var out strings.Builder
-		if code := execute(context.Background(), args, &out); code == 0 {
+		stderr := captureStderr(t)
+		code := execute(context.Background(), args, &out)
+		if got := stderr(); got != "" {
+			t.Errorf("%v: wrote to stderr: %q", args, got)
+		}
+		if code == 0 {
 			t.Errorf("%v: exit code 0, want non-zero", args)
 		}
 		lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
@@ -158,11 +170,23 @@ func TestSuccessPrintsOnlyData(t *testing.T) {
 	}))
 	defer srv.Close()
 	var out strings.Builder
+	stderr := captureStderr(t)
+	defer func() {
+		if got := stderr(); got != "" {
+			t.Errorf("wrote to stderr: %q", got)
+		}
+	}()
 	if code := execute(context.Background(), []string{"get", "--url", srv.URL}, &out); code != 0 || out.String() != "hello" {
 		t.Errorf("get: code %d, stdout %q", code, out.String())
 	}
 	out.Reset()
-	if code := execute(context.Background(), []string{"scan", "--host", "127.0.0.1", "--ports", "1"}, &out); code != 0 || out.String() != "[]\n" {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+	if code := execute(context.Background(), []string{"scan", "--host", "127.0.0.1", "--ports", closed}, &out); code != 0 || out.String() != "[]\n" {
 		t.Errorf("scan: code %d, stdout %q", code, out.String())
 	}
 }
@@ -203,4 +227,23 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.sb.String()
+}
+
+// captureStderr redirects os.Stderr to a pipe and returns a function that restores it and
+// returns what was written.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	return func() string {
+		os.Stderr = orig
+		_ = w.Close()
+		b, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(b)
+	}
 }

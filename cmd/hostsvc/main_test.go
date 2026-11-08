@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -26,10 +28,19 @@ func TestFailureIsOneJSONErrorLine(t *testing.T) {
 		nil,
 		{"bogus"},
 		{"facts"},
+		{"facts", "--nope"},
+		{"facts", "-h"},
+		{"up", "--x"},
+		{"down", "--help"},
 		{"facts", "--cluster", "nope", "--topology", "does-not-exist.yaml"},
 	} {
 		var out strings.Builder
-		if code := execute(context.Background(), args, &out); code == 0 {
+		stderr := captureStderr(t)
+		code := execute(context.Background(), args, &out)
+		if got := stderr(); got != "" {
+			t.Errorf("%v: wrote to stderr: %q", args, got)
+		}
+		if code == 0 {
 			t.Errorf("%v: exit code 0, want non-zero", args)
 		}
 		lines := jsonLines(t, out.String())
@@ -47,5 +58,24 @@ func TestLogsAreCompactJSON(t *testing.T) {
 	execute(context.Background(), []string{"bogus"}, &out)
 	if strings.Contains(out.String(), "\n  ") {
 		t.Errorf("log is not compact: %q", out.String())
+	}
+}
+
+// captureStderr redirects os.Stderr to a pipe and returns a function that restores it and
+// returns what was written.
+func captureStderr(t *testing.T) func() string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stderr
+	os.Stderr = w
+	return func() string {
+		os.Stderr = orig
+		_ = w.Close()
+		b, _ := io.ReadAll(r)
+		_ = r.Close()
+		return string(b)
 	}
 }
