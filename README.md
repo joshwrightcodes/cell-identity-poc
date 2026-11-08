@@ -62,8 +62,7 @@ An unknown name fails with a list of the known cells. For example, `CELL=kiln mi
 3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
-The bundle store keeps bundles in an `emptyDir` volume.
-If its pod restarts, run `mise run cell:publish` again.
+The bundle store keeps bundles on a persistent volume, so they survive a pod restart.
 
 ## Layout
 

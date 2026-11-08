@@ -25,7 +25,7 @@ apply_bundle() {
 for c in "${BOOTSTRAP[@]}"; do
   apply_bundle "$c"
 done
-k -n cell-system rollout status deploy/bundle-store --timeout=300s >/dev/null
+k -n cell-system rollout status statefulset/bundle-store --timeout=300s >/dev/null
 k -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null
 k -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null
 k apply --server-side -f "$ROOT/bootstrap/root.yaml" >/dev/null

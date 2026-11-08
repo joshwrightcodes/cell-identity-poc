@@ -25,7 +25,6 @@ proves that the base works before identity work starts.
 
 - Identity between planes. SPIRE, the worker and the gateways come in later milestones.
 - A mesh across clusters. No mesh link joins two clusters, including clusters in the same cell.
-- Persistent storage for the bundle store.
 - A telemetry backend. The collector prints what it receives.
 
 ## Layers
@@ -74,6 +73,7 @@ plaintext. Strict mTLS on the collector would reject them.
 - `scripts/hydrate.sh` renders each component into plain YAML.
 - `scripts/publish.sh` pushes each bundle as a single-layer OCI artifact and records its digest.
 - The publish script stands in for the worker, which publishes bundles in a later milestone.
+- The bundle store keeps bundles on a 1Gi volume from the default StorageClass, so a pod restart keeps them.
 - The bundle store accepts plain HTTP for now. The SVID proxy replaces it when SPIRE arrives.
 
 ### Mesh

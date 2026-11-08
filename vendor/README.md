@@ -120,8 +120,8 @@ image configuration and history with `docker image inspect` and `docker history`
   arguments and runs `exec`. It has no network call, no `sudo` and no credential access.
 - The default configuration stores blobs on the local filesystem and enables delete. It also opens a
   debug listener on port 5001 inside the container, with Prometheus `/metrics` turned on.
-  `kiln-registry` sets `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in the container then shows
-  only port 5000. The bundle store keeps the default listener until its own change.
+  `kiln-registry` and the bundle store set `REGISTRY_HTTP_DEBUG_ADDR` to empty, and `netstat` in each
+  container then shows only port 5000.
 - Setuid and setgid: `docker run --rm --entrypoint find <image> / -xdev ( -perm -4000 -o -perm -2000 ) -type f`
   printed nothing. The entrypoint override runs only `find`, not the registry.
 - Persistence: a shell with the entrypoint overridden checked the usual startup paths. The image has no
@@ -138,3 +138,42 @@ image configuration and history with `docker image inspect` and `docker history`
 - The review did not read the Alpine packages or any file outside the paths named above.
 - The review did not observe the network behaviour of the binary at run time.
 - The `kiln-registry` container has no credentials. It serves HTTP without authentication on 127.0.0.1 only.
+
+## Local-path provisioner (2026-11-08)
+
+The image `docker.io/kindest/local-path-provisioner:v20260820-69b56db7` provides the `standard`
+StorageClass in every kind cluster. The bundle store uses it for its volume. The provisioner has run in all
+five clusters since M0, so this review happened after its first run. The cluster nodes pull the image and
+run it on their own. The review did not run any code from the sources.
+
+- The kind v0.33.0 source holds the image definition in `images/local-path-provisioner`. The `Makefile`
+  pins the upstream `rancher/local-path-provisioner` at `v0.0.34`.
+  The upstream tag resolves to commit `af49f3fdf69e2e5ad790d295b6005ba3767ec991`.
+  The `Dockerfile` builds that tag with the Go toolchain and copies the binary into `gcr.io/distroless/static-debian13`.
+  The build also runs `go install github.com/google/go-licenses@latest` in the build stage. The final image does not contain that tool.
+- The upstream source has three Go files, `main.go`, `provisioner.go` and `util.go`, with 1778 lines in
+  all Go files outside `vendor/`. The files contain no non-ASCII characters.
+- The files contain no `net/http` client, no `net.Dial`, no `os/exec` and no `sudo`.
+  The only network peer is the Kubernetes API server, through `client-go`.
+  The only environment reads are `HOME`, `KUBECONFIG` and the settings that the manifest passes.
+- The provisioner creates a short-lived helper pod for each volume setup and teardown. The helper pod
+  mounts the parent directory of the volume as a `hostPath` on the node and runs the `setup` and `teardown`
+  scripts from the `local-path-config` ConfigMap. The helper image is `docker.io/kindest/local-path-helper:v20260131-7181c60a`.
+  The scripts are `mkdir -m 0777 -p "$VOL_DIR"` and `rm -rf "$VOL_DIR"`.
+  The helper pod has no `privileged` setting in the provisioner source or in the manifest.
+  It runs as the image user, which is root, and it tolerates every taint.
+- The provisioner creates each PersistentVolume as a `hostPath` volume under `/var/local-path-provisioner`
+  on the node. The directory mode is 0777, so every pod user can write to the volume.
+- RBAC from `/kind/manifests/default-storage.yaml` in the node image: a Role in `local-path-storage` that
+  allows create, update and delete on `pods`, and a ClusterRole that reads nodes, claims, ConfigMaps, pods and pod logs.
+  The ClusterRole also manages PersistentVolumes, creates events and reads StorageClasses.
+  The account cannot read Secrets.
+- The provisioner pod has no `securityContext`, no `privileged` setting and no `hostPath` of its own.
+  It mounts only the `local-path-config` ConfigMap.
+- The ConfigMap `local-path-config` holds only the node path map, the two scripts and the helper pod template.
+- The review did not read the vendored Go modules under `vendor/` in the upstream source.
+- The review did not check the published image against a build of the source.
+- The review did not observe the network behaviour of the image at run time.
+- Result: no obfuscation, hidden Unicode, unexpected network call, `sudo`, persistence or credential
+  access. The root helper pod with a node `hostPath` is the main exposure. It is the normal design of this provisioner and
+  stays inside the kind node.
