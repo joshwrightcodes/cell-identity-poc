@@ -102,7 +102,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 
 - Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository's `mise.toml` pins every tool, and mise tasks are the only entry points. The harness asserts the exact versions.
 - Kubernetes v1.37.0 node image, pinned by digest.
-- Until M1 shows that kind clusters survive a restart of the Colima VM, a Mac restart is a disaster recovery event. The gate runs under `caffeinate`.
+- kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
 - Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
 - Telemetry goes through OpenTelemetry (OTLP). Do not add Prometheus client libraries, `/metrics` endpoints or ServiceMonitors. Upstream metrics listeners are turned off.
@@ -786,7 +786,7 @@ this order, each with its own scope document:
 | Pods reach the host service through `host.docker.internal` | M1 | A fixed gateway address in the cluster config |
 | Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster |
 | kind's local-path provisioner passes review | M1 | Stop and report |
-| kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery |
+| kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery. Result 2026-11-08: they do not survive, so this fallback applies |
 | Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
 | Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |

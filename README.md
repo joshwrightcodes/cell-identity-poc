@@ -47,13 +47,50 @@ mise run harness:up
 CELL=dev-cell-1 mise run cell:verify
 ```
 
-`harness:up` starts the Colima VM, through `vm:up`. It then creates all five clusters through the host service.
+`harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions. It then creates all five clusters through the host service.
 After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy.
 `cell:verify` runs one check for each base rule and prints PASS or FAIL.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
 An unknown name fails with a list of the known cells. For example, `CELL=kiln mise run cell:up` stands up the base cell on `kiln` only.
+
+## Size and time
+
+`harness/versions.env` holds the expected tool versions and the time budget of `gate:m1`.
+`harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
+`harness:size` prints the memory and CPU of every node container and of `kiln-registry`.
+
+Two runs from clean, each with `harness:down`, `harness:up` and `gate:m1`, gave these results on 2026-11-08:
+
+| Run | `harness:up` | `gate:m1` |
+| --- | --- | --- |
+| 1 | 17 minutes 2 seconds | 65 seconds |
+| 2 | 17 minutes 13 seconds | 64 seconds |
+
+After the clusters were healthy, the five node containers used about 8 GiB of memory in total:
+
+| Container | Memory | CPU |
+| --- | --- | --- |
+| `kiln`, `dev-cp`, `dev-cell-1`, `dev-cell-2` (each) | 1.7 to 1.8 GiB | 6 to 10 percent |
+| `rogue` | 0.6 GiB | 5 percent |
+| `kiln-registry` | 32 MiB | 0 percent |
+
+The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
+
+`gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
+The budget is 2 minutes. This is 1.5 times the slower run of 65 seconds, rounded up to the next minute.
+The budget does not cover `harness:up`.
+
+## Restart of the VM
+
+`harness:restart-check` stops and starts the VM, waits until every node is Ready, and runs `gate:m1`.
+On 2026-11-08 the clusters did not survive a restart.
+All five nodes returned to Ready within seconds.
+The workloads did not recover: `istiod` and the Istio CNI pod stayed not Ready, and the mesh pods stayed in `Unknown` or `istio-validation` back-off.
+Eight of the 15 `cell:verify` checks failed, and the first `gate:m1` run failed one test.
+Treat a restart of the Mac or the VM as a disaster recovery event.
+Run `mise run harness:down` and `mise run harness:up` after it.
 
 ## How a change reaches the cell
 

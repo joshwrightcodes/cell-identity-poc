@@ -85,8 +85,8 @@ description = "Run the host service: up, down or facts, with the arguments after
 run = "go run ./cmd/hostsvc"
 
 [tasks."harness:up"]
-description = "Create all five clusters through the host service, then stand up the base cell on each cluster that has components"
-depends = ["vm:up"]
+description = "Check the tool versions, create all five clusters through the host service, then stand up the base cell on each cluster that has components"
+depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 
 [tasks."harness:down"]
@@ -103,3 +103,16 @@ run = "ko build --base-import-paths --tags latest ./cmd/netprobe"
 description = "Run the M1 end-to-end tests, plus the go test arguments after --"
 depends = ["images"]
 run = "scripts/gate.sh m1"
+
+[tasks."harness:preflight"]
+description = "Check the tool versions and the Colima profile against harness/versions.env"
+depends = ["vm:up"]
+run = "scripts/preflight.sh"
+
+[tasks."harness:size"]
+description = "Print the memory and CPU of every kind node container and the registry"
+run = "scripts/size.sh"
+
+[tasks."harness:restart-check"]
+description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate"
+run = "scripts/restart-check.sh"
