@@ -66,8 +66,9 @@ zero-width characters sit inside character tables of those libraries. The review
 `dist/index.js` from source. v5.2.4 to v5.2.7 are less than two weeks old as of 2026-11-08.
 
 The workflow `.github/workflows/unit.yml` sets the `version` input of the action to mise
-2026.10.19, released on 2026-10-24. That release is the newest one that is at least two weeks old as
-of 2026-11-08. The action also has a `sha256` input, a checksum of the mise binary for one
+2026.11.3, released on 2026-11-06. This is an owner exception to the two-week rule: CI pins the
+same mise version as the local install. A newer mise writes `mise.lock` in a newer format, and an
+older mise cannot read it. Change the local and CI versions together. The action also has a `sha256` input, a checksum of the mise binary for one
 platform. The workflow does not set it, because the action already checks the signed checksums of
 a pinned version, and the review found no use of that input in `dist/index.js`.
 

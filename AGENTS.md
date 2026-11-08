@@ -4,6 +4,7 @@
 
 - Run every tool through `mise run <task>` or `mise x -- <tool>`, because `mise.toml` pins the versions.
 - Use the kubeconfig context that kind writes, `kind-<cluster>`. Do not write another kubeconfig file.
+- CI pins the same mise version as the local install, in `.github/workflows/unit.yml`. Update both together, because an older mise cannot read the `mise.lock` format of a newer one.
 - Run Go only through mise. `mise.toml` sets `GOFLAGS=-mod=readonly`, because `vendor/` holds review records, not Go modules.
 - Every Docker command uses the PoC VM through `DOCKER_HOST` in `mise.toml`. Do not change the Docker context.
 
