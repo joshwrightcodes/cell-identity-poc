@@ -1,0 +1,102 @@
+<svg xmlns="http://www.w3.org/2000/svg" class="d" viewBox="0 0 1100 560" width="1100" height="560" role="img" aria-label="Kiln at the top, dev-cp in the middle, and dev-cell-1, dev-cell-2 and rogue at the bottom, all inside a Colima VM. Cells dial up to dev-cp, and dev-cp dials up to Kiln. The rogue cell's connection is rejected. A host service on the Mac creates clusters and serves their keys. Markers 1 to 4, I and V show what the PoC validates.">
+      <style>
+  svg { --bg: #ffffff; --ink: #17212b; --muted: #55636f; --kiln: #3346b3; --env: #0b7a65; --cell: #17212b; --ext: #6b7680; --check: #a15c00; --rogue: #b3261e; --on-check: #ffffff;
+    --f-kiln: #e6e9f8; --f-env: #e2f3ef; --f-cell: #f4f6f8; --f-ext: #eceff1; --f-rogue: #fbeaea; --f-vm: #f7f9fa; }
+  @media (prefers-color-scheme: dark) {
+    svg { --bg: #0d1117; --ink: #e8eef2; --muted: #9dabb6; --kiln: #9aabff; --env: #4fd2b6; --cell: #e8eef2; --ext: #9dabb6; --check: #f0b45a; --rogue: #ff8f86; --on-check: #11171d;
+      --f-kiln: #20284a; --f-env: #123029; --f-cell: #141b21; --f-ext: #222b33; --f-rogue: #3a1d1c; --f-vm: #161d24; }
+  }
+  .bg { fill: var(--bg); }
+  text { font-family: -apple-system, "Segoe UI", "Helvetica Neue", Arial, sans-serif; fill: var(--ink); }
+  .b { stroke-width: 1.5; }
+  .b.kiln { fill: var(--f-kiln); stroke: var(--kiln); }
+  .b.env { fill: var(--f-env); stroke: var(--env); }
+  .b.cell { fill: var(--f-cell); stroke: var(--cell); }
+  .b.rogue { fill: var(--f-rogue); stroke: var(--rogue); }
+  .b.ext { fill: var(--f-ext); stroke: var(--ext); }
+  .frame { fill: var(--f-vm); stroke: var(--ext); stroke-width: 1.4; stroke-dasharray: 7 5; }
+  .mac { fill: none; stroke: var(--ext); stroke-width: 1.4; }
+  .n { font-size: 15px; font-weight: 600; }
+  .k { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11px; fill: var(--muted); }
+  .t { font-size: 12.5px; fill: var(--muted); }
+  .bn { font-size: 15px; font-weight: 700; fill: var(--muted); }
+  .al { font-size: 12px; fill: var(--muted); }
+  .al.rogue { fill: var(--rogue); font-weight: 600; }
+  .a { fill: none; stroke-width: 2; }
+  .a.up { stroke: var(--env); }
+  .a.host { stroke: var(--ext); }
+  .a.atk { stroke: var(--rogue); stroke-dasharray: 6 5; }
+  .ah.up { fill: var(--env); } .ah.host { fill: var(--ext); } .ah.atk { fill: var(--rogue); }
+  .x { stroke: var(--rogue); stroke-width: 3; stroke-linecap: round; }
+  .mk circle { fill: var(--check); }
+  .mk text { fill: var(--on-check); font: 700 12px ui-monospace, Menlo, Consolas, monospace; text-anchor: middle; dominant-baseline: central; }
+</style>
+<rect class="bg" x="0" y="0" width="1100" height="560" rx="12"/>
+<defs>
+        <marker id="h-up" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah up" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="h-host" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah host" d="M0,0 L10,5 L0,10 z"/></marker>
+        <marker id="h-atk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="ah atk" d="M0,0 L10,5 L0,10 z"/></marker>
+      </defs>
+
+      <rect class="mac" x="20" y="20" width="240" height="520" rx="14"/>
+      <text class="bn" x="36" y="46">Mac</text>
+      <rect class="b ext" x="36" y="96" width="208" height="128" rx="8"/>
+      <text class="n" x="50" y="122">Host service</text>
+      <text class="k" x="50" y="140">stands in for the provider</text>
+      <text class="t" x="50" y="166">creates kind clusters</text>
+      <text class="t" x="50" y="186">serves each cluster's keys</text>
+      <text class="t" x="50" y="206">over pinned TLS</text>
+
+      <rect class="frame" x="290" y="20" width="790" height="520" rx="14"/>
+      <text class="bn" x="306" y="46">Colima VM · one kind cluster per box</text>
+
+      <rect class="b kiln" x="440" y="66" width="460" height="104" rx="8"/>
+      <text class="n" x="456" y="92">kiln</text>
+      <text class="k" x="496" y="92">management plane</text>
+      <text class="t" x="456" y="118">Kiln stand-in: signs specs, checks each cell's proof</text>
+      <text class="t" x="456" y="140">Argo CD central view, read-only</text>
+
+      <rect class="b env" x="440" y="236" width="460" height="112" rx="8"/>
+      <text class="n" x="456" y="262">dev-cp</text>
+      <text class="k" x="514" y="262">environment control plane</text>
+      <text class="t" x="456" y="288">SPIRE server with the cluster_jwt attestor</text>
+      <text class="t" x="456" y="310">kiln-envd · cell gateway · relay</text>
+      <text class="t" x="456" y="332">cell controller</text>
+
+      <rect class="b cell" x="310" y="424" width="230" height="96" rx="8"/>
+      <text class="n" x="324" y="450">dev-cell-1</text>
+      <text class="t" x="324" y="474">kiln-celld + SPIRE sidecar</text>
+      <text class="t" x="324" y="496">Argo CD, last good state</text>
+
+      <rect class="b cell" x="560" y="424" width="230" height="96" rx="8"/>
+      <text class="n" x="574" y="450">dev-cell-2</text>
+      <text class="t" x="574" y="474">kiln-celld + SPIRE sidecar</text>
+      <text class="t" x="574" y="496">Argo CD, last good state</text>
+
+      <rect class="b rogue" x="830" y="424" width="230" height="96" rx="8"/>
+      <text class="n" x="844" y="450">rogue</text>
+      <text class="t" x="844" y="474">genuine images</text>
+      <text class="t" x="844" y="496">not in any signed record</text>
+
+      <path class="a up" d="M425,424 L540,350" marker-end="url(#h-up)"/>
+      <path class="a up" d="M675,424 L675,350" marker-end="url(#h-up)"/>
+      <text class="al" x="690" y="396">attest, then take signed work</text>
+      <path class="a atk" d="M945,424 L860,350" marker-end="url(#h-atk)"/>
+      <line class="x" x1="894" y1="378" x2="910" y2="394"/><line class="x" x1="910" y1="378" x2="894" y2="394"/>
+      <text class="al rogue" x="922" y="392">rejected</text>
+      <path class="a up" d="M670,236 L670,172" marker-end="url(#h-up)"/>
+      <text class="al" x="684" y="210">specs down, status and proof up</text>
+
+      <path class="a host" d="M440,124 L246,124" marker-end="url(#h-host)"/>
+      <text class="al" x="300" y="116">reads cluster keys</text>
+      <path class="a host" d="M440,320 L360,320 L360,196 L246,196" marker-end="url(#h-host)"/>
+      <text class="al" x="300" y="342">creates new cells</text>
+
+      <g class="mk"><circle cx="360" cy="260" r="12"/><text x="360" y="260">1</text></g>
+      <g class="mk"><circle cx="490" cy="386" r="12"/><text x="490" y="386">2</text></g>
+      <g class="mk"><circle cx="900" cy="66" r="12"/><text x="900" y="66">3</text></g>
+      <g class="mk"><circle cx="1006" cy="396" r="12"/><text x="1006" y="396">4</text></g>
+      <g class="mk"><circle cx="645" cy="204" r="12"/><text x="645" y="204">I</text></g>
+      <g class="mk"><circle cx="645" cy="390" r="12"/><text x="645" y="390">I</text></g>
+      <g class="mk"><circle cx="880" cy="136" r="12"/><text x="880" y="136">V</text></g>
+    </svg>

@@ -7,6 +7,31 @@ The first milestone is the base cell: one cluster with Argo CD, Istio, network p
 OpenTelemetry collector. Every later plane starts from this base.
 `docs/design/base-cell.md` describes it.
 
+## What the PoC shows
+
+![Kiln, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
+
+Five kind clusters run in one Colima VM on a Mac. Each connection goes up a layer, and Kiln
+connects to no cluster. A host service on the Mac stands in for the cloud provider. The
+markers match this list:
+
+1. Kiln requests two new cells, and `dev-cp` creates them. The cell controller acts only on a
+   step that Kiln signs.
+2. Each cell's `kiln-celld` registers and authenticates. The `cluster_jwt` attestor checks a
+   pod-bound token against the cell's keys in a signed record.
+3. Both cells appear valid in Kiln. Kiln reads each cluster's keys itself, and checks a second
+   proof that `dev-cp` cannot make.
+4. `dev-cp` and Kiln reject a rogue cell and a man in the middle. The rogue cluster's keys are in no
+   record, and TLS interception fails at every hop.
+
+- **I:** island mode at both levels. If Kiln or `dev-cp` goes away, cells keep their
+  identities and their last good state.
+- **V:** a read-only central view in Kiln. It shows the Argo CD state of both cells, and it
+  cannot change a cell.
+
+`docs/design/poc-scope.md` gives the build scope. `docs/design/target-architecture.md` gives
+the full design.
+
 ## What you need
 
 - A Mac with Apple silicon and macOS 26 or later.
