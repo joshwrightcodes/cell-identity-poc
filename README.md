@@ -127,32 +127,33 @@ Each item name is a placeholder too.
 Put settings for your secret manager in `.envrc.local`.
 Git ignores this file, and direnv loads it through `.envrc`.
 
+A failed `mise run pki` prints one JSON error line and exits with a non-zero status.
+Each step keeps the output in a shell variable, and `&&` runs a write only after success.
+Because of this, an error line never reaches your secret manager.
+
 1. Create the root CA, and store its bundle:
 
    ```sh
-   mise run pki -- root | <write> <root-ca-bundle>
+   root="$(mise run pki -- root)" && printf '%s\n' "$root" | <write> <root-ca-bundle>
+   unset root
    ```
 
 2. Create the intermediate CA from the root bundle, and store its key and certificate as separate items:
 
    ```sh
-   inter="$(<read> <root-ca-bundle> | mise run pki -- intermediate --days 30)"
-   printf '%s\n' "$inter" | mise run pki -- key | <write> <intermediate-key>
-   printf '%s\n' "$inter" | mise run pki -- cert | <write> <intermediate-cert>
-   unset inter
+   inter="$(<read> <root-ca-bundle> | mise run pki -- intermediate --days 30)" &&
+     key="$(printf '%s\n' "$inter" | mise run pki -- key)" &&
+     cert="$(printf '%s\n' "$inter" | mise run pki -- cert)" &&
+     printf '%s\n' "$key" | <write> <intermediate-key> &&
+     printf '%s\n' "$cert" | <write> <intermediate-cert>
+   unset inter key cert
    ```
 
 3. Store the root certificate on its own:
 
    ```sh
-   <read> <root-ca-bundle> | mise run pki -- cert | <write> <root-cert>
-   ```
-
-4. Give the operator its access token from standard input:
-
-   ```sh
-   <read> <operator-token> | mise x -- kubectl --context kind-dev-cp -n <operator-namespace> \
-     create secret generic <operator-token-secret> --from-file=token=/dev/stdin
+   cert="$(<read> <root-ca-bundle> | mise run pki -- cert)" && printf '%s\n' "$cert" | <write> <root-cert>
+   unset cert
    ```
 
 The intermediate is valid for 30 days, and the root for one year.
