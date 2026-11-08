@@ -3,7 +3,7 @@
 ## Tools
 
 - Run every tool through `mise run <task>` or `mise x -- <tool>`, because `mise.toml` pins the versions.
-- Use the kubeconfig context that `container cluster create` writes. Do not write another kubeconfig file.
+- Use the kubeconfig context that kind writes, `kind-<cluster>`. Do not write another kubeconfig file.
 
 ## Commands
 

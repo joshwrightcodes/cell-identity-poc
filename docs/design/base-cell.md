@@ -19,7 +19,7 @@ proves that the base works before identity work starts.
 - Argo CD applies only hydrated bundles from a store inside the cluster.
 - The mesh protects traffic between workloads inside the cluster.
 - NetworkPolicy contains every namespace, so a workload cannot leave the cluster unless a rule allows it.
-- The same layout runs on `container cluster` and on EKS.
+- The same layout runs on kind and on EKS.
 
 ## Non-goals
 
@@ -32,7 +32,7 @@ proves that the base works before identity work starts.
 
 | Layer | Contents | Applied by |
 | --- | --- | --- |
-| 1. Cluster | Kubernetes cluster | Provider: `container cluster` locally |
+| 1. Cluster | Kubernetes cluster | Provider: kind on a Colima VM locally |
 | 2. Bootstrap set | Namespaces, Argo CD core, bundle store | `scripts/up.sh`, once |
 | 3. Platform set | Network policy, Istio, egress gateway, collector, mesh policy | Argo CD |
 | 4. Role set | Services for management, CCP or worker cell | Argo CD, in later milestones |
@@ -126,6 +126,8 @@ plaintext. Strict mTLS on the collector would reject them.
 - All checks pass on `container` 1.6.1 and 1.7.1, Kubernetes v1.37.0, Argo CD v3.6.1 and
   Istio 1.30.8. The 1.7.1 run uses the signed GitHub release, because the Homebrew build of
   1.7.1 has no cluster plugins.
+- On 2026-11-08, all checks pass on kind 0.33.0 in a Colima 0.10.3 VM, with the same Kubernetes,
+  Argo CD and Istio versions.
 - kindnet enforces NetworkPolicy. With the `apps-demo` policies removed, `plaintext` reached
   `example.com`. With the policies back, the request timed out.
 - Argo CD self-heal restored the deleted policies, once automated sync was back on.

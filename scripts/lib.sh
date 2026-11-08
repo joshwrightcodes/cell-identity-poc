@@ -28,7 +28,7 @@ BOOTSTRAP=(namespaces argocd cell-system)
 
 BUNDLE_STORE_HOST="bundle-store.cell-system.svc.cluster.local:5000"
 
-k() { kubectl --context "$CELL_NAME" "$@"; }
+k() { kubectl --context "kind-$CELL_NAME" "$@"; }
 
 log() { printf '==> %s\n' "$*" >&2; }
 
@@ -50,7 +50,7 @@ bundle_store_forward() {
     die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store. Stop the old port-forward first."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
-  kubectl --context "$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
+  kubectl --context "kind-$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
     >/dev/null 2>&1 &
   BUNDLE_STORE_PF_PID=$!
   trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT

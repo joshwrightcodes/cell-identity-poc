@@ -3,13 +3,24 @@
 # Application as Synced and Healthy.
 source "$(dirname "$0")/lib.sh"
 
-clusters="$(container cluster list)" || die "container cluster list failed. Is the container system running?"
-if awk 'NR > 1 { print $1 }' <<<"$clusters" | grep -qx "$CELL_NAME"; then
+clusters="$(kind get clusters 2>/dev/null)" || die "kind get clusters failed. Is the Colima VM running?"
+if grep -qx "$CELL_NAME" <<<"$clusters"; then
   log "cluster $CELL_NAME exists"
 else
   log "creating cluster $CELL_NAME"
-  container cluster create --name "$CELL_NAME" --cpus "$CELL_CPUS" --memory "$CELL_MEMORY" \
-    --node-image "$CELL_NODE_IMAGE"
+  mkdir -p "$BUILD"
+  cat >"$BUILD/kind.yaml" <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: $CELL_NAME
+networking:
+  podSubnet: $CELL_POD_SUBNET
+  serviceSubnet: $CELL_SERVICE_SUBNET
+nodes:
+  - role: control-plane
+    image: $CELL_NODE_IMAGE
+EOF
+  kind create cluster --config "$BUILD/kind.yaml" --wait 300s
 fi
 k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
 

@@ -1,5 +1,5 @@
 # The in-cluster bundle store. Argo CD reads hydrated bundles from it, and nothing else.
-# The cluster has no StorageClass, so bundles live in an emptyDir. After a restart, run
+# Bundles live in an emptyDir. After a restart, run
 # mise run cell:publish to push them again.
 apiVersion: v1
 kind: ServiceAccount

@@ -1,6 +1,6 @@
 # Tools and tasks for the cell PoC. `mise run <task>` puts these versions first on PATH.
-# Tools from outside this file: mise itself, and Apple `container` 1.7.1 or later from the
-# signed GitHub release. The Homebrew build of 1.7.1 has no cluster plugins.
+# Tools from outside this file: mise itself, and Colima, Lima and the Docker CLI from the global
+# mise config. kind runs its clusters on the Colima VM.
 
 [settings]
 # mise.lock pins each tool with its checksum. Run `mise lock` after a version change.
@@ -13,6 +13,7 @@ kustomize = "5.8.3"
 oras = "1.3.6"
 yq = "4.54.2"
 jq = "1.8.2"
+kind = "0.33.0"
 # Keep the same version as ARGOCD_VERSION in cell.env.
 argocd = "3.6.1"
 
@@ -37,7 +38,7 @@ run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
 description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
-run = 'argocd admin dashboard --context "$CELL_NAME" --namespace argocd --address 127.0.0.1 --port 8080'
+run = 'argocd admin dashboard --context "kind-$CELL_NAME" --namespace argocd --address 127.0.0.1 --port 8080'
 
 [tasks."cell:down"]
 description = "Delete the cluster"

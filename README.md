@@ -10,9 +10,8 @@ OpenTelemetry collector. Every later plane starts from this base.
 ## What you need
 
 - A Mac with Apple silicon and macOS 26 or later.
-- Apple `container` 1.7.1 or later, with `container system start` done. Install the signed
-  release, for example with `mise use -g container@1.7.1`. The Homebrew build of 1.7.1 has no
-  cluster plugins, so `container cluster` fails with it.
+- Colima, Lima and the Docker CLI, from your global mise config, with a Colima VM running. For
+  example: `colima start --profile poc --vm-type vz --cpu 14 --memory 40 --disk 120`.
 - mise. It installs every other tool at the version that `mise.toml` pins.
 - About 6 CPUs and 12 GB of memory free for the cell.
 
@@ -35,7 +34,7 @@ bundles and waits until Argo CD reports every Application as Synced and Healthy.
 3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
-The bundle store keeps bundles in an `emptyDir` volume, because the cluster has no StorageClass.
+The bundle store keeps bundles in an `emptyDir` volume.
 If its pod restarts, run `mise run cell:publish` again.
 
 ## Layout
@@ -57,8 +56,8 @@ It needs no login, and it stops when you press Ctrl-C.
 
 ```sh
 mise run cell:ui
-kubectl --context cell-a-1 -n argocd get applications
-kubectl --context cell-a-1 -n observability-system logs deploy/otel-collector
+kubectl --context kind-cell-a-1 -n argocd get applications
+kubectl --context kind-cell-a-1 -n observability-system logs deploy/otel-collector
 ```
 
 ## Remove the cell
