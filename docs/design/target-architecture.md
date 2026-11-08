@@ -100,7 +100,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 
 ## Constraints
 
-- Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository pins kind, and the global mise config pins Colima, Lima and the Docker CLI. The harness asserts the exact versions.
+- Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository's `mise.toml` pins every tool, and mise tasks are the only entry points. The harness asserts the exact versions.
 - Kubernetes v1.37.0 node image, pinned by digest.
 - Until M1 shows that kind clusters survive a restart of the Colima VM, a Mac restart is a disaster recovery event. The gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
