@@ -18,6 +18,9 @@
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
 | Delete the cell | `mise run cell:down` |
 | Fetch upstream files for review | `mise run vendor:fetch` |
+| Run the Go unit tests | `mise run test`, or `mise run test -- ./internal/topology/...` |
+| Check the Go code | `mise run lint` |
+| Run the M1 end-to-end gate | `mise run gate:m1` |
 
 ## References
 

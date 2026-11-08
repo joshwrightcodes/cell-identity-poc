@@ -18,9 +18,13 @@ jq = "1.8.2"
 kind = "0.33.0"
 # Keep the same version as ARGOCD_VERSION in cell.env.
 argocd = "3.6.1"
+go = "1.27.3"
+ko = "0.19.1"
 
 [env]
 _.file = "cell.env"
+# vendor/ holds reviewed third-party manifests, not Go modules. Make Go ignore it.
+GOFLAGS = "-mod=readonly"
 # Every Docker and kind command talks to the PoC VM, whatever the current Docker context is.
 DOCKER_HOST = "unix://{{env.HOME}}/.colima/poc/docker.sock"
 
@@ -56,6 +60,14 @@ run = 'argocd admin dashboard --context "kind-$CELL_NAME" --namespace argocd --a
 [tasks."cell:down"]
 description = "Delete the cluster"
 run = "scripts/down.sh"
+
+[tasks.test]
+description = "Run the Go unit tests, or the packages given after --"
+run = 'go test "${@:-./...}"'
+
+[tasks.lint]
+description = "Run go vet on every package"
+run = "go vet ./..."
 
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest and Istio charts into vendor/ for review"

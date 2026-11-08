@@ -42,3 +42,28 @@ Run these checks on each new version, and record the result here.
 - v3.6.1 adds one object compared with v3.5.6: a headless Service for the application controller.
 - Images: `quay.io/argoproj/argocd:v3.6.1`, `public.ecr.aws/docker/library/redis:8.10.1-alpine`,
   and Istio images from `registry.istio.io/release`. The review did not inspect image contents.
+
+## Go module, tools and CI actions (2026-11-08)
+
+Each item was cloned at the tagged commit into a scratch directory and read. Nothing ran
+during the review. The checks above apply, with these results.
+
+| Item | Version | Commit | Result |
+| --- | --- | --- | --- |
+| `sigs.k8s.io/yaml` | v1.6.0 | `048d724aca2d37ddb5b03c90b5b4550a3a48766d` | No hidden Unicode. No `net`, `net/http` or `os/exec` import outside tests. It depends on `go.yaml.in/yaml/v2` v2.4.2. |
+| `go.yaml.in/yaml/v2` | v2.4.2 | not cloned | Indirect module from the YAML fork that Kubernetes maintains. Its module checksum is in `go.sum`. The review did not read its source. |
+| `ko` | v0.19.1 | `e388f65a1f036f19703b8aff13e1aa5521bc6988` | No hidden Unicode. `curl` and `sudo` appear only in `pkg/caps/gen.sh`, a developer script that ko does not run. mise pins the binary checksum in `mise.lock`. |
+| `go` | 1.27.3 | not cloned | Official toolchain from mise. mise pins the archive checksum in `mise.lock`. The review did not read its source. |
+| `actions/checkout` | v7.0.1 | `3d3c42e5aac5ba805825da76410c181273ba90b1` | No hidden Unicode. `curl` appears only in a developer script under `src/misc`. The workflow sets `persist-credentials: false`. |
+| `jdx/mise-action` | v5.2.3 | `82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e` | See below. |
+
+`jdx/mise-action` downloads the mise binary from `github.com/jdx/mise` releases, and falls back
+to `mise.jdx.dev`. It checks the signed checksums and, from mise 2026.9.3, a signed release
+attestation. It runs `chmod`, `tar` and `mv`, and it writes only to the mise data directory,
+`GITHUB_ENV` and `GITHUB_PATH`. It does not use `sudo`. It keeps the GitHub token local to the
+action by default. The bundled `dist/index.js` has ten zero-width characters inside character
+tables of bundled libraries. The review did not rebuild `dist/index.js` from source. v5.2.4 to
+v5.2.7 are less than two weeks old as of 2026-11-08.
+
+Base image `gcr.io/distroless/static-debian13:nonroot` is pinned by digest in `.ko.yaml`. The
+review did not inspect the image contents.
