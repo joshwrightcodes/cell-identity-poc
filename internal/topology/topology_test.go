@@ -6,6 +6,8 @@ import (
 	"testing"
 )
 
+const pinnedImage = "docker.io/kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5"
+
 func reserved() []netip.Prefix {
 	return []netip.Prefix{
 		netip.MustParsePrefix("172.18.0.0/16"),
@@ -43,7 +45,7 @@ func TestValidateAcceptsHarnessTopology(t *testing.T) {
 }
 
 func TestValidateAcceptsIPv6Reserved(t *testing.T) {
-	topo := &Topology{Clusters: []Cluster{cluster("a", "10.1.0.0/16", "10.2.0.0/16")}}
+	topo := &Topology{NodeImage: pinnedImage, Clusters: []Cluster{cluster("a", "10.1.0.0/16", "10.2.0.0/16")}}
 	res := append(reserved(), netip.MustParsePrefix("fc00:f853:ccd:e793::/64"))
 	if err := topo.Validate(res); err != nil {
 		t.Fatalf("Validate: %v", err)
@@ -83,7 +85,7 @@ func TestValidateRejectsOverlap(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := (&Topology{Clusters: tt.clusters}).Validate(reserved())
+			err := (&Topology{NodeImage: pinnedImage, Clusters: tt.clusters}).Validate(reserved())
 			if err == nil {
 				t.Fatal("Validate returned nil")
 			}
@@ -97,7 +99,7 @@ func TestValidateRejectsOverlap(t *testing.T) {
 }
 
 func TestValidateRejectsBadPrefix(t *testing.T) {
-	topo := &Topology{Clusters: []Cluster{cluster("a", "10.1.0.0", "10.2.0.0/16")}}
+	topo := &Topology{NodeImage: pinnedImage, Clusters: []Cluster{cluster("a", "10.1.0.0", "10.2.0.0/16")}}
 	if err := topo.Validate(nil); err == nil {
 		t.Fatal("Validate accepted an address with no prefix length")
 	}
@@ -124,7 +126,7 @@ func TestValidateRejectsBadNames(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := (&Topology{Clusters: tt.clusters}).Validate(nil); err == nil {
+			if err := (&Topology{NodeImage: pinnedImage, Clusters: tt.clusters}).Validate(nil); err == nil {
 				t.Fatal("Validate returned nil")
 			}
 		})
@@ -135,8 +137,42 @@ func TestValidateRejectsSharedIssuer(t *testing.T) {
 	a := cluster("a", "10.1.0.0/16", "10.2.0.0/16")
 	b := cluster("b", "10.3.0.0/16", "10.4.0.0/16")
 	b.Issuer = a.Issuer
-	err := (&Topology{Clusters: []Cluster{a, b}}).Validate(nil)
+	err := (&Topology{NodeImage: pinnedImage, Clusters: []Cluster{a, b}}).Validate(nil)
 	if err == nil || !strings.Contains(err.Error(), a.Issuer) {
 		t.Fatalf("Validate = %v, want an error naming the issuer", err)
+	}
+}
+
+func TestValidateRejectsHostBits(t *testing.T) {
+	tests := []struct{ name, pod, svc string }{
+		{"pod subnet", "10.1.5.0/16", "10.2.0.0/16"},
+		{"service subnet", "10.1.0.0/16", "10.2.0.1/16"},
+		{"ipv6", "10.1.0.0/16", "fc00:1::1/64"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			topo := &Topology{NodeImage: pinnedImage, Clusters: []Cluster{cluster("a", tt.pod, tt.svc)}}
+			err := topo.Validate(nil)
+			if err == nil || !strings.Contains(err.Error(), "host bits") {
+				t.Fatalf("Validate = %v, want a host bits error", err)
+			}
+		})
+	}
+}
+
+func TestValidateRejectsUnpinnedNodeImage(t *testing.T) {
+	for _, image := range []string{
+		"",
+		"docker.io/kindest/node:v1.37.0",
+		"docker.io/kindest/node:v1.37.0@sha256:abc",
+		"docker.io/kindest/node:v1.37.0@sha512:" + strings.Repeat("a", 64),
+	} {
+		t.Run(image, func(t *testing.T) {
+			topo := &Topology{NodeImage: image, Clusters: []Cluster{cluster("a", "10.1.0.0/16", "10.2.0.0/16")}}
+			err := topo.Validate(nil)
+			if err == nil || !strings.Contains(err.Error(), "node image") {
+				t.Fatalf("Validate = %v, want a node image error", err)
+			}
+		})
 	}
 }

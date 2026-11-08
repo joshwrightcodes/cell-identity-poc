@@ -55,7 +55,7 @@ var testCluster = topology.Cluster{
 }
 
 func newTestService(rt *fakeRuntime, obs Observed) *Service {
-	topo := &topology.Topology{NodeImage: "kindest/node:test", Clusters: []topology.Cluster{testCluster}}
+	topo := &topology.Topology{NodeImage: "kindest/node:test@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5", Clusters: []topology.Cluster{testCluster}}
 	s := New(rt, topo)
 	s.Docker = (&fakeDocker{}).run
 	s.Prober = fakeProber{obs: obs}

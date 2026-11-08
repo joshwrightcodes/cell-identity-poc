@@ -26,6 +26,8 @@ type Topology struct {
 	Clusters  []Cluster `json:"clusters"`
 }
 
+var nodeImagePinned = regexp.MustCompile(`^[^@\s]+@sha256:[0-9a-f]{64}$`)
+
 var dnsLabel = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 // Load reads a topology from a YAML file. Unknown fields are an error.
@@ -56,9 +58,12 @@ type claim struct {
 	prefix netip.Prefix
 }
 
-// Validate checks cluster names, issuers and subnets. No subnet may overlap
+// Validate checks the node image pin, cluster names, issuers and subnets. No subnet may overlap
 // another subnet or a reserved prefix. Both IPv4 and IPv6 prefixes are checked.
 func (t *Topology) Validate(reserved []netip.Prefix) error {
+	if !nodeImagePinned.MatchString(t.NodeImage) {
+		return fmt.Errorf("node image %q is not pinned by an @sha256 digest", t.NodeImage)
+	}
 	names := map[string]bool{}
 	issuers := map[string]string{}
 	var claims []claim
@@ -90,6 +95,9 @@ func (t *Topology) Validate(reserved []netip.Prefix) error {
 			p, err := netip.ParsePrefix(s.value)
 			if err != nil {
 				return fmt.Errorf("cluster %s %s %q: %w", c.Name, s.kind, s.value, err)
+			}
+			if p != p.Masked() {
+				return fmt.Errorf("cluster %s %s %q has host bits set, want %s", c.Name, s.kind, s.value, p.Masked())
 			}
 			claims = append(claims, claim{owner: c.Name + " " + s.kind, prefix: p})
 		}
