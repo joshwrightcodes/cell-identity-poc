@@ -65,5 +65,39 @@ action by default. The bundled `dist/index.js` has ten zero-width characters ins
 tables of bundled libraries. The review did not rebuild `dist/index.js` from source. v5.2.4 to
 v5.2.7 are less than two weeks old as of 2026-11-08.
 
+## kind library and its modules (2026-11-08)
+
+The host service imports `sigs.k8s.io/kind` v0.33.0 as a Go library: `pkg/cluster`,
+`pkg/apis/config/v1alpha4` and the Docker provider. The review read a scratch clone at the
+tagged commit `407a9675e6d9af1200b5f57f9ca52ec6cdacce74` and ran nothing from it.
+
+- No hidden Unicode in `pkg/`. One emoji appears in a comment in `pkg/internal/env/term.go`.
+- `net/http` appears only in `pkg/build/nodeimage`, which the host service does not import.
+- `os/exec` appears only in `pkg/exec`, the wrapper that all providers use.
+- No `sudo`, `curl` or `wget`. No access to credentials. The Docker provider reads the Docker
+  CLI proxy settings from `~/.docker/config.json` and the `KIND_EXPERIMENTAL_DOCKER_NETWORK` variable.
+- The Docker provider runs the `docker` command line: `docker run`, `inspect`, `network`,
+  `ps`, `rm`, `exec`, `logs`, `pull` and `info`. The host service depends on `docker` on `PATH`
+  and on `DOCKER_HOST`. mise provides both.
+- kind creates containers from the node image, which has a digest pin in `harness/topology.yaml`.
+  The review did not inspect the image contents. Node containers run privileged, as kind requires.
+
+The host service reads cluster facts with the Go standard library and the kubeconfig from kind.
+It does not use `client-go`.
+
+| Module | Version | Result |
+| --- | --- | --- |
+| `sigs.k8s.io/kind` | v0.33.0 | See above. |
+| `al.essio.dev/pkg/shellescape` | v1.5.1 | Read from the Go module cache, which `go mod verify` checked. No hidden Unicode, no network or process code. |
+| `github.com/BurntSushi/toml` | v1.4.0 | Same result. A test runner outside the build uses `os/exec`. |
+| `github.com/evanphx/json-patch/v5` | v5.6.0 | Same result. |
+| `github.com/pelletier/go-toml` | v1.9.5 | Same result. A code generator outside the build uses `os/exec`. |
+| `github.com/pkg/errors` | v0.9.1 | Same result. |
+| `github.com/spf13/cobra` | v1.8.0 | Same result. |
+| `github.com/spf13/pflag` | v1.0.5 | Same result. It imports `net` only to parse IP flags. |
+| `go.yaml.in/yaml/v3` | v3.0.4 | Same result. |
+| `golang.org/x/sys` | v0.6.0 | Same result. `execabs` and platform files use process calls, as expected. |
+| `github.com/mattn/go-isatty` | v0.0.20 | Same result. |
+
 Base image `gcr.io/distroless/static-debian13:nonroot` is pinned by digest in `.ko.yaml`. The
 review did not inspect the image contents.

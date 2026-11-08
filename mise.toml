@@ -73,3 +73,7 @@ run = "go vet ./..."
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest and Istio charts into vendor/ for review"
 run = "scripts/vendor-fetch.sh"
+
+[tasks.hostsvc]
+description = "Run the host service: up, down or facts, with the arguments after --"
+run = "go run ./cmd/hostsvc"
