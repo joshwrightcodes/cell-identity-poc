@@ -105,7 +105,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 - kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
 - Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
-- Telemetry goes through OpenTelemetry (OTLP). Do not add Prometheus client libraries, `/metrics` endpoints or ServiceMonitors. Upstream metrics listeners are turned off.
+- Telemetry leaves a cluster only as OpenTelemetry (OTLP). **[owner]** Bespoke binaries log to stdout and export OTLP, with no Prometheus client libraries or ServiceMonitors. Upstream components that expose only Prometheus metrics keep their endpoint, and only the collector in the same cluster may scrape it.
 - Upstream SPIRE and Argo CD Agent stay unforked. Fixes needed upstream are offered as contributions, after the owner approves each one.
 - Read each third-party component before it runs, and report the result.
 - Scripts do not write secrets to disk.
@@ -143,7 +143,7 @@ Local instances use `dev` as `<env>`: the clusters are `management`, `dev-cp`, `
 
 | Cluster | Runs | Trust domain |
 | --- | --- | --- |
-| `management` | Kiln stand-in: intent, approvals, signed specs, key checks, Argo CD Agent principal, telemetry gateway | `kiln.poc.internal` |
+| `management` | Kiln stand-in: intent, approvals, signed specs, key checks, Argo CD Agent principal, telemetry gateway. Also a SPIRE server for Kiln's own workloads, the observability stack and Kiali | `kiln.poc.internal` |
 | `dev-cp` | kiln-envd, SPIRE server, cell gateway, relay, cell controller with ACK, local alert rules | `dev.env.poc.internal` |
 | `dev-cell-1`, `dev-cell-2` | The base cell, plus `kiln-celld`, its watchdog, `ops-runs`, `ack-system` controllers | Identities from `dev.env.poc.internal`; mesh in `<cell>.mesh.poc.internal` |
 | `rogue` | Genuine `kiln-celld` and agent images, plus attack tools | Unregistered |
@@ -169,6 +169,9 @@ telemetry gateway. It has no developer portal, catalog or workflow engine.
 | kiln-celld | `spiffe://<env>.env.poc.internal/cell/<cell>/kiln-celld` |
 | Argo CD agent | `spiffe://<env>.env.poc.internal/cell/<cell>/argocd-agent` |
 | Cell collector | `spiffe://<env>.env.poc.internal/cell/<cell>/otel` |
+| Plane collector | `spiffe://<env>.env.poc.internal/cp/otel` |
+| Cell mesh tunnel | `spiffe://<env>.env.poc.internal/cell/<cell>/mesh-view` |
+| Kiln Kiali | `spiffe://kiln.poc.internal/kiali` |
 | SPIRE agent, per pod | `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>` |
 
 - Kiln and each environment pin each other's root CA. Trust domains do not federate through bundle endpoints.
@@ -593,11 +596,25 @@ One small binary, built in this repository with go-spiffe:
 | `spiffe-server` | Kiln listeners | Requires an anchored client ID pattern and the second proof, checks the registry, sets the identity header and removes any copy from the client |
 | `token` | Bundle store | Checks a service account token with the cell's own TokenReview API |
 
+| `tunnel` | Cell mesh tunnel | Dials up to Kiln and holds one stream. It serves Kiali's read requests back down the stream, against an allow-list of read-only Kubernetes API paths |
+
 go-spiffe follows bundle and SVID changes at run time, so a CA rotation needs no restart.
+
+## Mesh view **[owner: central Kiali; details are a call]**
+
+Kiali runs in the `management` cluster. It shows the mesh of each cell, and it changes nothing.
+
+- Metrics come from the observability stack. Each cell's collector scrapes the Envoy and istiod endpoints in its own cluster, and exports them as OTLP.
+- Kiali also reads each cell's Kubernetes and Istio objects. Kiln dials into no cell, so the cell's `cell-proxy` opens a tunnel up to Kiln, through the relay. Kiali's requests travel down that tunnel.
+- At the cell end, the tunnel answers only `get`, `list` and `watch` on an allow-list of paths. A service account with an explicit read-only Role serves them. It has no access to Secrets, `pods/exec`, `pods/log` in `ops-runs`, or any write verb.
+- Kiali in Kiln uses its own SVID, `spiffe://kiln.poc.internal/kiali`, and sees one remote cluster per cell. No kubeconfig credential leaves a cell.
+- Each cell is its own mesh, with its own trust domain. Kiali shows them as separate meshes, not as one multi-cluster mesh.
 
 ## Telemetry **[owner: no personal data in signals; details are a call]**
 
-- Each cell's collector sends OTLP through the telemetry relay to Kiln.
+- Each cell's collector sends OTLP through the telemetry relay to Kiln. The `<env>-cp` collector sends OTLP to Kiln directly, with its own SVID.
+- Each collector also scrapes the Prometheus endpoints of upstream components in its own cluster: Argo CD, Argo CD Agent, istiod and Envoy. A NetworkPolicy admits only the collector to those endpoints.
+- Locally, Kiln's telemetry gateway feeds the `otel-lgtm` image, which runs Grafana, Loki, Tempo and Prometheus. Grafana shows every cluster, and the `cluster` resource attribute tells them apart.
 - The collector forwards only allow-listed attributes, span names and event names. Log bodies come only from fixed message templates.
 - The collector runs as a StatefulSet with the Recreate strategy, with a persistent queue sized in bytes for 24 hours. It filters before it queues, and the relay limits the rate at which a backlog drains after an island.
 - `kiln-celld` status messages carry a health summary for the cell: Argo CD health, root digest, SVID expiry and collector drops. The environment control plane can therefore see its cells during an island with Kiln.
@@ -791,11 +808,14 @@ this order, each with its own scope document:
 | Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
 | Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |
 | Service account key rotation on kind nodes | M2 | Stop and report |
-| Approver signatures from device-held keys in the PoC | M4 | Software keys per test approver |
-| Argo CD OCI source through a localhost proxy that adds a token | M7 | Local TLS on the proxy |
-| Argo CD Agent v0.10.0 with Argo CD v3.6.1, header auth behind `cell-proxy` | M8 | The newest v3.5 release |
-| The writes autonomous mode needs, beyond the refresh annotation | M8 | Report the gap |
-| Principal metrics listener off | M8 | NetworkPolicy blocks it |
+| Approver signatures from device-held keys in the PoC | M5 | Software keys per test approver |
+| Argo CD OCI source through a localhost proxy that adds a token | M8 | Local TLS on the proxy |
+| Argo CD Agent v0.10.0 with Argo CD v3.6.1, header auth behind `cell-proxy` | M3 | The newest v3.5 release |
+| The writes autonomous mode needs, beyond the refresh annotation | M3 | Report the gap |
+| Only the in-cluster collector reaches the principal and agent metrics endpoints | M3 | Turn the endpoint off |
+| Istio metric names survive the OTLP path into Prometheus, so Kiali finds `istio_requests_total` | M3 | A collector transform that restores the names |
+| Kiali accepts a remote cluster served through the `cell-proxy` tunnel, with no credential in its kubeconfig | M3 | A Kiali view that uses metrics only. Report the gap first |
+| Kiali shows several separate meshes, each with its own trust domain, in one instance | M3 | One Kiali for each cell in `management` |
 
 ## Departures from the Kiln canon
 
