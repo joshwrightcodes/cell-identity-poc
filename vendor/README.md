@@ -7,6 +7,7 @@ it is committed. `mise run vendor:fetch` downloads the versions that `cells/comm
 | --- | --- | --- |
 | `argocd/v3.6.1/core-install.yaml` | Argo CD repository, `manifests/core-install.yaml` | v3.6.1 |
 | `charts/istio-1.30.8/{base,cni,istiod,gateway}` | `oci://gcr.io/istio-release/charts` | 1.30.8 |
+| `charts/external-secrets-2.14.0/external-secrets` | `oci://ghcr.io/external-secrets/charts/external-secrets` | 2.14.0 |
 
 SHA-256 of `argocd/v3.6.1/core-install.yaml`:
 `0b38189d6e1fd76ef5c3db10355026c48a02020d82bf21a1a1b5ab16dffe4f3c`
@@ -487,3 +488,135 @@ the server code and its go-jose and hcl imports, although it never calls the ser
 The review did not read the other client-go packages, the generated clientset for other API
 groups, or the test files. It did not compare any module with its upstream repository. Because of
 this, the result rests on the checksums in `go.sum` and on the read of the cache.
+
+## External Secrets Operator v2.14.0 (2026-11-08)
+
+The External Secrets Operator (ESO) copies keys from the secret manager into `dev-cp`. The cell
+uses chart 2.14.0 and image v2.14.0. The ESO project published both on 2026-10-23. This is the newest
+release on or before 2026-10-25, so it meets the two-week rule. The tag `v2.14.0` points at commit
+`e932f3a3f6f274e8e269c01aa1f5fb3d1322e3c9`. The review read the chart and a scratch clone of the
+tag, and ran nothing from them.
+
+| Item | Digest |
+| --- | --- |
+| Chart archive `external-secrets-2.14.0.tgz` | SHA-256 `0a6d9e91b1ff50adfdbf24b50b582babfa7c5b7df42b21974ca4b3fb88ee5e34` |
+| Chart manifest in `ghcr.io/external-secrets/charts` | `sha256:0e3d45f11522f2730ff55deef57bc43e0ff4aadc00bdab5557fa4d354b0c3ab7` |
+| `ghcr.io/external-secrets/external-secrets:v2.14.0` index | `sha256:10608eb53e636e744903d5f3657a4d9c44e28d9d9c181b73e07bc7dd2e6884dc` |
+| amd64 manifest | `sha256:0fc0750017357a3874b3bd102e1f3d5c8b9acac3d828f8108b6f176383f66ed2` |
+| arm64 manifest | `sha256:a6a2f852e771830554a31f3392e68d6251ef9322990413b20b9df2554c8b0ab7` |
+
+The chart archive from the registry and the archive in the GitHub release `helm-chart-2.14.0` have
+the same SHA-256. `cells/common.env` holds this value, and `vendor:fetch` checks it before it
+unpacks the chart. The unpacked files match the reviewed copy.
+
+### Image
+
+These facts come from the registry and from the binary layer, read on 2026-11-08.
+
+- The arm64 image config has user `65534`, the entrypoint `/bin/external-secrets`, no command and no
+  exposed port. The chart runs the container as user 1000.
+- The base is distroless static on Debian 13. The build adds one static binary of 290 MB.
+- `go version -m` read the build information of the binary without a run. The binary uses Go 1.27.3,
+  `CGO_ENABLED=0` and the build tag `all_providers`. It has no VCS stamp, so the review could not tie
+  the binary to the commit.
+
+### Chart
+
+The checks at the top of this file give these results:
+
+- No hidden Unicode. The non-ASCII characters are the micro sign and em dashes in CRD descriptions,
+  and the greater-than-or-equal sign and a curly apostrophe in comments.
+- No long encoded strings.
+- URLs are documentation links and example addresses in a subchart note. No template downloads
+  anything, runs a shell command or calls `lookup`.
+- No `privileged`, `hostPID`, `hostIPC`, `hostPath` or `hostPort`. `hostNetwork` is a value, and it
+  is false.
+- No ClusterRole has a wildcard.
+- The chart bundles an SDK server subchart. It is off by default, and the cell leaves it off.
+
+The webhook and the cert controller:
+
+- The webhook validates SecretStore, ClusterSecretStore and ExternalSecret objects. It also serves
+  CRD conversion when `crds.conversion.enabled` is true. That value is false by default.
+- The cert controller creates and renews the webhook certificate. It writes the CA bundle into the
+  webhook configuration and the CRDs.
+- The controller command in `cmd/controller/root.go` never requests the webhook server.
+  controller-runtime v0.25.2 starts that server only on such a request, so the controller opens no
+  webhook port.
+- Because of this, the controller runs ExternalSecret and ClusterSecretStore objects without the
+  webhook and the cert controller, and the cell disables both.
+- Cost: the provider check of a store runs only in the webhook. Without it, a store error shows only
+  when the controller creates a provider client. `secrets:connect` checks the token reference itself.
+- The cert controller ClusterRole can read every CRD. It can update and patch only the three ESO CRDs
+  and the two ESO webhook configurations, by name. The cell does not render it.
+
+`components/external-secrets/values.yaml` also disables these items:
+
+- The reconcilers and CRDs for ClusterExternalSecret, PushSecret, ClusterPushSecret and
+  ClusterGenerator, and the SecretStore reconciler.
+- The chart ignores `crds.createSecretStore` and always installs the SecretStore CRD.
+- ServiceAccount token creation, leader election RBAC and the ClusterRole for service bindings.
+- Aggregation of ESO permissions to the `view`, `edit` and `admin` ClusterRoles.
+- The OpenShift finalizer permissions.
+- The health listener, through `--live-addr=0`. No probe uses it.
+
+ClusterRole `external-secrets-controller` keeps these permissions, because a ClusterSecretStore
+serves other namespaces:
+
+- Read, create, update, patch and delete Secrets in every namespace.
+- Read ConfigMaps, ServiceAccounts and namespaces.
+- Read and update ExternalSecret, SecretStore and ClusterSecretStore objects and their status.
+- Manage GeneratorState objects, read generator objects, and create events.
+
+The chart also renders ClusterRoles `external-secrets-view` and `external-secrets-edit`. They have no
+binding and no aggregation label, so they grant nothing.
+
+The controller configures zap through controller-runtime with `Development` false. controller-runtime
+then uses its JSON encoder, so the controller writes JSON logs to standard error. No flag changes
+the format. The cell sets the time encoding to `iso8601`. The controller serves Prometheus metrics
+on port 8080. No Service selects it, and the NetworkPolicy admits no ingress.
+
+### Provider of the secret manager
+
+The cell uses the ESO provider for the secret manager. `.envrc.local` selects it. The review read
+the provider package at the tag, the vendor SDK that it wraps, and the SDK code that sends requests.
+
+What the provider reads:
+
+- One key of one Kubernetes Secret, from the token reference in the store. In a ClusterSecretStore,
+  the reference must name a namespace. Without one, the controller reads the namespace of the
+  ExternalSecret.
+- At client creation, the provider makes one remote call with the token. A store becomes Ready only
+  after this call succeeds.
+
+Where it connects:
+
+- The SDK sends requests only to host names that match a fixed list of vendor domains. The list
+  includes test domains of the vendor.
+- The host check does not restrict the scheme or the port, and it does not run again after a
+  redirect. The NetworkPolicy limits egress to TCP port 443 on public addresses.
+- The SDK gives its compiled code no file system access.
+
+How it holds the token:
+
+- Only in memory. The provider passes the token to the SDK when it creates a client.
+- The provider keeps one client for each version of a store. A new token in the Secret alone does
+  not reach a cached client. Because of this, `secrets:connect` changes an annotation on the store,
+  and the store gets a new resource version.
+
+Searches:
+
+- The provider package and the SDK Go code have no hidden Unicode.
+- The provider package imports no `net`, `net/http`, `os`, `os/exec`, `syscall` or `unsafe` package.
+- The module checksums in the ESO `go.sum` match the build information of the binary.
+
+The review did not read these items:
+
+- The part of the SDK that ships as compiled code. The review did not decompile it.
+- Other ESO providers, the generators and the PushSecret code.
+- Image signatures and the provenance files of the release.
+- The binary compared with a source build, and its network behaviour at run time.
+
+Result: medium concern. The controller can write Secrets in every namespace. SDK code that the
+review could not read holds the token, and its allowed hosts include vendor test domains. The
+NetworkPolicy and the namespace condition on the store limit the effect.
