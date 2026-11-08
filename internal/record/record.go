@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -39,6 +40,7 @@ func Sign(c Cell, key ed25519.PrivateKey) ([]byte, error) {
 }
 
 // Verify checks the envelope against the trusted keys and returns the cell record.
+// The keyid field is ignored, and one valid signature from any trusted key is enough.
 func Verify(envelope []byte, keys []ed25519.PublicKey) (Cell, error) {
 	body, err := verifyPayload(envelope, keys)
 	if err != nil {
@@ -50,5 +52,24 @@ func Verify(envelope []byte, keys []ed25519.PublicKey) (Cell, error) {
 	if err := dec.Decode(&c); err != nil {
 		return Cell{}, fmt.Errorf("decode record: %w", err)
 	}
+	if dec.More() {
+		return Cell{}, errors.New("decode record: trailing data after object")
+	}
+	if err := c.validate(); err != nil {
+		return Cell{}, err
+	}
 	return c, nil
+}
+
+func (c Cell) validate() error {
+	if c.Name == "" || c.Env == "" || c.Issuer == "" {
+		return errors.New("record needs a name, env and issuer")
+	}
+	var set struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if err := json.Unmarshal(c.JWKS, &set); err != nil || len(set.Keys) == 0 {
+		return errors.New("record jwks must be a JSON key set with at least one key")
+	}
+	return nil
 }

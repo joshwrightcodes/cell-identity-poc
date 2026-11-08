@@ -22,7 +22,7 @@ func testCell() Cell {
 		Name:     "dev-cell-1",
 		Env:      "dev",
 		Issuer:   "https://10.0.0.1:6443",
-		JWKS:     json.RawMessage(`{"keys":[]}`),
+		JWKS:     json.RawMessage(`{"keys":[{"kty":"RSA"}]}`),
 		Subjects: []Subject{{Namespace: "celld", ServiceAccount: "celld"}},
 		Epoch:    1,
 		Counter:  7,

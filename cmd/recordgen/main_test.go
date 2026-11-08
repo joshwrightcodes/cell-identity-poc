@@ -14,7 +14,7 @@ import (
 
 func TestRunPrintsVerifiableConfigMap(t *testing.T) {
 	facts := func(string) (hostsvc.Facts, error) {
-		return hostsvc.Facts{Name: "dev-cell-1", Issuer: "https://10.0.0.1:6443", JWKS: json.RawMessage(`{"keys":[]}`)}, nil
+		return hostsvc.Facts{Name: "dev-cell-1", Issuer: "https://10.0.0.1:6443", JWKS: json.RawMessage(`{"keys":[{"kty":"RSA"}]}`)}, nil
 	}
 	var out bytes.Buffer
 	if err := run([]string{"--cluster", "dev-cell-1", "--subject", "celld/celld"}, &out, facts); err != nil {

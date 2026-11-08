@@ -3,20 +3,19 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
 
 const envName = "dev"
@@ -35,29 +34,26 @@ func (s *subjects) Set(v string) error {
 }
 
 func main() {
-	if err := run(os.Args[1:], os.Stdout, hostsvcFacts); err != nil {
+	if err := run(os.Args[1:], os.Stdout, nil); err != nil {
 		fmt.Fprintln(os.Stderr, "recordgen failed:", err)
 		os.Exit(1)
 	}
 }
 
-func hostsvcFacts(cluster string) (hostsvc.Facts, error) {
-	var out, errb bytes.Buffer
-	cmd := exec.Command("go", "run", "./cmd/hostsvc", "facts", "--cluster", cluster)
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	if err := cmd.Run(); err != nil {
-		return hostsvc.Facts{}, fmt.Errorf("hostsvc facts: %w: %s", err, strings.TrimSpace(errb.String()))
+func hostsvcFacts(topologyPath string) func(string) (hostsvc.Facts, error) {
+	return func(cluster string) (hostsvc.Facts, error) {
+		topo, err := topology.Load(topologyPath)
+		if err != nil {
+			return hostsvc.Facts{}, fmt.Errorf("load topology: %w", err)
+		}
+		return hostsvc.New(hostsvc.NewKindRuntime(), topo).Facts(context.Background(), cluster)
 	}
-	var f hostsvc.Facts
-	if err := json.Unmarshal(out.Bytes(), &f); err != nil {
-		return hostsvc.Facts{}, fmt.Errorf("decode facts: %w", err)
-	}
-	return f, nil
 }
 
 func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) error {
 	fs := flag.NewFlagSet("recordgen", flag.ContinueOnError)
 	cluster := fs.String("cluster", "", "cluster to read facts from")
+	topologyPath := fs.String("topology", "harness/topology.yaml", "topology file")
 	var subs subjects
 	fs.Var(&subs, "subject", "allowed subject as <namespace>/<serviceaccount>, repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -65,6 +61,9 @@ func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) 
 	}
 	if *cluster == "" {
 		return errors.New("--cluster is required")
+	}
+	if facts == nil {
+		facts = hostsvcFacts(*topologyPath)
 	}
 	f, err := facts(*cluster)
 	if err != nil {
