@@ -62,7 +62,7 @@ These stay in the target architecture, and come in later increments:
 - Every cluster gets a storage provisioner that passes the vendor review. The bundle store moves to a persistent volume.
 - `kiln-celld`, Argo CD and their Deployments are outside every Argo CD Application. An admission policy keeps bundles away from them.
 - The relay is a TLS passthrough that routes by port. Kiln has one listener for `dev`.
-- Local cluster CIDRs are made unique per cluster at creation, so routes and policies can name them.
+- Every local cluster uses the pod subnet `10.244.0.0/16`, which `container` 1.7.1 fixes in its kubeadm configuration. Pod networks are not routed between clusters, so cross-cluster traffic uses node addresses only. Unique CIDRs are an EKS requirement in the target architecture.
 
 ## Bespoke components
 
@@ -89,7 +89,7 @@ it exists.
 | # | Milestone | Done when |
 | --- | --- | --- |
 | M0 | Base cell | Done |
-| M1 | Harness | The host service creates all five clusters twice from clean, with unique CIDRs and storage. A pod in `rogue` cannot reach pod-network targets in a cell |
+| M1 | Harness | The host service creates all five clusters twice from clean, with storage and one shared image store. A pod in `rogue` reaches no port on a cell's node except the listed residual ports |
 | M2 | Attestor | Against a test-signed record, `kiln-celld` gets an SVID. Pod-bound, lifetime, audience, subject and unknown-key tests fail as expected. A sidecar renews without a new token |
 | M3 | Kiln stand-in and specs | kiln-envd pulls signed specs, and refuses unsigned or older ones. Kiln binds issuers and checks keys. The test-signed record fixture is deleted |
 | M4 | Signed work | `kiln-celld` claims, verifies and applies operations once. Forged, replayed, expired and wrong-target items fail. `dev-cp` cannot pose as a cell to Kiln |
@@ -104,7 +104,7 @@ for M9. Each tier has a time budget, set at M1.
 
 ## Residual limits of the PoC
 
-- Locally, every cluster shares vmnet, so clusters can reach each other's Kubernetes API and node ports. The PoC tests isolation on the pod network only.
+- Locally, every cluster shares vmnet, so clusters can reach each other's Kubernetes API, kubelet, etcd and kube-proxy health ports. The PoC lists these as residual ports, and tests that nothing else is reachable.
 - A compromised Kiln can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run.
 - The relay cannot close a revoked cell's streams. Kiln closes them.
