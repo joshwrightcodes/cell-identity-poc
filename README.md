@@ -48,15 +48,19 @@ the full design.
 
 ## Set up the cell
 
-Before the first `harness:up`, create the keys and `.envrc.local` as [Keys](#keys) describes.
-The SPIRE server in `dev-cp` cannot start without them.
+Follow these steps for the first setup:
 
-```sh
-mise trust
-mise install
-mise run harness:up
-mise run harness:verify
-```
+1. Run `mise trust` and `mise install` in the checkout.
+2. Create the keys and `.envrc.local`, as steps 1 to 4 of [Keys](#keys) describe.
+   The SPIRE server in `dev-cp` cannot start without them.
+3. Create and check the clusters:
+
+   ```sh
+   mise run harness:up
+   mise run harness:verify
+   ```
+
+Step 5 of [Keys](#keys), `secrets:connect`, needs the cluster, so it comes during or after `harness:up`.
 
 With `POC_SECRET_TOKEN_CMD` in the environment, `harness:up` connects the secret store of `dev-cp` itself.
 Without it, the `cell:up` of `dev-cp` prints this command once a minute while the SPIRE server waits for its keys.
@@ -415,13 +419,35 @@ To replace the intermediate in one step, run:
 mise run pki:rotate-intermediate
 ```
 
-The task reads the root CA bundle through `POC_SECRET_READ_CMD`, and pkigen signs a new intermediate.
+The task reads the root CA bundle at the remote key `POC_ROOT_CA_BUNDLE` through `POC_SECRET_READ_CMD`, and pkigen signs a new intermediate.
 `POC_SECRET_WRITE_CMD` stores the new key and certificate at the two remote keys of the table above.
-The task then runs `secrets:connect` and `cell:restart` in `dev-cp`.
+The task then runs `secrets:connect`, and waits until Secret `spire-upstream` holds the new certificate.
+Next, it runs `cell:restart` in `dev-cp`.
 Last, it checks that the active X.509 authority of the server has the new intermediate as its upstream authority.
+`PKI_ROTATE_CHECK_WAIT` bounds each of the two waits in seconds. The default is 120.
+`cell:verify` in `dev-cp` also fails when the active authority does not chain to the intermediate in the Secret.
 The keys stay in shell variables and pipes, and the task prints no key.
 `PKI_INTERMEDIATE_DAYS` sets the validity of the new intermediate. The default is 30.
 Use a write identity for this task, and not the read-only cluster token.
+
+## Move a live dev-cp to the scoped operator
+
+A `dev-cp` from before the scoped External Secrets Operator runs the cluster-wide operator and ClusterSecretStore `poc-secrets`.
+`cell:verify` then fails its store and operator checks.
+Run the one migration command, with the settings of `secrets:connect` in place:
+
+```sh
+mise run eso:migrate
+mise run harness:verify
+```
+
+First, the task annotates Namespace `spire-system` with `Prune=false,Delete=false`, and it reads the annotation back.
+No bundle of the old Application holds the namespace any more. Without the guard, Argo CD can delete it, with the SPIRE server and its datastore.
+The task then publishes the bundles, waits for the scoped controller, and runs `secrets:connect`.
+It checks the UIDs of the namespace and the datastore volume, the store, the operator permissions and the SPIRE server.
+Last, it deletes the token copy in `external-secrets`, ClusterSecretStore `poc-secrets` and its CRD.
+A run on a migrated cluster only checks and cleans up.
+On a failure after the annotation, the task prints the rollback commands.
 
 ## Layout
 

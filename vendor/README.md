@@ -604,7 +604,7 @@ The cell scopes the operator to one namespace, the store namespace `spire-system
   namespace of the ExternalSecret, whatever namespace it names (`runtime/esutils/resolvers/secret_ref.go`).
   Because of this, `secrets:connect` puts a copy of the token Secret in each store namespace.
 - The render holds Namespace `spire-system`, because the Role lives there and the
-  `spire-server` bundle comes in a later sync wave. The namespace carries `Prune=false`.
+  `spire-server` bundle comes in a later sync wave. The namespace carries `Prune=false,Delete=false`.
 - On 2026-11-09 the scoped controller ran in a test namespace of `rogue`, with the fake provider of
   ESO. A SecretStore became Ready, an ExternalSecret synced its target Secret, and the log held no
   RBAC error. `kubectl auth can-i` gave the controller Secret access in that namespace only. The
@@ -673,7 +673,8 @@ hosts include vendor test domains. The controller can read and write only the Se
 - The NetworkPolicy admits DNS and every public address on TCP port 443. It blocks only the
   private and link-local ranges, so the controller can reach any public host on that port.
 - In `spire-system`, the controller can read Secret `spire-upstream` with the intermediate CA key,
-  and the copy of the access token.
+  and the copy of the access token. Other accounts can read them too, as the residual limits in
+  `docs/design/poc-scope.md` list, for example `istio-reader-service-account` in every namespace.
 
 ## celld modules (2026-11-08)
 

@@ -27,6 +27,7 @@
 | Fetch upstream files for review | `mise run vendor:fetch` |
 | Connect the External Secrets Operator to the secret manager (see README "Keys"; `CELL` defaults to `dev-cp` here) | `mise run secrets:connect` |
 | Replace the intermediate CA of the SPIRE server (see README "Keys") | `mise run pki:rotate-intermediate` |
+| Move a live `dev-cp` from the cluster-wide External Secrets Operator to the scoped one | `mise run eso:migrate` |
 | Run the Go unit tests | `mise run test`, or `mise run test -- ./internal/topology/...` |
 | Check the Go code | `mise run lint` |
 | Run the M1 end-to-end gate | `mise run gate:m1` |
