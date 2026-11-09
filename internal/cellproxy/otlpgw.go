@@ -34,6 +34,8 @@ import (
 	"google.golang.org/grpc/tap"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 )
 
 // The source attribute keys. Every collector sets them, and the gateway sets them again from the
@@ -92,6 +94,8 @@ const (
 	maxHeaderListBytes = 64 << 10
 	// logEvery is the shortest time between two repeated Warn lines of one sender.
 	logEvery = time.Minute
+	// maxLogKeys bounds the keys of the log limiter, as for the refusal lines of the server.
+	maxLogKeys = 256
 	// minClientPing is the shortest ping interval that a client may use.
 	minClientPing = 10 * time.Second
 )
@@ -109,10 +113,11 @@ var sourceLabels = func() map[string]string {
 }()
 
 // labelForm is the name that a store derives from an attribute key, in lower case: each
-// character that is not an ASCII letter or digit becomes "_", and a run of "_" becomes one. Keys
-// with the same label form end up as one label, so k8s_cluster_name and k8s.cluster.name are the
-// same key to the gateway. A map value flattens to <key>_<inner key>, so the same rule matches a
-// nested map entry too.
+// character that is not an ASCII letter or digit becomes "_", a run of "_" becomes one, and a "_"
+// at either end goes. Keys with the same label form end up as one label, so k8s_cluster_name,
+// k8s.cluster.name and _k8s.cluster.name_ are the same key to the gateway. A map value flattens
+// to <key>_<inner key>, so the same rule matches a nested map entry too. Dropping the edges
+// matches more keys than a store merges, which costs only a deleted spoof.
 func labelForm(k string) string {
 	var b strings.Builder
 	under := false
@@ -132,7 +137,7 @@ func labelForm(k string) string {
 		b.WriteByte(c)
 		under = false
 	}
-	return b.String()
+	return strings.Trim(b.String(), "_")
 }
 
 // sourceKey returns the source key that k is a form of.
@@ -504,61 +509,60 @@ type slot struct {
 
 func (s *slot) done() { s.once.Do(s.free) }
 
-// logLimiter lets one line for each key through, then at most one line per interval. The line
-// that goes through carries the number of lines held back since the last one.
+// logLimiter lets the first line of each key through, then at most one line per logEvery, through
+// internal/lograte. It also collects the overwrites of each key between two lines.
 type logLimiter struct {
-	mu    sync.Mutex
-	every time.Duration
-	now   func() time.Time
-	keys  map[string]*limitState
+	now     func() time.Time
+	limit   *lograte.Limiter
+	mu      sync.Mutex
+	pending map[string]map[Overwrite]int64
 }
 
-type limitState struct {
-	last   time.Time
-	held   int
-	counts map[Overwrite]int64
-}
-
-func newLogLimiter(every time.Duration) *logLimiter {
-	return &logLimiter{every: every, now: time.Now, keys: map[string]*limitState{}}
+func newLogLimiter() *logLimiter {
+	l := &logLimiter{now: time.Now, pending: map[string]map[Overwrite]int64{}}
+	l.limit = lograte.New(logEvery, maxLogKeys, func() time.Time { return l.now() })
+	return l
 }
 
 // allow reports whether a line for key may go out, the lines held back before it, and the
-// overwrites that add gave key since the last line.
-func (l *logLimiter) allow(key string, add []Overwrite) (bool, int, map[Overwrite]int64) {
+// overwrites that add gave key since its last line. It logs the keys that the limiter forgot.
+func (l *logLimiter) allow(log *slog.Logger, key string, add []Overwrite) (bool, int, map[Overwrite]int64) {
+	counted, ok, suppressed, held := l.limit.Allow(key)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	st, ok := l.keys[key]
-	if !ok {
-		st = &limitState{counts: map[Overwrite]int64{}}
-		l.keys[key] = st
+	for _, h := range held {
+		log.Warn("log lines suppressed", "key", h.Key, "suppressed", h.Suppressed)
+		delete(l.pending, h.Key)
+	}
+	p := l.pending[counted]
+	if p == nil {
+		p = map[Overwrite]int64{}
+		l.pending[counted] = p
 	}
 	for _, o := range add {
-		st.counts[o]++
+		p[o]++
 	}
-	now := l.now()
-	if !st.last.IsZero() && now.Sub(st.last) < l.every {
-		st.held++
+	if !ok {
 		return false, 0, nil
 	}
-	held, counts := st.held, st.counts
-	st.last, st.held, st.counts = now, 0, map[Overwrite]int64{}
-	return true, held, counts
+	delete(l.pending, counted)
+	return true, suppressed, p
 }
 
 // Gateway receives OTLP logs, traces and metrics from the senders that the accept loop verified,
 // sets the source attributes again from the SPIFFE ID of each sender, and forwards each request
 // to the upstream. Register serves its three OTLP services on a gRPC server.
 type Gateway struct {
-	logs    collogspb.LogsServiceClient
-	traces  coltracepb.TraceServiceClient
-	metrics colmetricspb.MetricsServiceClient
-	inst    instruments
-	log     *slog.Logger
-	timeout time.Duration
-	slots   *slotPool
-	limiter *logLimiter
-	codec   *otlpCodec
+	logs     collogspb.LogsServiceClient
+	traces   coltracepb.TraceServiceClient
+	metrics  colmetricspb.MetricsServiceClient
+	inst     instruments
+	log      *slog.Logger
+	timeout  time.Duration
+	slots    *slotPool
+	limiter  *logLimiter
+	codec    *otlpCodec
+	upstream *grpc.ClientConn
 }
 
 // NewGateway returns a gateway that forwards to upstream. Its metrics come from meter.
@@ -568,15 +572,16 @@ func NewGateway(upstream *grpc.ClientConn, meter metric.Meter, log *slog.Logger)
 		return nil, err
 	}
 	return &Gateway{
-		logs:    collogspb.NewLogsServiceClient(upstream),
-		traces:  coltracepb.NewTraceServiceClient(upstream),
-		metrics: colmetricspb.NewMetricsServiceClient(upstream),
-		inst:    inst,
-		log:     log,
-		timeout: forwardTimeout,
-		slots:   newSlotPool(maxGatewayCalls, maxSenderCalls),
-		limiter: newLogLimiter(logEvery),
-		codec:   newOTLPCodec(),
+		logs:     collogspb.NewLogsServiceClient(upstream),
+		traces:   coltracepb.NewTraceServiceClient(upstream),
+		metrics:  colmetricspb.NewMetricsServiceClient(upstream),
+		inst:     inst,
+		log:      log,
+		timeout:  forwardTimeout,
+		slots:    newSlotPool(maxGatewayCalls, maxSenderCalls),
+		limiter:  newLogLimiter(),
+		codec:    newOTLPCodec(),
+		upstream: upstream,
 	}, nil
 }
 
@@ -735,13 +740,14 @@ func forward[Req proto.Message, Resp any](ctx context.Context, g *Gateway, signa
 	reset func(Req, Source) []Overwrite, call func(context.Context, Req, ...grpc.CallOption) (Resp, error)) (Resp, error) {
 	var zero Resp
 	log := g.log.With("signal", signal)
+	refused := g.codec.refusal(req)
 	src, id, err := peerSource(ctx)
 	if err != nil {
 		return zero, g.deny(ctx, log, signal, Source{}, PeerNotAllowed, codes.PermissionDenied, err.Error())
 	}
 	log = log.With("sender_cluster", src.Cluster, "spiffe_id", id)
-	if err := g.codec.refusal(req); err != nil {
-		return zero, g.deny(ctx, log, signal, src, RequestTooLarge, codes.ResourceExhausted, err.Error())
+	if refused != nil {
+		return zero, g.deny(ctx, log, signal, src, RequestTooLarge, codes.ResourceExhausted, refused.Error())
 	}
 	if ows := reset(req, src); len(ows) > 0 {
 		g.count(ctx, src, ows)
@@ -796,7 +802,7 @@ func (g *Gateway) overwrites(ctx context.Context, n int64, o Overwrite, src Sour
 // logOverwrites writes one Warn line for each sender at most once per logEvery. The line holds
 // every overwrite since the line before, as level/attribute=count.
 func (g *Gateway) logOverwrites(log *slog.Logger, src Source, ows []Overwrite) {
-	ok, held, counts := g.limiter.allow("overwrite "+src.Cluster, ows)
+	ok, suppressed, counts := g.limiter.allow(log, "overwrite "+src.Cluster, ows)
 	if !ok {
 		return
 	}
@@ -807,7 +813,7 @@ func (g *Gateway) logOverwrites(log *slog.Logger, src Source, ows []Overwrite) {
 		total += c
 	}
 	slices.Sort(pairs)
-	log.Warn("source attributes overwritten", "count", total, "overwrites", pairs, "requests_held", held)
+	log.Warn("source attributes overwritten", "count", total, "overwrites", pairs, "suppressed", suppressed)
 }
 
 // peerSource returns the source and the ID of the verified TLS peer of the call. Only an otel
@@ -845,8 +851,8 @@ func (g *Gateway) deny(ctx context.Context, log *slog.Logger, signal string, src
 	}
 	g.inst.denied.Add(ctx, 1, metric.WithAttributes(attrs...))
 	id := requestID()
-	if ok, held, _ := g.limiter.allow("denied "+string(reason)+" "+src.Cluster, nil); ok {
-		log.Warn("request denied", "reason", string(reason), "request_id", id, "error", detail, "requests_held", held)
+	if ok, suppressed, _ := g.limiter.allow(log, "denied "+string(reason)+" "+src.Cluster, nil); ok {
+		log.Warn("request denied", "reason", string(reason), "request_id", id, "error", detail, "suppressed", suppressed)
 	}
 	_ = grpc.SetTrailer(ctx, metadata.Pairs("x-request-id", id))
 	return status.Error(code, "denied")
@@ -860,9 +866,9 @@ func (g *Gateway) upstreamFailed(ctx context.Context, log *slog.Logger, signal s
 	st := status.Convert(err)
 	g.inst.failures.Add(ctx, 1, metric.WithAttributes(attribute.String("signal", signal), attribute.String("code", st.Code().String())))
 	id := requestID()
-	if ok, held, _ := g.limiter.allow("upstream "+st.Code().String()+" "+src.Cluster, nil); ok {
+	if ok, suppressed, _ := g.limiter.allow(log, "upstream "+st.Code().String()+" "+src.Cluster, nil); ok {
 		log.Warn("upstream failed", "reason", string(UpstreamUnavailable), "code", st.Code().String(), "request_id", id,
-			"error", err.Error(), "requests_held", held)
+			"error", err.Error(), "suppressed", suppressed)
 	}
 	_ = grpc.SetTrailer(ctx, metadata.Pairs("x-request-id", id))
 	p := st.Proto()
@@ -881,6 +887,7 @@ func (g *Gateway) upstreamFailed(ctx context.Context, log *slog.Logger, signal s
 type otlpBackend struct {
 	srv *grpc.Server
 	ln  *handoverListener
+	gw  *Gateway
 }
 
 // NewOTLPBackend returns the otlp backend. One gRPC server serves the OTLP services of gw on each
@@ -908,7 +915,7 @@ func NewOTLPBackend(gw *Gateway, maxRecvBytes int) Backend {
 	gw.Register(srv)
 	ln := &handoverListener{conns: make(chan *handoverConn), done: make(chan struct{})}
 	go func() { _ = srv.Serve(ln) }()
-	return &otlpBackend{srv: srv, ln: ln}
+	return &otlpBackend{srv: srv, ln: ln, gw: gw}
 }
 
 func (b *otlpBackend) Name() string { return "otlp" }
@@ -943,7 +950,7 @@ func (b *otlpBackend) Serve(ctx context.Context, conn *tls.Conn, _ Source) error
 }
 
 // Shutdown sends GOAWAY on every connection and waits for the running calls until ctx ends.
-// Then it closes every connection.
+// Then it closes every connection and the upstream connection.
 func (b *otlpBackend) Shutdown(ctx context.Context) {
 	done := make(chan struct{})
 	go func() { b.srv.GracefulStop(); close(done) }()
@@ -952,6 +959,9 @@ func (b *otlpBackend) Shutdown(ctx context.Context) {
 	case <-ctx.Done():
 		b.srv.Stop()
 		<-done
+	}
+	if b.gw.upstream != nil {
+		_ = b.gw.upstream.Close()
 	}
 }
 

@@ -916,3 +916,17 @@ files of tag `v0.38.0` of `grafana/docker-otel-lgtm` through `gh api`, and ran n
 
 The cell collectors use collector 0.164.0. In that version `exporter/otlpexporter/factory.go`
 lines 41 to 47 set gzip compression by default and no client keepalive.
+
+A gateway test writes raw HTTP/2 frames with the `Framer` of `x/net/http2` (`frame.go`) and the
+`hpack` package, from `x/net` v0.59.0. On 2026-11-10 the review searched both in the module cache
+for the checks below, and ran nothing from them during the review. It did not read the frame
+parsing or the HPACK code line by line.
+
+- `frame.go` imports standard library packages, `x/net/http/httpguts`, `x/net/internal/httpsfv`
+  and `hpack`. It logs frames only when `GODEBUG` sets `http2debug=2`.
+- The `hpack` files import only standard library packages. `gen.go` has the build tag `ignore`,
+  so no build compiles it.
+- No hidden Unicode and no other non-ASCII characters. No `os/exec`, `unsafe`, `syscall`, `sudo`,
+  environment reads or dials, and no `init` function.
+- `go list` shows that both build into `cell-proxy` as part of `x/net/http2`. These searches
+  narrow the gap that the `cell-proxy` modules review above names.

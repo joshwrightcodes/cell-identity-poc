@@ -25,11 +25,20 @@ import (
 //   - Attributes: 1,024 in one attribute set or map, eight times the SDK default limit of 128.
 //   - Messages: 500,000 in total, more than twice the densest request at the receive limit.
 //   - Depth: 32 nested messages. An exemplar attribute with a map three levels deep is at depth 17.
+//   - NumberBytes: 8 MiB of decoded repeated numbers, for example histogram buckets. A fixed-width
+//     field decodes to its wire size, so only varints (up to 8 bytes from 1 wire byte) reach the
+//     cap. 8 MiB holds one million 64-bit buckets, and a classic histogram batch at the receive
+//     limit holds about 230,000.
+//   - Strings: 65,536 elements of repeated strings in total. In OTLP only the id_keys and
+//     description_keys of an entity reference are such fields, with a few keys each.
 type scanLimits struct {
-	Resources, Scopes, Records, Attributes, Messages, Depth int
+	Resources, Scopes, Records, Attributes, Messages, Depth, NumberBytes, Strings int
 }
 
-var defaultScanLimits = scanLimits{Resources: 1024, Scopes: 8192, Records: 65536, Attributes: 1024, Messages: 500000, Depth: 32}
+var defaultScanLimits = scanLimits{
+	Resources: 1024, Scopes: 8192, Records: 65536, Attributes: 1024, Messages: 500000, Depth: 32,
+	NumberBytes: 8 << 20, Strings: 65536,
+}
 
 type scanKind int
 
@@ -64,8 +73,45 @@ var scanKinds = map[protoreflect.FullName]scanKind{
 var errMalformed = errors.New("malformed wire bytes")
 
 type scanner struct {
-	lim                                  scanLimits
-	resources, scopes, records, messages int
+	lim                                                        scanLimits
+	resources, scopes, records, messages, numberBytes, strings int
+}
+
+// goSize is the size of one element of a repeated number field of kind k in a Go slice.
+func goSize(k protoreflect.Kind) int {
+	switch k {
+	case protoreflect.BoolKind:
+		return 1
+	case protoreflect.Int64Kind, protoreflect.Sint64Kind, protoreflect.Uint64Kind,
+		protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind, protoreflect.DoubleKind:
+		return 8
+	}
+	return 4
+}
+
+// packedCount is the number of elements in the packed bytes v of a field of kind k.
+func packedCount(v []byte, k protoreflect.Kind) int {
+	switch k {
+	case protoreflect.Fixed64Kind, protoreflect.Sfixed64Kind, protoreflect.DoubleKind:
+		return len(v) / 8
+	case protoreflect.Fixed32Kind, protoreflect.Sfixed32Kind, protoreflect.FloatKind:
+		return len(v) / 4
+	}
+	n := 0
+	for _, c := range v {
+		if c < 0x80 {
+			n++
+		}
+	}
+	return n
+}
+
+// numbers counts n decoded elements of a repeated number field of kind k.
+func (s *scanner) numbers(n int, k protoreflect.Kind) error {
+	if s.numberBytes += n * goSize(k); s.numberBytes > s.lim.NumberBytes {
+		return fmt.Errorf("more than %d bytes of repeated numbers", s.lim.NumberBytes)
+	}
+	return nil
 }
 
 // scanMessage walks the wire bytes b of a message of type md with protowire, and counts each
@@ -82,11 +128,17 @@ func (s *scanner) scanMessage(b []byte, md protoreflect.MessageDescriptor, depth
 			return errMalformed
 		}
 		b = b[n:]
+		fd := fields.ByNumber(num)
 		if typ != protowire.BytesType {
 			if n = protowire.ConsumeFieldValue(num, typ, b); n < 0 {
 				return errMalformed
 			}
 			b = b[n:]
+			if fd != nil && fd.IsList() {
+				if err := s.numbers(1, fd.Kind()); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		v, n := protowire.ConsumeBytes(b)
@@ -94,8 +146,22 @@ func (s *scanner) scanMessage(b []byte, md protoreflect.MessageDescriptor, depth
 			return errMalformed
 		}
 		b = b[n:]
-		fd := fields.ByNumber(num)
-		if fd == nil || fd.Kind() != protoreflect.MessageKind {
+		if fd == nil {
+			continue
+		}
+		switch k := fd.Kind(); {
+		case k == protoreflect.MessageKind:
+		case !fd.IsList():
+			continue
+		case k == protoreflect.StringKind || k == protoreflect.BytesKind:
+			if s.strings++; s.strings > s.lim.Strings {
+				return fmt.Errorf("more than %d elements of repeated strings", s.lim.Strings)
+			}
+			continue
+		default:
+			if err := s.numbers(packedCount(v, k), k); err != nil {
+				return err
+			}
 			continue
 		}
 		child := fd.Message()

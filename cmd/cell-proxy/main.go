@@ -277,6 +277,7 @@ func parseServer(args []string) (serverConfig, error) {
 		cfg.backend = func(tel *telemetry.T) (cellproxy.Backend, error) {
 			gw, err := cellproxy.NewGateway(up, tel.Meter, tel.Log)
 			if err != nil {
+				_ = up.Close()
 				return nil, err
 			}
 			up.Connect()

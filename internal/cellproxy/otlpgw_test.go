@@ -5,6 +5,7 @@ import (
 	stdgzip "compress/gzip"
 	"context"
 	"crypto/tls"
+	"errors"
 	"maps"
 	"net"
 	"regexp"
@@ -28,6 +29,8 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/connectivity"
@@ -165,6 +168,15 @@ func TestResetResourceEdgeCases(t *testing.T) {
 		{"map k8s={cluster={name}}", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
 			kvl("k8s", kvl("cluster", str("name", "dev-cell-2"))),
 		}}, []string{"k8s.cluster.name"}},
+		{"leading separator _platform={cell}", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kvl("_platform", str("cell", "dev-cell-2")),
+		}}, []string{"platform.cell"}},
+		{"trailing separator platform={cell_}", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kvl("platform", str("cell_", "dev-cell-2")),
+		}}, []string{"platform.cell"}},
+		{"both ends .platform.cell_", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			str(".platform.cell_", "dev-cell-2"),
+		}}, []string{"platform.cell"}},
 	}
 	src := mustSource(t, otelID1)
 	for _, c := range cases {
@@ -522,6 +534,8 @@ type gwHarness struct {
 	gw     *Gateway
 	reader *sdkmetric.ManualReader
 	log    *syncBuffer
+	// client is the plaintext address of spiffe-client after serve.
+	client string
 }
 
 func newGWHarness(t *testing.T, up *otlpUpstream) *gwHarness {
@@ -579,6 +593,7 @@ func (h *gwHarness) serve(t *testing.T, allow, id string, opts ...grpc.DialOptio
 	cli := &Client{TLS: ClientTLS(source(env.svid(t, id)), mgmt.bundle(), spiffeIDOf(telemetryID)), Upstream: srvLn.Addr().String(), Log: jsonLog(&syncBuffer{})}
 	cliDone := make(chan struct{})
 	go func() { _ = cli.Serve(ctx, cliLn); close(cliDone) }()
+	h.client = cliLn.Addr().String()
 
 	opts = append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)
 	conn, err := grpc.NewClient("passthrough:///"+cliLn.Addr().String(), opts...)
@@ -1192,8 +1207,8 @@ func TestGatewayOverwriteLogIsRateLimited(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := lines()
-	if len(got) != 2 || got[1]["count"] != float64(3) || got[1]["requests_held"] != float64(2) {
-		t.Fatalf("lines after the interval are %v, want a second one with count 3 and requests_held 2", got)
+	if len(got) != 2 || got[1]["count"] != float64(3) || got[1]["suppressed"] != float64(2) {
+		t.Fatalf("lines after the interval are %v, want a second one with count 3 and suppressed 2", got)
 	}
 	if pairs, _ := got[1]["overwrites"].([]any); len(pairs) != 1 || pairs[0] != "resource/k8s.cluster.name=3" {
 		t.Fatalf("overwrites are %v, want [resource/k8s.cluster.name=3]", got[1]["overwrites"])
@@ -1279,5 +1294,238 @@ func TestOTLPCodecDropsUnknownFields(t *testing.T) {
 	attr := req.GetResourceLogs()[0].GetResource().GetAttributes()[0]
 	if attr.GetKey() != "keep" || len(attr.ProtoReflect().GetUnknown()) != 0 {
 		t.Fatalf("attribute is %v with unknown bytes %q, want key keep and no unknown bytes", attr, attr.ProtoReflect().GetUnknown())
+	}
+}
+
+// TestGatewayFreesSlotOfExpiredStream sends streams whose grpc-timeout has passed when the tap
+// runs. grpc-go then aborts the stream after the tap and before the stats handler sees it, so only
+// the end of the stream context frees the slot (http2_server.go lines 596 to 602 in v1.84.0). That
+// release runs in its own goroutine, so the test sends one stream at a time and waits for the slot
+// after each. A Go client fails such a call locally, so the test writes HTTP/2 frames itself.
+func TestGatewayFreesSlotOfExpiredStream(t *testing.T) {
+	h := newGWHarness(t, &otlpUpstream{})
+	conn := h.serve(t, otelPattern, otelID1)
+	c := dialTCP(t, h.client)
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	if _, err := c.Write([]byte(http2.ClientPreface)); err != nil {
+		t.Fatal(err)
+	}
+	fr := http2.NewFramer(c, c)
+	if err := fr.WriteSettings(); err != nil {
+		t.Fatal(err)
+	}
+	var block bytes.Buffer
+	enc := hpack.NewEncoder(&block)
+	dec := hpack.NewDecoder(4096, nil)
+	slotsUsed := func() int64 {
+		return h.points(t, "cellproxy.gateway.slots.used")[attrSet(attribute.String("sender.cluster", "dev-cell-1"))]
+	}
+	for i := range maxSenderCalls + 1 {
+		id := uint32(2*i + 1)
+		block.Reset()
+		for _, f := range [][2]string{
+			{":method", "POST"}, {":scheme", "http"}, {":path", "/opentelemetry.proto.collector.logs.v1.LogsService/Export"},
+			{":authority", "gateway"}, {"content-type", "application/grpc"}, {"te", "trailers"}, {"grpc-timeout", "1n"},
+		} {
+			_ = enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+		}
+		if err := fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block.Bytes(), EndHeaders: true, EndStream: true}); err != nil {
+			t.Fatal(err)
+		}
+		end := ""
+		for end == "" {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				t.Fatalf("read on stream %d: %v", id, err)
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.HeadersFrame:
+				fields, err := dec.DecodeFull(f.HeaderBlockFragment())
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, hf := range fields {
+					if hf.Name == "grpc-status" && f.StreamID == id && f.StreamEnded() {
+						end = hf.Value
+					}
+				}
+			case *http2.RSTStreamFrame:
+				if f.StreamID == id {
+					end = "rst " + f.ErrCode.String()
+				}
+			case *http2.GoAwayFrame:
+				t.Fatalf("server sent GOAWAY %v", f.ErrCode)
+			}
+		}
+		if end == strconv.Itoa(int(codes.Unavailable)) {
+			t.Fatalf("stream %d was refused as overloaded: an earlier expired stream holds its slot", id)
+		}
+		deadline := time.Now().Add(2 * time.Second)
+		for slotsUsed() != 0 {
+			if time.Now().After(deadline) {
+				t.Fatalf("slots used is %d after expired stream %d ended (%s), want 0", slotsUsed(), id, end)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	if _, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{}); err != nil {
+		t.Fatalf("an export after the expired streams gave %v", err)
+	}
+}
+
+func TestOTLPCodecCapsRepeatedScalars(t *testing.T) {
+	cases := map[string]proto.Message{
+		"entity id_keys": &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+			Resource: &resourcepb.Resource{EntityRefs: []*commonpb.EntityRef{{IdKeys: make([]string, 1_800_000)}}},
+		}}},
+		"exponential histogram buckets": &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+			ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{Data: &metricspb.Metric_ExponentialHistogram{
+				ExponentialHistogram: &metricspb.ExponentialHistogram{DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+					Positive: &metricspb.ExponentialHistogramDataPoint_Buckets{BucketCounts: make([]uint64, 3_600_000)},
+				}}},
+			}}}}},
+		}}},
+	}
+	c := newOTLPCodec()
+	for name, m := range cases {
+		t.Run(name, func(t *testing.T) {
+			wire, err := proto.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(wire) > MaxRecvMsgBytes {
+				t.Fatalf("the request has %d bytes, more than the receive limit", len(wire))
+			}
+			allocs := testing.AllocsPerRun(3, func() {
+				req := m.ProtoReflect().New().Interface()
+				if err := c.Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, req); err != nil {
+					t.Fatal(err)
+				}
+				if c.refusal(req) == nil {
+					t.Fatal("the codec accepted the request")
+				}
+			})
+			t.Logf("wire=%d bytes allocations per refusal: %v", len(wire), allocs)
+			if allocs > 20 {
+				t.Fatalf("%v allocations per refusal, want at most 20", allocs)
+			}
+		})
+	}
+}
+
+// TestOTLPCodecWorstAllowedShape decodes one request at the message, number and string caps
+// together, the worst decode cost of one call that the scan lets through.
+func TestOTLPCodecWorstAllowedShape(t *testing.T) {
+	lim := defaultScanLimits
+	empty := make([]*commonpb.KeyValue, lim.Attributes)
+	for i := range empty {
+		empty[i] = &commonpb.KeyValue{}
+	}
+	points := make([]*metricspb.NumberDataPoint, (lim.Messages-16)/(lim.Attributes+1))
+	for i := range points {
+		points[i] = &metricspb.NumberDataPoint{Attributes: empty}
+	}
+	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		Resource: &resourcepb.Resource{EntityRefs: []*commonpb.EntityRef{{IdKeys: make([]string, lim.Strings)}}},
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{
+			{Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: points}}},
+			{Data: &metricspb.Metric_ExponentialHistogram{ExponentialHistogram: &metricspb.ExponentialHistogram{
+				DataPoints: []*metricspb.ExponentialHistogramDataPoint{{
+					Positive: &metricspb.ExponentialHistogramDataPoint_Buckets{BucketCounts: make([]uint64, lim.NumberBytes/8)},
+				}},
+			}}},
+		}}},
+	}}}
+	wire, err := proto.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) > MaxRecvMsgBytes {
+		t.Fatalf("the request has %d bytes, more than the receive limit", len(wire))
+	}
+	c := newOTLPCodec()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got := &colmetricspb.ExportMetricsServiceRequest{}
+	if err := c.Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, got); err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if err := c.refusal(got); err != nil {
+		t.Fatalf("the codec refused the worst allowed shape: %v", err)
+	}
+	total, live := (after.TotalAlloc-before.TotalAlloc)>>20, (int64(after.HeapAlloc)-int64(before.HeapAlloc))>>20
+	runtime.KeepAlive(got)
+	t.Logf("wire=%d bytes total_alloc=%d MiB live_heap=%d MiB", len(wire), total, live)
+	if total > 256 {
+		t.Fatalf("the decode allocated %d MiB, want at most 256 MiB", total)
+	}
+}
+
+func TestOTLPBackendShutdownClosesUpstream(t *testing.T) {
+	h := newGWHarness(t, &otlpUpstream{})
+	b := NewOTLPBackend(h.gw, MaxRecvMsgBytes).(*otlpBackend)
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	b.Shutdown(ctx)
+	if st := h.gw.upstream.GetState(); st != connectivity.Shutdown {
+		t.Fatalf("the upstream connection is %v after Shutdown, want SHUTDOWN", st)
+	}
+}
+
+// TestSlotPoolConcurrent runs many senders at once. Run it with -race.
+func TestSlotPoolConcurrent(t *testing.T) {
+	p := newSlotPool(maxGatewayCalls, maxSenderCalls)
+	senders := []string{"dev-cell-1", "dev-cell-2", "dev-cell-3", "dev-cell-4", "dev-cp"}
+	var total atomic.Int64
+	per := map[string]*atomic.Int64{}
+	for _, s := range senders {
+		per[s] = &atomic.Int64{}
+	}
+	var over atomic.Int64
+	var wg sync.WaitGroup
+	for g := range 64 {
+		s := senders[g%len(senders)]
+		wg.Go(func() {
+			for range 2000 {
+				if !p.take(s) {
+					continue
+				}
+				if total.Add(1) > maxGatewayCalls || per[s].Add(1) > maxSenderCalls {
+					over.Add(1)
+				}
+				per[s].Add(-1)
+				total.Add(-1)
+				p.give(s)
+			}
+		})
+	}
+	wg.Wait()
+	if n := over.Load(); n != 0 {
+		t.Fatalf("%d takes passed a limit", n)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.used != 0 || len(p.bySender) != 0 {
+		t.Fatalf("pool holds used=%d and %v at the end, want none", p.used, p.bySender)
+	}
+}
+
+func TestGatewayClearsRefusalOfDeniedPeer(t *testing.T) {
+	h := newGWHarness(t, &otlpUpstream{})
+	req := &collogspb.ExportLogsServiceRequest{}
+	h.gw.codec.refused.Store(req, errors.New("more than 1024 resources"))
+	if _, err := h.gw.ExportLogs(t.Context(), req); status.Code(err) != codes.PermissionDenied {
+		t.Fatalf("got %v, want PermissionDenied", err)
+	}
+	if _, ok := h.gw.codec.refused.Load(req); ok {
+		t.Fatal("the refusal of a denied peer stays in the codec")
 	}
 }
