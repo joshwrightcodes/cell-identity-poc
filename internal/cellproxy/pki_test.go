@@ -279,13 +279,13 @@ func logLines(t *testing.T, out *syncBuffer) []map[string]any {
 }
 
 // waitForLog waits up to 5 seconds for a line with msg and reason. A non-empty id must match
-// the spiffe_id of the line too.
+// the spiffe_id or the unverified_spiffe_id of the line too.
 func waitForLog(t *testing.T, out *syncBuffer, msg string, reason Reason, id string) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		for _, l := range logLines(t, out) {
-			if l["msg"] == msg && l["reason"] == string(reason) && (id == "" || l["spiffe_id"] == id) {
+			if l["msg"] == msg && l["reason"] == string(reason) && (id == "" || l["spiffe_id"] == id || l["unverified_spiffe_id"] == id) {
 				return l
 			}
 		}

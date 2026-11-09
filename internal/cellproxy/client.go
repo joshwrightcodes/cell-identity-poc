@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -21,25 +22,15 @@ type Client struct {
 	TLS      *tls.Config
 	Upstream string
 	Log      *slog.Logger
+
+	once     sync.Once
+	refusals *refusalLog
 }
 
 // Serve accepts connections on ln until ctx ends, then waits for the open connections to end.
 func (c *Client) Serve(ctx context.Context, ln net.Listener) error {
-	c.Log.Info("listening", "addr", ln.Addr().String(), "upstream", c.Upstream)
-	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
-	defer stop()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	for {
-		down, err := ln.Accept()
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			return err
-		}
-		wg.Go(func() { c.handle(ctx, down) })
-	}
+	c.once.Do(func() { c.refusals = newRefusalLog(c.Log) })
+	return serveListener(ctx, ln, c.Log.With("upstream", c.Upstream), func(down net.Conn) { c.handle(ctx, down) })
 }
 
 func (c *Client) handle(ctx context.Context, down net.Conn) {
@@ -48,7 +39,7 @@ func (c *Client) handle(ctx context.Context, down net.Conn) {
 	d := net.Dialer{Timeout: dialTimeout, KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: keepAlivePeriod, Interval: keepAlivePeriod}}
 	raw, err := d.DialContext(ctx, "tcp", c.Upstream)
 	if err != nil {
-		c.Log.Warn("upstream dial failed", "reason", string(UpstreamUnavailable), "error", err.Error())
+		c.refusals.write("upstream dial failed", UpstreamUnavailable, c.Upstream, "", err)
 		return
 	}
 	up := tls.Client(raw, c.TLS)
@@ -56,16 +47,27 @@ func (c *Client) handle(ctx context.Context, down net.Conn) {
 	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	err = up.HandshakeContext(hctx)
 	cancel()
+	if err == nil {
+		err = requireH2(up)
+	}
 	if err != nil {
 		var pe *PeerError
 		if errors.As(err, &pe) {
-			c.Log.Warn("peer refused", "reason", string(pe.Reason), "spiffe_id", pe.ID, "error", pe.Err.Error())
+			c.refusals.write("peer refused", pe.Reason, c.Upstream, pe.ID, pe.Err)
 		} else {
-			c.Log.Warn("handshake failed", "error", err.Error())
+			c.refusals.write("handshake failed", HandshakeFailed, c.Upstream, "", err)
 		}
 		return
 	}
 	pipe(ctx, down, up)
+}
+
+// requireH2 refuses a server that did not agree on ALPN h2.
+func requireH2(conn *tls.Conn) error {
+	if p := conn.ConnectionState().NegotiatedProtocol; p != "h2" {
+		return &PeerError{Reason: ProtocolNotH2, Err: fmt.Errorf("server agreed on ALPN %q, not h2", p)}
+	}
+	return nil
 }
 
 // pipe copies bytes both ways. When one side closes or half-closes, or ctx ends, it closes both.

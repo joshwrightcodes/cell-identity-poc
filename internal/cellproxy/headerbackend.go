@@ -13,6 +13,7 @@ import (
 	"net/http/httputil"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -22,12 +23,19 @@ const (
 	maxConcurrentStreams = 100
 	upstreamReadIdle     = 30 * time.Second
 	upstreamPingTimeout  = 15 * time.Second
-	// bodyReadTimeout bounds the read of a RefreshToken body.
-	bodyReadTimeout = 10 * time.Second
+	// The downstream side pings a silent agent too, so a dead peer ends before the TCP keepalive.
+	downstreamReadIdle    = 30 * time.Second
+	downstreamPingTimeout = 15 * time.Second
 
 	pathAuthenticate = "/authapi.Authentication/Authenticate"
 	pathRefreshToken = "/authapi.Authentication/RefreshToken"
 )
+
+// closeGrace lets the last frames of a finished request leave before the downstream closes.
+const closeGrace = 500 * time.Millisecond
+
+// bodyReadTimeout bounds the read of a RefreshToken body. Tests shorten it.
+var bodyReadTimeout = 10 * time.Second
 
 // headerBackend serves gRPC from a cell agent and proxies it to the Argo CD Agent principal. It
 // sets the identity header to the agent name of the verified source, and checks that the token
@@ -46,39 +54,67 @@ func NewHeaderBackend(upstream, header string, log *slog.Logger) Backend {
 
 func (b *headerBackend) Name() string { return "grpc-header" }
 
-// Serve serves HTTP/2 on conn until conn or ctx ends, then closes the upstream connection.
+// Serve serves HTTP/2 on conn until conn, ctx or the upstream connection ends, then closes the
+// upstream connection. The downstream ends with its upstream, so the agent dials again and gets
+// a new upstream connection.
 func (b *headerBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
 
-	h := &headerHandler{backend: b, src: src, log: b.log.With("agent", src.AgentName())}
+	log := b.log.With("agent", src.AgentName())
 	d := net.Dialer{Timeout: dialTimeout, KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: keepAlivePeriod, Interval: keepAlivePeriod}}
-	if up, err := d.DialContext(ctx, "tcp", b.upstream); err != nil {
-		h.log.Warn("upstream dial failed", "reason", string(UpstreamUnavailable), "error", err.Error())
-	} else {
-		t := &http2.Transport{ReadIdleTimeout: upstreamReadIdle, PingTimeout: upstreamPingTimeout}
-		cc, err := t.NewClientConn(up)
-		if err != nil {
-			_ = up.Close()
-			h.log.Warn("upstream connection failed", "reason", string(UpstreamUnavailable), "error", err.Error())
-		} else {
-			defer func() { _ = cc.Close() }()
-			h.proxy = &httputil.ReverseProxy{
-				Rewrite:       h.rewrite,
-				Transport:     cc,
-				FlushInterval: -1,
-				ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-					h.deny(w, r, UpstreamUnavailable, err.Error())
-				},
-				ErrorLog: slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
-			}
-		}
+	raw, err := d.DialContext(ctx, "tcp", b.upstream)
+	if err != nil {
+		log.Warn("upstream dial failed", "reason", string(UpstreamUnavailable), "error", err.Error())
+		return nil
 	}
-	srv := &http2.Server{MaxConcurrentStreams: maxConcurrentStreams, IdleTimeout: idleTimeout(ctx)}
+	h := &headerHandler{backend: b, src: src, log: log, end: cancel}
+	t := &http2.Transport{ReadIdleTimeout: upstreamReadIdle, PingTimeout: upstreamPingTimeout}
+	cc, err := t.NewClientConn(&watchedConn{Conn: raw, onError: h.upstreamEnded})
+	if err != nil {
+		_ = raw.Close()
+		log.Warn("upstream connection failed", "reason", string(UpstreamUnavailable), "error", err.Error())
+		return nil
+	}
+	defer func() { _ = cc.Close() }()
+	h.proxy = &httputil.ReverseProxy{
+		Rewrite:   h.rewrite,
+		Transport: cc,
+		// ReverseProxy flushes a streamed response at once, because its ContentLength is -1. A
+		// trailers-only response has ContentLength 0, and -1 here would flush its headers from a
+		// timer that races the trailers, so the client could lose the status.
+		FlushInterval: 0,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			h.deny(w, r, UpstreamUnavailable, err.Error())
+			if !cc.CanTakeNewRequest() {
+				h.upstreamEnded()
+			}
+		},
+		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+	}
+	srv := &http2.Server{
+		MaxConcurrentStreams: maxConcurrentStreams, IdleTimeout: idleTimeout(ctx),
+		ReadIdleTimeout: downstreamReadIdle, PingTimeout: downstreamPingTimeout,
+	}
 	srv.ServeConn(conn, &http2.ServeConnOpts{Context: ctx, Handler: h})
 	return nil
+}
+
+// watchedConn calls onError once when a read fails, so a dead upstream ends the downstream.
+type watchedConn struct {
+	net.Conn
+	once    sync.Once
+	onError func()
+}
+
+func (c *watchedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		c.once.Do(c.onError)
+	}
+	return n, err
 }
 
 type headerHandler struct {
@@ -86,16 +122,47 @@ type headerHandler struct {
 	src     Source
 	log     *slog.Logger
 	proxy   *httputil.ReverseProxy
+	// end closes the downstream connection.
+	end func()
+
+	mu     sync.Mutex
+	active int
+	gone   bool
+}
+
+// upstreamEnded marks the upstream connection as unusable. The downstream ends closeGrace after
+// its last open request, so the responses of those requests still reach the agent.
+func (h *headerHandler) upstreamEnded() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.gone {
+		return
+	}
+	h.gone = true
+	h.log.Warn("upstream connection ended", "reason", string(UpstreamUnavailable), "open_requests", h.active)
+	if h.active == 0 {
+		time.AfterFunc(closeGrace, h.end)
+	}
 }
 
 func (h *headerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mu.Lock()
+	h.active++
+	h.mu.Unlock()
+	defer func() {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if h.active--; h.active == 0 && h.gone {
+			time.AfterFunc(closeGrace, h.end)
+		}
+	}()
+	h.serve(w, r)
+}
+
+func (h *headerHandler) serve(w http.ResponseWriter, r *http.Request) {
 	// The path must reach the upstream as the handler sees it: no query and no escapes.
 	if r.Method != http.MethodPost || !isGRPC(r) || r.RequestURI != r.URL.Path || h.src.Plane != PlaneCell {
 		h.deny(w, r, RequestNotAllowed, "not a gRPC request from a cell")
-		return
-	}
-	if h.proxy == nil {
-		h.deny(w, r, UpstreamUnavailable, "no upstream connection")
 		return
 	}
 	auth := r.Header.Values("Authorization")
@@ -137,6 +204,7 @@ func (h *headerHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *headerHandler) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.URL.Scheme = "http"
 	pr.Out.URL.Host = h.backend.upstream
+	pr.Out.Host = h.backend.upstream
 	for k := range pr.Out.Header {
 		lk := strings.ToLower(k)
 		if k == h.backend.header || lk == "forwarded" || lk == "x-real-ip" || strings.HasPrefix(lk, "x-forwarded-") {

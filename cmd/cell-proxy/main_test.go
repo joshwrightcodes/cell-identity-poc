@@ -261,6 +261,9 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 		"unparsable bundle":      with(args, "--peer-bundle", garbage),
 		"missing bundle file":    with(args, "--peer-bundle", filepath.Join(t.TempDir(), "absent.crt")),
 		"unanchored --allow-id":  with(args, "--allow-id", "dev"),
+		"top-level alternation":  with(args, "--allow-id", "^a|b$"),
+		"gateway alternation":    with(args, "--allow-id", `^spiffe://dev\.env\.poc\.internal/cp/otel|/cell/[a-z0-9-]+/celld$`),
+		"multi-line anchors":     with(args, "--allow-id", "(?m)^a$"),
 	}
 	for name, a := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -273,6 +276,21 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 				t.Fatalf("output is %v, want one JSON error line", lines)
 			}
 		})
+	}
+}
+
+func TestAllowIDMustBeFullyAnchored(t *testing.T) {
+	good := []string{viewPattern, `^(?:a|b)$`, `^spiffe://dev\.env\.poc\.internal/(?:cp/otel|cell/[a-z0-9-]+/otel)$`}
+	for _, p := range good {
+		if err := fullyAnchored(p); err != nil {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
+	bad := []string{"dev", "^a|b$", "^a", "a$", `^a\$`, "(?m)^a$", "^(a$)", "^a$|^b$"}
+	for _, p := range bad {
+		if err := fullyAnchored(p); err == nil {
+			t.Errorf("%s is accepted", p)
+		}
 	}
 }
 
@@ -302,6 +320,82 @@ func TestProbeReportsServerID(t *testing.T) {
 			t.Fatalf("exit %d, output %v", code, lines)
 		}
 	})
+}
+
+func TestConfigErrorsExitTwo(t *testing.T) {
+	mgmt := newCA(t, mgmtTD)
+	envCA := newCA(t, "dev.env.poc.internal")
+	bundle := mgmt.bundleFile(t)
+	probeArgs := []string{"probe", "--upstream", "127.0.0.1:1", "--expect-id", principalID, "--peer-bundle", bundle, "--peer-trust-domain", mgmtTD}
+	clientArgs := []string{"spiffe-client", "--listen", "127.0.0.1:0", "--upstream", "127.0.0.1:1", "--expect-id", principalID, "--peer-bundle", bundle, "--peer-trust-domain", mgmtTD}
+	cases := map[string][]string{
+		"probe with no --upstream":      without(probeArgs, "--upstream"),
+		"probe with an unknown flag":    append(slices.Clone(probeArgs), "--nope"),
+		"probe with an extra argument":  append(slices.Clone(probeArgs), "extra"),
+		"whoami with an argument":       {"whoami", "extra"},
+		"server with an extra argument": append(serverArgs(t, envCA), "extra"),
+		"client with an extra argument": append(clientArgs, "extra"),
+	}
+	for name, a := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := execute(t.Context(), a, &out); code != 2 {
+				t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+			}
+			if lines := jsonLines(t, out.String()); len(lines) != 1 || lines[0]["level"] != "ERROR" {
+				t.Fatalf("output is %v, want one JSON error line", lines)
+			}
+		})
+	}
+}
+
+func TestProbeReasons(t *testing.T) {
+	mgmt := newCA(t, mgmtTD)
+	bundle := mgmt.bundleFile(t)
+	plain, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plain.Close() })
+	go func() {
+		for {
+			c, err := plain.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	der, _, key := mgmt.leaf(t, principalID)
+	noALPN, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}}, MinVersion: tls.VersionTLS13})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = noALPN.Close() })
+	go func() {
+		for {
+			c, err := noALPN.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = c.(*tls.Conn).Handshake(); _ = c.Close() }()
+		}
+	}()
+	cases := map[string]struct{ addr, want string }{
+		"closed port": {"127.0.0.1:1", "upstream_unavailable"},
+		"not TLS":     {plain.Addr().String(), "handshake_failed"},
+		"no ALPN":     {noALPN.Addr().String(), "protocol_not_h2"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			code := execute(t.Context(), []string{"probe", "--upstream", c.addr, "--expect-id", principalID, "--peer-bundle", bundle, "--peer-trust-domain", mgmtTD}, &out)
+			lines := jsonLines(t, out.String())
+			if code != 1 || len(lines) != 1 || lines[0]["reason"] != c.want {
+				t.Fatalf("exit %d, output %v, want reason %s", code, lines, c.want)
+			}
+		})
+	}
 }
 
 func TestWhoamiPrintsOnlyIDs(t *testing.T) {
@@ -368,6 +462,14 @@ func TestLogsAreJSON(t *testing.T) {
 	for _, want := range []string{"registry loaded", "listening", "handshake failed"} {
 		if !msgs[want] {
 			t.Fatalf("no %q line in:\n%s", want, out.String())
+		}
+	}
+	for _, l := range lines {
+		if l["msg"] == "registry loaded" && (l["records"] != float64(1) || l["revoked"] != float64(0) || l["signers"] != float64(1) || l["content_sha256"] == nil) {
+			t.Fatalf("registry line is %v", l)
+		}
+		if l["msg"] == "handshake failed" && (l["reason"] != "handshake_failed" || l["remote"] == nil) {
+			t.Fatalf("refusal line is %v, want reason and remote", l)
 		}
 	}
 }

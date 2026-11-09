@@ -27,6 +27,9 @@ func Probe(ctx context.Context, addr string, peer x509bundle.Source, expect spif
 	if err := conn.HandshakeContext(hctx); err != nil {
 		return spiffeid.ID{}, err
 	}
+	if err := requireH2(conn); err != nil {
+		return spiffeid.ID{}, err
+	}
 	certs := conn.ConnectionState().PeerCertificates
 	if len(certs) == 0 {
 		return spiffeid.ID{}, errors.New("server sent no certificate")

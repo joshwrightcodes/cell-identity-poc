@@ -832,9 +832,8 @@ calls and registry queries gave each date.
   cutoff. M3 uses 0.164.0 instead, which has a publish date on the cutoff day.
 - Argo CD v3.6.1 and Istio 1.30.8 have publish dates after the cutoff. Earlier milestones pinned
   them, and the decision about them belongs to the maintainers. M3 does not change them.
-- The Kiali chart index gives one `created` value, 2026-11-02T17:06:56Z, to 258 of its 280
-  entries. That value is the time of an index build, not a publish date. Because of this, the
-  table uses the commit date of the chart tag.
+- The Kiali chart index gives 258 of its 280 entries the same `created` value, 2026-11-02T17:06:56Z.
+  That value is the time of an index build, not a publish date. The table uses the tag commit date.
 
 ## cell-proxy modules (2026-11-09)
 
@@ -865,3 +864,6 @@ the review.
 
 The review did not read the HTTP/2 code of the Go standard library, or the frame and `hpack` code
 of `x/net/http2`.
+
+`internal/telemetry` now holds the OpenTelemetry setup that `cmd/celld` had. It adds no module, so
+the "celld modules" review above covers its exporters, the SDK and `logr`.

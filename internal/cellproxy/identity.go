@@ -52,17 +52,30 @@ func ParseSource(id spiffeid.ID) (Source, error) {
 	switch {
 	case len(segs) == 3 && segs[0] == "cell":
 		name := segs[1]
-		if len(name) > maxCellName {
-			return Source{}, fmt.Errorf("cell name has more than %d characters", maxCellName)
-		}
-		if slices.Contains(reservedCells, name) || name == env+"-cp" {
-			return Source{}, fmt.Errorf("cell name %q is reserved", name)
+		if err := checkCellName(name, env); err != nil {
+			return Source{}, err
 		}
 		return Source{Env: env, Cluster: name, Plane: PlaneCell, Cell: name, Role: segs[2]}, nil
 	case len(segs) == 2 && segs[0] == "cp":
 		return Source{Env: env, Cluster: env + "-cp", Plane: PlaneEnvironment, Role: segs[1]}, nil
 	}
 	return Source{}, errors.New("path is neither /cell/<cell>/<role> nor /cp/<role>")
+}
+
+// checkCellName requires that env and name are DNS labels, that name has at most 59 characters,
+// and that name is not reserved.
+func checkCellName(name, env string) error {
+	switch {
+	case !dnsLabel.MatchString(env):
+		return fmt.Errorf("environment %q is not a DNS label", env)
+	case !dnsLabel.MatchString(name):
+		return fmt.Errorf("cell name %q is not a DNS label", name)
+	case len(name) > maxCellName:
+		return fmt.Errorf("cell name has more than %d characters", maxCellName)
+	case slices.Contains(reservedCells, name) || name == env+"-cp":
+		return fmt.Errorf("cell name %q is reserved", name)
+	}
+	return nil
 }
 
 // AgentName is the name of the Argo CD agent of a cell source, <env>-<cell>.

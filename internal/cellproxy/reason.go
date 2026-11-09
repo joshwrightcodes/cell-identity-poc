@@ -24,6 +24,12 @@ const (
 	UpstreamUnavailable Reason = "upstream_unavailable"
 	// Overloaded: the server holds its maximum number of connections.
 	Overloaded Reason = "overloaded"
+	// NoClientCert: the client sent no certificate, as a probe does. Logs carry it at Debug.
+	NoClientCert Reason = "no_client_cert"
+	// ProtocolNotH2: the handshake did not agree on ALPN h2.
+	ProtocolNotH2 Reason = "protocol_not_h2"
+	// HandshakeFailed: the handshake failed for another reason, for example a timeout.
+	HandshakeFailed Reason = "handshake_failed"
 )
 
 // GRPCCode is the status for a refused request. A peer reason ends the handshake, so no status

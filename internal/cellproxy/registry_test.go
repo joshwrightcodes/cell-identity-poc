@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,36 @@ func TestLoadRegistry(t *testing.T) {
 		"zero records": func(t *testing.T) string {
 			return writeRegistry(t, keys, priv)
 		},
+		"name with capitals": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = "Dev-Cell-2", "dev"
+			return writeRegistry(t, keys, priv, c)
+		},
+		"name with a space": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = "dev-cell-2 ", "dev"
+			return writeRegistry(t, keys, priv, c)
+		},
+		"env with a space": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = "dev-cell-2", "dev env"
+			return writeRegistry(t, keys, priv, c)
+		},
+		"reserved name": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = "management", "dev"
+			return writeRegistry(t, keys, priv, c)
+		},
+		"environment plane name": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = "dev-cp", "dev"
+			return writeRegistry(t, keys, priv, c)
+		},
+		"60-character name": func(t *testing.T) string {
+			c := cell("dev-cell-1", false)
+			c.Name, c.Env = strings.Repeat("a", 60), "dev"
+			return writeRegistry(t, keys, priv, c)
+		},
 	}
 	for name, dir := range bad {
 		t.Run(name, func(t *testing.T) {
@@ -99,6 +130,16 @@ func TestLoadRegistry(t *testing.T) {
 		}
 		if reg.Allows(Source{Env: "dev", Plane: "cell", Cell: "dev-cell-1", Cluster: "dev-cell-1", Role: "otel"}) {
 			t.Fatal("a name with a revoked record is allowed")
+		}
+	})
+
+	t.Run("stats", func(t *testing.T) {
+		reg, err := LoadRegistry(writeRegistry(t, []ed25519.PublicKey{pub, otherPub}, priv, cell("dev-cell-1", false), cell("dev-cell-2", true)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := reg.Stats(); got != (RegistryStats{Records: 2, Revoked: 1, Signers: 2}) {
+			t.Fatalf("stats %+v", got)
 		}
 	})
 

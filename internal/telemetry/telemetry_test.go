@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -287,6 +288,53 @@ func TestErrorHandlerRateLimited(t *testing.T) {
 	if last["msg"] != "telemetry error" || last["error"] != "export refused" || last["suppressed"] != float64(99) {
 		t.Fatalf("line after 10 seconds is %v, want suppressed 99", last)
 	}
+}
+
+// TestErrorHandlerBounded sends more distinct messages than the handler remembers. The extra
+// messages share one limited key, and their held-back count reaches a later line.
+func TestErrorHandlerBounded(t *testing.T) {
+	out := &syncBuffer{}
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	h := newErrorHandler(out, func() time.Time { return now })
+	for i := range maxTrackedErrors + 50 {
+		h.Handle(fmt.Errorf("error %d", i))
+	}
+	if n := len(jsonLines(t, out.String())); n != maxTrackedErrors+1 {
+		t.Fatalf("got %d lines, want %d: one for each remembered message and one shared", n, maxTrackedErrors+1)
+	}
+	now = now.Add(errorWindow)
+	h.Handle(errors.New("later"))
+	lines := jsonLines(t, out.String())
+	var held map[string]any
+	for _, l := range lines {
+		if l["msg"] == "telemetry errors suppressed" {
+			held = l
+		}
+	}
+	if held == nil || held["suppressed"] != float64(49) {
+		t.Fatalf("no line carries the 49 held-back messages:\n%s", out.String())
+	}
+}
+
+// TestErrorHandlerKeepsSuppressedCounts makes the handler forget a message with held-back
+// errors. The count still reaches a line.
+func TestErrorHandlerKeepsSuppressedCounts(t *testing.T) {
+	out := &syncBuffer{}
+	now := time.Date(2026, 11, 9, 0, 0, 0, 0, time.UTC)
+	h := newErrorHandler(out, func() time.Time { return now })
+	for range 5 {
+		h.Handle(errors.New("export refused"))
+	}
+	now = now.Add(time.Minute)
+	for i := range maxTrackedErrors {
+		h.Handle(fmt.Errorf("error %d", i))
+	}
+	for _, l := range jsonLines(t, out.String()) {
+		if l["msg"] == "telemetry errors suppressed" && l["error"] == "export refused" && l["suppressed"] == float64(4) {
+			return
+		}
+	}
+	t.Fatalf("the 4 held-back errors were lost:\n%s", out.String())
 }
 
 func TestShutdownFlushesAllWhenOneStalls(t *testing.T) {

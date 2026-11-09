@@ -10,7 +10,8 @@ import (
 	"log/slog"
 )
 
-// Attrs is an error that adds its own key and value pairs to the error line.
+// Attrs is an error that adds its own key and value pairs to the error line. The keys time,
+// level, msg and error belong to the line itself, so LogAttrs must not use them.
 type Attrs interface {
 	error
 	LogAttrs() []any

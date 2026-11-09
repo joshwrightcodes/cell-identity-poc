@@ -26,17 +26,29 @@ func probeTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
 }
 
 // ServerTLS requires a client SVID that chains to peer, matches allow, names a valid source and
-// passes the registry. It logs each refused peer as "peer refused" with the reason and the ID.
+// passes the registry. It logs each refused peer as "peer refused", with the reason, the remote
+// address and the ID. The server issues no session tickets, so every connection runs these checks.
 func ServerTLS(svids x509svid.Source, peer x509bundle.Source, allow *regexp.Regexp, reg *Registry, log *slog.Logger) *tls.Config {
-	cfg := pin(tlsconfig.MTLSServerConfig(svids, peer, allowed(allow, reg)))
-	verify := cfg.VerifyPeerCertificate
-	cfg.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error {
-		err := verify(raw, chains)
-		var pe *PeerError
-		if errors.As(err, &pe) {
-			log.Warn("peer refused", "reason", string(pe.Reason), "spiffe_id", pe.ID, "error", pe.Err.Error())
+	base := pin(tlsconfig.MTLSServerConfig(svids, peer, allowed(allow, reg)))
+	// The client must still send a certificate: pin refuses an empty chain as no_client_cert.
+	// RequestClientCert lets that refusal reach the verify callback, which logs it.
+	base.ClientAuth = tls.RequestClientCert
+	base.SessionTicketsDisabled = true
+	refusals := newRefusalLog(log)
+	verify := base.VerifyPeerCertificate
+	cfg := base.Clone()
+	cfg.GetConfigForClient = func(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+		remote := hello.Conn.RemoteAddr().String()
+		c := base.Clone()
+		c.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error {
+			err := verify(raw, chains)
+			var pe *PeerError
+			if errors.As(err, &pe) {
+				refusals.write("peer refused", pe.Reason, remote, pe.ID, pe.Err)
+			}
+			return err
 		}
-		return err
+		return c, nil
 	}
 	return cfg
 }
@@ -70,13 +82,16 @@ func allowed(allow *regexp.Regexp, reg *Registry) tlsconfig.Authorizer {
 	}
 }
 
-// pin limits the config to TLS 1.3 and ALPN h2, and marks every verify error that the
-// authorizer did not raise as an untrusted peer.
+// pin limits the config to TLS 1.3 and ALPN h2. It refuses an empty chain as no_client_cert, and
+// marks every other verify error that the authorizer did not raise as an untrusted peer.
 func pin(cfg *tls.Config) *tls.Config {
 	cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
 	cfg.NextProtos = []string{"h2"}
 	verify := cfg.VerifyPeerCertificate
 	cfg.VerifyPeerCertificate = func(raw [][]byte, chains [][]*x509.Certificate) error {
+		if len(raw) == 0 {
+			return &PeerError{Reason: NoClientCert, Err: errors.New("peer sent no certificate")}
+		}
 		err := verify(raw, chains)
 		if err == nil || ReasonOf(err) != "" {
 			return err

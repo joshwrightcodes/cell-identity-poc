@@ -78,8 +78,11 @@ func TestTLSConfigPinsVersionAndALPN(t *testing.T) {
 			t.Errorf("%s NextProtos %v, want [h2]", name, cfg.NextProtos)
 		}
 	}
-	if server.ClientAuth != tls.RequireAnyClientCert || server.VerifyPeerCertificate == nil {
-		t.Errorf("server ClientAuth %v, want a required client certificate that the config verifies", server.ClientAuth)
+	if server.ClientAuth == tls.NoClientCert || server.VerifyPeerCertificate == nil || server.GetConfigForClient == nil {
+		t.Errorf("server ClientAuth %v, want a client certificate that the config verifies", server.ClientAuth)
+	}
+	if !server.SessionTicketsDisabled {
+		t.Error("the server issues session tickets, so a resumed handshake would skip the checks")
 	}
 
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", server)

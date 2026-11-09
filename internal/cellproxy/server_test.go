@@ -85,11 +85,22 @@ func (u *upstream) bidi(srv any, stream grpc.ServerStream) error {
 	}
 }
 
+// fail ends a unary call with NotFound and trailer x-test: 1 before any reply, so grpc-go sends
+// a trailers-only response.
+func (u *upstream) fail(srv any, ctx context.Context, dec func(any) error, _ grpc.UnaryServerInterceptor) (any, error) {
+	if err := dec(&wrapperspb.StringValue{}); err != nil {
+		return nil, err
+	}
+	srv.(*upstream).record(ctx)
+	_ = grpc.SetTrailer(ctx, metadata.Pairs("x-test", "1"))
+	return nil, status.Error(codes.NotFound, "no such item")
+}
+
 func (u *upstream) register(s *grpc.Server) {
 	unary := func(name string) grpc.MethodDesc { return grpc.MethodDesc{MethodName: name, Handler: u.unary} }
 	s.RegisterService(&grpc.ServiceDesc{
 		ServiceName: "test.Echo", HandlerType: (*any)(nil),
-		Methods: []grpc.MethodDesc{unary("Unary")},
+		Methods: []grpc.MethodDesc{unary("Unary"), {MethodName: "Fail", Handler: u.fail}},
 		Streams: []grpc.StreamDesc{{StreamName: "Bidi", Handler: u.bidi, ServerStreams: true, ClientStreams: true}},
 	}, u)
 	s.RegisterService(&grpc.ServiceDesc{
@@ -348,6 +359,23 @@ func TestServerProxiesBidiStream(t *testing.T) {
 	})
 }
 
+// TestServerKeepsTrailersOnlyStatus makes 200 calls that end with a trailers-only response. Each
+// must reach the client with the upstream code, message and trailer.
+func TestServerKeepsTrailersOnlyStatus(t *testing.T) {
+	h := newHarness(t, harnessConfig{})
+	conn := h.dial(t)
+	for i := range 200 {
+		var trailer metadata.MD
+		err := unaryCall(withToken(t.Context(), t), conn, "/test.Echo/Fail", grpc.Trailer(&trailer))
+		if st, _ := status.FromError(err); st.Code() != codes.NotFound || st.Message() != "no such item" {
+			t.Fatalf("call %d gave %v, want NotFound with the upstream message", i, err)
+		}
+		if got := trailer.Get("x-test"); len(got) != 1 || got[0] != "1" {
+			t.Fatalf("call %d trailer x-test is %v, want [1]", i, got)
+		}
+	}
+}
+
 func TestServerClosesUpstreamWithDownstream(t *testing.T) {
 	h := newHarness(t, harnessConfig{})
 	open := func() (*grpc.ClientConn, *tracked) {
@@ -443,6 +471,9 @@ func TestServerStripsClientIdentityHeader(t *testing.T) {
 	if got := md.Get("x-cell-agent"); len(got) != 1 || got[0] != "dev-dev-cell-1" {
 		t.Fatalf("upstream x-cell-agent is %v, want exactly [dev-dev-cell-1]", got)
 	}
+	if got := md.Get(":authority"); len(got) != 1 || got[0] != h.split.Addr().String() {
+		t.Fatalf("upstream :authority is %v, want the upstream address %s", got, h.split.Addr())
+	}
 	for _, k := range []string{"x-forwarded-for", "x-forwarded-port", "x-real-ip", "forwarded"} {
 		if got := md.Get(k); len(got) != 0 {
 			t.Fatalf("upstream got %s %v", k, got)
@@ -474,6 +505,9 @@ func TestReasonStatusMapping(t *testing.T) {
 		{RequestNotAllowed, codes.PermissionDenied, http.StatusForbidden},
 		{UpstreamUnavailable, codes.Unavailable, http.StatusServiceUnavailable},
 		{Overloaded, codes.Unavailable, http.StatusServiceUnavailable},
+		{NoClientCert, codes.PermissionDenied, http.StatusForbidden},
+		{ProtocolNotH2, codes.PermissionDenied, http.StatusForbidden},
+		{HandshakeFailed, codes.PermissionDenied, http.StatusForbidden},
 	}
 	for _, c := range cases {
 		if got := c.reason.GRPCCode(); got != c.code {
@@ -486,6 +520,7 @@ func TestReasonStatusMapping(t *testing.T) {
 	names := map[Reason]string{
 		PeerUntrusted: "peer_untrusted", PeerNotAllowed: "peer_not_allowed", SubjectMismatch: "subject_mismatch",
 		RequestNotAllowed: "request_not_allowed", UpstreamUnavailable: "upstream_unavailable", Overloaded: "overloaded",
+		NoClientCert: "no_client_cert", ProtocolNotH2: "protocol_not_h2", HandshakeFailed: "handshake_failed",
 	}
 	for r, want := range names {
 		if string(r) != want {
@@ -546,11 +581,12 @@ func TestServerAllowPattern(t *testing.T) {
 		}
 	})
 	refused := map[string]string{
-		"cell/dev-cell-1/celld":          "spiffe://dev.env.poc.internal/cell/dev-cell-1/celld",
-		"cell/dev-cell-1/argocd-agentx":  "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agentx",
-		"cell/dev-cell-1/argocd-agent/x": "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent/x",
-		"cell/rogue/argocd-agent":        "spiffe://dev.env.poc.internal/cell/rogue/argocd-agent",
-		"revoked dev-cell-2":             agentID2,
+		"cell/dev-cell-1/celld":                    "spiffe://dev.env.poc.internal/cell/dev-cell-1/celld",
+		"cell/dev-cell-1/argocd-agentx":            "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agentx",
+		"cell/dev-cell-1/argocd-agent/x":           "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent/x",
+		"cell/dev-cell-3/argocd-agent (no record)": "spiffe://dev.env.poc.internal/cell/dev-cell-3/argocd-agent",
+		"cell/rogue/argocd-agent (reserved)":       "spiffe://dev.env.poc.internal/cell/rogue/argocd-agent",
+		"revoked dev-cell-2":                       agentID2,
 	}
 	for name, id := range refused {
 		t.Run(name, func(t *testing.T) {
@@ -563,7 +599,10 @@ func TestServerAllowPattern(t *testing.T) {
 	t.Run("self-signed", func(t *testing.T) {
 		drain(backend)
 		connect(t, nil, agentID1)
-		waitForLog(t, out, "peer refused", PeerUntrusted, agentID1)
+		line := waitForLog(t, out, "peer refused", PeerUntrusted, agentID1)
+		if _, ok := line["spiffe_id"]; ok || line["remote"] == nil {
+			t.Fatalf("an untrusted ID is logged as spiffe_id, or the line has no remote: %v", line)
+		}
 		assertNoSource(t, backend)
 	})
 }

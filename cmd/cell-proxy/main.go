@@ -13,8 +13,11 @@
 // configuration error is one JSON error line and exit status 2.
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
-// whoami prints the sorted IDs of the X.509 SVIDs of this process. Neither starts telemetry. On
-// failure each prints one JSON error line and exits with status 1.
+// whoami prints the sorted IDs of the X.509 SVIDs of this process. Neither starts telemetry. A
+// configuration error is one JSON error line and exit status 2, as in the other modes. Any other
+// failure is one JSON error line and exit status 1. The probe error line carries a reason:
+// upstream_unavailable when the dial fails, peer_untrusted, peer_not_allowed or protocol_not_h2
+// for a refused server, and handshake_failed for any other handshake error.
 package main
 
 import (
@@ -29,6 +32,7 @@ import (
 	"os"
 	"os/signal"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"strings"
 	"syscall"
@@ -74,9 +78,18 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 	case "spiffe-server":
 		return runServer(ctx, args[1:], stdout)
 	case "probe":
-		return cli.Run(stdout, name, func(out io.Writer) error { return probe(ctx, args[1:], out) })
+		cfg, err := parseProbe(args[1:])
+		if err != nil {
+			cli.Fail(stdout, name, err)
+			return exitConfig
+		}
+		return cli.Run(stdout, name, func(out io.Writer) error { return probe(ctx, cfg, out) })
 	case "whoami":
-		return cli.Run(stdout, name, func(out io.Writer) error { return whoami(ctx, args[1:], out) })
+		if len(args) > 1 {
+			cli.Fail(stdout, name, errors.New("whoami takes no arguments"))
+			return exitConfig
+		}
+		return cli.Run(stdout, name, func(out io.Writer) error { return whoami(ctx, out) })
 	}
 	cli.Fail(stdout, name, fmt.Errorf("unknown mode %q", args[0]))
 	return exitConfig
@@ -86,6 +99,17 @@ func newFlags(mode string) *flag.FlagSet {
 	fs := flag.NewFlagSet(name+" "+mode, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	return fs
+}
+
+// parseFlags parses args and refuses an argument that is not a flag.
+func parseFlags(fs *flag.FlagSet, args []string) error {
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	return nil
 }
 
 func required(values map[string]string) error {
@@ -144,7 +168,7 @@ func parseClient(args []string) (clientConfig, error) {
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the server")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the server trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the server")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return clientConfig{}, err
 	}
 	if err := required(map[string]string{"listen": *listen, "upstream": *upstream, "expect-id": *expect, "peer-bundle": *bundle, "peer-trust-domain": *td}); err != nil {
@@ -195,7 +219,7 @@ func parseServer(args []string) (serverConfig, error) {
 	backend := fs.String("backend", "", "backend for each connection: grpc-header")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
 	header := fs.String("identity-header", "x-cell-agent", "header that carries <env>-<cell> to the upstream")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return serverConfig{}, err
 	}
 	if err := required(map[string]string{"peer-bundle": *bundle, "peer-trust-domain": *td, "allow-id": *allow, "registry-dir": *registryDir, "backend": *backend}); err != nil {
@@ -205,8 +229,8 @@ func parseServer(args []string) (serverConfig, error) {
 	if err != nil {
 		return serverConfig{}, err
 	}
-	if !strings.HasPrefix(*allow, "^") || !strings.HasSuffix(*allow, "$") || strings.HasSuffix(*allow, `\$`) {
-		return serverConfig{}, fmt.Errorf("--allow-id %q must start with ^ and end with $", *allow)
+	if err := fullyAnchored(*allow); err != nil {
+		return serverConfig{}, fmt.Errorf("--allow-id %q: %w", *allow, err)
 	}
 	pattern, err := regexp.Compile(*allow)
 	if err != nil {
@@ -236,7 +260,9 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		return exitConfig
 	}
 	return serve(ctx, stdout, func(ctx context.Context, tel *telemetry.T, svids *workloadapi.X509Source) error {
-		tel.Log.Info("registry loaded", "content_sha256", cfg.registry.ContentSHA256())
+		st := cfg.registry.Stats()
+		tel.Log.Info("registry loaded", "content_sha256", cfg.registry.ContentSHA256(),
+			"records", st.Records, "revoked", st.Revoked, "signers", st.Signers)
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {
 			return err
@@ -278,6 +304,21 @@ func serve(ctx context.Context, stdout io.Writer, fn func(context.Context, *tele
 	return 0
 }
 
+// fullyAnchored requires that the whole pattern sits between ^ and $. A top-level alternation
+// such as ^a|b$ anchors each branch at one end only, so it fails. Group it as ^(?:a|b)$.
+func fullyAnchored(p string) error {
+	re, err := syntax.Parse(p, syntax.Perl)
+	if err != nil {
+		return err
+	}
+	re = re.Simplify()
+	if re.Op == syntax.OpConcat && len(re.Sub) >= 2 &&
+		re.Sub[0].Op == syntax.OpBeginText && re.Sub[len(re.Sub)-1].Op == syntax.OpEndText {
+		return nil
+	}
+	return errors.New("must be one expression between ^ and $, for example ^(?:a|b)$")
+}
+
 // reasonError adds the reason of a refused probe to the error line.
 type reasonError struct {
 	reason cellproxy.Reason
@@ -288,31 +329,46 @@ func (e reasonError) Error() string   { return e.err.Error() }
 func (e reasonError) Unwrap() error   { return e.err }
 func (e reasonError) LogAttrs() []any { return []any{"reason", string(e.reason)} }
 
-func probe(ctx context.Context, args []string, out io.Writer) error {
+type probeConfig struct {
+	upstream string
+	expect   spiffeid.ID
+	peer     *x509bundle.Bundle
+}
+
+func parseProbe(args []string) (probeConfig, error) {
 	fs := newFlags("probe")
 	upstream := fs.String("upstream", "", "server address as host:port")
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the server")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the server trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the server")
-	if err := fs.Parse(args); err != nil {
-		return err
+	if err := parseFlags(fs, args); err != nil {
+		return probeConfig{}, err
 	}
 	if err := required(map[string]string{"upstream": *upstream, "expect-id": *expect, "peer-bundle": *bundle, "peer-trust-domain": *td}); err != nil {
-		return err
+		return probeConfig{}, err
 	}
 	peer, trustDomain, err := loadPeer(*bundle, *td)
 	if err != nil {
-		return err
+		return probeConfig{}, err
 	}
 	want, err := expectedID(*expect, trustDomain)
 	if err != nil {
-		return err
+		return probeConfig{}, err
 	}
-	got, err := cellproxy.Probe(ctx, *upstream, peer, want)
+	return probeConfig{upstream: *upstream, expect: want, peer: peer}, nil
+}
+
+func probe(ctx context.Context, cfg probeConfig, out io.Writer) error {
+	got, err := cellproxy.Probe(ctx, cfg.upstream, cfg.peer, cfg.expect)
 	if err != nil {
 		reason := cellproxy.ReasonOf(err)
-		if reason == "" {
+		var op *net.OpError
+		switch {
+		case reason != "":
+		case errors.As(err, &op) && op.Op == "dial":
 			reason = cellproxy.UpstreamUnavailable
+		default:
+			reason = cellproxy.HandshakeFailed
 		}
 		return reasonError{reason: reason, err: err}
 	}
@@ -322,10 +378,7 @@ func probe(ctx context.Context, args []string, out io.Writer) error {
 	}{got.String(), true})
 }
 
-func whoami(ctx context.Context, args []string, out io.Writer) error {
-	if len(args) > 0 {
-		return errors.New("whoami takes no arguments")
-	}
+func whoami(ctx context.Context, out io.Writer) error {
 	ctx, cancel := context.WithTimeout(ctx, sourceTimeout)
 	defer cancel()
 	svids, err := workloadapi.FetchX509SVIDs(ctx)
