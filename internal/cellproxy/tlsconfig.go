@@ -34,6 +34,13 @@ func ServerTLS(svids x509svid.Source, peer x509bundle.Source, allow *regexp.Rege
 	// RequestClientCert lets that refusal reach the verify callback, which logs it.
 	base.ClientAuth = tls.RequestClientCert
 	base.SessionTicketsDisabled = true
+	// VerifyConnection runs on every handshake, also when a caller replaces the verify callback.
+	base.VerifyConnection = func(cs tls.ConnectionState) error {
+		if len(cs.PeerCertificates) == 0 {
+			return &PeerError{Reason: NoClientCert, Err: errors.New("peer sent no certificate")}
+		}
+		return nil
+	}
 	refusals := newRefusalLog(log)
 	verify := base.VerifyPeerCertificate
 	cfg := base.Clone()

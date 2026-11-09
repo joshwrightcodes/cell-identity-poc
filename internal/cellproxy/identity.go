@@ -1,6 +1,9 @@
 // Package cellproxy carries streams between the planes over SPIFFE mTLS. The client side takes
 // plaintext TCP and dials one exact management plane ID. The server side ends TLS 1.3, checks an
 // anchored ID pattern and the cell registry, and hands each connection to a backend.
+//
+// The Argo CD agent must run with gRPC compression off. The grpc-header backend refuses a
+// compressed RefreshToken frame, so an agent with compression on cannot refresh its token.
 package cellproxy
 
 import (

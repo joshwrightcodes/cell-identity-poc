@@ -3,6 +3,7 @@ package cellproxy
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"log/slog"
@@ -306,4 +307,40 @@ func TestClientRequiresALPN(t *testing.T) {
 		t.Fatal("spiffe-client kept a connection to a server with no ALPN")
 	}
 	waitForLog(t, out, "peer refused", ProtocolNotH2, "")
+}
+
+// TestServerTLSRequiresClientCertWithoutVerifyCallback replaces the verify callback, as a later
+// caller might. A client with no certificate must still fail the handshake.
+func TestServerTLSRequiresClientCertWithoutVerifyCallback(t *testing.T) {
+	mgmt, env := newCA(t, mgmtTD), newCA(t, envTD)
+	cfg := ServerTLS(source(mgmt.svid(t, principalID)), env.bundle(), regexp.MustCompile(viewPattern), testRegistry(t), jsonLog(&syncBuffer{}))
+	cfg.GetConfigForClient = nil
+	cfg.VerifyPeerCertificate = func([][]byte, [][]*x509.Certificate) error { return nil }
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	result := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			result <- err
+			return
+		}
+		defer func() { _ = c.Close() }()
+		result <- c.(*tls.Conn).Handshake()
+	}()
+	c, err := tls.Dial("tcp", ln.Addr().String(), clientConfig(t, nil, ""))
+	if err == nil {
+		defer func() { _ = c.Close() }()
+	}
+	select {
+	case err := <-result:
+		if ReasonOf(err) != NoClientCert {
+			t.Fatalf("server handshake gave %v, want reason %s", err, NoClientCert)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server handshake did not end")
+	}
 }

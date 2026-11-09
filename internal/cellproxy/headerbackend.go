@@ -78,7 +78,10 @@ func (b *headerBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) e
 		log.Warn("upstream connection failed", "reason", string(UpstreamUnavailable), "error", err.Error())
 		return nil
 	}
-	defer func() { _ = cc.Close() }()
+	defer func() {
+		h.closing()
+		_ = cc.Close()
+	}()
 	h.proxy = &httputil.ReverseProxy{
 		Rewrite:   h.rewrite,
 		Transport: cc,
@@ -88,7 +91,9 @@ func (b *headerBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) e
 		FlushInterval: 0,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			h.deny(w, r, UpstreamUnavailable, err.Error())
-			if !cc.CanTakeNewRequest() {
+			// At its stream limit a healthy connection also takes no new request, so only a
+			// closed or closing connection ends the downstream.
+			if st := cc.State(); st.Closed || st.Closing {
 				h.upstreamEnded()
 			}
 		},
@@ -128,6 +133,13 @@ type headerHandler struct {
 	mu     sync.Mutex
 	active int
 	gone   bool
+}
+
+// closing marks a normal end of the downstream, so the upstream close that follows logs nothing.
+func (h *headerHandler) closing() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.gone = true
 }
 
 // upstreamEnded marks the upstream connection as unusable. The downstream ends closeGrace after

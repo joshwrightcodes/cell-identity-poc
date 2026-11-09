@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -18,7 +19,9 @@ import (
 
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 func TestServerRecoversAfterUpstreamRestart(t *testing.T) {
@@ -198,4 +201,80 @@ func TestRefreshTokenBodyDeadline(t *testing.T) {
 		t.Fatalf("grpc-status %q, want 7", got)
 	}
 	waitForLog(t, h.serverLog, "request denied", SubjectMismatch, "")
+}
+
+func TestServerNormalCloseLogsNoWarn(t *testing.T) {
+	h := newHarness(t, harnessConfig{})
+	conn, err := grpc.NewClient("passthrough:///"+h.client, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unaryCall(withToken(t.Context(), t), conn, "/test.Echo/Unary"); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for !hasMsg(t, h.serverLog, "connection closed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection closed line:\n%s", h.serverLog.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(closeGrace + 200*time.Millisecond)
+	for _, l := range logLines(t, h.serverLog) {
+		if l["level"] == "WARN" || l["level"] == "ERROR" {
+			t.Fatalf("a normal close logged %v", l)
+		}
+	}
+}
+
+// TestServerKeepsDownstreamAtUpstreamStreamLimit fills the one stream that the upstream allows,
+// and lets a second call time out while it waits for that stream. The healthy upstream must not
+// end the downstream connection.
+func TestServerKeepsDownstreamAtUpstreamStreamLimit(t *testing.T) {
+	h := newHarness(t, harnessConfig{})
+	h.upstreams[0].Stop()
+	s := grpc.NewServer(grpc.MaxConcurrentStreams(1))
+	h.up.register(s)
+	h.upstreams[0] = s
+	go func() { _ = s.Serve(newChanListener(h.split.targets[0], h.split.Addr())) }()
+	conn := h.dial(t)
+
+	held, err := conn.NewStream(withToken(t.Context(), t), bidiDesc(), "/test.Echo/Bidi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	send(t, held, "1")
+	recv(t, held, "1")
+	ctx, cancel := context.WithTimeout(withToken(t.Context(), t), 300*time.Millisecond)
+	_ = unaryCall(ctx, conn, "/test.Echo/Unary")
+	cancel()
+	send(t, held, "2")
+	recv(t, held, "2")
+	if err := held.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+	if err := held.RecvMsg(&wrapperspb.StringValue{}); !errors.Is(err, io.EOF) {
+		t.Fatalf("held stream ended with %v", err)
+	}
+	time.Sleep(closeGrace + 300*time.Millisecond)
+	if err := unaryCall(withToken(t.Context(), t), conn, "/test.Echo/Unary"); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(h.split.accepted()); n != 1 {
+		t.Fatalf("%d upstream connections, want the first one kept", n)
+	}
+	if hasMsg(t, h.serverLog, "upstream connection ended") {
+		t.Fatalf("a healthy upstream at its stream limit ended the downstream:\n%s", h.serverLog.String())
+	}
+}
+
+func hasMsg(t *testing.T, out *syncBuffer, msg string) bool {
+	t.Helper()
+	for _, l := range logLines(t, out) {
+		if l["msg"] == msg {
+			return true
+		}
+	}
+	return false
 }
