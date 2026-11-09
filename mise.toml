@@ -90,6 +90,11 @@ description = "Apply the token Secret and SecretStore poc-secrets in each store 
 env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
 run = "scripts/secrets-connect.sh"
 
+[tasks."eso:migrate"]
+description = "Move a live CELL (default dev-cp) from the cluster-scoped External Secrets Operator to the one scoped to its store namespace. Safe to run again"
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
+run = "scripts/eso-migrate.sh"
+
 [tasks."pki:rotate-intermediate"]
 description = "Sign a new intermediate CA, write it to the secret manager, sync it with secrets:connect, restart the SPIRE server of CELL (default dev-cp) and check its CA"
 env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }

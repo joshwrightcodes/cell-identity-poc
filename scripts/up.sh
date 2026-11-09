@@ -37,22 +37,15 @@ log "applied the root Application"
 
 "$ROOT/scripts/publish.sh"
 
-# Every Application must report the revision that publish.sh pushed, so a check that runs before
-# Argo CD reads the new root bundle cannot pass.
 expected=$((${#COMPONENTS[@]} + 1))
-published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")"
-apps_ready() {
-  k -n argocd get applications -o json | jq -e --argjson n "$expected" --argjson pub "$published_json" '
-    (.items | length) == $n and
-    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
-      and .status.sync.revision == $pub[.metadata.name])'
-}
 log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
 end=$((SECONDS + 900))
 store_done=0
 last_hint=-60
-until apps_ready >/dev/null 2>&1; do
-  if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)) && app_healthy external-secrets; then
+# Without direnv, the token command still comes from .envrc.local.
+[[ -z "${SECRET_STORE_NAMESPACES:-}" ]] || load_local_settings POC_SECRET_TOKEN_CMD
+until apps_at_published >/dev/null 2>&1; do
+  if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)); then
     connect_store_step "$ROOT/scripts/secrets-connect.sh"
   fi
   if ((SECONDS >= end)); then

@@ -252,7 +252,7 @@ func TestRenderExternalSecrets(t *testing.T) {
 
 	// The operator bundle holds the store namespace, because its Role lives there and the bundle of
 	// the namespace comes in a later sync wave. Prune=false keeps the namespace and its data when a
-	// bundle drops it.
+	// bundle drops it, and Delete=false keeps it when its Application is deleted.
 	t.Run("store namespace enforces restricted pod security outside the mesh and is never pruned", func(t *testing.T) {
 		ns := objs["Namespace/"+storeNamespace]
 		if ns == nil {
@@ -262,8 +262,8 @@ func TestRenderExternalSecrets(t *testing.T) {
 		if labels["pod-security.kubernetes.io/enforce"] != "restricted" || labels["istio-injection"] != "disabled" {
 			t.Fatalf("namespace labels are %v", labels)
 		}
-		if got := get[string](t, ns, "metadata", "annotations", "argocd.argoproj.io/sync-options"); got != "Prune=false" {
-			t.Fatalf("the sync options of Namespace %s are %q, want Prune=false", storeNamespace, got)
+		if got := get[string](t, ns, "metadata", "annotations", "argocd.argoproj.io/sync-options"); got != "Prune=false,Delete=false" {
+			t.Fatalf("the sync options of Namespace %s are %q, want Prune=false,Delete=false", storeNamespace, got)
 		}
 	})
 

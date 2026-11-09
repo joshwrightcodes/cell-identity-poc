@@ -43,17 +43,17 @@ kubectl config get-contexts "kind-$CELL_NAME" -o name >/dev/null 2>&1 \
   || die "kubeconfig has no context kind-$CELL_NAME, so the cluster does not exist. Run: CELL=$CELL mise run cell:up"
 
 # In a second shell during cell:up, the operator can still be on its way. Wait for its CRD and for
-# an available controller, for up to SECRETS_CONNECT_ESO_WAIT seconds.
+# the rollout of the controller that is scoped to the store namespace, for up to
+# SECRETS_CONNECT_ESO_WAIT seconds. A controller of an older bundle ignores SecretStore objects.
 eso_wait="${SECRETS_CONNECT_ESO_WAIT:-300}"
 eso_ready() {
-  k get crd secretstores.external-secrets.io >/dev/null 2>&1 \
-    && k -n external-secrets get deployment external-secrets -o json 2>/dev/null | jq -e '(.status.availableReplicas // 0) >= 1' >/dev/null
+  k get crd secretstores.external-secrets.io >/dev/null 2>&1 && eso_controller_rolled_out
 }
 end=$((SECONDS + eso_wait))
 until eso_ready; do
   if ((SECONDS >= end)); then
     log "check the operator: mise x -- kubectl --context kind-$CELL_NAME -n argocd get application external-secrets"
-    die "the External Secrets Operator in kind-$CELL_NAME is not ready after ${eso_wait}s. Run CELL=$CELL mise run secrets:connect again when it is Healthy."
+    die "the External Secrets Operator in kind-$CELL_NAME has no rolled-out controller scoped to ${store_namespaces%% *} after ${eso_wait}s. Run CELL=$CELL mise run secrets:connect again when it is Healthy."
   fi
   sleep 5
 done

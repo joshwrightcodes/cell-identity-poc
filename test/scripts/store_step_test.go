@@ -12,10 +12,20 @@ import (
 )
 
 // storeKubectl answers the store checks of store_gaps in scripts/lib.sh. STUB_STORE_NOT_READY makes
-// the SecretStore not Ready, and STUB_SECRET_MISSING removes the target Secret.
+// the SecretStore not Ready, and STUB_SECRET_MISSING removes the target Secret. The Application
+// external-secrets is Synced and Healthy at the published digest sha256:new, unless STUB_APP_OLD
+// gives it an older revision. The operator Deployment runs the scoped controller, unless
+// STUB_OLD_CONTROLLER keeps the cluster-wide one, or STUB_ROLLOUT leaves an old pod running.
 const storeKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 case " $* " in
+  *" get application external-secrets "*)
+    rev=sha256:new; [[ -z "${STUB_APP_OLD:-}" ]] || rev=sha256:old
+    echo "{\"status\":{\"sync\":{\"status\":\"Synced\",\"revision\":\"$rev\"},\"health\":{\"status\":\"Healthy\"}}}" ;;
+  *" get deployment external-secrets "*)
+    arg=--namespace=spire-system; [[ -z "${STUB_OLD_CONTROLLER:-}" ]] || arg=--enable-secret-store-reconciler=false
+    replicas=1; [[ -z "${STUB_ROLLOUT:-}" ]] || replicas=2
+    echo "{\"metadata\":{\"generation\":3},\"spec\":{\"replicas\":1,\"template\":{\"spec\":{\"containers\":[{\"args\":[\"$arg\"]}]}}},\"status\":{\"observedGeneration\":3,\"replicas\":$replicas,\"updatedReplicas\":1,\"availableReplicas\":$replicas}}" ;;
   *" get secretstore poc-secrets "*)
     if [[ -n "${STUB_STORE_NOT_READY:-}" ]]; then echo '{"status":{"conditions":[{"type":"Ready","status":"False"}]}}'
     else echo '{"status":{"conditions":[{"type":"Ready","status":"True"}]}}'; fi ;;
@@ -46,7 +56,12 @@ func runStoreStep(t *testing.T, env ...string) (string, int, error) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("bash", "-c", `source "$1"; store_done=0; last_hint=-60; connect_store_step "$2"; echo "store_done=$store_done"`, "_", lib, connect)
+	published := filepath.Join(dir, "published.env")
+	if err := os.WriteFile(published, []byte("external-secrets=sha256:new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "-c", `source "$1"; PUBLISHED="$3"; store_done=0; last_hint=-60; connect_store_step "$2"; echo "store_done=$store_done"`,
+		"_", lib, connect, published)
 	cmd.Env = append([]string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=dev-cp"}, env...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
@@ -88,5 +103,19 @@ func TestStoreStepStopsWhenSecretsConnectFails(t *testing.T) {
 	out, _, err := runStoreStep(t, "STUB_SECRET_MISSING=1", "POC_SECRET_TOKEN_CMD=true", "STUB_CONNECT_FAIL=1")
 	if err == nil || !strings.Contains(out, "secrets:connect failed. Fix the cause, then run: CELL=dev-cp mise run secrets:connect") {
 		t.Fatalf("err %v, output %q; want a failure that names secrets:connect", err, out)
+	}
+}
+
+// Before Argo CD has synced the published external-secrets bundle and the scoped controller has
+// rolled out, the old controller can still serve. secrets:connect would then fail like a
+// credential problem, so the step waits.
+func TestStoreStepWaitsForTheScopedController(t *testing.T) {
+	for _, state := range []string{"STUB_APP_OLD=1", "STUB_OLD_CONTROLLER=1", "STUB_ROLLOUT=1"} {
+		t.Run(state, func(t *testing.T) {
+			out, runs, err := runStoreStep(t, state, "STUB_SECRET_MISSING=1", "POC_SECRET_TOKEN_CMD=true")
+			if err != nil || runs != 0 || !strings.Contains(out, "store_done=0") || strings.Contains(out, "second shell") {
+				t.Fatalf("err %v, %d runs, output %q; want no run and no hint yet", err, runs, out)
+			}
+		})
 	}
 }

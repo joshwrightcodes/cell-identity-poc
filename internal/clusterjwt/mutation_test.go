@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"testing"
@@ -236,5 +237,25 @@ func TestReplyTimeIsLogged(t *testing.T) {
 	}
 	if attested != 1 || refused != 1 {
 		t.Fatalf("got %d attested and %d refused lines with a reply time, want 1 and 1:\n%s", attested, refused, f.logs.String())
+	}
+}
+
+// The agent must give up on its TokenRequest before the server gives up on the challenge, so a
+// slow API server ends in a clear agent error and not in a challenge_timeout on the server.
+func TestTokenRequestTimeoutIsBelowTheChallengeTimeout(t *testing.T) {
+	conf, err := os.ReadFile("../../components/spire-server/server.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?m)^\s*challenge_timeout = "([^"]+)"`).FindSubmatch(conf)
+	if m == nil {
+		t.Fatal("server.conf sets no challenge_timeout")
+	}
+	challenge, err := time.ParseDuration(string(m[1]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tokenRequestTimeout >= challenge {
+		t.Fatalf("tokenRequestTimeout %s is not below challenge_timeout %s of server.conf", tokenRequestTimeout, challenge)
 	}
 }

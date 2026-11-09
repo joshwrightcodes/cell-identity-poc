@@ -63,7 +63,9 @@ lock="${GATE_M2_REPAIR_LOCK:-$BUILD_ROOT/gate-m2-repair.lock}"
 lock_holder() {
   local pid
   pid="$(cat "$lock/pid" 2>/dev/null)" || return 1
-  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # The system can give the PID of an ended repair to another process. Only a repair counts.
+  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *gate-m2-repair* ]] && echo "$pid"
 }
 if holder="$(lock_holder)"; then
   die "a repair already runs as process $holder. Wait until it ends, or stop it with kill $holder. Then run the command again"
@@ -89,11 +91,13 @@ if [[ "${1:-}" == "--check" ]]; then
   exit 0
 fi
 
-# A lock that no live process holds is left from a repair that ended without its cleanup.
+# A lock that no live repair holds is left from a repair that ended without its cleanup.
 mkdir -p "$(dirname "$lock")"
+# A rename moves the stale lock aside in one step, so two repairs cannot both remove it.
 if ! mkdir "$lock" 2>/dev/null; then
-  rm -rf "$lock"
-  mkdir "$lock" || die "could not take the lock $lock"
+  stale="$lock.stale.$$"
+  mv "$lock" "$stale" 2>/dev/null && rm -rf "$stale"
+  mkdir "$lock" 2>/dev/null || die "could not take the lock $lock, which another repair took first"
 fi
 echo "$$" >"$lock/pid"
 trap 'rm -rf "$lock"' EXIT

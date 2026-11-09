@@ -3,7 +3,8 @@
 #   1. Read the root CA bundle from the secret manager, and let pkigen sign a new intermediate.
 #   2. Write the new key and certificate to the remote keys <cluster>/spire-server/intermediate-key
 #      and <cluster>/spire-server/intermediate-cert.
-#   3. Run secrets:connect, which syncs Secret spire-upstream now.
+#   3. Run secrets:connect, which syncs Secret spire-upstream now, and check that the Secret holds
+#      the new certificate.
 #   4. Restart the SPIRE server, so that it signs a new CA through the new intermediate.
 #   5. Check that the active X.509 authority of the server names the new intermediate as its
 #      upstream authority.
@@ -52,6 +53,20 @@ printf '%s\n' "$cert" | bash -c "$POC_SECRET_WRITE_CMD" _ "$CELL_NAME/spire-serv
 log "wrote the new intermediate to $CELL_NAME/spire-server/intermediate-key and intermediate-cert"
 
 "$ROOT/scripts/secrets-connect.sh" || die "secrets:connect failed. Fix the cause, then run: CELL=$CELL_NAME mise run secrets:connect, and then CELL=$CELL_NAME mise run cell:restart"
+# secrets:connect waits for a refresh of the ExternalSecret after its force sync. The Secret must
+# also hold the new certificate before the restart, or the new server signs with the old one.
+secret_ski() {
+  k -n spire-system get secret spire-upstream -o jsonpath='{.data.intermediate-cert}' | base64 -d | pki info | jq -r '.subject_key_id'
+}
+end=$((SECONDS + ${PKI_ROTATE_CHECK_WAIT:-120}))
+until got="$(secret_ski 2>/dev/null)" && [[ "$got" == "$want_ski" ]]; do
+  if ((SECONDS >= end)); then
+    die "Secret spire-system/spire-upstream does not hold the new intermediate $want_ski, so the restart would keep the old one. Run: CELL=$CELL_NAME mise run secrets:connect, then CELL=$CELL_NAME mise run cell:restart"
+  fi
+  sleep 5
+done
+log "Secret spire-system/spire-upstream holds the new intermediate"
+
 "$ROOT/scripts/restart.sh" || die "the restart failed. Run: CELL=$CELL_NAME mise run cell:restart"
 
 # active_upstream prints the subject key ID of the upstream authority of the active X.509 authority.

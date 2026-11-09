@@ -50,8 +50,9 @@ metadata:
     istio-injection: disabled
     pod-security.kubernetes.io/enforce: restricted
   annotations:
-    # A bundle that drops the namespace must not delete it, and the data of the workloads in it.
-    argocd.argoproj.io/sync-options: Prune=false
+    # A bundle that drops the namespace, or a deleted Application, must not delete it and the data of
+    # the workloads in it.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

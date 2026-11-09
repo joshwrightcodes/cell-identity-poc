@@ -43,7 +43,8 @@ func runRepair(t *testing.T, pid int, args ...string) (string, error) {
 }
 
 func TestRepairRefusesToRunBesideAnotherRepair(t *testing.T) {
-	holder := exec.Command("sleep", "60")
+	// The holder shows the command name of a repair, as ps prints it.
+	holder := exec.Command("bash", "-c", "exec -a gate-m2-repair.sh sleep 60")
 	if err := holder.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +55,20 @@ func TestRepairRefusesToRunBesideAnotherRepair(t *testing.T) {
 		if err == nil || !strings.Contains(out, want) {
 			t.Fatalf("repair %v: err %v, output %q; want a refusal that names the process", args, err, out)
 		}
+	}
+}
+
+// A PID can be reused by another process after a repair ends without its cleanup. A lock whose
+// process is no repair counts as stale.
+func TestRepairTakesOverALockOfAnotherProcess(t *testing.T) {
+	other := exec.Command("sleep", "60")
+	if err := other.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+	out, err := runRepair(t, other.Process.Pid, "--check")
+	if strings.Contains(out, "already runs") {
+		t.Fatalf("the check refused a lock of a process that is no repair: %q (err %v)", out, err)
 	}
 }
 

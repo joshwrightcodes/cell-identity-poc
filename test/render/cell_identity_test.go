@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/hashicorp/hcl"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 )
 
 var cellIdentityFacts = []string{
@@ -155,7 +157,12 @@ func TestRenderCellIdentity(t *testing.T) {
 		for _, e := range get[[]any](t, named(t, mains, "spire-agent"), "env") {
 			agentEnv = append(agentEnv, get[string](t, e, "name")+"="+get[string](t, e, "valueFrom", "fieldRef", "fieldPath"))
 		}
-		if !slices.Equal(agentEnv, []string{"POD_NAME=metadata.name", "POD_UID=metadata.uid", "POD_NAMESPACE=metadata.namespace", "SERVICE_ACCOUNT=spec.serviceAccountName"}) {
+		// The agent plugin reads these names, so they come from the wire contract of internal/clusterjwt.
+		wantEnv := []string{
+			clusterjwt.EnvPodName + "=metadata.name", clusterjwt.EnvPodUID + "=metadata.uid",
+			clusterjwt.EnvPodNamespace + "=metadata.namespace", clusterjwt.EnvServiceAccount + "=spec.serviceAccountName",
+		}
+		if !slices.Equal(agentEnv, wantEnv) {
 			t.Fatalf("spire-agent env is %v", agentEnv)
 		}
 		for _, v := range get[[]any](t, pod, "volumes") {

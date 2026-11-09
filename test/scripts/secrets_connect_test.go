@@ -57,7 +57,8 @@ case " $* " in
     echo "unable to access the vault" ;;
   *" -n external-secrets get deployment external-secrets -o json "*)
     [[ -z "${STUB_NO_ESO:-}" ]] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }
-    echo '{"status":{"availableReplicas":1}}' ;;
+    arg=--namespace=spire-system; [[ -z "${STUB_OLD_CONTROLLER:-}" ]] || arg=--enable-secret-store-reconciler=false
+    echo "{\"metadata\":{\"generation\":2},\"spec\":{\"replicas\":1,\"template\":{\"spec\":{\"containers\":[{\"args\":[\"$arg\"]}]}}},\"status\":{\"observedGeneration\":2,\"replicas\":1,\"updatedReplicas\":1,\"availableReplicas\":1}}" ;;
   *" get externalsecrets.external-secrets.io -o json "*)
     [[ -z "${STUB_NO_ES:-}" ]] || { echo '{"items":[]}'; exit 0; }
     echo '{"items":[
@@ -314,6 +315,7 @@ func TestSecretsConnectFailsClosed(t *testing.T) {
 		{"provider does not use the token secret", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token,
 			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"other","key":"token"}}}`}, "poc-secrets-token"},
 		{"operator not installed", append(both(), "STUB_NO_ESO=1", "SECRETS_CONNECT_ESO_WAIT=1"), "Run CELL=dev-cp mise run secrets:connect again when it is Healthy"},
+		{"old cluster-wide controller", append(both(), "STUB_OLD_CONTROLLER=1", "SECRETS_CONNECT_ESO_WAIT=1"), "scoped to spire-system"},
 		{"token command fails", []string{"POC_SECRET_TOKEN_CMD=echo partial; exit 3", "POC_SECRET_STORE_PROVIDER=" + provider}, "POC_SECRET_TOKEN_CMD"},
 		{"token command prints nothing", []string{"POC_SECRET_TOKEN_CMD=true", "POC_SECRET_STORE_PROVIDER=" + provider}, "no token"},
 	}

@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_ROOT="$ROOT/build"
+# POC_BUILD_ROOT names another build directory, for the tests.
+BUILD_ROOT="${POC_BUILD_ROOT:-$ROOT/build}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 
@@ -156,16 +157,50 @@ live_image_mismatches() {
   done
 }
 
-# app_healthy <name> succeeds when the Application is Healthy.
-app_healthy() {
-  k -n argocd get application "$1" -o json 2>/dev/null | jq -e '.status.health.status == "Healthy"' >/dev/null
+# apps_at_published succeeds when Argo CD reports every Application of the cluster Synced and
+# Healthy at the revision that publish.sh pushed. A check that runs before Argo CD reads the new
+# root bundle cannot pass.
+apps_at_published() {
+  local published_json
+  published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
+  k -n argocd get applications -o json | jq -e --argjson n "$((${#COMPONENTS[@]} + 1))" --argjson pub "$published_json" '
+    (.items | length) == $n and
+    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
+      and .status.sync.revision == $pub[.metadata.name])'
 }
 
-# connect_store_step <secrets:connect script> runs secrets:connect once when the secret store has a
-# gap and POC_SECRET_TOKEN_CMD is set. Without that setting, it asks for secrets:connect in a second
-# shell, once a minute. It sets store_done when the store has no gap.
+# eso_controller_rolled_out succeeds when the operator Deployment runs only pods of its current
+# spec, and that spec scopes the controller to the store namespace. Until then a controller of an
+# older bundle, which ignores SecretStore objects, can still serve.
+eso_controller_rolled_out() {
+  local store_ns
+  read -r store_ns _ <<<"${SECRET_STORE_NAMESPACES:-}"
+  [[ -n "$store_ns" ]] || return 1
+  k -n external-secrets get deployment external-secrets -o json 2>/dev/null | jq -e --arg arg "--namespace=$store_ns" '
+    (.spec.replicas // 1) as $want
+    | (.status.observedGeneration // 0) == .metadata.generation
+      and (.status.replicas // 0) == $want and (.status.updatedReplicas // 0) == $want
+      and (.status.availableReplicas // 0) == $want
+      and any(.spec.template.spec.containers[].args[]?; . == $arg)' >/dev/null
+}
+
+# eso_published_synced succeeds when Argo CD reports the Application external-secrets Synced and
+# Healthy at the digest that the last cell:publish recorded in build/<cluster>/published.env.
+eso_published_synced() {
+  local want
+  want="$(sed -n 's/^external-secrets=//p' "$PUBLISHED" 2>/dev/null)"
+  [[ -n "$want" ]] || return 1
+  k -n argocd get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
+    .status.sync.status == "Synced" and .status.health.status == "Healthy" and .status.sync.revision == $want' >/dev/null
+}
+
+# connect_store_step <secrets:connect script> waits until the published operator bundle is synced
+# and its scoped controller has rolled out. Then it runs secrets:connect once when the secret store
+# has a gap and POC_SECRET_TOKEN_CMD is set. Without that setting, it asks for secrets:connect in a
+# second shell, once a minute. It sets store_done when the store has no gap.
 connect_store_step() {
   local gaps
+  eso_published_synced && eso_controller_rolled_out || return 0
   gaps="$(store_gaps)"
   if [[ -z "$gaps" ]]; then
     store_done=1

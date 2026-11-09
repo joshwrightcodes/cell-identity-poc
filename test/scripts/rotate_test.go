@@ -53,7 +53,8 @@ exec "$STUB_PKIGEN" "$@"
 
 // rotateKubectl plays the cluster for secrets:connect, cell:restart and the authority check. The
 // active authority names the subject key ID of the intermediate certificate that the write command
-// stored, unless STUB_OLD_AUTHORITY is set.
+// stored, unless STUB_OLD_AUTHORITY is set. Secret spire-upstream holds that certificate, unless
+// STUB_SECRET_STALE keeps the root certificate there.
 const rotateKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_DIR/kubectl.log"
@@ -65,9 +66,13 @@ case " $* " in
       ski="$("$STUB_PKIGEN" info <"$STUB_DIR/written-dev-cp_spire-server_intermediate-cert" | jq -r .subject_key_id)"
     fi
     echo "{\"active\":{\"authority_id\":\"x\",\"upstream_authority_subject_key_id\":\"$ski\"}}" ;;
+  *" get secret spire-upstream -o jsonpath={.data.intermediate-cert} "*)
+    if [[ -n "${STUB_SECRET_STALE:-}" ]]; then sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$STUB_DIR/root-bundle" | base64
+    else base64 <"$STUB_DIR/written-dev-cp_spire-server_intermediate-cert"; fi ;;
   *" apply "*) cat >/dev/null; echo applied ;;
   *" wait "*) echo "condition met" ;;
-  *" -n external-secrets get deployment external-secrets -o json "*) echo '{"status":{"availableReplicas":1}}' ;;
+  *" -n external-secrets get deployment external-secrets -o json "*)
+    echo '{"metadata":{"generation":1},"spec":{"replicas":1,"template":{"spec":{"containers":[{"args":["--namespace=spire-system"]}]}}},"status":{"observedGeneration":1,"replicas":1,"updatedReplicas":1,"availableReplicas":1}}' ;;
   *" get externalsecrets.external-secrets.io -o json "*)
     echo '{"items":[{"metadata":{"name":"spire-upstream"},"spec":{"secretStoreRef":{"kind":"SecretStore","name":"poc-secrets"},"target":{"name":"spire-upstream"}}}]}' ;;
   *" annotate "*) echo annotated ;;
@@ -196,6 +201,7 @@ func TestRotateIntermediateFailsClosed(t *testing.T) {
 		want string
 	}{
 		{"server still on the old intermediate", []string{"STUB_OLD_AUTHORITY=1"}, "has the upstream authority 'old'"},
+		{"Secret not refreshed", []string{"STUB_SECRET_STALE=1"}, "Secret spire-system/spire-upstream does not hold the new intermediate"},
 		{"no write command", []string{"POC_SECRET_WRITE_CMD="}, "POC_SECRET_WRITE_CMD is not set"},
 		{"no SPIRE server in the cluster", []string{"CELL=dev-cell-1"}, "CELL=dev-cp mise run pki:rotate-intermediate"},
 		{"root read fails", []string{"POC_ROOT_CA_BUNDLE=vault/other"}, "POC_SECRET_READ_CMD failed"},

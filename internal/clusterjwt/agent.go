@@ -29,7 +29,9 @@ const (
 	// MinTokenTTL is the shortest lifetime that the Kubernetes TokenRequest API accepts.
 	MinTokenTTL = 10 * time.Minute
 
-	tokenRequestTimeout = 30 * time.Second
+	// tokenRequestTimeout stays below challenge_timeout of the server (10s in server.conf), so a slow
+	// API server ends as an agent error, not as a challenge timeout on the server.
+	tokenRequestTimeout = 8 * time.Second
 	boundObjectKind     = "Pod"
 	boundObjectAPIV     = "v1"
 	maxIdentityValue    = 253

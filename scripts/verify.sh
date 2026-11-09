@@ -428,7 +428,7 @@ check_secret_store() {
 # The intermediate CA in Secret spire-upstream must stay valid for more than 7 days. The check reads
 # only the certificate of the Secret.
 check_intermediate_expiry() {
-  local cert info left
+  local cert info left want got
   cert="$(k -n spire-system get secret spire-upstream -o jsonpath='{.data.intermediate-cert}' | base64 -d)" \
     || { echo "could not read the intermediate certificate from Secret spire-system/spire-upstream"; return 1; }
   info="$(cd "$ROOT" && printf '%s\n' "$cert" | mise run pki -- info 2>/dev/null)" || { echo "pkigen could not read the intermediate certificate: $info"; return 1; }
@@ -438,6 +438,29 @@ check_intermediate_expiry() {
     echo "Run: CELL=$CELL_NAME mise run pki:rotate-intermediate"
     return 1
   fi
+  # The server reads the files only when it signs a CA, so its active CA can still chain to an
+  # older intermediate than the Secret holds.
+  want="$(jq -r .subject_key_id <<<"$info")"
+  got="$(k -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority x509 show \
+    -socketPath /run/spire/sockets/api.sock -output json | jq -r '.active.upstream_authority_subject_key_id // ""')" \
+    || { echo "could not read the active X.509 authority of spire-server-0"; return 1; }
+  if [[ "$got" != "$want" ]]; then
+    echo "the active X.509 authority of the server has the upstream authority '$got', and Secret spire-upstream holds the intermediate $want."
+    echo "Run: CELL=$CELL_NAME mise run cell:restart"
+    return 1
+  fi
+}
+
+# The operator must not list Secrets in every namespace, and no copy of the access token may lie
+# outside the store namespaces.
+check_operator_scope() {
+  local can extra
+  can="$(k auth can-i list secrets -A --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
+  [[ "$can" == no ]] || { echo "the External Secrets Operator can list Secrets in every namespace (can-i: '${can:-unknown}'). Run: CELL=$CELL_NAME mise run eso:migrate"; return 1; }
+  extra="$(k get secrets -A --field-selector metadata.name=poc-secrets-token -o json \
+    | jq -r --arg keep " $SECRET_STORE_NAMESPACES " '.items[] | select(($keep | contains(" " + .metadata.namespace + " ")) | not)
+      | "\(.metadata.namespace)/\(.metadata.name)"')" || { echo "could not list the Secrets named poc-secrets-token"; return 1; }
+  [[ -z "$extra" ]] || { echo "a copy of the access token lies outside $SECRET_STORE_NAMESPACES: $extra. Run: CELL=$CELL_NAME mise run eso:migrate"; return 1; }
 }
 
 # The rogue probe proves the policy only when the node port has a ready local endpoint, because the
@@ -538,7 +561,7 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
-  check "The intermediate CA in Secret spire-upstream is valid for more than 7 days" check_intermediate_expiry
+  check "The intermediate CA in Secret spire-upstream is valid for more than 7 days, and the active CA of the server chains to it" check_intermediate_expiry
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.
   probe_targets+=("rogue/default")
   own_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
@@ -547,6 +570,7 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
 fi
 if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "SecretStore $SECRET_STORE is Ready, and each ExternalSecret that uses it is Ready and refreshed in time" check_secret_store
+  check "The External Secrets Operator cannot list Secrets in every namespace, and no token copy lies outside $SECRET_STORE_NAMESPACES" check_operator_scope
 fi
 
 if ((failures > 0)); then
