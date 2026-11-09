@@ -2,10 +2,21 @@
 # Render the External Secrets Operator from the vendored chart, with its namespace and NetworkPolicies.
 # The controller may reach only DNS, the Kubernetes API and public addresses on port 443. The
 # policies deny all ingress, because the controller serves nothing that another pod needs.
-# Inputs: EXTERNAL_SECRETS_VERSION from cells/common.env, and API_SERVER_IPS, API_SERVER_PORT,
-# API_SERVICE_IP and DNS_SERVICE_IP from build/<cluster>/facts.env.
+# The controller works in one namespace, the store namespace. Its Role and RoleBinding live there,
+# so this bundle also holds that Namespace: the bundle of the namespace comes in a later sync wave.
+# Inputs: EXTERNAL_SECRETS_VERSION from cells/common.env, SECRET_STORE_NAMESPACES from
+# cells/<cluster>.env, and API_SERVER_IPS, API_SERVER_PORT, API_SERVICE_IP and DNS_SERVICE_IP from
+# build/<cluster>/facts.env.
 set -euo pipefail
 : "${EXTERNAL_SECRETS_VERSION:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
+
+# The controller takes one --namespace, so the cell has one store namespace.
+read -r -a store_namespaces <<<"${SECRET_STORE_NAMESPACES:-}"
+if ((${#store_namespaces[@]} != 1)) || [[ ! "${store_namespaces[0]}" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
+  printf 'error: external-secrets render: SECRET_STORE_NAMESPACES must name exactly one namespace, got %s\n' "'${SECRET_STORE_NAMESPACES:-}'" >&2
+  exit 1
+fi
+store_namespace="${store_namespaces[0]}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -18,7 +29,7 @@ PRIVATE_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.
 
 # Render the chart first, so a chart error prints nothing.
 manifests="$(helm template external-secrets "$chart" --namespace "$namespace" --kube-version 1.37.0 \
-  --values "$here/values.yaml")"
+  --values "$here/values.yaml" --set "scopedNamespace=$store_namespace")"
 
 api_peers="$(for ip in $API_SERVER_IPS; do printf '        - ipBlock:\n            cidr: %s/32\n' "$ip"; done)"
 
@@ -30,6 +41,17 @@ metadata:
   labels:
     istio-injection: disabled
     pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: $store_namespace
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+  annotations:
+    # A bundle that drops the namespace must not delete it, and the data of the workloads in it.
+    argocd.argoproj.io/sync-options: Prune=false
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

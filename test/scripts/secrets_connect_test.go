@@ -19,20 +19,27 @@ import (
 )
 
 const (
-	token    = "stub-token-0f9e8d7c6b5a"
-	provider = `{"stubProvider":{"store":"poc","auth":{"secretRef":{"name":"poc-secrets-token","key":"token","namespace":"external-secrets"}}}}`
+	token = "stub-token-0f9e8d7c6b5a"
+	// provider refers to the token Secret without a namespace, as a namespaced store must.
+	provider = `{"stubProvider":{"store":"poc","auth":{"secretRef":{"name":"poc-secrets-token","key":"token"}}}}`
+	// providerWithNamespace is the form for a ClusterSecretStore. The script drops the namespace.
+	providerWithNamespace = `{"stubProvider":{"store":"poc","auth":{"secretRef":{"name":"poc-secrets-token","key":"token","namespace":"external-secrets"}}}}`
 )
 
 // stubKubectl logs each call, answers the install checks and saves each applied manifest.
-// STUB_NO_ESO makes the install checks fail. STUB_APPLY_FAIL makes apply fail and echo its input,
-// the way a server error can quote a request. Two ExternalSecrets exist in spire-system: one uses
-// the store poc-secrets, and one uses another store. STUB_NO_ES lists none. The ExternalSecret
-// reports Ready with a refresh time of now. STUB_NO_TARGET makes it fail to sync and the target
-// Secret missing, and STUB_STALE_REFRESH gives it a refresh time from before the force sync.
+// STUB_NO_CONTEXT removes the kubeconfig context. STUB_NO_ESO makes the install checks fail.
+// STUB_APPLY_FAIL makes apply fail and echo its input, the way a server error can quote a request.
+// Three ExternalSecrets exist in spire-system: one uses the store poc-secrets, one another store,
+// and one a ClusterSecretStore of the same name. STUB_NO_ES lists none. The ExternalSecret reports
+// Ready with a refresh time of now. STUB_NO_TARGET makes it fail to sync and the target Secret
+// missing, and STUB_STALE_REFRESH gives it a refresh time from before the force sync.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_DIR/kubectl.log"
 case " $* " in
+  *" config get-contexts "*)
+    [[ -z "${STUB_NO_CONTEXT:-}" ]] || { echo 'error: context not found' >&2; exit 1; }
+    echo "kind-dev-cp" ;;
   *" apply "*)
     n=$(ls "$STUB_DIR" | grep -c '^applied-' || true)
     input="$(cat)"
@@ -46,7 +53,7 @@ case " $* " in
   *" wait "*)
     [[ -z "${STUB_NOT_READY:-}" ]] || { echo 'error: timed out waiting for the condition' >&2; exit 1; }
     echo "condition met" ;;
-  *" get clustersecretstore "*)
+  *" get secretstore "*)
     echo "unable to access the vault" ;;
   *" -n external-secrets get deployment external-secrets -o json "*)
     [[ -z "${STUB_NO_ESO:-}" ]] || { echo 'Error from server (NotFound): not found' >&2; exit 1; }
@@ -54,8 +61,9 @@ case " $* " in
   *" get externalsecrets.external-secrets.io -o json "*)
     [[ -z "${STUB_NO_ES:-}" ]] || { echo '{"items":[]}'; exit 0; }
     echo '{"items":[
-      {"metadata":{"name":"spire-upstream"},"spec":{"secretStoreRef":{"kind":"ClusterSecretStore","name":"poc-secrets"},"target":{"name":"spire-upstream"}}},
-      {"metadata":{"name":"other"},"spec":{"secretStoreRef":{"kind":"ClusterSecretStore","name":"other-store"}}}]}' ;;
+      {"metadata":{"name":"spire-upstream"},"spec":{"secretStoreRef":{"kind":"SecretStore","name":"poc-secrets"},"target":{"name":"spire-upstream"}}},
+      {"metadata":{"name":"other"},"spec":{"secretStoreRef":{"kind":"SecretStore","name":"other-store"}}},
+      {"metadata":{"name":"cluster-scoped"},"spec":{"secretStoreRef":{"kind":"ClusterSecretStore","name":"poc-secrets"}}}]}' ;;
   *" annotate "*)
     echo "annotated" ;;
   *" get externalsecret "*)
@@ -95,11 +103,13 @@ func run(t *testing.T, env ...string) result {
 		t.Fatal(err)
 	}
 	cmd := exec.Command(script)
+	// POC_ENVRC_LOCAL points away from the .envrc.local of the checkout, so no test reads it.
 	cmd.Env = []string{
 		"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
 		"STUB_DIR=" + dir,
 		"CELL=dev-cp",
+		"POC_ENVRC_LOCAL=" + filepath.Join(dir, "no-envrc-local"),
 	}
 	cmd.Env = append(cmd.Env, env...)
 	var stdout, stderr bytes.Buffer
@@ -173,6 +183,9 @@ func TestSecretsConnect(t *testing.T) {
 	assertNoToken(t, r)
 
 	for _, c := range r.calls {
+		if c == "config get-contexts kind-dev-cp -o name" {
+			continue
+		}
 		if !strings.HasPrefix(c, "--context kind-dev-cp ") {
 			t.Fatalf("kubectl call %q does not target kind-dev-cp", c)
 		}
@@ -186,7 +199,7 @@ func TestSecretsConnect(t *testing.T) {
 	waitAt, annotateAt, secretAt := -1, -1, -1
 	for i, c := range r.calls {
 		switch {
-		case strings.Contains(c, " wait ") && strings.Contains(c, "clustersecretstore/poc-secrets"):
+		case strings.Contains(c, "-n spire-system wait ") && strings.Contains(c, "secretstore/poc-secrets"):
 			waitAt = i
 		case strings.Contains(c, " annotate "):
 			if !strings.Contains(c, "-n spire-system annotate externalsecret spire-upstream force-sync=") || !strings.HasSuffix(c, " --overwrite") {
@@ -201,10 +214,10 @@ func TestSecretsConnect(t *testing.T) {
 		t.Fatalf("calls %v: want the store wait, then the force sync, then the check for Secret spire-upstream", r.calls)
 	}
 
-	t.Run("token secret comes first and holds the command output", func(t *testing.T) {
+	t.Run("token secret comes first, in the store namespace, and holds the command output", func(t *testing.T) {
 		s := r.applied[0]
 		if get(t, s, "kind") != "Secret" || get(t, s, "metadata", "name") != "poc-secrets-token" ||
-			get(t, s, "metadata", "namespace") != "external-secrets" {
+			get(t, s, "metadata", "namespace") != "spire-system" {
 			t.Fatalf("first manifest is %v", s["metadata"])
 		}
 		data := get(t, s, "data").(map[string]any)
@@ -220,10 +233,10 @@ func TestSecretsConnect(t *testing.T) {
 		}
 	})
 
-	t.Run("store has the name and the provider block from the variable", func(t *testing.T) {
+	t.Run("store is a SecretStore in the store namespace with the provider block from the variable", func(t *testing.T) {
 		s := r.applied[1]
-		if get(t, s, "apiVersion") != "external-secrets.io/v1" || get(t, s, "kind") != "ClusterSecretStore" ||
-			get(t, s, "metadata", "name") != "poc-secrets" {
+		if get(t, s, "apiVersion") != "external-secrets.io/v1" || get(t, s, "kind") != "SecretStore" ||
+			get(t, s, "metadata", "name") != "poc-secrets" || get(t, s, "metadata", "namespace") != "spire-system" {
 			t.Fatalf("second manifest is %v %v", s["kind"], s["metadata"])
 		}
 		var want any
@@ -233,9 +246,8 @@ func TestSecretsConnect(t *testing.T) {
 		if got := get(t, s, "spec", "provider"); !reflect.DeepEqual(got, want) {
 			t.Fatalf("provider is %v, want %v", got, want)
 		}
-		conditions := get(t, s, "spec", "conditions").([]any)
-		if len(conditions) != 1 || !reflect.DeepEqual(get(t, conditions[0], "namespaces"), []any{"spire-system"}) {
-			t.Fatalf("conditions are %v, want only the namespaces from cells/dev-cp.env", conditions)
+		if _, ok := get(t, s, "spec").(map[string]any)["conditions"]; ok {
+			t.Fatal("a namespaced store has conditions")
 		}
 		if at, ok := get(t, s, "metadata", "annotations").(map[string]any)["cell.poc.internal/connected-at"].(string); !ok || at == "" {
 			t.Fatal("store has no connected-at annotation, so a new token would not reach a cached provider client")
@@ -243,12 +255,45 @@ func TestSecretsConnect(t *testing.T) {
 	})
 }
 
+// A token reference in the form for a ClusterSecretStore names a namespace. A namespaced store
+// reads the Secret in its own namespace, so the script drops the field.
+func TestSecretsConnectDropsTheTokenNamespace(t *testing.T) {
+	r := run(t, "POC_SECRET_TOKEN_CMD=printf %s "+token, "POC_SECRET_STORE_PROVIDER="+providerWithNamespace)
+	if r.err != nil {
+		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
+	}
+	var want any
+	if err := json.Unmarshal([]byte(provider), &want); err != nil {
+		t.Fatal(err)
+	}
+	if got := get(t, r.applied[1], "spec", "provider"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("provider is %v, want %v", got, want)
+	}
+}
+
+// Without the two settings in the environment, the script reads .envrc.local itself.
+func TestSecretsConnectReadsEnvrcLocal(t *testing.T) {
+	file := filepath.Join(t.TempDir(), ".envrc.local")
+	content := "export POC_SECRET_TOKEN_CMD='printf %s " + token + "'\nexport POC_SECRET_STORE_PROVIDER='" + provider + "'\n"
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := run(t, "POC_ENVRC_LOCAL="+file)
+	if r.err != nil {
+		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
+	}
+	assertNoToken(t, r)
+	if len(r.applied) != 2 {
+		t.Fatalf("got %d applied manifests, want 2", len(r.applied))
+	}
+}
+
 func TestSecretsConnectWithoutExternalSecrets(t *testing.T) {
 	r := run(t, append(both(), "STUB_NO_ES=1")...)
 	if r.err != nil {
 		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
 	}
-	if !strings.Contains(r.stderr, "no ExternalSecret in spire-system uses ClusterSecretStore poc-secrets") {
+	if !strings.Contains(r.stderr, "no ExternalSecret in spire-system uses SecretStore poc-secrets") {
 		t.Fatalf("stderr %q does not say that no ExternalSecret uses the store", r.stderr)
 	}
 }
@@ -259,13 +304,15 @@ func TestSecretsConnectFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{"no token command", []string{"POC_SECRET_STORE_PROVIDER=" + provider}, "POC_SECRET_TOKEN_CMD"},
+		{"no token command", []string{"POC_SECRET_STORE_PROVIDER=" + provider}, "direnv allow"},
+		{"cluster without a store namespace", append(both(), "CELL=dev-cell-1"), "CELL=dev-cp mise run secrets:connect"},
+		{"no kubeconfig context", append(both(), "STUB_NO_CONTEXT=1"), "CELL=dev-cp mise run cell:up"},
 		{"no provider", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token}, "POC_SECRET_STORE_PROVIDER"},
 		{"provider is not JSON", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token, "POC_SECRET_STORE_PROVIDER=vault: x"}, "POC_SECRET_STORE_PROVIDER"},
 		{"provider has two blocks", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token,
-			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"poc-secrets-token","key":"token","namespace":"external-secrets"}},"b":{}}`}, "one provider"},
+			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"poc-secrets-token","key":"token"}},"b":{}}`}, "one provider"},
 		{"provider does not use the token secret", []string{"POC_SECRET_TOKEN_CMD=printf %s " + token,
-			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"other","key":"token","namespace":"external-secrets"}}}`}, "poc-secrets-token"},
+			`POC_SECRET_STORE_PROVIDER={"a":{"ref":{"name":"other","key":"token"}}}`}, "poc-secrets-token"},
 		{"operator not installed", append(both(), "STUB_NO_ESO=1", "SECRETS_CONNECT_ESO_WAIT=1"), "Run CELL=dev-cp mise run secrets:connect again when it is Healthy"},
 		{"token command fails", []string{"POC_SECRET_TOKEN_CMD=echo partial; exit 3", "POC_SECRET_STORE_PROVIDER=" + provider}, "POC_SECRET_TOKEN_CMD"},
 		{"token command prints nothing", []string{"POC_SECRET_TOKEN_CMD=true", "POC_SECRET_STORE_PROVIDER=" + provider}, "no token"},

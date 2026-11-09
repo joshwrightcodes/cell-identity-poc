@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net/url"
 	"strings"
@@ -353,4 +354,31 @@ func TestTrustBundleRejects(t *testing.T) {
 			t.Fatalf("error %q", out)
 		}
 	})
+}
+
+// info prints the facts that pki:rotate-intermediate and cell:verify compare: the subject key ID
+// in the hex form of SPIRE, and NotAfter.
+func TestInfoPrintsSubjectKeyIDAndExpiry(t *testing.T) {
+	root := runOK(t, []string{"root"}, "")
+	inter := runOK(t, []string{"intermediate", "--days", "30"}, root)
+	_, cert := parseBundle(t, inter)
+	out := runOK(t, []string{"info"}, certOnly(t, inter))
+	var got struct {
+		SubjectKeyID string `json:"subject_key_id"`
+		NotAfter     string `json:"not_after"`
+	}
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("info output %q is not JSON: %v", out, err)
+	}
+	if want := fmt.Sprintf("%x", cert.SubjectKeyId); got.SubjectKeyID != want || want == "" {
+		t.Fatalf("subject_key_id %q, want %q", got.SubjectKeyID, want)
+	}
+	if want := cert.NotAfter.UTC().Format(time.RFC3339); got.NotAfter != want {
+		t.Fatalf("not_after %q, want %q", got.NotAfter, want)
+	}
+	for name, in := range map[string]string{"empty": "", "a bundle": inter, "two certificates": certOnly(t, inter) + certOnly(t, root)} {
+		if msg := runFail(t, []string{"info"}, in); !strings.Contains(msg, "one CERTIFICATE") {
+			t.Fatalf("%s: error %q does not ask for one CERTIFICATE block", name, msg)
+		}
+	}
 }

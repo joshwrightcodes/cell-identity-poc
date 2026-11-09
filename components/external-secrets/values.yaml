@@ -1,5 +1,6 @@
 # Values for the vendored External Secrets Operator chart. The cell runs only the controller,
-# and only for ExternalSecret and ClusterSecretStore. vendor/README.md records the review.
+# and only for ExternalSecret and SecretStore objects in one namespace. render.sh sets that
+# namespace, scopedNamespace, from SECRET_STORE_NAMESPACES. vendor/README.md records the review.
 global:
   compatibility:
     openshift:
@@ -13,13 +14,18 @@ crds:
   createClusterExternalSecret: false
   createClusterGenerator: false
   createClusterPushSecret: false
+  createClusterSecretStore: false
   createPushSecret: false
-# The chart installs the SecretStore CRD in every case. Its reconciler stays off.
+# Roles and a RoleBinding in scopedNamespace replace the ClusterRoles, and the controller watches
+# only that namespace. The cluster store reconcilers stay off.
+scopedRBAC: true
 processClusterExternalSecret: false
 processClusterGenerator: false
 processClusterPushSecret: false
+processClusterStore: false
 processPushSecret: false
-processSecretStore: false
+# The SecretStore reconciler sets the Ready condition of the store.
+processSecretStore: true
 openshiftFinalizers: false
 
 rbac:

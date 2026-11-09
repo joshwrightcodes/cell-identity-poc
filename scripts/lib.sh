@@ -92,7 +92,7 @@ wait_for() {
 # Start a port-forward to the bundle store. Sets BUNDLE_BUNDLE_STORE_PF_PID.
 bundle_store_forward() {
   if curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/" >/dev/null 2>&1; then
-    die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store. Stop the old port-forward first."
+    die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store, probably from an old port-forward. Find its process with: lsof -nP -iTCP:${CELL_BUNDLE_STORE_PORT} -sTCP:LISTEN. Stop that process, then run the command again."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
   kubectl --context "kind-$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
@@ -103,6 +103,44 @@ bundle_store_forward() {
 }
 
 source "$ROOT/scripts/gate-traces.sh"
+
+# load_local_settings reads the gitignored .envrc.local when one of the given variables is unset.
+# direnv loads the file after direnv allow, so this matters only without direnv. POC_ENVRC_LOCAL
+# names another file, for the tests.
+load_local_settings() {
+  local file="${POC_ENVRC_LOCAL:-$ROOT/.envrc.local}" name
+  for name in "$@"; do
+    if [[ -z "${!name:-}" ]]; then
+      [[ -f "$file" ]] || return 0
+      # shellcheck source=/dev/null
+      source "$file"
+      log "read the settings from $file"
+      return 0
+    fi
+  done
+}
+
+# SECRET_STORE is the name of the SecretStore that secrets:connect applies in each namespace of
+# SECRET_STORE_NAMESPACES.
+SECRET_STORE=poc-secrets
+
+# store_gaps prints one line for each namespace of SECRET_STORE_NAMESPACES whose SecretStore is not
+# Ready, and for each missing target Secret of an ExternalSecret that uses the store. It prints
+# nothing when secrets:connect has nothing to do.
+store_gaps() {
+  local ns list target
+  for ns in ${SECRET_STORE_NAMESPACES:-}; do
+    k -n "$ns" get secretstore "$SECRET_STORE" -o json 2>/dev/null \
+      | jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null 2>&1 \
+      || echo "SecretStore $ns/$SECRET_STORE is not Ready"
+    list="$(k -n "$ns" get externalsecrets.external-secrets.io -o json 2>/dev/null)" || continue
+    for target in $(jq -r --arg store "$SECRET_STORE" '.items[]
+        | select(.spec.secretStoreRef.kind == "SecretStore" and .spec.secretStoreRef.name == $store)
+        | .spec.target.name // .metadata.name' <<<"$list"); do
+      k -n "$ns" get secret "$target" >/dev/null 2>&1 || echo "Secret $ns/$target is missing"
+    done
+  done
+}
 
 # live_image_mismatches <cluster> <namespace> <kind/name> prints one line for each local image of the
 # workload that differs from build/images.env, and prints nothing when all match.
@@ -116,4 +154,30 @@ live_image_mismatches() {
     want="$(sed -n "s/^IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$name")=//p" "$BUILD_ROOT/images.env" 2>/dev/null)"
     [[ -n "$want" && "$image" == "$want" ]] || echo "$workload in $cluster runs $image, and build/images.env has '${want:-nothing}' for $name"
   done
+}
+
+# app_healthy <name> succeeds when the Application is Healthy.
+app_healthy() {
+  k -n argocd get application "$1" -o json 2>/dev/null | jq -e '.status.health.status == "Healthy"' >/dev/null
+}
+
+# connect_store_step <secrets:connect script> runs secrets:connect once when the secret store has a
+# gap and POC_SECRET_TOKEN_CMD is set. Without that setting, it asks for secrets:connect in a second
+# shell, once a minute. It sets store_done when the store has no gap.
+connect_store_step() {
+  local gaps
+  gaps="$(store_gaps)"
+  if [[ -z "$gaps" ]]; then
+    store_done=1
+    log "the secret store of $CELL_NAME is connected"
+    return 0
+  fi
+  if [[ -n "${POC_SECRET_TOKEN_CMD:-}" ]]; then
+    log "running secrets:connect, because: ${gaps//$'\n'/; }"
+    "$1" || die "secrets:connect failed. Fix the cause, then run: CELL=$CELL_NAME mise run secrets:connect"
+    store_done=1
+  elif ((SECONDS - last_hint >= 60)); then
+    log "${gaps//$'\n'/; }. Run in a second shell: CELL=$CELL_NAME mise run secrets:connect"
+    last_hint=$SECONDS
+  fi
 }

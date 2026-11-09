@@ -26,8 +26,15 @@ if [[ "$milestone" == m2 ]]; then
     | sed -n 's/^ *agent_ttl = "\(.*\)"$/\1/p')" || die "could not read the server config of dev-cp"
   [[ "$ttl" == 1m ]] || die "the SPIRE server in dev-cp sets agent_ttl '$ttl', and the renewal tests need 1m. Set SPIRE_SVID_TTL=1m in cells/dev-cp.env, then run: CELL=dev-cp mise run cell:up"
   stale=""
-  for target in dev-cp:spire-system:statefulset/spire-server dev-cell-1:cell-identity-system:deployment/celld \
-      dev-cell-2:cell-identity-system:deployment/celld; do
+  topology="$ROOT/harness/topology.yaml"
+  targets=()
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "spire-server") | .name' "$topology"); do
+    targets+=("$cluster:spire-system:statefulset/spire-server")
+  done
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$topology"); do
+    targets+=("$cluster:cell-identity-system:deployment/celld")
+  done
+  for target in "${targets[@]}"; do
     IFS=: read -r cluster ns workload <<<"$target"
     found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
     [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'

@@ -135,6 +135,12 @@ check_psa_rejects_privileged() {
   grep -q "violates PodSecurity" <<<"$out" || { echo "$out"; return 1; }
 }
 
+# missing_cell_hint <cell> prints the two ways out when an agent cell has no cluster.
+missing_cell_hint() {
+  echo "Create the cluster: mise run hostsvc -- up --only $1, then run CELL=$1 mise run cell:up and CELL=$CELL_NAME mise run cell:up."
+  echo "Or remove $1 from SPIRE_AGENT_CELLS in cells/$CELL_NAME.env, then run CELL=$CELL_NAME mise run cell:up."
+}
+
 node_ip() {
   local facts ip
   facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$1" 2>/dev/null)" || { echo "no host service facts for $1"; return 1; }
@@ -164,7 +170,7 @@ check_spire_server_address() {
 check_agent_cells_current() {
   local cell ip facts want got cidrs traces want_cidrs=() stale=()
   for cell in $SPIRE_AGENT_CELLS; do
-    ip="$(node_ip "$cell")" || { echo "$ip"; return 1; }
+    ip="$(node_ip "$cell")" || { echo "$ip."; missing_cell_hint "$cell"; return 1; }
     want_cidrs+=("$ip/32")
     facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"
     want="$(jq -cS '.jwks.keys | sort_by(.kid)' <<<"$facts")"
@@ -390,6 +396,65 @@ check_svid_ttl() {
   fi
 }
 
+# The secret store of each namespace in SECRET_STORE_NAMESPACES must be Ready, and each
+# ExternalSecret that uses it must be Ready with a refresh within twice its refresh interval.
+check_secret_store() {
+  local ns problems=() list
+  for ns in $SECRET_STORE_NAMESPACES; do
+    k -n "$ns" get secretstore "$SECRET_STORE" -o json 2>/dev/null \
+      | jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null \
+      || problems+=("SecretStore $ns/$SECRET_STORE is missing or not Ready")
+    list="$(k -n "$ns" get externalsecrets.external-secrets.io -o json)" || { echo "could not list the ExternalSecrets in $ns"; return 1; }
+    while read -r line; do
+      [[ -n "$line" ]] && problems+=("$line")
+    done < <(jq -r --arg ns "$ns" --arg store "$SECRET_STORE" '
+      def seconds: capture("^(?<n>[0-9]+)(?<u>[smh])$") | (.n | tonumber) * ({"s": 1, "m": 60, "h": 3600}[.u]);
+      .items[] | select(.spec.secretStoreRef.name == $store)
+      | (.spec.refreshInterval // "1h" | seconds) as $every
+      | ((.status.refreshTime // "1970-01-01T00:00:00Z") | fromdateiso8601) as $at
+      | if any(.status.conditions[]?; .type == "Ready" and .status == "True") | not then
+          "ExternalSecret \($ns)/\(.metadata.name) is not Ready: \([.status.conditions[]? | select(.type == "Ready") | .message] | join("; "))"
+        elif now - $at > 2 * $every then
+          "ExternalSecret \($ns)/\(.metadata.name) last refreshed at \(.status.refreshTime // "never"), more than twice its interval of \(.spec.refreshInterval // "1h") ago"
+        else empty end' <<<"$list")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: CELL=$CELL_NAME mise run secrets:connect"
+    return 1
+  fi
+}
+
+# The intermediate CA in Secret spire-upstream must stay valid for more than 7 days. The check reads
+# only the certificate of the Secret.
+check_intermediate_expiry() {
+  local cert info left
+  cert="$(k -n spire-system get secret spire-upstream -o jsonpath='{.data.intermediate-cert}' | base64 -d)" \
+    || { echo "could not read the intermediate certificate from Secret spire-system/spire-upstream"; return 1; }
+  info="$(cd "$ROOT" && printf '%s\n' "$cert" | mise run pki -- info 2>/dev/null)" || { echo "pkigen could not read the intermediate certificate: $info"; return 1; }
+  left="$(jq -r '((.not_after | fromdateiso8601) - now) / 86400 | floor' <<<"$info")"
+  if ((left <= 7)); then
+    echo "the intermediate CA expires at $(jq -r .not_after <<<"$info"), in $left days."
+    echo "Run: CELL=$CELL_NAME mise run pki:rotate-intermediate"
+    return 1
+  fi
+}
+
+# The rogue probe proves the policy only when the node port has a ready local endpoint, because the
+# Service uses the local traffic policy and a port without one also times out.
+check_server_endpoint() {
+  k -n spire-system get endpointslices -l kubernetes.io/service-name=spire-server -o json \
+    | jq -e --arg node "$CELL_NAME-control-plane" 'any(.items[].endpoints[]?; .nodeName == $node and .conditions.ready == true)' >/dev/null \
+    || { echo "the spire-server Service has no ready endpoint on $CELL_NAME-control-plane. Read: mise x -- kubectl --context kind-$CELL_NAME -n spire-system describe pod spire-server-0"; return 1; }
+}
+
+# expect_rogue_blocked <ip:port> requires the ready local endpoint first, and then a blocked dial
+# from rogue.
+expect_rogue_blocked() {
+  check_server_endpoint || return 1
+  expect_dial_blocked rogue default "$1"
+}
+
 # The SPIRE server must hold the node alias and the celld entry of each agent cell, with the
 # parents and selectors that the render declares.
 check_agent_entries() {
@@ -473,11 +538,15 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
+  check "The intermediate CA in Secret spire-upstream is valid for more than 7 days" check_intermediate_expiry
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.
   probe_targets+=("rogue/default")
   own_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
-  check "A probe pod in rogue cannot open TCP to the SPIRE node port of $CELL_NAME (steady state)" \
-    expect_dial_blocked rogue default "${own_ip:-unknown}:30081"
+  check "The SPIRE node port of $CELL_NAME has a ready local endpoint, and a probe pod in rogue cannot open TCP to it (steady state)" \
+    expect_rogue_blocked "${own_ip:-unknown}:30081"
+fi
+if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
+  check "SecretStore $SECRET_STORE is Ready, and each ExternalSecret that uses it is Ready and refreshed in time" check_secret_store
 fi
 
 if ((failures > 0)); then

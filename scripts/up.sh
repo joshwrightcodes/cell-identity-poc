@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Stand up the cell: create the cluster through the host service, apply the bootstrap set,
-# publish the bundles, then wait until Argo CD reports every Application as Synced and Healthy at
-# the published revision. Last, apply the harness components and wait for their rollouts.
+# Set up the cell: create the cluster through the host service, apply the bootstrap set, publish
+# the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
+# published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
+# store, or asks for secrets:connect in a second shell. Last, apply the harness components and wait
+# for their rollouts.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
 log "creating cluster $CELL_NAME through the host service"
 (cd "$ROOT" && mise run hostsvc -- up --only "$CELL_NAME")
-k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null
+k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
+  || die "the node of $CELL_NAME is not Ready after 300s. Read its state: mise x -- kubectl --context kind-$CELL_NAME describe nodes. Then run CELL=$CELL_NAME mise run cell:up again"
 
 "$ROOT/scripts/facts.sh"
 "$ROOT/scripts/hydrate.sh"
@@ -46,7 +49,12 @@ apps_ready() {
 }
 log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
 end=$((SECONDS + 900))
+store_done=0
+last_hint=-60
 until apps_ready >/dev/null 2>&1; do
+  if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)) && app_healthy external-secrets; then
+    connect_store_step "$ROOT/scripts/secrets-connect.sh"
+  fi
   if ((SECONDS >= end)); then
     k -n argocd get applications
     die "Applications did not reach the published revisions, Synced and Healthy, in 900s"

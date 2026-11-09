@@ -56,7 +56,7 @@ description = "Push the hydrated bundles to the in-cluster store and point the r
 run = "scripts/publish.sh"
 
 [tasks."cell:verify"]
-description = "Run the base cell checks and print PASS or FAIL for each"
+description = "Run the checks of the cluster CELL: the base cell rules, and the identity, secret store and SPIRE server checks of its component sets. Prints PASS or FAIL for each"
 run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
@@ -64,7 +64,7 @@ description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with
 run = "scripts/ui.sh"
 
 [tasks."cell:restart"]
-description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again"
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp, restart the SPIRE server"
 run = "scripts/restart.sh"
 
 [tasks."cell:down"]
@@ -85,17 +85,28 @@ description = "Download the pinned Argo CD manifest, Istio charts and External S
 run = "scripts/vendor-fetch.sh"
 
 [tasks."secrets:connect"]
-description = "Apply the token Secret and ClusterSecretStore poc-secrets in the cluster CELL, from the settings in .envrc.local"
+description = "Apply the token Secret and SecretStore poc-secrets in each store namespace of the cluster CELL (default dev-cp), from the settings in .envrc.local"
+# The cluster with the secret store is the default here, not dev-cell-1.
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
 run = "scripts/secrets-connect.sh"
+
+[tasks."pki:rotate-intermediate"]
+description = "Sign a new intermediate CA, write it to the secret manager, sync it with secrets:connect, restart the SPIRE server of CELL (default dev-cp) and check its CA"
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
+run = "scripts/pki-rotate-intermediate.sh"
 
 [tasks.hostsvc]
 description = "Run the host service: up, down or facts, with the arguments after --"
 run = "go run ./cmd/hostsvc"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create all five clusters through the host service, then set up the base cell on each cluster that has components"
+description = "Check the tool versions, create all five clusters through the host service, build the images, then run cell:up on each cluster that has components. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
+
+[tasks."harness:verify"]
+description = "Run cell:verify on every cluster that has components, and print one PASS or FAIL line for each"
+run = "scripts/harness-verify.sh"
 
 [tasks."harness:down"]
 description = "Delete all five clusters through the host service"
@@ -140,5 +151,5 @@ description = "Print a ConfigMap with a test-signed cell record and its public k
 run = "go run ./cmd/recordgen"
 
 [tasks.pki]
-description = "Print a CA bundle as PEM: root, or intermediate with the root bundle on stdin. See cmd/pkigen"
+description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"
 run = "go run ./cmd/pkigen"

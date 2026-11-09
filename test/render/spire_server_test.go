@@ -389,6 +389,16 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	}
 
+	// The external-secrets bundle holds Namespace spire-system, because the Role of the operator
+	// lives there and comes in an earlier sync wave. Two bundles must not hold one object.
+	t.Run("the bundle holds no Namespace", func(t *testing.T) {
+		for key := range objs {
+			if strings.HasPrefix(key, "Namespace/") {
+				t.Fatalf("render contains %s", key)
+			}
+		}
+	})
+
 	t.Run("network policy admits only the agent nodes", func(t *testing.T) {
 		deny := objs["NetworkPolicy/default-deny"]
 		if types := get[[]any](t, deny, "spec", "policyTypes"); len(types) != 2 || len(get[map[string]any](t, deny, "spec", "podSelector")) != 0 {
@@ -536,6 +546,8 @@ func TestRenderSpireServer(t *testing.T) {
 			`UpstreamAuthority "disk"`,
 			`bundle_file_path = "/run/spire/upstream/root.crt"`,
 			`records_dir = "/run/spire/records"`,
+			// Three times the slowest challenge reply of the gate:m2 runs, with a floor of 10s.
+			`challenge_timeout = "10s"`,
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("server.conf lacks %q", want)
@@ -577,7 +589,7 @@ func TestRenderSpireServer(t *testing.T) {
 			t.Fatalf("sync options are %q", opts)
 		}
 		spec := get[map[string]any](t, es, "spec")
-		if get[string](t, spec, "secretStoreRef", "kind") != "ClusterSecretStore" || get[string](t, spec, "secretStoreRef", "name") != "poc-secrets" {
+		if get[string](t, spec, "secretStoreRef", "kind") != "SecretStore" || get[string](t, spec, "secretStoreRef", "name") != "poc-secrets" {
 			t.Fatalf("secretStoreRef is %v", spec["secretStoreRef"])
 		}
 		if get[string](t, spec, "target", "name") != "spire-upstream" || get[string](t, spec, "target", "creationPolicy") != "Owner" {
@@ -684,7 +696,7 @@ func TestRenderFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{"cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 bad-facts"}, "no host service facts for bad-facts"},
+		{"cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 bad-facts"}, "Create the cluster: mise run hostsvc -- up --only bad-facts, then run CELL=bad-facts mise run cell:up. Or remove bad-facts from SPIRE_AGENT_CELLS"},
 		{"cell without node address", []string{"SPIRE_AGENT_CELLS=no-ip"}, "node address of no-ip"},
 		{"no cells", []string{"SPIRE_AGENT_CELLS= "}, "names no cell"},
 		{"unset cells", []string{"SPIRE_AGENT_CELLS="}, "SPIRE_AGENT_CELLS"},

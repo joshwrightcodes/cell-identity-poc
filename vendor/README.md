@@ -574,7 +574,7 @@ The webhook and the cert controller:
 - The controller command in `cmd/controller/root.go` never requests the webhook server.
   controller-runtime v0.25.2 starts that server only on such a request, so the controller opens no
   webhook port.
-- Because of this, the controller runs ExternalSecret and ClusterSecretStore objects without the
+- Because of this, the controller runs ExternalSecret and SecretStore objects without the
   webhook and the cert controller, and the cell disables both.
 - Cost: the provider check of a store runs only in the webhook. Without it, a store error shows only
   when the controller creates a provider client. `secrets:connect` checks the token reference itself.
@@ -583,24 +583,43 @@ The webhook and the cert controller:
 
 `components/external-secrets/values.yaml` also disables these items:
 
-- The reconcilers and CRDs for ClusterExternalSecret, PushSecret, ClusterPushSecret and
-  ClusterGenerator, and the SecretStore reconciler.
-- The chart ignores `crds.createSecretStore` and always installs the SecretStore CRD.
+- The reconcilers and CRDs for ClusterExternalSecret, ClusterSecretStore, PushSecret,
+  ClusterPushSecret and ClusterGenerator.
 - ServiceAccount token creation, leader election RBAC and the ClusterRole for service bindings.
 - Aggregation of ESO permissions to the `view`, `edit` and `admin` ClusterRoles.
 - The OpenShift finalizer permissions.
 - The health listener, through `--live-addr=0`. No probe uses it.
 
-ClusterRole `external-secrets-controller` keeps these permissions, because a ClusterSecretStore
-serves other namespaces:
+The cell scopes the operator to one namespace, the store namespace `spire-system` from
+`SECRET_STORE_NAMESPACES` in `cells/dev-cp.env`:
 
-- Read, create, update, patch and delete Secrets in every namespace.
-- Read ConfigMaps, ServiceAccounts and namespaces.
-- Read and update ExternalSecret, SecretStore and ClusterSecretStore objects and their status.
+- `scopedRBAC: true` renders Roles and one RoleBinding in `scopedNamespace`, and no ClusterRole
+  (`templates/rbac.yaml` in the chart).
+- `scopedNamespace` adds `--namespace=spire-system`. The controller command then limits the
+  manager cache to that namespace (`cmd/controller/root.go`, `DefaultNamespaces`).
+- With `scopedRBAC`, the chart also turns off the reconcilers of ClusterSecretStore,
+  ClusterExternalSecret and ClusterPushSecret (`templates/deployment.yaml`).
+- The SecretStore reconciler stays on. It sets the Ready condition of the store.
+- The store is a namespaced SecretStore. For such a store the token reference resolves in the
+  namespace of the ExternalSecret, whatever namespace it names (`runtime/esutils/resolvers/secret_ref.go`).
+  Because of this, `secrets:connect` puts a copy of the token Secret in each store namespace.
+- The render holds Namespace `spire-system`, because the Role lives there and the
+  `spire-server` bundle comes in a later sync wave. The namespace carries `Prune=false`.
+- On 2026-11-09 the scoped controller ran in a test namespace of `rogue`, with the fake provider of
+  ESO. A SecretStore became Ready, an ExternalSecret synced its target Secret, and the log held no
+  RBAC error. `kubectl auth can-i` gave the controller Secret access in that namespace only. The
+  check then removed every object that it created.
+
+Role `external-secrets-controller` in `spire-system` keeps these permissions:
+
+- Read, create, update, patch and delete Secrets in `spire-system`.
+- Read ConfigMaps and ServiceAccounts in `spire-system`. Its rule for namespaces grants nothing,
+  because a Role cannot grant a resource of the cluster scope.
+- Read and update ExternalSecret and SecretStore objects and their status.
 - Manage GeneratorState objects, read generator objects, and create events.
 
-The chart also renders ClusterRoles `external-secrets-view` and `external-secrets-edit`. They have no
-binding and no aggregation label, so they grant nothing.
+The chart also renders Roles `external-secrets-view` and `external-secrets-edit` in `spire-system`.
+They have no binding, so they grant nothing.
 
 The controller configures zap through controller-runtime with `Development` false. controller-runtime
 then uses its JSON encoder, so the controller writes JSON logs to standard error. No flag changes
@@ -614,9 +633,8 @@ the provider package at the tag, the vendor SDK that it wraps, and the SDK code 
 
 What the provider reads:
 
-- One key of one Kubernetes Secret, from the token reference in the store. In a ClusterSecretStore,
-  the reference must name a namespace. Without one, the controller reads the namespace of the
-  ExternalSecret.
+- One key of one Kubernetes Secret, from the token reference in the store. A namespaced
+  SecretStore reads it in the namespace of the ExternalSecret.
 - At client creation, the provider makes one remote call with the token. A store becomes Ready only
   after this call succeeds.
 
@@ -648,9 +666,14 @@ The review did not read these items:
 - Image signatures and the provenance files of the release.
 - The binary compared with a source build, and its network behaviour at run time.
 
-Result: medium concern. The controller can write Secrets in every namespace. SDK code that the
-review could not read holds the token, and its allowed hosts include vendor test domains. The
-NetworkPolicy and the namespace condition on the store limit the effect.
+Result: medium concern. SDK code that the review could not read holds the token, and its allowed
+hosts include vendor test domains. The controller can read and write only the Secrets of
+`spire-system`, and it reads no store of the cluster scope. Two gaps remain:
+
+- The NetworkPolicy admits DNS and every public address on TCP port 443. It blocks only the
+  private and link-local ranges, so the controller can reach any public host on that port.
+- In `spire-system`, the controller can read Secret `spire-upstream` with the intermediate CA key,
+  and the copy of the access token.
 
 ## celld modules (2026-11-08)
 

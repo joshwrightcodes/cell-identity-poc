@@ -1,13 +1,6 @@
 # The SPIRE server of the environment trust domain. render.sh fills in the plugin image, the
-# config checksum, the record volume and the agent node addresses.
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: spire-system
-  labels:
-    istio-injection: disabled
-    pod-security.kubernetes.io/enforce: restricted
----
+# config checksum, the record volume and the agent node addresses. The external-secrets bundle
+# holds Namespace spire-system, the store namespace of the operator.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -16,8 +9,9 @@ metadata:
 automountServiceAccountToken: false
 ---
 # The External Secrets Operator copies the upstream CA from the secret manager into Secret
-# spire-upstream. Remote keys follow <cluster>/<service>/<key>. secrets:connect applies the
-# ClusterSecretStore. The CRD comes from the external-secrets bundle in an earlier sync wave.
+# spire-upstream. Remote keys follow <cluster>/<service>/<key>. secrets:connect applies
+# SecretStore poc-secrets in this namespace. The CRD comes from the external-secrets bundle in an
+# earlier sync wave.
 apiVersion: external-secrets.io/v1
 kind: ExternalSecret
 metadata:
@@ -28,7 +22,7 @@ metadata:
 spec:
   refreshInterval: 1h
   secretStoreRef:
-    kind: ClusterSecretStore
+    kind: SecretStore
     name: poc-secrets
   target:
     name: spire-upstream
@@ -257,7 +251,9 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Only the node addresses of the agent cells may reach the server API.
+# Of the pod traffic, only the node addresses of the agent cells reach the server API. kindnet
+# accepts each packet of a root process on the dev-cp node before it checks a policy, so root
+# processes there, host network pods and the API server included, also reach it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

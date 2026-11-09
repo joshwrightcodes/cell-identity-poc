@@ -17,10 +17,17 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
-const esoNamespace = "external-secrets"
+const (
+	esoNamespace = "external-secrets"
+	// storeNamespace is SECRET_STORE_NAMESPACES of cells/dev-cp.env: the one namespace where the
+	// operator works.
+	storeNamespace = "spire-system"
+)
 
-// esoFacts are the cluster facts that render.sh reads, in the form of build/<cluster>/facts.env.
+// esoFacts are the cluster facts that render.sh reads, in the form of build/<cluster>/facts.env,
+// and the store namespace from cells/dev-cp.env.
 var esoFacts = []string{
+	"SECRET_STORE_NAMESPACES=" + storeNamespace,
 	"POD_CIDR=10.11.0.0/16",
 	"SERVICE_CIDR=10.111.0.0/16",
 	"API_SERVER_IPS=172.18.0.4",
@@ -65,7 +72,8 @@ func renderExternalSecrets(t *testing.T, env ...string) (string, string, error) 
 	return stdout.String(), stderr.String(), err
 }
 
-// esoDocs parses the render into objects keyed by kind/name. Namespaced objects must be in external-secrets.
+// esoDocs parses the render into objects keyed by kind/name. Namespaced objects must be in
+// external-secrets, apart from the Roles and RoleBindings of the store namespace.
 func esoDocs(t *testing.T, out string) map[string]object {
 	t.Helper()
 	clusterScoped := []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
@@ -89,7 +97,7 @@ func esoDocs(t *testing.T, out string) map[string]object {
 			if ns != nil {
 				t.Fatalf("cluster-scoped %s has namespace %v", key, ns)
 			}
-		} else if ns != esoNamespace {
+		} else if ns != esoNamespace && !(ns == storeNamespace && (kind == "Role" || kind == "RoleBinding")) {
 			t.Fatalf("%s has namespace %v, want %s", key, ns, esoNamespace)
 		}
 		byKey[key] = o
@@ -158,7 +166,8 @@ func TestRenderExternalSecrets(t *testing.T) {
 		}
 		for _, want := range []string{
 			"--live-addr=0",
-			"--enable-secret-store-reconciler=false",
+			"--namespace=" + storeNamespace,
+			"--enable-cluster-store-reconciler=false",
 			"--enable-cluster-external-secret-reconciler=false",
 			"--enable-push-secret-reconciler=false",
 			"--enable-cluster-push-secret-reconciler=false",
@@ -167,6 +176,10 @@ func TestRenderExternalSecrets(t *testing.T) {
 			if !slices.Contains(args, want) {
 				t.Fatalf("args %v lack %s", args, want)
 			}
+		}
+		// The SecretStore reconciler sets the Ready condition that secrets:connect waits for.
+		if slices.Contains(args, "--enable-secret-store-reconciler=false") {
+			t.Fatalf("args %v turn off the SecretStore reconciler", args)
 		}
 		if _, ok := lookup(c, "resources", "limits", "memory"); !ok {
 			t.Fatal("the controller has no memory limit")
@@ -185,18 +198,72 @@ func TestRenderExternalSecrets(t *testing.T) {
 				t.Fatalf("%s has conversion strategy %v", name, strategy)
 			}
 		}
-		for _, want := range []string{"externalsecrets.external-secrets.io", "clustersecretstores.external-secrets.io", "generatorstates.generators.external-secrets.io"} {
+		for _, want := range []string{"externalsecrets.external-secrets.io", "secretstores.external-secrets.io", "generatorstates.generators.external-secrets.io"} {
 			if !slices.Contains(crds, want) {
 				t.Fatalf("CRDs %v lack %s", crds, want)
 			}
 		}
-		for _, unwanted := range []string{"pushsecrets", "clusterpushsecrets", "clusterexternalsecrets"} {
+		for _, unwanted := range []string{"pushsecrets", "clusterpushsecrets", "clusterexternalsecrets", "clustersecretstores"} {
 			if slices.Contains(crds, unwanted+".external-secrets.io") {
 				t.Fatalf("CRDs include %s", unwanted)
 			}
 		}
 		if slices.Contains(crds, "clustergenerators.generators.external-secrets.io") {
 			t.Fatal("CRDs include clustergenerators")
+		}
+	})
+
+	// The operator can read and write Secrets only in the store namespace, and it reads no store
+	// that spans namespaces.
+	t.Run("RBAC is scoped to the store namespace", func(t *testing.T) {
+		for key := range objs {
+			if kind := strings.Split(key, "/")[0]; kind == "ClusterRole" || kind == "ClusterRoleBinding" {
+				t.Fatalf("render contains %s", key)
+			}
+		}
+		binding := objs["RoleBinding/external-secrets-controller"]
+		if binding == nil {
+			t.Fatal("render has no RoleBinding external-secrets-controller")
+		}
+		if ns := get[string](t, binding, "metadata", "namespace"); ns != storeNamespace {
+			t.Fatalf("the controller RoleBinding is in %s, want %s", ns, storeNamespace)
+		}
+		if ref := get[map[string]any](t, binding, "roleRef"); ref["kind"] != "Role" || ref["name"] != "external-secrets-controller" {
+			t.Fatalf("the controller RoleBinding refers to %v", ref)
+		}
+		subjects := get[[]any](t, binding, "subjects")
+		if len(subjects) != 1 || get[string](t, subjects[0], "name") != "external-secrets" ||
+			get[string](t, subjects[0], "namespace") != esoNamespace || get[string](t, subjects[0], "kind") != "ServiceAccount" {
+			t.Fatalf("the controller RoleBinding binds %v", subjects)
+		}
+		for key, o := range objs {
+			if !strings.HasPrefix(key, "Role/") {
+				continue
+			}
+			rules, _ := lookup(o, "rules")
+			list, _ := rules.([]any)
+			for _, rule := range list {
+				if res, ok := lookup(rule, "resources"); ok && slices.Contains(res.([]any), any("clustersecretstores")) {
+					t.Fatalf("%s grants access to ClusterSecretStore objects", key)
+				}
+			}
+		}
+	})
+
+	// The operator bundle holds the store namespace, because its Role lives there and the bundle of
+	// the namespace comes in a later sync wave. Prune=false keeps the namespace and its data when a
+	// bundle drops it.
+	t.Run("store namespace enforces restricted pod security outside the mesh and is never pruned", func(t *testing.T) {
+		ns := objs["Namespace/"+storeNamespace]
+		if ns == nil {
+			t.Fatalf("render has no Namespace %s", storeNamespace)
+		}
+		labels := get[map[string]any](t, ns, "metadata", "labels")
+		if labels["pod-security.kubernetes.io/enforce"] != "restricted" || labels["istio-injection"] != "disabled" {
+			t.Fatalf("namespace labels are %v", labels)
+		}
+		if got := get[string](t, ns, "metadata", "annotations", "argocd.argoproj.io/sync-options"); got != "Prune=false" {
+			t.Fatalf("the sync options of Namespace %s are %q, want Prune=false", storeNamespace, got)
 		}
 	})
 
@@ -326,6 +393,21 @@ func TestRenderExternalSecrets(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestRenderExternalSecretsNeedsOneStoreNamespace(t *testing.T) {
+	for name, value := range map[string]string{"none": "", "two": "spire-system other", "not a label": "Spire_System"} {
+		t.Run(name, func(t *testing.T) {
+			env := append(slices.Clone(esoFacts[1:]), "SECRET_STORE_NAMESPACES="+value)
+			out, stderr, err := renderExternalSecrets(t, env...)
+			if err == nil || out != "" {
+				t.Fatalf("render succeeded or printed manifests, err %v", err)
+			}
+			if !strings.Contains(stderr, "SECRET_STORE_NAMESPACES") {
+				t.Fatalf("stderr %q does not name SECRET_STORE_NAMESPACES", stderr)
+			}
+		})
+	}
 }
 
 func TestRenderExternalSecretsFailsClosed(t *testing.T) {

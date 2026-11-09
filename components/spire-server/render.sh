@@ -59,13 +59,15 @@ entries='{}'
 keys=()
 records=""
 for cell in $SPIRE_AGENT_CELLS; do
+  # A cell without a cluster has no facts. The node check below would then send the operator to a
+  # repair that cannot reach the node either.
+  if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
+    die "no host service facts for $cell: ${facts:-no output}. Create the cluster: mise run hostsvc -- up --only $cell, then run CELL=$cell mise run cell:up. Or remove $cell from SPIRE_AGENT_CELLS in cells/dev-cp.env"
+  fi
   # The record signs the keys that the cell publishes. While the M2 key rotation test has changed the
   # cell, those keys include the test key, so the render stops until the node is repaired.
   traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
   [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
-  if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
-    die "no host service facts for $cell: ${facts:-no output}"
-  fi
   ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
   [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
   peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"

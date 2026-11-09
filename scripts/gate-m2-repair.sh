@@ -56,6 +56,19 @@ signing_kid() {
   b64url_json "$head" | jq -r '.kid // ""'
 }
 
+# Only one repair runs at a time. A repair that a test cleanup started can outlast the go test
+# timeout, and then a new gate or repair must not run beside it. The lock directory holds the
+# process ID of the repair. GATE_M2_REPAIR_LOCK names another directory, for the tests.
+lock="${GATE_M2_REPAIR_LOCK:-$BUILD_ROOT/gate-m2-repair.lock}"
+lock_holder() {
+  local pid
+  pid="$(cat "$lock/pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && echo "$pid"
+}
+if holder="$(lock_holder)"; then
+  die "a repair already runs as process $holder. Wait until it ends, or stop it with kill $holder. Then run the command again"
+fi
+
 if [[ "${1:-}" == "--check" ]]; then
   found=()
   # The node traces come first. The JWKS counts only on a node without traces, because the API
@@ -75,6 +88,15 @@ if [[ "${1:-}" == "--check" ]]; then
   fi
   exit 0
 fi
+
+# A lock that no live process holds is left from a repair that ended without its cleanup.
+mkdir -p "$(dirname "$lock")"
+if ! mkdir "$lock" 2>/dev/null; then
+  rm -rf "$lock"
+  mkdir "$lock" || die "could not take the lock $lock"
+fi
+echo "$$" >"$lock/pid"
+trap 'rm -rf "$lock"' EXIT
 
 # Every failure from here on leaves the repair unfinished, and a new run continues it.
 die() { printf 'error: %s. Run: mise run gate:m2:repair again\n' "$*" >&2; exit 1; }

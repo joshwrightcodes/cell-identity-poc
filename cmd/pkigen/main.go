@@ -5,6 +5,7 @@
 //	pkigen cert < bundle
 //	pkigen key < bundle
 //	pkigen trust-bundle [--trust-domain <td>] < PEM certificates
+//	pkigen info < one PEM certificate
 //
 // root prints a bundle for a new self-signed root CA. intermediate reads a root bundle on stdin and
 // prints a bundle for a new intermediate CA that the root signs. A bundle is two PEM blocks in this
@@ -13,7 +14,8 @@
 // The intermediate has no path length limit, because the SPIRE server CA sits below it.
 // trust-bundle reads the PEM certificates of a trust bundle on stdin and prints them again. It fails
 // when the input holds anything else, or when a certificate is not a CA, is not valid now, or has a
-// URI SAN other than spiffe://<td>.
+// URI SAN other than spiffe://<td>. info reads one certificate on stdin and prints one JSON object
+// with its subject key ID, as lowercase hex like SPIRE prints it, and its NotAfter in RFC 3339.
 // NotBefore is one minute before the current time. intermediate refuses a root whose URI SAN is not
 // spiffe://<td> for the --trust-domain value.
 //
@@ -28,6 +30,8 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -66,10 +70,10 @@ func execute(args []string, stdin io.Reader, stdout io.Writer, now func() time.T
 
 func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) error {
 	if len(args) == 0 {
-		return errors.New("usage: pkigen root|intermediate|cert|key|trust-bundle [--trust-domain <td>] [--days <n>]")
+		return errors.New("usage: pkigen root|intermediate|cert|key|trust-bundle|info [--trust-domain <td>] [--days <n>]")
 	}
 	cmd := args[0]
-	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0, "key": 0, "trust-bundle": 0}
+	defaultDays := map[string]int{"root": 365, "intermediate": 30, "cert": 0, "key": 0, "trust-bundle": 0, "info": 0}
 	days, known := defaultDays[cmd]
 	if !known {
 		return fmt.Errorf("unknown command %q", cmd)
@@ -119,6 +123,8 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time)
 		return writeBundle(stdout, key, cert)
 	case "trust-bundle":
 		return checkTrustBundle(stdin, stdout, td, now())
+	case "info":
+		return certInfo(stdin, stdout)
 	case "cert":
 		_, cert, err := readBundle(stdin)
 		if err != nil {
@@ -193,6 +199,26 @@ func writeBundle(w io.Writer, key *ecdsa.PrivateKey, cert *x509.Certificate) err
 		return err
 	}
 	return pem.Encode(w, &pem.Block{Type: certBlock, Bytes: cert.Raw})
+}
+
+// certInfo prints the subject key ID and the NotAfter of the one certificate on r.
+func certInfo(r io.Reader, w io.Writer) error {
+	data, err := readInput(r, "stdin")
+	if err != nil {
+		return err
+	}
+	block, rest := pem.Decode(data)
+	if block == nil || block.Type != certBlock || len(bytes.TrimSpace(rest)) != 0 {
+		return errors.New("stdin must hold exactly one CERTIFICATE block")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("the CERTIFICATE block does not parse: %w", err)
+	}
+	return json.NewEncoder(w).Encode(struct {
+		SubjectKeyID string `json:"subject_key_id"`
+		NotAfter     string `json:"not_after"`
+	}{hex.EncodeToString(cert.SubjectKeyId), cert.NotAfter.UTC().Format(time.RFC3339)})
 }
 
 // readInput reads all of r, up to maxInput bytes. what names the input in the errors.
