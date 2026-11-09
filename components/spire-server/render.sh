@@ -10,8 +10,9 @@
 # build/images.env. The server config carries the SHA-256 of the plugin binary from that image,
 # so the server checks the binary before it runs it.
 # Inputs come from cells/<cluster>.env: SPIRE_AGENT_CELLS, SPIRE_AGENT_SUBJECT and SPIRE_SVID_TTL.
+# POC_ENV comes from cells/common.env.
 set -euo pipefail
-: "${SPIRE_AGENT_CELLS:?}" "${SPIRE_AGENT_SUBJECT:?}" "${SPIRE_SVID_TTL:?}"
+: "${SPIRE_AGENT_CELLS:?}" "${SPIRE_AGENT_SUBJECT:?}" "${SPIRE_SVID_TTL:?}" "${POC_ENV:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -48,6 +49,7 @@ ca_seconds="$(seconds "$ca_ttl")"
 (($(seconds "$SPIRE_SVID_TTL") * 6 <= ca_seconds)) || die "SPIRE_SVID_TTL $SPIRE_SVID_TTL is above ca_ttl / 6 for ca_ttl $ca_ttl"
 ((300 * 6 <= ca_seconds)) || die "ca_ttl $ca_ttl is below 30m, the floor for the default JWT SVID lifetime of 5m"
 
+[[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$SPIRE_AGENT_SUBJECT" =~ ^[a-z0-9-]+/[a-z0-9-]+$ ]] || die "SPIRE_AGENT_SUBJECT '$SPIRE_AGENT_SUBJECT' is not <namespace>/<service account>"
 trust_domain=dev.env.poc.internal
@@ -68,7 +70,7 @@ for cell in $SPIRE_AGENT_CELLS; do
   [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
   peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
 
-  if ! record="$(cd "$root" && mise run record:fixture -- --cluster "$cell" --subject "$SPIRE_AGENT_SUBJECT" 2>/dev/null)"; then
+  if ! record="$(cd "$root" && mise run record:fixture -- --cluster "$cell" --subject "$SPIRE_AGENT_SUBJECT" --env "$POC_ENV" 2>/dev/null)"; then
     die "could not sign the record of $cell: ${record:-no output}"
   fi
   name="cell-record-$cell"
@@ -101,7 +103,7 @@ done
 key_list="$(printf '"%s", ' "${keys[@]}")"
 key_list="[${key_list%, }]"
 server_conf="$(sed -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" \
-  -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" "$here/server.conf")"
+  -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" -e "s|@POC_ENV@|$POC_ENV|g" "$here/server.conf")"
 controller_conf="$(cat "$here/controller-manager.yaml")"
 
 # config_map <name> <key> <content> prints a ConfigMap with one literal block value.

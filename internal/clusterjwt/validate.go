@@ -123,7 +123,7 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if now.Sub(exp) > skew {
 		return Claims{}, fail(Expired)
 	}
-	if env == "" || nonce == "" || rec.Env != env || len(tc.Audience) != 1 || tc.Audience[0] != "spire-"+env+"/"+nonce {
+	if env == "" || nonce == "" || rec.Env != env || len(tc.Audience) != 1 || tc.Audience[0] != Audience(env, nonce) {
 		return Claims{}, fail(WrongAudience)
 	}
 

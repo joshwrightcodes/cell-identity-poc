@@ -63,6 +63,8 @@ type fixtureOptions struct {
 	extraHCL       string
 	signRecordWith ed25519.PrivateKey
 	revoked        map[string]bool
+	// mutate changes the record of a cell before it is signed.
+	mutate func(rec *record.Cell)
 }
 
 func newFixture(t *testing.T, o fixtureOptions) *fixture {
@@ -84,6 +86,9 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 		rec := k.record(t)
 		rec.Name = name
 		rec.Revoked = o.revoked[name]
+		if o.mutate != nil {
+			o.mutate(&rec)
+		}
 		env, err := record.Sign(rec, signer)
 		if err != nil {
 			t.Fatal(err)

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+
+	"github.com/go-jose/go-jose/v4"
 )
 
 // PayloadType is the DSSE payload type of a cell record.
@@ -72,5 +74,11 @@ func (c Cell) validate() error {
 	if err := json.Unmarshal(c.JWKS, &set); err != nil || len(set.Keys) == 0 {
 		return errors.New("record jwks must be a JSON key set with at least one key")
 	}
-	return nil
+	for _, raw := range set.Keys {
+		var k jose.JSONWebKey
+		if k.UnmarshalJSON(raw) == nil && k.Valid() && k.IsPublic() {
+			return nil
+		}
+	}
+	return errors.New("record jwks holds no public key that go-jose can parse")
 }

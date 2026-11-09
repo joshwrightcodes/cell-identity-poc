@@ -9,9 +9,10 @@
 #   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
 #     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
 #     checks the binary before it runs it.
-# Inputs: SPIRE_SERVER_CLUSTER from cells/<cluster>.env, and the cluster facts from build/facts.env.
+# Inputs: SPIRE_SERVER_CLUSTER from cells/<cluster>.env, POC_ENV from cells/common.env, and the
+# cluster facts from build/facts.env.
 set -euo pipefail
-: "${CELL_NAME:?}" "${SPIRE_SERVER_CLUSTER:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
+: "${CELL_NAME:?}" "${SPIRE_SERVER_CLUSTER:?}" "${POC_ENV:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -54,7 +55,9 @@ api_peers="$(for ip in $API_SERVER_IPS; do [[ "$ip" =~ $ipv4 ]] || exit 1; print
   || die "API_SERVER_IPS '$API_SERVER_IPS' holds an address that is not IPv4"
 [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"
 
-agent_conf="$(sed -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" -e "s|@SPIRE_AGENT_PLUGIN_CHECKSUM@|$checksum|" "$here/agent.conf")"
+[[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
+agent_conf="$(sed -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" -e "s|@SPIRE_AGENT_PLUGIN_CHECKSUM@|$checksum|" \
+  -e "s|@POC_ENV@|$POC_ENV|g" "$here/agent.conf")"
 
 # config_map <name> <key> <content> prints a ConfigMap with one literal block value.
 config_map() {

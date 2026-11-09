@@ -33,12 +33,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/big"
 	"net/url"
 	"os"
 	"regexp"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 )
 
 const (
@@ -60,15 +61,7 @@ func main() {
 
 // execute runs one command. On failure it writes one compact JSON error line to stdout and returns 1.
 func execute(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) int {
-	var out bytes.Buffer
-	if err := run(args, stdin, &out, now); err != nil {
-		slog.New(slog.NewJSONHandler(stdout, nil)).Error("pkigen failed", "error", err.Error())
-		return 1
-	}
-	if _, err := stdout.Write(out.Bytes()); err != nil {
-		return 1
-	}
-	return 0
+	return cli.Run(stdout, "pkigen", func(out io.Writer) error { return run(args, stdin, out, now) })
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) error {
@@ -202,15 +195,24 @@ func writeBundle(w io.Writer, key *ecdsa.PrivateKey, cert *x509.Certificate) err
 	return pem.Encode(w, &pem.Block{Type: certBlock, Bytes: cert.Raw})
 }
 
+// readInput reads all of r, up to maxInput bytes. what names the input in the errors.
+func readInput(r io.Reader, what string) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxInput+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", what, err)
+	}
+	if len(data) > maxInput {
+		return nil, fmt.Errorf("%s is larger than %d bytes", what, maxInput)
+	}
+	return data, nil
+}
+
 // readBundle reads exactly two PEM blocks from r: a CA key, then its certificate.
 // Its errors name the block type and never include block contents.
 func readBundle(r io.Reader) (*ecdsa.PrivateKey, *x509.Certificate, error) {
-	data, err := io.ReadAll(io.LimitReader(r, maxInput+1))
+	data, err := readInput(r, "stdin")
 	if err != nil {
-		return nil, nil, fmt.Errorf("read stdin: %w", err)
-	}
-	if len(data) > maxInput {
-		return nil, nil, fmt.Errorf("stdin is larger than %d bytes", maxInput)
+		return nil, nil, err
 	}
 	var blocks []*pem.Block
 	rest := data
@@ -253,12 +255,9 @@ func readBundle(r io.Reader) (*ecdsa.PrivateKey, *x509.Certificate, error) {
 
 // checkTrustBundle copies the CA certificates on r to w, and fails on any other input.
 func checkTrustBundle(r io.Reader, w io.Writer, td string, now time.Time) error {
-	data, err := io.ReadAll(io.LimitReader(r, maxInput+1))
+	data, err := readInput(r, "trust bundle")
 	if err != nil {
-		return fmt.Errorf("read trust bundle: %w", err)
-	}
-	if len(data) > maxInput {
-		return errors.New("trust bundle is larger than 1 MiB")
+		return err
 	}
 	want := "spiffe://" + td
 	var certs []*x509.Certificate

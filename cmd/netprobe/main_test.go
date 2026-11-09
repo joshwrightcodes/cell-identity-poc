@@ -312,3 +312,27 @@ func TestDialRejectsHostName(t *testing.T) {
 		t.Fatalf("exit %d, output %q", code, out.String())
 	}
 }
+
+// A body that breaks off after part of the data gives only the error line, not the partial data.
+func TestGetPrintsNoPartialBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte(`{"partial":`))
+		w.(http.Flusher).Flush()
+		if hj, ok := w.(http.Hijacker); ok {
+			if c, _, err := hj.Hijack(); err == nil {
+				_ = c.Close()
+			}
+		}
+	}))
+	defer srv.Close()
+	var out bytes.Buffer
+	if code := execute(context.Background(), []string{"get", "--url", srv.URL}, &out); code != 1 {
+		t.Fatalf("exit code %d, want 1", code)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	var rec map[string]any
+	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &rec) != nil || rec["msg"] != "netprobe failed" {
+		t.Fatalf("want one JSON error line and no partial body, got %q", out.String())
+	}
+}

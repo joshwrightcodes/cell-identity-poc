@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
@@ -25,13 +26,8 @@ func main() {
 // execute runs one command and returns the exit code. Every log line is compact JSON on stdout.
 // A failure is one JSON error line on stdout, so the facts command prints only data on success.
 func execute(ctx context.Context, args []string, stdout io.Writer) int {
-	logger := slog.New(slog.NewJSONHandler(stdout, nil))
-	slog.SetDefault(logger)
-	if err := run(ctx, args, stdout); err != nil {
-		logger.Error("hostsvc failed", "error", err)
-		return 1
-	}
-	return 0
+	slog.SetDefault(slog.New(slog.NewJSONHandler(stdout, nil)))
+	return cli.Run(stdout, "hostsvc", func(out io.Writer) error { return run(ctx, args, out) })
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {

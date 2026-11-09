@@ -77,8 +77,8 @@ usage = 'arg "[packages]..." var=#true default="./..."'
 run = 'eval go test ${usage_packages?}'
 
 [tasks.lint]
-description = "Run go vet on every package"
-run = "go vet ./..."
+description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag"
+run = ["go vet ./...", "go vet -tags e2e ./test/e2e/"]
 
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest, Istio charts and External Secrets Operator chart into vendor/ for review"

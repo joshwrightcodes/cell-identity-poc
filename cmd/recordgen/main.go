@@ -10,16 +10,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"strings"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
-
-const envName = "dev"
 
 type subjects []record.Subject
 
@@ -40,11 +38,7 @@ func main() {
 
 // execute runs the command. On failure it writes one compact JSON error line to w and returns 1.
 func execute(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) int {
-	if err := run(args, w, facts); err != nil {
-		slog.New(slog.NewJSONHandler(w, nil)).Error("recordgen failed", "error", err.Error())
-		return 1
-	}
-	return 0
+	return cli.Run(w, "recordgen", func(out io.Writer) error { return run(args, out, facts) })
 }
 
 func hostsvcFacts(topologyPath string) func(string) (hostsvc.Facts, error) {
@@ -62,6 +56,7 @@ func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) 
 	fs.SetOutput(io.Discard)
 	cluster := fs.String("cluster", "", "cluster to read facts from")
 	topologyPath := fs.String("topology", "harness/topology.yaml", "topology file")
+	envName := fs.String("env", "", "environment of the record, POC_ENV in cells/common.env")
 	var subs subjects
 	fs.Var(&subs, "subject", "allowed subject as <namespace>/<serviceaccount>, repeatable")
 	if err := fs.Parse(args); err != nil {
@@ -69,6 +64,9 @@ func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) 
 	}
 	if *cluster == "" {
 		return errors.New("--cluster is required")
+	}
+	if *envName == "" {
+		return errors.New("--env is required")
 	}
 	if facts == nil {
 		facts = hostsvcFacts(*topologyPath)
@@ -82,7 +80,7 @@ func run(args []string, w io.Writer, facts func(string) (hostsvc.Facts, error)) 
 		return err
 	}
 	env, err := record.Sign(record.Cell{
-		Name: f.Name, Env: envName, Issuer: f.Issuer, JWKS: f.JWKS,
+		Name: f.Name, Env: *envName, Issuer: f.Issuer, JWKS: f.JWKS,
 		Subjects: subs, Epoch: 1, Counter: 1,
 	}, priv)
 	if err != nil {

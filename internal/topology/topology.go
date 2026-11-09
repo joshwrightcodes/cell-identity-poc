@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"slices"
 
 	"sigs.k8s.io/yaml"
 )
@@ -111,4 +112,26 @@ func (t *Topology) Validate(reserved []netip.Prefix) error {
 		}
 	}
 	return nil
+}
+
+// WithComponent returns the names of the clusters that have the component set, in topology order.
+func (t *Topology) WithComponent(set string) []string {
+	var out []string
+	for _, c := range t.Clusters {
+		if slices.Contains(c.Components, set) {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+// WithComponents returns the names of the clusters that have any component set, in topology order.
+func (t *Topology) WithComponents() []string {
+	var out []string
+	for _, c := range t.Clusters {
+		if len(c.Components) > 0 {
+			out = append(out, c.Name)
+		}
+	}
+	return out
 }

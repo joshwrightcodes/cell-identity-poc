@@ -21,9 +21,43 @@ const (
 	imagesEnv    = "../../build/images.env"
 	topologyPath = "../../harness/topology.yaml"
 	podTimeout   = 5 * time.Minute
+	// agentCellSet is the component set of each cell whose celld attests to the SPIRE server.
+	agentCellSet = "cell-identity"
 )
 
+// clustersWith returns the clusters in harness/topology.yaml that have the component set, or every
+// cluster with components when set is empty.
+func clustersWith(t *testing.T, set string) []string {
+	t.Helper()
+	topo, err := topology.Load(topologyPath)
+	if err != nil {
+		t.Fatalf("load topology: %v", err)
+	}
+	names := topo.WithComponents()
+	if set != "" {
+		names = topo.WithComponent(set)
+	}
+	if len(names) == 0 {
+		t.Fatalf("no cluster in %s has the component set %q", topologyPath, set)
+	}
+	return names
+}
+
 var podCounter atomic.Int64
+
+// pocEnv is POC_ENV from cells/common.env: the environment in each attestation audience.
+var pocEnv = func() string {
+	data, err := os.ReadFile("../../cells/common.env")
+	if err != nil {
+		return ""
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "POC_ENV="); ok {
+			return v
+		}
+	}
+	return ""
+}()
 
 // probeImage and attestprobeImage are the references that `mise run images` recorded in
 // build/images.env, pinned by digest. Each is empty when the file or the line is missing.
@@ -100,12 +134,16 @@ func kubectl(t *testing.T, cluster, stdin string, args ...string) (string, error
 }
 
 // testNamespaceLabel marks each namespace that createNamespace makes.
-const testNamespaceLabel = "cell.poc.internal/e2e"
+const (
+	testNamespaceLabel = "cell.poc.internal/e2e"
+	podSecurityLabel   = "pod-security.kubernetes.io/enforce"
+)
 
 // createNamespace makes a test namespace and deletes it when the test ends. It first removes a
 // namespace of the same name that an earlier run left behind, and it waits until the default
 // service account exists, because a pod cannot start before then. It never deletes a namespace
-// without the test label, so a test name cannot remove a harness namespace.
+// without the test label, so a test name cannot remove a harness namespace. Pod Security enforces
+// the restricted profile in each test namespace.
 func createNamespace(t *testing.T, cluster, ns string) {
 	t.Helper()
 	deleteNamespace := func() error {
@@ -126,7 +164,8 @@ func createNamespace(t *testing.T, cluster, ns string) {
 	default:
 		t.Fatalf("namespace %s exists in %s without the label %s=true, so it is not a test namespace", ns, cluster, testNamespaceLabel)
 	}
-	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true"}}}`, ns, testNamespaceLabel)
+	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true", %q: "restricted"}}}`,
+		ns, testNamespaceLabel, podSecurityLabel)
 	if _, err := kubectl(t, cluster, manifest, "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}

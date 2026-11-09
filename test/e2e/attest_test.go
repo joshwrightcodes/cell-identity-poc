@@ -25,7 +25,7 @@ const (
 // TestM2CelldGetsSVID replaces the celld pod in each cell. The new pod must log its X.509 SVID
 // within two minutes, and the SPIRE server log must hold an agent ID with the UID of that pod.
 func TestM2CelldGetsSVID(t *testing.T) {
-	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+	for _, cell := range clustersWith(t, agentCellSet) {
 		t.Run(cell, func(t *testing.T) {
 			t.Parallel()
 			pod := replaceCelldPod(t, cell)

@@ -27,6 +27,8 @@ import (
 
 	"github.com/hashicorp/hcl"
 	"sigs.k8s.io/yaml"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
 const stubBinary = "stub plugin binary"
@@ -198,11 +200,7 @@ func render(t *testing.T, env ...string) result {
 // sets the trust domain of the bundle that the stub server prints.
 func renderScript(t *testing.T, component, binary string, env ...string) result {
 	t.Helper()
-	for _, tool := range []string{"yq", "jq", "tar", "bash", "go"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH; run the test through mise run test", tool)
-		}
-	}
+	testtool.Need(t, "yq", "jq", "tar", "bash", "go")
 	dir := t.TempDir()
 	write := func(name, content string, mode os.FileMode) string {
 		p := filepath.Join(dir, name)

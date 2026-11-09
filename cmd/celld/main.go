@@ -41,6 +41,8 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 )
 
 const (
@@ -71,19 +73,18 @@ type telemetryStarter func(ctx context.Context, stdout io.Writer) (*telemetry, e
 // execute runs celld until ctx ends and returns the exit code. A failure is one JSON error line
 // on stdout.
 func execute(ctx context.Context, args []string, stdout io.Writer, start telemetryStarter) int {
-	boot := slog.New(slog.NewJSONHandler(stdout, nil))
 	if len(args) > 0 {
-		boot.Error("celld failed", "error", "celld takes no arguments")
+		cli.Fail(stdout, "celld", errors.New("celld takes no arguments"))
 		return 1
 	}
 	tel, err := start(ctx, stdout)
 	if err != nil {
-		boot.Error("celld failed", "error", fmt.Sprintf("start telemetry: %v", err))
+		cli.Fail(stdout, "celld", fmt.Errorf("start telemetry: %w", err))
 		return 1
 	}
 	defer func() {
 		if err := tel.shutdown(shutdownTimeout); err != nil {
-			boot.Warn("telemetry shutdown", "error", err.Error())
+			slog.New(slog.NewJSONHandler(stdout, nil)).Warn("telemetry shutdown", "error", err.Error())
 		}
 	}()
 
@@ -195,10 +196,12 @@ func startTelemetry(ctx context.Context, stdout io.Writer) (*telemetry, error) {
 	}
 	metricExp, err := otlpmetricgrpc.New(ctx)
 	if err != nil {
+		_ = withTimeout(shutdownTimeout, traceExp.Shutdown)
 		return nil, fmt.Errorf("metric exporter: %w", err)
 	}
 	logExp, err := otlploggrpc.New(ctx)
 	if err != nil {
+		_ = errors.Join(withTimeout(shutdownTimeout, traceExp.Shutdown), withTimeout(shutdownTimeout, metricExp.Shutdown))
 		return nil, fmt.Errorf("log exporter: %w", err)
 	}
 	tp := sdktrace.NewTracerProvider(sdktrace.WithResource(res), sdktrace.WithBatcher(traceExp))

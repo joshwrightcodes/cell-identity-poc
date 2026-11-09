@@ -2,7 +2,7 @@
 // throwaway CSR and a token of one variant. The rejection tests of the cluster_jwt attestor run it
 // as a Job in a cell.
 //
-//	attestprobe --variant <name> --server <ip>:<port> --cell <cell> [--token-file <path>]
+//	attestprobe --variant <name> --server <ip>:<port> --cell <cell> --env <env> [--token-file <path>]
 //
 // The probe sends the cell name, waits for the nonce, and answers with a token. It makes the token
 // through TokenRequest for the service account of its own pod. With --token-file it sends the token
@@ -23,10 +23,8 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log/slog"
 	"maps"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -45,16 +43,12 @@ import (
 	apitypes "k8s.io/apimachinery/pkg/types"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 )
 
-const (
-	attestorType   = "cluster_jwt"
-	defaultTimeout = 60 * time.Second
-	maxNonceLength = 128
-	nonceBytes     = 32
-)
-
-var nonceRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+const defaultTimeout = 60 * time.Second
 
 // variant describes the token that the probe makes. Each variant breaks one rule of the server
 // plugin, apart from good and other-subject.
@@ -99,7 +93,7 @@ func (m minter) mint(ctx context.Context, nonce string) (string, error) {
 	}
 	seconds := int64(m.variant.lifetime / time.Second)
 	req := &authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{
-		Audiences:         []string{"spire-" + m.env + "/" + audienceNonce},
+		Audiences:         []string{clusterjwt.Audience(m.env, audienceNonce)},
 		ExpirationSeconds: &seconds,
 	}}
 	if m.variant.bound {
@@ -118,7 +112,7 @@ func (m minter) mint(ctx context.Context, nonce string) (string, error) {
 }
 
 func randomNonce() (string, error) {
-	b := make([]byte, nonceBytes)
+	b := make([]byte, clusterjwt.NonceBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
@@ -138,14 +132,12 @@ func attest(ctx context.Context, stream attestStream, cell string, mint func(con
 	if err != nil {
 		return "", err
 	}
-	payload, err := json.Marshal(struct {
-		Cell string `json:"cell"`
-	}{cell})
+	payload, err := json.Marshal(clusterjwt.Payload{Cell: cell})
 	if err != nil {
 		return "", err
 	}
 	params := &agentv1.AttestAgentRequest{Step: &agentv1.AttestAgentRequest_Params_{Params: &agentv1.AttestAgentRequest_Params{
-		Data:   &types.AttestationData{Type: attestorType, Payload: payload},
+		Data:   &types.AttestationData{Type: clusterjwt.PluginName, Payload: payload},
 		Params: &agentv1.AgentX509SVIDParams{Csr: csr},
 	}}}
 	if err := send(stream, params); err != nil {
@@ -170,16 +162,14 @@ func attest(ctx context.Context, stream attestStream, cell string, mint func(con
 			}
 			challenged = true
 			nonce := string(step.Challenge)
-			if len(nonce) > maxNonceLength || !nonceRE.MatchString(nonce) {
+			if !clusterjwt.ValidNonce(nonce) {
 				return "", errors.New("the server sent a malformed nonce")
 			}
 			token, err := mint(ctx, nonce)
 			if err != nil {
 				return "", err
 			}
-			body, err := json.Marshal(struct {
-				Token string `json:"token"`
-			}{token})
+			body, err := json.Marshal(clusterjwt.Response{Token: token})
 			if err != nil {
 				return "", err
 			}
@@ -248,15 +238,14 @@ func main() {
 
 // execute runs the probe. It prints the outcome line, or one compact JSON error line, to w.
 func execute(ctx context.Context, args []string, w io.Writer, d deps) int {
-	line, err := run(ctx, args, d)
-	if err != nil {
-		slog.New(slog.NewJSONHandler(w, nil)).Error("attestprobe failed", "error", err.Error())
-		return 1
-	}
-	if _, err := fmt.Fprintln(w, line); err != nil {
-		return 1
-	}
-	return 0
+	return cli.Run(w, "attestprobe", func(out io.Writer) error {
+		line, err := run(ctx, args, d)
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Fprintln(out, line)
+		return err
+	})
 }
 
 func run(ctx context.Context, args []string, d deps) (string, error) {
@@ -301,7 +290,7 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 	fs.StringVar(&cfg.variant, "variant", "", "token variant: "+strings.Join(variantNames(), ", "))
 	fs.StringVar(&cfg.server, "server", "", "SPIRE server address as <IP address>:<port>")
 	fs.StringVar(&cfg.cell, "cell", "", "cell name in the attestation payload")
-	fs.StringVar(&cfg.env, "env", "dev", "environment in the token audience")
+	fs.StringVar(&cfg.env, "env", "", "environment in the token audience, POC_ENV in cells/common.env")
 	fs.StringVar(&cfg.trustDomain, "trust-domain", "dev.env.poc.internal", "trust domain of the SPIRE server")
 	fs.StringVar(&cfg.bundlePath, "bundle", "/run/spire/bundle/bundle.crt", "PEM trust bundle of the SPIRE server")
 	fs.StringVar(&cfg.tokenFile, "token-file", "", "send the token in this file instead of a new one; needs --variant good")
@@ -320,6 +309,8 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 		return config{}, errors.New("--server is required")
 	case cfg.cell == "":
 		return config{}, errors.New("--cell is required")
+	case cfg.env == "":
+		return config{}, errors.New("--env is required")
 	case cfg.tokenFile != "" && cfg.variant != "good":
 		return config{}, errors.New("--token-file needs --variant good")
 	case cfg.timeout <= 0:
@@ -330,7 +321,8 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 			name string
 			dst  *string
 		}{
-			{"POD_NAME", &cfg.pod.name}, {"POD_UID", &cfg.pod.uid}, {"POD_NAMESPACE", &cfg.pod.namespace}, {"SERVICE_ACCOUNT", &cfg.pod.serviceAccount},
+			{clusterjwt.EnvPodName, &cfg.pod.name}, {clusterjwt.EnvPodUID, &cfg.pod.uid},
+			{clusterjwt.EnvPodNamespace, &cfg.pod.namespace}, {clusterjwt.EnvServiceAccount, &cfg.pod.serviceAccount},
 		} {
 			v, ok := lookupEnv(e.name)
 			if !ok || v == "" {

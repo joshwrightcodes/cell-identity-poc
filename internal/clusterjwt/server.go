@@ -44,7 +44,6 @@ const (
 	defaultInflight  = 8
 	defaultTimeout   = "30s"
 	recordSuffix     = ".dsse.json"
-	nonceBytes       = 32
 	maxKIDLogLength  = 64
 	maxRecordFileLen = 1 << 20
 )
@@ -286,28 +285,32 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 	if err := stream.Send(&nodeattestorv1.AttestResponse{Response: &nodeattestorv1.AttestResponse_Challenge{Challenge: []byte(nonce)}}); err != nil {
 		return p.deny(rec.Name, "", Abandoned)
 	}
+	sent := time.Now()
 	reply, reason := recvWithin(stream, st.timeout)
 	if reason != "" {
 		return p.deny(rec.Name, "", reason)
 	}
+	// replyMS is the time from the challenge to the reply, which challenge_timeout bounds.
+	replyMS := time.Since(sent).Milliseconds()
 	var resp Response
 	if err := decodeStrict(reply.GetChallengeResponse(), &resp); err != nil {
-		return p.deny(rec.Name, "", Malformed)
+		return p.deny(rec.Name, "", Malformed, "challenge_reply_ms", replyMS)
 	}
 	kid := tokenKID(resp.Token)
 	claims, err := Validate(rec, resp.Token, st.env, nonce, p.now())
 	if err != nil {
-		return p.deny(rec.Name, kid, ReasonOf(err))
+		return p.deny(rec.Name, kid, ReasonOf(err), "challenge_reply_ms", replyMS)
 	}
 	if !podUIDRE.MatchString(claims.PodUID) {
-		return p.deny(rec.Name, kid, Malformed)
+		return p.deny(rec.Name, kid, Malformed, "challenge_reply_ms", replyMS)
 	}
 	if !st.limit.allow(rec.Name) {
-		return p.deny(rec.Name, kid, RateLimited)
+		return p.deny(rec.Name, kid, RateLimited, "challenge_reply_ms", replyMS)
 	}
 
 	id := fmt.Sprintf("spiffe://%s/spire/agent/%s/%s/%s/%s", st.trustDomain, PluginName, rec.Name, claims.PodUID, nonceHash(nonce))
-	p.log.Info("attested", "cell", rec.Name, "kid", kid, "namespace", claims.Namespace, "service_account", claims.ServiceAccount, "agent_id", id)
+	p.log.Info("attested", "cell", rec.Name, "kid", kid, "namespace", claims.Namespace, "service_account", claims.ServiceAccount,
+		"agent_id", id, "challenge_reply_ms", replyMS)
 	return stream.Send(&nodeattestorv1.AttestResponse{Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 		AgentAttributes: &nodeattestorv1.AgentAttributes{
 			SpiffeId: id,
@@ -349,16 +352,17 @@ func recvWithin(stream nodeattestorv1.NodeAttestor_AttestServer, d time.Duration
 }
 
 func newNonce() (string, error) {
-	b := make([]byte, nonceBytes)
+	b := make([]byte, NonceBytes)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// deny logs the refusal and returns the gRPC error. It never receives the token.
-func (p *Plugin) deny(cell, kid string, reason Reason) error {
-	p.log.Warn("attestation refused", "reason", string(reason), "cell", cell, "kid", kid)
+// deny logs the refusal with any extra key and value pairs, and returns the gRPC error. It never
+// receives the token.
+func (p *Plugin) deny(cell, kid string, reason Reason, extra ...any) error {
+	p.log.Warn("attestation refused", append([]any{"reason", string(reason), "cell", cell, "kid", kid}, extra...)...)
 	return status.Error(codes.PermissionDenied, "cluster_jwt: "+string(reason))
 }
 

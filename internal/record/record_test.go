@@ -1,11 +1,16 @@
 package record
 
 import (
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/go-jose/go-jose/v4"
 )
 
 func testKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
@@ -17,12 +22,25 @@ func testKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 	return pub, priv
 }
 
+// testJWKS is a key set with one P-256 public key.
+var testJWKS = func() json.RawMessage {
+	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	raw, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &k.PublicKey, KeyID: "ec-1"}}})
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}()
+
 func testCell() Cell {
 	return Cell{
 		Name:     "dev-cell-1",
 		Env:      "dev",
 		Issuer:   "https://10.0.0.1:6443",
-		JWKS:     json.RawMessage(`{"keys":[{"kty":"RSA"}]}`),
+		JWKS:     testJWKS,
 		Subjects: []Subject{{Namespace: "celld", ServiceAccount: "celld"}},
 		Epoch:    1,
 		Counter:  7,
@@ -133,6 +151,9 @@ func TestVerifyRejectsIncompleteRecords(t *testing.T) {
 		"empty issuer": func(c *Cell) { c.Issuer = "" },
 		"empty keys":   func(c *Cell) { c.JWKS = json.RawMessage(`{"keys":[]}`) },
 		"not a set":    func(c *Cell) { c.JWKS = json.RawMessage(`[1]`) },
+		// A key that go-jose cannot parse, and a symmetric key, are no public key that checks a token.
+		"no usable key": func(c *Cell) { c.JWKS = json.RawMessage(`{"keys":[{"kty":"RSA"}]}`) },
+		"only a secret": func(c *Cell) { c.JWKS = json.RawMessage(`{"keys":[{"kty":"oct","k":"c2VjcmV0LXNlY3JldC1zZWNyZXQ"}]}`) },
 	}
 	for name, f := range cases {
 		t.Run(name, func(t *testing.T) {

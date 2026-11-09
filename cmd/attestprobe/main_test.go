@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -11,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
 	"github.com/spiffe/spire-api-sdk/proto/spire/api/types"
 	"google.golang.org/grpc/codes"
@@ -20,6 +24,9 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
 const testNonce = "bm9uY2Utbm9uY2Utbm9uY2Utbm9uY2Utbm9uY2Utbm9u"
@@ -294,7 +301,7 @@ func newTestDeps(t *testing.T, script ...func([]*agentv1.AttestAgentRequest) (*a
 	return td
 }
 
-var baseArgs = []string{"--server", "172.18.0.3:30081", "--cell", "dev-cell-1"}
+var baseArgs = []string{"--server", "172.18.0.3:30081", "--cell", "dev-cell-1", "--env", "dev"}
 
 func TestExecutePrintsOnlyTheOutcome(t *testing.T) {
 	td := newTestDeps(t, challenge(testNonce), result("/spire/agent/cluster_jwt/dev-cell-1/x/y"))
@@ -342,8 +349,9 @@ func TestExecuteFailsWithOneJSONLine(t *testing.T) {
 	}{
 		"no variant":              {args: baseArgs},
 		"unknown variant":         {args: append([]string{"--variant", "bad"}, baseArgs...)},
-		"no server":               {args: []string{"--variant", "good", "--cell", "dev-cell-1"}},
-		"no cell":                 {args: []string{"--variant", "good", "--server", "172.18.0.3:30081"}},
+		"no server":               {args: []string{"--variant", "good", "--cell", "dev-cell-1", "--env", "dev"}},
+		"no cell":                 {args: []string{"--variant", "good", "--server", "172.18.0.3:30081", "--env", "dev"}},
+		"no env":                  {args: []string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1"}},
 		"token file with variant": {args: append([]string{"--variant", "long-lifetime", "--token-file", "/run/attestprobe/token"}, baseArgs...)},
 		"missing pod identity":    {args: append([]string{"--variant", "good"}, baseArgs...), env: map[string]string{"POD_UID": ""}},
 		"unknown flag":            {args: append([]string{"--variant", "good", "--nope"}, baseArgs...)},
@@ -379,5 +387,108 @@ func TestExecuteHonoursTheTimeout(t *testing.T) {
 	}
 	if time.Since(start) > 5*time.Second {
 		t.Fatalf("the probe ignored --timeout")
+	}
+}
+
+// apiServer stands in for the Kubernetes API server: it answers each TokenRequest with a JWT that
+// it signs the way the API server does, from the fields of the request.
+type apiServer struct {
+	key    *ecdsa.PrivateKey
+	issuer string
+	now    time.Time
+}
+
+func (a apiServer) sign(t *testing.T, pod podIdentity, req *authenticationv1.TokenRequest) string {
+	t.Helper()
+	kube := map[string]any{
+		"namespace":      pod.namespace,
+		"serviceaccount": map[string]string{"name": pod.serviceAccount, "uid": "sa-uid"},
+	}
+	if ref := req.Spec.BoundObjectRef; ref != nil {
+		kube["pod"] = map[string]string{"name": ref.Name, "uid": string(ref.UID)}
+		kube["node"] = map[string]string{"name": "dev-cell-1-control-plane", "uid": "node-uid"}
+	}
+	claims := map[string]any{
+		"iss": a.issuer, "aud": req.Spec.Audiences, "iat": a.now.Unix(), "nbf": a.now.Unix(),
+		"exp":           a.now.Unix() + *req.Spec.ExpirationSeconds,
+		"sub":           "system:serviceaccount:" + pod.namespace + ":" + pod.serviceAccount,
+		"kubernetes.io": kube,
+	}
+	body, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: a.key},
+		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "ec-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	jws, err := signer.Sign(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := jws.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestProbeTokensAgainstValidate makes the token of each variant through the probe, signs it like
+// the API server, and checks it with clusterjwt.Validate. The good token must pass, and every other
+// variant must fail with the reason that its rejection test expects in the server log. The probe
+// and the server plugin share the wire contract, so a change to one side fails here.
+func TestProbeTokensAgainstValidate(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := apiServer{key: key, issuer: "https://dev-cell-1.issuer.poc.internal", now: time.Unix(1_800_000_000, 0)}
+	jwks, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "ec-1"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pod := testPod()
+	rec := record.Cell{
+		Name: "dev-cell-1", Env: "dev", Issuer: api.issuer, JWKS: jwks,
+		Subjects: []record.Subject{{Namespace: pod.namespace, ServiceAccount: pod.serviceAccount}},
+	}
+	for _, tc := range []struct {
+		variant string
+		want    clusterjwt.Reason
+	}{
+		{"good", ""},
+		{"not-pod-bound", clusterjwt.NotPodBound},
+		{"long-lifetime", clusterjwt.LifetimeTooLong},
+		{"wrong-audience", clusterjwt.WrongAudience},
+	} {
+		t.Run(tc.variant, func(t *testing.T) {
+			cs := fake.NewClientset()
+			cs.PrependReactor("create", "serviceaccounts", func(a k8stesting.Action) (bool, runtime.Object, error) {
+				req := a.(k8stesting.CreateAction).GetObject().(*authenticationv1.TokenRequest).DeepCopy()
+				req.Status.Token = api.sign(t, pod, req)
+				return true, req, nil
+			})
+			m := minter{client: cs.CoreV1(), pod: pod, env: "dev", variant: variants[tc.variant]}
+			token, err := m.mint(context.Background(), testNonce)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claims, err := clusterjwt.Validate(rec, token, "dev", testNonce, api.now)
+			if got := clusterjwt.ReasonOf(err); got != tc.want {
+				t.Fatalf("Validate: reason %q (err %v), want %q", got, err, tc.want)
+			}
+			if tc.want == "" && (claims.PodUID != pod.uid || claims.PodName != pod.name || claims.ServiceAccount != pod.serviceAccount) {
+				t.Fatalf("Validate returned claims %+v for pod %+v", claims, pod)
+			}
+		})
+	}
+}
+
+// The environment comes from the caller, so cells/common.env stays its one source.
+func TestParseNeedsEnv(t *testing.T) {
+	_, err := parse([]string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1"}, podEnv(nil))
+	if err == nil || !strings.Contains(err.Error(), "--env") {
+		t.Fatalf("err = %v, want an error that names --env", err)
 	}
 }

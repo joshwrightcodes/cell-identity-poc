@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 )
 
 // The rejection tests run attestprobe as a Job in a cell. Each test asserts what the probe prints and
@@ -135,7 +137,7 @@ func TestM2RejectRogueKey(t *testing.T) {
 		t.Fatalf("UID of the token holder pod in rogue: %q, %v", uid, err)
 	}
 	token, err := kubectl(t, "rogue", "", "-n", celldNamespace, "create", "token", celldAccount,
-		"--audience", "spire-dev/rogue", "--duration", "10m",
+		"--audience", clusterjwt.Audience(pocEnv, "rogue"), "--duration", "10m",
 		"--bound-object-kind", "Pod", "--bound-object-name", "token-holder", "--bound-object-uid", uid)
 	if err != nil {
 		t.Fatalf("TokenRequest in rogue: %v", err)
@@ -171,10 +173,13 @@ func TestM2RejectRogueKey(t *testing.T) {
 // TestM2RogueCannotDialServer checks the network half of the rogue case: a TCP connect from rogue to
 // the SPIRE node port of dev-cp times out, because the server NetworkPolicy drops it. As a control,
 // the same pod reaches the API server port of that node, a residual port of the shared network, so
-// the address is right and the pod has a working network.
+// the address is right and the pod has a working network. The Service uses the local traffic
+// policy, so a node port without a ready server pod on the node also times out. The test first
+// requires a ready local endpoint, so a timeout means that the policy dropped the dial.
 func TestM2RogueCannotDialServer(t *testing.T) {
 	t.Parallel()
 	createNamespace(t, "rogue", rogueDialNS)
+	requireLocalServerEndpoint(t)
 	ip := clusterFacts(t, spireCluster).NodeIP
 	for _, tc := range []struct {
 		port int
@@ -193,6 +198,40 @@ func TestM2RogueCannotDialServer(t *testing.T) {
 			t.Fatalf("dial from rogue to %s: want %s, got %s (%s)", addr, tc.want, res.Result, res.Error)
 		}
 	}
+}
+
+// requireLocalServerEndpoint fails the test unless the spire-server Service has a ready endpoint on
+// the node of dev-cp.
+func requireLocalServerEndpoint(t *testing.T) {
+	t.Helper()
+	out, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "get", "endpointslices",
+		"-l", "kubernetes.io/service-name=spire-server", "-o", "json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var slices struct {
+		Items []struct {
+			Endpoints []struct {
+				NodeName   string `json:"nodeName"`
+				Conditions struct {
+					Ready *bool `json:"ready"`
+				} `json:"conditions"`
+			} `json:"endpoints"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &slices); err != nil {
+		t.Fatalf("decode the EndpointSlices of spire-server: %v", err)
+	}
+	node := spireCluster + "-control-plane"
+	for _, s := range slices.Items {
+		for _, e := range s.Endpoints {
+			if e.NodeName == node && e.Conditions.Ready != nil && *e.Conditions.Ready {
+				return
+			}
+		}
+	}
+	t.Fatalf("the spire-server Service in %s has no ready endpoint on %s, so a blocked dial would prove nothing. Run: CELL=%s mise run cell:verify",
+		spireCluster, node, spireCluster)
 }
 
 // TestM2RenewWithoutToken removes the RoleBinding that lets the celld pod request tokens, after its
@@ -322,7 +361,7 @@ func runAttestProbe(t *testing.T, p probe) probeResult {
 	if p.namespace == celldNamespace {
 		allowProbeEgress(t, p.cell, run)
 	}
-	args := []string{"--variant", p.variant, "--cell", p.cell,
+	args := []string{"--variant", p.variant, "--cell", p.cell, "--env", pocEnv,
 		"--server", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, spireNodePort)}
 	volumes := []map[string]any{{"name": "bundle", "configMap": map[string]any{"name": trustBundleMap}}}
 	mounts := []map[string]any{{"name": "bundle", "mountPath": "/run/spire/bundle", "readOnly": true}}

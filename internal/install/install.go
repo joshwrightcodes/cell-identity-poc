@@ -68,6 +68,11 @@ func install(name, src, dir string) (err error) {
 		_ = tmp.Close()
 		return fmt.Errorf("make binary executable: %w", err)
 	}
+	// The data reaches the disk before the rename makes it visible under its name.
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("flush copy: %w", err)
+	}
 	if err = tmp.Close(); err != nil {
 		return fmt.Errorf("close copy: %w", err)
 	}

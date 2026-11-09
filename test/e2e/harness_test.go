@@ -22,7 +22,7 @@ const nodePortServer = 30090
 
 func TestM1RogueReachesOnlyResidualPorts(t *testing.T) {
 	createNamespace(t, "rogue", "m1-scan")
-	for _, target := range []string{"management", "dev-cp", "dev-cell-1", "dev-cell-2"} {
+	for _, target := range clustersWith(t, "") {
 		t.Run(target, func(t *testing.T) {
 			ip := clusterFacts(t, target).NodeIP
 			out := runPod(t, "rogue", "m1-scan", []string{"scan", "--host", ip, "--ports", "1-65535",

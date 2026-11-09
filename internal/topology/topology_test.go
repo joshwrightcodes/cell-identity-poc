@@ -176,3 +176,21 @@ func TestValidateRejectsUnpinnedNodeImage(t *testing.T) {
 		})
 	}
 }
+
+func TestNamesByComponentSet(t *testing.T) {
+	topo := &Topology{Clusters: []Cluster{
+		{Name: "a", Components: []string{"base-cell", "spire-server"}},
+		{Name: "b", Components: []string{"base-cell", "cell-identity"}},
+		{Name: "c"},
+		{Name: "d", Components: []string{"base-cell", "cell-identity"}},
+	}}
+	if got := strings.Join(topo.WithComponent("cell-identity"), " "); got != "b d" {
+		t.Fatalf("WithComponent(cell-identity) = %q, want \"b d\"", got)
+	}
+	if got := strings.Join(topo.WithComponent("spire-server"), " "); got != "a" {
+		t.Fatalf("WithComponent(spire-server) = %q, want \"a\"", got)
+	}
+	if got := strings.Join(topo.WithComponents(), " "); got != "a b d" {
+		t.Fatalf("WithComponents() = %q, want \"a b d\"", got)
+	}
+}

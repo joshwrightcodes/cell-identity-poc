@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
 const esoNamespace = "external-secrets"
@@ -45,11 +47,7 @@ func commonEnv(t *testing.T, name string) string {
 
 func renderExternalSecrets(t *testing.T, env ...string) (string, string, error) {
 	t.Helper()
-	for _, tool := range []string{"helm", "bash"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH; run the test through mise run test", tool)
-		}
-	}
+	testtool.Need(t, "helm", "bash")
 	script, err := filepath.Abs("../../components/external-secrets/render.sh")
 	if err != nil {
 		t.Fatal(err)

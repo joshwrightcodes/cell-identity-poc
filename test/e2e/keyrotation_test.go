@@ -16,7 +16,7 @@ import (
 const (
 	apiserverManifest = "/etc/kubernetes/manifests/kube-apiserver.yaml"
 	// The test saves the original manifest here before its edit. scripts/gate-m2-repair.sh restores
-	// it from this file. The paths match KEYTEST_* in scripts/lib.sh.
+	// it from this file. The paths match KEYTEST_* in scripts/gate-traces.sh.
 	savedManifest = "/root/m2-test-kube-apiserver.yaml"
 	apiserverWait = 4 * time.Minute
 	// kubeadm writes these two flags into the manifest of each kind node.

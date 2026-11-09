@@ -49,13 +49,20 @@ func precheck(run string) error {
 			return err
 		}
 	}
+	// The other checks concern the M2 tests only, so a run of the M1 tests alone skips them.
+	if run != "" && !strings.Contains(run, "M2") {
+		return nil
+	}
+	if pocEnv == "" {
+		return errors.New("cells/common.env sets no POC_ENV")
+	}
 	// A run that ended before its cleanups can leave the API server of dev-cell-1 with the test key,
 	// and dev-cp with test bundles.
 	if out, err := command("", "bash", "../../scripts/gate-m2-repair.sh", "--check"); err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
 	}
 	// The renewal tests need SVIDs of 1m. scripts/gate.sh checks the same before gate:m2.
-	if run == "" || strings.Contains(run, "M2") {
+	{
 		conf, err := command("", "kubectl", "--context", "kind-"+spireCluster, "-n", spireNamespace, "get", "configmap", "spire-server",
 			"-o", `jsonpath={.data.server\.conf}`)
 		if err != nil {
@@ -66,7 +73,7 @@ func precheck(run string) error {
 				"Set SPIRE_SVID_TTL=1m in cells/dev-cp.env, then run: CELL=dev-cp mise run cell:up", spireCluster, ttl)
 		}
 	}
-	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+	for _, cell := range topo.WithComponent(agentCellSet) {
 		// A run that ended before its cleanup can leave probe objects in the harness namespace, where
 		// cell:verify reports them. Each one carries the probe label.
 		if out, err := command("", "kubectl", "--context", "kind-"+cell, "-n", celldNamespace, "delete",
@@ -124,11 +131,11 @@ func command(stdin, name string, args ...string) (string, error) {
 		cmd.Stdin = strings.NewReader(stdin)
 	}
 	out, err := cmd.CombinedOutput()
+	if err != nil && ctx.Err() != nil {
+		return string(out), fmt.Errorf("%s %s: timed out after %s: %w", name, strings.Join(args, " "), kubectlTimeout, err)
+	}
 	if err != nil {
 		return string(out), fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
-	}
-	if ctx.Err() != nil {
-		return string(out), errors.New(name + " timed out")
 	}
 	return string(out), nil
 }

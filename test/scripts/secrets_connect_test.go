@@ -14,6 +14,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
 const (
@@ -83,11 +85,7 @@ type result struct {
 
 func run(t *testing.T, env ...string) result {
 	t.Helper()
-	for _, tool := range []string{"yq", "jq", "bash", "base64"} {
-		if _, err := exec.LookPath(tool); err != nil {
-			t.Skipf("%s is not on PATH; run the test through mise run test", tool)
-		}
-	}
+	testtool.Need(t, "yq", "jq", "bash", "base64")
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(stubKubectl), 0o755); err != nil {
 		t.Fatal(err)

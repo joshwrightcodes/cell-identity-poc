@@ -30,25 +30,12 @@ const (
 	MinTokenTTL = 10 * time.Minute
 
 	tokenRequestTimeout = 30 * time.Second
-	maxNonceLength      = 128
+	boundObjectKind     = "Pod"
+	boundObjectAPIV     = "v1"
+	maxIdentityValue    = 253
 )
 
-// Names of the downward API variables that identify the pod of the agent.
-const (
-	envPodName       = "POD_NAME"
-	envPodUID        = "POD_UID"
-	envPodNamespace  = "POD_NAMESPACE"
-	envServiceAcct   = "SERVICE_ACCOUNT"
-	audiencePrefix   = "spire-"
-	boundObjectKind  = "Pod"
-	boundObjectAPIV  = "v1"
-	maxIdentityValue = 253
-)
-
-var (
-	nonceRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
-	envRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
-)
+var envRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
 
 // tokenClient is the part of the Kubernetes core client that the agent uses.
 type tokenClient interface {
@@ -160,7 +147,7 @@ func (a *Agent) build(text string, withClient bool) (*agentState, error) {
 		name string
 		dst  *string
 	}{
-		{envPodName, &st.podName}, {envPodUID, &st.podUID}, {envPodNamespace, &st.namespace}, {envServiceAcct, &st.serviceAccount},
+		{EnvPodName, &st.podName}, {EnvPodUID, &st.podUID}, {EnvPodNamespace, &st.namespace}, {EnvServiceAccount, &st.serviceAccount},
 	} {
 		name, dst := e.name, e.dst
 		v, ok := a.lookupEnv(name)
@@ -199,7 +186,7 @@ func (a *Agent) AidAttestation(stream agentv1.NodeAttestor_AidAttestationServer)
 		return status.Error(codes.Aborted, "cluster_jwt agent: stream ended before the challenge")
 	}
 	nonce := string(ch.GetChallenge())
-	if nonce == "" || len(nonce) > maxNonceLength || !nonceRE.MatchString(nonce) {
+	if !ValidNonce(nonce) {
 		a.log.Warn("challenge refused", "reason", "malformed nonce")
 		return status.Error(codes.InvalidArgument, "cluster_jwt agent: malformed challenge")
 	}
@@ -237,7 +224,7 @@ func (a *Agent) requestToken(ctx context.Context, st *agentState, nonce string) 
 	seconds := int64(st.ttl / time.Second)
 	req := &authenticationv1.TokenRequest{
 		Spec: authenticationv1.TokenRequestSpec{
-			Audiences:         []string{audiencePrefix + st.env + "/" + nonce},
+			Audiences:         []string{Audience(st.env, nonce)},
 			ExpirationSeconds: &seconds,
 			BoundObjectRef: &authenticationv1.BoundObjectReference{
 				APIVersion: boundObjectAPIV, Kind: boundObjectKind, Name: st.podName, UID: apitypes.UID(st.podUID),
