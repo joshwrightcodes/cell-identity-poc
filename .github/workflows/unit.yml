@@ -11,13 +11,39 @@ permissions:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    env:
+      MISE_VERSION: 2026.11.3
+      # SHA-256 of mise-v2026.11.3-linux-x64.tar.zst, from the release SHASUMS256.txt.
+      MISE_SHA256: aecb9bdaec0de3cc4da51aea5f7cdb628582e627cccb71f50779cac78d7166a0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: jdx/mise-action@82a612c5ab8bcda7cc5db6b7e81a8e7584c3dc6e # v5.2.3
+      # gh downloads the release asset through the authenticated API with the job token.
+      - name: Install mise
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          asset="mise-v${MISE_VERSION}-linux-x64.tar.zst"
+          dir="$RUNNER_TEMP/mise"
+          mkdir -p "$dir" "$HOME/.local/bin"
+          gh release download "v${MISE_VERSION}" --repo jdx/mise --pattern "$asset" --dir "$dir"
+          echo "${MISE_SHA256}  ${dir}/${asset}" | sha256sum --check --strict -
+          tar --zstd -xf "${dir}/${asset}" -C "$dir"
+          install -m 0755 "${dir}/mise/bin/mise" "$HOME/.local/bin/mise"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          version: 2026.11.3
-          install_args: go yq jq helm
+          path: ~/.local/share/mise
+          key: mise-${{ runner.os }}-${{ env.MISE_VERSION }}-${{ hashFiles('mise.toml', 'mise.lock') }}
+      - name: Install tools
+        env:
+          MISE_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          mise --version
+          mise trust --yes
+          mise install go yq jq helm
       - run: mise run test
       - run: mise run lint
