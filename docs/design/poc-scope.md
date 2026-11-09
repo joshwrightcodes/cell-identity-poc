@@ -99,7 +99,7 @@ it exists.
 | --- | --- | --- |
 | M0 | Base cell | Done |
 | M1 | Harness | The host service creates all five clusters twice from clean, with storage and one registry mirror. A pod in `rogue` reaches no port on a cell's node except the residual ports 2379, 2380, 6443, 10250 and 10256 |
-| M2 | Attestor | Against a test-signed record, `celld` gets an SVID. Pod-bound, lifetime, audience, subject and unknown-key tests fail as expected. A sidecar renews without a new token |
+| M2 | Attestor | Against a test-signed record, `celld` gets an SVID. Pod-bound, lifetime, audience, subject and unknown key ID tests fail as expected. A sidecar renews without a new token |
 | M3 | Central view and observability | `management` shows both cells in one Argo CD UI, with live manifests. Writes, annotation changes, `.operation`, exec and Secret reads through the view fail. A cell's SVID cannot pose as the management plane's principal. Grafana shows logs, metrics and traces from all five clusters, each tagged with its cluster, plane, environment and cell. A cell that labels its signals as another cell's is corrected at the gateway, and telemetry from `rogue` fails. Kiali shows the mesh of each cell, and cannot change it |
 | M4 | Management plane stand-in and specs | envd pulls signed specs, and refuses unsigned or older ones. The management plane binds issuers and checks keys. The test-signed record fixture is deleted |
 | M5 | Signed work | `celld` claims, verifies and applies operations once. Forged, replayed, expired and wrong-target items fail. `dev-cp` cannot pose as a cell to the management plane |
@@ -108,8 +108,9 @@ it exists.
 | M8 | Bundles | Bundles that the management plane signs reach Argo CD in each cell. A bundle outside its allow-list fails, and a rollback restores the last good root |
 | M9 | Island mode and revocation | Both island levels hold for three SVID lifetimes, with no pod restarts. Revocation works connected and locally |
 
-The full gate runs on the Mac, under `caffeinate`, with a fast tier for M1–M8 and a slow tier
-for M9. Each tier has a time budget, set at M1.
+The full gate runs on the Mac, with a fast tier for M1–M8 and a slow tier for M9. Each tier has a
+time budget, set at M1. The Mac must stay awake for the whole gate, so a keep-awake tool must run.
+macOS still sleeps when the lid closes on battery power.
 
 ## Residual limits of the PoC
 
@@ -118,7 +119,9 @@ for M9. Each tier has a time budget, set at M1.
 - Every pod, including those in `rogue`, reaches every listener on the loopback interface of the Mac through `host.docker.internal`, not only the host service.
 - A compromised management plane can sign any work. Approver checks in cells come later.
 - Keys are fixed for the life of a run. The M2 key rotation test changes the signing key of `dev-cell-1` for two to three minutes, and then restores it.
-- The test profile gives agent and workload SVIDs a lifetime of 1 minute. After a pause of more than a minute, for example while the Mac sleeps, each agent attests again as a new agent when its container restarts. The server keeps the old agent entries until it prunes them. This follows from the agent source and is not verified.
+- `dev-cp` gives agent and workload SVIDs a lifetime of 1 minute (`SPIRE_SVID_TTL` in `cells/dev-cp.env`). After a pause longer than the remaining lifetime, for example while the Mac sleeps, an agent cannot renew. The rotator then ends the agent (`pkg/agent/svid/rotator.go:102-105` in v1.15.5), and the restarted container attests as a new agent. The server keeps the old agent entries until it prunes them. The exit follows from the agent source, and no test verifies it.
+- Any identity that can create a pod in `cell-identity-system` can run it as the `celld` service account, and so attest as that cell. The rejection tests rely on this. Admission control that limits pod creation there comes later.
+- The SPIRE server NetworkPolicy admits by the node address of each agent cell, so admission is per node, not per workload. Each pod that the policies of its own namespace let out reaches the SPIRE port, and the token checks of the plugin decide which pod attests.
 - One shared vault and one access token serve every PoC cluster. Because of this, a compromised cluster can read every PoC secret, including the SPIRE intermediate key. Production uses a vault and a token for each cluster.
 - The relay cannot close a revoked cell's streams. The management plane closes them.
 - Up to 8 held attestation streams for one cell (`per_cell_inflight`) can delay the attestation of that cell for up to `challenge_timeout`. The SPIRE port admits the node address of each agent cell, and not only the cell that an attestation names. So any pod in a namespace without policies in any agent cell can hold these slots for any cell. Examples are `kube-system`, `default` and `local-path-storage`, and any host network pod.

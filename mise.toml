@@ -104,7 +104,8 @@ run = "scripts/harness.sh down"
 [tasks.images]
 description = "Build and push the in-cluster images to the local registry at localhost:5001, and record their digests in build/images.env"
 depends = ["vm:up"]
-env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
+# Without VCS stamps, a binary changes only when its sources change, so a commit alone gives no new digests.
+env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64", GOFLAGS = "-mod=readonly -buildvcs=false" }
 run = "scripts/images.sh"
 
 [tasks."gate:m1"]
@@ -116,6 +117,10 @@ run = "scripts/gate.sh m1"
 description = "Run the M2 end-to-end tests against the SPIRE server in dev-cp, plus the go test arguments after --"
 depends = ["images"]
 run = "scripts/gate.sh m2"
+
+[tasks."gate:m2:repair"]
+description = "Restore the API server of dev-cell-1 after a gate:m2 run that stopped before its cleanup. Safe to run again"
+run = "scripts/gate-m2-repair.sh"
 
 [tasks."harness:preflight"]
 description = "Check the tool versions and the Colima profile against harness/versions.env"

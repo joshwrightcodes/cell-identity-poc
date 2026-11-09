@@ -99,19 +99,35 @@ func kubectl(t *testing.T, cluster, stdin string, args ...string) (string, error
 	return string(out), nil
 }
 
+// testNamespaceLabel marks each namespace that createNamespace makes.
+const testNamespaceLabel = "cell.poc.internal/e2e"
+
 // createNamespace makes a test namespace and deletes it when the test ends. It first removes a
 // namespace of the same name that an earlier run left behind, and it waits until the default
-// service account exists, because a pod cannot start before then.
+// service account exists, because a pod cannot start before then. It never deletes a namespace
+// without the test label, so a test name cannot remove a harness namespace.
 func createNamespace(t *testing.T, cluster, ns string) {
 	t.Helper()
 	deleteNamespace := func() error {
 		_, err := kubectl(t, cluster, "", "delete", "namespace", ns, "--ignore-not-found", "--wait=true", "--timeout=180s")
 		return err
 	}
-	if err := deleteNamespace(); err != nil {
-		t.Fatalf("remove leftover namespace %s in %s: %v", ns, cluster, err)
+	label, err := kubectl(t, cluster, "", "get", "namespace", ns, "--ignore-not-found",
+		"-o", "jsonpath={.metadata.labels.cell\\.poc\\.internal/e2e}{.metadata.name}")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := kubectl(t, cluster, "", "create", "namespace", ns); err != nil {
+	switch label {
+	case "":
+	case "true" + ns:
+		if err := deleteNamespace(); err != nil {
+			t.Fatalf("remove leftover namespace %s in %s: %v", ns, cluster, err)
+		}
+	default:
+		t.Fatalf("namespace %s exists in %s without the label %s=true, so it is not a test namespace", ns, cluster, testNamespaceLabel)
+	}
+	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true"}}}`, ns, testNamespaceLabel)
+	if _, err := kubectl(t, cluster, manifest, "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {

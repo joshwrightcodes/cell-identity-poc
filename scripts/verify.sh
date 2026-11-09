@@ -162,7 +162,7 @@ check_spire_server_address() {
 # The SPIRE server renders the node address and the signed record of each agent cell. A rebuilt
 # cell has a new service account key, and it can have a new node address.
 check_agent_cells_current() {
-  local cell ip facts want got cidrs want_cidrs=() stale=()
+  local cell ip facts want got cidrs traces want_cidrs=() stale=()
   for cell in $SPIRE_AGENT_CELLS; do
     ip="$(node_ip "$cell")" || { echo "$ip"; return 1; }
     want_cidrs+=("$ip/32")
@@ -178,6 +178,16 @@ check_agent_cells_current() {
   [[ "$cidrs" == "$want" ]] || stale+=("the NetworkPolicy admits '$cidrs', but the agent cell nodes are '$want'")
   if ((${#stale[@]} > 0)); then
     printf '%s\n' "${stale[@]}"
+    # A new record signs the live keys. While the key rotation test has changed a cell, those keys
+    # include the test key, so the node must be repaired first.
+    for cell in $SPIRE_AGENT_CELLS; do
+      traces="$(keytest_leftover "$cell" 2>/dev/null || true)"
+      if [[ -n "$traces" ]]; then
+        printf '%s\n' "$traces"
+        echo "Run: mise run gate:m2:repair, and then CELL=$CELL_NAME mise run cell:verify again"
+        return 1
+      fi
+    done
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
@@ -324,25 +334,47 @@ check_harness_objects() {
   fi
 }
 
-# image_ref <name> prints the reference of cmd/<name> in build/images.env.
-image_ref() {
-  sed -n "s/^IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$1")=//p" "$BUILD_ROOT/images.env" 2>/dev/null
-}
-
 # check_live_images <namespace> <kind/name> <command>: every local image of the workload must be the
 # one that build/images.env records for it.
 check_live_images() {
-  local ns="$1" workload="$2" next="$3" image name want bad=()
-  for image in $(k -n "$ns" get "$workload" -o json \
-      | jq -r '.spec.template.spec | ((.initContainers // []) + .containers)[].image | select(startswith("localhost:5001/"))'); do
-    name="${image#localhost:5001/}"
-    name="${name%%@*}"
-    want="$(image_ref "$name")"
-    [[ -n "$want" && "$image" == "$want" ]] || bad+=("$workload runs $image, and build/images.env has '${want:-nothing}' for $name")
-  done
-  if ((${#bad[@]} > 0)); then
-    printf '%s\n' "${bad[@]}"
-    echo "Run: $next"
+  local bad
+  bad="$(live_image_mismatches "$CELL_NAME" "$1" "$2")" || { echo "could not read $2 in $1"; return 1; }
+  if [[ -n "$bad" ]]; then
+    printf '%s\n' "$bad"
+    echo "Run: $3"
+    return 1
+  fi
+}
+
+# The M2 key rotation test changes the API server of a cell on its node. The node must hold no trace
+# of it, and the API server must publish exactly the keys that the record of the cell holds.
+check_keytest_clean() {
+  local traces live record
+  traces="$(keytest_leftover "$CELL_NAME")" || { echo "could not read the node $CELL_NAME-control-plane"; return 1; }
+  live="$(k get --raw /openid/v1/jwks | jq -cS '.keys | sort_by(.kid)')" || { echo "could not read the JWKS of $CELL_NAME"; return 1; }
+  record="$(kubectl --context "kind-$SPIRE_SERVER_CLUSTER" -n spire-system get configmap "cell-record-$CELL_NAME" -o jsonpath='{.data.record\.dsse\.json}' \
+    | jq -r .payload | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)')" || { echo "could not read the record of $CELL_NAME in $SPIRE_SERVER_CLUSTER"; return 1; }
+  if [[ -n "$traces" ]]; then
+    printf '%s\n' "$traces"
+    echo "Run: mise run gate:m2:repair"
+    return 1
+  fi
+  if [[ -z "$live" || "$live" != "$record" ]]; then
+    echo "the API server of $CELL_NAME publishes other keys than its record in $SPIRE_SERVER_CLUSTER."
+    echo "Run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:up"
+    return 1
+  fi
+}
+
+# The server config must hold the SVID lifetimes that SPIRE_SVID_TTL in cells/$CELL.env sets.
+check_svid_ttl() {
+  local conf agent x509
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  agent="$(sed -n 's/^ *agent_ttl = "\(.*\)"$/\1/p' <<<"$conf")"
+  x509="$(sed -n 's/^ *default_x509_svid_ttl = "\(.*\)"$/\1/p' <<<"$conf")"
+  if [[ "$agent" != "$SPIRE_SVID_TTL" || "$x509" != "$SPIRE_SVID_TTL" ]]; then
+    echo "the server sets agent_ttl '$agent' and default_x509_svid_ttl '$x509', and SPIRE_SVID_TTL is '$SPIRE_SVID_TTL'."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
 }
@@ -414,6 +446,8 @@ if has_harness cell-identity; then
     check_harness_objects cell-identity cell-identity-system
   check "celld runs the images that build/images.env records" \
     check_live_images cell-identity-system deployment/celld "CELL=$CELL_NAME mise run cell:up"
+  check "The node holds no trace of the M2 key rotation test, and the API server publishes the keys of the record" \
+    check_keytest_clean
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the SPIRE node port (steady state)" \
     expect_dial_blocked "$CELL_NAME" cell-identity-system "${spire_ip:-unknown}:30081"
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the collector (steady state)" \
@@ -424,6 +458,7 @@ fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
   check "The SPIRE server holds the node alias and celld entries of $SPIRE_AGENT_CELLS" check_agent_entries
+  check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.

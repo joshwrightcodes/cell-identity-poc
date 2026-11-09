@@ -193,6 +193,10 @@ func TestValidateReasons(t *testing.T) {
 		{name: "subject_not_allowed", want: SubjectNotAllowed, mutate: func(s *spec) {
 			s.K8s.Svcacct.Name = "other"
 		}},
+		// The account name matches the record, and only the namespace differs. sub follows the claim.
+		{name: "subject_not_allowed_namespace", want: SubjectNotAllowed, mutate: func(s *spec) {
+			s.K8s.Namespace = "other"
+		}},
 		{name: "not_pod_bound", want: NotPodBound, mutate: func(s *spec) { s.K8s.Pod = nil }},
 		{name: "lifetime_too_long", want: LifetimeTooLong, mutate: func(s *spec) {
 			s.EXP = s.IAT + 3600

@@ -9,9 +9,9 @@
 # The plugin image is the one that `mise run images` built on this Mac, pinned by the digest in
 # build/images.env. The server config carries the SHA-256 of the plugin binary from that image,
 # so the server checks the binary before it runs it.
-# Inputs come from cells/<cluster>.env: SPIRE_AGENT_CELLS and SPIRE_AGENT_SUBJECT.
+# Inputs come from cells/<cluster>.env: SPIRE_AGENT_CELLS, SPIRE_AGENT_SUBJECT and SPIRE_SVID_TTL.
 set -euo pipefail
-: "${SPIRE_AGENT_CELLS:?}" "${SPIRE_AGENT_SUBJECT:?}"
+: "${SPIRE_AGENT_CELLS:?}" "${SPIRE_AGENT_SUBJECT:?}" "${SPIRE_SVID_TTL:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -25,6 +25,27 @@ source "$root/scripts/ko-image.sh"
 # The plugin image and the checksum of the binary in it.
 plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
 checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no plugin checksum"
+
+# seconds <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
+seconds() {
+  local n="${1%[smh]}"
+  case "$1" in
+    *s) echo "$n" ;;
+    *m) echo $((n * 60)) ;;
+    *h) echo $((n * 3600)) ;;
+  esac
+}
+
+# SPIRE_SVID_TTL sets agent_ttl and default_x509_svid_ttl. The M2 tests verified renewal at 1m, so
+# that is the floor. SPIRE warns when an SVID lifetime exceeds ca_ttl / 6. The JWT SVID lifetime
+# keeps its default of 5m, so the same rule needs ca_ttl of 30m or more.
+[[ "$SPIRE_SVID_TTL" =~ ^[1-9][0-9]*[smh]$ ]] && (($(seconds "$SPIRE_SVID_TTL") >= 60)) \
+  || die "SPIRE_SVID_TTL '$SPIRE_SVID_TTL' is not a lifetime of 1m or more, such as 1m or 1h"
+ca_ttl="$(sed -n 's/^ *ca_ttl = "\([1-9][0-9]*[smh]\)"$/\1/p' "$here/server.conf")"
+[[ -n "$ca_ttl" ]] || die "server.conf sets no ca_ttl of the form <n>s, <n>m or <n>h"
+ca_seconds="$(seconds "$ca_ttl")"
+(($(seconds "$SPIRE_SVID_TTL") * 6 <= ca_seconds)) || die "SPIRE_SVID_TTL $SPIRE_SVID_TTL is above ca_ttl / 6 for ca_ttl $ca_ttl"
+((300 * 6 <= ca_seconds)) || die "ca_ttl $ca_ttl is below 30m, the floor for the default JWT SVID lifetime of 5m"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$SPIRE_AGENT_SUBJECT" =~ ^[a-z0-9-]+/[a-z0-9-]+$ ]] || die "SPIRE_AGENT_SUBJECT '$SPIRE_AGENT_SUBJECT' is not <namespace>/<service account>"
@@ -74,7 +95,8 @@ done
 
 key_list="$(printf '"%s", ' "${keys[@]}")"
 key_list="[${key_list%, }]"
-server_conf="$(sed -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" "$here/server.conf")"
+server_conf="$(sed -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" \
+  -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" "$here/server.conf")"
 controller_conf="$(cat "$here/controller-manager.yaml")"
 
 # config_map <name> <key> <content> prints a ConfigMap with one literal block value.

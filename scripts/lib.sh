@@ -101,3 +101,34 @@ bundle_store_forward() {
   trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
   wait_for "port-forward to the bundle store" 30 curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/"
 }
+
+# The M2 key rotation test edits the API server of one cell on its node. These paths name what it
+# leaves behind when a run ends before its cleanup. scripts/gate-m2-repair.sh restores the node.
+KEYTEST_MANIFEST=/etc/kubernetes/manifests/kube-apiserver.yaml
+KEYTEST_SAVED=/root/m2-test-kube-apiserver.yaml
+KEYTEST_KEY=/etc/kubernetes/pki/m2-test-sa
+
+# keytest_leftover <cluster> prints one line for each trace of the key rotation test on the node of
+# the cluster, and prints nothing when the node is clean. It fails when it cannot read the node.
+keytest_leftover() {
+  local node="$1-control-plane"
+  docker exec "$node" sh -c "
+    [ -e '$KEYTEST_SAVED' ] && echo 'the node holds the saved manifest $KEYTEST_SAVED'
+    grep -q 'm2-test-sa' '$KEYTEST_MANIFEST' && echo '$KEYTEST_MANIFEST names the test key'
+    for f in '$KEYTEST_KEY.key' '$KEYTEST_KEY.pub'; do [ -e \"\$f\" ] && echo \"the node holds \$f\"; done
+    true"
+}
+
+# live_image_mismatches <cluster> <namespace> <kind/name> prints one line for each local image of the
+# workload that differs from build/images.env, and prints nothing when all match.
+live_image_mismatches() {
+  local cluster="$1" ns="$2" workload="$3" json images image name want
+  json="$(kubectl --context "kind-$cluster" -n "$ns" get "$workload" -o json)" || return 1
+  images="$(jq -r '.spec.template.spec | ((.initContainers // []) + .containers)[].image | select(startswith("localhost:5001/"))' <<<"$json")" || return 1
+  for image in $images; do
+    name="${image#localhost:5001/}"
+    name="${name%%@*}"
+    want="$(sed -n "s/^IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$name")=//p" "$BUILD_ROOT/images.env" 2>/dev/null)"
+    [[ -n "$want" && "$image" == "$want" ]] || echo "$workload in $cluster runs $image, and build/images.env has '${want:-nothing}' for $name"
+  done
+}

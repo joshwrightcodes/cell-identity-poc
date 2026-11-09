@@ -3,9 +3,10 @@
 package e2e
 
 import (
-	"encoding/json"
+	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -14,13 +15,16 @@ import (
 
 const (
 	apiserverManifest = "/etc/kubernetes/manifests/kube-apiserver.yaml"
-	apiserverWait     = 4 * time.Minute
-	workloadWait      = 5 * time.Minute
+	// The test saves the original manifest here before its edit. scripts/gate-m2-repair.sh restores
+	// it from this file. The paths match KEYTEST_* in scripts/lib.sh.
+	savedManifest = "/root/m2-test-kube-apiserver.yaml"
+	apiserverWait = 4 * time.Minute
 	// kubeadm writes these two flags into the manifest of each kind node.
 	saVerifyFlag  = "    - --service-account-key-file=/etc/kubernetes/pki/sa.pub\n"
 	saSigningFlag = "    - --service-account-signing-key-file=/etc/kubernetes/pki/sa.key\n"
-	// The API server reads its signing key only from a file. The cleanup deletes both files.
+	// The API server reads its signing key only from a file. The repair deletes both files.
 	testKeyPath = "/etc/kubernetes/pki/m2-test-sa"
+	repairHint  = "Run: mise run gate:m2:repair"
 )
 
 // TestM2KeyRotationDenied adds a second service account key to the API server of dev-cell-1 and
@@ -38,7 +42,7 @@ func TestM2KeyRotationDenied(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.Contains(manifest, testKeyPath) {
-		t.Fatalf("%s on %s still names %s from an earlier run. Remove the two m2-test-sa flags, then run cell:verify", apiserverManifest, node, testKeyPath)
+		t.Fatalf("%s on %s still names %s from an earlier run. %s", apiserverManifest, node, testKeyPath, repairHint)
 	}
 	edited, err := addSigningKey(manifest)
 	if err != nil {
@@ -51,7 +55,10 @@ func TestM2KeyRotationDenied(t *testing.T) {
 	pod := pods[0]
 	agentID := agentIDOf(t, cell, pod)
 
-	t.Cleanup(func() { restoreAPIServer(t, cell, node, manifest, oldKIDs) })
+	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && test ! -e "+savedManifest+" && cp "+apiserverManifest+" "+savedManifest); err != nil {
+		t.Fatalf("save %s on %s to %s, which must not exist yet: %v. %s", apiserverManifest, node, savedManifest, err, repairHint)
+	}
+	t.Cleanup(func() { repairAPIServer(t) })
 	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "+
 		testKeyPath+".key 2>/dev/null && openssl pkey -in "+testKeyPath+".key -pubout -out "+testKeyPath+".pub"); err != nil {
 		t.Fatalf("make the second key on %s: %v", node, err)
@@ -106,139 +113,20 @@ func addSigningKey(manifest string) (string, error) {
 	return strings.Replace(out, saSigningFlag, "    - --service-account-signing-key-file="+testKeyPath+".key\n", 1), nil
 }
 
-// restoreAPIServer writes the original manifest back and deletes the test key. Pods that received a
-// token from the test key during the test hold a token that the API server no longer accepts, so the
-// cleanup deletes them, and their controllers create them again.
-func restoreAPIServer(t *testing.T, cell, node, manifest string, oldKIDs []string) {
+// repairAPIServer runs scripts/gate-m2-repair.sh, the same code as `mise run gate:m2:repair`. It
+// restores the saved manifest and deletes the test key. It makes sure that kube-controller-manager,
+// which keeps a token for each controller in memory, runs a new container. It deletes each pod with
+// a projected token from the test key, and the controllers create those pods again.
+func repairAPIServer(t *testing.T) {
 	t.Helper()
-	writeNodeFile(t, node, apiserverManifest, manifest)
-	if _, err := dockerExec(t, node, "", "rm", "-f", testKeyPath+".key", testKeyPath+".pub"); err != nil {
-		t.Errorf("delete the test key on %s: %v", node, err)
-	}
-	waitFor(t, "the API server of "+cell+" to verify and sign with the original key only", apiserverWait, func() (bool, string) {
-		kids, err := apiKIDsOnce(t, cell)
-		if err != nil {
-			return false, err.Error()
-		}
-		signing, err := signingKID(t, cell)
-		if err != nil {
-			return false, err.Error()
-		}
-		return slices.Equal(kids, oldKIDs) && signing == oldKIDs[0], fmt.Sprintf("keys %v, signing key %s", kids, signing)
-	})
-	// The mirror pod of the static pod reports the new container a little after the API answers.
-	mirror := "kube-apiserver-" + node
-	waitFor(t, "pod "+mirror+" Ready", apiserverWait, func() (bool, string) {
-		out, err := kubectl(t, cell, "", "-n", "kube-system", "get", "pod", mirror,
-			"-o", `jsonpath={.status.conditions[?(@.type=="Ready")].status}`)
-		if err != nil {
-			return false, err.Error()
-		}
-		return out == "True", "Ready " + out
-	})
-	deletePodsWithOtherKeys(t, cell, node, oldKIDs)
-	waitWorkloadsReady(t, cell)
-}
-
-// deletePodsWithOtherKeys deletes each pod whose projected token on the node has a key ID outside
-// kids. It reads only the token header, which holds the algorithm and the key ID.
-func deletePodsWithOtherKeys(t *testing.T, cell, node string, kids []string) {
-	t.Helper()
-	out, err := dockerExec(t, node, "", "sh", "-c",
-		`for f in /var/lib/kubelet/pods/*/volumes/kubernetes.io~projected/*/token; do [ -f "$f" ] && printf '%s %s\n' "$f" "$(cut -d. -f1 "$f")"; done; true`)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m2-repair.sh")
+	out, err := cmd.CombinedOutput()
+	t.Logf("gate-m2-repair.sh:\n%s", strings.TrimSpace(string(out)))
 	if err != nil {
-		t.Errorf("list the projected tokens on %s: %v", node, err)
-		return
+		t.Errorf("the repair of dev-cell-1 failed: %v. %s", err, repairHint)
 	}
-	stale := map[string]bool{}
-	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
-		path, head, ok := strings.Cut(line, " ")
-		if !ok {
-			continue
-		}
-		rest, ok := strings.CutPrefix(path, "/var/lib/kubelet/pods/")
-		if !ok {
-			continue
-		}
-		uid, _, _ := strings.Cut(rest, "/")
-		if kid := tokenKID(head + "."); kid != "" && !slices.Contains(kids, kid) {
-			stale[uid] = true
-		}
-	}
-	if len(stale) == 0 {
-		t.Logf("no pod on %s holds a token from the test key", node)
-		return
-	}
-	list, err := kubectl(t, cell, "", "get", "pods", "-A", "-o", "json")
-	if err != nil {
-		t.Errorf("list pods in %s: %v", cell, err)
-		return
-	}
-	var pods struct {
-		Items []struct {
-			Metadata struct{ Name, Namespace, UID string } `json:"metadata"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(list), &pods); err != nil {
-		t.Errorf("decode pods of %s: %v", cell, err)
-		return
-	}
-	for _, p := range pods.Items {
-		if !stale[p.Metadata.UID] {
-			continue
-		}
-		t.Logf("deleting pod %s/%s, which holds a token from the test key", p.Metadata.Namespace, p.Metadata.Name)
-		if _, err := kubectl(t, cell, "", "-n", p.Metadata.Namespace, "delete", "pod", p.Metadata.Name, "--wait=false"); err != nil {
-			t.Errorf("delete pod %s/%s: %v", p.Metadata.Namespace, p.Metadata.Name, err)
-		}
-	}
-}
-
-// waitWorkloadsReady waits until every Deployment, StatefulSet and DaemonSet of the cluster has all
-// of its replicas updated and ready.
-func waitWorkloadsReady(t *testing.T, cell string) {
-	t.Helper()
-	waitFor(t, "every workload of "+cell+" ready", workloadWait, func() (bool, string) {
-		out, err := kubectl(t, cell, "", "get", "deployments,statefulsets,daemonsets", "-A", "-o", "json")
-		if err != nil {
-			return false, err.Error()
-		}
-		var list struct {
-			Items []struct {
-				Kind     string                          `json:"kind"`
-				Metadata struct{ Name, Namespace string } `json:"metadata"`
-				Spec     struct {
-					Replicas *int `json:"replicas"`
-				} `json:"spec"`
-				Status struct {
-					Replicas, ReadyReplicas, UpdatedReplicas, AvailableReplicas int
-					DesiredNumberScheduled, NumberReady, UpdatedNumberScheduled int
-				} `json:"status"`
-			} `json:"items"`
-		}
-		if err := json.Unmarshal([]byte(out), &list); err != nil {
-			return false, err.Error()
-		}
-		var bad []string
-		for _, w := range list.Items {
-			s := w.Status
-			var ready bool
-			switch w.Kind {
-			case "DaemonSet":
-				ready = s.NumberReady == s.DesiredNumberScheduled && s.UpdatedNumberScheduled == s.DesiredNumberScheduled
-			default:
-				want := 1
-				if w.Spec.Replicas != nil {
-					want = *w.Spec.Replicas
-				}
-				ready = s.ReadyReplicas == want && s.UpdatedReplicas == want && s.Replicas == want
-			}
-			if !ready {
-				bad = append(bad, w.Kind+"/"+w.Metadata.Namespace+"/"+w.Metadata.Name)
-			}
-		}
-		return len(bad) == 0, strings.Join(bad, ", ")
-	})
 }
 
 // writeNodeFile replaces a file on a node through a temporary file, so kubelet never reads a part.
@@ -271,7 +159,8 @@ func apiKIDsOnce(t *testing.T, cell string) ([]string, error) {
 // signingKID requests a short token for celld and returns the key ID in its header.
 func signingKID(t *testing.T, cell string) (string, error) {
 	t.Helper()
-	out, err := kubectl(t, cell, "", "-n", celldNamespace, "create", "token", celldAccount, "--duration", "10m")
+	// The audience m2-kid-probe makes the token useless to the API server and to every service.
+	out, err := kubectl(t, cell, "", "-n", celldNamespace, "create", "token", celldAccount, "--duration", "10m", "--audience", "m2-kid-probe")
 	if err != nil {
 		return "", err
 	}

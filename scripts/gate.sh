@@ -16,6 +16,19 @@ build_start=$SECONDS
 go test -tags e2e -count=1 -run '^$' ./test/e2e/ >/dev/null || die "the end-to-end tests do not build"
 log "gate $milestone build took $((SECONDS - build_start))s"
 
+# The M2 tests run against the deployed SPIRE server, plugins and celld. Each must run the image
+# that `mise run images` recorded, or the gate tests old code.
+if [[ "$milestone" == m2 ]]; then
+  stale=""
+  for target in dev-cp:spire-system:statefulset/spire-server dev-cell-1:cell-identity-system:deployment/celld \
+      dev-cell-2:cell-identity-system:deployment/celld; do
+    IFS=: read -r cluster ns workload <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
 start=$SECONDS
 status=0
 go test -tags e2e -count=1 -timeout 30m ./test/e2e/ -run "$pattern" "$@" || status=$?

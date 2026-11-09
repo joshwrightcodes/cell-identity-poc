@@ -46,9 +46,9 @@ const (
 	tokenBinding   = "celld-token"
 	trustBundleMap = "spire-trust-bundle"
 	otherNamespace = "m2-other-subject"
-	otherAccount   = "attestprobe-other"
 	rogueDialNS    = "m2-rogue-dial"
 	spireNodePort  = 30081
+	apiServerPort  = 6443
 )
 
 func TestM2AttestProbeIssued(t *testing.T) {
@@ -59,7 +59,6 @@ func TestM2AttestProbeIssued(t *testing.T) {
 	if !ok || !want.MatchString(id) {
 		t.Fatalf("attestprobe --variant good: want issued:<an agent ID like %s>, got %q", want, res.out)
 	}
-	t.Cleanup(func() { evictAgent(t, id) })
 	waitServerLog(t, "a line "+attestDone+" for "+id, res.start, func(l logLine) bool {
 		return l.str("msg") == attestDone && l.str("agent_id") == id
 	})
@@ -80,8 +79,8 @@ func TestM2RejectWrongAudience(t *testing.T) {
 	rejectInCell(t, "wrong-audience", "wrong_audience")
 }
 
-// TestM2RejectOtherSubject runs the probe in another namespace, as a service account that the
-// record of the cell does not name.
+// TestM2RejectOtherSubject runs the probe as a service account named celld in another namespace.
+// The account name matches the record, so only the namespace differs.
 func TestM2RejectOtherSubject(t *testing.T) {
 	t.Parallel()
 	createNamespace(t, rejectCell, otherNamespace)
@@ -102,12 +101,12 @@ metadata: {name: %[1]s, namespace: %[2]s}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: %[1]s}
 subjects:
   - {kind: ServiceAccount, name: %[1]s, namespace: %[2]s}
-`, otherAccount, otherNamespace)
+`, celldAccount, otherNamespace)
 	if _, err := kubectl(t, rejectCell, rbac, "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
 	copyTrustBundle(t, rejectCell, otherNamespace)
-	res := runAttestProbe(t, probe{cell: rejectCell, namespace: otherNamespace, account: otherAccount, variant: "other-subject"})
+	res := runAttestProbe(t, probe{cell: rejectCell, namespace: otherNamespace, account: celldAccount, variant: "other-subject"})
 	expectRefusal(t, res, rejectCell, "subject_not_allowed", cellKIDs(t, rejectCell))
 }
 
@@ -149,7 +148,15 @@ func TestM2RejectRogueKey(t *testing.T) {
 	t.Logf("rogue token with key ID %s", kid)
 
 	secret := "m2-rogue-token-" + randomHex(t, 4)
-	if _, err := kubectl(t, rejectCell, token, "-n", celldNamespace, "create", "secret", "generic", secret, "--from-file=token=/dev/stdin"); err != nil {
+	manifest, err := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "Secret",
+		"metadata": map[string]any{"name": secret, "namespace": celldNamespace, "labels": map[string]string{probeLabel: secret}},
+		"data":     map[string]string{"token": base64.StdEncoding.EncodeToString([]byte(token))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kubectl(t, rejectCell, string(manifest), "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
@@ -162,21 +169,29 @@ func TestM2RejectRogueKey(t *testing.T) {
 }
 
 // TestM2RogueCannotDialServer checks the network half of the rogue case: a TCP connect from rogue to
-// the SPIRE node port of dev-cp times out, because the server NetworkPolicy drops it.
+// the SPIRE node port of dev-cp times out, because the server NetworkPolicy drops it. As a control,
+// the same pod reaches the API server port of that node, a residual port of the shared network, so
+// the address is right and the pod has a working network.
 func TestM2RogueCannotDialServer(t *testing.T) {
 	t.Parallel()
 	createNamespace(t, "rogue", rogueDialNS)
-	addr := fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, spireNodePort)
-	out := runPod(t, "rogue", rogueDialNS, []string{"dial", "--addr", addr, "--timeout", "3s"})
-	var res struct {
-		Result string `json:"result"`
-		Error  string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(out), &res); err != nil {
-		t.Fatalf("decode dial output %q: %v", out, err)
-	}
-	if res.Result != "timeout" {
-		t.Fatalf("dial from rogue to %s: want timeout, got %s (%s)", addr, res.Result, res.Error)
+	ip := clusterFacts(t, spireCluster).NodeIP
+	for _, tc := range []struct {
+		port int
+		want string
+	}{{apiServerPort, "connected"}, {spireNodePort, "timeout"}} {
+		addr := fmt.Sprintf("%s:%d", ip, tc.port)
+		out := runPod(t, "rogue", rogueDialNS, []string{"dial", "--addr", addr, "--timeout", "3s"})
+		var res struct {
+			Result string `json:"result"`
+			Error  string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(out), &res); err != nil {
+			t.Fatalf("decode dial output %q: %v", out, err)
+		}
+		if res.Result != tc.want {
+			t.Fatalf("dial from rogue to %s: want %s, got %s (%s)", addr, tc.want, res.Result, res.Error)
+		}
 	}
 }
 
@@ -241,11 +256,22 @@ func TestM2AgentRestartKeepsID(t *testing.T) {
 	if _, err := dockerExec(t, pod.Spec.NodeName, "", "crictl", "stop", id); err != nil {
 		t.Fatalf("stop the spire-agent container: %v", err)
 	}
+	stopped := time.Now()
 	waitFor(t, "a new ready spire-agent container in "+pod.Metadata.Name, containerWait, func() (bool, string) {
 		newID, n := agentContainer(t, cell, pod.Metadata.Name)
 		return n == restarts+1 && newID != id && containerReady(t, cell, pod.Metadata.Name, "spire-agent"),
 			fmt.Sprintf("container %s with %d restarts", newID, n)
 	})
+	// The SVID lasts SPIRE_SVID_TTL of cells/dev-cp.env. A restart that takes longer finds it expired,
+	// and the agent then attests again as a new agent. That is a timing failure, not a lost SVID.
+	if logs, err := podLog(t, cell, pod.Metadata.Name, "spire-agent", time.Time{}); err == nil {
+		if expired := matching(logs, func(l logLine) bool {
+			return strings.HasPrefix(l.str("msg"), "SVID key recovered, but SVID is expired")
+		}); len(expired) > 0 {
+			t.Fatalf("the agent SVID expired while the container was down: the restart took %s, against the SVID lifetime SPIRE_SVID_TTL of cells/dev-cp.env",
+				time.Since(stopped).Round(time.Second))
+		}
+	}
 
 	var logs string
 	waitFor(t, "an agent rotation for "+agentID+" in the new container", renewWait, func() (bool, string) {
@@ -382,6 +408,10 @@ func runAttestProbe(t *testing.T, p probe) probeResult {
 	}
 	out := strings.TrimSpace(logs)
 	t.Logf("attestprobe --variant %s in %s/%s as %s printed %q", p.variant, p.cell, p.namespace, p.account, out)
+	// An issued SVID makes an agent entry on the server, whatever the test expected.
+	if id, ok := strings.CutPrefix(out, "issued:"); ok && strings.HasPrefix(id, "spiffe://") {
+		t.Cleanup(func() { evictAgent(t, id) })
+	}
 	return probeResult{out: out, podUID: uid, start: start}
 }
 
@@ -403,7 +433,7 @@ func allowProbeEgress(t *testing.T, cell, run string) {
 	name := "m2-attestprobe-" + run
 	policy, err := json.Marshal(map[string]any{
 		"apiVersion": "networking.k8s.io/v1", "kind": "NetworkPolicy",
-		"metadata": map[string]any{"name": name, "namespace": celldNamespace},
+		"metadata": map[string]any{"name": name, "namespace": celldNamespace, "labels": map[string]string{probeLabel: run}},
 		"spec": map[string]any{
 			"podSelector": map[string]any{"matchLabels": map[string]string{probeLabel: run}},
 			"policyTypes": []string{"Egress"}, "egress": live.Spec.Egress,

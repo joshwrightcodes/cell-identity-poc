@@ -169,7 +169,7 @@ func digestOf(b []byte) string {
 
 func render(t *testing.T, env ...string) result {
 	t.Helper()
-	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", env...)
+	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append([]string{"SPIRE_SVID_TTL=1m"}, env...)...)
 }
 
 // renderScript runs the render script of a component with stub host commands. The stub image
@@ -488,6 +488,9 @@ func TestRenderSpireServer(t *testing.T) {
 				SocketPath      string `hcl:"socket_path"`
 				LogFormat       string `hcl:"log_format"`
 				PruneTOFU       bool   `hcl:"prune_tofu_nodes"`
+				CATTL           string `hcl:"ca_ttl"`
+				AgentTTL        string `hcl:"agent_ttl"`
+				X509TTL         string `hcl:"default_x509_svid_ttl"`
 				PruneExpiredFor string `hcl:"prune_attested_nodes_expired_for"`
 				RateLimit       struct {
 					Attestation *bool `hcl:"attestation"`
@@ -502,6 +505,9 @@ func TestRenderSpireServer(t *testing.T) {
 			s.PruneExpiredFor == "" || s.RateLimit.Attestation == nil || *s.RateLimit.Attestation ||
 			s.SocketPath != "/run/spire/sockets/api.sock" {
 			t.Fatalf("server block is %+v", s)
+		}
+		if s.CATTL != "24h" || s.AgentTTL != "1m" || s.X509TTL != "1m" {
+			t.Fatalf("lifetimes: ca_ttl %q, agent_ttl %q, default_x509_svid_ttl %q; want 24h, and SPIRE_SVID_TTL 1m for both SVIDs", s.CATTL, s.AgentTTL, s.X509TTL)
 		}
 
 		sum := sha256.Sum256([]byte(stubBinary))
@@ -639,6 +645,20 @@ func keysOf(m map[string]any) []string {
 	return out
 }
 
+// TestRenderSVIDLifetime renders the lifetime that a long-lived environment sets.
+func TestRenderSVIDLifetime(t *testing.T) {
+	r := render(t, "SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=1h")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	text := get[string](t, docs(t, r.stdout)["ConfigMap/spire-server"], "data", "server.conf")
+	for _, want := range []string{`agent_ttl = "1h"`, `default_x509_svid_ttl = "1h"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("server.conf lacks %q", want)
+		}
+	}
+}
+
 func TestRenderFailsClosed(t *testing.T) {
 	cases := []struct {
 		name string
@@ -655,6 +675,10 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"layer with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_LAYER=1"}, "could not fetch layer"},
 		{"manifest with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_MANIFEST=1"}, "could not fetch the manifest of localhost:5001/cluster-jwt-server@sha256:"},
 		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_AGENT_SUBJECT=celld"}, "is not <namespace>/<service account>"},
+		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},
+		{"SVID lifetime in days", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=1d"}, "SPIRE_SVID_TTL '1d' is not"},
+		{"SVID lifetime below the tested floor", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=30s"}, "SPIRE_SVID_TTL '30s' is not"},
+		{"SVID lifetime above ca_ttl / 6", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=5h"}, "above ca_ttl / 6"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

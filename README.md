@@ -146,6 +146,52 @@ The other runs took 312 and 381 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 The budgets do not cover `harness:up`.
 
+## Side effects of gate:m2
+
+`gate:m2` changes the clusters while it runs, and it puts them back before it ends:
+
+- It replaces the `celld` pod in each cell, so the SPIRE server keeps about six old agent entries until it prunes them, one hour after they expire.
+- It removes the `celld-token` RoleBinding of `dev-cell-2` for about a minute, and then applies it again from the harness bundle.
+- It edits the API server manifest of `dev-cell-1` on the node and signs tokens with a test key for two to three minutes.
+- After the edit, it makes sure that `kube-controller-manager` of `dev-cell-1` runs a new container, because it keeps a token for each controller in memory.
+  kubelet can delay that container by its restart back-off, up to 5 minutes.
+- It deletes each pod of `dev-cell-1` that received a token from the test key, and the controllers create those pods again.
+  The deleted pods can include `kindnet`. NetworkPolicy then probably fails open until its new pod runs, as the residual limits in `docs/design/poc-scope.md` say.
+
+A run that stops before its cleanup, for example after Ctrl-C or a closed terminal, can leave `dev-cell-1` with the test key.
+The next run then stops in its precheck, and `CELL=dev-cell-1 mise run cell:verify` fails.
+Both print the repair command:
+
+```sh
+mise run gate:m2:repair
+CELL=dev-cell-1 mise run cell:verify
+```
+
+The repair is safe to run again.
+A stopped run can also leave probe objects in `cell-identity-system`, and the next gate run deletes them.
+If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mise run cell:up` for that cell.
+
+## SVID lifetimes and sleep
+
+`SPIRE_SVID_TTL` in `cells/dev-cp.env` sets the lifetime of agent and workload SVIDs.
+The value is `1m`, so a gate sees two renewals in about a minute.
+For an environment that stays up without gates, set `SPIRE_SVID_TTL=1h` and run `CELL=dev-cp mise run cell:up`.
+The render accepts values from `1m` to `4h`, which is `ca_ttl` divided by 6.
+`cell:verify` in `dev-cp` checks that the server runs the value of `SPIRE_SVID_TTL`.
+
+With `1m`, a sleep of the Mac longer than about half a minute lets agent SVIDs expire.
+An agent with an expired SVID exits, and its new container attests as a new agent.
+The Mac must stay awake for the whole gate, so run a keep-awake tool while the gate runs.
+macOS still sleeps when you close the lid on battery power, whatever tool runs.
+
+After a sleep, follow these steps:
+
+1. Run `CELL=<cluster> mise run cell:verify` for `dev-cp`, `dev-cell-1` and `dev-cell-2`.
+2. If new pods stay in `ContainerCreating` and the events show `Unauthorized` from `istio-cni`, delete the `istio-cni-node` pod of that cell.
+   Its DaemonSet creates a new pod with a new token.
+3. If `celld` holds no current SVID, run `CELL=<cell> mise run cell:restart`.
+4. If a gate stopped during the sleep, run `mise run gate:m2:repair`.
+
 ## Restart of the VM
 
 `harness:restart-check` stops and starts the VM, waits until every node is Ready, and runs `gate:m1`.
@@ -185,8 +231,11 @@ Each image reaches its cluster through one command:
 
 `mise run images` builds all five and records their digests in `build/images.env`.
 `cell:verify` fails when a running image differs from that file.
-ko stamps the commit of the checkout into each binary, so a new commit gives new digests.
-`gate:m1` and `gate:m2` run `mise run images` first. After a new commit or a gate run, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
+`mise run images` builds without VCS stamps, so a digest changes only when the sources of that image change.
+A comment line in `build/images.env` records the commit of the build.
+`gate:m1` and `gate:m2` run `mise run images` first.
+After a change under `cmd/` or `internal/`, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
+`gate:m2` first compares the deployed images with `build/images.env`, and it prints the `cell:up` commands when they differ.
 
 ## Keys
 

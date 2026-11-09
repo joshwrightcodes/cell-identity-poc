@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -338,7 +339,8 @@ func forwardBundleStore(t *testing.T) string {
 	t.Helper()
 	cmd := exec.Command("kubectl", "--context", "kind-"+spireCluster, "-n", "cell-system",
 		"port-forward", "--address", "127.0.0.1", "svc/bundle-store", ":5000")
-	var stderr strings.Builder
+	// exec copies stderr in its own goroutine while the process runs, so reads take the lock.
+	var stderr lockedBuffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -387,6 +389,24 @@ func forwardBundleStore(t *testing.T) string {
 		return resp.StatusCode == http.StatusOK, resp.Status
 	})
 	return addr
+}
+
+// lockedBuffer is a buffer that one goroutine writes while another reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // runTool runs a pinned tool with extra environment variables and returns standard output.

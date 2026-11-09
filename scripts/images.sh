@@ -20,6 +20,10 @@ refs="$(ko build --base-import-paths --tags latest "${paths[@]}")" || die "ko bu
 mkdir -p "$root/build"
 tmp="$(mktemp "$root/build/.images.env.XXXXXX")"
 trap 'rm -f "$tmp"' EXIT
+# The binaries carry no VCS stamp, so the commit is a note for people. Readers skip comment lines.
+commit="$(git -C "$root" rev-parse HEAD)"
+git -C "$root" diff --quiet HEAD -- || commit+=" with local changes"
+printf '# commit %s\n' "$commit" >"$tmp"
 for name in "${images[@]}"; do
   ref="$(grep -E "^${KO_DOCKER_REPO}/${name}@sha256:[0-9a-f]{64}$" <<<"$refs" || true)"
   [[ -n "$ref" && "$(wc -l <<<"$ref")" -eq 1 ]] || die "ko printed no single reference for $name: $refs"
