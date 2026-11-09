@@ -140,16 +140,26 @@ func TestM3MgmtServerHealthy(t *testing.T) {
 	}
 }
 
-// TestM3MgmtServerClosedToOtherPods dials the server API from a namespace with no policy. Only the
-// local plane workloads may reach it.
+// TestM3MgmtServerClosedToOtherPods dials the server from namespaces with no policy: the API on its
+// ClusterIP and on its pod address, and the metrics port. Only the local plane workloads may reach
+// the API, and no pod may reach the metrics port before the collector of a later task.
 func TestM3MgmtServerClosedToOtherPods(t *testing.T) {
 	needProbeImage(t)
 	ip, err := kubectl(t, mgmtCluster, "", "-n", spireNamespace, "get", "service", "spire-server", "-o", "jsonpath={.spec.clusterIP}")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := probeFromFreshNamespace(t, mgmtCluster, strings.TrimSpace(ip), 8081, 3*time.Second); err != nil {
+	podIP, err := kubectl(t, mgmtCluster, "", "-n", spireNamespace, "get", "pod", spireServerPod, "-o", "jsonpath={.status.podIP}")
+	if err != nil {
 		t.Fatal(err)
+	}
+	for _, target := range []struct {
+		addr string
+		port int
+	}{{strings.TrimSpace(ip), 8081}, {strings.TrimSpace(podIP), 8081}, {strings.TrimSpace(podIP), 9988}} {
+		if err := probeFromFreshNamespace(t, mgmtCluster, target.addr, target.port, 3*time.Second); err != nil {
+			t.Error(err)
+		}
 	}
 }
 
@@ -245,6 +255,10 @@ func TestM3ManagementHasNoSecretStore(t *testing.T) {
 	}
 	if got := ephemeralDial(t, mgmtCluster, "external-secrets", pod, strings.TrimSpace(apiIP)+":443", 5*time.Second); got != "connected" {
 		t.Fatalf("the control dial from the operator pod to the API service gave %q, want connected", got)
+	}
+	// A pod with no policy must reach 1.1.1.1:443, or a timeout from the operator pod proves nothing.
+	if got := dialFrom(t, mgmtCluster, freshNamespace(t, mgmtCluster), "1.1.1.1", 443, 5*time.Second); got != "connected" {
+		t.Fatalf("the control dial to 1.1.1.1:443 from a namespace with no policy gave %q, want connected. Check the internet route of the VM", got)
 	}
 	start := time.Now()
 	if got := ephemeralDial(t, mgmtCluster, "external-secrets", pod, "1.1.1.1:443", 5*time.Second); got != "timeout" {

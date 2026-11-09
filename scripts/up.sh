@@ -15,17 +15,6 @@ k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
 "$ROOT/scripts/facts.sh"
 "$ROOT/scripts/hydrate.sh"
 
-apply_bundle() {
-  local file="$BUNDLES/$1/manifests.yaml"
-  if ! k apply --server-side --force-conflicts -f "$file" >/dev/null 2>&1; then
-    # A bundle can hold a CRD and an object of that kind. The first apply fails for that object.
-    # Wait for the CRD, then apply again. The second apply shows any real error.
-    k wait --for=condition=Established crd --all --timeout=120s >/dev/null
-    k apply --server-side --force-conflicts -f "$file" >/dev/null
-  fi
-  log "applied bundle $1"
-}
-
 for c in "${BOOTSTRAP[@]}"; do
   apply_bundle "$c"
 done
@@ -56,36 +45,13 @@ until apps_at_published >/dev/null 2>&1; do
 done
 k -n argocd get applications
 
-# release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD
-# Application managed before: the tracking annotation and the argocd-controller field manager.
-# The harness apply then owns every field. Objects without these leftovers stay unchanged.
-release_from_argocd() {
-  local obj kind name ns live patch scope
-  while read -r obj; do
-    kind="$(jq -r .kind <<<"$obj")" name="$(jq -r .name <<<"$obj")" ns="$(jq -r .ns <<<"$obj")"
-    scope=()
-    [[ -n "$ns" ]] && scope=(-n "$ns")
-    live="$(k "${scope[@]}" get "$kind/$name" -o json --show-managed-fields 2>/dev/null)" || continue
-    if jq -e '.metadata.annotations["argocd.argoproj.io/tracking-id"] != null' <<<"$live" >/dev/null; then
-      k "${scope[@]}" annotate "$kind/$name" argocd.argoproj.io/tracking-id- >/dev/null
-      log "removed the Argo CD tracking annotation from $kind/$name"
-    fi
-    if jq -e 'any(.metadata.managedFields[]?; .manager == "argocd-controller")' <<<"$live" >/dev/null; then
-      patch="$(jq -c '[{op: "replace", path: "/metadata/managedFields",
-        value: [.metadata.managedFields[] | select(.manager != "argocd-controller")]}]' <<<"$live")"
-      k "${scope[@]}" patch "$kind/$name" --type=json -p "$patch" >/dev/null
-      log "removed the argocd-controller field manager from $kind/$name"
-    fi
-  done < <(yq -o=json -I=0 'select(.kind != null) | {"kind": .kind, "name": .metadata.name, "ns": (.metadata.namespace // "")}' "$1")
-}
-
 # Harness components stay outside Argo CD. The harness applies them after the root bundle syncs,
 # so no Application from an older root bundle still claims their objects. The apply does not
 # prune: an object that leaves the bundle stays in the cluster. cell:verify reports a
-# NetworkPolicy that the bundle does not hold.
+# NetworkPolicy that the bundle does not hold. harness_apply stops before it takes an object that
+# another owner holds.
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  apply_bundle "${entry%%:*}"
-  release_from_argocd "$BUNDLES/${entry%%:*}/manifests.yaml"
+  harness_apply "${entry%%:*}"
 done
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   harness_rollout_wait "${entry%%:*}" "${entry#*:}"

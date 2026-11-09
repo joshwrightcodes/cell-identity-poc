@@ -441,7 +441,10 @@ It has no route to the internet.
 
 The SPIRE server in `management` makes its CA inside the cluster, with no upstream authority.
 The CA is a self-signed root of the trust domain `mgmt.poc.internal`.
-It lives 90 days, from `SPIRE_CA_TTL=2160h`, so no CA rotation falls inside a run.
+It lives 90 days, from `SPIRE_CA_TTL=2160h`.
+SPIRE prepares a new root by itself after 60 days, and signs with it after 83 days.
+`cell:verify` in `management` fails 7 days before day 60.
+Run `mgmt:rotate-ca` before then.
 The server keeps the CA key in the file `keys.json` on its data volume, the PersistentVolumeClaim `data-spire-server-0` in `spire-system`.
 The key has no encryption on the disk of the VM.
 
@@ -451,6 +454,28 @@ Each copy of the root in another cluster then stays valid, and no other cluster 
 A new data volume gives a new root, for example after `cell:down` and `cell:up` of `management`.
 Then each copy of the old root fails, so run `cell:up` again on each cluster that holds a copy.
 `pki:rotate-intermediate` does not apply to `management`.
+
+To replace the CA of `management`, run:
+
+```sh
+mise run mgmt:rotate-ca
+```
+
+Use it when someone may hold a copy of `keys.json`, or before SPIRE prepares a new root.
+The task finds each copy of the root in the other clusters.
+A copy is a ConfigMap with the key `root.crt` and the annotation `poc.internal/peer-root-sha256`.
+The task then runs these steps:
+
+1. It prepares a new X.509 authority and a new JWT authority. The bundle then holds the old and the new root.
+2. It runs `cell:up` on each cluster that holds a copy, and waits until each copy equals the bundle.
+3. It activates the new authorities. New SVIDs chain to the new root, and each copy holds it.
+4. It taints the old authorities, so the agents replace their SVIDs. After `MGMT_ROTATE_TAINT_WAIT` seconds, 120 by default, it revokes them.
+5. It runs `cell:up` on each cluster that holds a copy again, and waits until each copy holds only the new root.
+
+`MGMT_ROTATE_WAIT` bounds each wait for the copies in seconds. The default is 900.
+The old key stays in `keys.json` until SPIRE prepares a new authority in its place.
+No copy trusts its root after step 5.
+`cell:down` and `cell:up` of `management` remain the last resort, because they also delete the datastore.
 
 ## Move a live dev-cp to the scoped operator
 

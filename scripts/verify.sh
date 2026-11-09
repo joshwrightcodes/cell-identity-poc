@@ -521,6 +521,50 @@ check_no_federation() {
   jq -e '(.bundles // []) | length == 0' <<<"$out" >/dev/null || { echo "the server holds federated bundles: $(jq -c '[.bundles[].trust_domain]' <<<"$out")"; return 1; }
 }
 
+# A server with no upstream authority keeps its CA key in keys.json on its data volume, so a restart
+# keeps the root. SPIRE prepares the next CA, a new self-signed root, at notAfter minus
+# min(lifetime / 2, 30 days) (pkg/server/ca/manager/slot.go of v1.15.5). Every peer copy must hold
+# that root before SPIRE activates it, so the check fails 7 days before that time.
+check_ca_key_persists() {
+  local conf pv path node state expires lifetime threshold left
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  grep -q '^ *KeyManager "disk" {$' <<<"$conf" || { echo "the server keeps its CA key in memory, so a restart makes a new root. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  pv="$(k -n spire-system get pvc data-spire-server-0 -o jsonpath='{.spec.volumeName}')" || { echo "no PersistentVolumeClaim data-spire-server-0"; return 1; }
+  path="$(k get pv "$pv" -o json | jq -r '.spec.hostPath.path // .spec.local.path // ""')"
+  node="$CELL_NAME-control-plane"
+  [[ -n "$path" ]] && docker exec "$node" test -s "$path/keys.json" \
+    || { echo "the data volume $pv holds no keys.json at '$path' on $node"; return 1; }
+  state="$(k -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority x509 show \
+    -socketPath /run/spire/sockets/api.sock -output json)" || { echo "could not read the X.509 authorities of spire-server-0"; return 1; }
+  expires="$(jq -r '.active.expires_at // 0 | tonumber' <<<"$state")"
+  lifetime="$(seconds_of "${SPIRE_CA_TTL:-24h}")"
+  threshold=$((expires - (lifetime / 2 < 2592000 ? lifetime / 2 : 2592000)))
+  left=$(((threshold - $(date +%s)) / 86400))
+  if ((expires == 0 || left < 7)); then
+    echo "SPIRE prepares a new root in $left days, at $(jq -rn --argjson t "$threshold" '$t | todate'), and activates it later. Run: CELL=$CELL_NAME mise run mgmt:rotate-ca"
+    return 1
+  fi
+}
+
+# seconds_of <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
+seconds_of() {
+  local n="${1%[smh]}"
+  case "$1" in
+    *s) echo "$n" ;;
+    *m) echo $((n * 60)) ;;
+    *h) echo $((n * 3600)) ;;
+  esac
+}
+
+# The server ServiceAccount can review tokens and read pods and nodes. No Secret may hold a token
+# that does not expire for an account in spire-system.
+check_no_token_secrets() {
+  local out
+  out="$(k -n spire-system get secrets --field-selector type=kubernetes.io/service-account-token -o name)" \
+    || { echo "could not list the Secrets in spire-system"; return 1; }
+  [[ -z "$out" ]] || { echo "spire-system holds ServiceAccount token Secrets: ${out//$'\n'/ }. Delete them."; return 1; }
+}
+
 # A cluster with the operator but no secret store holds no store of either kind, no copy of the
 # store token, and an operator that cannot list Secrets in every namespace.
 check_no_secret_store() {
@@ -537,6 +581,9 @@ check_no_secret_store() {
   [[ -z "$out" ]] || problems+=("copies of the store token: ${out//$'\n'/ }")
   out="$(k auth can-i list secrets -A --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
   [[ "$out" == no ]] || problems+=("the operator can list Secrets in every namespace (can-i: '${out:-unknown}')")
+  # The positive control shows that the account name is right, so the "no" above is not a typo.
+  out="$(k auth can-i get secrets -n "$EXTERNAL_SECRETS_NAMESPACE" --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
+  [[ "$out" == yes ]] || problems+=("the operator cannot read Secrets in $EXTERNAL_SECRETS_NAMESPACE (can-i: '${out:-unknown}'), so the account name of the check is wrong")
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
     echo "$CELL_NAME has no secret store. Delete each object above, then run: CELL=$CELL_NAME mise run cell:up"
@@ -613,8 +660,20 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
   check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
   check "The SPIRE server of $SPIRE_TRUST_DOMAIN holds no federated bundle" check_no_federation
 fi
+if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" && -z "${SPIRE_UPSTREAM:-}" ]]; then
+  check "The SPIRE server keeps its CA key on its data volume, and the next root is more than 7 days away" check_ca_key_persists
+fi
 if [[ -n "${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
   check "The SPIRE server holds the node alias and the entry of each local workload in SPIRE_LOCAL_WORKLOADS" check_local_entries
+  check "Every pod that runs as a ServiceAccount of SPIRE_LOCAL_WORKLOADS belongs to its harness or link component" check_plane_pods
+  check "spire-system holds no ServiceAccount token Secret" check_no_token_secrets
+  # Only the local plane workloads reach the server pod, and no pod reaches the metrics port.
+  probe_targets+=("$CELL_NAME/default")
+  server_pod_ip="$(k -n spire-system get pod spire-server-0 -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+  check "A probe pod in default of $CELL_NAME cannot open TCP to the SPIRE server API on its pod address (steady state)" \
+    expect_dial_blocked "$CELL_NAME" default "${server_pod_ip:-unknown}:8081"
+  check "A probe pod in default of $CELL_NAME cannot open TCP to the SPIRE server metrics port (steady state)" \
+    expect_dial_blocked "$CELL_NAME" default "${server_pod_ip:-unknown}:9988"
 fi
 if [[ -n "${EXTERNAL_SECRETS_NAMESPACE:-}" && -z "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "$CELL_NAME has no SecretStore, no ClusterSecretStore and no store token, and the operator cannot list Secrets in every namespace" check_no_secret_store

@@ -133,27 +133,57 @@ func portForward(t *testing.T, cluster, ns, target string, port int) string {
 	return ""
 }
 
-// probeFromFreshNamespace makes namespace m3-probe-<random> with Pod Security restricted and no
-// NetworkPolicy, and dials addr:port once from a netprobe pod there. It returns nil when the dial
-// timed out, which is what a NetworkPolicy drop gives, and an error with the result otherwise. The
-// namespace goes away when the test ends.
-func probeFromFreshNamespace(t *testing.T, cluster, addr string, port int, timeout time.Duration) error {
+// freshNamespace makes namespace m3-probe-<random> with Pod Security restricted and no
+// NetworkPolicy. It goes away when the test ends.
+func freshNamespace(t *testing.T, cluster string) string {
+	t.Helper()
+	ns := "m3-probe-" + randomHex(t, 4)
+	t.Logf("made the fresh namespace %s in %s", ns, cluster)
+	createNamespace(t, cluster, ns)
+	return ns
+}
+
+// dialFrom dials addr:port once from a netprobe pod in ns, and returns the netprobe result:
+// connected, refused, timeout or error.
+func dialFrom(t *testing.T, cluster, ns, addr string, port int, timeout time.Duration) string {
 	t.Helper()
 	if net.ParseIP(addr) == nil {
-		t.Fatalf("probe address %q is not an IP address; netprobe dial takes no name", addr)
+		t.Fatalf("dial address %q is not an IP address; netprobe dial takes no name", addr)
 	}
-	ns := "m3-probe-" + randomHex(t, 4)
-	t.Logf("probing %s:%d from the fresh namespace %s in %s", addr, port, ns, cluster)
-	createNamespace(t, cluster, ns)
 	out := runPod(t, cluster, ns, []string{"dial", "--addr", net.JoinHostPort(addr, strconv.Itoa(port)), "--timeout", timeout.String()})
 	var res struct {
 		Result string `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &res); err != nil {
-		return fmt.Errorf("netprobe dial printed %q: %w", out, err)
+		t.Fatalf("netprobe dial printed %q: %v", out, err)
 	}
-	if res.Result != "timeout" {
-		return fmt.Errorf("the dial from %s/%s to %s:%d gave %q, want a timeout: %s", cluster, ns, addr, port, res.Result, out)
+	t.Logf("dial from %s/%s to %s:%d: %s", cluster, ns, addr, port, res.Result)
+	return res.Result
+}
+
+// apiServiceIP returns the ClusterIP of Service kubernetes in a cluster.
+func apiServiceIP(t *testing.T, cluster string) string {
+	t.Helper()
+	ip, err := kubectl(t, cluster, "", "-n", "default", "get", "service", "kubernetes", "-o", "jsonpath={.spec.clusterIP}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(ip)
+}
+
+// probeFromFreshNamespace makes a fresh namespace, and dials addr:port once from a netprobe pod
+// there. It returns nil when the dial timed out, which is what a NetworkPolicy drop gives, and an
+// error with the result otherwise. First, a control dial to the API service must connect from the
+// same namespace, so a timeout cannot come from broken pod networking.
+func probeFromFreshNamespace(t *testing.T, cluster, addr string, port int, timeout time.Duration) error {
+	t.Helper()
+	ns := freshNamespace(t, cluster)
+	t.Logf("probing %s:%d from %s in %s", addr, port, ns, cluster)
+	if got := dialFrom(t, cluster, ns, apiServiceIP(t, cluster), 443, timeout); got != "connected" {
+		return fmt.Errorf("the control dial from %s/%s to the API service gave %q, want connected, so a timeout would prove nothing", cluster, ns, got)
+	}
+	if got := dialFrom(t, cluster, ns, addr, port, timeout); got != "timeout" {
+		return fmt.Errorf("the dial from %s/%s to %s:%d gave %q, want a timeout", cluster, ns, addr, port, got)
 	}
 	return nil
 }

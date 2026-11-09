@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Restart the Deployments of every harness component of the cluster $CELL, and wait until each has
-# new Ready pods. Only the Deployments with the harness label of the component count, because a
-# harness component can share its namespace with Argo CD objects. A restarted celld pod gets a new
-# pod UID, so its SPIRE agent attests again.
+# Restart the Deployments and StatefulSets of every harness component of the cluster $CELL, and
+# wait until each has new Ready pods. Only the workloads with the harness label of the component
+# count, because a harness component can share its namespace with Argo CD objects. They must be
+# exactly the workloads that the bundle of the component renders. A restarted celld pod gets a
+# new pod UID, so its SPIRE agent attests again.
 # In a cluster with the spire-server component set, restart the SPIRE server pod. It keeps its
 # datastore. With an upstream authority (dev-cp), the new server signs a new CA through it. Without
 # one (management), the server loads its CA key from the data volume, so the root stays the same
@@ -49,21 +50,22 @@ fi
 
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   ns="${entry#*:}"
-  for deployment in $(harness_deployments "${entry%%:*}" "$ns"); do
-    selector="$(k -n "$ns" get "$deployment" -o json \
+  workloads="$(harness_workloads "${entry%%:*}" "$ns")" || exit 1
+  for workload in $workloads; do
+    selector="$(k -n "$ns" get "$workload" -o json \
       | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
-    [[ -n "$selector" ]] || die "$deployment in $ns has no label selector"
+    [[ -n "$selector" ]] || die "$workload in $ns has no label selector"
     old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
-    k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of $deployment in $ns"
+    k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of $workload in $ns"
     end=$((SECONDS + 300))
     until uids="$(new_ready_pods "$ns" "$selector" "$old")" && [[ -n "$uids" ]]; do
       if ((SECONDS >= end)); then
-        rollout_hint "$ns" "$deployment" >&2
-        die "$deployment in $ns has no new Ready pod after 300s"
+        rollout_hint "$ns" "$workload" >&2
+        die "$workload in $ns has no new Ready pod after 300s"
       fi
       sleep 2
     done
-    k -n "$ns" rollout status "$deployment" --timeout=300s >/dev/null || { rollout_hint "$ns" "$deployment" >&2; die "$deployment in $ns did not finish its rollout"; }
-    log "restarted $deployment in $ns"
+    k -n "$ns" rollout status "$workload" --timeout=300s >/dev/null || { rollout_hint "$ns" "$workload" >&2; die "$workload in $ns did not finish its rollout"; }
+    log "restarted $workload in $ns"
   done
 done

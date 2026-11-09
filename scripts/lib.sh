@@ -222,23 +222,146 @@ connect_store_step() {
 # Harness and link objects carry this label, with the name of their component as the value.
 HARNESS_LABEL=cell.poc.internal/harness
 
-# harness_deployments <component> <namespace> prints the Deployments of a harness component, as
-# deployment.apps/<name>. Other Deployments in the namespace belong to a bundle.
-harness_deployments() {
-  k -n "$2" get deployments -l "$HARNESS_LABEL=$1" -o name
+# harness_workloads <component> <namespace> prints the Deployments and StatefulSets of a harness
+# component, as <kind>.apps/<name>. Other workloads in the namespace belong to a bundle. The live
+# workloads with the harness label must be exactly the ones that the bundle of the component
+# renders in the namespace, so a lost label or a failed API call stops the caller. The output of
+# die ends only a command substitution, so call it as: list="$(harness_workloads c ns)" || exit 1
+harness_workloads() {
+  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" live want
+  [[ -f "$bundle" ]] || die "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"
+  live="$(k -n "$ns" get deployments,statefulsets -l "$HARNESS_LABEL=$comp" -o name)" \
+    || die "could not list the Deployments and StatefulSets of $comp in $ns"
+  live="$(sed '/^$/d' <<<"$live" | sort)"
+  want="$(NS="$ns" yq -N 'select((.kind == "Deployment" or .kind == "StatefulSet") and .metadata.namespace == strenv(NS))
+    | (.kind | downcase) + ".apps/" + .metadata.name' "$bundle" | sed '/^$/d' | sort)"
+  [[ "$live" == "$want" ]] || die "$ns holds the workloads '${live//$'\n'/ }' with the label $HARNESS_LABEL=$comp, and the bundle $comp renders '${want//$'\n'/ }'. Run: CELL=$CELL_NAME mise run cell:up"
+  printf '%s\n' "$live"
 }
 
-# harness_rollout_wait <component> <namespace> waits for the rollout of each Deployment of a
-# harness component.
+# harness_rollout_wait <component> <namespace> waits for the rollout of each Deployment and
+# StatefulSet of a harness component.
 harness_rollout_wait() {
-  local deployment
-  for deployment in $(harness_deployments "$1" "$2"); do
-    if ! k -n "$2" rollout status "$deployment" --timeout=300s >/dev/null; then
-      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $2 describe $deployment"
-      log "read the logs: mise x -- kubectl --context kind-$CELL_NAME -n $2 logs $deployment --all-containers"
-      die "$deployment in $2 did not finish its rollout in 300s"
+  local workload workloads
+  workloads="$(harness_workloads "$1" "$2")" || exit 1
+  for workload in $workloads; do
+    if ! k -n "$2" rollout status "$workload" --timeout=300s >/dev/null; then
+      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $2 describe $workload"
+      log "read the logs: mise x -- kubectl --context kind-$CELL_NAME -n $2 logs $workload --all-containers"
+      die "$workload in $2 did not finish its rollout in 300s"
     fi
   done
+}
+
+apply_bundle() {
+  local file="$BUNDLES/$1/manifests.yaml"
+  if ! k apply --server-side --force-conflicts -f "$file" >/dev/null 2>&1; then
+    # A bundle can hold a CRD and an object of that kind. The first apply fails for that object.
+    # Wait for the CRD, then apply again. The second apply shows any real error.
+    k wait --for=condition=Established crd --all --timeout=120s >/dev/null
+    k apply --server-side --force-conflicts -f "$file" >/dev/null
+  fi
+  log "applied bundle $1"
+}
+
+# release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD
+# Application managed before: the tracking annotation and the argocd-controller field manager.
+# The harness apply then owns every field. Objects without these leftovers stay unchanged.
+# harness_conflicts runs first, so a tracking annotation here names an Application that the
+# current root no longer holds.
+release_from_argocd() {
+  local obj kind name ns live patch scope
+  while read -r obj; do
+    kind="$(jq -r .kind <<<"$obj")" name="$(jq -r .name <<<"$obj")" ns="$(jq -r .ns <<<"$obj")"
+    scope=()
+    [[ -n "$ns" ]] && scope=(-n "$ns")
+    live="$(k "${scope[@]}" get "$kind/$name" -o json --show-managed-fields 2>/dev/null)" || continue
+    if jq -e '.metadata.annotations["argocd.argoproj.io/tracking-id"] != null' <<<"$live" >/dev/null; then
+      k "${scope[@]}" annotate "$kind/$name" argocd.argoproj.io/tracking-id- >/dev/null
+      log "removed the Argo CD tracking annotation from $kind/$name"
+    fi
+    if jq -e 'any(.metadata.managedFields[]?; .manager == "argocd-controller")' <<<"$live" >/dev/null; then
+      patch="$(jq -c '[{op: "replace", path: "/metadata/managedFields",
+        value: [.metadata.managedFields[] | select(.manager != "argocd-controller")]}]' <<<"$live")"
+      k "${scope[@]}" patch "$kind/$name" --type=json -p "$patch" >/dev/null
+      log "removed the argocd-controller field manager from $kind/$name"
+    fi
+  done < <(yq -o=json -I=0 'select(.kind != null) | {"kind": .kind, "name": .metadata.name, "ns": (.metadata.namespace // "")}' "$1")
+}
+
+# harness_conflicts <component> prints one line for each live object of the bundle of a harness
+# component that another owner holds: an Argo CD Application of the current root, another harness
+# or link component, or an owner reference. It prints nothing when the harness may apply the bundle.
+harness_conflicts() {
+  local comp="$1" bundle="$BUNDLES/$1/manifests.yaml" live apps
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  live="$(k get -f "$bundle" -o json --ignore-not-found)" || { echo "could not read the live objects of the bundle $comp"; return 1; }
+  apps="$(printf '%s\n' root ${COMPONENTS[@]+"${COMPONENTS[@]%%:*}"} | jq -Rn '[inputs]')"
+  jq -r --arg comp "$comp" --arg label "$HARNESS_LABEL" --argjson apps "$apps" '
+    (if .kind == "List" then .items[] else . end)
+    | ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | split(":")[0]) as $app
+    | (.metadata.labels[$label] // "") as $owner
+    | ([(.metadata.ownerReferences // [])[] | "\(.kind)/\(.name)"] | join(", ")) as $refs
+    | "\(.kind)/\(.metadata.name)\(if .metadata.namespace then " in " + .metadata.namespace else "" end)" as $o
+    | if $app != "" and ($apps | index($app)) != null then "\($o) belongs to the Argo CD Application \($app)"
+      elif $owner != "" and $owner != $comp then "\($o) carries the label \($label)=\($owner)"
+      elif $refs != "" then "\($o) has the owner \($refs)"
+      else empty end' <<<"$live"
+}
+
+# harness_apply <component> applies the bundle of a harness component. It stops before the apply
+# when another owner holds one of its objects, because a server-side apply with force would take
+# that object, and its owner would then take it back on each sync.
+harness_apply() {
+  local conflicts
+  conflicts="$(harness_conflicts "$1")" || die "$conflicts"
+  [[ -z "$conflicts" ]] || die "the harness component $1 renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the harness render or remove it from the other owner, so that one owner holds it. Then run: CELL=$CELL_NAME mise run cell:up"
+  apply_bundle "$1"
+  release_from_argocd "$BUNDLES/$1/manifests.yaml"
+}
+
+# has_component_entry <component> <namespace> succeeds when the cluster has that harness or link
+# component in that namespace.
+has_component_entry() {
+  local entry
+  for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+    [[ "$entry" == "$1:$2" ]] && return 0
+  done
+  return 1
+}
+
+# check_plane_pods checks each pod that runs as a ServiceAccount of SPIRE_LOCAL_WORKLOADS. k8s_psat
+# gives such a pod the plane SVID, and a pod label is not an identity. So the pod must carry the
+# harness label of a harness or link component in its namespace, and its controller (through its
+# ReplicaSet) must be a Deployment or StatefulSet that the bundle of that component renders there.
+check_plane_pods() {
+  local w sub ns sa pods sets pod comp kind name problems=()
+  for w in ${SPIRE_LOCAL_WORKLOADS:-}; do
+    sub="${w#*=}" ns="${sub%%/*}" sa="${sub#*/}"
+    pods="$(k -n "$ns" get pods -o json 2>/dev/null)" || pods='{"items":[]}'
+    sets="$(k -n "$ns" get replicasets -o json 2>/dev/null)" || sets='{"items":[]}'
+    while IFS='|' read -r pod comp kind name; do
+      [[ -n "$pod" ]] || continue
+      if [[ -z "$comp" ]] || ! has_component_entry "$comp" "$ns"; then
+        problems+=("pod $ns/$pod runs as $sa, and carries no $HARNESS_LABEL of a harness or link component in $ns (label '${comp}')")
+      elif [[ "$kind" != Deployment && "$kind" != StatefulSet ]] \
+        || ! KIND="$kind" NAME="$name" NS="$ns" yq -e 'select(.kind == strenv(KIND) and .metadata.name == strenv(NAME) and .metadata.namespace == strenv(NS))' \
+          "$BUNDLES/$comp/manifests.yaml" >/dev/null 2>&1; then
+        problems+=("pod $ns/$pod runs as $sa, and its controller '${kind}/${name}' is no workload of the bundle $comp in $ns")
+      fi
+    done < <(jq -r --arg sa "$sa" --arg label "$HARNESS_LABEL" --argjson sets "$sets" '
+      ($sets.items | map({key: .metadata.name,
+        value: ([(.metadata.ownerReferences // [])[] | select(.controller == true)][0] // {kind: "", name: ""})}) | from_entries) as $owners
+      | .items[] | select(.spec.serviceAccountName == $sa)
+      | ([(.metadata.ownerReferences // [])[] | select(.controller == true)][0] // {kind: "", name: ""}) as $o
+      | (if $o.kind == "ReplicaSet" then ($owners[$o.name] // {kind: "", name: ""}) else $o end) as $w
+      | [.metadata.name, (.metadata.labels[$label] // ""), $w.kind, $w.name] | join("|")' <<<"$pods")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Delete each pod above and the workload that made it. Only the harness may run a plane ServiceAccount."
+    return 1
+  fi
 }
 
 # check_harness_objects <component> <namespace> compares the namespace with the bundle of a harness
