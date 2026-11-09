@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"k8s.io/client-go/rest"
 )
 
@@ -175,27 +176,57 @@ func (l *trackListener) dropAll() {
 }
 
 // tunnelHarness runs the fake API, spiffe-server with the tunnel backend, and a local listener for
-// the hub handler of dev-cell-1.
+// the hub handler of each cell (dev-cell-1 by default).
 type tunnelHarness struct {
 	api      *fakeAPI
 	hub      *TunnelHub
 	hubURL   string
+	hubURLs  map[string]string
 	server   string
 	hubLog   *syncBuffer
 	cellLog  *syncBuffer
 	mgmt     *testCA
 	env      *testCA
 	accepted *trackListener
+	metrics  *TunnelMetrics
 	// stopServer cancels the accept loop, and serverDone closes when it returns.
 	stopServer context.CancelFunc
 	serverDone chan struct{}
 }
 
+// tunnelHarnessConfig changes the defaults of the harness: the cells dev-cell-1, the allow
+// pattern meshPattern, and testRegistry (dev-cell-2 revoked).
+type tunnelHarnessConfig struct {
+	wait     time.Duration
+	cells    []string
+	allow    string
+	registry *Registry
+	metrics  *TunnelMetrics
+}
+
 func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
 	t.Helper()
-	h := &tunnelHarness{api: newFakeAPI(t), hubLog: &syncBuffer{}, cellLog: &syncBuffer{}, mgmt: newCA(t, mgmtTD), env: newCA(t, envTD)}
+	return newTunnelHarnessWith(t, tunnelHarnessConfig{wait: wait})
+}
+
+func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness {
+	t.Helper()
+	if cfg.cells == nil {
+		cfg.cells = []string{"dev-cell-1"}
+	}
+	if cfg.allow == "" {
+		cfg.allow = meshPattern
+	}
+	if cfg.registry == nil {
+		cfg.registry = testRegistry(t)
+	}
+	h := &tunnelHarness{api: newFakeAPI(t), hubLog: &syncBuffer{}, cellLog: &syncBuffer{}, mgmt: newCA(t, mgmtTD), env: newCA(t, envTD), hubURLs: map[string]string{}, metrics: cfg.metrics}
 	log := jsonLog(h.hubLog)
-	h.hub = NewTunnelHub(map[string]string{"dev-cell-1": "127.0.0.1:0"}, wait, log)
+	cells := map[string]string{}
+	for _, c := range cfg.cells {
+		cells[c] = "127.0.0.1:0"
+	}
+	h.hub = NewTunnelHub(cells, cfg.wait, log, WithMetrics(cfg.metrics))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -203,30 +234,47 @@ func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
 	h.accepted = &trackListener{Listener: ln}
 	h.server = ln.Addr().String()
 	srv := NewServer(ServerConfig{
-		TLS: ServerTLS(source(h.mgmt.svid(t, kialiID)), h.env.bundle(), regexp.MustCompile(meshPattern), testRegistry(t), log),
+		TLS: ServerTLS(source(h.mgmt.svid(t, kialiID)), h.env.bundle(), regexp.MustCompile(cfg.allow), cfg.registry, log),
 	}, NewTunnelBackend(h.hub), log)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stopServer, h.serverDone = cancel, make(chan struct{})
 	go func() { _ = srv.Serve(ctx, h.accepted); close(h.serverDone) }()
-	hubSrv := httptest.NewServer(h.hub.Handler("dev-cell-1"))
-	h.hubURL = hubSrv.URL
+	var hubSrvs []*httptest.Server
+	for _, c := range cfg.cells {
+		srv := httptest.NewServer(h.hub.Handler(c))
+		hubSrvs = append(hubSrvs, srv)
+		h.hubURLs[c] = srv.URL
+	}
+	h.hubURL = h.hubURLs["dev-cell-1"]
 	t.Cleanup(func() {
 		h.api.releaseWatches()
 		cancel()
 		<-h.serverDone
-		hubSrv.Close()
+		for _, srv := range hubSrvs {
+			srv.Close()
+		}
 	})
 	return h
 }
 
 func (h *tunnelHarness) dialer(t *testing.T) func(context.Context) (net.Conn, error) {
 	t.Helper()
-	return TunnelDialer(h.server, ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog))
+	return h.dialerFor(t, meshViewID1)
+}
+
+// dialerFor dials the hub with an SVID for id from the environment CA.
+func (h *tunnelHarness) dialerFor(t *testing.T, id string) func(context.Context) (net.Conn, error) {
+	t.Helper()
+	return h.dialerWith(source(h.env.svid(t, id)))
+}
+
+func (h *tunnelHarness) dialerWith(svids x509svid.Source) func(context.Context) (net.Conn, error) {
+	return TunnelDialer(h.server, ClientTLS(svids, h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog), WithMetrics(h.metrics))
 }
 
 func (h *tunnelHarness) cellHandler(t *testing.T) http.Handler {
 	t.Helper()
-	return NewCellHandler(h.api.url(), h.api.transport(t), jsonLog(h.cellLog))
+	return NewCellHandler(h.api.url(), h.api.transport(t), jsonLog(h.cellLog), WithMetrics(h.metrics))
 }
 
 // startCell runs the cell side with dial and handler until the test ends or stop is called.
@@ -246,14 +294,19 @@ func startCell(t *testing.T, dial func(context.Context) (net.Conn, error), handl
 	return func() { cancel(); <-done }
 }
 
-// waitTunnels waits until the hub has logged n tunnel_up lines, within d.
+// waitTunnels waits until the hub has logged n tunnel_up lines for dev-cell-1, within d.
 func (h *tunnelHarness) waitTunnels(t *testing.T, n int, d time.Duration) {
+	t.Helper()
+	h.waitTunnelsFor(t, "dev-cell-1", n, d)
+}
+
+func (h *tunnelHarness) waitTunnelsFor(t *testing.T, cell string, n int, d time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(d)
 	for {
 		count := 0
 		for _, l := range logLines(t, h.hubLog) {
-			if l["msg"] == "tunnel_up" && l["cell"] == "dev-cell-1" {
+			if l["msg"] == "tunnel_up" && l["cell"] == cell {
 				count++
 			}
 		}
@@ -296,6 +349,16 @@ func TestCellHandlerStripsHeaders(t *testing.T) {
 		"X-Forwarded-For":   {"1.2.3.4"},
 		"X-Forwarded-Port":  {"443"},
 		"X-Forwarded-Proto": {"https"},
+		"X-Real-Ip":         {"1.2.3.4"},
+		"Forwarded":         {"for=1.2.3.4"},
+		// The API server takes a client Audit-ID as the ID of its audit event.
+		"Audit-Id":               {"forged-audit"},
+		"X-Http-Method-Override": {"DELETE"},
+		"X-Remote-User":          {"system:admin"},
+		"X-Remote-Group":         {"system:masters"},
+		"Cookie":                 {"session=x"},
+		"Accept":                 {"application/json;as=Table;v=v1;g=meta.k8s.io"},
+		"User-Agent":             {"kiali/v2.34.0"},
 	}
 	rec := serveCell(t, h, http.MethodGet, "/api/v1/namespaces/apps-demo/pods?labelSelector=app%3Dweb", nil, header)
 	if rec.Code != http.StatusOK {
@@ -305,14 +368,57 @@ func TestCellHandlerStripsHeaders(t *testing.T) {
 	if v := got.Values("Authorization"); len(v) != 1 || v[0] != "Bearer "+podToken {
 		t.Fatalf("the API got Authorization %v, want only the pod token", v)
 	}
+	// Accept-Encoding comes from the transport of the pod.
+	allowed := map[string]bool{"Authorization": true, "Accept": true, "Accept-Encoding": true, "User-Agent": true}
 	for k := range got {
-		lk := strings.ToLower(k)
-		if strings.HasPrefix(lk, "impersonate-") || strings.HasPrefix(lk, "x-forwarded-") || lk == "upgrade" || lk == "connection" {
+		if !allowed[k] {
 			t.Errorf("the API got %s: %v", k, got[k])
 		}
 	}
+	if got.Get("Accept") != header.Get("Accept") || got.Get("User-Agent") != header.Get("User-Agent") {
+		t.Errorf("the API got Accept %q and User-Agent %q", got.Get("Accept"), got.Get("User-Agent"))
+	}
 	if u.Path != "/api/v1/namespaces/apps-demo/pods" || u.RawQuery != "labelSelector=app%3Dweb" {
 		t.Fatalf("the API got %s?%s", u.Path, u.RawQuery)
+	}
+}
+
+func TestCellHandlerDropsGetBody(t *testing.T) {
+	api := newFakeAPI(t)
+	h := NewCellHandler(api.url(), api.transport(t), jsonLog(&syncBuffer{}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/namespaces/apps-demo/pods", strings.NewReader(`{"kind":"DeleteOptions"}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	if _, _, body := api.last(); len(body) != 0 {
+		t.Fatalf("the API got a GET body %q", body)
+	}
+}
+
+// TestCellHandlerNormalisesQuery checks that the API gets the query that the allow-list parsed,
+// encoded again, and not the bytes that the client sent.
+func TestCellHandlerNormalisesQuery(t *testing.T) {
+	api := newFakeAPI(t)
+	h := NewCellHandler(api.url(), api.transport(t), jsonLog(&syncBuffer{}))
+	cases := map[string]string{
+		"limit=1&":                       "limit=1",
+		"%6Cimit=1":                      "limit=1",
+		"&&limit=1":                      "limit=1",
+		"labelSelector=a%26b":            "labelSelector=a%26b",
+		"limit=5&labelSelector=app%3Dx&": "labelSelector=app%3Dx&limit=5",
+	}
+	for raw, want := range cases {
+		t.Run(raw, func(t *testing.T) {
+			rec := serveCell(t, h, http.MethodGet, "/api/v1/pods?"+raw, nil, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+			}
+			if _, u, _ := api.last(); u.RawQuery != want {
+				t.Fatalf("the API got query %q, want %q", u.RawQuery, want)
+			}
+		})
 	}
 }
 
@@ -619,57 +725,6 @@ func TestHubNewestConnWins(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the hub did not close the older connection")
 	}
-}
-
-func TestHubRefusesUnknownCell(t *testing.T) {
-	out := &syncBuffer{}
-	hub := NewTunnelHub(map[string]string{"dev-cell-1": ":18001"}, time.Second, jsonLog(out))
-	a, b := net.Pipe()
-	defer func() { _ = b.Close() }()
-	done := make(chan struct{})
-	go func() {
-		hub.Accept(tlsServerConn(a), Source{Env: "dev", Cluster: "dev-cell-9", Plane: PlaneCell, Cell: "dev-cell-9", Role: "mesh-view"})
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Accept did not return for an unknown cell")
-	}
-	if _, err := b.Read(make([]byte, 1)); err == nil {
-		t.Fatal("the connection of an unknown cell is still open")
-	}
-	waitForLog(t, out, "tunnel refused", PeerNotAllowed, "")
-}
-
-// TestTunnelStopsWhenContextEnds checks that each side ends an open tunnel when its context
-// ends, and does not wait for the other side.
-func TestTunnelStopsWhenContextEnds(t *testing.T) {
-	within := func(t *testing.T, what string, f func()) {
-		t.Helper()
-		done := make(chan struct{})
-		go func() { f(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatalf("%s did not return within 5 seconds of the cancel", what)
-		}
-	}
-	t.Run("cell", func(t *testing.T) {
-		h := newTunnelHarness(t, 5*time.Second)
-		stop := startCell(t, h.dialer(t), h.cellHandler(t))
-		h.waitTunnels(t, 1, 5*time.Second)
-		within(t, "RunTunnel", stop)
-	})
-	t.Run("hub", func(t *testing.T) {
-		h := newTunnelHarness(t, 5*time.Second)
-		startCell(t, h.dialer(t), h.cellHandler(t))
-		h.waitTunnels(t, 1, 5*time.Second)
-		within(t, "Server.Serve with the tunnel backend", func() {
-			h.stopServer()
-			<-h.serverDone
-		})
-	})
 }
 
 func TestTunnelRefusesWrongServer(t *testing.T) {

@@ -233,7 +233,6 @@ type serverConfig struct {
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
 	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
-	tunnel   *tunnelConfig
 }
 
 func parseServer(args []string) (serverConfig, error) {
@@ -246,9 +245,7 @@ func parseServer(args []string) (serverConfig, error) {
 	backend := fs.String("backend", "", "backend for each connection: grpc-header, otlp or tunnel")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
 	header := fs.String("identity-header", "x-cell-agent", "header that carries <env>-<cell> to the upstream")
-	tunnelCells := map[string]string{}
-	fs.Func("tunnel-cell", "<cell>=<listen addr> of a tunnel listener; repeat for each cell", tunnelCellFlag(tunnelCells))
-	tunnelWait := fs.Duration("tunnel-wait", 10*time.Second, "how long a tunnel request waits for the tunnel of its cell")
+	tunnelBackend := registerTunnelFlags(fs)
 	if err := parseFlags(fs, args); err != nil {
 		return serverConfig{}, err
 	}
@@ -273,11 +270,9 @@ func parseServer(args []string) (serverConfig, error) {
 	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg}
 	switch *backend {
 	case "tunnel":
-		tc, err := newTunnelConfig(tunnelCells, *tunnelWait)
-		if err != nil {
+		if cfg.backend, err = tunnelBackend(*listen); err != nil {
 			return serverConfig{}, err
 		}
-		cfg.tunnel = tc
 	case "grpc-header":
 		if err := required(map[string]string{"upstream": *upstream, "identity-header": *header}); err != nil {
 			return serverConfig{}, err
@@ -339,13 +334,6 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		st := cfg.registry.Stats()
 		tel.Log.Info("registry loaded", "content_sha256", cfg.registry.ContentSHA256(),
 			"records", st.Records, "revoked", st.Revoked, "signers", st.Signers)
-		if cfg.tunnel != nil {
-			ln, err := net.Listen("tcp", cfg.listen)
-			if err != nil {
-				return err
-			}
-			return serveTunnelHub(ctx, ln, cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, cfg.registry, tel.Log), cfg.tunnel, tel.Log)
-		}
 		backend, err := cfg.backend(tel)
 		if err != nil {
 			return err
@@ -363,7 +351,7 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 			return err
 		}
 		tlsCfg := cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, cfg.registry, tel.Log)
-		return cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, backend, tel.Log).Serve(ctx, ln)
+		return serveBackend(ctx, cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, backend, tel.Log), ln, backend)
 	})
 }
 

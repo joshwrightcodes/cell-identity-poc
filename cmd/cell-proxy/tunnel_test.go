@@ -79,15 +79,16 @@ func TestTunnelBackendFlags(t *testing.T) {
 	envCA := newCA(t, "dev.env.poc.internal")
 	args := tunnelServerArgs(t, envCA)
 	cases := map[string][]string{
-		"no --tunnel-cell":         without(args, "--tunnel-cell"),
-		"no address":               with(args, "--tunnel-cell", "dev-cell-1"),
-		"no cell name":             with(args, "--tunnel-cell", "=127.0.0.1:18001"),
-		"cell name not a label":    with(args, "--tunnel-cell", "Dev_Cell=127.0.0.1:18001"),
-		"address with no port":     with(args, "--tunnel-cell", "dev-cell-1=127.0.0.1"),
-		"same cell twice":          append(slicesClone(args), "--tunnel-cell", "dev-cell-1=127.0.0.1:18002"),
-		"same address twice":       append(with(args, "--tunnel-cell", "dev-cell-1=127.0.0.1:18001"), "--tunnel-cell", "dev-cell-2=127.0.0.1:18001"),
-		"negative --tunnel-wait":   with(args, "--tunnel-wait", "-1s"),
-		"unparsable --tunnel-wait": with(args, "--tunnel-wait", "soon"),
+		"no --tunnel-cell":             without(args, "--tunnel-cell"),
+		"no address":                   with(args, "--tunnel-cell", "dev-cell-1"),
+		"no cell name":                 with(args, "--tunnel-cell", "=127.0.0.1:18001"),
+		"cell name not a label":        with(args, "--tunnel-cell", "Dev_Cell=127.0.0.1:18001"),
+		"address with no port":         with(args, "--tunnel-cell", "dev-cell-1=127.0.0.1"),
+		"same cell twice":              append(slicesClone(args), "--tunnel-cell", "dev-cell-1=127.0.0.1:18002"),
+		"same address twice":           append(with(args, "--tunnel-cell", "dev-cell-1=127.0.0.1:18001"), "--tunnel-cell", "dev-cell-2=127.0.0.1:18001"),
+		"negative --tunnel-wait":       with(args, "--tunnel-wait", "-1s"),
+		"unparsable --tunnel-wait":     with(args, "--tunnel-wait", "soon"),
+		"cell on the --listen address": with(with(args, "--listen", "127.0.0.1:18001"), "--tunnel-cell", "dev-cell-1=127.0.0.1:18001"),
 	}
 	for name, a := range cases {
 		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
@@ -103,7 +104,7 @@ func TestTunnelBackendServesHubListener(t *testing.T) {
 	serveWorkloadAPI(t, mgmt, "spiffe://mgmt.poc.internal/kiali")
 	out := &syncBuffer{}
 	stop := runUntilCanceled(t, tunnelServerArgs(t, envCA), out)
-	line := waitLine(t, out, "tunnel listening")
+	line := waitLine(t, out, "tunnel_listening")
 	if line["cell"] != "dev-cell-1" {
 		t.Fatalf("tunnel listening line %v", line)
 	}
@@ -137,6 +138,9 @@ func TestTunnelModeFlags(t *testing.T) {
 		"no --peer-bundle":              without(args, "--peer-bundle"),
 		"no --peer-trust-domain":        without(args, "--peer-trust-domain"),
 		"--expect-id in another domain": with(args, "--expect-id", "spiffe://dev.env.poc.internal/kiali"),
+		"--upstream not host:port":      with(args, "--upstream", "https://10.0.0.1:30445"),
+		"--upstream with no port":       with(args, "--upstream", "10.0.0.1"),
+		"argument that is not a flag":   append(slicesClone(args), "extra"),
 	}
 	for name, a := range cases {
 		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
@@ -173,6 +177,7 @@ func TestPromqlProxyFlags(t *testing.T) {
 		"upstream not a URL":  with(args, "--upstream", "127.0.0.1:9090"),
 		"upstream with query": with(args, "--upstream", "http://127.0.0.1:9090?x=1"),
 		"upstream ftp":        with(args, "--upstream", "ftp://127.0.0.1:9090"),
+		"argument not a flag": append(slicesClone(args), "extra"),
 	}
 	for name, a := range cases {
 		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })

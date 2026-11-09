@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,11 +31,24 @@ const (
 
 var cellLabel = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,57}[a-z0-9])?$`)
 
-// tunnelConfig is the tunnel backend of spiffe-server: the listen address of each cell, and the
-// wait of a request for its tunnel.
-type tunnelConfig struct {
-	cells map[string]string
-	wait  time.Duration
+// registerTunnelFlags adds --tunnel-cell and --tunnel-wait to fs. The returned function checks
+// them against --listen and gives the backend factory of --backend tunnel.
+func registerTunnelFlags(fs *flag.FlagSet) func(listen string) (func(*telemetry.T) (cellproxy.Backend, error), error) {
+	cells := map[string]string{}
+	fs.Func("tunnel-cell", "<cell>=<listen addr> of a tunnel listener; repeat for each cell", tunnelCellFlag(cells))
+	wait := fs.Duration("tunnel-wait", 10*time.Second, "how long a tunnel request waits for the tunnel of its cell")
+	return func(listen string) (func(*telemetry.T) (cellproxy.Backend, error), error) {
+		if err := checkTunnelCells(cells, *wait, listen); err != nil {
+			return nil, err
+		}
+		return func(tel *telemetry.T) (cellproxy.Backend, error) {
+			m, err := cellproxy.NewTunnelMetrics(tel.Meter)
+			if err != nil {
+				return nil, fmt.Errorf("tunnel metrics: %w", err)
+			}
+			return cellproxy.NewTunnelBackend(cellproxy.NewTunnelHub(cells, *wait, tel.Log, cellproxy.WithMetrics(m))), nil
+		}, nil
+	}
 }
 
 // tunnelCellFlag parses one --tunnel-cell <cell>=<listen addr> into cells.
@@ -56,41 +69,44 @@ func tunnelCellFlag(cells map[string]string) func(string) error {
 	}
 }
 
-func newTunnelConfig(cells map[string]string, wait time.Duration) (*tunnelConfig, error) {
+func checkTunnelCells(cells map[string]string, wait time.Duration, listen string) error {
 	if len(cells) == 0 {
-		return nil, errors.New("--tunnel-cell required for --backend tunnel")
+		return errors.New("--tunnel-cell required for --backend tunnel")
 	}
 	if wait <= 0 {
-		return nil, fmt.Errorf("--tunnel-wait %s must be positive", wait)
+		return fmt.Errorf("--tunnel-wait %s must be positive", wait)
 	}
-	seen := map[string]string{}
+	seen := map[string]string{listen: "--listen"}
 	for cell, addr := range cells {
 		if _, port, _ := net.SplitHostPort(addr); port == "0" {
 			continue
 		}
 		if other, dup := seen[addr]; dup {
-			return nil, fmt.Errorf("cells %s and %s share the listen address %s", other, cell, addr)
+			return fmt.Errorf("%s and cell %s share the listen address %s", other, cell, addr)
 		}
-		seen[addr] = cell
+		seen[addr] = "cell " + cell
 	}
-	return &tunnelConfig{cells: cells, wait: wait}, nil
+	return nil
 }
 
-// serveTunnelHub runs the accept loop with the tunnel backend and the local listener of each
-// cell, until ctx ends or one of them fails.
-func serveTunnelHub(ctx context.Context, ln net.Listener, tlsCfg *tls.Config, cfg *tunnelConfig, log *slog.Logger) error {
-	hub := cellproxy.NewTunnelHub(cfg.cells, cfg.wait, log)
+// serveBackend runs srv on ln. A backend with listeners of its own (Run) runs them too, and the
+// first of the two to fail stops the other.
+func serveBackend(ctx context.Context, srv *cellproxy.Server, ln net.Listener, b cellproxy.Backend) error {
+	r, ok := b.(interface{ Run(context.Context) error })
+	if !ok {
+		return srv.Serve(ctx, ln)
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	hubErr := make(chan error, 1)
+	runErr := make(chan error, 1)
 	go func() {
-		hubErr <- hub.Serve(ctx)
+		runErr <- r.Run(ctx)
 		cancel()
 	}()
-	err := cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, cellproxy.NewTunnelBackend(hub), log).Serve(ctx, ln)
+	err := srv.Serve(ctx, ln)
 	cancel()
-	if herr := <-hubErr; err == nil {
-		err = herr
+	if rerr := <-runErr; err == nil {
+		err = rerr
 	}
 	return err
 }
@@ -107,11 +123,14 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the tunnel hub")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the management plane trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the management plane")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return tunnelModeConfig{}, err
 	}
 	if err := required(map[string]string{"upstream": *upstream, "expect-id": *expect, "peer-bundle": *bundle, "peer-trust-domain": *td}); err != nil {
 		return tunnelModeConfig{}, err
+	}
+	if host, port, err := net.SplitHostPort(*upstream); err != nil || host == "" || port == "" {
+		return tunnelModeConfig{}, fmt.Errorf("--upstream %q is not host:port", *upstream)
 	}
 	peer, trustDomain, err := loadPeer(*bundle, *td)
 	if err != nil {
@@ -145,9 +164,13 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 		if err != nil {
 			return fmt.Errorf("kubernetes host: %w", err)
 		}
-		tel.Log.Info("tunnel starting", "upstream", cfg.upstream, "expect_id", cfg.expect.String(), "api", api.Host)
-		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log)
-		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log))
+		m, err := cellproxy.NewTunnelMetrics(tel.Meter)
+		if err != nil {
+			return fmt.Errorf("tunnel metrics: %w", err)
+		}
+		tel.Log.Info("tunnel_starting", "upstream", cfg.upstream, "expect_id", cfg.expect.String(), "api", api.Host)
+		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m))
+		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)))
 	})
 }
 
@@ -155,7 +178,7 @@ func parsePromProxy(args []string) (string, *url.URL, error) {
 	fs := newFlags("promql-proxy")
 	listen := fs.String("listen", "", "address to listen on")
 	upstream := fs.String("upstream", "", "Prometheus base URL, for example http://lgtm:9090")
-	if err := fs.Parse(args); err != nil {
+	if err := parseFlags(fs, args); err != nil {
 		return "", nil, err
 	}
 	if err := required(map[string]string{"listen": *listen, "upstream": *upstream}); err != nil {

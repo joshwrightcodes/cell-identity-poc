@@ -17,10 +17,15 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/net/http2"
 )
+
+// MeshViewRole is the only role that may hold the tunnel of a cell.
+const MeshViewRole = "mesh-view"
 
 const (
 	tunnelMinBackoff  = time.Second
@@ -31,6 +36,21 @@ const (
 	maxReviewBody     = 64 << 10
 	readHeaderTimeout = 10 * time.Second
 )
+
+// forwardHeaders are the only request headers that cross the tunnel and reach the Kubernetes
+// API. The transport of the pod adds Authorization with the pod token.
+var forwardHeaders = []string{"Accept", "Accept-Encoding", "Content-Type", "User-Agent"}
+
+// allowedHeaders returns a new header with only the forwardHeaders of in.
+func allowedHeaders(in http.Header) http.Header {
+	out := http.Header{}
+	for _, k := range forwardHeaders {
+		if v := in.Values(k); len(v) > 0 {
+			out[k] = slices.Clone(v)
+		}
+	}
+	return out
+}
 
 // tunnelClock lets a test run the redial loop on a fake clock.
 type tunnelClock struct {
@@ -95,13 +115,26 @@ func serveTunnel(ctx context.Context, srv *http2.Server, conn net.Conn, h http.H
 }
 
 // TunnelDialer returns the dial function of RunTunnel: TCP to addr, then a TLS handshake with
-// cfg, which comes from ClientTLS. A refused server gives a *PeerError.
-func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger) func(context.Context) (net.Conn, error) {
+// cfg, which comes from ClientTLS. A refused server gives a *PeerError. In TLS 1.3 the hub checks
+// the client certificate after the client finishes its handshake, so the cell logs
+// tunnel_connected only when the first HTTP/2 bytes of the hub arrive. A hub that ends the
+// connection before that is logged as tunnel_refused with reason peer_not_allowed.
+func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...TunnelOption) func(context.Context) (net.Conn, error) {
+	m := applyOptions(opts).metrics
+	up := &atomic.Bool{}
+	series := attribute.NewSet(attribute.String("side", sideCell), attribute.String("upstream", addr))
+	if err := m.observeUp(func() map[attribute.Set]bool { return map[attribute.Set]bool{series: up.Load()} }); err != nil {
+		log.Warn("tunnel metric not registered", "error", err.Error())
+	}
+	result := func(ctx context.Context, r string) {
+		m.connect(ctx, attribute.String("side", sideCell), attribute.String("result", r))
+	}
 	return func(ctx context.Context) (net.Conn, error) {
 		d := net.Dialer{Timeout: dialTimeout, KeepAliveConfig: net.KeepAliveConfig{Enable: true, Idle: keepAlivePeriod, Interval: keepAlivePeriod}}
 		raw, err := d.DialContext(ctx, "tcp", addr)
 		if err != nil {
-			log.Warn("tunnel dial failed", "reason", string(UpstreamUnavailable), "upstream", addr, "error", err.Error())
+			result(ctx, dialFailed)
+			log.Warn("tunnel_dial_failed", "reason", string(UpstreamUnavailable), "upstream", addr, "error", err.Error())
 			return nil, err
 		}
 		conn := tls.Client(raw, cfg)
@@ -112,50 +145,112 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger) func(context.C
 			_ = conn.Close()
 			var pe *PeerError
 			if errors.As(err, &pe) {
+				result(ctx, dialServerRefused)
 				log.Warn("peer refused", "reason", string(pe.Reason), "spiffe_id", pe.ID, "error", pe.Err.Error())
 			} else {
-				log.Warn("handshake failed", "upstream", addr, "error", err.Error())
+				result(ctx, dialFailed)
+				log.Warn("tunnel_dial_failed", "reason", string(UpstreamUnavailable), "upstream", addr, "error", err.Error())
 			}
 			return nil, err
 		}
-		log.Info("tunnel connected", "upstream", addr)
-		return &loggedConn{Conn: conn, log: log, start: time.Now()}, nil
+		return &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result}, nil
 	}
 }
 
-// loggedConn logs the end of a tunnel once.
-type loggedConn struct {
+// cellConn is the cell end of one tunnel. It logs the acceptance or the refusal by the hub, and
+// the end of the tunnel with who closed it.
+type cellConn struct {
 	net.Conn
-	log   *slog.Logger
-	start time.Time
-	once  sync.Once
+	log      *slog.Logger
+	upstream string
+	up       *atomic.Bool
+	result   func(context.Context, string)
+
+	mu         sync.Mutex
+	acceptedAt time.Time
+	closing    bool
+	peerErr    error
+	once       sync.Once
 }
 
-func (c *loggedConn) Close() error {
-	c.once.Do(func() { c.log.Info("tunnel closed", "lived_seconds", int(time.Since(c.start).Seconds())) })
+func (c *cellConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n > 0 && c.acceptedAt.IsZero() {
+		c.acceptedAt = time.Now()
+		c.up.Store(true)
+		c.result(context.Background(), dialConnected)
+		c.log.Info("tunnel_connected", "upstream", c.upstream)
+	}
+	if err != nil && !c.closing && c.peerErr == nil {
+		c.peerErr = err
+		if c.acceptedAt.IsZero() {
+			c.result(context.Background(), dialRefusedByHub)
+			c.log.Warn("tunnel_refused", "reason", string(PeerNotAllowed), "upstream", c.upstream, "error", refusalDetail(err))
+		}
+	}
+	return n, err
+}
+
+// refusalDetail says why the hub ended a tunnel before HTTP/2 started.
+func refusalDetail(err error) string {
+	if errors.Is(err, io.EOF) {
+		return "the hub closed the tunnel before HTTP/2 started: it refused this source"
+	}
+	return err.Error()
+}
+
+func (c *cellConn) Close() error {
+	c.mu.Lock()
+	c.closing = true
+	acceptedAt, peerErr := c.acceptedAt, c.peerErr
+	c.mu.Unlock()
+	c.once.Do(func() {
+		if acceptedAt.IsZero() {
+			return
+		}
+		c.up.Store(false)
+		lived := time.Since(acceptedAt)
+		closedBy, level, attrs := "cell", slog.LevelInfo, []any{}
+		if peerErr != nil {
+			closedBy = "hub"
+			attrs = append(attrs, "error", peerErr.Error())
+			if lived < tunnelStableAfter {
+				level = slog.LevelWarn
+			}
+		}
+		attrs = append(attrs, "upstream", c.upstream, "lived_seconds", int(lived.Seconds()), "closed_by", closedBy)
+		c.log.Log(context.Background(), level, "tunnel_closed", attrs...)
+	})
 	return c.Conn.Close()
 }
 
 type cellHandler struct {
-	api   *url.URL
-	proxy *httputil.ReverseProxy
-	log   *slog.Logger
+	api     *url.URL
+	proxy   *httputil.ReverseProxy
+	log     *slog.Logger
+	metrics *TunnelMetrics
 }
 
 // NewCellHandler serves the requests that arrive through the tunnel. It passes a request to the
 // Kubernetes API at api only when the path is canonical and Allowed admits it. The upstream URL
-// holds the checked path and the allowed query keys only. The handler deletes Authorization,
-// Impersonate-*, Upgrade, Connection and the forwarding headers, so rt sets the token of the pod.
-// A refusal is HTTP 403 with {"error":"denied","request_id":"<id>"}, and a log line with reason
-// request_not_allowed.
-func NewCellHandler(api *url.URL, rt http.RoundTripper, log *slog.Logger) http.Handler {
-	h := &cellHandler{api: api, log: log}
+// holds the checked path and the allowed query keys only, encoded again. The request carries only
+// the headers in forwardHeaders, so rt sets the token of the pod, and no client header reaches
+// the API. A refusal is HTTP 403 with {"error":"denied","request_id":"<id>"}, and a log line with
+// reason request_not_allowed.
+func NewCellHandler(api *url.URL, rt http.RoundTripper, log *slog.Logger, opts ...TunnelOption) http.Handler {
+	h := &cellHandler{api: api, log: log, metrics: applyOptions(opts).metrics}
 	h.proxy = &httputil.ReverseProxy{
 		Rewrite:       h.rewrite,
 		Transport:     rt,
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			upstreamFailed(w, r, log, err)
+			if r.Context().Err() == nil {
+				h.refuse(w, r, UpstreamUnavailable, err.Error())
+				return
+			}
+			log.Info("request canceled", "method", r.Method, "path", r.URL.Path)
 		},
 		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 	}
@@ -164,18 +259,23 @@ func NewCellHandler(api *url.URL, rt http.RoundTripper, log *slog.Logger) http.H
 
 func (h *cellHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !Allowed(r.Method, r.URL) {
-		refuse(w, r, h.log, RequestNotAllowed, "not an allowed Kubernetes read")
+		h.refuse(w, r, RequestNotAllowed, "not an allowed Kubernetes read")
 		return
 	}
 	if r.Method == http.MethodPost {
 		if err := bufferBody(w, r, maxReviewBody); err != nil {
-			refuse(w, r, h.log, RequestNotAllowed, err.Error())
+			h.refuse(w, r, RequestNotAllowed, err.Error())
 			return
 		}
 	} else {
 		dropBody(r)
 	}
 	h.proxy.ServeHTTP(w, r)
+}
+
+func (h *cellHandler) refuse(w http.ResponseWriter, r *http.Request, reason Reason, detail string) {
+	h.metrics.refusedRequest(r.Context(), attribute.String("side", sideCell), attribute.String("reason", string(reason)))
+	refuse(w, r, h.log, reason, detail)
 }
 
 func (h *cellHandler) rewrite(pr *httputil.ProxyRequest) {
@@ -193,10 +293,11 @@ func (h *cellHandler) rewrite(pr *httputil.ProxyRequest) {
 	target.RawQuery = kept.Encode()
 	pr.Out.URL = &target
 	pr.Out.Host = ""
-	stripIdentity(pr.Out.Header)
+	pr.Out.Header = allowedHeaders(pr.In.Header)
 }
 
-// stripIdentity deletes every header that could carry an identity or a protocol switch.
+// stripIdentity deletes every header that could carry an identity, a forwarding chain or a
+// protocol switch. The Prometheus proxy uses it.
 func stripIdentity(h http.Header) {
 	for k := range h {
 		lk := strings.ToLower(k)
@@ -250,16 +351,6 @@ func refuse(w http.ResponseWriter, r *http.Request, log *slog.Logger, reason Rea
 	_, _ = w.Write(append(body, '\n'))
 }
 
-// upstreamFailed answers a failed upstream call. A request that its client canceled gets no
-// answer and no warning.
-func upstreamFailed(w http.ResponseWriter, r *http.Request, log *slog.Logger, err error) {
-	if r.Context().Err() != nil {
-		log.Info("request canceled", "method", r.Method, "path", r.URL.Path)
-		return
-	}
-	refuse(w, r, log, UpstreamUnavailable, err.Error())
-}
-
 // TunnelHub is the management side of the mesh-view tunnel. It keeps one HTTP/2 client
 // connection for each cell, over the connection that the cell dialed, and serves a local
 // handler for each cell that sends requests through it.
@@ -267,14 +358,20 @@ type TunnelHub struct {
 	cells   map[string]string
 	wait    time.Duration
 	log     *slog.Logger
+	metrics *TunnelMetrics
+	ids     atomic.Uint64
 	mu      sync.Mutex
 	conns   map[string]*tunnelConn
 	changed chan struct{}
 }
 
 type tunnelConn struct {
-	cc   *http2.ClientConn
-	done <-chan struct{}
+	id       uint64
+	cc       *http2.ClientConn
+	done     <-chan struct{}
+	remote   string
+	start    time.Time
+	replaced atomic.Bool
 }
 
 func (t *tunnelConn) usable() bool {
@@ -289,20 +386,42 @@ func (t *tunnelConn) usable() bool {
 
 // NewTunnelHub returns a hub for cells, a map from each cell name to the address of its local
 // listener. A request waits up to wait for a tunnel. A zero wait means 10 seconds.
-func NewTunnelHub(cells map[string]string, wait time.Duration, log *slog.Logger) *TunnelHub {
+func NewTunnelHub(cells map[string]string, wait time.Duration, log *slog.Logger, opts ...TunnelOption) *TunnelHub {
 	if wait == 0 {
 		wait = defaultTunnelWait
 	}
-	return &TunnelHub{cells: cells, wait: wait, log: log, conns: map[string]*tunnelConn{}, changed: make(chan struct{})}
+	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: applyOptions(opts).metrics, conns: map[string]*tunnelConn{}, changed: make(chan struct{})}
+	if err := h.metrics.observeUp(h.upSeries); err != nil {
+		log.Warn("tunnel metric not registered", "error", err.Error())
+	}
+	return h
 }
 
-// Accept makes conn the tunnel of the cell of s, and returns when conn ends. The newest
-// connection of a cell wins: the hub closes the one before it. The client connection pings an
-// idle tunnel after 30 seconds, and closes it when the ping gets no answer within 15 seconds.
+// upSeries reports each configured cell, with a usable tunnel or not.
+func (h *TunnelHub) upSeries() map[attribute.Set]bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make(map[attribute.Set]bool, len(h.cells))
+	for cell := range h.cells {
+		tc := h.conns[cell]
+		out[attribute.NewSet(attribute.String("side", sideHub), attribute.String("cell", cell))] = tc != nil && tc.usable()
+	}
+	return out
+}
+
+// Accept makes conn the tunnel of the cell of s, and returns when conn ends. Only the role
+// mesh-view of a cell with a listener may hold a tunnel, whatever --allow-id admits. The newest
+// connection of a cell wins: the hub closes the one before it and logs tunnel_replaced. The hub
+// closes a tunnel when the leaf certificate of the cell expires, so the cell dials again with its
+// new SVID. The client connection pings an idle tunnel after 30 seconds, and closes it when the
+// ping gets no answer within 15 seconds.
 func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 	log := h.log.With("cell", s.Cell)
-	if _, ok := h.cells[s.Cell]; !ok || s.Plane != PlaneCell {
-		log.Warn("tunnel refused", "reason", string(PeerNotAllowed), "error", "no tunnel listener for this cell")
+	if _, ok := h.cells[s.Cell]; !ok || s.Plane != PlaneCell || s.Role != MeshViewRole {
+		h.metrics.connect(context.Background(), attribute.String("side", sideHub), attribute.String("cell", s.Cell),
+			attribute.String("result", "refused"), attribute.String("reason", string(PeerNotAllowed)), attribute.String("role", s.Role))
+		log.Warn("tunnel_refused", "reason", string(PeerNotAllowed), "plane", s.Plane, "role", s.Role,
+			"error", "only the "+MeshViewRole+" role of a cell with a tunnel listener may hold a tunnel")
 		_ = conn.Close()
 		return
 	}
@@ -310,11 +429,20 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 	t := &http2.Transport{ReadIdleTimeout: upstreamReadIdle, PingTimeout: upstreamPingTimeout}
 	cc, err := t.NewClientConn(nc)
 	if err != nil {
-		log.Warn("tunnel failed", "reason", string(UpstreamUnavailable), "error", err.Error())
+		log.Warn("tunnel_failed", "reason", string(UpstreamUnavailable), "error", err.Error())
 		_ = nc.Close()
 		return
 	}
-	tc := &tunnelConn{cc: cc, done: nc.done}
+	tc := &tunnelConn{id: h.ids.Add(1), cc: cc, done: nc.done, remote: conn.RemoteAddr().String(), start: time.Now()}
+	log = log.With("conn_id", tc.id)
+	if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
+		notAfter := certs[0].NotAfter
+		expiry := time.AfterFunc(time.Until(notAfter), func() {
+			log.Info("tunnel_expired", "not_after", notAfter.UTC().Format(time.RFC3339))
+			_ = nc.Close()
+		})
+		defer expiry.Stop()
+	}
 	h.mu.Lock()
 	old := h.conns[s.Cell]
 	h.conns[s.Cell] = tc
@@ -322,9 +450,14 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 	h.changed = make(chan struct{})
 	h.mu.Unlock()
 	if old != nil {
+		old.replaced.Store(true)
+		log.Info("tunnel_replaced", "old_conn_id", old.id, "new_conn_id", tc.id, "old_remote", old.remote, "new_remote", tc.remote,
+			"old_age_seconds", time.Since(old.start).Seconds(), "new_age_seconds", time.Since(tc.start).Seconds())
 		_ = old.cc.Close()
 	}
-	log.Info("tunnel_up", "env", s.Env)
+	h.metrics.connect(context.Background(), attribute.String("side", sideHub), attribute.String("cell", s.Cell),
+		attribute.String("result", "accepted"), attribute.Bool("replaced", old != nil))
+	log.Info("tunnel_up", "env", s.Env, "remote", tc.remote)
 	<-nc.done
 	h.mu.Lock()
 	if h.conns[s.Cell] == tc {
@@ -332,7 +465,7 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 	}
 	h.mu.Unlock()
 	_ = cc.Close()
-	log.Info("tunnel_down")
+	log.Info("tunnel_down", "replaced", tc.replaced.Load(), "age_seconds", time.Since(tc.start).Seconds())
 }
 
 // await returns a usable tunnel of cell, or nil when none comes within the wait of the hub.
@@ -356,19 +489,26 @@ func (h *TunnelHub) await(ctx context.Context, cell string) *tunnelConn {
 	}
 }
 
-// Handler sends each request through the tunnel of cell. With no tunnel, it waits for one up to
-// the wait of the hub, then answers 503 with upstream_unavailable. It refuses a protocol
-// upgrade, which HTTP/2 cannot carry.
+// Handler sends each request through the tunnel of cell, with only the headers in forwardHeaders. With no tunnel, it waits for one up to the wait of the hub, then answers 503 with
+// upstream_unavailable. It refuses a protocol upgrade, which HTTP/2 cannot carry.
 func (h *TunnelHub) Handler(cell string) http.Handler {
 	log := h.log.With("cell", cell)
+	cellAttr := attribute.String("cell", cell)
+	refuseHub := func(w http.ResponseWriter, r *http.Request, reason Reason, detail string) {
+		h.metrics.refusedRequest(r.Context(), attribute.String("side", sideHub), cellAttr, attribute.String("reason", string(reason)))
+		refuse(w, r, log, reason, detail)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "" {
-			refuse(w, r, log, RequestNotAllowed, "protocol upgrade")
+			refuseHub(w, r, RequestNotAllowed, "protocol upgrade")
 			return
 		}
 		tc := h.await(r.Context(), cell)
 		if tc == nil {
-			refuse(w, r, log, UpstreamUnavailable, "no tunnel from the cell")
+			if r.Context().Err() != nil {
+				return
+			}
+			refuseHub(w, r, UpstreamUnavailable, "no tunnel from the cell")
 			return
 		}
 		proxy := &httputil.ReverseProxy{
@@ -376,11 +516,20 @@ func (h *TunnelHub) Handler(cell string) http.Handler {
 				pr.Out.URL.Scheme = "http"
 				pr.Out.URL.Host = cell
 				pr.Out.Host = ""
+				pr.Out.Header = allowedHeaders(pr.In.Header)
 			},
 			Transport:     tc.cc,
 			FlushInterval: -1,
+			ModifyResponse: func(resp *http.Response) error {
+				h.metrics.response(resp.Request.Context(), attribute.String("side", sideHub), cellAttr, attribute.Int("status", resp.StatusCode))
+				return nil
+			},
 			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				upstreamFailed(w, r, log, err)
+				if r.Context().Err() != nil {
+					log.Info("request canceled", "method", r.Method, "path", r.URL.Path)
+					return
+				}
+				refuseHub(w, r, UpstreamUnavailable, err.Error())
 			},
 			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
 		}
@@ -388,9 +537,9 @@ func (h *TunnelHub) Handler(cell string) http.Handler {
 	})
 }
 
-// Serve listens on the address of each cell and serves its handler there, until ctx ends or a
+// Run listens on the address of each cell and serves its handler there, until ctx ends or a
 // listener fails.
-func (h *TunnelHub) Serve(ctx context.Context) error {
+func (h *TunnelHub) Run(ctx context.Context) error {
 	cells := make([]string, 0, len(h.cells))
 	for c := range h.cells {
 		cells = append(cells, c)
@@ -416,7 +565,7 @@ func (h *TunnelHub) Serve(ctx context.Context) error {
 	errc := make(chan error, len(servers))
 	var wg sync.WaitGroup
 	for i, srv := range servers {
-		h.log.Info("tunnel listening", "cell", cells[i], "addr", lns[i].Addr().String())
+		h.log.Info("tunnel_listening", "cell", cells[i], "addr", lns[i].Addr().String(), "wait_seconds", h.wait.Seconds(), "cells", cells)
 		wg.Go(func() {
 			if err := srv.Serve(lns[i]); !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("serve cell %s: %w", cells[i], err)
@@ -462,7 +611,8 @@ func (c *notifyConn) Close() error {
 
 type tunnelBackend struct{ hub *TunnelHub }
 
-// NewTunnelBackend returns the tunnel backend. It hands each verified cell connection to h.
+// NewTunnelBackend returns the tunnel backend. It hands each verified cell connection to h, and
+// its Run serves the local listeners of h.
 func NewTunnelBackend(h *TunnelHub) Backend { return &tunnelBackend{hub: h} }
 
 func (b *tunnelBackend) Name() string { return "tunnel" }
@@ -474,3 +624,6 @@ func (b *tunnelBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) e
 	b.hub.Accept(conn, src)
 	return nil
 }
+
+// Run serves the local listeners of the hub until ctx ends.
+func (b *tunnelBackend) Run(ctx context.Context) error { return b.hub.Run(ctx) }

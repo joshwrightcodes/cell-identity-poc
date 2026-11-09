@@ -19,6 +19,7 @@ type fakeProm struct {
 	mu     sync.Mutex
 	method string
 	uri    string
+	header http.Header
 	body   []byte
 }
 
@@ -29,7 +30,7 @@ func newFakeProm(t *testing.T) *fakeProm {
 		p.hits.Add(1)
 		body, _ := io.ReadAll(r.Body)
 		p.mu.Lock()
-		p.method, p.uri, p.body = r.Method, r.URL.RequestURI(), body
+		p.method, p.uri, p.header, p.body = r.Method, r.URL.RequestURI(), r.Header.Clone(), body
 		p.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, `{"status":"success","data":{}}`)
@@ -100,6 +101,28 @@ var promDenied = []struct {
 	{"GET trailing slash", "GET", "/api/v1/query/", "", ""},
 	{"GET graph", "GET", "/graph", "", ""},
 	{"GET root", "GET", "/", "", ""},
+}
+
+func TestPromProxyStripsIdentity(t *testing.T) {
+	prom := newFakeProm(t)
+	upstream, _ := url.Parse(prom.srv.URL)
+	h := NewPromProxy(upstream, jsonLog(&syncBuffer{}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/query?query=up", nil)
+	req.Header.Set("Authorization", "Bearer kiali-token")
+	req.Header.Set("Impersonate-User", "admin")
+	req.Header.Set("X-Real-Ip", "1.2.3.4")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+	}
+	prom.mu.Lock()
+	defer prom.mu.Unlock()
+	for _, k := range []string{"Authorization", "Impersonate-User", "X-Real-Ip"} {
+		if v := prom.header.Values(k); len(v) != 0 {
+			t.Errorf("the upstream got %s: %v", k, v)
+		}
+	}
 }
 
 func TestPromAllowList(t *testing.T) {
