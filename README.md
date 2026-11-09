@@ -177,25 +177,28 @@ mise x -- kubectl --context kind-dev-cp -n spire-system exec spire-server-0 -c s
 `harness:preflight` fails when a tool version or the Colima profile `poc` differs from that file.
 `harness:size` prints the memory and CPU of every node container and of `registry-mirror`.
 
-Two runs from clean, each with `harness:down` and `harness:up`, gave these `harness:up` durations on 2026-11-08:
+Two runs from clean on 2026-11-09, each with `harness:down` and then `harness:up`, gave these durations.
+Neither run needed a manual step. `secrets:connect` ran inside the `dev-cp` step.
 
-| Run | `harness:up` |
-| --- | --- |
-| 1 | 17 minutes 2 seconds |
-| 2 | 17 minutes 13 seconds |
+| Run | `harness:up` | `management` | `dev-cp` | `dev-cell-1` | `dev-cell-2` |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 16 minutes 53 seconds | 195 s | 271 s | 183 s | 223 s |
+| 2 | 16 minutes 53 seconds | 217 s | 220 s | 233 s | 201 s |
 
-The final `gate:m1`, with five tests, ran after the last fixes on the healthy clusters.
-It took 102 to 104 seconds in each run.
+The rest of each run creates the five clusters, in about 100 seconds, and builds the images, in about 15 seconds.
+`harness:verify` passed every check in both runs.
+After each run, `gate:m1` took 104 and 105 seconds, and `gate:m2` took 400 and 401 seconds.
 
 After the clusters were healthy, the five node containers used about 8 GiB of memory in total:
 
 | Container | Memory | CPU |
 | --- | --- | --- |
-| `management`, `dev-cp`, `dev-cell-1`, `dev-cell-2` (each) | 1.7 to 1.8 GiB | 6 to 10 percent |
-| `rogue` | 0.6 GiB | 5 percent |
-| `registry-mirror` | 32 MiB | 0 percent |
+| `dev-cp` | 2.0 to 2.1 GiB | 9 percent |
+| `management`, `dev-cell-1`, `dev-cell-2` (each) | 1.75 to 1.9 GiB | 8 to 16 percent |
+| `rogue` | 0.6 GiB | 5 to 6 percent |
+| `registry-mirror` | 70 MiB | 0 percent |
 
-The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
+The VM reports 8.9 GB of 40 GB in use, and 18 GB more in the file cache.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slowest run of 104 seconds, rounded up to the next minute.
