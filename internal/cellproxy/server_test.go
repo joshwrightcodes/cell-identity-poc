@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	collogspb "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -489,6 +490,16 @@ func TestEachBackendThroughSpiffeClient(t *testing.T) {
 		}
 		if n := h.up.hits.Load(); n != 1 {
 			t.Fatalf("upstream hits %d, want 1", n)
+		}
+	})
+	t.Run("otlp", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{})
+		conn := h.serve(t, otelPattern, otelID1)
+		if _, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		if n := h.up.calls.Load(); n != 1 {
+			t.Fatalf("upstream calls %d, want 1", n)
 		}
 	})
 }

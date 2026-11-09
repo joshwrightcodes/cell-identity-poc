@@ -2,13 +2,16 @@
 //
 //	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
+//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port>
 //	cell-proxy probe --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy whoami
 //
 // spiffe-client takes plaintext TCP and pipes each connection over mTLS to one exact server ID.
 // spiffe-server ends mTLS, checks the client ID against --allow-id and the signed cell records
-// in --registry-dir, and hands the connection to its backend. Both get their own SVID from the
-// Workload API at SPIFFE_ENDPOINT_SOCKET, and trust a peer only through the --peer-bundle file.
+// in --registry-dir, and hands the connection to its backend. The otlp backend is the telemetry
+// gateway: it sets the source attributes again and forwards OTLP in plaintext gRPC to --upstream,
+// a peer in the same namespace. Both get their own SVID from the Workload API at
+// SPIFFE_ENDPOINT_SOCKET, and trust a peer only through the --peer-bundle file.
 // They log compact JSON to stdout and export OTLP, as package internal/telemetry describes. A
 // configuration error is one JSON error line and exit status 2.
 //
@@ -41,6 +44,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
@@ -55,6 +60,9 @@ const (
 	shutdownTimeout = 15 * time.Second
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
+	// otlpMaxRecvBytes is the largest OTLP message after decompression. Collectors set
+	// send_batch_max_size so that a batch stays below it.
+	otlpMaxRecvBytes = 8 << 20
 )
 
 func main() {
@@ -206,7 +214,7 @@ type serverConfig struct {
 	peer     *x509bundle.Bundle
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
-	backend  func(log *slog.Logger) cellproxy.Backend
+	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
 }
 
 func parseServer(args []string) (serverConfig, error) {
@@ -216,7 +224,7 @@ func parseServer(args []string) (serverConfig, error) {
 	td := fs.String("peer-trust-domain", "", "trust domain of the clients")
 	allow := fs.String("allow-id", "", "anchored regular expression for the client SPIFFE IDs")
 	registryDir := fs.String("registry-dir", "", "directory with signers.pub and the *.dsse.json cell records")
-	backend := fs.String("backend", "", "backend for each connection: grpc-header")
+	backend := fs.String("backend", "", "backend for each connection: grpc-header or otlp")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
 	header := fs.String("identity-header", "x-cell-agent", "header that carries <env>-<cell> to the upstream")
 	if err := parseFlags(fs, args); err != nil {
@@ -246,7 +254,24 @@ func parseServer(args []string) (serverConfig, error) {
 		if err := required(map[string]string{"upstream": *upstream, "identity-header": *header}); err != nil {
 			return serverConfig{}, err
 		}
-		cfg.backend = func(log *slog.Logger) cellproxy.Backend { return cellproxy.NewHeaderBackend(*upstream, *header, log) }
+		cfg.backend = func(tel *telemetry.T) (cellproxy.Backend, error) {
+			return cellproxy.NewHeaderBackend(*upstream, *header, tel.Log), nil
+		}
+	case "otlp":
+		if err := required(map[string]string{"upstream": *upstream}); err != nil {
+			return serverConfig{}, err
+		}
+		cfg.backend = func(tel *telemetry.T) (cellproxy.Backend, error) {
+			up, err := grpc.NewClient(*upstream, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			if err != nil {
+				return nil, fmt.Errorf("--upstream: %w", err)
+			}
+			counter, err := cellproxy.NewOverwriteCounter(tel.Meter)
+			if err != nil {
+				return nil, err
+			}
+			return cellproxy.NewOTLPBackend(cellproxy.NewGateway(up, counter, tel.Log), otlpMaxRecvBytes), nil
+		}
 	default:
 		return serverConfig{}, fmt.Errorf("unknown --backend %q", *backend)
 	}
@@ -263,12 +288,16 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		st := cfg.registry.Stats()
 		tel.Log.Info("registry loaded", "content_sha256", cfg.registry.ContentSHA256(),
 			"records", st.Records, "revoked", st.Revoked, "signers", st.Signers)
+		backend, err := cfg.backend(tel)
+		if err != nil {
+			return err
+		}
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {
 			return err
 		}
 		tlsCfg := cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, cfg.registry, tel.Log)
-		return cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, cfg.backend(tel.Log), tel.Log).Serve(ctx, ln)
+		return cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, backend, tel.Log).Serve(ctx, ln)
 	})
 }
 

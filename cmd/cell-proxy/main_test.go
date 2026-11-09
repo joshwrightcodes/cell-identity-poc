@@ -473,3 +473,51 @@ func TestLogsAreJSON(t *testing.T) {
 		}
 	}
 }
+
+func TestServerOTLPBackend(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+	args := with(without(serverArgs(t, envCA), "--identity-header"), "--backend", "otlp")
+
+	t.Run("no --upstream", func(t *testing.T) {
+		var out bytes.Buffer
+		if code := execute(t.Context(), without(args, "--upstream"), &out); code != 2 {
+			t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+		}
+		lines := jsonLines(t, out.String())
+		if len(lines) != 1 || lines[0]["level"] != "ERROR" || !strings.Contains(lines[0]["error"].(string), "--upstream") {
+			t.Fatalf("output is %v, want one JSON error line that names --upstream", lines)
+		}
+	})
+
+	t.Run("starts and stops", func(t *testing.T) {
+		serveWorkloadAPI(t, mgmt, "spiffe://mgmt.poc.internal/telemetry")
+		out := &syncBuffer{}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan int, 1)
+		go func() { done <- execute(ctx, args, out) }()
+		deadline := time.Now().Add(30 * time.Second)
+		for !strings.Contains(out.String(), `"msg":"listening"`) {
+			if time.Now().After(deadline) {
+				t.Fatalf("spiffe-server did not listen:\n%s", out.String())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		cancel()
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Fatalf("exit code %d after cancel\n%s", code, out.String())
+			}
+		case <-time.After(30 * time.Second):
+			t.Fatal("spiffe-server did not stop")
+		}
+		for _, l := range jsonLines(t, out.String()) {
+			if l["msg"] == "listening" && l["backend"] != "otlp" {
+				t.Fatalf("listening line is %v, want backend otlp", l)
+			}
+		}
+	})
+}
