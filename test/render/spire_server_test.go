@@ -70,6 +70,7 @@ esac
 // STUB_BAD_MANIFEST serves a manifest, and STUB_BAD_LAYER a layer, whose digest does not match.
 const stubOras = `#!/usr/bin/env bash
 set -euo pipefail
+echo "oras $*" >>"$STUB_LOG"
 [[ -z "${STUB_NO_REGISTRY:-}" ]] || exit 1
 out=-
 args=()
@@ -194,11 +195,46 @@ func render(t *testing.T, env ...string) result {
 	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append([]string{"SPIRE_SVID_TTL=1m"}, env...)...)
 }
 
-// renderScript runs the render script of a component with stub host commands. The stub image
-// holds one file at binary, and every image in images.env pins that stub image. STUB_IMAGES=missing
-// and STUB_IMAGES=stale make images.env missing or older than the Go sources. STUB_TRUST_DOMAIN
-// sets the trust domain of the bundle that the stub server prints.
+// cellEnvKeys returns every setting name of cells/*.env. mise loads the file of one cluster into
+// the environment of go test, so the stub runner drops these names, and a render reads only the
+// settings that a test passes.
+func cellEnvKeys(t *testing.T) map[string]bool {
+	t.Helper()
+	files, err := filepath.Glob("../../cells/*.env")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no cells/*.env files: %v", err)
+	}
+	keys := map[string]bool{"CELL": true}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for line := range strings.SplitSeq(string(data), "\n") {
+			if k, _, ok := strings.Cut(line, "="); ok && regexp.MustCompile(`^[A-Z_][A-Z0-9_]*$`).MatchString(k) {
+				keys[k] = true
+			}
+		}
+	}
+	return keys
+}
+
+// renderScript runs the render script of a component with stub host commands.
 func renderScript(t *testing.T, component, binary string, env ...string) result {
+	t.Helper()
+	script, err := filepath.Abs("../../components/" + component + "/render.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return runStubbed(t, binary, "", []string{script}, env...)
+}
+
+// runStubbed runs argv with stub host commands and stdin. The stub image holds one file at binary,
+// and every image in images.env pins that stub image. STUB_IMAGES=missing and STUB_IMAGES=stale
+// make images.env missing or older than the Go sources. STUB_TRUST_DOMAIN sets the trust domain of
+// the bundle that the stub server prints. STUB_CELL=<cluster> loads cells/common.env and
+// cells/<cluster>.env first, as hydrate does. The other values of env then override them.
+func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string) result {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "tar", "bash", "go")
 	dir := t.TempDir()
@@ -247,20 +283,39 @@ func renderScript(t *testing.T, component, binary string, env ...string) result 
 	bundleFile := write("bundle.pem", bundle, 0o644)
 	logFile := filepath.Join(dir, "mise.log")
 
-	script, err := filepath.Abs("../../components/" + component + "/render.sh")
-	if err != nil {
-		t.Fatal(err)
+	if cell := opts["STUB_CELL"]; cell != "" {
+		common, _ := filepath.Abs("../../cells/common.env")
+		file, _ := filepath.Abs("../../cells/" + cell + ".env")
+		var overrides []string
+		for _, e := range env {
+			if !strings.HasPrefix(e, "STUB_") {
+				overrides = append(overrides, e)
+			}
+		}
+		argv = append([]string{"bash", "-c", `set -a; source "$1"; source "$2"; set +a; shift 2
+for kv in "${@:2}"; do export "$kv"; done
+exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	}
-	cmd := exec.Command(script)
-	cmd.Env = append(os.Environ(),
+	cellKeys := cellEnvKeys(t)
+	var base []string
+	for _, e := range os.Environ() {
+		if k, _, _ := strings.Cut(e, "="); !cellKeys[k] {
+			base = append(base, e)
+		}
+	}
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Env = append(base,
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
-		"SPIRE_AGENT_SUBJECT=cell-identity-system/celld")
+		"POC_ENV="+commonEnv(t, "POC_ENV"), "SPIRE_AGENT_SUBJECT=cell-identity-system/celld")
 	cmd.Env = append(cmd.Env, env...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err = cmd.Run()
+	err := cmd.Run()
 	logData, _ := os.ReadFile(logFile)
 	return result{stdout.String(), stderr.String(), err, string(logData), digest, bundle}
 }
@@ -727,4 +782,28 @@ func TestRenderFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// goldenSpireDevCP holds the dev-cp render of M2, with the stub image digest replaced by
+// stubDigest. UPDATE_GOLDEN=1 writes the file again from the current render.
+const goldenSpireDevCP = "testdata/spire-server-dev-cp.golden.yaml"
+
+// TestSpireServerDevCPKeepsM2Objects renders the server with cells/dev-cp.env and compares each
+// object with the M2 render.
+func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
+	r := render(t, "STUB_CELL=dev-cp")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	out := strings.ReplaceAll(r.stdout, r.digest, stubDigest)
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		if err := os.WriteFile(goldenSpireDevCP, []byte(out), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(goldenSpireDevCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sameObjects(t, docs(t, out), docs(t, string(want)))
 }
