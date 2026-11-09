@@ -12,8 +12,8 @@ import (
 
 // Registry settings. Nodes pull localhost:5001 images from the registry container by name.
 const (
-	RegistryName   = "kiln-registry"
-	RegistryVolume = "kiln-registry-data"
+	RegistryName   = "registry-mirror"
+	RegistryVolume = "registry-mirror-data"
 	registryUser   = "65534:65534"
 	RegistryImage  = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
 	// HostsDir is the containerd registry configuration directory for localhost:5001 on a node.

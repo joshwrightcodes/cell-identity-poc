@@ -2,7 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_ROOT="$ROOT/build"
+# POC_BUILD_ROOT names another build directory, for the tests.
+BUILD_ROOT="${POC_BUILD_ROOT:-$ROOT/build}"
 
 log() { printf '==> %s\n' "$*" >&2; }
 
@@ -20,6 +21,8 @@ set +a
 BUILD="$BUILD_ROOT/$CELL"
 BUNDLES="$BUILD/bundles"
 FACTS="$BUILD/facts.env"
+# publish.sh writes the digest of each bundle that it pushed here, one <name>=<digest> line each.
+PUBLISHED="$BUILD/published.env"
 
 # Component sets. Each set name in harness/topology.yaml maps to a list of bundles.
 # Each entry is <component>:<sync wave>:<destination namespace>.
@@ -37,12 +40,35 @@ BASE_CELL_COMPONENTS=(
   "apps-demo:5:apps-demo"
 )
 
+# The External Secrets Operator. It must be healthy, with its CRDs, before a later wave applies an ExternalSecret.
+EXTERNAL_SECRETS_COMPONENTS=(
+  "external-secrets:6:external-secrets"
+)
+
+# The SPIRE server of the environment trust domain. It comes last, after the base cell is healthy.
+SPIRE_SERVER_COMPONENTS=(
+  "spire-server:7:spire-system"
+)
+
+# Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
+# out of the root bundle and out of every Argo CD Application. A bundle can still write to their
+# namespace, as the residual limits in docs/design/poc-scope.md say.
+# Each entry is <component>:<namespace>.
+# celld with its SPIRE agent sidecar attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
+CELL_IDENTITY_HARNESS=(
+  "cell-identity:cell-identity-system"
+)
+
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
+HARNESS_COMPONENTS=()
 set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$ROOT/harness/topology.yaml")"
 for set_name in $set_names; do
   case "$set_name" in
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
+    external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
+    spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
+    cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done
@@ -67,7 +93,7 @@ wait_for() {
 # Start a port-forward to the bundle store. Sets BUNDLE_BUNDLE_STORE_PF_PID.
 bundle_store_forward() {
   if curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/" >/dev/null 2>&1; then
-    die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store. Stop the old port-forward first."
+    die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store, probably from an old port-forward. Find its process with: lsof -nP -iTCP:${CELL_BUNDLE_STORE_PORT} -sTCP:LISTEN. Stop that process, then run the command again."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
   kubectl --context "kind-$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
@@ -75,4 +101,118 @@ bundle_store_forward() {
   BUNDLE_STORE_PF_PID=$!
   trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
   wait_for "port-forward to the bundle store" 30 curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/"
+}
+
+source "$ROOT/scripts/gate-traces.sh"
+
+# load_local_settings reads the gitignored .envrc.local when one of the given variables is unset.
+# direnv loads the file after direnv allow, so this matters only without direnv. POC_ENVRC_LOCAL
+# names another file, for the tests.
+load_local_settings() {
+  local file="${POC_ENVRC_LOCAL:-$ROOT/.envrc.local}" name
+  for name in "$@"; do
+    if [[ -z "${!name:-}" ]]; then
+      [[ -f "$file" ]] || return 0
+      # shellcheck source=/dev/null
+      source "$file"
+      log "read the settings from $file"
+      return 0
+    fi
+  done
+}
+
+# SECRET_STORE is the name of the SecretStore that secrets:connect applies in each namespace of
+# SECRET_STORE_NAMESPACES.
+SECRET_STORE=poc-secrets
+
+# store_gaps prints one line for each namespace of SECRET_STORE_NAMESPACES whose SecretStore is not
+# Ready, and for each missing target Secret of an ExternalSecret that uses the store. It prints
+# nothing when secrets:connect has nothing to do.
+store_gaps() {
+  local ns list target
+  for ns in ${SECRET_STORE_NAMESPACES:-}; do
+    k -n "$ns" get secretstore "$SECRET_STORE" -o json 2>/dev/null \
+      | jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null 2>&1 \
+      || echo "SecretStore $ns/$SECRET_STORE is not Ready"
+    list="$(k -n "$ns" get externalsecrets.external-secrets.io -o json 2>/dev/null)" || continue
+    for target in $(jq -r --arg store "$SECRET_STORE" '.items[]
+        | select(.spec.secretStoreRef.kind == "SecretStore" and .spec.secretStoreRef.name == $store)
+        | .spec.target.name // .metadata.name' <<<"$list"); do
+      k -n "$ns" get secret "$target" >/dev/null 2>&1 || echo "Secret $ns/$target is missing"
+    done
+  done
+}
+
+# live_image_mismatches <cluster> <namespace> <kind/name> prints one line for each local image of the
+# workload that differs from build/images.env, and prints nothing when all match.
+live_image_mismatches() {
+  local cluster="$1" ns="$2" workload="$3" json images image name want
+  json="$(kubectl --context "kind-$cluster" -n "$ns" get "$workload" -o json)" || return 1
+  images="$(jq -r '.spec.template.spec | ((.initContainers // []) + .containers)[].image | select(startswith("localhost:5001/"))' <<<"$json")" || return 1
+  for image in $images; do
+    name="${image#localhost:5001/}"
+    name="${name%%@*}"
+    want="$(sed -n "s/^IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$name")=//p" "$BUILD_ROOT/images.env" 2>/dev/null)"
+    [[ -n "$want" && "$image" == "$want" ]] || echo "$workload in $cluster runs $image, and build/images.env has '${want:-nothing}' for $name"
+  done
+}
+
+# apps_at_published succeeds when Argo CD reports every Application of the cluster Synced and
+# Healthy at the revision that publish.sh pushed. A check that runs before Argo CD reads the new
+# root bundle cannot pass.
+apps_at_published() {
+  local published_json
+  published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
+  k -n argocd get applications -o json | jq -e --argjson n "$((${#COMPONENTS[@]} + 1))" --argjson pub "$published_json" '
+    (.items | length) == $n and
+    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
+      and .status.sync.revision == $pub[.metadata.name])'
+}
+
+# eso_controller_rolled_out succeeds when the operator Deployment runs only pods of its current
+# spec, and that spec scopes the controller to the store namespace. Until then a controller of an
+# older bundle, which ignores SecretStore objects, can still serve.
+eso_controller_rolled_out() {
+  local store_ns
+  read -r store_ns _ <<<"${SECRET_STORE_NAMESPACES:-}"
+  [[ -n "$store_ns" ]] || return 1
+  k -n external-secrets get deployment external-secrets -o json 2>/dev/null | jq -e --arg arg "--namespace=$store_ns" '
+    (.spec.replicas // 1) as $want
+    | (.status.observedGeneration // 0) == .metadata.generation
+      and (.status.replicas // 0) == $want and (.status.updatedReplicas // 0) == $want
+      and (.status.availableReplicas // 0) == $want
+      and any(.spec.template.spec.containers[].args[]?; . == $arg)' >/dev/null
+}
+
+# eso_published_synced succeeds when Argo CD reports the Application external-secrets Synced and
+# Healthy at the digest that the last cell:publish recorded in build/<cluster>/published.env.
+eso_published_synced() {
+  local want
+  want="$(sed -n 's/^external-secrets=//p' "$PUBLISHED" 2>/dev/null)"
+  [[ -n "$want" ]] || return 1
+  k -n argocd get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
+    .status.sync.status == "Synced" and .status.health.status == "Healthy" and .status.sync.revision == $want' >/dev/null
+}
+
+# connect_store_step <secrets:connect script> waits until the published operator bundle is synced
+# and its scoped controller has rolled out. Then it runs secrets:connect once when the secret store
+# has a gap and POC_SECRET_TOKEN_CMD is set. Without that setting, it asks for secrets:connect in a
+# second shell, once a minute. It sets store_done when the store has no gap.
+connect_store_step() {
+  local gaps
+  eso_published_synced && eso_controller_rolled_out || return 0
+  gaps="$(store_gaps)"
+  if [[ -z "$gaps" ]]; then
+    store_done=1
+    log "the secret store of $CELL_NAME is connected"
+    return 0
+  fi
+  if [[ -n "${POC_SECRET_TOKEN_CMD:-}" ]]; then
+    log "running secrets:connect, because: ${gaps//$'\n'/; }"
+    "$1" || die "secrets:connect failed. Fix the cause, then run: CELL=$CELL_NAME mise run secrets:connect"
+    store_done=1
+  elif ((SECONDS - last_hint >= 60)); then
+    log "${gaps//$'\n'/; }. Run in a second shell: CELL=$CELL_NAME mise run secrets:connect"
+    last_hint=$SECONDS
+  fi
 }

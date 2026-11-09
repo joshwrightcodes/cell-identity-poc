@@ -102,7 +102,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 
 - Local runtime: kind 0.33.0 on a Colima 0.10.3 VM with the Docker runtime. **[owner]** The repository's `mise.toml` pins every tool, and mise tasks are the only entry points. The harness asserts the exact versions.
 - Kubernetes v1.37.0 node image, pinned by digest.
-- kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the gate runs under `caffeinate`.
+- kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the Mac must stay awake for the whole gate.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
 - Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
 - Telemetry leaves a cluster only as OpenTelemetry (OTLP). **[owner]** Bespoke binaries write every log as compact JSON, one object per line, to stdout, and export OTLP, with no Prometheus client libraries or ServiceMonitors. A command whose stdout carries data prints only that data on success, and one JSON error line on failure. Upstream components use their JSON log format where they have one. Upstream components that expose only Prometheus metrics keep their endpoint, and only the collector in the same cluster may scrape it.
@@ -135,7 +135,7 @@ Local instances use `dev` as `<env>`: the clusters are `management`, `dev-cp`, `
 | Approver keys | One signing key per approver, held on the approver's device | Never in a cluster. Public keys travel in signed approver directories |
 | Rebuildable keys | SPIRE server CAs, the Argo CD Agent JWT key, mesh CAs | Generated inside the cluster |
 
-- Locally, `mise run keys:seed` reads each key from the secret manager CLI on standard input, and creates the Kubernetes Secret directly. Unit tests generate throwaway keys in memory.
+- Locally, the secret manager holds each key at `<cluster>/<service>/<key>`. The External Secrets Operator syncs the keys into a Kubernetes Secret in the cluster. Unit tests generate throwaway keys in memory.
 - On EKS, an external store holds the online keys. A provider-neutral sync delivers them, and each key rotates with one command.
 - Key set changes follow the signer matrix in "Key rotation and recovery".
 
@@ -293,8 +293,8 @@ The server plugin takes these steps. Any error denies:
 4. It requires a token bound to a pod, with the pod UID and node claims.
 5. It requires a lifetime of 15 minutes or less, and an `iat` no older than 15 minutes.
 6. It requires the audience `spire-<env>/<nonce>`, where the nonce comes from the server for this attestation. The sidecar requests that token through TokenRequest for its own service account. A copied token therefore works only once, and only for the attestation it was made for.
-7. It limits attestation per cell.
-8. It returns `can_reattest = false`, and an agent ID that includes the nonce's hash: `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>`.
+7. It caps the challenges in flight for each cell (default 8). After a token validates, it charges a per-cell rate budget (default 2 each second, burst 10). Failed attempts use none of the budget.
+8. It returns `can_reattest = false`, and an agent ID that includes the nonce's hash: `spiffe://<env>.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>`. The nonce hash is the first 16 bytes of SHA-256 over the base64url nonce string, in hex.
 
 Because agents do not re-attest, a running agent renews its SVID without a new token. SPIRE
 re-attests a re-attestable agent on every rotation (verified in `pkg/agent/svid/rotator.go`),
@@ -303,8 +303,10 @@ expired attests again as a new agent, with a new nonce.
 
 - The server prunes old agents with `prune_tofu_nodes = true` and `prune_attested_nodes_expired_for`.
 - SPIRE's built-in per-IP limit is turned off, because cells share addresses. The server makes each nonce inside one attestation stream, so a token copied into another stream fails, and no nonce cache is needed.
-- Plugins have no datastore access: the plugin SDK offers only the `agentstore` and `identityprovider` host services (as of 2026-11-08). Each server keeps its own per-cell limit in memory, so a second server divides the limit.
+- Plugins have no datastore access: SPIRE offers server plugins only the `identityprovider`, `agentstore` and `metrics` host services (as of 2026-11-08). Each server keeps the in-flight cap and the rate budget in memory, so a second server divides the budget.
 - A node alias entry maps cluster and service account selectors to the workload parent, so HPA scale events write no entries.
+- Registration entries are `ClusterStaticEntry` manifests that spire-controller-manager reconciles in static manifest mode.
+- SPIRE returns the reason of a refusal to the agent as `nodeattestor(cluster_jwt): <reason>`, verified on 2026-11-09 with SPIRE v1.15.5. The plugin also logs the reason, the cell and the key ID. The reason holds no token contents.
 
 ### Independent key check **[call]**
 
@@ -813,10 +815,10 @@ this order, each with its own scope document:
 | Each node pulls ko images through the registry mirror | M1 | `kind load` for each cluster. Result 2026-11-08: every node of all five clusters pulls through the mirror, so no fallback applies |
 | kind's local-path provisioner passes review | M1 | Stop and report. Result 2026-11-08: the review in `vendor/README.md` found nothing that blocks its use |
 | kind clusters survive a restart of the Colima VM | M1 | Treat a restart as disaster recovery. Result 2026-11-08: they do not survive, so this fallback applies |
-| Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed |
-| Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign |
-| Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier |
-| Service account key rotation on kind nodes | M2 | Stop and report |
+| Sidecar SPIRE agent with the `unix` workload attestor | M2 | DaemonSet agent where allowed. Result 2026-11-08, SPIRE v1.15.5: it works in `dev-cell-1` and `dev-cell-2`. The `celld` pod shares one process namespace. The agent runs as user 1000 with no capabilities, reads the caller uid 65532 from `/proc`, and issues the `celld` SVID. On 2026-11-09 a test stopped the agent container on the node. The new container loaded the SVID from the pod memory volume, kept the agent ID and renewed, with no new attestation. So no fallback applies |
+| Non-reattestable agents with a nonce in the agent ID, renewal without a token, and a sidecar's TokenRequest with a nonce audience | M2 | Report and redesign. Result 2026-11-09, SPIRE v1.15.5: it works. Each agent ID holds the pod UID and the nonce hash. A test removes the RoleBinding that lets `celld` request tokens. The agent then renews twice through `RenewAgent`, `celld` gets two newer SVIDs, and the server logs no second attestation. With `can_reattest` set to true, the same test fails. A token with the audience of another nonce fails with `wrong_audience`. So no redesign is needed |
+| Shortest SVID and intermediate lifetimes SPIRE allows, for the test profile | M2 | Longer slow tier. Result 2026-11-08, SPIRE v1.15.5. The shortest tested values that run cleanly are `ca_ttl` 1m, `default_x509_svid_ttl` 10s and `agent_ttl` 10s, with `default_jwt_svid_ttl` 10s. SPIRE sets no lower bound, but it warns when an SVID lifetime exceeds `ca_ttl` divided by 6. The CA rotator runs every 10 seconds, so with a `ca_ttl` of 30s the CA expires before the next rotation. With the default JWT lifetime of 5 minutes, the shortest values are `ca_ttl` 30m and 5m for both SVID lifetimes. `spire-server validate` hides these warnings, so the check used `spire-server run` with no agent. Result 2026-11-09: `SPIRE_SVID_TTL` in `cells/dev-cp.env` sets `default_x509_svid_ttl` and `agent_ttl` to 1m, with `ca_ttl` 24h. Agents and `celld` renew about every 30 seconds, and the M2 renewal tests pass. Agent renewal at 10s is not verified. The lifetime of the upstream intermediate is not measured yet. No fallback applies |
+| Service account key rotation on kind nodes | M2 | Stop and report. Result 2026-11-09: it works. A test edits the static API server manifest of `dev-cell-1` on the node. It adds a second `--service-account-key-file` and signs with the new key. The API server publishes both keys and signs with the new one. The running `celld` agent keeps its renewals, and a new pod fails with `unknown_kid`, because the record holds only the first key. The cleanup restores the manifest and deletes the key. It makes sure that `kube-controller-manager`, which keeps a token for each controller in memory, runs a new container, and it deletes any pod that holds a token from that key. `mise run gate:m2:repair` runs the same cleanup after an interrupted run. So no fallback applies |
 | Approver signatures from device-held keys in the PoC | M5 | Software keys per test approver |
 | Argo CD OCI source through a localhost proxy that adds a token | M8 | Local TLS on the proxy |
 | Argo CD Agent v0.10.0 with Argo CD v3.6.1, header auth behind `cell-proxy` | M3 | The newest v3.5 release |

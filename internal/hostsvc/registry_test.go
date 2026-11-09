@@ -48,10 +48,10 @@ func (f *fakeDocker) has(prefix string) bool {
 
 func TestHostsTOMLPointsAtRegistry(t *testing.T) {
 	got := HostsTOML()
-	if !strings.Contains(got, `server = "http://kiln-registry:5000"`) {
+	if !strings.Contains(got, `server = "http://registry-mirror:5000"`) {
 		t.Errorf("no server line:\n%s", got)
 	}
-	if !strings.Contains(got, `[host."http://kiln-registry:5000"]`) {
+	if !strings.Contains(got, `[host."http://registry-mirror:5000"]`) {
 		t.Errorf("no host table:\n%s", got)
 	}
 	if HostsDir != "/etc/containerd/certs.d/localhost:5001" {
@@ -73,12 +73,12 @@ func TestEnsureRegistryStartsAbsentContainer(t *testing.T) {
 	if err := s.EnsureRegistry(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	want := "run -d --restart=always --name kiln-registry --user 65534:65534 " +
-		"-v kiln-registry-data:/var/lib/registry -e REGISTRY_HTTP_DEBUG_ADDR= -p 127.0.0.1:5001:5000 " + RegistryImage
+	want := "run -d --restart=always --name registry-mirror --user 65534:65534 " +
+		"-v registry-mirror-data:/var/lib/registry -e REGISTRY_HTTP_DEBUG_ADDR= -p 127.0.0.1:5001:5000 " + RegistryImage
 	if !d.has(want) {
 		t.Errorf("calls = %q", d.calls)
 	}
-	if !d.has("network connect kind kiln-registry") {
+	if !d.has("network connect kind registry-mirror") {
 		t.Errorf("calls = %q", d.calls)
 	}
 }
@@ -163,7 +163,7 @@ func TestEnsureRegistryPreparesVolumeForUnprivilegedUser(t *testing.T) {
 	if err := s.EnsureRegistry(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !d.has("run --rm --user 0 --entrypoint chown -v kiln-registry-data:/var/lib/registry " + RegistryImage + " 65534:65534 /var/lib/registry") {
+	if !d.has("run --rm --user 0 --entrypoint chown -v registry-mirror-data:/var/lib/registry " + RegistryImage + " 65534:65534 /var/lib/registry") {
 		t.Errorf("calls = %q", d.calls)
 	}
 }
@@ -175,7 +175,7 @@ func TestEnsureRegistryReplacesRootContainer(t *testing.T) {
 	if err := s.EnsureRegistry(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if !d.has("rm -f kiln-registry") || !d.has("run -d ") {
+	if !d.has("rm -f registry-mirror") || !d.has("run -d ") {
 		t.Errorf("calls = %q", d.calls)
 	}
 }

@@ -4,7 +4,7 @@ source "$(dirname "$0")/lib.sh"
 
 containers="$(
   docker ps --filter label=io.x-k8s.kind.cluster --format '{{.Names}}'
-  docker ps --filter name=kiln-registry --format '{{.Names}}'
+  docker ps --filter name=registry-mirror --format '{{.Names}}'
 )"
 [[ -n "$containers" ]] || die "no kind node or registry container is running"
 # shellcheck disable=SC2086

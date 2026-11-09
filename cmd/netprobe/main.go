@@ -1,5 +1,8 @@
 // Command netprobe is the network probe for the harness tests. It scans TCP ports, reports the
-// peer address of each request, and fetches URLs.
+// peer address of each request, fetches URLs, and reports the result of one TCP connect.
+//
+// dial prints {"addr", "result", "error"} with result connected, refused, timeout or error. A
+// NetworkPolicy that drops packets gives timeout. A host that answers with a reset gives refused.
 package main
 
 import (
@@ -18,33 +21,32 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 )
 
 func main() {
-	slog.SetDefault(newLogger(os.Args[1:], os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
-		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("netprobe failed", "error", err)
-		os.Exit(1)
-	}
+	code := execute(ctx, os.Args[1:], os.Stdout)
+	stop()
+	os.Exit(code)
 }
 
-// newLogger sends the logs of the long-running serve mode to stdout. The data commands keep
-// stdout for their data, so their logs go to stderr.
-func newLogger(args []string, stdout io.Writer) *slog.Logger {
-	if len(args) > 0 && args[0] == "serve" {
-		return slog.New(slog.NewTextHandler(stdout, nil))
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+// execute runs one command and returns the exit code. Every log line is compact JSON on stdout.
+// A failure is one JSON error line on stdout, so the data commands print only data on success.
+func execute(ctx context.Context, args []string, stdout io.Writer) int {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(stdout, nil)))
+	return cli.Run(stdout, "netprobe", func(out io.Writer) error { return run(ctx, args, out) })
 }
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: netprobe scan|serve|get")
+		return errors.New("usage: netprobe scan|serve|get|dial")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	switch args[0] {
 	case "scan":
 		host := fs.String("host", "", "IP address to scan")
@@ -91,6 +93,30 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			return errors.New("get needs --url")
 		}
 		return get(ctx, *url, stdout, *timeout)
+	case "dial":
+		addr := fs.String("addr", "", "IP address and port")
+		timeout := fs.Duration("timeout", 3*time.Second, "connect timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		host, _, err := net.SplitHostPort(*addr)
+		if err != nil || net.ParseIP(host) == nil {
+			return fmt.Errorf("dial needs --addr <IP address>:<port>, got %q", *addr)
+		}
+		d := net.Dialer{Timeout: *timeout}
+		c, err := d.DialContext(ctx, "tcp", *addr)
+		if c != nil {
+			_ = c.Close()
+		}
+		out := struct {
+			Addr   string `json:"addr"`
+			Result string `json:"result"`
+			Error  string `json:"error,omitempty"`
+		}{Addr: *addr, Result: dialClass(err)}
+		if err != nil {
+			out.Error = err.Error()
+		}
+		return json.NewEncoder(stdout).Encode(out)
 	}
 	return fmt.Errorf("unknown command %q", args[0])
 }
@@ -168,11 +194,24 @@ func get(ctx context.Context, url string, out io.Writer, timeout time.Duration) 
 		return err
 	}
 	defer resp.Body.Close()
-	if _, err := io.Copy(out, resp.Body); err != nil {
-		return err
-	}
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	return nil
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+// dialClass names the outcome of one TCP connect.
+func dialClass(err error) string {
+	var ne net.Error
+	switch {
+	case err == nil:
+		return "connected"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, context.DeadlineExceeded), errors.As(err, &ne) && ne.Timeout():
+		return "timeout"
+	default:
+		return "error"
+	}
 }

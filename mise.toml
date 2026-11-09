@@ -43,7 +43,7 @@ description = "Stop the Colima VM. kind clusters stop with it"
 run = "colima stop --profile poc"
 
 [tasks."cell:up"]
-description = "Create the cluster through the host service, apply the bootstrap set, publish every bundle and wait for Argo CD"
+description = "Create the cluster through the host service, apply the bootstrap set, publish every bundle, wait for Argo CD at the published revisions, then apply the harness components"
 depends = ["vm:up"]
 run = "scripts/up.sh"
 
@@ -56,12 +56,16 @@ description = "Push the hydrated bundles to the in-cluster store and point the r
 run = "scripts/publish.sh"
 
 [tasks."cell:verify"]
-description = "Run the base cell checks and print PASS or FAIL for each"
+description = "Run the checks of the cluster CELL: the base cell rules, and the identity, secret store and SPIRE server checks of its component sets. Prints PASS or FAIL for each"
 run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
 description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
 run = "scripts/ui.sh"
+
+[tasks."cell:restart"]
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp, restart the SPIRE server"
+run = "scripts/restart.sh"
 
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
@@ -73,36 +77,66 @@ usage = 'arg "[packages]..." var=#true default="./..."'
 run = 'eval go test ${usage_packages?}'
 
 [tasks.lint]
-description = "Run go vet on every package"
-run = "go vet ./..."
+description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag"
+run = ["go vet ./...", "go vet -tags e2e ./test/e2e/"]
 
 [tasks."vendor:fetch"]
-description = "Download the pinned Argo CD manifest and Istio charts into vendor/ for review"
+description = "Download the pinned Argo CD manifest, Istio charts and External Secrets Operator chart into vendor/ for review"
 run = "scripts/vendor-fetch.sh"
+
+[tasks."secrets:connect"]
+description = "Apply the token Secret and SecretStore poc-secrets in each store namespace of the cluster CELL (default dev-cp), from the settings in .envrc.local"
+# The cluster with the secret store is the default here, not dev-cell-1.
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
+run = "scripts/secrets-connect.sh"
+
+[tasks."eso:migrate"]
+description = "Move a live CELL (default dev-cp) from the cluster-scoped External Secrets Operator to the one scoped to its store namespace. Safe to run again"
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
+run = "scripts/eso-migrate.sh"
+
+[tasks."pki:rotate-intermediate"]
+description = "Sign a new intermediate CA, write it to the secret manager, sync it with secrets:connect, restart the SPIRE server of CELL (default dev-cp) and check its CA"
+env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
+run = "scripts/pki-rotate-intermediate.sh"
 
 [tasks.hostsvc]
 description = "Run the host service: up, down or facts, with the arguments after --"
 run = "go run ./cmd/hostsvc"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create all five clusters through the host service, then set up the base cell on each cluster that has components"
+description = "Check the tool versions, create all five clusters through the host service, build the images, then run cell:up on each cluster that has components. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
+
+[tasks."harness:verify"]
+description = "Run cell:verify on every cluster that has components, and print one PASS or FAIL line for each"
+run = "scripts/harness-verify.sh"
 
 [tasks."harness:down"]
 description = "Delete all five clusters through the host service"
 run = "scripts/harness.sh down"
 
 [tasks.images]
-description = "Build and push the in-cluster images to the local registry at localhost:5001"
+description = "Build and push the in-cluster images to the local registry at localhost:5001, and record their digests in build/images.env"
 depends = ["vm:up"]
-env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64" }
-run = "ko build --base-import-paths --tags latest ./cmd/netprobe"
+# Without VCS stamps, a binary changes only when its sources change, so a commit alone gives no new digests.
+env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64", GOFLAGS = "-mod=readonly -buildvcs=false" }
+run = "scripts/images.sh"
 
 [tasks."gate:m1"]
 description = "Run the M1 end-to-end tests, plus the go test arguments after --"
 depends = ["images"]
 run = "scripts/gate.sh m1"
+
+[tasks."gate:m2"]
+description = "Run the M2 end-to-end tests against the SPIRE server in dev-cp, plus the go test arguments after --"
+depends = ["images"]
+run = "scripts/gate.sh m2"
+
+[tasks."gate:m2:repair"]
+description = "Repair dev-cp and dev-cell-1 after any gate:m2 run that stopped before its cleanups. Safe to run again"
+run = "scripts/gate-m2-repair.sh"
 
 [tasks."harness:preflight"]
 description = "Check the tool versions and the Colima profile against harness/versions.env"
@@ -116,3 +150,11 @@ run = "scripts/size.sh"
 [tasks."harness:restart-check"]
 description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
 run = "scripts/restart-check.sh"
+
+[tasks."record:fixture"]
+description = "Print a ConfigMap with a test-signed cell record and its public key: --cluster <name> --subject <ns>/<sa>"
+run = "go run ./cmd/recordgen"
+
+[tasks.pki]
+description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"
+run = "go run ./cmd/pkigen"

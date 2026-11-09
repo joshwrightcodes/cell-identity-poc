@@ -1,0 +1,23 @@
+# Copy this file to .envrc.local, then replace each placeholder. Git ignores .envrc.local, and
+# direnv loads it through .envrc after `direnv allow`. Without direnv, `mise run secrets:connect`
+# and `mise run pki:rotate-intermediate` read this file themselves. Both tasks act on dev-cp unless
+# CELL names another cluster.
+
+# A command that prints the read-only access token of your secret manager on standard output.
+export POC_SECRET_TOKEN_CMD='<your secret CLI> read <reference to the access token>'
+
+# The provider block of SecretStore poc-secrets, as one JSON object with one key: the External
+# Secrets Operator name of your provider. The block must refer to key "token" of Secret
+# "poc-secrets-token". The store reads that Secret in its own namespace, so the reference needs no
+# namespace. The general form is:
+#   {"<provider>": {"<vault field>": "<vault>", "auth": {"<secret ref field>":
+#     {"name": "poc-secrets-token", "key": "token"}}}}
+export POC_SECRET_STORE_PROVIDER='<provider block JSON for your secret manager>'
+
+# pki:rotate-intermediate only. The two commands get the remote key as "$1". The read command
+# prints the value of that key. The write command stores its standard input at that key. Use a
+# write identity that can change the intermediate items, and not the cluster access token.
+export POC_SECRET_READ_CMD='<your secret CLI> read "$1"'
+export POC_SECRET_WRITE_CMD='<your secret CLI> write "$1"'
+# The remote key of the root CA bundle.
+export POC_ROOT_CA_BUNDLE='<reference to the root CA bundle>'

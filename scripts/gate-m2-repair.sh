@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+# Repair what a gate:m2 run leaves behind when it stops before its cleanups, for example after Ctrl-C,
+# a go test timeout or a closed terminal. The tests run the same steps in their cleanups. The script
+# is safe to run again.
+#
+# Usage: gate-m2-repair.sh [--check]
+#   --check prints each trace and exits 1, or exits 0 when it finds none.
+#
+# The repair:
+#   1. dev-cp: tags root:current and spire-server:current with the digests in
+#      build/dev-cp/published.env again, refreshes root, waits for the Applications at those digests,
+#      and waits until the SPIRE server holds no entry under /m2-test/;
+#   2. dev-cell-1: puts back the manifest that the key rotation test saved, or removes the two test
+#      flags, checks the manifest, deletes the test key, and waits until the API server publishes
+#      and signs with one key;
+#   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory,
+#      runs a container that started after the API server, and waits for a ready kube-scheduler;
+#   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
+#      a time, and waits for every workload.
+# Each wait has a bound, and the log names it.
+export CELL=dev-cell-1
+source "$(dirname "$0")/lib.sh"
+
+node="$CELL_NAME-control-plane"
+cp="$SPIRE_SERVER_CLUSTER"
+on_node() { docker exec "$node" "$@"; }
+kcp() { kubectl --context "kind-$cp" "$@"; }
+
+# wait_until <seconds> <what> <command...> logs the wait with its bound, and fails after the bound.
+wait_until() {
+  local bound="$1" what="$2" end
+  shift 2
+  end=$((SECONDS + bound))
+  log "waiting up to ${bound}s until $what"
+  until "$@" >/dev/null 2>&1; do
+    ((SECONDS < end)) || die "$what: not true after ${bound}s"
+    sleep 3
+  done
+}
+
+# api_kids prints the sorted key IDs that the API server publishes.
+api_kids() { k get --raw /openid/v1/jwks | jq -r '[.keys[].kid] | sort | join(" ")'; }
+
+b64url_json() {
+  local s="${1//-/+}"
+  s="${s//_//}"
+  while ((${#s} % 4)); do s+="="; done
+  base64 -d <<<"$s" 2>/dev/null
+}
+
+# signing_kid requests a short token for celld and prints the key ID of its header. The audience
+# m2-kid-probe makes the token useless to any service.
+signing_kid() {
+  local head
+  head="$(k -n cell-identity-system create token celld --duration 10m --audience m2-kid-probe | cut -d. -f1)" || return 1
+  b64url_json "$head" | jq -r '.kid // ""'
+}
+
+# Only one repair runs at a time. A repair that a test cleanup started can outlast the go test
+# timeout, and then a new gate or repair must not run beside it. The lock directory holds the
+# process ID of the repair. GATE_M2_REPAIR_LOCK names another directory, for the tests.
+lock="${GATE_M2_REPAIR_LOCK:-$BUILD_ROOT/gate-m2-repair.lock}"
+lock_holder() {
+  local pid
+  pid="$(cat "$lock/pid" 2>/dev/null)" || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  # The system can give the PID of an ended repair to another process. Only a repair counts.
+  [[ "$(ps -p "$pid" -o command= 2>/dev/null)" == *gate-m2-repair* ]] && echo "$pid"
+}
+if holder="$(lock_holder)"; then
+  die "a repair already runs as process $holder. Wait until it ends, or stop it with kill $holder. Then run the command again"
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+  found=()
+  # The node traces come first. The JWKS counts only on a node without traces, because the API
+  # server may not answer while the node holds the test key.
+  node_traces="$(keytest_leftover "$CELL_NAME")" || die "$node_traces"
+  if [[ -n "$node_traces" ]]; then
+    found+=("$node_traces")
+  else
+    kids="$(api_kids 2>/dev/null)" || die "cannot read the JWKS of $CELL_NAME"
+    [[ "$kids" != *" "* ]] || found+=("the API server of $CELL_NAME publishes the keys $kids")
+  fi
+  cp_traces="$(bundle_traces "$cp")" || die "$cp_traces"
+  [[ -z "$cp_traces" ]] || found+=("$cp_traces")
+  if ((${#found[@]} > 0)); then
+    printf '%s\n' "${found[@]}" >&2
+    die "a gate:m2 run left $cp or $CELL_NAME changed. Run: mise run gate:m2:repair"
+  fi
+  exit 0
+fi
+
+# A lock that no live repair holds is left from a repair that ended without its cleanup.
+mkdir -p "$(dirname "$lock")"
+# A rename moves the stale lock aside in one step, so two repairs cannot both remove it.
+if ! mkdir "$lock" 2>/dev/null; then
+  stale="$lock.stale.$$"
+  mv "$lock" "$stale" 2>/dev/null && rm -rf "$stale"
+  mkdir "$lock" 2>/dev/null || die "could not take the lock $lock, which another repair took first"
+fi
+echo "$$" >"$lock/pid"
+trap 'rm -rf "$lock"' EXIT
+
+# Every failure from here on leaves the repair unfinished, and a new run continues it.
+die() { printf 'error: %s. Run: mise run gate:m2:repair again\n' "$*" >&2; exit 1; }
+
+# Step 1: the bundles and the test entry in dev-cp.
+apps_at_published() {
+  local apps
+  apps="$(kcp -n argocd get applications -o json)" || return 1
+  jq -e --arg root "$(published_digest "$cp" root)" --arg spire "$(published_digest "$cp" spire-server)" '
+    (.items | length) > 0
+    and all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")
+    and any(.items[]; .metadata.name == "root" and .status.sync.revision == $root)
+    and any(.items[]; .metadata.name == "spire-server" and .spec.source.targetRevision == $spire and .status.sync.revision == $spire)' <<<"$apps"
+}
+no_test_entries() {
+  local entries
+  entries="$(kcp -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" || return 1
+  jq -e --arg p "$BUNDLE_TEST_PATH" '[.entries[] | select(.spiffe_id.path | startswith($p))] | length == 0' <<<"$entries"
+}
+retagged=0
+store_forward_start "$cp" || die "cannot reach the bundle store of $cp"
+for name in "${BUNDLE_TEST_NAMES[@]}"; do
+  want="$(published_digest "$cp" "$name")"
+  [[ "$want" == sha256:* ]] || { store_forward_stop; die "build/$cp/published.env has no digest for $name. Run: CELL=$cp mise run cell:up"; }
+  got="$(oras resolve --plain-http "$STORE_ADDR/bundles/$name:current" 2>/dev/null || true)"
+  if [[ "$got" != "$want" ]]; then
+    oras tag --plain-http "$STORE_ADDR/bundles/$name@$want" current >/dev/null \
+      || { store_forward_stop; die "could not tag $name@$want as current in the bundle store of $cp"; }
+    log "tagged $name@$want as current again, in place of ${got:-nothing}"
+    retagged=1
+  fi
+done
+store_forward_stop
+if ((retagged)) || ! apps_at_published >/dev/null 2>&1; then
+  kcp -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+  wait_until 300 "the Applications of $cp are Synced and Healthy at the digests of build/$cp/published.env" apps_at_published
+fi
+wait_until 120 "the SPIRE server of $cp holds no entry under $BUNDLE_TEST_PATH" no_test_entries
+log "the bundles of $cp match build/$cp/published.env"
+
+# Step 2: the API server of dev-cell-1.
+identity="$(node_matches "$CELL_NAME")" || die "$identity"
+changed=0
+if on_node test -e "$KEYTEST_SAVED"; then
+  changed=1
+  if ! on_node cmp -s "$KEYTEST_SAVED" "$KEYTEST_MANIFEST"; then
+    on_node sh -c "umask 077 && cp '$KEYTEST_SAVED' /root/m2-test.tmp && mv /root/m2-test.tmp '$KEYTEST_MANIFEST'"
+    log "restored $KEYTEST_MANIFEST from $KEYTEST_SAVED"
+  fi
+elif on_node grep -q 'm2-test-sa' "$KEYTEST_MANIFEST"; then
+  changed=1
+  on_node sh -c "umask 077 && sed -e '\\|--service-account-key-file=$KEYTEST_KEY.pub|d' \
+    -e 's|--service-account-signing-key-file=$KEYTEST_KEY.key|--service-account-signing-key-file=/etc/kubernetes/pki/sa.key|' \
+    '$KEYTEST_MANIFEST' > /root/m2-test.tmp && mv /root/m2-test.tmp '$KEYTEST_MANIFEST'"
+  log "removed the test key flags from $KEYTEST_MANIFEST"
+fi
+# The API server needs the key files for as long as its manifest names them.
+on_node grep -q 'm2-test-sa' "$KEYTEST_MANIFEST" && die "$KEYTEST_MANIFEST still names the test key, so the key stays"
+on_node rm -f "$KEYTEST_KEY.key" "$KEYTEST_KEY.pub"
+
+one_key() {
+  local kids signing ready
+  kids="$(api_kids)" && [[ -n "$kids" && "$kids" != *" "* ]] || return 1
+  signing="$(signing_kid)" && [[ "$signing" == "$kids" ]] || return 1
+  ready="$(k -n kube-system get pod "kube-apiserver-$node" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+  [[ "$ready" == True ]]
+}
+wait_until 240 "the API server of $CELL_NAME publishes one key, signs with it and is Ready" one_key
+kid="$(api_kids)"
+log "the API server of $CELL_NAME publishes and signs with the key $kid"
+
+# Step 3: kube-controller-manager. The reference is the start of the API server container, so a
+# rerun accepts the container that an earlier run started.
+started_at() {
+  k -n kube-system get pod "$1-$node" -o json \
+    | jq -er '.status.containerStatuses[0] | select(.ready) | .state.running.startedAt | fromdateiso8601'
+}
+if ((changed)); then
+  api_started="$(started_at kube-apiserver)" || die "cannot read the start of the kube-apiserver container"
+  manager_current() { local s; s="$(started_at kube-controller-manager)" && ((s >= api_started)); }
+  if ! manager_current; then
+    for id in $(on_node crictl ps --name '^kube-controller-manager$' -q); do
+      on_node crictl stop "$id" >/dev/null
+    done
+    log "stopped the kube-controller-manager container, which started before the API server"
+  fi
+  # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait
+  # while kube-scheduler is in back-off, so step 4 starts only when it runs.
+  scheduler_ready() { started_at kube-scheduler >/dev/null; }
+  control_plane_ready() { manager_current && scheduler_ready; }
+  wait_until 330 "kube-controller-manager runs a ready container that started after the API server, and kube-scheduler is ready" control_plane_ready
+  log "kube-controller-manager runs a container that started after the API server, and kube-scheduler is ready"
+fi
+
+# Step 4: pods with a projected token from another key. Only the token header leaves the node.
+stale=()
+while read -r path head; do
+  [[ -n "$head" ]] || continue
+  file_kid="$(b64url_json "$head" | jq -r '.kid // ""' 2>/dev/null)"
+  if [[ -n "$file_kid" && "$file_kid" != "$kid" ]]; then
+    uid="${path#/var/lib/kubelet/pods/}"
+    stale+=("${uid%%/*}")
+  fi
+done < <(on_node sh -c 'find /var/lib/kubelet/pods/*/volumes/kubernetes.io~projected -type f 2>/dev/null | while read -r f; do
+  h="$(head -n 1 "$f" | grep -oE "^eyJ[^.]*\.[^.]*\." | cut -s -d. -f1)"
+  [ -n "$h" ] && printf "%s %s\n" "$f" "$h"; done; true')
+
+workload_ready() {
+  k -n "$2" get "$1" "$3" -o json | jq -e '
+    if .kind == "DaemonSet" then .status.numberReady == .status.desiredNumberScheduled and .status.updatedNumberScheduled == .status.desiredNumberScheduled
+    else ((.status.readyReplicas // 0) == (.spec.replicas // 1)) and ((.status.updatedReplicas // 0) == (.spec.replicas // 1)) and ((.status.replicas // 0) == (.spec.replicas // 1)) end'
+}
+
+# replace_pod <namespace> <pod> <owner kind> <owner name>. A Deployment outside the harness and
+# outside Argo CD gets a rollout restart. kubectl then owns the restart annotation, which
+# cell:verify and Argo CD would report on their objects, so their pods are deleted instead.
+restarted=()
+replace_pod() {
+  local ns="$1" pod="$2" kind="$3" owner="$4" deployment managed
+  case "$kind" in
+    ReplicaSet)
+      deployment="$(k -n "$ns" get replicaset "$owner" -o jsonpath='{.metadata.ownerReferences[?(@.kind=="Deployment")].name}')"
+      managed="$(k -n "$ns" get deployment "$deployment" -o json \
+        | jq -r '(.metadata.labels["cell.poc.internal/harness"] // .metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | length')"
+      if [[ "$managed" == 0 ]]; then
+        [[ " ${restarted[*]-} " == *" $ns/$deployment "* ]] && return 0
+        restarted+=("$ns/$deployment")
+        log "restarting deployment $ns/$deployment, whose pod $pod holds a token from another key"
+        k -n "$ns" rollout restart deployment "$deployment" >/dev/null
+        log "waiting up to 120s for the rollout of $ns/$deployment"
+        k -n "$ns" rollout status deployment "$deployment" --timeout=120s >/dev/null || die "the rollout of $ns/$deployment did not finish in 120s"
+        return 0
+      fi
+      kind=deployment owner="$deployment" ;;
+    DaemonSet) kind=daemonset ;;
+    StatefulSet) kind=statefulset ;;
+    *) kind="" ;;
+  esac
+  log "deleting pod $ns/$pod, which holds a token from another key"
+  log "waiting up to 60s until pod $ns/$pod is gone"
+  k -n "$ns" delete pod "$pod" --wait=true --timeout=60s >/dev/null || die "pod $ns/$pod did not go within 60s"
+  if [[ -n "$kind" ]]; then
+    sleep 3
+    wait_until 120 "$kind $ns/$owner is ready again" workload_ready "$kind" "$ns" "$owner"
+  fi
+}
+if ((${#stale[@]} > 0)); then
+  uids="$(printf '%s\n' "${stale[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
+  # kindnet enforces NetworkPolicy, so its pods come first.
+  while read -r ns pod kind owner; do
+    replace_pod "$ns" "$pod" "$kind" "$owner" </dev/null
+  done < <(k get pods -A -o json | jq -r --argjson uids "$uids" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
+    | sort_by(if (.metadata.ownerReferences[0].name // "") == "kindnet" then 0 else 1 end)
+    | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"')
+fi
+
+all_ready() {
+  local bad
+  bad="$(k get deployments,statefulsets,daemonsets -A -o json | jq -r '.items[] | select(
+    if .kind == "DaemonSet" then .status.numberReady != .status.desiredNumberScheduled or .status.updatedNumberScheduled != .status.desiredNumberScheduled
+    else ((.status.readyReplicas // 0) != (.spec.replicas // 1)) or ((.status.updatedReplicas // 0) != (.spec.replicas // 1)) or ((.status.replicas // 0) != (.spec.replicas // 1)) end)
+    | "\(.kind)/\(.metadata.namespace)/\(.metadata.name)"')" || return 1
+  [[ -z "$bad" ]]
+}
+wait_until 180 "every workload of $CELL_NAME is ready" all_ready
+on_node rm -f "$KEYTEST_SAVED"
+log "$cp and $CELL_NAME are repaired. Run: CELL=$cp mise run cell:verify and CELL=$CELL_NAME mise run cell:verify"

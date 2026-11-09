@@ -11,35 +11,32 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
 
 func main() {
-	slog.SetDefault(newLogger(os.Args[1:], os.Stdout))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	if err := run(ctx, os.Args[1:]); err != nil {
-		slog.New(slog.NewTextHandler(os.Stderr, nil)).Error("hostsvc failed", "error", err)
-		os.Exit(1)
-	}
+	code := execute(ctx, os.Args[1:], os.Stdout)
+	stop()
+	os.Exit(code)
 }
 
-// newLogger sends the progress logs of up and down to stdout. The facts command keeps stdout
-// for its JSON, so its logs go to stderr.
-func newLogger(args []string, stdout io.Writer) *slog.Logger {
-	if len(args) > 0 && (args[0] == "up" || args[0] == "down") {
-		return slog.New(slog.NewTextHandler(stdout, nil))
-	}
-	return slog.New(slog.NewTextHandler(os.Stderr, nil))
+// execute runs one command and returns the exit code. Every log line is compact JSON on stdout.
+// A failure is one JSON error line on stdout, so the facts command prints only data on success.
+func execute(ctx context.Context, args []string, stdout io.Writer) int {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(stdout, nil)))
+	return cli.Run(stdout, "hostsvc", func(out io.Writer) error { return run(ctx, args, out) })
 }
 
-func run(ctx context.Context, args []string) error {
+func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: hostsvc up|down [--only <name>] | facts --cluster <name>  [--topology <file>]")
 	}
 	cmd := args[0]
 	fs := flag.NewFlagSet(cmd, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
 	topoPath := fs.String("topology", "harness/topology.yaml", "topology file")
 	only := fs.String("only", "", "act on this cluster only (up, down)")
 	name := fs.String("cluster", "", "cluster name (facts)")
@@ -84,7 +81,7 @@ func run(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		enc := json.NewEncoder(os.Stdout)
+		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		return enc.Encode(f)
 	default:
