@@ -105,7 +105,7 @@ Anti-goals. The PoC fails if any of these hold, even when all tests pass:
 - kind clusters do not survive a restart of the Colima VM. The M1 restart check showed nodes that return to Ready, but `istiod` and the mesh pods do not recover. A Mac restart is a disaster recovery event, and the gate runs under `caffeinate`.
 - Go 1.27, module path `github.com/joshwrightcodes/cell-identity-poc`, ko for images and distroless images. Every bespoke binary comes from one Go module with one release version.
 - Images: locally, ko pushes to one registry container on the `kind` network, and each node's containerd uses it as a mirror. On EKS, images live in ECR. CI pushes through GitHub OIDC, and nodes pull with their IAM role.
-- Telemetry leaves a cluster only as OpenTelemetry (OTLP). **[owner]** Bespoke binaries log to stdout and export OTLP, with no Prometheus client libraries or ServiceMonitors. Upstream components that expose only Prometheus metrics keep their endpoint, and only the collector in the same cluster may scrape it.
+- Telemetry leaves a cluster only as OpenTelemetry (OTLP). **[owner]** Bespoke binaries write every log as compact JSON, one object per line, to stdout, and export OTLP, with no Prometheus client libraries or ServiceMonitors. A command whose stdout carries data prints only that data on success, and one JSON error line on failure. Upstream components use their JSON log format where they have one. Upstream components that expose only Prometheus metrics keep their endpoint, and only the collector in the same cluster may scrape it.
 - Upstream SPIRE and Argo CD Agent stay unforked. Fixes needed upstream are offered as contributions, after the owner approves each one.
 - Read each third-party component before it runs, and report the result.
 - Scripts do not write secrets to disk.
@@ -614,7 +614,16 @@ Kiali runs in the `management` cluster. It shows the mesh of each cell, and it c
 
 - Each cell's collector sends OTLP through the telemetry relay to Kiln. The `<env>-cp` collector sends OTLP to Kiln directly, with its own SVID.
 - Each collector also scrapes the Prometheus endpoints of upstream components in its own cluster: Argo CD, Argo CD Agent, istiod and Envoy. A NetworkPolicy admits only the collector to those endpoints.
-- Locally, Kiln's telemetry gateway feeds the `otel-lgtm` image, which runs Grafana, Loki, Tempo and Prometheus. Grafana shows every cluster, and the `cluster` resource attribute tells them apart.
+- Locally, Kiln's telemetry gateway feeds the `otel-lgtm` image, which runs Grafana, Loki, Tempo and Prometheus.
+- Every collector tags every log, span and metric with the source attributes in the table below. **[owner]** The attributes become Prometheus labels, Loki index labels and Tempo search fields, so every view can filter by cluster, plane, environment and cell.
+- The telemetry gateway does not trust the attributes that a cell sends. It sets them again from the verified SPIFFE ID of the stream. A cell therefore cannot label its signals as another cell's. The gateway counts each overwrite that changes a value, and an alert fires on any such change.
+
+| Attribute | Value | Set on |
+| --- | --- | --- |
+| `k8s.cluster.name` | The cluster name, for example `dev-cell-1` | Every cluster |
+| `platform.plane` | `management`, `environment` or `cell` | Every cluster |
+| `deployment.environment.name` | The environment, for example `dev` | Environment and cell clusters |
+| `platform.cell` | The cell name, for example `dev-cell-1` | Cell clusters |
 - The collector forwards only allow-listed attributes, span names and event names. Log bodies come only from fixed message templates.
 - The collector runs as a StatefulSet with the Recreate strategy, with a persistent queue sized in bytes for 24 hours. It filters before it queues, and the relay limits the rate at which a backlog drains after an island.
 - `celld` status messages carry a health summary for the cell: Argo CD health, root digest, SVID expiry and collector drops. The environment control plane can therefore see its cells during an island with Kiln.
