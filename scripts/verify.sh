@@ -458,8 +458,8 @@ check_operator_scope() {
   can="$(k auth can-i list secrets -A --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
   [[ "$can" == no ]] || { echo "the External Secrets Operator can list Secrets in every namespace (can-i: '${can:-unknown}'). Run: CELL=$CELL_NAME mise run eso:migrate"; return 1; }
   extra="$(k get secrets -A --field-selector metadata.name=poc-secrets-token -o json \
-    | jq -r --arg keep " $SECRET_STORE_NAMESPACES " '.items[] | select(($keep | contains(" " + .metadata.namespace + " ")) | not)
-      | "\(.metadata.namespace)/\(.metadata.name)"')" || { echo "could not list the Secrets named poc-secrets-token"; return 1; }
+    | jq -r --arg keep " $SECRET_STORE_NAMESPACES " '.items[] | .metadata.namespace as $ns
+      | select(($keep | contains(" " + $ns + " ")) | not) | "\($ns)/\(.metadata.name)"')" || { echo "could not list the Secrets named poc-secrets-token"; return 1; }
   [[ -z "$extra" ]] || { echo "a copy of the access token lies outside $SECRET_STORE_NAMESPACES: $extra. Run: CELL=$CELL_NAME mise run eso:migrate"; return 1; }
 }
 
