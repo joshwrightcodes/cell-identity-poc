@@ -3,6 +3,9 @@
 //	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port>
+//	cell-proxy spiffe-server ... --backend tunnel --tunnel-cell <cell>=<listen addr> [--tunnel-cell ...] [--tunnel-wait 10s]
+//	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
+//	cell-proxy promql-proxy --listen <addr> --upstream <url>
 //	cell-proxy probe --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy whoami
 //
@@ -13,7 +16,8 @@
 // a peer in the same namespace. Both get their own SVID from the Workload API at
 // SPIFFE_ENDPOINT_SOCKET, and trust a peer only through the --peer-bundle file.
 // They log compact JSON to stdout and export OTLP, as package internal/telemetry describes. A
-// configuration error is one JSON error line and exit status 2.
+// configuration error is one JSON error line and exit status 2. promql-proxy passes only the
+// Prometheus reads of Kiali to --upstream, and has no SVID.
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
 // whoami prints the sorted IDs of the X.509 SVIDs of this process. Neither starts telemetry. A
@@ -21,6 +25,12 @@
 // failure is one JSON error line and exit status 1. The probe error line carries a reason:
 // upstream_unavailable when the dial fails, peer_untrusted, peer_not_allowed or protocol_not_h2
 // for a refused server, and handshake_failed for any other handshake error.
+//
+// The tunnel backend of spiffe-server holds one tunnel for each --tunnel-cell, and serves a
+// plaintext HTTP listener for each cell that sends its requests through the tunnel of that cell.
+// tunnel is the cell side: it dials one exact server ID with its SVID, and serves the allowed
+// Kubernetes reads on the dialed connection with the token of its pod. promql-proxy passes only
+// the Prometheus reads of Kiali to --upstream, and has no SVID.
 package main
 
 import (
@@ -81,7 +91,7 @@ func main() {
 // execute runs one mode and returns the exit status.
 func execute(ctx context.Context, args []string, stdout io.Writer) int {
 	if len(args) == 0 {
-		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, probe or whoami"))
+		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, tunnel, promql-proxy, probe or whoami"))
 		return exitConfig
 	}
 	switch args[0] {
@@ -89,6 +99,10 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 		return runClient(ctx, args[1:], stdout)
 	case "spiffe-server":
 		return runServer(ctx, args[1:], stdout)
+	case "tunnel":
+		return runTunnel(ctx, args[1:], stdout)
+	case "promql-proxy":
+		return runPromProxy(ctx, args[1:], stdout)
 	case "probe":
 		cfg, err := parseProbe(args[1:])
 		if err != nil {
@@ -219,6 +233,7 @@ type serverConfig struct {
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
 	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
+	tunnel   *tunnelConfig
 }
 
 func parseServer(args []string) (serverConfig, error) {
@@ -228,9 +243,12 @@ func parseServer(args []string) (serverConfig, error) {
 	td := fs.String("peer-trust-domain", "", "trust domain of the clients")
 	allow := fs.String("allow-id", "", "anchored regular expression for the client SPIFFE IDs")
 	registryDir := fs.String("registry-dir", "", "directory with signers.pub and the *.dsse.json cell records")
-	backend := fs.String("backend", "", "backend for each connection: grpc-header or otlp")
+	backend := fs.String("backend", "", "backend for each connection: grpc-header, otlp or tunnel")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
 	header := fs.String("identity-header", "x-cell-agent", "header that carries <env>-<cell> to the upstream")
+	tunnelCells := map[string]string{}
+	fs.Func("tunnel-cell", "<cell>=<listen addr> of a tunnel listener; repeat for each cell", tunnelCellFlag(tunnelCells))
+	tunnelWait := fs.Duration("tunnel-wait", 10*time.Second, "how long a tunnel request waits for the tunnel of its cell")
 	if err := parseFlags(fs, args); err != nil {
 		return serverConfig{}, err
 	}
@@ -254,6 +272,12 @@ func parseServer(args []string) (serverConfig, error) {
 	}
 	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg}
 	switch *backend {
+	case "tunnel":
+		tc, err := newTunnelConfig(tunnelCells, *tunnelWait)
+		if err != nil {
+			return serverConfig{}, err
+		}
+		cfg.tunnel = tc
 	case "grpc-header":
 		if err := required(map[string]string{"upstream": *upstream, "identity-header": *header}); err != nil {
 			return serverConfig{}, err
@@ -315,6 +339,13 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		st := cfg.registry.Stats()
 		tel.Log.Info("registry loaded", "content_sha256", cfg.registry.ContentSHA256(),
 			"records", st.Records, "revoked", st.Revoked, "signers", st.Signers)
+		if cfg.tunnel != nil {
+			ln, err := net.Listen("tcp", cfg.listen)
+			if err != nil {
+				return err
+			}
+			return serveTunnelHub(ctx, ln, cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, cfg.registry, tel.Log), cfg.tunnel, tel.Log)
+		}
 		backend, err := cfg.backend(tel)
 		if err != nil {
 			return err
@@ -339,6 +370,21 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 // serve starts telemetry and the X.509 source, then runs fn until ctx ends. A failure is one
 // JSON error line and status 1.
 func serve(ctx context.Context, stdout io.Writer, fn func(context.Context, *telemetry.T, *workloadapi.X509Source) error) int {
+	return serveTelemetry(ctx, stdout, func(ctx context.Context, tel *telemetry.T) error {
+		sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
+		svids, err := workloadapi.NewX509Source(sctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("x509 source from the workload api: %w", err)
+		}
+		defer func() { _ = svids.Close() }()
+		return fn(ctx, tel, svids)
+	})
+}
+
+// serveTelemetry starts telemetry, then runs fn until ctx ends. A failure is one JSON error line
+// and status 1.
+func serveTelemetry(ctx context.Context, stdout io.Writer, fn func(context.Context, *telemetry.T) error) int {
 	tel, err := telemetry.Start(ctx, name, stdout)
 	if err != nil {
 		cli.Fail(stdout, name, fmt.Errorf("start telemetry: %w", err))
@@ -352,15 +398,7 @@ func serve(ctx context.Context, stdout io.Writer, fn func(context.Context, *tele
 			slog.New(slog.NewJSONHandler(stdout, nil)).Warn("telemetry shutdown", "error", err.Error())
 		}
 	}()
-	sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
-	svids, err := workloadapi.NewX509Source(sctx)
-	cancel()
-	if err != nil {
-		tel.Log.Error(name+" failed", "error", fmt.Sprintf("x509 source from the workload api: %v", err))
-		return 1
-	}
-	defer func() { _ = svids.Close() }()
-	if err := fn(ctx, tel, svids); err != nil {
+	if err := fn(ctx, tel); err != nil {
 		tel.Log.Error(name+" failed", "error", err.Error())
 		return 1
 	}

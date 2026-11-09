@@ -502,6 +502,7 @@ func TestEachBackendThroughSpiffeClient(t *testing.T) {
 			t.Fatalf("upstream calls %d, want 1", n)
 		}
 	})
+	t.Run("tunnel", tunnelThroughSpiffeClient)
 }
 
 func TestReasonStatusMapping(t *testing.T) {
