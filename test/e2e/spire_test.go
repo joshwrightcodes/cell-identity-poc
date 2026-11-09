@@ -113,9 +113,15 @@ func TestM2EntriesReconcile(t *testing.T) {
 		waitApps(t, origRoot, origSpire)
 	}
 	t.Cleanup(func() {
+		failedBefore := t.Failed()
+		defer func() {
+			if t.Failed() && !failedBefore {
+				t.Logf("the restore of %s did not finish. %s", spireCluster, repairHint)
+			}
+		}()
 		restore(t)
 		if left := entriesUnder(t, spireTestPath); len(left) > 0 {
-			t.Errorf("want no entry under spiffe://%s%s after the test, got %v", spireTD, spireTestPath, left)
+			t.Errorf("want no entry under spiffe://%s%s after the test, got %v. %s", spireTD, spireTestPath, left, repairHint)
 		}
 	})
 

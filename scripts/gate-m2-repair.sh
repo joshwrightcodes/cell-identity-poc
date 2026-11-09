@@ -14,7 +14,7 @@
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes
 #      and signs with one key;
 #   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory,
-#      runs a container that started after the API server;
+#      runs a container that started after the API server, and waits for a ready kube-scheduler;
 #   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
 #      a time, and waits for every workload.
 # Each wait has a bound, and the log names it.
@@ -75,6 +75,9 @@ if [[ "${1:-}" == "--check" ]]; then
   fi
   exit 0
 fi
+
+# Every failure from here on leaves the repair unfinished, and a new run continues it.
+die() { printf 'error: %s. Run: mise run gate:m2:repair again\n' "$*" >&2; exit 1; }
 
 # Step 1: the bundles and the test entry in dev-cp.
 apps_at_published() {
@@ -159,9 +162,12 @@ if ((changed)); then
     done
     log "stopped the kube-controller-manager container, which started before the API server"
   fi
-  # kubelet can delay the new container by its restart back-off, up to 5 minutes.
-  wait_until 330 "kube-controller-manager runs a ready container that started after the API server" manager_current
-  log "kube-controller-manager runs a container that started after the API server"
+  # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait
+  # while kube-scheduler is in back-off, so step 4 starts only when it runs.
+  scheduler_ready() { started_at kube-scheduler >/dev/null; }
+  control_plane_ready() { manager_current && scheduler_ready; }
+  wait_until 330 "kube-controller-manager runs a ready container that started after the API server, and kube-scheduler is ready" control_plane_ready
+  log "kube-controller-manager runs a container that started after the API server, and kube-scheduler is ready"
 fi
 
 # Step 4: pods with a projected token from another key. Only the token header leaves the node.

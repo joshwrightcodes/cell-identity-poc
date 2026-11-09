@@ -177,10 +177,15 @@ CELL=dev-cell-1 mise run cell:verify
 ```
 
 The repair puts back the bundles of `dev-cp` and the API server of `dev-cell-1`, and it is safe to run again.
+The repair, the gate prechecks and `cell:verify` in `dev-cp` take `build/dev-cp/published.env` of this checkout as the truth, which the last `cell:publish` from this checkout wrote.
+After a publish from another checkout, run `CELL=dev-cp mise run cell:up` here instead of the repair.
 It usually takes a few minutes.
 Each wait has a bound, and the log names it.
 The fixed waits add up to about 20 minutes, and each replaced pod adds up to 3 minutes.
 kubelet back-off alone can take 5 minutes of that time.
+New pods of `dev-cell-1` wait while `kube-scheduler` is in kubelet back-off, so the repair waits for it before it replaces pods.
+A repair in the cleanup of a test can outlast the `go test` timeout in the worst case.
+The next run then stops in its precheck and prints the repair command.
 A stopped run can also leave probe objects in `cell-identity-system`, and the next gate run deletes them.
 If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mise run cell:up` for that cell.
 

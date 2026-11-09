@@ -26,8 +26,12 @@ const maxClockSkew = time.Second
 // test, so it skips the checks.
 func TestMain(m *testing.M) {
 	flag.Parse()
-	if f := flag.Lookup("test.run"); f == nil || f.Value.String() != "^$" {
-		if err := precheck(); err != nil {
+	run := ""
+	if f := flag.Lookup("test.run"); f != nil {
+		run = f.Value.String()
+	}
+	if run != "^$" {
+		if err := precheck(run); err != nil {
 			fmt.Fprintf(os.Stderr, "e2e precheck failed: %v\n", err)
 			os.Exit(1)
 		}
@@ -35,7 +39,7 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func precheck() error {
+func precheck(run string) error {
 	topo, err := topology.Load(topologyPath)
 	if err != nil {
 		return fmt.Errorf("load topology: %w", err)
@@ -49,6 +53,18 @@ func precheck() error {
 	// and dev-cp with test bundles.
 	if out, err := command("", "bash", "../../scripts/gate-m2-repair.sh", "--check"); err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
+	}
+	// The renewal tests need SVIDs of 1m. scripts/gate.sh checks the same before gate:m2.
+	if run == "" || strings.Contains(run, "M2") {
+		conf, err := command("", "kubectl", "--context", "kind-"+spireCluster, "-n", spireNamespace, "get", "configmap", "spire-server",
+			"-o", `jsonpath={.data.server\.conf}`)
+		if err != nil {
+			return fmt.Errorf("read the server config of %s: %w\n%s", spireCluster, err, conf)
+		}
+		if ttl := agentTTL(conf); ttl != "1m" {
+			return fmt.Errorf("the SPIRE server in %s sets agent_ttl %q, and the renewal tests need 1m. "+
+				"Set SPIRE_SVID_TTL=1m in cells/dev-cp.env, then run: CELL=dev-cp mise run cell:up", spireCluster, ttl)
+		}
 	}
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 		// A run that ended before its cleanup can leave probe objects in the harness namespace, where
@@ -64,6 +80,16 @@ func precheck() error {
 		}
 	}
 	return nil
+}
+
+// agentTTL returns the value of agent_ttl in a SPIRE server config.
+func agentTTL(conf string) string {
+	for line := range strings.SplitSeq(conf, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), "agent_ttl = "); ok {
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
 }
 
 // checkClock compares the clock of a node with the clock of this Mac, at the midpoint of the call.

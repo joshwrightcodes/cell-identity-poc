@@ -17,7 +17,7 @@ node_matches() {
   kube_ip="$(kubectl --context "kind-$1" get node "$node" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}' 2>/dev/null)" || {
     echo "cannot read the node $node from the API server of $1"; return 1; }
   [[ -n "$kube_ip" && " $docker_ip " == *" $kube_ip "* ]] || {
-    echo "the container $node has the addresses '${docker_ip% }', and the API server of $1 reports '$kube_ip'"; return 1; }
+    echo "the container $node has the addresses '${docker_ip% }', and the API server of $1 reports '$kube_ip'. DOCKER_HOST is '${DOCKER_HOST:-unset}'"; return 1; }
 }
 
 # keytest_leftover <cluster> prints each trace of the key rotation test on the node of the cluster.
