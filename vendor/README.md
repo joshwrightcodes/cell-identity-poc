@@ -803,3 +803,65 @@ registry, read on 2026-11-08. The review listed the layer files and ran nothing 
   No file is setuid or setgid.
 - The pod runs the sidecar as user 1000, with a read-only root file system and no capabilities.
 - The review did not compare the binary with a source build, and did not check image signatures.
+
+## M3 version dates (2026-11-09)
+
+Each version that M3 pins must have a publish date on or before 2026-10-26, two weeks before the
+work date. The table gives the date of the release artefact and its source. Read-only `gh api`
+calls and registry queries gave each date.
+
+| Item | Version | Date (UTC) | Source |
+| --- | --- | --- | --- |
+| go-spiffe | v2.9.0 | 2026-10-05T18:26:53Z | GitHub release `published_at` |
+| OpenTelemetry Go | v1.47.0 | 2026-10-02T08:18:45Z | GitHub release `published_at` |
+| grpc-go | v1.84.0 | 2026-09-17T20:03:39Z | GitHub release `published_at` |
+| `google.golang.org/protobuf` | v1.36.12 | 2026-08-10T15:29:56Z | GitHub release `published_at` |
+| `golang.org/x/net` | v0.59.0 | 2026-09-08T19:18:02Z | `proxy.golang.org` version info, because the repository has no GitHub releases |
+| `go.opentelemetry.io/proto/otlp` | v1.11.0 | 2026-07-22T21:40:59Z | `proxy.golang.org` version info |
+| SPIRE | v1.15.5 | 2026-10-20T18:35:18Z | GitHub release; image `spire-server` created 2026-10-20T18:07:27Z |
+| Argo CD | v3.6.1 | 2026-11-04T14:20:31Z | GitHub release; image `quay.io/argoproj/argocd` created 2026-11-04T13:48:52Z |
+| Argo CD Agent | v0.10.0 | 2026-08-26T21:32:56Z | GitHub release; image `quay.io/argoprojlabs/argocd-agent` created 2026-08-26T21:24:06Z |
+| `grafana/otel-lgtm` | v0.38.0 | 2026-10-23T11:18:25Z | GitHub release of `grafana/docker-otel-lgtm`; image created 2026-10-23T11:10:11Z |
+| Kiali | v2.34.0 | 2026-10-25T13:59:52Z | GitHub release; image `quay.io/kiali/kiali` created 2026-10-25T13:59:23Z |
+| kiali-server chart | 2.34.0 | 2026-10-26T16:06:40Z | Commit date of tag `v2.34.0` in `kiali/helm-charts` |
+| Collector Kubernetes distribution | 0.164.0 | 2026-10-26T23:46:44Z | GitHub release; image `opentelemetry-collector-k8s` created 2026-10-26T23:48:32Z |
+| Istio | 1.30.8 | 2026-11-06T19:00:51Z | GitHub release; image `pilot` created 2026-11-06T13:54:46Z; chart `istiod` created 2026-11-06T17:21:39Z |
+| External Secrets Operator | 2.14.0 | 2026-10-23T15:06:48Z | GitHub release; chart release 2026-10-23T16:22:37Z; image created 2026-10-23T13:01:14Z |
+
+- The collector Kubernetes distribution 0.165.0 has a publish date of 2026-11-07, after the
+  cutoff. M3 uses 0.164.0 instead, which has a publish date on the cutoff day.
+- Argo CD v3.6.1 and Istio 1.30.8 have publish dates after the cutoff. Earlier milestones pinned
+  them, and the decision about them belongs to the maintainers. M3 does not change them.
+- The Kiali chart index gives one `created` value, 2026-11-02T17:06:56Z, to 258 of its 280
+  entries. That value is the time of an index build, not a publish date. Because of this, the
+  table uses the commit date of the chart tag.
+
+## cell-proxy modules (2026-11-09)
+
+`internal/cellproxy` makes two modules direct requirements. Both were already in the module graph
+at the same versions, so `go.sum` does not change.
+
+| Module | Version | Commit | Date | Package that cell-proxy uses |
+| --- | --- | --- | --- | --- |
+| `golang.org/x/net` | v0.59.0 | `540d04cfe5028e2655754591a4d3e08c586809f2` | 2026-09-08 | `http2` |
+| `google.golang.org/protobuf` | v1.36.12 | `cdd4c5f7406e82462949c7a65defa9f3029c162d` | 2026-08-10 | `encoding/protowire` |
+
+The review read the files in the Go module cache, and `go mod verify` passes. Nothing ran during
+the review.
+
+- With Go 1.27, `x/net/http2` wraps the HTTP/2 code of `net/http`. The build tag
+  `go1.27 && !http2legacy` selects `server_wrap.go`, `transport_wrap.go` and `clientconn.go`.
+- Those files import only standard library packages. `NewClientConn` uses the connection that the
+  caller gives, and it does not dial.
+- The `init` function in `http2.go` reads only `GODEBUG`, for debug logs and extended CONNECT.
+- `protowire` imports `io`, `math`, `math/bits` and one internal errors package. It has no file,
+  network or environment access.
+- The 71 files of `x/net/http2` and `protowire` have no hidden Unicode. The only other non-ASCII
+  characters are ellipses in comments of `protowire/wire.go`.
+- The files that the review read have no `sudo`, `os/exec`, `unsafe` or `syscall` import.
+- Go 1.27 marks `http2.ClientConn` as deprecated in favour of `net/http.ClientConn`.
+- The tests also use `types/known/wrapperspb` from the protobuf module and `encoding/gzip` from
+  grpc-go. Neither is in the `cell-proxy` binary.
+
+The review did not read the HTTP/2 code of the Go standard library, or the frame and `hpack` code
+of `x/net/http2`.

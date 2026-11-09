@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -51,5 +52,28 @@ func assertErrorLine(t *testing.T, out, msg, text string) {
 	}
 	if rec["level"] != "ERROR" || rec["msg"] != msg || rec["error"] != text {
 		t.Fatalf("line %v, want level ERROR, msg %q and error %q", rec, msg, text)
+	}
+}
+
+type reasonError struct{ error }
+
+func (e reasonError) LogAttrs() []any { return []any{"reason", "peer_not_allowed"} }
+
+// An error with its own attributes adds them to the error line, also when it is wrapped.
+func TestFailAddsTheAttributesOfTheError(t *testing.T) {
+	var w bytes.Buffer
+	code := Run(&w, "probe", func(io.Writer) error {
+		return fmt.Errorf("handshake: %w", reasonError{errors.New("wrong server")})
+	})
+	if code != 1 {
+		t.Fatalf("code %d, want 1", code)
+	}
+	assertErrorLine(t, w.String(), "probe failed", "handshake: wrong server")
+	var rec map[string]any
+	if err := json.Unmarshal(w.Bytes(), &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec["reason"] != "peer_not_allowed" {
+		t.Fatalf("line %v has no reason", rec)
 	}
 }
