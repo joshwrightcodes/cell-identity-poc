@@ -39,8 +39,8 @@ const (
 	agentRotated    = "Successfully rotated agent SVID"
 	agentReattested = "Successfully reattested node"
 	celldUpdated    = "x509 svid updated"
-	// The test profile in components/spire-server/server.conf gives agent and workload SVIDs a
-	// lifetime of 1 minute. The agent renews at about half of that.
+	// SPIRE_SVID_TTL in cells/dev-cp.env gives agent and workload SVIDs their lifetime, and
+	// scripts/gate.sh requires 1m for gate:m2. The agent renews at about half of that.
 	renewWait      = 3 * time.Minute
 	containerWait  = 2 * time.Minute
 	tokenBinding   = "celld-token"

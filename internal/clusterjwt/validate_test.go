@@ -218,7 +218,7 @@ func TestValidateReasons(t *testing.T) {
 		}},
 	}
 	for _, tc := range cases {
-		t.Run(string(tc.want), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			rec := k.record(t)
 			if tc.rec != nil {
 				rec = tc.rec(rec)

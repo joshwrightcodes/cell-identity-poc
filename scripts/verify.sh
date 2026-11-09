@@ -180,9 +180,9 @@ check_agent_cells_current() {
     printf '%s\n' "${stale[@]}"
     # A new record signs the live keys. While the key rotation test has changed a cell, those keys
     # include the test key, so the node must be repaired first.
+    # A node that cannot be read counts as one that needs the repair.
     for cell in $SPIRE_AGENT_CELLS; do
-      traces="$(keytest_leftover "$cell" 2>/dev/null || true)"
-      if [[ -n "$traces" ]]; then
+      if ! traces="$(keytest_leftover "$cell")" || [[ -n "$traces" ]]; then
         printf '%s\n' "$traces"
         echo "Run: mise run gate:m2:repair, and then CELL=$CELL_NAME mise run cell:verify again"
         return 1
@@ -350,18 +350,29 @@ check_live_images() {
 # of it, and the API server must publish exactly the keys that the record of the cell holds.
 check_keytest_clean() {
   local traces live record
-  traces="$(keytest_leftover "$CELL_NAME")" || { echo "could not read the node $CELL_NAME-control-plane"; return 1; }
-  live="$(k get --raw /openid/v1/jwks | jq -cS '.keys | sort_by(.kid)')" || { echo "could not read the JWKS of $CELL_NAME"; return 1; }
-  record="$(kubectl --context "kind-$SPIRE_SERVER_CLUSTER" -n spire-system get configmap "cell-record-$CELL_NAME" -o jsonpath='{.data.record\.dsse\.json}' \
-    | jq -r .payload | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)')" || { echo "could not read the record of $CELL_NAME in $SPIRE_SERVER_CLUSTER"; return 1; }
-  if [[ -n "$traces" ]]; then
+  # The node traces come first, because the API server may not answer while the node holds them.
+  if ! traces="$(keytest_leftover "$CELL_NAME")" || [[ -n "$traces" ]]; then
     printf '%s\n' "$traces"
     echo "Run: mise run gate:m2:repair"
     return 1
   fi
+  live="$(k get --raw /openid/v1/jwks | jq -cS '.keys | sort_by(.kid)')" || { echo "could not read the JWKS of $CELL_NAME"; return 1; }
+  record="$(kubectl --context "kind-$SPIRE_SERVER_CLUSTER" -n spire-system get configmap "cell-record-$CELL_NAME" -o jsonpath='{.data.record\.dsse\.json}' \
+    | jq -r .payload | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)')" || { echo "could not read the record of $CELL_NAME in $SPIRE_SERVER_CLUSTER"; return 1; }
   if [[ -z "$live" || "$live" != "$record" ]]; then
     echo "the API server of $CELL_NAME publishes other keys than its record in $SPIRE_SERVER_CLUSTER."
     echo "Run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:up"
+    return 1
+  fi
+}
+
+# The entries test of gate:m2 publishes test bundles and adds an entry under /m2-test/. A run that
+# stops before its cleanup leaves them, and Argo CD still reports Synced and Healthy.
+check_no_gate_bundles() {
+  local traces
+  if ! traces="$(bundle_traces "$CELL_NAME")" || [[ -n "$traces" ]]; then
+    printf '%s\n' "$traces"
+    echo "Run: mise run gate:m2:repair"
     return 1
   fi
 }
@@ -459,6 +470,7 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
   check "The SPIRE server holds the node alias and celld entries of $SPIRE_AGENT_CELLS" check_agent_entries
   check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
+  check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.

@@ -27,7 +27,7 @@
 | Check the Go code | `mise run lint` |
 | Run the M1 end-to-end gate | `mise run gate:m1` |
 | Run the M2 end-to-end gate against the SPIRE server in `dev-cp` | `mise run gate:m2` |
-| Restore `dev-cell-1` after a `gate:m2` run that stopped before its cleanup | `mise run gate:m2:repair` |
+| Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References

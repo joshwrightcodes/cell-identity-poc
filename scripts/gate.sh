@@ -16,9 +16,15 @@ build_start=$SECONDS
 go test -tags e2e -count=1 -run '^$' ./test/e2e/ >/dev/null || die "the end-to-end tests do not build"
 log "gate $milestone build took $((SECONDS - build_start))s"
 
-# The M2 tests run against the deployed SPIRE server, plugins and celld. Each must run the image
-# that `mise run images` recorded, or the gate tests old code.
+# The M2 tests run against the deployed SPIRE server, plugins and celld. First, an earlier run must
+# have left no trace, because the cell:up hint below would sign a record with a test key. Then the
+# renewal tests need SVIDs of 1m, and each workload must run the image that `mise run images`
+# recorded, or the gate tests old code.
 if [[ "$milestone" == m2 ]]; then
+  "$ROOT/scripts/gate-m2-repair.sh" --check || exit 1
+  ttl="$(kubectl --context kind-dev-cp -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}' \
+    | sed -n 's/^ *agent_ttl = "\(.*\)"$/\1/p')" || die "could not read the server config of dev-cp"
+  [[ "$ttl" == 1m ]] || die "the SPIRE server in dev-cp sets agent_ttl '$ttl', and the renewal tests need 1m. Set SPIRE_SVID_TTL=1m in cells/dev-cp.env, then run: CELL=dev-cp mise run cell:up"
   stale=""
   for target in dev-cp:spire-system:statefulset/spire-server dev-cell-1:cell-identity-system:deployment/celld \
       dev-cell-2:cell-identity-system:deployment/celld; do

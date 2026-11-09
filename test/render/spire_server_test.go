@@ -91,12 +91,32 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
+if [[ " $* " == *" get node "* ]]; then
+  echo 10.9.0.7
+  exit 0
+fi
 if [[ -n "${STUB_NO_SERVER:-}" ]]; then
   echo 'Error from server (NotFound): pods "spire-server-0" not found' >&2
   exit 1
 fi
 cat "$STUB_BUNDLE_FILE"
 [[ -z "${STUB_BAD_BUNDLE:-}" ]] || echo "not a certificate"
+`
+
+// stubDocker answers the node checks of scripts/gate-traces.sh. Every node has the address 10.9.0.7
+// unless STUB_DOCKER_IP sets another one. STUB_KEYTEST_TRACE names a cell whose node holds a trace of
+// the key rotation test.
+const stubDocker = `#!/usr/bin/env bash
+set -euo pipefail
+echo "docker $*" >>"$STUB_LOG"
+case "$1" in
+  inspect) echo "${STUB_DOCKER_IP:-10.9.0.7} " ;;
+  exec)
+    if [[ "$2" == "${STUB_KEYTEST_TRACE:-none}-control-plane" ]]; then
+      echo "/etc/kubernetes/manifests/kube-apiserver.yaml names the test key"
+    fi ;;
+  *) exit 1 ;;
+esac
 `
 
 type result struct {
@@ -200,6 +220,7 @@ func renderScript(t *testing.T, component, binary string, env ...string) result 
 	write("mise", stubMise, 0o755)
 	write("oras", stubOras, 0o755)
 	write("kubectl", stubKubectl, 0o755)
+	write("docker", stubDocker, 0o755)
 	layerBytes := layerTarGz(t, binary)
 	layer := write("layer.tar.gz", string(layerBytes), 0o644)
 	manifestBytes := []byte(`{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{"digest":"sha256:0000"},{"digest":"` + digestOf(layerBytes) + `"}]}`)
@@ -675,6 +696,8 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"layer with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_LAYER=1"}, "could not fetch layer"},
 		{"manifest with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_MANIFEST=1"}, "could not fetch the manifest of localhost:5001/cluster-jwt-server@sha256:"},
 		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_AGENT_SUBJECT=celld"}, "is not <namespace>/<service account>"},
+		{"key test trace on an agent cell", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_KEYTEST_TRACE=dev-cell-2"}, "Run: mise run gate:m2:repair"},
+		{"docker reaches another daemon", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_DOCKER_IP=10.0.0.99"}, "reports '10.9.0.7'"},
 		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},
 		{"SVID lifetime in days", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=1d"}, "SPIRE_SVID_TTL '1d' is not"},
 		{"SVID lifetime below the tested floor", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=30s"}, "SPIRE_SVID_TTL '30s' is not"},

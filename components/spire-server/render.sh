@@ -21,6 +21,7 @@ plugin_binary=/ko-app/cluster-jwt-server
 die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
+source "$root/scripts/gate-traces.sh"
 
 # The plugin image and the checksum of the binary in it.
 plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
@@ -56,6 +57,10 @@ entries='{}'
 keys=()
 records=""
 for cell in $SPIRE_AGENT_CELLS; do
+  # The record signs the keys that the cell publishes. While the M2 key rotation test has changed the
+  # cell, those keys include the test key, so the render stops until the node is repaired.
+  traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
+  [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
   if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
     die "no host service facts for $cell: ${facts:-no output}"
   fi

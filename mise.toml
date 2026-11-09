@@ -119,7 +119,7 @@ depends = ["images"]
 run = "scripts/gate.sh m2"
 
 [tasks."gate:m2:repair"]
-description = "Restore the API server of dev-cell-1 after a gate:m2 run that stopped before its cleanup. Safe to run again"
+description = "Repair dev-cp and dev-cell-1 after any gate:m2 run that stopped before its cleanups. Safe to run again"
 run = "scripts/gate-m2-repair.sh"
 
 [tasks."harness:preflight"]

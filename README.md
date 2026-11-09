@@ -151,24 +151,35 @@ The budgets do not cover `harness:up`.
 
 `gate:m2` changes the clusters while it runs, and it puts them back before it ends:
 
+- It publishes test bundles of `root` and `spire-server` in `dev-cp`, with an entry under `/m2-test/`, for about two minutes.
 - It replaces the `celld` pod in each cell, so the SPIRE server keeps about six old agent entries until it prunes them, one hour after they expire.
 - It removes the `celld-token` RoleBinding of `dev-cell-2` for about a minute, and then applies it again from the harness bundle.
 - It edits the API server manifest of `dev-cell-1` on the node and signs tokens with a test key for two to three minutes.
 - After the edit, it makes sure that `kube-controller-manager` of `dev-cell-1` runs a new container, because it keeps a token for each controller in memory.
   kubelet can delay that container by its restart back-off, up to 5 minutes.
-- It deletes each pod of `dev-cell-1` that received a token from the test key, and the controllers create those pods again.
-  The deleted pods can include `kindnet`. NetworkPolicy then probably fails open until its new pod runs, as the residual limits in `docs/design/poc-scope.md` say.
+  Until it runs, no controller of `dev-cell-1` replaces a pod.
+- It replaces each pod of `dev-cell-1` that received a token from the test key.
+  The `kindnet` pod comes first, and the others follow one at a time.
+  A Deployment outside the harness and outside Argo CD gets a rollout restart, so `coredns` keeps one ready pod.
+  The other pods are deleted, and their controllers create them again.
+  While the `kindnet` pod restarts, NetworkPolicy probably fails open, as the residual limits in `docs/design/poc-scope.md` say.
 
-A run that stops before its cleanup, for example after Ctrl-C or a closed terminal, can leave `dev-cell-1` with the test key.
-The next run then stops in its precheck, and `CELL=dev-cell-1 mise run cell:verify` fails.
-Both print the repair command:
+A run that stops before its cleanups, for example after Ctrl-C, a go test timeout or a closed terminal, can leave these changes in place.
+The next `gate:m2` run then stops before its other checks.
+`CELL=dev-cp mise run cell:verify` and `CELL=dev-cell-1 mise run cell:verify` fail, and a render of `dev-cp` refuses to sign the record of a changed cell.
+Each of them prints the repair command:
 
 ```sh
 mise run gate:m2:repair
+CELL=dev-cp mise run cell:verify
 CELL=dev-cell-1 mise run cell:verify
 ```
 
-The repair is safe to run again.
+The repair puts back the bundles of `dev-cp` and the API server of `dev-cell-1`, and it is safe to run again.
+It usually takes a few minutes.
+Each wait has a bound, and the log names it.
+The fixed waits add up to about 20 minutes, and each replaced pod adds up to 3 minutes.
+kubelet back-off alone can take 5 minutes of that time.
 A stopped run can also leave probe objects in `cell-identity-system`, and the next gate run deletes them.
 If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mise run cell:up` for that cell.
 

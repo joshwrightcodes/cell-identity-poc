@@ -88,6 +88,13 @@ func TestM2EntriesReconcile(t *testing.T) {
 	spireRef := store + "/bundles/" + spireApp
 	origRoot := orasResolve(t, rootRef+":current")
 	origSpireTag := orasResolve(t, spireRef+":current")
+	// The restore goes back to these tags. A run that stopped before its cleanup can leave test
+	// bundles on them, so they must be the bundles that the last cell:publish pushed.
+	published := publishedDigests(t, spireCluster)
+	if origRoot != published["root"] || origSpireTag != published[spireApp] {
+		t.Fatalf("root:current is %s and %s:current is %s, but build/%s/published.env has %s and %s. Run: mise run gate:m2:repair",
+			origRoot, spireApp, origSpireTag, spireCluster, published["root"], published[spireApp])
+	}
 	origSpire := appTargetRevision(t, spireApp)
 	if !strings.HasPrefix(origSpire, "sha256:") {
 		t.Fatalf("Application %s: want a targetRevision that pins a digest, got %q", spireApp, origSpire)
@@ -407,6 +414,22 @@ func (b *lockedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// publishedDigests reads build/<cluster>/published.env, which scripts/publish.sh writes.
+func publishedDigests(t *testing.T, cluster string) map[string]string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("../../build", cluster, "published.env"))
+	if err != nil {
+		t.Fatalf("read the published digests of %s: %v. Run: CELL=%s mise run cell:up", cluster, err, cluster)
+	}
+	out := map[string]string{}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if name, digest, ok := strings.Cut(line, "="); ok {
+			out[name] = digest
+		}
+	}
+	return out
 }
 
 // runTool runs a pinned tool with extra environment variables and returns standard output.

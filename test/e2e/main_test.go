@@ -45,7 +45,8 @@ func precheck() error {
 			return err
 		}
 	}
-	// A run that ended before its cleanup can leave the API server of dev-cell-1 with the test key.
+	// A run that ended before its cleanups can leave the API server of dev-cell-1 with the test key,
+	// and dev-cp with test bundles.
 	if out, err := command("", "bash", "../../scripts/gate-m2-repair.sh", "--check"); err != nil {
 		return fmt.Errorf("%w\n%s", err, out)
 	}
@@ -80,7 +81,10 @@ func checkClock(node string) error {
 	mid := before.Add(after.Sub(before) / 2)
 	skew := time.Duration((secs - float64(mid.UnixNano())/1e9) * float64(time.Second))
 	if math.Abs(float64(skew)) > float64(maxClockSkew) {
-		return fmt.Errorf("the clock of %s differs from this Mac by %s, over %s. Check the time sync of the Colima VM", node, skew, maxClockSkew)
+		return fmt.Errorf("the clock of %s differs from this Mac by %s, over %s. Sync the clock of the VM: "+
+			"mise x -- colima ssh --profile poc -- sudo systemctl restart systemd-timesyncd. "+
+			"If the skew stays, mise run vm:down && mise run vm:up restarts the VM, and the clusters then need mise run harness:down and mise run harness:up",
+			node, skew, maxClockSkew)
 	}
 	return nil
 }

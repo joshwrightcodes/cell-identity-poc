@@ -119,7 +119,8 @@ func addSigningKey(manifest string) (string, error) {
 // a projected token from the test key, and the controllers create those pods again.
 func repairAPIServer(t *testing.T) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	// The fixed waits of the script add up to about 20 minutes, and each replaced pod adds up to 3.
+	ctx, cancel := context.WithTimeout(context.Background(), 26*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m2-repair.sh")
 	out, err := cmd.CombinedOutput()
