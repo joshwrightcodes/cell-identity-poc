@@ -141,8 +141,9 @@ The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slower run of 103 seconds, rounded up to the next minute.
 `gate:m2` fails when the run takes longer than `GATE_M2_BUDGET_MINUTES`.
-The budget is 10 minutes. This is 1.5 times the slowest of three runs, 392 seconds, rounded up to the next minute.
-The other runs took 312 and 381 seconds.
+The budget is 12 minutes. This is 1.5 times the slowest run, 471 seconds, rounded up to the next minute.
+In that run, the cleanup of the key rotation test waited about 90 seconds for kubelet to start `kube-controller-manager` again.
+Other runs took 312 to 392 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 The budgets do not cover `harness:up`.
 
