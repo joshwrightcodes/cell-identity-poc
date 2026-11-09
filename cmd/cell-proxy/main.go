@@ -37,6 +37,7 @@ import (
 	"regexp"
 	"regexp/syntax"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -45,6 +46,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
@@ -60,9 +62,11 @@ const (
 	shutdownTimeout = 15 * time.Second
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
-	// otlpMaxRecvBytes is the largest OTLP message after decompression. Collectors set
-	// send_batch_max_size so that a batch stays below it.
-	otlpMaxRecvBytes = 8 << 20
+	// drainTimeout bounds the wait for running calls when the server stops.
+	drainTimeout = 5 * time.Second
+	// upstreamMaxBackoff bounds the wait between two connection attempts to the OTLP upstream, so
+	// the gateway follows a store that comes back.
+	upstreamMaxBackoff = 5 * time.Second
 )
 
 func main() {
@@ -258,24 +262,46 @@ func parseServer(args []string) (serverConfig, error) {
 			return cellproxy.NewHeaderBackend(*upstream, *header, tel.Log), nil
 		}
 	case "otlp":
-		if err := required(map[string]string{"upstream": *upstream}); err != nil {
+		if err := hostPort(*upstream); err != nil {
 			return serverConfig{}, err
 		}
+		bo := backoff.DefaultConfig
+		bo.MaxDelay = upstreamMaxBackoff
+		up, err := grpc.NewClient(*upstream,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithConnectParams(grpc.ConnectParams{Backoff: bo}),
+			grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(cellproxy.UpstreamMaxMsgBytes)))
+		if err != nil {
+			return serverConfig{}, fmt.Errorf("--upstream: %w", err)
+		}
 		cfg.backend = func(tel *telemetry.T) (cellproxy.Backend, error) {
-			up, err := grpc.NewClient(*upstream, grpc.WithTransportCredentials(insecure.NewCredentials()))
-			if err != nil {
-				return nil, fmt.Errorf("--upstream: %w", err)
-			}
-			counter, err := cellproxy.NewOverwriteCounter(tel.Meter)
+			gw, err := cellproxy.NewGateway(up, tel.Meter, tel.Log)
 			if err != nil {
 				return nil, err
 			}
-			return cellproxy.NewOTLPBackend(cellproxy.NewGateway(up, counter, tel.Log), otlpMaxRecvBytes), nil
+			up.Connect()
+			tel.Log.Info("otlp upstream", "upstream", *upstream, "max_recv_bytes", cellproxy.MaxRecvMsgBytes)
+			return cellproxy.NewOTLPBackend(gw, cellproxy.MaxRecvMsgBytes), nil
 		}
 	default:
 		return serverConfig{}, fmt.Errorf("unknown --backend %q", *backend)
 	}
 	return cfg, nil
+}
+
+// hostPort checks that --upstream is host:port with a host and a port number.
+func hostPort(s string) error {
+	if s == "" {
+		return errors.New("--upstream required")
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return fmt.Errorf("--upstream %q is not host:port: %w", s, err)
+	}
+	if n, err := strconv.Atoi(port); host == "" || err != nil || n < 1 || n > 65535 {
+		return fmt.Errorf("--upstream %q needs a host and a port from 1 to 65535", s)
+	}
+	return nil
 }
 
 func runServer(ctx context.Context, args []string, stdout io.Writer) int {
@@ -291,6 +317,14 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		backend, err := cfg.backend(tel)
 		if err != nil {
 			return err
+		}
+		if d, ok := backend.(interface{ Shutdown(context.Context) }); ok {
+			stop := context.AfterFunc(ctx, func() {
+				dctx, cancel := context.WithTimeout(context.Background(), drainTimeout)
+				defer cancel()
+				d.Shutdown(dctx)
+			})
+			defer stop()
 		}
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {

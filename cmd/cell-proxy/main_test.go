@@ -480,16 +480,26 @@ func TestServerOTLPBackend(t *testing.T) {
 	mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
 	args := with(without(serverArgs(t, envCA), "--identity-header"), "--backend", "otlp")
 
-	t.Run("no --upstream", func(t *testing.T) {
-		var out bytes.Buffer
-		if code := execute(t.Context(), without(args, "--upstream"), &out); code != 2 {
-			t.Fatalf("exit code %d, want 2\n%s", code, out.String())
-		}
-		lines := jsonLines(t, out.String())
-		if len(lines) != 1 || lines[0]["level"] != "ERROR" || !strings.Contains(lines[0]["error"].(string), "--upstream") {
-			t.Fatalf("output is %v, want one JSON error line that names --upstream", lines)
-		}
-	})
+	bad := map[string][]string{
+		"no --upstream":   without(args, "--upstream"),
+		"no port":         with(args, "--upstream", "lgtm"),
+		"no host":         with(args, "--upstream", ":4317"),
+		"port not number": with(args, "--upstream", "lgtm:otlp"),
+		"port 0":          with(args, "--upstream", "lgtm:0"),
+		"port too large":  with(args, "--upstream", "lgtm:70000"),
+	}
+	for name, a := range bad {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := execute(t.Context(), a, &out); code != 2 {
+				t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+			}
+			lines := jsonLines(t, out.String())
+			if len(lines) != 1 || lines[0]["level"] != "ERROR" || !strings.Contains(lines[0]["error"].(string), "--upstream") {
+				t.Fatalf("output is %v, want one JSON error line that names --upstream", lines)
+			}
+		})
+	}
 
 	t.Run("starts and stops", func(t *testing.T) {
 		serveWorkloadAPI(t, mgmt, "spiffe://mgmt.poc.internal/telemetry")

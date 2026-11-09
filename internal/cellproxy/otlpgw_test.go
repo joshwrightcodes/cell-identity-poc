@@ -1,11 +1,14 @@
 package cellproxy
 
 import (
+	"bytes"
+	stdgzip "compress/gzip"
 	"context"
 	"crypto/tls"
 	"maps"
 	"net"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -27,12 +30,17 @@ import (
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/encoding/gzip"
+	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/anypb"
 )
 
 const (
@@ -145,6 +153,18 @@ func TestResetResourceEdgeCases(t *testing.T) {
 		{"underscore form of platform.cell", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
 			str("platform.cell", "dev-cell-1"), str("platform_cell", "dev-cell-2"),
 		}}, []string{"platform.cell"}},
+		{"underscore form with the verified value", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			str("platform_cell", "dev-cell-1"),
+		}}, []string{"platform.cell"}},
+		{"upper case Platform.Cell", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			str("Platform.Cell", "dev-cell-2"),
+		}}, []string{"platform.cell"}},
+		{"map platform={cell}", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kvl("platform", str("cell", "dev-cell-2")),
+		}}, []string{"platform.cell"}},
+		{"map k8s={cluster={name}}", &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+			kvl("k8s", kvl("cluster", str("name", "dev-cell-2"))),
+		}}, []string{"k8s.cluster.name"}},
 	}
 	src := mustSource(t, otelID1)
 	for _, c := range cases {
@@ -181,24 +201,79 @@ func TestEnvironmentSenderLosesCellAttribute(t *testing.T) {
 	}
 }
 
-// spoofSets builds nested attribute sets that each hold two spoofed source keys and one other
-// key, and remembers each set so the test can check it after the strip.
+func mapValue(kvs ...*commonpb.KeyValue) *commonpb.AnyValue {
+	return &commonpb.AnyValue{Value: &commonpb.AnyValue_KvlistValue{KvlistValue: &commonpb.KeyValueList{Values: kvs}}}
+}
+
+// kvl is an attribute whose value is a map.
+func kvl(k string, kvs ...*commonpb.KeyValue) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: k, Value: mapValue(kvs...)}
+}
+
+// arr is an attribute whose value is an array.
+func arr(k string, vs ...*commonpb.AnyValue) *commonpb.KeyValue {
+	return &commonpb.KeyValue{Key: k, Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_ArrayValue{ArrayValue: &commonpb.ArrayValue{Values: vs}}}}
+}
+
+// spoofSets builds nested attribute sets that each hold spoofed source keys and other keys, and
+// remembers each set so the test can check it after the strip. In the flat form the source keys
+// are attribute keys. In the map form they are entries of map values, also in an array.
 type spoofSets struct {
+	maps bool
 	sets []*[]*commonpb.KeyValue
 	want []Overwrite
 }
 
 func (s *spoofSets) attrs(level string) []*commonpb.KeyValue {
-	s.want = append(s.want, Overwrite{Level: level, Attribute: "platform.cell"}, Overwrite{Level: level, Attribute: "k8s.cluster.name"})
-	return []*commonpb.KeyValue{str("platform_cell", "dev-cell-2"), str("keep", "yes"), str("k8s.cluster.name", "dev-cell-2")}
+	if !s.maps {
+		s.want = append(s.want, Overwrite{Level: level, Attribute: "platform.cell"}, Overwrite{Level: level, Attribute: "k8s.cluster.name"})
+		return []*commonpb.KeyValue{str("platform_cell", "dev-cell-2"), str("keep", "yes"), str("k8s.cluster.name", "dev-cell-2")}
+	}
+	s.want = append(s.want, Overwrite{Level: level, Attribute: "platform.cell"}, Overwrite{Level: level, Attribute: "k8s.cluster.name"},
+		Overwrite{Level: level, Attribute: "deployment.environment.name"})
+	return []*commonpb.KeyValue{
+		kvl("platform", str("cell", "dev-cell-2")),
+		str("keep", "yes"),
+		kvl("k8s", kvl("cluster", str("name", "dev-cell-2")), str("version", "1.37")),
+		arr("deployment", mapValue(str("environment.name", "prod"))),
+	}
 }
 
 func (s *spoofSets) track(p *[]*commonpb.KeyValue) { s.sets = append(s.sets, p) }
 
+// checkMaps checks a set of the map form: platform is gone, k8s keeps only version, and the array
+// element of deployment is an empty map.
+func checkMaps(t *testing.T, attrs []*commonpb.KeyValue) {
+	t.Helper()
+	var keys []string
+	for _, kv := range attrs {
+		keys = append(keys, kv.GetKey())
+		switch kv.GetKey() {
+		case "k8s":
+			inner := kv.GetValue().GetKvlistValue().GetValues()
+			if len(inner) != 1 || inner[0].GetKey() != "version" {
+				t.Fatalf("k8s is %v, want only version", kv.GetValue())
+			}
+		case "deployment":
+			elems := kv.GetValue().GetArrayValue().GetValues()
+			if len(elems) != 1 || len(elems[0].GetKvlistValue().GetValues()) != 0 {
+				t.Fatalf("deployment is %v, want one empty map", kv.GetValue())
+			}
+		}
+	}
+	if !slices.Equal(keys, []string{"keep", "k8s", "deployment"}) {
+		t.Fatalf("keys are %v, want [keep k8s deployment]", keys)
+	}
+}
+
 func (s *spoofSets) check(t *testing.T, deleted []Overwrite) {
 	t.Helper()
 	for _, p := range s.sets {
-		wantAttrs(t, *p, map[string]string{"keep": "yes"})
+		if s.maps {
+			checkMaps(t, *p)
+		} else {
+			wantAttrs(t, *p, map[string]string{"keep": "yes"})
+		}
 	}
 	sortOverwrites := func(o []Overwrite) []Overwrite {
 		o = slices.Clone(o)
@@ -269,10 +344,41 @@ func TestGatewayStripsNestedSourceAttributes(t *testing.T) {
 		"metrics": func(s *spoofSets) any { return spoofedMetrics(s) },
 	}
 	for name, build := range cases {
-		t.Run(name, func(t *testing.T) {
-			s := &spoofSets{}
-			req := build(s)
-			s.check(t, StripNestedSource(req))
+		for _, maps := range []bool{false, true} {
+			form := "flat"
+			if maps {
+				form = "map"
+			}
+			t.Run(name+" "+form, func(t *testing.T) {
+				s := &spoofSets{maps: maps}
+				req := build(s)
+				s.check(t, StripNestedSource(req))
+			})
+		}
+	}
+}
+
+func TestMeshLabelsCollapseOtherForms(t *testing.T) {
+	cases := []struct {
+		name    string
+		in      []*commonpb.KeyValue
+		changed []string
+	}{
+		{"duplicate with the same value", []*commonpb.KeyValue{str("source_cluster", "dev-cell-1"), str("source_cluster", "dev-cell-1")}, nil},
+		{"duplicate with another value", []*commonpb.KeyValue{str("source_cluster", "dev-cell-1"), str("source_cluster", "dev-cell-2")}, []string{"source_cluster"}},
+		{"other form source.cluster", []*commonpb.KeyValue{str("source_cluster", "dev-cell-1"), str("source.cluster", "dev-cell-2")}, []string{"source_cluster"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := &metricspb.NumberDataPoint{Attributes: c.in}
+			rm := &metricspb.ResourceMetrics{ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{
+				Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{p}}},
+			}}}}}
+			changed := ResetMeshLabels(rm, mustSource(t, otelID1))
+			wantAttrs(t, p.Attributes, map[string]string{"source_cluster": "dev-cell-1"})
+			if !slices.Equal(changed, c.changed) {
+				t.Fatalf("changed is %v, want %v", changed, c.changed)
+			}
 		})
 	}
 }
@@ -330,13 +436,25 @@ type otlpUpstream struct {
 	metrics  []*colmetricspb.ExportMetricsServiceRequest
 	logsResp *collogspb.ExportLogsServiceResponse
 	// block, when not nil, holds each call until it closes or the call ends.
-	block    chan struct{}
+	block chan struct{}
+	// fail, when not nil, is the answer to each call.
+	fail     error
 	calls    atomic.Int64
 	inflight atomic.Int64
+	// deadlines holds the time that each call had left when it arrived.
+	deadlines []time.Duration
 }
 
 func (u *otlpUpstream) enter(ctx context.Context) error {
 	u.calls.Add(1)
+	if dl, ok := ctx.Deadline(); ok {
+		u.mu.Lock()
+		u.deadlines = append(u.deadlines, time.Until(dl))
+		u.mu.Unlock()
+	}
+	if u.fail != nil {
+		return u.fail
+	}
 	if u.block == nil {
 		return nil
 	}
@@ -427,22 +545,22 @@ func newGWHarness(t *testing.T, up *otlpUpstream) *gwHarness {
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
-	counter, err := NewOverwriteCounter(mp.Meter("test"))
+	out := &syncBuffer{}
+	gw, err := NewGateway(conn, mp.Meter("test"), jsonLog(out))
 	if err != nil {
 		t.Fatal(err)
 	}
-	out := &syncBuffer{}
-	return &gwHarness{up: up, gw: NewGateway(conn, counter, jsonLog(out)), reader: reader, log: out}
+	return &gwHarness{up: up, gw: gw, reader: reader, log: out}
 }
 
 // serve runs the gateway behind spiffe-server with the otlp backend and allow, and spiffe-client
 // with the SVID id. It returns a gRPC connection to spiffe-client.
-func (h *gwHarness) serve(t *testing.T, allow, id string) *grpc.ClientConn {
+func (h *gwHarness) serve(t *testing.T, allow, id string, opts ...grpc.DialOption) *grpc.ClientConn {
 	t.Helper()
 	mgmt, env := newCA(t, mgmtTD), newCA(t, envTD)
 	telemetryID := "spiffe://mgmt.poc.internal/telemetry"
 	ctx, cancel := context.WithCancel(context.Background())
-	backend := NewOTLPBackend(h.gw, 8<<20)
+	backend := NewOTLPBackend(h.gw, MaxRecvMsgBytes)
 	srvLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -462,16 +580,19 @@ func (h *gwHarness) serve(t *testing.T, allow, id string) *grpc.ClientConn {
 	cliDone := make(chan struct{})
 	go func() { _ = cli.Serve(ctx, cliLn); close(cliDone) }()
 
-	conn, err := grpc.NewClient("passthrough:///"+cliLn.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts = append([]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}, opts...)
+	conn, err := grpc.NewClient("passthrough:///"+cliLn.Addr().String(), opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
 		_ = conn.Close()
+		sctx, scancel := context.WithTimeout(context.Background(), time.Second)
+		defer scancel()
+		backend.(*otlpBackend).Shutdown(sctx)
 		cancel()
 		<-cliDone
 		<-srvDone
-		backend.(*otlpBackend).srv.Stop()
 	})
 	return conn
 }
@@ -488,6 +609,11 @@ func peerContext(t *testing.T, id string) context.Context {
 
 // counterPoints returns the overwrite counter as attribute set and value.
 func (h *gwHarness) counterPoints(t *testing.T) map[attribute.Distinct]int64 {
+	return h.points(t, OverwriteCounterName)
+}
+
+// points returns the int64 data points of the metric name as attribute set and value.
+func (h *gwHarness) points(t *testing.T, name string) map[attribute.Distinct]int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := h.reader.Collect(context.Background(), &rm); err != nil {
@@ -496,15 +622,27 @@ func (h *gwHarness) counterPoints(t *testing.T) map[attribute.Distinct]int64 {
 	got := map[attribute.Distinct]int64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "cellproxy.gateway.attribute.overwrites" {
+			if m.Name != name {
 				continue
 			}
-			for _, dp := range m.Data.(metricdata.Sum[int64]).DataPoints {
-				got[dp.Attributes.Equivalent()] = dp.Value
+			switch d := m.Data.(type) {
+			case metricdata.Sum[int64]:
+				for _, dp := range d.DataPoints {
+					got[dp.Attributes.Equivalent()] = dp.Value
+				}
+			case metricdata.Gauge[int64]:
+				for _, dp := range d.DataPoints {
+					got[dp.Attributes.Equivalent()] = dp.Value
+				}
 			}
 		}
 	}
 	return got
+}
+
+func attrSet(kv ...attribute.KeyValue) attribute.Distinct {
+	set := attribute.NewSet(kv...)
+	return set.Equivalent()
 }
 
 func overwriteKey(attr, level, cluster string) attribute.Distinct {
@@ -605,26 +743,102 @@ func TestGatewayPassesPartialSuccess(t *testing.T) {
 	}
 }
 
-func TestGatewayRefusesOversize(t *testing.T) {
-	cases := map[string][]grpc.CallOption{
-		"plain": nil,
-		"gzip":  {grpc.UseCompressor(gzip.Name)},
+// logsOfSize is a logs request with one record whose wire size is size bytes.
+func logsOfSize(t *testing.T, size int) *collogspb.ExportLogsServiceRequest {
+	t.Helper()
+	build := func(n int) *collogspb.ExportLogsServiceRequest {
+		body := &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: strings.Repeat("a", n)}}
+		return &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+			ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{Body: body}}}},
+		}}}
 	}
-	for name, opts := range cases {
-		t.Run(name, func(t *testing.T) {
-			h := newGWHarness(t, &otlpUpstream{})
-			conn := h.serve(t, otelPattern, otelID1)
-			body := &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: strings.Repeat("a", 9<<20)}}
-			_, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
-				ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{Body: body}}}},
-			}}}, opts...)
-			if status.Code(err) != codes.ResourceExhausted {
-				t.Fatalf("got %v, want ResourceExhausted", err)
+	n := size - (proto.Size(build(size)) - size)
+	req := build(n)
+	if got := proto.Size(req); got != size {
+		t.Fatalf("request has %d bytes, want %d", got, size)
+	}
+	return req
+}
+
+func TestGatewayReceiveLimit(t *testing.T) {
+	sizes := []struct {
+		name string
+		size int
+		code codes.Code
+	}{
+		{"64 KiB below the limit", MaxRecvMsgBytes - 64<<10, codes.OK},
+		{"1 KiB above the limit", MaxRecvMsgBytes + 1<<10, codes.ResourceExhausted},
+		{"9 MiB", 9 << 20, codes.ResourceExhausted},
+	}
+	compressions := map[string][]grpc.CallOption{"plain": nil, "gzip": {grpc.UseCompressor(gzip.Name)}}
+	for _, sz := range sizes {
+		for cname, opts := range compressions {
+			t.Run(sz.name+" "+cname, func(t *testing.T) {
+				h := newGWHarness(t, &otlpUpstream{})
+				conn := h.serve(t, otelPattern, otelID1)
+				_, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), logsOfSize(t, sz.size), opts...)
+				if status.Code(err) != sz.code {
+					t.Fatalf("got %v, want %v", err, sz.code)
+				}
+				want := int64(0)
+				if sz.code == codes.OK {
+					want = 1
+				}
+				if n := h.up.calls.Load(); n != want {
+					t.Fatalf("upstream got %d calls, want %d", n, want)
+				}
+			})
+		}
+	}
+}
+
+func TestGatewayRefusesGrowthPastUpstreamLimit(t *testing.T) {
+	h := newGWHarness(t, &otlpUpstream{})
+	longCell := "spiffe://dev.env.poc.internal/cell/" + strings.Repeat("a", 59) + "/otel"
+	points := make([]*metricspb.NumberDataPoint, 40000)
+	for i := range points {
+		points[i] = &metricspb.NumberDataPoint{Attributes: []*commonpb.KeyValue{str("source_cluster", "x"), str("destination_cluster", "y")}}
+	}
+	req := &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{
+			Name: "istio_requests_total", Data: &metricspb.Metric_Sum{Sum: &metricspb.Sum{DataPoints: points}},
+		}}}},
+	}}}
+	if size := proto.Size(req); size > MaxRecvMsgBytes {
+		t.Fatalf("the request has %d bytes, more than the receive limit", size)
+	}
+	_, err := h.gw.ExportMetrics(peerContext(t, longCell), req)
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("got %v, want ResourceExhausted", err)
+	}
+	waitForLog(t, h.log, "request denied", RequestTooLarge, "")
+	if n := h.up.calls.Load(); n != 0 {
+		t.Fatalf("upstream got %d calls, want none", n)
+	}
+}
+
+func TestSlotPoolSharesSlots(t *testing.T) {
+	p := newSlotPool(maxGatewayCalls, maxSenderCalls)
+	senders := []string{"dev-cell-1", "dev-cell-2", "dev-cell-3", "dev-cp"}
+	for _, s := range senders {
+		for i := range maxSenderCalls {
+			if !p.take(s) {
+				t.Fatalf("%s could not take slot %d", s, i+1)
 			}
-			if n := h.up.calls.Load(); n != 0 {
-				t.Fatalf("upstream got %d calls, want none", n)
-			}
-		})
+		}
+		if p.take(s) {
+			t.Fatalf("%s took more than its share of %d", s, maxSenderCalls)
+		}
+	}
+	if p.take("dev-cell-4") {
+		t.Fatal("a fifth sender took a slot when all 16 are taken")
+	}
+	p.give("dev-cell-1")
+	if !p.take("dev-cell-4") {
+		t.Fatal("a fifth sender could not take a freed slot")
+	}
+	if p.take("dev-cell-1") {
+		t.Fatal("dev-cell-1 took a slot when all 16 are taken")
 	}
 }
 
@@ -633,36 +847,45 @@ func TestGatewayOverload(t *testing.T) {
 	h := newGWHarness(t, &otlpUpstream{block: block})
 	timeout := 500 * time.Millisecond
 	h.gw.timeout = timeout
-	ctx := peerContext(t, otelID1)
+	client := collogspb.NewLogsServiceClient(h.serve(t, otelPattern, otelID1))
 	export := func() error {
-		_, err := h.gw.ExportLogs(ctx, &collogspb.ExportLogsServiceRequest{})
+		_, err := client.Export(t.Context(), &collogspb.ExportLogsServiceRequest{})
 		return err
+	}
+	slotsUsed := func() int64 {
+		return h.points(t, "cellproxy.gateway.slots.used")[attrSet(attribute.String("sender.cluster", "dev-cell-1"))]
 	}
 
 	start := time.Now()
-	errs := make(chan error, maxGatewayCalls)
-	for range maxGatewayCalls {
+	errs := make(chan error, maxSenderCalls)
+	for range maxSenderCalls {
 		go func() { errs <- export() }()
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for h.up.inflight.Load() != maxGatewayCalls {
+	for h.up.inflight.Load() != maxSenderCalls {
 		if time.Now().After(deadline) {
-			t.Fatalf("%d calls reached the upstream, want %d", h.up.inflight.Load(), maxGatewayCalls)
+			t.Fatalf("%d calls reached the upstream, want %d", h.up.inflight.Load(), maxSenderCalls)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if n := slotsUsed(); n != maxSenderCalls {
+		t.Fatalf("slots used is %d, want %d", n, maxSenderCalls)
 	}
 
 	extra := time.Now()
 	err := export()
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("call %d gave %v, want Unavailable", maxGatewayCalls+1, err)
+	if st, _ := status.FromError(err); st.Code() != codes.Unavailable || st.Message() != "denied" {
+		t.Fatalf("call %d of one sender gave %v, want Unavailable with only \"denied\"", maxSenderCalls+1, err)
 	}
-	if d := time.Since(extra); d > 100*time.Millisecond {
-		t.Fatalf("call %d took %v, want it to fail at once", maxGatewayCalls+1, d)
+	if d := time.Since(extra); d > 200*time.Millisecond {
+		t.Fatalf("call %d took %v, want it to fail at once", maxSenderCalls+1, d)
+	}
+	if n := h.gw.codec.decoded.Load(); n != maxSenderCalls {
+		t.Fatalf("the codec decoded %d messages, want %d: the refused call must not be read", n, maxSenderCalls)
 	}
 	waitForLog(t, h.log, "request denied", Overloaded, "")
 
-	for range maxGatewayCalls {
+	for range maxSenderCalls {
 		select {
 		case err := <-errs:
 			if status.Code(err) != codes.Unavailable {
@@ -677,6 +900,13 @@ func TestGatewayOverload(t *testing.T) {
 		t.Fatalf("the blocked calls ended after %v, before the %v deadline", d, timeout)
 	}
 	waitForLog(t, h.log, "upstream failed", UpstreamUnavailable, "")
+	deadline = time.Now().Add(5 * time.Second)
+	for slotsUsed() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("slots used is %d after the calls ended, want 0", slotsUsed())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 
 	close(block)
 	if err := export(); err != nil {
@@ -684,26 +914,349 @@ func TestGatewayOverload(t *testing.T) {
 	}
 }
 
-func TestGatewayRefusesNonOtelRole(t *testing.T) {
-	h := newGWHarness(t, &otlpUpstream{})
-	conn := h.serve(t, otelPattern, agentID1)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	if _, err := collogspb.NewLogsServiceClient(conn).Export(ctx, &collogspb.ExportLogsServiceRequest{}); err == nil {
-		t.Fatal("the export from an argocd-agent ID succeeded")
+// rawMessage is wire bytes that rawCodec sends as they are.
+type rawMessage struct{ b []byte }
+
+type rawCodec struct{}
+
+func (rawCodec) Name() string { return "proto" }
+
+func (rawCodec) Marshal(v any) (mem.BufferSlice, error) {
+	return mem.BufferSlice{mem.SliceBuffer(v.(*rawMessage).b)}, nil
+}
+
+func (rawCodec) Unmarshal(data mem.BufferSlice, v any) error {
+	return proto.Unmarshal(data.Materialize(), v.(proto.Message))
+}
+
+// nest wraps b in field num, once for each number, innermost first.
+func nest(b []byte, nums ...protowire.Number) []byte {
+	for _, n := range nums {
+		b = protowire.AppendBytes(protowire.AppendTag(nil, n, protowire.BytesType), b)
 	}
-	waitForLog(t, h.log, "peer refused", PeerNotAllowed, agentID1)
-	if n := h.up.calls.Load(); n != 0 {
-		t.Fatalf("upstream got %d calls, want none", n)
+	return b
+}
+
+// bombs are logs requests just below the receive limit, made of empty messages of 2 wire bytes
+// each: empty resources, and empty attributes of one log record.
+func bombs() map[string][]byte {
+	n := (MaxRecvMsgBytes - 64) / 2
+	return map[string][]byte{
+		"empty resources":  bytes.Repeat([]byte{0x0a, 0x00}, n),
+		"empty attributes": nest(bytes.Repeat([]byte{0x32, 0x00}, n), 2, 2, 1),
 	}
 }
 
-func TestGatewayRefusesCallWithoutTLSPeer(t *testing.T) {
-	h := newGWHarness(t, &otlpUpstream{})
-	plain := peer.NewContext(t.Context(), &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}})
-	for name, ctx := range map[string]context.Context{"no peer": t.Context(), "peer without TLS": plain} {
+func TestGatewayRefusesDecodeBomb(t *testing.T) {
+	for name, bomb := range bombs() {
 		t.Run(name, func(t *testing.T) {
+			h := newGWHarness(t, &otlpUpstream{})
+			conn := h.serve(t, otelPattern, otelID1)
+			var zipped bytes.Buffer
+			zw := stdgzip.NewWriter(&zipped)
+			_, _ = zw.Write(bomb)
+			_ = zw.Close()
+
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			start := time.Now()
+			err := conn.Invoke(t.Context(), "/opentelemetry.proto.collector.logs.v1.LogsService/Export", &rawMessage{b: bomb},
+				&collogspb.ExportLogsServiceResponse{}, grpc.ForceCodecV2(rawCodec{}), grpc.UseCompressor(gzip.Name))
+			took := time.Since(start)
+			runtime.ReadMemStats(&after)
+			alloc := after.TotalAlloc - before.TotalAlloc
+			t.Logf("wire=%d bytes gzip=%d bytes took=%v total_alloc=%d KiB", len(bomb), zipped.Len(), took, alloc>>10)
+
+			if status.Code(err) != codes.ResourceExhausted {
+				t.Fatalf("got %v, want ResourceExhausted", err)
+			}
+			if took > 2*time.Second {
+				t.Fatalf("the refusal took %v, want less than 2s", took)
+			}
+			if alloc > 64<<20 {
+				t.Fatalf("the call allocated %d MiB, want less than 64 MiB", alloc>>20)
+			}
+			if n := h.gw.codec.decoded.Load(); n != 0 {
+				t.Fatalf("the codec decoded %d messages, want none", n)
+			}
+			waitForLog(t, h.log, "request denied", RequestTooLarge, "")
+			if n := h.up.calls.Load(); n != 0 {
+				t.Fatalf("upstream got %d calls, want none", n)
+			}
+		})
+	}
+}
+
+func TestOTLPCodecScanAllocations(t *testing.T) {
+	c := newOTLPCodec()
+	for name, bomb := range bombs() {
+		t.Run(name, func(t *testing.T) {
+			allocs := testing.AllocsPerRun(5, func() {
+				req := &collogspb.ExportLogsServiceRequest{}
+				if err := c.Unmarshal(mem.BufferSlice{mem.SliceBuffer(bomb)}, req); err != nil {
+					t.Fatal(err)
+				}
+				if c.refusal(req) == nil {
+					t.Fatal("the codec accepted the bomb")
+				}
+			})
+			t.Logf("allocations per refused bomb: %v", allocs)
+			if allocs > 20 {
+				t.Fatalf("%v allocations per refused bomb, want at most 20", allocs)
+			}
+		})
+	}
+	t.Run("largest allowed shape", func(t *testing.T) {
+		kvs := bytes.Repeat([]byte{0x32, 0x00}, defaultScanLimits.Attributes)
+		rec := protowire.AppendBytes(protowire.AppendTag(nil, 2, protowire.BytesType), kvs)
+		records := (defaultScanLimits.Messages - 16) / (defaultScanLimits.Attributes + 1)
+		wire := nest(bytes.Repeat(rec, records), 2, 1)
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		req := &collogspb.ExportLogsServiceRequest{}
+		if err := c.Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, req); err != nil {
+			t.Fatal(err)
+		}
+		runtime.ReadMemStats(&after)
+		if err := c.refusal(req); err != nil {
+			t.Fatalf("the codec refused the largest allowed shape: %v", err)
+		}
+		t.Logf("wire=%d bytes messages=%d total_alloc=%d MiB", len(wire), records*(defaultScanLimits.Attributes+1)+2, (after.TotalAlloc-before.TotalAlloc)>>20)
+	})
+}
+
+func TestGatewayForwardDeadline(t *testing.T) {
+	cases := []struct {
+		name     string
+		deadline time.Duration
+		min, max time.Duration
+		code     codes.Code
+	}{
+		{"no deadline of the sender", 0, 2500 * time.Millisecond, 3 * time.Second, codes.OK},
+		{"sender deadline 2.5s", 2500 * time.Millisecond, time.Second, 1500 * time.Millisecond, codes.OK},
+		{"sender deadline below the margin", 500 * time.Millisecond, 0, 0, codes.DeadlineExceeded},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newGWHarness(t, &otlpUpstream{})
+			h.gw.timeout = 3 * time.Second
+			ctx := peerContext(t, otelID1)
+			if c.deadline > 0 {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, c.deadline)
+				defer cancel()
+			}
 			_, err := h.gw.ExportLogs(ctx, &collogspb.ExportLogsServiceRequest{})
+			if status.Code(err) != c.code {
+				t.Fatalf("got %v, want %v", err, c.code)
+			}
+			h.up.mu.Lock()
+			defer h.up.mu.Unlock()
+			if c.code != codes.OK {
+				if len(h.up.deadlines) != 0 {
+					t.Fatalf("upstream got %d calls, want none", len(h.up.deadlines))
+				}
+				return
+			}
+			if len(h.up.deadlines) != 1 || h.up.deadlines[0] < c.min || h.up.deadlines[0] > c.max {
+				t.Fatalf("upstream deadlines are %v, want one between %v and %v", h.up.deadlines, c.min, c.max)
+			}
+		})
+	}
+}
+
+func TestGatewayMetrics(t *testing.T) {
+	logs := attribute.String("signal", "logs")
+	cell1 := attribute.String("sender.cluster", "dev-cell-1")
+	t.Run("accepted and last export", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{})
+		before := time.Now().Unix()
+		if _, err := h.gw.ExportLogs(peerContext(t, otelID1), &collogspb.ExportLogsServiceRequest{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := h.points(t, "cellproxy.gateway.exports.accepted"); !maps.Equal(got, map[attribute.Distinct]int64{attrSet(logs, cell1): 1}) {
+			t.Fatalf("accepted is %v", got)
+		}
+		last := h.points(t, "cellproxy.gateway.last_export.time")[attrSet(logs, cell1)]
+		if last < before || last > time.Now().Unix() {
+			t.Fatalf("last export time is %d, want between %d and now", last, before)
+		}
+	})
+	t.Run("upstream failure", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{fail: status.Error(codes.Unavailable, "store down")})
+		if _, err := h.gw.ExportLogs(peerContext(t, otelID1), &collogspb.ExportLogsServiceRequest{}); status.Code(err) != codes.Unavailable {
+			t.Fatalf("got %v, want Unavailable", err)
+		}
+		want := map[attribute.Distinct]int64{attrSet(logs, attribute.String("code", "Unavailable")): 1}
+		if got := h.points(t, "cellproxy.gateway.upstream.failures"); !maps.Equal(got, want) {
+			t.Fatalf("failures are %v", got)
+		}
+	})
+	t.Run("denied", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{})
+		if _, err := h.gw.ExportLogs(t.Context(), &collogspb.ExportLogsServiceRequest{}); status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("got %v, want PermissionDenied", err)
+		}
+		want := map[attribute.Distinct]int64{attrSet(logs, attribute.String("reason", string(PeerNotAllowed))): 1}
+		if got := h.points(t, "cellproxy.gateway.exports.denied"); !maps.Equal(got, want) {
+			t.Fatalf("denied is %v", got)
+		}
+	})
+}
+
+func TestGatewayHidesUpstreamError(t *testing.T) {
+	const retryInfo = "type.googleapis.com/google.rpc.RetryInfo"
+	throttle := status.New(codes.Unavailable, "memory limiter of tenant x").Proto()
+	throttle.Details = []*anypb.Any{
+		{TypeUrl: retryInfo, Value: []byte{0x0a, 0x02, 0x08, 0x05}},
+		{TypeUrl: "type.googleapis.com/google.rpc.DebugInfo"},
+	}
+	cases := []struct {
+		name    string
+		fail    error
+		code    codes.Code
+		details []string
+	}{
+		{"invalid argument", status.Error(codes.InvalidArgument, "tenant x path /loki/api"), codes.InvalidArgument, nil},
+		{"unavailable with RetryInfo", status.ErrorProto(throttle), codes.Unavailable, []string{retryInfo}},
+		{"deadline", status.Error(codes.DeadlineExceeded, "slow store"), codes.Unavailable, nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newGWHarness(t, &otlpUpstream{fail: c.fail})
+			conn := h.serve(t, otelPattern, otelID1)
+			_, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{})
+			st := status.Convert(err)
+			if st.Code() != c.code || st.Message() != "denied" {
+				t.Fatalf("got %v, want %v with only \"denied\"", err, c.code)
+			}
+			var urls []string
+			for _, d := range st.Proto().GetDetails() {
+				urls = append(urls, d.GetTypeUrl())
+			}
+			if !slices.Equal(urls, c.details) {
+				t.Fatalf("details are %v, want %v", urls, c.details)
+			}
+		})
+	}
+}
+
+func TestGatewaySenderCancel(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	h := newGWHarness(t, &otlpUpstream{block: block})
+	ctx, cancel := context.WithCancel(peerContext(t, otelID1))
+	go func() {
+		for h.up.inflight.Load() == 0 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+	}()
+	_, err := h.gw.ExportLogs(ctx, &collogspb.ExportLogsServiceRequest{})
+	if status.Code(err) != codes.Canceled {
+		t.Fatalf("got %v, want Canceled", err)
+	}
+	if strings.Contains(h.log.String(), "upstream failed") {
+		t.Fatalf("a cancel of the sender was logged as an upstream failure:\n%s", h.log.String())
+	}
+}
+
+func TestGatewayOverwriteLogIsRateLimited(t *testing.T) {
+	h := newGWHarness(t, &otlpUpstream{})
+	now := time.Now()
+	h.gw.limiter.now = func() time.Time { return now }
+	spoofed := func() *collogspb.ExportLogsServiceRequest {
+		return &collogspb.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{Resource: spoofedResource()}}}
+	}
+	lines := func() []map[string]any {
+		var out []map[string]any
+		for _, l := range logLines(t, h.log) {
+			if l["msg"] == "source attributes overwritten" {
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+	for range 3 {
+		if _, err := h.gw.ExportLogs(peerContext(t, otelID1), spoofed()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := lines(); len(got) != 1 || got[0]["count"] != float64(1) {
+		t.Fatalf("lines after 3 calls in one interval are %v, want one with count 1", got)
+	}
+	now = now.Add(logEvery)
+	if _, err := h.gw.ExportLogs(peerContext(t, otelID1), spoofed()); err != nil {
+		t.Fatal(err)
+	}
+	got := lines()
+	if len(got) != 2 || got[1]["count"] != float64(3) || got[1]["requests_held"] != float64(2) {
+		t.Fatalf("lines after the interval are %v, want a second one with count 3 and requests_held 2", got)
+	}
+	if pairs, _ := got[1]["overwrites"].([]any); len(pairs) != 1 || pairs[0] != "resource/k8s.cluster.name=3" {
+		t.Fatalf("overwrites are %v, want [resource/k8s.cluster.name=3]", got[1]["overwrites"])
+	}
+}
+
+// TestGatewayAllowsClientKeepalive runs for 40 seconds: grpc-go sends a GOAWAY after the third
+// early ping, and a client pings at most every 10 seconds.
+func TestGatewayAllowsClientKeepalive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for 40 seconds")
+	}
+	h := newGWHarness(t, &otlpUpstream{})
+	conn := h.serve(t, otelPattern, otelID1,
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: minClientPing, Timeout: 5 * time.Second, PermitWithoutStream: true}))
+	if _, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
+	defer cancel()
+	if conn.WaitForStateChange(ctx, connectivity.Ready) {
+		t.Fatalf("the idle connection left READY for %v: the server refused the client pings", conn.GetState())
+	}
+}
+
+func TestGatewayRefusesNonOtelRole(t *testing.T) {
+	t.Run("allow pattern", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{})
+		conn := h.serve(t, otelPattern, agentID1)
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		if _, err := collogspb.NewLogsServiceClient(conn).Export(ctx, &collogspb.ExportLogsServiceRequest{}); err == nil {
+			t.Fatal("the export from an argocd-agent ID succeeded")
+		}
+		waitForLog(t, h.log, "peer refused", PeerNotAllowed, agentID1)
+		if n := h.up.calls.Load(); n != 0 {
+			t.Fatalf("upstream got %d calls, want none", n)
+		}
+	})
+	t.Run("gateway with a loose pattern", func(t *testing.T) {
+		h := newGWHarness(t, &otlpUpstream{})
+		conn := h.serve(t, `^spiffe://dev\.env\.poc\.internal/.*$`, "spiffe://dev.env.poc.internal/cell/dev-cell-1/celld")
+		_, err := collogspb.NewLogsServiceClient(conn).Export(t.Context(), &collogspb.ExportLogsServiceRequest{})
+		if st, _ := status.FromError(err); st.Code() != codes.PermissionDenied || st.Message() != "denied" {
+			t.Fatalf("got %v, want PermissionDenied with only \"denied\"", err)
+		}
+		waitForLog(t, h.log, "request denied", PeerNotAllowed, "")
+		if n := h.up.calls.Load(); n != 0 {
+			t.Fatalf("upstream got %d calls, want none", n)
+		}
+	})
+}
+
+func TestGatewayRefusesCallWithoutTLSPeer(t *testing.T) {
+	for name, ctx := range map[string]func(t *testing.T) context.Context{
+		"no peer": func(t *testing.T) context.Context { return t.Context() },
+		"peer without TLS": func(t *testing.T) context.Context {
+			return peer.NewContext(t.Context(), &peer.Peer{Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newGWHarness(t, &otlpUpstream{})
+			_, err := h.gw.ExportLogs(ctx(t), &collogspb.ExportLogsServiceRequest{})
 			if st, _ := status.FromError(err); st.Code() != codes.PermissionDenied || st.Message() != "denied" {
 				t.Fatalf("got %v, want PermissionDenied with only \"denied\"", err)
 			}
@@ -712,5 +1265,19 @@ func TestGatewayRefusesCallWithoutTLSPeer(t *testing.T) {
 				t.Fatalf("upstream got %d calls, want none", n)
 			}
 		})
+	}
+}
+
+func TestOTLPCodecDropsUnknownFields(t *testing.T) {
+	kv := protowire.AppendString(protowire.AppendTag(nil, 1, protowire.BytesType), "keep")
+	kv = protowire.AppendString(protowire.AppendTag(kv, 99, protowire.BytesType), "platform.cell=dev-cell-2")
+	wire := nest(kv, 1, 1, 1)
+	req := &collogspb.ExportLogsServiceRequest{}
+	if err := newOTLPCodec().Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, req); err != nil {
+		t.Fatal(err)
+	}
+	attr := req.GetResourceLogs()[0].GetResource().GetAttributes()[0]
+	if attr.GetKey() != "keep" || len(attr.ProtoReflect().GetUnknown()) != 0 {
+		t.Fatalf("attribute is %v with unknown bytes %q, want key keep and no unknown bytes", attr, attr.ProtoReflect().GetUnknown())
 	}
 }

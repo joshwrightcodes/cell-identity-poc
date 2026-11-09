@@ -898,3 +898,21 @@ this.
 
 The review did not read the grpc-gateway runtime line by line. The `celld` review searched it
 together with the other packages of that build.
+
+### Upstream limits of the gateway (2026-11-10)
+
+The gateway receive limit depends on the OTLP receiver of `otel-lgtm` v0.38.0. The review read the
+files of tag `v0.38.0` of `grafana/docker-otel-lgtm` through `gh api`, and ran nothing.
+
+- `docker/Dockerfile` pins `otelcol-contrib` v0.163.1. `docker/download-otelcol.sh` checks the
+  archive with `cosign verify-blob` before it unpacks it.
+- `docker/otelcol-config.yaml` sets the gRPC receiver endpoint `0.0.0.0:4317` and no
+  `max_recv_msg_size_mib`.
+- In collector core v0.163.0, `config/configgrpc/configgrpc.go` lines 358 and 359 add
+  `grpc.MaxRecvMsgSize` only for a value above 0. The receiver therefore keeps the grpc-go default
+  of 4 MiB.
+- The review did not check which core version `otelcol-contrib` v0.163.1 uses. It did not inspect
+  the image contents.
+
+The cell collectors use collector 0.164.0. In that version `exporter/otlpexporter/factory.go`
+lines 41 to 47 set gzip compression by default and no client keepalive.
