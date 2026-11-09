@@ -141,8 +141,9 @@ The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slower run of 103 seconds, rounded up to the next minute.
 `gate:m2` fails when the run takes longer than `GATE_M2_BUDGET_MINUTES`.
-The budget is 8 minutes. This is 1.5 times the slower run of 312 seconds, rounded up to the next minute.
-The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes about two minutes of that time.
+The budget is 10 minutes. This is 1.5 times the slower run of 381 seconds, rounded up to the next minute.
+The faster run took 312 seconds.
+The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 The budgets do not cover `harness:up`.
 
 ## Restart of the VM
