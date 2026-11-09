@@ -19,7 +19,7 @@
 | Delete all five clusters | `mise run harness:down` |
 | Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
-| Restart `celld` in a cell, or the SPIRE server in `dev-cp` | `CELL=dev-cp mise run cell:restart` |
+| Restart `celld` in a cell, or the SPIRE server in `dev-cp` or `management` | `CELL=dev-cp mise run cell:restart` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
@@ -32,6 +32,7 @@
 | Check the Go code | `mise run lint` |
 | Run the M1 end-to-end gate | `mise run gate:m1` |
 | Run the M2 end-to-end gate against the SPIRE server in `dev-cp` | `mise run gate:m2` |
+| Run the M3 end-to-end gate against the management plane and `dev-cp` | `mise run gate:m3` |
 | Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 

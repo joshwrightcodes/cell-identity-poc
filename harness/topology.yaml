@@ -6,7 +6,7 @@ clusters:
     podSubnet: 10.10.0.0/16
     serviceSubnet: 10.110.0.0/16
     issuer: https://management.issuer.poc.internal
-    components: [base-cell]
+    components: [base-cell, external-secrets, spire-server]
   - name: dev-cp
     podSubnet: 10.11.0.0/16
     serviceSubnet: 10.111.0.0/16

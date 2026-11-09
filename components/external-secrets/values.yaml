@@ -1,6 +1,7 @@
 # Values for the vendored External Secrets Operator chart. The cell runs only the controller,
-# and only for ExternalSecret and SecretStore objects in one namespace. render.sh sets that
-# namespace, scopedNamespace, from SECRET_STORE_NAMESPACES. vendor/README.md records the review.
+# and only for ExternalSecret, SecretStore and generator objects in one namespace. render.sh sets
+# that namespace, scopedNamespace, from EXTERNAL_SECRETS_NAMESPACE or SECRET_STORE_NAMESPACES.
+# vendor/README.md records the review.
 global:
   compatibility:
     openshift:

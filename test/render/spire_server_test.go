@@ -190,9 +190,27 @@ func digestOf(b []byte) string {
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
+// serverFacts are the cluster facts of build/<cluster>/facts.env that the server render reads.
+var serverFacts = []string{"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", "API_SERVICE_IP=10.111.0.1", "DNS_SERVICE_IP=10.111.0.10"}
+
+// render renders the server with the settings of an environment server like dev-cp, with no local
+// workload. The env values override them.
 func render(t *testing.T, env ...string) result {
 	t.Helper()
-	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append([]string{"SPIRE_SVID_TTL=1m"}, env...)...)
+	defaults := []string{"SPIRE_SVID_TTL=1m", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal", "SPIRE_UPSTREAM=disk",
+		"SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld", "SECRET_STORE_NAMESPACES=spire-system"}
+	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append(append(defaults, serverFacts...), env...)...)
+}
+
+// renderCell renders the server with cells/common.env and cells/<cluster>.env, as hydrate does.
+func renderCell(t *testing.T, cluster string, env ...string) result {
+	t.Helper()
+	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append(append([]string{"STUB_CELL=" + cluster}, serverFacts...), env...)...)
+}
+
+// hydrated replaces @CELL_NAME@ as scripts/hydrate.sh does.
+func hydrated(out, cluster string) string {
+	return strings.ReplaceAll(out, "@CELL_NAME@", cluster)
 }
 
 // cellEnvKeys returns every setting name of cells/*.env. mise loads the file of one cluster into
@@ -308,7 +326,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
-		"POC_ENV="+commonEnv(t, "POC_ENV"), "SPIRE_AGENT_SUBJECT=cell-identity-system/celld")
+		"POC_ENV="+commonEnv(t, "POC_ENV"))
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -350,7 +368,12 @@ func docs(t *testing.T, out string) map[string]object {
 	return docsIn(t, out, "spire-system")
 }
 
-// docsIn parses the render output by kind and name. Every object except the Namespace must be in ns.
+// clusterScoped lists the cluster-scoped kinds that a render can print.
+var clusterScoped = []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
+	"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
+
+// docsIn parses the render output by kind and name. Every namespaced object must be in ns, and no
+// Namespace other than ns may appear.
 func docsIn(t *testing.T, out, ns string) map[string]object {
 	t.Helper()
 	byKey := map[string]object{}
@@ -369,7 +392,15 @@ func docsIn(t *testing.T, out, ns string) map[string]object {
 		if _, dup := byKey[key]; dup {
 			t.Fatalf("%s appears twice", key)
 		}
-		if got, _ := lookup(o, "metadata", "namespace"); key != "Namespace/"+ns && got != ns {
+		got, _ := lookup(o, "metadata", "namespace")
+		switch kind := get[string](t, o, "kind"); {
+		case kind == "Namespace" && key != "Namespace/"+ns:
+			t.Fatalf("render prints %s, want only Namespace/%s", key, ns)
+		case slices.Contains(clusterScoped, kind):
+			if got != nil {
+				t.Fatalf("cluster-scoped %s has namespace %v", key, got)
+			}
+		case got != ns:
 			t.Fatalf("%s has namespace %v, want %s", key, got, ns)
 		}
 		byKey[key] = o
@@ -428,12 +459,18 @@ func named(t *testing.T, list []any, name string) map[string]any {
 	return nil
 }
 
+// TestRenderSpireServer renders the environment server with cells/dev-cp.env. It keeps the M2
+// checks, and checks the k8s_psat path for the dev-cp plane workload cp/otel.
 func TestRenderSpireServer(t *testing.T) {
-	r := render(t, "SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2")
+	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
-	objs := docs(t, r.stdout)
+	objs := docs(t, hydrated(r.stdout, "dev-cp"))
+
+	t.Run("k8s_psat admits the plane workload cp/otel", func(t *testing.T) {
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink"})
+	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
 		t.Fatalf("render left tokens %v", left)
@@ -562,9 +599,10 @@ func TestRenderSpireServer(t *testing.T) {
 		if err := hcl.Decode(&top, text); err != nil {
 			t.Fatalf("server.conf does not parse: %v", err)
 		}
-		if len(top) != 2 || top["server"] == nil || top["plugins"] == nil {
-			t.Fatalf("server.conf top-level blocks: %v; want only server and plugins, so no telemetry or health listener", keysOf(top))
+		if len(top) != 3 || top["server"] == nil || top["plugins"] == nil || top["telemetry"] == nil {
+			t.Fatalf("server.conf top-level blocks: %v; want only server, plugins and telemetry, so no health listener", keysOf(top))
 		}
+		checkPrometheus(t, text)
 		var conf struct {
 			Server struct {
 				TrustDomain     string `hcl:"trust_domain"`
@@ -603,10 +641,15 @@ func TestRenderSpireServer(t *testing.T) {
 			`records_dir = "/run/spire/records"`,
 			// Three times the slowest challenge reply of the gate:m2 runs, with a floor of 10s.
 			`challenge_timeout = "10s"`,
+			// The upstream authority signs a new CA after each restart, so the keys stay in memory.
+			`KeyManager "memory"`,
 		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("server.conf lacks %q", want)
 			}
+		}
+		if strings.Contains(text, `KeyManager "disk"`) {
+			t.Fatal("the dev-cp server keeps its CA key on disk")
 		}
 	})
 
@@ -663,9 +706,9 @@ func TestRenderSpireServer(t *testing.T) {
 			pairs = append(pairs, get[string](t, d, "secretKey")+"<-"+get[string](t, d, "remoteRef", "key"))
 		}
 		if !slices.Equal(pairs, []string{
-			"intermediate-key<-@CELL_NAME@/spire-server/intermediate-key",
-			"intermediate-cert<-@CELL_NAME@/spire-server/intermediate-cert",
-			"root-cert<-@CELL_NAME@/spire-server/root-cert",
+			"intermediate-key<-dev-cp/spire-server/intermediate-key",
+			"intermediate-cert<-dev-cp/spire-server/intermediate-cert",
+			"root-cert<-dev-cp/spire-server/root-cert",
 		}) {
 			t.Fatalf("data is %v", pairs)
 		}
@@ -673,7 +716,8 @@ func TestRenderSpireServer(t *testing.T) {
 
 	t.Run("entries declare a node alias and the celld ID for each cell", func(t *testing.T) {
 		data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
-		if got := keysOf(data); !slices.Equal(got, []string{"dev-cell-1-celld.yaml", "dev-cell-1-nodes.yaml", "dev-cell-2-celld.yaml", "dev-cell-2-nodes.yaml"}) {
+		if got := keysOf(data); !slices.Equal(got, []string{"agents-observability-system-otel-uplink.yaml", "dev-cell-1-celld.yaml", "dev-cell-1-nodes.yaml",
+			"dev-cell-2-celld.yaml", "dev-cell-2-nodes.yaml", "workload-cp-otel.yaml"}) {
 			t.Fatalf("spire-entries keys are %v", got)
 		}
 		type entry struct {
@@ -753,20 +797,34 @@ func TestRenderFailsClosed(t *testing.T) {
 	}{
 		{"cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 bad-facts"}, "Create the cluster: mise run hostsvc -- up --only bad-facts, then run CELL=bad-facts mise run cell:up. Or remove bad-facts from SPIRE_AGENT_CELLS"},
 		{"cell without node address", []string{"SPIRE_AGENT_CELLS=no-ip"}, "node address of no-ip"},
-		{"no cells", []string{"SPIRE_AGENT_CELLS= "}, "names no cell"},
-		{"unset cells", []string{"SPIRE_AGENT_CELLS="}, "SPIRE_AGENT_CELLS"},
+		{"blank cells with subjects", []string{"SPIRE_AGENT_CELLS= "}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
+		{"cells without subjects", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS="}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
+		{"no cell and no local workload", []string{"SPIRE_AGENT_CELLS=", "SPIRE_CELL_SUBJECTS="}, "names no agent cell and no local workload"},
 		{"no images file", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_IMAGES=missing"}, "Run mise run images first"},
 		{"stale images file", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_IMAGES=stale"}, "Run mise run images again"},
 		{"image not in the registry", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_NO_REGISTRY=1"}, "the registry has no localhost:5001/cluster-jwt-server@sha256:"},
 		{"layer with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_LAYER=1"}, "could not fetch layer"},
 		{"manifest with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_MANIFEST=1"}, "could not fetch the manifest of localhost:5001/cluster-jwt-server@sha256:"},
-		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_AGENT_SUBJECT=celld"}, "is not <namespace>/<service account>"},
+		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=celld=celld"}, "is not <namespace>/<service account>=<role>"},
+		{"subject without a role", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld"}, "is not <namespace>/<service account>=<role>"},
+		{"two subjects before per-role aliases", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld argocd/argocd-agent=argocd-agent"}, "takes one subject"},
 		{"key test trace on an agent cell", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_KEYTEST_TRACE=dev-cell-2"}, "Run: mise run gate:m2:repair"},
 		{"docker reaches another daemon", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_DOCKER_IP=10.0.0.99"}, "reports '10.9.0.7'"},
 		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},
 		{"SVID lifetime in days", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=1d"}, "SPIRE_SVID_TTL '1d' is not"},
 		{"SVID lifetime below the tested floor", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=30s"}, "SPIRE_SVID_TTL '30s' is not"},
 		{"SVID lifetime above ca_ttl / 6", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=5h"}, "above ca_ttl / 6"},
+		{"CA lifetime in days", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CA_TTL=90d"}, "SPIRE_CA_TTL '90d' is not"},
+		{"CA lifetime below the JWT floor", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CA_TTL=20m"}, "below 30m"},
+		{"unset trust domain", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_TRUST_DOMAIN="}, "SPIRE_TRUST_DOMAIN"},
+		{"trust domain with a path", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal/x"}, "is not a trust domain name"},
+		{"unknown upstream", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_UPSTREAM=vault"}, "SPIRE_UPSTREAM 'vault' is not disk"},
+		{"local workload without a path", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=observability-system/otel-uplink"}, "is not <spiffe path>=<namespace>/<service account>"},
+		{"local workload with an agent path", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=spire/agent/x=observability-system/otel-uplink"}, "reserved"},
+		{"local workload with a cell path", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=cell/dev-cell-1/celld=observability-system/otel-uplink"}, "reserved"},
+		{"local workload with an alias path", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=agents/x=observability-system/otel-uplink"}, "reserved"},
+		{"local workload path twice", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=cp/otel=observability-system/otel-uplink cp/otel=observability-system/other"}, "names cp/otel twice"},
+		{"local workloads without API facts", []string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=cp/otel=observability-system/otel-uplink", "API_SERVER_IPS="}, "API_SERVER_IPS"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -785,25 +843,405 @@ func TestRenderFailsClosed(t *testing.T) {
 }
 
 // goldenSpireDevCP holds the dev-cp render of M2, with the stub image digest replaced by
-// stubDigest. UPDATE_GOLDEN=1 writes the file again from the current render.
+// stubDigest.
 const goldenSpireDevCP = "testdata/spire-server-dev-cp.golden.yaml"
 
+// psatOnly matches the lines that the k8s_psat path and the telemetry block add to server.conf.
+var psatOnly = regexp.MustCompile(`(?ms)^  NodeAttestor "k8s_psat" \{$.*?^  \}$\n|^telemetry \{$.*?^\}$\n?`)
+
+// configLines returns the lines of a SPIRE config without comments and blank lines.
+func configLines(text string) []string {
+	var out []string
+	for line := range strings.SplitSeq(text, "\n") {
+		if s := strings.TrimSpace(line); s != "" && !strings.HasPrefix(s, "#") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 // TestSpireServerDevCPKeepsM2Objects renders the server with cells/dev-cp.env and compares each
-// object with the M2 render.
+// object with the M2 render, after it removes the k8s_psat additions: the plugin and telemetry
+// blocks, the cp/otel entries, the token volume and the objects that only k8s_psat needs.
 func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
-	r := render(t, "STUB_CELL=dev-cp")
+	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
-	}
-	out := strings.ReplaceAll(r.stdout, r.digest, stubDigest)
-	if os.Getenv("UPDATE_GOLDEN") != "" {
-		if err := os.WriteFile(goldenSpireDevCP, []byte(out), 0o644); err != nil {
-			t.Fatal(err)
-		}
 	}
 	want, err := os.ReadFile(goldenSpireDevCP)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sameObjects(t, docs(t, out), docs(t, string(want)))
+	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
+	m2 := docs(t, string(want))
+	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api"} {
+		if _, ok := got[key]; !ok {
+			t.Fatalf("render has no %s", key)
+		}
+		delete(got, key)
+	}
+	entries := get[map[string]any](t, got["ConfigMap/spire-entries"], "data")
+	delete(entries, "agents-observability-system-otel-uplink.yaml")
+	delete(entries, "workload-cp-otel.yaml")
+
+	conf := get[string](t, got["ConfigMap/spire-server"], "data", "server.conf")
+	if n := len(psatOnly.FindAllString(conf, -1)); n != 2 {
+		t.Fatalf("server.conf has %d k8s_psat or telemetry blocks, want 2:\n%s", n, conf)
+	}
+	gotLines := configLines(psatOnly.ReplaceAllString(conf, ""))
+	wantLines := configLines(get[string](t, m2["ConfigMap/spire-server"], "data", "server.conf"))
+	if !slices.Equal(gotLines, wantLines) {
+		t.Errorf("server.conf without the k8s_psat and telemetry blocks differs from M2.\ngot:\n%s\nwant:\n%s", strings.Join(gotLines, "\n"), strings.Join(wantLines, "\n"))
+	}
+	delete(got, "ConfigMap/spire-server")
+	delete(m2, "ConfigMap/spire-server")
+
+	pod := get[map[string]any](t, got["StatefulSet/spire-server"], "spec", "template", "spec")
+	pod["volumes"] = slices.DeleteFunc(get[[]any](t, pod, "volumes"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
+	server := named(t, get[[]any](t, pod, "containers"), "spire-server")
+	server["volumeMounts"] = slices.DeleteFunc(get[[]any](t, server, "volumeMounts"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
+	for _, o := range []object{got["StatefulSet/spire-server"], m2["StatefulSet/spire-server"]} {
+		delete(get[map[string]any](t, o, "spec", "template", "metadata", "annotations"), "cell.poc.internal/config-checksum")
+	}
+	sameObjects(t, got, m2)
+}
+
+// hclAt walks a config that hcl.Decode read into a map. HCL gives each block as a list of maps, so
+// at a list the walk takes the first map that holds the next key.
+func hclAt(t *testing.T, v any, keys ...string) any {
+	t.Helper()
+	for _, k := range keys {
+		var next any
+		var found bool
+		switch x := v.(type) {
+		case map[string]any:
+			next, found = x[k]
+		case []map[string]any:
+			for _, m := range x {
+				if next, found = m[k]; found {
+					break
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("config has no %q on the path %v", k, keys)
+		}
+		v = next
+	}
+	return v
+}
+
+// checkPrometheus checks that the telemetry block serves Prometheus on all addresses at 9988, so
+// the collector in the same cluster can scrape it.
+func checkPrometheus(t *testing.T, text string) {
+	t.Helper()
+	var top map[string]any
+	if err := hcl.Decode(&top, text); err != nil {
+		t.Fatalf("server.conf does not parse: %v", err)
+	}
+	prom := hclAt(t, top, "telemetry", "Prometheus").([]map[string]any)
+	if len(prom) != 1 || prom[0]["host"] != "0.0.0.0" || prom[0]["port"] != 9988 {
+		t.Fatalf("telemetry Prometheus is %v, want host 0.0.0.0 and port 9988", prom)
+	}
+}
+
+// checkPSAT checks the k8s_psat path of a server render: the plugin config, the API access of the
+// server, the ingress rule for each local workload, and the alias and entry of each workload.
+// workloads maps each SPIFFE path to <namespace>/<service account>.
+func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloads map[string]string) {
+	t.Helper()
+	text := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
+	// k8s_psat ignores unknown keys, so only this exact key gives each sidecar its own agent ID.
+	if !regexp.MustCompile(`(?m)^ +use_pod_uid_for_agent_id = true$`).MatchString(text) {
+		t.Fatalf("server.conf lacks the literal key use_pod_uid_for_agent_id = true:\n%s", text)
+	}
+	var top map[string]any
+	if err := hcl.Decode(&top, text); err != nil {
+		t.Fatalf("server.conf does not parse: %v", err)
+	}
+	clusters := hclAt(t, top, "plugins", "NodeAttestor", "k8s_psat", "plugin_data", "clusters").([]map[string]any)
+	if len(clusters) != 1 || len(clusters[0]) != 1 {
+		t.Fatalf("k8s_psat clusters are %v, want only %s", clusters, cluster)
+	}
+	c := hclAt(t, clusters, cluster).([]map[string]any)
+	var accounts, wantAccounts []string
+	for _, a := range c[0]["service_account_allow_list"].([]any) {
+		accounts = append(accounts, a.(string))
+	}
+	for _, sub := range workloads {
+		wantAccounts = append(wantAccounts, strings.Replace(sub, "/", ":", 1))
+	}
+	slices.Sort(accounts)
+	slices.Sort(wantAccounts)
+	wantAccounts = slices.Compact(wantAccounts)
+	if !slices.Equal(accounts, wantAccounts) || c[0]["use_pod_uid_for_agent_id"] != true || len(c[0]) != 2 {
+		t.Fatalf("k8s_psat cluster %s is %v, want the accounts %v and use_pod_uid_for_agent_id", cluster, c[0], wantAccounts)
+	}
+
+	role := objs["ClusterRole/spire-server-psat"]
+	var rules []string
+	for _, r := range get[[]any](t, role, "rules") {
+		if len(r.(map[string]any)) != 3 {
+			t.Fatalf("rule %v has more than apiGroups, resources and verbs", r)
+		}
+		rules = append(rules, fmt.Sprintf("%v %v %v", get[[]any](t, r, "apiGroups"), get[[]any](t, r, "resources"), get[[]any](t, r, "verbs")))
+	}
+	if want := []string{"[authentication.k8s.io] [tokenreviews] [create]", "[] [pods] [get]", "[] [nodes] [get]"}; !slices.Equal(rules, want) {
+		t.Fatalf("ClusterRole spire-server-psat rules are %v, want %v", rules, want)
+	}
+	binding := objs["ClusterRoleBinding/spire-server-psat"]
+	if get[string](t, binding, "roleRef", "kind") != "ClusterRole" || get[string](t, binding, "roleRef", "name") != "spire-server-psat" ||
+		len(get[[]any](t, binding, "subjects")) != 1 || get[string](t, binding, "subjects", 0, "name") != "spire-server" ||
+		get[string](t, binding, "subjects", 0, "namespace") != "spire-system" {
+		t.Fatalf("ClusterRoleBinding is %v", binding)
+	}
+
+	// The account mounts no token. Only the server container gets one, for TokenReview and the pod
+	// and node reads.
+	if objs["ServiceAccount/spire-server"]["automountServiceAccountToken"] != false {
+		t.Fatal("the ServiceAccount mounts a token")
+	}
+	pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
+	if pod["automountServiceAccountToken"] != false {
+		t.Fatal("the pod mounts the automatic token")
+	}
+	token := named(t, get[[]any](t, pod, "volumes"), "api-token")
+	if e, ok := lookup(token, "projected", "sources", 0, "serviceAccountToken", "expirationSeconds"); !ok || e != float64(600) {
+		t.Fatalf("api-token volume is %v", token)
+	}
+	if _, ok := lookup(token, "projected", "sources", 0, "serviceAccountToken", "audience"); ok {
+		t.Fatal("the server token has an audience, so the API server would refuse it")
+	}
+	for _, c := range append(get[[]any](t, pod, "containers"), func() []any { l, _ := lookup(pod, "initContainers"); s, _ := l.([]any); return s }()...) {
+		var paths []string
+		for _, m := range get[[]any](t, c, "volumeMounts") {
+			if get[string](t, m, "name") == "api-token" {
+				paths = append(paths, get[string](t, m, "mountPath"))
+			}
+		}
+		want := []string(nil)
+		if get[string](t, c, "name") == "spire-server" {
+			want = []string{"/var/run/secrets/kubernetes.io/serviceaccount"}
+		}
+		if !slices.Equal(paths, want) {
+			t.Fatalf("%s mounts api-token at %v, want %v", get[string](t, c, "name"), paths, want)
+		}
+	}
+
+	// Flow N8: each local workload pod reaches the server API. Flow N9: the server reaches the API server.
+	np := objs["NetworkPolicy/spire-server-workloads"]
+	if get[string](t, np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
+		t.Fatalf("workload policy selects %v", get[map[string]any](t, np, "spec", "podSelector"))
+	}
+	ingress := get[[]any](t, np, "spec", "ingress")
+	if len(ingress) != 1 || !slices.Equal(get[[]any](t, np, "spec", "policyTypes"), []any{"Ingress"}) {
+		t.Fatalf("workload policy spec is %v", np["spec"])
+	}
+	var peers, wantPeers []string
+	for _, p := range get[[]any](t, ingress[0], "from") {
+		if len(p.(map[string]any)) != 2 {
+			t.Fatalf("peer %v needs exactly a namespace and a pod selector", p)
+		}
+		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+
+			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
+	}
+	for _, sub := range workloads {
+		wantPeers = append(wantPeers, sub)
+	}
+	slices.Sort(peers)
+	slices.Sort(wantPeers)
+	if !slices.Equal(peers, slices.Compact(wantPeers)) {
+		t.Fatalf("workload peers are %v, want %v", peers, wantPeers)
+	}
+	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
+		t.Fatalf("workload ports are %v", ports)
+	}
+	api := objs["NetworkPolicy/spire-server-api"]
+	if !slices.Equal(get[[]any](t, api, "spec", "policyTypes"), []any{"Egress"}) ||
+		get[string](t, api, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
+		t.Fatalf("API policy spec is %v", api["spec"])
+	}
+	var egress []string
+	for _, rule := range get[[]any](t, api, "spec", "egress") {
+		var to []string
+		for _, p := range get[[]any](t, rule, "to") {
+			to = append(to, get[string](t, p, "ipBlock", "cidr"))
+		}
+		var ports []string
+		for _, p := range get[[]any](t, rule, "ports") {
+			ports = append(ports, fmt.Sprintf("%s/%v", get[string](t, p, "protocol"), get[float64](t, p, "port")))
+		}
+		egress = append(egress, strings.Join(to, ",")+" "+strings.Join(ports, ","))
+	}
+	if want := []string{"172.18.0.4/32 TCP/6443", "10.111.0.1/32 TCP/443"}; !slices.Equal(egress, want) {
+		t.Fatalf("API egress is %v, want %v", egress, want)
+	}
+
+	data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
+	for path, sub := range workloads {
+		ns, sa, _ := strings.Cut(sub, "/")
+		alias := "spiffe://" + td + "/agents/" + ns + "/" + sa
+		for file, want := range map[string]entrySpec{
+			"agents-" + ns + "-" + sa + ".yaml": {alias, "spiffe://" + td + "/spire/server",
+				[]string{"k8s_psat:cluster:" + cluster, "k8s_psat:agent_ns:" + ns, "k8s_psat:agent_sa:" + sa}},
+			"workload-" + strings.ReplaceAll(path, "/", "-") + ".yaml": {"spiffe://" + td + "/" + path, alias, []string{"unix:uid:65532"}},
+		} {
+			var got struct {
+				APIVersion string `json:"apiVersion"`
+				Kind       string `json:"kind"`
+				Metadata   struct {
+					Name string `json:"name"`
+				} `json:"metadata"`
+				Spec entrySpec `json:"spec"`
+			}
+			text, ok := data[file].(string)
+			if !ok {
+				t.Fatalf("spire-entries has no %s; keys %v", file, keysOf(data))
+			}
+			if err := yaml.UnmarshalStrict([]byte(text), &got); err != nil {
+				t.Fatalf("%s: %v", file, err)
+			}
+			if got.Kind != "ClusterStaticEntry" || got.Metadata.Name+".yaml" != file || got.Spec.SPIFFEID != want.SPIFFEID ||
+				got.Spec.ParentID != want.ParentID || !slices.Equal(got.Spec.Selectors, want.Selectors) {
+				t.Fatalf("%s is %+v, want spec %+v", file, got, want)
+			}
+		}
+	}
+}
+
+// managementWorkloads are the plane workloads of cells/management.env.
+var managementWorkloads = map[string]string{
+	"argocd/principal": "central-view-system/argocd-agent-principal",
+	"telemetry":        "observability-system/telemetry-gateway",
+	"kiali":            "mesh-view-system/mesh-view-hub",
+}
+
+// TestSpireServerRenderManagement renders the management plane server with cells/management.env.
+// It has its own CA with no upstream authority, admits only its local workloads, and needs nothing
+// from a cell, the host service or the secret manager.
+func TestSpireServerRenderManagement(t *testing.T) {
+	r := renderCell(t, "management")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
+		t.Fatalf("render left tokens %v", left)
+	}
+	if strings.TrimSpace(r.log) != "" {
+		t.Fatalf("the render ran host commands; want no image fetch, record or host service call:\n%s", r.log)
+	}
+	objs := docs(t, hydrated(r.stdout, "management"))
+	checkPSAT(t, objs, "management", "mgmt.poc.internal", managementWorkloads)
+
+	var kinds []string
+	for k := range objs {
+		kinds = append(kinds, k)
+	}
+	slices.Sort(kinds)
+	want := []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "ConfigMap/spire-controller-manager",
+		"ConfigMap/spire-entries", "ConfigMap/spire-server", "Namespace/spire-system", "NetworkPolicy/default-deny",
+		"NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-workloads", "Service/spire-server", "ServiceAccount/spire-server",
+		"StatefulSet/spire-server"}
+	if !slices.Equal(kinds, want) {
+		t.Fatalf("objects are %v, want %v: no ExternalSecret, no record and no agent node policy", kinds, want)
+	}
+
+	t.Run("the bundle holds Namespace spire-system, never pruned", func(t *testing.T) {
+		ns := objs["Namespace/spire-system"]
+		labels := get[map[string]any](t, ns, "metadata", "labels")
+		if labels["pod-security.kubernetes.io/enforce"] != "restricted" || labels["istio-injection"] != "disabled" {
+			t.Fatalf("namespace labels are %v", labels)
+		}
+		if got := get[string](t, ns, "metadata", "annotations", "argocd.argoproj.io/sync-options"); got != "Prune=false,Delete=false" {
+			t.Fatalf("sync options are %q", got)
+		}
+	})
+
+	t.Run("server config", func(t *testing.T) {
+		text := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
+		var conf struct {
+			Server struct {
+				TrustDomain string `hcl:"trust_domain"`
+				CATTL       string `hcl:"ca_ttl"`
+				AgentTTL    string `hcl:"agent_ttl"`
+				X509TTL     string `hcl:"default_x509_svid_ttl"`
+				LogFormat   string `hcl:"log_format"`
+			} `hcl:"server"`
+		}
+		if err := hcl.Decode(&conf, text); err != nil {
+			t.Fatalf("server.conf does not parse: %v", err)
+		}
+		if s := conf.Server; s.TrustDomain != "mgmt.poc.internal" || s.CATTL != "2160h" || s.AgentTTL != "1h" || s.X509TTL != "1h" || s.LogFormat != "json" {
+			t.Fatalf("server block is %+v", s)
+		}
+		checkPrometheus(t, text)
+		for _, unwanted := range []string{"UpstreamAuthority", `NodeAttestor "cluster_jwt"`, `KeyManager "memory"`, "record_public_keys"} {
+			if strings.Contains(text, unwanted) {
+				t.Fatalf("server.conf holds %q:\n%s", unwanted, text)
+			}
+		}
+		// A restart keeps the CA key, so every peer copy of the root stays valid.
+		if !regexp.MustCompile(`(?s)KeyManager "disk" \{\s*plugin_data \{\s*keys_path = "/run/spire/data/keys\.json"\s*\}`).MatchString(text) {
+			t.Fatalf("server.conf has no disk KeyManager on the data volume:\n%s", text)
+		}
+	})
+
+	t.Run("controller manager config", func(t *testing.T) {
+		var cm map[string]any
+		if err := yaml.Unmarshal([]byte(get[string](t, objs["ConfigMap/spire-controller-manager"], "data", "config.yaml")), &cm); err != nil {
+			t.Fatal(err)
+		}
+		if cm["trustDomain"] != "mgmt.poc.internal" || cm["clusterName"] != "management" {
+			t.Fatalf("config is %v", cm)
+		}
+	})
+
+	t.Run("statefulset runs only the server and the controller manager", func(t *testing.T) {
+		pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
+		if _, ok := pod["initContainers"]; ok {
+			t.Fatal("the pod has an init container")
+		}
+		var volumes []string
+		for _, v := range get[[]any](t, pod, "volumes") {
+			volumes = append(volumes, get[string](t, v, "name"))
+			if name, ok := lookup(v, "configMap", "name"); ok {
+				if _, found := objs["ConfigMap/"+name.(string)]; !found {
+					t.Fatalf("volume uses ConfigMap %v, which the render does not print", name)
+				}
+			}
+		}
+		for _, unwanted := range []string{"upstream", "records", "plugins"} {
+			if slices.Contains(volumes, unwanted) {
+				t.Fatalf("volumes %v hold %s", volumes, unwanted)
+			}
+		}
+		for _, claim := range get[[]any](t, objs["StatefulSet/spire-server"], "spec", "volumeClaimTemplates") {
+			volumes = append(volumes, get[string](t, claim, "metadata", "name"))
+		}
+		for _, c := range get[[]any](t, pod, "containers") {
+			for _, m := range get[[]any](t, c, "volumeMounts") {
+				if !slices.Contains(volumes, get[string](t, m, "name")) {
+					t.Fatalf("%s mounts %s, which the pod does not have", get[string](t, c, "name"), get[string](t, m, "name"))
+				}
+			}
+		}
+		if claims := get[[]any](t, objs["StatefulSet/spire-server"], "spec", "volumeClaimTemplates"); len(claims) != 1 || get[string](t, claims[0], "metadata", "name") != "data" {
+			t.Fatalf("volume claims are %v", claims)
+		}
+	})
+
+	t.Run("agents reach the server only through its ClusterIP service", func(t *testing.T) {
+		svc := objs["Service/spire-server"]
+		spec := get[map[string]any](t, svc, "spec")
+		ports := get[[]any](t, spec, "ports")
+		if typ, _ := spec["type"].(string); (typ != "" && typ != "ClusterIP") || len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
+			t.Fatalf("service spec is %v", spec)
+		}
+		if _, ok := lookup(ports[0], "nodePort"); ok {
+			t.Fatal("the service has a node port")
+		}
+		if _, ok := spec["externalTrafficPolicy"]; ok {
+			t.Fatal("a ClusterIP service sets externalTrafficPolicy")
+		}
+	})
 }

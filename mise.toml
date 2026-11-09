@@ -64,7 +64,7 @@ description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with
 run = "scripts/ui.sh"
 
 [tasks."cell:restart"]
-description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp, restart the SPIRE server"
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
 
 [tasks."cell:down"]
@@ -133,6 +133,11 @@ run = "scripts/gate.sh m1"
 description = "Run the M2 end-to-end tests against the SPIRE server in dev-cp, plus the go test arguments after --"
 depends = ["images"]
 run = "scripts/gate.sh m2"
+
+[tasks."gate:m3"]
+description = "Run the M3 end-to-end tests against the management plane and dev-cp, plus the go test arguments after --"
+depends = ["images"]
+run = "scripts/gate.sh m3"
 
 [tasks."gate:m2:repair"]
 description = "Repair dev-cp and dev-cell-1 after any gate:m2 run that stopped before its cleanups. Safe to run again"

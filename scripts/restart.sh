@@ -3,8 +3,10 @@
 # new Ready pods. Only the Deployments with the harness label of the component count, because a
 # harness component can share its namespace with Argo CD objects. A restarted celld pod gets a new
 # pod UID, so its SPIRE agent attests again.
-# In a cluster with the spire-server component set, restart the SPIRE server pod. The new server
-# signs a new CA through its upstream authority, and it keeps its datastore.
+# In a cluster with the spire-server component set, restart the SPIRE server pod. It keeps its
+# datastore. With an upstream authority (dev-cp), the new server signs a new CA through it. Without
+# one (management), the server loads its CA key from the data volume, so the root stays the same
+# and every peer copy of it stays valid.
 # The script deletes the pods and lets the controller replace them. It does not change the
 # Deployment or the StatefulSet, so their field managers stay the same.
 source "$(dirname "$0")/lib.sh"

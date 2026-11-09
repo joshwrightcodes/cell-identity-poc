@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3 [go test arguments]
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3 [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern}_BUDGET_MINUTES"
@@ -38,6 +38,24 @@ if [[ "$milestone" == m2 ]]; then
     IFS=: read -r cluster ns workload <<<"$target"
     found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
     [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# The M3 tests run against the plane servers and the workloads of every cluster. Each Deployment or
+# StatefulSet that runs a local image must run the one that `mise run images` recorded, or the gate
+# tests old code.
+if [[ "$milestone" == m3 ]]; then
+  stale=""
+  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+    workloads="$(kubectl --context "kind-$cluster" get deployments,statefulsets -A -o json | jq -r '.items[]
+      | select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
+      | "\(.metadata.namespace) \(.kind | ascii_downcase)/\(.metadata.name)"')" || die "could not list the workloads of $cluster"
+    while read -r ns workload; do
+      [[ -n "$ns" ]] || continue
+      found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+      [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'
+    done <<<"$workloads"
   done
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi

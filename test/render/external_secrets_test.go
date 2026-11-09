@@ -2,6 +2,8 @@ package render
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/netip"
 	"os"
@@ -76,8 +78,12 @@ func renderExternalSecrets(t *testing.T, env ...string) (string, string, error) 
 // external-secrets, apart from the Roles and RoleBindings of the store namespace.
 func esoDocs(t *testing.T, out string) map[string]object {
 	t.Helper()
-	clusterScoped := []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-		"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration"}
+	return esoDocsIn(t, out, storeNamespace)
+}
+
+// esoDocsIn is esoDocs for the controller namespace scope.
+func esoDocsIn(t *testing.T, out, scope string) map[string]object {
+	t.Helper()
 	byKey := map[string]object{}
 	for _, d := range regexp.MustCompile(`(?m)^---\s*$`).Split(out, -1) {
 		var o object
@@ -97,7 +103,7 @@ func esoDocs(t *testing.T, out string) map[string]object {
 			if ns != nil {
 				t.Fatalf("cluster-scoped %s has namespace %v", key, ns)
 			}
-		} else if ns != esoNamespace && !(ns == storeNamespace && (kind == "Role" || kind == "RoleBinding")) {
+		} else if ns != esoNamespace && !(ns == scope && (kind == "Role" || kind == "RoleBinding")) {
 			t.Fatalf("%s has namespace %v, want %s", key, ns, esoNamespace)
 		}
 		byKey[key] = o
@@ -395,18 +401,99 @@ func TestRenderExternalSecrets(t *testing.T) {
 	})
 }
 
+// The controller takes one --namespace. EXTERNAL_SECRETS_NAMESPACE names it, and defaults to
+// SECRET_STORE_NAMESPACES, the store namespace of secrets:connect. A store outside the controller
+// namespace would never become Ready.
 func TestRenderExternalSecretsNeedsOneStoreNamespace(t *testing.T) {
-	for name, value := range map[string]string{"none": "", "two": "spire-system other", "not a label": "Spire_System"} {
+	for name, env := range map[string][]string{
+		"none":                         {"SECRET_STORE_NAMESPACES="},
+		"two":                          {"SECRET_STORE_NAMESPACES=spire-system other"},
+		"not a label":                  {"SECRET_STORE_NAMESPACES=Spire_System"},
+		"two controller namespaces":    {"SECRET_STORE_NAMESPACES=", "EXTERNAL_SECRETS_NAMESPACE=observability-system other"},
+		"controller outside the store": {"SECRET_STORE_NAMESPACES=spire-system", "EXTERNAL_SECRETS_NAMESPACE=observability-system"},
+	} {
 		t.Run(name, func(t *testing.T) {
-			env := append(slices.Clone(esoFacts[1:]), "SECRET_STORE_NAMESPACES="+value)
-			out, stderr, err := renderExternalSecrets(t, env...)
+			out, stderr, err := renderExternalSecrets(t, append(slices.Clone(esoFacts[1:]), env...)...)
 			if err == nil || out != "" {
 				t.Fatalf("render succeeded or printed manifests, err %v", err)
 			}
-			if !strings.Contains(stderr, "SECRET_STORE_NAMESPACES") {
-				t.Fatalf("stderr %q does not name SECRET_STORE_NAMESPACES", stderr)
+			if !strings.Contains(stderr, "SECRET_STORE_NAMESPACES") || !strings.Contains(stderr, "EXTERNAL_SECRETS_NAMESPACE") {
+				t.Fatalf("stderr %q does not name SECRET_STORE_NAMESPACES and EXTERNAL_SECRETS_NAMESPACE", stderr)
 			}
 		})
+	}
+}
+
+// cellSetting reads one setting of cells/<cluster>.env, or returns "" when the file has none.
+func cellSetting(t *testing.T, cluster, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("../../cells/" + cluster + ".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, name+"="); ok {
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
+}
+
+// TestRenderExternalSecretsWithoutStore renders the operator of management. It has no secret store,
+// so it gets no internet egress and no store Namespace. It works only in observability-system, which
+// the namespaces bundle holds, for the Password generator of Grafana.
+func TestRenderExternalSecretsWithoutStore(t *testing.T) {
+	scope := cellSetting(t, "management", "EXTERNAL_SECRETS_NAMESPACE")
+	if scope != "observability-system" || cellSetting(t, "management", "SECRET_STORE_NAMESPACES") != "" {
+		t.Fatalf("cells/management.env sets EXTERNAL_SECRETS_NAMESPACE %q and SECRET_STORE_NAMESPACES %q, want observability-system and none",
+			scope, cellSetting(t, "management", "SECRET_STORE_NAMESPACES"))
+	}
+	out, stderr, err := renderExternalSecrets(t, append(slices.Clone(esoFacts[1:]), "EXTERNAL_SECRETS_NAMESPACE="+scope)...)
+	if err != nil {
+		t.Fatalf("render failed: %v\n%s", err, stderr)
+	}
+	objs := esoDocsIn(t, out, scope)
+	var namespaces []string
+	for key := range objs {
+		if name, ok := strings.CutPrefix(key, "Namespace/"); ok {
+			namespaces = append(namespaces, name)
+		}
+	}
+	if !slices.Equal(namespaces, []string{esoNamespace}) {
+		t.Fatalf("Namespaces are %v, want only %s: the namespaces bundle holds %s", namespaces, esoNamespace, scope)
+	}
+	var args []string
+	for _, a := range get[[]any](t, objs["Deployment/external-secrets"], "spec", "template", "spec", "containers", 0, "args") {
+		args = append(args, a.(string))
+	}
+	if !slices.Contains(args, "--namespace="+scope) {
+		t.Fatalf("args %v lack --namespace=%s", args, scope)
+	}
+	for _, key := range []string{"Role/external-secrets-controller", "RoleBinding/external-secrets-controller"} {
+		if ns := get[string](t, objs[key], "metadata", "namespace"); ns != scope {
+			t.Fatalf("%s is in %s, want %s", key, ns, scope)
+		}
+	}
+	var peers []string
+	for key, o := range objs {
+		if !strings.HasPrefix(key, "NetworkPolicy/") {
+			continue
+		}
+		egress, _ := lookup(o, "spec", "egress")
+		list, _ := egress.([]any)
+		for _, rule := range list {
+			for _, p := range get[[]any](t, rule, "to") {
+				if cidr, ok := lookup(p, "ipBlock", "cidr"); ok {
+					peers = append(peers, cidr.(string))
+				} else {
+					peers = append(peers, "dns-pods")
+				}
+			}
+		}
+	}
+	slices.Sort(peers)
+	if want := []string{"10.111.0.1/32", "10.111.0.10/32", "172.18.0.4/32", "dns-pods"}; !slices.Equal(peers, want) {
+		t.Fatalf("egress peers are %v, want only DNS and the API server %v", peers, want)
 	}
 }
 
@@ -430,5 +517,41 @@ func TestRenderExternalSecretsFailsClosed(t *testing.T) {
 				t.Fatalf("stderr %q does not name %s", stderr, missing)
 			}
 		})
+	}
+}
+
+// goldenESODevCP holds the SHA-256 of the dev-cp render of M2. UPDATE_GOLDEN=1 writes it again.
+const goldenESODevCP = "testdata/external-secrets-dev-cp.sha256"
+
+// TestRenderExternalSecretsDevCPUnchanged renders the operator with the store namespace of dev-cp,
+// with and without EXTERNAL_SECRETS_NAMESPACE. Both renders must equal the M2 render byte for byte.
+func TestRenderExternalSecretsDevCPUnchanged(t *testing.T) {
+	sum := func(s string) string {
+		h := sha256.Sum256([]byte(s))
+		return hex.EncodeToString(h[:])
+	}
+	out, stderr, err := renderExternalSecrets(t, esoFacts...)
+	if err != nil {
+		t.Fatalf("render failed: %v\n%s", err, stderr)
+	}
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		if err := os.WriteFile(goldenESODevCP, []byte(sum(out)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := os.ReadFile(goldenESODevCP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.TrimSpace(string(data))
+	if got := sum(out); got != want {
+		t.Fatalf("the dev-cp render has SHA-256 %s, and the M2 render in %s has %s", got, goldenESODevCP, want)
+	}
+	same, stderr, err := renderExternalSecrets(t, append(slices.Clone(esoFacts), "EXTERNAL_SECRETS_NAMESPACE="+storeNamespace)...)
+	if err != nil {
+		t.Fatalf("render with EXTERNAL_SECRETS_NAMESPACE failed: %v\n%s", err, stderr)
+	}
+	if got := sum(same); got != want {
+		t.Fatalf("the render with EXTERNAL_SECRETS_NAMESPACE=%s has SHA-256 %s, want the M2 %s", storeNamespace, got, want)
 	}
 }

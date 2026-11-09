@@ -433,6 +433,25 @@ The keys stay in shell variables and pipes, and the task prints no key.
 `PKI_INTERMEDIATE_DAYS` sets the validity of the new intermediate. The default is 30.
 Use a write identity for this task, and not the read-only cluster token.
 
+### Keys of the management plane
+
+`management` holds no secret manager token, and its operator has no secret store.
+The operator works only in `observability-system`, the namespace in `EXTERNAL_SECRETS_NAMESPACE` of `cells/management.env`.
+It has no route to the internet.
+
+The SPIRE server in `management` makes its CA inside the cluster, with no upstream authority.
+The CA is a self-signed root of the trust domain `mgmt.poc.internal`.
+It lives 90 days, from `SPIRE_CA_TTL=2160h`, so no CA rotation falls inside a run.
+The server keeps the CA key in the file `keys.json` on its data volume, the PersistentVolumeClaim `data-spire-server-0` in `spire-system`.
+The key has no encryption on the disk of the VM.
+
+A restart of the server loads the same key from the volume, so the root stays the same.
+This applies to `CELL=management mise run cell:restart`, a node restart and a pod eviction.
+Each copy of the root in another cluster then stays valid, and no other cluster needs a new render.
+A new data volume gives a new root, for example after `cell:down` and `cell:up` of `management`.
+Then each copy of the old root fails, so run `cell:up` again on each cluster that holds a copy.
+`pki:rotate-intermediate` does not apply to `management`.
+
 ## Move a live dev-cp to the scoped operator
 
 A `dev-cp` from before the scoped External Secrets Operator runs the cluster-wide operator and ClusterSecretStore `poc-secrets`.

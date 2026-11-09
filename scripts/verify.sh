@@ -445,27 +445,101 @@ expect_rogue_blocked() {
   expect_dial_blocked rogue default "$1"
 }
 
-# The SPIRE server must hold the node alias and the celld entry of each agent cell, with the
-# parents and selectors that the render declares.
+# The SPIRE server must hold the node alias and the role entry of each agent cell, with the
+# parents and selectors that the render declares. SPIRE_CELL_SUBJECTS holds one
+# <namespace>/<service account>=<role> entry.
 check_agent_entries() {
-  local entries cell sa missing=()
+  local entries cell subject sa role missing=()
   entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
     /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
     || { echo "could not read the entries from spire-server-0"; return 1; }
-  sa="${SPIRE_AGENT_SUBJECT/\//:}"
+  read -r subject _ <<<"$SPIRE_CELL_SUBJECTS"
+  sa="${subject%%=*}"
+  sa="${sa/\//:}"
+  role="${subject#*=}"
   for cell in $SPIRE_AGENT_CELLS; do
     jq -e --arg cell "$cell" --arg sa "$sa" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/nodes"
       and .parent_id.path == "/spire/server"
       and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
-      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://dev.env.poc.internal/cell/$cell/nodes with the selectors of $cell")
-    jq -e --arg cell "$cell" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/celld"
+      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/nodes with the selectors of $cell")
+    jq -e --arg cell "$cell" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/\($role)"
       and .parent_id.path == "/cell/\($cell)/nodes"
       and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
-      <<<"$entries" >/dev/null || missing+=("no celld entry spiffe://dev.env.poc.internal/cell/$cell/celld with selector unix:uid:65532")
+      <<<"$entries" >/dev/null || missing+=("no $role entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/$role with selector unix:uid:65532")
   done
   if ((${#missing[@]} > 0)); then
     printf '%s\n' "${missing[@]}"
     echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# The SPIRE server must be Ready at its current revision, and healthy on its admin socket.
+check_server_healthy() {
+  local out
+  k -n spire-system get statefulset spire-server -o json | jq -e '(.spec.replicas // 1) as $want
+    | (.status.readyReplicas // 0) == $want and (.status.updatedReplicas // 0) == $want
+      and .status.currentRevision == .status.updateRevision' >/dev/null \
+    || { echo "statefulset/spire-server in spire-system is not Ready at its current revision. Read: mise x -- kubectl --context kind-$CELL_NAME -n spire-system describe pod spire-server-0"; return 1; }
+  out="$(k -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server healthcheck -socketPath /run/spire/sockets/api.sock 2>&1)"
+  [[ "$out" == "Server is healthy." ]] || { echo "spire-server healthcheck: ${out:-no output}"; return 1; }
+}
+
+# The SPIRE server must hold the node alias and the entry of each local workload in
+# SPIRE_LOCAL_WORKLOADS, with the parents and selectors that the render declares.
+check_local_entries() {
+  local entries w path sub ns sa missing=()
+  entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not read the entries from spire-server-0"; return 1; }
+  for w in $SPIRE_LOCAL_WORKLOADS; do
+    path="${w%%=*}" sub="${w#*=}"
+    ns="${sub%%/*}" sa="${sub#*/}"
+    jq -e --arg td "$SPIRE_TRUST_DOMAIN" --arg ns "$ns" --arg sa "$sa" --arg cluster "$CELL_NAME" 'any(.entries[];
+      .spiffe_id.trust_domain == $td and .spiffe_id.path == "/agents/\($ns)/\($sa)" and .parent_id.path == "/spire/server"
+      and ([.selectors[] | "\(.type):\(.value)"] | sort)
+        == (["k8s_psat:cluster:\($cluster)", "k8s_psat:agent_ns:\($ns)", "k8s_psat:agent_sa:\($sa)"] | sort))' \
+      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/agents/$ns/$sa with the k8s_psat selectors of $CELL_NAME")
+    jq -e --arg td "$SPIRE_TRUST_DOMAIN" --arg path "/$path" --arg parent "/agents/$ns/$sa" 'any(.entries[];
+      .spiffe_id.trust_domain == $td and .spiffe_id.path == $path and .parent_id.path == $parent
+      and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
+      <<<"$entries" >/dev/null || missing+=("no entry spiffe://$SPIRE_TRUST_DOMAIN/$path under the alias of $sub with selector unix:uid:65532")
+  done
+  if ((${#missing[@]} > 0)); then
+    printf '%s\n' "${missing[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# The SPIRE server trusts only its own trust domain, so it holds no federated bundle.
+check_no_federation() {
+  local out
+  out="$(k -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle list -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not list the federated bundles of spire-server-0"; return 1; }
+  jq -e '(.bundles // []) | length == 0' <<<"$out" >/dev/null || { echo "the server holds federated bundles: $(jq -c '[.bundles[].trust_domain]' <<<"$out")"; return 1; }
+}
+
+# A cluster with the operator but no secret store holds no store of either kind, no copy of the
+# store token, and an operator that cannot list Secrets in every namespace.
+check_no_secret_store() {
+  local out problems=()
+  out="$(k get secretstores.external-secrets.io -A -o name)" || { echo "could not list the SecretStores"; return 1; }
+  [[ -z "$out" ]] || problems+=("SecretStores: ${out//$'\n'/ }")
+  if out="$(k get clustersecretstores.external-secrets.io -o name 2>&1)"; then
+    [[ -z "$out" ]] || problems+=("ClusterSecretStores: ${out//$'\n'/ }")
+  elif [[ "$out" != *"the server doesn't have a resource type"* ]]; then
+    echo "could not list the ClusterSecretStores: $out"
+    return 1
+  fi
+  out="$(k get secrets -A --field-selector metadata.name=poc-secrets-token -o name)" || { echo "could not list the Secrets named poc-secrets-token"; return 1; }
+  [[ -z "$out" ]] || problems+=("copies of the store token: ${out//$'\n'/ }")
+  out="$(k auth can-i list secrets -A --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
+  [[ "$out" == no ]] || problems+=("the operator can list Secrets in every namespace (can-i: '${out:-unknown}')")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "$CELL_NAME has no secret store. Delete each object above, then run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
 }
@@ -523,8 +597,7 @@ if has_harness cell-identity; then
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
-  check "The SPIRE server holds the node alias and celld entries of $SPIRE_AGENT_CELLS" check_agent_entries
-  check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
+  check "The SPIRE server holds the node alias and role entries of $SPIRE_AGENT_CELLS" check_agent_entries
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
@@ -534,6 +607,17 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   own_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
   check "The SPIRE node port of $CELL_NAME has a ready local endpoint, and a probe pod in rogue cannot open TCP to it (steady state)" \
     expect_rogue_blocked "${own_ip:-unknown}:30081"
+fi
+if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
+  check "The SPIRE server is Ready and healthy" check_server_healthy
+  check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
+  check "The SPIRE server of $SPIRE_TRUST_DOMAIN holds no federated bundle" check_no_federation
+fi
+if [[ -n "${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
+  check "The SPIRE server holds the node alias and the entry of each local workload in SPIRE_LOCAL_WORKLOADS" check_local_entries
+fi
+if [[ -n "${EXTERNAL_SECRETS_NAMESPACE:-}" && -z "${SECRET_STORE_NAMESPACES:-}" ]]; then
+  check "$CELL_NAME has no SecretStore, no ClusterSecretStore and no store token, and the operator cannot list Secrets in every namespace" check_no_secret_store
 fi
 if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "SecretStore $SECRET_STORE is Ready, and each ExternalSecret that uses it is Ready and refreshed in time" check_secret_store
