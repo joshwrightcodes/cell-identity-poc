@@ -520,7 +520,8 @@ func TestRenderExternalSecretsFailsClosed(t *testing.T) {
 	}
 }
 
-// goldenESODevCP holds the SHA-256 of the dev-cp render of M2. UPDATE_GOLDEN=1 writes it again.
+// goldenESODevCP holds the SHA-256 of the dev-cp render of M2 at commit 2d8cb64. UPDATE_GOLDEN=1
+// writes it again; do that only from that commit.
 const goldenESODevCP = "testdata/external-secrets-dev-cp.sha256"
 
 // TestRenderExternalSecretsDevCPUnchanged renders the operator with the store namespace of dev-cp,

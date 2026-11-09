@@ -15,7 +15,8 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-// goldenCelld holds the cell-identity render of M2, before the sidecar helper existed. The image
+// goldenCelld holds the cell-identity render of M2 at commit 2d8cb64, before the sidecar helper
+// existed. Write it again only from that commit, never from a later render. The image
 // digest of the stub registry is replaced by stubDigest, so the file does not depend on the gzip
 // output of one Go version. UPDATE_GOLDEN=1 writes the file again from the current render.
 const (
@@ -101,6 +102,8 @@ spec:
       containers:
         - name: uplink
           image: localhost:5001/celld@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          securityContext:
+            runAsUser: 65532
           volumeMounts:
             - name: spire-agent-socket
               mountPath: /run/spire/agent
@@ -299,6 +302,8 @@ func TestSpireSidecarFailsClosed(t *testing.T) {
 		{"not a workload", "k8s_psat", strings.Replace(planeWorkload, "kind: Deployment", "kind: Job", 1), []string{bundle}, "not one Deployment or StatefulSet"},
 		{"volume name taken", "k8s_psat", collide, []string{bundle}, "already has a volume or container named data"},
 		{"socket volume not mounted", "k8s_psat", strings.Replace(planeWorkload, "name: spire-agent-socket", "name: other", 1), []string{bundle}, "no container mounts spire-agent-socket"},
+		{"container without a user", "k8s_psat", strings.Replace(planeWorkload, "            runAsUser: 65532\n", "            runAsGroup: 65532\n", 1), []string{bundle}, "container uplink sets no runAsUser"},
+		{"container as the agent user", "k8s_psat", strings.Replace(planeWorkload, "runAsUser: 65532", "runAsUser: 1000", 1), []string{bundle}, "container uplink runs as user 1000"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

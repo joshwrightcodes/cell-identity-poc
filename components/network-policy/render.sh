@@ -8,6 +8,10 @@
 set -euo pipefail
 : "${NODE_IPS:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
+source "$(cd "$(dirname "$0")/../lib" && pwd)/addresses.sh"
+node_ips="$(ipv4_list NODE_IPS)" || exit 1
+api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
+
 NAMESPACES=(argocd cell-system istio-system istio-egress observability-system apps-demo)
 
 # Private and link-local ranges. The egress gateway may reach any public address on 443, but
@@ -16,7 +20,7 @@ PRIVATE_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.
 
 node_peers() {
   local ip
-  for ip in $NODE_IPS; do
+  for ip in $node_ips; do
     printf '        - ipBlock:\n            cidr: %s/32\n' "$ip"
   done
 }
@@ -24,7 +28,7 @@ node_peers() {
 api_server_rule() {
   local ip
   printf '    - to:\n'
-  for ip in $API_SERVER_IPS; do
+  for ip in $api_ips; do
     printf '        - ipBlock:\n            cidr: %s/32\n' "$ip"
   done
   printf '      ports:\n        - protocol: TCP\n          port: %s\n' "$API_SERVER_PORT"

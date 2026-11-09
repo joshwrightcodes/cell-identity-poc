@@ -31,6 +31,8 @@ fi
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 namespace=external-secrets
+source "$root/components/lib/addresses.sh"
+api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 chart="$root/vendor/charts/external-secrets-$EXTERNAL_SECRETS_VERSION/external-secrets"
 
 # Private and link-local ranges. They hold the pod, service and kind networks, the Lima host
@@ -41,7 +43,7 @@ PRIVATE_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.
 manifests="$(helm template external-secrets "$chart" --namespace "$namespace" --kube-version 1.37.0 \
   --values "$here/values.yaml" --set "scopedNamespace=$store_namespace")"
 
-api_peers="$(for ip in $API_SERVER_IPS; do printf '        - ipBlock:\n            cidr: %s/32\n' "$ip"; done)"
+api_peers="$(for ip in $api_ips; do printf '        - ipBlock:\n            cidr: %s/32\n' "$ip"; done)"
 
 # The namespaces bundle holds the base namespaces. Two Applications must not hold one Namespace.
 base_namespaces=" $(kustomize build "$root/components/namespaces" | yq -N 'select(.kind == "Namespace") | .metadata.name' | tr '\n' ' ') "

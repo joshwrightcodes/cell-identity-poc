@@ -14,7 +14,8 @@
 #   - cluster_jwt only: the init container that installs the plugin from the cluster-jwt-agent
 #     image, the downward API variables that the plugin reads, and a Role and RoleBinding
 #     <workload>-token that let the agent request tokens for the ServiceAccount of the workload only.
-# Each container that needs an SVID mounts the socket volume at /run/spire/agent itself.
+# Each container that needs an SVID mounts the socket volume at /run/spire/agent itself. Each
+# container of the workload sets a runAsUser other than 0 and 1000, directly or in the pod.
 #
 # Inputs:
 #   SPIRE_SIDECAR_SERVER_ADDRESS    the address of the SPIRE server
@@ -79,6 +80,15 @@ spire_sidecar() (
   done
   NAME="$socket" yq -e '[.spec.template.spec.containers[].volumeMounts[]? | select(.name == strenv(NAME))] | length > 0' <<<"$input" >/dev/null \
     || die "no container mounts $socket, so no container can reach the Workload API"
+  # The pod shares one process namespace. A container that runs as the agent user could read the
+  # agent key and token through /proc, and one with no fixed user runs as the image default.
+  users="$(yq -N '(.spec.template.spec.securityContext.runAsUser // "") as $pod
+    | ((.spec.template.spec.initContainers // []) + .spec.template.spec.containers)[]
+    | .name + "=" + ((.securityContext.runAsUser // $pod) | tostring)' <<<"$input")"
+  while IFS='=' read -r name uid; do
+    [[ -n "$uid" ]] || die "container $name sets no runAsUser, so it could run as the agent user 1000"
+    [[ "$uid" != 1000 && "$uid" != 0 ]] || die "container $name runs as user $uid, and only the agent may run as 1000, no container as root"
+  done <<<"$users"
 
   if [[ "$mode" == cluster_jwt ]]; then
     plugin_image="$(ko_image cluster-jwt-agent)" || die "no agent plugin image"

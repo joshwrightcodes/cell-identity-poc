@@ -26,6 +26,7 @@ die() { printf 'error: cell-identity render: %s\n' "$*" >&2; exit 1; }
 source "$root/scripts/ko-image.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/spire-sidecar.sh"
+source "$root/components/lib/addresses.sh"
 
 celld_image="$(ko_image celld)" || die "no celld image"
 
@@ -38,8 +39,8 @@ server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 
 bundle="$(peer_root_pem "$SPIRE_SERVER_CLUSTER" "$trust_domain")" || exit 1
 
-api_peers="$(for ip in $API_SERVER_IPS; do [[ "$ip" =~ $ipv4 ]] || exit 1; printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)" \
-  || die "API_SERVER_IPS '$API_SERVER_IPS' holds an address that is not IPv4"
+api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
+api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
 [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"
 
 manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '

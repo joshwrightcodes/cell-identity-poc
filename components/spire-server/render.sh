@@ -40,6 +40,7 @@ die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
 source "$root/scripts/gate-traces.sh"
+source "$root/components/lib/addresses.sh"
 
 # seconds <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
 seconds() {
@@ -184,8 +185,8 @@ if ((${#local_workloads[@]} > 0)); then
       podSelector: {matchLabels: {"app.kubernetes.io/name": $sa}}}] | unique' <<<"$workload_peers")"
   done
   ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-  api_peers="$(for ip in $API_SERVER_IPS; do [[ "$ip" =~ $ipv4 ]] || exit 1; printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)" \
-    || die "API_SERVER_IPS '$API_SERVER_IPS' holds an address that is not IPv4"
+  api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
+  api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
   [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"
   [[ "$API_SERVICE_IP" =~ $ipv4 ]] || die "API_SERVICE_IP '$API_SERVICE_IP' is not an IPv4 address"
 fi

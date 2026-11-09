@@ -842,8 +842,8 @@ func TestRenderFailsClosed(t *testing.T) {
 	}
 }
 
-// goldenSpireDevCP holds the dev-cp render of M2, with the stub image digest replaced by
-// stubDigest.
+// goldenSpireDevCP holds the dev-cp render of M2 at commit 2d8cb64, with the stub image digest
+// replaced by stubDigest.
 const goldenSpireDevCP = "testdata/spire-server-dev-cp.golden.yaml"
 
 // psatOnly matches the lines that the k8s_psat path and the telemetry block add to server.conf.

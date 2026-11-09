@@ -448,3 +448,67 @@ func TestNoEmptyPeerList(t *testing.T) {
 		}
 	}
 }
+
+// TestHarnessObjectsHaveOneOwner checks that no harness or link component renders an object with
+// the kind, namespace and name of a bundle object of the same cluster. cell:up would take such an
+// object from its Application, and Argo CD would take it back on each sync.
+func TestHarnessObjectsHaveOneOwner(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		bundleObjs := map[string]string{}
+		for _, c := range cr.components {
+			if c.kind == "bundle" {
+				for _, o := range c.objs {
+					bundleObjs[objName(o)] = c.name
+				}
+			}
+		}
+		for _, c := range cr.components {
+			if c.kind == "bundle" {
+				continue
+			}
+			for _, o := range c.objs {
+				if owner, ok := bundleObjs[objName(o)]; ok {
+					t.Errorf("%s: the %s component %s renders %s, which the bundle %s also renders", cr.name, c.kind, c.name, objName(o), owner)
+				}
+			}
+		}
+	}
+}
+
+// TestRendersRefuseEmptyAddressLists renders each component that builds a NetworkPolicy peer list
+// from an address list of build/<cluster>/facts.env. A blank or malformed list must stop the
+// render, because a rule with no peers admits every peer.
+func TestRendersRefuseEmptyAddressLists(t *testing.T) {
+	type render func(t *testing.T, env ...string) (string, string, error)
+	script := func(component, cluster string) render {
+		return func(t *testing.T, env ...string) (string, string, error) {
+			r := renderScript(t, component, stubBinaries[component], append(append([]string{"STUB_CELL=" + cluster}, bundleFacts...), env...)...)
+			return r.stdout, r.stderr, r.err
+		}
+	}
+	eso := func(t *testing.T, env ...string) (string, string, error) {
+		return renderExternalSecrets(t, append(slices.Clone(esoFacts), env...)...)
+	}
+	cases := []struct {
+		name   string
+		render render
+		vars   []string
+	}{
+		{"spire-server of management", script("spire-server", "management"), []string{"API_SERVER_IPS"}},
+		{"cell-identity", script("cell-identity", "dev-cell-1"), []string{"API_SERVER_IPS"}},
+		{"external-secrets", eso, []string{"API_SERVER_IPS"}},
+		{"network-policy", script("network-policy", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+	}
+	for _, tc := range cases {
+		for _, v := range tc.vars {
+			for value, want := range map[string]string{" ": v + " holds no address", "172.18.0": "is not IPv4: 172.18.0"} {
+				t.Run(fmt.Sprintf("%s %s=%q", tc.name, v, value), func(t *testing.T) {
+					out, stderr, err := tc.render(t, v+"="+value)
+					if err == nil || out != "" || !strings.Contains(stderr, want) {
+						t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", err, len(out), stderr, want)
+					}
+				})
+			}
+		}
+	}
+}
