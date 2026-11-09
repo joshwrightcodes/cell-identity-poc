@@ -15,6 +15,10 @@
 #   5. Refresh each copy again, and wait until each copy holds only the new root.
 # The old key stays in keys.json until SPIRE prepares into its slot again, but no copy trusts its
 # root after step 5. No other cluster holds a copy of the JWT keys.
+# A run that stops goes on from the step that failed when it runs again. Before a prepare, the
+# script reads the authority slots and the bundle. A prepared authority is activated, not prepared
+# again. An old authority that is not revoked yet is tainted or revoked first, and nothing is
+# prepared, because SPIRE prepares into the slot of the old authority.
 #
 # A copy is a ConfigMap in another cluster with the annotation poc.internal/peer-root-sha256 and a
 # key root.crt whose certificates are all CAs of SPIRE_TRUST_DOMAIN (components/lib/peer-root.sh).
@@ -102,38 +106,118 @@ wait_for_copies() {
   done
 }
 
-old_x509="$(server localauthority x509 show | jq -r '.active.authority_id // ""')"
-old_jwt="$(server localauthority jwt show | jq -r '.active.authority_id // ""')"
-[[ -n "$old_x509" && -n "$old_jwt" ]] || die "could not read the active authorities of the SPIRE server in $CELL_NAME"
+# manual <kind> <verb> <authority ID> prints the command that runs one authority step by hand.
+manual() {
+  printf 'mise x -- kubectl --context kind-%s -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority %s %s -socketPath /run/spire/sockets/api.sock -authorityID %s' \
+    "$CELL_NAME" "$1" "$2" "$3"
+}
+
+# bundle_state prints "<kind> <authority ID> <tainted>" for each authority in the bundle. The ID of
+# an X.509 authority is the subject key ID of its root, which pkigen info prints as SPIRE does.
+bundle_state() {
+  local json asn1 tainted ski
+  json="$(server bundle show)" || return 1
+  while read -r asn1 tainted; do
+    ski="$(printf -- '-----BEGIN CERTIFICATE-----\n%s\n-----END CERTIFICATE-----\n' "$(fold -w 64 <<<"$asn1")" \
+      | (cd "$ROOT" && mise run pki -- info 2>/dev/null) | jq -r '.subject_key_id // ""')" || return 1
+    [[ -n "$ski" ]] || return 1
+    echo "x509 $ski $tainted"
+  done < <(jq -r '.x509_authorities[]? | "\(.asn1) \(.tainted // false)"' <<<"$json")
+  jq -r '.jwt_authorities[]? | "jwt \(.key_id) \(.tainted // false)"' <<<"$json"
+}
+
+# read_state reads the authority slots of both kinds and the bundle.
+read_state() {
+  x509_state="$(server localauthority x509 show)" && jwt_state="$(server localauthority jwt show)" && bundle="$(bundle_state)" \
+    || die "could not read the authorities of the SPIRE server in $CELL_NAME"
+}
+
+# slot <kind> <active|prepared|old> prints the authority ID in that slot, or nothing.
+slot() {
+  local state="${1}_state"
+  jq -r --arg slot "$2" '.[$slot].authority_id // ""' <<<"${!state}"
+}
+
+# old_status <kind> prints none, untainted, tainted or revoked for the old slot. SPIRE keeps
+# listing an old authority after its revoke, so the bundle tells whether a step is left.
+old_status() {
+  local id tainted
+  id="$(slot "$1" old)"
+  [[ -n "$id" ]] || { echo none; return; }
+  tainted="$(awk -v k="$1" -v id="$id" '$1 == k && $2 == id { print $3 }' <<<"$bundle")"
+  case "$tainted" in
+    true) echo tainted ;;
+    false) echo untainted ;;
+    *) echo revoked ;;
+  esac
+}
+
 holders="$(copies)"
 log "other clusters hold $(grep -c . <<<"$holders" || true) copies of the root of $SPIRE_TRUST_DOMAIN"
-before="$(bundle_blocks)" || die "could not read the bundle of $CELL_NAME"
+read_state
 
-new_x509="$(server localauthority x509 prepare | jq -r '.prepared_authority.authority_id // ""')"
-new_jwt="$(server localauthority jwt prepare | jq -r '.prepared_authority.authority_id // ""')"
-[[ -n "$new_x509" && -n "$new_jwt" ]] || die "SPIRE prepared no new authority. Run: CELL=$CELL_NAME mise run mgmt:rotate-ca again"
-added="$(comm -13 <(printf '%s\n' "$before") <(bundle_blocks))"
-[[ -n "$added" && "$(wc -l <<<"$added")" -eq 1 ]] || die "the bundle of $CELL_NAME did not gain exactly one root when SPIRE prepared $new_x509"
-log "prepared the X.509 authority $new_x509 and the JWT authority $new_jwt. The bundle holds the new root"
+# SPIRE prepares into the slot that holds the old authority, so a prepare before the old authority
+# is revoked would leave its root trusted until it expires. A run that stopped after the activate
+# goes on from the taint or the revoke, and prepares nothing.
+if [[ "$(old_status x509)" == *tainted || "$(old_status jwt)" == *tainted ]]; then
+  log "an earlier rotation left old authorities to revoke (X.509 $(old_status x509), JWT $(old_status jwt)). This run finishes that rotation, and prepares nothing"
+else
+  for kind in x509 jwt; do
+    id="$(slot "$kind" prepared)"
+    if [[ -n "$id" ]]; then
+      log "the $kind authority $id is prepared already, from an earlier run or from SPIRE itself"
+      continue
+    fi
+    before="$(bundle_blocks)" || die "could not read the bundle of $CELL_NAME"
+    id="$(server localauthority "$kind" prepare | jq -r '.prepared_authority.authority_id // ""')"
+    [[ -n "$id" ]] || die "SPIRE prepared no new $kind authority. Run: CELL=$CELL_NAME mise run mgmt:rotate-ca again"
+    if [[ "$kind" == x509 ]]; then
+      added="$(comm -13 <(printf '%s\n' "$before") <(bundle_blocks))"
+      [[ -n "$added" && "$(wc -l <<<"$added")" -eq 1 ]] || die "the bundle of $CELL_NAME did not gain exactly one root when SPIRE prepared $id"
+    fi
+    log "prepared the $kind authority $id"
+  done
+  read_state
+
+  refresh "$holders"
+  wait_for_copies "$holders"
+  log "each copy holds the new root"
+
+  for kind in x509 jwt; do
+    id="$(slot "$kind" prepared)"
+    server localauthority "$kind" activate -authorityID "$id" >/dev/null \
+      || die "could not activate the $kind authority $id. Each copy holds its root. Run: $(manual "$kind" activate "$id"), then CELL=$CELL_NAME mise run mgmt:rotate-ca again"
+    log "activated the $kind authority $id"
+  done
+  read_state
+fi
+
+tainted_now=0
+for kind in x509 jwt; do
+  if [[ "$(old_status "$kind")" == untainted ]]; then
+    id="$(slot "$kind" old)"
+    server localauthority "$kind" taint -authorityID "$id" >/dev/null \
+      || die "could not taint the old $kind authority $id. Run: $(manual "$kind" taint "$id"), wait ${taint_wait}s, then run: $(manual "$kind" revoke "$id"). Or run CELL=$CELL_NAME mise run mgmt:rotate-ca again, which goes on from this step"
+    log "tainted the old $kind authority $id"
+    tainted_now=1
+  fi
+done
+if ((tainted_now)); then
+  log "the agents replace the SVIDs that the tainted authorities signed. Waiting ${taint_wait}s"
+  sleep "$taint_wait"
+fi
+read_state
+for kind in x509 jwt; do
+  if [[ "$(old_status "$kind")" == tainted ]]; then
+    id="$(slot "$kind" old)"
+    server localauthority "$kind" revoke -authorityID "$id" >/dev/null \
+      || die "could not revoke the old $kind authority $id. Run: $(manual "$kind" revoke "$id"). Or run CELL=$CELL_NAME mise run mgmt:rotate-ca again, which goes on from this step"
+    log "revoked the old $kind authority $id"
+  fi
+done
+read_state
+log "the bundle holds $(grep -c '^x509 ' <<<"$bundle" || true) root(s)"
 
 refresh "$holders"
 wait_for_copies "$holders"
-log "each copy holds the new root"
-
-server localauthority x509 activate -authorityID "$new_x509" >/dev/null || die "could not activate $new_x509. Each copy holds it. Run: mise x -- kubectl --context kind-$CELL_NAME -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority x509 activate -socketPath /run/spire/sockets/api.sock -authorityID $new_x509"
-server localauthority jwt activate -authorityID "$new_jwt" >/dev/null || die "could not activate the JWT authority $new_jwt"
-log "activated $new_x509 and the JWT authority $new_jwt"
-
-server localauthority x509 taint -authorityID "$old_x509" >/dev/null || die "could not taint the old authority $old_x509"
-server localauthority jwt taint -authorityID "$old_jwt" >/dev/null || die "could not taint the old JWT authority $old_jwt"
-log "tainted the old authorities. The agents replace the SVIDs that they signed. Waiting ${taint_wait}s"
-sleep "$taint_wait"
-server localauthority x509 revoke -authorityID "$old_x509" >/dev/null || die "could not revoke the old authority $old_x509"
-server localauthority jwt revoke -authorityID "$old_jwt" >/dev/null || die "could not revoke the old JWT authority $old_jwt"
-left="$(comm -12 <(printf '%s\n' "$before") <(bundle_blocks) | grep -c . || true)"
-((left == 0)) || log "the bundle still holds $left root(s) from before the rotation, which SPIRE prepared earlier and never activated"
-log "revoked the old authorities. The bundle holds $(bundle_blocks | wc -l | tr -d ' ') root(s)"
-
-refresh "$holders"
-wait_for_copies "$holders"
-log "the CA of $CELL_NAME is $new_x509, and each copy holds only the roots of the bundle"
+log "the CA of $CELL_NAME is $(slot x509 active), and each copy holds only the roots of the bundle"
