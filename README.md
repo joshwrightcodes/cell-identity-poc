@@ -11,23 +11,23 @@ OpenTelemetry collector. Every later plane starts from this base.
 
 ![The management cluster, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
 
-Five kind clusters run in one Colima VM on a Mac. Each connection goes up a layer, and Kiln
-connects to no cluster. A host service on the Mac acts as the cloud provider. The
+Five kind clusters run in one Colima VM on a Mac. Each connection goes up a layer, and the
+management plane connects to no cluster. A host service on the Mac acts as the cloud provider. The
 markers match this list:
 
-1. Kiln requests two new cells, and `dev-cp` creates them. The cell controller acts only on a
-   step that Kiln signs.
+1. The portal requests two new cells, and `dev-cp` creates them. The cell controller acts only on
+   a step that the management plane signs.
 2. Each cell's `celld` registers and authenticates. The `cluster_jwt` attestor checks a
    pod-bound token against the cell's keys in a signed record.
-3. Both cells appear valid in Kiln. Kiln reads each cluster's keys itself, and checks a second
-   proof that `dev-cp` cannot make.
-4. `dev-cp` and Kiln reject a rogue cell and a man in the middle. The rogue cluster's keys are in no
-   record, and TLS interception fails at every hop.
+3. Both cells appear valid in the management plane. The management plane reads each cluster's keys
+   itself, and checks a second proof that `dev-cp` cannot make.
+4. `dev-cp` and the management plane reject a rogue cell and a man in the middle. The rogue
+   cluster's keys are in no record, and TLS interception fails at every hop.
 
-- **I:** island mode at both levels. If Kiln or `dev-cp` goes away, cells keep their
-  identities and their last good state.
-- **V:** a read-only central view in Kiln. It shows the Argo CD state of both cells, and it
-  cannot change a cell.
+- **I:** island mode at both levels. If the management plane or `dev-cp` goes away, cells keep
+  their identities and their last good state.
+- **V:** a read-only central view in the management plane. It shows the Argo CD state of both
+  cells, and it cannot change a cell.
 
 `docs/design/poc-scope.md` gives the build scope. `docs/design/target-architecture.md` gives
 the full design.
@@ -35,9 +35,16 @@ the full design.
 ## What you need
 
 - A Mac with Apple silicon and macOS 26 or later.
+- git, to clone the repository.
 - mise. It installs every tool at the version that `mise.toml` pins, Colima, Lima and the Docker
-  CLI included.
+  CLI included. Run `mise trust` once in the checkout, because mise does not load an untrusted
+  `mise.toml`.
 - 14 CPUs, 40 GB of memory and 120 GB of disk for the Colima VM `poc`.
+- A secret manager with a provider in the External Secrets Operator 2.14. The operator must reach
+  it on a public address over TCP port 443, because its NetworkPolicy blocks private ranges.
+  The secret manager holds the CA keys, as [Keys](#keys) describes.
+- direnv is optional. After `direnv allow`, it loads `.envrc.local` in the checkout. Without it,
+  `secrets:connect` and `pki:rotate-intermediate` read `.envrc.local` themselves.
 
 ## Set up the cell
 
@@ -45,21 +52,33 @@ Before the first `harness:up`, create the keys and `.envrc.local` as [Keys](#key
 The SPIRE server in `dev-cp` cannot start without them.
 
 ```sh
+mise trust
 mise install
 mise run harness:up
-CELL=dev-cell-1 mise run cell:verify
+mise run harness:verify
 ```
 
-`harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions. It then creates all five clusters through the host service.
+With `POC_SECRET_TOKEN_CMD` in the environment, `harness:up` connects the secret store of `dev-cp` itself.
+Without it, the `cell:up` of `dev-cp` prints this command once a minute while the SPIRE server waits for its keys.
+Run it in a second shell:
+
+```sh
+CELL=dev-cp mise run secrets:connect
+```
+
+`harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions.
+It then creates all five clusters through the host service, and builds the images with `mise run images`.
 After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
+In `dev-cp`, that wait also runs `secrets:connect` once, or prints the command above, while the secret store is not connected.
 Last, `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
 Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
-`cell:verify` runs one check for each base rule and prints PASS or FAIL.
+`cell:verify` runs the checks of one cluster and prints PASS or FAIL for each.
+`harness:verify` runs `cell:verify` on each cluster with components, and prints one line for each cluster at the end.
 
 `harness:up` stops at the first cluster that fails, so a failure in `dev-cp` also stops the cells.
-To resume, fix the cause and run the remaining clusters in topology order:
+It then prints the commands for the remaining clusters. Fix the cause, and run them in topology order:
 
 ```sh
 CELL=dev-cp mise run cell:up
@@ -92,7 +111,8 @@ CELL=dev-cell-1 mise run cell:verify
 ```
 
 To rebuild `dev-cp`, set it up first. Its `cell:up` waits for the SPIRE server, which needs Secret `spire-upstream`.
-Run `secrets:connect` in a second shell while that `cell:up` waits, as [Keys](#keys) describes.
+With `POC_SECRET_TOKEN_CMD` in the environment, `cell:up` runs `secrets:connect` itself.
+Otherwise run `secrets:connect` in a second shell while that `cell:up` waits, as [Keys](#keys) describes.
 Then render each cell again, because each cell holds the `dev-cp` node address.
 The new server has an empty datastore, so it knows no earlier agent.
 `cell:restart` restarts `celld` in a cell, so that its agent attests again:
@@ -100,14 +120,50 @@ The new server has an empty datastore, so it knows no earlier agent.
 ```sh
 CELL=dev-cp mise run cell:down
 CELL=dev-cp mise run cell:up            # first shell
-CELL=dev-cp mise run secrets:connect    # second shell, while cell:up waits
+CELL=dev-cp mise run secrets:connect    # second shell, only without POC_SECRET_TOKEN_CMD
 CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
 CELL=dev-cell-1 mise run cell:restart
 CELL=dev-cell-2 mise run cell:restart
-CELL=dev-cp mise run cell:verify
-CELL=dev-cell-1 mise run cell:verify
-CELL=dev-cell-2 mise run cell:verify
+mise run harness:verify
+```
+
+`CELL=dev-cp mise run cell:restart` restarts the SPIRE server, which then signs a new CA through the intermediate.
+The server keeps its datastore, so the agents keep their identities.
+On 2026-11-09 the new server pod was Ready about 2 seconds after the old pod stopped. No agent of a cell restarted.
+A `cell:restart` of `dev-cp` took 3 seconds from the delete to a Ready new pod. The agents of both cells ran on for 75 seconds after it with no restart, longer than one SVID lifetime.
+
+## Add or remove a cell
+
+A cell is an entry in `harness/topology.yaml` and a file `cells/<cell>.env`.
+To add a cell, for example `dev-cell-3`, follow these steps:
+
+1. Add the cluster to `harness/topology.yaml`, with pod and service subnets that overlap no other subnet, and the component sets `base-cell` and `cell-identity`.
+2. Copy `cells/dev-cell-2.env` to `cells/dev-cell-3.env`. Set `CELL_NAME`, `CELL_MESH_TRUST_DOMAIN`, and a `CELL_BUNDLE_STORE_PORT` that no other cell uses.
+3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`.
+4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
+5. Create the cluster, sign its record in `dev-cp`, and set it up:
+
+   ```sh
+   mise run hostsvc -- up --only dev-cell-3
+   CELL=dev-cp mise run cell:up
+   CELL=dev-cell-3 mise run cell:up
+   mise run harness:verify
+   ```
+
+`harness:up`, `harness:verify`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
+The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, because each test gives one of them its own role.
+
+To remove a cell, remove it from `SPIRE_AGENT_CELLS` and run `CELL=dev-cp mise run cell:up`.
+Then delete the cluster with `CELL=<cell> mise run cell:down`, and remove its entry and its `cells/<cell>.env`.
+The server keeps the entries of the old agents of that cell until they expire and it prunes them.
+To end them at once, evict each agent of the cell:
+
+```sh
+mise x -- kubectl --context kind-dev-cp -n spire-system exec spire-server-0 -c spire-server -- \
+  /opt/spire/bin/spire-server agent list -socketPath /run/spire/sockets/api.sock
+mise x -- kubectl --context kind-dev-cp -n spire-system exec spire-server-0 -c spire-server -- \
+  /opt/spire/bin/spire-server agent evict -socketPath /run/spire/sockets/api.sock -spiffeID <agent ID>
 ```
 
 ## Size and time
@@ -125,8 +181,7 @@ Two runs from clean, each with `harness:down` and `harness:up`, gave these `harn
 | 2 | 17 minutes 13 seconds |
 
 The final `gate:m1`, with five tests, ran after the last fixes on the healthy clusters.
-It took about 102 seconds in one run and 103 seconds in the slower run.
-An earlier version of the gate took 65 and 64 seconds, so those numbers no longer apply.
+It took 102 to 104 seconds in each run.
 
 After the clusters were healthy, the five node containers used about 8 GiB of memory in total:
 
@@ -139,7 +194,8 @@ After the clusters were healthy, the five node containers used about 8 GiB of me
 The VM reports 8.5 GB of 40 GB in use, and 16 GB more in the file cache.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
-The budget is 3 minutes. This is 1.5 times the slower run of 103 seconds, rounded up to the next minute.
+The budget is 3 minutes. This is 1.5 times the slowest run of 104 seconds, rounded up to the next minute.
+`gate:m1` runs only the clock check of the end-to-end prechecks. The M2 prechecks run for `gate:m2`, and for a direct `go test` run with no `-run` pattern.
 `gate:m2` fails when the run takes longer than `GATE_M2_BUDGET_MINUTES`.
 The budget is 14 minutes. This is 1.5 times the slowest run, 547 seconds, rounded up to the next minute.
 In that run, the cleanup of the key rotation test waited a few minutes for kubelet to start `kube-controller-manager` again.
@@ -163,7 +219,7 @@ The budgets do not cover `harness:up`.
   The `kindnet` pod comes first, and the others follow one at a time.
   A Deployment outside the harness and outside Argo CD gets a rollout restart, so `coredns` keeps one ready pod.
   The other pods are deleted, and their controllers create them again.
-  While the `kindnet` pod restarts, NetworkPolicy probably fails open, as the residual limits in `docs/design/poc-scope.md` say.
+  While the `kindnet` pod restarts, NetworkPolicy fails open, as the residual limits in `docs/design/poc-scope.md` say.
 
 A run that stops before its cleanups, for example after Ctrl-C, a go test timeout or a closed terminal, can leave these changes in place.
 The next `gate:m2` run then stops before its other checks.
@@ -186,6 +242,7 @@ kubelet back-off alone can take 5 minutes of that time.
 New pods of `dev-cell-1` wait while `kube-scheduler` is in kubelet back-off, so the repair waits for it before it replaces pods.
 A repair in the cleanup of a test can outlast the `go test` timeout in the worst case.
 The next run then stops in its precheck and prints the repair command.
+Only one repair runs at a time. A repair holds the lock `build/gate-m2-repair.lock`, and a second repair or a gate precheck refuses to start beside it.
 A stopped run can also leave probe objects in `cell-identity-system`, and the next gate run deletes them.
 If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mise run cell:up` for that cell.
 
@@ -193,7 +250,8 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 
 `SPIRE_SVID_TTL` in `cells/dev-cp.env` sets the lifetime of agent and workload SVIDs.
 The value is `1m`, so a gate sees two renewals in about a minute.
-For an environment that stays up without gates, set `SPIRE_SVID_TTL=1h` and run `CELL=dev-cp mise run cell:up`.
+For an environment that stays up without gates, change the value to `1h` in `cells/dev-cp.env`, and run `CELL=dev-cp mise run cell:up`.
+A value in the shell environment has no effect, because mise and `scripts/lib.sh` load `cells/dev-cp.env` after the shell.
 The render accepts values from `1m` to `4h`, which is `ca_ttl` divided by 6.
 `cell:verify` in `dev-cp` checks that the server runs the value of `SPIRE_SVID_TTL`.
 
@@ -259,7 +317,8 @@ After a change under `cmd/` or `internal/`, run `cell:up` for `dev-cp` and for e
 
 The SPIRE server in `dev-cp` gets its CA from an intermediate CA, and a root CA signs the intermediate.
 The keys live in your secret manager. The External Secrets Operator in `dev-cp` copies them into Secret
-`spire-upstream` in the namespace `spire-system`. No step in this repository writes a key to disk.
+`spire-upstream` in the namespace `spire-system`.
+No script in this repository writes a key to a file. etcd in `dev-cp` still stores each Secret on the disk of the VM, with no encryption.
 
 A cluster reads each key from the remote key `<cluster>/<service>/<key>`.
 The ExternalSecret `spire-upstream` reads these three keys:
@@ -277,6 +336,8 @@ The SPIRE agents read the root certificate from ConfigMap `spire-trust-bundle`.
 
 `mise run pki` prints PEM on standard output. `root` and `intermediate` print a bundle: the key, then the certificate.
 `key` and `cert` read a bundle on standard input and print one part of it.
+`trust-bundle` checks PEM certificates of a trust bundle and prints them again.
+`info` reads one certificate and prints its subject key ID and expiry as JSON.
 The steps below use placeholders in angle brackets.
 Replace `<read>` and `<write>` with the read and write commands of your secret manager.
 `<write> <dev-cp/spire-server/root-cert>` stores standard input at the place that this remote key names.
@@ -317,33 +378,50 @@ Because of this, an error line never reaches your secret manager.
    ```
 
 4. Copy `.envrc.local.example` to `.envrc.local`, and replace each placeholder.
-   Git ignores `.envrc.local`, and direnv loads it through `.envrc`.
+   Git ignores `.envrc.local`. direnv loads it through `.envrc` after `direnv allow`.
    `POC_SECRET_TOKEN_CMD` prints the read-only access token.
    `POC_SECRET_STORE_PROVIDER` holds the provider block of the store, as JSON.
+   The three other settings serve `pki:rotate-intermediate` only.
 
 5. Connect the operator in `dev-cp` to your secret manager:
 
    ```sh
-   CELL=dev-cp mise run secrets:connect
+   mise run secrets:connect
    ```
 
-`secrets:connect` needs the operator in the cluster, so run it after the `external-secrets` Application is Healthy.
-`cell:up` for `dev-cp` waits until the SPIRE server is healthy, and the server needs Secret `spire-upstream`.
-Because of this, run `secrets:connect` in a second shell while `cell:up` waits.
+`secrets:connect` acts on `dev-cp` unless `CELL` names another cluster.
+It needs the operator in the cluster, so it first waits up to `SECRETS_CONNECT_ESO_WAIT` seconds for it.
+The default is 300 seconds.
+`cell:up` for `dev-cp` runs it when `POC_SECRET_TOKEN_CMD` is set and the store is not connected.
+Otherwise run it in a second shell while `cell:up` waits.
 
-`secrets:connect` creates Secret `poc-secrets-token` in the namespace `external-secrets`.
-It then applies ClusterSecretStore `poc-secrets` and waits until the store is Ready.
-Last, it forces a sync of each ExternalSecret that uses the store, and waits until each target Secret exists.
+The operator works only in the namespace in `SECRET_STORE_NAMESPACES` of `cells/dev-cp.env`, `spire-system`.
+In that namespace, `secrets:connect` creates Secret `poc-secrets-token`.
+It then applies SecretStore `poc-secrets` and waits until the store is Ready.
+Last, it forces a sync of each ExternalSecret that uses the store.
+It waits up to `SECRETS_CONNECT_SYNC_WAIT` seconds, 120 by default, until each target Secret exists.
 An ExternalSecret that failed before the store existed would otherwise wait for its retry delay.
-Only the namespaces in `SECRET_STORE_NAMESPACES` of `cells/<cluster>.env` can use the store.
 The token reaches `kubectl` through a pipe, and the script never prints it.
 The Secret and the store live outside every bundle, so Argo CD never deletes them.
 Run `secrets:connect` again after a change of the access token.
+`cell:verify` in `dev-cp` checks that the store is Ready and that each ExternalSecret refreshed within twice its interval.
 
 The intermediate is valid for 30 days, and the root for one year.
-Create a new intermediate before the old one expires.
 The operator reads the keys again every hour.
-The SPIRE server reads the new files when it signs its next CA.
+`cell:verify` in `dev-cp` fails when the intermediate expires in 7 days or less.
+To replace the intermediate in one step, run:
+
+```sh
+mise run pki:rotate-intermediate
+```
+
+The task reads the root CA bundle through `POC_SECRET_READ_CMD`, and pkigen signs a new intermediate.
+`POC_SECRET_WRITE_CMD` stores the new key and certificate at the two remote keys of the table above.
+The task then runs `secrets:connect` and `cell:restart` in `dev-cp`.
+Last, it checks that the active X.509 authority of the server has the new intermediate as its upstream authority.
+The keys stay in shell variables and pipes, and the task prints no key.
+`PKI_INTERMEDIATE_DAYS` sets the validity of the new intermediate. The default is 30.
+Use a write identity for this task, and not the read-only cluster token.
 
 ## Layout
 

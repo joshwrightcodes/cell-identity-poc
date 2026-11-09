@@ -13,16 +13,20 @@
 | Task | Command |
 | --- | --- |
 | Start or stop the Colima VM | `mise run vm:up`, `mise run vm:down` |
-| Create all five clusters and set up their base cells | `mise run harness:up` |
+| Create all five clusters, build the images and set up each cluster with components | `mise run harness:up` |
+| Run `cell:verify` on every cluster with components | `mise run harness:verify` |
+| Build the in-cluster images and record their digests in `build/images.env` | `mise run images` |
 | Delete all five clusters | `mise run harness:down` |
 | Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
+| Restart `celld` in a cell, or the SPIRE server in `dev-cp` | `CELL=dev-cp mise run cell:restart` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
 | Delete the cell | `mise run cell:down` |
 | Fetch upstream files for review | `mise run vendor:fetch` |
-| Connect the External Secrets Operator to the secret manager (see README "Keys") | `CELL=dev-cp mise run secrets:connect` |
+| Connect the External Secrets Operator to the secret manager (see README "Keys"; `CELL` defaults to `dev-cp` here) | `mise run secrets:connect` |
+| Replace the intermediate CA of the SPIRE server (see README "Keys") | `mise run pki:rotate-intermediate` |
 | Run the Go unit tests | `mise run test`, or `mise run test -- ./internal/topology/...` |
 | Check the Go code | `mise run lint` |
 | Run the M1 end-to-end gate | `mise run gate:m1` |
