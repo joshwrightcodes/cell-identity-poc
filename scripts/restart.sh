@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Restart the Deployments of every harness component of the cluster $CELL, and wait until each has
-# new Ready pods. A restarted celld pod gets a new pod UID, so its SPIRE agent attests again.
+# new Ready pods. Only the Deployments with the harness label of the component count, because a
+# harness component can share its namespace with Argo CD objects. A restarted celld pod gets a new
+# pod UID, so its SPIRE agent attests again.
 # In a cluster with the spire-server component set, restart the SPIRE server pod. The new server
 # signs a new CA through its upstream authority, and it keeps its datastore.
 # The script deletes the pods and lets the controller replace them. It does not change the
@@ -45,7 +47,7 @@ fi
 
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   ns="${entry#*:}"
-  for deployment in $(k -n "$ns" get deployments -o name); do
+  for deployment in $(harness_deployments "${entry%%:*}" "$ns"); do
     selector="$(k -n "$ns" get "$deployment" -o json \
       | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
     [[ -n "$selector" ]] || die "$deployment in $ns has no label selector"

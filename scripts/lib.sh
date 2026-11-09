@@ -53,7 +53,9 @@ SPIRE_SERVER_COMPONENTS=(
 # Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
 # out of the root bundle and out of every Argo CD Application. A bundle can still write to their
 # namespace, as the residual limits in docs/design/poc-scope.md say.
-# Each entry is <component>:<namespace>.
+# Each entry is <component>:<namespace>. A harness component can share its namespace with the
+# objects of a bundle. Every harness object carries the label HARNESS_LABEL=<component>, and
+# cell:up, cell:restart and cell:verify act only on the labelled objects there.
 # celld with its SPIRE agent sidecar attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
 CELL_IDENTITY_HARNESS=(
   "cell-identity:cell-identity-system"
@@ -214,5 +216,77 @@ connect_store_step() {
   elif ((SECONDS - last_hint >= 60)); then
     log "${gaps//$'\n'/; }. Run in a second shell: CELL=$CELL_NAME mise run secrets:connect"
     last_hint=$SECONDS
+  fi
+}
+
+# Harness and link objects carry this label, with the name of their component as the value.
+HARNESS_LABEL=cell.poc.internal/harness
+
+# harness_deployments <component> <namespace> prints the Deployments of a harness component, as
+# deployment.apps/<name>. Other Deployments in the namespace belong to a bundle.
+harness_deployments() {
+  k -n "$2" get deployments -l "$HARNESS_LABEL=$1" -o name
+}
+
+# harness_rollout_wait <component> <namespace> waits for the rollout of each Deployment of a
+# harness component.
+harness_rollout_wait() {
+  local deployment
+  for deployment in $(harness_deployments "$1" "$2"); do
+    if ! k -n "$2" rollout status "$deployment" --timeout=300s >/dev/null; then
+      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $2 describe $deployment"
+      log "read the logs: mise x -- kubectl --context kind-$CELL_NAME -n $2 logs $deployment --all-containers"
+      die "$deployment in $2 did not finish its rollout in 300s"
+    fi
+  done
+}
+
+# check_harness_objects <component> <namespace> compares the namespace with the bundle of a harness
+# component. The harness apply does not prune, and kubectl diff sees only the fields of its own
+# field manager. Each object of the bundle must have only the field manager kubectl, and
+# kube-controller-manager for status.
+#   - When the bundle holds the Namespace, the component owns it: for each kind in the bundle, the
+#     namespace must hold exactly the objects of the bundle, apart from objects that only system
+#     controllers write, for example kube-root-ca.crt. The Namespace must have only kubectl.
+#   - Otherwise the namespace is shared with a bundle, whose Application owns the Namespace and its
+#     own objects. For each kind, the objects with the harness label of the component must be
+#     exactly the objects of the bundle.
+check_harness_objects() {
+  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned problems=()
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
+  for kind in $(yq -N -r 'select(.kind != null and .kind != "Namespace") | .kind' "$bundle" | sort -u); do
+    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
+    live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
+    if [[ -n "$owned" ]]; then
+      got="$(jq -r --arg label "$HARNESS_LABEL" '[.items[]
+        | select((.metadata.labels[$label] // "") != ""
+          or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
+        | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
+      [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' that the harness or a person wrote, and the bundle $comp has '$want'")
+    else
+      got="$(jq -r --arg label "$HARNESS_LABEL" --arg comp "$comp" '[.items[]
+        | select(.metadata.labels[$label] == $comp) | .metadata.name] | sort | join(" ")' <<<"$live")" \
+        || { echo "could not read the $kind objects in $ns"; return 1; }
+      [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
+    fi
+    bad="$(jq -r --arg want " $want " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
+      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
+        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
+      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$live")" \
+      || { echo "could not read the field managers of $kind in $ns"; return 1; }
+    [[ -z "$bad" ]] || problems+=("$bad")
+  done
+  if [[ -n "$owned" ]]; then
+    live="$(k get namespace "$ns" -o json --show-managed-fields)" || { echo "no namespace $ns"; return 1; }
+    bad="$(jq -r --arg ns "$ns" '.metadata.managedFields[]? | select(.manager == "kubectl" and .operation == "Apply" | not)
+      | "Namespace/\($ns) has the field manager \(.manager)"' <<<"$live")" \
+      || { echo "could not read the field managers of $ns"; return 1; }
+    [[ -z "$bad" ]] || problems+=("$bad")
+  fi
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Delete each extra object, and each field that another manager added. Then run: CELL=$CELL_NAME mise run cell:up"
+    return 1
   fi
 }

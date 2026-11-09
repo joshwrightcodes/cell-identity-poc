@@ -307,39 +307,6 @@ check_harness_drift() {
   esac
 }
 
-# The harness apply does not prune, and kubectl diff sees only the fields of its own field manager.
-# So for each kind in the bundle, the namespace must hold exactly the objects of the bundle, apart
-# from objects that only system controllers write, for example kube-root-ca.crt. Each object of
-# the bundle must have only the field manager kubectl, and kube-controller-manager for status.
-check_harness_objects() {
-  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad problems=()
-  for kind in $(yq -N -r 'select(.kind != null and .kind != "Namespace") | .kind' "$bundle" | sort -u); do
-    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
-    live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
-    got="$(jq -r --arg label "cell.poc.internal/harness" '[.items[]
-      | select((.metadata.labels[$label] // "") != ""
-        or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
-      | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
-    [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' that the harness or a person wrote, and the bundle $comp has '$want'")
-    bad="$(jq -r --arg want " $want " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
-      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
-        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
-      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$live")" \
-      || { echo "could not read the field managers of $kind in $ns"; return 1; }
-    [[ -z "$bad" ]] || problems+=("$bad")
-  done
-  live="$(k get namespace "$ns" -o json --show-managed-fields)" || { echo "no namespace $ns"; return 1; }
-  bad="$(jq -r --arg ns "$ns" '.metadata.managedFields[]? | select(.manager == "kubectl" and .operation == "Apply" | not)
-    | "Namespace/\($ns) has the field manager \(.manager)"' <<<"$live")" \
-    || { echo "could not read the field managers of $ns"; return 1; }
-  [[ -z "$bad" ]] || problems+=("$bad")
-  if ((${#problems[@]} > 0)); then
-    printf '%s\n' "${problems[@]}"
-    echo "Delete each extra object, and each field that another manager added. Then run: CELL=$CELL_NAME mise run cell:up"
-    return 1
-  fi
-}
-
 # check_live_images <namespace> <kind/name> <command>: every local image of the workload must be the
 # one that build/images.env records for it.
 check_live_images() {
