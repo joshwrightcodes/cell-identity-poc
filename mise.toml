@@ -60,8 +60,12 @@ description = "Run the checks of the cluster CELL: the base cell rules, and the 
 run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
-description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
+description = "Serve the Argo CD UI on http://localhost:8080 from this Mac. The UI lists only the root Application, so the task prints the child Applications first"
 run = "scripts/ui.sh"
+
+[tasks."cell:ui:clean"]
+description = "Remove what the server of cell:ui wrote into argocd: the initial admin Secret and the admin and signing keys of argocd-secret. Safe to run again"
+run = "scripts/ui.sh --clean"
 
 [tasks."cell:restart"]
 description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"

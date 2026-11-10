@@ -69,8 +69,10 @@ plaintext. Strict mTLS on the collector would reject them.
 - Every child Application lives in `argocd-apps` and uses the AppProject `cell`. The root Application stays in `argocd`.
 - The setting `application.namespaces: argocd-apps` in `argocd-cmd-params-cm` and `sourceNamespaces` in the AppProject `cell` allow this.
 - The application controller reads `application.namespaces` when it starts. Its pod template carries the annotation `poc.internal/cmd-params-sha256`, the SHA-256 of `components/argocd/argocd-cmd-params-cm.yaml`. A change to that file restarts the controller.
+- The AppProject `default` in `argocd` allows no source, no destination and no kind. `admin.enabled` is `false` in `argocd-cm`.
 - The ValidatingAdmissionPolicy `argocd-apps-no-secrets` and its binding deny a Secret in `argocd-apps`, for every user.
-- `mise run cell:ui` serves the UI of `argocd admin dashboard`. That local server does not read `application.namespaces`, so the UI lists only the root Application. The script prints the child Applications of `argocd-apps` first.
+- `mise run cell:ui` serves the UI of `argocd admin dashboard`. That local server does not read `application.namespaces`, so the UI lists only the root Application. The script prints the Applications of both namespaces first.
+- The same local server writes `server.secretkey` into `argocd-secret`, and an admin password when admin is on. The AppProject `default` stops it from creating a permissive project. `cell:ui` removes the keys when the server stops. `mise run cell:ui:clean` removes them after a killed run.
 - Sync waves order the components. Argo CD reports the health of child Applications, so each wave waits for the one before it.
 - The Istio Applications ignore the webhook fields that istiod writes at run time.
 
@@ -86,7 +88,7 @@ Two states are transient. While both copies of an Application exist, Argo CD can
 
 The tracking ID of every object changes to the form `argocd-apps_<name>:<group>/<kind>:<namespace>/<name>`. The old form was `<name>:...`. Scripts that read the tracking ID accept both forms.
 
-The live move on the four base-cell clusters left no old Application behind. If one stays, run `mise run cell:up` again, so that the root Application prunes it. If `cell:verify` still reports it, run `kubectl -n argocd delete application <name>`. An Application has no finalizer, so the delete leaves the managed objects in place.
+If an old Application stays in `argocd`, run `mise run cell:up` again, so that the root Application prunes it. This step is not tested on a live cluster. As a last resort, list the Applications first with `kubectl -n argocd get applications`. Delete one only after `cell:up` finished, because an older root bundle recreates it through self-heal. Never delete `root`. An Application has no finalizer, so the delete leaves the managed objects in place. `SharedResourceWarning` is possible while both copies exist, but no run showed it.
 
 ### Bundles
 
@@ -128,6 +130,8 @@ The live move on the four base-cell clusters left no old Application behind. If 
 | --- | --- |
 | Every Application is Synced and Healthy | Argo CD manages every component |
 | No Application is outside `argocd-apps`, except the root | Child Applications stay in one namespace |
+| `argocd` holds the AppProjects `cell` and a locked `default`, and no admin password | The dashboard leaves no open project or credential |
+| `argocd-apps` holds no Secret, and its policy and binding deny one | No credential in the namespace that the central view mirrors |
 | No remote clusters, and only the local store as a source | Argo CD stays local |
 | `argocd`, `cell-system` and `observability-system` have no mesh proxies | Platform stays out of the mesh |
 | Demo workloads have mesh proxies, except `plaintext` | Workloads join the mesh |

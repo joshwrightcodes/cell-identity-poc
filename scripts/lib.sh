@@ -173,27 +173,130 @@ live_image_mismatches() {
 # APPS_NAMESPACE holds every child Application. The root Application stays in argocd.
 APPS_NAMESPACE=argocd-apps
 
-# apps_json prints the root Application from argocd and the child Applications from argocd-apps as
-# one List.
-apps_json() {
+# applications_json <kubectl command...> prints the Applications of argocd and argocd-apps as one
+# object: root (the list of argocd), children (the list of argocd-apps) and items (both lists).
+# The kubectl command is the part before -n, for example: applications_json k. Its errors reach
+# standard error.
+applications_json() {
   local root children
-  root="$(k -n argocd get applications -o json)" || return 1
-  children="$(k -n "$APPS_NAMESPACE" get applications -o json)" || return 1
-  jq -n --argjson r "$root" --argjson c "$children" '{items: ($r.items + $c.items)}'
+  root="$("$@" -n argocd get applications -o json)" || return 1
+  children="$("$@" -n "$APPS_NAMESPACE" get applications -o json)" || return 1
+  jq -s '{root: .[0].items, children: .[1].items, items: (.[0].items + .[1].items)}' <<<"$root"$'\n'"$children"
+}
+
+# apps_json prints the Applications of the cluster CELL_NAME as a list: {items: [...]}.
+apps_json() {
+  applications_json k | jq '{items}'
+}
+
+# apps_match_published reads the object of applications_json and the published digests as JSON from
+# standard input, one document after the other. It succeeds when argocd holds only the root, argocd-apps
+# holds exactly the published components, and each Application is Synced and Healthy at its digest.
+apps_match_published() {
+  jq -s -e '.[0] as $a | .[1] as $pub
+    | ($a.root | map(.metadata.name)) == ["root"]
+      and ($a.children | map(.metadata.name) | sort) == ($pub | del(.root) | keys | sort)
+      and all($a.root[], $a.children[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
+        and ((.status.sync.revision // "") != "") and .status.sync.revision == $pub[.metadata.name])' >/dev/null
 }
 
 # apps_at_published succeeds when Argo CD reports every Application of the cluster Synced and
 # Healthy at the revision that publish.sh pushed. The root Application is in argocd and has no
 # sibling there. A check that runs before Argo CD reads the new root bundle cannot pass.
 apps_at_published() {
-  local published_json root children
+  local published_json apps
   published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
-  root="$(k -n argocd get applications -o json)" || return 1
-  children="$(k -n "$APPS_NAMESPACE" get applications -o json)" || return 1
-  jq -n -e --argjson root "$root" --argjson children "$children" --argjson n "${#COMPONENTS[@]}" --argjson pub "$published_json" '
-    ($root.items | map(.metadata.name)) == ["root"] and ($children.items | length) == $n and
-    all($root.items[], $children.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
-      and .status.sync.revision == $pub[.metadata.name])' >/dev/null
+  apps="$(applications_json k)" || return 1
+  printf '%s\n%s\n' "$apps" "$published_json" | apps_match_published
+}
+
+# apps_blockers prints one line for each reason that apps_at_published fails.
+apps_blockers() {
+  local published_json apps
+  published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
+  apps="$(applications_json k)" || return 1
+  printf '%s\n%s\n' "$apps" "$published_json" | jq -s -r '.[0] as $a | .[1] as $pub
+    | ($a.root | map(.metadata.name) | map(select(. != "root"))) as $stray
+    | (($pub | del(.root) | keys) - ($a.children | map(.metadata.name))) as $missing
+    | (($a.children | map(.metadata.name)) - ($pub | del(.root) | keys)) as $unknown
+    | (if ($stray | length) > 0 then "argocd holds Applications other than root: \($stray | join(", "))" else empty end),
+      (if ($a.root | map(.metadata.name) | index("root")) == null then "argocd has no root Application" else empty end),
+      (if ($missing | length) > 0 then "argocd-apps lacks \($missing | join(", "))" else empty end),
+      (if ($unknown | length) > 0 then "argocd-apps holds Applications that were not published: \($unknown | join(", "))" else empty end),
+      ($a.items[] | select(.status.sync.status != "Synced" or .status.health.status != "Healthy"
+          or .status.sync.revision != $pub[.metadata.name])
+        | "\(.metadata.namespace)/\(.metadata.name) is \(.status.sync.status // "unknown")/\(.status.health.status // "unknown") at \(.status.sync.revision // "no revision"), published \($pub[.metadata.name] // "nothing")")'
+}
+
+# check_apps_namespace succeeds when argocd holds only the root Application and argocd-apps holds
+# every other Application.
+check_apps_namespace() {
+  local found
+  found="$(k get applications -A -o json | jq -r '.items[]
+    | select((.metadata.namespace == "argocd" and .metadata.name == "root") or .metadata.namespace == "argocd-apps" | not)
+    | "\(.metadata.namespace)/\(.metadata.name)"')" || return 1
+  [[ -z "$found" ]] || {
+    echo "Applications outside $APPS_NAMESPACE, except the root: ${found//$'\n'/ }. Run: CELL=$CELL_NAME mise run cell:up. If one stays, list them with kubectl --context kind-$CELL_NAME get applications -A, then delete it with kubectl --context kind-$CELL_NAME -n <namespace> delete application <name>"
+    return 1
+  }
+  k -n argocd get application root >/dev/null 2>&1 || { echo "argocd has no root Application. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+# check_argocd_projects succeeds when argocd holds exactly the AppProjects cell and default, and
+# default allows no source, no destination and no kind. The server of argocd admin dashboard
+# creates a permissive default when none exists.
+check_argocd_projects() {
+  local json
+  json="$(k -n argocd get appprojects -o json)" || return 1
+  jq -e '(.items | map(.metadata.name) | sort) == ["cell", "default"]' >/dev/null <<<"$json" \
+    || { echo "AppProjects in argocd: $(jq -r '[.items[].metadata.name] | join(" ")' <<<"$json"), want cell and default. Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
+  jq -e '.items[] | select(.metadata.name == "default") | .spec
+    | ((.sourceRepos // []) | length) == 0 and ((.destinations // []) | length) == 0
+      and ((.clusterResourceWhitelist // []) | length) == 0 and ((.namespaceResourceWhitelist // []) | length) == 0' >/dev/null <<<"$json" \
+    || { echo "AppProject default allows a source, a destination or a kind. Run: CELL=$CELL_NAME mise run cell:up, then CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
+}
+
+# check_no_admin_credentials succeeds when argocd holds no admin password. The server of argocd admin
+# dashboard writes one when admin.enabled is not false.
+check_no_admin_credentials() {
+  local secret
+  if k -n argocd get secret argocd-initial-admin-secret >/dev/null 2>&1; then
+    echo "argocd holds the Secret argocd-initial-admin-secret. Run: CELL=$CELL_NAME mise run cell:ui:clean"
+    return 1
+  fi
+  secret="$(k -n argocd get secret argocd-secret -o json)" || return 1
+  jq -e '(.data // {}) | has("admin.password") or has("admin.passwordMtime") | not' >/dev/null <<<"$secret" \
+    || { echo "argocd-secret holds admin.password. Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
+}
+
+# check_apps_guard succeeds when argocd-apps holds no Secret, and the policy and the binding that
+# deny a Secret there exist with their effect.
+check_apps_guard() {
+  local secrets
+  secrets="$(k -n "$APPS_NAMESPACE" get secrets -o name)" || return 1
+  [[ -z "$secrets" ]] || { echo "$APPS_NAMESPACE holds Secrets: ${secrets//$'\n'/ }"; return 1; }
+  k get validatingadmissionpolicy argocd-apps-no-secrets -o json | jq -e '
+    .spec.failurePolicy == "Fail" and .spec.validations[0].expression == "false"' >/dev/null \
+    || { echo "ValidatingAdmissionPolicy argocd-apps-no-secrets is missing or does not deny"; return 1; }
+  k get validatingadmissionpolicybinding argocd-apps-no-secrets -o json | jq -e '
+    .spec.policyName == "argocd-apps-no-secrets" and .spec.validationActions == ["Deny"]' >/dev/null \
+    || { echo "ValidatingAdmissionPolicyBinding argocd-apps-no-secrets is missing or does not deny"; return 1; }
+}
+
+# clean_dashboard_leftovers removes what the server of argocd admin dashboard wrote into argocd:
+# the initial admin Secret, and the admin keys and the signing key of argocd-secret.
+clean_dashboard_leftovers() {
+  local keys key patch=()
+  k -n argocd delete secret argocd-initial-admin-secret --ignore-not-found >/dev/null || return 1
+  keys="$(k -n argocd get secret argocd-secret -o json 2>/dev/null | jq -r '(.data // {}) | keys[]
+    | select(. == "admin.password" or . == "admin.passwordMtime" or . == "server.secretkey")')" || return 1
+  for key in $keys; do
+    patch+=("{\"op\":\"remove\",\"path\":\"/data/$key\"}")
+  done
+  if ((${#patch[@]} > 0)); then
+    k -n argocd patch secret argocd-secret --type=json -p "[$(IFS=,; echo "${patch[*]}")]" >/dev/null || return 1
+    log "removed ${keys//$'\n'/, } from argocd-secret"
+  fi
 }
 
 # eso_controller_rolled_out succeeds when the operator Deployment runs only pods of its current

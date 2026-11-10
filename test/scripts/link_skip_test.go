@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -77,9 +78,14 @@ if [[ " $* " == *" get pod spire-server-0 "* ]]; then
   exit 0
 fi
 if [[ " $* " == *" get applications -o json "* ]]; then
+  # STUB_CHILDREN_IN names the namespace of the child Applications, argocd-apps by default.
   want='. != "root"'
   [[ " $* " != *" -n argocd get "* ]] || want='. == "root"'
-  cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: .},
+  if [[ "${STUB_CHILDREN_IN:-argocd-apps}" == argocd ]]; then
+    want='. == "root" or . != "root"'
+    [[ " $* " == *" -n argocd get "* ]] || want='false'
+  fi
+  cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: ., namespace: \"x\"},
     status: {sync: {status: \"Synced\", revision: \"sha256:1\"}, health: {status: \"Healthy\"}}}]}"
 fi
 exit 0
@@ -162,5 +168,64 @@ func TestLinkPhaseNeedsTheOtherClusters(t *testing.T) {
 				t.Fatalf("%s worked before the check:\n%s", script, calls)
 			}
 		})
+	}
+}
+
+// up.sh stops at UP_WAIT with the reason when the child Applications are in the wrong namespace.
+func TestUpNamesWhyTheApplicationsAreNotReady(t *testing.T) {
+	root, logFile := linkRoot(t)
+	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))
+	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"), "CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + logFile,
+		"CELL_UP_SKIP_LINK=1", "UP_WAIT=1", "STUB_CHILDREN_IN=argocd"}
+	start := time.Now()
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "in 1s. Blocked by:") || !strings.Contains(string(out), "argocd holds Applications other than root") ||
+		!strings.Contains(string(out), "argocd-apps lacks") {
+		t.Fatalf("err %v, output %s; want a stop after UP_WAIT that names the blockers", err, out)
+	}
+	if time.Since(start) > 60*time.Second {
+		t.Fatalf("up.sh took %s with UP_WAIT=1", time.Since(start))
+	}
+}
+
+// publish.sh writes every child Application into argocd-apps.
+func TestPublishWritesTheApplicationsToArgocdApps(t *testing.T) {
+	root, logFile := linkRoot(t)
+	b, err := os.ReadFile("../../scripts/publish.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "scripts", "publish.sh"), b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(path, content string) {
+		p := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("bin/oras", "#!/usr/bin/env bash\ncase \" $* \" in *\" push \"*) echo '{\"digest\":\"sha256:abc\"}' ;; esac\nexit 0\n")
+	write("bin/curl", "#!/usr/bin/env bash\n[[ -e \"$STUB_LOG.curl\" ]] || { touch \"$STUB_LOG.curl\"; exit 22; }\nexit 0\n")
+	write("bin/kubectl", "#!/usr/bin/env bash\nif [[ \" $* \" == *\" port-forward \"* ]]; then exec sleep 60; fi\nexit 0\n")
+	script := `source "$1/scripts/lib.sh"; for e in "${COMPONENTS[@]}"; do mkdir -p "$BUNDLES/${e%%:*}"; done; "$1/scripts/publish.sh"`
+	cmd := exec.Command("bash", "-c", script, "_", root)
+	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"), "CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + logFile}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("publish.sh failed: %v\n%s", err, out)
+	}
+	files, err := filepath.Glob(filepath.Join(root, "build", "management", "root", "*.yaml"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("publish.sh wrote no Application: %v", err)
+	}
+	for _, f := range files {
+		data, _ := os.ReadFile(f)
+		if !strings.Contains(string(data), "\n  namespace: argocd-apps\n") {
+			t.Errorf("%s does not name the namespace argocd-apps:\n%s", filepath.Base(f), data)
+		}
 	}
 }

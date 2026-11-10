@@ -6,6 +6,7 @@ resources:
   - ../../vendor/argocd/v3.6.1
   - bundle-store.yaml
   - project.yaml
+  - default-project.yaml
   - apps-namespace-guard.yaml
 patches:
   - path: argocd-cm.yaml

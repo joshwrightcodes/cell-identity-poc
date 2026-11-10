@@ -574,6 +574,7 @@ The cell runs the Argo CD core install, which has no UI. `mise run cell:ui` serv
 from your Mac at <http://localhost:8080> and reads the cluster through your kubeconfig.
 It needs no login, and it stops when you press Ctrl-C.
 The UI lists only the root Application. The script prints the child Applications first, and the `kubectl` line below lists them again.
+The local server writes a signing key into `argocd-secret` in the cluster. The script removes the key when you stop the UI. After a killed run, use `mise run cell:ui:clean`.
 
 ```sh
 mise run cell:ui

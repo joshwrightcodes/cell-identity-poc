@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"slices"
 	"testing"
 )
 
@@ -64,12 +63,14 @@ func TestAppsNamespaceRenders(t *testing.T) {
 			if got := fmt.Sprint(get[[]any](t, rule, "resources")); got != "[secrets]" {
 				t.Errorf("the policy matches resources %s, want [secrets]", got)
 			}
-			ops := []string{}
-			for _, op := range get[[]any](t, rule, "operations") {
-				ops = append(ops, op.(string))
+			if got := fmt.Sprint(get[[]any](t, rule, "operations")); got != "[CREATE UPDATE]" {
+				t.Errorf("the policy matches operations %s, want [CREATE UPDATE]", got)
 			}
-			if !slices.Contains(ops, "CREATE") {
-				t.Errorf("the policy matches operations %v, want CREATE", ops)
+			if got := fmt.Sprint(get[[]any](t, rule, "apiGroups")); got != "[]" {
+				t.Errorf("the policy matches apiGroups %s, want the core group [\"\"]", got)
+			}
+			if got := get[string](t, policy, "spec", "failurePolicy"); got != "Fail" {
+				t.Errorf("the policy failurePolicy is %s, want Fail", got)
 			}
 			if got := get[string](t, get[[]any](t, policy, "spec", "validations")[0], "expression"); got != "false" {
 				t.Errorf("the policy expression is %q, want false, so that it denies every Secret", got)
@@ -80,6 +81,21 @@ func TestAppsNamespaceRenders(t *testing.T) {
 			}
 			if got := fmt.Sprint(get[[]any](t, binding, "spec", "validationActions")); got != "[Deny]" {
 				t.Errorf("the binding actions are %s, want [Deny]", got)
+			}
+			if got := get[string](t, binding, "spec", "policyName"); got != "argocd-apps-no-secrets" {
+				t.Errorf("the binding names the policy %q, want argocd-apps-no-secrets", got)
+			}
+			def := argo["AppProject argocd/default"]
+			if def == nil {
+				t.Fatal("the argocd component renders no AppProject default")
+			}
+			for _, field := range []string{"sourceRepos", "destinations", "clusterResourceWhitelist", "namespaceResourceWhitelist"} {
+				if v, ok := lookup(def, "spec", field); !ok || len(v.([]any)) != 0 {
+					t.Errorf("AppProject default %s = %v, want an empty list", field, v)
+				}
+			}
+			if got, _ := lookup(argo["ConfigMap argocd/argocd-cm"], "data", "admin.enabled"); got != "false" {
+				t.Errorf("argocd-cm admin.enabled = %v, want \"false\"", got)
 			}
 			if got := get[string](t, binding, "spec", "matchResources", "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name"); got != "argocd-apps" {
 				t.Errorf("the binding selects the namespace %q, want argocd-apps", got)

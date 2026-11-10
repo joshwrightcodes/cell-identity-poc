@@ -1,5 +1,6 @@
-# Child Applications live in argocd-apps. A Secret in that namespace would let a tenant of the
-# namespace hand credentials to Argo CD, so the namespace admits none, for every user.
+# Child Applications live in argocd-apps, and the central view mirrors that namespace. A Secret there
+# would put a credential in the namespace that the mirror reads, so the namespace admits none, for
+# every user.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:

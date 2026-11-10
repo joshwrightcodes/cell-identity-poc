@@ -107,10 +107,8 @@ die() { printf 'error: %s. Run: mise run gate:m2:repair again\n' "$*" >&2; exit 
 
 # Step 1: the bundles and the test entry in dev-cp.
 apps_at_published() {
-  local apps children
-  apps="$(kcp -n argocd get applications -o json)" || return 1
-  children="$(kcp -n argocd-apps get applications -o json)" || return 1
-  apps="$(jq -n --argjson r "$apps" --argjson c "$children" '{items: ($r.items + $c.items)}')" || return 1
+  local apps
+  apps="$(applications_json kcp)" || return 1
   jq -e --arg root "$(published_digest "$cp" root)" --arg spire "$(published_digest "$cp" spire-server)" '
     (.items | length) > 0
     and all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")

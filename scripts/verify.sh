@@ -64,16 +64,6 @@ check_apps_synced() {
     || { k get applications -A; return 1; }
 }
 
-# Every child Application lives in argocd-apps, and argocd holds only the root Application.
-check_apps_namespace() {
-  local found
-  found="$(k get applications -A -o json | jq -r '.items[]
-    | select((.metadata.namespace == "argocd" and .metadata.name == "root") or .metadata.namespace == "argocd-apps" | not)
-    | "\(.metadata.namespace)/\(.metadata.name)"')" || return 1
-  [[ -z "$found" ]] || { echo "Applications outside $APPS_NAMESPACE, except the root: ${found//$'\n'/ }"; return 1; }
-  k -n argocd get application root >/dev/null 2>&1 || { echo "argocd has no root Application"; return 1; }
-}
-
 check_argocd_local_only() {
   local clusters
   clusters="$(k -n argocd get secrets -l argocd.argoproj.io/secret-type=cluster -o name)"
@@ -618,6 +608,9 @@ log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "No Application is outside argocd-apps, except the root" check_apps_namespace
+check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
+check "argocd holds no admin password" check_no_admin_credentials
+check "argocd-apps holds no Secret, and its policy denies one" check_apps_guard
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh

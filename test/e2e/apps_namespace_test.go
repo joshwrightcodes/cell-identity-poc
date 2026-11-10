@@ -60,11 +60,10 @@ func TestM3AppsNamespaceHoldsNoSecrets(t *testing.T) {
 				t.Errorf("%s holds Secrets: %s", appsNamespace, secrets)
 			}
 
-			// A denied create stores nothing. A create that succeeds is removed again.
-			out, err := kubectl(t, cluster, "", "-n", appsNamespace, "create", "secret", "generic", "x", "--from-literal=k=v")
+			// A server dry run reaches admission and stores nothing.
+			out, err := kubectl(t, cluster, "", "-n", appsNamespace, "create", "secret", "generic", "x", "--from-literal=k=v", "--dry-run=server")
 			if err == nil {
-				_, _ = kubectl(t, cluster, "", "-n", appsNamespace, "delete", "secret", "x")
-				t.Fatalf("kubectl create secret in %s succeeded: %s", appsNamespace, out)
+				t.Fatalf("kubectl create secret --dry-run=server in %s succeeded: %s", appsNamespace, out)
 			}
 			if !strings.Contains(err.Error(), appsPolicyName) {
 				t.Errorf("the denial does not name the policy %s: %v", appsPolicyName, err)

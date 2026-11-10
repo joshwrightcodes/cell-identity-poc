@@ -3,7 +3,7 @@
 # the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
 # store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
-# for their rollouts. Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
+# for their rollouts. UP_WAIT sets the bound of the Application wait in seconds (default 900). Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
@@ -35,18 +35,21 @@ log "applied the root Application"
 
 expected=$((${#COMPONENTS[@]} + 1))
 log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
-end=$((SECONDS + 900))
+up_wait="${UP_WAIT:-900}"
+end=$((SECONDS + up_wait))
 store_done=0
 last_hint=-60
 # Without direnv, the token command still comes from .envrc.local.
 [[ -z "${SECRET_STORE_NAMESPACES:-}" ]] || load_local_settings POC_SECRET_TOKEN_CMD
-until apps_at_published >/dev/null 2>&1; do
+until apps_at_published 2>/dev/null; do
   if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)); then
     connect_store_step "$ROOT/scripts/secrets-connect.sh"
   fi
   if ((SECONDS >= end)); then
     k get applications -A
-    die "Applications did not reach the published revisions, Synced and Healthy, in 900s"
+    apps_at_published >/dev/null || true
+    blockers="$(apps_blockers 2>&1)" || true
+    die "Applications did not reach the published revisions, Synced and Healthy, in ${up_wait}s. Blocked by: ${blockers//$'\n'/; }"
   fi
   sleep 10
 done

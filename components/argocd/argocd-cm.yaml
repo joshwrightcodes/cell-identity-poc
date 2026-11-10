@@ -16,3 +16,5 @@ data:
     end
     return hs
   timeout.reconciliation: 60s
+  # The server of argocd admin dashboard writes an admin password unless admin is off.
+  admin.enabled: "false"
