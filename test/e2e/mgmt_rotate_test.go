@@ -19,11 +19,17 @@ import (
 
 // rotateHook is the MGMT_ROTATE_REFRESH command of the test. For the test copy, it records the
 // authority state of the management server, then renders the copy again with peer_root_configmap
-// and applies it, as a peer render does. Any other copy belongs to a real render, so the hook runs
-// cell:up of its cluster once.
+// and applies it, as a peer render does. Any other copy belongs to a real render. A copy in
+// management is the trust bundle of a link component sidecar, so the hook runs cell:link, which is
+// safe to run at each refresh. For a copy in another cluster the hook runs cell:up of that cluster
+// once.
 const rotateHook = `#!/usr/bin/env bash
 set -euo pipefail
 cluster="$1" ns="$2" name="$3"
+if [[ "$cluster" == management ]]; then
+  CELL=management "$ROTATE_ROOT/scripts/link.sh"
+  exit 0
+fi
 if [[ "$cluster" != "$ROTATE_TEST_CLUSTER" || "$ns" != "$ROTATE_TEST_NS" ]]; then
   grep -qxF "$cluster" "$ROTATE_DONE" 2>/dev/null && exit 0
   echo "$cluster" >>"$ROTATE_DONE"
