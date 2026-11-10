@@ -16,7 +16,6 @@ import (
 	"io"
 	"math/big"
 	"net"
-	"net/http"
 	"net/url"
 	"os/exec"
 	"slices"
@@ -58,23 +57,12 @@ func centralForward(t *testing.T) string {
 	return portForward(t, mgmtCluster, viewNamespace, "deploy/argocd-server", 8080)
 }
 
-// centralAPIAt reads path from the central argocd-server at addr, with no credential.
+// centralAPIAt reads path from the central argocd-server at addr, with no credential. It retries only
+// the empty-cause HTTP 500 of upstream issue 1107 (see centralAPIRetryEmptyCause), and fails on any
+// other answer.
 func centralAPIAt(t *testing.T, addr, path string) []byte {
 	t.Helper()
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get("http://" + addr + path)
-	if err != nil {
-		t.Fatalf("GET %s from the central argocd-server: %v", path, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET %s: HTTP %d, want 200 for the anonymous user: %s", path, resp.StatusCode, body)
-	}
-	return body
+	return centralAPIRetryEmptyCause(t, addr, path)
 }
 
 // principalPod returns the name and pod address of the Ready principal pod.
