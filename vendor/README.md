@@ -6,6 +6,8 @@ it is committed. `mise run vendor:fetch` downloads the versions that `cells/comm
 | Path | Source | Version |
 | --- | --- | --- |
 | `argocd/v3.6.1/core-install.yaml` | Argo CD repository, `manifests/core-install.yaml` | v3.6.1 |
+| `argocd/v3.6.1/install.yaml` | Argo CD repository, `manifests/install.yaml` (central view only) | v3.6.1 |
+| `argocd-agent/v0.10.0/{principal,agent}` | Argo CD Agent tag archive, `install/kubernetes/` | v0.10.0 |
 | `charts/istio-1.30.8/{base,cni,istiod,gateway}` | `oci://gcr.io/istio-release/charts` | 1.30.8 |
 | `charts/external-secrets-2.14.0/external-secrets` | `oci://ghcr.io/external-secrets/charts/external-secrets` | 2.14.0 |
 
@@ -930,3 +932,161 @@ parsing or the HPACK code line by line.
   environment reads or dials, and no `init` function.
 - `go list` shows that both build into `cell-proxy` as part of `x/net/http2`. These searches
   narrow the gap that the `cell-proxy` modules review above names.
+
+## Argo CD v3.6.1 full install for the central view (2026-11-10)
+
+`argocd/v3.6.1/install.yaml` is the full install of the Argo CD tag `v3.6.1`. Its SHA-256 is
+`7be23ca7d9ca3d3074dee8332f1ca92a933b990cee7c9cf22cf3843ee8c2913e`. `components/central-view` names
+the file directly. The kustomization of the cells keeps `core-install.yaml` alone. The review read
+the file and ran nothing from it.
+
+- No hidden Unicode and no other non-ASCII characters, the same as `core-install.yaml`.
+- The long encoded strings are the SSH host keys that `core-install.yaml` also holds.
+- The URLs are the same as in `core-install.yaml`. No object downloads anything or runs a shell
+  command, apart from the `copyutil` init container of the repo server, which copies the `argocd`
+  binary into a shared volume.
+- No `privileged`, `hostNetwork`, `hostPID`, `hostIPC` or `hostPath`.
+- Images: `quay.io/argoproj/argocd:v3.6.1`, `public.ecr.aws/docker/library/redis:8.10.1-alpine` and,
+  for Dex only, `ghcr.io/dexidp/dex:v2.46.0`. The view pins the index digests
+  `sha256:296e3d74f449b2ce45265613fcb68c18ed7366488360c8ea32f5f2a93d2e5c54` (Argo CD) and
+  `sha256:ef216d85ec44f4fdf7c0e6df2d1757a4734ed32fbb278cabd3181b5a27353b79` (Redis), read from the
+  registries on 2026-11-10. The review did not inspect the image contents.
+
+The view keeps `argocd-server`, `argocd-repo-server` and `argocd-redis` with their ServiceAccounts,
+Services, ConfigMaps and the Roles of the server and Redis. It drops the CRDs, the application
+controller, the ApplicationSet controller, Dex, notifications, Secret `argocd-secret` and the
+upstream NetworkPolicies. `viewkeys` makes `argocd-secret`, because `argocd-server` needs
+`server.secretkey`.
+
+RBAC of `argocd-server`, as the view changes it:
+
+| Rule in v3.6.1 | In the view | Reason |
+| --- | --- | --- |
+| Role: create, get, list, watch, update, patch and delete on Secrets and ConfigMaps | get, list and watch | The server reads its settings, the cluster Secrets and the keys. |
+| Role: every verb on Applications, AppProjects and ApplicationSets | get, list and watch | The view changes no object in its namespace. |
+| Role: create and list on Events | kept | Write that stays: the server records an Event for each user action. |
+| ClusterRole: delete, get and patch on every resource, update on every finalizer | removed | The view reaches cell resources only through the resource proxy. |
+| ClusterRole: get, list and watch on Applications and ApplicationSets | kept | The server lists the Applications of every namespace. |
+| (none) | patch on Applications, through a Role in each agent namespace | Write that stays: a refresh in the UI patches the refresh annotation of the Application. The guard in each cell is the control. |
+| ClusterRole: list Events, get pods and logs, create Jobs and Workflows | removed | The view runs no resource action in management. |
+
+`argocd-server` stops at start when AppProject `default` is missing and it cannot create it
+(observed on 2026-11-10: `appprojects.argoproj.io is forbidden ... cannot create resource`). The
+view renders AppProject `default` with no source and no destination.
+
+The full install starts the Redis password with an init container: `secret-init` in Deployment
+`argocd-redis` runs `argocd admin redis-initial-password`. It creates Secret `argocd-redis` when it is
+missing. v3.6.1 has no Job `argocd-redis-secret-init`. The view gives only that init container a
+projected API token. Role `argocd-redis` keeps get on Secret `argocd-redis` and create on Secrets.
+
+`argocd-server` reads two Redis addresses: `REDIS_SERVER` for its own cache and
+`REPO_SERVER_REDIS_SERVER` for the cache of the repo server (`util/cache/cache.go` line 225 and
+`cmd/argocd-server/commands/argocd_server.go` line 364 of v3.6.1). Without the second one, it uses
+`argocd-redis:6379`. The view sets both to the Redis proxy of the principal.
+
+## Argo CD Agent v0.10.0 (2026-11-10)
+
+The central view runs the principal of Argo CD Agent v0.10.0. The tag `v0.10.0` points at commit
+`78a3788f5aa757707c00e563198f3d4c676fe04b`. The review read a copy of the tag archive in a scratch
+directory and ran nothing from it.
+
+| Item | Digest |
+| --- | --- |
+| Tag archive from `codeload.github.com` | SHA-256 `9060a59f18891b41efd662c09a0c93a824462bf8507f136ebbe4c346075d4d07` |
+| `install/kubernetes/principal` and `agent`, sorted file list | SHA-256 `c0cda6f7fbed368c4b3f7dd085095df47f79436cd4894d22a6cfa9eb0d647c56` (`ARGOCD_AGENT_MANIFESTS_SHA256`) |
+| `quay.io/argoprojlabs/argocd-agent:v0.10.0` index | `sha256:ec9baba6e81555bfa5ce1fa6252f06c6100b56ae7f85273ba2f7e2309303800d` |
+| arm64 manifest | `sha256:a5c9027ff491e05649b159cf6a105de05af0c1cbb84bd54f36575ceb955c696d` |
+| amd64 manifest | `sha256:e262e4ef7da9128d9b72d133383b624bd4fb0ada8ceb127d10ff9e2f72f7a64f` |
+
+`vendor:fetch` downloads the archive, checks the SHA-256 of the file list and copies the two
+directories into `argocd-agent/v0.10.0/`. The view uses its own manifest
+(`components/central-view/principal.yaml`). The vendored files are the review record, and the agent
+manifest feeds the cells in a later task.
+
+### Image
+
+These facts come from the registry and from the binary layer, read on 2026-11-10.
+
+- The arm64 image config has user `999`, the entrypoint `/bin/argocd-agent` and no exposed port.
+  The base is Alpine 3.23.5 with `apk upgrade`, so the image holds a shell and busybox.
+- The last layer holds one file, `/bin/argocd-agent`, 116 MB.
+- `go version -m` read the build information of the binary without a run: Go 1.26.3,
+  `CGO_ENABLED=0`, module `github.com/argoproj-labs/argocd-agent` v0.10.0, VCS revision
+  `78a3788f5aa757707c00e563198f3d4c676fe04b` with `vcs.modified=false`. The binary therefore comes
+  from the reviewed commit. It links 172 modules, among them Argo CD v3.5.1.
+- The `Dockerfile` of the tag builds with `golang:1.26.3` and copies the binary into `alpine:3.23`,
+  which matches the image history.
+
+### Manifests
+
+- No hidden Unicode and no other non-ASCII characters. No long encoded strings. No URL.
+- No `privileged`, `hostNetwork`, `hostPID`, `hostIPC` or `hostPath`.
+- The upstream principal ClusterRole can create, update and delete Applications, AppProjects and
+  ApplicationSets in every namespace, and create namespaces. The view lists and watches them in
+  every namespace, writes Applications only through a Role in each agent namespace, and writes
+  AppProjects only in `central-view-system`.
+- The upstream principal Role can write every Secret and ConfigMap of its namespace. The view
+  grants get, list and watch only.
+- `principal-params-cm.yaml` says that header authentication needs the gRPC listener on
+  `127.0.0.1`. The view sets `--listen-host=127.0.0.1`.
+
+### Source
+
+The review read `cmd/argocd-agent/principal.go`, `principal/server.go`, `principal/resource.go`,
+`principal/event.go`, `pkg/principal/identity.go`, `internal/argocd/cluster/`, `internal/tlsutil/`
+and `cmd/ctl/` (`ca.go`, `jwt.go`, `agent.go`).
+
+- Every flag that the view sets exists in `cmd/argocd-agent/principal.go`: `--namespace`,
+  `--listen-host`, `--listen-port`, `--insecure-plaintext`, `--auth`, `--allowed-namespaces`,
+  `--namespace-create-enable`, `--enable-resource-proxy`, `--redis-server-address`,
+  `--metrics-port`, `--healthz-port` and `--log-format`. `--auth header:<name>:<regex>` takes the
+  first capture group as the agent name, and needs `--insecure-plaintext`
+  (`validateAuthTLSPairing`).
+- Only the gRPC listener takes a host. The resource proxy listens on `0.0.0.0:9090` and the Redis
+  proxy on `0.0.0.0:6379` (`principal/server.go` lines 232 to 236). Metrics listen on `:8000` and
+  health on `:8003`.
+- `cmd/argocd-agent/principal.go` imports `net/http/pprof`, which registers on the default HTTP mux.
+  The health server serves that mux (`principal/server.go` lines 872 to 884). So port 8003 also
+  serves `/debug/pprof/`. On 2026-11-10 `wget http://127.0.0.1:8003/debug/pprof/cmdline` inside the
+  pod printed the arguments of the principal. The view probes the health port from inside the
+  pod, and admits no peer on 8003.
+- At start the principal reads ConfigMap `argocd-agent-principal-identity`, and creates it when it
+  is missing (`pkg/principal/identity.go`, `principal/server.go` line 710). The view renders it with
+  a fixed value, so the principal writes no ConfigMap.
+- With `--insecure-plaintext` the principal loads no root CA for agents. The resource proxy reads its
+  certificate from Secret `argocd-agent-resource-proxy-tls`, which must have the type
+  `kubernetes.io/tls`, and its client CA from `tls.crt` and `ca.crt` of `argocd-agent-ca`
+  (`getResourceProxyTLSConfigFromKube`, `internal/tlsutil/kubernetes.go`). No key of the CA is read.
+- The resource proxy takes the agent name from the CN of the client certificate, or from a bearer
+  token that the principal signed (`principal/resource.go`, `extractAgentFromAuth`).
+- The principal writes Secrets only for self-registered agents and in HA mode, which the view leaves
+  off. It keeps cluster state in Redis.
+- `internal/kube/client.go` imports `os/exec` only for an exit error type. No `sudo`, no HTTP client
+  call and no hidden Unicode in the non-test Go code of `cmd`, `principal`, `internal` and `pkg`.
+
+`cmd/viewkeys` copies these formats from `argocd-agentctl`:
+
+- `argocd-agent-jwt`: key `jwt.key`, an RSA key of 4096 bits in PKCS#8 PEM (`cmd/ctl/jwt.go`).
+- `argocd-agent-resource-proxy-tls`: type `kubernetes.io/tls`, `tls.crt` and `tls.key`
+  (`cmd/ctl/ca.go`, `issueAndSaveSecret`).
+- `cluster-<agent>`: label `argocd.argoproj.io/secret-type: cluster`, label
+  `argocd-agent.argoproj-labs.io/agent-name: <agent>`, annotations `managed-by: argocd-agent` and
+  `argocd.argoproj.io/skip-reconcile: "true"`, and keys `name`, `server` and `config`
+  (`cmd/ctl/agent.go`, `internal/argocd/cluster/conversion.go`). The server is
+  `https://<host>:9090?agentName=<agent>`.
+- The validity: 3650 days for the CA and 180 days for each leaf (`internal/tlsutil/generate.go`).
+
+`viewkeys` differs from `argocd-agentctl` in four points. It keeps no CA key, so `argocd-agent-ca`
+has the type `Opaque`, because a `kubernetes.io/tls` Secret needs `tls.key`. It gives each
+certificate a random serial number, where `argocd-agentctl` uses 1. It sets only the key usages that
+each certificate needs. It uses ECDSA P-256 keys for the certificates.
+
+The review did not read these items:
+
+- The agent side (`agent/`, `pkg/client/`), apart from the call that an earlier task cited.
+- The Redis proxy and the event stream code line by line, the HA code and the test files.
+- The 172 modules of the binary, and the image signatures.
+- The network behaviour of the binary at run time.
+
+Result: medium concern. The principal image holds a shell and busybox, its health port serves
+pprof, and its resource and Redis proxies bind every address. NetworkPolicy limits each of them.
