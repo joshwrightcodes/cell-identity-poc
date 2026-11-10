@@ -1,7 +1,9 @@
-# The view guard of a cell. The policy argocd-agent-read-only denies every write, delete and connect
-# request of the agent ServiceAccount, whatever its RBAC grants. RBAC already gives the agent no
-# write verb, so this policy is the second control: a role that someone adds later does not open a
-# write path for the central view. render.sh replaces @POC_ENV@ with the environment name.
+# The view guard of a cell. The policy argocd-agent-read-only denies every update, delete and connect
+# request of the agent ServiceAccount that reaches admission, and every create request except one.
+# RBAC already gives the agent no write verb, so this policy is the second control: a role that
+# someone adds later does not open a write path for the central view. A grant of impersonate,
+# or of a write to the admission objects, is a grant that this policy cannot see, so the tests ask
+# RBAC that the agent holds none. render.sh replaces @POC_ENV@ with the environment name.
 #
 # The one request that the agent may create is the TokenRequest of its own SPIRE agent sidecar. The
 # request names the ServiceAccount argocd-agent in argocd and one audience spire-<env>/<nonce>. It
@@ -32,7 +34,7 @@ spec:
     - expression: |-
         request.operation != 'CREATE' || (
           request.resource.group == '' && request.resource.resource == 'serviceaccounts' &&
-          request.subResource == 'token' && request.namespace == 'argocd' && request.name == 'argocd-agent' &&
+          has(request.subResource) && request.subResource == 'token' && request.namespace == 'argocd' && request.name == 'argocd-agent' &&
           has(object.spec.audiences) && object.spec.audiences.size() == 1 &&
           object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') &&
           has(object.spec.boundObjectRef) && has(object.spec.boundObjectRef.kind) &&

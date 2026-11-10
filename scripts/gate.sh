@@ -46,6 +46,8 @@ fi
 # StatefulSet that runs a local image must run the one that `mise run images` recorded, or the gate
 # tests old code.
 if [[ "$milestone" == m3 ]]; then
+  # An earlier run that stopped before its cleanups can leave a grant for the test group in a cell.
+  "$ROOT/scripts/gate-m3-repair.sh" --check || exit 1
   stale=""
   for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
     workloads="$(kubectl --context "kind-$cluster" get deployments,statefulsets -A -o json | jq -r '.items[]
@@ -60,11 +62,22 @@ if [[ "$milestone" == m3 ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
+# go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,
+# and the text of the run goes to standard output as it does without -json.
+mkdir -p "$BUILD_ROOT"
+events="$BUILD_ROOT/gate-$milestone.json"
+durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS
 status=0
-go test -tags e2e -count=1 -timeout 30m ./test/e2e/ -run "$pattern" "$@" || status=$?
+go test -tags e2e -count=1 -timeout 30m -json ./test/e2e/ -run "$pattern" "$@" \
+  | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
+# The duration of each top-level test, slowest first.
+jq -Rrn '[inputs | fromjson? | select(.Test != null and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
+    | {test: .Test, action: .Action, elapsed: .Elapsed}] | sort_by(-.elapsed)[] | "\(.elapsed)s \(.action) \(.test)"' "$events" >"$durations" || true
+log "the slowest tests of gate $milestone (every test is in $durations):"
+head -n 12 "$durations" >&2
 
 if [[ -n "$budget_minutes" ]] && ((elapsed > budget_minutes * 60)); then
   printf 'FAIL: gate %s took %ss, over the budget of %s minutes\n' "$milestone" "$elapsed" "$budget_minutes" >&2

@@ -295,6 +295,8 @@ func TestRenderArgoCDAgentFailsClosed(t *testing.T) {
 		{"SPIRE_SERVER_CLUSTER=missing", "no host service facts for missing"},
 		{"STUB_NO_SERVER=1", "could not read the trust bundle"},
 		{"API_SERVER_IPS= ", "API_SERVER_IPS holds no address"},
+		{"POC_ENV=a.b", "is not a short DNS label"},
+		{"POC_ENV=a|b", "is not a short DNS label"},
 	} {
 		t.Run(tc.env, func(t *testing.T) {
 			r := renderAgent(t, "dev-cell-1", tc.env)

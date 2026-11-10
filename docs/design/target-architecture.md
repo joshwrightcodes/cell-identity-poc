@@ -580,7 +580,7 @@ cell:
 - An admission policy keeps the set of Secrets in `argocd` closed, and RBAC refuses a Secret `get`. The resource proxy refuses a Secret list.
 - The agent's read access excludes `ops-runs`, so Job logs never reach the view.
 - Argo CD RBAC at Kiln also denies sync, terminate, delete and exec, as defence in depth.
-- Tests drive real principal events and resource requests. A separate test gives the service account a temporary Role with every write verb, and shows that the policy alone denies each write.
+- Tests drive real principal events and resource requests. A separate test binds a temporary Role to a test group. The Role holds Application, ConfigMap and ServiceAccount writes, exec and token create. The test then shows that the policy alone denies each write.
 - A refresh from the central view fails by design, because the central `argocd-server` is read-only in the agent namespaces.
 
 ### Upgrades **[call]**

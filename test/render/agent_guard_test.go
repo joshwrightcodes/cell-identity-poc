@@ -58,6 +58,14 @@ func TestRenderAgentGuard(t *testing.T) {
 					t.Errorf("resourceRules %s is %s, want %s", field, got, want)
 				}
 			}
+			if v, ok := lookup(rules[0], "scope"); ok && v != "*" {
+				t.Errorf("resourceRules scope is %v, want every scope", v)
+			}
+			for _, sel := range []string{"namespaceSelector", "objectSelector"} {
+				if _, ok := lookup(policy, "spec", "matchConstraints", sel); ok {
+					t.Errorf("the policy narrows its match with %s", sel)
+				}
+			}
 			cond := get[[]any](t, policy, "spec", "matchConditions")
 			if len(cond) != 1 || lookupOr(cond[0], "expression") != `request.userInfo.username == "system:serviceaccount:argocd:argocd-agent"` {
 				t.Errorf("match conditions %v, want the agent ServiceAccount only", cond)
@@ -78,7 +86,7 @@ func TestRenderAgentGuard(t *testing.T) {
 				t.Errorf("the create validation lacks %s:\n%s", want, token)
 			}
 			for _, clause := range []string{
-				"request.resource.group == ''", "request.resource.resource == 'serviceaccounts'", "request.subResource == 'token'",
+				"request.resource.group == ''", "request.resource.resource == 'serviceaccounts'", "has(request.subResource) && request.subResource == 'token'",
 				"request.namespace == 'argocd'", "request.name == 'argocd-agent'", "object.spec.audiences.size() == 1",
 				"object.spec.boundObjectRef.kind == 'Pod'",
 				"request.userInfo.extra['authentication.kubernetes.io/pod-name'] == [object.spec.boundObjectRef.name]",

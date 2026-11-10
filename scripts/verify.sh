@@ -690,6 +690,7 @@ check_agent_connected() {
   [[ "$code" == 200 ]] && return 0
   echo "the agent answers HTTP '${code:-none}' on /healthz, so it holds no stream to the principal."
   echo "Read the cell-proxy log: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c cell-proxy"
+  echo "A pod that cannot attest: read the SPIRE sidecar log, and look for the guard: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c spire-agent | grep argocd-agent-read-only"
   echo "If management has no principal yet, run: CELL=management mise run cell:link"
   echo "If the relay holds old node addresses, run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify, and then the command that it prints"
   return 1
@@ -731,6 +732,8 @@ if has_harness argocd-agent; then
     check_live_images argocd deployment/argocd-agent "CELL=$CELL_NAME mise run cell:up"
   check "cell-proxy of the agent and its NetworkPolicy use the current $SPIRE_SERVER_CLUSTER node address" check_agent_env_address
   check "ConfigMap mgmt-root holds the live roots of management" check_agent_mgmt_root
+  check "The ServiceAccount argocd-agent is not managed by Argo CD, so the view cannot reach its token subresource" check_agent_unmanaged
+  check "No object of a gate run is left, and no binding grants the agent more than the render" check_agent_grants
   check "The Argo CD Agent holds a stream to the principal" check_agent_connected
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then

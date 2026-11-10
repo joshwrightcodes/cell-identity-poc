@@ -308,6 +308,50 @@ check_argocd_secrets() {
     || { echo "ValidatingAdmissionPolicyBinding argocd-secrets-allowed is missing or does not deny in argocd"; return 1; }
 }
 
+# GUARD_TEST_LABEL marks each object that gate:m3 makes, and GUARD_TEST_GROUP is the group that the
+# temporary Role of the guard test binds. The test impersonates the agent ServiceAccount with that
+# group, so the real agent never holds the grant.
+GUARD_TEST_LABEL=poc.internal/test
+GUARD_TEST_GROUP=poc:guard-test
+
+# check_agent_unmanaged succeeds when the ServiceAccount argocd-agent has no annotation or label that
+# makes Argo CD count it as managed, and no owner reference. The agent resource proxy of the view
+# forwards a POST to a subresource of a managed object, and the guard admits one such POST: the
+# bound token request of the agent itself. Only this check of "managed" keeps the view away from it.
+check_agent_unmanaged() {
+  local sa key found
+  sa="$(k -n argocd get serviceaccount argocd-agent -o json)" || { echo "no ServiceAccount argocd-agent in argocd"; return 1; }
+  key="$(k -n argocd get configmap argocd-cm -o jsonpath='{.data.application\.instanceLabelKey}' 2>/dev/null)" || key=""
+  key="${key:-app.kubernetes.io/instance}"
+  found="$(jq -r --arg key "$key" '[
+      (if (.metadata.annotations // {}) | has("argocd.argoproj.io/tracking-id") then "the annotation argocd.argoproj.io/tracking-id" else empty end),
+      (if (.metadata.labels // {}) | has($key) then "the label \($key)" else empty end),
+      (if ((.metadata.ownerReferences // []) | length) > 0 then "an owner reference" else empty end)] | join(", ")' <<<"$sa")" || return 1
+  [[ -z "$found" ]] && return 0
+  echo "the ServiceAccount argocd-agent has $found, so Argo CD counts it as managed and the resource proxy of the view can reach its token subresource"
+  return 1
+}
+
+# check_agent_grants succeeds when no object has the label GUARD_TEST_LABEL, and no RoleBinding or
+# ClusterRoleBinding that grants the ServiceAccount argocd-agent, or the group GUARD_TEST_GROUP,
+# lacks the harness label of argocd-agent. check_harness_objects compares each labelled binding with
+# the render.
+check_agent_grants() {
+  local left extra
+  left="$(k get roles,rolebindings,clusterroles,clusterrolebindings,namespaces,serviceaccounts -A -l "$GUARD_TEST_LABEL" -o json \
+    | jq -r '.items[] | "\(.kind) \(.metadata.namespace // "-")/\(.metadata.name)"')" || { echo "could not list the objects with the label $GUARD_TEST_LABEL"; return 1; }
+  extra="$(k get rolebindings,clusterrolebindings -A -o json | jq -r --arg label "$HARNESS_LABEL" --arg group "$GUARD_TEST_GROUP" '.items[]
+    | select(any(.subjects[]?; (.kind == "ServiceAccount" and .name == "argocd-agent" and .namespace == "argocd") or (.kind == "Group" and .name == $group)))
+    | select((.metadata.labels[$label] // "") != "argocd-agent")
+    | "\(.kind) \(.metadata.namespace // "-")/\(.metadata.name)"')" || { echo "could not list the bindings"; return 1; }
+  if [[ -n "$left" || -n "$extra" ]]; then
+    [[ -z "$left" ]] || printf 'objects of a gate run: %s\n' "$(tr '\n' ',' <<<"$left")"
+    [[ -z "$extra" ]] || printf 'bindings for the agent ServiceAccount or the test group that the render does not hold: %s\n' "$(tr '\n' ',' <<<"$extra")"
+    echo "Run: mise run gate:m3:repair"
+    return 1
+  fi
+}
+
 # The relay copies the node address of RELAY_TARGET into its routes and its egress policy, and the
 # node addresses of SPIRE_AGENT_CELLS into its ingress policy. Docker can give a rebuilt node a new
 # address, and the relay then sends the streams of the cells to the wrong node.

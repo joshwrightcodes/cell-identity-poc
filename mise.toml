@@ -158,6 +158,10 @@ description = "Run the M3 end-to-end tests against the management plane and dev-
 depends = ["images"]
 run = "scripts/gate.sh m3"
 
+[tasks."gate:m3:repair"]
+description = "Delete the objects that a gate:m3 run left in the cells when it stopped before its cleanups. With --check, only list them. Safe to run again"
+run = "scripts/gate-m3-repair.sh"
+
 [tasks."mgmt:rotate-ca"]
 description = "Replace the CA of the SPIRE server in CELL (default management) with a new root: prepare, refresh every peer copy, activate, revoke the old root, refresh again"
 env = { CELL = "{{get_env(name='CELL', default='management')}}" }

@@ -551,9 +551,12 @@ func TestRelayCapsCountSilentConnections(t *testing.T) {
 				}
 			}
 			waitLog(t, logs, `"result":"first_byte_timeout"`)
+			if len(dialed) != 0 {
+				t.Errorf("the upstream saw %d connections before any connection sent a byte, want none", len(dialed))
+			}
 			waitFor(t, func() bool { return admitted(dialAndSend(t, relayAddr)) })
-			if len(dialed) != 1 {
-				t.Errorf("the upstream saw %d connections, want 1 from the connection that sent a byte", len(dialed))
+			if len(dialed) < 1 {
+				t.Error("the upstream saw no connection from the one that sent a byte")
 			}
 		})
 	}

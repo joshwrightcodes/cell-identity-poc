@@ -19,6 +19,7 @@ import (
 //   - STUB_EXTRA adds a ConfigMap with the label of cell-identity that the bundle does not hold.
 //   - STUB_NS_MANAGER sets the field manager of the Namespace.
 //   - STUB_VAP_MANAGER is a managedFields entry that the labelled ValidatingAdmissionPolicy guard also has.
+//   - STUB_CM_VAP_STATUS gives ConfigMap spire-agent the status manager of the admission policies.
 //   - STUB_FOREIGN_MANAGER gives ConfigMap spire-agent a second field manager, argocd-controller.
 //   - STUB_NO_LABEL makes the labelled workload list empty, and STUB_LIST_FAIL makes it fail.
 //   - STUB_LIVE is the answer to "get -f <bundle>", the live objects of the bundle.
@@ -41,6 +42,7 @@ case "$args" in
   *" get ConfigMap -o json --show-managed-fields "*)
     managers='{"manager":"kubectl","operation":"Apply"}'
     [[ -z "${STUB_FOREIGN_MANAGER:-}" ]] || managers="$managers"',{"manager":"argocd-controller","operation":"Update"}'
+    [[ -z "${STUB_CM_VAP_STATUS:-}" ]] || managers="$managers"',{"manager":"validatingadmissionpolicy-status","operation":"Apply","subresource":"status"}'
     cm='{"kind":"ConfigMap","metadata":{"name":"spire-agent","labels":{"cell.poc.internal/harness":"cell-identity"},"managedFields":['"$managers"']}}'
     argocm='{"metadata":{"name":"argocd-cm","managedFields":[{"manager":"argocd-controller","operation":"Apply"}]}}'
     linkcm='{"metadata":{"name":"link-config","labels":{"cell.poc.internal/harness":"link"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
@@ -378,5 +380,14 @@ func TestHarnessObjectsAcceptThePolicyStatusManager(t *testing.T) {
 				t.Fatalf("err %v, output %q; want a failure that says %q", err, out, tc.want)
 			}
 		})
+	}
+}
+
+// The status manager of the admission policies is no excuse for another kind: a ConfigMap that it
+// wrote is an extra field manager.
+func TestHarnessObjectsRefuseThePolicyStatusManagerOnAnotherKind(t *testing.T) {
+	out, _, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`, "STUB_CM_VAP_STATUS=1")
+	if err == nil || !strings.Contains(out, "ConfigMap/spire-agent has the field manager validatingadmissionpolicy-status (Apply status)") {
+		t.Fatalf("err %v, output %q; want a failure that names the status manager on the ConfigMap", err, out)
 	}
 }

@@ -46,6 +46,7 @@ source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/spire-sidecar.sh"
 
 [[ "$ARGOCD_AGENT_IMAGE" =~ @sha256:[0-9a-f]{64}$ ]] || die "ARGOCD_AGENT_IMAGE '$ARGOCD_AGENT_IMAGE' is not pinned by digest"
+[[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label, so it cannot go into the audience pattern of the guard"
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$API_SERVICE_IP" =~ $ipv4 ]] || die "API_SERVICE_IP '$API_SERVICE_IP' is not an IPv4 address"
 [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"

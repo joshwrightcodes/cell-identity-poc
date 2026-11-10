@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Remove what a gate:m3 run leaves behind when it stops before its cleanups, for example after Ctrl-C,
+# a go test timeout or a closed terminal. The guard test makes a Role and a RoleBinding in argocd, a
+# ClusterRole and a ClusterRoleBinding, and a Namespace, each with the label poc.internal/test. The
+# script deletes every object with that label in each cell with the Argo CD Agent. It is safe to run
+# again.
+#
+# Usage: gate-m3-repair.sh [--check]
+#   --check prints each object that it would delete and exits 1, or exits 0 when it finds none.
+# GATE_M3_CELLS names the cells to act on, separated by spaces. The default is every cluster of
+# harness/topology.yaml with the component argocd-agent.
+export CELL=dev-cell-1
+source "$(dirname "$0")/lib.sh"
+
+cells="${GATE_M3_CELLS:-$(yq -r '.clusters[] | select(.components[] == "argocd-agent") | .name' "$ROOT/harness/topology.yaml")}"
+check=0
+[[ "${1:-}" == "--check" ]] && check=1
+
+# leftovers <cell> prints "<kind> <namespace or -> <name>" for each object with the test label.
+leftovers() {
+  kubectl --context "kind-$1" get roles,rolebindings,clusterroles,clusterrolebindings,namespaces,serviceaccounts -A -l "$GUARD_TEST_LABEL" -o json \
+    | jq -r '.items[] | "\(.kind | ascii_downcase) \(.metadata.namespace // "-") \(.metadata.name)"'
+}
+
+status=0
+for cell in $cells; do
+  found="$(leftovers "$cell")" || die "could not list the objects with the label $GUARD_TEST_LABEL in $cell"
+  [[ -n "$found" ]] || continue
+  status=1
+  while read -r kind ns name; do
+    if ((check)); then
+      echo "$cell: $kind $ns/$name has the label $GUARD_TEST_LABEL. Run: mise run gate:m3:repair"
+      continue
+    fi
+    log "deleting $kind $ns/$name in $cell"
+    # A ServiceAccount goes with its Namespace, and a delete of one that is already gone is no error.
+    if [[ "$ns" == "-" ]]; then
+      kubectl --context "kind-$cell" delete "$kind" "$name" --ignore-not-found --wait=true --timeout=2m || die "could not delete $kind $name in $cell"
+    else
+      kubectl --context "kind-$cell" -n "$ns" delete "$kind" "$name" --ignore-not-found --wait=true --timeout=2m || die "could not delete $kind $ns/$name in $cell"
+    fi
+  done <<<"$found"
+  if ((!check)); then
+    again="$(leftovers "$cell")" || die "could not list the objects with the label $GUARD_TEST_LABEL in $cell"
+    [[ -z "$again" ]] || die "$cell still has objects with the label $GUARD_TEST_LABEL: $(tr '\n' ',' <<<"$again")"
+    status=0
+  fi
+done
+exit "$status"
