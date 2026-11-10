@@ -24,6 +24,15 @@ json_fail() {
 # CELL names the cluster. cells/common.env and cells/$CELL.env hold its settings.
 CELL="${CELL:-dev-cell-1}"
 [[ -f "$ROOT/cells/$CELL.env" ]] || die "unknown cell '$CELL'. Known cells: $(cd "$ROOT/cells" && ls *.env | sed -e 's/\.env$//' -e '/^common$/d' | paste -sd' ' -)"
+# A nested run inherits the variables of the outer cluster: mgmt:rotate-ca runs cell:up for each other
+# cluster from a shell that holds the settings of management. A variable that a cell env file defines
+# and that the cluster CELL leaves out would then reach its renders, for example COLLECTOR_STORE. So
+# drop every variable that any cell env file defines, and take them from common.env and
+# cells/$CELL.env alone.
+for _name in $(sed -n 's/^\([A-Z_][A-Z0-9_]*\)=.*/\1/p' "$ROOT"/cells/*.env | sort -u); do
+  [[ "$_name" == CELL ]] || unset "$_name"
+done
+unset _name
 set -a
 source "$ROOT/cells/common.env"
 source "$ROOT/cells/$CELL.env"
