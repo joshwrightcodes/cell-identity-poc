@@ -6,5 +6,3 @@ data:
   # Argo CD sends traces to the in-cluster collector over OTLP.
   otlp.address: otel-collector.observability-system.svc.cluster.local:4317
   otlp.insecure: "true"
-  # Child Applications live in this namespace, apart from the root Application and the Argo CD settings.
-  application.namespaces: argocd-apps

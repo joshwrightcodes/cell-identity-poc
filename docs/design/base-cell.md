@@ -42,8 +42,7 @@ The demo workloads in `apps-demo` take the place of the role set in this milesto
 
 | Namespace | Contents | Mesh | Pod Security |
 | --- | --- | --- | --- |
-| `argocd` | Argo CD core install, and the root Application | No | restricted |
-| `argocd-apps` | Every child Application, and no Secret | No | restricted |
+| `argocd` | Argo CD core install, every Application, and three Secrets | No | restricted |
 | `cell-system` | Bundle store; later the worker and SPIRE agent sidecars | No | restricted |
 | `istio-system` | istiod, istio-cni | Control plane | privileged |
 | `istio-egress` | Egress gateway | Yes | restricted |
@@ -66,29 +65,47 @@ plaintext. Strict mTLS on the collector would reject them.
 - A root Application follows the `current` tag of the root bundle.
 - Bootstrap applies the root Application once. It is the only object that Argo CD does not manage, because a self-managed root waits on itself.
 - Each child Application pins its bundle by digest.
-- Every child Application lives in `argocd-apps` and uses the AppProject `cell`. The root Application stays in `argocd`.
-- The setting `application.namespaces: argocd-apps` in `argocd-cmd-params-cm` and `sourceNamespaces` in the AppProject `cell` allow this.
-- The application controller reads `application.namespaces` when it starts. Its pod template carries the annotation `poc.internal/cmd-params-sha256`, the SHA-256 of `components/argocd/argocd-cmd-params-cm.yaml`. A change to that file restarts the controller.
+- Every Application lives in `argocd` and uses the AppProject `cell`. The ValidatingAdmissionPolicy `argocd-cell-project` and its binding deny another project.
 - The AppProject `default` in `argocd` allows no source, no destination and no kind. `admin.enabled` is `false` in `argocd-cm`.
-- The ValidatingAdmissionPolicy `argocd-apps-no-secrets` and its binding deny a Secret in `argocd-apps`, for every user.
-- `mise run cell:ui` serves the UI of `argocd admin dashboard`. That local server does not read `application.namespaces`, so the UI lists only the root Application. The script prints the Applications of both namespaces first.
+- `mise run cell:ui` serves the UI of `argocd admin dashboard`. The UI lists every Application, because the local server reads the namespace `argocd`.
 - The same local server writes `server.secretkey` into `argocd-secret`, and an admin password when admin is on. The AppProject `default` stops it from creating a permissive project. `cell:ui` removes the keys when the server stops. `mise run cell:ui:clean` removes them after a killed run.
 - Sync waves order the components. Argo CD reports the health of child Applications, so each wave waits for the one before it.
 - The Istio Applications ignore the webhook fields that istiod writes at run time.
 
-### Move of the child Applications
+### Secrets in `argocd`
 
-An older cell keeps its child Applications in `argocd`. The next `mise run cell:up` moves them.
+The Argo CD Agent of a cell runs with `--namespace=argocd`. Argo CD Agent v0.10.0 serves the managed resources and the resource tree of an Application only when the Application lives in that namespace. The agent also needs the verbs `list` and `watch` on Secrets there, because it does not start without them.
 
-1. The bootstrap set applies the new namespace, the project, the setting and the policy. The controller restarts.
-2. The new root bundle holds each child Application in `argocd-apps`. The root Application creates them and prunes the old copies in `argocd`.
-3. The wait in `cell:up` ends when `argocd` holds only the root Application and `argocd-apps` holds one Application per component.
+The guarantee has four parts:
 
-Two states are transient. While both copies of an Application exist, Argo CD can report `SharedResourceWarning` on the objects that they both claim. The warning ends when the root Application prunes the old copy.
+- `argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. None of them holds a credential that the agent could misuse. `bundle-store` holds no credential.
+- The ValidatingAdmissionPolicy `argocd-secrets-allowed` and its binding deny every other Secret in `argocd`, on create and on update, for every user.
+- The Role `argocd-agent` has `list` and `watch` on Secrets and no `get`. The agent in autonomous mode sends no Secret to the central view, and the resource proxy of the agent refuses a Secret read.
+- A new Secret in `argocd` needs a change to the policy list. The check `cell:verify` compares the live Secrets with that list.
 
-The tracking ID of every object changes to the form `argocd-apps_<name>:<group>/<kind>:<namespace>/<name>`. The old form was `<name>:...`. Scripts that read the tracking ID accept both forms.
+The set is small, but it is a set of Secrets and not an empty namespace. The agent process can read these three Secrets in its own memory.
 
-If an old Application stays in `argocd`, run `mise run cell:up` again, so that the root Application prunes it. This step is not tested on a live cluster. As a last resort, list the Applications first with `kubectl -n argocd get applications`. Delete one only after `cell:up` finished, because an older root bundle recreates it through self-heal. Never delete `root`. An Application has no finalizer, so the delete leaves the managed objects in place. `SharedResourceWarning` is possible while both copies exist, but no run showed it.
+The root Application carries the label `argocd-agent.argoproj-labs.io/ignore-sync: "true"`. The agent skips it, so the central view mirrors only the child Applications.
+
+### Move of the child Applications back to `argocd`
+
+An older cell keeps its child Applications in `argocd-apps`. The next `mise run cell:up` moves them.
+
+1. The bootstrap set applies the project, the setting and the new policies. The root Application gets the `ignore-sync` label.
+2. `cell:up` runs `retire_apps_namespace`. The step deletes the namespace `argocd-apps` with its old Applications, Role and AppProject copy. It then deletes the policies `argocd-apps-no-secrets` and `argocd-apps-cell-project`.
+3. The new root bundle holds each child Application in `argocd`. The root Application creates them.
+4. The wait in `cell:up` ends when `argocd` holds the root Application and one Application per component, all at the published revision.
+5. The harness applies the agent with `--namespace=argocd`. The agent restarts and sends the Applications of `argocd`.
+
+Step 2 comes before step 3 for two reasons. The old Applications repair the old policies, and the old policy `argocd-apps-cell-project` denies a child Application in `argocd`. The harness apply does not prune, and the Application that owned the old objects is gone after step 2, so this step is the only place that removes them.
+
+The step is safe to repeat. On a cell with none of these objects, it changes nothing. An Application has no finalizer, so the delete leaves the objects that the old Applications managed in place. The new Applications take them over.
+
+The old root operation can keep retrying against the old bundle for a few minutes. Argo CD starts the sync of the new revision when the retries end, and `cell:up` waits for it.
+
+The tracking ID of every object changes back to the form `<name>:<group>/<kind>:<namespace>/<name>`.
+
+If a step fails, run `mise run cell:up` again.
 
 ### Bundles
 
@@ -129,9 +146,9 @@ If an old Application stays in `argocd`, run `mise run cell:up` again, so that t
 | Check | Rule |
 | --- | --- |
 | Every Application is Synced and Healthy | Argo CD manages every component |
-| No Application is outside `argocd-apps`, except the root | Child Applications stay in one namespace |
+| No Application is outside `argocd`, except the mirrors of the central view | Every Application stays in the namespace that the agent reads |
 | `argocd` holds the AppProjects `cell` and a locked `default`, and no admin password | The dashboard leaves no open project or credential |
-| `argocd-apps` holds no Secret, and its policy and binding deny one | No credential in the namespace that the central view mirrors |
+| `argocd` holds only `argocd-redis`, `argocd-secret` and `bundle-store`, the agent cannot get a Secret, and the policy and binding deny another | The set of Secrets that the agent can list stays closed |
 | No remote clusters, and only the local store as a source | Argo CD stays local |
 | `argocd`, `cell-system` and `observability-system` have no mesh proxies | Platform stays out of the mesh |
 | Demo workloads have mesh proxies, except `plaintext` | Workloads join the mesh |

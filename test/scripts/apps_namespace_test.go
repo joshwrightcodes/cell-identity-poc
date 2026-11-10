@@ -14,8 +14,10 @@ import (
 
 // appsKubectl serves the Applications of $STUB_APPS, a JSON list of {ns, name, sync, health, rev}.
 // A call with -n answers for that namespace, and a call with -A for every namespace. It also
-// answers the reads of AppProjects and Secrets from $STUB_PROJECTS, $STUB_SECRETS and
-// $STUB_ADMIN_SECRET.
+// answers the reads of AppProjects and Secrets from $STUB_PROJECTS and $STUB_ARGOCD_SECRET, the
+// Secret names of argocd from $STUB_SECRET_NAMES (default: the allowed three), the answer of
+// can-i from $STUB_CAN_GET (default no), and the admission objects from $STUB_VAP and $STUB_VAPB.
+// $STUB_ARGOCD_APPS_NS makes the namespace argocd-apps exist. Every delete goes to $STUB_LOG.
 const appsKubectl = `#!/usr/bin/env bash
 args=" $* "
 echo "kubectl $*" >>"${STUB_LOG:-/dev/null}"
@@ -32,6 +34,15 @@ if [[ "$args" == *" get application root "* ]]; then
   exit
 fi
 if [[ "$args" == *" get appprojects -o json "* ]]; then echo "$STUB_PROJECTS"; exit 0; fi
+if [[ "$args" == *" get secrets -o jsonpath="* ]]; then
+  printf '%s\n' "${STUB_SECRET_NAMES-argocd-redis argocd-secret bundle-store}" | tr ' ' '\n'
+  exit 0
+fi
+if [[ "$args" == *" auth can-i get secrets "* ]]; then echo "${STUB_CAN_GET:-no}"; [[ "${STUB_CAN_GET:-no}" == yes ]]; exit; fi
+if [[ "$args" == *" get validatingadmissionpolicy argocd-secrets-allowed "* ]]; then echo "${STUB_VAP:-}"; [[ -n "${STUB_VAP:-}" ]]; exit; fi
+if [[ "$args" == *" get validatingadmissionpolicybinding argocd-secrets-allowed "* ]]; then echo "${STUB_VAPB:-}"; [[ -n "${STUB_VAPB:-}" ]]; exit; fi
+if [[ "$args" == *" get namespace argocd-apps "* ]]; then [[ -n "${STUB_ARGOCD_APPS_NS:-}" ]]; exit; fi
+if [[ "$args" == *" delete "* ]]; then exit 0; fi
 if [[ "$args" == *" get secret argocd-initial-admin-secret "* ]]; then [[ -n "${STUB_INITIAL_SECRET:-}" ]]; exit; fi
 if [[ "$args" == *" get secret argocd-secret -o json "* ]]; then
   if [[ -n "${STUB_ARGOCD_SECRET:-}" ]]; then echo "$STUB_ARGOCD_SECRET"; else echo '{"data":{}}'; fi
@@ -52,8 +63,8 @@ type stubApp struct {
 func goodApps() []stubApp {
 	return []stubApp{
 		{"argocd", "root", "Synced", "Healthy", "sha256:r"},
-		{"argocd-apps", "a", "Synced", "Healthy", "sha256:a"},
-		{"argocd-apps", "b", "Synced", "Healthy", "sha256:b"},
+		{"argocd", "a", "Synced", "Healthy", "sha256:a"},
+		{"argocd", "b", "Synced", "Healthy", "sha256:b"},
 	}
 }
 
@@ -97,17 +108,14 @@ func TestAppsAtPublished(t *testing.T) {
 		apps []stubApp
 		ok   bool
 	}{
-		{"root in argocd and children in argocd-apps", goodApps(), true},
-		{"a child also in argocd", with(goodApps(), func(a []stubApp) []stubApp {
-			return append(a, stubApp{"argocd", "a", "Synced", "Healthy", "sha256:a"})
-		}), false},
-		{"a child missing from argocd-apps", goodApps()[:2], false},
+		{"the root and every child in argocd", goodApps(), true},
+		{"a child missing from argocd", goodApps()[:2], false},
 		{"a child at a stale revision", with(goodApps(), func(a []stubApp) []stubApp { a[2].Rev = "sha256:old"; return a }), false},
 		{"a child that is not Healthy", with(goodApps(), func(a []stubApp) []stubApp { a[1].Health = "Progressing"; return a }), false},
-		{"an unknown child without a revision", with(goodApps()[:2], func(a []stubApp) []stubApp {
-			return append(a, stubApp{"argocd-apps", "zzz", "Synced", "Healthy", ""}, stubApp{"argocd-apps", "b", "Synced", "Healthy", "sha256:b"}, stubApp{"argocd-apps", "c", "Synced", "Healthy", "sha256:c"})
+		{"an unknown child without a revision", with(goodApps(), func(a []stubApp) []stubApp {
+			return append(a, stubApp{"argocd", "zzz", "Synced", "Healthy", ""})
 		}), false},
-		{"the root in argocd-apps", []stubApp{{"argocd-apps", "root", "Synced", "Healthy", "sha256:r"}, goodApps()[1], goodApps()[2]}, false},
+		{"no root", goodApps()[1:], false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := runLib(t, tc.apps, `apps_at_published`)
@@ -121,11 +129,15 @@ func TestAppsAtPublished(t *testing.T) {
 func TestAppsBlockersNameTheReason(t *testing.T) {
 	apps := with(goodApps(), func(a []stubApp) []stubApp {
 		a[2].Health = "Progressing"
-		return append(a, stubApp{"argocd", "a", "Synced", "Healthy", "sha256:a"})
+		return append(a, stubApp{"argocd", "zzz", "Synced", "Healthy", "sha256:z"})
 	})
 	out, err := runLib(t, apps, `apps_blockers`)
-	if err != nil || !strings.Contains(out, "argocd holds Applications other than root: a") || !strings.Contains(out, "argocd-apps/b is Synced/Progressing") {
-		t.Fatalf("err %v, output %q; want the stray Application and the unhealthy child", err, out)
+	if err != nil || !strings.Contains(out, "argocd holds Applications that were not published: zzz") || !strings.Contains(out, "argocd/b is Synced/Progressing") {
+		t.Fatalf("err %v, output %q; want the unknown Application and the unhealthy child", err, out)
+	}
+	out, err = runLib(t, goodApps()[:2], `apps_blockers`)
+	if err != nil || !strings.Contains(out, "argocd lacks b") {
+		t.Fatalf("err %v, output %q; want the missing child", err, out)
 	}
 }
 
@@ -135,9 +147,9 @@ func TestCheckAppsNamespace(t *testing.T) {
 		apps []stubApp
 		want string
 	}{
-		{"split correctly", goodApps(), ""},
+		{"every Application in argocd", goodApps(), ""},
 		{"an Application in a third namespace", append(goodApps(), stubApp{"other", "x", "Synced", "Healthy", "sha256:x"}), "other/x"},
-		{"a child left in argocd", append(goodApps(), stubApp{"argocd", "a", "Synced", "Healthy", "sha256:a"}), "argocd/a"},
+		{"a child left in argocd-apps", append(goodApps(), stubApp{"argocd-apps", "a", "Synced", "Healthy", "sha256:a"}), "argocd-apps/a"},
 		{"no root", goodApps()[1:], "argocd has no root Application"},
 		{"a mirror outside management", append(goodApps(), stubApp{"dev-dev-cell-1", "a", "Synced", "Healthy", "sha256:a"}), "dev-dev-cell-1/a"},
 	} {
@@ -169,9 +181,9 @@ func TestCheckAppsNamespaceAdmitsTheViewMirrors(t *testing.T) {
 	}
 }
 
-// applications_json merges the two namespaces for the repair and the trace check, and it keeps the
-// errors of kubectl.
-func TestApplicationsJSONMergesBothNamespaces(t *testing.T) {
+// applications_json splits the Applications of argocd into the root and the children for the repair
+// and the trace check, and it keeps the errors of kubectl.
+func TestApplicationsJSONSplitsRootAndChildren(t *testing.T) {
 	out, err := runLib(t, goodApps(), `applications_json kubectl | jq -c '[[.root[].metadata.name], [.children[].metadata.name], (.items | length)]'`)
 	if err != nil || strings.TrimSpace(out) != `[["root"],["a","b"],3]` {
 		t.Fatalf("err %v, output %q; want root, the two children and three items", err, out)
@@ -182,8 +194,8 @@ func TestApplicationsJSONMergesBothNamespaces(t *testing.T) {
 	}
 }
 
-// bundle_traces reads root from argocd and spire-server from argocd-apps.
-func TestBundleTracesReadBothNamespaces(t *testing.T) {
+// bundle_traces reads root and spire-server from argocd.
+func TestBundleTracesReadArgocd(t *testing.T) {
 	snippet := `store_forward_start() { STORE_ADDR=x; }; store_forward_stop() { :; }
 oras() { echo "$(sed -n "s/^$(basename "${@: -1}" | sed 's/:current//')=//p" "$BUILD_ROOT/dev-cp/published.env")"; }
 published_digest() { sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env"; }
@@ -193,19 +205,19 @@ printf 'spire-server=sha256:s\n' >>"$BUILD_ROOT/dev-cp/published.env"
 bundle_traces dev-cp`
 	apps := []stubApp{
 		{"argocd", "root", "Synced", "Healthy", "sha256:r"},
-		{"argocd-apps", "spire-server", "Synced", "Healthy", "sha256:s"},
+		{"argocd", "spire-server", "Synced", "Healthy", "sha256:s"},
 	}
 	out, err := runLib(t, apps, snippet)
 	if err != nil || strings.TrimSpace(out) != "" {
 		t.Fatalf("err %v, output %q; want no trace", err, out)
 	}
-	stale := []stubApp{apps[0], {"argocd-apps", "spire-server", "Synced", "Healthy", "sha256:old"}}
+	stale := []stubApp{apps[0], {"argocd", "spire-server", "Synced", "Healthy", "sha256:old"}}
 	out, _ = runLib(t, stale, snippet)
 	if !strings.Contains(out, "Application spire-server pins sha256:old") {
 		t.Fatalf("output %q; want the trace of the stale spire-server", out)
 	}
 	out, err = runLib(t, apps[:1], snippet)
-	if err == nil || !strings.Contains(out, "no Application spire-server in argocd-apps") {
+	if err == nil || !strings.Contains(out, "no Application root or spire-server in argocd") {
 		t.Fatalf("err %v, output %q; want a stop that names the missing Application", err, out)
 	}
 }
@@ -240,5 +252,64 @@ func TestClusterChecksOfArgocd(t *testing.T) {
 				t.Fatalf("err %v, want success %v; output %q", err, tc.ok, out)
 			}
 		})
+	}
+}
+
+const (
+	goodVAP = `{"spec":{"failurePolicy":"Fail","matchConstraints":{"resourceRules":[{"operations":["CREATE","UPDATE"]}]},
+"validations":[{"expression":"object.metadata.name in ['argocd-redis', 'argocd-secret', 'bundle-store']"}]}}`
+	goodVAPB = `{"spec":{"policyName":"argocd-secrets-allowed","validationActions":["Deny"],
+"matchResources":{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"argocd"}}}}}`
+)
+
+func TestCheckArgocdSecrets(t *testing.T) {
+	good := []string{"STUB_VAP=" + goodVAP, "STUB_VAPB=" + goodVAPB}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"the allowed set", good, ""},
+		{"a Secret outside the set", append([]string{"STUB_SECRET_NAMES=argocd-redis argocd-secret bundle-store repo-token"}, good...), "repo-token"},
+		{"the agent can get a Secret", append([]string{"STUB_CAN_GET=yes"}, good...), "can get Secrets in argocd"},
+		{"no policy", []string{"STUB_VAPB=" + goodVAPB}, "argocd-secrets-allowed is missing"},
+		{"a wider policy", []string{"STUB_VAP=" + strings.Replace(goodVAP, "'bundle-store'", "'bundle-store', 'other'", 1), "STUB_VAPB=" + goodVAPB}, "does not allow exactly"},
+		{"a policy that only warns", []string{"STUB_VAP=" + goodVAP, "STUB_VAPB=" + strings.Replace(goodVAPB, `"Deny"`, `"Warn"`, 1)}, "does not deny"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runLib(t, nil, `check_argocd_secrets`, tc.env...)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("check_argocd_secrets failed: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out, tc.want) {
+				t.Fatalf("err %v, output %q; want a failure that names %q", err, out, tc.want)
+			}
+		})
+	}
+}
+
+// retire_apps_namespace deletes the namespace argocd-apps when it exists, and then the policies of
+// the time when child Applications lived there. A second run on a clean cell deletes no namespace.
+func TestRetireAppsNamespace(t *testing.T) {
+	log := filepath.Join(t.TempDir(), "calls.log")
+	out, err := runLib(t, nil, `retire_apps_namespace`, "STUB_ARGOCD_APPS_NS=1", "STUB_LOG="+log)
+	if err != nil {
+		t.Fatalf("the retire step failed: %v\n%s", err, out)
+	}
+	calls, _ := os.ReadFile(log)
+	for _, want := range []string{"delete namespace argocd-apps", "delete validatingadmissionpolicy argocd-apps-no-secrets", "delete validatingadmissionpolicybinding argocd-apps-cell-project"} {
+		if !strings.Contains(string(calls), want) {
+			t.Errorf("the calls lack %q:\n%s", want, calls)
+		}
+	}
+	log = filepath.Join(t.TempDir(), "calls.log")
+	if out, err := runLib(t, nil, `retire_apps_namespace`, "STUB_LOG="+log); err != nil {
+		t.Fatalf("the second run failed: %v\n%s", err, out)
+	}
+	if calls, _ := os.ReadFile(log); strings.Contains(string(calls), "delete namespace") {
+		t.Errorf("a clean cell got a namespace delete:\n%s", calls)
 	}
 }

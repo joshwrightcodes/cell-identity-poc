@@ -81,9 +81,9 @@ bundle_traces() {
   done
   store_forward_stop
   apps="$(applications_json kubectl --context "kind-$cluster")" || {
-    echo "cannot read the Applications of $cluster: root in argocd and spire-server in argocd-apps"; return 1; }
+    echo "cannot read the Applications of $cluster in argocd"; return 1; }
   jq -e '[.items[] | select(.metadata.name == "root" or .metadata.name == "spire-server")] | length == 2' >/dev/null <<<"$apps" || {
-    echo "$cluster has no Application root in argocd, or no Application spire-server in argocd-apps"; return 1; }
+    echo "$cluster has no Application root or spire-server in argocd"; return 1; }
   jq -r --arg root "$(published_digest "$cluster" root)" --arg spire "$(published_digest "$cluster" spire-server)" '.items[]
     | select(.metadata.name == "root" or .metadata.name == "spire-server")
     | if .metadata.name == "root" then select(.status.sync.revision != $root)

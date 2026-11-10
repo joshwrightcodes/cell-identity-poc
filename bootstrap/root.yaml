@@ -1,11 +1,14 @@
 # The root Application. It follows the root bundle's current tag, and each child Application
 # in that bundle pins its own bundle by digest. Bootstrap applies it once. It is not in a
 # bundle, because the argocd Application would then wait for the root, which waits for argocd.
+# The label keeps the Argo CD Agent from mirroring the root Application to the central view.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: root
   namespace: argocd
+  labels:
+    argocd-agent.argoproj-labs.io/ignore-sync: "true"
 spec:
   project: cell
   source:

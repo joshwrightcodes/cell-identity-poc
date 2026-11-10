@@ -3,21 +3,23 @@
 package e2e
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
-	"os"
 	"slices"
 	"strings"
 	"testing"
 )
 
 const (
-	appsNamespace  = "argocd-apps"
 	controllerPod  = "argocd-application-controller-0"
 	cmdParamsCM    = "argocd-cmd-params-cm"
-	appsPolicyName = "argocd-apps-no-secrets"
+	secretsPolicy  = "argocd-secrets-allowed"
+	agentRole      = "argocd-agent"
+	agentAccount   = "system:serviceaccount:argocd:argocd-agent"
+	retiredAppsNS  = "argocd-apps"
+	checksumNotice = "poc.internal/cmd-params-sha256"
 )
+
+var allowedSecrets = []string{"argocd-redis", "argocd-secret", "bundle-store"}
 
 // applicationNames lists the Applications of a namespace, sorted.
 func applicationNames(t *testing.T, cluster, ns string) []string {
@@ -31,89 +33,118 @@ func applicationNames(t *testing.T, cluster, ns string) []string {
 	return names
 }
 
-// TestM3AppsNamespaceHoldsNoSecrets checks, in each base-cell cluster, that argocd-apps holds one
-// Application per component and no Secret, that argocd holds only the root Application, that the
-// admission policy denies a Secret in argocd-apps, and that the application controller started
-// after the last change of argocd-cmd-params-cm: it runs the StatefulSet revision whose template
-// carries the checksum of the file that holds the setting.
-func TestM3AppsNamespaceHoldsNoSecrets(t *testing.T) {
+// TestM3ArgocdHoldsOnlyAllowedSecrets checks, in each base-cell cluster, that argocd holds the root
+// Application and one Application per component and no other Application anywhere, that argocd
+// holds only the three allowed Secrets, that the admission policy denies any other Secret there,
+// that the namespace argocd-apps is gone, and that no setting of application.namespaces remains.
+// In a cluster with the agent, the agent can list and watch Secrets in argocd and cannot get one.
+func TestM3ArgocdHoldsOnlyAllowedSecrets(t *testing.T) {
 	for _, cluster := range clustersWith(t, "") {
 		t.Run(cluster, func(t *testing.T) {
-			var want []string
+			want := []string{"root"}
 			for name := range publishedDigests(t, cluster) {
 				if name != "root" {
 					want = append(want, name)
 				}
 			}
 			slices.Sort(want)
-			if got := applicationNames(t, cluster, appsNamespace); !slices.Equal(got, want) {
-				t.Errorf("%s holds the Applications %v, want one for each component: %v", appsNamespace, got, want)
+			if got := applicationNames(t, cluster, "argocd"); !slices.Equal(got, want) {
+				t.Errorf("argocd holds the Applications %v, want root and one for each component: %v", got, want)
 			}
-			if got := applicationNames(t, cluster, "argocd"); !slices.Equal(got, []string{"root"}) {
-				t.Errorf("argocd holds the Applications %v, want only root", got)
-			}
-			secrets, err := kubectl(t, cluster, "", "-n", appsNamespace, "get", "secrets", "-o", "name")
+			all, err := kubectl(t, cluster, "", "get", "applications.argoproj.io", "-A", "-o", "jsonpath={range .items[*]}{.metadata.namespace}{\"\\n\"}{end}")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if strings.TrimSpace(secrets) != "" {
-				t.Errorf("%s holds Secrets: %s", appsNamespace, secrets)
+			for _, ns := range strings.Fields(all) {
+				// The principal in management keeps the mirror of each cell in the namespace of its agent.
+				if ns != "argocd" && !(cluster == mgmtCluster && strings.HasPrefix(ns, pocEnv+"-")) {
+					t.Errorf("an Application lives in the namespace %s, outside argocd", ns)
+				}
+			}
+			if out, err := kubectl(t, cluster, "", "get", "namespace", retiredAppsNS, "-o", "name"); err == nil {
+				t.Errorf("the namespace %s still exists: %s", retiredAppsNS, out)
+			}
+
+			names, err := kubectl(t, cluster, "", "-n", "argocd", "get", "secrets", "-o", "jsonpath={.items[*].metadata.name}")
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range strings.Fields(names) {
+				if !slices.Contains(allowedSecrets, name) {
+					t.Errorf("argocd holds the Secret %s, outside the allowed set %v", name, allowedSecrets)
+				}
 			}
 
 			// A server dry run reaches admission and stores nothing.
-			out, err := kubectl(t, cluster, "", "-n", appsNamespace, "create", "secret", "generic", "x", "--from-literal=k=v", "--dry-run=server")
+			out, err := kubectl(t, cluster, "", "-n", "argocd", "create", "secret", "generic", "m3-other", "--from-literal=k=v", "--dry-run=server")
 			if err == nil {
-				t.Fatalf("kubectl create secret --dry-run=server in %s succeeded: %s", appsNamespace, out)
+				t.Fatalf("kubectl create secret m3-other --dry-run=server in argocd succeeded: %s", out)
 			}
-			if !strings.Contains(err.Error(), appsPolicyName) {
-				t.Errorf("the denial does not name the policy %s: %v", appsPolicyName, err)
+			if !strings.Contains(err.Error(), secretsPolicy) {
+				t.Errorf("the denial does not name the policy %s: %v", secretsPolicy, err)
 			}
-
-			cm, err := kubectl(t, cluster, "", "-n", "argocd", "get", "configmap", cmdParamsCM, "-o", "jsonpath={.data.application\\.namespaces}")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cm != appsNamespace {
-				t.Errorf("%s application.namespaces is %q, want %q", cmdParamsCM, cm, appsNamespace)
+			for _, name := range allowedSecrets {
+				_, err := kubectl(t, cluster, "", "-n", "argocd", "create", "secret", "generic", name, "--from-literal=k=v", "--dry-run=server")
+				if err != nil && strings.Contains(err.Error(), secretsPolicy) {
+					t.Errorf("the policy denied the allowed Secret %s: %v", name, err)
+				}
 			}
 
-			// The ConfigMap has no change time that tells a data change from a change of field
-			// owner, because Argo CD takes the fields after the bootstrap apply. So the check
-			// follows the content: the controller pod belongs to the current StatefulSet revision,
-			// and that revision carries the checksum of the file that holds the setting.
-			sts, err := kubectl(t, cluster, "", "-n", "argocd", "get", "statefulset", "argocd-application-controller", "-o", "json")
+			cm, err := kubectl(t, cluster, "", "-n", "argocd", "get", "configmap", cmdParamsCM, "-o", "json")
 			if err != nil {
 				t.Fatal(err)
 			}
-			var set struct {
-				Spec struct {
-					Template struct {
-						Metadata struct {
-							Annotations map[string]string `json:"annotations"`
-						} `json:"metadata"`
-					} `json:"template"`
-				} `json:"spec"`
-				Status struct {
-					UpdateRevision string `json:"updateRevision"`
-				} `json:"status"`
+			var params struct {
+				Data map[string]string `json:"data"`
 			}
-			if err := json.Unmarshal([]byte(sts), &set); err != nil {
+			if err := json.Unmarshal([]byte(cm), &params); err != nil {
 				t.Fatal(err)
 			}
-			params, err := os.ReadFile("../../components/argocd/argocd-cmd-params-cm.yaml")
+			if v, ok := params.Data["application.namespaces"]; ok {
+				t.Errorf("%s sets application.namespaces to %q", cmdParamsCM, v)
+			}
+			ann, err := kubectl(t, cluster, "", "-n", "argocd", "get", "statefulset", "argocd-application-controller", "-o", "jsonpath={.spec.template.metadata.annotations}")
 			if err != nil {
 				t.Fatal(err)
 			}
-			sum := sha256.Sum256(params)
-			if got, want := set.Spec.Template.Metadata.Annotations["poc.internal/cmd-params-sha256"], hex.EncodeToString(sum[:]); got != want {
-				t.Errorf("the controller template carries cmd-params-sha256 %q, want %s", got, want)
+			if strings.Contains(ann, checksumNotice) {
+				t.Errorf("the controller template still carries %s: %s", checksumNotice, ann)
 			}
-			pod, err := kubectl(t, cluster, "", "-n", "argocd", "get", "pod", controllerPod, "-o", "jsonpath={.metadata.labels.controller-revision-hash}")
+			if out, err := kubectl(t, cluster, "", "-n", "argocd", "get", "pod", controllerPod, "-o", "jsonpath={.status.phase}"); err != nil || out != "Running" {
+				t.Errorf("%s is %q (%v), want Running", controllerPod, out, err)
+			}
+
+			if !slices.Contains(viewCells(t), cluster) {
+				return
+			}
+			rules, err := kubectl(t, cluster, "", "-n", "argocd", "get", "role", agentRole, "-o", "json")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if pod != set.Status.UpdateRevision {
-				t.Errorf("%s runs revision %q, want the current revision %q", controllerPod, pod, set.Status.UpdateRevision)
+			var role struct {
+				Rules []struct {
+					Resources []string `json:"resources"`
+					Verbs     []string `json:"verbs"`
+				} `json:"rules"`
+			}
+			if err := json.Unmarshal([]byte(rules), &role); err != nil {
+				t.Fatal(err)
+			}
+			var secretVerbs []string
+			for _, r := range role.Rules {
+				if slices.Contains(r.Resources, "secrets") {
+					secretVerbs = append(secretVerbs, r.Verbs...)
+				}
+			}
+			slices.Sort(secretVerbs)
+			if !slices.Equal(secretVerbs, []string{"list", "watch"}) {
+				t.Errorf("the Role %s grants %v on Secrets, want [list watch]", agentRole, secretVerbs)
+			}
+			for verb, want := range map[string]string{"get": "no", "list": "yes", "watch": "yes"} {
+				got, _ := kubectl(t, cluster, "", "auth", "can-i", verb, "secrets", "-n", "argocd", "--as="+agentAccount)
+				if strings.TrimSpace(got) != want {
+					t.Errorf("can-i %s secrets in argocd as the agent: %q, want %q", verb, strings.TrimSpace(got), want)
+				}
 			}
 		})
 	}

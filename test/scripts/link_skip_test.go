@@ -78,13 +78,9 @@ if [[ " $* " == *" get pod spire-server-0 "* ]]; then
   exit 0
 fi
 if [[ " $* " == *" get applications -o json "* ]]; then
-  # STUB_CHILDREN_IN names the namespace of the child Applications, argocd-apps by default.
-  want='. != "root"'
-  [[ " $* " != *" -n argocd get "* ]] || want='. == "root"'
-  if [[ "${STUB_CHILDREN_IN:-argocd-apps}" == argocd ]]; then
-    want='. == "root" or . != "root"'
-    [[ " $* " == *" -n argocd get "* ]] || want='false'
-  fi
+  # STUB_NO_CHILDREN leaves only the root Application in argocd.
+  want='. == "root" or . != "root"'
+  [[ -z "${STUB_NO_CHILDREN:-}" ]] || want='. == "root"'
   cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: ., namespace: \"x\"},
     status: {sync: {status: \"Synced\", revision: \"sha256:1\"}, health: {status: \"Healthy\"}}}]}"
 fi
@@ -171,17 +167,16 @@ func TestLinkPhaseNeedsTheOtherClusters(t *testing.T) {
 	}
 }
 
-// up.sh stops at UP_WAIT with the reason when the child Applications are in the wrong namespace.
+// up.sh stops at UP_WAIT with the reason when argocd lacks the child Applications.
 func TestUpNamesWhyTheApplicationsAreNotReady(t *testing.T) {
 	root, logFile := linkRoot(t)
 	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))
 	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"), "CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + logFile,
-		"CELL_UP_SKIP_LINK=1", "UP_WAIT=1", "STUB_CHILDREN_IN=argocd"}
+		"CELL_UP_SKIP_LINK=1", "UP_WAIT=1", "STUB_NO_CHILDREN=1"}
 	start := time.Now()
 	out, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(out), "in 1s. Blocked by:") || !strings.Contains(string(out), "argocd holds Applications other than root") ||
-		!strings.Contains(string(out), "argocd-apps lacks") {
+	if err == nil || !strings.Contains(string(out), "in 1s. Blocked by:") || !strings.Contains(string(out), "argocd lacks") {
 		t.Fatalf("err %v, output %s; want a stop after UP_WAIT that names the blockers", err, out)
 	}
 	if time.Since(start) > 60*time.Second {
@@ -189,8 +184,8 @@ func TestUpNamesWhyTheApplicationsAreNotReady(t *testing.T) {
 	}
 }
 
-// publish.sh writes every child Application into argocd-apps.
-func TestPublishWritesTheApplicationsToArgocdApps(t *testing.T) {
+// publish.sh writes every child Application into argocd.
+func TestPublishWritesTheApplicationsToArgocd(t *testing.T) {
 	root, logFile := linkRoot(t)
 	b, err := os.ReadFile("../../scripts/publish.sh")
 	if err != nil {
@@ -224,8 +219,8 @@ func TestPublishWritesTheApplicationsToArgocdApps(t *testing.T) {
 	}
 	for _, f := range files {
 		data, _ := os.ReadFile(f)
-		if !strings.Contains(string(data), "\n  namespace: argocd-apps\n") {
-			t.Errorf("%s does not name the namespace argocd-apps:\n%s", filepath.Base(f), data)
+		if !strings.Contains(string(data), "\n  namespace: argocd\n") {
+			t.Errorf("%s does not name the namespace argocd:\n%s", filepath.Base(f), data)
 		}
 	}
 }

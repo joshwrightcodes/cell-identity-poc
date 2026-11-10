@@ -1113,8 +1113,8 @@ and the AppProject path of `principal/event.go`, in the same scratch copy. It ra
   namespace only, and Namespaces in the cluster (`agent/agent.go` lines 300 to 470). Its settings
   manager reads `argocd-cm` in that namespace (`agent/tracking.go`).
 - Argo CD reads AppProjects only in its own namespace, and the agent sends only the AppProjects of
-  its namespace. So the cells put a copy of AppProject `cell` in `argocd-apps`. The principal stores
-  it as `<agent>-cell` in its namespace, with `sourceNamespaces` set to the agent namespace
+  its namespace, which is `argocd`. So the agent sends AppProject `cell` from `argocd`. The principal
+  stores it as `<agent>-cell` in its namespace, with `sourceNamespaces` set to the agent namespace
   (`principal/event.go` lines 525 to 545). The central `argocd-server` needs that project, because
   `getAppEnforceRBAC` loads the project of each Application (`server/application/application.go`
   lines 248 to 252 of Argo CD v3.6.1).

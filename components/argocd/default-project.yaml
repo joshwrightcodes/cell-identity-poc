@@ -1,9 +1,12 @@
 # The server of argocd admin dashboard creates AppProject default with every source, destination and
-# kind when none exists. This project allows nothing, so Applications cannot use it.
+# kind when none exists. This project allows nothing, so Applications cannot use it. The label
+# keeps the Argo CD Agent from mirroring it to the central view.
 apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
   name: default
+  labels:
+    argocd-agent.argoproj-labs.io/ignore-sync: "true"
 spec:
   description: Allows nothing. Applications use the project cell
   sourceRepos: []

@@ -7,17 +7,7 @@ resources:
   - bundle-store.yaml
   - project.yaml
   - default-project.yaml
-  - apps-namespace-guard.yaml
+  - guards.yaml
 patches:
   - path: argocd-cm.yaml
   - path: argocd-cmd-params-cm.yaml
-  # The controller reads application.namespaces from argocd-cmd-params-cm at start. This checksum
-  # of components/argocd/argocd-cmd-params-cm.yaml restarts it when that file changes.
-  - target:
-      kind: StatefulSet
-      name: argocd-application-controller
-    patch: |-
-      - op: add
-        path: /spec/template/metadata/annotations
-        value:
-          poc.internal/cmd-params-sha256: "63e5e990c0f99e172f5469c1c615951a33b70d256314b3a89a4cf2a6ac98d136"

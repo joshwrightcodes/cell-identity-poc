@@ -52,7 +52,7 @@ eso_ready() {
 end=$((SECONDS + eso_wait))
 until eso_ready; do
   if ((SECONDS >= end)); then
-    log "check the operator: mise x -- kubectl --context kind-$CELL_NAME -n argocd-apps get application external-secrets"
+    log "check the operator: mise x -- kubectl --context kind-$CELL_NAME -n argocd get application external-secrets"
     die "the External Secrets Operator in kind-$CELL_NAME has no rolled-out controller scoped to ${store_namespaces%% *} after ${eso_wait}s. Run CELL=$CELL mise run secrets:connect again when it is Healthy."
   fi
   sleep 5

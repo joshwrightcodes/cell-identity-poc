@@ -184,18 +184,12 @@ live_image_mismatches() {
   done
 }
 
-# APPS_NAMESPACE holds every child Application. The root Application stays in argocd.
-APPS_NAMESPACE=argocd-apps
-
-# applications_json <kubectl command...> prints the Applications of argocd and argocd-apps as one
-# object: root (the list of argocd), children (the list of argocd-apps) and items (both lists).
-# The kubectl command is the part before -n, for example: applications_json k. Its errors reach
-# standard error.
+# applications_json <kubectl command...> prints the Applications of argocd as one object: root (the
+# Application root), children (every other Application) and items (all of them). The kubectl
+# command is the part before -n, for example: applications_json k. Its errors reach standard error.
 applications_json() {
-  local root children
-  root="$("$@" -n argocd get applications -o json)" || return 1
-  children="$("$@" -n "$APPS_NAMESPACE" get applications -o json)" || return 1
-  jq -s '{root: .[0].items, children: .[1].items, items: (.[0].items + .[1].items)}' <<<"$root"$'\n'"$children"
+  "$@" -n argocd get applications -o json \
+    | jq '{root: [.items[] | select(.metadata.name == "root")], children: [.items[] | select(.metadata.name != "root")], items}'
 }
 
 # apps_json prints the Applications of the cluster CELL_NAME as a list: {items: [...]}.
@@ -204,8 +198,8 @@ apps_json() {
 }
 
 # apps_match_published reads the object of applications_json and the published digests as JSON from
-# standard input, one document after the other. It succeeds when argocd holds only the root, argocd-apps
-# holds exactly the published components, and each Application is Synced and Healthy at its digest.
+# standard input, one document after the other. It succeeds when argocd holds the root and exactly the
+# published components, and each Application is Synced and Healthy at its digest.
 apps_match_published() {
   jq -s -e '.[0] as $a | .[1] as $pub
     | ($a.root | map(.metadata.name)) == ["root"]
@@ -215,8 +209,8 @@ apps_match_published() {
 }
 
 # apps_at_published succeeds when Argo CD reports every Application of the cluster Synced and
-# Healthy at the revision that publish.sh pushed. The root Application is in argocd and has no
-# sibling there. A check that runs before Argo CD reads the new root bundle cannot pass.
+# Healthy at the revision that publish.sh pushed. A check that runs before Argo CD reads the new
+# root bundle cannot pass.
 apps_at_published() {
   local published_json apps
   published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
@@ -230,30 +224,27 @@ apps_blockers() {
   published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
   apps="$(applications_json k)" || return 1
   printf '%s\n%s\n' "$apps" "$published_json" | jq -s -r '.[0] as $a | .[1] as $pub
-    | ($a.root | map(.metadata.name) | map(select(. != "root"))) as $stray
     | (($pub | del(.root) | keys) - ($a.children | map(.metadata.name))) as $missing
     | (($a.children | map(.metadata.name)) - ($pub | del(.root) | keys)) as $unknown
-    | (if ($stray | length) > 0 then "argocd holds Applications other than root: \($stray | join(", "))" else empty end),
-      (if ($a.root | map(.metadata.name) | index("root")) == null then "argocd has no root Application" else empty end),
-      (if ($missing | length) > 0 then "argocd-apps lacks \($missing | join(", "))" else empty end),
-      (if ($unknown | length) > 0 then "argocd-apps holds Applications that were not published: \($unknown | join(", "))" else empty end),
+    | (if ($a.root | length) == 0 then "argocd has no root Application" else empty end),
+      (if ($missing | length) > 0 then "argocd lacks \($missing | join(", "))" else empty end),
+      (if ($unknown | length) > 0 then "argocd holds Applications that were not published: \($unknown | join(", "))" else empty end),
       ($a.items[] | select(.status.sync.status != "Synced" or .status.health.status != "Healthy"
           or .status.sync.revision != $pub[.metadata.name])
         | "\(.metadata.namespace)/\(.metadata.name) is \(.status.sync.status // "unknown")/\(.status.health.status // "unknown") at \(.status.sync.revision // "no revision"), published \($pub[.metadata.name] // "nothing")")'
 }
 
-# check_apps_namespace succeeds when argocd holds only the root Application and argocd-apps holds
-# every other Application. In a cluster with VIEW_CELLS, the principal of the central view also
-# mirrors the Applications of each cell into its agent namespace <POC_ENV>-<cell>.
+# check_apps_namespace succeeds when every Application lives in argocd, and argocd has the root
+# Application. In a cluster with VIEW_CELLS, the principal of the central view also mirrors the
+# Applications of each cell into its agent namespace <POC_ENV>-<cell>.
 check_apps_namespace() {
   local found cell mirrors=()
   for cell in ${VIEW_CELLS:-}; do mirrors+=("$POC_ENV-$cell"); done
   found="$(k get applications -A -o json | jq -r --argjson mirrors "$(printf '%s\n' ${mirrors[@]+"${mirrors[@]}"} | jq -Rcn '[inputs | select(length > 0)]')" '.items[]
-    | select((.metadata.namespace == "argocd" and .metadata.name == "root") or .metadata.namespace == "argocd-apps"
-        or (.metadata.namespace as $ns | $mirrors | index($ns)) != null | not)
+    | select(.metadata.namespace == "argocd" or (.metadata.namespace as $ns | $mirrors | index($ns)) != null | not)
     | "\(.metadata.namespace)/\(.metadata.name)"')" || return 1
   [[ -z "$found" ]] || {
-    echo "Applications outside $APPS_NAMESPACE, except the root: ${found//$'\n'/ }. Run: CELL=$CELL_NAME mise run cell:up. If one stays, list them with kubectl --context kind-$CELL_NAME get applications -A, then delete it with kubectl --context kind-$CELL_NAME -n <namespace> delete application <name>"
+    echo "Applications outside argocd: ${found//$'\n'/ }. Run: CELL=$CELL_NAME mise run cell:up. If one stays, list them with kubectl --context kind-$CELL_NAME get applications -A, then delete it with kubectl --context kind-$CELL_NAME -n <namespace> delete application <name>"
     return 1
   }
   k -n argocd get application root >/dev/null 2>&1 || { echo "argocd has no root Application. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
@@ -286,18 +277,55 @@ check_no_admin_credentials() {
     || { echo "argocd-secret holds admin.password. Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
 }
 
-# check_apps_guard succeeds when argocd-apps holds no Secret, and the policy and the binding that
-# deny a Secret there exist with their effect.
-check_apps_guard() {
-  local secrets
-  secrets="$(k -n "$APPS_NAMESPACE" get secrets -o name)" || return 1
-  [[ -z "$secrets" ]] || { echo "$APPS_NAMESPACE holds Secrets: ${secrets//$'\n'/ }"; return 1; }
-  k get validatingadmissionpolicy argocd-apps-no-secrets -o json | jq -e '
-    .spec.failurePolicy == "Fail" and .spec.validations[0].expression == "false"' >/dev/null \
-    || { echo "ValidatingAdmissionPolicy argocd-apps-no-secrets is missing or does not deny"; return 1; }
-  k get validatingadmissionpolicybinding argocd-apps-no-secrets -o json | jq -e '
-    .spec.policyName == "argocd-apps-no-secrets" and .spec.validationActions == ["Deny"]' >/dev/null \
-    || { echo "ValidatingAdmissionPolicyBinding argocd-apps-no-secrets is missing or does not deny"; return 1; }
+# ARGOCD_SECRETS is the closed set of Secrets that argocd may hold. components/argocd/guards.yaml
+# enforces the same set at admission.
+ARGOCD_SECRETS=(argocd-redis argocd-secret bundle-store)
+
+# check_argocd_secrets succeeds when every Secret in argocd is in ARGOCD_SECRETS, the Argo CD Agent
+# cannot get a Secret there, and the policy and the binding that keep the set closed exist with
+# their effect.
+check_argocd_secrets() {
+  local secrets name extra=() allowed policy
+  secrets="$(k -n argocd get secrets -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
+  for name in $secrets; do
+    [[ " ${ARGOCD_SECRETS[*]} " == *" $name "* ]] || extra+=("$name")
+  done
+  ((${#extra[@]} == 0)) || { echo "argocd holds Secrets outside the allowed set (${ARGOCD_SECRETS[*]}): ${extra[*]}"; return 1; }
+  allowed="$(k auth can-i get secrets -n argocd --as=system:serviceaccount:argocd:argocd-agent)" || true
+  [[ "$allowed" == no ]] || { echo "the ServiceAccount argocd-agent can get Secrets in argocd (can-i says '$allowed')"; return 1; }
+  policy="$(printf '%s\n' "${ARGOCD_SECRETS[@]}" | jq -Rcn '[inputs]')"
+  k get validatingadmissionpolicy argocd-secrets-allowed -o json | jq -e --argjson names "$policy" '
+    .spec.failurePolicy == "Fail" and (.spec.validations | length) == 1
+      and .spec.validations[0].expression == "object.metadata.name in [\($names | map("\u0027" + . + "\u0027") | join(", "))]"
+      and (.spec.matchConstraints.resourceRules | length) == 1
+      and .spec.matchConstraints.resourceRules[0].operations == ["CREATE", "UPDATE"]' >/dev/null \
+    || { echo "ValidatingAdmissionPolicy argocd-secrets-allowed is missing, or it does not allow exactly ${ARGOCD_SECRETS[*]}"; return 1; }
+  k get validatingadmissionpolicybinding argocd-secrets-allowed -o json | jq -e '
+    .spec.policyName == "argocd-secrets-allowed" and .spec.validationActions == ["Deny"]
+      and .spec.matchResources.namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "argocd"' >/dev/null \
+    || { echo "ValidatingAdmissionPolicyBinding argocd-secrets-allowed is missing or does not deny in argocd"; return 1; }
+}
+
+# retire_apps_namespace deletes the namespace argocd-apps, with the Applications, the Role and the
+# AppProject copy in it, and then the policies argocd-apps-no-secrets and argocd-apps-cell-project.
+# Older cells held every child Application in that namespace. Run it before the new root bundle
+# reaches the cell, for three reasons:
+#   - The Applications in the namespace repair the old policies, so they must go first. An
+#     Application has no finalizer, so the delete leaves the objects that it manages in place.
+#   - The policy argocd-apps-cell-project denies an Application in argocd other than the root.
+#   - The harness apply does not prune, and the Application that owned the old objects is pruned
+#     with the old root bundle, so nothing else removes them.
+# It does nothing on a cell that holds none of these objects.
+retire_apps_namespace() {
+  local name
+  if k get namespace argocd-apps >/dev/null 2>&1; then
+    log "deleting the namespace argocd-apps"
+    k delete namespace argocd-apps --ignore-not-found --wait=true --timeout=180s >/dev/null || return 1
+  fi
+  for name in argocd-apps-no-secrets argocd-apps-cell-project; do
+    k delete validatingadmissionpolicybinding "$name" --ignore-not-found >/dev/null || return 1
+    k delete validatingadmissionpolicy "$name" --ignore-not-found >/dev/null || return 1
+  done
 }
 
 # clean_dashboard_leftovers removes what the server of argocd admin dashboard wrote into argocd:
@@ -337,7 +365,7 @@ eso_published_synced() {
   local want
   want="$(sed -n 's/^external-secrets=//p' "$PUBLISHED" 2>/dev/null)"
   [[ -n "$want" ]] || return 1
-  k -n "$APPS_NAMESPACE" get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
+  k -n argocd get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
     .status.sync.status == "Synced" and .status.health.status == "Healthy" and .status.sync.revision == $want' >/dev/null
 }
 
@@ -491,7 +519,7 @@ harness_conflicts() {
   apps="$(printf '%s\n' root ${COMPONENTS[@]+"${COMPONENTS[@]%%:*}"} | jq -Rn '[inputs]')"
   jq -r --arg comp "$comp" --arg label "$HARNESS_LABEL" --argjson apps "$apps" '
     (if .kind == "List" then .items[] else . end)
-    | ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | split(":")[0] // "" | sub("^argocd-apps_"; "")) as $app
+    | ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | split(":")[0]) as $app
     | (.metadata.labels[$label] // "") as $owner
     | ([(.metadata.ownerReferences // [])[] | "\(.kind)/\(.name)"] | join(", ")) as $refs
     | "\(.kind)/\(.metadata.name)\(if .metadata.namespace then " in " + .metadata.namespace else "" end)" as $o

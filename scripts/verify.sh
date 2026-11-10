@@ -75,7 +75,7 @@ check_argocd_local_only() {
 }
 
 # The base platform namespaces, and the namespace of each harness and link component of this cell.
-platform_namespaces=(argocd argocd-apps cell-system observability-system)
+platform_namespaces=(argocd cell-system observability-system)
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   platform_namespaces+=("${entry#*:}")
 done
@@ -613,10 +613,10 @@ check_traces_received() {
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
-check "No Application is outside argocd-apps, except the root" check_apps_namespace
+check "No Application is outside argocd, except the mirrors of the central view" check_apps_namespace
 check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
 check "argocd holds no admin password" check_no_admin_credentials
-check "argocd-apps holds no Secret, and its policy denies one" check_apps_guard
+check "argocd holds only the allowed Secrets, and the agent cannot get one" check_argocd_secrets
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh

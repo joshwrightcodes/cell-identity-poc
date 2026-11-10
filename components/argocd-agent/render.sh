@@ -3,8 +3,8 @@
 #
 # The bundle holds the agent Deployment with cell-proxy and a cluster_jwt SPIRE agent sidecar
 # (manifests.yaml), ConfigMap mgmt-root, the NetworkPolicy of flow N20, the agent Role in
-# argocd-apps, a copy of AppProject cell in argocd-apps, and the read rules of the central view. Every object and the pod template carry
-# the harness label cell.poc.internal/harness=argocd-agent.
+# argocd, and the read rules of the central view. Every object and the pod template carry the
+# harness label cell.poc.internal/harness=argocd-agent.
 #
 # The read rules let the resource proxy of the view read the live objects of the cell. render.sh
 # derives them from the kinds of the bundles in AGENT_BUNDLES (default build/<cluster>/bundles),
@@ -125,16 +125,8 @@ deployment="$(yq 'select(.kind == "Deployment" and .metadata.name == "argocd-age
     SPIRE_SIDECAR_BUNDLE="$env_bundle" SPIRE_SIDECAR_CELL="@CELL_NAME@" \
     spire_sidecar argocd-agent cluster_jwt)" || die "the SPIRE sidecar of the agent failed"
 
-# The agent sends only the AppProjects of its namespace, and Argo CD reads AppProjects only in
-# argocd. So the copy of AppProject cell in argocd-apps lets the principal store the project of the
-# mirrored Applications, as <agent>-cell. Argo CD ignores the copy.
-project="$(yq '.metadata.namespace = "argocd-apps"' "$root/components/argocd/project.yaml")"
-[[ "$(yq '.kind + "/" + .metadata.name' <<<"$project")" == AppProject/cell ]] || die "components/argocd/project.yaml holds no AppProject cell"
-
 {
   yq 'select(.kind != "Deployment")' <<<"$manifests"
-  echo "---"
-  echo "$project"
   echo "---"
   echo "$deployment"
   echo "---"

@@ -19,7 +19,7 @@ import (
 const storeKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 case " $* " in
-  *" -n argocd-apps get application external-secrets "*)
+  *" get application external-secrets "*)
     rev=sha256:new; [[ -z "${STUB_APP_OLD:-}" ]] || rev=sha256:old
     echo "{\"status\":{\"sync\":{\"status\":\"Synced\",\"revision\":\"$rev\"},\"health\":{\"status\":\"Healthy\"}}}" ;;
   *" get deployment external-secrets "*)

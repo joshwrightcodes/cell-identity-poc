@@ -106,6 +106,11 @@ func decodeApplications(t *testing.T, data []byte) []cellApplication {
 	return out
 }
 
+// withoutRoot drops the root Application, which the agent does not mirror.
+func withoutRoot(apps []cellApplication) []cellApplication {
+	return slices.DeleteFunc(apps, func(a cellApplication) bool { return a.Name == "root" })
+}
+
 // TestM3BothCellsInCentralView lists the Applications of each agent namespace through the central
 // API. Each cell has one Application there per child Application, with the status of the cell. The
 // managed resources of apps-demo hold the live Deployment echo of that cell.
@@ -113,13 +118,13 @@ func TestM3BothCellsInCentralView(t *testing.T) {
 	for _, cell := range viewCells(t) {
 		t.Run(cell, func(t *testing.T) {
 			requireViewConnected(t, agentName(cell))
-			out, err := kubectl(t, cell, "", "-n", appsNamespace, "get", "applications.argoproj.io", "-o", "json")
+			out, err := kubectl(t, cell, "", "-n", agentNamespace, "get", "applications.argoproj.io", "-o", "json")
 			if err != nil {
 				t.Fatal(err)
 			}
-			want := decodeApplications(t, []byte(out))
+			want := withoutRoot(decodeApplications(t, []byte(out)))
 			if len(want) == 0 {
-				t.Fatalf("%s holds no child Application in %s", cell, appsNamespace)
+				t.Fatalf("%s holds no child Application in %s", cell, agentNamespace)
 			}
 			waitFor(t, "the central view of "+cell+" matches the cell", agentWait, func() (bool, string) {
 				got := decodeApplications(t, centralAPI(t, "/api/v1/applications?appNamespace="+agentName(cell)))
@@ -435,7 +440,7 @@ func TestM3TokenReplayAcrossCells(t *testing.T) {
 	req = protoString(req, 1, "header")
 	req = protoString(req, 3, "autonomous")
 	req = protoString(req, 4, version)
-	req = protoString(req, 5, appsNamespace)
+	req = protoString(req, 5, agentNamespace)
 	one := dialView(t, addr, svid("dev-cell-1"), roots)
 	resp, status := one.call(t, "/authapi.Authentication/Authenticate", "", req)
 	if status != "0" {
@@ -676,8 +681,7 @@ func TestM3RelayNodePortAdmission(t *testing.T) {
 }
 
 // TestM3AppsProjectGuard checks, in each cluster with Argo CD, that the admission policy denies an
-// Application in argocd other than the root, and an Application in argocd-apps with another project
-// than cell. A dry run of an allowed Application passes.
+// Application in argocd with another project than cell. A dry run of an allowed Application passes.
 func TestM3AppsProjectGuard(t *testing.T) {
 	app := func(ns, name, project string) string {
 		return fmt.Sprintf(`{"apiVersion":"argoproj.io/v1alpha1","kind":"Application","metadata":{"name":%q,"namespace":%q},
@@ -689,9 +693,8 @@ func TestM3AppsProjectGuard(t *testing.T) {
 			for _, tc := range []struct {
 				ns, name, project, want string
 			}{
-				{appsNamespace, "m3-guard-probe", "default", "uses the project cell"},
-				{"argocd", "m3-guard-probe", "cell", "holds only the root Application"},
-				{appsNamespace, "m3-guard-probe", "cell", ""},
+				{"argocd", "m3-guard-probe", "default", "uses the project cell"},
+				{"argocd", "m3-guard-probe", "cell", ""},
 			} {
 				_, err := kubectl(t, cluster, app(tc.ns, tc.name, tc.project), "create", "--dry-run=server", "-f", "-")
 				switch {
@@ -700,6 +703,58 @@ func TestM3AppsProjectGuard(t *testing.T) {
 				case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
 					t.Errorf("%s/%s with project %s: %v, want a denial that says %q", tc.ns, tc.name, tc.project, err, tc.want)
 				}
+			}
+		})
+	}
+}
+
+// TestM3CentralViewShowsLiveResources reads the managed resources and the resource tree of every
+// child Application of each cell through the central API. Both answer HTTP 200, the managed
+// resources carry a live manifest for each object that the cell holds, and the tree has nodes.
+func TestM3CentralViewShowsLiveResources(t *testing.T) {
+	for _, cell := range viewCells(t) {
+		t.Run(cell, func(t *testing.T) {
+			requireViewConnected(t, agentName(cell))
+			out, err := kubectl(t, cell, "", "-n", agentNamespace, "get", "applications.argoproj.io", "-o", "json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			apps := withoutRoot(decodeApplications(t, []byte(out)))
+			if len(apps) == 0 {
+				t.Fatalf("%s holds no child Application in %s", cell, agentNamespace)
+			}
+			for _, app := range apps {
+				base := "/api/v1/applications/" + app.Name
+				query := "?appNamespace=" + agentName(cell)
+				var res struct {
+					Items []struct {
+						Kind, Name, Namespace, LiveState string
+					} `json:"items"`
+				}
+				data := centralAPI(t, base+"/managed-resources"+query)
+				if err := json.Unmarshal(data, &res); err != nil {
+					t.Fatalf("%s: decode the managed resources: %v", app.Name, err)
+				}
+				live := 0
+				for _, item := range res.Items {
+					if strings.TrimSpace(item.LiveState) != "" && item.LiveState != "null" {
+						live++
+					}
+				}
+				if len(res.Items) == 0 || live == 0 {
+					t.Errorf("%s in %s: the managed resources hold %d objects and %d live manifests, want both above zero", app.Name, cell, len(res.Items), live)
+				}
+				var tree struct {
+					Nodes []struct{ Kind, Name string } `json:"nodes"`
+				}
+				data = centralAPI(t, base+"/resource-tree"+query)
+				if err := json.Unmarshal(data, &tree); err != nil {
+					t.Fatalf("%s: decode the resource tree: %v", app.Name, err)
+				}
+				if len(tree.Nodes) == 0 {
+					t.Errorf("%s in %s: the resource tree has no node", app.Name, cell)
+				}
+				t.Logf("%s %s: %d managed resources, %d live manifests, %d tree nodes", cell, app.Name, len(res.Items), live, len(tree.Nodes))
 			}
 		})
 	}

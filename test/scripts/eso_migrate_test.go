@@ -29,7 +29,7 @@ case " $* " in
     echo annotated ;;
   *"sync-options}"*) cat "$STUB_DIR/annotation" 2>/dev/null || true ;;
   *"tracking-id}"*)
-    if ((published)); then if [[ -n "${STUB_OLD_TRACKING:-}" ]]; then echo "external-secrets:/Namespace:spire-system/spire-system"; else echo "argocd-apps_external-secrets:/Namespace:spire-system/spire-system"; fi
+    if ((published)); then echo "external-secrets:/Namespace:spire-system/spire-system"
     else echo "spire-server:/Namespace:spire-system/spire-system"; fi ;;
   *" get namespace spire-system -o jsonpath={.metadata.uid} "*)
     if [[ -n "${STUB_NS_UID_CHANGES:-}" ]] && ((connected)); then echo uid-new; else echo uid-ns; fi ;;
@@ -40,13 +40,10 @@ case " $* " in
   *" get deployment external-secrets -o json "*)
     arg=--enable-secret-store-reconciler=false; ((published)) && arg=--namespace=spire-system
     echo "{\"metadata\":{\"generation\":4},\"spec\":{\"replicas\":1,\"template\":{\"spec\":{\"containers\":[{\"args\":[\"$arg\"]}]}}},\"status\":{\"observedGeneration\":4,\"replicas\":1,\"updatedReplicas\":1,\"availableReplicas\":1}}" ;;
-  *" -n argocd-apps get application external-secrets -o json "*)
+  *" get application external-secrets -o json "*)
     echo '{"status":{"sync":{"status":"Synced","revision":"sha256:new"},"health":{"status":"Healthy"}}}' ;;
-  *" -n argocd get applications -o json "*)
-    jq -Rn '{items: [inputs | select(length > 0) | split("=") | select(.[0] == "root") | {metadata: {name: .[0]},
-      status: {sync: {status: "Synced", revision: .[1]}, health: {status: "Healthy"}}}]}' <"$POC_BUILD_ROOT/dev-cp/published.env" ;;
-  *" -n argocd-apps get applications -o json "*)
-    jq -Rn '{items: [inputs | select(length > 0) | split("=") | select(.[0] != "root") | {metadata: {name: .[0]},
+  *" get applications -o json "*)
+    jq -Rn '{items: [inputs | select(length > 0) | split("=") | {metadata: {name: .[0]},
       status: {sync: {status: "Synced", revision: .[1]}, health: {status: "Healthy"}}}]}' <"$POC_BUILD_ROOT/dev-cp/published.env" ;;
   *" get clusterroles,clusterrolebindings -o name "*)
     ((published)) || echo clusterrole.rbac.authorization.k8s.io/external-secrets-controller ;;
@@ -187,14 +184,6 @@ func TestMigrateOnAMigratedClusterOnlyChecks(t *testing.T) {
 	}
 	if index(calls, "delete crd clustersecretstores.external-secrets.io") < 0 {
 		t.Fatal("the cleanup did not run")
-	}
-}
-
-// A cell that has not moved its Applications yet carries the tracking IDs of the form <name>:.
-func TestMigrateAcceptsTheOldTrackingID(t *testing.T) {
-	out, _, err := runMigrate(t, "STUB_OLD_TRACKING=1")
-	if err != nil {
-		t.Fatalf("eso:migrate failed: %v\n%s", err, out)
 	}
 }
 

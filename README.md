@@ -180,13 +180,16 @@ The view is read-only, so a refresh in the UI fails with a permission error.
 `argocd-server` may read the Applications of the agent namespaces and change none of them.
 
 Each cell runs the harness component `argocd-agent` in the namespace `argocd`.
-The agent runs in autonomous mode, and sends the Applications of `argocd-apps` to the principal.
-It also sends a copy of AppProject `cell` from `argocd-apps`, which Argo CD itself ignores.
+The agent runs in autonomous mode with `--namespace=argocd`, and sends the child Applications of `argocd` to the principal.
+The root Application carries the label `argocd-agent.argoproj-labs.io/ignore-sync`, so the agent does not send it.
 The principal stores the Applications in `<env>-<cell>`, and the project as `<env>-<cell>-cell` in `central-view-system`.
 The `cell-proxy` sidecar of the agent dials the relay in `dev-cp` on node port 30443, and accepts only the principal ID `spiffe://mgmt.poc.internal/argocd/principal`.
 It trusts that ID only through ConfigMap `mgmt-root`, a copy of the live root of `management`.
-The agent reads the live objects of the bundle kinds for the view, and it may read no Secret outside `argocd-apps`.
-An admission policy admits in `argocd` only the root Application, and in `argocd-apps` only Applications of the project `cell`.
+The agent reads the live objects of the bundle kinds for the view.
+`argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. None of them holds a usable credential.
+An admission policy denies every other Secret in `argocd`, and a second policy admits only Applications of the project `cell`.
+The agent can list and watch these Secrets, because it does not start without that access, but it cannot get one.
+The agent in autonomous mode never sends a Secret to the central view, and the resource proxy refuses a Secret read.
 
 The relay in `dev-cp` is the bundle `relay-system` at wave 8.
 Deployment `relay-view` passes node ports 30443 and 30445 to node ports 31443 and 31445 of `management`.
@@ -592,12 +595,12 @@ On a failure after the annotation, the task prints the rollback commands.
 The cell runs the Argo CD core install, which has no UI. `mise run cell:ui` serves the UI
 from your Mac at <http://localhost:8080> and reads the cluster through your kubeconfig.
 It needs no login, and it stops when you press Ctrl-C.
-The UI lists only the root Application. The script prints the child Applications first, and the `kubectl` line below lists them again.
+The UI lists every Application of the cell.
 The local server writes a signing key into `argocd-secret` in the cluster. The script removes the key when you stop the UI. After a killed run, use `mise run cell:ui:clean`.
 
 ```sh
 mise run cell:ui
-kubectl --context kind-dev-cell-1 -n argocd-apps get applications
+kubectl --context kind-dev-cell-1 -n argocd get applications
 kubectl --context kind-dev-cell-1 -n observability-system logs deploy/otel-collector
 ```
 

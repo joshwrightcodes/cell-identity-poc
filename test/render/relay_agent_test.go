@@ -163,7 +163,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 	}
 	agentArgs := fmt.Sprint(get[[]any](t, named(t, containers, "argocd-agent"), "args"))
 	for _, want := range []string{"agent", "--agent-mode=autonomous", "--creds=header:", "--insecure-plaintext", "--server-address=127.0.0.1",
-		"--server-port=8443", "--namespace=argocd-apps", "--metrics-port=8181", "--log-format=json", "--enable-compression=false",
+		"--server-port=8443", "--namespace=argocd", "--metrics-port=8181", "--log-format=json", "--enable-compression=false",
 		"--redis-creds-dir-path=/run/argocd-agent/redis"} {
 		if !strings.Contains(" "+strings.Trim(agentArgs, "[]")+" ", " "+want+" ") {
 			t.Errorf("agent args %s lack %s", agentArgs, want)
@@ -184,8 +184,10 @@ func TestRenderArgoCDAgent(t *testing.T) {
 	if !strings.Contains(get[string](t, root, "data", "root.crt"), "BEGIN CERTIFICATE") {
 		t.Error("mgmt-root holds no certificate")
 	}
-	if p := objs["AppProject argocd-apps/cell"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "sourceNamespaces")) != "[argocd-apps]" {
-		t.Errorf("no copy of AppProject cell in argocd-apps: %v", p)
+	for key, o := range objs {
+		if o["kind"] == "AppProject" || lookupOr(o, "metadata", "namespace") == "argocd-apps" {
+			t.Errorf("the agent bundle holds %s", key)
+		}
 	}
 
 	t.Run("RBAC", func(t *testing.T) {
@@ -201,7 +203,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 			return strings.Join(out, "; ")
 		}
 		for key, want := range map[string]string{
-			"Role argocd-apps/argocd-agent": "[argoproj.io] [applications] [get list watch update patch]; [argoproj.io] [appprojects] [get list watch]; " +
+			"Role argocd/argocd-agent": "[argoproj.io] [applications] [get list watch update patch]; [argoproj.io] [appprojects] [get list watch]; " +
 				"[] [configmaps] [get list watch]; [] [secrets] [list watch]",
 			"Role argocd/argocd-agent-token":      "[] [serviceaccounts/token] [create]",
 			"Role apps-demo/argocd-agent-read":    "[] [services] [get list watch]; [apps] [deployments] [get list watch]; [security.istio.io] [authorizationpolicies] [get list watch]",
@@ -225,7 +227,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				for _, res := range get[[]any](t, rule, "resources") {
 					s := res.(string)
 					if s == "*" || s == "events" || strings.HasSuffix(s, "/exec") || strings.HasSuffix(s, "/attach") ||
-						strings.HasSuffix(s, "/portforward") || strings.HasSuffix(s, "/proxy") || (s == "secrets" && key != "Role argocd-apps/argocd-agent") {
+						strings.HasSuffix(s, "/portforward") || strings.HasSuffix(s, "/proxy") || (s == "secrets" && key != "Role argocd/argocd-agent") {
 						t.Errorf("%s grants %s", key, s)
 					}
 				}
@@ -241,7 +243,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				t.Errorf("the render reads the objects of the harness bundle: %s", key)
 			}
 		}
-		for _, key := range []string{"RoleBinding argocd-apps/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
+		for _, key := range []string{"RoleBinding argocd/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
 			if fmt.Sprint(lookupOr(objs[key], "subjects")) != "[map[kind:ServiceAccount name:argocd-agent namespace:argocd]]" {
 				t.Errorf("%s binds %v, want argocd/argocd-agent only", key, lookupOr(objs[key], "subjects"))
 			}
