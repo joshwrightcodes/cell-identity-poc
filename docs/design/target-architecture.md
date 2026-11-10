@@ -573,11 +573,15 @@ proxy also forwards creates, patches and deletes, and its terminal path runs exe
 cell:
 
 - The agent's service account has an explicit Role in each namespace it may read. It has no wildcard resources, and none of `pods/exec`, `pods/attach`, `pods/portforward`, `*/proxy` or `serviceaccounts/token`.
-- A ValidatingAdmissionPolicy lets that service account change only the `argocd.argoproj.io/refresh` annotation. It denies every other annotation, `.operation`, and every create, update, delete and connect.
-- The agent's Applications live in a namespace that holds no Secrets. The agent may list and watch Secrets there, because its informer requires it.
+- The Role has no write verb on Applications. The principal sends an event for each change of a mirrored Application, and the agent logs a Forbidden for each one.
+- A ValidatingAdmissionPolicy denies every update, delete and connect request of that service account. It also denies every create request, except the bound token request of its own SPIRE agent.
+- The token request names the account `argocd-agent`, one audience `spire-<env>/<nonce>`, and the Pod that sends it. A token for another audience, account or Pod is denied.
+- The agent's Applications live in `argocd`, next to the Secrets `argocd-redis`, `argocd-secret` and `bundle-store`. The agent may list and watch Secrets there, because its informer requires it. It has no `get` verb.
+- An admission policy keeps the set of Secrets in `argocd` closed, and RBAC refuses a Secret `get`. The resource proxy refuses a Secret list.
 - The agent's read access excludes `ops-runs`, so Job logs never reach the view.
 - Argo CD RBAC at Kiln also denies sync, terminate, delete and exec, as defence in depth.
-- Tests drive real principal events: resource requests, terminal requests and annotation updates. They do not call the API as the agent's service account.
+- Tests drive real principal events and resource requests. A separate test gives the service account a temporary Role with every write verb, and shows that the policy alone denies each write.
+- A refresh from the central view fails by design, because the central `argocd-server` is read-only in the agent namespaces.
 
 ### Upgrades **[call]**
 
@@ -822,7 +826,7 @@ this order, each with its own scope document:
 | Approver signatures from device-held keys in the PoC | M5 | Software keys per test approver |
 | Argo CD OCI source through a localhost proxy that adds a token | M8 | Local TLS on the proxy |
 | Argo CD Agent v0.10.0 with Argo CD v3.6.1, header auth behind `cell-proxy` | M3 | The newest v3.5 release |
-| The writes autonomous mode needs, beyond the refresh annotation | M3 | Report the gap |
+| The writes autonomous mode needs, beyond the refresh annotation | M3 | Report the gap. Result 2026-11-10, Argo CD Agent v0.10.0: it needs none. The agent Role has no write verb on Applications, and the agent still mirrors every Application and serves the resource proxy. During the gate run the agent tried only Application writes, one for each principal event for a changed management copy: `update` for each `spec-update` event, and `set-operation`. The API server answered each with Forbidden from RBAC, and the policy `argocd-agent-read-only` saw none. The agent log holds no create, delete or exec attempt. The policy denies the same writes when a Role grants them, as `TestM3GuardDeniesWithoutRBAC` shows. No gap remains |
 | Only the in-cluster collector reaches the principal and agent metrics endpoints | M3 | Turn the endpoint off |
 | Istio metric names survive the OTLP path into Prometheus, so Kiali finds `istio_requests_total` | M3 | A collector transform that restores the names |
 | Kiali accepts a remote cluster served through the `cell-proxy` tunnel, with no credential in its kubeconfig | M3 | A Kiali view that uses metrics only. Report the gap first |
