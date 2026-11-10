@@ -47,6 +47,7 @@ case "$2" in
       dev-cell-1) echo '{"name":"dev-cell-1","nodeIP":"10.9.0.1"}' ;;
       dev-cell-2) echo '{"name":"dev-cell-2","nodeIP":"10.9.0.2"}' ;;
       dev-cp) echo '{"name":"dev-cp","nodeIP":"10.9.0.9"}' ;;
+      management) echo '{"name":"management","nodeIP":"10.9.0.10"}' ;;
       no-ip) echo '{"name":"no-ip","nodeIP":""}' ;;
       *) echo '{"level":"ERROR","msg":"hostsvc failed","error":"cluster does not exist"}'; exit 1 ;;
     esac ;;
@@ -100,7 +101,8 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 `
 
 // stubKubectl answers "spire-server bundle show" with the file STUB_BUNDLE_FILE, and in the context
-// kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. STUB_NO_SERVER
+// kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. It answers
+// "api-resources" with a fixed table, or fails with STUB_NO_API. STUB_NO_SERVER
 // makes it fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line
 // that is not PEM.
 const stubKubectl = `#!/usr/bin/env bash
@@ -108,6 +110,26 @@ set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
 if [[ " $* " == *" get node "* ]]; then
   echo 10.9.0.7
+  exit 0
+fi
+if [[ " $* " == *" api-resources "* ]]; then
+  [[ -z "${STUB_NO_API:-}" ]] || exit 1
+  cat <<'TABLE'
+configmaps                          cm           v1                                true         ConfigMap
+events                              ev           v1                                true         Event
+namespaces                          ns           v1                                false        Namespace
+pods                                po           v1                                true         Pod
+secrets                                          v1                                true         Secret
+serviceaccounts                     sa           v1                                true         ServiceAccount
+services                            svc          v1                                true         Service
+validatingwebhookconfigurations                  admissionregistration.k8s.io/v1   false        ValidatingWebhookConfiguration
+customresourcedefinitions           crd,crds     apiextensions.k8s.io/v1           false        CustomResourceDefinition
+deployments                         deploy       apps/v1                           true         Deployment
+statefulsets                        sts          apps/v1                           true         StatefulSet
+events                              ev           events.k8s.io/v1                  true         Event
+clusterroles                                     rbac.authorization.k8s.io/v1      false        ClusterRole
+authorizationpolicies               ap           security.istio.io/v1              true         AuthorizationPolicy
+TABLE
   exit 0
 fi
 if [[ -n "${STUB_NO_SERVER:-}" ]]; then
@@ -296,7 +318,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -339,7 +361,9 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		}
 	}
 	cmd := exec.Command(argv[0], argv[1:]...)
+	agentBundles, _ := filepath.Abs("testdata/agent-bundles")
 	cmd.Env = append(base,
+		"AGENT_BUNDLES="+agentBundles,
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
@@ -731,11 +755,19 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
-	t.Run("entries declare a node alias and the celld ID for each cell", func(t *testing.T) {
+	t.Run("entries declare a node alias and the role ID for each subject of each cell", func(t *testing.T) {
 		data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
-		if got := keysOf(data); !slices.Equal(got, []string{"agents-observability-system-otel-uplink.yaml", "dev-cell-1-celld.yaml", "dev-cell-1-nodes.yaml",
-			"dev-cell-2-celld.yaml", "dev-cell-2-nodes.yaml", "workload-cp-otel.yaml"}) {
-			t.Fatalf("spire-entries keys are %v", got)
+		subjects := map[string]string{"celld": "cell-identity-system:celld", "argocd-agent": "argocd:argocd-agent",
+			"otel": "observability-system:otel-uplink", "mesh-view": "mesh-view-system:mesh-view"}
+		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml"}
+		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+			for role := range subjects {
+				wantKeys = append(wantKeys, cell+"-agents-"+role+".yaml", cell+"-"+role+".yaml")
+			}
+		}
+		slices.Sort(wantKeys)
+		if got := keysOf(data); !slices.Equal(got, wantKeys) {
+			t.Fatalf("spire-entries keys are %v, want %v", got, wantKeys)
 		}
 		type entry struct {
 			APIVersion string `json:"apiVersion"`
@@ -746,21 +778,33 @@ func TestRenderSpireServer(t *testing.T) {
 			Spec entrySpec `json:"spec"`
 		}
 		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-			alias := "spiffe://dev.env.poc.internal/cell/" + cell + "/nodes"
-			for file, want := range map[string]entry{
-				cell + "-nodes.yaml": {Spec: entrySpec{alias, "spiffe://dev.env.poc.internal/spire/server", []string{"cluster_jwt:cell:" + cell, "cluster_jwt:sa:cell-identity-system:celld"}}},
-				cell + "-celld.yaml": {Spec: entrySpec{"spiffe://dev.env.poc.internal/cell/" + cell + "/celld", alias, []string{"unix:uid:65532"}}},
-			} {
-				var got entry
-				if err := yaml.UnmarshalStrict([]byte(get[string](t, data, file)), &got); err != nil {
-					t.Fatalf("%s: %v", file, err)
+			for role, sa := range subjects {
+				alias := "spiffe://dev.env.poc.internal/cell/" + cell + "/agents/" + role
+				for file, want := range map[string]entry{
+					cell + "-agents-" + role + ".yaml": {Spec: entrySpec{alias, "spiffe://dev.env.poc.internal/spire/server", []string{"cluster_jwt:cell:" + cell, "cluster_jwt:sa:" + sa}}},
+					cell + "-" + role + ".yaml":        {Spec: entrySpec{"spiffe://dev.env.poc.internal/cell/" + cell + "/" + role, alias, []string{"unix:uid:65532"}}},
+				} {
+					var got entry
+					if err := yaml.UnmarshalStrict([]byte(get[string](t, data, file)), &got); err != nil {
+						t.Fatalf("%s: %v", file, err)
+					}
+					if got.APIVersion != "spire.spiffe.io/v1alpha1" || got.Kind != "ClusterStaticEntry" || got.Metadata.Name+".yaml" != file {
+						t.Fatalf("%s header is %+v", file, got)
+					}
+					if got.Spec.SPIFFEID != want.Spec.SPIFFEID || got.Spec.ParentID != want.Spec.ParentID || !slices.Equal(got.Spec.Selectors, want.Spec.Selectors) {
+						t.Fatalf("%s spec is %+v, want %+v", file, got.Spec, want.Spec)
+					}
 				}
-				if got.APIVersion != "spire.spiffe.io/v1alpha1" || got.Kind != "ClusterStaticEntry" || got.Metadata.Name+".yaml" != file {
-					t.Fatalf("%s header is %+v", file, got)
-				}
-				if got.Spec.SPIFFEID != want.Spec.SPIFFEID || got.Spec.ParentID != want.Spec.ParentID || !slices.Equal(got.Spec.Selectors, want.Spec.Selectors) {
-					t.Fatalf("%s spec is %+v, want %+v", file, got.Spec, want.Spec)
-				}
+			}
+		}
+	})
+
+	t.Run("each record lists every subject", func(t *testing.T) {
+		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+			want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --subject argocd/argocd-agent" +
+				" --subject observability-system/otel-uplink --subject mesh-view-system/mesh-view --env "
+			if !strings.Contains(r.log, want) {
+				t.Fatalf("the render signed the record of %s without the four subjects; want %q in:\n%s", cell, want, r.log)
 			}
 		}
 	})
@@ -824,7 +868,9 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"manifest with another digest", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_BAD_MANIFEST=1"}, "could not fetch the manifest of localhost:5001/cluster-jwt-server@sha256:"},
 		{"subject without a namespace", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=celld=celld"}, "is not <namespace>/<service account>=<role>"},
 		{"subject without a role", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld"}, "is not <namespace>/<service account>=<role>"},
-		{"two subjects before per-role aliases", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld argocd/argocd-agent=argocd-agent"}, "takes one subject"},
+		{"one role twice", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld argocd/argocd-agent=celld"}, "names the role celld twice"},
+		{"one ServiceAccount twice", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld cell-identity-system/celld=other"}, "names the ServiceAccount cell-identity-system/celld twice"},
+		{"the alias path as a role", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=agents"}, "the path of the node aliases"},
 		{"key test trace on an agent cell", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_KEYTEST_TRACE=dev-cell-2"}, "Run: mise run gate:m2:repair"},
 		{"docker reaches another daemon", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_DOCKER_IP=10.0.0.99"}, "reports '10.9.0.7'"},
 		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},
@@ -897,9 +943,10 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 		}
 		delete(got, key)
 	}
-	entries := get[map[string]any](t, got["ConfigMap/spire-entries"], "data")
-	delete(entries, "agents-observability-system-otel-uplink.yaml")
-	delete(entries, "workload-cp-otel.yaml")
+	// The per-subject aliases cell/<cell>/agents/<role> replace the M2 alias cell/<cell>/nodes, so the
+	// entries differ from M2. TestRenderSpireServer checks every entry.
+	got["ConfigMap/spire-entries"]["data"] = map[string]any{}
+	m2["ConfigMap/spire-entries"]["data"] = map[string]any{}
 
 	conf := get[string](t, got["ConfigMap/spire-server"], "data", "server.conf")
 	if n := len(psatOnly.FindAllString(conf, -1)); n != 2 {

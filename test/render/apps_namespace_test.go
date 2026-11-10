@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -74,6 +75,26 @@ func TestAppsNamespaceRenders(t *testing.T) {
 			}
 			if got := get[string](t, get[[]any](t, policy, "spec", "validations")[0], "expression"); got != "false" {
 				t.Errorf("the policy expression is %q, want false, so that it denies every Secret", got)
+			}
+			project := argo["ValidatingAdmissionPolicy argocd-apps-cell-project"]
+			if project == nil {
+				t.Fatal("the argocd component renders no ValidatingAdmissionPolicy argocd-apps-cell-project")
+			}
+			prule := get[[]any](t, project, "spec", "matchConstraints", "resourceRules")[0]
+			if got := fmt.Sprint(get[[]any](t, prule, "resources"), get[[]any](t, prule, "apiGroups"), get[[]any](t, prule, "operations")); got != "[applications] [argoproj.io] [CREATE UPDATE]" {
+				t.Errorf("the project policy matches %s, want applications of argoproj.io on CREATE and UPDATE", got)
+			}
+			var exprs []string
+			for _, v := range get[[]any](t, project, "spec", "validations") {
+				exprs = append(exprs, get[string](t, v, "expression"))
+			}
+			if want := []string{"request.namespace != 'argocd' || object.metadata.name == 'root'", "object.spec.project == 'cell'"}; !slices.Equal(exprs, want) || get[string](t, project, "spec", "failurePolicy") != "Fail" {
+				t.Errorf("the project policy has %q with failurePolicy %v, want %q and Fail", exprs, lookupOr(project, "spec", "failurePolicy"), want)
+			}
+			pb := argo["ValidatingAdmissionPolicyBinding argocd-apps-cell-project"]
+			if pb == nil || fmt.Sprint(lookupOr(pb, "spec", "validationActions")) != "[Deny]" ||
+				fmt.Sprint(lookupOr(pb, "spec", "matchResources", "namespaceSelector")) != "map[matchExpressions:[map[key:kubernetes.io/metadata.name operator:In values:[argocd argocd-apps]]]]" {
+				t.Errorf("the project binding is %v, want Deny for argocd and argocd-apps", pb)
 			}
 			binding := argo["ValidatingAdmissionPolicyBinding argocd-apps-no-secrets"]
 			if binding == nil {

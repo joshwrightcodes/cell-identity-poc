@@ -1,0 +1,127 @@
+# The relay of the environment control plane. render.sh fills in the routes, the image and the
+# network peers. Each Deployment runs one relay process, which passes TCP streams of the cells to
+# the node of the management plane by port. The relay ends no TLS: cell-proxy runs SPIFFE mTLS end
+# to end, from the cell to the management plane.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: relay-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: relay
+  namespace: relay-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "@RELAY@"
+  namespace: relay-system
+  labels:
+    app.kubernetes.io/name: "@RELAY@"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: "@RELAY@"
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: "@RELAY@"
+    spec:
+      serviceAccountName: relay
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: relay
+          image: "@RELAY_IMAGE@"
+          args: "@RELAY_ARGS@"
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: "@RELAY@"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports: "@RELAY_PORTS@"
+          # The health listener has its own port, so a probe never opens a route.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# Flow N17: the cell nodes reach the relay on the node ports. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the cell nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: "@RELAY@"
+  namespace: relay-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: "@RELAY@"
+  ports: "@SERVICE_PORTS@"
+---
+# Flows N17, N18, N23 and N11 of the relay. The cell nodes reach the routes, the own nodes reach
+# the health port for the kubelet probes, and the relay reaches the routed node ports of the
+# management plane and the collector.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: "@RELAY@"
+  namespace: relay-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: "@RELAY@"
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: "@CELL_PEERS@"
+      ports: "@ROUTE_PORTS@"
+    - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to: "@TARGET_PEERS@"
+      ports: "@TARGET_PORTS@"
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317

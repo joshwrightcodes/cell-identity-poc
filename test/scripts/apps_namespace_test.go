@@ -139,9 +139,10 @@ func TestCheckAppsNamespace(t *testing.T) {
 		{"an Application in a third namespace", append(goodApps(), stubApp{"other", "x", "Synced", "Healthy", "sha256:x"}), "other/x"},
 		{"a child left in argocd", append(goodApps(), stubApp{"argocd", "a", "Synced", "Healthy", "sha256:a"}), "argocd/a"},
 		{"no root", goodApps()[1:], "argocd has no root Application"},
+		{"a mirror outside management", append(goodApps(), stubApp{"dev-dev-cell-1", "a", "Synced", "Healthy", "sha256:a"}), "dev-dev-cell-1/a"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := runLib(t, tc.apps, `check_apps_namespace`)
+			out, err := runLib(t, tc.apps, `check_apps_namespace`, "CELL=dev-cell-1")
 			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("check_apps_namespace failed: %v\n%s", err, out)
@@ -152,6 +153,19 @@ func TestCheckAppsNamespace(t *testing.T) {
 				t.Fatalf("err %v, output %q; want a failure that names %q and the next command", err, out, tc.want)
 			}
 		})
+	}
+}
+
+// In management, the principal mirrors the Applications of each cell of VIEW_CELLS into its agent
+// namespace. Only those namespaces may hold mirrors.
+func TestCheckAppsNamespaceAdmitsTheViewMirrors(t *testing.T) {
+	mirrors := append(goodApps(), stubApp{"dev-dev-cell-1", "a", "Synced", "Healthy", "sha256:a"}, stubApp{"dev-dev-cell-2", "b", "Synced", "Healthy", "sha256:b"})
+	if out, err := runLib(t, mirrors, `check_apps_namespace`, "CELL=management"); err != nil {
+		t.Fatalf("check_apps_namespace failed in management: %v\n%s", err, out)
+	}
+	other := append(mirrors, stubApp{"dev-dev-cell-3", "c", "Synced", "Healthy", "sha256:c"})
+	if out, err := runLib(t, other, `check_apps_namespace`, "CELL=management"); err == nil || !strings.Contains(out, "dev-dev-cell-3/c") {
+		t.Fatalf("err %v, output %q; want a failure that names dev-dev-cell-3/c", err, out)
 	}
 }
 

@@ -268,3 +268,64 @@ func statefulSetReady(t *testing.T, cluster, ns, name string) {
 			fmt.Sprintf("replicas %d, ready %d, updated %d, revision %s of %s", sts.Spec.Replicas, s.ReadyReplicas, s.UpdatedReplicas, s.CurrentRevision, s.UpdateRevision)
 	})
 }
+
+// principalEvent is one line of the principal log about the stream of an agent.
+type principalEvent struct {
+	at        time.Time
+	connected bool
+	line      string
+}
+
+// lastPrincipalEvent returns the last line of the principal log that opens or closes the event
+// stream of agent: "An agent connected to the subscription stream" or "Closing EventStream".
+func lastPrincipalEvent(t *testing.T, agent string) (principalEvent, bool, error) {
+	t.Helper()
+	pod, _, _ := principalPod(t)
+	logs, err := kubectl(t, mgmtCluster, "", "-n", viewNamespace, "logs", pod, "-c", principalName)
+	if err != nil {
+		return principalEvent{}, false, err
+	}
+	var last principalEvent
+	found := false
+	for l := range strings.SplitSeq(logs, "\n") {
+		var rec struct {
+			Msg, Client, Time string
+		}
+		if json.Unmarshal([]byte(l), &rec) != nil || rec.Client != agent {
+			continue
+		}
+		if rec.Msg != "An agent connected to the subscription stream" && rec.Msg != "Closing EventStream" {
+			continue
+		}
+		at, _ := time.Parse(time.RFC3339, rec.Time)
+		last, found = principalEvent{at: at, connected: rec.Msg != "Closing EventStream", line: l}, true
+	}
+	return last, found, nil
+}
+
+// viewConnectedSince reports whether the principal lists agent as connected, with a stream that
+// opened at or after since.
+func viewConnectedSince(t *testing.T, agent string, since time.Time) (bool, string) {
+	t.Helper()
+	ev, found, err := lastPrincipalEvent(t, agent)
+	switch {
+	case err != nil:
+		return false, err.Error()
+	case !found:
+		return false, "the principal log has no stream line for " + agent
+	case !ev.connected:
+		return false, "the last stream line of " + agent + " closes the stream: " + ev.line
+	case ev.at.Before(since.Truncate(time.Second)):
+		return false, fmt.Sprintf("the stream of %s opened at %s, before %s: %s", agent, ev.at.Format(time.RFC3339), since.UTC().Format(time.RFC3339), ev.line)
+	}
+	return true, ev.line
+}
+
+// requireViewConnected fails at once, with the principal log line, when the principal does not
+// list agent as connected.
+func requireViewConnected(t *testing.T, agent string) {
+	t.Helper()
+	if ok, detail := viewConnectedSince(t, agent, time.Time{}); !ok {
+		t.Fatalf("the principal does not list %s as connected: %s", agent, detail)
+	}
+}

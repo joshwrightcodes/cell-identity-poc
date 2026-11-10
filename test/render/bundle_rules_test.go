@@ -43,7 +43,7 @@ var bundleFacts = []string{"POD_CIDR=10.11.0.0/16", "SERVICE_CIDR=10.111.0.0/16"
 	"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", "API_SERVICE_IP=10.111.0.1", "DNS_SERVICE_IP=10.111.0.10"}
 
 // stubBinaries names the binary that the stub image must hold for each render that checks one.
-var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent"}
+var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent", "argocd-agent": "/ko-app/cluster-jwt-agent"}
 
 var (
 	renderAllMu  sync.Mutex
@@ -246,6 +246,24 @@ func (cr *clusterRender) waveOf(name string) (int, bool) {
 // TestRootBundleWaveOrder checks that no bundle depends on a later wave, a harness component or a
 // link component, so a clean harness:up never waits for something that comes later.
 func TestRootBundleWaveOrder(t *testing.T) {
+	// The relay comes at wave 8 in dev-cp, after spire-server, and each cell runs the agent as a
+	// harness component, so the loop below checks both.
+	want := map[string]string{"dev-cp": "bundle relay-system 8 relay-system", "dev-cell-1": "harness argocd-agent 0 argocd", "dev-cell-2": "harness argocd-agent 0 argocd"}
+	for _, cr := range renderAll(t) {
+		if w, ok := want[cr.name]; ok {
+			found := false
+			for _, c := range cr.components {
+				found = found || fmt.Sprintf("%s %s %d %s", c.kind, c.name, c.wave, c.ns) == w
+			}
+			if !found {
+				t.Errorf("%s has no component %q", cr.name, w)
+			}
+			delete(want, cr.name)
+		}
+	}
+	if len(want) > 0 {
+		t.Errorf("the topology has no cluster %v", want)
+	}
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			// Each CRD by group and kind, with the component that holds it.
@@ -416,6 +434,13 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 			}
 		}
 	}
+	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
+		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
+		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin"} {
+		if !seen[name] {
+			t.Errorf("no render holds the container %q", name)
+		}
+	}
 	for _, list := range []map[string]bool{unpinnedBefore, unboundedBefore} {
 		for name := range list {
 			if !seen[name] {
@@ -498,6 +523,8 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"cell-identity", script("cell-identity", "dev-cell-1"), []string{"API_SERVER_IPS"}},
 		{"external-secrets", eso, []string{"API_SERVER_IPS"}},
 		{"network-policy", script("network-policy", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"relay-system", script("relay-system", "dev-cp"), []string{"NODE_IPS"}},
+		{"argocd-agent", script("argocd-agent", "dev-cell-1"), []string{"API_SERVER_IPS"}},
 	}
 	for _, tc := range cases {
 		for _, v := range tc.vars {

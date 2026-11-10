@@ -50,6 +50,12 @@ SPIRE_SERVER_COMPONENTS=(
   "spire-server:7:spire-system"
 )
 
+# The relay of the environment control plane. Its render reads only node addresses from the host
+# service, so it needs no earlier wave beyond the base cell.
+RELAY_SYSTEM_COMPONENTS=(
+  "relay-system:8:relay-system"
+)
+
 # Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
 # out of the root bundle and out of every Argo CD Application. A bundle can still write to their
 # namespace, as the residual limits in docs/design/poc-scope.md say.
@@ -59,6 +65,12 @@ SPIRE_SERVER_COMPONENTS=(
 # celld with its SPIRE agent sidecar attests to the SPIRE server in SPIRE_SERVER_CLUSTER.
 CELL_IDENTITY_HARNESS=(
   "cell-identity:cell-identity-system"
+)
+# The Argo CD Agent of the cell shares the namespace argocd with Argo CD. Its cell-proxy sidecar
+# dials the relay of the environment control plane, and its SPIRE agent sidecar attests to the
+# server in SPIRE_SERVER_CLUSTER.
+ARGOCD_AGENT_HARNESS=(
+  "argocd-agent:argocd"
 )
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
@@ -80,7 +92,9 @@ for set_name in $set_names; do
     base-cell) COMPONENTS+=("${BASE_CELL_COMPONENTS[@]}") ;;
     external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
+    relay-system) COMPONENTS+=("${RELAY_SYSTEM_COMPONENTS[@]}") ;;
     cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
+    argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
@@ -229,11 +243,14 @@ apps_blockers() {
 }
 
 # check_apps_namespace succeeds when argocd holds only the root Application and argocd-apps holds
-# every other Application.
+# every other Application. In a cluster with VIEW_CELLS, the principal of the central view also
+# mirrors the Applications of each cell into its agent namespace <POC_ENV>-<cell>.
 check_apps_namespace() {
-  local found
-  found="$(k get applications -A -o json | jq -r '.items[]
-    | select((.metadata.namespace == "argocd" and .metadata.name == "root") or .metadata.namespace == "argocd-apps" | not)
+  local found cell mirrors=()
+  for cell in ${VIEW_CELLS:-}; do mirrors+=("$POC_ENV-$cell"); done
+  found="$(k get applications -A -o json | jq -r --argjson mirrors "$(printf '%s\n' ${mirrors[@]+"${mirrors[@]}"} | jq -Rcn '[inputs | select(length > 0)]')" '.items[]
+    | select((.metadata.namespace == "argocd" and .metadata.name == "root") or .metadata.namespace == "argocd-apps"
+        or (.metadata.namespace as $ns | $mirrors | index($ns)) != null | not)
     | "\(.metadata.namespace)/\(.metadata.name)"')" || return 1
   [[ -z "$found" ]] || {
     echo "Applications outside $APPS_NAMESPACE, except the root: ${found//$'\n'/ }. Run: CELL=$CELL_NAME mise run cell:up. If one stays, list them with kubectl --context kind-$CELL_NAME get applications -A, then delete it with kubectl --context kind-$CELL_NAME -n <namespace> delete application <name>"
@@ -553,8 +570,29 @@ check_plane_pods() {
 #   - For each cluster-scoped kind of the bundle, Namespace included, the objects with the harness
 #     label of the component must be exactly the objects of the bundle. A list of a cluster-scoped
 #     kind holds the objects of every owner, so only the label tells them apart.
+# runtime_objects <component> <namespace> <kind> prints a JSON object {names, managers, labels} for
+# the objects of one kind that a workload of the component writes at run time, or null. The bundle
+# cannot hold them, so check_harness_objects skips each one whose name matches names, whose field
+# managers are all in managers, and whose harness label is absent or in labels. The one case: the
+# principal of central-view stores the AppProjects of each autonomous agent in central-view-system
+# as <agent>-<project>, for each agent <POC_ENV>-<cell> of VIEW_CELLS. The principal creates them
+# with the field manager foo and updates them as argocd-agent (v0.10.0
+# internal/backend/kubernetes/appproject/kubernetes.go lines 88 and 123). Each one keeps the labels
+# of the copy in the cell, so it carries the harness label argocd-agent.
+runtime_objects() {
+  local cell agents=()
+  if [[ "$1" == central-view && "$2" == central-view-system && "$3" == AppProject ]]; then
+    for cell in ${VIEW_CELLS:-}; do agents+=("$POC_ENV-$cell"); done
+    ((${#agents[@]} > 0)) || { echo null; return; }
+    jq -cn --arg re "^($(IFS='|'; echo "${agents[*]}"))-[a-z0-9]([a-z0-9-]*[a-z0-9])?$" \
+      '{names: $re, managers: ["foo", "argocd-agent"], labels: ["argocd-agent"]}'
+    return
+  fi
+  echo null
+}
+
 check_harness_objects() {
-  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned problems=()
+  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned runtime problems=()
   [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
   # managers_of <live list> <names> prints each field manager of the named objects other than
@@ -568,8 +606,13 @@ check_harness_objects() {
   for kind in $(NS="$ns" yq -N -r 'select(.kind != null and .metadata.namespace == strenv(NS)) | .kind' "$bundle" | sort -u); do
     want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
+    runtime="$(runtime_objects "$comp" "$ns" "$kind")"
     if [[ -n "$owned" ]]; then
-      got="$(jq -r --arg label "$HARNESS_LABEL" '[.items[]
+      got="$(jq -r --arg label "$HARNESS_LABEL" --argjson runtime "$runtime" '[.items[]
+        | select(($runtime == null) or ((((.metadata.labels[$label] // "") as $l | $l == "" or ($runtime.labels | index($l)) != null)
+            and (.metadata.name | test($runtime.names))
+            and ((.metadata.managedFields // []) | length) > 0
+            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not))
         | select((.metadata.labels[$label] // "") != ""
           or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
         | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }

@@ -238,19 +238,25 @@ func TestRenderCentralView(t *testing.T) {
 	}
 }
 
-// VIEW_CELLS must name the clusters with the cell-identity set in harness/topology.yaml, and each
+// VIEW_CELLS must name the clusters with the argocd-agent set in harness/topology.yaml, and each
 // of them must be in SPIRE_AGENT_CELLS of dev-cp.
 func TestViewCellsMatchTopology(t *testing.T) {
 	topo, err := topology.Load("../../harness/topology.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := topo.WithComponent("cell-identity")
+	want := topo.WithComponent("argocd-agent")
 	view := strings.Fields(cellSetting(t, "management", "VIEW_CELLS"))
 	slices.Sort(want)
 	slices.Sort(view)
 	if !slices.Equal(view, want) {
-		t.Errorf("VIEW_CELLS of management is %v, and the cell-identity clusters are %v", view, want)
+		t.Errorf("VIEW_CELLS of management is %v, and the clusters with an Argo CD Agent are %v", view, want)
+	}
+	// An agent attests with cluster_jwt, so each agent cluster also runs the cell identity.
+	for _, c := range want {
+		if !slices.Contains(topo.WithComponent("cell-identity"), c) {
+			t.Errorf("%s has the argocd-agent set and not the cell-identity set", c)
+		}
 	}
 	agents := strings.Fields(cellSetting(t, "dev-cp", "SPIRE_AGENT_CELLS"))
 	for _, c := range view {

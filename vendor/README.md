@@ -999,8 +999,8 @@ directory and ran nothing from it.
 
 `vendor:fetch` downloads the archive, checks the SHA-256 of the file list and copies the two
 directories into `argocd-agent/v0.10.0/`. The view uses its own manifest
-(`components/central-view/principal.yaml`). The vendored files are the review record, and the agent
-manifest feeds the cells in a later task.
+(`components/central-view/principal.yaml`), and so do the cells (`components/argocd-agent/manifests.yaml`).
+The vendored files are the review record.
 
 ### Image
 
@@ -1096,12 +1096,49 @@ has the type `Opaque`, because a `kubernetes.io/tls` Secret needs `tls.key`. It 
 certificate a random serial number, where `argocd-agentctl` uses 1. It sets only the key usages that
 each certificate needs. It uses ECDSA P-256 keys for the certificates.
 
+### Agent side (2026-11-10)
+
+The review read `cmd/argocd-agent/agent.go`, `agent/agent.go`, `agent/filters.go`, `agent/tracking.go`,
+`agent/options.go`, the connect and authentication path of `pkg/client/remote.go`,
+`internal/resync/resync.go`, `principal/apis/auth/auth.go`, `principal/apis/eventstream/eventstream.go`
+and the AppProject path of `principal/event.go`, in the same scratch copy. It ran nothing from it.
+
+- Every flag that the cells set exists in `cmd/argocd-agent/agent.go`: `--agent-mode`, `--creds`,
+  `--insecure-plaintext`, `--server-address`, `--server-port`, `--namespace`, `--redis-addr`,
+  `--redis-creds-dir-path`, `--enable-compression`, `--metrics-port`, `--healthz-port` and
+  `--log-format`. `--creds header:` gives the method `header` with no credential (`parseCreds`).
+- `--redis-creds-dir-path` reads the password from the file `auth` in that directory (`redisCreds`).
+  So the agent reads the Redis password of the cell from a Secret volume, and needs no Secret read.
+- The agent watches Applications, AppProjects, repository Secrets and GPG ConfigMaps in its own
+  namespace only, and Namespaces in the cluster (`agent/agent.go` lines 300 to 470). Its settings
+  manager reads `argocd-cm` in that namespace (`agent/tracking.go`).
+- Argo CD reads AppProjects only in its own namespace, and the agent sends only the AppProjects of
+  its namespace. So the cells put a copy of AppProject `cell` in `argocd-apps`. The principal stores
+  it as `<agent>-cell` in its namespace, with `sourceNamespaces` set to the agent namespace
+  (`principal/event.go` lines 525 to 545). The central `argocd-server` needs that project, because
+  `getAppEnforceRBAC` loads the project of each Application (`server/application/application.go`
+  lines 248 to 252 of Argo CD v3.6.1).
+- `/healthz` answers 200 only while the stream to the principal is up (`agent/agent.go` lines 736
+  to 743). The cells probe the metrics port instead. The health port must be from 1 to 32767
+  (`WithHealthzPort`), so it cannot be off.
+- `cmd/argocd-agent/agent.go` imports `net/http/pprof`, and the health server serves the default
+  mux (`agent/agent.go` lines 626 to 634). So port 8002 of the agent also serves `/debug/pprof/`,
+  on every address. The namespace-wide policy `argocd` admits every pod of `argocd` to it.
+- The agent sends the access token as the raw `authorization` value, and `RefreshToken` with no
+  `authorization` value (`pkg/client/remote.go`). The principal rejects an agent whose version
+  differs from its own (`principal/apis/auth/auth.go` lines 150 to 153).
+- The principal logs "An agent connected to the subscription stream" and "Closing EventStream"
+  with the field `client` (`principal/apis/eventstream/eventstream.go` lines 190 and 508).
+- No `sudo`, no `os/exec` call, no HTTP client outside the remote and the resource proxy, and no
+  hidden Unicode in the files above.
+
 The review did not read these items:
 
-- The agent side (`agent/`, `pkg/client/`), apart from the call that an earlier task cited.
+- The agent resource proxy and Redis proxy line by line, and `agent/inbound*.go` and `agent/outbound*.go`.
 - The Redis proxy and the event stream code line by line, the HA code and the test files.
 - The 172 modules of the binary, and the image signatures.
 - The network behaviour of the binary at run time.
 
-Result: medium concern. The principal image holds a shell and busybox, its health port serves
-pprof, and its resource and Redis proxies bind every address. NetworkPolicy limits each of them.
+Result: medium concern. The image holds a shell and busybox. The health ports of the principal and
+the agent serve pprof, and the resource and Redis proxies of the principal bind every address.
+NetworkPolicy limits each of them.

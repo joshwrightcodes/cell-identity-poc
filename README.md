@@ -178,7 +178,23 @@ mise run view:ui
 
 The view is read-only, so a refresh in the UI fails with a permission error.
 `argocd-server` may read the Applications of the agent namespaces and change none of them.
-Before the agents of the cells connect (a later milestone task), the list of Applications is empty. That is the expected result.
+
+Each cell runs the harness component `argocd-agent` in the namespace `argocd`.
+The agent runs in autonomous mode, and sends the Applications of `argocd-apps` to the principal.
+It also sends a copy of AppProject `cell` from `argocd-apps`, which Argo CD itself ignores.
+The principal stores the Applications in `<env>-<cell>`, and the project as `<env>-<cell>-cell` in `central-view-system`.
+The `cell-proxy` sidecar of the agent dials the relay in `dev-cp` on node port 30443, and accepts only the principal ID `spiffe://mgmt.poc.internal/argocd/principal`.
+It trusts that ID only through ConfigMap `mgmt-root`, a copy of the live root of `management`.
+The agent reads the live objects of the bundle kinds for the view, and it may read no Secret outside `argocd-apps`.
+An admission policy admits in `argocd` only the root Application, and in `argocd-apps` only Applications of the project `cell`.
+
+The relay in `dev-cp` is the bundle `relay-system` at wave 8.
+Deployment `relay-view` passes node ports 30443 and 30445 to node ports 31443 and 31445 of `management`.
+Deployment `relay-telemetry` passes node port 30444 to node port 31444.
+The relay ends no TLS. Only the node addresses of the cells reach its node ports.
+
+`cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-root` and the stream to the principal.
+After a rebuild of `dev-cp` or a new root of `management`, it prints `CELL=<cell> mise run cell:up`.
 
 While `view:ui` runs, the page is open on the Mac loopback. Every pod on the VM, `rogue` included, can reach it through `host.docker.internal`.
 The task prints a warning about this when it starts. Stop it with Ctrl-C when you are done.
@@ -200,9 +216,11 @@ The client certificates of the view are valid for 180 days. `cell:verify` fails 
 A cell is an entry in `harness/topology.yaml` and a file `cells/<cell>.env`.
 To add a cell, for example `dev-cell-3`, follow these steps:
 
-1. Add the cluster to `harness/topology.yaml`, with pod and service subnets that overlap no other subnet, and the component sets `base-cell` and `cell-identity`.
+1. Add the cluster to `harness/topology.yaml`, with pod and service subnets that overlap no other subnet, and the component sets `base-cell`, `cell-identity` and `argocd-agent`.
 2. Copy `cells/dev-cell-2.env` to `cells/dev-cell-3.env`. Set `CELL_NAME`, `CELL_MESH_TRUST_DOMAIN`, and a `CELL_BUNDLE_STORE_PORT` that no other cell uses.
-3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`.
+3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`, and to `VIEW_CELLS` in `cells/management.env`.
+   The SPIRE server signs a record of the cell for each subject of `SPIRE_CELL_SUBJECTS`, and renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject.
+   The relay admits the node address of the cell.
 4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
 5. Create the cluster, sign its record in `dev-cp`, and set it up:
 
@@ -210,6 +228,7 @@ To add a cell, for example `dev-cell-3`, follow these steps:
    mise run hostsvc -- up --only dev-cell-3
    CELL=dev-cp mise run cell:up
    CELL=dev-cell-3 mise run cell:up
+   CELL=management mise run cell:link
    mise run harness:verify
    ```
 

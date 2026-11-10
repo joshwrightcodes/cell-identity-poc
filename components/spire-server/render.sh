@@ -6,8 +6,10 @@
 #     For each cell, the render reads the node address from the host service and signs a test
 #     record of the cell for the subjects. The NetworkPolicy admits only those node addresses on the
 #     node port, and the plugin trusts only those records. ConfigMap spire-entries gets two
-#     ClusterStaticEntry manifests for each cell: a node alias that matches the attested agents of
-#     the cell, and the ID of the subject role under that alias. The plugin image is the one that
+#     ClusterStaticEntry manifests for each subject of each cell: a node alias
+#     spiffe://<td>/cell/<cell>/agents/<role> that matches only the attested agents of that cell and
+#     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias. So the agent of
+#     one subject gets no entry of another subject. The plugin image is the one that
 #     `mise run images` built on this Mac, pinned by the digest in build/images.env. The server
 #     config carries the SHA-256 of the plugin binary from that image, so the server checks the
 #     binary before it runs it.
@@ -90,13 +92,17 @@ plugin_image=""
 checksum=""
 if ((${#cells[@]} > 0)); then
   sections+=(cluster_jwt)
+  # Each subject is <namespace>/<service account>=<role>. A role and a ServiceAccount may appear once.
+  subject_args=()
+  seen_roles=" " seen_accounts=" "
   for subject in "${subjects[@]}"; do
     [[ "$subject" =~ ^[a-z0-9-]+/[a-z0-9-]+=[a-z0-9-]+$ ]] || die "SPIRE_CELL_SUBJECTS entry '$subject' is not <namespace>/<service account>=<role>"
+    [[ "${subject#*=}" != agents ]] || die "the role agents of SPIRE_CELL_SUBJECTS is the path of the node aliases"
+    [[ "$seen_roles" != *" ${subject#*=} "* ]] || die "SPIRE_CELL_SUBJECTS names the role ${subject#*=} twice"
+    [[ "$seen_accounts" != *" ${subject%%=*} "* ]] || die "SPIRE_CELL_SUBJECTS names the ServiceAccount ${subject%%=*} twice"
+    seen_roles+="${subject#*=} " seen_accounts+="${subject%%=*} "
+    subject_args+=(--subject "${subject%%=*}")
   done
-  # The node alias cell/<cell>/nodes matches one ServiceAccount, so it serves one subject.
-  ((${#subjects[@]} == 1)) || die "SPIRE_CELL_SUBJECTS takes one subject until each role has its own node alias, got '${SPIRE_CELL_SUBJECTS}'"
-  subject_sa="${subjects[0]%%=*}"
-  role="${subjects[0]#*=}"
 
   # The plugin image and the checksum of the binary in it.
   plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
@@ -117,7 +123,7 @@ if ((${#cells[@]} > 0)); then
     [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
     peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
 
-    if ! record="$(cd "$root" && mise run record:fixture -- --cluster "$cell" --subject "$subject_sa" --env "$POC_ENV" 2>/dev/null)"; then
+    if ! record="$(cd "$root" && mise run record:fixture -- --cluster "$cell" "${subject_args[@]}" --env "$POC_ENV" 2>/dev/null)"; then
       die "could not sign the record of $cell: ${record:-no output}"
     fi
     name="cell-record-$cell"
@@ -131,20 +137,23 @@ if ((${#cells[@]} > 0)); then
       '. + [{configMap: {name: $name, items: [{key: "record.dsse.json", path: $path}]}}]' <<<"$sources")"
 
     # The cluster_jwt plugin gives an attested agent the selectors cluster_jwt:cell:<cell> and
-    # cluster_jwt:sa:<namespace>:<service account>. The alias matches both. The role entry selects
-    # the uid of the ko images.
-    alias_id="spiffe://$td/cell/$cell/nodes"
-    entries="$(jq -c --arg cell "$cell" --arg td "$td" --arg alias "$alias_id" --arg sa "${subject_sa/\//:}" --arg role "$role" --arg uid "$workload_uid" '
-      . + {
-        ($cell + "-nodes.yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
-          metadata: {name: ($cell + "-nodes")},
-          spec: {spiffeID: $alias, parentID: ("spiffe://" + $td + "/spire/server"),
-            selectors: ["cluster_jwt:cell:" + $cell, "cluster_jwt:sa:" + $sa]}},
-        ($cell + "-" + $role + ".yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
-          metadata: {name: ($cell + "-" + $role)},
-          spec: {spiffeID: ("spiffe://" + $td + "/cell/" + $cell + "/" + $role), parentID: $alias,
-            selectors: ["unix:uid:" + $uid]}}
-      }' <<<"$entries")"
+    # cluster_jwt:sa:<namespace>:<service account>. Each alias matches both, for one subject. The
+    # role entry selects the uid of the ko images.
+    for subject in "${subjects[@]}"; do
+      subject_sa="${subject%%=*}" role="${subject#*=}"
+      alias_id="spiffe://$td/cell/$cell/agents/$role"
+      entries="$(jq -c --arg cell "$cell" --arg td "$td" --arg alias "$alias_id" --arg sa "${subject_sa/\//:}" --arg role "$role" --arg uid "$workload_uid" '
+        . + {
+          ($cell + "-agents-" + $role + ".yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
+            metadata: {name: ($cell + "-agents-" + $role)},
+            spec: {spiffeID: $alias, parentID: ("spiffe://" + $td + "/spire/server"),
+              selectors: ["cluster_jwt:cell:" + $cell, "cluster_jwt:sa:" + $sa]}},
+          ($cell + "-" + $role + ".yaml"): {apiVersion: "spire.spiffe.io/v1alpha1", kind: "ClusterStaticEntry",
+            metadata: {name: ($cell + "-" + $role)},
+            spec: {spiffeID: ("spiffe://" + $td + "/cell/" + $cell + "/" + $role), parentID: $alias,
+              selectors: ["unix:uid:" + $uid]}}
+        }' <<<"$entries")"
+    done
   done
 fi
 

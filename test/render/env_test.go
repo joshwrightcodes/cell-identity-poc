@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -27,7 +28,7 @@ func pluginEnv(t *testing.T, text string) string {
 func TestEnvironmentNameHasOneSource(t *testing.T) {
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
 		t.Run(env, func(t *testing.T) {
-			server := render(t, "POC_ENV="+env, "SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2")
+			server := render(t, "POC_ENV="+env, "SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "SPIRE_CELL_SUBJECTS="+cellEnv(t, "dev-cp", "SPIRE_CELL_SUBJECTS"))
 			if server.err != nil {
 				t.Fatalf("spire-server render failed: %v\n%s", server.err, server.stderr)
 			}
@@ -36,7 +37,8 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				t.Fatalf("server plugin env is %q, want %q", got, env)
 			}
 			for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-				want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --env " + env
+				want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --subject argocd/argocd-agent" +
+					" --subject observability-system/otel-uplink --subject mesh-view-system/mesh-view --env " + env
 				if !strings.Contains(server.log, want) {
 					t.Fatalf("the render did not sign the record of %s for env %s; want %q in:\n%s", cell, env, want, server.log)
 				}
@@ -74,4 +76,20 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 			}
 		})
 	}
+}
+
+// cellEnv returns the value of a setting in cells/<cluster>.env, without its quotes.
+func cellEnv(t *testing.T, cluster, name string) string {
+	t.Helper()
+	data, err := os.ReadFile("../../cells/" + cluster + ".env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for line := range strings.SplitSeq(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, name+"="); ok {
+			return strings.Trim(v, `"`)
+		}
+	}
+	t.Fatalf("cells/%s.env sets no %s", cluster, name)
+	return ""
 }

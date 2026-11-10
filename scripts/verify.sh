@@ -141,6 +141,11 @@ missing_cell_hint() {
   echo "Or remove $1 from SPIRE_AGENT_CELLS in cells/$CELL_NAME.env, then run CELL=$CELL_NAME mise run cell:up."
 }
 
+# pem_lines prints each PEM certificate on standard input as one line, sorted.
+pem_lines() {
+  awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
+}
+
 node_ip() {
   local facts ip
   facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$1" 2>/dev/null)" || { echo "no host service facts for $1"; return 1; }
@@ -214,7 +219,7 @@ check_celld_svid() {
   fi
   echo "the last identity event of celld is ${line:-missing}, want an SVID for $want with a not_after in the future."
   echo "Read the agent log: mise x -- kubectl --context kind-$CELL_NAME -n cell-identity-system logs deploy/celld -c spire-agent"
-  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify runs the check 'The SPIRE server holds the node alias and celld entries'."
+  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify runs the check 'The SPIRE server holds the node alias and the role entry of each subject'."
   echo "Then run: CELL=$CELL_NAME mise run cell:up"
   return 1
 }
@@ -445,27 +450,28 @@ expect_rogue_blocked() {
   expect_dial_blocked rogue default "$1"
 }
 
-# The SPIRE server must hold the node alias and the role entry of each agent cell, with the
-# parents and selectors that the render declares. SPIRE_CELL_SUBJECTS holds one
-# <namespace>/<service account>=<role> entry.
+# The SPIRE server must hold, for each agent cell and each subject of SPIRE_CELL_SUBJECTS, the node
+# alias cell/<cell>/agents/<role> and the role entry under it, with the parents and selectors that
+# the render declares.
 check_agent_entries() {
   local entries cell subject sa role missing=()
   entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
     /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
     || { echo "could not read the entries from spire-server-0"; return 1; }
-  read -r subject _ <<<"$SPIRE_CELL_SUBJECTS"
-  sa="${subject%%=*}"
-  sa="${sa/\//:}"
-  role="${subject#*=}"
   for cell in $SPIRE_AGENT_CELLS; do
-    jq -e --arg cell "$cell" --arg sa "$sa" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/nodes"
-      and .parent_id.path == "/spire/server"
-      and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
-      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/nodes with the selectors of $cell")
-    jq -e --arg cell "$cell" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/\($role)"
-      and .parent_id.path == "/cell/\($cell)/nodes"
-      and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
-      <<<"$entries" >/dev/null || missing+=("no $role entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/$role with selector unix:uid:65532")
+    for subject in $SPIRE_CELL_SUBJECTS; do
+      sa="${subject%%=*}"
+      sa="${sa/\//:}"
+      role="${subject#*=}"
+      jq -e --arg cell "$cell" --arg sa "$sa" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/agents/\($role)"
+        and .parent_id.path == "/spire/server"
+        and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
+        <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/agents/$role with the selectors of $cell and $sa")
+      jq -e --arg cell "$cell" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/\($role)"
+        and .parent_id.path == "/cell/\($cell)/agents/\($role)"
+        and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
+        <<<"$entries" >/dev/null || missing+=("no $role entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/$role under its alias with selector unix:uid:65532")
+    done
   done
   if ((${#missing[@]} > 0)); then
     printf '%s\n' "${missing[@]}"
@@ -646,9 +652,89 @@ if has_harness cell-identity; then
   check "plaintext cannot reach the SPIRE node port, because of NetworkPolicy" \
     expect_no_tcp plaintext "http://${spire_ip:-unknown}:30081/"
 fi
+# The agent copies the node address of SPIRE_SERVER_CLUSTER into the cell-proxy upstream and the
+# NetworkPolicy. A rebuilt control plane can get a new address.
+check_agent_env_address() {
+  local want args cidrs
+  want="$(node_ip "$SPIRE_SERVER_CLUSTER")" || { echo "$want"; return 1; }
+  args="$(k -n argocd get deployment argocd-agent -o json | jq -r '.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[]')" \
+    || { echo "could not read deployment/argocd-agent in argocd"; return 1; }
+  cidrs="$(k -n argocd get networkpolicy argocd-agent -o json \
+    | jq -r '[.spec.egress[] | select(any(.ports[]; .port == 30443)) | .to[].ipBlock.cidr] | join(" ")')"
+  if ! grep -qxF -- "--upstream=$want:30443" <<<"$args" || [[ "$cidrs" != "$want/32" ]]; then
+    echo "the $SPIRE_SERVER_CLUSTER node is $want, but cell-proxy dials '$(grep -- '--upstream=' <<<"$args")' and the NetworkPolicy allows '$cidrs'."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# ConfigMap mgmt-root must hold the live roots of the management plane, or cell-proxy refuses the
+# principal after a new management root.
+check_agent_mgmt_root() {
+  local live got
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n argocd get configmap mgmt-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap argocd/mgmt-root holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# The agent answers 200 on /healthz only while its stream to the principal is up.
+check_agent_connected() {
+  local code
+  code="$(k -n argocd exec deploy/argocd-agent -c argocd-agent -- wget -q -S -O /dev/null http://127.0.0.1:8002/healthz 2>&1 | sed -n 's/^ *HTTP\/[0-9.]* \([0-9]*\).*/\1/p' | tail -n 1)"
+  [[ "$code" == 200 ]] && return 0
+  echo "the agent answers HTTP '${code:-none}' on /healthz, so it holds no stream to the principal."
+  echo "Read the cell-proxy log: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c cell-proxy"
+  echo "If management has no principal yet, run: CELL=management mise run cell:link"
+  return 1
+}
+
+# A pod that runs as the ServiceAccount of a cell subject can attest as that subject. In a namespace
+# that a harness component shares with a bundle, such a pod must belong to the harness component,
+# as check_plane_pods requires in a plane. In a namespace that the component owns,
+# check_harness_objects already compares every workload with the bundle. The subjects come from
+# SPIRE_CELL_SUBJECTS of SPIRE_SERVER_CLUSTER.
+check_cell_subject_pods() {
+  local subjects s ns entry comp accounts=""
+  subjects="$(set -a; source "$ROOT/cells/$SPIRE_SERVER_CLUSTER.env"; echo "$SPIRE_CELL_SUBJECTS")"
+  [[ -n "$subjects" ]] || { echo "cells/$SPIRE_SERVER_CLUSTER.env names no SPIRE_CELL_SUBJECTS"; return 1; }
+  for s in $subjects; do
+    ns="${s%%/*}"
+    for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+      comp="${entry%%:*}"
+      [[ "${entry#*:}" == "$ns" ]] || continue
+      NS="$ns" yq -e 'select(.kind == "Namespace" and .metadata.name == strenv(NS))' "$BUNDLES/$comp/manifests.yaml" >/dev/null 2>&1 \
+        || accounts+="${s#*=}=${s%%=*} "
+    done
+  done
+  [[ -n "$accounts" ]] || return 0
+  SPIRE_LOCAL_WORKLOADS="$accounts" check_plane_pods
+}
+
+if [[ -n "${SPIRE_SERVER_CLUSTER:-}" ]]; then
+  check "Every pod that runs as a ServiceAccount of SPIRE_CELL_SUBJECTS in a shared namespace belongs to its harness component" check_cell_subject_pods
+fi
+
+if has_harness argocd-agent; then
+  agent_bundle="$BUNDLES/argocd-agent/manifests.yaml"
+  check "The argocd-agent objects match the bundle" check_harness_drift argocd-agent
+  for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$agent_bundle" 2>/dev/null | sort -u); do
+    check "$ns has exactly the argocd-agent objects of the bundle, with no other field manager" check_harness_objects argocd-agent "$ns"
+  done
+  check "The Argo CD Agent runs the images that build/images.env records" \
+    check_live_images argocd deployment/argocd-agent "CELL=$CELL_NAME mise run cell:up"
+  check "cell-proxy of the agent and its NetworkPolicy use the current $SPIRE_SERVER_CLUSTER node address" check_agent_env_address
+  check "ConfigMap mgmt-root holds the live roots of management" check_agent_mgmt_root
+  check "The Argo CD Agent holds a stream to the principal" check_agent_connected
+fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
-  check "The SPIRE server holds the node alias and role entries of $SPIRE_AGENT_CELLS" check_agent_entries
+  check "The SPIRE server holds the node alias and the role entry of each subject of $SPIRE_AGENT_CELLS" check_agent_entries
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
@@ -713,11 +799,6 @@ check_view_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:link"
     return 1
   fi
-}
-
-# pem_lines prints each PEM certificate on standard input as one line, sorted.
-pem_lines() {
-  awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
 }
 
 # The Secrets of central-view-system must be exactly the view keys and argocd-redis. An extra
