@@ -76,7 +76,9 @@ After that it runs `cell:up` for each cluster that has the `base-cell` component
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
 In `dev-cp`, that wait also runs `secrets:connect` once, or prints the command above, while the secret store is not connected.
-Last, `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
+Then `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
+Last, `cell:up` runs the link phase of a cluster with link components, as [Central Argo CD view](#central-argo-cd-view) describes.
+`harness:up` sets up `management` first with `CELL_UP_SKIP_LINK=1`, and runs `CELL=management mise run cell:link` after the cells.
 Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
 `cell:verify` runs the checks of one cluster and prints PASS or FAIL for each.
 `harness:verify` runs `cell:verify` on each cluster with components, and prints one line for each cluster at the end.
@@ -85,9 +87,11 @@ Harness components stay outside every Argo CD Application. A bundle can still wr
 It then prints the commands for the remaining clusters. Fix the cause, and run them in topology order:
 
 ```sh
+CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up
 CELL=dev-cp mise run cell:up
 CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
+CELL=management mise run cell:link
 ```
 
 Each `cell:up` of `dev-cp` signs the test records of the cells again, with a new key.
@@ -129,13 +133,54 @@ CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
 CELL=dev-cell-1 mise run cell:restart
 CELL=dev-cell-2 mise run cell:restart
+CELL=management mise run cell:link
 mise run harness:verify
 ```
+
+The last `cell:link` copies the new `dev-cp` root and node address into the central view.
 
 `CELL=dev-cp mise run cell:restart` restarts the SPIRE server, which then signs a new CA through the intermediate.
 The server keeps its datastore, so the agents keep their identities.
 On 2026-11-09 the new server pod was Ready about 2 seconds after the old pod stopped. No agent of a cell restarted.
 A `cell:restart` of `dev-cp` took 3 seconds from the delete to a Ready new pod. The agents of both cells ran on for 75 seconds after it with no restart, longer than one SVID lifetime.
+
+## Central Argo CD view
+
+The `management` cluster holds one read-only Argo CD UI for both cells, in `central-view-system`.
+The link component `central-view` renders it in the link phase, after every other component.
+Its render reads the live root and node address of `dev-cp`, and it signs a record for each cell of `VIEW_CELLS` in `cells/management.env`.
+Because of this, the cells and `dev-cp` must exist first.
+
+The view has these parts:
+
+- `argocd-server`, `argocd-repo-server` and `argocd-redis` from the full Argo CD install. The view runs no application controller.
+- The Argo CD Agent principal, with `cell-proxy` and a SPIRE agent in the same pod.
+  `cell-proxy` accepts SPIFFE mTLS on node port 31443 from the `dev-cp` node only.
+  It admits only `spiffe://dev.env.poc.internal/cell/<cell>/argocd-agent` for a registered cell.
+  It then calls the principal on `127.0.0.1:8443` with the header `x-cell-agent: <env>-<cell>`.
+- One agent namespace `<env>-<cell>` for each cell, with a default deny.
+- Job `viewkeys`, which makes the keys of the view inside the cluster. No Secret holds the key of the agent CA.
+
+Run the link phase again after a change to a cell, to `dev-cp` or to `VIEW_CELLS`:
+
+```sh
+CELL=management mise run cell:link
+```
+
+Open the UI on `http://127.0.0.1:8090`. The anonymous user can read and cannot sync, change or delete:
+
+```sh
+mise run view:ui
+```
+
+Make new view keys and a new central Redis password with one command. The command restarts `argocd-redis`, `argocd-repo-server`, the principal and `argocd-server`, and prints one JSON line:
+
+```sh
+mise run view:rotate-keys
+```
+
+The client certificates of the view are valid for 180 days. Run `view:rotate-keys` before they expire.
+`viewkeys` keeps no CA key. So a new cell in `VIEW_CELLS` also needs `view:rotate-keys`, after its `cell:link` fails with a message that names the command.
 
 ## Add or remove a cell
 
@@ -464,13 +509,15 @@ mise run mgmt:rotate-ca
 Use it when someone may hold a copy of `keys.json`, or before SPIRE prepares a new root.
 The task finds each copy of the root in the other clusters.
 A copy is a ConfigMap with the key `root.crt` and the annotation `poc.internal/peer-root-sha256`.
+The task also finds the trust bundle of each SPIRE agent sidecar of a link component in `management`, for example `spire-trust-bundle-argocd-agent-principal`.
+A new pod of that workload attests with this bundle, so the bundle must hold the active root.
 The task then runs these steps:
 
 1. It prepares a new X.509 authority and a new JWT authority. The bundle then holds the old and the new root.
-2. It runs `cell:up` on each cluster that holds a copy, and waits until each copy equals the bundle.
+2. It runs `cell:up` on each other cluster that holds a copy, and `cell:link` in `management` for its own copies. Then it waits until each copy equals the bundle.
 3. It activates the new authorities. New SVIDs chain to the new root, and each copy holds it.
 4. It taints the old authorities, so the agents replace their SVIDs. After `MGMT_ROTATE_TAINT_WAIT` seconds, 120 by default, it revokes them.
-5. It runs `cell:up` on each cluster that holds a copy again, and waits until each copy holds only the new root.
+5. It runs the refresh of step 2 again, and waits until each copy holds only the new root.
 
 `MGMT_ROTATE_WAIT` bounds each wait for the copies in seconds. The default is 900.
 The old key stays in `keys.json` until SPIRE prepares a new authority in its place.

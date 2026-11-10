@@ -35,7 +35,8 @@ const stubBinary = "stub plugin binary"
 
 // stubMise answers "mise run hostsvc -- facts" and "mise run record:fixture" for the cells below,
 // and runs the real pkigen for "mise run pki". The cell bad-facts fails the way hostsvc fails, and
-// no-ip has no node address.
+// no-ip has no node address. STUB_RANDOM_KEYS gives each record a new signature and key, as the
+// real record:fixture does.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
@@ -51,14 +52,24 @@ case "$2" in
     esac ;;
   record:fixture)
     cell="$5"
+    if [[ "$cell" == bad-facts ]]; then
+      echo '{"level":"ERROR","msg":"recordgen failed","error":"cluster does not exist"}'
+      exit 1
+    fi
+    key="stubkey${cell##*-}="
+    sig=""
+    if [[ -n "${STUB_RANDOM_KEYS:-}" ]]; then
+      key="$(head -c 32 /dev/urandom | base64)"
+      sig=",\\\"signatures\\\":[\\\"$RANDOM$RANDOM\\\"]"
+    fi
     cat <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: cell-record-$cell
 data:
-  record.dsse.json: "{\"payload\":\"$cell\"}"
-  signer.pub: "stubkey${cell##*-}="
+  record.dsse.json: "{\"payload\":\"$cell\"$sig}"
+  signer.pub: "$key"
 EOF
     ;;
   pki) shift 3; exec "$STUB_PKIGEN" "$@" ;;
@@ -88,7 +99,8 @@ esac
 if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 `
 
-// stubKubectl answers "spire-server bundle show" with the file STUB_BUNDLE_FILE. STUB_NO_SERVER
+// stubKubectl answers "spire-server bundle show" with the file STUB_BUNDLE_FILE, and in the context
+// kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. STUB_NO_SERVER
 // makes it fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line
 // that is not PEM.
 const stubKubectl = `#!/usr/bin/env bash
@@ -101,6 +113,10 @@ fi
 if [[ -n "${STUB_NO_SERVER:-}" ]]; then
   echo 'Error from server (NotFound): pods "spire-server-0" not found' >&2
   exit 1
+fi
+if [[ " $* " == *" --context kind-management "* ]]; then
+  cat "$STUB_MGMT_BUNDLE_FILE"
+  exit 0
 fi
 cat "$STUB_BUNDLE_FILE"
 [[ -z "${STUB_BAD_BUNDLE:-}" ]] || echo "not a certificate"
@@ -280,7 +296,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -299,6 +315,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	}
 	bundle := caPEM(t, td)
 	bundleFile := write("bundle.pem", bundle, 0o644)
+	mgmtBundleFile := write("mgmt-bundle.pem", caPEM(t, "mgmt.poc.internal"), 0o644)
 	logFile := filepath.Join(dir, "mise.log")
 
 	if cell := opts["STUB_CELL"]; cell != "" {
@@ -325,7 +342,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	cmd.Env = append(base,
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
-		"STUB_BUNDLE_FILE="+bundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
+		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"POC_ENV="+commonEnv(t, "POC_ENV"))
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {

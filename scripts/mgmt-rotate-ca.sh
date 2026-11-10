@@ -22,8 +22,11 @@
 #
 # A copy is a ConfigMap in another cluster with the annotation poc.internal/peer-root-sha256 and a
 # key root.crt whose certificates are all CAs of SPIRE_TRUST_DOMAIN (components/lib/peer-root.sh).
-# By default, a refresh runs cell:up once for each cluster that holds a copy, because the render of
-# that cluster reads the live bundle. MGMT_ROTATE_REFRESH names another command, for the tests. The
+# The trust bundle of each SPIRE agent sidecar of a link component in this cluster is a copy too:
+# ConfigMap spire-trust-bundle-<workload> with the harness label and the key bundle.crt. A new pod
+# of that workload attests with it, so it must hold the active root.
+# By default, a refresh runs cell:up once for each other cluster that holds a copy, and the link
+# phase (cell:link) of this cluster for its own copies, because each render reads the live bundle. MGMT_ROTATE_REFRESH names another command, for the tests. The
 # script runs it once for each copy, as <command> <cluster> <namespace> <name>.
 # MGMT_ROTATE_WAIT bounds each wait for the copies in seconds (default 900). MGMT_ROTATE_TAINT_WAIT
 # is the time between taint and revoke in seconds (default 120).
@@ -56,31 +59,37 @@ bundle_blocks() {
     -socketPath /run/spire/sockets/api.sock -format pem | pem_blocks
 }
 
-# copies prints "<cluster> <namespace> <name>" for each copy of the root in another cluster.
+# copies prints "<cluster> <namespace> <name> <key>" for each copy of the root.
 copies() {
-  local cluster list ns name
+  local cluster list ns name key
   for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
-    [[ "$cluster" != "$CELL_NAME" ]] || continue
     list="$(kubectl --context "kind-$cluster" get configmaps -A -o json)" || die "could not list the ConfigMaps of $cluster"
-    while read -r ns name; do
+    while read -r ns name key; do
       [[ -n "$ns" ]] || continue
       # pkigen fails unless every certificate is a CA of the trust domain.
-      if jq -r --arg ns "$ns" --arg name "$name" '.items[] | select(.metadata.namespace == $ns and .metadata.name == $name) | .data["root.crt"]' <<<"$list" \
+      if jq -r --arg ns "$ns" --arg name "$name" --arg key "$key" '.items[] | select(.metadata.namespace == $ns and .metadata.name == $name) | .data[$key]' <<<"$list" \
         | (cd "$ROOT" && mise run pki -- trust-bundle --trust-domain "$SPIRE_TRUST_DOMAIN") >/dev/null 2>&1; then
-        echo "$cluster $ns $name"
+        echo "$cluster $ns $name $key"
       fi
-    done < <(jq -r '.items[] | select(.metadata.annotations["poc.internal/peer-root-sha256"] != null and .data["root.crt"] != null)
-      | "\(.metadata.namespace) \(.metadata.name)"' <<<"$list")
+    done < <(jq -r --arg own "$([[ "$cluster" == "$CELL_NAME" ]] && echo 1)" --arg label "$HARNESS_LABEL" '.items[]
+      | if $own == "" then select(.metadata.annotations["poc.internal/peer-root-sha256"] != null and .data["root.crt"] != null)
+          | "\(.metadata.namespace) \(.metadata.name) root.crt"
+        else select((.metadata.name | startswith("spire-trust-bundle-")) and (.metadata.labels[$label] // "") != "" and .data["bundle.crt"] != null)
+          | "\(.metadata.namespace) \(.metadata.name) bundle.crt" end' <<<"$list")
   done
 }
 
 # refresh <copies> renders each copy again from the live bundle.
 refresh() {
-  local cluster ns name done_clusters=" "
-  while read -r cluster ns name; do
+  local cluster ns name key done_clusters=" "
+  while read -r cluster ns name key; do
     [[ -n "$cluster" ]] || continue
     if [[ -n "${MGMT_ROTATE_REFRESH:-}" ]]; then
       "$MGMT_ROTATE_REFRESH" "$cluster" "$ns" "$name" || die "the refresh of $cluster $ns/$name failed"
+    elif [[ "$cluster" == "$CELL_NAME" && "$done_clusters" != *" $cluster "* ]]; then
+      log "running cell:link in $cluster, which holds the copy $ns/$name"
+      CELL="$cluster" "$ROOT/scripts/link.sh" || die "cell:link of $cluster failed. Fix the cause, then run: CELL=$cluster mise run cell:link, and CELL=$CELL_NAME mise run mgmt:rotate-ca again"
+      done_clusters+="$cluster "
     elif [[ "$done_clusters" != *" $cluster "* ]]; then
       log "running cell:up in $cluster, which holds the copy $ns/$name"
       CELL="$cluster" "$ROOT/scripts/up.sh" || die "cell:up of $cluster failed. Fix the cause, then run: CELL=$cluster mise run cell:up, and CELL=$CELL_NAME mise run mgmt:rotate-ca again"
@@ -91,13 +100,13 @@ refresh() {
 
 # wait_for_copies <copies> waits until each copy holds exactly the roots of the live bundle.
 wait_for_copies() {
-  local want cluster ns name got end=$((SECONDS + wait_seconds)) stale
+  local want cluster ns name key got end=$((SECONDS + wait_seconds)) stale
   want="$(bundle_blocks)" || die "could not read the bundle of $CELL_NAME"
   while :; do
     stale=()
-    while read -r cluster ns name; do
+    while read -r cluster ns name key; do
       [[ -n "$cluster" ]] || continue
-      got="$(kubectl --context "kind-$cluster" -n "$ns" get configmap "$name" -o jsonpath='{.data.root\.crt}' | pem_blocks)"
+      got="$(kubectl --context "kind-$cluster" -n "$ns" get configmap "$name" -o json | jq -r --arg key "${key:-root.crt}" '.data[$key] // ""' | pem_blocks)"
       [[ "$got" == "$want" ]] || stale+=("$cluster $ns/$name")
     done <<<"$1"
     ((${#stale[@]} == 0)) && return 0
@@ -153,7 +162,7 @@ old_status() {
 }
 
 holders="$(copies)"
-log "other clusters hold $(grep -c . <<<"$holders" || true) copies of the root of $SPIRE_TRUST_DOMAIN"
+log "$(grep -c . <<<"$holders" || true) ConfigMaps hold a copy of the root of $SPIRE_TRUST_DOMAIN: $(cut -d' ' -f1-3 <<<"$holders" | paste -sd, - | sed 's/,/, /g')"
 read_state
 
 # SPIRE prepares into the slot that holds the old authority, so a prepare before the old authority

@@ -20,6 +20,9 @@
 | Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
 | Restart `celld` in a cell, or the SPIRE server in `dev-cp` or `management` | `CELL=dev-cp mise run cell:restart` |
+| Run the link phase of `management`: the central Argo CD view (see README "Central Argo CD view") | `mise run cell:link` |
+| Central read-only Argo CD UI on 127.0.0.1:8090 | `mise run view:ui` |
+| New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
@@ -50,6 +53,9 @@
 - Add a component as `components/<name>/`, then add it to a component set in `scripts/lib.sh`.
   An Argo CD component goes in a set that `COMPONENTS` takes. A harness component, which stays outside
   Argo CD, goes in a set that `HARNESS_COMPONENTS` takes. `cell:up` applies harness components itself.
+  A link component reads live facts of other clusters, goes in a set that `LINK_COMPONENTS` takes, and
+  renders and applies in the link phase (`scripts/link.sh`). `CELL_UP_SKIP_LINK=1` skips that phase.
+- Every harness and link object carries the label `cell.poc.internal/harness=<component>`.
 - A component is a kustomization, or an executable `render.sh` that prints YAML.
 - `@CELL_NAME@` and `@CELL_MESH_TRUST_DOMAIN@` in rendered output are replaced by `scripts/hydrate.sh`.
 - Extra Application fields for a component go in `components/<name>/application.yaml`.

@@ -94,11 +94,14 @@ func precheck(run string) error {
 	return nil
 }
 
-// precheckM3 checks that the management plane has its SPIRE server. The clock check above covers
-// every cluster.
+// precheckM3 checks that the management plane has its SPIRE server, and that its link phase ran.
+// The clock check above covers every cluster.
 func precheckM3() error {
 	if out, err := command("", "kubectl", "--context", "kind-"+mgmtCluster, "-n", spireNamespace, "get", "statefulset", "spire-server", "-o", "name"); err != nil {
 		return fmt.Errorf("%s has no SPIRE server. Run: CELL=%s mise run cell:up\n%s", mgmtCluster, mgmtCluster, out)
+	}
+	if out, err := command("", "kubectl", "--context", "kind-"+mgmtCluster, "-n", viewNamespace, "get", "deployment", principalName, "-o", "name"); err != nil {
+		return fmt.Errorf("%s has no Deployment %s, so its link phase has not run. Run: CELL=%s mise run cell:link\n%s", mgmtCluster, principalName, mgmtCluster, out)
 	}
 	return nil
 }

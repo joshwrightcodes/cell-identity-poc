@@ -61,9 +61,19 @@ CELL_IDENTITY_HARNESS=(
   "cell-identity:cell-identity-system"
 )
 
+# Link components. scripts/link.sh renders and applies them in the link phase, after every wave
+# and harness component, because their render reads the live roots and node addresses of other
+# clusters. They follow the harness rules: no Argo CD Application holds them, every object carries
+# HARNESS_LABEL=<component>, and cell:verify and cell:restart act on the labelled objects.
+# Each entry is <component>:<namespace>.
+CENTRAL_VIEW_LINK=(
+  "central-view:central-view-system"
+)
+
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
 HARNESS_COMPONENTS=()
+LINK_COMPONENTS=()
 set_names="$(yq -r ".clusters[] | select(.name == \"$CELL\") | .components[]" "$ROOT/harness/topology.yaml")"
 for set_name in $set_names; do
   case "$set_name" in
@@ -71,6 +81,7 @@ for set_name in $set_names; do
     external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
     cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
+    central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done
@@ -365,21 +376,33 @@ check_plane_pods() {
 }
 
 # check_harness_objects <component> <namespace> compares the namespace with the bundle of a harness
-# component. The harness apply does not prune, and kubectl diff sees only the fields of its own
-# field manager. Each object of the bundle must have only the field manager kubectl, and
+# or link component. The harness apply does not prune, and kubectl diff sees only the fields of
+# its own field manager. Each object of the bundle must have only the field manager kubectl, and
 # kube-controller-manager for status.
-#   - When the bundle holds the Namespace, the component owns it: for each kind in the bundle, the
-#     namespace must hold exactly the objects of the bundle, apart from objects that only system
-#     controllers write, for example kube-root-ca.crt. The Namespace must have only kubectl.
+#   - When the bundle holds the Namespace, the component owns it: for each kind that the bundle
+#     holds in the namespace, the namespace must hold exactly the objects of the bundle, apart from
+#     objects that only system controllers write, for example kube-root-ca.crt. The Namespace must
+#     have only kubectl.
 #   - Otherwise the namespace is shared with a bundle, whose Application owns the Namespace and its
 #     own objects. For each kind, the objects with the harness label of the component must be
-#     exactly the objects of the bundle.
+#     exactly the objects of the bundle in the namespace.
+#   - For each cluster-scoped kind of the bundle, Namespace included, the objects with the harness
+#     label of the component must be exactly the objects of the bundle. A list of a cluster-scoped
+#     kind holds the objects of every owner, so only the label tells them apart.
 check_harness_objects() {
   local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned problems=()
   [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
-  for kind in $(yq -N -r 'select(.kind != null and .kind != "Namespace") | .kind' "$bundle" | sort -u); do
-    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
+  # managers_of <live list> <names> prints each field manager of the named objects other than
+  # kubectl Apply and the status of kube-controller-manager.
+  managers_of() {
+    jq -r --arg want " $2 " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
+      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
+        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
+      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$1"
+  }
+  for kind in $(NS="$ns" yq -N -r 'select(.kind != null and .metadata.namespace == strenv(NS)) | .kind' "$bundle" | sort -u); do
+    want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
     if [[ -n "$owned" ]]; then
       got="$(jq -r --arg label "$HARNESS_LABEL" '[.items[]
@@ -393,11 +416,15 @@ check_harness_objects() {
         || { echo "could not read the $kind objects in $ns"; return 1; }
       [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
     fi
-    bad="$(jq -r --arg want " $want " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
-      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
-        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
-      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$live")" \
-      || { echo "could not read the field managers of $kind in $ns"; return 1; }
+    bad="$(managers_of "$live" "$want")" || { echo "could not read the field managers of $kind in $ns"; return 1; }
+    [[ -z "$bad" ]] || problems+=("$bad")
+  done
+  for kind in $(yq -N -r 'select(.kind != null and (.metadata.namespace // "") == "") | .kind' "$bundle" | sort -u); do
+    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND) and (.metadata.namespace // "") == "") | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
+    live="$(k get "$kind" -l "$HARNESS_LABEL=$comp" -o json --show-managed-fields)" || { echo "could not list $kind with the label $HARNESS_LABEL=$comp"; return 1; }
+    got="$(jq -r '[.items[].metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects"; return 1; }
+    [[ "$got" == "$want" ]] || problems+=("the cluster has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
+    bad="$(managers_of "$live" "$want")" || { echo "could not read the field managers of $kind"; return 1; }
     [[ -z "$bad" ]] || problems+=("$bad")
   done
   if [[ -n "$owned" ]]; then

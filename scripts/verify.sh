@@ -74,9 +74,9 @@ check_argocd_local_only() {
     || { echo "an Application has another destination or source"; return 1; }
 }
 
-# The base platform namespaces, and the namespace of each harness component of this cell.
+# The base platform namespaces, and the namespace of each harness and link component of this cell.
 platform_namespaces=(argocd cell-system observability-system)
-for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   platform_namespaces+=("${entry#*:}")
 done
 
@@ -682,6 +682,23 @@ if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "SecretStore $SECRET_STORE is Ready, and each ExternalSecret that uses it is Ready and refreshed in time" check_secret_store
   check "The External Secrets Operator cannot list Secrets in every namespace, and no token copy lies outside $SECRET_STORE_NAMESPACES" check_operator_scope
 fi
+
+# Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
+# and the images of each workload. cell:link renders them again from the live facts.
+for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+  comp="${entry%%:*}"
+  bundle="$BUNDLES/$comp/manifests.yaml"
+  check "The $comp objects match the bundle" check_harness_drift "$comp"
+  for ns in $(yq -N 'select(.kind == "Namespace") | .metadata.name' "$bundle" 2>/dev/null); do
+    check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
+  done
+  for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
+      | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
+        | .metadata.namespace + "|" + (.kind | ascii_downcase) + "/" + .metadata.name'); do
+    check "${workload#*|} runs the images that build/images.env records" \
+      check_live_images "${workload%%|*}" "${workload#*|}" "CELL=$CELL_NAME mise run cell:link"
+  done
+done
 
 if ((failures > 0)); then
   log "$failures check(s) failed"

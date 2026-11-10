@@ -2,8 +2,8 @@
 # Set up the cell: create the cluster through the host service, apply the bootstrap set, publish
 # the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
-# store, or asks for secrets:connect in a second shell. Last, apply the harness components and wait
-# for their rollouts.
+# store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
+# for their rollouts. Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
@@ -13,7 +13,8 @@ k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
   || die "the node of $CELL_NAME is not Ready after 300s. Read its state: mise x -- kubectl --context kind-$CELL_NAME describe nodes. Then run CELL=$CELL_NAME mise run cell:up again"
 
 "$ROOT/scripts/facts.sh"
-"$ROOT/scripts/hydrate.sh"
+# The link components render in the link phase, after every wave, because they read live facts.
+CELL_UP_SKIP_LINK=1 "$ROOT/scripts/hydrate.sh"
 
 for c in "${BOOTSTRAP[@]}"; do
   apply_bundle "$c"
@@ -57,4 +58,12 @@ for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   harness_rollout_wait "${entry%%:*}" "${entry#*:}"
   log "harness component ${entry%%:*} is rolled out"
 done
+if ((${#LINK_COMPONENTS[@]} > 0)); then
+  if [[ "${CELL_UP_SKIP_LINK:-}" == 1 ]]; then
+    log "skipping the link phase, because CELL_UP_SKIP_LINK=1. Run it later: CELL=$CELL_NAME mise run cell:link"
+  else
+    log "running the link phase of $CELL_NAME"
+    "$ROOT/scripts/link.sh"
+  fi
+fi
 log "cell $CELL_NAME is up. Run mise run cell:verify."

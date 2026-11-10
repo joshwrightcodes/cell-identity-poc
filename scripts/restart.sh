@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Restart the Deployments and StatefulSets of every harness component of the cluster $CELL, and
+# Restart the Deployments and StatefulSets of every harness and link component of the cluster $CELL, and
 # wait until each has new Ready pods. Only the workloads with the harness label of the component
 # count, because a harness component can share its namespace with Argo CD objects. They must be
 # exactly the workloads that the bundle of the component renders. A restarted celld pod gets a
@@ -16,8 +16,8 @@ runs_spire_server=0
 for entry in "${COMPONENTS[@]}"; do
   [[ "${entry%%:*}" == spire-server ]] && runs_spire_server=1
 done
-((${#HARNESS_COMPONENTS[@]} > 0 || runs_spire_server)) \
-  || die "cluster $CELL_NAME has no harness component and no SPIRE server in harness/topology.yaml, so cell:restart has nothing to restart"
+((${#HARNESS_COMPONENTS[@]} + ${#LINK_COMPONENTS[@]} > 0 || runs_spire_server)) \
+  || die "cluster $CELL_NAME has no harness or link component and no SPIRE server in harness/topology.yaml, so cell:restart has nothing to restart"
 
 # rollout_hint <namespace> <deployment> prints the commands that show why a rollout failed.
 rollout_hint() {
@@ -48,7 +48,7 @@ if ((runs_spire_server)); then
   log "restarted the SPIRE server in spire-system. It answered no agent for $((SECONDS - stopped))s"
 fi
 
-for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   ns="${entry#*:}"
   workloads="$(harness_workloads "${entry%%:*}" "$ns")" || exit 1
   for workload in $workloads; do

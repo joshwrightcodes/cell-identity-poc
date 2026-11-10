@@ -67,6 +67,21 @@ run = "scripts/ui.sh"
 description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
 
+[tasks."cell:link"]
+description = "Run the link phase of the cluster CELL (default management): render each link component with the live facts of the other clusters, apply it, run its Jobs and wait for its rollouts"
+env = { CELL = "{{get_env(name='CELL', default='management')}}" }
+run = "scripts/link.sh"
+
+[tasks."view:ui"]
+description = "Serve the read-only central Argo CD UI of management on http://127.0.0.1:8090"
+env = { CELL = "management" }
+run = "scripts/view-ui.sh"
+
+[tasks."view:rotate-keys"]
+description = "Make new view keys in management: new agent CA and certificates, JWT key and server key, a new central Redis password, then restart argocd-redis, argocd-repo-server, the principal and argocd-server"
+env = { CELL = "management" }
+run = "scripts/view-rotate-keys.sh"
+
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
 run = "scripts/down.sh"

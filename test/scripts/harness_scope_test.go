@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,6 +22,8 @@ import (
 //   - STUB_NO_LABEL makes the labelled workload list empty, and STUB_LIST_FAIL makes it fail.
 //   - STUB_LIVE is the answer to "get -f <bundle>", the live objects of the bundle.
 //   - STUB_IMPOSTOR adds a pod that runs as celld: "unlabelled" or "foreign-owner".
+//   - The labelled lists of the cluster-scoped kinds hold Namespace shared and ClusterRole
+//     celld-read. STUB_CLUSTER_EXTRA adds ClusterRole left-over-read with the label of cell-identity.
 const sharedKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
@@ -42,6 +45,12 @@ case "$args" in
     extra=""
     [[ -z "${STUB_EXTRA:-}" ]] || extra=',{"metadata":{"name":"left-over","labels":{"cell.poc.internal/harness":"cell-identity"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
     echo "{\"items\":[$cm,$argocm,$linkcm$extra]}" ;;
+  *" get Namespace -l cell.poc.internal/harness=cell-identity -o json --show-managed-fields "*)
+    echo "{\"items\":[{\"kind\":\"Namespace\",\"metadata\":{\"name\":\"shared\",\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]}}]}" ;;
+  *" get ClusterRole -l cell.poc.internal/harness=cell-identity -o json --show-managed-fields "*)
+    roles='{"kind":"ClusterRole","metadata":{"name":"celld-read","managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
+    [[ -z "${STUB_CLUSTER_EXTRA:-}" ]] || roles="$roles"',{"kind":"ClusterRole","metadata":{"name":"left-over-read","managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
+    echo "{\"items\":[$roles]}" ;;
   *" get namespace shared -o json --show-managed-fields "*)
     echo "{\"metadata\":{\"name\":\"shared\",\"managedFields\":[{\"manager\":\"${STUB_NS_MANAGER:-argocd-controller}\",\"operation\":\"Apply\"}]}}" ;;
   *" get -f "*" -o json --ignore-not-found "*) printf '%s' "${STUB_LIVE:-}" ;;
@@ -107,7 +116,14 @@ func runHarnessScript(t *testing.T, owned bool, snippet string, env ...string) (
 			ns = v
 		}
 	}
-	if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte(harnessBundle(owned, ns)), 0o644); err != nil {
+	// STUB_BUNDLE_EXTRA appends documents to the bundle.
+	extra := ""
+	for _, e := range env {
+		if v, ok := strings.CutPrefix(e, "STUB_BUNDLE_EXTRA="); ok {
+			extra = "\n---\n" + v
+		}
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte(harnessBundle(owned, ns)+extra), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	lib, err := filepath.Abs("../../scripts/lib.sh")
@@ -294,5 +310,37 @@ func TestRotateCARefusesOtherServers(t *testing.T) {
 				t.Fatalf("err %v, output %q, kubectl calls %q; want a stop that says %q and no call", err, out, calls, want)
 			}
 		})
+	}
+}
+
+// A bundle with objects of other namespaces and of the cluster scope, as the central view has. The
+// check of one namespace compares only the objects of that namespace. It compares each
+// cluster-scoped kind by the harness label, because a list of that kind holds the objects of every
+// owner, and it never lists a cluster-scoped kind in the namespace.
+func TestHarnessObjectsOfOtherNamespacesAndTheClusterScope(t *testing.T) {
+	extra := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: elsewhere\n  namespace: other\n---\n" +
+		"apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: celld-read\n"
+	for _, owned := range []bool{false, true} {
+		t.Run(fmt.Sprintf("owned=%v", owned), func(t *testing.T) {
+			out, calls, err := runHarnessScript(t, owned, `check_harness_objects cell-identity shared`, "STUB_BUNDLE_EXTRA="+extra, "STUB_NS_MANAGER=kubectl")
+			if owned {
+				// The owned namespace still holds the Argo CD objects of the stub.
+				if err == nil || strings.Contains(out, "elsewhere") || strings.Contains(out, "ClusterRole") {
+					t.Fatalf("err %v, output %q; want a failure for the Argo CD objects only", err, out)
+				}
+			} else if err != nil {
+				t.Fatalf("check failed: %v\n%s\ncalls:\n%s", err, out, calls)
+			}
+			if !strings.Contains(calls, "get ClusterRole -l cell.poc.internal/harness=cell-identity") || strings.Contains(calls, "-n shared get ClusterRole") {
+				t.Fatalf("calls:\n%s\nwant a labelled list of ClusterRoles and no namespaced one", calls)
+			}
+			if owned != strings.Contains(calls, "get Namespace -l cell.poc.internal/harness=cell-identity") {
+				t.Fatalf("calls:\n%s\nwant a labelled list of Namespaces only when the bundle holds one", calls)
+			}
+		})
+	}
+	out, _, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`, "STUB_BUNDLE_EXTRA="+extra, "STUB_CLUSTER_EXTRA=1")
+	if err == nil || !strings.Contains(out, "the cluster has the ClusterRole objects 'celld-read left-over-read' with the label cell.poc.internal/harness=cell-identity, and the bundle cell-identity has 'celld-read'") {
+		t.Fatalf("err %v, output %q; want a failure that names the extra ClusterRole", err, out)
 	}
 }
