@@ -98,7 +98,10 @@ Each `cell:up` of `dev-cp` signs the test records of the cells again, with a new
 The server config changes because of this, so the SPIRE server pod restarts. M4 replaces the test records.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
-An unknown name fails with a list of the known cells. For example, `CELL=management mise run cell:up` sets up the base cell on `management` only.
+An unknown name fails with a list of the known cells. For example, `CELL=dev-cell-1 mise run cell:up` sets up `dev-cell-1` only.
+`cell:up` of `management` also runs its link phase, which needs `dev-cp` and each cell of `VIEW_CELLS`.
+When one of them is missing, `cell:up` stops before its first apply and prints the command.
+To set up the base cell of `management` alone, run `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`.
 
 ## Rebuild one cluster
 
@@ -173,14 +176,24 @@ Open the UI on `http://127.0.0.1:8090`. The anonymous user can read and cannot s
 mise run view:ui
 ```
 
+The view is read-only, so a refresh in the UI fails with a permission error.
+`argocd-server` may read the Applications of the agent namespaces and change none of them.
+Before the agents of the cells connect (a later milestone task), the list of Applications is empty. That is the expected result.
+
+While `view:ui` runs, the page is open on the Mac loopback. Every pod on the VM, `rogue` included, can reach it through `host.docker.internal`.
+The task prints a warning about this when it starts. Stop it with Ctrl-C when you are done.
+
 Make new view keys and a new central Redis password with one command. The command restarts `argocd-redis`, `argocd-repo-server`, the principal and `argocd-server`, and prints one JSON line:
 
 ```sh
 mise run view:rotate-keys
 ```
 
-The client certificates of the view are valid for 180 days. Run `view:rotate-keys` before they expire.
-`viewkeys` keeps no CA key. So a new cell in `VIEW_CELLS` also needs `view:rotate-keys`, after its `cell:link` fails with a message that names the command.
+If the task stops before its end, run it again. It is safe to run again, and only one run may go at a time.
+
+The client certificates of the view are valid for 180 days. `cell:verify` fails 30 days before they expire. Run `view:rotate-keys` then.
+`viewkeys` keeps no CA key. When a certificate Secret is missing or does not match the CA, for example after a new cell in `VIEW_CELLS`, `cell:link` makes a new CA and new certificates, and starts the principal and `argocd-server` again.
+`cell:verify` of `management` also compares the view listener address and ConfigMap `peer-root` with the live values of `dev-cp`. After a rebuild of `dev-cp`, it prints `CELL=management mise run cell:link`.
 
 ## Add or remove a cell
 

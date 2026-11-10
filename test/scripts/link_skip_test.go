@@ -72,6 +72,10 @@ echo publish >>"$STUB_LOG"
 	write("bin/mise", "#!/usr/bin/env bash\necho \"mise $*\" >>\"$STUB_LOG\"\n")
 	write("bin/kubectl", `#!/usr/bin/env bash
 echo "kubectl $*" >>"$STUB_LOG"
+if [[ " $* " == *" get pod spire-server-0 "* ]]; then
+  [[ -n "${STUB_NO_SPIRE:-}" ]] || echo Running
+  exit 0
+fi
 if [[ " $* " == *" get applications -o json "* ]]; then
   cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn '{items: [inputs | {metadata: {name: .},
     status: {sync: {status: "Synced", revision: "sha256:1"}, health: {status: "Healthy"}}}]}'
@@ -122,5 +126,39 @@ func TestLinkSkippedWhenAsked(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(calls), "\n")
 	if lines[len(lines)-1] != "link" || strings.Contains(calls, "render central-view") {
 		t.Fatalf("up calls:\n%s\nwant link.sh as the last call, and no render of central-view in up.sh", calls)
+	}
+}
+
+// Without CELL_UP_SKIP_LINK, cell:up and cell:link of management stop before any apply when the
+// environment control plane has no running SPIRE server, and name the commands that go on.
+func TestLinkPhaseNeedsTheOtherClusters(t *testing.T) {
+	root, logFile := linkRoot(t)
+	for _, script := range []string{"up.sh", "link.sh"} {
+		t.Run(script, func(t *testing.T) {
+			if script == "link.sh" {
+				b, err := os.ReadFile("../../scripts/link.sh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(root, "scripts", "link.sh"), b, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cmd := exec.Command(filepath.Join(root, "scripts", script))
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
+				"HOME=" + os.Getenv("HOME"), "CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + logFile, "STUB_NO_SPIRE=1"}
+			out, err := cmd.CombinedOutput()
+			calls, _ := os.ReadFile(logFile)
+			_ = os.Remove(logFile)
+			if err == nil || !strings.Contains(string(out), "the SPIRE server of dev-cp does not run. Run: CELL=dev-cp mise run cell:up") {
+				t.Fatalf("err %v, output %s; want a stop that names dev-cp", err, out)
+			}
+			if script == "up.sh" && !strings.Contains(string(out), "CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up") {
+				t.Fatalf("output %s does not name the command without the link phase", out)
+			}
+			if strings.Contains(string(calls), " apply ") || strings.Contains(string(calls), "hostsvc -- up") || strings.Contains(string(calls), "render ") {
+				t.Fatalf("%s worked before the check:\n%s", script, calls)
+			}
+		})
 	}
 }

@@ -61,7 +61,9 @@ bundle_blocks() {
 
 # copies prints "<cluster> <namespace> <name> <key>" for each copy of the root.
 copies() {
-  local cluster list ns name key
+  local cluster list ns name key links
+  # Only cell:link renders the copies of this cluster, so only link components count.
+  links="$(printf '%s\n' ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"} | jq -Rn '[inputs | select(length > 0)]')"
   for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
     list="$(kubectl --context "kind-$cluster" get configmaps -A -o json)" || die "could not list the ConfigMaps of $cluster"
     while read -r ns name key; do
@@ -71,10 +73,11 @@ copies() {
         | (cd "$ROOT" && mise run pki -- trust-bundle --trust-domain "$SPIRE_TRUST_DOMAIN") >/dev/null 2>&1; then
         echo "$cluster $ns $name $key"
       fi
-    done < <(jq -r --arg own "$([[ "$cluster" == "$CELL_NAME" ]] && echo 1)" --arg label "$HARNESS_LABEL" '.items[]
+    done < <(jq -r --arg own "$([[ "$cluster" == "$CELL_NAME" ]] && echo 1)" --arg label "$HARNESS_LABEL" --argjson links "$links" '.items[]
       | if $own == "" then select(.metadata.annotations["poc.internal/peer-root-sha256"] != null and .data["root.crt"] != null)
           | "\(.metadata.namespace) \(.metadata.name) root.crt"
-        else select((.metadata.name | startswith("spire-trust-bundle-")) and (.metadata.labels[$label] // "") != "" and .data["bundle.crt"] != null)
+        else select((.metadata.name | startswith("spire-trust-bundle-")) and .data["bundle.crt"] != null
+            and ((.metadata.labels[$label] // "") as $c | $links | index($c) != null))
           | "\(.metadata.namespace) \(.metadata.name) bundle.crt" end' <<<"$list")
   done
 }

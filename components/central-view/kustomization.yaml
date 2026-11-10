@@ -17,8 +17,7 @@ patches:
   - path: argocd-rbac-cm.yaml
   - path: argocd-cmd-params-cm.yaml
   # argocd-server reads Secrets and ConfigMaps of its namespace and changes none. It reads
-  # Applications in every namespace. render.sh adds a Role in each agent namespace, where it may
-  # patch an Application for the refresh annotation.
+  # Applications in every namespace and changes none, so a refresh in the view fails.
   - target:
       kind: Role
       name: argocd-server

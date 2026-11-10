@@ -23,14 +23,23 @@ import (
 )
 
 // caRotateKubectl sends each exec into the server pod to the fake spire-server, and answers the
-// ConfigMap lists of the copy search with no copy.
+// ConfigMap lists of the copy search with no copy. With STUB_OWN_COPY, management holds the trust
+// bundle of the principal sidecar, with the content of $STUB_STATE/own.pem.
 const caRotateKubectl = `#!/usr/bin/env bash
 set -euo pipefail
+own() {
+  jq -n --rawfile pem "$STUB_STATE/own.pem" '{kind: "ConfigMap", metadata: {namespace: "central-view-system",
+    name: "spire-trust-bundle-argocd-agent-principal", labels: {"cell.poc.internal/harness": "central-view"}},
+    data: {"bundle.crt": $pem}}'
+}
 case " $* " in
   *" exec spire-server-0 "*)
     while (($#)) && [[ "$1" != -- ]]; do shift; done
     shift 2
     exec "$STUB_DIR/spire-server" "$@" ;;
+  *" --context kind-management get configmaps -A -o json "*)
+    if [[ -n "${STUB_OWN_COPY:-}" ]]; then own | jq '{items: [.]}'; else echo '{"items":[]}'; fi ;;
+  *" --context kind-management -n central-view-system get configmap spire-trust-bundle-argocd-agent-principal -o json "*) own ;;
   *" get configmaps -A -o json "*) echo '{"items":[]}' ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac

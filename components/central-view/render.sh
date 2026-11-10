@@ -24,10 +24,10 @@
 #   - the cell-proxy and viewkeys images that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root and of the registry content, so a new
 # root or a new set of cells restarts the pod.
-# Inputs: VIEW_CELLS and SPIRE_TRUST_DOMAIN from cells/management.env, POC_ENV and
+# Inputs: VIEW_CELLS, VIEW_CONTROL_PLANE and SPIRE_TRUST_DOMAIN from cells/management.env, POC_ENV and
 # ARGOCD_AGENT_IMAGE from cells/common.env, and the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
-: "${CELL_NAME:?}" "${POC_ENV:?}" "${VIEW_CELLS:?}" "${SPIRE_TRUST_DOMAIN:?}" "${ARGOCD_AGENT_IMAGE:?}"
+: "${CELL_NAME:?}" "${POC_ENV:?}" "${VIEW_CELLS:?}" "${VIEW_CONTROL_PLANE:?}" "${SPIRE_TRUST_DOMAIN:?}" "${ARGOCD_AGENT_IMAGE:?}"
 : "${NODE_IPS:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -35,7 +35,7 @@ root="$(cd "$here/../.." && pwd)"
 namespace=central-view-system
 component=central-view
 # The environment control plane, and the trust domain of the agents in its cells.
-env_cluster=dev-cp
+env_cluster="$VIEW_CONTROL_PLANE"
 env_td=dev.env.poc.internal
 
 die() { printf 'error: central-view render: %s\n' "$*" >&2; exit 1; }
@@ -52,10 +52,19 @@ read -r -a cells <<<"$VIEW_CELLS"
 ((${#cells[@]} > 0)) || die "VIEW_CELLS names no cell"
 agents=()
 for cell in "${cells[@]}"; do
-  # The agent name <env>-<cell> must fit a 63-character label.
   [[ "$cell" =~ ^[a-z0-9]([a-z0-9-]{0,57}[a-z0-9])?$ ]] || die "VIEW_CELLS entry '$cell' is not a cell name of at most 59 characters"
   case "$cell" in cp | dev-cp | management | rogue) die "VIEW_CELLS names the reserved name $cell" ;; esac
+  # The agent name <env>-<cell> is a namespace name, so it must fit a 63-character label.
+  ((${#POC_ENV} + 1 + ${#cell} <= 63)) || die "the agent name $POC_ENV-$cell is longer than 63 characters"
   agents+=("$POC_ENV-$cell")
+done
+# The principal stores the AppProjects of every agent in one namespace as <agent>-<project>. So no
+# agent name may start with another agent name and a dash, or two cells could map to one project.
+for a in "${agents[@]}"; do
+  for b in "${agents[@]}"; do
+    [[ "$a" == "$b" || "$b" != "$a"-* ]] || die "the agent name $b starts with the agent name $a and a dash, so their AppProjects could collide in $namespace"
+    [[ "$a" != "$b" || "$(printf '%s\n' "${agents[@]}" | grep -cxF "$a")" == 1 ]] || die "VIEW_CELLS names $a twice"
+  done
 done
 agent_list="$(IFS=,; echo "${agents[*]}")"
 
@@ -119,23 +128,13 @@ for ns in "${agents[@]}"; do
   echo "---"
   NS="$ns" yq -n '.apiVersion = "rbac.authorization.k8s.io/v1" | .kind = "Role"
     | .metadata.name = "argocd-agent-principal" | .metadata.namespace = strenv(NS)
-    | .rules = [{"apiGroups": ["argoproj.io"], "resources": ["applications", "applicationsets"],
+    | .rules = [{"apiGroups": ["argoproj.io"], "resources": ["applications"],
         "verbs": ["create", "get", "list", "watch", "update", "patch", "delete"]}]'
   echo "---"
   NS="$ns" yq -n '.apiVersion = "rbac.authorization.k8s.io/v1" | .kind = "RoleBinding"
     | .metadata.name = "argocd-agent-principal" | .metadata.namespace = strenv(NS)
     | .roleRef = {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "argocd-agent-principal"}
     | .subjects = [{"kind": "ServiceAccount", "name": "argocd-agent-principal", "namespace": "central-view-system"}]'
-  echo "---"
-  # A refresh in the UI patches the refresh annotation of the Application.
-  NS="$ns" yq -n '.apiVersion = "rbac.authorization.k8s.io/v1" | .kind = "Role"
-    | .metadata.name = "argocd-server" | .metadata.namespace = strenv(NS)
-    | .rules = [{"apiGroups": ["argoproj.io"], "resources": ["applications"], "verbs": ["patch"]}]'
-  echo "---"
-  NS="$ns" yq -n '.apiVersion = "rbac.authorization.k8s.io/v1" | .kind = "RoleBinding"
-    | .metadata.name = "argocd-server" | .metadata.namespace = strenv(NS)
-    | .roleRef = {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "argocd-server"}
-    | .subjects = [{"kind": "ServiceAccount", "name": "argocd-server", "namespace": "central-view-system"}]'
   echo "---"
 done)"
 

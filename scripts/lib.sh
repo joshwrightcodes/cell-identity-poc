@@ -233,6 +233,53 @@ connect_store_step() {
 # Harness and link objects carry this label, with the name of their component as the value.
 HARNESS_LABEL=cell.poc.internal/harness
 
+# fix_command <component> prints the command that renders and applies a component again: cell:link
+# for a link component, cell:up for every other one.
+fix_command() {
+  local entry
+  for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+    [[ "${entry%%:*}" == "$1" ]] && { echo "CELL=$CELL_NAME mise run cell:link"; return; }
+  done
+  echo "CELL=$CELL_NAME mise run cell:up"
+}
+
+# link_preflight prints one line for each cluster that the link phase of $CELL needs and that does
+# not answer: the environment control plane VIEW_CONTROL_PLANE with its SPIRE server, and each cell
+# of VIEW_CELLS. It prints nothing when the link phase can run, or when the cluster has none.
+link_preflight() {
+  local c
+  ((${#LINK_COMPONENTS[@]} > 0)) || return 0
+  for c in ${VIEW_CONTROL_PLANE:-} ${VIEW_CELLS:-}; do
+    if ! (cd "$ROOT" && mise run hostsvc -- facts --cluster "$c" >/dev/null 2>&1); then
+      echo "cluster $c does not exist. Create it: CELL=$c mise run cell:up"
+    elif [[ "$c" == "${VIEW_CONTROL_PLANE:-}" ]] \
+      && ! kubectl --context "kind-$c" -n spire-system get pod spire-server-0 -o jsonpath='{.status.phase}' 2>/dev/null | grep -qx Running; then
+      echo "the SPIRE server of $c does not run. Run: CELL=$c mise run cell:up"
+    fi
+  done
+}
+
+# restart_deployment_pods <namespace> <deployment> deletes the pods of a Deployment and waits for a
+# new Ready pod. It changes no field of the Deployment, so its field managers stay the same.
+restart_deployment_pods() {
+  local ns="$1" name="$2" selector old uids end
+  selector="$(k -n "$ns" get deployment "$name" -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
+  [[ -n "$selector" ]] || die "deployment/$name in $ns has no label selector"
+  old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
+  k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of deployment/$name in $ns"
+  end=$((SECONDS + 300))
+  until uids="$(k -n "$ns" get pods -l "$selector" -o json | jq -r --arg old " $old " '
+      [.items[] | .metadata.uid as $uid | select(($old | contains(" " + $uid + " ")) | not)
+        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.uid] | join(" ")')" \
+      && [[ -n "$uids" ]]; do
+    if ((SECONDS >= end)); then
+      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $ns describe deployment/$name"
+      die "deployment/$name in $ns has no new Ready pod after 300s"
+    fi
+    sleep 2
+  done
+}
+
 # harness_workloads <component> <namespace> prints the Deployments and StatefulSets of a harness
 # component, as <kind>.apps/<name>. Other workloads in the namespace belong to a bundle. The live
 # workloads with the harness label must be exactly the ones that the bundle of the component
@@ -240,13 +287,13 @@ HARNESS_LABEL=cell.poc.internal/harness
 # die ends only a command substitution, so call it as: list="$(harness_workloads c ns)" || exit 1
 harness_workloads() {
   local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" live want
-  [[ -f "$bundle" ]] || die "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"
+  [[ -f "$bundle" ]] || die "no $bundle. Run: $(fix_command "$comp")"
   live="$(k -n "$ns" get deployments,statefulsets -l "$HARNESS_LABEL=$comp" -o name)" \
     || die "could not list the Deployments and StatefulSets of $comp in $ns"
   live="$(sed '/^$/d' <<<"$live" | sort)"
   want="$(NS="$ns" yq -N 'select((.kind == "Deployment" or .kind == "StatefulSet") and .metadata.namespace == strenv(NS))
     | (.kind | downcase) + ".apps/" + .metadata.name' "$bundle" | sed '/^$/d' | sort)"
-  [[ "$live" == "$want" ]] || die "$ns holds the workloads '${live//$'\n'/ }' with the label $HARNESS_LABEL=$comp, and the bundle $comp renders '${want//$'\n'/ }'. Run: CELL=$CELL_NAME mise run cell:up"
+  [[ "$live" == "$want" ]] || die "$ns holds the workloads '${live//$'\n'/ }' with the label $HARNESS_LABEL=$comp, and the bundle $comp renders '${want//$'\n'/ }'. Run: $(fix_command "$comp")"
   printf '%s\n' "$live"
 }
 
@@ -305,7 +352,7 @@ release_from_argocd() {
 # or link component, or an owner reference. It prints nothing when the harness may apply the bundle.
 harness_conflicts() {
   local comp="$1" bundle="$BUNDLES/$1/manifests.yaml" live apps
-  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   live="$(k get -f "$bundle" -o json --ignore-not-found)" || { echo "could not read the live objects of the bundle $comp"; return 1; }
   apps="$(printf '%s\n' root ${COMPONENTS[@]+"${COMPONENTS[@]%%:*}"} | jq -Rn '[inputs]')"
   jq -r --arg comp "$comp" --arg label "$HARNESS_LABEL" --argjson apps "$apps" '
@@ -326,7 +373,7 @@ harness_conflicts() {
 harness_apply() {
   local conflicts
   conflicts="$(harness_conflicts "$1")" || die "$conflicts"
-  [[ -z "$conflicts" ]] || die "the harness component $1 renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the harness render or remove it from the other owner, so that one owner holds it. Then run: CELL=$CELL_NAME mise run cell:up"
+  [[ -z "$conflicts" ]] || die "the harness component $1 renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the harness render or remove it from the other owner, so that one owner holds it. Then run: $(fix_command "$1")"
   apply_bundle "$1"
   release_from_argocd "$BUNDLES/$1/manifests.yaml"
 }
@@ -391,7 +438,7 @@ check_plane_pods() {
 #     kind holds the objects of every owner, so only the label tells them apart.
 check_harness_objects() {
   local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned problems=()
-  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
   # managers_of <live list> <names> prints each field manager of the named objects other than
   # kubectl Apply and the status of kube-controller-manager.
@@ -436,7 +483,7 @@ check_harness_objects() {
   fi
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
-    echo "Delete each extra object, and each field that another manager added. Then run: CELL=$CELL_NAME mise run cell:up"
+    echo "Delete each extra object, and each field that another manager added. Then run: $(fix_command "$comp")"
     return 1
   fi
 }

@@ -7,6 +7,12 @@
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
+# The link phase comes last, and it needs other clusters. Check them before the first step, so a
+# missing cluster stops cell:up in seconds and not after the base cell.
+if [[ "${CELL_UP_SKIP_LINK:-}" != 1 ]]; then
+  missing="$(link_preflight)"
+  [[ -z "$missing" ]] || die "the link phase of $CELL_NAME needs other clusters:"$'\n'"$missing"$'\n'"Or set up the base cell alone now, and run the link phase later: CELL_UP_SKIP_LINK=1 CELL=$CELL_NAME mise run cell:up, then CELL=$CELL_NAME mise run cell:link"
+fi
 log "creating cluster $CELL_NAME through the host service"
 (cd "$ROOT" && mise run hostsvc -- up --only "$CELL_NAME")
 k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \

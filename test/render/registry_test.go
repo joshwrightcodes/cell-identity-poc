@@ -204,10 +204,22 @@ func TestRenderCentralView(t *testing.T) {
 			t.Errorf("the argocd-server ClusterRole grants %s", got)
 		}
 	}
-	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-		role := objs["Role dev-"+cell+"/argocd-server"]
-		if role == nil || fmt.Sprint(role["rules"]) != "[map[apiGroups:[argoproj.io] resources:[applications] verbs:[patch]]]" {
-			t.Errorf("Role dev-%s/argocd-server is %v, want patch on applications only", cell, role)
+	// In the agent namespaces, only the principal writes, and only Applications.
+	for key, o := range objs {
+		ns, _ := lookup(o, "metadata", "namespace")
+		if ns != "dev-dev-cell-1" && ns != "dev-dev-cell-2" {
+			continue
+		}
+		switch o["kind"] {
+		case "Role":
+			if key != "Role "+ns.(string)+"/argocd-agent-principal" ||
+				fmt.Sprint(o["rules"]) != "[map[apiGroups:[argoproj.io] resources:[applications] verbs:[create get list watch update patch delete]]]" {
+				t.Errorf("%s grants %v, want only the principal Role on applications", key, o["rules"])
+			}
+		case "RoleBinding":
+			if subj := fmt.Sprint(o["subjects"]); subj != "[map[kind:ServiceAccount name:argocd-agent-principal namespace:central-view-system]]" {
+				t.Errorf("%s binds %s, want the principal only", key, subj)
+			}
 		}
 	}
 	crb := objs["ClusterRoleBinding argocd-server"]
@@ -257,9 +269,17 @@ func TestRenderCentralViewFailsClosed(t *testing.T) {
 		{"ARGOCD_AGENT_IMAGE=quay.io/argoprojlabs/argocd-agent:v0.10.0", "not pinned by digest"},
 		{"STUB_NO_SERVER=1", "could not read the trust bundle"},
 		{"VIEW_CELLS=bad-facts", "could not sign the record of bad-facts"},
+		{"VIEW_CELLS=" + strings.Repeat("a", 59) + " POC_ENV=" + strings.Repeat("e", 10), ""},
+		{"VIEW_CELLS=dev-cell-1 dev-cell-1-x", "starts with the agent name dev-dev-cell-1 and a dash"},
+		{"VIEW_CELLS=dev-cell-1 dev-cell-1", "names dev-dev-cell-1 twice"},
 	} {
 		t.Run(tc.env, func(t *testing.T) {
-			r := renderCentralView(t, tc.env)
+			env := []string{tc.env}
+			if before, after, ok := strings.Cut(tc.env, " POC_ENV="); ok {
+				env = []string{before, "POC_ENV=" + after}
+				tc.want = "is longer than 63 characters"
+			}
+			r := renderCentralView(t, env...)
 			if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
 				t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", r.err, len(r.stdout), r.stderr, tc.want)
 			}

@@ -6,8 +6,10 @@
 source "$(dirname "$0")/lib.sh"
 
 port=8090
-if curl -fsS -o /dev/null "http://127.0.0.1:$port/" 2>/dev/null; then
-  die "port $port already serves a page, probably from an old view:ui. Find its process with: lsof -nP -iTCP:$port -sTCP:LISTEN"
+if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+  die "port $port already has a listener, probably an old view:ui. Find its process with: lsof -nP -iTCP:$port -sTCP:LISTEN"
 fi
-log "serving the central view on http://127.0.0.1:$port"
-exec kubectl --context "kind-$CELL_NAME" -n central-view-system port-forward --address 127.0.0.1 svc/argocd-server "$port:80"
+log "WARNING: while view:ui runs, every pod on the VM, rogue included, can read this view through host.docker.internal:$port"
+log "serving the central view on http://127.0.0.1:$port. Before the cell agents connect, the list of Applications is empty"
+kubectl --context "kind-$CELL_NAME" -n central-view-system port-forward --address 127.0.0.1 svc/argocd-server "$port:80" \
+  || die "the port-forward to argocd-server stopped. Check the view: CELL=$CELL_NAME mise run cell:verify"

@@ -7,8 +7,19 @@
 #   3. Restart argocd-redis, argocd-repo-server, the principal and argocd-server, in this order, and
 #      wait for a new Ready pod of each.
 # Standard output carries one JSON line with the restarted workloads. Agents in cells get new
-# tokens when they connect again. Log lines go to standard error.
+# tokens when they connect again. Log lines go to standard error. One run may go at a time, and a
+# run that stops goes on when it runs again.
 source "$(dirname "$0")/lib.sh"
+
+mkdir -p "$BUILD"
+lock="$BUILD/.view-rotate.lock"
+mkdir "$lock" 2>/dev/null || die "another view:rotate-keys runs, or one stopped and left $lock. When no run goes on, remove that directory and run the task again"
+finished=0
+on_exit() {
+  rmdir "$lock" 2>/dev/null || true
+  ((finished)) || log "view:rotate-keys stopped before its end. Run it again: mise run view:rotate-keys"
+}
+trap on_exit EXIT
 
 ns=central-view-system
 bundle="$BUNDLES/central-view/manifests.yaml"
@@ -16,7 +27,7 @@ bundle="$BUNDLES/central-view/manifests.yaml"
 k -n "$ns" get job viewkeys >/dev/null 2>&1 || die "Job viewkeys is missing in $ns. Run: CELL=$CELL_NAME mise run cell:link"
 
 job=viewkeys-rotate
-k -n "$ns" delete job "$job" --ignore-not-found --wait=true --timeout=120s >/dev/null
+k -n "$ns" delete job "$job" --ignore-not-found --wait=true --timeout=120s >/dev/null || die "could not delete the old Job $job in $ns"
 JOB="$job" yq 'select(.kind == "Job" and .metadata.name == "viewkeys")
     | .metadata.name = strenv(JOB) | del(.metadata.labels["cell.poc.internal/harness"])
     | .spec.template.spec.containers[0].args += ["--rotate"]' "$bundle" \
@@ -31,27 +42,12 @@ k -n "$ns" delete job "$job" --wait=true --timeout=120s >/dev/null || die "could
 k -n "$ns" delete secret argocd-redis --ignore-not-found >/dev/null || die "could not delete Secret argocd-redis"
 log "deleted Secret argocd-redis"
 
-# new_ready_pods <selector> <old UIDs> prints the UIDs of the Ready pods that are not old.
-new_ready_pods() {
-  k -n "$ns" get pods -l "$1" -o json | jq -r --arg old " $2 " '
-    [.items[] | .metadata.uid as $uid | select(($old | contains(" " + $uid + " ")) | not)
-      | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.uid] | join(" ")'
-}
 restarted=()
 for name in argocd-redis argocd-repo-server argocd-agent-principal argocd-server; do
-  selector="app.kubernetes.io/name=$name"
-  old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
-  k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of $name"
-  end=$((SECONDS + 300))
-  until uids="$(new_ready_pods "$selector" "$old")" && [[ -n "$uids" ]]; do
-    if ((SECONDS >= end)); then
-      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $ns describe deployment/$name"
-      die "deployment/$name in $ns has no new Ready pod after 300s"
-    fi
-    sleep 2
-  done
+  restart_deployment_pods "$ns" "$name"
   k -n "$ns" get secret argocd-redis >/dev/null 2>&1 || die "Secret argocd-redis is still missing after the restart of $name"
   log "restarted deployment/$name"
   restarted+=("deployment/$name")
 done
+finished=1
 printf '%s\n' "${restarted[@]}" | jq -Rnc --arg ns "$ns" '{namespace: $ns, restarted: [inputs]}'

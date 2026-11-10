@@ -967,7 +967,6 @@ RBAC of `argocd-server`, as the view changes it:
 | Role: create and list on Events | kept | Write that stays: the server records an Event for each user action. |
 | ClusterRole: delete, get and patch on every resource, update on every finalizer | removed | The view reaches cell resources only through the resource proxy. |
 | ClusterRole: get, list and watch on Applications and ApplicationSets | kept | The server lists the Applications of every namespace. |
-| (none) | patch on Applications, through a Role in each agent namespace | Write that stays: a refresh in the UI patches the refresh annotation of the Application. The guard in each cell is the control. |
 | ClusterRole: list Events, get pods and logs, create Jobs and Workflows | removed | The view runs no resource action in management. |
 
 `argocd-server` stops at start when AppProject `default` is missing and it cannot create it
@@ -1024,7 +1023,17 @@ These facts come from the registry and from the binary layer, read on 2026-11-10
 - The upstream principal ClusterRole can create, update and delete Applications, AppProjects and
   ApplicationSets in every namespace, and create namespaces. The view lists and watches them in
   every namespace, writes Applications only through a Role in each agent namespace, and writes
-  AppProjects only in `central-view-system`.
+  AppProjects only in `central-view-system`. Each write that stays has a call in v0.10.0:
+  - Applications in an agent namespace, create: `principal/event.go` line 263 (`appManager.Create`
+    of an Application that an autonomous agent sends; line 846 sets the namespace to the agent).
+  - Applications, update and patch: lines 281 and 306 (`UpdateAutonomousApp`), lines 318 and 418
+    (`UpdateStatus`), and `principal/callbacks.go` line 153 (`RemoveFinalizers`). The backend calls
+    are `Update` and `Patch` in `internal/backend/kubernetes/application/kubernetes.go` lines 157 to 167.
+  - Applications, delete: `principal/event.go` lines 332 and 376.
+  - AppProjects in `central-view-system`, create, update and delete: `principal/event.go` lines 573,
+    592 and 608, after line 568 sets the namespace to the namespace of the principal.
+  - ApplicationSets are written only in HA mode (`principal/ha_integration.go`), so the view grants
+    no write on them.
 - The upstream principal Role can write every Secret and ConfigMap of its namespace. The view
   grants get, list and watch only.
 - `principal-params-cm.yaml` says that header authentication needs the gRPC listener on
@@ -1049,7 +1058,13 @@ and `cmd/ctl/` (`ca.go`, `jwt.go`, `agent.go`).
   The health server serves that mux (`principal/server.go` lines 872 to 884). So port 8003 also
   serves `/debug/pprof/`. On 2026-11-10 `wget http://127.0.0.1:8003/debug/pprof/cmdline` inside the
   pod printed the arguments of the principal. The view probes the health port from inside the
-  pod, and admits no peer on 8003.
+  pod, and no NetworkPolicy rule admits a peer on 8003. The API server pod proxy
+  (`pods/<pod>:8003/proxy/debug/pprof/`) and root processes on the node skip NetworkPolicy, so
+  each holder of `pods/proxy` in `central-view-system` can still read and load pprof.
+- The Redis proxy on 6379 answers `get` and `subscribe` on the keys `app|managed-resources|<agent>_*`
+  and `app|resources-tree|<agent>_*` from the agent, before any `AUTH` reaches `argocd-redis`
+  (`principal/redisproxy/redisproxy.go` lines 343 to 440). So a peer that reaches 6379 reads the
+  live state of every cell Application with no password. NetworkPolicy flow N4 is the only control.
 - At start the principal reads ConfigMap `argocd-agent-principal-identity`, and creates it when it
   is missing (`pkg/principal/identity.go`, `principal/server.go` line 710). The view renders it with
   a fixed value, so the principal writes no ConfigMap.

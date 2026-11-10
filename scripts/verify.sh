@@ -297,12 +297,12 @@ expect_dial_blocked() {
 # The harness applies its components without Argo CD, so cell:verify compares them with the bundle.
 check_harness_drift() {
   local bundle="$BUNDLES/$1/manifests.yaml" out rc
-  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$1")"; return 1; }
   out="$(k diff --server-side --force-conflicts -f "$bundle" 2>&1)"
   rc=$?
   case "$rc" in
     0) return 0 ;;
-    1) printf '%s\n' "$out" | head -n 40; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1 ;;
+    1) printf '%s\n' "$out" | head -n 40; echo "Run: $(fix_command "$1")"; return 1 ;;
     *) echo "kubectl diff failed: $out"; return 1 ;;
   esac
 }
@@ -683,6 +683,69 @@ if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "The External Secrets Operator cannot list Secrets in every namespace, and no token copy lies outside $SECRET_STORE_NAMESPACES" check_operator_scope
 fi
 
+# The central view copies the node address and the trust bundle of VIEW_CONTROL_PLANE. A rebuilt
+# control plane can have new ones, so both must match the live values.
+check_view_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n central-view-system get networkpolicy argocd-agent-principal -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy central-view-system/argocd-agent-principal"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the view listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_view_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n central-view-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap central-view-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+# pem_lines prints each PEM certificate on standard input as one line, sorted.
+pem_lines() {
+  awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
+}
+
+# The Secrets of central-view-system must be exactly the view keys and argocd-redis. An extra
+# cluster Secret would add a cluster that argocd-server shows and calls.
+check_view_secrets() {
+  local want got
+  want="$(printf '%s\n' argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret argocd-redis \
+    $(for c in $VIEW_CELLS; do echo "cluster-$POC_ENV-$c"; done) | sort | paste -sd' ' -)"
+  got="$(k -n central-view-system get secrets -o name | sed 's|^secret/||' | sort | paste -sd' ' -)" \
+    || { echo "could not list the Secrets of central-view-system"; return 1; }
+  if [[ "$got" != "$want" ]]; then
+    echo "central-view-system holds the Secrets '$got', and the view needs '$want'."
+    echo "Delete each extra Secret. For a missing one, run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+# The view certificates live 180 days. The check fails 30 days before the resource proxy
+# certificate expires, and every view certificate has the same lifetime.
+check_view_cert_expiry() {
+  local cert info left
+  cert="$(k -n central-view-system get secret argocd-agent-resource-proxy-tls -o jsonpath='{.data.tls\.crt}' | base64 -d)" \
+    || { echo "could not read Secret central-view-system/argocd-agent-resource-proxy-tls"; return 1; }
+  info="$(cd "$ROOT" && printf '%s\n' "$cert" | mise run pki -- info 2>/dev/null)" || { echo "pkigen could not read the certificate: $info"; return 1; }
+  left="$(jq -r '((.not_after | fromdateiso8601) - now) / 86400 | floor' <<<"$info")"
+  if ((left < 30)); then
+    echo "the view certificates expire at $(jq -r .not_after <<<"$info"), in $left days."
+    echo "Run: mise run view:rotate-keys"
+    return 1
+  fi
+}
+
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.
 for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
@@ -692,6 +755,12 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   for ns in $(yq -N 'select(.kind == "Namespace") | .metadata.name' "$bundle" 2>/dev/null); do
     check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
   done
+  if [[ "$comp" == central-view ]]; then
+    check "The view listener admits the current $VIEW_CONTROL_PLANE node address" check_view_env_address
+    check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root
+    check "central-view-system holds only the Secrets of the view" check_view_secrets
+    check "The view certificates are valid for 30 days or more" check_view_cert_expiry
+  fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
       | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
         | .metadata.namespace + "|" + (.kind | ascii_downcase) + "/" + .metadata.name'); do

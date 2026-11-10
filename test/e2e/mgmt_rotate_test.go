@@ -172,6 +172,11 @@ func TestM3MgmtCARotation(t *testing.T) {
 	if verifiesAt(t, oldCert, oldKey, copyRoots) {
 		t.Fatal("a plane SVID of the old CA still verifies at the peer copy")
 	}
+	// The trust bundle of the principal sidecar is a copy in management, and the hook relinked it.
+	own, _ := kubectl(t, mgmtCluster, "", "-n", viewNamespace, "get", "configmap", "spire-trust-bundle-"+principalName, "-o", `jsonpath={.data.bundle\.crt}`)
+	if block, _ := pem.Decode([]byte(own)); block == nil || !bytes.Equal(block.Bytes, roots[0].Raw) || strings.Count(own, "BEGIN CERTIFICATE") != 1 {
+		t.Fatalf("the sidecar trust bundle of the principal holds %d certificates, want only the new root", strings.Count(own, "BEGIN CERTIFICATE"))
+	}
 }
 
 func activeAuthority(t *testing.T, out string) string {

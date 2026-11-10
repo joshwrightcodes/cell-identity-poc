@@ -423,6 +423,31 @@ func TestM3ArgoCDServerReadOnlyRBAC(t *testing.T) {
 	}
 }
 
+// TestM3ViewWritesInAgentNamespaces checks the writes of the view ServiceAccounts in each agent
+// namespace. argocd-server writes nothing there. The principal writes only Applications, which it
+// stores for the autonomous agents (vendor/README.md lists each call in v0.10.0).
+func TestM3ViewWritesInAgentNamespaces(t *testing.T) {
+	server := "system:serviceaccount:" + viewNamespace + ":argocd-server"
+	principal := "system:serviceaccount:" + viewNamespace + ":" + principalName
+	for _, cell := range viewCells(t) {
+		ns := pocEnv + "-" + cell
+		if !canI(t, mgmtCluster, server, "get", "applications.argoproj.io", ns) {
+			t.Errorf("argocd-server cannot read the Applications of %s, so the checks below prove nothing", ns)
+		}
+		for _, resource := range []string{"applications.argoproj.io", "appprojects.argoproj.io", "applicationsets.argoproj.io", "secrets"} {
+			for _, verb := range []string{"create", "update", "patch", "delete"} {
+				if canI(t, mgmtCluster, server, verb, resource, ns) {
+					t.Errorf("argocd-server can %s %s in %s", verb, resource, ns)
+				}
+				want := resource == "applications.argoproj.io"
+				if got := canI(t, mgmtCluster, principal, verb, resource, ns); got != want {
+					t.Errorf("the principal can %s %s in %s: %v, want %v", verb, resource, ns, got, want)
+				}
+			}
+		}
+	}
+}
+
 // TestM3CentralAPIReadOnly reads the central API as the anonymous user. It may list Applications
 // and may not sync one.
 func TestM3CentralAPIReadOnly(t *testing.T) {
@@ -433,14 +458,20 @@ func TestM3CentralAPIReadOnly(t *testing.T) {
 		t.Fatalf("applications: %v", err)
 	}
 	t.Logf("the central view lists %d Applications", len(apps.Items))
-	for _, action := range []string{"sync", "update", "delete", "override"} {
+	for _, path := range []string{"applications/sync/*", "applications/update/*", "applications/delete/*", "applications/override/*",
+		"applications/action/*/*", "exec/create/*"} {
 		var can struct{ Value string }
-		if err := json.Unmarshal(centralAPI(t, "/api/v1/account/can-i/applications/"+action+"/*"), &can); err != nil {
+		if err := json.Unmarshal(centralAPI(t, "/api/v1/account/can-i/"+path), &can); err != nil {
 			t.Fatal(err)
 		}
 		if can.Value != "no" {
-			t.Errorf("the anonymous user can %s Applications: %q", action, can.Value)
+			t.Errorf("the anonymous user can %s: %q", path, can.Value)
 		}
+	}
+	// The cluster Secrets hold the client keys of the resource proxy. The API must not show them.
+	clusters := string(centralAPI(t, "/api/v1/clusters"))
+	if strings.Contains(clusters, "keyData") || strings.Contains(clusters, "PRIVATE KEY") || strings.Contains(clusters, "LS0tLS1CRUdJTi") {
+		t.Error("the anonymous cluster list holds key material")
 	}
 }
 
@@ -466,7 +497,14 @@ func podUID(t *testing.T, name string) string {
 // TestM3ViewKeysRotate runs view:rotate-keys. The agent JWT key and the Redis password change, and
 // the principal and argocd-server are Ready with new pods.
 func TestM3ViewKeysRotate(t *testing.T) {
-	jwt, redis := secretSum(t, "argocd-agent-jwt"), secretSum(t, "argocd-redis")
+	names := []string{"argocd-agent-jwt", "argocd-redis", "argocd-agent-ca", "argocd-agent-resource-proxy-tls", "argocd-secret"}
+	for _, cell := range viewCells(t) {
+		names = append(names, "cluster-"+pocEnv+"-"+cell)
+	}
+	before := map[string]string{}
+	for _, n := range names {
+		before[n] = secretSum(t, n)
+	}
 	principalUID, serverUID := podUID(t, principalName), podUID(t, "argocd-server")
 	cmd := exec.Command("mise", "run", "view:rotate-keys")
 	cmd.Dir = "../.."
@@ -476,13 +514,16 @@ func TestM3ViewKeysRotate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("view:rotate-keys: %v\n%s", err, stderr.String())
 	}
+	// mise prints its own lines on standard error, so standard output is the data line alone.
 	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 	var res struct{ Restarted []string }
-	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &res); err != nil || len(res.Restarted) != 4 {
+	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &res) != nil || len(res.Restarted) != 4 {
 		t.Fatalf("view:rotate-keys printed %q, want one JSON line with four restarted workloads", out)
 	}
-	if secretSum(t, "argocd-agent-jwt") == jwt || secretSum(t, "argocd-redis") == redis {
-		t.Error("argocd-agent-jwt or argocd-redis kept its content")
+	for _, n := range names {
+		if secretSum(t, n) == before[n] {
+			t.Errorf("Secret %s kept its content", n)
+		}
 	}
 	for name, old := range map[string]string{principalName: principalUID, "argocd-server": serverUID} {
 		waitFor(t, name+" Ready", statefulsetWait, func() (bool, string) { return deploymentReady(t, viewNamespace, name) })

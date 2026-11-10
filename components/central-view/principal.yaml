@@ -46,7 +46,8 @@ subjects:
     namespace: central-view-system
 ---
 # The principal lists and watches Applications and namespaces in every namespace. It writes
-# Applications only in the agent namespaces, through the Role that render.sh adds to each one.
+# Applications only in the agent namespaces, through the Role that render.sh adds to each one:
+# create, update, patch and delete, for the Applications that each autonomous agent sends.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -146,7 +147,8 @@ spec:
             - name: healthz
               containerPort: 8003
           # The health server uses the default HTTP mux, where the principal binary also registers
-          # net/http/pprof. The probes run inside the pod, so no peer outside the pod needs port 8003.
+          # net/http/pprof. The probes run inside the pod, and no NetworkPolicy rule admits a peer on
+          # port 8003. The API server pod proxy and root host processes still reach it.
           readinessProbe:
             exec:
               command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8003/healthz"]

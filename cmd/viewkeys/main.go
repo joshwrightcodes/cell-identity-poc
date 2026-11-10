@@ -13,9 +13,13 @@
 //     resource proxy, with a client certificate whose CN is the agent name.
 //
 // The formats follow argocd-agentctl of Argo CD Agent v0.10.0 (cmd/ctl/ca.go, cmd/ctl/jwt.go and
-// cmd/ctl/agent.go), as vendor/README.md records. Without the CA key, a new certificate needs a new
-// CA. So when the CA Secret exists and a certificate Secret is missing, the run fails and names
-// view:rotate-keys. --rotate deletes the whole set first, then creates it again.
+// cmd/ctl/agent.go), as vendor/README.md records. Each certificate Secret carries the SHA-256 of
+// its CA in the annotation poc.internal/agent-ca-sha256. A run keeps the CA only when every
+// certificate Secret exists, carries that digest and chains to the CA. Without the CA key, any
+// other state needs a new CA, so the run makes a new CA, replaces every certificate Secret, and
+// writes the CA Secret last. A run that stops half way therefore leaves no CA Secret or a CA that
+// its leaves do not match, and the next run recovers. The output then names the reason, so the
+// caller restarts the pods that read the certificates. --rotate deletes the whole set first.
 //
 // Standard output carries one JSON line with the Secret names on success, and one JSON error
 // line on failure. No line holds key material.
@@ -28,9 +32,11 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"flag"
@@ -49,6 +55,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
@@ -71,6 +78,8 @@ const (
 	jwtBits = 4096
 	// secretKeyBytes is the size of server.secretkey.
 	secretKeyBytes = 32
+	// caDigestAnnotation on each certificate Secret holds the SHA-256 of the CA that signed it.
+	caDigestAnnotation = "poc.internal/agent-ca-sha256"
 )
 
 var (
@@ -148,6 +157,8 @@ type result struct {
 	Deleted   []string `json:"deleted"`
 	Created   []string `json:"created"`
 	Existing  []string `json:"existing"`
+	// Reason says why the run made a new CA, and is empty when it kept the CA.
+	Reason string `json:"new_ca_reason,omitempty"`
 }
 
 func clusterSecretName(agent string) string { return "cluster-" + agent }
@@ -161,6 +172,7 @@ func run(ctx context.Context, client kubernetes.Interface, cfg config, out io.Wr
 	}
 
 	if cfg.rotate {
+		// The CA goes first. A run that stops here then finds no CA, and makes the whole set again.
 		for _, n := range append([]string{caSecret, jwtSecret, argoSecret}, leaves...) {
 			err := secrets.Delete(ctx, n, metav1.DeleteOptions{})
 			if err != nil && !apierrors.IsNotFound(err) {
@@ -183,16 +195,39 @@ func run(ctx context.Context, client kubernetes.Interface, cfg config, out io.Wr
 		}
 		return true, nil
 	}
-	record := func(n string, created bool) {
-		if created {
-			res.Created = append(res.Created, n)
-		} else {
-			res.Existing = append(res.Existing, n)
+	// replace creates a Secret, and replaces the one that exists.
+	replace := func(s *corev1.Secret) error {
+		created, err := create(s.DeepCopy())
+		if err != nil {
+			return err
 		}
+		if !created {
+			if err := secrets.Delete(ctx, s.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+				return fmt.Errorf("delete Secret %s: %w", s.Name, err)
+			}
+			res.Deleted = append(res.Deleted, s.Name)
+			if created, err = create(s.DeepCopy()); err != nil {
+				return err
+			} else if !created {
+				return fmt.Errorf("secret %s came back during the run. Run viewkeys again", s.Name)
+			}
+		}
+		res.Created = append(res.Created, s.Name)
+		return nil
 	}
 
-	for _, mk := range []func() (*corev1.Secret, error){jwtKey, serverKey} {
-		s, err := mk()
+	// The two keys that no CA signs. The run makes a key only for a Secret that it cannot read.
+	for _, k := range []struct {
+		name string
+		make func() (*corev1.Secret, error)
+	}{{jwtSecret, jwtKey}, {argoSecret, serverKey}} {
+		if _, err := secrets.Get(ctx, k.name, metav1.GetOptions{}); err == nil {
+			res.Existing = append(res.Existing, k.name)
+			continue
+		} else if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get Secret %s: %w", k.name, err)
+		}
+		s, err := k.make()
 		if err != nil {
 			return err
 		}
@@ -200,40 +235,30 @@ func run(ctx context.Context, client kubernetes.Interface, cfg config, out io.Wr
 		if err != nil {
 			return err
 		}
-		record(s.Name, created)
+		if created {
+			res.Created = append(res.Created, k.name)
+		} else {
+			res.Existing = append(res.Existing, k.name)
+		}
 	}
+
+	// A kept CA stays only when every certificate Secret exists, carries the digest of that CA,
+	// and chains to it. The CA key is gone, so any other state needs a new CA and new leaves.
+	keep, err := keptCA(ctx, secrets, leaves)
+	if err != nil {
+		return err
+	}
+	if keep == "" {
+		res.Existing = append(res.Existing, caSecret)
+		res.Existing = append(res.Existing, leaves...)
+		return writeResult(out, res)
+	}
+	res.Reason = keep
 
 	ca, err := newCA()
 	if err != nil {
 		return err
 	}
-	caCreated, err := create(ca.secret())
-	if err != nil {
-		return err
-	}
-	record(caSecret, caCreated)
-	if !caCreated {
-		// The stored CA is not the one in memory, so this run cannot sign. Every certificate Secret
-		// must exist already.
-		var missing []string
-		for _, n := range leaves {
-			if _, err := secrets.Get(ctx, n, metav1.GetOptions{}); err != nil {
-				if !apierrors.IsNotFound(err) {
-					return fmt.Errorf("get Secret %s: %w", n, err)
-				}
-				missing = append(missing, n)
-				continue
-			}
-			res.Existing = append(res.Existing, n)
-		}
-		if len(missing) > 0 {
-			return fmt.Errorf("secret %s exists, and %s is missing. No copy of the CA key exists, so a new certificate needs a new CA. Run: mise run view:rotate-keys",
-				caSecret, strings.Join(missing, ", "))
-		}
-		return writeResult(out, res)
-	}
-
-	// The CA is new, so a certificate Secret that exists chains to a CA whose key is gone. Replace it.
 	proxy, err := ca.serverSecret(cfg.proxyHost)
 	if err != nil {
 		return err
@@ -247,24 +272,77 @@ func run(ctx context.Context, client kubernetes.Interface, cfg config, out io.Wr
 		leafSecrets = append(leafSecrets, s)
 	}
 	for _, s := range leafSecrets {
-		created, err := create(s.DeepCopy())
-		if err != nil {
+		if err := replace(s); err != nil {
 			return err
 		}
-		if !created {
-			if err := secrets.Delete(ctx, s.Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
-				return fmt.Errorf("delete Secret %s, which chains to a lost CA: %w", s.Name, err)
-			}
-			res.Deleted = append(res.Deleted, s.Name)
-			if created, err = create(s.DeepCopy()); err != nil {
-				return err
-			} else if !created {
-				return fmt.Errorf("secret %s came back during the run. Run viewkeys again", s.Name)
-			}
-		}
-		res.Created = append(res.Created, s.Name)
+	}
+	// The CA comes last. Until it is written, a run that stops leaves leaves without their CA, and
+	// the next run replaces them.
+	if err := replace(ca.secret()); err != nil {
+		return err
 	}
 	return writeResult(out, res)
+}
+
+// keptCA returns "" when the CA Secret and every leaf of the set are consistent, and otherwise the
+// reason why the run needs a new CA.
+func keptCA(ctx context.Context, secrets typedcorev1.SecretInterface, leaves []string) (string, error) {
+	s, err := secrets.Get(ctx, caSecret, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return "no " + caSecret, nil
+	} else if err != nil {
+		return "", fmt.Errorf("get Secret %s: %w", caSecret, err)
+	}
+	ca, err := parsePEMCert(s.Data["ca.crt"])
+	if err != nil {
+		return caSecret + " holds no CA certificate", nil
+	}
+	digest := caDigest(ca)
+	roots := x509.NewCertPool()
+	roots.AddCert(ca)
+	for _, n := range leaves {
+		leaf, err := secrets.Get(ctx, n, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return n + " is missing", nil
+		} else if err != nil {
+			return "", fmt.Errorf("get Secret %s: %w", n, err)
+		}
+		if leaf.Annotations[caDigestAnnotation] != digest {
+			return n + " names another CA", nil
+		}
+		certPEM, usage := leaf.Data["tls.crt"], x509.ExtKeyUsageServerAuth
+		if n != proxySecret {
+			var conf struct {
+				TLS tlsClientConfig `json:"tlsClientConfig"`
+			}
+			if json.Unmarshal(leaf.Data["config"], &conf) != nil {
+				return n + " holds no cluster config", nil
+			}
+			certPEM, usage = conf.TLS.CertData, x509.ExtKeyUsageClientAuth
+		}
+		cert, err := parsePEMCert(certPEM)
+		if err != nil {
+			return n + " holds no certificate", nil
+		}
+		if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, KeyUsages: []x509.ExtKeyUsage{usage}}); err != nil {
+			return n + " does not chain to " + caSecret, nil
+		}
+	}
+	return "", nil
+}
+
+func parsePEMCert(data []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(data)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, fmt.Errorf("no PEM certificate")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// caDigest is the hex SHA-256 of the DER form of the CA certificate.
+func caDigest(ca *x509.Certificate) string {
+	sum := sha256.Sum256(ca.Raw)
+	return hex.EncodeToString(sum[:])
 }
 
 func writeResult(out io.Writer, res result) error {
@@ -387,7 +465,7 @@ func (a *authority) serverSecret(host string) (*corev1.Secret, error) {
 		return nil, err
 	}
 	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: proxySecret},
+		ObjectMeta: metav1.ObjectMeta{Name: proxySecret, Annotations: map[string]string{caDigestAnnotation: caDigest(a.cert)}},
 		Type:       corev1.SecretTypeTLS,
 		Data:       map[string][]byte{"tls.crt": crt, "tls.key": key},
 	}, nil
@@ -424,6 +502,7 @@ func (a *authority) clusterSecret(agent, host string) (*corev1.Secret, error) {
 			Annotations: map[string]string{
 				"managed-by":                        "argocd-agent",
 				"argocd.argoproj.io/skip-reconcile": "true",
+				caDigestAnnotation:                  caDigest(a.cert),
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
