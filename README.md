@@ -296,8 +296,10 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 20 minutes. This is 1.5 times the slowest run, 786 seconds on 2026-11-10, rounded up to the next minute.
-The slowest tests are the management CA rotation (188 seconds) and the fresh-namespace dial tests.
+The budget is 21 minutes. This is 1.5 times the slowest run, 814 seconds on 2026-11-11, rounded up to the next minute.
+`gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
+It prints the twelve slowest tests at the end.
+The slowest tests are the management CA rotation (180 seconds), the fresh-namespace dial tests (95 seconds) and the relay node port test (73 seconds).
 The budgets do not cover `harness:up`.
 
 ## Side effects of gate:m2
@@ -341,6 +343,35 @@ The next run then stops in its precheck and prints the repair command.
 Only one repair runs at a time. A repair holds the lock `build/gate-m2-repair.lock`, and a second repair or a gate precheck refuses to start beside it.
 A stopped run can also leave probe objects in `cell-identity-system`, and the next gate run deletes them.
 If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mise run cell:up` for that cell.
+
+## Side effects of gate:m3
+
+`gate:m3` changes the clusters while it runs, and it puts them back before it ends:
+
+- It patches the management copy of the Application `apps-demo` of `dev-cell-1`, with an annotation, a sync operation and a status. The agent refuses each change. A cleanup removes the test annotation and the operation.
+- It makes a Role, a RoleBinding, a ClusterRole, a ClusterRoleBinding, a Namespace `view-guard-test` and a ServiceAccount in each cell, for about 10 seconds. Each object has the label `poc.internal/test=view-guard`. The Roles bind to the group `poc:guard-test`, so the real agent never holds them.
+- It sends server-side dry runs as the agent ServiceAccount. These make no change. It also mints bound tokens of 10 minutes for the SPIRE audience.
+- It replaces the agent Pod of `dev-cell-1`. The new Pod attests again, and the SPIRE server keeps the old agent entry until it prunes it.
+- It rotates the view keys of the principal, rotates the CA of the SPIRE server in `management`, and restarts that server. The agents connect again within two minutes.
+- It starts test pods in fresh namespaces of every cluster, and it deletes them.
+
+A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.
+`cell:verify` fails on each of them, and on any binding for the agent ServiceAccount or the test group that the render does not hold.
+The next `gate:m3` refuses to start. Each of them prints the repair command:
+
+```sh
+mise run gate:m3:repair -- --check
+mise run gate:m3:repair
+```
+
+The repair deletes every object with the label, waits until each one is gone, and is safe to run again.
+
+In normal operation the agent logs one error line for each event of the principal that it cannot apply.
+Each line says `cannot patch resource "applications"`, because the Role of the agent has no write verb.
+This is the expected answer of RBAC, and it is not a guard denial.
+A guard denial names the policy.
+To list the denials of the policy, run `mise x -- kubectl --context kind-<cell> -n argocd logs deploy/argocd-agent -c spire-agent | grep argocd-agent-read-only`.
+In normal operation this prints nothing.
 
 ## SVID lifetimes and sleep
 

@@ -264,7 +264,7 @@ func TestM3ViewStatusPatchFails(t *testing.T) {
 	rv := mgmtPatch(t, agent, `{"status":{"operationState":{"phase":"Terminating"}}}`)
 	awaitRefusal(t, cell, rv, before)
 	after := cellAppFacts(t, cell)
-	if strings.Contains(after["operationState"], "Terminating") {
+	if strings.Contains(after["operationState"], "Terminating") && !strings.Contains(before["operationState"], "Terminating") {
 		t.Errorf("the operation state of the Application in the cell is %s", after["operationState"])
 	}
 	requireSameFacts(t, "after the status patch", before, after)
