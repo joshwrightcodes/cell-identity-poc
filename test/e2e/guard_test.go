@@ -379,6 +379,8 @@ func TestM3AgentCannotReadOrEscalate(t *testing.T) {
 	checks = append(checks,
 		check{"get nodes/proxy", "get", "nodes", "proxy", "", false},
 		check{"create serviceaccounts/token for default in argocd", "create", "serviceaccounts/default", "token", "argocd", false},
+		check{"create serviceaccounts/token for default in apps-demo", "create", "serviceaccounts/default", "token", demoNS, false},
+		check{"create serviceaccounts/token for echo in apps-demo", "create", "serviceaccounts/echo", "token", demoNS, false},
 		check{"create serviceaccounts/token for argocd-agent in argocd", "create", "serviceaccounts/argocd-agent", "token", "argocd", true},
 	)
 	for _, verb := range []string{"update", "patch", "delete"} {
@@ -440,6 +442,8 @@ func decodeB64(t *testing.T, s string) string {
 
 // guardTestRole grants the agent ServiceAccount every write that the guard must still deny, plus a
 // token request with no name. RBAC then allows each request below, and only the policy can deny it.
+// The Namespace view-guard-test holds a ServiceAccount argocd-agent, so a token request for it
+// reaches the policy.
 const guardTestRole = `apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -467,6 +471,41 @@ kind: RoleBinding
 metadata:
   name: view-guard-test
   namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: view-guard-test
+subjects:
+  - kind: ServiceAccount
+    name: argocd-agent
+    namespace: argocd
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: view-guard-test
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-agent
+  namespace: view-guard-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: view-guard-test
+  namespace: view-guard-test
+rules:
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: view-guard-test
+  namespace: view-guard-test
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
@@ -522,6 +561,7 @@ func TestM3GuardDeniesWithoutRBAC(t *testing.T) {
 			}
 			t.Cleanup(func() {
 				_, _ = kubectl(t, cell, "", "-n", "argocd", "delete", "rolebinding/view-guard-test", "role/view-guard-test", "--ignore-not-found")
+				_, _ = kubectl(t, cell, "", "delete", "namespace", "view-guard-test", "--ignore-not-found", "--timeout=2m")
 			})
 			waitFor(t, "RBAC allows the agent ServiceAccount to update Applications", time.Minute, func() (bool, string) {
 				out, _ := kubectl(t, cell, "", "auth", "can-i", "update", "applications.argoproj.io", "-n", "argocd", "--as="+agentAccount)
@@ -572,11 +612,17 @@ func TestM3GuardDeniesWithoutRBAC(t *testing.T) {
 				requireDeniedBy(t, "a token with two audiences", denyCreate, token("argocd-agent", true, append(audience("spire-"+pocEnv+"/abc"), "--audience=https://kubernetes.default.svc")...))
 				requireDeniedBy(t, "a token with no bound object", denyCreate, token("argocd-agent", true, "--audience=spire-"+pocEnv+"/abc", "--duration=10m"))
 				requireDeniedBy(t, "a token bound to a Secret", denyCreate, token("argocd-agent", true, "--audience=spire-"+pocEnv+"/abc", "--bound-object-kind=Secret", "--bound-object-name=argocd-redis", "--duration=10m"))
+				requireDeniedBy(t, "a token bound to a Secret with the name and UID of the agent Pod", denyCreate, token("argocd-agent", true,
+					"--audience=spire-"+pocEnv+"/abc", "--bound-object-kind=Secret", "--bound-object-name="+agentPodName, "--bound-object-uid="+agentPodUID, "--duration=10m"))
 				requireDeniedBy(t, "a token with no pod extras", denyCreate, token("argocd-agent", false, audience("spire-"+pocEnv+"/abc")...))
 				requireDeniedBy(t, "a token bound to another Pod", denyCreate, token("argocd-agent", true, "--audience=spire-"+pocEnv+"/abc",
 					"--bound-object-kind=Pod", "--bound-object-name="+otherPodName, "--bound-object-uid="+otherPodUID, "--duration=10m"))
+				requireDeniedBy(t, "a token bound to another Pod name", denyCreate, token("argocd-agent", true, "--audience=spire-"+pocEnv+"/abc",
+					"--bound-object-kind=Pod", "--bound-object-name="+otherPodName, "--bound-object-uid="+agentPodUID, "--duration=10m"))
 				requireDeniedBy(t, "a token bound to another Pod UID", denyCreate, token("argocd-agent", true, "--audience=spire-"+pocEnv+"/abc",
 					"--bound-object-kind=Pod", "--bound-object-name="+agentPodName, "--bound-object-uid="+otherPodUID, "--duration=10m"))
+				requireDeniedBy(t, "a token for the account of the same name in another namespace", denyCreate, as(append([]string{"-n", "view-guard-test", "create", "token", "argocd-agent",
+					"--as-user-extra=authentication.kubernetes.io/pod-name=" + agentPodName, "--as-user-extra=authentication.kubernetes.io/pod-uid=" + agentPodUID}, audience("spire-"+pocEnv+"/abc")...)...))
 				requireDeniedBy(t, "a token for another account", denyCreate, token("default", true, audience("spire-"+pocEnv+"/abc")...))
 			})
 		})
