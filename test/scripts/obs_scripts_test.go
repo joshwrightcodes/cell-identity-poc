@@ -43,10 +43,12 @@ case "$args" in
         else printf '{"message":"Invalid"}\n401'; fi ;;
       *) echo "unexpected request $method $url" >&2; exit 2 ;;
     esac ;;
-  *" apply -f - "*)
+  *" patch secret grafana-admin --type merge --patch-file /dev/stdin "*)
     body="$(cat)"
-    [[ ! -e "$state/apply-fail" ]] || { echo "apply failed" >&2; exit 1; }
-    jq -r .stringData.password <<<"$body" | tr -d '\n' >"$state/secret" ;;
+    [[ ! -e "$state/apply-fail" ]] || { echo "patch failed" >&2; exit 1; }
+    # The patch must drop the last-applied annotation, and it must set the password.
+    [[ "$(jq -r '.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] | tostring' <<<"$body")" == null ]] || exit 3
+    jq -r .data.password <<<"$body" | base64 -d | tr -d '\n' >"$state/secret" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -58,6 +60,15 @@ func obsRun(t *testing.T, state string, script string, env ...string) (string, s
 	testtool.Need(t, "yq", "jq", "bash", "base64")
 	bin := t.TempDir()
 	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(obsKubectl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A jq wrapper records its argument list, because a password there is visible to every process of the user.
+	realJQ, err := exec.LookPath("jq")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := "#!/usr/bin/env bash\necho \"jq $*\" >>\"$STUB_STATE/argv.log\"\nexec " + realJQ + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "jq"), []byte(wrapper), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	path, err := filepath.Abs("../../scripts/" + script)
@@ -121,7 +132,7 @@ func TestObsPasswordPrintsOnlyThePassword(t *testing.T) {
 // characters, reaches the Secret and Grafana, the old one stops working, no argument list of kubectl
 // holds a password, and the output holds neither password.
 func TestObsRotatePassword(t *testing.T) {
-	const old = "OldPassw0rdOldPassw0rdOldPassw0rd"
+	const old = "OldPassw0rdOldPassw0rdOldPassw0r"
 	state := obsState(t, old, old)
 	out, errOut, code := obsRun(t, state, "obs-rotate-password.sh")
 	if code != 0 {
@@ -139,8 +150,11 @@ func TestObsRotatePassword(t *testing.T) {
 	argv, _ := os.ReadFile(filepath.Join(state, "argv.log"))
 	for _, p := range []string{old, fresh} {
 		if strings.Contains(string(argv)+out+errOut, p) {
-			t.Errorf("a password appears in an argument list or in the output: %.20s", p)
+			t.Errorf("a password appears in an argument list of kubectl or jq, or in the output: %.20s", p)
 		}
+	}
+	if strings.Contains(string(argv), " apply ") || strings.Contains(string(argv), "apply -f") {
+		t.Errorf("the script used kubectl apply, which writes the password into last-applied-configuration:\n%s", argv)
 	}
 }
 
@@ -148,7 +162,7 @@ func TestObsRotatePassword(t *testing.T) {
 // prints one JSON error line with the command that makes Grafana use the Secret again, and that the
 // line holds no password.
 func TestObsRotatePasswordFailureNamesTheRepair(t *testing.T) {
-	const old = "OldPassw0rdOldPassw0rdOldPassw0rd"
+	const old = "OldPassw0rdOldPassw0rdOldPassw0r"
 	state := obsState(t, old, old)
 	if err := os.WriteFile(filepath.Join(state, "apply-fail"), nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -196,5 +210,35 @@ func TestObsUIBusyPort(t *testing.T) {
 	out, _, code = obsRun(t, obsState(t, "x", "x"), "obs-ui.sh", "OBS_UI_PORT=abc")
 	if m := oneJSONLine(t, out); code == 0 || !strings.Contains(m["error"].(string), "not a port number") {
 		t.Fatalf("exit %d, output %q, want one JSON error line for a bad port", code, out)
+	}
+}
+
+// TestNoLastAppliedSecretCheck checks the cell:verify row: a Secret in observability-system with the
+// annotation last-applied-configuration fails it and names the Secret, and Secrets without it pass.
+func TestNoLastAppliedSecretCheck(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	lib, err := filepath.Abs("../../scripts/lib.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, items, want string }{
+		{"clean", `{"metadata":{"name":"grafana-admin","annotations":{"reconcile.external-secrets.io/data-hash":"x"}}},{"metadata":{"name":"other"}}`, ""},
+		{"annotated", `{"metadata":{"name":"grafana-admin","annotations":{"kubectl.kubernetes.io/last-applied-configuration":"{}"}}}`, "grafana-admin"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stub := "#!/usr/bin/env bash\necho '{\"items\":[" + tc.items + "]}'\n"
+			if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", `source "$1"; check_no_last_applied_secret`, "_", lib)
+			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=management"}
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			err := cmd.Run()
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(out.String(), tc.want) || !strings.Contains(out.String(), "obs:rotate-password")) {
+				t.Fatalf("err %v, output %q, want %q", err, out.String(), tc.want)
+			}
+		})
 	}
 }

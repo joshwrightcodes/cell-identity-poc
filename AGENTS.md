@@ -65,3 +65,5 @@
 - Pin every image by digest.
 - Review third-party files before they run, and record the result in `vendor/README.md`.
 - `build/` is generated. Do not edit it or commit it.
+
+Cell settings come from `cells/common.env` and `cells/<cluster>.env` alone. `scripts/lib.sh` drops every variable that a cell env file defines before it sources them, so an override in the shell, for example `SPIRE_SVID_TTL=1m CELL=dev-cp mise run cell:up`, has no effect. Edit the file instead.

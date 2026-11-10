@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -742,6 +743,43 @@ func (c *cellUIDs) has(group, kind, ns, uid string) bool {
 	return c.byKind[key][uid]
 }
 
+// emptyCauseBody matches the one answer that upstream Argo CD Agent issue 1107 produces. When a cache key
+// of an app has expired in the Redis of the cell, the Redis proxy of the principal answers with an
+// error with no text, and the API server turns it into HTTP 500 with an empty cause after the colon.
+// The controller of the cell writes the key again at its next reconcile of that app.
+var emptyCauseBody = regexp.MustCompile(`^\{"error":"error getting cached app (managed resources|resource tree): ","code":2,"message":"error getting cached app (managed resources|resource tree): "\}\s*$`)
+
+// emptyCauseWait bounds the retry. A measured miss window was 105 seconds, so this covers two reconcile
+// periods of 60 seconds with margin.
+const emptyCauseWait = 3 * time.Minute
+
+// centralAPIRetryEmptyCause reads path from the central argocd-server like centralAPIAt, and retries
+// only the empty-cause 500 of issue 1107 for up to emptyCauseWait. Any other answer fails at once.
+func centralAPIRetryEmptyCause(t *testing.T, addr, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(emptyCauseWait)
+	for {
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Get("http://" + addr + path)
+		if err != nil {
+			t.Fatalf("GET %s from the central argocd-server: %v", path, err)
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case resp.StatusCode == http.StatusOK:
+			return body
+		case resp.StatusCode == http.StatusInternalServerError && emptyCauseBody.Match(body) && time.Now().Before(deadline):
+			t.Logf("GET %s: the cache key of the app has expired in the cell (upstream issue 1107), retrying: %s", path, body)
+			time.Sleep(5 * time.Second)
+		default:
+			t.Fatalf("GET %s: HTTP %d, want 200 for the anonymous user: %s", path, resp.StatusCode, body)
+		}
+	}
+}
+
 // TestM3CentralViewShowsLiveResources reads the managed resources and the resource tree of every
 // child Application of each cell through the central API. Both answer HTTP 200. Every managed
 // resource carries a live manifest, except an object that the cell reports as Missing, and its uid
@@ -794,7 +832,7 @@ func TestM3CentralViewShowsLiveResources(t *testing.T) {
 						Group, Kind, Name, Namespace, LiveState string
 					} `json:"items"`
 				}
-				if err := json.Unmarshal(centralAPIAt(t, addr, base+"/managed-resources"+query), &res); err != nil {
+				if err := json.Unmarshal(centralAPIRetryEmptyCause(t, addr, base+"/managed-resources"+query), &res); err != nil {
 					t.Fatalf("%s: decode the managed resources: %v", app.Name, err)
 				}
 				if len(res.Items) == 0 {
@@ -822,7 +860,7 @@ func TestM3CentralViewShowsLiveResources(t *testing.T) {
 				var tree struct {
 					Nodes []struct{ Group, Kind, Name, Namespace, UID string } `json:"nodes"`
 				}
-				if err := json.Unmarshal(centralAPIAt(t, addr, base+"/resource-tree"+query), &tree); err != nil {
+				if err := json.Unmarshal(centralAPIRetryEmptyCause(t, addr, base+"/resource-tree"+query), &tree); err != nil {
 					t.Fatalf("%s: decode the resource tree: %v", app.Name, err)
 				}
 				if len(tree.Nodes) == 0 {

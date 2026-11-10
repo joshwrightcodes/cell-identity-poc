@@ -75,8 +75,9 @@ func TestLgtmRender(t *testing.T) {
 		"GF_ANALYTICS_REPORTING_ENABLED":        "false",
 		"GF_ANALYTICS_CHECK_FOR_UPDATES":        "false",
 		"GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES": "false",
-		"TEMPO_EXTRA_ARGS":                      "-reporting.enabled=false",
-		"PYROSCOPE_EXTRA_ARGS":                  "-usage-stats.enabled=false",
+		"TEMPO_EXTRA_ARGS":                      "-reporting.enabled=false -backend-worker.compaction.block-retention=48h -backend-scheduler.provider.work.compaction.block-retention=48h",
+		"PYROSCOPE_EXTRA_ARGS":                  "-usage-stats.enabled=false -retention-period=48h",
+		"PROMETHEUS_EXTRA_ARGS":                 "--storage.tsdb.retention.time=48h --storage.tsdb.retention.size=3GB",
 	}
 	if got := envOf(t, ctr); fmt.Sprint(got) != fmt.Sprint(wantEnv) {
 		t.Errorf("env %v, want %v", got, wantEnv)
@@ -166,7 +167,8 @@ func TestLgtmConfigRender(t *testing.T) {
 	}
 	var loki struct {
 		Limits struct {
-			OTLP struct {
+			Retention string `json:"retention_period"`
+			OTLP      struct {
 				Resource struct {
 					Attrs []struct {
 						Action     string   `json:"action"`
@@ -175,6 +177,10 @@ func TestLgtmConfigRender(t *testing.T) {
 				} `json:"resource_attributes"`
 			} `json:"otlp_config"`
 		} `json:"limits_config"`
+		Compactor struct {
+			Enabled bool   `json:"retention_enabled"`
+			Store   string `json:"delete_request_store"`
+		} `json:"compactor"`
 		Analytics struct {
 			Reporting bool `json:"reporting_enabled"`
 		} `json:"analytics"`
@@ -191,6 +197,9 @@ func TestLgtmConfigRender(t *testing.T) {
 	slices.Sort(indexed)
 	if want := []string{"deployment.environment.name", "k8s.cluster.name", "platform.cell", "platform.plane"}; !slices.Equal(indexed, want) {
 		t.Errorf("Loki index labels %v, want %v", indexed, want)
+	}
+	if loki.Limits.Retention != "48h" || !loki.Compactor.Enabled || loki.Compactor.Store == "" {
+		t.Errorf("Loki retention %q, compactor %+v, want 48h with the compactor and its delete request store on", loki.Limits.Retention, loki.Compactor)
 	}
 	if loki.Analytics.Reporting {
 		t.Error("Loki usage reporting is on")
@@ -265,7 +274,7 @@ func TestTelemetryGatewayRender(t *testing.T) {
 	for _, a := range get[[]any](t, ctr, "args") {
 		args = append(args, a.(string))
 	}
-	want := []string{"spiffe-server", "--listen=:8444", "--backend=otlp", "--upstream=lgtm.observability-system.svc:4317", "--upstream-wait=2m",
+	want := []string{"spiffe-server", "--listen=:8444", "--backend=otlp", "--upstream=lgtm.observability-system.svc.cluster.local:4317", "--upstream-wait=2m",
 		`--allow-id=^spiffe://dev\.env\.poc\.internal/(cell/[a-z0-9-]+|cp)/otel$`, "--registry-dir=/run/cell-proxy/registry",
 		"--peer-bundle=/run/cell-proxy/peer-root/root.crt", "--peer-trust-domain=dev.env.poc.internal"}
 	if !slices.Equal(args, want) {
@@ -335,7 +344,7 @@ func TestManagementCollectorRender(t *testing.T) {
 			image := get[string](t, get[[]any](t, dep, "spec", "template", "spec", "containers")[0], "image")
 			_, hasEgress := objs["NetworkPolicy observability-system/collector-egress"]
 			if cluster != "management" {
-				if !strings.Contains(conf, "debug:") || strings.Contains(conf, "otlp:\n    endpoint") || strings.Contains(conf, "resource:") || hasEgress || strings.Contains(image, "-k8s") {
+				if !strings.Contains(conf, "debug:") || strings.Contains(conf, "otlp:\n    endpoint") || strings.Contains(conf, "resource:") || strings.Contains(conf, "transform") || hasEgress || strings.Contains(image, "-k8s") {
 					t.Errorf("the collector of %s changed: egress %v image %s\n%s", cluster, hasEgress, image, conf)
 				}
 				return
@@ -351,6 +360,28 @@ func TestManagementCollectorRender(t *testing.T) {
 			if !hasEgress || !strings.HasPrefix(image, "docker.io/otel/opentelemetry-collector-k8s:0.164.0@sha256:") {
 				t.Errorf("egress policy %v, image %s", hasEgress, image)
 			}
+			// Every form of every source attribute goes at every level, before the resource processor sets
+			// the values of management.
+			for _, want := range []string{"context: resource", "context: scope", "context: span", "context: spanevent", "context: datapoint", "context: log",
+				"platform[._-]cell", "deployment[._-]environment[._-]name", "source[._-]cluster", "destination[._-]cluster", "k8s[._-]cluster[._-]name", "platform[._-]plane", "(?i)",
+				"processors: [transform, resource, batch]"} {
+				if !strings.Contains(conf, want) {
+					t.Errorf("the management collector config lacks %q:\n%s", want, conf)
+				}
+			}
+			if n := strings.Count(conf, "delete_matching_keys(attributes"); n != 10 {
+				t.Errorf("the config has %d delete statements, want 10 (4 trace, 3 metric and 3 log contexts)", n)
+			}
+			col := objs["NetworkPolicy observability-system/collector"]
+			var admitted []string
+			for _, r := range get[[]any](t, col, "spec", "ingress") {
+				for _, f := range get[[]any](t, r, "from") {
+					admitted = append(admitted, fmt.Sprint(f))
+				}
+			}
+			if want := "[map[namespaceSelector:map[matchExpressions:[map[key:kubernetes.io/metadata.name operator:In values:[apps-demo argocd cell-system istio-egress central-view-system]]]]] map[podSelector:map[matchLabels:map[app.kubernetes.io/name:telemetry-gateway]]]]"; fmt.Sprint(admitted) != want {
+				t.Errorf("the collector ingress admits %v, want only the named senders", admitted)
+			}
 			eg := get[[]any](t, objs["NetworkPolicy observability-system/collector-egress"], "spec", "egress")
 			if len(eg) != 1 || fmt.Sprint(lookupOr(eg[0], "to")) != "[map[podSelector:map[matchLabels:map[app.kubernetes.io/name:lgtm]]]]" || fmt.Sprint(lookupOr(get[[]any](t, eg[0], "ports")[0], "port")) != "4317" {
 				t.Errorf("collector egress %v, want lgtm on 4317 only", eg)
@@ -359,7 +390,7 @@ func TestManagementCollectorRender(t *testing.T) {
 			if fmt.Sprint(lookupOr(dns, "spec", "podSelector", "matchExpressions")) != "[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm]]]" {
 				t.Errorf("allow-dns selects %v, want every pod except lgtm", lookupOr(dns, "spec", "podSelector"))
 			}
-			col := objs["NetworkPolicy observability-system/collector"]
+			col = objs["NetworkPolicy observability-system/collector"]
 			if fmt.Sprint(lookupOr(col, "spec", "podSelector", "matchLabels")) != "map[app.kubernetes.io/name:otel-collector]" {
 				t.Errorf("the collector ingress policy selects %v, want only the collector", lookupOr(col, "spec", "podSelector"))
 			}

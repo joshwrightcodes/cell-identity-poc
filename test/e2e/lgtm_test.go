@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"slices"
 	"strconv"
@@ -373,26 +374,35 @@ func TestM3LgtmHardened(t *testing.T) {
 	// a failed name lookup does not hide an open route. The resolver of curl can outlast the timeouts
 	// of curl itself, so timeout ends the process at 5 seconds.
 	for _, target := range []string{"https://grafana.com", "https://1.1.1.1"} {
-		start := time.Now()
-		_, err := kubectl(t, mgmtCluster, "", "-n", obsNamespace, "exec", lgtmPod, "-c", lgtmContainer, "--",
-			"timeout", "5", "curl", "-sS", "--connect-timeout", "5", "-o", "/dev/null", target)
-		if err == nil {
-			t.Errorf("curl to %s from %s succeeded, want a failure", target, lgtmPod)
-		} else if d := time.Since(start); d > 9*time.Second {
-			t.Errorf("curl to %s from %s took %s to fail, want within 5 seconds of the process start", target, lgtmPod, d)
-		}
+		t.Run("egress "+target, func(t *testing.T) {
+			t.Parallel()
+			start := time.Now()
+			_, err := kubectl(t, mgmtCluster, "", "-n", obsNamespace, "exec", lgtmPod, "-c", lgtmContainer, "--",
+				"timeout", "5", "curl", "-sS", "--connect-timeout", "5", "-o", "/dev/null", target)
+			if err == nil {
+				t.Errorf("curl to %s from %s succeeded, want a failure", target, lgtmPod)
+			} else if d := time.Since(start); d > 9*time.Second {
+				t.Errorf("curl to %s from %s took %s to fail, want within 5 seconds of the process start", target, lgtmPod, d)
+			}
+		})
 	}
 
+	// The pod listens on more ports than its Service names: Loki push 3100, Tempo 3200, Pyroscope ingest
+	// 4040 and OTLP over HTTP 4318 accept data, and Prometheus on 9090 accepts remote write and OTLP. No
+	// pod may reach any of them.
 	ip := mgmtPodIP(t, obsNamespace, lgtmPod)
-	for _, port := range []int{4317, 9090, 3000} {
-		if err := probeFromFreshNamespace(t, mgmtCluster, ip, port, 3*time.Second); err != nil {
-			t.Errorf("a pod in a fresh namespace reaches lgtm on %d: %v", port, err)
-		}
+	for _, port := range []int{4317, 9090, 3000, 3100, 3200, 4040, 4318} {
+		t.Run("ingress "+strconv.Itoa(port), func(t *testing.T) {
+			t.Parallel()
+			if err := probeFromFreshNamespace(t, mgmtCluster, ip, port, 3*time.Second); err != nil {
+				t.Errorf("a pod in a fresh namespace reaches lgtm on %d: %v", port, err)
+			}
+		})
 	}
 }
 
 // collectorConn dials the OTLP gRPC port of the management collector through a port-forward. The
-// collector listens in plaintext, as every cell workload reaches it.
+// collector listens in plaintext, as every workload of management reaches it.
 func collectorConn(t *testing.T) *grpc.ClientConn {
 	t.Helper()
 	addr := portForward(t, mgmtCluster, obsNamespace, "svc/otel-collector", 4317)
@@ -404,29 +414,84 @@ func collectorConn(t *testing.T) *grpc.ClientConn {
 	return conn
 }
 
-// TestM3ManagementSignals checks that the management collector reaches the store with its own
-// source attributes. Traces and logs of management carry k8s.cluster.name and platform.plane. No
-// workload of management sends metrics yet, so the test sends a gauge through the collector with
-// resource attributes that claim dev-cell-1. The collector must replace them, and Prometheus must
-// hold the series with the management labels.
+// TestM3ManagementSignals checks that the management collector reaches the store with its own source
+// attributes, and that a pod of management cannot forge the signals of a cell through it. Traces and
+// logs of management carry k8s.cluster.name and platform.plane. No workload of management sends
+// metrics yet. So the test sends a gauge, a log and a span through the collector with every source
+// attribute spoofed at the resource, at the record and at the data point, in several forms. The stores
+// must return them with the values of management only. No series, stream or trace of management may
+// carry platform_cell, deployment_environment_name, source_cluster, or a cluster of a cell.
 func TestM3ManagementSignals(t *testing.T) {
 	marker := "m3mgmt" + randomHex(t, 4)
-	metric := "m3_mgmt_" + marker
-	sendMetric(t, collectorConn(t), &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
-		strAttr("service.name", "m3-mgmt"), strAttr("k8s.cluster.name", "dev-cell-1"), strAttr("platform.plane", "cell")}}, metric, time.Now())
+	metric := "m3_spoof_" + marker
+	res := &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+		strAttr("service.name", "m3-mgmt"), strAttr("k8s.cluster.name", "dev-cell-1"), strAttr("platform.plane", "cell"),
+		strAttr("platform.cell", "dev-cell-1"), strAttr("deployment.environment.name", "dev"), strAttr("Platform-Cell", "dev-cell-1")}}
+	sendSignals(t, collectorConn(t), res, marker,
+		strAttr("m3.marker", marker), strAttr("platform_cell", "dev-cell-1"), strAttr("platform.cell", "dev-cell-1"), strAttr("k8s_cluster_name", "dev-cell-1"),
+		strAttr("k8s.cluster.name", "dev-cell-1"), strAttr("platform_plane", "cell"), strAttr("deployment_environment_name", "dev"),
+		strAttr("source_cluster", "dev-cell-1"), strAttr("destination_cluster", "dev-cell-1"), strAttr("_Platform_Cell_", "dev-cell-1"))
+	forged := []string{"platform_cell", "deployment_environment_name", "source_cluster", "destination_cluster"}
+
 	waitFor(t, "the metric "+metric+" with the management labels in Prometheus", signalWait, func() (bool, string) {
 		s := promSamples(t, fmt.Sprintf(`{__name__=%q}`, metric))
 		if len(s) != 1 {
 			return false, fmt.Sprintf("%d series", len(s))
 		}
-		if l := s[0].labels; l["k8s_cluster_name"] != "management" || l["platform_plane"] != "management" {
+		l := s[0].labels
+		if l["k8s_cluster_name"] != "management" || l["platform_plane"] != "management" {
 			t.Fatalf("the series %s has the labels %v, want k8s_cluster_name and platform_plane management", metric, l)
+		}
+		for _, k := range forged {
+			if v, ok := l[k]; ok {
+				t.Errorf("the series %s keeps the forged label %s=%s: %v", metric, k, v, l)
+			}
 		}
 		return true, ""
 	})
-	if n := len(promSamples(t, `group({k8s_cluster_name="management", platform_plane="management"})`)); n == 0 {
-		t.Error("Prometheus has no series with k8s_cluster_name and platform_plane management")
+	for _, q := range []string{
+		`{k8s_cluster_name="management", platform_cell!=""}`, `{k8s_cluster_name="management", source_cluster!=""}`,
+		`{k8s_cluster_name="management", deployment_environment_name!=""}`, `{platform_cell=~".+", platform_plane="management"}`,
+		`{k8s_cluster_name=~"dev-cell-.+", platform_plane="management"}`,
+	} {
+		if n := len(promSamples(t, q)); n != 0 {
+			t.Errorf("Prometheus returns %d series for %s, want none", n, q)
+		}
 	}
+
+	waitFor(t, "the log with the management labels in Loki", signalWait, func() (bool, string) {
+		lines := lokiLines(t, fmt.Sprintf(`{k8s_cluster_name="management", platform_plane="management"} |= %q`, marker))
+		if len(lines) != 1 {
+			return false, fmt.Sprintf("%d lines", len(lines))
+		}
+		for k, v := range lines[0].labels {
+			for _, f := range forged {
+				if strings.HasPrefix(k, f) {
+					t.Errorf("the log line keeps %s=%s: %v", k, v, lines[0].labels)
+				}
+			}
+		}
+		return true, ""
+	})
+	for _, q := range []string{`{platform_cell=~".+"} |= %q`, `{k8s_cluster_name=~"dev-cell-.+"} |= %q`, `{deployment_environment_name=~".+", platform_plane="management"} |= %q`} {
+		if n := len(lokiLines(t, fmt.Sprintf(q, marker))); n != 0 {
+			t.Errorf("Loki returns %d lines with the marker for %s, want none", n, q)
+		}
+	}
+
+	waitFor(t, "the span with the management values in Tempo", signalWait, func() (bool, string) {
+		n := tempoTraces(t, fmt.Sprintf(`{ span.m3.marker = %q && resource.k8s.cluster.name = "management" && resource.platform.plane = "management" }`, marker))
+		return n == 1, fmt.Sprintf("%d traces", n)
+	})
+	for _, q := range []string{
+		`resource.k8s.cluster.name = "dev-cell-1"`, `resource.platform.plane = "cell"`, `resource.platform.cell != nil`, `resource.deployment.environment.name != nil`,
+		`span.platform_cell != nil`, `span.platform.cell != nil`, `span.k8s_cluster_name != nil`, `span.k8s.cluster.name != nil`, `span.source_cluster != nil`, `span.destination_cluster != nil`,
+	} {
+		if n := tempoTraces(t, fmt.Sprintf(`{ span.m3.marker = %q && %s }`, marker, q)); n != 0 {
+			t.Errorf("Tempo returns %d traces for the marker with %s, want 0", n, q)
+		}
+	}
+
 	waitFor(t, "a trace from management in Tempo", signalWait, func() (bool, string) {
 		// The mesh sends spans for the requests of the demo workloads.
 		if _, err := kubectl(t, mgmtCluster, "", "-n", "apps-demo", "exec", "deploy/client", "-c", "curl", "--", "curl", "-sS", "-o", "/dev/null", "--max-time", "10", "http://echo/hostname"); err != nil {
@@ -525,6 +590,38 @@ func sendMetric(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, n
 	}
 }
 
+// sendSignals sends one gauge, one log and one span through conn. Each carries res and the record
+// attributes attrs, and the log body and the span name carry the marker. The gauge is named
+// m3_spoof_<marker>.
+func sendSignals(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) {
+	t.Helper()
+	now := time.Now()
+	sendMetric(t, conn, res, "m3_spoof_"+marker, now, attrs...)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if _, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+		Resource: res,
+		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+			TimeUnixNano: uint64(now.UnixNano()), SeverityText: "INFO", Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log " + marker}},
+			Attributes: attrs,
+		}}}},
+	}}}); err != nil {
+		t.Fatalf("export the log: %v", err)
+	}
+	traceID, spanID := bytes.Repeat([]byte{0x3a}, 16), bytes.Repeat([]byte{0x5c}, 8)
+	copy(traceID, []byte(marker))
+	if _, err := colltrace.NewTraceServiceClient(conn).Export(ctx, &colltrace.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
+		Resource: res,
+		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{
+			TraceId: traceID, SpanId: spanID, Name: "span " + marker, Kind: tracepb.Span_SPAN_KIND_INTERNAL,
+			StartTimeUnixNano: uint64(now.Add(-time.Second).UnixNano()), EndTimeUnixNano: uint64(now.UnixNano()),
+			Attributes: attrs,
+		}}}},
+	}}}); err != nil {
+		t.Fatalf("export the span: %v", err)
+	}
+}
+
 // overwriteSeries reads each series of the resource-level overwrite counter of one sender cluster
 // from Prometheus, with its last value. The key is the sorted label set, so every attribute and every
 // gateway process has its own entry.
@@ -564,31 +661,7 @@ func TestM3GatewayResetsSpoofedAttributes(t *testing.T) {
 	conn := gatewayConn(t, senderCert(t, "spiffe://"+envTrustDomain+"/cell/dev-cell-1/otel"))
 	base := overwriteSeries(t, "dev-cell-1")
 
-	now := time.Now()
-	sendMetric(t, conn, spoofResource("m3-spoof"), metric, now, strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if _, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
-		Resource: spoofResource("m3-spoof"),
-		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
-			TimeUnixNano: uint64(now.UnixNano()), SeverityText: "INFO", Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log " + marker}},
-			Attributes: []*commonpb.KeyValue{strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker)},
-		}}}},
-	}}}); err != nil {
-		t.Fatalf("export the log through the gateway: %v", err)
-	}
-	traceID, spanID := bytes.Repeat([]byte{0x3a}, 16), bytes.Repeat([]byte{0x5c}, 8)
-	copy(traceID, []byte(marker))
-	if _, err := colltrace.NewTraceServiceClient(conn).Export(ctx, &colltrace.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
-		Resource: spoofResource("m3-spoof"),
-		ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{
-			TraceId: traceID, SpanId: spanID, Name: "span " + marker, Kind: tracepb.Span_SPAN_KIND_INTERNAL,
-			StartTimeUnixNano: uint64(now.Add(-time.Second).UnixNano()), EndTimeUnixNano: uint64(now.UnixNano()),
-			Attributes: []*commonpb.KeyValue{strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker)},
-		}}}},
-	}}}); err != nil {
-		t.Fatalf("export the span through the gateway: %v", err)
-	}
+	sendSignals(t, conn, spoofResource("m3-spoof"), marker, strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker))
 
 	waitFor(t, "the metric "+metric+" with the values of dev-cell-1 in Prometheus", signalWait, func() (bool, string) {
 		s := promSamples(t, fmt.Sprintf(`{__name__=%q}`, metric))
@@ -612,6 +685,12 @@ func TestM3GatewayResetsSpoofedAttributes(t *testing.T) {
 		}
 		return true, ""
 	})
+	for _, l := range lokiLines(t, fmt.Sprintf(`{k8s_cluster_name="dev-cell-1"} |= %q`, marker)) {
+		// A record attribute with the name of an index label would show as <name>_extracted.
+		if _, ok := l.labels["platform_cell_extracted"]; ok {
+			t.Errorf("the log line keeps the record attribute platform_cell: %v", l.labels)
+		}
+	}
 	if n := len(lokiLines(t, fmt.Sprintf(`{platform_cell="dev-cell-2"} |= %q`, marker))); n != 0 {
 		t.Errorf("Loki returns %d lines with the marker under platform_cell dev-cell-2, want 0", n)
 	}
@@ -866,11 +945,48 @@ func TestM3GrafanaPasswordRotates(t *testing.T) {
 	if strings.Contains(stdout.String()+stderr.String(), fresh) {
 		t.Errorf("the output of obs:rotate-password holds the new password")
 	}
+	// A client-side apply would copy the password into this annotation.
+	if out, err := kubectl(t, mgmtCluster, "", "-n", obsNamespace, "get", "secrets", "-o", `jsonpath={range .items[*]}{.metadata.annotations.kubectl\.kubernetes\.io/last-applied-configuration}{end}`); err != nil || strings.TrimSpace(out) != "" {
+		t.Errorf("a Secret of %s carries the annotation last-applied-configuration (error %v)", obsNamespace, err)
+	}
 	if code, _ := grafanaCall(t, "admin:"+old, "GET", "/api/user", ""); code != 401 {
 		t.Errorf("the old password answers HTTP %d, want 401", code)
 	}
 	if code, _ := grafanaCall(t, "admin:"+fresh, "GET", "/api/user", ""); code != 200 {
 		t.Errorf("the new password answers HTTP %d, want 200", code)
+	}
+}
+
+// TestM3GrafanaRestoreCommand makes Grafana and Secret grafana-admin differ on purpose, as a failed rotation
+// does. It then runs the command that obs-rotate-password.sh prints for that case, and requires that
+// Grafana accepts the password of the Secret again. The test makes no failed login on purpose: Grafana
+// blocks a user for 5 minutes after 5 failed logins, and the block refuses the right password too.
+func TestM3GrafanaRestoreCommand(t *testing.T) {
+	secretPW := grafanaPassword(t)
+	other := randomHex(t, 16)
+	body, _ := json.Marshal(map[string]string{"oldPassword": secretPW, "newPassword": other, "confirmNew": other})
+	if code, out := grafanaCall(t, "admin:"+secretPW, "PUT", "/api/user/password", string(body)); code != 200 {
+		t.Fatalf("PUT /api/user/password answers HTTP %d: %s", code, out)
+	}
+	show := exec.Command("bash", "scripts/obs-rotate-password.sh", "--restore-command")
+	show.Dir = "../.."
+	show.Env = append(os.Environ(), "CELL=management")
+	command, err := show.Output()
+	if err != nil {
+		t.Fatalf("obs-rotate-password.sh --restore-command: %v", err)
+	}
+	restore := exec.Command("bash", "-c", strings.TrimSpace(string(command)))
+	restore.Dir = "../.."
+	var out bytes.Buffer
+	restore.Stdout, restore.Stderr = &out, &out
+	if err := restore.Run(); err != nil {
+		t.Fatalf("the restore command failed: %v\n%s", err, out.String())
+	}
+	if strings.Contains(out.String(), secretPW) || strings.Contains(out.String(), other) {
+		t.Errorf("the output of the restore command holds a password")
+	}
+	if code, _ := grafanaCall(t, "admin:"+secretPW, "GET", "/api/user", ""); code != 200 {
+		t.Errorf("after the restore, the Secret password gets HTTP %d, want 200\n%s", code, out.String())
 	}
 }
 
@@ -884,9 +1000,26 @@ func TestM3TelemetryNodePortAdmission(t *testing.T) {
 	}
 	for cluster, want := range map[string]string{envCluster: "connected", "dev-cell-1": "timeout", "rogue": "timeout"} {
 		t.Run(cluster, func(t *testing.T) {
+			t.Parallel()
 			ns := freshNamespace(t, cluster)
 			if got := dialFrom(t, cluster, ns, ip, telemetryPort, 3*time.Second); got != want {
 				t.Errorf("dial from %s to %s:%d gave %q, want %q", cluster, ip, telemetryPort, got, want)
+			}
+		})
+	}
+}
+
+// TestM3CollectorIngressLimited checks that a pod in a fresh namespace of management cannot reach the
+// collector. Only the named senders of management may, so no other pod can send forged signals.
+func TestM3CollectorIngressLimited(t *testing.T) {
+	needProbeImage(t)
+	pod, _ := readyPod(t, obsNamespace, "otel-collector")
+	ip := mgmtPodIP(t, obsNamespace, pod)
+	for _, port := range []int{4317, 4318} {
+		t.Run(strconv.Itoa(port), func(t *testing.T) {
+			t.Parallel()
+			if err := probeFromFreshNamespace(t, mgmtCluster, ip, port, 3*time.Second); err != nil {
+				t.Errorf("a pod in a fresh namespace reaches the collector on %d: %v", port, err)
 			}
 		})
 	}

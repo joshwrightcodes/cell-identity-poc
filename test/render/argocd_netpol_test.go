@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-const notLgtmSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm]]]]"
+const notStoreSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm telemetry-gateway]]]]"
 
 const notAgentSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[argocd-agent]]]]"
 
@@ -57,8 +57,8 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 				}
 			}
 			// The store probes itself inside its pod, so no node address reaches it.
-			if p := policies["NetworkPolicy observability-system/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != notLgtmSelector {
-				t.Errorf("allow-from-nodes in observability-system selects %v, want every pod except lgtm", p)
+			if p := policies["NetworkPolicy observability-system/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != notStoreSelector {
+				t.Errorf("allow-from-nodes in observability-system selects %v, want every pod except lgtm and the gateway", p)
 			}
 			store := policies["NetworkPolicy cell-system/bundle-store"]
 			if store == nil {

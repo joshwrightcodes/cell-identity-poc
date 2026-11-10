@@ -227,16 +227,18 @@ The bundle `observability-store` at wave 8 holds it, and `vendor/README.md` reco
 The pod runs as user 10001 on a read-only root file system, and it has no route out.
 Its data lives on a 10 GiB volume.
 
-The store receives OTLP on port 4317 from two senders only:
+The store receives OTLP on port 4317 from two senders only. The pod listens on more ports (3100, 3200, 4040, 4318, and 9090, which also accepts remote write), and the NetworkPolicy admits no pod to any of them:
 
-- The collector `otel-collector` in `management`. It sets `k8s.cluster.name` and `platform.plane` on every resource, and exports to `lgtm`. The other clusters keep the `debug` exporter.
+- The collector `otel-collector` in `management`. It deletes every form of the source attributes (`k8s.cluster.name`, `platform.plane`, `platform.cell`, `deployment.environment.name`, `source_cluster` and `destination_cluster`) at the resource, scope, record, span, span event and data point, then sets `k8s.cluster.name` and `platform.plane` to `management`, and exports to `lgtm`. Span links and exemplars are not reachable, so they keep their attributes. Its NetworkPolicy admits only `apps-demo`, `argocd`, `cell-system`, `istio-egress`, `central-view-system` and the gateway, so no other pod can forge the signals of a cell. A new sender in `management` needs its namespace in `components/observability-system/render.sh`. The other clusters keep the `debug` exporter.
 - The telemetry gateway, the link component `telemetry-gateway`. It runs `cell-proxy` with the `otlp` backend and a SPIRE agent in one pod.
   It accepts SPIFFE mTLS on node port 31444 from the `dev-cp` node only, and its ID is `spiffe://mgmt.poc.internal/telemetry`.
   It admits `spiffe://dev.env.poc.internal/cell/<cell>/otel` for a registered cell, and `spiffe://dev.env.poc.internal/cp/otel`.
   It sets the source attributes of every resource again from the verified ID, and it counts each change in `cellproxy_gateway_attribute_overwrites_total`.
-  The pod opens its listener only after the first connection to the store is ready. This is the readiness check of the gateway.
+  The node port admits the address of the `dev-cp` node, so every pod of `dev-cp` with egress to the `management` node reaches it. The mTLS check of `cell-proxy` decides who may send.
+  The pod opens its listener only after the first connection to the store is ready, and its probe covers that first connection only. A later outage leaves the pod Ready. The metric `cellproxy.gateway.upstream.failures` shows it, and `cell:verify` reads it.
 
 Prometheus accepts samples up to 25 hours old, so a collector queue can drain after a long outage.
+Each component keeps 48 hours of data. Prometheus also stops at 3 GB. The volume has a request of 10Gi, but `local-path` enforces no size, so `cell:verify` fails when `/data` of `lgtm-0` holds more than 8 GiB.
 Prometheus keeps `platform.plane` and `platform.cell` as labels, and Loki makes the four source attributes index labels.
 
 Grafana has no anonymous access. Its admin password comes from an External Secrets `Password` generator in the cluster, so no secret manager takes part.
@@ -258,7 +260,9 @@ mise run obs:rotate-password
 ```
 
 The Secret keeps its value after a restart, because the generator runs only once. A new data volume makes Grafana read the Secret again for its first password.
-If the Secret and Grafana differ after a failed rotation, the error line holds the command that sets Grafana to the password of the Secret.
+The task changes the Secret with a merge patch and never uses `kubectl apply`, because a client-side apply copies the password into the annotation `last-applied-configuration`. The same patch removes that annotation. `cell:verify` fails when a Secret of `observability-system` has it.
+If the Secret and Grafana differ after a failed rotation, the error line holds the command that sets Grafana to the password of the Secret. Print it with `scripts/obs-rotate-password.sh --restore-command`. `TestM3GrafanaRestoreCommand` runs it.
+Grafana blocks the user `admin` for 5 minutes after 5 failed logins, and the block refuses the right password too. `cell:verify`, `obs:rotate-password` and the gate each make one or two failed logins on purpose. When a check shows HTTP 401 after several runs in a row, wait 5 minutes before you suspect a wrong password.
 
 ## Add or remove a cell
 
@@ -396,7 +400,7 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It rotates the view keys of the principal, rotates the CA of the SPIRE server in `management`, and restarts that server. The agents connect again within two minutes.
 - It starts test pods in fresh namespaces of every cluster, and it deletes them.
 - It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
-- It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers, and Prometheus, Loki and Tempo age them out.
+- It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers for 48 hours, then each component deletes them.
 
 A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.
 `cell:verify` fails on each of them, and on any binding for the agent ServiceAccount or the test group that the render does not hold.

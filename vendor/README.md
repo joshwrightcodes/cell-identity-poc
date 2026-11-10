@@ -1163,6 +1163,18 @@ hidden Unicode, `sudo`, persistence, credential access and obfuscated code. It f
 - The base is `ubi9-micro` 9.8, pinned by digest, with `curl-minimal` added. The image sets no `USER`.
 - Six processes run in one container: Grafana v13.2.4, Prometheus v3.15.0, Loki v3.7.8, Tempo v3.1.0,
   Pyroscope v2.4.1 and `otelcol-contrib` v0.163.1. The OBI eBPF agent is off unless `ENABLE_OBI=true`.
+  Grafana also starts 13 backend plugin binaries for its data sources (Elasticsearch, PostgreSQL, MySQL,
+  MSSQL, InfluxDB, OpenTSDB, Cloud Monitoring, Jaeger, Zipkin, Loki, Prometheus, Tempo and Pyroscope),
+  and `run-all.sh` ends with `sleep infinity`. The store uses only four of those data sources.
+  `GF_PLUGINS_DISABLE_PLUGINS` could stop the others. The PoC does not set it, because the list of
+  plugin IDs is not verified for this image.
+- Prometheus runs with `--web.enable-remote-write-receiver` and `--web.enable-otlp-receiver`, so port 9090
+  accepts writes. Loki (3100), Tempo (3200), Pyroscope (4040) and the `otelcol` HTTP receiver (4318) also
+  accept data on `0.0.0.0`. Only the NetworkPolicy keeps pods away from them, and a peer that Task 11
+  admits to 9090 must be `promql-proxy` alone.
+- The image sets no retention for Loki or Pyroscope, 14 days for Tempo and 15 days for Prometheus. The
+  pod sets 48 hours for each, through `loki.yaml`, `TEMPO_EXTRA_ARGS`, `PYROSCOPE_EXTRA_ARGS` and
+  `PROMETHEUS_EXTRA_ARGS`.
 - The build downloads each component from its upstream release page. It checks the SHA-256 file of
   Loki, Tempo, Prometheus and Pyroscope, and the checksum that `grafana.com` gives for Grafana. It
   checks `otelcol-contrib` with `cosign verify-blob`, which the build installs from a checked RPM.
@@ -1227,7 +1239,7 @@ core plugins of Grafana 13.2.4: `alertlist`, `alertmanager`, `annolist`, `barcha
 
 ### Not inspected
 
-The review did not inspect the layers of the image, the six binaries or the image signature. It did
+The review did not inspect the layers of the image, the six binaries, the 13 plugin binaries or the image signature. It did
 not compare the downloaded archives with a source build.
 
 ### Collector Kubernetes distribution 0.164.0 (2026-11-10)
