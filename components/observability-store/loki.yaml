@@ -28,6 +28,7 @@ schema_config:
 # The source attributes of the platform become index labels, so a query selects the logs of one
 # cluster, plane or cell with a stream selector. Loki writes each name with underscores.
 limits_config:
+  retention_period: 48h
   otlp_config:
     resource_attributes:
       attributes_config:
@@ -37,6 +38,13 @@ limits_config:
             - platform.plane
             - deployment.environment.name
             - platform.cell
+
+# Without the compactor, Loki keeps every log for ever. The compactor deletes what is older than
+# retention_period.
+compactor:
+  working_directory: /data/loki/compactor
+  retention_enabled: true
+  delete_request_store: filesystem
 
 # Loki sends usage statistics to the vendor by default. The pod has no route out, so the report
 # would only log errors.

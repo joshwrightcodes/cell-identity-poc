@@ -607,6 +607,7 @@ check_traces_in_store() {
   query="{ resource.k8s.cluster.name = \"$COLLECTOR_CLUSTER\" && resource.service.name =~ \"echo.*\" }"
   body="$(jq -nc --arg q "$query" '{queries: [{refId: "A", datasource: {type: "tempo", uid: "tempo"}, queryType: "traceql", query: $q,
     limit: 5, tableType: "traces"}], from: "now-30m", to: "now"}')"
+  grafana_login_ok || return 1
   until out="$(lgtm_curl "admin:$pw" POST /api/ds/query "$body" 2>&1)" && code="$(tail -n 1 <<<"$out")" && [[ "$code" == 200 ]] \
       && [[ "$(sed '$d' <<<"$out" | jq -r '[.results.A.frames[]?.data.values[0][]?] | length' 2>/dev/null)" -gt 0 ]]; do
     for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
@@ -624,8 +625,69 @@ check_lgtm_hardened() {
   code="$(k -n observability-system exec lgtm-0 -c lgtm -- curl -sS -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:3000/api/datasources 2>&1)" \
     || { echo "could not call Grafana in lgtm-0: $code"; return 1; }
   [[ "$code" == 401 ]] || { echo "an anonymous read of /api/datasources answers HTTP '$code', want 401. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  code="$(k -n observability-system exec lgtm-0 -c lgtm -- curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -u admin:admin http://127.0.0.1:3000/api/user 2>&1)" \
+    || { echo "could not call Grafana in lgtm-0: $code"; return 1; }
+  [[ "$code" == 401 ]] || { echo "the default login admin:admin answers HTTP '$code', want 401, so Grafana did not read the generated password"; return 1; }
   k -n observability-system exec lgtm-0 -c lgtm -- test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token \
     || { echo "lgtm-0 holds a service account token"; return 1; }
+}
+
+# grafana_login_ok prints nothing and succeeds when Grafana accepts the password of Secret grafana-admin.
+# Otherwise it names the fix, so a 401 does not look like a failure of the store.
+grafana_login_ok() {
+  local pw out code fix
+  fix="CELL=$CELL_NAME mise run obs:rotate-password, or, when it fails, the restore command that it prints (CELL=$CELL_NAME scripts/obs-rotate-password.sh --restore-command)"
+  pw="$("$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  out="$(lgtm_curl "admin:$pw" GET /api/user 2>&1)" || { echo "could not call Grafana in lgtm-0: $out"; return 1; }
+  code="$(tail -n 1 <<<"$out")"
+  [[ "$code" == 200 ]] && return 0
+  if [[ "$code" == 401 ]]; then
+    echo "Grafana refuses the password of Secret grafana-admin (HTTP 401), so the Secret and the Grafana database differ, or Grafana blocks the user for 5 minutes after 5 failed logins (wait, then run again). Fix for a difference: $fix"
+  else
+    echo "GET /api/user in Grafana answers HTTP '$code'"
+  fi
+  return 1
+}
+
+# The four data sources of the image must pass their health check.
+check_grafana_datasources() {
+  local pw uid out code
+  grafana_login_ok || return 1
+  pw="$("$ROOT/scripts/obs-password.sh")"
+  for uid in prometheus loki tempo pyroscope; do
+    out="$(lgtm_curl "admin:$pw" GET "/api/datasources/uid/$uid/health" 2>&1)" || { echo "could not call Grafana: $out"; return 1; }
+    code="$(tail -n 1 <<<"$out")"
+    [[ "$code" == 200 && "$(sed '$d' <<<"$out" | jq -r .status 2>/dev/null)" == OK ]] || { echo "data source $uid: HTTP $code: $(sed '$d' <<<"$out" | head -c 200)"; return 1; }
+  done
+}
+
+# The gateway counts each failed forward to the store. Nothing may have failed in the last 5 minutes. A
+# store that the gateway cannot reach, or a policy that drifted on flow N10, shows here first.
+check_gateway_store_path() {
+  local pw out code n
+  grafana_login_ok || return 1
+  pw="$("$ROOT/scripts/obs-password.sh")"
+  out="$(lgtm_curl "admin:$pw" GET '/api/datasources/proxy/uid/prometheus/api/v1/query?query=sum(increase(cellproxy_gateway_upstream_failures_total%5B5m%5D))' 2>&1)" \
+    || { echo "could not query Prometheus: $out"; return 1; }
+  code="$(tail -n 1 <<<"$out")"
+  [[ "$code" == 200 ]] || { echo "the Prometheus query answers HTTP '$code'"; return 1; }
+  n="$(sed '$d' <<<"$out" | jq -r '.data.result[0].value[1] // "0"')"
+  awk -v n="$n" 'BEGIN { exit !(n + 0 < 0.5) }' || { echo "the gateway failed $n forwards to the store in the last 5 minutes. Read: kubectl --context kind-$CELL_NAME -n observability-system logs deploy/telemetry-gateway -c cell-proxy"; return 1; }
+}
+
+# The data volume has no size limit of its own: local-path ignores the 10Gi request, and the files lie on the
+# disk of the VM. Retention keeps each component at 48 hours, so 8 GiB means that a bound failed.
+LGTM_DISK_LIMIT_KB=$((8 * 1024 * 1024))
+check_lgtm_disk() {
+  local kb
+  kb="$(k -n observability-system exec lgtm-0 -c lgtm -- du -sk /data 2>/dev/null | awk '{print $1}')" || { echo "could not run du in lgtm-0"; return 1; }
+  [[ "$kb" =~ ^[0-9]+$ ]] || { echo "du in lgtm-0 printed '$kb'"; return 1; }
+  ((kb < LGTM_DISK_LIMIT_KB)) || { echo "/data of lgtm-0 holds $((kb / 1024)) MiB, over the limit of $((LGTM_DISK_LIMIT_KB / 1024)) MiB. Check the retention settings in components/observability-store"; return 1; }
+}
+
+check_grafana_secret_synced() {
+  k -n observability-system get externalsecret grafana-admin -o json | jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null \
+    || { echo "ExternalSecret grafana-admin is not Ready. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
 }
 
 check_traces_received() {
@@ -667,6 +729,11 @@ check "plaintext cannot reach the bundle store" expect_no_connection plaintext "
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
 if [[ -n "${COLLECTOR_STORE:-}" ]]; then
   check "lgtm runs as user 10001, and Grafana answers 401 to an anonymous read" check_lgtm_hardened
+  check "ExternalSecret grafana-admin is Ready" check_grafana_secret_synced
+  check "No Secret in observability-system carries the annotation last-applied-configuration" check_no_last_applied_secret
+  check "Grafana accepts the password of Secret grafana-admin, and its four data sources are healthy" check_grafana_datasources
+  check "The gateway forwarded to the store with no failure in the last 5 minutes" check_gateway_store_path
+  check "/data of lgtm-0 holds less than 8 GiB" check_lgtm_disk
   check "Tempo holds a trace of echo from $COLLECTOR_CLUSTER, so the collector reaches the store" check_traces_received
 else
   check "The collector receives telemetry for echo" check_traces_received

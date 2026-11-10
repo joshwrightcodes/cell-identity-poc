@@ -8,5 +8,6 @@ encoded="$(k -n observability-system get secret grafana-admin -o jsonpath='{.dat
   || json_fail obs:password "could not read Secret grafana-admin in observability-system of $CELL_NAME" \
     fix="CELL=$CELL_NAME mise run cell:up"
 [[ -n "$encoded" ]] || json_fail obs:password "Secret grafana-admin has no key password" fix="CELL=$CELL_NAME mise run cell:up"
-password="$(base64 -d <<<"$encoded")" || json_fail obs:password "Secret grafana-admin does not hold valid base64"
+password="$(printf '%s' "$encoded" | base64 -d)" || json_fail obs:password "Secret grafana-admin does not hold valid base64"
+[[ "$password" =~ ^[A-Za-z0-9]{32}$ ]] || json_fail obs:password "Secret grafana-admin does not hold 32 letters and digits" fix="CELL=$CELL_NAME mise run obs:rotate-password"
 printf '%s\n' "$password"

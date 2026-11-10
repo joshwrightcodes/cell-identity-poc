@@ -212,6 +212,8 @@ store_gaps() {
 # password in a variable of the caller, not on a command line of this Mac either.
 lgtm_curl() {
   local creds="$1" method="$2" path="$3" body="${4:-}" esc
+  # The credentials go into a curl config, where a quote or a newline would add a directive.
+  [[ "$creds" =~ ^[A-Za-z0-9]+:[A-Za-z0-9]+$ ]] || { echo "lgtm_curl: the credentials are not user:password with letters and digits" >&2; return 1; }
   {
     printf 'user = "%s"\n' "$creds"
     printf 'request = "%s"\n' "$method"
@@ -784,4 +786,19 @@ check_harness_objects() {
     echo "Delete each extra object, and each field that another manager added. Then run: $(fix_command "$comp")"
     return 1
   fi
+}
+
+# check_no_last_applied_secret succeeds when no Secret in observability-system carries the annotation
+# kubectl.kubernetes.io/last-applied-configuration. A client-side kubectl apply writes the whole Secret,
+# password included, into it, and kubectl describe prints annotations.
+check_no_last_applied_secret() {
+  local found
+  found="$(k -n observability-system get secrets -o json | jq -r '.items[]
+    | select(.metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"] != null) | .metadata.name')" \
+    || { echo "could not list the Secrets of observability-system"; return 1; }
+  [[ -z "$found" ]] || {
+    echo "the Secrets ${found//$'\n'/, } carry the annotation last-applied-configuration, which can hold a password."
+    echo "Run: CELL=$CELL_NAME mise run obs:rotate-password, which removes it from grafana-admin. Delete it from another Secret with: kubectl annotate secret <name> kubectl.kubernetes.io/last-applied-configuration-"
+    return 1
+  }
 }

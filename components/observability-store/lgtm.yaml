@@ -65,10 +65,16 @@ spec:
             - name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES
               value: "false"
             # Tempo and Pyroscope report usage to the vendor by default. The pod has no route out.
+            # Each component keeps 48 hours of data. Without a bound, Loki and Pyroscope keep their
+            # data for ever, Tempo for 14 days and Prometheus for 15 days, and the volume is a
+            # local-path directory on the disk of the VM that no size limit applies to. Prometheus
+            # also stops at 3 GB. The Loki bound is in loki.yaml.
             - name: TEMPO_EXTRA_ARGS
-              value: -reporting.enabled=false
+              value: -reporting.enabled=false -backend-worker.compaction.block-retention=48h -backend-scheduler.provider.work.compaction.block-retention=48h
             - name: PYROSCOPE_EXTRA_ARGS
-              value: -usage-stats.enabled=false
+              value: -usage-stats.enabled=false -retention-period=48h
+            - name: PROMETHEUS_EXTRA_ARGS
+              value: --storage.tsdb.retention.time=48h --storage.tsdb.retention.size=3GB
           ports:
             - name: otlp-grpc
               containerPort: 4317

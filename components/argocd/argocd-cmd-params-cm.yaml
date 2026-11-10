@@ -6,3 +6,8 @@ data:
   # Argo CD sends traces to the in-cluster collector over OTLP.
   otlp.address: otel-collector.observability-system.svc.cluster.local:4317
   otlp.insecure: "true"
+  # The controller writes the cache key of an app again only when its state changes, and the key
+  # expires after one hour by default. A read of an expired key through the central view fails with
+  # HTTP 500 (upstream Argo CD Agent issue 1107). Argo CD v3.6.1 accepts at most 10h and falls back to
+  # 1h for a larger value. 10h makes that window ten times rarer.
+  controller.app.state.cache.expiration: 10h

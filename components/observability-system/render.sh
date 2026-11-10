@@ -40,6 +40,9 @@ if [[ -n "$store" ]]; then
   ((store_port <= 65535)) || die "COLLECTOR_STORE '$store' has a port above 65535"
 fi
 
+# The five source attributes and the Istio destination label, in every flattened form.
+SOURCE_KEYS_RE='(?i)^[_.-]*(k8s[._-]cluster[._-]name|platform[._-]plane|platform[._-]cell|deployment[._-]environment[._-]name|source[._-]cluster|destination[._-]cluster)[_.-]*$'
+
 collector="$(yq 'select(.kind != null) | .metadata.namespace = "observability-system"' "$here/collector.yaml")"
 if [[ -n "$store" ]]; then
   config="$(cat <<YAML
@@ -51,6 +54,35 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 processors:
+  # Any pod of management may send to this collector, so it strips every form of every source
+  # attribute at every level that the transform processor reaches, and the resource processor then
+  # sets the values of management. A form is the key with any of . _ - as separator, in any case,
+  # with separators at the ends. Span links and exemplars are not reachable.
+  transform:
+    error_mode: propagate
+    trace_statements:
+      - context: resource
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: scope
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: span
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: spanevent
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+    metric_statements:
+      - context: resource
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: scope
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: datapoint
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+    log_statements:
+      - context: resource
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: scope
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
+      - context: log
+        statements: [ 'delete_matching_keys(attributes, "$SOURCE_KEYS_RE")' ]
   resource:
     attributes:
       - key: k8s.cluster.name
@@ -72,15 +104,15 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [resource, batch]
+      processors: [transform, resource, batch]
       exporters: [otlp]
     logs:
       receivers: [otlp]
-      processors: [resource, batch]
+      processors: [transform, resource, batch]
       exporters: [otlp]
     metrics:
       receivers: [otlp]
-      processors: [resource, batch]
+      processors: [transform, resource, batch]
       exporters: [otlp]
 YAML
 )"
@@ -140,8 +172,8 @@ spec:
         - protocol: TCP
           port: 53
 ---
-# Flow N23: the kubelet probes each pod from a node address. The store probes itself inside the
-# pod, so it admits no node address.
+# Flow N23: the kubelet probes each pod from a node address. The store and the gateway probe
+# themselves inside the pod, so they admit no node address.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -152,11 +184,53 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/name
         operator: NotIn
-        values: [lgtm]
+        values: [lgtm, telemetry-gateway]
   policyTypes: [Ingress]
   ingress:
     - from:
 $(node_peers)
+EOF
+if [[ -n "$store" ]]; then
+  # Management: only the workloads that send telemetry today may reach the collector. A pod of any
+  # other namespace could forge the signals of a cell through it. Add a namespace here when a new
+  # workload of management sends OTLP.
+  cat <<EOF
+---
+# Flow N11 in, management: apps-demo (Envoy), argocd, istio-egress and central-view-system
+# (cell-proxy of the principal) send to 4317, and cell-system (the bundle store) sends to 4318. The
+# gateway sends its own telemetry on 4317.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: collector
+  namespace: $namespace
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchExpressions:
+              - key: kubernetes.io/metadata.name
+                operator: In
+                values: [apps-demo, argocd, cell-system, istio-egress, central-view-system]
+      ports:
+        - protocol: TCP
+          port: 4317
+        - protocol: TCP
+          port: 4318
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: telemetry-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+EOF
+else
+  cat <<EOF
 ---
 # Flow N11 in: every pod of the cluster sends OTLP to the collector.
 apiVersion: networking.k8s.io/v1
@@ -178,6 +252,7 @@ spec:
         - protocol: TCP
           port: 4318
 EOF
+fi
 if [[ -n "$store" ]]; then
   cat <<EOF
 ---

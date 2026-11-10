@@ -48,7 +48,7 @@ spec:
             - spiffe-server
             - --listen=:8444
             - --backend=otlp
-            - --upstream=lgtm.observability-system.svc:4317
+            - --upstream=lgtm.observability-system.svc.cluster.local:4317
             - --upstream-wait=2m
             - "--allow-id=@ALLOW_ID@"
             - --registry-dir=/run/cell-proxy/registry
@@ -62,6 +62,10 @@ spec:
             # Each pod gets its own metric series, so a counter that starts again after a restart
             # never continues the series of the pod before it. Prometheus keeps service.instance.id
             # as a label.
+            # The SDK exports metrics every 60 seconds by default. A shorter period makes the overwrite
+            # counter reach the store sooner, for the alarm and for the tests.
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "10000"
             - name: POD_NAME
               valueFrom:
                 fieldRef:
