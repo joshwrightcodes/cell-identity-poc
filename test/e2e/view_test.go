@@ -47,8 +47,20 @@ func viewCells(t *testing.T) []string {
 // The anonymous user must get HTTP 200.
 func centralAPI(t *testing.T, path string) []byte {
 	t.Helper()
+	return centralAPIAt(t, centralForward(t), path)
+}
+
+// centralForward starts a port-forward to the central argocd-server, and returns its address. It
+// stops when the test ends. A test that makes many calls starts it once and uses centralAPIAt.
+func centralForward(t *testing.T) string {
+	t.Helper()
 	// portForward matches the container port, and Service argocd-server maps port 80 to 8080.
-	addr := portForward(t, mgmtCluster, viewNamespace, "deploy/argocd-server", 8080)
+	return portForward(t, mgmtCluster, viewNamespace, "deploy/argocd-server", 8080)
+}
+
+// centralAPIAt reads path from the central argocd-server at addr, with no credential.
+func centralAPIAt(t *testing.T, addr, path string) []byte {
+	t.Helper()
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get("http://" + addr + path)
 	if err != nil {
@@ -76,7 +88,7 @@ func principalPod(t *testing.T) (name, ip, uid string) {
 		Items []struct {
 			Metadata struct{ Name, UID string } `json:"metadata"`
 			Status   struct {
-				PodIP      string `json:"podIP"`
+				PodIP      string                          `json:"podIP"`
 				Conditions []struct{ Type, Status string } `json:"conditions"`
 			} `json:"status"`
 		} `json:"items"`

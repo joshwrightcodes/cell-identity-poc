@@ -17,7 +17,6 @@ import (
 // answers the reads of AppProjects and Secrets from $STUB_PROJECTS and $STUB_ARGOCD_SECRET, the
 // Secret names of argocd from $STUB_SECRET_NAMES (default: the allowed three), the answer of
 // can-i from $STUB_CAN_GET (default no), and the admission objects from $STUB_VAP and $STUB_VAPB.
-// $STUB_ARGOCD_APPS_NS makes the namespace argocd-apps exist. Every delete goes to $STUB_LOG.
 const appsKubectl = `#!/usr/bin/env bash
 args=" $* "
 echo "kubectl $*" >>"${STUB_LOG:-/dev/null}"
@@ -39,10 +38,9 @@ if [[ "$args" == *" get secrets -o jsonpath="* ]]; then
   exit 0
 fi
 if [[ "$args" == *" auth can-i get secrets "* ]]; then echo "${STUB_CAN_GET:-no}"; [[ "${STUB_CAN_GET:-no}" == yes ]]; exit; fi
+if [[ "$args" == *" auth can-i "*" secrets "* ]]; then verb="$(sed -E 's/.* auth can-i ([a-z]+) secrets.*/\1/' <<<"$args")"; echo "$([[ "$verb" == "${STUB_CAN_VERB:-}" ]] && echo yes || echo no)"; [[ "$verb" == "${STUB_CAN_VERB:-}" ]]; exit; fi
 if [[ "$args" == *" get validatingadmissionpolicy argocd-secrets-allowed "* ]]; then echo "${STUB_VAP:-}"; [[ -n "${STUB_VAP:-}" ]]; exit; fi
 if [[ "$args" == *" get validatingadmissionpolicybinding argocd-secrets-allowed "* ]]; then echo "${STUB_VAPB:-}"; [[ -n "${STUB_VAPB:-}" ]]; exit; fi
-if [[ "$args" == *" get namespace argocd-apps "* ]]; then [[ -n "${STUB_ARGOCD_APPS_NS:-}" ]]; exit; fi
-if [[ "$args" == *" delete "* ]]; then exit 0; fi
 if [[ "$args" == *" get secret argocd-initial-admin-secret "* ]]; then [[ -n "${STUB_INITIAL_SECRET:-}" ]]; exit; fi
 if [[ "$args" == *" get secret argocd-secret -o json "* ]]; then
   if [[ -n "${STUB_ARGOCD_SECRET:-}" ]]; then echo "$STUB_ARGOCD_SECRET"; else echo '{"data":{}}'; fi
@@ -272,6 +270,8 @@ func TestCheckArgocdSecrets(t *testing.T) {
 		{"the allowed set", good, ""},
 		{"a Secret outside the set", append([]string{"STUB_SECRET_NAMES=argocd-redis argocd-secret bundle-store repo-token"}, good...), "repo-token"},
 		{"the agent can get a Secret", append([]string{"STUB_CAN_GET=yes"}, good...), "can get Secrets in argocd"},
+		{"the agent can update a Secret", append([]string{"STUB_CAN_VERB=update"}, good...), "can update Secrets in argocd"},
+		{"the agent can create a Secret", append([]string{"STUB_CAN_VERB=create"}, good...), "can create Secrets in argocd"},
 		{"no policy", []string{"STUB_VAPB=" + goodVAPB}, "argocd-secrets-allowed is missing"},
 		{"a wider policy", []string{"STUB_VAP=" + strings.Replace(goodVAP, "'bundle-store'", "'bundle-store', 'other'", 1), "STUB_VAPB=" + goodVAPB}, "does not allow exactly"},
 		{"a policy that only warns", []string{"STUB_VAP=" + goodVAP, "STUB_VAPB=" + strings.Replace(goodVAPB, `"Deny"`, `"Warn"`, 1)}, "does not deny"},
@@ -291,25 +291,74 @@ func TestCheckArgocdSecrets(t *testing.T) {
 	}
 }
 
-// retire_apps_namespace deletes the namespace argocd-apps when it exists, and then the policies of
-// the time when child Applications lived there. A second run on a clean cell deletes no namespace.
-func TestRetireAppsNamespace(t *testing.T) {
-	log := filepath.Join(t.TempDir(), "calls.log")
-	out, err := runLib(t, nil, `retire_apps_namespace`, "STUB_ARGOCD_APPS_NS=1", "STUB_LOG="+log)
-	if err != nil {
-		t.Fatalf("the retire step failed: %v\n%s", err, out)
+// relayKubectl serves the live relay objects from files in $STUB_DIR: deploy-<name>.json and
+// np-<name>.json.
+const relayKubectl = `#!/usr/bin/env bash
+args=" $* "
+for kind in deployment networkpolicy; do
+  for name in relay-view relay-telemetry; do
+    if [[ "$args" == *" get $kind $name -o json "* ]]; then
+      f="$STUB_DIR/${kind:0:1}-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
+    fi
+  done
+done
+echo "unexpected kubectl call: $*" >&2
+exit 2
+`
+
+func relayFixture(t *testing.T, target string, cells ...string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(relayKubectl), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	calls, _ := os.ReadFile(log)
-	for _, want := range []string{"delete namespace argocd-apps", "delete validatingadmissionpolicy argocd-apps-no-secrets", "delete validatingadmissionpolicybinding argocd-apps-cell-project"} {
-		if !strings.Contains(string(calls), want) {
-			t.Errorf("the calls lack %q:\n%s", want, calls)
+	var from []string
+	for _, c := range cells {
+		from = append(from, `{"ipBlock":{"cidr":"`+c+`/32"}}`)
+	}
+	for name, ports := range map[string][]string{"relay-view": {"8443=" + target + ":31443", "8445=" + target + ":31445"}, "relay-telemetry": {"8444=" + target + ":31444"}} {
+		var args []string
+		for _, p := range ports {
+			args = append(args, `"--route"`, `"`+p+`"`)
+		}
+		deploy := `{"spec":{"template":{"spec":{"containers":[{"args":[` + strings.Join(args, ",") + `,"--health",":8080"]}]}}}}`
+		np := `{"spec":{"ingress":[{"from":[` + strings.Join(from, ",") + `]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}]}],"egress":[{"to":[{"ipBlock":{"cidr":"` + target + `/32"}}]},{"to":[]}]}}`
+		for f, data := range map[string]string{"d-" + name + ".json": deploy, "n-" + name + ".json": np} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte(data), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
-	log = filepath.Join(t.TempDir(), "calls.log")
-	if out, err := runLib(t, nil, `retire_apps_namespace`, "STUB_LOG="+log); err != nil {
-		t.Fatalf("the second run failed: %v\n%s", err, out)
-	}
-	if calls, _ := os.ReadFile(log); strings.Contains(string(calls), "delete namespace") {
-		t.Errorf("a clean cell got a namespace delete:\n%s", calls)
+	return dir
+}
+
+// check_relay_current compares the routes and the policies of the relay with the node addresses
+// that the host service reports now. The fixture holds management at 172.18.0.3 and the cells at
+// 172.18.0.5 and 172.18.0.6.
+func TestCheckRelayCurrent(t *testing.T) {
+	for _, tc := range []struct {
+		name, mgmt, cell2, want string
+	}{
+		{"current", "172.18.0.3", "172.18.0.6", ""},
+		{"the management node moved", "172.18.0.9", "172.18.0.6", "relay-view routes to '172.18.0.3'"},
+		{"a cell node moved", "172.18.0.3", "172.18.0.7", "the ingress policy of relay-view admits"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := relayFixture(t, "172.18.0.3", "172.18.0.5", "172.18.0.6")
+			snippet := `node_ip() { case "$1" in management) echo "$STUB_MGMT" ;; dev-cell-1) echo 172.18.0.5 ;; dev-cell-2) echo "$STUB_CELL2" ;; esac; }
+RELAY_TARGET=management SPIRE_AGENT_CELLS="dev-cell-1 dev-cell-2" CELL_NAME=dev-cp
+check_relay_current`
+			out, err := runLib(t, nil, snippet, "STUB_DIR="+dir, "STUB_MGMT="+tc.mgmt, "STUB_CELL2="+tc.cell2,
+				"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("check_relay_current failed: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out, tc.want) || !strings.Contains(out, "Run: CELL=dev-cp mise run cell:up") {
+				t.Fatalf("err %v, output %q; want a failure that names %q and the next command", err, out, tc.want)
+			}
+		})
 	}
 }

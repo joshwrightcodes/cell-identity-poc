@@ -616,7 +616,7 @@ check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "No Application is outside argocd, except the mirrors of the central view" check_apps_namespace
 check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
 check "argocd holds no admin password" check_no_admin_credentials
-check "argocd holds only the allowed Secrets, and the agent cannot get one" check_argocd_secrets
+check "argocd holds only the allowed Secrets, and the agent can list them but not get or change them" check_argocd_secrets
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh
@@ -691,6 +691,7 @@ check_agent_connected() {
   echo "the agent answers HTTP '${code:-none}' on /healthz, so it holds no stream to the principal."
   echo "Read the cell-proxy log: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c cell-proxy"
   echo "If management has no principal yet, run: CELL=management mise run cell:link"
+  echo "If the relay holds old node addresses, run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify, and then the command that it prints"
   return 1
 }
 
@@ -752,6 +753,14 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" && -z "${SPIRE_UPSTREAM:-}" ]]; then
   check "The SPIRE server keeps its CA key on its data volume, and the next root is more than 7 days away" check_ca_key_persists
+fi
+if [[ -n "${RELAY_TARGET:-}" ]]; then
+  check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and $SPIRE_AGENT_CELLS" check_relay_current
+  relay_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
+  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES; do
+    check "A probe pod in rogue cannot open TCP to the relay node port ${route%%:*} of $CELL_NAME (steady state)" \
+      expect_dial_blocked rogue default "${relay_ip:-unknown}:${route%%:*}"
+  done
 fi
 if [[ -n "${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
   check "The SPIRE server holds the node alias and the entry of each local workload in SPIRE_LOCAL_WORKLOADS" check_local_entries

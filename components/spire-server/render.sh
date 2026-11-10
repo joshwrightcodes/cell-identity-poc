@@ -97,7 +97,7 @@ if ((${#cells[@]} > 0)); then
   seen_roles=" " seen_accounts=" "
   for subject in "${subjects[@]}"; do
     [[ "$subject" =~ ^[a-z0-9-]+/[a-z0-9-]+=[a-z0-9-]+$ ]] || die "SPIRE_CELL_SUBJECTS entry '$subject' is not <namespace>/<service account>=<role>"
-    [[ "${subject#*=}" != agents ]] || die "the role agents of SPIRE_CELL_SUBJECTS is the path of the node aliases"
+    [[ ! "${subject#*=}" =~ ^agents(-|$) ]] || die "the role ${subject#*=} of SPIRE_CELL_SUBJECTS is the path of the node aliases, or names an alias entry"
     [[ "$seen_roles" != *" ${subject#*=} "* ]] || die "SPIRE_CELL_SUBJECTS names the role ${subject#*=} twice"
     [[ "$seen_accounts" != *" ${subject%%=*} "* ]] || die "SPIRE_CELL_SUBJECTS names the ServiceAccount ${subject%%=*} twice"
     seen_roles+="${subject#*=} " seen_accounts+="${subject%%=*} "

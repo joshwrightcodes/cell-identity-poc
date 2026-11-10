@@ -347,3 +347,203 @@ func waitLog(t *testing.T, logs *syncBuffer, want string) string {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// echoUpstream echoes every byte back until the client closes.
+func echoUpstream(t *testing.T) string {
+	t.Helper()
+	return upstreamServer(t, func(c net.Conn) { _, _ = io.Copy(c, c) })
+}
+
+// TestRelayStreamOutlivesFirstByteDeadline sends one byte, waits longer than the first-byte
+// deadline, and then exchanges bytes both ways. The deadline covers only the wait for the first
+// byte, so a long stream stays open.
+func TestRelayStreamOutlivesFirstByteDeadline(t *testing.T) {
+	relayAddr, logs := startRelay(t, echoUpstream(t), func(r *relay) { r.firstByteTimeout = 200 * time.Millisecond })
+	c, err := net.Dial("tcp", relayAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	exchange := func(msg string) {
+		t.Helper()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		if _, err := c.Write([]byte(msg)); err != nil {
+			t.Fatalf("write %q: %v", msg, err)
+		}
+		got := make([]byte, len(msg))
+		if _, err := io.ReadFull(c, got); err != nil || string(got) != msg {
+			t.Fatalf("echo of %q: got %q, %v", msg, got, err)
+		}
+	}
+	exchange("a")
+	time.Sleep(700 * time.Millisecond)
+	exchange("bc")
+	time.Sleep(300 * time.Millisecond)
+	exchange("def")
+	_ = c.Close()
+	line := waitLog(t, logs, "connection ended")
+	if strings.Contains(line, "timeout") || strings.Contains(line, "client_error") || !strings.Contains(line, `"result":"closed"`) {
+		t.Errorf("the stream ended with %s, want result closed", line)
+	}
+}
+
+// TestRelayStopClosesConnections cancels the relay while one client waits for its first byte and
+// another holds a live stream. Both clients see the close within a second, and serve returns.
+func TestRelayStopClosesConnections(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &relay{upstream: echoUpstream(t), dialTimeout: dialTimeout, firstByteTimeout: firstByteTimeout,
+		keepAlive: keepAlive, log: slog.New(slog.NewJSONHandler(&syncBuffer{}, nil))}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- r.serve(ctx, ln) }()
+	silent, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	live, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer live.Close()
+	_, _ = live.Write([]byte("x"))
+	_ = live.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(live, make([]byte, 1)); err != nil {
+		t.Fatalf("echo before the stop: %v", err)
+	}
+	cancel()
+	for name, c := range map[string]net.Conn{"silent": silent, "live": live} {
+		_ = c.SetReadDeadline(time.Now().Add(time.Second))
+		if _, err := c.Read(make([]byte, 1)); !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+			t.Errorf("the %s client read %v after the stop, want the close within 1s", name, err)
+		}
+	}
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Errorf("serve: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve did not return within 1s of the stop")
+	}
+}
+
+// dialAndSend opens a connection to the relay, and sends one byte.
+func dialAndSend(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	_, _ = c.Write([]byte("x"))
+	return c
+}
+
+// refused reports whether the relay closed the connection at once, with no echo. The client sent a
+// byte that the relay did not read, so the close may arrive as a reset.
+func refused(c net.Conn) bool {
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := c.Read(make([]byte, 1))
+	var ne net.Error
+	return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+}
+
+func admitted(c net.Conn) bool {
+	_ = c.SetReadDeadline(time.Now().Add(time.Second))
+	_, err := io.ReadFull(c, make([]byte, 1))
+	return err == nil
+}
+
+// TestRelayLimitsOneSource opens connections from one address up to the limit. The next one is
+// closed at once, dials no upstream and logs source_limit. A freed slot admits a new connection.
+func TestRelayLimitsOneSource(t *testing.T) {
+	counted := make(chan struct{}, 16)
+	addr := upstreamServer(t, func(c net.Conn) { counted <- struct{}{}; _, _ = io.Copy(c, c) })
+	relayAddr, logs := startRelay(t, addr, func(r *relay) { r.limits = newLimiter(100, 2) })
+	a, b := dialAndSend(t, relayAddr), dialAndSend(t, relayAddr)
+	if !admitted(a) || !admitted(b) {
+		t.Fatal("the first two connections of one source were not admitted")
+	}
+	third := dialAndSend(t, relayAddr)
+	if !refused(third) {
+		t.Fatal("the third connection of one source was admitted, want it refused")
+	}
+	waitLog(t, logs, `"result":"source_limit"`)
+	if len(counted) != 2 {
+		t.Errorf("the upstream saw %d connections, want 2", len(counted))
+	}
+	_ = a.Close()
+	waitFor(t, func() bool {
+		c := dialAndSend(t, relayAddr)
+		return admitted(c)
+	})
+}
+
+// TestRelayLimitsAllConnections checks the global limit, with a per-source limit that is higher.
+func TestRelayLimitsAllConnections(t *testing.T) {
+	relayAddr, logs := startRelay(t, echoUpstream(t), func(r *relay) { r.limits = newLimiter(2, 100) })
+	a, b := dialAndSend(t, relayAddr), dialAndSend(t, relayAddr)
+	if !admitted(a) || !admitted(b) {
+		t.Fatal("the first two connections were not admitted")
+	}
+	if !refused(dialAndSend(t, relayAddr)) {
+		t.Fatal("a connection over the global limit was admitted")
+	}
+	waitLog(t, logs, `"result":"overloaded"`)
+}
+
+// TestLimiterCountsEachSource checks that sources do not share a slot count, that a release frees
+// a slot, and that the map holds no entry for a source with no connection.
+func TestLimiterCountsEachSource(t *testing.T) {
+	l := newLimiter(3, 2)
+	for _, src := range []string{"10.0.0.1", "10.0.0.1", "10.0.0.2"} {
+		if r := l.acquire(src); r != "" {
+			t.Fatalf("acquire %s: %q", src, r)
+		}
+	}
+	if r := l.acquire("10.0.0.1"); r != "overloaded" {
+		t.Errorf("a fourth connection gave %q, want overloaded", r)
+	}
+	l.release("10.0.0.2")
+	if r := l.acquire("10.0.0.1"); r != "source_limit" {
+		t.Errorf("a third connection of one source gave %q, want source_limit", r)
+	}
+	if r := l.acquire("10.0.0.3"); r != "" {
+		t.Errorf("another source gave %q, want admission", r)
+	}
+	l.release("10.0.0.1")
+	l.release("10.0.0.1")
+	l.release("10.0.0.3")
+	if len(l.perSource) != 0 || l.total != 0 {
+		t.Errorf("after every release: total %d, sources %v, want none", l.total, l.perSource)
+	}
+}
+
+func TestParseLimits(t *testing.T) {
+	if cfg, err := parse([]string{"--route", "8443=127.0.0.1:1"}); err != nil || cfg.maxConns != defaultMaxConns || cfg.maxPerSource != defaultMaxPerSource {
+		t.Errorf("defaults: %+v, %v", cfg, err)
+	}
+	if cfg, err := parse([]string{"--route", "8443=127.0.0.1:1", "--max-conns", "5", "--max-conns-per-source", "3"}); err != nil || cfg.maxConns != 5 || cfg.maxPerSource != 3 {
+		t.Errorf("set: %+v, %v", cfg, err)
+	}
+	for _, bad := range []string{"--max-conns=0", "--max-conns-per-source=0", "--max-conns=-1"} {
+		if _, err := parse([]string{"--route", "8443=127.0.0.1:1", bad}); err == nil {
+			t.Errorf("%s was accepted", bad)
+		}
+	}
+}
+
+func waitFor(t *testing.T, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatal("the condition did not hold within 5s")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

@@ -15,7 +15,9 @@ metadata:
 automountServiceAccountToken: false
 ---
 # The agent watches and mirrors the Applications of argocd, and reads the AppProjects and
-# ConfigMaps there. It cannot start without list and watch on Secrets, because it syncs a
+# ConfigMaps there. It has no write verb on Applications: in autonomous mode it writes an
+# Application only when the principal sends a create, update, operation or delete event, and the
+# view sends none. The agent also cannot start without list and watch on Secrets, because it syncs a
 # repository informer. It has no get verb, and the policy argocd-secrets-allowed keeps the Secrets
 # of argocd to a closed set with no credential. The agent sends no Secret to the principal.
 apiVersion: rbac.authorization.k8s.io/v1
@@ -26,7 +28,7 @@ metadata:
 rules:
   - apiGroups: [argoproj.io]
     resources: [applications]
-    verbs: [get, list, watch, update, patch]
+    verbs: [get, list, watch]
   - apiGroups: [argoproj.io]
     resources: [appprojects]
     verbs: [get, list, watch]
@@ -198,9 +200,11 @@ spec:
                       fieldRef:
                         fieldPath: metadata.namespace
 ---
-# Flow N20, on the agent pod only. The namespace-wide policy argocd already admits the API server,
-# the cell argocd-redis and the collector. This policy adds the relay node port and the SPIRE node
-# port of the environment control plane, and names the other peers of the pod.
+# Flow N20, on the agent pod only. The namespace policies argocd and allow-from-nodes exclude the
+# agent pod, so this policy and allow-dns hold every rule of the pod. The pod admits no ingress,
+# so no pod reaches the metrics port, the health port or the profiling endpoints. Its egress is the
+# relay node port and the SPIRE node port of the environment control plane, the API server, the
+# cell argocd-redis and the collector. It cannot reach the bundle store or any other argocd pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -210,7 +214,7 @@ spec:
   podSelector:
     matchLabels:
       app.kubernetes.io/name: argocd-agent
-  policyTypes: [Egress]
+  policyTypes: [Ingress, Egress]
   egress:
     - to:
         - ipBlock:

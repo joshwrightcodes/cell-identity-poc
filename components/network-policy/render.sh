@@ -18,6 +18,17 @@ NAMESPACES=(argocd cell-system istio-system istio-egress observability-system ap
 # no private address, so it cannot reach other clusters or the host network.
 PRIVATE_RANGES=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8)
 
+# not_agent_selector prints the podSelector that picks every pod of argocd except the Argo CD Agent.
+# The agent has its own policy argocd-agent, which holds every rule that it needs.
+not_agent_selector() {
+  printf '  podSelector:\n    matchExpressions:\n      - key: app.kubernetes.io/name\n        operator: NotIn\n        values: [argocd-agent]\n'
+}
+
+# node_selector prints the podSelector of allow-from-nodes in the namespace $1.
+node_selector() {
+  if [[ "$1" == argocd ]]; then not_agent_selector; else printf '  podSelector: {}\n'; fi
+}
+
 node_peers() {
   local ip
   for ip in $node_ips; do
@@ -83,7 +94,7 @@ metadata:
   name: allow-from-nodes
   namespace: $ns
 spec:
-  podSelector: {}
+$(node_selector "$ns")
   policyTypes: [Ingress]
   ingress:
     - from:
@@ -99,7 +110,7 @@ metadata:
   name: argocd
   namespace: argocd
 spec:
-  podSelector: {}
+$(not_agent_selector)
   policyTypes: [Ingress, Egress]
   ingress:
     - from:
@@ -135,6 +146,9 @@ spec:
   ingress:
     - from:
 $(namespace_peer argocd)
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-repo-server
       ports:
         - protocol: TCP
           port: 5000

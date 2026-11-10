@@ -64,6 +64,13 @@ func TestM3ArgocdHoldsOnlyAllowedSecrets(t *testing.T) {
 			if out, err := kubectl(t, cluster, "", "get", "namespace", retiredAppsNS, "-o", "name"); err == nil {
 				t.Errorf("the namespace %s still exists: %s", retiredAppsNS, out)
 			}
+			for _, kind := range []string{"validatingadmissionpolicy", "validatingadmissionpolicybinding"} {
+				for _, name := range []string{"argocd-apps-no-secrets", "argocd-apps-cell-project"} {
+					if out, err := kubectl(t, cluster, "", "get", kind, name, "-o", "name"); err == nil {
+						t.Errorf("the old %s %s still exists: %s", kind, name, out)
+					}
+				}
+			}
 
 			names, err := kubectl(t, cluster, "", "-n", "argocd", "get", "secrets", "-o", "jsonpath={.items[*].metadata.name}")
 			if err != nil {

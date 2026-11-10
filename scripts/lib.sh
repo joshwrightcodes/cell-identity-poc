@@ -285,14 +285,16 @@ ARGOCD_SECRETS=(argocd-redis argocd-secret bundle-store)
 # cannot get a Secret there, and the policy and the binding that keep the set closed exist with
 # their effect.
 check_argocd_secrets() {
-  local secrets name extra=() allowed policy
+  local secrets name verb extra=() allowed policy
   secrets="$(k -n argocd get secrets -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')" || return 1
   for name in $secrets; do
     [[ " ${ARGOCD_SECRETS[*]} " == *" $name "* ]] || extra+=("$name")
   done
   ((${#extra[@]} == 0)) || { echo "argocd holds Secrets outside the allowed set (${ARGOCD_SECRETS[*]}): ${extra[*]}"; return 1; }
-  allowed="$(k auth can-i get secrets -n argocd --as=system:serviceaccount:argocd:argocd-agent)" || true
-  [[ "$allowed" == no ]] || { echo "the ServiceAccount argocd-agent can get Secrets in argocd (can-i says '$allowed')"; return 1; }
+  for verb in get create update patch delete; do
+    allowed="$(k auth can-i "$verb" secrets -n argocd --as=system:serviceaccount:argocd:argocd-agent)" || true
+    [[ "$allowed" == no ]] || { echo "the ServiceAccount argocd-agent can $verb Secrets in argocd (can-i says '$allowed')"; return 1; }
+  done
   policy="$(printf '%s\n' "${ARGOCD_SECRETS[@]}" | jq -Rcn '[inputs]')"
   k get validatingadmissionpolicy argocd-secrets-allowed -o json | jq -e --argjson names "$policy" '
     .spec.failurePolicy == "Fail" and (.spec.validations | length) == 1
@@ -306,26 +308,33 @@ check_argocd_secrets() {
     || { echo "ValidatingAdmissionPolicyBinding argocd-secrets-allowed is missing or does not deny in argocd"; return 1; }
 }
 
-# retire_apps_namespace deletes the namespace argocd-apps, with the Applications, the Role and the
-# AppProject copy in it, and then the policies argocd-apps-no-secrets and argocd-apps-cell-project.
-# Older cells held every child Application in that namespace. Run it before the new root bundle
-# reaches the cell, for three reasons:
-#   - The Applications in the namespace repair the old policies, so they must go first. An
-#     Application has no finalizer, so the delete leaves the objects that it manages in place.
-#   - The policy argocd-apps-cell-project denies an Application in argocd other than the root.
-#   - The harness apply does not prune, and the Application that owned the old objects is pruned
-#     with the old root bundle, so nothing else removes them.
-# It does nothing on a cell that holds none of these objects.
-retire_apps_namespace() {
-  local name
-  if k get namespace argocd-apps >/dev/null 2>&1; then
-    log "deleting the namespace argocd-apps"
-    k delete namespace argocd-apps --ignore-not-found --wait=true --timeout=180s >/dev/null || return 1
-  fi
-  for name in argocd-apps-no-secrets argocd-apps-cell-project; do
-    k delete validatingadmissionpolicybinding "$name" --ignore-not-found >/dev/null || return 1
-    k delete validatingadmissionpolicy "$name" --ignore-not-found >/dev/null || return 1
+# The relay copies the node address of RELAY_TARGET into its routes and its egress policy, and the
+# node addresses of SPIRE_AGENT_CELLS into its ingress policy. Docker can give a rebuilt node a new
+# address, and the relay then sends the streams of the cells to the wrong node.
+# check_relay_current needs the function node_ip <cluster>, which verify.sh defines.
+check_relay_current() {
+  local target cell ip name json hosts cidrs want_cells stale=() cell_cidrs=()
+  target="$(node_ip "$RELAY_TARGET")" || { echo "$target"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  for cell in $SPIRE_AGENT_CELLS; do
+    ip="$(node_ip "$cell")" || { echo "$ip"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+    cell_cidrs+=("$ip/32")
   done
+  want_cells="$(printf '%s\n' "${cell_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
+  for name in relay-view relay-telemetry; do
+    json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; return 1; }
+    hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
+    [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
+    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; return 1; }
+    cidrs="$(jq -r '[.spec.egress[0].to[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+    [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
+    cidrs="$(jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+    [[ "$cidrs" == "$want_cells" ]] || stale+=("the ingress policy of $name admits '$cidrs', but the nodes of $SPIRE_AGENT_CELLS are '$want_cells'")
+  done
+  if ((${#stale[@]} > 0)); then
+    printf '%s\n' "${stale[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
 }
 
 # clean_dashboard_leftovers removes what the server of argocd admin dashboard wrote into argocd:

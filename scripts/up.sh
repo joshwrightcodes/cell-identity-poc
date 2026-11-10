@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Set up the cell: create the cluster through the host service, apply the bootstrap set, delete
-# the namespace argocd-apps and its policies, publish the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
+# Set up the cell: create the cluster through the host service, apply the bootstrap set, publish
+# the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
 # store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
-# for their rollouts. UP_WAIT sets the bound of the Application wait in seconds (default 900). Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
+# for their rollouts. UP_WAIT sets the bound of the Application wait in seconds (default 900).
+# Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
@@ -28,7 +29,6 @@ done
 k -n cell-system rollout status statefulset/bundle-store --timeout=300s >/dev/null
 k -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null
 k -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null
-retire_apps_namespace || die "could not delete the namespace argocd-apps and its policies. Run: CELL=$CELL_NAME mise run cell:up again"
 k apply --server-side -f "$ROOT/bootstrap/root.yaml" >/dev/null
 log "applied the root Application"
 

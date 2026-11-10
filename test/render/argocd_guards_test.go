@@ -2,6 +2,7 @@ package render
 
 import (
 	"fmt"
+	"os"
 	"slices"
 	"testing"
 )
@@ -11,6 +12,18 @@ import (
 // project cell, the locked AppProject default, and the absence of the settings and the namespace
 // that older cells used for child Applications.
 func TestArgocdGuardsRender(t *testing.T) {
+	rootFile, err := os.ReadFile("../../bootstrap/root.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootApp, err := parseDocs(string(rootFile))
+	if err != nil || len(rootApp) != 1 {
+		t.Fatalf("read bootstrap/root.yaml: %d objects, %v", len(rootApp), err)
+	}
+	if got, _ := lookup(rootApp[0], "metadata", "labels", "argocd-agent.argoproj-labs.io/ignore-sync"); got != "true" {
+		t.Errorf("the root Application ignore-sync label = %v, want \"true\"", got)
+	}
+
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			byComponent := map[string]map[string]object{}

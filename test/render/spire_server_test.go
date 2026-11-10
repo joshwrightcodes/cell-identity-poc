@@ -871,6 +871,7 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"one role twice", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld argocd/argocd-agent=celld"}, "names the role celld twice"},
 		{"one ServiceAccount twice", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld cell-identity-system/celld=other"}, "names the ServiceAccount cell-identity-system/celld twice"},
 		{"the alias path as a role", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=agents"}, "the path of the node aliases"},
+		{"a role that names an alias entry", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=agents-celld"}, "the path of the node aliases, or names an alias entry"},
 		{"key test trace on an agent cell", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_KEYTEST_TRACE=dev-cell-2"}, "Run: mise run gate:m2:repair"},
 		{"docker reaches another daemon", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_DOCKER_IP=10.0.0.99"}, "reports '10.9.0.7'"},
 		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},

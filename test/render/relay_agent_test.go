@@ -203,7 +203,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 			return strings.Join(out, "; ")
 		}
 		for key, want := range map[string]string{
-			"Role argocd/argocd-agent": "[argoproj.io] [applications] [get list watch update patch]; [argoproj.io] [appprojects] [get list watch]; " +
+			"Role argocd/argocd-agent": "[argoproj.io] [applications] [get list watch]; [argoproj.io] [appprojects] [get list watch]; " +
 				"[] [configmaps] [get list watch]; [] [secrets] [list watch]",
 			"Role argocd/argocd-agent-token":      "[] [serviceaccounts/token] [create]",
 			"Role apps-demo/argocd-agent-read":    "[] [services] [get list watch]; [apps] [deployments] [get list watch]; [security.istio.io] [authorizationpolicies] [get list watch]",
@@ -253,7 +253,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 	t.Run("network policy of flow N20", func(t *testing.T) {
 		np := objs["NetworkPolicy argocd/argocd-agent"]
 		if fmt.Sprint(lookupOr(np, "spec", "podSelector")) != "map[matchLabels:map[app.kubernetes.io/name:argocd-agent]]" ||
-			fmt.Sprint(lookupOr(np, "spec", "policyTypes")) != "[Egress]" {
+			fmt.Sprint(lookupOr(np, "spec", "policyTypes")) != "[Ingress Egress]" {
 			t.Fatalf("policy selects %v with types %v", lookupOr(np, "spec", "podSelector"), lookupOr(np, "spec", "policyTypes"))
 		}
 		egress := get[[]any](t, np, "spec", "egress")
@@ -262,6 +262,25 @@ func TestRenderArgoCDAgent(t *testing.T) {
 		}
 		if peers := fmt.Sprint(lookupOr(egress[1], "to")); peers != "[map[ipBlock:map[cidr:172.18.0.4/32]]]" {
 			t.Errorf("the API rule reaches %s", peers)
+		}
+		if _, ok := lookup(np, "spec", "ingress"); ok {
+			t.Error("the agent policy has ingress rules, want none, so no pod reaches the agent ports")
+		}
+		var targets []string
+		for _, rule := range egress {
+			for _, to := range get[[]any](t, rule, "to") {
+				switch {
+				case lookupOr(to, "ipBlock", "cidr") != nil:
+					targets = append(targets, fmt.Sprint(lookupOr(to, "ipBlock", "cidr")))
+				default:
+					targets = append(targets, fmt.Sprint(lookupOr(to, "namespaceSelector", "matchLabels"))+fmt.Sprint(lookupOr(to, "podSelector", "matchLabels")))
+				}
+			}
+		}
+		want := []string{"10.9.0.9/32", "172.18.0.4/32", "10.111.0.1/32", "<nil>map[app.kubernetes.io/name:argocd-redis]",
+			"map[kubernetes.io/metadata.name:observability-system]map[app.kubernetes.io/name:otel-collector]"}
+		if !slices.Equal(targets, want) {
+			t.Errorf("the agent egress reaches %v, want exactly %v", targets, want)
 		}
 	})
 }

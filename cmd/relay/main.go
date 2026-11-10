@@ -1,6 +1,7 @@
 // Command relay passes TCP streams through the environment control plane, by listen port.
 //
 //	relay --route <listen port>=<host:port> [--route ...] [--health <addr>]
+//	      [--max-conns <n>] [--max-conns-per-source <n>]
 //
 // Each route listens on its port on every address, and pipes each connection to its upstream. The
 // relay ends no TLS and reads no byte of a stream, so the SPIFFE mTLS of cell-proxy runs end to
@@ -11,7 +12,10 @@
 //   - the upstream dial must finish within 5 seconds;
 //   - both sockets send TCP keepalives every 30 seconds;
 //   - a client half-close reaches the upstream as a half-close, and an upstream close or error
-//     closes both sides.
+//     closes both sides;
+//   - the relay holds at most --max-conns connections in all, and at most --max-conns-per-source
+//     from one client address. It closes a connection over a limit at once and dials nothing, so
+//     one pod cannot fill the pre-authentication slots of the upstream listener through the relay.
 //
 // --health serves HTTP 200 on /healthz for the kubelet probes, on its own port, so a probe never
 // reaches a route. The relay logs compact JSON to stdout and exports OTLP, as package
@@ -53,6 +57,11 @@ const (
 	exitConfig      = 2
 	// firstReadSize is the most that the relay reads before it dials the upstream.
 	firstReadSize = 32 << 10
+	// defaultMaxConns and defaultMaxPerSource bound the open connections of the whole relay, and of
+	// one client address. The management view listener keeps 64 handshake slots for every cell, so
+	// the per-source limit stays well under that.
+	defaultMaxConns     = 256
+	defaultMaxPerSource = 16
 )
 
 func main() {
@@ -104,8 +113,10 @@ func parseRoutes(vals []string) ([]route, error) {
 }
 
 type config struct {
-	routes []route
-	health string
+	routes       []route
+	health       string
+	maxConns     int
+	maxPerSource int
 }
 
 func parse(args []string) (config, error) {
@@ -114,6 +125,8 @@ func parse(args []string) (config, error) {
 	var routes routeFlags
 	fs.Var(&routes, "route", "<listen port>=<host:port>, repeatable")
 	health := fs.String("health", "", "address of the HTTP health listener, for example :8080")
+	maxConns := fs.Int("max-conns", defaultMaxConns, "most open connections in all")
+	maxPerSource := fs.Int("max-conns-per-source", defaultMaxPerSource, "most open connections from one client address")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -129,7 +142,10 @@ func parse(args []string) (config, error) {
 			return config{}, fmt.Errorf("--health %q is not [host]:port", *health)
 		}
 	}
-	return config{routes: parsed, health: *health}, nil
+	if *maxConns < 1 || *maxPerSource < 1 {
+		return config{}, errors.New("--max-conns and --max-conns-per-source are at least 1")
+	}
+	return config{routes: parsed, health: *health, maxConns: *maxConns, maxPerSource: *maxPerSource}, nil
 }
 
 // execute parses the flags, starts telemetry and serves every route until ctx ends.
@@ -165,8 +181,14 @@ func run(ctx context.Context, cfg config, tel *telemetry.T) error {
 	if err != nil {
 		return err
 	}
+	open, err := tel.Meter.Int64UpDownCounter("relay.connections.open",
+		metric.WithDescription("Client connections that the relay holds open, by listen port"))
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	lim := newLimiter(cfg.maxConns, cfg.maxPerSource)
 	var listeners []net.Listener
 	defer func() {
 		for _, ln := range listeners {
@@ -184,7 +206,7 @@ func run(ctx context.Context, cfg config, tel *telemetry.T) error {
 	var wg sync.WaitGroup
 	for i, r := range cfg.routes {
 		rl := &relay{upstream: r.upstream, dialTimeout: dialTimeout, firstByteTimeout: firstByteTimeout, keepAlive: keepAlive,
-			log: tel.Log.With("listen_port", r.listen, "upstream", r.upstream), conns: conns,
+			log: tel.Log.With("listen_port", r.listen, "upstream", r.upstream), conns: conns, open: open, limits: lim,
 			attrs: []attribute.KeyValue{attribute.Int("listen.port", r.listen)}}
 		ln := listeners[i]
 		wg.Go(func() { errs <- rl.serve(ctx, ln) })
@@ -222,7 +244,57 @@ type relay struct {
 	log                                      *slog.Logger
 	// conns counts the ended connections, with attrs. It may be nil.
 	conns metric.Int64Counter
+	// open counts the connections that the relay holds, with attrs. It may be nil.
+	open  metric.Int64UpDownCounter
 	attrs []attribute.KeyValue
+	// limits bounds the connections of every route that shares it. It may be nil.
+	limits *limiter
+}
+
+// limiter bounds the open connections of the whole relay and of each client address.
+type limiter struct {
+	mu                 sync.Mutex
+	total              int
+	perSource          map[string]int
+	maxTotal, maxEvery int
+}
+
+func newLimiter(maxTotal, maxPerSource int) *limiter {
+	return &limiter{perSource: map[string]int{}, maxTotal: maxTotal, maxEvery: maxPerSource}
+}
+
+// acquire takes a slot for the client address, and returns "" on success. Otherwise it returns the
+// result label of the refusal.
+func (l *limiter) acquire(source string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	switch {
+	case l.total >= l.maxTotal:
+		return "overloaded"
+	case l.perSource[source] >= l.maxEvery:
+		return "source_limit"
+	}
+	l.total++
+	l.perSource[source]++
+	return ""
+}
+
+func (l *limiter) release(source string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total--
+	if l.perSource[source]--; l.perSource[source] <= 0 {
+		delete(l.perSource, source)
+	}
+}
+
+// sourceOf returns the address of a connection without its port.
+func sourceOf(c net.Conn) string {
+	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
+	if err != nil {
+		return c.RemoteAddr().String()
+	}
+	return host
 }
 
 // serve accepts on ln until ctx ends, then closes every open connection and waits for them.
@@ -262,15 +334,22 @@ func (r *relay) handle(ctx context.Context, down net.Conn) {
 	client := down.RemoteAddr().String()
 	defer func() { _ = down.Close() }()
 	setKeepAlive(down, r.keepAlive)
+	source := sourceOf(down)
+	opened := false
 	done := func(result string, err error, sent, received int64) {
-		attrs := []any{"client", client, "result", result, "duration", time.Since(start).String(),
+		attrs := []any{"client", client, "result", result, "duration_ms", time.Since(start).Milliseconds(),
 			"bytes_up", sent, "bytes_down", received}
 		if err != nil {
 			attrs = append(attrs, "error", err.Error())
 		}
 		level := slog.LevelInfo
-		if result != "closed" && result != "stopped" {
+		switch result {
+		case "closed", "stopped", "client_closed_early":
+		default:
 			level = slog.LevelWarn
+		}
+		if opened && r.open != nil {
+			r.open.Add(context.WithoutCancel(ctx), -1, metric.WithAttributes(r.attrs...))
 		}
 		r.log.Log(ctx, level, "connection ended", attrs...)
 		if r.conns != nil {
@@ -278,13 +357,29 @@ func (r *relay) handle(ctx context.Context, down net.Conn) {
 			r.conns.Add(context.WithoutCancel(ctx), 1, metric.WithAttributes(kv...))
 		}
 	}
+	if r.limits != nil {
+		if result := r.limits.acquire(source); result != "" {
+			done(result, nil, 0, 0)
+			return
+		}
+		defer r.limits.release(source)
+	}
+	if r.open != nil {
+		r.open.Add(ctx, 1, metric.WithAttributes(r.attrs...))
+		opened = true
+	}
+	// A shutdown ends a connection that still waits for its first byte, and the pipe ends the rest.
+	stopRead := context.AfterFunc(ctx, func() { _ = down.Close() })
+	defer stopRead()
 	buf := make([]byte, firstReadSize)
 	_ = down.SetReadDeadline(time.Now().Add(r.firstByteTimeout))
 	n, err := down.Read(buf)
 	_ = down.SetReadDeadline(time.Time{})
 	if n == 0 {
 		var ne net.Error
-		if errors.As(err, &ne) && ne.Timeout() {
+		if ctx.Err() != nil {
+			done("stopped", nil, 0, 0)
+		} else if errors.As(err, &ne) && ne.Timeout() {
 			done("first_byte_timeout", nil, 0, 0)
 		} else {
 			done("client_closed_early", err, 0, 0)

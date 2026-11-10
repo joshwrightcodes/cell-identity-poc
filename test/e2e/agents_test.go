@@ -29,6 +29,7 @@ const (
 	relayNamespace  = "relay-system"
 	relayViewPort   = 30443
 	relayTelPort    = 30444
+	relayMeshPort   = 30445
 	impostorPort    = 30092
 	// agentWait bounds every wait for an agent stream.
 	agentWait = 2 * time.Minute
@@ -118,6 +119,7 @@ func TestM3BothCellsInCentralView(t *testing.T) {
 	for _, cell := range viewCells(t) {
 		t.Run(cell, func(t *testing.T) {
 			requireViewConnected(t, agentName(cell))
+			addr := centralForward(t)
 			out, err := kubectl(t, cell, "", "-n", agentNamespace, "get", "applications.argoproj.io", "-o", "json")
 			if err != nil {
 				t.Fatal(err)
@@ -127,7 +129,7 @@ func TestM3BothCellsInCentralView(t *testing.T) {
 				t.Fatalf("%s holds no child Application in %s", cell, agentNamespace)
 			}
 			waitFor(t, "the central view of "+cell+" matches the cell", agentWait, func() (bool, string) {
-				got := decodeApplications(t, centralAPI(t, "/api/v1/applications?appNamespace="+agentName(cell)))
+				got := decodeApplications(t, centralAPIAt(t, addr, "/api/v1/applications?appNamespace="+agentName(cell)))
 				return slices.Equal(got, want), fmt.Sprintf("central %v, cell %v", got, want)
 			})
 			uid, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "deployment", "echo", "-o", "jsonpath={.metadata.uid}")
@@ -139,7 +141,7 @@ func TestM3BothCellsInCentralView(t *testing.T) {
 					Kind, Name, Namespace, LiveState string
 				} `json:"items"`
 			}
-			data := centralAPI(t, "/api/v1/applications/apps-demo/managed-resources?appNamespace="+agentName(cell))
+			data := centralAPIAt(t, addr, "/api/v1/applications/apps-demo/managed-resources?appNamespace="+agentName(cell))
 			if err := json.Unmarshal(data, &res); err != nil {
 				t.Fatalf("decode managed resources: %v", err)
 			}
@@ -657,7 +659,7 @@ func TestM3RelayNodePortAdmission(t *testing.T) {
 	for _, cell := range viewCells(t) {
 		t.Run(cell, func(t *testing.T) {
 			ns := freshNamespace(t, cell)
-			for _, port := range []int{relayViewPort, relayTelPort} {
+			for _, port := range []int{relayViewPort, relayTelPort, relayMeshPort} {
 				if got := dialFrom(t, cell, ns, envIP, port, 3*time.Second); got != "connected" {
 					t.Errorf("dial from %s to %s:%d gave %q, want connected", cell, envIP, port, got)
 				}
@@ -671,7 +673,7 @@ func TestM3RelayNodePortAdmission(t *testing.T) {
 			if got := dialFrom(t, cluster, ns, apiServiceIP(t, cluster), 443, 3*time.Second); got != "connected" {
 				t.Fatalf("the control dial from %s/%s to the API service gave %q, want connected", cluster, ns, got)
 			}
-			for _, port := range []int{relayViewPort, relayTelPort} {
+			for _, port := range []int{relayViewPort, relayTelPort, relayMeshPort} {
 				if got := dialFrom(t, cluster, ns, envIP, port, 3*time.Second); got != "timeout" {
 					t.Errorf("the dial from %s/%s to %s:%d gave %q, want a timeout", cluster, ns, envIP, port, got)
 				}
@@ -708,53 +710,130 @@ func TestM3AppsProjectGuard(t *testing.T) {
 	}
 }
 
+// cellUIDs lists the uids of the live objects of one kind in one namespace of a cell, and reads
+// each pair once. An empty namespace means a cluster-scoped kind.
+type cellUIDs struct {
+	t       *testing.T
+	cluster string
+	byKind  map[string]map[string]bool
+}
+
+func (c *cellUIDs) has(group, kind, ns, uid string) bool {
+	c.t.Helper()
+	resource := strings.ToLower(kind)
+	if group != "" {
+		resource += "." + group
+	}
+	key := resource + "/" + ns
+	if c.byKind[key] == nil {
+		args := []string{"get", resource, "-o", `jsonpath={range .items[*]}{.metadata.uid}{"\n"}{end}`}
+		if ns != "" {
+			args = append([]string{"-n", ns}, args...)
+		}
+		out, err := kubectl(c.t, c.cluster, "", args...)
+		if err != nil {
+			c.t.Fatalf("list the uids of %s: %v", key, err)
+		}
+		c.byKind[key] = map[string]bool{}
+		for _, id := range strings.Fields(out) {
+			c.byKind[key][id] = true
+		}
+	}
+	return c.byKind[key][uid]
+}
+
 // TestM3CentralViewShowsLiveResources reads the managed resources and the resource tree of every
-// child Application of each cell through the central API. Both answer HTTP 200, the managed
-// resources carry a live manifest for each object that the cell holds, and the tree has nodes.
+// child Application of each cell through the central API. Both answer HTTP 200. Every managed
+// resource carries a live manifest, except an object that the cell reports as Missing, and its uid
+// is the uid of a live object in the cell. Every node of the tree names a live object of the cell
+// by uid.
 func TestM3CentralViewShowsLiveResources(t *testing.T) {
 	for _, cell := range viewCells(t) {
 		t.Run(cell, func(t *testing.T) {
 			requireViewConnected(t, agentName(cell))
+			addr := centralForward(t)
 			out, err := kubectl(t, cell, "", "-n", agentNamespace, "get", "applications.argoproj.io", "-o", "json")
 			if err != nil {
+				t.Fatal(err)
+			}
+			var cellApps struct {
+				Items []struct {
+					Metadata struct{ Name string } `json:"metadata"`
+					Status   struct {
+						Resources []struct {
+							Kind, Name, Namespace string
+							Health                struct{ Status string }
+						} `json:"resources"`
+					} `json:"status"`
+				} `json:"items"`
+			}
+			if err := json.Unmarshal([]byte(out), &cellApps); err != nil {
 				t.Fatal(err)
 			}
 			apps := withoutRoot(decodeApplications(t, []byte(out)))
 			if len(apps) == 0 {
 				t.Fatalf("%s holds no child Application in %s", cell, agentNamespace)
 			}
+			uids := &cellUIDs{t: t, cluster: cell, byKind: map[string]map[string]bool{}}
 			for _, app := range apps {
+				missing := map[string]bool{}
+				for _, ca := range cellApps.Items {
+					if ca.Metadata.Name != app.Name {
+						continue
+					}
+					for _, r := range ca.Status.Resources {
+						if r.Health.Status == "Missing" {
+							missing[r.Kind+"/"+r.Namespace+"/"+r.Name] = true
+						}
+					}
+				}
 				base := "/api/v1/applications/" + app.Name
 				query := "?appNamespace=" + agentName(cell)
 				var res struct {
 					Items []struct {
-						Kind, Name, Namespace, LiveState string
+						Group, Kind, Name, Namespace, LiveState string
 					} `json:"items"`
 				}
-				data := centralAPI(t, base+"/managed-resources"+query)
-				if err := json.Unmarshal(data, &res); err != nil {
+				if err := json.Unmarshal(centralAPIAt(t, addr, base+"/managed-resources"+query), &res); err != nil {
 					t.Fatalf("%s: decode the managed resources: %v", app.Name, err)
 				}
-				live := 0
+				if len(res.Items) == 0 {
+					t.Errorf("%s in %s: the managed resources are empty", app.Name, cell)
+				}
 				for _, item := range res.Items {
-					if strings.TrimSpace(item.LiveState) != "" && item.LiveState != "null" {
-						live++
+					id := item.Kind + "/" + item.Namespace + "/" + item.Name
+					if strings.TrimSpace(item.LiveState) == "" || item.LiveState == "null" {
+						if !missing[id] {
+							t.Errorf("%s in %s: %s has no live manifest in the view, and the cell does not report it Missing", app.Name, cell, id)
+						}
+						continue
+					}
+					var live struct {
+						Metadata struct{ UID string } `json:"metadata"`
+					}
+					if err := json.Unmarshal([]byte(item.LiveState), &live); err != nil || live.Metadata.UID == "" {
+						t.Errorf("%s in %s: the live manifest of %s is no object with a uid: %v", app.Name, cell, id, err)
+						continue
+					}
+					if !uids.has(item.Group, item.Kind, item.Namespace, live.Metadata.UID) {
+						t.Errorf("%s in %s: the live manifest of %s has uid %s, which no object of the cell has", app.Name, cell, id, live.Metadata.UID)
 					}
 				}
-				if len(res.Items) == 0 || live == 0 {
-					t.Errorf("%s in %s: the managed resources hold %d objects and %d live manifests, want both above zero", app.Name, cell, len(res.Items), live)
-				}
 				var tree struct {
-					Nodes []struct{ Kind, Name string } `json:"nodes"`
+					Nodes []struct{ Group, Kind, Name, Namespace, UID string } `json:"nodes"`
 				}
-				data = centralAPI(t, base+"/resource-tree"+query)
-				if err := json.Unmarshal(data, &tree); err != nil {
+				if err := json.Unmarshal(centralAPIAt(t, addr, base+"/resource-tree"+query), &tree); err != nil {
 					t.Fatalf("%s: decode the resource tree: %v", app.Name, err)
 				}
 				if len(tree.Nodes) == 0 {
 					t.Errorf("%s in %s: the resource tree has no node", app.Name, cell)
 				}
-				t.Logf("%s %s: %d managed resources, %d live manifests, %d tree nodes", cell, app.Name, len(res.Items), live, len(tree.Nodes))
+				for _, n := range tree.Nodes {
+					if !uids.has(n.Group, n.Kind, n.Namespace, n.UID) {
+						t.Errorf("%s in %s: the tree node %s/%s/%s has uid %s, which no object of the cell has", app.Name, cell, n.Kind, n.Namespace, n.Name, n.UID)
+					}
+				}
+				t.Logf("%s %s: %d managed resources and %d tree nodes, all matched to live objects", cell, app.Name, len(res.Items), len(tree.Nodes))
 			}
 		})
 	}

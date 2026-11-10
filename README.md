@@ -186,18 +186,23 @@ The principal stores the Applications in `<env>-<cell>`, and the project as `<en
 The `cell-proxy` sidecar of the agent dials the relay in `dev-cp` on node port 30443, and accepts only the principal ID `spiffe://mgmt.poc.internal/argocd/principal`.
 It trusts that ID only through ConfigMap `mgmt-root`, a copy of the live root of `management`.
 The agent reads the live objects of the bundle kinds for the view.
-`argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. None of them holds a usable credential.
+`argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`.
+`argocd-redis` holds the Redis password of the cell, and `argocd-secret` holds the signing key while `cell:ui` runs. `bundle-store` holds no credential.
 An admission policy denies every other Secret in `argocd`, and a second policy admits only Applications of the project `cell`.
-The agent can list and watch these Secrets, because it does not start without that access, but it cannot get one.
+The agent can list and watch these Secrets, because it does not start without that access, but it cannot get one, and it cannot create, change or delete an Application or a Secret.
 The agent in autonomous mode never sends a Secret to the central view, and the resource proxy refuses a Secret read.
+The network policies of `argocd` leave the agent pod out. The agent has its own policy: no ingress, and egress only to the relay, the SPIRE server, the API server, Redis and the collector.
+Only the repo server reaches the bundle store.
 
 The relay in `dev-cp` is the bundle `relay-system` at wave 8.
 Deployment `relay-view` passes node ports 30443 and 30445 to node ports 31443 and 31445 of `management`.
 Deployment `relay-telemetry` passes node port 30444 to node port 31444.
-The relay ends no TLS. Only the node addresses of the cells reach its node ports.
+The relay ends no TLS. It holds at most 256 connections, and 16 from one client address.
+The NetworkPolicy admits the node addresses of the cells. Every pod of a cell that no policy limits reaches the relay through its node address, so cell-proxy, and not the network, decides who is a peer.
 
 `cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-root` and the stream to the principal.
 After a rebuild of `dev-cp` or a new root of `management`, it prints `CELL=<cell> mise run cell:up`.
+`cell:verify` of `dev-cp` checks that the relay routes and admit lists use the current node addresses of `management` and the cells. When it fails, run `CELL=dev-cp mise run cell:up`.
 
 While `view:ui` runs, the page is open on the Mac loopback. Every pod on the VM, `rogue` included, can reach it through `host.docker.internal`.
 The task prints a warning about this when it starts. Stop it with Ctrl-C when you are done.
@@ -238,7 +243,8 @@ To add a cell, for example `dev-cell-3`, follow these steps:
 `harness:up`, `harness:verify`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
 The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, because each test gives one of them its own role.
 
-To remove a cell, remove it from `SPIRE_AGENT_CELLS` and run `CELL=dev-cp mise run cell:up`.
+To remove a cell, remove it from `SPIRE_AGENT_CELLS` and from `VIEW_CELLS`.
+Then run `CELL=dev-cp mise run cell:up`, which also takes the cell out of the relay admit lists, and `CELL=management mise run cell:link`, which removes the view record of the cell.
 Then delete the cluster with `CELL=<cell> mise run cell:down`, and remove its entry and its `cells/<cell>.env`.
 The server keeps the entries of the old agents of that cell until they expire and it prunes them.
 To end them at once, evict each agent of the cell:
@@ -289,6 +295,9 @@ In that run, the cleanup of the key rotation test waited a few minutes for kubel
 Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
+`gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
+The budget is 18 minutes. This is 1.5 times the slowest run, 706 seconds on 2026-11-10, rounded up to the next minute.
+The slowest tests are the management CA rotation (188 seconds) and the fresh-namespace dial tests.
 The budgets do not cover `harness:up`.
 
 ## Side effects of gate:m2
