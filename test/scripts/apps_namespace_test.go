@@ -147,7 +147,6 @@ func TestCheckAppsNamespace(t *testing.T) {
 	}{
 		{"every Application in argocd", goodApps(), ""},
 		{"an Application in a third namespace", append(goodApps(), stubApp{"other", "x", "Synced", "Healthy", "sha256:x"}), "other/x"},
-		{"a child left in argocd-apps", append(goodApps(), stubApp{"argocd-apps", "a", "Synced", "Healthy", "sha256:a"}), "argocd-apps/a"},
 		{"no root", goodApps()[1:], "argocd has no root Application"},
 		{"a mirror outside management", append(goodApps(), stubApp{"dev-dev-cell-1", "a", "Synced", "Healthy", "sha256:a"}), "dev-dev-cell-1/a"},
 	} {

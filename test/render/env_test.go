@@ -53,6 +53,16 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				t.Fatalf("agent plugin env is %q, want %q", got, env)
 			}
 
+			// The view guard of the cell: the audience pattern of the token request.
+			guard := renderAgent(t, "dev-cell-1", "POC_ENV="+env)
+			if guard.err != nil {
+				t.Fatalf("argocd-agent render failed: %v\n%s", guard.err, guard.stderr)
+			}
+			policy := objectsIn(t, strings.ReplaceAll(guard.stdout, "@CELL_NAME@", "dev-cell-1"))["ValidatingAdmissionPolicy argocd-agent-read-only"]
+			if policy == nil || !strings.Contains(get[string](t, get[[]any](t, policy, "spec", "validations")[2], "expression"), "'"+guardAudiencePattern(env)+"'") {
+				t.Fatalf("the view guard does not hold the audience pattern %s", guardAudiencePattern(env))
+			}
+
 			// The central view: the --auth pattern, the agent namespaces and the registry --env.
 			view := renderCentralView(t, "POC_ENV="+env)
 			if view.err != nil {

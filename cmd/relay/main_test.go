@@ -496,6 +496,69 @@ func TestRelayLimitsAllConnections(t *testing.T) {
 	waitLog(t, logs, `"result":"overloaded"`)
 }
 
+// dialSilent opens a connection to the relay and sends nothing.
+func dialSilent(t *testing.T, addr string) net.Conn {
+	t.Helper()
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// closedByRelay reports whether the relay closed a connection within wait, with no byte sent.
+func closedByRelay(c net.Conn, wait time.Duration) bool {
+	_ = c.SetReadDeadline(time.Now().Add(wait))
+	_, err := c.Read(make([]byte, 1))
+	var ne net.Error
+	return err != nil && !(errors.As(err, &ne) && ne.Timeout())
+}
+
+// TestRelayCapsCountSilentConnections opens connections that never send a byte. Each one holds a
+// slot until the first-byte timeout, so silent clients fill the caps, and the relay refuses the
+// next connection at once, with no upstream dial. When the timeout closes the silent connections,
+// the relay admits new ones. The global cap and the per-source cap each have their own case.
+func TestRelayCapsCountSilentConnections(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		total, source int
+		result        string
+	}{
+		{"per-source cap", 100, 2, "source_limit"},
+		{"global cap", 2, 100, "overloaded"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dialed := make(chan struct{}, 16)
+			upstream := upstreamServer(t, func(c net.Conn) { dialed <- struct{}{}; _, _ = io.Copy(c, c) })
+			relayAddr, logs := startRelay(t, upstream, func(r *relay) {
+				r.limits = newLimiter(tc.total, tc.source)
+				r.firstByteTimeout = 700 * time.Millisecond
+			})
+			first, second := dialSilent(t, relayAddr), dialSilent(t, relayAddr)
+			time.Sleep(100 * time.Millisecond)
+			if closedByRelay(first, 50*time.Millisecond) || closedByRelay(second, 50*time.Millisecond) {
+				t.Fatal("the relay closed a silent connection before the first-byte timeout")
+			}
+			third := dialSilent(t, relayAddr)
+			if !closedByRelay(third, 500*time.Millisecond) {
+				t.Fatal("a third silent connection stayed open, want the cap to refuse it at once")
+			}
+			waitLog(t, logs, `"result":"`+tc.result+`"`)
+			for _, c := range []net.Conn{first, second} {
+				if !closedByRelay(c, 3*time.Second) {
+					t.Fatal("a silent connection stayed open past the first-byte timeout")
+				}
+			}
+			waitLog(t, logs, `"result":"first_byte_timeout"`)
+			waitFor(t, func() bool { return admitted(dialAndSend(t, relayAddr)) })
+			if len(dialed) != 1 {
+				t.Errorf("the upstream saw %d connections, want 1 from the connection that sent a byte", len(dialed))
+			}
+		})
+	}
+}
+
 // TestLimiterCountsEachSource checks that sources do not share a slot count, that a release frees
 // a slot, and that the map holds no entry for a source with no connection.
 func TestLimiterCountsEachSource(t *testing.T) {

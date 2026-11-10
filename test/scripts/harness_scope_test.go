@@ -18,6 +18,7 @@ import (
 // link-config to another harness component. Every call goes to $STUB_LOG.
 //   - STUB_EXTRA adds a ConfigMap with the label of cell-identity that the bundle does not hold.
 //   - STUB_NS_MANAGER sets the field manager of the Namespace.
+//   - STUB_VAP_MANAGER is a managedFields entry that the labelled ValidatingAdmissionPolicy guard also has.
 //   - STUB_FOREIGN_MANAGER gives ConfigMap spire-agent a second field manager, argocd-controller.
 //   - STUB_NO_LABEL makes the labelled workload list empty, and STUB_LIST_FAIL makes it fail.
 //   - STUB_LIVE is the answer to "get -f <bundle>", the live objects of the bundle.
@@ -52,6 +53,8 @@ case "$args" in
     roles='{"kind":"ClusterRole","metadata":{"name":"celld-read","managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
     [[ -z "${STUB_CLUSTER_EXTRA:-}" ]] || roles="$roles"',{"kind":"ClusterRole","metadata":{"name":"left-over-read","managedFields":[{"manager":"kubectl","operation":"Apply"}]}}'
     echo "{\"items\":[$roles]}" ;;
+  *" get ValidatingAdmissionPolicy -l cell.poc.internal/harness=cell-identity -o json --show-managed-fields "*)
+    echo "{\"items\":[{\"kind\":\"ValidatingAdmissionPolicy\",\"metadata\":{\"name\":\"guard\",\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"},${STUB_VAP_MANAGER:-}]}}]}" ;;
   *" get namespace shared -o json --show-managed-fields "*)
     echo "{\"metadata\":{\"name\":\"shared\",\"managedFields\":[{\"manager\":\"${STUB_NS_MANAGER:-argocd-controller}\",\"operation\":\"Apply\"}]}}" ;;
   *" get -f "*" -o json --ignore-not-found "*) printf '%s' "${STUB_LIVE:-}" ;;
@@ -351,5 +354,29 @@ func TestHarnessObjectsOfOtherNamespacesAndTheClusterScope(t *testing.T) {
 	out, _, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`, "STUB_BUNDLE_EXTRA="+extra, "STUB_CLUSTER_EXTRA=1")
 	if err == nil || !strings.Contains(out, "the cluster has the ClusterRole objects 'celld-read left-over-read' with the label cell.poc.internal/harness=cell-identity, and the bundle cell-identity has 'celld-read'") {
 		t.Fatalf("err %v, output %q; want a failure that names the extra ClusterRole", err, out)
+	}
+}
+
+// The API server writes the status of a ValidatingAdmissionPolicy for its type check, with the field
+// manager validatingadmissionpolicy-status. The check accepts that manager for the status of that
+// kind and no other write of it.
+func TestHarnessObjectsAcceptThePolicyStatusManager(t *testing.T) {
+	extra := "apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingAdmissionPolicy\nmetadata:\n  name: guard\n"
+	for _, tc := range []struct {
+		name, manager, want string
+	}{
+		{"status of the policy", `{"manager":"validatingadmissionpolicy-status","operation":"Apply","subresource":"status"}`, ""},
+		{"the object of the policy", `{"manager":"validatingadmissionpolicy-status","operation":"Apply"}`, "ValidatingAdmissionPolicy/guard has the field manager validatingadmissionpolicy-status (Apply object)"},
+		{"another manager of status", `{"manager":"argocd-controller","operation":"Apply","subresource":"status"}`, "ValidatingAdmissionPolicy/guard has the field manager argocd-controller (Apply status)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, _, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`, "STUB_BUNDLE_EXTRA="+extra, "STUB_VAP_MANAGER="+tc.manager)
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("check failed: %v\n%s", err, out)
+			case tc.want != "" && (err == nil || !strings.Contains(out, tc.want)):
+				t.Fatalf("err %v, output %q; want a failure that says %q", err, out, tc.want)
+			}
+		})
 	}
 }

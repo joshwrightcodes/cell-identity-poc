@@ -90,8 +90,8 @@ func TestM3AgentPodIsolation(t *testing.T) {
 }
 
 // TestM3AgentCannotWriteApplications checks that the agent ServiceAccount has no write verb on
-// Applications, and cannot touch the root Application. The view sends no write event, so the
-// agent needs none.
+// Applications, and cannot touch the root Application. The principal sends an event for each change
+// of a mirrored Application, and the agent has no right to apply it.
 func TestM3AgentCannotWriteApplications(t *testing.T) {
 	for _, cell := range viewCells(t) {
 		t.Run(cell, func(t *testing.T) {

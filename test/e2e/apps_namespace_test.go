@@ -15,7 +15,6 @@ const (
 	secretsPolicy  = "argocd-secrets-allowed"
 	agentRole      = "argocd-agent"
 	agentAccount   = "system:serviceaccount:argocd:argocd-agent"
-	retiredAppsNS  = "argocd-apps"
 	checksumNotice = "poc.internal/cmd-params-sha256"
 )
 
@@ -36,7 +35,7 @@ func applicationNames(t *testing.T, cluster, ns string) []string {
 // TestM3ArgocdHoldsOnlyAllowedSecrets checks, in each base-cell cluster, that argocd holds the root
 // Application and one Application per component and no other Application anywhere, that argocd
 // holds only the three allowed Secrets, that the admission policy denies any other Secret there,
-// that the namespace argocd-apps is gone, and that no setting of application.namespaces remains.
+// and that no setting of application.namespaces remains.
 // In a cluster with the agent, the agent can list and watch Secrets in argocd and cannot get one.
 func TestM3ArgocdHoldsOnlyAllowedSecrets(t *testing.T) {
 	for _, cluster := range clustersWith(t, "") {
@@ -59,16 +58,6 @@ func TestM3ArgocdHoldsOnlyAllowedSecrets(t *testing.T) {
 				// The principal in management keeps the mirror of each cell in the namespace of its agent.
 				if ns != "argocd" && !(cluster == mgmtCluster && strings.HasPrefix(ns, pocEnv+"-")) {
 					t.Errorf("an Application lives in the namespace %s, outside argocd", ns)
-				}
-			}
-			if out, err := kubectl(t, cluster, "", "get", "namespace", retiredAppsNS, "-o", "name"); err == nil {
-				t.Errorf("the namespace %s still exists: %s", retiredAppsNS, out)
-			}
-			for _, kind := range []string{"validatingadmissionpolicy", "validatingadmissionpolicybinding"} {
-				for _, name := range []string{"argocd-apps-no-secrets", "argocd-apps-cell-project"} {
-					if out, err := kubectl(t, cluster, "", "get", kind, name, "-o", "name"); err == nil {
-						t.Errorf("the old %s %s still exists: %s", kind, name, out)
-					}
 				}
 			}
 

@@ -185,7 +185,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 		t.Error("mgmt-root holds no certificate")
 	}
 	for key, o := range objs {
-		if o["kind"] == "AppProject" || lookupOr(o, "metadata", "namespace") == "argocd-apps" {
+		if o["kind"] == "AppProject" {
 			t.Errorf("the agent bundle holds %s", key)
 		}
 	}

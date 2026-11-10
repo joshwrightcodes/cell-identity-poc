@@ -35,17 +35,6 @@ func TestArgocdGuardsRender(t *testing.T) {
 				byComponent[c.name] = objs
 			}
 
-			if byComponent["namespaces"]["Namespace argocd-apps"] != nil {
-				t.Error("the namespaces component renders a Namespace argocd-apps")
-			}
-			for name, objs := range byComponent {
-				for key, o := range objs {
-					if lookupOr(o, "metadata", "namespace") == "argocd-apps" {
-						t.Errorf("the component %s renders %s in argocd-apps", name, key)
-					}
-				}
-			}
-
 			argo := byComponent["argocd"]
 			if v, ok := lookup(argo["ConfigMap argocd/argocd-cmd-params-cm"], "data", "application.namespaces"); ok {
 				t.Errorf("application.namespaces = %v, want it unset", v)

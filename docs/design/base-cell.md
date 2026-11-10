@@ -78,15 +78,15 @@ The Argo CD Agent of a cell runs with `--namespace=argocd`. Argo CD Agent v0.10.
 
 The guarantee has four parts:
 
-- `argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. None of them holds a credential that the agent could misuse. `bundle-store` holds no credential.
+- `argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. `argocd-redis` holds the Redis password. `argocd-secret` holds the signing key while `cell:ui` runs. `bundle-store` holds no credential.
 - The ValidatingAdmissionPolicy `argocd-secrets-allowed` and its binding deny every other Secret in `argocd`, on create and on update, for every user.
-- The Role `argocd-agent` has `list` and `watch` on Secrets and no `get`. The agent in autonomous mode sends no Secret to the central view, and the resource proxy of the agent refuses a Secret read.
+- The Role `argocd-agent` has `list` and `watch` on Secrets and no `get`. RBAC refuses a Secret `get`, and the resource proxy of the agent refuses a Secret list. The agent sends no Secret to the central view.
 - A new Secret in `argocd` needs a change to the policy list. The check `cell:verify` compares the live Secrets with that list.
 
-The set is small, but it is a set of Secrets and not an empty namespace. The agent process can read these three Secrets in its own memory.
+The set is small, but it is a set of Secrets and not an empty namespace. The agent process can list these Secrets, so it holds the Redis password in its memory.
 
 The root Application carries the label `argocd-agent.argoproj-labs.io/ignore-sync: "true"`. The agent skips it, so the central view mirrors only the child Applications.
-The label hides an Application from the central view. It does not protect it. The protection is that the agent has no write verb on Applications, because the view sends no write event.
+The label hides an Application from the central view. It does not protect it. The protection is that the agent has no write verb on Applications. The principal sends an event for each change of a mirrored Application, and the agent logs a Forbidden for each one. The policy `argocd-agent-read-only` denies the same writes a second time.
 The Redis proxy of the agent still serves the cached resource tree and managed resources of `root`, because it strips the namespace prefix from a cache key and reads any name. These hold no Secret data, because the cell controller masks Secrets before it writes the cache.
 
 ### Bundles

@@ -3,7 +3,7 @@
 #
 # The bundle holds the agent Deployment with cell-proxy and a cluster_jwt SPIRE agent sidecar
 # (manifests.yaml), ConfigMap mgmt-root, the NetworkPolicy of flow N20, the agent Role in
-# argocd, and the read rules of the central view. Every object and the pod template carry the
+# argocd, the read rules of the central view, and the view guard (guard.yaml). Every object and the pod template carry the
 # harness label cell.poc.internal/harness=argocd-agent.
 #
 # The read rules let the resource proxy of the view read the live objects of the cell. render.sh
@@ -132,6 +132,8 @@ deployment="$(yq 'select(.kind == "Deployment" and .metadata.name == "argocd-age
   echo "---"
   echo "$mgmt_root"
   echo "$read_rbac"
+  echo "---"
+  sed "s|@POC_ENV@|$POC_ENV|g" "$here/guard.yaml"
 } | COMP="$component" yq 'select(.kind != null)
     | .metadata.labels["cell.poc.internal/harness"] = strenv(COMP)
     | with(select(.spec.template.metadata != null); .spec.template.metadata.labels["cell.poc.internal/harness"] = strenv(COMP))'

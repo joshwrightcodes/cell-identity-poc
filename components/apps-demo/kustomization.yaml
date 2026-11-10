@@ -3,3 +3,4 @@ kind: Kustomization
 namespace: apps-demo
 resources:
   - workloads.yaml
+  - view-canary.yaml

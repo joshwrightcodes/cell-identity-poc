@@ -595,8 +595,9 @@ check_plane_pods() {
 
 # check_harness_objects <component> <namespace> compares the namespace with the bundle of a harness
 # or link component. The harness apply does not prune, and kubectl diff sees only the fields of
-# its own field manager. Each object of the bundle must have only the field manager kubectl, and
-# kube-controller-manager for status.
+# its own field manager. Each object of the bundle must have only the field manager kubectl,
+# kube-controller-manager for status, and validatingadmissionpolicy-status for the status of a
+# ValidatingAdmissionPolicy, which the API server writes for its type check.
 #   - When the bundle holds the Namespace, the component owns it: for each kind that the bundle
 #     holds in the namespace, the namespace must hold exactly the objects of the bundle, apart from
 #     objects that only system controllers write, for example kube-root-ca.crt. The Namespace must
@@ -633,11 +634,12 @@ check_harness_objects() {
   [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
   # managers_of <live list> <names> prints each field manager of the named objects other than
-  # kubectl Apply and the status of kube-controller-manager.
+  # kubectl Apply and the status writes named above.
   managers_of() {
     jq -r --arg want " $2 " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
       | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
-        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
+        or (.manager == "kube-controller-manager" and .subresource == "status")
+        or (.manager == "validatingadmissionpolicy-status" and .subresource == "status" and $o.kind == "ValidatingAdmissionPolicy") | not)
       | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$1"
   }
   for kind in $(NS="$ns" yq -N -r 'select(.kind != null and .metadata.namespace == strenv(NS)) | .kind' "$bundle" | sort -u); do

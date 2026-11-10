@@ -1,0 +1,9 @@
+# A Secret that the central view must never show. The e2e tests read it as the admin of the cell,
+# and check that no central object holds the marker. The value is a test marker, not a credential.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: view-canary
+type: Opaque
+stringData:
+  marker: canary-5f6bf0988bf835e13923e52e
