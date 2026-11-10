@@ -2,7 +2,7 @@
 //
 //	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
-//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port>
+//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port> [--upstream-wait <duration>]
 //	cell-proxy spiffe-server ... --backend tunnel --tunnel-cell <cell>=<listen addr> [--tunnel-cell ...] [--tunnel-wait 10s]
 //	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy promql-proxy --listen <addr> --upstream <url>
@@ -13,7 +13,8 @@
 // spiffe-server ends mTLS, checks the client ID against --allow-id and the signed cell records
 // in --registry-dir, and hands the connection to its backend. The otlp backend is the telemetry
 // gateway: it sets the source attributes again and forwards OTLP in plaintext gRPC to --upstream,
-// a peer in the same namespace. Both get their own SVID from the Workload API at
+// a peer in the same namespace. With --upstream-wait it opens its listener only after the first
+// upstream connection is ready, and fails when that takes longer. Both get their own SVID from the Workload API at
 // SPIFFE_ENDPOINT_SOCKET, and trust a peer only through the --peer-bundle file.
 // They log compact JSON to stdout and export OTLP, as package internal/telemetry describes. A
 // configuration error is one JSON error line and exit status 2. promql-proxy passes only the
@@ -57,6 +58,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
@@ -233,6 +235,9 @@ type serverConfig struct {
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
 	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
+	// waitUpstream, when set, blocks until the first upstream connection is ready. The server
+	// opens its listener after that, so a readiness probe of the listener covers the upstream.
+	waitUpstream func(ctx context.Context) error
 }
 
 func parseServer(args []string) (serverConfig, error) {
@@ -244,6 +249,7 @@ func parseServer(args []string) (serverConfig, error) {
 	registryDir := fs.String("registry-dir", "", "directory with signers.pub and the *.dsse.json cell records")
 	backend := fs.String("backend", "", "backend for each connection: grpc-header, otlp or tunnel")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
+	upstreamWait := fs.Duration("upstream-wait", 0, "otlp backend: wait this long for the first upstream connection before the listener opens, and fail after that. 0 does not wait")
 	header := fs.String("identity-header", "x-cell-agent", "header that carries <env>-<cell> to the upstream")
 	tunnelBackend := registerTunnelFlags(fs)
 	if err := parseFlags(fs, args); err != nil {
@@ -293,6 +299,13 @@ func parseServer(args []string) (serverConfig, error) {
 		if err != nil {
 			return serverConfig{}, fmt.Errorf("--upstream: %w", err)
 		}
+		if *upstreamWait < 0 {
+			_ = up.Close()
+			return serverConfig{}, errors.New("--upstream-wait must not be negative")
+		}
+		if *upstreamWait > 0 {
+			cfg.waitUpstream = func(ctx context.Context) error { return waitUpstreamReady(ctx, up, *upstream, *upstreamWait) }
+		}
 		cfg.backend = func(tel *telemetry.T) (cellproxy.Backend, error) {
 			gw, err := cellproxy.NewGateway(up, tel.Meter, tel.Log)
 			if err != nil {
@@ -307,6 +320,19 @@ func parseServer(args []string) (serverConfig, error) {
 		return serverConfig{}, fmt.Errorf("unknown --backend %q", *backend)
 	}
 	return cfg, nil
+}
+
+// waitUpstreamReady blocks until conn is READY, for at most wait. It starts the first connect.
+func waitUpstreamReady(ctx context.Context, conn *grpc.ClientConn, target string, wait time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	conn.Connect()
+	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
+		if !conn.WaitForStateChange(ctx, state) {
+			return fmt.Errorf("the upstream %s was not ready after %s, last state %s", target, wait, state)
+		}
+	}
+	return nil
 }
 
 // hostPort checks that --upstream is host:port with a host and a port number.
@@ -345,6 +371,12 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 				d.Shutdown(dctx)
 			})
 			defer stop()
+		}
+		if cfg.waitUpstream != nil {
+			if err := cfg.waitUpstream(ctx); err != nil {
+				return err
+			}
+			tel.Log.Info("otlp upstream ready")
 		}
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {

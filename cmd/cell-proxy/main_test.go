@@ -531,3 +531,79 @@ func TestServerOTLPBackend(t *testing.T) {
 		}
 	})
 }
+
+// TestServerOTLPWaitsForUpstream checks --upstream-wait: the listener opens only after the first
+// upstream connection is ready, and a store that never answers ends the server with status 1.
+func TestServerOTLPWaitsForUpstream(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+	serveWorkloadAPI(t, mgmt, "spiffe://mgmt.poc.internal/telemetry")
+	args := with(without(serverArgs(t, envCA), "--identity-header"), "--backend", "otlp")
+
+	t.Run("negative wait", func(t *testing.T) {
+		var out bytes.Buffer
+		if code := execute(t.Context(), append(slices.Clone(args), "--upstream-wait", "-1s"), &out); code != 2 {
+			t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+		}
+	})
+
+	t.Run("no upstream", func(t *testing.T) {
+		out := &syncBuffer{}
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		code := execute(ctx, append(slices.Clone(args), "--upstream-wait", "400ms"), out)
+		if code != 1 {
+			t.Fatalf("exit code %d, want 1\n%s", code, out.String())
+		}
+		if strings.Contains(out.String(), `"msg":"listening"`) {
+			t.Fatalf("the server listened without an upstream:\n%s", out.String())
+		}
+		if !strings.Contains(out.String(), "was not ready after 400ms") {
+			t.Fatalf("the error line does not name the wait:\n%s", out.String())
+		}
+	})
+
+	t.Run("late upstream", func(t *testing.T) {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := probe.Addr().String()
+		_ = probe.Close()
+		out := &syncBuffer{}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan int, 1)
+		go func() {
+			done <- execute(ctx, with(append(slices.Clone(args), "--upstream-wait", "30s"), "--upstream", addr), out)
+		}()
+		time.Sleep(1500 * time.Millisecond)
+		if strings.Contains(out.String(), `"msg":"listening"`) {
+			t.Fatalf("the server listened before the upstream answered:\n%s", out.String())
+		}
+		ln, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		srv := grpc.NewServer()
+		go func() { _ = srv.Serve(ln) }()
+		defer srv.Stop()
+		deadline := time.Now().Add(30 * time.Second)
+		for !strings.Contains(out.String(), `"msg":"listening"`) {
+			if time.Now().After(deadline) {
+				t.Fatalf("the server did not listen after the upstream came up:\n%s", out.String())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if !strings.Contains(out.String(), `"msg":"otlp upstream ready"`) {
+			t.Fatalf("no ready line:\n%s", out.String())
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the server did not stop")
+		}
+	})
+}
