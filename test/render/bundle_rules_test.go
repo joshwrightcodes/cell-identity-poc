@@ -248,7 +248,7 @@ func (cr *clusterRender) waveOf(name string) (int, bool) {
 func TestRootBundleWaveOrder(t *testing.T) {
 	// The relay comes at wave 8 in dev-cp, after spire-server, and each cell runs the agent as a
 	// harness component, so the loop below checks both.
-	want := map[string]string{"dev-cp": "bundle relay-system 8 relay-system", "dev-cell-1": "harness argocd-agent 0 argocd", "dev-cell-2": "harness argocd-agent 0 argocd"}
+	want := map[string]string{"management": "bundle observability-store 8 observability-system", "dev-cp": "bundle relay-system 8 relay-system", "dev-cell-1": "harness argocd-agent 0 argocd", "dev-cell-2": "harness argocd-agent 0 argocd"}
 	for _, cr := range renderAll(t) {
 		if w, ok := want[cr.name]; ok {
 			found := false
@@ -436,7 +436,9 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 	}
 	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
-		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin"} {
+		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
+		"observability-store StatefulSet observability-system/lgtm lgtm", "telemetry-gateway Deployment observability-system/telemetry-gateway cell-proxy",
+		"telemetry-gateway Deployment observability-system/telemetry-gateway spire-agent"} {
 		if !seen[name] {
 			t.Errorf("no render holds the container %q", name)
 		}

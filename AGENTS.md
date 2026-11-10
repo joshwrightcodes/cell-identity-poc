@@ -23,6 +23,8 @@
 | Run the link phase of `management`: the central Argo CD view (see README "Central Argo CD view") | `mise run cell:link` |
 | Central read-only Argo CD UI on 127.0.0.1:8090 | `mise run view:ui` |
 | New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |
+| Grafana of `management` on 127.0.0.1:3300, and its admin password (see README "Telemetry store") | `mise run obs:ui`, `mise run obs:password` |
+| New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |

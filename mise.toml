@@ -86,6 +86,21 @@ description = "Make new view keys in management: new agent CA and certificates, 
 env = { CELL = "management" }
 run = "scripts/view-rotate-keys.sh"
 
+[tasks."obs:ui"]
+description = "Serve Grafana of management on http://127.0.0.1:${OBS_UI_PORT:-3300}. Print the admin password with obs:password. The task prints one JSON line and exits when the port is busy"
+env = { CELL = "management" }
+run = "scripts/obs-ui.sh"
+
+[tasks."obs:password"]
+description = "Print the Grafana admin password of management on standard output, for a pipe to the clipboard. The task writes no file"
+env = { CELL = "management" }
+run = "scripts/obs-password.sh"
+
+[tasks."obs:rotate-password"]
+description = "Rotate the Grafana admin password of management through the Grafana API, replace Secret grafana-admin, and check the new and the old password"
+env = { CELL = "management" }
+run = "scripts/obs-rotate-password.sh"
+
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
 run = "scripts/down.sh"

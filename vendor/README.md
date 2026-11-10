@@ -1142,3 +1142,101 @@ The review did not read these items:
 Result: medium concern. The image holds a shell and busybox. The health ports of the principal and
 the agent serve pprof, and the resource and Redis proxies of the principal bind every address.
 NetworkPolicy limits each of them.
+
+## grafana/otel-lgtm v0.38.0 (2026-11-10)
+
+`management` runs `docker.io/grafana/otel-lgtm:0.38.0` as StatefulSet `lgtm`. The repository is
+`grafana/docker-otel-lgtm`. The review read these files of tag `v0.38.0` through `gh api`, in a scratch
+directory, and ran nothing from them before it ended: `docker/Dockerfile`, every `docker/run-*.sh`,
+`docker/download-*.sh`, `docker/install-cosign.sh`, `docker/grafana-plugins.sh`, `docker/common.sh`,
+`docker/logging.sh`, `docker/healthcheck.sh` and every baked config. The review checked these files for
+hidden Unicode, `sudo`, persistence, credential access and obfuscated code. It found none.
+
+| Item | Digest |
+| --- | --- |
+| Index `grafana/otel-lgtm:0.38.0`, pinned by the pod | `sha256:75cdf892daffadf3763ef61c16a6d7f8586216fce0b40bba7874a0b053121084` |
+| arm64 manifest, the one that the VM pulls | `sha256:61ffd7c074d354759207d7541a0361cc2b4a897f0e06003c9672384a6b8cc2f6` |
+| amd64 manifest | `sha256:bf33fa01b1a0314edc88c5bc2a295067e65270cf9c3f678a943a4a2c2a2472fd` |
+
+### What the image holds
+
+- The base is `ubi9-micro` 9.8, pinned by digest, with `curl-minimal` added. The image sets no `USER`.
+- Six processes run in one container: Grafana v13.2.4, Prometheus v3.15.0, Loki v3.7.8, Tempo v3.1.0,
+  Pyroscope v2.4.1 and `otelcol-contrib` v0.163.1. The OBI eBPF agent is off unless `ENABLE_OBI=true`.
+- The build downloads each component from its upstream release page. It checks the SHA-256 file of
+  Loki, Tempo, Prometheus and Pyroscope, and the checksum that `grafana.com` gives for Grafana. It
+  checks `otelcol-contrib` with `cosign verify-blob`, which the build installs from a checked RPM.
+  The review did not check these archives itself.
+- `eval` appears once in `run-all.sh`, and it uses only the fixed component names of the script.
+- `run-otelcol.sh` adds an export to a remote OTLP endpoint only when an `OTEL_EXPORTER_OTLP_*`
+  variable is set. The pod sets none. It writes `otelcol-config-export-http.yaml` into the working
+  directory in that case only, so the read-only root file system does not break the start.
+
+### Start-up downloads and calls to the Internet
+
+- `run-grafana.sh` always sets `GF_PLUGINS_PREINSTALL` to `grafana-llm-app`. Grafana then installs
+  that plugin and the Drilldown apps from `grafana.com` at each start. The pod sets
+  `GF_PLUGINS_PREINSTALL_DISABLED=true` and `GF_PLUGINS_PREINSTALL_AUTO_UPDATE=false`, so Grafana
+  downloads nothing. The live plugin list below shows that none of them is present.
+- Grafana checks for updates and sends usage reports by default. The pod turns each off with
+  `GF_ANALYTICS_REPORTING_ENABLED`, `GF_ANALYTICS_CHECK_FOR_UPDATES` and
+  `GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES`.
+- Loki, Tempo and Pyroscope report usage by default. The Loki override sets
+  `analytics.reporting_enabled: false`. `TEMPO_EXTRA_ARGS=-reporting.enabled=false` and
+  `PYROSCOPE_EXTRA_ARGS=-usage-stats.enabled=false` turn the other two off. Both flags exist in the
+  binaries, which the review checked with `-help` in the running pod.
+- The NetworkPolicy gives the pod no egress, and the namespace policy `allow-dns` leaves it out. A
+  `curl` from the pod to `grafana.com` and to `1.1.1.1` fails, and `TestM3LgtmHardened` checks both.
+
+### Controls
+
+- The pod runs as user and group 10001, with `fsGroup` 10001, `runAsNonRoot`, no capability, no
+  privilege escalation, the `RuntimeDefault` seccomp profile and `readOnlyRootFilesystem: true`.
+  The image starts under these limits without root, and all six components reach their health check.
+- Writable paths: the volume `data` at `/data` (Grafana, Loki, Prometheus, Tempo and Pyroscope), a
+  memory-backed `emptyDir` at `/tmp` (Grafana plugin sockets and `/tmp/ready`) and one at `/var/tempo`.
+- The pod mounts no service account token. Anonymous access is off. The admin password comes from
+  Secret `grafana-admin`.
+
+### Findings
+
+- The brief mandates `GF_SECURITY_ADMIN_PASSWORD__FILE`. The suffix `__FILE` belongs to the
+  `run.sh` of the official Grafana image, and this image starts `./bin/grafana server` directly.
+  On the live pod, Grafana ignored the variable and created the admin user with the password
+  `admin`: `admin:admin` got HTTP 200. The pod therefore sets
+  `GF_SECURITY_ADMIN_PASSWORD=$__file{/run/grafana-admin/password}`. Grafana expands `$__file{}`
+  in a setting itself. With that value, `admin:admin` gets 401 and the generated password gets 200.
+- The image provisions four data sources, not three: Prometheus, Loki and Tempo, and Pyroscope
+  (`docker/grafana-datasources.yaml`). All four pass their health check as user 10001.
+- The Prometheus config of the image already promotes `deployment.environment.name` and
+  `k8s.cluster.name`. The override adds `platform.plane` and `platform.cell`.
+- Data sources are present and healthy with the default log setting, so `ENABLE_LOGS_GRAFANA=true`
+  was not needed.
+
+### Plugins of the running image
+
+`/api/plugins?embedded=0` lists 46 plugins with `GF_PLUGINS_PREINSTALL_DISABLED=true`. They are the
+core plugins of Grafana 13.2.4: `alertlist`, `alertmanager`, `annolist`, `barchart`, `bargauge`,
+`candlestick`, `canvas`, `cloudwatch`, `dashlist`, `elasticsearch`, `flamegraph`, `gauge`, `geomap`,
+`gettingstarted`, `grafana-azure-monitor-datasource`, `grafana-postgresql-datasource`,
+`grafana-pyroscope-datasource`, `grafana-testdata-datasource`, `graphite`, `heatmap`, `histogram`,
+`influxdb`, `jaeger`, `logs`, `logstable`, `loki`, `mssql`, `mysql`, `news`, `nodeGraph`, `opentsdb`,
+`piechart`, `prometheus`, `stackdriver`, `stat`, `state-timeline`, `status-history`, `table`,
+`tempo`, `text`, `timeseries`, `traces`, `trend`, `welcome`, `xychart` and `zipkin`.
+`TestM3LgtmHardened` compares the live list with this one.
+
+### Not inspected
+
+The review did not inspect the layers of the image, the six binaries or the image signature. It did
+not compare the downloaded archives with a source build.
+
+### Collector Kubernetes distribution 0.164.0 (2026-11-10)
+
+The collector of `management` uses `docker.io/otel/opentelemetry-collector-k8s:0.164.0`, pinned by the
+index digest `sha256:8f7e5aaac0302f090164d5f9c14e4437d8037c5aaa2d025fc3ad74c1922602eb`. The
+processor `resource` is not in the core image, and the render needs it to set `k8s.cluster.name` and
+`platform.plane`. The review read `distributions/otelcol-k8s/manifest.yaml` of tag `v0.164.0` in
+`open-telemetry/opentelemetry-collector-releases`. The manifest lists `resourceprocessor`,
+`prometheusreceiver`, `k8seventsreceiver`, `k8sobjectsreceiver`, `filestorage` and `otlpexporter`.
+This settles row 10 of the M3 verify table for the component list, not for the image contents. The
+review did not inspect the image.

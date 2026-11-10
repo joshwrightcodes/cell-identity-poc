@@ -5,6 +5,8 @@ import (
 	"testing"
 )
 
+const notLgtmSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm]]]]"
+
 const notAgentSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[argocd-agent]]]]"
 
 // TestArgocdPoliciesExcludeTheAgent checks, in every cluster, that the namespace policies of argocd
@@ -15,10 +17,12 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 		t.Run(cr.name, func(t *testing.T) {
 			var policies map[string]object
 			for _, c := range cr.components {
-				if c.name != "network-policy" {
+				if c.name != "network-policy" && c.name != "observability-system" {
 					continue
 				}
-				policies = map[string]object{}
+				if policies == nil {
+					policies = map[string]object{}
+				}
 				for _, o := range c.objs {
 					policies[objName(o)] = o
 				}
@@ -47,10 +51,14 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 			if policies["NetworkPolicy argocd/argocd"] == nil || policies["NetworkPolicy argocd/allow-from-nodes"] == nil {
 				t.Fatalf("the policies argocd and allow-from-nodes are missing in %s", cr.name)
 			}
-			for _, name := range []string{"cell-system", "istio-system", "observability-system", "apps-demo"} {
+			for _, name := range []string{"cell-system", "istio-system", "apps-demo"} {
 				if p := policies["NetworkPolicy "+name+"/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != "map[]" {
 					t.Errorf("allow-from-nodes in %s changed: %v", name, p)
 				}
+			}
+			// The store probes itself inside its pod, so no node address reaches it.
+			if p := policies["NetworkPolicy observability-system/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != notLgtmSelector {
+				t.Errorf("allow-from-nodes in observability-system selects %v, want every pod except lgtm", p)
 			}
 			store := policies["NetworkPolicy cell-system/bundle-store"]
 			if store == nil {

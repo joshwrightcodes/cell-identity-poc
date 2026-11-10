@@ -219,6 +219,47 @@ The client certificates of the view are valid for 180 days. `cell:verify` fails 
 `viewkeys` keeps no CA key. When a certificate Secret is missing or does not match the CA, for example after a new cell in `VIEW_CELLS`, `cell:link` makes a new CA and new certificates, and starts the principal and `argocd-server` again.
 `cell:verify` of `management` also compares the view listener address and ConfigMap `peer-root` with the live values of `dev-cp`. After a rebuild of `dev-cp`, it prints `CELL=management mise run cell:link`.
 
+## Telemetry store
+
+The `management` cluster holds one telemetry store in `observability-system`.
+It is StatefulSet `lgtm`, the image `grafana/otel-lgtm` with Grafana, Prometheus, Loki and Tempo.
+The bundle `observability-store` at wave 8 holds it, and `vendor/README.md` records its review.
+The pod runs as user 10001 on a read-only root file system, and it has no route out.
+Its data lives on a 10 GiB volume.
+
+The store receives OTLP on port 4317 from two senders only:
+
+- The collector `otel-collector` in `management`. It sets `k8s.cluster.name` and `platform.plane` on every resource, and exports to `lgtm`. The other clusters keep the `debug` exporter.
+- The telemetry gateway, the link component `telemetry-gateway`. It runs `cell-proxy` with the `otlp` backend and a SPIRE agent in one pod.
+  It accepts SPIFFE mTLS on node port 31444 from the `dev-cp` node only, and its ID is `spiffe://mgmt.poc.internal/telemetry`.
+  It admits `spiffe://dev.env.poc.internal/cell/<cell>/otel` for a registered cell, and `spiffe://dev.env.poc.internal/cp/otel`.
+  It sets the source attributes of every resource again from the verified ID, and it counts each change in `cellproxy_gateway_attribute_overwrites_total`.
+  The pod opens its listener only after the first connection to the store is ready. This is the readiness check of the gateway.
+
+Prometheus accepts samples up to 25 hours old, so a collector queue can drain after a long outage.
+Prometheus keeps `platform.plane` and `platform.cell` as labels, and Loki makes the four source attributes index labels.
+
+Grafana has no anonymous access. Its admin password comes from an External Secrets `Password` generator in the cluster, so no secret manager takes part.
+Print it, and open Grafana on `http://127.0.0.1:3300`:
+
+```sh
+mise run obs:password | pbcopy
+mise run obs:ui
+```
+
+`OBS_UI_PORT` sets another port. The task prints one JSON line and stops when the port is busy.
+While `obs:ui` runs, every pod on the VM, `rogue` included, can reach Grafana through `host.docker.internal`.
+
+Rotate the admin password with one command. It changes the password through the Grafana API, replaces Secret `grafana-admin`, and checks that the new password works and the old one gets 401.
+It writes no file, and the new password never reaches the output:
+
+```sh
+mise run obs:rotate-password
+```
+
+The Secret keeps its value after a restart, because the generator runs only once. A new data volume makes Grafana read the Secret again for its first password.
+If the Secret and Grafana differ after a failed rotation, the error line holds the command that sets Grafana to the password of the Secret.
+
 ## Add or remove a cell
 
 A cell is an entry in `harness/topology.yaml` and a file `cells/<cell>.env`.
@@ -354,6 +395,8 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It replaces the agent Pod of `dev-cell-1`. The new Pod attests again, and the SPIRE server keeps the old agent entry until it prunes it.
 - It rotates the view keys of the principal, rotates the CA of the SPIRE server in `management`, and restarts that server. The agents connect again within two minutes.
 - It starts test pods in fresh namespaces of every cluster, and it deletes them.
+- It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
+- It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers, and Prometheus, Loki and Tempo age them out.
 
 A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.
 `cell:verify` fails on each of them, and on any binding for the agent ServiceAccount or the test group that the render does not hold.
@@ -558,6 +601,7 @@ Use a write identity for this task, and not the read-only cluster token.
 `management` holds no secret manager token, and its operator has no secret store.
 The operator works only in `observability-system`, the namespace in `EXTERNAL_SECRETS_NAMESPACE` of `cells/management.env`.
 It has no route to the internet.
+It makes one Secret there: `grafana-admin`, from a `Password` generator. The operator can read and write every Secret in that namespace.
 
 The SPIRE server in `management` makes its CA inside the cluster, with no upstream authority.
 The CA is a self-signed root of the trust domain `mgmt.poc.internal`.
