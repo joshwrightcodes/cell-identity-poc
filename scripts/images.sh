@@ -7,7 +7,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 out_file="$root/build/images.env"
 : "${KO_DOCKER_REPO:?}"
-images=(netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys)
+images=(netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay)
 
 die() { printf 'error: images: %s\n' "$*" >&2; exit 1; }
 

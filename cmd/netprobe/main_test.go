@@ -3,11 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -334,5 +342,154 @@ func TestGetPrintsNoPartialBody(t *testing.T) {
 	var rec map[string]any
 	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &rec) != nil || rec["msg"] != "netprobe failed" {
 		t.Fatalf("want one JSON error line and no partial body, got %q", out.String())
+	}
+}
+
+// testChain makes a CA and a leaf with the URI SAN id, and returns the leaf and CA PEM blocks, the
+// leaf key PEM, and the leaf certificate.
+func testChain(t *testing.T, id string) (chainPEM, keyPEM []byte, leaf *x509.Certificate) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, _ := x509.ParseCertificate(caDER)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(id)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		URIs: []*url.URL{u}, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, _ = x509.ParseCertificate(der)
+	pkcs8, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chainPEM = append(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})...)
+	return chainPEM, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: pkcs8}), leaf
+}
+
+// TestTLSServeUsesStdinCert starts tlsserve with a chain and key on standard input. A client sees
+// that chain, TLS 1.3 and ALPN h2. The output never holds the key.
+func TestTLSServeUsesStdinCert(t *testing.T) {
+	chain, key, leaf := testChain(t, "spiffe://dev.env.poc.internal/cell/dev-cell-2/argocd-agent")
+	old := stdin
+	stdin = bytes.NewReader(append(append([]byte{}, chain...), key...))
+	t.Cleanup(func() { stdin = old })
+	out := &syncBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, []string{"tlsserve", "--addr", "127.0.0.1:0"}, out) }()
+	var addr string
+	deadline := time.Now().Add(5 * time.Second)
+	for addr == "" {
+		for l := range strings.SplitSeq(out.String(), "\n") {
+			var rec struct{ Msg, Addr string }
+			if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "serving tls" {
+				addr = rec.Addr
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tlsserve logged no address: %q", out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	conn, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}})
+	if err != nil {
+		t.Fatalf("handshake with tlsserve: %v", err)
+	}
+	st := conn.ConnectionState()
+	_ = conn.Close()
+	if st.Version != tls.VersionTLS13 || st.NegotiatedProtocol != "h2" {
+		t.Errorf("version %x, ALPN %q; want TLS 1.3 and h2", st.Version, st.NegotiatedProtocol)
+	}
+	if len(st.PeerCertificates) != 2 || !st.PeerCertificates[0].Equal(leaf) {
+		t.Fatalf("the client saw %d certificates, want the leaf and the CA from stdin", len(st.PeerCertificates))
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Errorf("exit status %d after the stop, want 0: %s", code, out.String())
+	}
+	if strings.Contains(out.String(), "PRIVATE KEY") || strings.Contains(out.String(), "BEGIN") {
+		t.Errorf("the output holds PEM: %q", out.String())
+	}
+}
+
+// TestTLSServeRefusesBadInput gives tlsserve no key, or no certificate. Each fails with one JSON
+// error line.
+func TestTLSServeRefusesBadInput(t *testing.T) {
+	chain, key, _ := testChain(t, "spiffe://x/y")
+	for name, in := range map[string][]byte{"no key": chain, "no certificate": key, "empty": nil} {
+		t.Run(name, func(t *testing.T) {
+			old := stdin
+			stdin = bytes.NewReader(in)
+			t.Cleanup(func() { stdin = old })
+			var out strings.Builder
+			if code := execute(context.Background(), []string{"tlsserve", "--addr", "127.0.0.1:0"}, &out); code == 0 {
+				t.Fatal("exit status 0, want a failure")
+			}
+			lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+			if len(lines) != 1 || !strings.Contains(lines[0], `"level":"ERROR"`) {
+				t.Fatalf("output %q, want one JSON error line", out.String())
+			}
+		})
+	}
+}
+
+// TestHTTPModePrintsOneLine sends a GET and a POST with a body from stdin. Each prints one JSON line
+// with the status and the first 4 KiB of the body, also for a 403.
+func TestHTTPModePrintsOneLine(t *testing.T) {
+	var gotBody, gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody, gotMethod = string(b), r.Method
+		if r.URL.Path == "/denied" {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte("no"))
+			return
+		}
+		_, _ = w.Write(bytes.Repeat([]byte("a"), 5000))
+	}))
+	defer srv.Close()
+	run := func(args ...string) (int, map[string]any) {
+		var out strings.Builder
+		code := execute(context.Background(), append([]string{"http"}, args...), &out)
+		lines := strings.Split(strings.TrimSuffix(out.String(), "\n"), "\n")
+		if len(lines) != 1 {
+			t.Fatalf("%v: %d lines, want one: %q", args, len(lines), out.String())
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(lines[0]), &m); err != nil {
+			t.Fatalf("%v: not JSON: %q", args, lines[0])
+		}
+		return code, m
+	}
+	code, m := run("--method", "GET", "--url", srv.URL+"/ok")
+	if code != 0 || m["status"] != float64(200) || len(m["body"].(string)) != 4096 || gotMethod != "GET" {
+		t.Fatalf("GET: exit %d, status %v, body %d bytes, method %s; want 0, 200, 4096 bytes, GET", code, m["status"], len(m["body"].(string)), gotMethod)
+	}
+	old := stdin
+	stdin = strings.NewReader(`{"kind":"x"}`)
+	t.Cleanup(func() { stdin = old })
+	code, m = run("--method", "POST", "--url", srv.URL+"/denied", "--body-stdin")
+	if code != 0 || m["status"] != float64(403) || m["body"] != "no" || gotBody != `{"kind":"x"}` || gotMethod != "POST" {
+		t.Fatalf("POST: exit %d, line %v, server got %s %q; want 0, 403, the stdin body", code, m, gotMethod, gotBody)
+	}
+	if code, m = run("--method", "GET", "--url", "http://127.0.0.1:1/"); code == 0 || m["error"] == nil {
+		t.Fatalf("a refused request: exit %d, line %v; want a JSON error line", code, m)
+	}
+	if code, _ = run("--url", srv.URL); code == 0 {
+		t.Fatal("no --method: exit 0, want a failure")
 	}
 }
