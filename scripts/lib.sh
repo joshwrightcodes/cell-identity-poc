@@ -9,6 +9,18 @@ log() { printf '==> %s\n' "$*" >&2; }
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# json_fail <name> <error> [key=value...] prints one JSON error line on standard output, in the
+# shape of the Go commands (log/slog JSONHandler), and exits with status 1. A script whose standard
+# output carries data uses it, so a caller never reads a partial result as data.
+json_fail() {
+  local name="$1" error="$2" pair args=()
+  shift 2
+  for pair in "$@"; do args+=(--arg "${pair%%=*}" "${pair#*=}"); done
+  jq -nc --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg msg "$name failed" --arg error "$error" "${args[@]}" \
+    '{time: $time, level: "ERROR", msg: $msg, error: $error} + (reduce ($ARGS.named | to_entries[] | select(.key != "time" and .key != "msg" and .key != "error")) as $e ({}; .[$e.key] = $e.value))'
+  exit 1
+}
+
 # CELL names the cluster. cells/common.env and cells/$CELL.env hold its settings.
 CELL="${CELL:-dev-cell-1}"
 [[ -f "$ROOT/cells/$CELL.env" ]] || die "unknown cell '$CELL'. Known cells: $(cd "$ROOT/cells" && ls *.env | sed -e 's/\.env$//' -e '/^common$/d' | paste -sd' ' -)"
@@ -56,6 +68,13 @@ RELAY_SYSTEM_COMPONENTS=(
   "relay-system:8:relay-system"
 )
 
+# The telemetry store of management: Grafana, Prometheus, Loki and Tempo in one StatefulSet, and the
+# Password generator of the Grafana admin password. It needs the operator of external-secrets, so it
+# comes after wave 6.
+OBSERVABILITY_STORE_COMPONENTS=(
+  "observability-store:8:observability-system"
+)
+
 # Harness components. The harness renders and applies them itself, like the bootstrap set. They stay
 # out of the root bundle and out of every Argo CD Application. A bundle can still write to their
 # namespace, as the residual limits in docs/design/poc-scope.md say.
@@ -81,6 +100,11 @@ ARGOCD_AGENT_HARNESS=(
 CENTRAL_VIEW_LINK=(
   "central-view:central-view-system"
 )
+# The telemetry gateway shares observability-system with the collector and the store. It carries the
+# harness label, so cell:verify tells its objects from those of the bundles.
+TELEMETRY_GATEWAY_LINK=(
+  "telemetry-gateway:observability-system"
+)
 
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
@@ -93,9 +117,11 @@ for set_name in $set_names; do
     external-secrets) COMPONENTS+=("${EXTERNAL_SECRETS_COMPONENTS[@]}") ;;
     spire-server) COMPONENTS+=("${SPIRE_SERVER_COMPONENTS[@]}") ;;
     relay-system) COMPONENTS+=("${RELAY_SYSTEM_COMPONENTS[@]}") ;;
+    observability-store) COMPONENTS+=("${OBSERVABILITY_STORE_COMPONENTS[@]}") ;;
     cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
+    telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done
@@ -168,6 +194,26 @@ store_gaps() {
       k -n "$ns" get secret "$target" >/dev/null 2>&1 || echo "Secret $ns/$target is missing"
     done
   done
+}
+
+# lgtm_curl <user:password> <method> <path> [json body] sends one request to Grafana from inside the
+# lgtm pod of $CELL_NAME, where Grafana listens on 127.0.0.1:3000. It prints the response body, then
+# a last line with the HTTP status code. The credentials and the body go into a curl config on the
+# standard input of curl, so no password reaches an argument list, and no file holds it. Pass the
+# password in a variable of the caller, not on a command line of this Mac either.
+lgtm_curl() {
+  local creds="$1" method="$2" path="$3" body="${4:-}" esc
+  {
+    printf 'user = "%s"\n' "$creds"
+    printf 'request = "%s"\n' "$method"
+    printf 'url = "http://127.0.0.1:3000%s"\n' "$path"
+    if [[ -n "$body" ]]; then
+      esc="${body//\\/\\\\}"; esc="${esc//\"/\\\"}"
+      printf 'header = "Content-Type: application/json"\n'
+      printf 'data = "%s"\n' "$esc"
+    fi
+    printf 'silent\nshow-error\nmax-time = 30\nwrite-out = "\\n%%{http_code}"\n'
+  } | k -n observability-system exec -i lgtm-0 -c lgtm -- curl -K -
 }
 
 # live_image_mismatches <cluster> <namespace> <kind/name> prints one line for each local image of the

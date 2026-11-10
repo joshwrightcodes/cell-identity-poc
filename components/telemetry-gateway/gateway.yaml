@@ -1,0 +1,209 @@
+# The telemetry gateway of management. render.sh fills in the @...@ values, and
+# components/lib/spire-sidecar.sh adds the k8s_psat SPIRE agent, which gives cell-proxy the SVID
+# spiffe://mgmt.poc.internal/telemetry.
+#
+# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the sender ID and the cell
+# registry, sets the source attributes of every resource again from the verified ID, and forwards
+# OTLP in plaintext gRPC to the store lgtm.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: telemetry-gateway
+  namespace: observability-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telemetry-gateway
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: telemetry-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: telemetry-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: telemetry-gateway
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/registry-content-sha256: "@REGISTRY_SHA256@"
+    spec:
+      serviceAccountName: telemetry-gateway
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # The telemetry entry selects unix:uid:65532, the user of the ko base image.
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - spiffe-server
+            - --listen=:8444
+            - --backend=otlp
+            - --upstream=lgtm.observability-system.svc:4317
+            - --upstream-wait=2m
+            - "--allow-id=@ALLOW_ID@"
+            - --registry-dir=/run/cell-proxy/registry
+            - --peer-bundle=/run/cell-proxy/peer-root/root.crt
+            - --peer-trust-domain=@PEER_TRUST_DOMAIN@
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-telemetry
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+            # The worst decoded request holds about 50 MiB, and the gateway serves 16 calls at once,
+            # so the heap peaks near 860 MiB. The Go runtime collects harder at 1000 MiB, below the
+            # memory limit of 1280 MiB.
+            - name: GOMEMLIMIT
+              value: 1000MiB
+          ports:
+            - name: telemetry
+              containerPort: 8444
+          # The listener opens only after the first connection to the store is ready, so the probe
+          # covers that connection. The probe makes one handshake with no client certificate and
+          # checks the server ID. It starts no telemetry and needs no node address.
+          startupProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/telemetry
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/telemetry
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/telemetry
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 1280Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: registry
+              mountPath: /run/cell-proxy/registry
+              readOnly: true
+            - name: peer-root
+              mountPath: /run/cell-proxy/peer-root
+              readOnly: true
+            - name: own-root
+              mountPath: /run/cell-proxy/own-root
+              readOnly: true
+      volumes:
+        - name: registry
+          configMap:
+            name: cell-registry
+        - name: peer-root
+          configMap:
+            name: peer-root
+        - name: own-root
+          configMap:
+            name: spire-trust-bundle-telemetry-gateway
+---
+# Flow N2: the dev-cp relay reaches cell-proxy on the node port. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the dev-cp node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: telemetry-listener
+  namespace: observability-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: telemetry-gateway
+  ports:
+    - name: telemetry
+      port: 8444
+      targetPort: 8444
+      nodePort: 31444
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telemetry-gateway
+  namespace: observability-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: telemetry-gateway
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N2: the dev-cp relay, through node port 31444 with the local traffic policy. The kubelet
+    # probes run inside the pod (N23), so no node address needs a port.
+    - from: "@ENV_NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8444
+  egress:
+    # N8: the SPIRE agent sidecar attests to the SPIRE server of management.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spire-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: spire-server
+      ports:
+        - protocol: TCP
+          port: 8081
+    # N10: the gateway forwards OTLP to the store.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lgtm
+      ports:
+        - protocol: TCP
+          port: 4317
+    # N11: cell-proxy exports its own OTLP to the collector of the cluster.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317

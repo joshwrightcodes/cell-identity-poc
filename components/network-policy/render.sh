@@ -12,7 +12,8 @@ source "$(cd "$(dirname "$0")/../lib" && pwd)/addresses.sh"
 node_ips="$(ipv4_list NODE_IPS)" || exit 1
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 
-NAMESPACES=(argocd cell-system istio-system istio-egress observability-system apps-demo)
+NAMESPACES=(argocd cell-system istio-system istio-egress apps-demo)
+# The policies of observability-system come from components/observability-system/render.sh.
 
 # Private and link-local ranges. The egress gateway may reach any public address on 443, but
 # no private address, so it cannot reach other clusters or the host network.
@@ -219,23 +220,6 @@ $(printf '              - %s\n' "${PRIVATE_RANGES[@]}")
       ports:
         - protocol: TCP
           port: 443
----
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: collector
-  namespace: observability-system
-spec:
-  podSelector: {}
-  policyTypes: [Ingress]
-  ingress:
-    - from:
-        - namespaceSelector: {}
-      ports:
-        - protocol: TCP
-          port: 4317
-        - protocol: TCP
-          port: 4318
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

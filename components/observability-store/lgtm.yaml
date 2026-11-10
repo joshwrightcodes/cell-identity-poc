@@ -1,0 +1,197 @@
+# The telemetry store of management: Grafana, Prometheus, Loki, Tempo and Pyroscope in one image.
+# render.sh fills in the checksum of the two config files, and adds their ConfigMap. The pod runs
+# as user 10001 with a read-only root file system. Every path that the image writes lives on the
+# data volume or on a memory volume. It has no egress at all: the components reach each other on
+# 127.0.0.1, and the store makes no call to the Internet.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lgtm
+  namespace: observability-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: lgtm
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: lgtm
+spec:
+  replicas: 1
+  serviceName: lgtm
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lgtm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lgtm
+      annotations:
+        poc.internal/lgtm-config-sha256: "@LGTM_CONFIG_SHA256@"
+    spec:
+      serviceAccountName: lgtm
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: lgtm
+          image: docker.io/grafana/otel-lgtm:0.38.0@sha256:75cdf892daffadf3763ef61c16a6d7f8586216fce0b40bba7874a0b053121084
+          env:
+            # Anonymous access defaults to on, with the Admin role.
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "false"
+            # The password comes from a file, and Grafana reads it only when it creates its
+            # database. The suffix __FILE belongs to the run script of the official Grafana image,
+            # and this image starts the Grafana binary directly, so Grafana would ignore it and
+            # keep the default password admin. Grafana expands $__file{} in a setting itself.
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: "$__file{/run/grafana-admin/password}"
+            # run-grafana.sh asks Grafana to download plugins from grafana.com at each start. The
+            # pod has no route out, so Grafana installs none.
+            - name: GF_PLUGINS_PREINSTALL_AUTO_UPDATE
+              value: "false"
+            - name: GF_PLUGINS_PREINSTALL_DISABLED
+              value: "true"
+            - name: GF_ANALYTICS_REPORTING_ENABLED
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_UPDATES
+              value: "false"
+            - name: GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES
+              value: "false"
+            # Tempo and Pyroscope report usage to the vendor by default. The pod has no route out.
+            - name: TEMPO_EXTRA_ARGS
+              value: -reporting.enabled=false
+            - name: PYROSCOPE_EXTRA_ARGS
+              value: -usage-stats.enabled=false
+          ports:
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: grafana
+              containerPort: 3000
+            - name: prometheus
+              containerPort: 9090
+          # The image script checks every component on 127.0.0.1, so no probe port needs ingress.
+          startupProbe:
+            exec:
+              command: ["/otel-lgtm/docker/healthcheck.sh"]
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command: ["/otel-lgtm/docker/healthcheck.sh"]
+            periodSeconds: 20
+            timeoutSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["/otel-lgtm/docker/healthcheck.sh"]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 4
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 300m
+              memory: 1Gi
+            limits:
+              memory: 3Gi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: tempo
+              mountPath: /var/tempo
+            - name: tmp
+              mountPath: /tmp
+            - name: grafana-admin
+              mountPath: /run/grafana-admin
+              readOnly: true
+            - name: config
+              mountPath: /otel-lgtm/prometheus.yaml
+              subPath: prometheus.yaml
+              readOnly: true
+            - name: config
+              mountPath: /otel-lgtm/loki-config.yaml
+              subPath: loki.yaml
+              readOnly: true
+      volumes:
+        - name: tempo
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: grafana-admin
+          secret:
+            secretName: grafana-admin
+            defaultMode: 0440
+        - name: config
+          configMap:
+            name: lgtm-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+---
+# Flow N10 uses 4317. The ports 9090 (Task 11) and 3000 (the port-forward of obs:ui) admit no pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lgtm
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: lgtm
+spec:
+  selector:
+    app.kubernetes.io/name: lgtm
+  ports:
+    - name: grpc-otlp
+      port: 4317
+      targetPort: otlp-grpc
+      appProtocol: grpc
+    - name: http-grafana
+      port: 3000
+      targetPort: grafana
+      appProtocol: http
+    - name: http-prometheus
+      port: 9090
+      targetPort: prometheus
+      appProtocol: http
+---
+# Flow N10: the collector and the telemetry gateway send OTLP on 4317. No pod reaches 3000 or 9090,
+# and the pod has no egress. The namespace policy allow-dns leaves lgtm out.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: lgtm
+  namespace: observability-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: lgtm
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: telemetry-gateway
+      ports:
+        - protocol: TCP
+          port: 4317
+  egress: []

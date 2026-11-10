@@ -77,7 +77,7 @@ check_argocd_local_only() {
 # The base platform namespaces, and the namespace of each harness and link component of this cell.
 platform_namespaces=(argocd cell-system observability-system)
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
-  platform_namespaces+=("${entry#*:}")
+  [[ " ${platform_namespaces[*]} " == *" ${entry#*:} "* ]] || platform_namespaces+=("${entry#*:}")
 done
 
 has_harness() {
@@ -597,7 +597,42 @@ check_no_secret_store() {
   fi
 }
 
+# check_traces_in_store asks Tempo through Grafana for a trace of echo with the cluster name of this
+# cluster. A cluster with a telemetry store prints nothing from its collector, so the logs of the
+# collector show no span there. The password stays in memory, and lgtm_curl puts it on the standard
+# input of curl.
+check_traces_in_store() {
+  local pw query body out code end=$((SECONDS + 120)) i
+  pw="$("$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  query="{ resource.k8s.cluster.name = \"$COLLECTOR_CLUSTER\" && resource.service.name =~ \"echo.*\" }"
+  body="$(jq -nc --arg q "$query" '{queries: [{refId: "A", datasource: {type: "tempo", uid: "tempo"}, queryType: "traceql", query: $q,
+    limit: 5, tableType: "traces"}], from: "now-30m", to: "now"}')"
+  until out="$(lgtm_curl "admin:$pw" POST /api/ds/query "$body" 2>&1)" && code="$(tail -n 1 <<<"$out")" && [[ "$code" == 200 ]] \
+      && [[ "$(sed '$d' <<<"$out" | jq -r '[.results.A.frames[]?.data.values[0][]?] | length' 2>/dev/null)" -gt 0 ]]; do
+    for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
+    ((SECONDS < end)) || { echo "Tempo holds no trace with k8s.cluster.name $COLLECTOR_CLUSTER for echo. The last answer: HTTP ${code:-none}"; return 1; }
+    sleep 5
+  done
+}
+
+# lgtm must run as user 10001, Grafana must refuse an anonymous read of the data sources, and the pod
+# must not read the Kubernetes API token that the account would give it.
+check_lgtm_hardened() {
+  local uid code
+  uid="$(k -n observability-system exec lgtm-0 -c lgtm -- id -u 2>&1)" || { echo "could not run id in lgtm-0: $uid"; return 1; }
+  [[ "$uid" == 10001 ]] || { echo "lgtm-0 runs as user '$uid', want 10001"; return 1; }
+  code="$(k -n observability-system exec lgtm-0 -c lgtm -- curl -sS -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:3000/api/datasources 2>&1)" \
+    || { echo "could not call Grafana in lgtm-0: $code"; return 1; }
+  [[ "$code" == 401 ]] || { echo "an anonymous read of /api/datasources answers HTTP '$code', want 401. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  k -n observability-system exec lgtm-0 -c lgtm -- test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token \
+    || { echo "lgtm-0 holds a service account token"; return 1; }
+}
+
 check_traces_received() {
+  if [[ -n "${COLLECTOR_STORE:-}" ]]; then
+    check_traces_in_store
+    return
+  fi
   local i
   for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
   local end=$((SECONDS + 60))
@@ -630,7 +665,12 @@ check "plaintext cannot reach the internet, because of NetworkPolicy" expect_no_
 check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_HOST/v2/"
 check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_HOST/v2/"
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
-check "The collector receives telemetry for echo" check_traces_received
+if [[ -n "${COLLECTOR_STORE:-}" ]]; then
+  check "lgtm runs as user 10001, and Grafana answers 401 to an anonymous read" check_lgtm_hardened
+  check "Tempo holds a trace of echo from $COLLECTOR_CLUSTER, so the collector reaches the store" check_traces_received
+else
+  check "The collector receives telemetry for echo" check_traces_received
+fi
 
 if has_harness cell-identity; then
   probe_targets+=("$CELL_NAME/cell-identity-system")
@@ -843,13 +883,41 @@ check_view_cert_expiry() {
   fi
 }
 
+# The telemetry gateway copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the
+# central view does.
+check_gateway_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n observability-system get networkpolicy telemetry-gateway -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy observability-system/telemetry-gateway"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the gateway listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_gateway_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n observability-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap observability-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.
 for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   comp="${entry%%:*}"
   bundle="$BUNDLES/$comp/manifests.yaml"
   check "The $comp objects match the bundle" check_harness_drift "$comp"
-  for ns in $(yq -N 'select(.kind == "Namespace") | .metadata.name' "$bundle" 2>/dev/null); do
+  for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$bundle" 2>/dev/null | sort -u); do
     check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
   done
   if [[ "$comp" == central-view ]]; then
@@ -857,6 +925,10 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root
     check "central-view-system holds only the Secrets of the view" check_view_secrets
     check "The view certificates are valid for 30 days or more" check_view_cert_expiry
+  fi
+  if [[ "$comp" == telemetry-gateway ]]; then
+    check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address
+    check "ConfigMap peer-root of observability-system holds the live roots of $VIEW_CONTROL_PLANE" check_gateway_peer_root
   fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
       | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))

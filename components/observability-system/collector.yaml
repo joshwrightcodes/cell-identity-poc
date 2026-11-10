@@ -1,6 +1,6 @@
-# The in-cluster OpenTelemetry collector. It receives OTLP and prints what it receives.
-# A later milestone forwards to a backend. The collector stays outside the mesh, because
-# Envoy sends traces and access logs to it in plaintext.
+# The in-cluster OpenTelemetry collector. It receives OTLP and prints what it receives. In
+# management, render.sh makes it export to the telemetry store instead. The collector stays
+# outside the mesh, because Envoy sends traces and access logs to it in plaintext.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
