@@ -661,9 +661,14 @@ func TestM3RelayNodePortAdmission(t *testing.T) {
 	}
 	for _, cluster := range []string{"rogue", mgmtCluster} {
 		t.Run(cluster, func(t *testing.T) {
+			ns := freshNamespace(t, cluster)
+			// A control dial must connect first, so a timeout cannot come from broken pod networking.
+			if got := dialFrom(t, cluster, ns, apiServiceIP(t, cluster), 443, 3*time.Second); got != "connected" {
+				t.Fatalf("the control dial from %s/%s to the API service gave %q, want connected", cluster, ns, got)
+			}
 			for _, port := range []int{relayViewPort, relayTelPort} {
-				if err := probeFromFreshNamespace(t, cluster, envIP, port, 3*time.Second); err != nil {
-					t.Error(err)
+				if got := dialFrom(t, cluster, ns, envIP, port, 3*time.Second); got != "timeout" {
+					t.Errorf("the dial from %s/%s to %s:%d gave %q, want a timeout", cluster, ns, envIP, port, got)
 				}
 			}
 		})

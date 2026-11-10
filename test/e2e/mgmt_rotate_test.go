@@ -22,7 +22,8 @@ import (
 // and applies it, as a peer render does. Any other copy belongs to a real render. A copy in
 // management is the trust bundle of a link component sidecar, so the hook runs cell:link, which is
 // safe to run at each refresh. For a copy in another cluster the hook runs cell:up of that cluster
-// once.
+// once for each content of the live bundle, as the refresh of mgmt:rotate-ca runs cell:up of a
+// cluster once in each pass.
 const rotateHook = `#!/usr/bin/env bash
 set -euo pipefail
 cluster="$1" ns="$2" name="$3"
@@ -31,8 +32,10 @@ if [[ "$cluster" == management ]]; then
   exit 0
 fi
 if [[ "$cluster" != "$ROTATE_TEST_CLUSTER" || "$ns" != "$ROTATE_TEST_NS" ]]; then
-  grep -qxF "$cluster" "$ROTATE_DONE" 2>/dev/null && exit 0
-  echo "$cluster" >>"$ROTATE_DONE"
+  pass="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem | shasum -a 256 | cut -d' ' -f1)"
+  grep -qxF "$cluster $pass" "$ROTATE_DONE" 2>/dev/null && exit 0
+  echo "$cluster $pass" >>"$ROTATE_DONE"
   CELL="$cluster" "$ROTATE_ROOT/scripts/up.sh"
   exit 0
 fi
