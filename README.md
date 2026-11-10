@@ -296,7 +296,7 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 18 minutes. This is 1.5 times the slowest run, 706 seconds on 2026-11-10, rounded up to the next minute.
+The budget is 20 minutes. This is 1.5 times the slowest run, 786 seconds on 2026-11-10, rounded up to the next minute.
 The slowest tests are the management CA rotation (188 seconds) and the fresh-namespace dial tests.
 The budgets do not cover `harness:up`.
 
