@@ -284,6 +284,9 @@ func TestTelemetryGatewayRender(t *testing.T) {
 	if env := envOf(t, ctr); env["GOMEMLIMIT"] != "1000MiB" || get[string](t, ctr, "resources", "limits", "memory") != "1280Mi" {
 		t.Errorf("GOMEMLIMIT %q and limit %v, want 1000MiB below 1280Mi", env["GOMEMLIMIT"], lookupOr(ctr, "resources", "limits", "memory"))
 	}
+	if env := envOf(t, ctr); env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME)" || get[string](t, named(t, get[[]any](t, ctr, "env"), "POD_NAME"), "valueFrom", "fieldRef", "fieldPath") != "metadata.name" {
+		t.Errorf("the gateway must carry its pod name as service.instance.id, got %q", env["OTEL_RESOURCE_ATTRIBUTES"])
+	}
 	for _, p := range []string{"startupProbe", "readinessProbe", "livenessProbe"} {
 		cmd := get[[]any](t, ctr, p, "exec", "command")
 		if fmt.Sprint(cmd[:2]) != "[/ko-app/cell-proxy probe]" || !strings.Contains(fmt.Sprint(cmd), "--expect-id=spiffe://mgmt.poc.internal/telemetry") {

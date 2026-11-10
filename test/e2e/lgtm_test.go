@@ -525,14 +525,32 @@ func sendMetric(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, n
 	}
 }
 
-// overwriteCount reads the sum of the resource-level overwrites of one sender cluster from Prometheus.
-func overwriteCount(t *testing.T, sender string) float64 {
+// overwriteSeries reads each series of the resource-level overwrite counter of one sender cluster
+// from Prometheus, with its last value. The key is the sorted label set, so every attribute and every
+// gateway process has its own entry.
+func overwriteSeries(t *testing.T, sender string) map[string]float64 {
 	t.Helper()
-	s := promSamples(t, fmt.Sprintf(`sum(cellproxy_gateway_attribute_overwrites_total{sender_cluster=%q,level="resource"})`, sender))
-	if len(s) == 0 {
-		return 0
+	out := map[string]float64{}
+	for _, s := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_attribute_overwrites_total{sender_cluster=%q,level="resource"}`, sender)) {
+		out[fmt.Sprint(s.labels)] = s.last
 	}
-	return s[0].last
+	return out
+}
+
+// overwriteRise returns how much the counters rose since base. A counter is cumulative for one gateway
+// process, and a restart of the gateway starts new series, so the rise adds the difference of each series
+// that was there before, and the whole value of each new series or of a counter that started again.
+func overwriteRise(base, now map[string]float64) float64 {
+	rise := 0.0
+	for key, v := range now {
+		switch b, ok := base[key]; {
+		case !ok || v < b:
+			rise += v
+		default:
+			rise += v - b
+		}
+	}
+	return rise
 }
 
 // TestM3GatewayResetsSpoofedAttributes sends a metric, a log and a span as cell/dev-cell-1/otel. Each
@@ -544,7 +562,7 @@ func TestM3GatewayResetsSpoofedAttributes(t *testing.T) {
 	marker := "m3spoof" + randomHex(t, 4)
 	metric := "m3_spoof_" + marker
 	conn := gatewayConn(t, senderCert(t, "spiffe://"+envTrustDomain+"/cell/dev-cell-1/otel"))
-	base := overwriteCount(t, "dev-cell-1")
+	base := overwriteSeries(t, "dev-cell-1")
 
 	now := time.Now()
 	sendMetric(t, conn, spoofResource("m3-spoof"), metric, now, strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker))
@@ -610,11 +628,11 @@ func TestM3GatewayResetsSpoofedAttributes(t *testing.T) {
 	}
 
 	waitFor(t, "the overwrite counter of dev-cell-1 to rise by 6", signalWait, func() (bool, string) {
-		got := overwriteCount(t, "dev-cell-1")
-		if got > base+6 {
-			t.Fatalf("the overwrite counter of dev-cell-1 rose from %v to %v, want exactly 6 more", base, got)
+		got := overwriteRise(base, overwriteSeries(t, "dev-cell-1"))
+		if got > 6 {
+			t.Fatalf("the overwrite counter of dev-cell-1 rose by %v, want exactly 6", got)
 		}
-		return got == base+6, fmt.Sprintf("%v, from %v", got, base)
+		return got == 6, fmt.Sprintf("rose by %v", got)
 	})
 
 	// dev-cp sends a metric that claims another cluster in an Istio label.

@@ -59,6 +59,15 @@ spec:
               value: unix:///run/spire/agent/agent.sock
             - name: OTEL_SERVICE_NAME
               value: cell-proxy-telemetry
+            # Each pod gets its own metric series, so a counter that starts again after a restart
+            # never continues the series of the pod before it. Prometheus keeps service.instance.id
+            # as a label.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.instance.id=$(POD_NAME)
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
             # The worst decoded request holds about 50 MiB, and the gateway serves 16 calls at once,
