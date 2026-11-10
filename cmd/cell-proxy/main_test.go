@@ -552,15 +552,43 @@ func TestServerOTLPWaitsForUpstream(t *testing.T) {
 		out := &syncBuffer{}
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		defer cancel()
+		started := time.Now()
 		code := execute(ctx, append(slices.Clone(args), "--upstream-wait", "400ms"), out)
+		if d := time.Since(started); d > 4*time.Second {
+			t.Fatalf("the wait of 400ms ended after %s, so its bound does not hold\n%s", d, out.String())
+		}
 		if code != 1 {
 			t.Fatalf("exit code %d, want 1\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), `"msg":"listening"`) {
 			t.Fatalf("the server listened without an upstream:\n%s", out.String())
 		}
-		if !strings.Contains(out.String(), "was not ready after 400ms") {
+		if !strings.Contains(out.String(), "was not ready after") || !strings.Contains(out.String(), "limit 400ms") {
 			t.Fatalf("the error line does not name the wait:\n%s", out.String())
+		}
+	})
+
+	t.Run("stop during the wait is no failure", func(t *testing.T) {
+		out := &syncBuffer{}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan int, 1)
+		go func() { done <- execute(ctx, append(slices.Clone(args), "--upstream-wait", "30s"), out) }()
+		time.Sleep(1500 * time.Millisecond)
+		cancel()
+		select {
+		case code := <-done:
+			if code != 0 || strings.Contains(out.String(), "was not ready") || strings.Contains(out.String(), `"level":"ERROR"`) {
+				t.Fatalf("exit %d, want 0 and no error line\n%s", code, out.String())
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the server did not stop")
+		}
+	})
+
+	t.Run("other backends refuse it", func(t *testing.T) {
+		var out bytes.Buffer
+		if code := execute(t.Context(), append(slices.Clone(serverArgs(t, envCA)), "--upstream-wait", "1s"), &out); code != 2 || !strings.Contains(out.String(), "--upstream-wait") {
+			t.Fatalf("exit %d, want 2 and a line that names --upstream-wait\n%s", code, out.String())
 		}
 	})
 

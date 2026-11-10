@@ -274,6 +274,9 @@ func parseServer(args []string) (serverConfig, error) {
 		return serverConfig{}, fmt.Errorf("--registry-dir: %w", err)
 	}
 	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg}
+	if *upstreamWait != 0 && *backend != "otlp" {
+		return serverConfig{}, errors.New("--upstream-wait applies to --backend otlp only")
+	}
 	switch *backend {
 	case "tunnel":
 		if cfg.backend, err = tunnelBackend(*listen); err != nil {
@@ -322,14 +325,19 @@ func parseServer(args []string) (serverConfig, error) {
 	return cfg, nil
 }
 
-// waitUpstreamReady blocks until conn is READY, for at most wait. It starts the first connect.
+// waitUpstreamReady blocks until conn is READY, for at most wait. It starts the first connect. It
+// returns ctx.Err() when ctx ends first, so a stop of the pod is no failure of the wait.
 func waitUpstreamReady(ctx context.Context, conn *grpc.ClientConn, target string, wait time.Duration) error {
-	ctx, cancel := context.WithTimeout(ctx, wait)
+	start := time.Now()
+	wctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	conn.Connect()
 	for state := conn.GetState(); state != connectivity.Ready; state = conn.GetState() {
-		if !conn.WaitForStateChange(ctx, state) {
-			return fmt.Errorf("the upstream %s was not ready after %s, last state %s", target, wait, state)
+		if !conn.WaitForStateChange(wctx, state) {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("the upstream %s was not ready after %s (limit %s), last state %s", target, time.Since(start).Round(time.Millisecond), wait, state)
 		}
 	}
 	return nil
@@ -374,6 +382,9 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		}
 		if cfg.waitUpstream != nil {
 			if err := cfg.waitUpstream(ctx); err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
 				return err
 			}
 			tel.Log.Info("otlp upstream ready")
