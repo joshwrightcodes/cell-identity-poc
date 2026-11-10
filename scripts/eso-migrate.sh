@@ -77,7 +77,7 @@ post_checks() {
   got="$(k -n "$store_ns" get pvc "$pvc" -o jsonpath='{.metadata.uid}' 2>/dev/null)"
   [[ "$got" == "$pvc_uid" ]] || echo "PersistentVolumeClaim $pvc has the UID '$got', not $pvc_uid: the SPIRE datastore is new"
   tracking="$(k get namespace "$store_ns" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}' 2>/dev/null)"
-  [[ "$tracking" == external-secrets:* ]] || echo "the tracking ID of Namespace $store_ns is '$tracking', not one of the Application external-secrets"
+  [[ "$tracking" == external-secrets:* || "$tracking" == argocd-apps_external-secrets:* ]] || echo "the tracking ID of Namespace $store_ns is '$tracking', not one of the Application external-secrets"
   k -n "$store_ns" get externalsecret spire-upstream -o json 2>/dev/null | jq -e '
     .spec.secretStoreRef.kind == "SecretStore" and any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null \
     || echo "ExternalSecret $store_ns/spire-upstream does not use a SecretStore, or it is not Ready"

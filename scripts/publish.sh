@@ -27,7 +27,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: $c
-  namespace: argocd
+  namespace: argocd-apps
   annotations:
     argocd.argoproj.io/sync-wave: "$wave"
 spec:

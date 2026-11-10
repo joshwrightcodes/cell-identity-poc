@@ -42,7 +42,8 @@ The demo workloads in `apps-demo` take the place of the role set in this milesto
 
 | Namespace | Contents | Mesh | Pod Security |
 | --- | --- | --- | --- |
-| `argocd` | Argo CD core install | No | restricted |
+| `argocd` | Argo CD core install, and the root Application | No | restricted |
+| `argocd-apps` | Every child Application, and no Secret | No | restricted |
 | `cell-system` | Bundle store; later the worker and SPIRE agent sidecars | No | restricted |
 | `istio-system` | istiod, istio-cni | Control plane | privileged |
 | `istio-egress` | Egress gateway | Yes | restricted |
@@ -65,8 +66,27 @@ plaintext. Strict mTLS on the collector would reject them.
 - A root Application follows the `current` tag of the root bundle.
 - Bootstrap applies the root Application once. It is the only object that Argo CD does not manage, because a self-managed root waits on itself.
 - Each child Application pins its bundle by digest.
+- Every child Application lives in `argocd-apps` and uses the AppProject `cell`. The root Application stays in `argocd`.
+- The setting `application.namespaces: argocd-apps` in `argocd-cmd-params-cm` and `sourceNamespaces` in the AppProject `cell` allow this.
+- The application controller reads `application.namespaces` when it starts. Its pod template carries the annotation `poc.internal/cmd-params-sha256`, the SHA-256 of `components/argocd/argocd-cmd-params-cm.yaml`. A change to that file restarts the controller.
+- The ValidatingAdmissionPolicy `argocd-apps-no-secrets` and its binding deny a Secret in `argocd-apps`, for every user.
+- `mise run cell:ui` serves the UI of `argocd admin dashboard`. That local server does not read `application.namespaces`, so the UI lists only the root Application. The script prints the child Applications of `argocd-apps` first.
 - Sync waves order the components. Argo CD reports the health of child Applications, so each wave waits for the one before it.
 - The Istio Applications ignore the webhook fields that istiod writes at run time.
+
+### Move of the child Applications
+
+An older cell keeps its child Applications in `argocd`. The next `mise run cell:up` moves them.
+
+1. The bootstrap set applies the new namespace, the project, the setting and the policy. The controller restarts.
+2. The new root bundle holds each child Application in `argocd-apps`. The root Application creates them and prunes the old copies in `argocd`.
+3. The wait in `cell:up` ends when `argocd` holds only the root Application and `argocd-apps` holds one Application per component.
+
+Two states are transient. While both copies of an Application exist, Argo CD can report `SharedResourceWarning` on the objects that they both claim. The warning ends when the root Application prunes the old copy.
+
+The tracking ID of every object changes to the form `argocd-apps_<name>:<group>/<kind>:<namespace>/<name>`. The old form was `<name>:...`. Scripts that read the tracking ID accept both forms.
+
+The live move on the four base-cell clusters left no old Application behind. If one stays, run `mise run cell:up` again, so that the root Application prunes it. If `cell:verify` still reports it, run `kubectl -n argocd delete application <name>`. An Application has no finalizer, so the delete leaves the managed objects in place.
 
 ### Bundles
 
@@ -107,6 +127,7 @@ plaintext. Strict mTLS on the collector would reject them.
 | Check | Rule |
 | --- | --- |
 | Every Application is Synced and Healthy | Argo CD manages every component |
+| No Application is outside `argocd-apps`, except the root | Child Applications stay in one namespace |
 | No remote clusters, and only the local store as a source | Argo CD stays local |
 | `argocd`, `cell-system` and `observability-system` have no mesh proxies | Platform stays out of the mesh |
 | Demo workloads have mesh proxies, except `plaintext` | Workloads join the mesh |

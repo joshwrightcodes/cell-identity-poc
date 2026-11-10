@@ -6,6 +6,8 @@ metadata:
   name: cell
 spec:
   description: Base cell components, applied from the in-cluster bundle store
+  sourceNamespaces:
+    - argocd-apps
   sourceRepos:
     - oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/*
   destinations:

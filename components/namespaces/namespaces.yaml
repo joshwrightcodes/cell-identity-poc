@@ -11,6 +11,14 @@ metadata:
 apiVersion: v1
 kind: Namespace
 metadata:
+  name: argocd-apps
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
   name: cell-system
   labels:
     istio-injection: disabled

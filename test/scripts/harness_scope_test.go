@@ -211,6 +211,7 @@ func TestHarnessApplyRefusesObjectsOfOtherOwners(t *testing.T) {
 	}
 	for _, tc := range []struct{ name, meta, want string }{
 		{"Application of the root", `"annotations":{"argocd.argoproj.io/tracking-id":"network-policy:/ConfigMap:shared/spire-agent"}`, "ConfigMap/spire-agent in shared belongs to the Argo CD Application network-policy"},
+		{"Application of the root in argocd-apps", `"annotations":{"argocd.argoproj.io/tracking-id":"argocd-apps_network-policy:/ConfigMap:shared/spire-agent"}`, "ConfigMap/spire-agent in shared belongs to the Argo CD Application network-policy"},
 		{"other component", `"labels":{"cell.poc.internal/harness":"link"}`, "ConfigMap/spire-agent in shared carries the label cell.poc.internal/harness=link"},
 		{"owner reference", `"ownerReferences":[{"kind":"Deployment","name":"argocd-server"}]`, "ConfigMap/spire-agent in shared has the owner Deployment/argocd-server"},
 	} {

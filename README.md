@@ -573,10 +573,11 @@ On a failure after the annotation, the task prints the rollback commands.
 The cell runs the Argo CD core install, which has no UI. `mise run cell:ui` serves the UI
 from your Mac at <http://localhost:8080> and reads the cluster through your kubeconfig.
 It needs no login, and it stops when you press Ctrl-C.
+The UI lists only the root Application. The script prints the child Applications first, and the `kubectl` line below lists them again.
 
 ```sh
 mise run cell:ui
-kubectl --context kind-dev-cell-1 -n argocd get applications
+kubectl --context kind-dev-cell-1 -n argocd-apps get applications
 kubectl --context kind-dev-cell-1 -n observability-system logs deploy/otel-collector
 ```
 

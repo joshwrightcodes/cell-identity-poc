@@ -1,0 +1,30 @@
+# Child Applications live in argocd-apps. A Secret in that namespace would let a tenant of the
+# namespace hand credentials to Argo CD, so the namespace admits none, for every user.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: argocd-apps-no-secrets
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["secrets"]
+  validations:
+    - expression: "false"
+      message: The namespace argocd-apps holds no Secret
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: argocd-apps-no-secrets
+spec:
+  policyName: argocd-apps-no-secrets
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: argocd-apps

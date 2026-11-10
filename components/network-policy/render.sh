@@ -12,7 +12,7 @@ source "$(cd "$(dirname "$0")/../lib" && pwd)/addresses.sh"
 node_ips="$(ipv4_list NODE_IPS)" || exit 1
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 
-NAMESPACES=(argocd cell-system istio-system istio-egress observability-system apps-demo)
+NAMESPACES=(argocd argocd-apps cell-system istio-system istio-egress observability-system apps-demo)
 
 # Private and link-local ranges. The egress gateway may reach any public address on 443, but
 # no private address, so it cannot reach other clusters or the host network.

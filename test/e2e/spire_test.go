@@ -282,22 +282,26 @@ func (a argoApp) String() string {
 
 func argoApps(t *testing.T) ([]argoApp, error) {
 	t.Helper()
-	out, err := kubectl(t, spireCluster, "", "-n", "argocd", "get", "applications", "-o", "json")
-	if err != nil {
-		return nil, err
+	var apps []argoApp
+	for _, ns := range []string{"argocd", appsNamespace} {
+		out, err := kubectl(t, spireCluster, "", "-n", ns, "get", "applications", "-o", "json")
+		if err != nil {
+			return nil, err
+		}
+		var list struct {
+			Items []argoApp `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(out), &list); err != nil {
+			return nil, fmt.Errorf("decode Applications of %s: %w", ns, err)
+		}
+		apps = append(apps, list.Items...)
 	}
-	var list struct {
-		Items []argoApp `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		return nil, fmt.Errorf("decode Applications: %w", err)
-	}
-	return list.Items, nil
+	return apps, nil
 }
 
 func appTargetRevision(t *testing.T, name string) string {
 	t.Helper()
-	out, err := kubectl(t, spireCluster, "", "-n", "argocd", "get", "application", name, "-o", "jsonpath={.spec.source.targetRevision}")
+	out, err := kubectl(t, spireCluster, "", "-n", appsNamespace, "get", "application", name, "-o", "jsonpath={.spec.source.targetRevision}")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -77,8 +77,10 @@ if [[ " $* " == *" get pod spire-server-0 "* ]]; then
   exit 0
 fi
 if [[ " $* " == *" get applications -o json "* ]]; then
-  cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn '{items: [inputs | {metadata: {name: .},
-    status: {sync: {status: "Synced", revision: "sha256:1"}, health: {status: "Healthy"}}}]}'
+  want='. != "root"'
+  [[ " $* " != *" -n argocd get "* ]] || want='. == "root"'
+  cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: .},
+    status: {sync: {status: \"Synced\", revision: \"sha256:1\"}, health: {status: \"Healthy\"}}}]}"
 fi
 exit 0
 `)

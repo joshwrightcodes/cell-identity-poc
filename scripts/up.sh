@@ -45,12 +45,12 @@ until apps_at_published >/dev/null 2>&1; do
     connect_store_step "$ROOT/scripts/secrets-connect.sh"
   fi
   if ((SECONDS >= end)); then
-    k -n argocd get applications
+    k get applications -A
     die "Applications did not reach the published revisions, Synced and Healthy, in 900s"
   fi
   sleep 10
 done
-k -n argocd get applications
+k get applications -A
 
 # Harness components stay outside Argo CD. The harness applies them after the root bundle syncs,
 # so no Application from an older root bundle still claims their objects. The apply does not

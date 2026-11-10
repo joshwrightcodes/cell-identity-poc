@@ -170,16 +170,30 @@ live_image_mismatches() {
   done
 }
 
+# APPS_NAMESPACE holds every child Application. The root Application stays in argocd.
+APPS_NAMESPACE=argocd-apps
+
+# apps_json prints the root Application from argocd and the child Applications from argocd-apps as
+# one List.
+apps_json() {
+  local root children
+  root="$(k -n argocd get applications -o json)" || return 1
+  children="$(k -n "$APPS_NAMESPACE" get applications -o json)" || return 1
+  jq -n --argjson r "$root" --argjson c "$children" '{items: ($r.items + $c.items)}'
+}
+
 # apps_at_published succeeds when Argo CD reports every Application of the cluster Synced and
-# Healthy at the revision that publish.sh pushed. A check that runs before Argo CD reads the new
-# root bundle cannot pass.
+# Healthy at the revision that publish.sh pushed. The root Application is in argocd and has no
+# sibling there. A check that runs before Argo CD reads the new root bundle cannot pass.
 apps_at_published() {
-  local published_json
+  local published_json root children
   published_json="$(jq -Rn '[inputs | select(length > 0) | split("=") | {(.[0]): .[1]}] | add' <"$PUBLISHED")" || return 1
-  k -n argocd get applications -o json | jq -e --argjson n "$((${#COMPONENTS[@]} + 1))" --argjson pub "$published_json" '
-    (.items | length) == $n and
-    all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
-      and .status.sync.revision == $pub[.metadata.name])'
+  root="$(k -n argocd get applications -o json)" || return 1
+  children="$(k -n "$APPS_NAMESPACE" get applications -o json)" || return 1
+  jq -n -e --argjson root "$root" --argjson children "$children" --argjson n "${#COMPONENTS[@]}" --argjson pub "$published_json" '
+    ($root.items | map(.metadata.name)) == ["root"] and ($children.items | length) == $n and
+    all($root.items[], $children.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy"
+      and .status.sync.revision == $pub[.metadata.name])' >/dev/null
 }
 
 # eso_controller_rolled_out succeeds when the operator Deployment runs only pods of its current
@@ -203,7 +217,7 @@ eso_published_synced() {
   local want
   want="$(sed -n 's/^external-secrets=//p' "$PUBLISHED" 2>/dev/null)"
   [[ -n "$want" ]] || return 1
-  k -n argocd get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
+  k -n "$APPS_NAMESPACE" get application external-secrets -o json 2>/dev/null | jq -e --arg want "$want" '
     .status.sync.status == "Synced" and .status.health.status == "Healthy" and .status.sync.revision == $want' >/dev/null
 }
 
@@ -357,7 +371,7 @@ harness_conflicts() {
   apps="$(printf '%s\n' root ${COMPONENTS[@]+"${COMPONENTS[@]%%:*}"} | jq -Rn '[inputs]')"
   jq -r --arg comp "$comp" --arg label "$HARNESS_LABEL" --argjson apps "$apps" '
     (if .kind == "List" then .items[] else . end)
-    | ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | split(":")[0]) as $app
+    | ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | split(":")[0] // "" | sub("^argocd-apps_"; "")) as $app
     | (.metadata.labels[$label] // "") as $owner
     | ([(.metadata.ownerReferences // [])[] | "\(.kind)/\(.name)"] | join(", ")) as $refs
     | "\(.kind)/\(.metadata.name)\(if .metadata.namespace then " in " + .metadata.namespace else "" end)" as $o
