@@ -168,8 +168,15 @@ type sample struct {
 // promSamples runs a PromQL query over the last hour and returns each series that has a point.
 func promSamples(t *testing.T, query string) []sample {
 	t.Helper()
+	return promSamplesFrom(t, query, "")
+}
+
+// promSamplesFrom is promSamples over the range that starts at from, in Grafana syntax such as now-2m.
+// A series that ended before from has no point, so the result shows live series only.
+func promSamplesFrom(t *testing.T, query, from string) []sample {
+	t.Helper()
 	var out []sample
-	for _, f := range framesOf(t, grafanaQuery(t, "prometheus", query)) {
+	for _, f := range framesOf(t, grafanaQueryFrom(t, "prometheus", query, from)) {
 		if len(f.Schema.Fields) < 2 || len(f.Data.Values) < 2 || len(f.Data.Values[1]) == 0 {
 			continue
 		}

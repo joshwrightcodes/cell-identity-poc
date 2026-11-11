@@ -307,7 +307,7 @@ func TestM3MetricsEndpointsCollectorOnly(t *testing.T) {
 			t.Parallel()
 			waitFor(t, "up equal to 1 for every job of "+cluster, signalWait, func() (bool, string) {
 				jobs := map[string]bool{}
-				for _, s := range promSamples(t, fmt.Sprintf(`last_over_time(up{k8s_cluster_name=%q}[3m])`, cluster)) {
+				for _, s := range promSamplesFrom(t, fmt.Sprintf(`last_over_time(up{k8s_cluster_name=%q}[1m])`, cluster), "now-2m") {
 					if s.last != 1 {
 						return false, fmt.Sprintf("job %s instance %s has up %v", s.labels["job"], s.labels["instance"], s.last)
 					}
