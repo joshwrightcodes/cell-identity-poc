@@ -276,10 +276,14 @@ The collector has these parts:
   Port 4318 (HTTP) serves the bundle store only. Its NetworkPolicy admits no other pod on 4318.
 - **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istiod` (15014), and `argocd` (8082 and 8084, and the central server on 8083 in `management`).
   Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file: `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
-  Each job copies `pod` and `namespace` into the labels of the data points. Each metrics port admits the collector pod only.
-- **Source attributes:** the transform processors delete every form of `k8s.cluster.name`, `platform.plane`, `platform.cell` and `deployment.environment.name`. OTLP data also loses `source_cluster` and `destination_cluster`, but scraped Envoy data keeps them, because the gateway checks them.
-  The resource processor then sets the row of its cluster. A pod cannot forge the attributes of another cluster in this collector, and the gateway sets them again.
+  Each job copies `pod` and `namespace` into the labels of the data points.
+  The metrics ports of the agent (8181), the principal (8000) and the SPIRE server (9988) admit the collector pod only.
+  The ports of the Argo CD controller (8082), the repo server (8084), istiod (15014) and Envoy (15090) admit the collector pod and the pods of their own namespace.
+- **Source attributes:** the transform processors delete every form of `k8s.cluster.name`, `platform.plane`, `platform.cell` and `deployment.environment.name`. OTLP data also loses `source_cluster` and `destination_cluster`, but scraped Envoy data keeps them.
+  The resource processor then sets the row of its cluster. A pod cannot forge the attributes of another cluster in this collector.
+  In `dev-cp` and the cells, the gateway sets the attributes and the two Istio labels again. `management` has no gateway, so its scraped Envoy labels get no second check.
 - **Exporter:** one `otlp_grpc` exporter with a timeout of 15 seconds, retries with no end, client keepalive every 30 seconds, 4 consumers, and requests of at most 3,000,000 bytes.
+  The gateway refuses a request of more than 1,024 resources, and the exporter then drops the batch. The batcher appends resources and counts bytes only, so the byte bound is 1,000 times the smallest resource of the cluster: 66,000 bytes in `management`, 129,000 in a cell. The batcher drops a single record above that bound and logs it.
   The queue is on the volume, so a restart or an outage does not lose data. Each of the three queues holds at most 384 MiB.
 - **Own metrics:** the collector sends them as OTLP to its own port 4317, so Prometheus holds `otelcol_exporter_queue_size` for every cluster.
 
@@ -306,24 +310,16 @@ The task deletes pods, because `kubectl rollout restart` writes an annotation th
 CELL=dev-cell-1 mise run cell:restart-mesh
 ```
 
-Read the queue size of a collector from Prometheus. The unit is bytes, and the size stays below 402,653,184 for each signal:
+Find the failing hop of a telemetry path with one task. It reads the collector and the uplink in the cluster itself, so the answer does not depend on the path. It reads the gateway counts and the newest sample from management.
+It prints one JSON object that names the first failing hop, and it exits with status 1 when a hop fails:
 
 ```sh
-kubectl --context kind-management -n observability-system exec lgtm-0 -c lgtm -- curl -s \
-  --data-urlencode 'query=otelcol_exporter_queue_size{k8s_cluster_name="dev-cell-1"}' http://127.0.0.1:9090/api/v1/query
+mise run obs:uplink-status dev-cell-1
 ```
 
-A growing queue means that the uplink, the relay or the gateway is down. `cell:verify` names the trace check that fails.
-
-The claim template of a StatefulSet is immutable, and `local-path` cannot grow a volume. To use a larger volume, change `storage` in `components/observability-system/collector.yaml`, then run these steps in the cluster.
-The steps delete the queue of that collector. The data in it is lost.
-
-```sh
-kubectl --context kind-dev-cell-1 -n observability-system delete statefulset otel-collector --cascade=orphan
-kubectl --context kind-dev-cell-1 -n observability-system delete pod otel-collector-0
-kubectl --context kind-dev-cell-1 -n observability-system delete pvc queue-otel-collector-0
-CELL=dev-cell-1 mise run cell:up
-```
+The queue of a collector is a file on its volume of 2 GiB. `QUEUE_MAX_BYTES` in `components/observability-system/render.sh` bounds each of the three queues at 384 MiB, and `local-path` enforces no size on the claim.
+The task reports the size of the queue volume as `queue_volume_kib`. The file shrinks at the next compaction.
+The metric `otelcol_exporter_queue_size` of a cell reaches Prometheus through the same uplink, so it shows the queue only while the path works.
 
 To add a sender of OTLP, add its namespace to `COLLECTOR_SENDERS` in the env file of the cluster, then run `cell:up`.
 
@@ -408,7 +404,7 @@ The budget is 37 minutes. This is 1.5 times the slowest run, 1,474 seconds on 20
 The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
 It prints the twelve slowest tests at the end.
-The slowest tests are the management CA rotation (240 seconds), the fresh-namespace dial tests (95 seconds) and the relay node port test (72 seconds).
+The slowest tests are the management CA rotation (409 seconds), the rogue telemetry test (245 seconds, 180 of them a fixed wait) and the fresh-namespace dial tests (97 seconds).
 The budgets do not cover `harness:up`.
 
 ## Side effects of gate:m2

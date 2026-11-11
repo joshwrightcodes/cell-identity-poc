@@ -37,10 +37,15 @@ namespace=observability-system
 K8S_COLLECTOR_IMAGE=docker.io/otel/opentelemetry-collector-k8s:0.164.0@sha256:8f7e5aaac0302f090164d5f9c14e4437d8037c5aaa2d025fc3ad74c1922602eb
 # The uplink listens here. Only the collector may reach the port.
 UPLINK_ENDPOINT=otel-uplink.observability-system.svc.cluster.local:4319
-# The exporter sends requests of at most this many bytes. The gateway refuses 3,670,016 bytes after
-# its attribute reset, which can add 400 bytes per resource. The receiver of the collector refuses
-# one message of 3 MiB or more, so one record never passes this bound alone.
-EXPORT_MAX_BYTES=3000000
+# The gateway refuses 3,670,016 bytes after its attribute reset, which can add 400 bytes for each
+# resource, so a request stays below EXPORT_BYTES_CAP. The gateway also refuses a request of more than
+# 1,024 resources, with ResourceExhausted and no RetryInfo, and the OTLP exporter then drops the whole
+# batch as a permanent error. The batcher appends the resources of merged requests and bounds bytes
+# only. So the byte bound is also the resource bound: every resource carries at least the attributes
+# that the resource processor sets, and a batch of at most RESOURCE_BUDGET times that size holds at most
+# RESOURCE_BUDGET resources. A record larger than the bound is dropped by the batcher, with a log line.
+EXPORT_BYTES_CAP=3000000
+RESOURCE_BUDGET=1000
 RECEIVE_MAX_MIB=3
 # The exporter has one queue for each signal, and the three queues share the volume of 2 GiB. Each
 # holds at most 384 MiB, so together they stay below 1.5 GiB. The rest is room for the file storage
@@ -197,17 +202,28 @@ EOF
   fi
 }
 
-# The attributes of this cluster, in the order of the source attribute table.
-resource_attributes() {
-  printf '      - key: k8s.cluster.name\n        value: %s\n        action: upsert\n' "$cluster"
-  printf '      - key: platform.plane\n        value: %s\n        action: upsert\n' "$plane"
-  if [[ "$plane" != management ]]; then
-    printf '      - key: deployment.environment.name\n        value: %s\n        action: upsert\n' "$POC_ENV"
-  fi
-  if [[ "$plane" == cell ]]; then
-    printf '      - key: platform.cell\n        value: %s\n        action: upsert\n' "$cluster"
-  fi
+# resource_pairs prints the attributes of this cluster, one "<key> <value>" line each, in the order of the
+# source attribute table.
+resource_pairs() {
+  echo "k8s.cluster.name $cluster"
+  echo "platform.plane $plane"
+  if [[ "$plane" != management ]]; then echo "deployment.environment.name $POC_ENV"; fi
+  if [[ "$plane" == cell ]]; then echo "platform.cell $cluster"; fi
 }
+resource_attributes() {
+  local k v
+  while read -r k v; do
+    printf '      - key: %s\n        value: %s\n        action: upsert\n' "$k" "$v"
+  done < <(resource_pairs)
+}
+
+# The smallest resource that leaves the collector: each attribute takes its key, its value and 8 bytes of
+# tags and lengths.
+min_resource=0
+while read -r k v; do min_resource=$((min_resource + ${#k} + ${#v} + 8)); done < <(resource_pairs)
+EXPORT_MAX_BYTES=$((RESOURCE_BUDGET * min_resource))
+((EXPORT_MAX_BYTES <= EXPORT_BYTES_CAP)) || EXPORT_MAX_BYTES=$EXPORT_BYTES_CAP
+EXPORT_MIN_BYTES=$((EXPORT_MAX_BYTES / 2))
 
 config="$(cat <<YAML
 extensions:
@@ -282,7 +298,7 @@ exporters:
       storage: file_storage
       batch:
         flush_timeout: 5s
-        min_size: 1000000
+        min_size: $EXPORT_MIN_BYTES
         max_size: $EXPORT_MAX_BYTES
         sizer: bytes
 service:

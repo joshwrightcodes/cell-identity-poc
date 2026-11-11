@@ -11,3 +11,31 @@ resources:
 patches:
   - path: argocd-cm.yaml
   - path: argocd-cmd-params-cm.yaml
+  # The upstream policies admit every namespace on the metrics ports, and policies add up. Only the
+  # collector of the cluster may scrape them (flow N15).
+  - target:
+      kind: NetworkPolicy
+      name: argocd-application-controller-network-policy
+    patch: |-
+      - op: replace
+        path: /spec/ingress/0/from
+        value:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: observability-system
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: otel-collector
+  - target:
+      kind: NetworkPolicy
+      name: argocd-repo-server-network-policy
+    patch: |-
+      - op: replace
+        path: /spec/ingress/1/from
+        value:
+          - namespaceSelector:
+              matchLabels:
+                kubernetes.io/metadata.name: observability-system
+            podSelector:
+              matchLabels:
+                app.kubernetes.io/name: otel-collector

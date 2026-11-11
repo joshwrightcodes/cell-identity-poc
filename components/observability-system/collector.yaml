@@ -9,19 +9,19 @@ metadata:
   name: otel-collector
 automountServiceAccountToken: false
 ---
-# The prometheus receiver lists pods to find its scrape targets, and the k8s_objects receiver
-# watches events. Both read only.
+# The prometheus receiver lists and watches pods to find its scrape targets, and the k8s_objects receiver
+# lists and watches events. Nothing reads namespaces or one object by name.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: otel-collector
 rules:
   - apiGroups: [""]
-    resources: [pods, namespaces, events]
-    verbs: [get, list, watch]
+    resources: [pods, events]
+    verbs: [list, watch]
   - apiGroups: [events.k8s.io]
     resources: [events]
-    verbs: [get, list, watch]
+    verbs: [list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -73,6 +73,11 @@ spec:
         - name: otel-collector
           image: "@COLLECTOR_IMAGE@"
           args: ["--config", "/etc/otelcol/config.yaml"]
+          # The Go runtime collects harder at 600 MiB, below the memory limit of 768Mi and above the
+          # limit of the memory_limiter processor (512 MiB).
+          env:
+            - name: GOMEMLIMIT
+              value: 600MiB
           ports:
             - name: otlp-grpc
               containerPort: 4317

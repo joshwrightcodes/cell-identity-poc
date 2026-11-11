@@ -124,6 +124,9 @@ func TestUplinkRender(t *testing.T) {
 			if tc.cluster == "dev-cp" {
 				wantPorts = []string{"4317", "8081", tc.port}
 			}
+			if got := eg[0].String(); got != "[map[podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]] 4317" {
+				t.Errorf("the first egress rule is %q, want the collector pod on 4317", got)
+			}
 			if !slices.Equal(ports, wantPorts) {
 				t.Errorf("egress ports %v, want %v", ports, wantPorts)
 			}

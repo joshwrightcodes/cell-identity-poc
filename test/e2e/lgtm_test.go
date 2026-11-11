@@ -455,8 +455,8 @@ func plaintextConn(t *testing.T, addr string) *grpc.ClientConn {
 // attribute spoofed at the resource, at the record and at the data point, in several forms. The stores
 // must return them with the values of management only. No series, stream or trace of management may
 // carry platform_cell, deployment_environment_name, or a cluster of a cell. The Envoy metrics that the
-// collector scrapes in management carry source_cluster=management, which Istio sets, so only another
-// value is a forgery.
+// collector scrapes in management carry source_cluster and destination_cluster, which Istio sets to
+// management, or to unknown for a peer with no metadata, so only another value is a forgery.
 func TestM3ManagementSignals(t *testing.T) {
 	marker := "m3mgmt" + randomHex(t, 4)
 	metric := "m3_spoof_" + marker
@@ -486,7 +486,8 @@ func TestM3ManagementSignals(t *testing.T) {
 		return true, ""
 	})
 	for _, q := range []string{
-		`{k8s_cluster_name="management", platform_cell!=""}`, `{k8s_cluster_name="management", source_cluster!="", source_cluster!="management"}`,
+		`{k8s_cluster_name="management", platform_cell!=""}`, `{k8s_cluster_name="management", source_cluster!="", source_cluster!="management", source_cluster!="unknown"}`,
+		`{k8s_cluster_name="management", destination_cluster!="", destination_cluster!="management", destination_cluster!="unknown"}`,
 		`{k8s_cluster_name="management", deployment_environment_name!=""}`, `{platform_cell=~".+", platform_plane="management"}`,
 		`{k8s_cluster_name=~"dev-cell-.+", platform_plane="management"}`,
 	} {
@@ -655,28 +656,52 @@ func sendSignals(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, 
 
 // sendSignalsErr is sendSignals, and it returns the first error of an export. It stops there.
 func sendSignalsErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) error {
-	now := time.Now()
+	for _, send := range []func(*grpc.ClientConn, *resourcepb.Resource, string, ...*commonpb.KeyValue) error{sendMetricErr, sendLogErr, sendSpanErr} {
+		if err := send(conn, res, marker, attrs...); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sendMetricErr exports one gauge named m3_spoof_<marker>.
+func sendMetricErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if _, err := collmetrics.NewMetricsServiceClient(conn).Export(ctx, &collmetrics.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
 		Resource: res,
 		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{
 			Name: "m3_spoof_" + marker, Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{{
-				Attributes: attrs, TimeUnixNano: uint64(now.UnixNano()), Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 42},
+				Attributes: attrs, TimeUnixNano: uint64(time.Now().UnixNano()), Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 42},
 			}}}},
 		}}}},
 	}}}); err != nil {
 		return fmt.Errorf("export the metric m3_spoof_%s: %w", marker, err)
 	}
+	return nil
+}
+
+// sendLogErr exports one log record whose body is "log <marker>".
+func sendLogErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	if _, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
 		Resource: res,
 		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
-			TimeUnixNano: uint64(now.UnixNano()), SeverityText: "INFO", Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log " + marker}},
+			TimeUnixNano: uint64(time.Now().UnixNano()), SeverityText: "INFO", Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "log " + marker}},
 			Attributes: attrs,
 		}}}},
 	}}}); err != nil {
 		return fmt.Errorf("export the log: %w", err)
 	}
+	return nil
+}
+
+// sendSpanErr exports one span named "span <marker>".
+func sendSpanErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	now := time.Now()
 	traceID, spanID := bytes.Repeat([]byte{0x3a}, 16), bytes.Repeat([]byte{0x5c}, 8)
 	copy(traceID, []byte(marker))
 	if _, err := colltrace.NewTraceServiceClient(conn).Export(ctx, &colltrace.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{{
@@ -698,7 +723,7 @@ func sendSignalsErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker stri
 func overwriteSeries(t *testing.T, sender string) map[string]float64 {
 	t.Helper()
 	out := map[string]float64{}
-	for _, s := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_attribute_overwrites_total{sender_cluster=%q,level="resource"}`, sender)) {
+	for _, s := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name="management",sender_cluster=%q,level="resource"}`, sender)) {
 		out[fmt.Sprint(s.labels)] = s.last
 	}
 	return out

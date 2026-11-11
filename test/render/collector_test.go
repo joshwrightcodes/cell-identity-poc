@@ -107,6 +107,9 @@ func TestCollectorRender(t *testing.T) {
 			if len(claims) != 1 || get[string](t, claims[0], "spec", "resources", "requests", "storage") != "2Gi" || get[string](t, claims[0], "metadata", "name") != "queue" {
 				t.Errorf("volume claims %v, want one claim queue of 2Gi", claims)
 			}
+			if env := envOf(t, ctr); env["GOMEMLIMIT"] != "600MiB" || get[string](t, ctr, "resources", "limits", "memory") != "768Mi" {
+				t.Errorf("GOMEMLIMIT %q and limit %v, want 600MiB below 768Mi", env["GOMEMLIMIT"], lookupOr(ctr, "resources", "limits", "memory"))
+			}
 			if get[string](t, ctr, "readinessProbe", "tcpSocket", "port") != "otlp-grpc" {
 				t.Errorf("readiness probe %v, want a TCP probe of 4317", ctr["readinessProbe"])
 			}
@@ -115,7 +118,7 @@ func TestCollectorRender(t *testing.T) {
 			}
 
 			role := objs["ClusterRole otel-collector"]
-			want := "[map[apiGroups:[] resources:[pods namespaces events] verbs:[get list watch]] map[apiGroups:[events.k8s.io] resources:[events] verbs:[get list watch]]]"
+			want := "[map[apiGroups:[] resources:[pods events] verbs:[list watch]] map[apiGroups:[events.k8s.io] resources:[events] verbs:[list watch]]]"
 			if got := fmt.Sprint(lookupOr(role, "rules")); got != want {
 				t.Errorf("ClusterRole rules %s, want %s", got, want)
 			}
@@ -178,14 +181,23 @@ func TestCollectorRender(t *testing.T) {
 				t.Errorf("three queues of %v bytes hold %v, over 1.5 GiB", q["queue_size"], total)
 			}
 			b := get[map[string]any](t, q, "batch")
-			// The gateway refuses 3,670,016 bytes after its reset, which adds at most 400 bytes for each of
-			// 1,024 resources. The collector refuses one message of 3 MiB, so a request holds the batch
-			// bound plus one record at most.
-			if b["sizer"] != "bytes" || get[float64](t, b, "max_size")+400*1024 >= 3670016 {
+			// The gateway refuses a request above 3,670,016 bytes after its reset, and a request of more than
+			// 1,024 resources, with ResourceExhausted and no RetryInfo. The exporter then drops the batch. The
+			// batcher appends resources and bounds bytes only, and every resource holds at least the attributes
+			// that the resource processor sets, so the byte bound must hold at most 1,024 such resources.
+			minResource := 0.0
+			for _, a := range get[[]any](t, conf, "processors", "resource", "attributes") {
+				minResource += float64(len(get[string](t, a, "key")) + len(get[string](t, a, "value")) + 8)
+			}
+			maxSize, minSize := get[float64](t, b, "max_size"), get[float64](t, b, "min_size")
+			if b["sizer"] != "bytes" || maxSize+400*1024 >= 3670016 {
 				t.Errorf("batch %v, want the bytes sizer and a bound that leaves the headroom of the gateway", b)
 			}
-			if get[float64](t, grpc, "max_recv_msg_size_mib")*1024*1024+get[float64](t, b, "max_size") >= 2*3670016 {
-				t.Error("a request could grow past twice the receive limit of the gateway")
+			if resources := maxSize / minResource; resources > 1024 {
+				t.Errorf("a batch of %v bytes can hold %.0f resources of %v bytes, over the gateway cap of 1,024", maxSize, resources, minResource)
+			}
+			if minSize <= 0 || minSize > maxSize {
+				t.Errorf("batch min_size %v, want above 0 and at most max_size %v, or the collector refuses the config", minSize, maxSize)
 			}
 			fs := get[map[string]any](t, conf, "extensions", "file_storage")
 			if get[bool](t, fs, "compaction", "on_start") != true || get[bool](t, fs, "compaction", "on_rebound") != true {
@@ -387,6 +399,36 @@ func TestCollectorPolicies(t *testing.T) {
 					t.Errorf("collector egress has a rule on %s (%s) is %v, want %v", port, job, has, want)
 				}
 			}
+			// Each scrape rule names its target pod and namespace, not a whole namespace.
+			peerOf := func(ports string) string {
+				for _, r := range out {
+					if strings.Join(r.ports, ",") == ports {
+						return r.peers
+					}
+				}
+				return ""
+			}
+			for ports, want := range map[string]string{
+				"9988":  "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:spire-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:spire-server]]]]",
+				"8181":  "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:argocd]] podSelector:map[matchLabels:map[app.kubernetes.io/name:argocd-agent]]]]",
+				"8000":  "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:central-view-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:argocd-agent-principal]]]]",
+				"15014": "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:istio-system]] podSelector:map[matchLabels:map[app:istiod]]]]",
+			} {
+				if got := peerOf(ports); got != "" && got != want {
+					t.Errorf("the collector egress on %s reaches %s, want %s", ports, got, want)
+				}
+			}
+			// The Envoy job keeps only the istio-proxy container on 15090.
+			for _, j := range get[[]any](t, collectorConfig(t, objs), "receivers", "prometheus", "config", "scrape_configs") {
+				if get[string](t, j, "job_name") == "envoy" && !strings.Contains(fmt.Sprint(get[[]any](t, j, "relabel_configs")[0]), "regex:istio-proxy;15090") {
+					t.Errorf("the envoy job keeps %v, want regex istio-proxy;15090", get[[]any](t, j, "relabel_configs")[0])
+				}
+			}
+			// The bundle store sends OTLP to the collector pod only.
+			store := clusterComponent(t, cl.name, "network-policy")["NetworkPolicy cell-system/bundle-store"]
+			if eg := peerRules(t, store, "egress"); len(eg) != 1 || eg[0].String() != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]] 4318" {
+				t.Errorf("the bundle store egress is %v, want the collector pod on 4318", eg)
+			}
 			if has := hasPorts("8083,8084"); has != (cl.name == "management") {
 				t.Errorf("the central argocd-server rule on 8083 is %v in %s", has, cl.name)
 			}
@@ -465,7 +507,9 @@ func TestIstiodNamesTheCluster(t *testing.T) {
 			}
 			var values struct {
 				Global    struct{ MultiCluster struct{ ClusterName string } }
-				Telemetry struct{ V2 struct{ Prometheus struct{ Enabled bool } } }
+				Telemetry struct {
+					V2 struct{ Prometheus struct{ Enabled bool } }
+				}
 			}
 			if err := yaml.Unmarshal([]byte(get[string](t, objs["ConfigMap istio-system/istio-sidecar-injector"], "data", "values")), &values); err != nil {
 				t.Fatal(err)
@@ -483,6 +527,38 @@ func TestIstiodNamesTheCluster(t *testing.T) {
 			mesh := get[string](t, objs["ConfigMap istio-system/istio"], "data", "mesh")
 			if !strings.Contains(mesh, "enablePrometheusMerge: false") {
 				t.Errorf("the mesh config does not set enablePrometheusMerge: false:\n%s", mesh)
+			}
+		})
+	}
+}
+
+// TestArgoCDMetricsPortsAdmitOnlyTheCollector checks, across every NetworkPolicy of the argocd component,
+// that each rule which names port 8082 (application controller) or 8084 (repo server) admits only the
+// collector pod. The upstream policies admit every namespace on these ports, and policies add up, so
+// the rule of the collector alone would leave them open.
+func TestArgoCDMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
+	collectorPeer := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]"
+	for _, cl := range collectorClusters {
+		t.Run(cl.name, func(t *testing.T) {
+			seen := map[string]bool{}
+			for _, o := range clusterComponent(t, cl.name, "argocd") {
+				if o["kind"] != "NetworkPolicy" {
+					continue
+				}
+				for _, r := range peerRules(t, o, "ingress") {
+					for _, p := range r.ports {
+						if p != "8082" && p != "8084" {
+							continue
+						}
+						seen[p] = true
+						if r.peers != collectorPeer {
+							t.Errorf("%s admits %s on %s, want only the collector", objName(o), r.peers, p)
+						}
+					}
+				}
+			}
+			if !seen["8082"] || !seen["8084"] {
+				t.Errorf("the argocd component has no rule for 8082 or 8084: %v", seen)
 			}
 		})
 	}

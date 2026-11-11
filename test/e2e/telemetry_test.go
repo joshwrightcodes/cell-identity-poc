@@ -18,12 +18,16 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	colllogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collmetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+	"google.golang.org/grpc"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 )
@@ -275,8 +279,9 @@ var collectorJobs = map[string][]string{
 }
 
 // TestM3MetricsEndpointsCollectorOnly checks that only the collector reaches a metrics endpoint. A
-// pod in a fresh namespace of each cluster times out on the agent (8181), istiod (15014), Envoy of
-// echo (15090) and the uplink (4319) in a cell, on the SPIRE server (9988) in management and dev-cp,
+// pod in a fresh namespace of each cluster times out on the application controller (8082) and the
+// repo server (8084) of argocd, and in a cell on the agent (8181), istiod (15014), Envoy of
+// echo (15090) and the uplink (4319), on the SPIRE server (9988) in management and dev-cp,
 // and on the principal (8000) in management. The collector scrapes each job, so up is 1.
 func TestM3MetricsEndpointsCollectorOnly(t *testing.T) {
 	type target struct {
@@ -291,6 +296,13 @@ func TestM3MetricsEndpointsCollectorOnly(t *testing.T) {
 			{"principal", viewNamespace, "app.kubernetes.io/name=" + principalName, 8000}},
 	}
 	targets["dev-cell-2"] = targets["dev-cell-1"]
+	// The application controller and the repo server of argocd, in every cluster. The upstream policies
+	// admitted every namespace on these ports.
+	for _, cluster := range telemetryClusters {
+		targets[cluster] = append(targets[cluster],
+			target{"application controller", "argocd", "app.kubernetes.io/name=argocd-application-controller", 8082},
+			target{"repo server", "argocd", "app.kubernetes.io/name=argocd-repo-server", 8084})
+	}
 	for cluster, list := range targets {
 		for _, tg := range list {
 			t.Run(cluster+" "+tg.name, func(t *testing.T) {
@@ -330,7 +342,7 @@ func TestM3MetricsEndpointsCollectorOnly(t *testing.T) {
 func overwriteCount(t *testing.T, sender, attribute string) map[string]float64 {
 	t.Helper()
 	out := map[string]float64{}
-	for _, s := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_attribute_overwrites_total{sender_cluster=%q,attribute=%q}`, sender, attribute)) {
+	for _, s := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name="management",sender_cluster=%q,attribute=%q}`, sender, attribute)) {
 		out[fmt.Sprint(s.labels)] = s.last
 	}
 	return out
@@ -434,8 +446,9 @@ func startRelayForwarder(t *testing.T, cell, ns, upstream string) string {
 	return name
 }
 
-// rogueTokenInRogue makes a pod-bound token for ServiceAccount otel-uplink in rogue and returns
-// it with its key ID. The key of rogue is not one of the keys that dev-cell-1 publishes.
+// rogueTokenInRogue makes a pod-bound token for ServiceAccount otel-uplink of namespace ns in rogue and
+// returns it with its key ID. Called with observability-system, it is the token that an attacker in
+// rogue would make for the real uplink subject. The key of rogue is not one of the keys that dev-cell-1 publishes.
 func rogueTokenInRogue(t *testing.T, ns string) (token, kid string) {
 	t.Helper()
 	needProbeImage(t)
@@ -475,7 +488,7 @@ func rogueTokenInRogue(t *testing.T, ns string) (token, kid string) {
 // time out within 5 seconds.
 //
 // Identity, from an admitted address: a pod in dev-cell-1 holds a token that rogue made for the
-// subject of the uplink, and the SPIRE server of dev-cp refuses it with unknown_kid, so the pod gets
+// real uplink subject (observability-system/otel-uplink), and the SPIRE server of dev-cp refuses it with unknown_kid, so the pod gets
 // no SVID. Then a client presents a certificate for cell/dev-cell-1/otel from a CA that nobody trusts
 // through a relay in dev-cell-1 and the real relay path on 30444, and sends OTLP with a rogue marker.
 // In the same window, a probe sends a cell marker through the collector and the uplink of dev-cell-1.
@@ -498,7 +511,7 @@ func TestM3RogueTelemetryFails(t *testing.T) {
 	const testNS = "m3-rogue-telemetry"
 	t.Run("identity", func(t *testing.T) {
 		needAttestprobeImage(t)
-		token, kid := rogueTokenInRogue(t, testNS)
+		token, kid := rogueTokenInRogue(t, obsNamespace)
 		// The test data holds the namespace, the ServiceAccount and the token rights of the subject.
 		cleanup := func() {
 			if _, err := kubectl(t, rejectCell, "", "delete", "-f", "testdata/rogue-telemetry.yaml", "--ignore-not-found", "--wait=true", "--timeout=180s"); err != nil {
@@ -544,8 +557,11 @@ func TestM3RogueTelemetryFails(t *testing.T) {
 		if err == nil {
 			t.Error("the gateway accepted an export from a certificate of an untrusted CA, want a refusal")
 		}
-		if err := sendSignalsErr(conn, rogueRes, rogueMarker); err == nil {
-			t.Error("the gateway accepted signals from a certificate of an untrusted CA, want a refusal")
+		// Each signal goes on its own, so that each absence check below has a send behind it.
+		for name, send := range map[string]func(*grpc.ClientConn, *resourcepb.Resource, string, ...*commonpb.KeyValue) error{"metric": sendMetricErr, "log": sendLogErr, "span": sendSpanErr} {
+			if err := send(conn, rogueRes, rogueMarker); err == nil {
+				t.Errorf("the gateway accepted a %s from a certificate of an untrusted CA, want a refusal", name)
+			}
 		}
 
 		// The cell sender: a probe sends through the collector, the real uplink, the relay and the gateway.
@@ -593,4 +609,97 @@ func TestM3RogueTelemetryFails(t *testing.T) {
 			t.Errorf("Tempo holds %d traces with the rogue marker", n)
 		}
 	})
+}
+
+// lokiCount returns how many log lines in the last 30 minutes of the cluster contain the marker, from a
+// LogQL count, so the answer is not cut at the line limit of a log query.
+func lokiCount(t *testing.T, cluster, marker string) int {
+	t.Helper()
+	q := fmt.Sprintf(`sum(count_over_time({k8s_cluster_name=%q} |= %q [30m]))`, cluster, marker)
+	body, err := json.Marshal(map[string]any{"queries": []any{map[string]any{"refId": "A", "datasource": map[string]string{"uid": "loki", "type": "loki"},
+		"expr": q, "queryType": "range", "step": "60s"}}, "from": "now-30m", "to": "now"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, resp := grafanaCall(t, "admin:"+grafanaPassword(t), "POST", "/api/ds/query", string(body))
+	if code != 200 {
+		t.Fatalf("loki count %q: HTTP %d: %s", q, code, resp)
+	}
+	best := 0.0
+	for _, f := range framesOf(t, resp) {
+		if len(f.Data.Values) < 2 {
+			continue
+		}
+		var vals []*float64
+		if err := json.Unmarshal(mustJSON(t, f.Data.Values[1]), &vals); err != nil {
+			t.Fatalf("decode the values of a Loki count: %v", err)
+		}
+		for _, v := range vals {
+			if v != nil {
+				best = max(best, *v)
+			}
+		}
+	}
+	return int(best)
+}
+
+// TestM3UplinkBatchesStayWithinGatewayLimits sends 1,500 requests of one log record each into the
+// collector of dev-cell-1 within a second. The exporter batch merges requests for up to 5 seconds, and it
+// appends their resources and does not join them. A batch of more than 1,024 resources gets
+// ResourceExhausted from the gateway with no RetryInfo, which the OTLP exporter treats as permanent, so
+// it drops the batch. The test requires every record in Loki, and no refusal for request_too_large.
+func TestM3UplinkBatchesStayWithinGatewayLimits(t *testing.T) {
+	const cell, total, workers = "dev-cell-1", 1500, 16
+	marker := "m3batch" + randomHex(t, 4)
+	denied := func() float64 {
+		sum := 0.0
+		for _, x := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_exports_denied_total{k8s_cluster_name="management",reason="request_too_large",sender_cluster=%q}`, cell)) {
+			sum += x.last
+		}
+		return sum
+	}
+	deniedBefore := denied()
+	conn := plaintextConn(t, portForward(t, cell, obsNamespace, "svc/otel-collector", 4317))
+	res := &resourcepb.Resource{Attributes: []*commonpb.KeyValue{strAttr("service.name", "m3-batch")}}
+	var wg sync.WaitGroup
+	errs := make(chan error, total)
+	next := make(chan int, total)
+	for i := range total {
+		next <- i
+	}
+	close(next)
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				_, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+					Resource: res,
+					ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+						TimeUnixNano: uint64(time.Now().UnixNano()), SeverityText: "INFO",
+						Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: fmt.Sprintf("%s record %d", marker, i)}},
+					}}}},
+				}}})
+				cancel()
+				if err != nil {
+					errs <- err
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("export to the collector of %s: %v", cell, err)
+	}
+	waitFor(t, fmt.Sprintf("%d records with the marker in Loki", total), signalWait, func() (bool, string) {
+		n := lokiCount(t, cell, marker)
+		return n == total, fmt.Sprintf("%d records", n)
+	})
+	// The gateway exports its counters every 10 seconds.
+	time.Sleep(20 * time.Second)
+	if after := denied(); after != deniedBefore {
+		t.Errorf("the gateway refused %v requests of %s as too large during the test", after-deniedBefore, cell)
+	}
 }

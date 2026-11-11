@@ -615,7 +615,7 @@ check_traces_in_store() {
     for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
     ((SECONDS < end)) || {
       echo "Tempo in management holds no trace of echo.apps-demo with k8s.cluster.name $name. The last answer: HTTP ${code:-none}."
-      echo "The collector, the uplink, the relay or the gateway can be down. Read the state: mise run harness:verify"
+      echo "The collector, the uplink, the relay or the gateway can be down. Read each hop: mise run obs:uplink-status $name"
       return 1
     }
     sleep 5
@@ -673,7 +673,7 @@ check_gateway_store_path() {
   local pw out code n
   grafana_login_ok || return 1
   pw="$("$ROOT/scripts/obs-password.sh")"
-  out="$(lgtm_curl "admin:$pw" GET '/api/datasources/proxy/uid/prometheus/api/v1/query?query=sum(increase(cellproxy_gateway_upstream_failures_total%5B5m%5D))' 2>&1)" \
+  out="$(lgtm_curl "admin:$pw" GET '/api/datasources/proxy/uid/prometheus/api/v1/query?query=sum(increase(cellproxy_gateway_upstream_failures_total%7Bk8s_cluster_name%3D%22management%22%7D%5B5m%5D))' 2>&1)" \
     || { echo "could not query Prometheus: $out"; return 1; }
   code="$(tail -n 1 <<<"$out")"
   [[ "$code" == 200 ]] || { echo "the Prometheus query answers HTTP '$code'"; return 1; }
@@ -714,7 +714,9 @@ check_collector_workload() {
   fi
   pvc="$(k -n observability-system get pvc queue-otel-collector-0 -o json 2>&1)" || { echo "no PVC queue-otel-collector-0: $pvc"; return 1; }
   phase="$(jq -r .status.phase <<<"$pvc")" size="$(jq -r '.status.capacity.storage // ""' <<<"$pvc")"
-  [[ "$phase" == Bound && "$size" == 2Gi ]] || { echo "PVC queue-otel-collector-0 is $phase with capacity '$size', want Bound and 2Gi. To resize it, see the collector commands in README.md"; return 1; }
+  want_size="$(yq -N 'select(.kind == "StatefulSet" and .metadata.name == "otel-collector") | .spec.volumeClaimTemplates[0].spec.resources.requests.storage' "$BUNDLES/observability-system/manifests.yaml")"
+  [[ -n "$want_size" && "$want_size" != null ]] || { echo "the bundle observability-system holds no claim template of otel-collector. Run: CELL=$CELL_NAME mise run cell:hydrate"; return 1; }
+  [[ "$phase" == Bound && "$size" == "$want_size" ]] || { echo "PVC queue-otel-collector-0 is $phase with capacity '$size', and the bundle asks for $want_size"; return 1; }
 }
 
 # The uplink copies the node address of its upstream cluster into the cell-proxy argument and its
@@ -787,7 +789,7 @@ if [[ -n "${COLLECTOR_STORE:-}" ]]; then
   check "The gateway forwarded to the store with no failure in the last 5 minutes" check_gateway_store_path
   check "/data of lgtm-0 holds less than 8 GiB" check_lgtm_disk
 fi
-check "The collector is a StatefulSet with a Ready replica and a 2Gi queue volume, and no Deployment of the old bundle remains" check_collector_workload
+check "The collector is a StatefulSet with a Ready replica and the queue volume of the bundle, and no Deployment of the old bundle remains" check_collector_workload
 check "Tempo in management holds a trace of echo from ${COLLECTOR_CLUSTER:-$CELL_NAME}, so its collector and uplink reach the store" check_traces_received
 
 if has_harness cell-identity; then

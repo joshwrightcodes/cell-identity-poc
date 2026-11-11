@@ -81,7 +81,7 @@ if [[ " $* " == *" get applications -o json "* ]]; then
   # STUB_NO_CHILDREN leaves only the root Application in argocd.
   want='. == "root" or . != "root"'
   [[ -z "${STUB_NO_CHILDREN:-}" ]] || want='. == "root"'
-  cut -d= -f1 "$POC_BUILD_ROOT/management/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: ., namespace: \"x\"},
+  cut -d= -f1 "$POC_BUILD_ROOT/${CELL:-management}/published.env" | jq -Rn "{items: [inputs | select($want) | {metadata: {name: ., namespace: \"x\"},
     status: {sync: {status: \"Synced\", revision: \"sha256:1\"}, health: {status: \"Healthy\"}}}]}"
 fi
 exit 0
@@ -244,13 +244,27 @@ func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
 			t.Fatalf("%s: hydrate with HYDRATE_ONLY=late calls:\n%s\nwant otel-uplink only", cell, calls)
 		}
 	}
-	up, err := os.ReadFile(filepath.Join(root, "scripts", "up.sh"))
-	if err != nil {
-		t.Fatal(err)
+	// Run up.sh for a cell. The first hydrate must skip the uplink, and the uplink must render once, after
+	// the bundles are published and before the harness applies it.
+	_, calls := runLinkScript(t, root, logFile, "up.sh", "CELL=dev-cell-1")
+	lines := strings.Split(strings.TrimSpace(calls), "\n")
+	index := func(prefix string, from int) int {
+		for i := from; i < len(lines); i++ {
+			if strings.Contains(lines[i], prefix) {
+				return i
+			}
+		}
+		return -1
 	}
-	text := string(up)
-	first, late, apply := strings.Index(text, "CELL_UP_SKIP_LATE=1"), strings.Index(text, "HYDRATE_ONLY=late"), strings.Index(text, `harness_apply "${entry%%:*}"`)
-	if first < 0 || late < first || apply < late {
-		t.Fatalf("up.sh must skip the late components at the first hydrate, render them (%d), and then apply the harness components (%d)", late, apply)
+	publish := index("publish", 0)
+	render := index("render otel-uplink", 0)
+	apply := -1
+	for i, l := range lines {
+		if strings.Contains(l, "apply --server-side") && strings.Contains(l, "bundles/otel-uplink/manifests.yaml") {
+			apply = i
+		}
+	}
+	if n := strings.Count(calls, "render otel-uplink"); n != 1 || publish < 0 || render < publish || apply < render {
+		t.Fatalf("up.sh calls:\n%s\nwant one render of otel-uplink, after publish (%d) and before its apply (render %d, apply %d)", calls, publish, render, apply)
 	}
 }

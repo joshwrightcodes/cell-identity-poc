@@ -1275,8 +1275,9 @@ other command ran in the image, and no config for the check reached a network.
 
 Rows 3 and 4 of the M3 verify table (2026-11-11):
 
-- Row 3 passes. Each metrics port of the agent, the principal, istiod, Envoy and the SPIRE server
-  admits the collector pod only. `TestM3MetricsEndpointsCollectorOnly` shows that a pod of a fresh
+- Row 3 passes. The metrics ports of the agent, the principal and the SPIRE server admit the collector pod
+  only. The ports of the Argo CD controller, the repo server, istiod and Envoy also admit the pods of
+  their own namespace. `TestM3MetricsEndpointsCollectorOnly` shows that a pod of a fresh
   namespace times out on each port, and that every scrape job of every cluster has `up` equal to 1.
 - Row 4 passes. `istio_requests_total` and `istio_request_duration_milliseconds_bucket` reach
   Prometheus with their names and labels, with `source_cluster` and `destination_cluster` equal to the

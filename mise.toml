@@ -105,6 +105,11 @@ description = "Rotate the Grafana admin password of management through the Grafa
 env = { CELL = "management" }
 run = "scripts/obs-rotate-password.sh"
 
+[tasks."obs:uplink-status"]
+description = "Report each hop of the telemetry path of one cluster: its collector queue and failures, the uplink, the gateway counts for that sender, and the newest sample in the store. Prints one JSON object that names the first failing hop"
+usage = 'arg "<cluster>"'
+run = 'scripts/uplink-status.sh ${usage_cluster?}'
+
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
 run = "scripts/down.sh"
