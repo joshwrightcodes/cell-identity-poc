@@ -454,7 +454,9 @@ func plaintextConn(t *testing.T, addr string) *grpc.ClientConn {
 // metrics yet. So the test sends a gauge, a log and a span through the collector with every source
 // attribute spoofed at the resource, at the record and at the data point, in several forms. The stores
 // must return them with the values of management only. No series, stream or trace of management may
-// carry platform_cell, deployment_environment_name, source_cluster, or a cluster of a cell.
+// carry platform_cell, deployment_environment_name, or a cluster of a cell. The Envoy metrics that the
+// collector scrapes in management carry source_cluster=management, which Istio sets, so only another
+// value is a forgery.
 func TestM3ManagementSignals(t *testing.T) {
 	marker := "m3mgmt" + randomHex(t, 4)
 	metric := "m3_spoof_" + marker
@@ -484,7 +486,7 @@ func TestM3ManagementSignals(t *testing.T) {
 		return true, ""
 	})
 	for _, q := range []string{
-		`{k8s_cluster_name="management", platform_cell!=""}`, `{k8s_cluster_name="management", source_cluster!=""}`,
+		`{k8s_cluster_name="management", platform_cell!=""}`, `{k8s_cluster_name="management", source_cluster!="", source_cluster!="management"}`,
 		`{k8s_cluster_name="management", deployment_environment_name!=""}`, `{platform_cell=~".+", platform_plane="management"}`,
 		`{k8s_cluster_name=~"dev-cell-.+", platform_plane="management"}`,
 	} {

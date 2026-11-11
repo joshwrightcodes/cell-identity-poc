@@ -404,8 +404,8 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 25 minutes. This is 1.5 times the slowest run, 991 seconds on 2026-11-11, rounded up to the next minute.
-The tests of the telemetry store add about two minutes. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
+The budget is 37 minutes. This is 1.5 times the slowest run, 1,474 seconds on 2026-11-12, rounded up to the next minute.
+The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
 It prints the twelve slowest tests at the end.
 The slowest tests are the management CA rotation (240 seconds), the fresh-namespace dial tests (95 seconds) and the relay node port test (72 seconds).
