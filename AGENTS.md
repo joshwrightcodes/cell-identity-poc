@@ -20,6 +20,7 @@
 | Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |
 | Check the cell | `mise run cell:verify` |
 | Restart `celld` in a cell, or the SPIRE server in `dev-cp` or `management` | `CELL=dev-cp mise run cell:restart` |
+| Start the sidecars of a cluster again, so each has the cell name as its cluster ID (see README "Collectors and uplinks") | `CELL=dev-cell-1 mise run cell:restart-mesh` |
 | Run the link phase of `management`: the central Argo CD view (see README "Central Argo CD view") | `mise run cell:link` |
 | Central read-only Argo CD UI on 127.0.0.1:8090 | `mise run view:ui` |
 | New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |

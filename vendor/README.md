@@ -1252,3 +1252,33 @@ processor `resource` is not in the core image, and the render needs it to set `k
 `prometheusreceiver`, `k8seventsreceiver`, `k8sobjectsreceiver`, `filestorage` and `otlpexporter`.
 This settles row 10 of the M3 verify table for the component list, not for the image contents. The
 review did not inspect the image.
+
+#### Use in every cluster (2026-11-11)
+
+Task 10 runs this image as the collector of every cluster. The manifest of components was read before
+the image ran, and the image then ran in `management` for several hours. Then the review ran the image with
+`otelcol-k8s components` and `otelcol-k8s validate --config` on a copy of each rendered config. No
+other command ran in the image, and no config for the check reached a network.
+
+- `components` lists the receivers `otlp`, `prometheus` and `k8s_objects`, the processors
+  `memory_limiter`, `resource` and `transform`, the exporter `otlp_grpc`, and the extension
+  `file_storage`. The names differ from the plan: `k8s_objects` is not `k8sobjects`, and the exporter
+  is `otlp_grpc` (the name `otlp` is an alias). All modules show contrib v0.164.1 on core 0.164.0.
+- `validate` accepts the rendered config of `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. It
+  also refuses an unknown value (`sizer: bogus`), so the check does decode the queue and batch keys.
+- The pod ran with a persistent queue, compaction at start, the bytes sizer for the queue and the
+  batch, the Prometheus scrape jobs, and the own metrics over OTLP. The review read the log of one
+  pod and found no call to an address outside the cluster. The config holds no such address.
+- Verify row 10 passes: the distribution holds the `prometheus` and `k8s_objects` receivers and the
+  `file_storage` extension. The fallback to contrib is not needed.
+- The review did not inspect the layers or the binary of the image.
+
+Rows 3 and 4 of the M3 verify table (2026-11-11):
+
+- Row 3 passes. Each metrics port of the agent, the principal, istiod, Envoy and the SPIRE server
+  admits the collector pod only. `TestM3MetricsEndpointsCollectorOnly` shows that a pod of a fresh
+  namespace times out on each port, and that every scrape job of every cluster has `up` equal to 1.
+- Row 4 passes. `istio_requests_total` and `istio_request_duration_milliseconds_bucket` reach
+  Prometheus with their names and labels, with `source_cluster` and `destination_cluster` equal to the
+  cell. `TestM3IstioMetricsSurviveOTLP` shows this. The value `telemetry.v2.prometheus.enabled: false`
+  had turned the Envoy metrics off, so the cell showed no Istio metric at all before this task.

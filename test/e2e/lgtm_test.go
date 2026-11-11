@@ -94,6 +94,13 @@ func grafanaCall(t *testing.T, creds, method, path, body string) (int, []byte) {
 // and Tempo queries the last 30 minutes. The call fails the test on any status but 200.
 func grafanaQuery(t *testing.T, datasource, query string) []byte {
 	t.Helper()
+	return grafanaQueryFrom(t, datasource, query, "")
+}
+
+// grafanaQueryFrom is grafanaQuery with a start time of Grafana syntax, for example now-15m. An empty
+// from keeps the default of the data source.
+func grafanaQueryFrom(t *testing.T, datasource, query, fromOverride string) []byte {
+	t.Helper()
 	q := map[string]any{"refId": "A", "datasource": map[string]string{"uid": datasource, "type": datasource}}
 	from := "now-1h"
 	switch datasource {
@@ -106,6 +113,9 @@ func grafanaQuery(t *testing.T, datasource, query string) []byte {
 		from = "now-30m"
 	default:
 		t.Fatalf("grafanaQuery: unknown data source %q", datasource)
+	}
+	if fromOverride != "" {
+		from = fromOverride
 	}
 	body, err := json.Marshal(map[string]any{"queries": []any{q}, "from": from, "to": "now"})
 	if err != nil {
@@ -186,8 +196,14 @@ type lokiLine struct {
 // lokiLines runs a LogQL query over the last hour and returns its lines.
 func lokiLines(t *testing.T, query string) []lokiLine {
 	t.Helper()
+	return lokiLinesFrom(t, query, "")
+}
+
+// lokiLinesFrom is lokiLines with a start time of Grafana syntax, for example now-15m.
+func lokiLinesFrom(t *testing.T, query, from string) []lokiLine {
+	t.Helper()
 	var out []lokiLine
-	for _, f := range framesOf(t, grafanaQuery(t, "loki", query)) {
+	for _, f := range framesOf(t, grafanaQueryFrom(t, "loki", query, from)) {
 		li, ll := -1, -1
 		for i, fld := range f.Schema.Fields {
 			switch fld.Name {
@@ -243,7 +259,13 @@ func tempoTraces(t *testing.T, query string) int {
 // readyPod returns the name and UID of the Ready pod with the app label in a namespace of management.
 func readyPod(t *testing.T, ns, app string) (name, uid string) {
 	t.Helper()
-	out, err := kubectl(t, mgmtCluster, "", "-n", ns, "get", "pods", "-l", "app.kubernetes.io/name="+app, "-o", "json")
+	return readyPodIn(t, mgmtCluster, ns, app)
+}
+
+// readyPodIn returns the name and UID of the Ready pod with the app label in a namespace of a cluster.
+func readyPodIn(t *testing.T, cluster, ns, app string) (name, uid string) {
+	t.Helper()
+	out, err := kubectl(t, cluster, "", "-n", ns, "get", "pods", "-l", "app.kubernetes.io/name="+app, "-o", "json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +290,7 @@ func readyPod(t *testing.T, ns, app string) (name, uid string) {
 			}
 		}
 	}
-	t.Fatalf("no Ready pod with the label app.kubernetes.io/name=%s in %s/%s", app, mgmtCluster, ns)
+	t.Fatalf("no Ready pod with the label app.kubernetes.io/name=%s in %s/%s", app, cluster, ns)
 	return "", ""
 }
 
@@ -405,10 +427,15 @@ func TestM3LgtmHardened(t *testing.T) {
 // collector listens in plaintext, as every workload of management reaches it.
 func collectorConn(t *testing.T) *grpc.ClientConn {
 	t.Helper()
-	addr := portForward(t, mgmtCluster, obsNamespace, "svc/otel-collector", 4317)
+	return plaintextConn(t, portForward(t, mgmtCluster, obsNamespace, "svc/otel-collector", 4317))
+}
+
+// plaintextConn dials a plaintext gRPC address, for example a port-forward to a collector.
+func plaintextConn(t *testing.T, addr string) *grpc.ClientConn {
+	t.Helper()
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		t.Fatalf("dial the collector at %s: %v", addr, err)
+		t.Fatalf("dial %s: %v", addr, err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return conn
@@ -511,6 +538,13 @@ func TestM3ManagementSignals(t *testing.T) {
 // management and the exact ID of the gateway.
 func gatewayConn(t *testing.T, cert tls.Certificate) *grpc.ClientConn {
 	t.Helper()
+	return dialTLS(t, portForward(t, mgmtCluster, obsNamespace, gatewayService, 8444), gatewayTLS(t, cert))
+}
+
+// gatewayTLS returns the client TLS config for the gateway of management: the sender certificate, the
+// roots of management and the exact ID of the gateway.
+func gatewayTLS(t *testing.T, cert tls.Certificate) *tls.Config {
+	t.Helper()
 	roots := x509.NewCertPool()
 	for _, c := range bundleRoots(t, mgmtCluster) {
 		roots.AddCert(c)
@@ -541,7 +575,17 @@ func gatewayConn(t *testing.T, cert tls.Certificate) *grpc.ClientConn {
 			return nil
 		},
 	}
-	addr := portForward(t, mgmtCluster, obsNamespace, gatewayService, 8444)
+	return cfg
+}
+
+// gatewayConnTo is gatewayConn for a gateway that answers at addr, for example through a relay.
+func gatewayConnTo(t *testing.T, addr string, cert tls.Certificate) *grpc.ClientConn {
+	t.Helper()
+	return dialTLS(t, addr, gatewayTLS(t, cert))
+}
+
+func dialTLS(t *testing.T, addr string, cfg *tls.Config) *grpc.ClientConn {
+	t.Helper()
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(credentials.NewTLS(cfg)))
 	if err != nil {
 		t.Fatalf("dial the gateway at %s: %v", addr, err)
@@ -595,10 +639,26 @@ func sendMetric(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, n
 // m3_spoof_<marker>.
 func sendSignals(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) {
 	t.Helper()
+	if err := sendSignalsErr(conn, res, marker, attrs...); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sendSignalsErr is sendSignals, and it returns the first error of an export. It stops there.
+func sendSignalsErr(conn *grpc.ClientConn, res *resourcepb.Resource, marker string, attrs ...*commonpb.KeyValue) error {
 	now := time.Now()
-	sendMetric(t, conn, res, "m3_spoof_"+marker, now, attrs...)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	if _, err := collmetrics.NewMetricsServiceClient(conn).Export(ctx, &collmetrics.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{{
+		Resource: res,
+		ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{{
+			Name: "m3_spoof_" + marker, Data: &metricspb.Metric_Gauge{Gauge: &metricspb.Gauge{DataPoints: []*metricspb.NumberDataPoint{{
+				Attributes: attrs, TimeUnixNano: uint64(now.UnixNano()), Value: &metricspb.NumberDataPoint_AsDouble{AsDouble: 42},
+			}}}},
+		}}}},
+	}}}); err != nil {
+		return fmt.Errorf("export the metric m3_spoof_%s: %w", marker, err)
+	}
 	if _, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
 		Resource: res,
 		ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
@@ -606,7 +666,7 @@ func sendSignals(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, 
 			Attributes: attrs,
 		}}}},
 	}}}); err != nil {
-		t.Fatalf("export the log: %v", err)
+		return fmt.Errorf("export the log: %w", err)
 	}
 	traceID, spanID := bytes.Repeat([]byte{0x3a}, 16), bytes.Repeat([]byte{0x5c}, 8)
 	copy(traceID, []byte(marker))
@@ -618,8 +678,9 @@ func sendSignals(t *testing.T, conn *grpc.ClientConn, res *resourcepb.Resource, 
 			Attributes: attrs,
 		}}}},
 	}}}); err != nil {
-		t.Fatalf("export the span: %v", err)
+		return fmt.Errorf("export the span: %w", err)
 	}
+	return nil
 }
 
 // overwriteSeries reads each series of the resource-level overwrite counter of one sender cluster
@@ -918,6 +979,10 @@ func TestM3WorkloadAPIOwnSVIDOnly(t *testing.T) {
 			t.Errorf("cell-proxy whoami in %s/%s prints %q, want only %s", tc.ns, tc.pod, out, tc.want)
 		}
 	}
+	// The uplink of each cluster gets only its own otel ID too.
+	for _, cluster := range []string{envCluster, "dev-cell-1", "dev-cell-2"} {
+		t.Run("uplink "+cluster, func(t *testing.T) { uplinkOwnSVID(t, cluster) })
+	}
 }
 
 // TestM3GrafanaPasswordRotates runs mise run obs:rotate-password. Afterwards the old password gets
@@ -1009,18 +1074,25 @@ func TestM3TelemetryNodePortAdmission(t *testing.T) {
 	}
 }
 
-// TestM3CollectorIngressLimited checks that a pod in a fresh namespace of management cannot reach the
-// collector. Only the named senders of management may, so no other pod can send forged signals.
+// TestM3CollectorIngressLimited checks that a pod in a fresh namespace of each cluster cannot reach the
+// collector on 4317 or 4318. Only the named senders of the cluster may, so no other pod can send forged
+// signals.
 func TestM3CollectorIngressLimited(t *testing.T) {
 	needProbeImage(t)
-	pod, _ := readyPod(t, obsNamespace, "otel-collector")
-	ip := mgmtPodIP(t, obsNamespace, pod)
-	for _, port := range []int{4317, 4318} {
-		t.Run(strconv.Itoa(port), func(t *testing.T) {
-			t.Parallel()
-			if err := probeFromFreshNamespace(t, mgmtCluster, ip, port, 3*time.Second); err != nil {
-				t.Errorf("a pod in a fresh namespace reaches the collector on %d: %v", port, err)
-			}
-		})
+	for _, cluster := range telemetryClusters {
+		pod, _ := readyPodIn(t, cluster, obsNamespace, "otel-collector")
+		out, err := kubectl(t, cluster, "", "-n", obsNamespace, "get", "pod", pod, "-o", "jsonpath={.status.podIP}")
+		if err != nil || net.ParseIP(strings.TrimSpace(out)) == nil {
+			t.Fatalf("pod address of %s/%s in %s: %q, %v", obsNamespace, pod, cluster, out, err)
+		}
+		ip := strings.TrimSpace(out)
+		for _, port := range []int{4317, 4318} {
+			t.Run(cluster+" "+strconv.Itoa(port), func(t *testing.T) {
+				t.Parallel()
+				if err := probeFromFreshNamespace(t, cluster, ip, port, 3*time.Second); err != nil {
+					t.Errorf("a pod in a fresh namespace of %s reaches the collector on %d: %v", cluster, port, err)
+				}
+			})
+		}
 	}
 }

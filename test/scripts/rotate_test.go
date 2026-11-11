@@ -82,6 +82,12 @@ case " $* " in
   *" delete pods "*) echo deleted ;;
   *" get pods -l app.kubernetes.io/name=spire-server -o json "*)
     echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=otel-uplink -o name "*) echo deployment.apps/otel-uplink ;;
+  *" get deployment.apps/otel-uplink -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"otel-uplink"}}}}' ;;
+  *" get pods -l app.kubernetes.io/name=otel-uplink -o jsonpath="*) echo old-uid ;;
+  *" get pods -l app.kubernetes.io/name=otel-uplink -o json "*)
+    echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+  *" rollout status "*) echo "rolled out" ;;
   *" get "*) echo found ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
@@ -115,6 +121,14 @@ func runRotate(t *testing.T, env ...string) rotateResult {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// dev-cp runs the harness component otel-uplink, and cell:restart restarts its Deployment too.
+	uplink := filepath.Join(dir, "build", "dev-cp", "bundles", "otel-uplink")
+	if err := os.MkdirAll(uplink, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(uplink, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: otel-uplink\n  namespace: observability-system\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(script)
 	cmd.Env = append([]string{
 		"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"),
@@ -122,6 +136,7 @@ func runRotate(t *testing.T, env ...string) rotateResult {
 		"STUB_DIR=" + dir,
 		"STUB_PKIGEN=" + pkigen(t),
 		"CELL=dev-cp",
+		"POC_BUILD_ROOT=" + filepath.Join(dir, "build"),
 		"POC_ENVRC_LOCAL=" + filepath.Join(dir, "no-envrc-local"),
 		// The read command prints the root bundle for the one remote key that the test expects.
 		`POC_SECRET_READ_CMD=[[ "$1" == vault/root-ca ]] && cat "` + rootFile + `"`,

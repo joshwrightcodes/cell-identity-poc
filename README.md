@@ -191,7 +191,7 @@ The agent reads the live objects of the bundle kinds for the view.
 An admission policy denies every other Secret in `argocd`, and a second policy admits only Applications of the project `cell`.
 The agent can list and watch these Secrets, because it does not start without that access, but it cannot get one, and it cannot create, change or delete an Application or a Secret.
 The agent in autonomous mode never sends a Secret to the central view, and the resource proxy refuses a Secret read.
-The network policies of `argocd` leave the agent pod out. The agent has its own policy: no ingress, and egress only to the relay, the SPIRE server, the API server, Redis and the collector.
+The network policies of `argocd` leave the agent pod out. The agent has its own policy: ingress only from the collector, on the metrics port, and egress only to the relay, the SPIRE server, the API server, Redis and the collector.
 Only the repo server reaches the bundle store.
 
 The relay in `dev-cp` is the bundle `relay-system` at wave 8.
@@ -229,7 +229,7 @@ Its data lives on a 10 GiB volume.
 
 The store receives OTLP on port 4317 from two senders only. The pod listens on more ports (3100, 3200, 4040, 4318, and 9090, which also accepts remote write), and the NetworkPolicy admits no pod to any of them:
 
-- The collector `otel-collector` in `management`. It deletes every form of the source attributes (`k8s.cluster.name`, `platform.plane`, `platform.cell`, `deployment.environment.name`, `source_cluster` and `destination_cluster`) at the resource, scope, record, span, span event and data point, then sets `k8s.cluster.name` and `platform.plane` to `management`, and exports to `lgtm`. Span links and exemplars are not reachable, so they keep their attributes. Its NetworkPolicy admits only `apps-demo`, `argocd`, `cell-system`, `istio-egress`, `central-view-system` and the gateway, so no other pod can forge the signals of a cell. A new sender in `management` needs its namespace in `components/observability-system/render.sh`. The other clusters keep the `debug` exporter.
+- The collector `otel-collector` in `management`. It deletes every form of the source attributes at every level that it reaches, then sets `k8s.cluster.name` and `platform.plane` to `management`, and exports to `lgtm`. The section "Collectors and uplinks" gives the details. Its NetworkPolicy admits only `COLLECTOR_SENDERS` of `cells/management.env` and the gateway, so no other pod can forge the signals of a cell.
 - The telemetry gateway, the link component `telemetry-gateway`. It runs `cell-proxy` with the `otlp` backend and a SPIRE agent in one pod.
   It accepts SPIFFE mTLS on node port 31444 from the `dev-cp` node only, and its ID is `spiffe://mgmt.poc.internal/telemetry`.
   It admits `spiffe://dev.env.poc.internal/cell/<cell>/otel` for a registered cell, and `spiffe://dev.env.poc.internal/cp/otel`.
@@ -263,6 +263,69 @@ The Secret keeps its value after a restart, because the generator runs only once
 The task changes the Secret with a merge patch and never uses `kubectl apply`, because a client-side apply copies the password into the annotation `last-applied-configuration`. The same patch removes that annotation. `cell:verify` fails when a Secret of `observability-system` has it.
 If the Secret and Grafana differ after a failed rotation, the error line holds the command that sets Grafana to the password of the Secret. Print it with `scripts/obs-rotate-password.sh --restore-command`. `TestM3GrafanaRestoreCommand` runs it.
 Grafana blocks the user `admin` for 5 minutes after 5 failed logins, and the block refuses the right password too. `cell:verify`, `obs:rotate-password` and the gate each make one or two failed logins on purpose. When a check shows HTTP 401 after several runs in a row, wait 5 minutes before you suspect a wrong password.
+
+## Collectors and uplinks
+
+Every cluster runs the StatefulSet `otel-collector` in `observability-system`, at wave 3.
+It uses the image `otel/opentelemetry-collector-k8s` 0.164.0, pinned by digest, and a volume of 2 GiB for its queue.
+The pod has no SPIRE sidecar. Only its collector container mounts a Kubernetes API token, for the receivers below.
+
+The collector has these parts:
+
+- **Receivers:** OTLP on port 4317 (gRPC), the Prometheus receiver, and `k8s_objects` for the Kubernetes events.
+  Port 4318 (HTTP) serves the bundle store only. Its NetworkPolicy admits no other pod on 4318.
+- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istiod` (15014), and `argocd` (8082 and 8084, and the central server on 8083 in `management`).
+  Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file: `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
+  Each job copies `pod` and `namespace` into the labels of the data points. Each metrics port admits the collector pod only.
+- **Source attributes:** the transform processors delete every form of `k8s.cluster.name`, `platform.plane`, `platform.cell` and `deployment.environment.name`. OTLP data also loses `source_cluster` and `destination_cluster`, but scraped Envoy data keeps them, because the gateway checks them.
+  The resource processor then sets the row of its cluster. A pod cannot forge the attributes of another cluster in this collector, and the gateway sets them again.
+- **Exporter:** one `otlp_grpc` exporter with a timeout of 15 seconds, retries with no end, client keepalive every 30 seconds, 4 consumers, and requests of at most 3,000,000 bytes.
+  The queue is on the volume, so a restart or an outage does not lose data. Each of the three queues holds at most 384 MiB.
+- **Own metrics:** the collector sends them as OTLP to its own port 4317, so Prometheus holds `otelcol_exporter_queue_size` for every cluster.
+
+| Cluster | `k8s.cluster.name` | `platform.plane` | `deployment.environment.name` | `platform.cell` | Exports to |
+| --- | --- | --- | --- | --- | --- |
+| `management` | `management` | `management` | absent | absent | `lgtm` |
+| `dev-cp` | `dev-cp` | `environment` | `POC_ENV` | absent | the uplink |
+| `dev-cell-1`, `dev-cell-2` | the cell | `cell` | `POC_ENV` | the cell | the uplink |
+
+The uplink is the harness component `otel-uplink` in `dev-cp` and in each cell.
+It runs `cell-proxy spiffe-client` on port 4319 and a SPIRE agent sidecar. Only the collector of its cluster may reach the port.
+In a cell, the uplink has the ID `spiffe://dev.env.poc.internal/cell/<cell>/otel`, a `cluster_jwt` sidecar, and the relay of `dev-cp` on node port 30444 as its upstream. ConfigMap `mgmt-root` holds the roots of `management`.
+In `dev-cp`, the uplink has the ID `spiffe://dev.env.poc.internal/cp/otel`, a `k8s_psat` sidecar, and the gateway on the node port 31444 of `management` as its upstream. ConfigMap `peer-root` holds the roots of `management`.
+Both uplinks accept only the ID `spiffe://mgmt.poc.internal/telemetry`.
+`dev-cp` renders its uplink after the SPIRE server exists, because the sidecar needs the live roots of `dev-cp`.
+`cell:verify` compares the node address and the roots in each uplink with the live values. `cell:up` writes them again.
+
+Istio gets the cell name as its cluster name (`global.multiCluster.clusterName`), so `source_cluster` equals the cell.
+A sidecar keeps the cluster ID that it had at start. After a change, run the task below for each cluster.
+It deletes the pods of every Deployment in the injected namespaces, waits for new Ready pods, and checks `ISTIO_META_CLUSTER_ID` of each `istio-proxy`. It prints one JSON line.
+The task deletes pods, because `kubectl rollout restart` writes an annotation that Argo CD then shows as a difference.
+
+```sh
+CELL=dev-cell-1 mise run cell:restart-mesh
+```
+
+Read the queue size of a collector from Prometheus. The unit is bytes, and the size stays below 402,653,184 for each signal:
+
+```sh
+kubectl --context kind-management -n observability-system exec lgtm-0 -c lgtm -- curl -s \
+  --data-urlencode 'query=otelcol_exporter_queue_size{k8s_cluster_name="dev-cell-1"}' http://127.0.0.1:9090/api/v1/query
+```
+
+A growing queue means that the uplink, the relay or the gateway is down. `cell:verify` names the trace check that fails.
+
+The claim template of a StatefulSet is immutable, and `local-path` cannot grow a volume. To use a larger volume, change `storage` in `components/observability-system/collector.yaml`, then run these steps in the cluster.
+The steps delete the queue of that collector. The data in it is lost.
+
+```sh
+kubectl --context kind-dev-cell-1 -n observability-system delete statefulset otel-collector --cascade=orphan
+kubectl --context kind-dev-cell-1 -n observability-system delete pod otel-collector-0
+kubectl --context kind-dev-cell-1 -n observability-system delete pvc queue-otel-collector-0
+CELL=dev-cell-1 mise run cell:up
+```
+
+To add a sender of OTLP, add its namespace to `COLLECTOR_SENDERS` in the env file of the cluster, then run `cell:up`.
 
 ## Add or remove a cell
 
@@ -690,7 +753,7 @@ The local server writes a signing key into `argocd-secret` in the cluster. The s
 ```sh
 mise run cell:ui
 kubectl --context kind-dev-cell-1 -n argocd get applications
-kubectl --context kind-dev-cell-1 -n observability-system logs deploy/otel-collector
+kubectl --context kind-dev-cell-1 -n observability-system logs statefulset/otel-collector
 ```
 
 ## Remove the cell

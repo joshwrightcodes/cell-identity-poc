@@ -43,7 +43,7 @@ var bundleFacts = []string{"POD_CIDR=10.11.0.0/16", "SERVICE_CIDR=10.111.0.0/16"
 	"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", "API_SERVICE_IP=10.111.0.1", "DNS_SERVICE_IP=10.111.0.10"}
 
 // stubBinaries names the binary that the stub image must hold for each render that checks one.
-var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent", "argocd-agent": "/ko-app/cluster-jwt-agent"}
+var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent", "argocd-agent": "/ko-app/cluster-jwt-agent", "otel-uplink": "/ko-app/cluster-jwt-agent"}
 
 var (
 	renderAllMu  sync.Mutex
@@ -248,15 +248,24 @@ func (cr *clusterRender) waveOf(name string) (int, bool) {
 func TestRootBundleWaveOrder(t *testing.T) {
 	// The relay comes at wave 8 in dev-cp, after spire-server, and each cell runs the agent as a
 	// harness component, so the loop below checks both.
-	want := map[string]string{"management": "bundle observability-store 8 observability-system", "dev-cp": "bundle relay-system 8 relay-system", "dev-cell-1": "harness argocd-agent 0 argocd", "dev-cell-2": "harness argocd-agent 0 argocd"}
+	// The collector comes at wave 3 in every cluster. The uplink is a harness component in dev-cp (the
+	// SPIRE server does not exist at the first hydrate) and in each cell.
+	want := map[string][]string{
+		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system"},
+		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
+		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
+		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
+	}
 	for _, cr := range renderAll(t) {
-		if w, ok := want[cr.name]; ok {
-			found := false
-			for _, c := range cr.components {
-				found = found || fmt.Sprintf("%s %s %d %s", c.kind, c.name, c.wave, c.ns) == w
-			}
-			if !found {
-				t.Errorf("%s has no component %q", cr.name, w)
+		if ws, ok := want[cr.name]; ok {
+			for _, w := range ws {
+				found := false
+				for _, c := range cr.components {
+					found = found || fmt.Sprintf("%s %s %d %s", c.kind, c.name, c.wave, c.ns) == w
+				}
+				if !found {
+					t.Errorf("%s has no component %q", cr.name, w)
+				}
 			}
 			delete(want, cr.name)
 		}
@@ -438,6 +447,8 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
 		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
 		"observability-store StatefulSet observability-system/lgtm lgtm", "telemetry-gateway Deployment observability-system/telemetry-gateway cell-proxy",
+		"observability-system StatefulSet observability-system/otel-collector otel-collector", "otel-uplink Deployment observability-system/otel-uplink cell-proxy",
+		"otel-uplink Deployment observability-system/otel-uplink spire-agent", "otel-uplink Deployment observability-system/otel-uplink install-agent-plugin",
 		"telemetry-gateway Deployment observability-system/telemetry-gateway spire-agent"} {
 		if !seen[name] {
 			t.Errorf("no render holds the container %q", name)
@@ -455,12 +466,25 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 // TestNoEmptyPeerList checks that every NetworkPolicy rule in every render names its peers. A rule
 // with an empty or missing from or to list admits every peer.
 func TestNoEmptyPeerList(t *testing.T) {
+	// The collector policies and both forms of the uplink must be among the policies that the loop sees.
+	seen := map[string]bool{}
+	defer func() {
+		for _, cluster := range []string{"management", "dev-cp", "dev-cell-1", "dev-cell-2"} {
+			if !seen[cluster+" collector"] || !seen[cluster+" collector-egress"] {
+				t.Errorf("the loop saw no collector policy in %s", cluster)
+			}
+			if cluster != "management" && !seen[cluster+" otel-uplink"] {
+				t.Errorf("the loop saw no uplink policy in %s", cluster)
+			}
+		}
+	}()
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
 			for _, o := range c.objs {
 				if o["kind"] != "NetworkPolicy" {
 					continue
 				}
+				seen[cr.name+" "+fmt.Sprint(lookupOr(o, "metadata", "name"))] = true
 				for _, dir := range [][2]string{{"ingress", "from"}, {"egress", "to"}} {
 					rules, _ := lookup(o, "spec", dir[0])
 					list, _ := rules.([]any)
@@ -527,6 +551,9 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"network-policy", script("network-policy", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"relay-system", script("relay-system", "dev-cp"), []string{"NODE_IPS"}},
 		{"argocd-agent", script("argocd-agent", "dev-cell-1"), []string{"API_SERVER_IPS"}},
+		{"observability-system", script("observability-system", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"otel-uplink of a cell", script("otel-uplink", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
 	}
 	for _, tc := range cases {
 		for _, v := range tc.vars {

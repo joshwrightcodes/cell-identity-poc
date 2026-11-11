@@ -37,6 +37,7 @@ case "$args" in
     [[ -z "${STUB_LIST_FAIL:-}" ]] || { echo "error: the server is unavailable" >&2; exit 1; }
     [[ -n "${STUB_NO_LABEL:-}" ]] || echo deployment.apps/celld ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=argocd-agent -o name "*) ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=otel-uplink -o name "*) ;;
   *" get deployments -o name "*|*" get deployments,statefulsets -o name "*) printf 'deployment.apps/argocd-repo-server\ndeployment.apps/celld\n' ;;
   *" get Deployment -o json --show-managed-fields "*) echo "{\"items\":[$labelled,$argo]}" ;;
   *" get ConfigMap -o json --show-managed-fields "*)
@@ -138,6 +139,14 @@ func runHarnessScript(t *testing.T, owned bool, snippet string, env ...string) (
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(agent, "manifests.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mgmt-root\n  namespace: argocd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// It also has the harness component otel-uplink, with a fixture bundle that holds no workload.
+	uplink := filepath.Join(build, "dev-cell-1", "bundles", "otel-uplink")
+	if err := os.MkdirAll(uplink, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(uplink, "manifests.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mgmt-root\n  namespace: observability-system\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	lib, err := filepath.Abs("../../scripts/lib.sh")

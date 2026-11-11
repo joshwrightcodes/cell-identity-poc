@@ -263,8 +263,11 @@ func TestRenderArgoCDAgent(t *testing.T) {
 		if peers := fmt.Sprint(lookupOr(egress[1], "to")); peers != "[map[ipBlock:map[cidr:172.18.0.4/32]]]" {
 			t.Errorf("the API rule reaches %s", peers)
 		}
-		if _, ok := lookup(np, "spec", "ingress"); ok {
-			t.Error("the agent policy has ingress rules, want none, so no pod reaches the agent ports")
+		// Flow N15: the collector scrapes the metrics port, and no other pod reaches an agent port.
+		ingress := get[[]any](t, np, "spec", "ingress")
+		if len(ingress) != 1 || fmt.Sprint(lookupOr(ingress[0], "from")) != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]" ||
+			!slices.Equal(portList(t, ingress[0]), []int{8181}) {
+			t.Errorf("the agent policy admits %v, want only the collector on 8181", ingress)
 		}
 		var targets []string
 		for _, rule := range egress {

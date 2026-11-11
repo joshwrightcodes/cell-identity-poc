@@ -938,7 +938,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
 	m2 := docs(t, string(want))
-	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api"} {
+	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("render has no %s", key)
 		}
@@ -1205,8 +1205,8 @@ func TestSpireServerRenderManagement(t *testing.T) {
 	slices.Sort(kinds)
 	want := []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "ConfigMap/spire-controller-manager",
 		"ConfigMap/spire-entries", "ConfigMap/spire-server", "Namespace/spire-system", "NetworkPolicy/default-deny",
-		"NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-workloads", "Service/spire-server", "ServiceAccount/spire-server",
-		"StatefulSet/spire-server"}
+		"NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics", "NetworkPolicy/spire-server-workloads", "Service/spire-server",
+		"ServiceAccount/spire-server", "StatefulSet/spire-server"}
 	if !slices.Equal(kinds, want) {
 		t.Fatalf("objects are %v, want %v: no ExternalSecret, no record and no agent node policy", kinds, want)
 	}
