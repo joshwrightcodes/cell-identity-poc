@@ -52,17 +52,57 @@ type tokenClaims struct {
 // Validate checks a service account token against a cell record. It trusts only the keys in
 // rec.JWKS and never reads keys from the token. It returns an *Error that carries a Reason.
 func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims, error) {
+	want := Audience(env, nonce)
+	return validate(rec, token, now, func(aud []string) bool {
+		return env != "" && nonce != "" && rec.Env == env && singleAudience(aud, want)
+	})
+}
+
+// ValidateFor runs every check of Validate except the env check, and requires the token to carry
+// exactly one audience, equal to audience. An empty audience never matches.
+func ValidateFor(rec record.Cell, token, audience string, now time.Time) (Claims, error) {
+	return validate(rec, token, now, func(aud []string) bool {
+		return audience != "" && singleAudience(aud, audience)
+	})
+}
+
+// Precheck runs every claim check of Validate without a signature check and without a key lookup,
+// so a caller can refuse a bad token before it fetches keys. It returns the same reasons as
+// ValidateFor. An empty issuer skips the issuer check, and an empty audience never matches.
+func Precheck(token, issuer, audience string, subject record.Subject, now time.Time) error {
+	jws, err := jose.ParseSignedCompact(token, allowedAlgs)
+	if err != nil {
+		return parseFailure(err)
+	}
+	if len(jws.Signatures) != 1 {
+		return fail(Malformed)
+	}
+	tc, err := decodeClaims(jws.UnsafePayloadWithoutVerification())
+	if err != nil {
+		return err
+	}
+	_, err = checkClaims(tc, claimRules{
+		issuer: issuer,
+		subjectAllowed: func(namespace, serviceAccount string) bool {
+			return subject.Namespace == namespace && subject.ServiceAccount == serviceAccount
+		},
+		audienceOK: func(aud []string) bool { return audience != "" && singleAudience(aud, audience) },
+	}, now)
+	return err
+}
+
+func singleAudience(aud []string, want string) bool {
+	return len(aud) == 1 && aud[0] == want
+}
+
+func validate(rec record.Cell, token string, now time.Time, audienceOK func([]string) bool) (Claims, error) {
 	if rec.Revoked {
 		return Claims{}, fail(Revoked)
 	}
 
 	jws, err := jose.ParseSignedCompact(token, allowedAlgs)
 	if err != nil {
-		var unexpected *jose.ErrUnexpectedSignatureAlgorithm
-		if errors.As(err, &unexpected) {
-			return Claims{}, fail(AlgNotAllowed)
-		}
-		return Claims{}, fail(Malformed)
+		return Claims{}, parseFailure(err)
 	}
 	if len(jws.Signatures) != 1 {
 		return Claims{}, fail(Malformed)
@@ -84,18 +124,48 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if err != nil {
 		return Claims{}, fail(BadSignature)
 	}
+	tc, err := decodeClaims(payload)
+	if err != nil {
+		return Claims{}, err
+	}
+	return checkClaims(tc, claimRules{
+		issuer:         rec.Issuer,
+		subjectAllowed: func(namespace, serviceAccount string) bool { return subjectAllowed(rec, namespace, serviceAccount) },
+		audienceOK:     audienceOK,
+	}, now)
+}
 
+func parseFailure(err error) error {
+	var unexpected *jose.ErrUnexpectedSignatureAlgorithm
+	if errors.As(err, &unexpected) {
+		return fail(AlgNotAllowed)
+	}
+	return fail(Malformed)
+}
+
+func decodeClaims(payload []byte) (tokenClaims, error) {
 	var tc tokenClaims
 	if err := json.Unmarshal(payload, &tc); err != nil {
-		return Claims{}, fail(Malformed)
+		return tc, fail(Malformed)
 	}
 	if tc.IssuedAt == nil || tc.Expiry == nil {
-		return Claims{}, fail(Malformed)
+		return tc, fail(Malformed)
 	}
-	if tc.Issuer != rec.Issuer {
+	return tc, nil
+}
+
+// claimRules holds what a token is compared with. An empty issuer skips the issuer check.
+type claimRules struct {
+	issuer         string
+	subjectAllowed func(namespace, serviceAccount string) bool
+	audienceOK     func([]string) bool
+}
+
+func checkClaims(tc tokenClaims, rules claimRules, now time.Time) (Claims, error) {
+	if rules.issuer != "" && tc.Issuer != rules.issuer {
 		return Claims{}, fail(IssuerMismatch)
 	}
-	if !subjectAllowed(rec, tc.Kube.Namespace, tc.Kube.Svcacct.Name) ||
+	if !rules.subjectAllowed(tc.Kube.Namespace, tc.Kube.Svcacct.Name) ||
 		tc.Subject != "system:serviceaccount:"+tc.Kube.Namespace+":"+tc.Kube.Svcacct.Name {
 		return Claims{}, fail(SubjectNotAllowed)
 	}
@@ -123,7 +193,7 @@ func Validate(rec record.Cell, token, env, nonce string, now time.Time) (Claims,
 	if now.Sub(exp) > skew {
 		return Claims{}, fail(Expired)
 	}
-	if env == "" || nonce == "" || rec.Env != env || len(tc.Audience) != 1 || tc.Audience[0] != Audience(env, nonce) {
+	if !rules.audienceOK(tc.Audience) {
 		return Claims{}, fail(WrongAudience)
 	}
 

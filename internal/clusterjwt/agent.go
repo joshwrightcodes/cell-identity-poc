@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"regexp"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -18,22 +17,20 @@ import (
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	authenticationv1 "k8s.io/api/authentication/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	apitypes "k8s.io/apimachinery/pkg/types"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/rest"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 )
 
 const (
 	// MinTokenTTL is the shortest lifetime that the Kubernetes TokenRequest API accepts.
 	MinTokenTTL = 10 * time.Minute
 
-	// tokenRequestTimeout stays below challenge_timeout of the server (10s in server.conf), so a slow
-	// API server ends as an agent error, not as a challenge timeout on the server.
-	tokenRequestTimeout = 8 * time.Second
-	boundObjectKind     = "Pod"
-	boundObjectAPIV     = "v1"
+	// tokenRequestTimeout is the timeout of one TokenRequest. It stays below challenge_timeout of the
+	// server (10s in server.conf), so a slow API server ends as an agent error, not as a challenge
+	// timeout on the server.
+	tokenRequestTimeout = satoken.RequestTimeout
 	maxIdentityValue    = 253
 )
 
@@ -221,24 +218,8 @@ func (a *Agent) AidAttestation(stream agentv1.NodeAttestor_AidAttestationServer)
 // requestToken asks for a token of the service account of the pod. The token binds to the pod by
 // name and UID, and its audience carries the nonce.
 func (a *Agent) requestToken(ctx context.Context, st *agentState, nonce string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, tokenRequestTimeout)
-	defer cancel()
-	seconds := int64(st.ttl / time.Second)
-	req := &authenticationv1.TokenRequest{
-		Spec: authenticationv1.TokenRequestSpec{
-			Audiences:         []string{Audience(st.env, nonce)},
-			ExpirationSeconds: &seconds,
-			BoundObjectRef: &authenticationv1.BoundObjectReference{
-				APIVersion: boundObjectAPIV, Kind: boundObjectKind, Name: st.podName, UID: apitypes.UID(st.podUID),
-			},
-		},
-	}
-	out, err := st.client.ServiceAccounts(st.namespace).CreateToken(ctx, st.serviceAccount, req, metav1.CreateOptions{})
-	if err != nil {
-		return "", err
-	}
-	if out == nil || strings.TrimSpace(out.Status.Token) == "" {
-		return "", errors.New("the API returned no token")
-	}
-	return out.Status.Token, nil
+	return satoken.Create(ctx, st.client, satoken.Request{
+		Namespace: st.namespace, ServiceAccount: st.serviceAccount, PodName: st.podName, PodUID: st.podUID,
+		Audience: Audience(st.env, nonce), TTL: st.ttl,
+	})
 }

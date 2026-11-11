@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -212,5 +213,88 @@ func TestVerifyMultiSignatureRule(t *testing.T) {
 	onlyGarbage := func(m map[string]any) { m["signatures"] = []any{garbage, garbage} }
 	if _, err := Verify(mutate(t, env, onlyGarbage), []ed25519.PublicKey{pub}); err == nil {
 		t.Fatal("only invalid signatures must fail")
+	}
+}
+
+const otherType = "application/vnd.poc.other+json"
+
+func TestEnvelopeSentinels(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	body := []byte(`{"a":1}`)
+	env, err := SignEnvelope(otherType, body, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := VerifyEnvelope(env, otherType, keys)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("round trip: %q %v", got, err)
+	}
+
+	foreignPub, _ := testKey(t)
+	cases := []struct {
+		name string
+		env  []byte
+		typ  string
+		keys []ed25519.PublicKey
+		want error
+	}{
+		{"other_type", env, PayloadType, keys, ErrPayloadType},
+		{"no_signatures", mutate(t, env, func(m map[string]any) { m["signatures"] = []any{} }), otherType, keys, ErrSignature},
+		{"foreign_key", env, otherType, []ed25519.PublicKey{foreignPub}, ErrSignature},
+		{"no_keys", env, otherType, nil, ErrSignature},
+		{"bad_json", []byte("{"), otherType, keys, ErrDecode},
+		{"bad_payload_base64", mutate(t, env, func(m map[string]any) { m["payload"] = "!!" }), otherType, keys, ErrDecode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := VerifyEnvelope(tc.env, tc.typ, tc.keys)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			for _, other := range []error{ErrPayloadType, ErrSignature, ErrDecode} {
+				if other != tc.want && errors.Is(err, other) {
+					t.Fatalf("%v also matches %v", err, other)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyWrapsDecodeErrors(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	for name, body := range map[string]string{
+		"unknown_field": `{"name":"a","bogus":1}`,
+		"trailing":      `{"name":"a"} {}`,
+		"not_json":      `nope`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, err := SignEnvelope(PayloadType, []byte(body), priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Verify(env, keys); !errors.Is(err, ErrDecode) {
+				t.Fatalf("got %v, want ErrDecode", err)
+			}
+		})
+	}
+	env, _ := Sign(testCell(), priv)
+	bad := mutate(t, env, func(m map[string]any) { m["payloadType"] = "text/plain" })
+	if _, err := Verify(bad, keys); !errors.Is(err, ErrPayloadType) {
+		t.Fatalf("got %v, want ErrPayloadType", err)
+	}
+}
+
+func TestVerifyWithPayload(t *testing.T) {
+	pub, priv := testKey(t)
+	env, _ := Sign(testCell(), priv)
+	c, raw, err := VerifyWithPayload(env, []ed25519.PublicKey{pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(testCell())
+	if c.Name != "dev-cell-1" || string(raw) != string(want) {
+		t.Fatalf("got %+v %s", c, raw)
 	}
 }
