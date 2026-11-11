@@ -2,7 +2,9 @@
 # Render every component into build/<cluster>/bundles/<component>/manifests.yaml.
 # A component with an executable render.sh renders itself. Every other component is a kustomization.
 # The renders of link components read the live roots and node addresses of other clusters, so
-# CELL_UP_SKIP_LINK=1 skips them, and HYDRATE_ONLY=link renders only them.
+# CELL_UP_SKIP_LINK=1 skips them, and HYDRATE_ONLY=link renders only them. The harness components in
+# LATE_HARNESS read the SPIRE server of their own cluster: CELL_UP_SKIP_LATE=1 skips them, and
+# HYDRATE_ONLY=late renders only them.
 source "$(dirname "$0")/lib.sh"
 
 [[ -f "$FACTS" ]] || "$ROOT/scripts/facts.sh"
@@ -16,9 +18,17 @@ case "${HYDRATE_ONLY:-}" in
       ((${#LINK_COMPONENTS[@]} == 0)) || log "skipping the link components, because CELL_UP_SKIP_LINK=1"
     else
       entries+=(${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"})
+    fi
+    if [[ "${CELL_UP_SKIP_LATE:-}" == 1 ]]; then
+      kept=()
+      for e in "${entries[@]}"; do [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]] || kept+=("$e"); done
+      entries=("${kept[@]}")
     fi ;;
   link) entries=(${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}) ;;
-  *) die "HYDRATE_ONLY '$HYDRATE_ONLY' is not link" ;;
+  late) for e in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+      if [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]]; then entries+=("$e"); fi
+    done ;;
+  *) die "HYDRATE_ONLY '$HYDRATE_ONLY' is not link or late" ;;
 esac
 
 # The render writes into a temporary directory. A failed render leaves the last good bundle in place.

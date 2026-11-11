@@ -21,7 +21,7 @@ k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
 
 "$ROOT/scripts/facts.sh"
 # The link components render in the link phase, after every wave, because they read live facts.
-CELL_UP_SKIP_LINK=1 "$ROOT/scripts/hydrate.sh"
+CELL_UP_SKIP_LINK=1 CELL_UP_SKIP_LATE=1 "$ROOT/scripts/hydrate.sh"
 
 for c in "${BOOTSTRAP[@]}"; do
   apply_bundle "$c"
@@ -61,6 +61,8 @@ k get applications -A
 # prune: an object that leaves the bundle stays in the cluster. cell:verify reports a
 # NetworkPolicy that the bundle does not hold. harness_apply stops before it takes an object that
 # another owner holds.
+# The components in LATE_HARNESS read the live SPIRE server of this cluster, which exists now.
+HYDRATE_ONLY=late "$ROOT/scripts/hydrate.sh"
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   harness_apply "${entry%%:*}"
 done

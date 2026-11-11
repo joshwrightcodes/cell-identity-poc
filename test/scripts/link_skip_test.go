@@ -224,3 +224,33 @@ func TestPublishWritesTheApplicationsToArgocd(t *testing.T) {
 		}
 	}
 }
+
+// The uplink of a cluster reads the live SPIRE server of that cluster, and on a clean harness:up the
+// server of dev-cp does not exist at the first hydrate. So up.sh skips the late harness components
+// in the first hydrate, and renders them after the waves.
+func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
+	root, logFile := linkRoot(t)
+	for _, cell := range []string{"dev-cp", "dev-cell-1"} {
+		_, calls := runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell)
+		if !strings.Contains(calls, "render otel-uplink") {
+			t.Fatalf("%s: hydrate calls:\n%s\nwant otel-uplink", cell, calls)
+		}
+		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "CELL_UP_SKIP_LATE=1")
+		if strings.Contains(calls, "render otel-uplink") || !strings.Contains(calls, "render spire-server") && cell == "dev-cp" {
+			t.Fatalf("%s: hydrate with CELL_UP_SKIP_LATE=1 calls:\n%s\nwant no otel-uplink", cell, calls)
+		}
+		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "HYDRATE_ONLY=late")
+		if strings.TrimSpace(calls) != "render otel-uplink" {
+			t.Fatalf("%s: hydrate with HYDRATE_ONLY=late calls:\n%s\nwant otel-uplink only", cell, calls)
+		}
+	}
+	up, err := os.ReadFile(filepath.Join(root, "scripts", "up.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(up)
+	first, late, apply := strings.Index(text, "CELL_UP_SKIP_LATE=1"), strings.Index(text, "HYDRATE_ONLY=late"), strings.Index(text, `harness_apply "${entry%%:*}"`)
+	if first < 0 || late < first || apply < late {
+		t.Fatalf("up.sh must skip the late components at the first hydrate, render them (%d), and then apply the harness components (%d)", late, apply)
+	}
+}

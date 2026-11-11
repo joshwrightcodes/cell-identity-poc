@@ -111,6 +111,12 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# LATE_HARNESS names the harness components whose render reads a live SPIRE server of the cluster
+# itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
+# these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
+# (CELL_UP_SKIP_LATE=1).
+LATE_HARNESS=(otel-uplink)
+
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
 # clusters. They follow the harness rules: no Argo CD Application holds them, every object carries
