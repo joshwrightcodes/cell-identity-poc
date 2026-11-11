@@ -597,21 +597,27 @@ check_no_secret_store() {
   fi
 }
 
-# check_traces_in_store asks Tempo through Grafana for a trace of echo with the cluster name of this
-# cluster. A cluster with a telemetry store prints nothing from its collector, so the logs of the
-# collector show no span there. The password stays in memory, and lgtm_curl puts it on the standard
-# input of curl.
+# check_traces_in_store asks Tempo through Grafana in management for a trace of echo with the cluster
+# name of this cluster. No collector prints what it receives, so the logs of the collector show no
+# span. The signals of every cluster but management reach Grafana through the collector, the uplink,
+# the relay and the gateway, so this check fails while any of them is down. The password stays in
+# memory, and lgtm_curl puts it on the standard input of curl.
 check_traces_in_store() {
-  local pw query body out code end=$((SECONDS + 120)) i
-  pw="$("$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
-  query="{ resource.k8s.cluster.name = \"$COLLECTOR_CLUSTER\" && resource.service.name =~ \"echo.*\" }"
+  local LGTM_CLUSTER=management
+  local pw query body out code end=$((SECONDS + 240)) i name="${COLLECTOR_CLUSTER:-$CELL_NAME}"
+  pw="$(CELL=management "$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  query="{ resource.k8s.cluster.name = \"$name\" && resource.service.name =~ \"echo.*\" }"
   body="$(jq -nc --arg q "$query" '{queries: [{refId: "A", datasource: {type: "tempo", uid: "tempo"}, queryType: "traceql", query: $q,
     limit: 5, tableType: "traces"}], from: "now-30m", to: "now"}')"
   grafana_login_ok || return 1
   until out="$(lgtm_curl "admin:$pw" POST /api/ds/query "$body" 2>&1)" && code="$(tail -n 1 <<<"$out")" && [[ "$code" == 200 ]] \
       && [[ "$(sed '$d' <<<"$out" | jq -r '[.results.A.frames[]?.data.values[0][]?] | length' 2>/dev/null)" -gt 0 ]]; do
     for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
-    ((SECONDS < end)) || { echo "Tempo holds no trace with k8s.cluster.name $COLLECTOR_CLUSTER for echo. The last answer: HTTP ${code:-none}"; return 1; }
+    ((SECONDS < end)) || {
+      echo "Tempo in management holds no trace of echo.apps-demo with k8s.cluster.name $name. The last answer: HTTP ${code:-none}."
+      echo "The collector, the uplink, the relay or the gateway can be down. Read the state: mise run harness:verify"
+      return 1
+    }
     sleep 5
   done
 }
@@ -635,9 +641,9 @@ check_lgtm_hardened() {
 # grafana_login_ok prints nothing and succeeds when Grafana accepts the password of Secret grafana-admin.
 # Otherwise it names the fix, so a 401 does not look like a failure of the store.
 grafana_login_ok() {
-  local pw out code fix
-  fix="CELL=$CELL_NAME mise run obs:rotate-password, or, when it fails, the restore command that it prints (CELL=$CELL_NAME scripts/obs-rotate-password.sh --restore-command)"
-  pw="$("$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  local pw out code fix lgtm="${LGTM_CLUSTER:-$CELL_NAME}"
+  fix="CELL=$lgtm mise run obs:rotate-password, or, when it fails, the restore command that it prints (CELL=$lgtm scripts/obs-rotate-password.sh --restore-command)"
+  pw="$(CELL="$lgtm" "$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
   out="$(lgtm_curl "admin:$pw" GET /api/user 2>&1)" || { echo "could not call Grafana in lgtm-0: $out"; return 1; }
   code="$(tail -n 1 <<<"$out")"
   [[ "$code" == 200 ]] && return 0
@@ -691,20 +697,66 @@ check_grafana_secret_synced() {
 }
 
 check_traces_received() {
-  if [[ -n "${COLLECTOR_STORE:-}" ]]; then
-    check_traces_in_store
-    return
+  check_traces_in_store
+}
+
+# The collector is a StatefulSet with one Ready replica and its queue volume. A Deployment of the same
+# name is a leftover of an older bundle: Argo CD prunes it, and a collector from it would run beside
+# the new one with the old config.
+check_collector_workload() {
+  local sts pvc phase size
+  sts="$(k -n observability-system get statefulset otel-collector -o json 2>&1)" || { echo "no StatefulSet otel-collector in observability-system: $sts. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  jq -e '.spec.replicas == 1 and .status.readyReplicas == 1 and .status.updatedReplicas == 1' >/dev/null <<<"$sts" \
+    || { echo "StatefulSet otel-collector has $(jq -r '[.spec.replicas, .status.readyReplicas // 0, .status.updatedReplicas // 0] | "replicas \(.[0]), ready \(.[1]), updated \(.[2])"' <<<"$sts"), want one Ready replica at its update revision"; return 1; }
+  if k -n observability-system get deployment otel-collector >/dev/null 2>&1; then
+    echo "Deployment otel-collector still exists, an object of the old bundle. Wait for Argo CD to prune it, or run: kubectl --context kind-$CELL_NAME -n observability-system delete deployment otel-collector"
+    return 1
   fi
-  local i
-  for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
-  local end=$((SECONDS + 60))
-  # Read the logs into a variable first. With pipefail, grep -q would close the pipe early
-  # and turn a match into a failure.
-  local logs
-  until logs="$(k -n observability-system logs deploy/otel-collector --since=5m)" && grep -q 'echo.apps-demo' <<<"$logs"; do
-    ((SECONDS < end)) || { echo "no span or access log for echo.apps-demo in the collector output"; return 1; }
-    sleep 5
-  done
+  pvc="$(k -n observability-system get pvc queue-otel-collector-0 -o json 2>&1)" || { echo "no PVC queue-otel-collector-0: $pvc"; return 1; }
+  phase="$(jq -r .status.phase <<<"$pvc")" size="$(jq -r '.status.capacity.storage // ""' <<<"$pvc")"
+  [[ "$phase" == Bound && "$size" == 2Gi ]] || { echo "PVC queue-otel-collector-0 is $phase with capacity '$size', want Bound and 2Gi. To resize it, see the collector commands in README.md"; return 1; }
+}
+
+# The uplink copies the node address of its upstream cluster into the cell-proxy argument and its
+# NetworkPolicy. A cell dials the relay of SPIRE_SERVER_CLUSTER on 30444, and dev-cp dials the gateway
+# of RELAY_TARGET on the target port of RELAY_TELEMETRY_ROUTES. Docker can give a rebuilt node a new address.
+uplink_upstream() {
+  case "$COLLECTOR_PLANE" in
+    cell) echo "$SPIRE_SERVER_CLUSTER 30444 mgmt-root" ;;
+    environment) echo "$RELAY_TARGET ${RELAY_TELEMETRY_ROUTES##*=} peer-root" ;;
+    *) return 1 ;;
+  esac
+}
+
+check_uplink_env_address() {
+  local cluster port cm want got
+  read -r cluster port cm <<<"$(uplink_upstream)" || { echo "COLLECTOR_PLANE '$COLLECTOR_PLANE' has no uplink"; return 1; }
+  want="$(node_ip "$cluster")" || { echo "$want"; return 1; }
+  got="$(k -n observability-system get deployment otel-uplink -o json \
+    | jq -r '[.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[] | select(startswith("--upstream="))] | join(" ")')" \
+    || { echo "could not read deployment/otel-uplink"; return 1; }
+  if [[ "$got" != "--upstream=$want:$port" ]]; then
+    echo "the $cluster node is $want, but the uplink has '$got', want --upstream=$want:$port."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  got="$(k -n observability-system get networkpolicy otel-uplink -o json \
+    | jq -r '[.spec.egress[].to[]?.ipBlock.cidr // empty] | join(" ")')" || { echo "could not read the NetworkPolicy otel-uplink"; return 1; }
+  [[ " $got " == *" $want/32 "* ]] || { echo "the NetworkPolicy otel-uplink admits egress to '$got', want $want/32. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+check_uplink_peer_root() {
+  local cluster port cm live got
+  read -r cluster port cm <<<"$(uplink_upstream)" || { echo "COLLECTOR_PLANE '$COLLECTOR_PLANE' has no uplink"; return 1; }
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n observability-system get configmap "$cm" -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap observability-system/$cm holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
 }
 
 log "checking cell $CELL_NAME"
@@ -734,10 +786,9 @@ if [[ -n "${COLLECTOR_STORE:-}" ]]; then
   check "Grafana accepts the password of Secret grafana-admin, and its four data sources are healthy" check_grafana_datasources
   check "The gateway forwarded to the store with no failure in the last 5 minutes" check_gateway_store_path
   check "/data of lgtm-0 holds less than 8 GiB" check_lgtm_disk
-  check "Tempo holds a trace of echo from $COLLECTOR_CLUSTER, so the collector reaches the store" check_traces_received
-else
-  check "The collector receives telemetry for echo" check_traces_received
 fi
+check "The collector is a StatefulSet with a Ready replica and a 2Gi queue volume, and no Deployment of the old bundle remains" check_collector_workload
+check "Tempo in management holds a trace of echo from ${COLLECTOR_CLUSTER:-$CELL_NAME}, so its collector and uplink reach the store" check_traces_received
 
 if has_harness cell-identity; then
   probe_targets+=("$CELL_NAME/cell-identity-system")
@@ -827,6 +878,15 @@ check_cell_subject_pods() {
 
 if [[ -n "${SPIRE_SERVER_CLUSTER:-}" ]]; then
   check "Every pod that runs as a ServiceAccount of SPIRE_CELL_SUBJECTS in a shared namespace belongs to its harness component" check_cell_subject_pods
+fi
+
+if has_harness otel-uplink; then
+  check "The otel-uplink objects match the bundle" check_harness_drift otel-uplink
+  check "observability-system has exactly the otel-uplink objects of the bundle, with no other field manager" check_harness_objects otel-uplink observability-system
+  check "The uplink runs the images that build/images.env records" \
+    check_live_images observability-system deployment/otel-uplink "CELL=$CELL_NAME mise run cell:up"
+  check "The uplink and its NetworkPolicy use the current node address of its upstream cluster" check_uplink_env_address
+  check "The peer root ConfigMap of the uplink holds the live roots of management" check_uplink_peer_root
 fi
 
 if has_harness argocd-agent; then

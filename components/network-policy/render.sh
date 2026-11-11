@@ -52,6 +52,12 @@ namespace_peer() {
   printf '        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: %s\n' "$1"
 }
 
+# collector_peer prints the peer of flow N15: the collector pod of observability-system. Each metrics
+# port admits this peer only.
+collector_peer() {
+  printf '        - namespaceSelector:\n            matchLabels:\n              kubernetes.io/metadata.name: observability-system\n          podSelector:\n            matchLabels:\n              app.kubernetes.io/name: otel-collector\n'
+}
+
 for ns in "${NAMESPACES[@]}"; do
   cat <<EOF
 ---
@@ -116,6 +122,14 @@ $(not_agent_selector)
   ingress:
     - from:
         - podSelector: {}
+    # N15: the application controller and the repo server.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 8082
+        - protocol: TCP
+          port: 8084
   egress:
     - to:
         - podSelector: {}
@@ -154,8 +168,12 @@ $(namespace_peer argocd)
         - protocol: TCP
           port: 5000
   egress:
+    # N11: the bundle store sends OTLP over HTTP to the collector.
     - to:
 $(namespace_peer observability-system)
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
       ports:
         - protocol: TCP
           port: 4318
@@ -180,6 +198,12 @@ spec:
           port: 15012
         - protocol: TCP
           port: 15017
+    # N15: the metrics of istiod.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15014
   egress:
     - to:
         - podSelector: {}
@@ -201,6 +225,12 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # N15: the Envoy metrics.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15090
   egress:
     - to:
 $(namespace_peer istio-system)
@@ -232,6 +262,12 @@ spec:
   ingress:
     - from:
         - podSelector: {}
+    # N15: the Envoy metrics.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15090
   egress:
     - to:
         - podSelector: {}

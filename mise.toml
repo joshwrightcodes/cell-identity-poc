@@ -71,6 +71,10 @@ run = "scripts/ui.sh --clean"
 description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
 
+[tasks."cell:restart-mesh"]
+description = "Start the sidecars of the cluster CELL again: delete the pods of every Deployment in each injected namespace, wait for new Ready pods, and check that each istio-proxy has the cell name as ISTIO_META_CLUSTER_ID. Prints one JSON line"
+run = "scripts/restart-mesh.sh"
+
 [tasks."cell:link"]
 description = "Run the link phase of the cluster CELL (default management): render each link component with the live facts of the other clusters, apply it, run its Jobs and wait for its rollouts"
 env = { CELL = "{{get_env(name='CELL', default='management')}}" }

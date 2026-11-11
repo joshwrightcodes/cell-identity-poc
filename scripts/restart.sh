@@ -25,13 +25,6 @@ rollout_hint() {
   printf 'Read the logs: mise x -- kubectl --context kind-%s -n %s logs %s --all-containers\n' "$CELL_NAME" "$1" "$2"
 }
 
-# new_ready_pods <namespace> <selector> <old UIDs> prints the UIDs of the Ready pods that are not old.
-new_ready_pods() {
-  k -n "$1" get pods -l "$2" -o json | jq -r --arg old " $3 " '
-    [.items[] | .metadata.uid as $uid | select(($old | contains(" " + $uid + " ")) | not)
-      | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.uid] | join(" ")'
-}
-
 if ((runs_spire_server)); then
   selector=app.kubernetes.io/name=spire-server
   old="$(k -n spire-system get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"

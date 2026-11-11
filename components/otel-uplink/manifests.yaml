@@ -1,0 +1,127 @@
+# The uplink of the collector: cell-proxy in client mode with a SPIRE agent sidecar.
+# render.sh fills in the @...@ values, and components/lib/spire-sidecar.sh adds the SPIRE agent.
+# The SVID of the sidecar is spiffe://dev.env.poc.internal/cell/<cell>/otel in a cell, and
+# spiffe://dev.env.poc.internal/cp/otel in dev-cp.
+#
+# cell-proxy listens for plaintext OTLP on :4319, where only the collector of the cluster may connect.
+# It dials the upstream with SPIFFE mTLS, and accepts only the exact server ID
+# spiffe://mgmt.poc.internal/telemetry, chained to the roots in the peer root ConfigMap. In a cell the
+# upstream is the relay of dev-cp, and in dev-cp it is the gateway in management.
+# The pod mounts no API token. The cluster_jwt plugin of the sidecar uses its own projected token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: otel-uplink
+  namespace: observability-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-uplink
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: otel-uplink
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: otel-uplink
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: otel-uplink
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+    spec:
+      serviceAccountName: otel-uplink
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # The otel entry selects unix:uid:65532, the user of the ko base image.
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - spiffe-client
+            - --listen=:4319
+            - "--upstream=@UPSTREAM@"
+            - --expect-id=spiffe://mgmt.poc.internal/telemetry
+            - --peer-bundle=/run/cell-proxy/peer-root/root.crt
+            - --peer-trust-domain=mgmt.poc.internal
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-uplink
+            # Each pod gets its own metric series, so a counter that starts again after a restart
+            # never continues the series of the pod before it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.instance.id=$(POD_NAME)
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: uplink
+              containerPort: 4319
+          # The client listens after it holds an SVID, so an open port means a working sidecar. The
+          # kubelet reaches the port from a node address (flow N23).
+          readinessProbe:
+            tcpSocket:
+              port: uplink
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: uplink
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: peer-root
+              mountPath: /run/cell-proxy/peer-root
+              readOnly: true
+      volumes:
+        - name: peer-root
+          configMap:
+            name: "@PEER_ROOT_CONFIGMAP@"
+---
+# Flow N19 and N21: the collector of the cluster sends OTLP to the uplink.
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-uplink
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: otel-uplink
+spec:
+  selector:
+    app.kubernetes.io/name: otel-uplink
+  ports:
+    - name: grpc-uplink
+      port: 4319
+      targetPort: uplink
+      appProtocol: grpc

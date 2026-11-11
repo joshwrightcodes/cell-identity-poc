@@ -357,6 +357,29 @@ spec:
         - protocol: TCP
           port: 8081
 ---
+# Flow N15: the collector of the cluster scrapes the metrics port, and no other pod reaches it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-metrics
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 9988
+---
 # Flow N9: the k8s_psat plugin reaches the API server for TokenReview and the pod and node reads.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

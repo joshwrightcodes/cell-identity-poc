@@ -62,6 +62,17 @@ spec:
           port: 9090
         - protocol: TCP
           port: 6379
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8000
   egress:
     # N6: the principal keeps its state in argocd-redis.
     - to:
@@ -121,6 +132,17 @@ spec:
       ports:
         - protocol: TCP
           port: 8080
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8083
   egress:
     # N4: the resource proxy and the Redis proxy of the principal.
     - to:
@@ -173,6 +195,17 @@ spec:
           port: 8081
     # N23: the kubelet probes the health port.
     - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8084
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
       ports:
         - protocol: TCP
           port: 8084

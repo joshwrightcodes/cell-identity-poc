@@ -101,6 +101,16 @@ ARGOCD_AGENT_HARNESS=(
   "argocd-agent:argocd"
 )
 
+# The uplink of the collector. It carries the telemetry of the cluster over SPIFFE mTLS: in a cell
+# through the relay of dev-cp (cluster_jwt agent sidecar), in dev-cp straight to the gateway in
+# management (k8s_psat agent sidecar). Both forms are the harness component otel-uplink, and the
+# render picks the form from COLLECTOR_PLANE. dev-cp needs its SPIRE server for the trust bundle of
+# the sidecar, and the server does not exist at the first hydrate, so the harness applies the
+# uplink after the waves.
+OTEL_UPLINK_HARNESS=(
+  "otel-uplink:observability-system"
+)
+
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
 # clusters. They follow the harness rules: no Argo CD Application holds them, every object carries
@@ -129,6 +139,7 @@ for set_name in $set_names; do
     observability-store) COMPONENTS+=("${OBSERVABILITY_STORE_COMPONENTS[@]}") ;;
     cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
+    otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
@@ -206,7 +217,7 @@ store_gaps() {
 }
 
 # lgtm_curl <user:password> <method> <path> [json body] sends one request to Grafana from inside the
-# lgtm pod of $CELL_NAME, where Grafana listens on 127.0.0.1:3000. It prints the response body, then
+# lgtm pod of $LGTM_CLUSTER (default $CELL_NAME), where Grafana listens on 127.0.0.1:3000. It prints the response body, then
 # a last line with the HTTP status code. The credentials and the body go into a curl config on the
 # standard input of curl, so no password reaches an argument list, and no file holds it. Pass the
 # password in a variable of the caller, not on a command line of this Mac either.
@@ -224,7 +235,7 @@ lgtm_curl() {
       printf 'data = "%s"\n' "$esc"
     fi
     printf 'silent\nshow-error\nmax-time = 30\nwrite-out = "\\n%%{http_code}"\n'
-  } | k -n observability-system exec -i lgtm-0 -c lgtm -- curl -K -
+  } | kubectl --context "kind-${LGTM_CLUSTER:-$CELL_NAME}" -n observability-system exec -i lgtm-0 -c lgtm -- curl -K -
 }
 
 # live_image_mismatches <cluster> <namespace> <kind/name> prints one line for each local image of the
@@ -531,6 +542,13 @@ link_preflight() {
   done
 }
 
+# new_ready_pods <namespace> <selector> <old UIDs> prints the UIDs of the Ready pods that are not old.
+new_ready_pods() {
+  k -n "$1" get pods -l "$2" -o json | jq -r --arg old " $3 " '
+    [.items[] | .metadata.uid as $uid | select(($old | contains(" " + $uid + " ")) | not)
+      | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.uid] | join(" ")'
+}
+
 # restart_deployment_pods <namespace> <deployment> deletes the pods of a Deployment and waits for a
 # new Ready pod. It changes no field of the Deployment, so its field managers stay the same.
 restart_deployment_pods() {
@@ -540,10 +558,7 @@ restart_deployment_pods() {
   old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
   k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of deployment/$name in $ns"
   end=$((SECONDS + 300))
-  until uids="$(k -n "$ns" get pods -l "$selector" -o json | jq -r --arg old " $old " '
-      [.items[] | .metadata.uid as $uid | select(($old | contains(" " + $uid + " ")) | not)
-        | select(any(.status.conditions[]?; .type == "Ready" and .status == "True")) | .metadata.uid] | join(" ")')" \
-      && [[ -n "$uids" ]]; do
+  until uids="$(new_ready_pods "$ns" "$selector" "$old")" && [[ -n "$uids" ]]; do
     if ((SECONDS >= end)); then
       log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $ns describe deployment/$name"
       die "deployment/$name in $ns has no new Ready pod after 300s"

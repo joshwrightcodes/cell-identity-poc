@@ -203,8 +203,9 @@ spec:
                         fieldPath: metadata.namespace
 ---
 # Flow N20, on the agent pod only. The namespace policies argocd and allow-from-nodes exclude the
-# agent pod, so this policy and allow-dns hold every rule of the pod. The pod admits no ingress,
-# so no pod reaches the metrics port, the health port or the profiling endpoints. Its egress is the
+# agent pod, so this policy and allow-dns hold every rule of the pod. The pod admits the collector of
+# the cluster on the metrics port (flow N15) and no other ingress, so no other pod reaches the metrics
+# port, the health port or the profiling endpoints. Its egress is the
 # relay node port and the SPIRE node port of the environment control plane, the API server, the
 # cell argocd-redis and the collector. It cannot reach the bundle store or any other argocd pod.
 apiVersion: networking.k8s.io/v1
@@ -217,6 +218,17 @@ spec:
     matchLabels:
       app.kubernetes.io/name: argocd-agent
   policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8181
   egress:
     - to:
         - ipBlock:
