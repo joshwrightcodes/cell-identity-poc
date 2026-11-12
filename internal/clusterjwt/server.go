@@ -8,10 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -23,6 +22,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 // PluginName is the name of the NodeAttestor plugin and the path segment of the agent ID.
@@ -43,6 +43,8 @@ const (
 	defaultBurst     = 10
 	defaultInflight  = 8
 	defaultTimeout   = "30s"
+	defaultReload    = "10s"
+	minReload        = time.Second
 	recordSuffix     = ".dsse.json"
 	maxKIDLogLength  = 64
 	maxRecordFileLen = 1 << 20
@@ -63,11 +65,13 @@ type pluginConfig struct {
 	PerCellBurst     int      `hcl:"per_cell_burst"`
 	PerCellInflight  int      `hcl:"per_cell_inflight"`
 	ChallengeTimeout string   `hcl:"challenge_timeout"`
+	ReloadInterval   string   `hcl:"reload_interval"`
 }
 
 var configKeys = map[string]bool{
 	"env": true, "trust_domain": true, "records_dir": true, "record_public_keys": true,
 	"per_cell_rate": true, "per_cell_burst": true, "per_cell_inflight": true, "challenge_timeout": true,
+	"reload_interval": true,
 }
 
 // state is the immutable result of one Configure call.
@@ -76,6 +80,11 @@ type state struct {
 	trustDomain string
 	timeout     time.Duration
 	records     map[string]record.Cell
+	// digests holds the digest of the signed payload of each record.
+	digests     map[string]string
+	dir         string
+	keys        []ed25519.PublicKey
+	reloadEvery time.Duration
 	rate        float64
 	burst       int
 	maxInflight int
@@ -92,11 +101,39 @@ type Plugin struct {
 	log    hclog.Logger
 	st     atomic.Pointer[state]
 	active atomic.Int64
+
+	// tick and stop drive the reload goroutine. A nil tick means a real ticker that runs for the
+	// process life.
+	tick    <-chan time.Time
+	stop    <-chan struct{}
+	started atomic.Bool
+
+	// markMu guards the fields below. They only grow for the process life.
+	markMu sync.Mutex
+	// marks holds the highest revision that any accepted spec gave each cell.
+	marks map[string]envspec.Revision
+	// retired holds the cells whose mark came from the retired list of a spec.
+	retired  map[string]bool
+	specMark envspec.Revision
+	// noted holds the refusals that the last load logged, so a repeated refusal is logged once.
+	noted map[string]bool
+
+	// Test seams. They stay nil in production.
+	afterResolve func()
+	afterLoad    func()
+	afterReload  func()
 }
 
-// New returns a plugin that is not configured yet.
+// New returns a plugin that is not configured yet. It reloads the records on a real ticker.
 func New() *Plugin {
 	return &Plugin{now: time.Now, log: hclog.NewNullLogger()}
+}
+
+// newWithTicker returns a plugin that reloads the records on each value of tick until stop closes.
+func newWithTicker(tick <-chan time.Time, stop <-chan struct{}) *Plugin {
+	p := New()
+	p.tick, p.stop = tick, stop
+	return p
 }
 
 // SetLogger receives the logger that SPIRE writes.
@@ -104,7 +141,7 @@ func (p *Plugin) SetLogger(l hclog.Logger) { p.log = l }
 
 // Validate checks a configuration without applying it.
 func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
-	if _, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain()); err != nil {
+	if _, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), false); err != nil {
 		return &configv1.ValidateResponse{Valid: false, Notes: []string{err.Error()}}, nil
 	}
 	return &configv1.ValidateResponse{Valid: true}, nil
@@ -112,7 +149,7 @@ func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*co
 
 // Configure loads the signed cell records and applies the configuration.
 func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	st, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain())
+	st, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), true)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "cluster_jwt: %v", err)
 	}
@@ -120,12 +157,27 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 		st.limit, st.gate = old.limit, old.gate
 	}
 	p.st.Store(st)
-	p.log.Info("configured", "env", st.env, "records", len(st.records))
+	p.log.Info("configured", "env", st.env, "records", len(st.records), "reload_interval", st.reloadEvery.String())
+	p.startReload(st.reloadEvery)
 	return &configv1.ConfigureResponse{}, nil
 }
 
-func (p *Plugin) build(text, coreTrustDomain string) (*state, error) {
-	cfg := pluginConfig{PerCellRate: defaultRate, PerCellBurst: defaultBurst, PerCellInflight: defaultInflight, ChallengeTimeout: defaultTimeout}
+// build parses the configuration and loads the records. Only a build with commit set raises the marks.
+func (p *Plugin) build(text, coreTrustDomain string, commit bool) (*state, error) {
+	st, err := p.parse(text, coreTrustDomain)
+	if err != nil {
+		return nil, err
+	}
+	snap, err := p.load(st, nil, commit)
+	if err != nil {
+		return nil, err
+	}
+	st.records, st.digests = snap.records, snap.digests
+	return st, nil
+}
+
+func (p *Plugin) parse(text, coreTrustDomain string) (*state, error) {
+	cfg := pluginConfig{PerCellRate: defaultRate, PerCellBurst: defaultBurst, PerCellInflight: defaultInflight, ChallengeTimeout: defaultTimeout, ReloadInterval: defaultReload}
 	if err := hcl.Decode(&cfg, text); err != nil {
 		return nil, fmt.Errorf("parse configuration: %w", err)
 	}
@@ -161,16 +213,17 @@ func (p *Plugin) build(text, coreTrustDomain string) (*state, error) {
 	if err != nil || timeout <= 0 {
 		return nil, errors.New("challenge_timeout must be a positive duration such as 30s")
 	}
+	every, err := time.ParseDuration(cfg.ReloadInterval)
+	if err != nil || (every != 0 && every < minReload) {
+		return nil, errors.New("reload_interval must be 0s or a duration of at least 1s")
+	}
 	keys, err := parseKeys(cfg.RecordPublicKeys)
 	if err != nil {
 		return nil, err
 	}
-	records, err := p.loadRecords(cfg.RecordsDir, cfg.Env, keys)
-	if err != nil {
-		return nil, err
-	}
 	return &state{
-		env: cfg.Env, trustDomain: cfg.TrustDomain, timeout: timeout, records: records,
+		env: cfg.Env, trustDomain: cfg.TrustDomain, timeout: timeout,
+		dir: cfg.RecordsDir, keys: keys, reloadEvery: every,
 		rate: cfg.PerCellRate, burst: cfg.PerCellBurst, maxInflight: cfg.PerCellInflight,
 		limit: newLimiter(cfg.PerCellRate, cfg.PerCellBurst, p.now),
 		gate:  newGate(cfg.PerCellInflight),
@@ -190,62 +243,6 @@ func parseKeys(in []string) ([]ed25519.PublicKey, error) {
 		keys = append(keys, ed25519.PublicKey(raw))
 	}
 	return keys, nil
-}
-
-// loadRecords reads every *.dsse.json file in dir. A file that fails verification, names another
-// environment or holds an unusable cell name is logged and skipped, so that its cell stays unknown.
-// For one cell name, supersedes picks the record.
-func (p *Plugin) loadRecords(dir, env string, keys []ed25519.PublicKey) (map[string]record.Cell, error) {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, fmt.Errorf("read records_dir: %w", err)
-	}
-	out := map[string]record.Cell{}
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, recordSuffix) {
-			continue
-		}
-		path := filepath.Join(dir, name)
-		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() || fi.Size() > maxRecordFileLen {
-			p.log.Warn("skipped record file", "file", name, "reason", "not a regular file of acceptable size")
-			continue
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			p.log.Warn("skipped record file", "file", name, "reason", "unreadable")
-			continue
-		}
-		rec, err := record.Verify(data, keys)
-		switch {
-		case err != nil:
-			p.log.Error("record file failed verification", "file", name, "file_cell", strings.TrimSuffix(name, recordSuffix), "reason", err.Error())
-			continue
-		case rec.Env != env:
-			p.log.Warn("skipped record file", "file", name, "reason", "other environment", "record_env", rec.Env)
-			continue
-		case !cellNameRE.MatchString(rec.Name):
-			p.log.Warn("skipped record file", "file", name, "reason", "cell name is not a DNS label")
-			continue
-		}
-		if old, ok := out[rec.Name]; ok && !supersedes(rec, old) {
-			continue
-		}
-		out[rec.Name] = rec
-	}
-	return out, nil
-}
-
-// supersedes reports whether a replaces b for one cell. A higher epoch and counter wins. At the same
-// epoch and counter, the revoked record wins, whatever the order of the files.
-func supersedes(a, b record.Cell) bool {
-	if a.Epoch != b.Epoch {
-		return a.Epoch > b.Epoch
-	}
-	if a.Counter != b.Counter {
-		return a.Counter > b.Counter
-	}
-	return a.Revoked && !b.Revoked
 }
 
 // Attest challenges the agent with a fresh nonce and checks the token that answers it.

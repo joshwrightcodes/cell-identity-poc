@@ -25,6 +25,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const testTrustDomain = "dev.env.poc.internal"
@@ -47,15 +48,20 @@ func (s *syncBuffer) String() string {
 }
 
 type fixture struct {
-	t      *testing.T
-	plugin *Plugin
-	client *nodeattestorv1.NodeAttestorPluginClient
-	logs   *syncBuffer
-	keys   keys
-	pub    ed25519.PublicKey
-	priv   ed25519.PrivateKey
-	cfg    *configv1.ConfigServiceClient
-	base   string
+	t        *testing.T
+	plugin   *Plugin
+	client   *nodeattestorv1.NodeAttestorPluginClient
+	logs     *syncBuffer
+	keys     keys
+	pub      ed25519.PublicKey
+	priv     ed25519.PrivateKey
+	cfg      *configv1.ConfigServiceClient
+	base     string
+	cm       *cmDir
+	tick     chan time.Time
+	reloaded chan struct{}
+	// specCounter is the counter of the spec that the fixture wrote.
+	specCounter uint64
 }
 
 type fixtureOptions struct {
@@ -65,6 +71,8 @@ type fixtureOptions struct {
 	revoked        map[string]bool
 	// mutate changes the record of a cell before it is signed.
 	mutate func(rec *record.Cell)
+	// ticker gives the plugin a test ticker, which fixture.reload drives.
+	ticker bool
 }
 
 func newFixture(t *testing.T, o fixtureOptions) *fixture {
@@ -82,10 +90,14 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 	if o.signRecordWith != nil {
 		signer = o.signRecordWith
 	}
+	files := map[string][]byte{}
+	var entries []envspec.Entry
+	specCounter := uint64(1)
 	for _, name := range o.cells {
 		rec := k.record(t)
 		rec.Name = name
 		rec.Revoked = o.revoked[name]
+		rec.Epoch, rec.Counter = 1, 1
 		if o.mutate != nil {
 			o.mutate(&rec)
 		}
@@ -93,16 +105,30 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, name+".dsse.json"), env, 0o600); err != nil {
-			t.Fatal(err)
-		}
+		files[name+".dsse.json"] = env
+		body, _ := json.Marshal(rec)
+		entries = append(entries, envspec.Entry{Name: name, Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)})
+		specCounter = max(specCounter, rec.Counter)
 	}
+	cm := &cmDir{t: t, root: dir}
+	specEnv := signSpec(t, priv, testEnv, 1, specCounter, entries, nil)
+	files[specFile] = specEnv
+	cm.write(files)
 
 	logs := &syncBuffer{}
 	logger := hclog.New(&hclog.LoggerOptions{Level: hclog.Debug, Output: logs, JSONFormat: true})
 	p := New()
+	var tick chan time.Time
+	var reloaded chan struct{}
+	if o.ticker {
+		tick, reloaded = make(chan time.Time), make(chan struct{}, 16)
+		stop := make(chan struct{})
+		t.Cleanup(func() { close(stop) })
+		p = newWithTicker(tick, stop)
+		p.afterReload = func() { reloaded <- struct{}{} }
+	}
 	p.now = func() time.Time { return testNow }
-	f := &fixture{t: t, plugin: p, client: new(nodeattestorv1.NodeAttestorPluginClient), logs: logs, keys: k, pub: pub, priv: priv}
+	f := &fixture{t: t, plugin: p, client: new(nodeattestorv1.NodeAttestorPluginClient), logs: logs, keys: k, pub: pub, priv: priv, cm: cm, specCounter: specCounter, tick: tick, reloaded: reloaded}
 	cfg := new(configv1.ConfigServiceClient)
 	f.cfg = cfg
 	plugintest.ServeInBackground(t, plugintest.Config{
@@ -528,6 +554,7 @@ func TestRevokedRecordWinsATie(t *testing.T) {
 	k := newKeys(t)
 	for _, order := range [][2]string{{"a", "b"}, {"b", "a"}} {
 		dir := t.TempDir()
+		var revokedEntry envspec.Entry
 		for i, rev := range []bool{false, true} {
 			rec := k.record(t)
 			rec.Revoked, rec.Epoch, rec.Counter = rev, 1, 1
@@ -536,11 +563,19 @@ func TestRevokedRecordWinsATie(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(dir, name), env, 0o600); err != nil {
 				t.Fatal(err)
 			}
+			if rev {
+				body, _ := json.Marshal(rec)
+				revokedEntry = envspec.Entry{Name: rec.Name, Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)}
+			}
 		}
-		recs, err := New().loadRecords(dir, "dev", []ed25519.PublicKey{pub})
+		if err := os.WriteFile(filepath.Join(dir, specFile), signSpec(t, priv, "dev", 1, 1, []envspec.Entry{revokedEntry}, nil), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		snap, err := New().load(&state{dir: dir, env: "dev", keys: []ed25519.PublicKey{pub}}, nil, false)
 		if err != nil {
 			t.Fatal(err)
 		}
+		recs := snap.records
 		if !recs["dev-cell-1"].Revoked {
 			t.Fatalf("order %v: revoked record lost the tie", order)
 		}
