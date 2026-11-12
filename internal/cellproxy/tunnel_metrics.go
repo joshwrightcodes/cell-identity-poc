@@ -22,6 +22,7 @@ const (
 	dialRefusedByHub  = "refused_by_hub"
 	dialServerRefused = "server_refused"
 	dialFailed        = "failed"
+	dialLeafExpiring  = "leaf_expiring"
 )
 
 // TunnelMetrics are the OTel instruments of the mesh-view tunnel:
@@ -80,6 +81,9 @@ func WithLogger(log *slog.Logger) TunnelOption { return func(o *tunnelOptions) {
 func WithKeepalive(readIdle, pingTimeout time.Duration) TunnelOption {
 	return func(o *tunnelOptions) { o.readIdle, o.pingTimeout = readIdle, pingTimeout }
 }
+
+// OptionsLogger returns the logger that opts set with WithLogger, or nil.
+func OptionsLogger(opts []TunnelOption) *slog.Logger { return applyOptions(opts).log }
 
 func (o tunnelOptions) keepalive() (time.Duration, time.Duration) {
 	idle, ping := o.readIdle, o.pingTimeout

@@ -1,3 +1,5 @@
+//go:build unix
+
 package cmdrun
 
 import (
@@ -6,6 +8,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -70,5 +73,39 @@ func TestRunReturnsWhenAChildLeftTheGroup(t *testing.T) {
 	}
 	if took > 15*time.Second {
 		t.Fatalf("Run took %s, want a return within the wait delay of %s", took, waitDelay)
+	}
+}
+
+// TestRunForwardsSignalsToTheGroup checks that a signal sent to the process reaches the command, which runs in a group
+// of its own: a Ctrl-C of the test run must stop a running task, not leave it behind.
+func TestRunForwardsSignalsToTheGroup(t *testing.T) {
+	marker := t.TempDir() + "/term"
+	done := make(chan Result, 1)
+	go func() {
+		res, _ := Run(30*time.Second, "", nil, "bash", "-c", `trap 'echo got >"$0"; exit 7' TERM; sleep 25 & wait`, marker)
+		done <- res
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for activeGroups() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the command did not start")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(300 * time.Millisecond)
+	forwardSignal(syscall.SIGTERM)
+	select {
+	case res := <-done:
+		if res.Code != 7 {
+			t.Errorf("the command ended with %+v, want status 7 from its trap", res)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the command did not stop after the signal")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("the trap of the command did not run: %v", err)
+	}
+	if n := activeGroups(); n != 0 {
+		t.Errorf("%d groups stay registered after the command ended", n)
 	}
 }

@@ -32,6 +32,8 @@ const (
 	HandshakeFailed Reason = "handshake_failed"
 	// PingTimeout: a ping on a tunnel got no answer, so the tunnel ends.
 	PingTimeout Reason = "ping_timeout"
+	// LeafExpiring: the leaf of the cell has less than two minimum backoffs of life left, so the cell skips the tunnel.
+	LeafExpiring Reason = "leaf_expiring"
 	// LibraryLog: a line that a library wrote to its logger.
 	LibraryLog Reason = "library_log"
 )

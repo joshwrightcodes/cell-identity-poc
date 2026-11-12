@@ -21,7 +21,8 @@ const DefaultStatusAddr = "127.0.0.1:18099"
 // EndInfo says how the last tunnel of a side ended.
 type EndInfo struct {
 	// Cause is expiry (the timer of an SVID), replaced (the hub closed it for a newer tunnel), peer_closed
-	// (the peer ended the connection: Detail has the error), or local_close (this side closed it, a missed ping included).
+	// (the peer ended the connection: Detail has the error), local_close (this side closed it, a missed ping included),
+	// or leaf_expiring (the cell skipped a dial because its leaf expires soon).
 	Cause  string    `json:"cause"`
 	Detail string    `json:"detail,omitempty"`
 	At     time.Time `json:"at"`
@@ -89,6 +90,19 @@ func (s *TunnelState) closed(id uint64, cause, detail string) {
 	s.last = &EndInfo{Cause: cause, Detail: detail, At: time.Now(), AgeSeconds: time.Since(at).Seconds()}
 	if len(s.open) == 0 {
 		s.downAt = time.Now()
+	}
+}
+
+// skipped records that the cell refused a tunnel because its leaf expires within two minimum backoffs. It shows
+// the cause while no tunnel is open.
+func (s *TunnelState) skipped(expiry time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.open) == 0 {
+		s.last = &EndInfo{Cause: "leaf_expiring", Detail: "the leaf expires at " + expiry.UTC().Format(time.RFC3339), At: time.Now()}
 	}
 }
 

@@ -11,6 +11,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 // captureStdLog sends the output of the standard library logger to a buffer until the test ends.
@@ -292,4 +295,62 @@ func TestTunnelRenewal(t *testing.T) {
 			t.Error("the old tunnel was marked renewed, but the hub never accepted the new one")
 		}
 	})
+}
+
+// TestTunnelShowsWhyItSkippedAShortLeaf checks that a dial refused for a short leaf leaves a cause: one rate-limited
+// Warn line with a reason, a count through OTel, and the cause in the tunnel state.
+func TestTunnelShowsWhyItSkippedAShortLeaf(t *testing.T) {
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(context.Background()) })
+	metrics, err := NewTunnelMetrics(mp.Meter("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := &syncBuffer{}
+	state := NewTunnelState()
+	clock := &fakeClock{t: time.Unix(1000, 0)}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	dials := 0
+	dial := func(context.Context) (net.Conn, error) {
+		dials++
+		if dials > 6 {
+			cancel()
+			return nil, context.Canceled
+		}
+		a, b := net.Pipe()
+		t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
+		return &endedConn{Conn: a, expiry: clock.now().Add(-time.Minute)}, nil
+	}
+	o := applyOptions([]TunnelOption{WithLogger(jsonLog(out)), WithState(state), WithMetrics(metrics)})
+	if err := runTunnelWith(ctx, dial, http.NotFoundHandler(), tunnelClock{now: clock.now, sleep: clock.sleep}, o); err != nil {
+		t.Fatal(err)
+	}
+	if n := countLog(t, out, "tunnel_dial_skipped"); n != 1 {
+		t.Fatalf("%d tunnel_dial_skipped lines for 6 skipped dials, want 1:\n%s", n, out.String())
+	}
+	findLog(t, out, "tunnel_dial_skipped", map[string]any{"reason": "leaf_expiring", "level": "WARN"}, time.Second)
+	if e := state.Status().Cells["self"].LastEnd; e == nil || e.Cause != "leaf_expiring" {
+		t.Errorf("the tunnel state shows %+v, want the cause leaf_expiring", e)
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var n int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == "cell_proxy.tunnel.connects" {
+				for _, dp := range sum.DataPoints {
+					if v, _ := dp.Attributes.Value("result"); v.AsString() == "leaf_expiring" {
+						n += dp.Value
+					}
+				}
+			}
+		}
+	}
+	if n != 6 {
+		t.Errorf("the connects counter has %d leaf_expiring results, want 6", n)
+	}
 }

@@ -152,6 +152,11 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status, readIdle: *readIdle, pingTimeout: *pingTimeout}, nil
 }
 
+// runOptions are the options of cellproxy.RunTunnel: the keepalive, and the logger for the lines of the HTTP/2 server.
+func (c tunnelModeConfig) runOptions(log *slog.Logger) []cellproxy.TunnelOption {
+	return []cellproxy.TunnelOption{cellproxy.WithKeepalive(c.readIdle, c.pingTimeout), cellproxy.WithLogger(log)}
+}
+
 // runTunnel is the cell side of the mesh-view tunnel. It reads the Kubernetes API with the
 // in-cluster config of its pod.
 func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
@@ -185,7 +190,7 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 			}
 		}()
 		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m), cellproxy.WithState(state))
-		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cellproxy.WithKeepalive(cfg.readIdle, cfg.pingTimeout), cellproxy.WithLogger(tel.Log))
+		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cfg.runOptions(tel.Log)...)
 	})
 }
 

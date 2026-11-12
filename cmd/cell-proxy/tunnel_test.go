@@ -5,12 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	stdlog "log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 const meshPattern = `^spiffe://dev\.env\.poc\.internal/cell/[a-z0-9-]+/mesh-view$`
@@ -221,5 +226,46 @@ func TestPromqlProxyServes(t *testing.T) {
 	defer mu.Unlock()
 	if len(hits) != 1 || hits[0] != "GET /api/v1/query?query=up" {
 		t.Fatalf("upstream got %v", hits)
+	}
+}
+
+// TestTunnelRunOptionsCarryTheLogger checks that the command gives RunTunnel the logger of its telemetry, so the HTTP/2
+// server of the cell logs through slog.
+func TestTunnelRunOptionsCarryTheLogger(t *testing.T) {
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if got := cellproxy.OptionsLogger(tunnelModeConfig{}.runOptions(log)); got != log {
+		t.Fatalf("the run options carry the logger %v, want the telemetry logger", got)
+	}
+}
+
+// TestServeTelemetryBridgesTheStandardLogger checks that a line of the standard logger, which the HTTP/2 client of the
+// hub writes, leaves the process as a JSON line on standard output.
+func TestServeTelemetryBridgesTheStandardLogger(t *testing.T) {
+	var prevOut io.Writer = stdlog.Writer()
+	prevFlags := stdlog.Flags()
+	t.Cleanup(func() { stdlog.SetOutput(prevOut); stdlog.SetFlags(prevFlags) })
+	var stray bytes.Buffer
+	stdlog.SetOutput(&stray)
+	var out syncBuffer
+	code := serveTelemetry(t.Context(), &out, func(context.Context, *telemetry.T) error {
+		stdlog.Printf("http2: Transport: a line of the hub transport")
+		return nil
+	})
+	if code != 0 {
+		t.Fatalf("exit %d:\n%s", code, out.String())
+	}
+	if stray.Len() != 0 {
+		t.Errorf("the standard logger kept the plain line %q", stray.String())
+	}
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("a line of standard output is not JSON: %q", line)
+		}
+		found = found || m["msg"] == "http2: Transport: a line of the hub transport"
+	}
+	if !found {
+		t.Errorf("standard output has no JSON line for the bridged message:\n%s", out.String())
 	}
 }

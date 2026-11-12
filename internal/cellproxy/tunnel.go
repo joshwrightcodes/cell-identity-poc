@@ -98,7 +98,9 @@ func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 
 func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, c tunnelClock, o tunnelOptions) error {
 	srv := newTunnelServer(o.keepalive())
-	base := &http.Server{ErrorLog: proxyErrorLog(cmp.Or(o.log, slog.Default()))}
+	log := cmp.Or(o.log, slog.Default())
+	base := &http.Server{ErrorLog: proxyErrorLog(log)}
+	skips := newLogLimiter()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	serve := func(conn net.Conn) chan struct{} {
@@ -136,6 +138,11 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 		}
 		if !renewing && !exp.IsZero() && exp.Sub(now) < 2*tunnelMinBackoff {
 			_ = conn.Close()
+			o.metrics.connect(ctx, attribute.String("side", sideCell), attribute.String("result", dialLeafExpiring))
+			if ok, suppressed, _ := skips.allow(log, "tunnel_dial_skipped", nil); ok {
+				log.Warn("tunnel_dial_skipped", "reason", string(LeafExpiring), "not_after", exp.UTC().Format(time.RFC3339), "suppressed", suppressed)
+			}
+			o.state.skipped(exp)
 			return false
 		}
 		start, cur, expiry = now, conn, exp
