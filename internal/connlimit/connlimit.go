@@ -13,12 +13,14 @@ import (
 type ctxKey struct{}
 
 // Listen wraps inner. It allows at most maxConns open connections, and Accept waits for a slot
-// while the cap is reached. Each accepted connection has a hard deadline of maxAge + grace on the
-// real clock, which a later SetDeadline call cannot extend. now supplies the accept time that
-// Expired compares with maxAge.
+// while the cap is reached. Close wakes a waiting Accept. Each accepted connection has a hard
+// deadline of maxAge + grace on the real clock, which a later SetDeadline call cannot extend. now
+// supplies the accept time that Expired compares with maxAge, and nil means time.Now. Listen
+// panics when maxConns or maxAge is not positive or grace is negative, because each value is a
+// fixed setting of the caller.
 func Listen(inner net.Listener, maxConns int, maxAge, grace time.Duration, now func() time.Time) net.Listener {
-	if maxConns < 1 {
-		maxConns = 1
+	if maxConns < 1 || maxAge <= 0 || grace < 0 {
+		panic("connlimit: maxConns and maxAge must be positive and grace must not be negative")
 	}
 	if now == nil {
 		now = time.Now
@@ -45,18 +47,20 @@ func (l *listener) Accept() (net.Conn, error) {
 	case <-l.done:
 		return nil, net.ErrClosed
 	}
-	c, err := l.Listener.Accept()
-	if err != nil {
-		<-l.slots
-		return nil, err
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			<-l.slots
+			return nil, err
+		}
+		hard := time.Now().Add(l.maxAge + l.grace)
+		if err := c.SetDeadline(hard); err != nil {
+			// Closing this connection leaves the slot taken for the next one, and keeps Serve running.
+			c.Close()
+			continue
+		}
+		return &conn{Conn: c, l: l, hard: hard, acceptedAt: l.now()}, nil
 	}
-	hard := time.Now().Add(l.maxAge + l.grace)
-	if err := c.SetDeadline(hard); err != nil {
-		c.Close()
-		<-l.slots
-		return nil, err
-	}
-	return &conn{Conn: c, l: l, hard: hard, acceptedAt: l.now()}, nil
 }
 
 func (l *listener) Close() error {

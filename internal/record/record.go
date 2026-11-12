@@ -66,7 +66,7 @@ func VerifyWithPayload(envelope []byte, keys []ed25519.PublicKey) (Cell, []byte,
 		return Cell{}, nil, fmt.Errorf("%w record: trailing data after object", ErrDecode)
 	}
 	if err := c.validate(); err != nil {
-		return Cell{}, nil, err
+		return Cell{}, nil, fmt.Errorf("%w record: %v", ErrDecode, err)
 	}
 	return c, body, nil
 }

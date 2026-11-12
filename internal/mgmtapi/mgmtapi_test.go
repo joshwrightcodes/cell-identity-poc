@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -118,5 +120,40 @@ func TestKeyErrorAs(t *testing.T) {
 	}
 	if (&KeyError{Reason: ReasonIssuerUntrusted}).Error() == "" {
 		t.Fatal("Error() must not be empty without a cause")
+	}
+}
+
+func TestPatternsMatchPathHelpers(t *testing.T) {
+	for _, tc := range []struct {
+		pattern string
+		path    func(string) string
+	}{
+		{SpecPattern, SpecPath}, {StatusPattern, StatusPath}, {NoncePattern, NoncePath},
+		{BindPattern, BindPath}, {KeysPattern, KeysPath},
+	} {
+		for _, value := range []string{"dev-cell-1", "a b", "x/y", "q?z"} {
+			var got string
+			mux := http.NewServeMux()
+			mux.HandleFunc(tc.pattern, func(w http.ResponseWriter, r *http.Request) {
+				for _, name := range []string{"env", "cell", "cluster"} {
+					if v := r.PathValue(name); v != "" {
+						got = v
+					}
+				}
+			})
+			req := httptest.NewRequest(http.MethodGet, tc.path(value), nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			if got != value {
+				t.Errorf("%s with %q: PathValue %q (status %d)", tc.pattern, value, got, rec.Code)
+			}
+		}
+	}
+}
+
+func TestDeniedError(t *testing.T) {
+	raw, _ := json.Marshal(Denied{Error: DeniedError, RequestID: "0123456789abcdef"})
+	if string(raw) != `{"error":"denied","request_id":"0123456789abcdef"}` {
+		t.Fatalf("got %s", raw)
 	}
 }

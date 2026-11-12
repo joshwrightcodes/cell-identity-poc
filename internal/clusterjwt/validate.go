@@ -68,7 +68,8 @@ func ValidateFor(rec record.Cell, token, audience string, now time.Time) (Claims
 
 // Precheck runs every claim check of Validate without a signature check and without a key lookup,
 // so a caller can refuse a bad token before it fetches keys. It returns the same reasons as
-// ValidateFor. An empty issuer skips the issuer check, and an empty audience never matches.
+// ValidateFor. An empty issuer skips the issuer check, and an empty audience never matches. A token with
+// no key ID is refused as unknown_kid, because no key set can verify it.
 func Precheck(token, issuer, audience string, subject record.Subject, now time.Time) error {
 	jws, err := jose.ParseSignedCompact(token, allowedAlgs)
 	if err != nil {
@@ -77,12 +78,16 @@ func Precheck(token, issuer, audience string, subject record.Subject, now time.T
 	if len(jws.Signatures) != 1 {
 		return fail(Malformed)
 	}
+	if jws.Signatures[0].Header.KeyID == "" {
+		return fail(UnknownKID)
+	}
 	tc, err := decodeClaims(jws.UnsafePayloadWithoutVerification())
 	if err != nil {
 		return err
 	}
 	_, err = checkClaims(tc, claimRules{
-		issuer: issuer,
+		issuer:     issuer,
+		skipIssuer: issuer == "",
 		subjectAllowed: func(namespace, serviceAccount string) bool {
 			return subject.Namespace == namespace && subject.ServiceAccount == serviceAccount
 		},
@@ -154,15 +159,17 @@ func decodeClaims(payload []byte) (tokenClaims, error) {
 	return tc, nil
 }
 
-// claimRules holds what a token is compared with. An empty issuer skips the issuer check.
+// claimRules holds what a token is compared with. The issuer check never passes on an empty
+// issuer, unless skipIssuer is set, which only Precheck does.
 type claimRules struct {
 	issuer         string
+	skipIssuer     bool
 	subjectAllowed func(namespace, serviceAccount string) bool
 	audienceOK     func([]string) bool
 }
 
 func checkClaims(tc tokenClaims, rules claimRules, now time.Time) (Claims, error) {
-	if rules.issuer != "" && tc.Issuer != rules.issuer {
+	if !rules.skipIssuer && (rules.issuer == "" || tc.Issuer != rules.issuer) {
 		return Claims{}, fail(IssuerMismatch)
 	}
 	if !rules.subjectAllowed(tc.Kube.Namespace, tc.Kube.Svcacct.Name) ||

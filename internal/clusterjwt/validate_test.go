@@ -616,3 +616,38 @@ func TestPrecheck(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateEmptyRecordIssuerRefused(t *testing.T) {
+	k := newKeys(t)
+	rec := k.record(t)
+	rec.Issuer = ""
+	for name, iss := range map[string]string{"foreign_iss": "https://evil.example", "absent_iss": ""} {
+		t.Run(name, func(t *testing.T) {
+			s := k.good()
+			s.Issuer = iss
+			s.Audience = []string{bindAud}
+			if iss == "" {
+				s.Omit = []string{"iss"}
+			}
+			token := s.token(t)
+			if _, err := ValidateFor(rec, token, bindAud, testNow); ReasonOf(err) != IssuerMismatch {
+				t.Fatalf("ValidateFor = %v, want issuer_mismatch", err)
+			}
+			s.Audience = []string{Audience(testEnv, testNonce)}
+			if _, err := Validate(rec, s.token(t), testEnv, testNonce, testNow); ReasonOf(err) != IssuerMismatch {
+				t.Fatalf("Validate = %v, want issuer_mismatch", err)
+			}
+		})
+	}
+}
+
+func TestPrecheckRefusesTokenWithoutKid(t *testing.T) {
+	k := newKeys(t)
+	s := k.good()
+	s.Audience = []string{bindAud}
+	s.KID = ""
+	err := Precheck(s.token(t), testIssuer, bindAud, record.Subject{Namespace: "celld", ServiceAccount: "celld"}, testNow)
+	if ReasonOf(err) != UnknownKID {
+		t.Fatalf("got %v, want unknown_kid", err)
+	}
+}

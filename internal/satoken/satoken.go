@@ -33,6 +33,9 @@ func Create(ctx context.Context, c corev1client.ServiceAccountsGetter, r Request
 	if r.TTL < time.Second {
 		return "", errors.New("token lifetime must be at least one second")
 	}
+	if r.Namespace == "" || r.ServiceAccount == "" || r.Audience == "" || r.PodName == "" || r.PodUID == "" {
+		return "", errors.New("token request needs a namespace, service account, audience, pod name and pod UID")
+	}
 	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
 	seconds := int64(r.TTL / time.Second)

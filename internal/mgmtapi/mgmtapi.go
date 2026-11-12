@@ -58,6 +58,9 @@ type Refusal struct {
 	At       time.Time     `json:"at"`
 }
 
+// DeniedError is the value of Denied.Error.
+const DeniedError = "denied"
+
 // Denied is the body of every HTTP 403 from the management plane.
 type Denied struct {
 	Error     string `json:"error"`
@@ -75,6 +78,16 @@ type ClusterKeys struct {
 func BindAudience(cell, nonce string) string {
 	return "mgmt-bind/" + cell + "/" + nonce
 }
+
+// Route patterns for http.ServeMux, one for each path helper. A server registers a pattern and
+// reads the wildcard with Request.PathValue.
+const (
+	SpecPattern   = "/v1/envs/{env}/spec"
+	StatusPattern = "/v1/envs/{env}/status"
+	NoncePattern  = "/v1/cells/{cell}/nonce"
+	BindPattern   = "/v1/cells/{cell}/bind"
+	KeysPattern   = "/v1/clusters/{cluster}/keys"
+)
 
 // SpecPath is the path of the signed spec bundle of an environment.
 func SpecPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/spec" }

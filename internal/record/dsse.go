@@ -4,6 +4,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 )
@@ -17,6 +18,19 @@ var (
 	// ErrDecode means the envelope, or the payload it carries, cannot be decoded.
 	ErrDecode = errors.New("cannot decode")
 )
+
+// MaxSignatures is the most signatures that an envelope may carry. Each one costs a verification.
+const MaxSignatures = 4
+
+// DecodeStrict decodes one JSON value into v and refuses what the default decoder lets through:
+// unknown members, duplicate members, members whose name differs only in case, invalid UTF-8 and
+// trailing data. Every failure wraps ErrDecode.
+func DecodeStrict(data []byte, v any) error {
+	if err := jsonv2.Unmarshal(data, v, jsonv2.RejectUnknownMembers(true)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDecode, err)
+	}
+	return nil
+}
 
 type envelope struct {
 	PayloadType string      `json:"payloadType"`
@@ -57,8 +71,11 @@ func SignEnvelope(payloadType string, body []byte, key ed25519.PrivateKey) ([]by
 // envelope field. It returns the raw payload. The error wraps ErrDecode, ErrPayloadType or ErrSignature.
 func VerifyEnvelope(data []byte, payloadType string, keys []ed25519.PublicKey) ([]byte, error) {
 	var env envelope
-	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, fmt.Errorf("%w envelope: %v", ErrDecode, err)
+	if err := DecodeStrict(data, &env); err != nil {
+		return nil, fmt.Errorf("envelope: %w", err)
+	}
+	if len(env.Signatures) > MaxSignatures {
+		return nil, fmt.Errorf("%w envelope: more than %d signatures", ErrDecode, MaxSignatures)
 	}
 	if env.PayloadType != payloadType {
 		return nil, fmt.Errorf("%w %q", ErrPayloadType, env.PayloadType)

@@ -3,14 +3,12 @@
 package spec
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"regexp"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
@@ -75,13 +73,17 @@ type Spec struct {
 	Retired  []Retired `json:"retired"`
 }
 
-// Sign returns a DSSE envelope that holds the spec signed with key. It does not validate the spec.
+// Sign returns a DSSE envelope that holds the spec signed with key. It runs Validate first, so it
+// never signs a spec that Verify refuses.
 func Sign(s Spec, key ed25519.PrivateKey) ([]byte, error) {
 	if s.Cells == nil {
 		s.Cells = []Entry{}
 	}
 	if s.Retired == nil {
 		s.Retired = []Retired{}
+	}
+	if err := s.Validate(); err != nil {
+		return nil, fmt.Errorf("refusing to sign: %w", err)
 	}
 	body, err := json.Marshal(s)
 	if err != nil {
@@ -91,26 +93,59 @@ func Sign(s Spec, key ed25519.PrivateKey) ([]byte, error) {
 }
 
 // Verify checks the envelope against the trusted keys, decodes the spec strictly and validates its
-// index. It returns the spec and the raw signed payload. The error wraps record.ErrPayloadType,
-// record.ErrSignature or record.ErrDecode, and every index error wraps record.ErrDecode.
+// index. It returns the spec and the raw signed payload. The decode refuses unknown, duplicate and
+// case-folded members, trailing data, and a missing or null list. The error wraps
+// record.ErrPayloadType, record.ErrSignature or record.ErrDecode, and every index error wraps
+// record.ErrDecode.
 func Verify(envelope []byte, keys []ed25519.PublicKey) (Spec, []byte, error) {
 	body, err := record.VerifyEnvelope(envelope, PayloadType, keys)
 	if err != nil {
 		return Spec{}, nil, err
 	}
 	var s Spec
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&s); err != nil {
-		return Spec{}, nil, fmt.Errorf("%w spec: %v", record.ErrDecode, err)
+	if err := record.DecodeStrict(body, &s); err != nil {
+		return Spec{}, nil, fmt.Errorf("spec: %w", err)
 	}
-	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Spec{}, nil, fmt.Errorf("%w spec: trailing data after object", record.ErrDecode)
+	if s.Cells == nil || s.Retired == nil {
+		return Spec{}, nil, fmt.Errorf("%w spec: cells and retired must be lists", record.ErrDecode)
 	}
-	if err := s.validate(); err != nil {
+	if err := s.Validate(); err != nil {
 		return Spec{}, nil, fmt.Errorf("%w spec: %v", record.ErrDecode, err)
 	}
 	return s, body, nil
+}
+
+// The errors of CheckRecord.
+var (
+	// ErrUnindexed means the spec has no entry for the record name.
+	ErrUnindexed = errors.New("spec has no entry for the record")
+	// ErrMismatch means a record differs from its entry in the spec.
+	ErrMismatch = errors.New("record differs from its spec entry")
+)
+
+// CheckRecord checks that the record c, whose signed payload is payload, is the record that the spec
+// indexes under name: the same name, the spec env, the entry revision and the entry digest.
+func (s Spec) CheckRecord(name string, c record.Cell, payload []byte) error {
+	var entry *Entry
+	for i := range s.Cells {
+		if s.Cells[i].Name == name {
+			entry = &s.Cells[i]
+			break
+		}
+	}
+	switch {
+	case entry == nil:
+		return fmt.Errorf("%w: %q", ErrUnindexed, name)
+	case c.Name != name:
+		return fmt.Errorf("%w: record names cell %q, entry is %q", ErrMismatch, c.Name, name)
+	case c.Env != s.Env:
+		return fmt.Errorf("%w: record env %q, spec env %q", ErrMismatch, c.Env, s.Env)
+	case RecordRevision(c) != entry.Revision:
+		return fmt.Errorf("%w: record revision %v, entry revision %v", ErrMismatch, RecordRevision(c), entry.Revision)
+	case RecordDigest(payload) != entry.RecordSHA256:
+		return fmt.Errorf("%w: record digest differs for %q", ErrMismatch, name)
+	}
+	return nil
 }
 
 // RecordDigest returns the lowercase hex SHA-256 of a record payload.
@@ -126,9 +161,14 @@ func RecordRevision(c record.Cell) Revision {
 
 func (r Revision) valid() bool { return r.Epoch >= 1 && r.Counter >= 1 }
 
-func validName(n string) bool { return len(n) <= MaxNameLength && labelRE.MatchString(n) }
+// ValidName reports whether n is a cell name that a spec accepts: a DNS label of at most
+// MaxNameLength characters.
+func ValidName(n string) bool { return len(n) <= MaxNameLength && labelRE.MatchString(n) }
 
-func (s Spec) validate() error {
+// Validate checks the rules that Verify applies to the index: a DNS label env, revisions of at
+// least 1, valid names in strictly ascending order in each list, no name in both lists, digests of
+// 64 lowercase hex characters, and no revision above the spec revision.
+func (s Spec) Validate() error {
 	if len(s.Env) > 63 || !labelRE.MatchString(s.Env) {
 		return errors.New("env is not a DNS label")
 	}
@@ -138,7 +178,7 @@ func (s Spec) validate() error {
 	cells := make(map[string]bool, len(s.Cells))
 	prev := ""
 	for i, e := range s.Cells {
-		if !validName(e.Name) {
+		if !ValidName(e.Name) {
 			return fmt.Errorf("cell %d has an invalid name", i)
 		}
 		if i > 0 && e.Name <= prev {
@@ -155,7 +195,7 @@ func (s Spec) validate() error {
 	}
 	prev = ""
 	for i, r := range s.Retired {
-		if !validName(r.Name) {
+		if !ValidName(r.Name) {
 			return fmt.Errorf("retired cell %d has an invalid name", i)
 		}
 		if i > 0 && r.Name <= prev {
