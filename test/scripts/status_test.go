@@ -490,7 +490,7 @@ func TestViewPodsTwoStalePodsEachGetTheirOwnTime(t *testing.T) {
 	}
 }
 
-// runVerifyFunctions runs functions of scripts/verify.sh with a stub kubectl, and returns the output.
+// runVerifyFunctions runs functions of scripts/verify.sh and scripts/verify-lib.sh with a stub kubectl, and returns the output.
 func runVerifyFunctions(t *testing.T, stub, call, cell string, env ...string) (string, error) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
@@ -500,8 +500,9 @@ func runVerifyFunctions(t *testing.T, stub, call, cell string, env ...string) (s
 	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	script := `source "$1"; for f in pem_lines peer_root_pods_current check_mesh_view_peer_root check_view_pods_current; do eval "$(sed -n "/^$f()/,/^}/p" "$2")"; done; ` + call
-	cmd := exec.Command("bash", "-c", script, "_", lib, verify)
+	script := `source "$1"; for f in pem_lines peer_root_pods_current check_mesh_view_peer_root check_view_pods_current; do eval "$(sed -n "/^$f()/,/^}/p" "$2" "$3")"; done; ` + call
+	verifyLib, _ := filepath.Abs("../../scripts/verify-lib.sh")
+	cmd := exec.Command("bash", "-c", script, "_", lib, verify, verifyLib)
 	cmd.Env = append([]string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + cell}, env...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out

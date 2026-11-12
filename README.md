@@ -192,6 +192,7 @@ The pid file is `build/hostsvc/serve.pid`, and the log is `build/hostsvc/serve.l
 `restart` stops the service, starts it, and links `mgmt-api` again, so `mgmtd` gets the new pin.
 `stop` ends only a process with the command line `build/bin/hostsvc serve`.
 A logout or a reboot of the Mac stops the service.
+The service runs in its own process group, so a Ctrl-C of the task that started it leaves it running.
 `harness:down` stops it last.
 
 `mgmtd` runs in namespace `mgmt-system` as StatefulSet `mgmtd`.

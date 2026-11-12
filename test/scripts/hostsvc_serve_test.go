@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -29,46 +30,105 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
-// fakeHostsvc stands for the binary that go build makes. serve prints the serving line of the real
-// binary (its certificate SHA-256 is new at each start, and root_sha256 comes from the map that the
-// test filled from the Go code), says that it listens by writing its pid for the fake lsof, and runs
-// until TERM. pin succeeds only for the certificate of the running process.
-const fakeHostsvc = `#!/usr/bin/env bash
-st="$STUB_STATE"
-case "$1" in
-  serve)
-    shift
-    while (($#)); do
-      case "$1" in
-        --listen) listen="$2"; shift 2 ;;
-        --client-bundle) bundle="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    port="${listen##*:}"
-    key="$(shasum -a 256 <"$bundle" | cut -d' ' -f1)"
-    root="$(cat "$st/map/$key" 2>/dev/null || echo unknown)"
-    cert="$(printf '%s-%s' "$$" "$RANDOM" | shasum -a 256 | cut -d' ' -f1)"
-    echo "$cert" >"$st/cert.$port"
-    echo "$$" >"$st/listen.$port"
-    trap 'rm -f "$st/listen.$port" "$st/cert.$port"; exit 0' TERM
-    printf '{"time":"2026-11-13T00:00:00Z","level":"INFO","msg":"serving","addr":"%s","cert_sha256":"%s","root_sha256":"%s","pid":%s}\n' "$listen" "$cert" "$root" "$$"
-    echo "$bundle" >>"$st/starts"
-    while :; do sleep 0.2; done ;;
-  pin)
-    shift
-    while (($#)); do
-      case "$1" in
-        --addr) addr="$2"; shift 2 ;;
-        --expect-sha256) expect="$2"; shift 2 ;;
-        *) shift ;;
-      esac
-    done
-    port="${addr##*:}"
-    [[ -f "$st/cert.$port" && "$(cat "$st/cert.$port")" == "$expect" ]] || { echo '{"level":"ERROR","msg":"hostsvc failed","error":"no such server"}'; exit 1; }
-    cat "$st/pin.pem" ;;
-esac
+// fakeHostsvcSource is the source of the fake binary that go build makes. It is a compiled program, so its command
+// line is exactly "<path> serve ...", as the real binary has. serve prints the serving line of the real binary (its
+// certificate SHA-256 is new at each start, and root_sha256 comes from the map that the test filled from the Go code),
+// says that it listens by writing its pid for the fake lsof, and runs until TERM. pin succeeds only for the certificate
+// of the running process.
+const fakeHostsvcSource = `package main
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+)
+
+func flagValue(args []string, name string) string {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == name {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func main() {
+	st := os.Getenv("STUB_STATE")
+	switch os.Args[1] {
+	case "serve":
+		listen, bundle := flagValue(os.Args, "--listen"), flagValue(os.Args, "--client-bundle")
+		port := listen[strings.LastIndex(listen, ":")+1:]
+		data, _ := os.ReadFile(bundle)
+		sum := sha256.Sum256(data)
+		root, err := os.ReadFile(filepath.Join(st, "map", hex.EncodeToString(sum[:])))
+		if err != nil {
+			root = []byte("unknown")
+		}
+		c := sha256.Sum256([]byte(fmt.Sprint(os.Getpid(), time.Now().UnixNano())))
+		cert := hex.EncodeToString(c[:])
+		_ = os.WriteFile(filepath.Join(st, "cert."+port), []byte(cert), 0o644)
+		_ = os.WriteFile(filepath.Join(st, "listen."+port), []byte(fmt.Sprint(os.Getpid())), 0o644)
+		f, _ := os.OpenFile(filepath.Join(st, "starts"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		fmt.Fprintln(f, bundle)
+		f.Close()
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGTERM)
+		fmt.Printf("{\"time\":\"2026-11-13T00:00:00Z\",\"level\":\"INFO\",\"msg\":\"serving\",\"addr\":\"%s\",\"cert_sha256\":\"%s\",\"root_sha256\":\"%s\",\"pid\":%d}\n", listen, cert, root, os.Getpid())
+		<-ch
+		os.Remove(filepath.Join(st, "listen."+port))
+		os.Remove(filepath.Join(st, "cert."+port))
+	case "pin":
+		addr, expect := flagValue(os.Args, "--addr"), flagValue(os.Args, "--expect-sha256")
+		port := addr[strings.LastIndex(addr, ":")+1:]
+		got, err := os.ReadFile(filepath.Join(st, "cert."+port))
+		if err != nil || string(got) != expect {
+			fmt.Println(` + "`" + `{"level":"ERROR","msg":"hostsvc failed","error":"no such server"}` + "`" + `)
+			os.Exit(1)
+		}
+		pem, _ := os.ReadFile(filepath.Join(st, "pin.pem"))
+		os.Stdout.Write(pem)
+	}
+}
 `
+
+var (
+	fakeBinOnce sync.Once
+	fakeBinPath string
+	fakeBinErr  error
+)
+
+// fakeHostsvcBinary compiles the fake host service once for the package.
+func fakeHostsvcBinary(t *testing.T) string {
+	t.Helper()
+	fakeBinOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "fake-hostsvc")
+		if err != nil {
+			fakeBinErr = err
+			return
+		}
+		src := filepath.Join(dir, "main.go")
+		if err := os.WriteFile(src, []byte(fakeHostsvcSource), 0o644); err != nil {
+			fakeBinErr = err
+			return
+		}
+		fakeBinPath = filepath.Join(dir, "hostsvc")
+		cmd := exec.Command("go", "build", "-o", fakeBinPath, src)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			fakeBinErr = fmt.Errorf("build the fake host service: %v: %s", err, out)
+		}
+	})
+	if fakeBinErr != nil {
+		t.Fatal(fakeBinErr)
+	}
+	return fakeBinPath
+}
 
 const fakeServeKubectl = `#!/usr/bin/env bash
 case " $* " in
@@ -160,7 +220,11 @@ func newServeEnv(t *testing.T) *serveEnv {
 	write("bin/mise", fakeServeMise, 0o755)
 	write("bin/go", fakeServeGo, 0o755)
 	write("bin/lsof", fakeLsof, 0o755)
-	write("state/hostsvc", fakeHostsvc, 0o755)
+	bin, err := os.ReadFile(fakeHostsvcBinary(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write("state/hostsvc", string(bin), 0o755)
 	write("state/pin.pem", caPEM(t, 99), 0o644)
 	e.rootA, e.rootB = caPEM(t, 1), caPEM(t, 2)
 	e.shaA, e.shaB = goRootSHA(t, e.rootA), goRootSHA(t, e.rootB)
@@ -335,6 +399,56 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(dir, "serve.pid")); err != nil {
 			t.Fatal("stop removed a pid file that does not name the host service")
+		}
+	})
+
+	t.Run("stop refuses a wrapper that only names the binary", func(t *testing.T) {
+		e := newServeEnv(t)
+		bin := filepath.Join(e.build, "bin", "hostsvc")
+		wrapper := exec.Command("sh", "-c", "sleep 60; true # "+bin+" serve")
+		if err := wrapper.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = wrapper.Process.Kill(); _ = wrapper.Wait() })
+		dir := filepath.Join(e.build, "hostsvc")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "serve.pid"), []byte(strconv.Itoa(wrapper.Process.Pid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, errOut, err := e.serve(t, "stop")
+		if err == nil || !strings.Contains(errOut, "is not the host service") || !alive(wrapper.Process.Pid) {
+			t.Fatalf("err %v, stderr %q; want a refusal that leaves the wrapper running", err, errOut)
+		}
+	})
+
+	t.Run("a second listener on the port fails start", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		pid := *e.status(t).PID
+		other := exec.Command("sleep", "60")
+		if err := other.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = other.Process.Kill(); _ = other.Wait() })
+		listen := filepath.Join(e.state, "listen.17443")
+		if err := os.WriteFile(listen, []byte(fmt.Sprintf("%d\n%d\n", pid, other.Process.Pid)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, errOut, err := e.serve(t, "start")
+		if err == nil || !strings.Contains(errOut, fmt.Sprintf("port 17443 is held by process %d %d", pid, other.Process.Pid)) {
+			t.Fatalf("err %v, stderr %q; want a stop that names both holders", err, errOut)
+		}
+	})
+
+	t.Run("the service runs in its own process group", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		pid := *e.status(t).PID
+		pgid, err := syscall.Getpgid(pid)
+		if err != nil || pgid == syscall.Getpgrp() || pgid != pid {
+			t.Fatalf("process group of the service %d (%v), want its own group %d, not the group %d of the caller", pgid, err, pid, syscall.Getpgrp())
 		}
 	})
 

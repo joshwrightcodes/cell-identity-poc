@@ -187,3 +187,4 @@ macOS still sleeps when the lid closes on battery power.
 - `prom-readonly` does not enforce `query_scope`, and the path is read-only. The Kiali signing key is predictable and unused under the `anonymous` strategy.
 - The tunnel state comes from the hub log, and the tunnel probe runs `whoami`. A pod that started in the same second as a newer view key, and did not read it, counts as current.
 - `harness:status` reads the current principal log, so a log rotation can hide connected agents.
+- The signing key of `mgmtd` lives on its volume in `management`. A process that can start a pod with a hostPath volume, or open a shell on the node, reads the key file. `TestM4SigningKeyReaders` logs the accounts that can create pods, exec, add ephemeral containers or create hostPath pods. The same test logs the accounts that can change ConfigMap `mgmt-signing-pub`. A change to that ConfigMap shows in `cell:verify` only while `mgmtd-0` is Ready.

@@ -4,17 +4,20 @@ package e2e
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"path/filepath"
+	"math/big"
+	"net"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -95,59 +98,99 @@ func TestM4HostServiceServesPinnedKeys(t *testing.T) {
 	}
 }
 
-// hostsvcLogLines counts the lines of the host service log.
-func hostsvcLogLines(t *testing.T) []string {
+// foreignCert makes a client certificate in this process, under a fresh self-signed CA that carries the URI SAN
+// spiffe://<caDomain>. The host service never saw that CA. The leaf has the URI SAN leafID.
+func foreignCert(t *testing.T, caDomain, leafID string) tls.Certificate {
 	t.Helper()
-	b, err := os.ReadFile(filepath.Join("../../build/hostsvc/serve.log"))
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Split(strings.TrimSpace(string(b)), "\n")
+	caURI, _ := url.Parse("spiffe://" + caDomain)
+	caTmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "foreign ca"}, NotBefore: time.Now().Add(-time.Hour),
+		NotAfter: time.Now().Add(time.Hour), IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign, URIs: []*url.URL{caURI}}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leafURI, _ := url.Parse(leafID)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{leafURI}}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
-// TestM4HostServiceRefusesOthers: a handshake with no client certificate, with a certificate that a party made for
-// the ID of mgmtd under its own CA (the rogue case), and with an SVID of another workload of management, each
-// fails, and the host service log shows no lookup.
-func TestM4HostServiceRefusesOthers(t *testing.T) {
-	before := len(hostsvcLogLines(t))
-	handshake := func(cert *tls.Certificate) error {
-		cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: hostsvc.KeyServerHost, InsecureSkipVerify: true}
-		if cert != nil {
-			cfg.Certificates = []tls.Certificate{*cert}
-		}
-		client := &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}}
-		resp, err := client.Get("https://" + hostsvcAddr + mgmtapi.KeysPath(clustersWith(t, agentCellSet)[0]))
-		if err == nil {
-			_, _ = io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			return fmt.Errorf("the request succeeded with status %d", resp.StatusCode)
-		}
+// handshakeRefused makes one TLS 1.3 handshake with the host service and reads once. TLS 1.3 reports a refused
+// client certificate on the first read, as an alert from the server. It returns an error unless the server
+// answered with a TLS alert.
+func handshakeRefused(cert *tls.Certificate) error {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, ServerName: hostsvc.KeyServerHost, InsecureSkipVerify: true}
+	if cert != nil {
+		cfg.Certificates = []tls.Certificate{*cert}
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", hostsvcAddr, cfg)
+	if err != nil {
+		return refusedByAlert(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_, _ = conn.Write([]byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+	buf := make([]byte, 1)
+	if _, err := conn.Read(buf); err != nil {
+		return refusedByAlert(err)
+	}
+	return fmt.Errorf("the server answered a client that it must refuse")
+}
+
+// refusedByAlert returns nil for an alert that the server sent, and the error otherwise, so a dial failure or a
+// stopped service does not pass as a refusal.
+func refusedByAlert(err error) error {
+	if strings.Contains(err.Error(), "remote error: tls:") {
 		return nil
 	}
-	if err := handshake(nil); err != nil {
-		t.Errorf("no client certificate: %v", err)
+	return fmt.Errorf("want a TLS alert from the server, got: %w", err)
+}
+
+// TestM4HostServiceRefusesOthers: with a positive control (the real SVID of mgmtd and the pin get the keys), each
+// of these clients fails with a TLS alert from the server: no client certificate; the exact ID of mgmtd under a CA
+// that the host service never saw; an ID of another trust domain under a foreign CA; and the real SVID of the
+// telemetry gateway of management. The test runs on the Mac, so it tests the authentication of the server. The
+// reach from a pod of rogue is the residual in docs/design/poc-scope.md.
+func TestM4HostServiceRefusesOthers(t *testing.T) {
+	src, _ := svidFor(t, mgmtCluster, mgmtAPIID)
+	pin, err := hostsvc.PinFromPEM(hostsvcPinPEM(t))
+	if err != nil {
+		t.Fatal(err)
 	}
-	// The certificate of the rogue cluster: a SPIRE-like certificate for the same ID under a CA that only rogue holds.
-	_, rogue := svidFor(t, "rogue", "spiffe://rogue.poc.internal/api")
-	if err := handshake(&rogue); err != nil {
-		t.Errorf("a certificate made in rogue: %v", err)
+	client, err := hostsvc.NewKeyClient(hostsvc.KeyClientConfig{Addr: hostsvcAddr, ServerName: hostsvc.KeyServerHost, Pin: pin, SVIDs: src})
+	if err != nil {
+		t.Fatal(err)
 	}
+	cell := clustersWith(t, agentCellSet)[0]
+	if _, err := client.Keys(context.Background(), cell); err != nil {
+		t.Fatalf("the positive control failed, so the refusals below prove nothing: %v", err)
+	}
+	sameID := foreignCert(t, mgmtTD, mgmtAPIID)
+	otherDomain := foreignCert(t, "rogue.poc.internal", "spiffe://rogue.poc.internal/api")
 	_, telemetry := svidFor(t, mgmtCluster, "spiffe://"+mgmtTD+"/telemetry")
-	if err := handshake(&telemetry); err != nil {
-		t.Errorf("the SVID of the telemetry gateway: %v", err)
-	}
-	for _, line := range hostsvcLogLines(t)[before:] {
-		if strings.Contains(line, "lookup") {
-			t.Errorf("the host service log shows a lookup after the refused handshakes: %s", line)
+	for name, cert := range map[string]*tls.Certificate{"no client certificate": nil, "the ID of mgmtd under a foreign CA": &sameID,
+		"an ID of another trust domain under a foreign CA": &otherDomain, "the SVID of the telemetry gateway": &telemetry} {
+		if err := handshakeRefused(cert); err != nil {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
-	// A pod in rogue reaches the port at the network level only. The refusals above show that the handshake decides.
-	ns := freshNamespace(t, "rogue")
-	out, err := command("", "docker", "exec", "rogue-control-plane", "getent", "ahostsv4", hostsvc.KeyServerHost)
-	if err != nil {
-		t.Fatalf("resolve %s in rogue: %v\n%s", hostsvc.KeyServerHost, err, out)
-	}
-	t.Logf("a pod in %s/%s dials %s: %s", "rogue", ns, hostsvc.KeyServerHost, strings.Fields(out)[0])
 }
 
 // TestM4MgmtdReachesHostService: mgmtd previews the keys of each cell, which makes it call the host service.
@@ -214,19 +257,38 @@ func TestM4SigningKeyReaders(t *testing.T) {
 	if err != nil || strings.TrimSpace(listing) != "400 "+mgmtdUID {
 		t.Fatalf("key file mode and owner %q (%v), want 400 %s", listing, err, mgmtdUID)
 	}
-	for _, verb := range []struct{ verb, resource, sub string }{{"create", "pods", ""}, {"create", "pods", "exec"}, {"update", "pods", "ephemeralcontainers"}} {
-		list, err := kubectl(t, mgmtCluster, "", "get", "serviceaccounts", "-A", "-o", `jsonpath={range .items[*]}{.metadata.namespace}:{.metadata.name}{"\n"}{end}`)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for sa := range strings.FieldsSeq(list) {
-			ns, name, _ := strings.Cut(sa, ":")
+	sas, err := kubectl(t, mgmtCluster, "", "get", "serviceaccounts", "-A", "-o", `jsonpath={range .items[*]}{.metadata.namespace}:{.metadata.name}{"\n"}{end}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accounts := strings.Fields(sas)
+	// Readers of the key: who can start a process next to mgmtd-0. Writers of the public key: who can change mgmt-signing-pub.
+	for _, verb := range []struct{ verb, resource, sub string }{{"create", "pods", ""}, {"create", "pods", "exec"}, {"update", "pods", "ephemeralcontainers"},
+		{"update", "configmaps", ""}, {"patch", "configmaps", ""}} {
+		for _, sa := range accounts {
 			if canISub(t, mgmtCluster, "system:serviceaccount:"+sa, verb.verb, verb.resource, verb.sub, mgmtNamespace) {
-				t.Logf("residual: %s/%s can %s %s/%s in %s", ns, name, verb.verb, verb.resource, verb.sub, mgmtNamespace)
+				t.Logf("residual: %s can %s %s/%s in %s", sa, verb.verb, verb.resource, verb.sub, mgmtNamespace)
 			}
 		}
 	}
-	t.Logf("residual: the local-path volume directory on %s and local-path-provisioner-service-account, which can create hostPath pods, reach the key file too", node)
+	// Kubernetes RBAC cannot name a hostPath volume. A pod that mounts the local-path directory reads the key file, and
+	// Pod Security stops such a pod only in a namespace that enforces restricted or baseline. So list the accounts that can
+	// create pods in each namespace that enforces neither.
+	nsList, err := kubectl(t, mgmtCluster, "", "get", "namespaces", "-o", `jsonpath={range .items[*]}{.metadata.name}={.metadata.labels.pod-security\.kubernetes\.io/enforce}{"\n"}{end}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for entry := range strings.FieldsSeq(nsList) {
+		ns, level, _ := strings.Cut(entry, "=")
+		if level == "restricted" || level == "baseline" {
+			continue
+		}
+		for _, sa := range accounts {
+			if canI(t, mgmtCluster, "system:serviceaccount:"+sa, "create", "pods", ns) {
+				t.Logf("residual: %s can create hostPath pods in %s, which enforces %q", sa, ns, level)
+			}
+		}
+	}
 }
 
 // TestM4SigningKeyStable deletes pod mgmtd-0. The key survives on the volume, so the public key does not change.
@@ -310,10 +372,20 @@ func TestM4BindListenerNoClientCert(t *testing.T) {
 
 // TestM4MgmtListenersAdmission: the node ports admit only the dev-cp node. A pod in a fresh namespace of another
 // cell cannot reach the bind node port of management directly. Each cell reaches the bind route only through
-// relay-bind in dev-cp, so a direct dial from a cell node address times out.
+// relay-bind in dev-cp, so a direct dial from a cell node address times out. A dev-cp subtest dials the same ports
+// and must connect. If the ingress of mgmt-bind widens to the cell nodes, the dev-cell-1 and dev-cell-2 subtests both fail.
 func TestM4MgmtListenersAdmission(t *testing.T) {
 	needProbeImage(t)
 	node := clusterFacts(t, mgmtCluster).NodeIP
+	// The positive half: the dev-cp node reaches both ports. It fails when mgmtd is down, or when the rule names another address.
+	t.Run("dev-cp", func(t *testing.T) {
+		ns := freshNamespace(t, "dev-cp")
+		for _, port := range []int{31446, 31447} {
+			if got := dialFrom(t, "dev-cp", ns, node, port, 10*time.Second); got != "connected" {
+				t.Errorf("a pod in dev-cp dials management %s:%d: %s, want connected", node, port, got)
+			}
+		}
+	})
 	for _, cell := range clustersWith(t, agentCellSet) {
 		t.Run(cell, func(t *testing.T) {
 			for _, port := range []int{31446, 31447} {

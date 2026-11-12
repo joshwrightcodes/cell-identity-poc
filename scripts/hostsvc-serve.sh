@@ -15,7 +15,8 @@
 #   status   Print one JSON line: running, pid, cert_sha256, root_sha256, expires_soon and the last
 #            error line of the log.
 #   pin      Print the certificate of the running service as PEM, checked against the serving log line.
-# The service makes a new TLS key at each start. It trusts only the root that it read at start.
+# The service makes a new TLS key at each start. It trusts only the root that it read at start. It runs in its
+# own process group, so a Ctrl-C of the task that started it leaves it running.
 CELL="${CELL:-management}"
 source "$(dirname "$0")/lib.sh"
 source "$ROOT/components/lib/peer-root.sh"
@@ -42,11 +43,17 @@ running_pid() {
   pid="$(tr -d '[:space:]' <"$pidfile")"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
   kill -0 "$pid" 2>/dev/null || return 0
-  [[ "$(cmd_of "$pid")" == *"$bin serve"* ]] && echo "$pid"
+  is_service_cmd "$(cmd_of "$pid")" && echo "$pid"
   return 0
 }
 
-port_holder() { lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1 || true; }
+# is_service_cmd <command line> succeeds when the command line is "$bin serve", alone or with arguments. A
+# wrapper that only names the binary does not match.
+is_service_cmd() { [[ "$1" == "$bin serve" || "$1" == "$bin serve "* ]]; }
+
+# port_holders prints every process that listens on the port, on one line. A second listener on another
+# address of the same port counts.
+port_holders() { { lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true; } | sort -un | paste -sd' ' -; }
 
 # log_field <name> prints a field of the last serving line of the log.
 log_field() {
@@ -107,7 +114,7 @@ do_stop() {
     return 0
   fi
   cmd="$(cmd_of "$pid")"
-  [[ "$cmd" == *"$bin serve"* ]] || die "process $pid is not the host service: its command line is '$cmd', and the host service runs '$bin serve'. Remove $pidfile if it is stale"
+  is_service_cmd "$cmd" || die "process $pid is not the host service: its command line is '$cmd', and the host service runs '$bin serve'. Remove $pidfile if it is stale"
   kill "$pid"
   end=$((SECONDS + wait_seconds))
   while kill -0 "$pid" 2>/dev/null; do
@@ -121,7 +128,7 @@ do_stop() {
 # current_state prints why the running service needs a restart, and nothing when it is current.
 current_state() {
   local pid="$1" want_root="$2" sha
-  [[ "$(port_holder)" == "$pid" ]] || { echo "process $pid does not hold port $port"; return; }
+  [[ "$(port_holders)" == "$pid" ]] || { echo "process $pid does not hold port $port alone"; return; }
   [[ "$(log_field root_sha256)" == "$want_root" ]] || { echo "it serves another management root than the live one"; return; }
   sha="$(log_field cert_sha256)"
   pin_pem "$sha" >/dev/null 2>&1 || { echo "the certificate on $addr does not have the SHA-256 of the serving line"; return; }
@@ -130,11 +137,11 @@ current_state() {
 }
 
 do_start() {
-  local pid holder root_pem want_root why nofile end sha
+  local pid holders root_pem want_root why nofile end sha
   pid="$(running_pid)"
-  holder="$(port_holder)"
-  if [[ -n "$holder" && "$holder" != "$pid" ]]; then
-    die "port $port is held by process $holder ($(cmd_of "$holder")), and the pid file names ${pid:-no host service}. Stop that process, then run: mise run hostsvc:serve -- start"
+  holders="$(port_holders)"
+  if [[ -n "$holders" && "$holders" != "$pid" ]]; then
+    die "port $port is held by process $holders ($(cmd_of "${holders%% *}")), and the pid file names ${pid:-no host service}. Stop that process, then run: mise run hostsvc:serve -- start"
   fi
   root_pem="$(peer_root_pem management "$SPIRE_TRUST_DOMAIN_MGMT")" || exit 1
   want_root="$(pem_der_sha256 <<<"$root_pem")"
@@ -159,15 +166,18 @@ do_start() {
   nofile="$(ulimit -n)"
   [[ "$nofile" == unlimited || "$nofile" -ge 1104 ]] || die "the limit on open files is $nofile, and the host service needs 1104"
   cd "$ROOT"
+  # Job control gives the service its own process group, so a Ctrl-C of the task that started it does not reach it.
+  set -m
   nohup "$bin" serve --listen "$addr" --client-bundle "$rootfile" >"$logfile" 2>&1 </dev/null &
   pid=$!
+  set +m
   disown "$pid" 2>/dev/null || true
   echo "$pid" >"$pidfile"
   end=$((SECONDS + wait_seconds))
   while :; do
     sha="$(log_field cert_sha256)"
     if kill -0 "$pid" 2>/dev/null; then
-      if [[ "$(port_holder)" == "$pid" && -n "$sha" ]] && pin_pem "$sha" >/dev/null 2>&1; then
+      if [[ "$(port_holders)" == "$pid" && -n "$sha" ]] && pin_pem "$sha" >/dev/null 2>&1; then
         log "the host service serves on $addr, process $pid, certificate $sha"
         return 0
       fi
