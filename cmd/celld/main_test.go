@@ -31,8 +31,12 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"google.golang.org/grpc"
+	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bind"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
 const testID = "spiffe://dev.env.poc.internal/cell/dev-cell-1/celld"
@@ -100,21 +104,181 @@ func jsonLines(t *testing.T, out string) []map[string]any {
 	return lines
 }
 
-func TestRejectsArguments(t *testing.T) {
-	var out bytes.Buffer
-	if code := execute(t.Context(), []string{"serve"}, &out, testTelemetry(discard())); code != 1 {
-		t.Fatalf("exit code %d, want 1", code)
+// blockingBind stands in for bind.Run: it returns when ctx ends.
+func blockingBind(ctx context.Context, _ bind.Config) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func fakeTokenClient() (corev1client.ServiceAccountsGetter, error) {
+	return fake.NewClientset().CoreV1(), nil
+}
+
+func testEnv(name string) (string, bool) {
+	v, ok := map[string]string{"POD_NAME": "celld-abc", "POD_UID": "uid-1", "POD_NAMESPACE": "cell-identity-system", "SERVICE_ACCOUNT": "celld"}[name]
+	return v, ok
+}
+
+func testDeps(start telemetryStarter) deps {
+	return deps{start: start, lookupEnv: testEnv, tokenClient: fakeTokenClient, bindRun: blockingBind}
+}
+
+func bundleFile(t *testing.T) string {
+	t.Helper()
+	pem, err := spiffetest.NewCA(t, "mgmt.poc.internal").Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
 	}
-	lines := jsonLines(t, out.String())
-	if len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["error"] != "celld takes no arguments" {
-		t.Fatalf("output is %v, want one JSON error line", lines)
+	path := filepath.Join(t.TempDir(), "bundle.pem")
+	if err := os.WriteFile(path, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func validArgs(t *testing.T) []string {
+	t.Helper()
+	return []string{"--cell", "dev-cell-1", "--bind-upstream", "127.0.0.1:1", "--bind-expect-id", "spiffe://mgmt.poc.internal/api", "--bind-peer-bundle", bundleFile(t)}
+}
+
+func TestCelldRequiresBindFlags(t *testing.T) {
+	base := validArgs(t)
+	without := func(flag string) []string {
+		var out []string
+		for i := 0; i < len(base); i += 2 {
+			if base[i] != flag {
+				out = append(out, base[i], base[i+1])
+			}
+		}
+		return out
+	}
+	cases := map[string][]string{
+		"no arguments":     nil,
+		"missing cell":     without("--cell"),
+		"missing upstream": without("--bind-upstream"),
+		"missing id":       without("--bind-expect-id"),
+		"missing bundle":   without("--bind-peer-bundle"),
+		"positional":       append(slices.Clone(base), "serve"),
+		"unknown flag":     append(slices.Clone(base), "--verbose"),
+		"id not spiffe":    {"--cell", "c", "--bind-upstream", "h:1", "--bind-expect-id", "https://x/api", "--bind-peer-bundle", base[7]},
+		"bundle missing":   {"--cell", "c", "--bind-upstream", "h:1", "--bind-expect-id", "spiffe://mgmt.poc.internal/api", "--bind-peer-bundle", "/nonexistent/bundle.pem"},
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := execute(t.Context(), args, &out, testDeps(testTelemetry(discard()))); code != 1 {
+				t.Fatalf("exit code %d, want 1", code)
+			}
+			lines := jsonLines(t, out.String())
+			if len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["error"] == nil {
+				t.Fatalf("output is %v, want one JSON error line", lines)
+			}
+		})
+	}
+	for _, name := range []string{"POD_NAME", "POD_UID", "POD_NAMESPACE", "SERVICE_ACCOUNT"} {
+		t.Run("env "+name, func(t *testing.T) {
+			d := testDeps(testTelemetry(discard()))
+			d.lookupEnv = func(n string) (string, bool) {
+				if n == name {
+					return "", false
+				}
+				return testEnv(n)
+			}
+			var out bytes.Buffer
+			if code := execute(t.Context(), base, &out, d); code != 1 {
+				t.Fatalf("exit code %d, want 1", code)
+			}
+			if lines := jsonLines(t, out.String()); len(lines) != 1 || !strings.Contains(lines[0]["error"].(string), name) {
+				t.Fatalf("output is %v, want one error line that names %s", lines, name)
+			}
+		})
+	}
+}
+
+func TestCelldPassesTheBindConfig(t *testing.T) {
+	var got bind.Config
+	d := testDeps(testTelemetry(discard()))
+	d.bindRun = func(ctx context.Context, cfg bind.Config) error { got = cfg; return blockingBind(ctx, cfg) }
+	_, addr := serveWorkloadAPI(t)
+	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
+	ctx, cancel := context.WithCancel(t.Context())
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, validArgs(t), out, d) }()
+	waitForLines(t, out, "watching the workload api", 1)
+	cancel()
+	<-done
+	if got.Cell != "dev-cell-1" || got.Upstream != "127.0.0.1:1" || got.TLS == nil || got.Tokens == nil || got.Log == nil || got.Observe == nil {
+		t.Fatalf("bind config %+v", got)
+	}
+}
+
+// TestCelldServesSVIDWhileBindFails runs the real bind loop against a closed port. The SVID watch
+// keeps running, the loop logs each failure, and the attempt counter counts it.
+func TestCelldServesSVIDWhileBindFails(t *testing.T) {
+	fake, addr := serveWorkloadAPI(t)
+	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
+	reader := sdkmetric.NewManualReader()
+	start := func(ctx context.Context, w io.Writer) (*telemetry.T, error) {
+		tel, err := testTelemetry(discard())(ctx, w)
+		if err == nil {
+			tel.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+		}
+		return tel, err
+	}
+	d := testDeps(start)
+	d.bindRun = func(ctx context.Context, cfg bind.Config) error {
+		cfg.Sleep = func(ctx context.Context, _ time.Duration) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Millisecond):
+				return nil
+			}
+		}
+		return bind.Run(ctx, cfg)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, validArgs(t), out, d) }()
+
+	fake.responses <- newCA(t).svid(t, 21)
+	waitForLines(t, out, "x509 svid updated", 1)
+	failed := waitForLines(t, out, "bind failed", 3)
+	if failed[0]["cell"] != "dev-cell-1" || failed[0]["result"] != "error" {
+		t.Fatalf("bind failed line is %v", failed[0])
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit code %d, want 0\n%s", code, out.String())
+	}
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var errs int64
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if sum, ok := m.Data.(metricdata.Sum[int64]); ok && m.Name == "celld.bind.attempts" {
+				for _, dp := range sum.DataPoints {
+					if v, _ := dp.Attributes.Value("result"); v.AsString() == "error" {
+						errs += dp.Value
+					}
+				}
+			}
+		}
+	}
+	if errs < 3 {
+		t.Fatalf("celld.bind.attempts with result=error is %d, want at least 3", errs)
 	}
 }
 
 func TestFailsWithoutWorkloadAPISocket(t *testing.T) {
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", "")
 	var out bytes.Buffer
-	if code := execute(t.Context(), nil, &out, testTelemetry(discard())); code != 1 {
+	if code := execute(t.Context(), validArgs(t), &out, testDeps(testTelemetry(discard()))); code != 1 {
 		t.Fatalf("exit code %d, want 1", code)
 	}
 	lines := jsonLines(t, out.String())
@@ -248,7 +412,9 @@ func TestLogsEachNewSVIDOnce(t *testing.T) {
 	defer cancel()
 	out := &syncBuffer{}
 	done := make(chan int, 1)
-	go func() { done <- execute(ctx, nil, out, testTelemetry(recordHandler{&mu, &exported})) }()
+	go func() {
+		done <- execute(ctx, validArgs(t), out, testDeps(testTelemetry(recordHandler{&mu, &exported})))
+	}()
 
 	fake.responses <- first
 	waitForLines(t, out, "x509 svid updated", 1)
