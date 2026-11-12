@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os/exec"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"time"
 )
+
+// statusAttemptMax bounds one run of a mise task in this file. harness:status takes about 2 minutes.
+const statusAttemptMax = 6 * time.Minute
 
 // statusSampleMax is the age limit of a Prometheus sample in harness:status.
 const statusSampleMax = 5 * time.Minute
@@ -22,7 +26,9 @@ const statusRetryWindow = 10 * time.Minute
 // standard output, the standard error and the exit status.
 func runMise(t *testing.T, cell string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
-	cmd := exec.Command("mise", append([]string{"run"}, args...)...)
+	ctx, cancel := context.WithTimeout(context.Background(), statusAttemptMax)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mise", append([]string{"run"}, args...)...)
 	cmd.Dir = "../.."
 	cmd.Env = append(cmd.Environ(), "CELL="+cell)
 	if cell == "" {
@@ -34,7 +40,7 @@ func runMise(t *testing.T, cell string, args ...string) (stdout, stderr string, 
 	if ee := (*exec.ExitError)(nil); errors.As(err, &ee) {
 		code = ee.ExitCode()
 	} else if err != nil {
-		t.Fatalf("mise run %s: %v", strings.Join(args, " "), err)
+		t.Fatalf("mise run %s: %v (the limit is %s)", strings.Join(args, " "), err, statusAttemptMax)
 	}
 	return out.String(), errBuf.String(), code
 }
@@ -172,8 +178,12 @@ func TestM3VerifyDetectsPeerRootDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 	stdout, stderr, code := runMise(t, cell, "cell:verify")
-	const check = "FAIL  The peer root ConfigMap of the mesh-view tunnel holds the live roots of management"
-	if code == 0 || !strings.Contains(stdout, check) || !strings.Contains(stdout, "CELL="+cell+" mise run cell:up") {
-		t.Fatalf("cell:verify exited %d, want a failure of the check %q and the command CELL=%s mise run cell:up.\nstdout:\n%s\nstderr:\n%s", code, check, cell, stdout, stderr)
+	// The bundle drift check of mesh-view prints the same command, so the test asserts the check under test: its
+	// own FAIL line, its detail line and its repair line, in that order.
+	const check = "FAIL  The peer root ConfigMap of the mesh-view tunnel holds the live roots of management\n" +
+		"      ConfigMap mesh-view-system/mgmt-root holds other roots than the live bundle of management.\n" +
+		"      Run: CELL=dev-cell-1 mise run cell:up"
+	if code == 0 || !strings.Contains(stdout, check) {
+		t.Fatalf("cell:verify exited %d, want the FAIL line, the detail line and the repair line of the peer root check:\n%s\nstdout:\n%s\nstderr:\n%s", code, check, stdout, stderr)
 	}
 }

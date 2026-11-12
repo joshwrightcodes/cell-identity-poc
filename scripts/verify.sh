@@ -146,6 +146,29 @@ pem_lines() {
   awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
 }
 
+# peer_root_pods_current <namespace> <app> <ConfigMap> <fix command> succeeds when every running pod of the
+# workload carries the digest of the ConfigMap in its annotation poc.internal/peer-root-sha256. The process reads
+# the roots once at start, so a ConfigMap that is right does not show that the pod trusts the same roots.
+peer_root_pods_current() {
+  local ns="$1" app="$2" cm="$3" fix="$4" raw want pods bad
+  raw="$(k -n "$ns" get configmap "$cm" -o jsonpath='{.data.root\.crt}')" || { echo "could not read ConfigMap $ns/$cm"; return 1; }
+  want="$(printf '%s' "$raw" | shasum -a 256 | cut -d' ' -f1)"
+  pods="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$app" -o json)" || { echo "could not read the pods of $app in $ns"; return 1; }
+  bad="$(jq -r --arg want "$want" '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $n
+      | ((.metadata.annotations["poc.internal/peer-root-sha256"] // "") | if . == "" then "none" else . end) as $got | select($got != $want) | "\($n) carries the root digest \($got)"] | .[]' <<<"$pods")"
+  if [[ -z "$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | length | select(. > 0)' <<<"$pods")" ]]; then
+    echo "$app has no running pod in $ns."
+    echo "Run: $fix"
+    return 1
+  fi
+  if [[ -n "$bad" ]]; then
+    echo "$bad"
+    echo "ConfigMap $ns/$cm has the digest $want, and a pod reads the roots only at start."
+    echo "Run: $fix"
+    return 1
+  fi
+}
+
 node_ip() {
   local facts ip
   facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$1" 2>/dev/null)" || { echo "no host service facts for $1"; return 1; }
@@ -759,6 +782,7 @@ check_uplink_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
+  peer_root_pods_current observability-system otel-uplink "$cm" "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
 # The mesh-view tunnel of a cell copies the node address of SPIRE_SERVER_CLUSTER into its
@@ -790,6 +814,7 @@ check_mesh_view_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
+  peer_root_pods_current mesh-view-system mesh-view mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
 # A gate test drops the packets between the relay and the hub with firewall rules on the dev-cp node. A run
@@ -880,6 +905,7 @@ check_agent_mgmt_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
+  peer_root_pods_current argocd argocd-agent mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
 # The agent answers 200 on /healthz only while its stream to the principal is up.
@@ -1032,6 +1058,7 @@ check_view_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:link"
     return 1
   fi
+  peer_root_pods_current central-view-system argocd-agent-principal peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
 }
 
 # The Secrets of central-view-system must be exactly the view keys and argocd-redis. An extra
@@ -1070,14 +1097,17 @@ check_view_cert_expiry() {
 # creates a Secret to change it, so its creation time is the time of its content.
 check_view_pods_current() {
   local ns=central-view-system secrets newest name started pod at late=()
-  secrets="$(k -n "$ns" get secrets argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret -o json)" \
-    || { echo "could not read the view key Secrets of $ns"; return 1; }
-  newest="$(jq -r '[.items[].metadata.creationTimestamp | fromdateiso8601] | max | todateiso8601' <<<"$secrets")"
+  # Only the creation times are read, so no Secret data enters this shell.
+  secrets="$(k -n "$ns" get secrets argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret \
+    -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{"\n"}{end}')" \
+    || { echo "could not read the view key Secrets of $ns. Run: CELL=management mise run cell:link"; return 1; }
+  newest="$(sort <<<"$secrets" | tail -n 1)"
+  [[ -n "$newest" ]] || { echo "the view key Secrets of $ns have no creation time. Run: CELL=management mise run cell:link"; return 1; }
   for name in argocd-agent-principal argocd-server; do
     started="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$name" -o json \
       | jq -r --arg name "$name" '.items[] | .metadata.name as $pod | .status.containerStatuses[]? | select(.name == $name)
-        | "\($pod) \(.state.running.startedAt // "")"')" || { echo "could not read the pods of $name in $ns"; return 1; }
-    [[ -n "$started" ]] || { echo "$name has no pod in $ns"; return 1; }
+        | "\($pod) \(.state.running.startedAt // "")"')" || { echo "could not read the pods of $name in $ns. Run: CELL=management mise run cell:link"; return 1; }
+    [[ -n "$started" ]] || { echo "$name has no pod in $ns. Run: CELL=management mise run cell:link"; return 1; }
     while read -r pod at; do
       if [[ -z "$at" || "$at" < "$newest" ]]; then
         late+=("$pod started at ${at:-no time}")
@@ -1085,7 +1115,9 @@ check_view_pods_current() {
     done <<<"$started"
   done
   if ((${#late[@]} > 0)); then
-    printf '%s, before the newest view key at %s.\n' "${late[@]}" "$newest"
+    for pod in "${late[@]}"; do
+      printf '%s, before the newest view key at %s.\n' "$pod" "$newest"
+    done
     echo "The pod reads the keys only at start, so it may hold old certificates."
     echo "Run: mise run view:rotate-keys"
     return 1
@@ -1118,6 +1150,7 @@ check_gateway_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:link"
     return 1
   fi
+  peer_root_pods_current observability-system telemetry-gateway peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
 }
 
 # The hub copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the gateway does. It
@@ -1146,6 +1179,7 @@ check_hub_peer_root() {
     echo "Run: CELL=$CELL_NAME mise run cell:link"
     return 1
   fi
+  peer_root_pods_current mesh-view-system mesh-view-hub peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
 }
 
 # hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not up, by the state that the hub serves.

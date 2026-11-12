@@ -21,7 +21,7 @@ const DefaultStatusAddr = "127.0.0.1:18099"
 // EndInfo says how the last tunnel of a side ended.
 type EndInfo struct {
 	// Cause is expiry (the timer of an SVID), replaced (the hub closed it for a newer tunnel), peer_closed
-	// (the peer ended the connection: Detail has the error), ping_timeout or local_close (this side closed it).
+	// (the peer ended the connection: Detail has the error), or local_close (this side closed it, a missed ping included).
 	Cause  string    `json:"cause"`
 	Detail string    `json:"detail,omitempty"`
 	At     time.Time `json:"at"`

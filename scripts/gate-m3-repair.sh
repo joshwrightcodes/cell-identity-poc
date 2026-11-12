@@ -65,4 +65,28 @@ for cell in $cells; do
     status=0
   fi
 done
+# TestM3VerifyDetectsPeerRootDrift changes ConfigMap mesh-view-system/mgmt-root in GATE_M3_ROOT_CELL (default
+# dev-cell-1) for about 80 seconds. A run that stopped hard leaves it changed, and the next start of the tunnel
+# pod then fails to verify the hub. The repair applies the live roots of management again. An empty
+# GATE_M3_ROOT_CELL skips this step.
+root_cell="${GATE_M3_ROOT_CELL-dev-cell-1}"
+if [[ -n "$root_cell" ]]; then
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem)" \
+    || die "could not read the trust bundle of management, so mgmt-root of $root_cell cannot be checked. Run: CELL=management mise run cell:verify"
+  have="$(kubectl --context "kind-$root_cell" -n mesh-view-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}')" \
+    || die "could not read ConfigMap mesh-view-system/mgmt-root in $root_cell. Run: CELL=$root_cell mise run cell:verify"
+  # The render stores the roots without the final newline, so both sides are compared in that form.
+  if [[ "$(printf '%s' "$live")" != "$have" ]]; then
+    status=1
+    if ((check)); then
+      echo "$root_cell: ConfigMap mesh-view-system/mgmt-root holds other roots than management. Run: mise run gate:m3:repair"
+    else
+      log "applying the live roots of management to mesh-view-system/mgmt-root in $root_cell"
+      jq -nc --arg pem "$live" '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "mgmt-root", namespace: "mesh-view-system"}, data: {"root.crt": $pem}}' \
+        | kubectl --context "kind-$root_cell" apply --server-side --force-conflicts -f - >/dev/null || die "could not apply mgmt-root in $root_cell"
+      status=0
+    fi
+  fi
+fi
 exit "$status"

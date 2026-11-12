@@ -62,6 +62,10 @@ Follow these steps for the first setup:
 
 Step 5 of [Keys](#keys), `secrets:connect`, needs the cluster, so it comes during or after `harness:up`.
 
+The `telemetry` value of `harness:status` can read bad for up to 5 minutes after a start or a restart.
+The collectors log export errors until the gateway exists, and `obs:uplink-status` counts the errors of the last 5 minutes.
+The task then exits with status 1 and says to wait. Run it again after 5 minutes.
+
 With `POC_SECRET_TOKEN_CMD` in the environment, `harness:up` connects the secret store of `dev-cp` itself.
 Without it, the `cell:up` of `dev-cp` prints this command once a minute while the SPIRE server waits for its keys.
 Run it in a second shell:
@@ -111,17 +115,18 @@ Renders read both facts once, so the other clusters keep the old values until th
 `cell:verify` compares the deployed values with the host service, and it prints the command to run when they differ.
 
 Renders copy values from other clusters, so a rebuild needs these commands in this order.
-Use the same order for a change of a root:
+The table also covers a new root that no one planned. For a planned change of the root of `management`, run `mise run mgmt:rotate-ca`, which keeps the old and the new root side by side.
+
 
 | Rebuilt cluster | Then run | Reason |
 | --- | --- | --- |
 | `management` | `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. |
-| `dev-cp` | `cell:up` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. |
+| `dev-cp` | `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. |
 | a cell | `CELL=dev-cp mise run cell:up` | The relay and the SPIRE node port admit the node addresses of the cells. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
-`mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the matching command.
+`mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the command for it.
 
 To rebuild a cell, for example `dev-cell-1`, create the cluster first.
 Then `dev-cp` can sign a record with the new key before the cell agent attests:
@@ -430,35 +435,40 @@ mise run harness:status
 ```
 
 The task prints one JSON object on each line of standard output, one for each cluster with components, in the order of `harness/topology.yaml`.
-The `rogue` cluster has no components, so it has no object.
+The `rogue` cluster has no components, so it has no object. Its health shows as probe failures in `dev-cp`, for example "could not start a probe pod in rogue/default".
 Progress lines go to standard error. The exit status is 1 when any value is bad.
 The task reads all clusters at the same time. It takes about two minutes, because it runs `cell:verify` on each cluster.
 It reads the checks of `cell:verify`, the hops of `obs:uplink-status` and the parts of `mesh:status` from those tasks. Use them for the detail of one part.
 
 Every object has these fields. Later milestones can add fields, but they keep these names:
 
-| Field | Meaning |
+| Field | Description |
 | --- | --- |
 | `cluster` | The name of the cluster. |
 | `ok` | `true` when every value below is good. |
 | `applications` | `total` is the number of Argo CD Applications. `bad` holds one text for each Application that is not Synced and Healthy. |
 | `verify` | `ok` is the result of `cell:verify`. `failed` holds the name of each failed check. |
-| `telemetry` | `ok` is the result of `obs:uplink-status`. `verdict` names the first hop that fails. |
+| `telemetry` | `ok` is the result of `obs:uplink-status`. `verdict` names the first hop that fails. `wait` is `true` when the only bad hop is the export of the collector and the store has a fresh sample. This state clears by itself within 5 minutes, and the problem says to wait. |
 | `problems` | One sentence for each bad value, with the command to run. |
 
 The object of `management` has these fields too:
 
-| Field | Meaning |
+| Field | Description |
 | --- | --- |
 | `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. |
 | `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
 | `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
-| `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `note` is empty, or says what to do. |
+| `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `absent_cells` holds the cells among them whose own API does not answer. `note` is empty, or says what to do. |
 | `mesh` | `ok` is the exit status of `mesh:status`. `lines` holds its output. |
 
 While a cell is down, Kiali cannot start. It stops during discovery and restarts with longer waits.
 It recovers about five minutes after the cell returns.
-In this state, `kiali.ready` is `false`, `kiali.down_cells` names the absent cell, and `kiali.note` says that and names the command `CELL=<cell> mise run cell:up`.
+A cell counts as absent only when its own API does not answer.
+In this state, `kiali.ready` is `false` and `kiali.absent_cells` names the cell.
+The field `kiali.note` says so and gives the command, for example `CELL=dev-cell-2 mise run cell:up`.
+When a tunnel is down and the cell API answers, the cell is not absent. The note then says that the cell has no tunnel at the hub, and points to `mise run mesh:status`.
+When every tunnel is down and the cell APIs answer, the note also points to `CELL=dev-cp mise run cell:verify`.
+That check names a firewall rule that a stopped gate run left.
 The same sentence appears in `problems`.
 
 To read the logs of a hop, run this task with a cluster, or `all`, and a label selector:
@@ -467,8 +477,8 @@ To read the logs of a hop, run this task with a cluster, or `all`, and a label s
 mise run harness:logs all app.kubernetes.io/name=argocd-agent-principal
 ```
 
-The task prints the JSON log lines of the matching pods, one on each line, with the added field `cluster`.
-A line that is not JSON becomes `{"cluster": ..., "raw": ...}`.
+The task prints the JSON log lines of the pods that match, one on each line, with the added fields `cluster`, `namespace`, `pod` and `container`.
+A line that is not JSON becomes `{"cluster": ..., "raw": ...}` with the same fields.
 A line that already has a `cluster` field keeps its value in `source_cluster`.
 A cluster that the task cannot read gives one error line with its name, and the exit status is 1 at the end.
 `LOGS_TAIL` sets the number of lines for each container, 200 by default, and `LOGS_SINCE` limits their age, for example `10m`.
@@ -492,7 +502,7 @@ Each stream has hops. Read the log of the first hop that fails, from the source 
 
 The `cell-proxy` logs carry a `reason` field when they refuse a peer or a request. The values are:
 
-| Reason | Meaning |
+| Reason | Description |
 | --- | --- |
 | `peer_untrusted` | The certificate of the peer does not chain to the peer bundle. A copy of a root is old. |
 | `peer_not_allowed` | The ID of the peer is not the expected ID, or the registry does not list it. |
@@ -506,7 +516,7 @@ The `cell-proxy` logs carry a `reason` field when they refuse a peer or a reques
 | `request_too_large` | The gateway refused an export that is over a size limit of the gateway or of its upstream. |
 | `resource_refused` | One resource of an export is over a size limit. The gateway drops it and forwards the other resources. |
 
-The hub and each tunnel pod also log the end of a tunnel as `tunnel_down` with a `cause`: `expiry`, `replaced`, `peer_closed`, `ping_timeout` or `local_close`.
+The hub and each tunnel pod also log the end of a tunnel as `tunnel_down` with a `cause`: `expiry`, `replaced`, `peer_closed` or `local_close`.
 A tunnel that the hub replaced with a newer one never counts as down.
 
 ## Add or remove a cell
@@ -651,6 +661,7 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It starts test pods in fresh namespaces of every cluster, and it deletes them.
 - It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
 - It deletes the `relay-view` pod in `dev-cp` and the Kiali pod in `management`. It scales `mesh-view` to zero in both cells for up to 30 seconds, and then applies the bundle again.
+- It changes ConfigMap `mesh-view-system/mgmt-root` in `dev-cell-1` for about 80 seconds, so that `cell:verify` can show the drift. The running tunnel keeps its roots. If a run stops hard, the next start of the tunnel pod fails to verify the hub. Run `mise run gate:m3:repair`, which applies the live roots of `management` again.
 - It adds two firewall rules on the `dev-cp` node that drop the packets between the relay and the hub, for up to four minutes in total. The test removes them, and a timer in the node removes them after 150 seconds. If a run stops hard, `mise run cell:verify` of `dev-cp` fails and names the repair. Run `mise run gate:m3:repair`, which also removes these rules.
 - It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers for 48 hours, then each component deletes them.
 

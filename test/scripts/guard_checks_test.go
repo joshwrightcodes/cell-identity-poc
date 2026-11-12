@@ -27,6 +27,9 @@ case "$args" in
     if [[ -f "$STUB_LOG.deleted" ]]; then echo "$empty"; else echo "${STUB_LEFT:-$empty}"; fi ;;
   *" get rolebindings,clusterrolebindings -A -o json "*) echo "${STUB_BINDINGS:-$empty}" ;;
   *" delete "*) touch "$STUB_LOG.deleted" ;;
+  *" exec spire-server-0 "*) printf '%s\n' "${STUB_PEM_LIVE:-PEM-A}" ;;
+  *" get configmap mgmt-root "*) printf '%s' "${STUB_PEM_CM:-PEM-A}" ;;
+  *" apply --server-side "*) cat >"$STUB_LOG.applied" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -142,6 +145,37 @@ func TestGateM3Repair(t *testing.T) {
 		out, calls, err := run(t, left)
 		if err != nil || !strings.Contains(calls, "-n argocd delete role view-guard-test") || !strings.Contains(calls, "delete namespace view-guard-test") {
 			t.Fatalf("err %v, output %q, calls %q; want a delete of the Role and the Namespace", err, out, calls)
+		}
+	})
+	t.Run("mgmt-root of the drift test is restored", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(guardKubectl), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		logFile := filepath.Join(dir, "kubectl.log")
+		runDrift := func(args ...string) (string, error) {
+			cmd := exec.Command("bash", append([]string{script}, args...)...)
+			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+				"POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_LOG=" + logFile, "GATE_M3_CELLS=dev-cell-1",
+				"STUB_PEM_LIVE=PEM-A", "STUB_PEM_CM=PEM-CHANGED"}
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			err := cmd.Run()
+			return out.String(), err
+		}
+		out, err := runDrift("--check")
+		if err == nil || !strings.Contains(out, "dev-cell-1: ConfigMap mesh-view-system/mgmt-root holds other roots") {
+			t.Fatalf("check: err %v, output %q; want a failure that names the ConfigMap", err, out)
+		}
+		if _, statErr := os.Stat(logFile + ".applied"); statErr == nil {
+			t.Fatalf("--check applied the ConfigMap")
+		}
+		if out, err = runDrift(); err != nil {
+			t.Fatalf("repair failed: %v\n%s", err, out)
+		}
+		applied, _ := os.ReadFile(logFile + ".applied")
+		if !strings.Contains(string(applied), `"root.crt":"PEM-A"`) || !strings.Contains(string(applied), `"name":"mgmt-root"`) {
+			t.Fatalf("applied %q, want ConfigMap mgmt-root with the live roots", applied)
 		}
 	})
 	t.Run("no leftover, no delete", func(t *testing.T) {
