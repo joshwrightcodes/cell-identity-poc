@@ -110,7 +110,7 @@ func fetchSpec(t *testing.T, cert tls.Certificate) (mgmtapi.SpecBundle, error) {
 	for _, r := range bundleRoots(t, mgmtCluster) {
 		pool.AddCert(r)
 	}
-	cfg := &tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}, RootCAs: pool, InsecureSkipVerify: true,
+	cfg := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert}, RootCAs: pool, InsecureSkipVerify: true,
 		VerifyConnection: func(cs tls.ConnectionState) error {
 			opts := x509.VerifyOptions{Roots: pool, Intermediates: x509.NewCertPool()}
 			for _, c := range cs.PeerCertificates[1:] {
@@ -124,7 +124,7 @@ func fetchSpec(t *testing.T, cert tls.Certificate) (mgmtapi.SpecBundle, error) {
 			}
 			return nil
 		}}
-	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg, DisableKeepAlives: true}}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg, ForceAttemptHTTP2: true, DisableKeepAlives: true}}
 	resp, err := client.Get("https://" + addr + mgmtapi.SpecPath(pocEnv))
 	if err != nil {
 		return mgmtapi.SpecBundle{}, err
