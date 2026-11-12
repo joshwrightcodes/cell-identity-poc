@@ -322,10 +322,14 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 	}
 	node := envCluster + "-control-plane"
 	rule := []string{"FORWARD", "-p", "tcp", "-d", mgmtIP, "--dport", strconv.Itoa(meshNodePort), "-j", "DROP"}
-	last, before := tunnelState(hubLog(t), cell)
-	if last != "tunnel_up" {
-		t.Fatalf("the hub tunnel of %s is %q before the test, want tunnel_up", cell, last)
-	}
+	// An SVID of 1 minute ends a tunnel every minute, and the cell dials again within seconds. So the
+	// test waits for a tunnel that is up before it starts.
+	var before int
+	waitFor(t, "the hub tunnel of "+cell+" to be up before the test", time.Minute, func() (bool, string) {
+		last, n := tunnelState(hubLog(t), cell)
+		before = n
+		return last == "tunnel_up", fmt.Sprintf("last tunnel line %q", last)
+	})
 	removed := false
 	remove := func() {
 		if removed {

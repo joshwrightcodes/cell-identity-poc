@@ -650,16 +650,18 @@ func TestTunnelBackoffResets(t *testing.T) {
 		}
 		return clock.sleeps
 	}
-	t.Run("after 60 seconds", func(t *testing.T) {
-		sleeps := run(t, 60*time.Second)
+	// A tunnel that ends with the SVID of the cell lives a little less than the SVID lifetime of 1 minute,
+	// and the cell must dial again within seconds, not after the 30-second cap.
+	t.Run("after 30 seconds", func(t *testing.T) {
+		sleeps := run(t, 30*time.Second)
 		if d := sleeps[5]; d < time.Second || d > 1500*time.Millisecond {
-			t.Fatalf("sleep after a 60-second connection is %s, want 1 second plus jitter", d)
+			t.Fatalf("sleep after a 30-second connection is %s, want 1 second plus jitter", d)
 		}
 	})
-	t.Run("after 59 seconds", func(t *testing.T) {
-		sleeps := run(t, 59*time.Second)
+	t.Run("after 29 seconds", func(t *testing.T) {
+		sleeps := run(t, 29*time.Second)
 		if d := sleeps[5]; d != 30*time.Second {
-			t.Fatalf("sleep after a 59-second connection is %s, want the 30-second cap", d)
+			t.Fatalf("sleep after a 29-second connection is %s, want the 30-second cap", d)
 		}
 	})
 }

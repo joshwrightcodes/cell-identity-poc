@@ -30,7 +30,7 @@ const MeshViewRole = "mesh-view"
 const (
 	tunnelMinBackoff  = time.Second
 	tunnelMaxBackoff  = 30 * time.Second
-	tunnelStableAfter = 60 * time.Second
+	tunnelStableAfter = 30 * time.Second
 	tunnelMaxStreams  = 250
 	defaultTunnelWait = 10 * time.Second
 	maxReviewBody     = 64 << 10
@@ -83,7 +83,7 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 // RunTunnel is the cell side of the mesh-view tunnel. It dials the management plane with dial,
 // serves HTTP/2 with h on the dialed connection, and dials again when the connection ends. The
 // wait between dials starts at 1 second, doubles up to 30 seconds, and has up to half of itself
-// added as jitter, within the 30-second cap. A connection that lived for 60 seconds resets the
+// added as jitter, within the 30-second cap. A connection that lived for 30 seconds resets the
 // wait to 1 second. RunTunnel returns nil when ctx ends.
 func RunTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler) error {
 	return runTunnel(ctx, dial, h, realClock)
