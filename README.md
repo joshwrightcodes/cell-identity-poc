@@ -274,17 +274,24 @@ The collector has these parts:
 
 - **Receivers:** OTLP on port 4317 (gRPC), the Prometheus receiver, and `k8s_objects` for the Kubernetes events.
   Port 4318 (HTTP) serves the bundle store only. Its NetworkPolicy admits no other pod on 4318.
-- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istiod` (15014), and `argocd` (8082 and 8084, and the central server on 8083 in `management`).
-  Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file: `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
+- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istiod` (15014), and `argocd`.
+  The `argocd` job reads ports 8082 and 8084, and the central server on 8083 in `management`.
+  Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file.
+  These are `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
   Each job copies `pod` and `namespace` into the labels of the data points.
   The metrics ports of the agent (8181), the principal (8000) and the SPIRE server (9988) admit the collector pod only.
-  The ports of the Argo CD controller (8082), the repo server (8084), istiod (15014) and Envoy (15090) admit the collector pod and the pods of their own namespace.
+  The ports of the Argo CD controller (8082), the repo server (8084), istiod (15014) and Envoy (15090) also admit the node address.
+  The policy `allow-from-nodes` admits it on every port.
+  The ports of istiod, Envoy in `apps-demo`, the controller and the repo server admit the pods of their own namespace too.
 - **Source attributes:** the transform processors delete every form of `k8s.cluster.name`, `platform.plane`, `platform.cell` and `deployment.environment.name`. OTLP data also loses `source_cluster` and `destination_cluster`, but scraped Envoy data keeps them.
   The resource processor then sets the row of its cluster. A pod cannot forge the attributes of another cluster in this collector.
   In `dev-cp` and the cells, the gateway sets the attributes and the two Istio labels again. `management` has no gateway, so its scraped Envoy labels get no second check.
-- **Exporter:** one `otlp_grpc` exporter with a timeout of 15 seconds, retries with no end, client keepalive every 30 seconds, 4 consumers, and requests of at most 3,000,000 bytes.
-  The gateway refuses a request of more than 1,024 resources, and the exporter then drops the batch. The batcher appends resources and counts bytes only, so the byte bound is 1,000 times the smallest resource of the cluster: 66,000 bytes in `management`, 129,000 in a cell. The batcher drops a single record above that bound and logs it.
-  The queue is on the volume, so a restart or an outage does not lose data. Each of the three queues holds at most 384 MiB.
+- **Exporter:** one `otlp_grpc` exporter with a timeout of 15 seconds, retries with no end, client keepalive every 30 seconds, and 4 consumers.
+  A request has at most 3,000,000 bytes. The gateway refuses a request of more than 1,024 resources, and the exporter then drops the batch.
+  The batcher appends resources and counts bytes only. So a request to the gateway has at most 1,000 times the smallest resource of the cluster.
+  That bound is 101,000 bytes in `dev-cp` and 129,000 bytes in a cell. `management` exports straight to `lgtm`, which has no resource cap.
+  The batcher drops a single record above the bound, and logs it.
+  The gateway drops one resource that passes a shape cap of one resource, forwards the others, and reports a partial success.
 - **Own metrics:** the collector sends them as OTLP to its own port 4317, so Prometheus holds `otelcol_exporter_queue_size` for every cluster.
 
 | Cluster | `k8s.cluster.name` | `platform.plane` | `deployment.environment.name` | `platform.cell` | Exports to |
@@ -318,7 +325,9 @@ mise run obs:uplink-status dev-cell-1
 ```
 
 The queue of a collector is a file on its volume of 2 GiB. `QUEUE_MAX_BYTES` in `components/observability-system/render.sh` bounds each of the three queues at 384 MiB, and `local-path` enforces no size on the claim.
-The task reports the size of the queue volume as `queue_volume_kib`. The file shrinks at the next compaction.
+The task reports `queue_file_peak_kib`, the largest size that the queue file reached.
+The file shrinks at the start of the collector, and when it is over 100 MiB and its live data falls below 10 MiB.
+The value is not the current queue size.
 The metric `otelcol_exporter_queue_size` of a cell reaches Prometheus through the same uplink, so it shows the queue only while the path works.
 
 To add a sender of OTLP, add its namespace to `COLLECTOR_SENDERS` in the env file of the cluster, then run `cell:up`.
@@ -404,7 +413,8 @@ The budget is 38 minutes. This is 1.5 times the slowest run, 1,517 seconds on 20
 The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
 It prints the twelve slowest tests at the end.
-The slowest tests are the management CA rotation (409 seconds), the rogue telemetry test (245 seconds, 180 of them a fixed wait) and the fresh-namespace dial tests (97 seconds).
+The slowest tests are the management CA rotation (409 seconds) and the rogue telemetry test (245 seconds).
+The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take 97 seconds.
 The budgets do not cover `harness:up`.
 
 ## Side effects of gate:m2

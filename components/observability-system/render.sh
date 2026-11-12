@@ -223,6 +223,8 @@ min_resource=0
 while read -r k v; do min_resource=$((min_resource + ${#k} + ${#v} + 8)); done < <(resource_pairs)
 EXPORT_MAX_BYTES=$((RESOURCE_BUDGET * min_resource))
 ((EXPORT_MAX_BYTES <= EXPORT_BYTES_CAP)) || EXPORT_MAX_BYTES=$EXPORT_BYTES_CAP
+# The store has no cap on resources, so management exports straight to it in requests up to the cap.
+[[ -z "$store" ]] || EXPORT_MAX_BYTES=$EXPORT_BYTES_CAP
 EXPORT_MIN_BYTES=$((EXPORT_MAX_BYTES / 2))
 
 config="$(cat <<YAML

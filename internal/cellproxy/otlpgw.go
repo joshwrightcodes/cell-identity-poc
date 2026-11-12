@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -73,6 +74,9 @@ const (
 	// RequestTooLarge: the request passes a shape cap, or passes the upstream limit after the
 	// reset. The status is ResourceExhausted.
 	RequestTooLarge Reason = "request_too_large"
+	// ResourceRefused: one resource of a request passes a shape cap of one resource. The gateway drops
+	// it, forwards the other resources, and reports a partial success.
+	ResourceRefused Reason = "resource_refused"
 
 	meshSourceCluster      = "source_cluster"
 	meshDestinationCluster = "destination_cluster"
@@ -628,17 +632,47 @@ var signals = map[string]string{
 
 // ExportLogs resets and forwards one logs request.
 func (g *Gateway) ExportLogs(ctx context.Context, req *collogspb.ExportLogsServiceRequest) (*collogspb.ExportLogsServiceResponse, error) {
-	return forward(ctx, g, "logs", req, resetLogs, g.logs.Export)
+	return forward(ctx, g, "logs", req, resetLogs, g.logs.Export, func(r *collogspb.ExportLogsServiceResponse, n int64, msg string) *collogspb.ExportLogsServiceResponse {
+		if r == nil {
+			r = &collogspb.ExportLogsServiceResponse{}
+		}
+		if r.PartialSuccess == nil {
+			r.PartialSuccess = &collogspb.ExportLogsPartialSuccess{}
+		}
+		r.PartialSuccess.RejectedLogRecords += n
+		r.PartialSuccess.ErrorMessage = msg
+		return r
+	})
 }
 
 // ExportTraces resets and forwards one trace request.
 func (g *Gateway) ExportTraces(ctx context.Context, req *coltracepb.ExportTraceServiceRequest) (*coltracepb.ExportTraceServiceResponse, error) {
-	return forward(ctx, g, "traces", req, resetTraces, g.traces.Export)
+	return forward(ctx, g, "traces", req, resetTraces, g.traces.Export, func(r *coltracepb.ExportTraceServiceResponse, n int64, msg string) *coltracepb.ExportTraceServiceResponse {
+		if r == nil {
+			r = &coltracepb.ExportTraceServiceResponse{}
+		}
+		if r.PartialSuccess == nil {
+			r.PartialSuccess = &coltracepb.ExportTracePartialSuccess{}
+		}
+		r.PartialSuccess.RejectedSpans += n
+		r.PartialSuccess.ErrorMessage = msg
+		return r
+	})
 }
 
 // ExportMetrics resets and forwards one metrics request.
 func (g *Gateway) ExportMetrics(ctx context.Context, req *colmetricspb.ExportMetricsServiceRequest) (*colmetricspb.ExportMetricsServiceResponse, error) {
-	return forward(ctx, g, "metrics", req, resetMetrics, g.metrics.Export)
+	return forward(ctx, g, "metrics", req, resetMetrics, g.metrics.Export, func(r *colmetricspb.ExportMetricsServiceResponse, n int64, msg string) *colmetricspb.ExportMetricsServiceResponse {
+		if r == nil {
+			r = &colmetricspb.ExportMetricsServiceResponse{}
+		}
+		if r.PartialSuccess == nil {
+			r.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
+		}
+		r.PartialSuccess.RejectedDataPoints += n
+		r.PartialSuccess.ErrorMessage = msg
+		return r
+	})
 }
 
 // resource gives the holder of *r a resource when it has none, and resets it.
@@ -737,10 +771,12 @@ func (slotRelease) HandleConn(context.Context, stats.ConnStats) {}
 // req under a deadline: the deadline of the sender less forwardMargin, at most g.timeout. It
 // returns the upstream response unchanged, partial_success included.
 func forward[Req proto.Message, Resp any](ctx context.Context, g *Gateway, signal string, req Req,
-	reset func(Req, Source) []Overwrite, call func(context.Context, Req, ...grpc.CallOption) (Resp, error)) (Resp, error) {
+	reset func(Req, Source) []Overwrite, call func(context.Context, Req, ...grpc.CallOption) (Resp, error),
+	partial func(Resp, int64, string) Resp) (Resp, error) {
 	var zero Resp
 	log := g.log.With("signal", signal)
 	refused := g.codec.refusal(req)
+	dropped := g.codec.droppedOf(req)
 	src, id, err := peerSource(ctx)
 	if err != nil {
 		return zero, g.deny(ctx, log, signal, Source{}, PeerNotAllowed, codes.PermissionDenied, err.Error())
@@ -772,6 +808,14 @@ func forward[Req proto.Message, Resp any](ctx context.Context, g *Gateway, signa
 		attrs := metric.WithAttributes(attribute.String("signal", signal), senderAttr(src))
 		g.inst.accepted.Add(ctx, 1, attrs)
 		g.inst.lastExport.Record(ctx, time.Now().Unix(), attrs)
+		if dropped.resources > 0 {
+			g.inst.denied.Add(ctx, int64(dropped.resources), metric.WithAttributes(attribute.String("reason", string(ResourceRefused)),
+				attribute.String("signal", signal), senderAttr(src)))
+			if ok, suppressed, _ := g.limiter.allow(log, "denied "+string(ResourceRefused)+" "+src.Cluster, nil); ok {
+				log.Warn("resources dropped", "reason", string(ResourceRefused), "resources", dropped.resources, "error", dropped.first.Error(), "suppressed", suppressed)
+			}
+			resp = partial(resp, int64(dropped.records), "the gateway dropped "+strconv.Itoa(dropped.resources)+" resource(s) that pass a shape cap")
+		}
 		return resp, nil
 	}
 	if ctx.Err() != nil {

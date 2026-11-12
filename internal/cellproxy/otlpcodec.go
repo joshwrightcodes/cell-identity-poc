@@ -198,11 +198,26 @@ func (s *scanner) scanMessage(b []byte, md protoreflect.MessageDescriptor, depth
 // into Internal, so a refused request decodes to an empty message, and the handler reads the
 // refusal with refusal. Unknown fields are dropped, so no attribute reaches the upstream in a
 // field that the gateway does not know.
+//
+// The collector of a cluster merges the telemetry of every workload into one request, so one
+// resource that passes a shape cap must not make the gateway refuse the others. The scan therefore
+// reads each resource of the request on its own. A resource that passes the caps of one resource
+// (attributes in one set, scopes, nesting depth, records, messages, repeated numbers and strings) is
+// dropped, and the handler reports it as a partial success. The totals of the whole request keep
+// their caps, and a request in which no resource passes is refused as a whole.
 type otlpCodec struct {
 	limits  scanLimits
 	refused sync.Map
+	dropped sync.Map
 	// decoded counts the requests that passed the scan.
 	decoded atomic.Int64
+}
+
+// droppedResources says how many resources of a request the scan dropped, how many records and points
+// they held (at least one for each), and why the first one failed.
+type droppedResources struct {
+	resources, records int
+	first              error
 }
 
 func newOTLPCodec() *otlpCodec { return &otlpCodec{limits: defaultScanLimits} }
@@ -213,6 +228,86 @@ func (c *otlpCodec) Marshal(v any) (mem.BufferSlice, error) {
 	return encoding.GetCodecV2(encproto.Name).Marshal(v)
 }
 
+// scanRequest reads the resources of a request of type md. It returns the wire bytes without the
+// resources that pass a cap of one resource, and what it dropped. It returns an error when a total
+// passes its cap or no resource passes. A request of other fields only has nothing to drop.
+func (c *otlpCodec) scanRequest(b []byte, md protoreflect.MessageDescriptor) ([]byte, droppedResources, error) {
+	var drop droppedResources
+	total := scanner{lim: c.limits}
+	fields := md.Fields()
+	var kept []byte
+	keptStart := 0
+	survivors := 0
+	rest := b
+	for len(rest) > 0 {
+		start := len(b) - len(rest)
+		num, typ, n := protowire.ConsumeTag(rest)
+		if n < 0 {
+			return b, drop, errMalformed
+		}
+		rest = rest[n:]
+		if typ != protowire.BytesType {
+			if n = protowire.ConsumeFieldValue(num, typ, rest); n < 0 {
+				return b, drop, errMalformed
+			}
+			rest = rest[n:]
+			continue
+		}
+		v, n := protowire.ConsumeBytes(rest)
+		if n < 0 {
+			return b, drop, errMalformed
+		}
+		rest = rest[n:]
+		end := len(b) - len(rest)
+		fd := fields.ByNumber(num)
+		if fd == nil || fd.Kind() != protoreflect.MessageKind || !fd.IsList() || scanKinds[fd.Message().FullName()] != kindResource {
+			continue
+		}
+		if total.messages++; total.messages > total.lim.Messages {
+			return b, drop, fmt.Errorf("more than %d messages", total.lim.Messages)
+		}
+		if total.resources++; total.resources > total.lim.Resources {
+			return b, drop, fmt.Errorf("more than %d resources", total.lim.Resources)
+		}
+		one := scanner{lim: c.limits}
+		if err := one.scanMessage(v, fd.Message(), 1); err != nil {
+			if errors.Is(err, errMalformed) {
+				return b, drop, errMalformed
+			}
+			if drop.resources++; drop.first == nil {
+				drop.first = err
+			}
+			drop.records += max(one.records, 1)
+			kept = append(kept, b[keptStart:start]...)
+			keptStart = end
+			continue
+		}
+		survivors++
+		total.messages += one.messages
+		total.records += one.records
+		total.scopes += one.scopes
+		total.numberBytes += one.numberBytes
+		total.strings += one.strings
+		switch {
+		case total.messages > total.lim.Messages:
+			return b, drop, fmt.Errorf("more than %d messages", total.lim.Messages)
+		case total.records > total.lim.Records:
+			return b, drop, fmt.Errorf("more than %d records or points", total.lim.Records)
+		case total.numberBytes > total.lim.NumberBytes:
+			return b, drop, fmt.Errorf("more than %d bytes of repeated numbers", total.lim.NumberBytes)
+		case total.strings > total.lim.Strings:
+			return b, drop, fmt.Errorf("more than %d elements of repeated strings", total.lim.Strings)
+		}
+	}
+	if drop.resources == 0 {
+		return b, drop, nil
+	}
+	if survivors == 0 {
+		return b, drop, drop.first
+	}
+	return append(kept, b[keptStart:]...), drop, nil
+}
+
 func (c *otlpCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	m, ok := v.(proto.Message)
 	if !ok {
@@ -220,11 +315,13 @@ func (c *otlpCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	}
 	buf := data.MaterializeToBuffer(mem.DefaultBufferPool())
 	defer buf.Free()
-	b := buf.ReadOnlyData()
-	s := scanner{lim: c.limits}
-	if err := s.scanMessage(b, m.ProtoReflect().Descriptor(), 0); err != nil && !errors.Is(err, errMalformed) {
+	b, drop, err := c.scanRequest(buf.ReadOnlyData(), m.ProtoReflect().Descriptor())
+	if err != nil && !errors.Is(err, errMalformed) {
 		c.refused.Store(m, err)
 		return nil
+	}
+	if drop.resources > 0 {
+		c.dropped.Store(m, drop)
 	}
 	c.decoded.Add(1)
 	return proto.UnmarshalOptions{DiscardUnknown: true}.Unmarshal(b, m)
@@ -239,4 +336,15 @@ func (c *otlpCodec) refusal(req any) error {
 		return err.(error)
 	}
 	return nil
+}
+
+// droppedOf returns what the scan dropped from req, once.
+func (c *otlpCodec) droppedOf(req any) droppedResources {
+	if c == nil {
+		return droppedResources{}
+	}
+	if d, ok := c.dropped.LoadAndDelete(req); ok {
+		return d.(droppedResources)
+	}
+	return droppedResources{}
 }

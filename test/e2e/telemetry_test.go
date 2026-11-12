@@ -296,8 +296,7 @@ func TestM3MetricsEndpointsCollectorOnly(t *testing.T) {
 			{"principal", viewNamespace, "app.kubernetes.io/name=" + principalName, 8000}},
 	}
 	targets["dev-cell-2"] = targets["dev-cell-1"]
-	// The application controller and the repo server of argocd, in every cluster. The upstream policies
-	// admitted every namespace on these ports.
+	// The application controller and the repo server of argocd, in every cluster.
 	for _, cluster := range telemetryClusters {
 		targets[cluster] = append(targets[cluster],
 			target{"application controller", "argocd", "app.kubernetes.io/name=argocd-application-controller", 8082},
@@ -701,5 +700,75 @@ func TestM3UplinkBatchesStayWithinGatewayLimits(t *testing.T) {
 	time.Sleep(20 * time.Second)
 	if after := denied(); after != deniedBefore {
 		t.Errorf("the gateway refused %v requests of %s as too large during the test", after-deniedBefore, cell)
+	}
+}
+
+// TestM3HostileWorkloadDoesNotDropOtherTelemetry sends one log record with more attributes in one set than
+// the gateway allows, among 200 normal records, into the collector of dev-cell-1 within a second. The batch
+// merges them. The gateway must drop only the hostile resource, so every normal record reaches Loki, the
+// hostile record does not, and the gateway does not count a refusal of the whole request.
+func TestM3HostileWorkloadDoesNotDropOtherTelemetry(t *testing.T) {
+	const cell, normal = "dev-cell-1", 200
+	marker := "m3hostile" + randomHex(t, 4)
+	refused := func() float64 {
+		sum := 0.0
+		for _, x := range promSamples(t, fmt.Sprintf(`cellproxy_gateway_exports_denied_total{k8s_cluster_name="management",reason="request_too_large",sender_cluster=%q}`, cell)) {
+			sum += x.last
+		}
+		return sum
+	}
+	before := refused()
+	conn := plaintextConn(t, portForward(t, cell, obsNamespace, "svc/otel-collector", 4317))
+	send := func(i int, attrs []*commonpb.KeyValue, body string) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err := colllogs.NewLogsServiceClient(conn).Export(ctx, &colllogs.ExportLogsServiceRequest{ResourceLogs: []*logspb.ResourceLogs{{
+			Resource: &resourcepb.Resource{Attributes: []*commonpb.KeyValue{strAttr("service.name", "m3-hostile")}},
+			ScopeLogs: []*logspb.ScopeLogs{{LogRecords: []*logspb.LogRecord{{
+				TimeUnixNano: uint64(time.Now().UnixNano()), SeverityText: "INFO", Attributes: attrs,
+				Body: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: fmt.Sprintf("%s %s %d", marker, body, i)}},
+			}}}},
+		}}})
+		return err
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, normal+1)
+	for i := range normal {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := send(i, nil, "normal"); err != nil {
+				errs <- err
+			}
+		}()
+		if i == normal/2 {
+			attrs := make([]*commonpb.KeyValue, 1100)
+			for j := range attrs {
+				attrs[j] = strAttr(fmt.Sprintf("hostile%d", j), "v")
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := send(0, attrs, "hostile"); err != nil {
+					errs <- err
+				}
+			}()
+		}
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("export to the collector of %s: %v", cell, err)
+	}
+	waitFor(t, fmt.Sprintf("%d normal records with the marker in Loki", normal), signalWait, func() (bool, string) {
+		n := lokiCount(t, cell, marker+" normal")
+		return n == normal, fmt.Sprintf("%d records", n)
+	})
+	if n := lokiCount(t, cell, marker+" hostile"); n != 0 {
+		t.Errorf("Loki holds %d hostile records, want none", n)
+	}
+	time.Sleep(20 * time.Second)
+	if after := refused(); after != before {
+		t.Errorf("the gateway refused %v whole requests of %s during the test", after-before, cell)
 	}
 }

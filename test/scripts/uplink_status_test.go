@@ -12,7 +12,7 @@ import (
 )
 
 // statusKubectl stands in for kubectl and docker in obs:uplink-status. STUB_COLLECTOR_READY, STUB_COLLECTOR_LOG,
-// STUB_UPLINK_READY, STUB_ACCEPTED and STUB_AGE set what each hop reports.
+// STUB_UPLINK_READY, STUB_ACCEPTED, STUB_DENIED and STUB_AGE set what each hop reports.
 const statusKubectl = `#!/usr/bin/env bash
 args=" $* "
 case "$args" in
@@ -25,7 +25,8 @@ case "$args" in
     q="$(sed -n 's/^query=//p' <<<"$*" | head -1)"
     case "$args" in
       *"exports_accepted_total"*) printf '{"data":{"result":[{"value":[0,"%s"]}]}}' "${STUB_ACCEPTED-10}" ;;
-      *"exports_denied_total"*|*"upstream_failures_total"*) echo '{"data":{"result":[{"value":[0,"0"]}]}}' ;;
+      *"exports_denied_total"*) printf '{"data":{"result":[{"value":[0,"%s"]}]}}' "${STUB_DENIED-0}" ;;
+      *"upstream_failures_total"*) echo '{"data":{"result":[{"value":[0,"0"]}]}}' ;;
       *"timestamp(up"*) printf '{"data":{"result":[{"value":[0,"%s"]}]}}' "${STUB_AGE-5}" ;;
     esac ;;
   *" exec dev-cell-1-control-plane "*|*" dev-cell-1-control-plane "*) echo "512 /q" ;;
@@ -62,7 +63,7 @@ func statusRun(t *testing.T, args []string, env ...string) (string, int) {
 }
 
 // TestUplinkStatusNamesTheFirstFailingHop checks that the task reports a healthy path, and that each broken
-// hop gets its own verdict, in the order collector, uplink, gateway, store.
+// hop gets its own verdict, in the order collector, uplink, gateway, collector export, store. A stale store names the collector log.
 func TestUplinkStatusNamesTheFirstFailingHop(t *testing.T) {
 	out, code := statusRun(t, []string{"dev-cell-1"})
 	if m := oneJSONLine(t, out); code != 0 || m["verdict"] != "every hop is healthy" {
@@ -78,6 +79,8 @@ func TestUplinkStatusNamesTheFirstFailingHop(t *testing.T) {
 		{"uplink not ready", []string{"STUB_UPLINK_READY="}, "uplink:"},
 		{"uplink errors", []string{`STUB_UPLINK_LOG={"level":"ERROR","msg":"dial"}`}, "uplink:"},
 		{"gateway accepts nothing", []string{"STUB_ACCEPTED=0"}, "gateway or relay:"},
+		{"gateway refuses", []string{"STUB_DENIED=3"}, "gateway or relay:"},
+		{"collector retries the export", []string{`STUB_COLLECTOR_LOG={"msg":"Exporting failed. Will retry the request after interval."}`}, "collector export:"},
 		{"store is stale", []string{"STUB_AGE=900"}, "store:"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

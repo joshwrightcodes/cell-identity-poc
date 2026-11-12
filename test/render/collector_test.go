@@ -193,7 +193,12 @@ func TestCollectorRender(t *testing.T) {
 			if b["sizer"] != "bytes" || maxSize+400*1024 >= 3670016 {
 				t.Errorf("batch %v, want the bytes sizer and a bound that leaves the headroom of the gateway", b)
 			}
-			if resources := maxSize / minResource; resources > 1024 {
+			if cl.name == "management" {
+				// The store has no resource cap, so management sends requests up to the byte cap.
+				if maxSize != 3000000 {
+					t.Errorf("management batch max_size %v, want 3,000,000", maxSize)
+				}
+			} else if resources := maxSize / minResource; resources > 1024 {
 				t.Errorf("a batch of %v bytes can hold %.0f resources of %v bytes, over the gateway cap of 1,024", maxSize, resources, minResource)
 			}
 			if minSize <= 0 || minSize > maxSize {
@@ -534,10 +539,15 @@ func TestIstiodNamesTheCluster(t *testing.T) {
 
 // TestArgoCDMetricsPortsAdmitOnlyTheCollector checks, across every NetworkPolicy of the argocd component,
 // that each rule which names port 8082 (application controller) or 8084 (repo server) admits only the
-// collector pod. The upstream policies admit every namespace on these ports, and policies add up, so
-// the rule of the collector alone would leave them open.
+// collector pod, that no rule names 7000 or 8080 (ApplicationSet controller) for another namespace, and
+// that a rule with no ports, which covers every port, admits only the pods of its own namespace or the
+// node address. Policies add up, so one open rule leaves the port open.
 func TestArgoCDMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
 	collectorPeer := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]"
+	// ownNamespaceOrNode says whether peers are only the pods of the namespace or node addresses.
+	ownNamespaceOrNode := func(peers string) bool {
+		return peers == "[map[podSelector:map[]]]" || strings.Contains(peers, "ipBlock") && !strings.Contains(peers, "namespaceSelector")
+	}
 	for _, cl := range collectorClusters {
 		t.Run(cl.name, func(t *testing.T) {
 			seen := map[string]bool{}
@@ -546,13 +556,20 @@ func TestArgoCDMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
 					continue
 				}
 				for _, r := range peerRules(t, o, "ingress") {
+					if len(r.ports) == 0 && !ownNamespaceOrNode(r.peers) {
+						t.Errorf("%s has a rule with no ports that admits %s, so it opens every port", objName(o), r.peers)
+					}
 					for _, p := range r.ports {
-						if p != "8082" && p != "8084" {
-							continue
-						}
-						seen[p] = true
-						if r.peers != collectorPeer {
-							t.Errorf("%s admits %s on %s, want only the collector", objName(o), r.peers, p)
+						switch p {
+						case "8082", "8084":
+							seen[p] = true
+							if r.peers != collectorPeer {
+								t.Errorf("%s admits %s on %s, want only the collector", objName(o), r.peers, p)
+							}
+						case "7000", "8080":
+							if !ownNamespaceOrNode(r.peers) {
+								t.Errorf("%s admits %s on %s, want the pods of the namespace at most", objName(o), r.peers, p)
+							}
 						}
 					}
 				}

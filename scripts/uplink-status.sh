@@ -7,7 +7,8 @@
 # Prometheus of lgtm.
 #   collector  Ready replica; the size of the queue volume on the node (the file of the persistent queue,
 #              which grows with the queue and shrinks at its next compaction); the lines "Exporting
-#              failed" and "Dropping data" of its log in the last 5 minutes.
+#              failed" and "Dropping data" of its log in the last 5 minutes. The size is the peak of
+#              the file since the last start or compaction, not the current queue.
 #   uplink     Ready pod; the ERROR lines of cell-proxy in the last 5 minutes. management has no uplink.
 #   gateway    accepted exports, refusals and upstream failures of the gateway for this sender in the last
 #              5 minutes. management has no gateway hop.
@@ -71,8 +72,10 @@ elif [[ "$uplink_ok" == false ]]; then
   verdict="uplink: its pod is not Ready, or cell-proxy logs errors. Read: mise x -- kubectl --context kind-$cluster -n observability-system logs deploy/otel-uplink -c cell-proxy"; status=1
 elif [[ "$gateway_ok" == false ]]; then
   verdict="gateway or relay: the gateway accepted no export from $cluster in 5 minutes, or it refused one. Read: CELL=management mise run cell:verify, then CELL=dev-cp mise run cell:verify"; status=1
+elif [[ "${failed:-0}" -gt 0 ]]; then
+  verdict="collector export: the exporter of the collector failed and retried ${failed} times in 5 minutes. Read: mise x -- kubectl --context kind-$cluster -n observability-system logs otel-collector-0"; status=1
 elif [[ "$store_ok" != true ]]; then
-  verdict="store: the newest sample of $cluster is ${age:-unknown} seconds old. Read: CELL=management mise run cell:verify"; status=1
+  verdict="store: the newest sample of $cluster is ${age:-unknown} seconds old. Read the collector first: mise x -- kubectl --context kind-$cluster -n observability-system logs otel-collector-0"; status=1
 fi
 
 jq -nc --arg cluster "$cluster" --arg verdict "$verdict" --argjson collector_ok "$collector_ok" --argjson uplink_ok "$uplink_ok" \
@@ -80,7 +83,7 @@ jq -nc --arg cluster "$cluster" --arg verdict "$verdict" --argjson collector_ok 
   --arg failed "${failed:-0}" --arg dropped "${dropped:-0}" --arg uplink_errors "$uplink_errors" --arg accepted "${accepted:-}" \
   --arg denied "${denied:-}" --arg upstream "${upstream:-}" --arg age "${age:-}" \
   '{cluster: $cluster, verdict: $verdict,
-    collector: {ok: $collector_ok, ready_replicas: ($ready | tonumber), queue_volume_kib: ($queue_kb | tonumber? // null), exporting_failed_5m: ($failed | tonumber), dropped_5m: ($dropped | tonumber)},
+    collector: {ok: $collector_ok, ready_replicas: ($ready | tonumber), queue_file_peak_kib: ($queue_kb | tonumber? // null), exporting_failed_5m: ($failed | tonumber), dropped_5m: ($dropped | tonumber)},
     uplink: {ok: $uplink_ok, error_lines_5m: ($uplink_errors | tonumber? // null)},
     gateway: {ok: $gateway_ok, accepted_5m: ($accepted | tonumber? // null), refused_5m: ($denied | tonumber? // null), upstream_failures_5m: ($upstream | tonumber? // null)},
     store: {ok: $store_ok, newest_sample_age_s: ($age | tonumber? // null)}}'
