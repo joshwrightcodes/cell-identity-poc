@@ -223,3 +223,77 @@ func TestPublishRepairsLabelDrift(t *testing.T) {
 		t.Fatalf("labels %v", cm.Labels)
 	}
 }
+
+// Writes never overlap, and the last write holds the current key. A background write that started
+// before a rotation finishes first, and the admin write after the rotation follows it.
+func TestPublishWritesAreSerialized(t *testing.T) {
+	oldKey, _ := newKey(t)
+	newer, _ := newKey(t)
+	var cur atomic.Pointer[ed25519.PublicKey]
+	cur.Store(&oldKey)
+	var active, maxActive atomic.Int32
+	var mu sync.Mutex
+	var written []ed25519.PublicKey
+	entered := make(chan struct{}, 4)
+	gate := make(chan struct{})
+	p := newKeyPublisher(func() ed25519.PublicKey { return *cur.Load() }, func(_ context.Context, k ed25519.PublicKey) error {
+		n := active.Add(1)
+		for {
+			m := maxActive.Load()
+			if n <= m || maxActive.CompareAndSwap(m, n) {
+				break
+			}
+		}
+		entered <- struct{}{}
+		<-gate
+		mu.Lock()
+		written = append(written, k)
+		mu.Unlock()
+		active.Add(-1)
+		return nil
+	})
+	var wg sync.WaitGroup
+	wg.Go(func() { _ = p.publish(t.Context(), oldKey) })
+	<-entered
+	cur.Store(&newer)
+	wg.Go(func() { _ = p.adminPublish(t.Context(), newer) })
+	select {
+	case <-entered:
+		t.Fatal("a second write started while the first one was running")
+	case <-time.After(300 * time.Millisecond):
+	}
+	gate <- struct{}{}
+	<-entered
+	gate <- struct{}{}
+	wg.Wait()
+	if maxActive.Load() != 1 {
+		t.Fatalf("%d writes at once", maxActive.Load())
+	}
+	if len(written) != 2 || !written[1].Equal(newer) {
+		t.Fatalf("the last write does not hold the current key")
+	}
+}
+
+// A publish that waits behind a stuck write gives up with its context.
+func TestPublishWaitRespectsContext(t *testing.T) {
+	pub, _ := newKey(t)
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	p := newKeyPublisher(func() ed25519.PublicKey { return pub }, func(context.Context, ed25519.PublicKey) error {
+		entered <- struct{}{}
+		<-gate
+		return nil
+	})
+	go func() { _ = p.publish(context.Background(), pub) }()
+	<-entered
+	defer close(gate)
+	ctx, cancel := context.WithTimeout(t.Context(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := p.adminPublish(ctx, pub); err == nil {
+		t.Fatal("the publish returned no error behind a stuck write")
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("the publish waited %s", time.Since(start))
+	}
+}

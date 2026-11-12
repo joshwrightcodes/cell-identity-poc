@@ -42,3 +42,6 @@ func keySourceError(err error) error {
 	}
 	return refuse(mgmtapi.ReasonIssuerUnavailable, "key_source")
 }
+
+// ErrRevisionUnknown means that a restore named a counter that the plane does not hold.
+var ErrRevisionUnknown = errors.New("no stored revision")

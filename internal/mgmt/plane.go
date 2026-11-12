@@ -244,7 +244,7 @@ func (p *Plane) restore(counter uint64, expect *uint64) error {
 		if counter != 0 && !slices.ContainsFunc(t.st.History, func(h Signed) bool {
 			return h.Revision.Epoch == t.st.Last.Epoch && h.Revision.Counter == counter
 		}) {
-			return fmt.Errorf("no stored revision with counter %d", counter)
+			return fmt.Errorf("%w with counter %d", ErrRevisionUnknown, counter)
 		}
 		if t.st.Served != counter {
 			t.st.Served = counter

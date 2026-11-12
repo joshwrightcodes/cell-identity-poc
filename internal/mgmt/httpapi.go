@@ -18,7 +18,6 @@ import (
 	"os"
 	"path"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -186,18 +185,23 @@ func (h *apiHandler) status(w http.ResponseWriter, r *http.Request) {
 
 // ---- Bind
 
+// bindHandlerTimeout is the deadline of one bind request. It stays below the 30 s attempt timeout
+// of celld.
+var bindHandlerTimeout = 25 * time.Second
+
 type bindHandler struct {
 	p     Binder
 	log   *slog.Logger
 	limit *lograte.Limiter
 	mux   *http.ServeMux
+	slots chan struct{}
 }
 
 // NewBindHandler serves the nonce and bind routes of the cells. Every denial is HTTP 403 with the
 // same body. The log line holds the reason, the detail, the cell and the request ID, and never the
 // token or the body.
 func NewBindHandler(p Binder, log *slog.Logger) http.Handler {
-	h := &bindHandler{p: p, log: log, limit: lograte.New(denialWindow, denialKeys, time.Now), mux: http.NewServeMux()}
+	h := &bindHandler{p: p, log: log, limit: lograte.New(denialWindow, denialKeys, time.Now), mux: http.NewServeMux(), slots: make(chan struct{}, maxConns)}
 	h.mux.HandleFunc(mgmtapi.NoncePattern, h.nonce)
 	h.mux.HandleFunc(mgmtapi.BindPattern, h.bind)
 	h.mux.HandleFunc("/", http.NotFound)
@@ -225,6 +229,13 @@ func (h *bindHandler) nonce(w http.ResponseWriter, r *http.Request) {
 			bad = "body_invalid"
 		}
 	}
+	if bad == "" || bad == "body_invalid" {
+		release, ok := h.admit(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	if bad != "" {
 		h.deny(w, cell, "request_invalid", bad)
 		return
@@ -249,16 +260,53 @@ func (h *bindHandler) bind(w http.ResponseWriter, r *http.Request) {
 			bad = "body_invalid"
 		}
 	}
+	if bad == "" || bad == "body_invalid" {
+		release, ok := h.admit(w, r)
+		if !ok {
+			return
+		}
+		defer release()
+	}
 	if bad != "" {
 		h.deny(w, cell, "request_invalid", bad)
 		return
 	}
-	resp, err := h.p.Bind(r.Context(), cell, req)
+	ctx, cancel := context.WithTimeout(r.Context(), bindHandlerTimeout)
+	defer cancel()
+	resp, err := h.p.Bind(ctx, cell, req)
 	if err != nil {
 		h.fail(w, cell, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// admit is called when the request body is read. The request is then complete, so its connection
+// leaves the pending pool, and the request takes a bind slot for as long as the handler runs. When
+// the established connections or the bind slots are full, the answer is a fast 503 that closes the
+// connection, and the cell retries with backoff.
+func (h *bindHandler) admit(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
+	if bc, found := r.Context().Value(bindConnKey{}).(*bindConn); found && !bc.promote() {
+		h.busy(w, "established_full")
+		return nil, false
+	}
+	select {
+	case h.slots <- struct{}{}:
+		return func() { <-h.slots }, true
+	default:
+		h.busy(w, "slots_full")
+		return nil, false
+	}
+}
+
+func (h *bindHandler) busy(w http.ResponseWriter, reason string) {
+	id := newRequestID()
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Retry-After", "1")
+	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy", "reason": reason, "request_id": id})
+	if _, ok, suppressed, _ := h.limit.Allow("busy"); ok {
+		h.log.Warn("bind_busy", "reason", reason, "request_id", id, "suppressed", suppressed)
+	}
 }
 
 func (h *bindHandler) fail(w http.ResponseWriter, cell string, err error) {
@@ -314,8 +362,7 @@ const ReasonNotFound = "not_found"
 func adminError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	out := map[string]any{"error": err.Error()}
-	if ReasonOf(err) == "" && strings.HasPrefix(err.Error(), "no stored revision") {
-		// The plane reports an unknown counter as a plain error with this text.
+	if errors.Is(err, ErrRevisionUnknown) {
 		out["reason"] = ReasonNotFound
 		status = http.StatusNotFound
 	} else if reason := ReasonOf(err); reason != "" {
@@ -534,6 +581,9 @@ const (
 // connContext marks the connection for the maximum age and adds the verified API peer.
 func connContext(ctx context.Context, c net.Conn) context.Context {
 	ctx = connlimit.ConnContext(ctx, c)
+	if v, ok := bindConns.Load(connKey(c)); ok {
+		ctx = context.WithValue(ctx, bindConnKey{}, v)
+	}
 	if v, ok := peerIDs.LoadAndDelete(connKey(c)); ok {
 		ctx = context.WithValue(ctx, peerCtxKey{}, v.(peerInfo))
 	}

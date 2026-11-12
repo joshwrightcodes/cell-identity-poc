@@ -28,11 +28,19 @@ const (
 	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key"
 )
 
-// listenAdmin listens on the unix socket at path. The socket is made under a restrictive umask and
-// then set to mode 0600, and a stale socket file is removed first.
-func listenAdmin(path string) (net.Listener, error) {
-	dir := filepath.Dir(path)
-	switch info, err := os.Stat(dir); {
+// Hooks that tests replace.
+var (
+	euid        = os.Geteuid
+	afterListen func()
+)
+
+// checkAdminDir makes the directory of the admin socket when it is absent, with mode 0700. It
+// refuses an existing directory that its own uid does not own, unless the directory has the sticky
+// bit, and one that group or others can write, unless the sticky bit stops them from renaming it.
+// It returns the directory as checked.
+func checkAdminDir(dir string) (fs.FileInfo, error) {
+	info, err := os.Stat(dir)
+	switch {
 	case errors.Is(err, fs.ErrNotExist):
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("admin socket directory: %w", err)
@@ -40,12 +48,29 @@ func listenAdmin(path string) (net.Listener, error) {
 		if err := os.Chmod(dir, 0o700); err != nil {
 			return nil, fmt.Errorf("admin socket directory mode: %w", err)
 		}
+		return os.Stat(dir)
 	case err != nil:
 		return nil, fmt.Errorf("admin socket directory: %w", err)
 	case !info.IsDir():
 		return nil, fmt.Errorf("admin socket directory %s is not a directory", dir)
-	case info.Mode().Perm()&0o022 != 0:
-		return nil, fmt.Errorf("admin socket directory %s is writable by group or others (mode %v); another container could replace the socket, so mgmtd creates its own directory under the shared volume", dir, info.Mode().Perm())
+	}
+	sticky := info.Mode()&os.ModeSticky != 0
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != euid() && !sticky {
+		return nil, fmt.Errorf("admin socket directory %s is owned by uid %d, not by this process (uid %d); another uid could replace it", dir, st.Uid, euid())
+	}
+	if info.Mode().Perm()&0o022 != 0 && !sticky {
+		return nil, fmt.Errorf("admin socket directory %s is writable by group or others (mode %v); mgmtd creates its own directory under the shared volume, and the volume must be mounted in the mgmtd container only", dir, info.Mode().Perm())
+	}
+	return info, nil
+}
+
+// listenAdmin listens on the unix socket at path. The socket is made under a restrictive umask and
+// then set to mode 0600, and a stale socket file is removed first.
+func listenAdmin(path string) (net.Listener, error) {
+	dir := filepath.Dir(path)
+	before, err := checkAdminDir(dir)
+	if err != nil {
+		return nil, err
 	}
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
@@ -64,6 +89,15 @@ func listenAdmin(path string) (net.Listener, error) {
 	if err := os.Chmod(path, 0o600); err != nil {
 		_ = ln.Close()
 		return nil, fmt.Errorf("admin socket mode: %w", err)
+	}
+	if afterListen != nil {
+		afterListen()
+	}
+	// The directory must be the one that passed the check. A rename of the directory between the
+	// check and the bind leaves another inode at this path.
+	if after, err := os.Stat(dir); err != nil || !os.SameFile(before, after) {
+		_ = ln.Close()
+		return nil, fmt.Errorf("admin socket directory %s changed while the socket was made", dir)
 	}
 	return ln, nil
 }
@@ -159,6 +193,14 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 }
 
 func ctlRequest(ctx context.Context, socket, method, path string, out io.Writer) error {
+	if fi, err := os.Lstat(socket); err == nil {
+		if fi.Mode()&os.ModeSocket == 0 {
+			return fmt.Errorf("%s is not a socket", socket)
+		}
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) != euid() && euid() != 0 {
+			return fmt.Errorf("%s is owned by uid %d, not by this user (uid %d)", socket, st.Uid, euid())
+		}
+	}
 	client := &http.Client{
 		Timeout: ctlTimeout,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {

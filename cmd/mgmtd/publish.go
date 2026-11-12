@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
-	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -132,24 +131,33 @@ func runPublisher(ctx context.Context, current func() ed25519.PublicKey, publish
 	}
 }
 
-// keyPublisher writes the current public key of the plane. One mutex serializes the writes, and
+// publishWriteTimeout bounds one write of the ConfigMap, so that a stuck write frees the lock.
+const publishWriteTimeout = 15 * time.Second
+
+// keyPublisher writes the current public key of the plane. One lock (a channel, so that a waiting caller can give up with its context) serializes the writes, and
 // each write reads the current key inside the lock, so a rotation that lands during a write is
 // never undone by a write of the older key.
 type keyPublisher struct {
-	mu      sync.Mutex
+	sem     chan struct{}
 	current func() ed25519.PublicKey
 	write   func(context.Context, ed25519.PublicKey) error
 	nudge   chan struct{}
 }
 
 func newKeyPublisher(current func() ed25519.PublicKey, write func(context.Context, ed25519.PublicKey) error) *keyPublisher {
-	return &keyPublisher{current: current, write: write, nudge: make(chan struct{}, 1)}
+	return &keyPublisher{sem: make(chan struct{}, 1), current: current, write: write, nudge: make(chan struct{}, 1)}
 }
 
 // publish writes the current key. The argument is ignored.
 func (p *keyPublisher) publish(ctx context.Context, _ ed25519.PublicKey) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	select {
+	case p.sem <- struct{}{}:
+	case <-ctx.Done():
+		return fmt.Errorf("wait for the publish in progress: %w", ctx.Err())
+	}
+	defer func() { <-p.sem }()
+	ctx, cancel := context.WithTimeout(ctx, publishWriteTimeout)
+	defer cancel()
 	return p.write(ctx, p.current())
 }
 

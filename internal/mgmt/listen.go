@@ -27,9 +27,12 @@ var (
 	handshakeDeadline = 5 * time.Second
 	firstByteDeadline = 1 * time.Second
 
-	maxConns  = 64
-	apiMaxAge = 5 * time.Minute
-	apiGrace  = 5 * time.Second
+	// maxConns is the number of verified API connections, and the number of bind requests that run
+	// at once. maxEstablished is the cap on bind connections that sent a complete request.
+	maxConns       = 64
+	maxEstablished = 1024
+	apiMaxAge      = 5 * time.Minute
+	apiGrace       = 5 * time.Second
 	// bindMaxAge plus bindGrace is the hard deadline of a bind connection. It stays below the 30 s
 	// attempt timeout of celld, and above the maximum age plus a 10 s key fetch.
 	bindMaxAge = 15 * time.Second
@@ -53,7 +56,9 @@ const (
 
 // FilesNeeded returns the number of open files that both listeners may use at once: the pending
 // pool, the verified connections of each listener and a margin for the rest of the process.
-func FilesNeeded() uint64 { return uint64(maxPendingHandshakes + 2*maxConns + filesMargin) }
+func FilesNeeded() uint64 {
+	return uint64(2*maxPendingHandshakes + maxEstablished + maxConns + filesMargin)
+}
 
 // ListenAPI wraps ln for the API server. The TLS handshake and the check of the client certificate
 // run first, in one pool of pending connections. Only a verified connection takes one of the
@@ -76,56 +81,142 @@ func ListenAPI(ln net.Listener, cfg *tls.Config, log *slog.Logger) net.Listener 
 	return connlimit.Listen(hl, maxConns, apiMaxAge, apiGrace, nil)
 }
 
-// ListenBind wraps ln for the bind server. A cell has no certificate to prove at the TLS layer, so
-// every connection counts against the cap of 64. A connection beyond the cap is closed at once with
-// no TLS, so a real cell fails fast and retries, and no connection waits in the kernel queue. A
-// connection ends at its maximum age plus the grace at the latest. The TLS handshake runs inside
-// the server, under its timeouts. Refusals go to log, at most one line in each window.
+// ListenBind wraps ln for the bind server, with the pending-pool design of the API listener. A cell
+// has no certificate to prove at the TLS layer, so the proof of a client is a complete request.
+// A connection that has not yet finished the TLS handshake and sent a complete request is pending.
+// All pending connections share one pool. A full pool refuses a new connection at once and evicts
+// none. Each pending connection has a first-byte deadline and a hard deadline, counted from accept,
+// which cover the handshake and the headers and the body of the first request. A connection that
+// sent a complete request is established, and the pool no longer holds it. Established connections
+// have their own cap, and each ends at its maximum age plus the grace at the latest. The bind
+// handler takes a bind slot only while it runs a request (see NewBindHandler). Refusals go to log,
+// at most one line in each window.
 func ListenBind(ln net.Listener, cfg *tls.Config, log *slog.Logger) net.Listener {
 	limit := lograte.New(refuseWindow, refuseKeys, time.Now)
-	rl := &refusingListener{Listener: ln, max: int32(maxConns), refused: func() {
-		if _, ok, suppressed, _ := limit.Allow("bind_full"); ok {
-			log.Warn("connection_refused", "reason", "listener_full", "suppressed", suppressed)
-		}
-	}}
-	// connlimit holds one more slot than the cap, so that one Accept always waits on rl and a
-	// refusal never depends on the timing of the server's accept loop.
-	return tls.NewListener(connlimit.Listen(rl, maxConns+1, bindMaxAge, bindGrace, nil), cfg)
+	bl := &bindListener{Listener: ln, pendingMax: int32(maxPendingHandshakes), establishedMax: int32(maxEstablished),
+		hard: handshakeDeadline, firstByte: firstByteDeadline, refused: func() {
+			if _, ok, suppressed, _ := limit.Allow("pool_full"); ok {
+				log.Warn("connection_refused", "reason", refusedPoolFull, "suppressed", suppressed)
+			}
+		}}
+	// connlimit never holds Accept, because the two caps keep the open connections below its own.
+	total := maxPendingHandshakes + maxEstablished + 1
+	return tls.NewListener(connlimit.Listen(bl, total, bindMaxAge, bindGrace, nil), cfg)
 }
 
-// refusingListener closes each connection beyond max open connections as soon as it accepts it.
-type refusingListener struct {
+// bindConns maps an open bind connection, by its two addresses, to its state, so that the handler
+// of a request finds the connection through the request context.
+var bindConns sync.Map
+
+type bindConnKey struct{}
+
+type bindListener struct {
 	net.Listener
-	max     int32
-	open    atomic.Int32
-	refused func()
+	pendingMax, establishedMax int32
+	pending, established       atomic.Int32
+	hard, firstByte            time.Duration
+	refused                    func()
 }
 
-func (l *refusingListener) Accept() (net.Conn, error) {
+func (l *bindListener) Accept() (net.Conn, error) {
 	for {
 		c, err := l.Listener.Accept()
 		if err != nil {
 			return nil, err
 		}
-		if l.open.Add(1) > l.max {
-			l.open.Add(-1)
+		if l.pending.Add(1) > l.pendingMax {
+			l.pending.Add(-1)
 			_ = c.Close()
 			l.refused()
 			continue
 		}
-		return &countedConn{Conn: c, l: l}, nil
+		bc := &bindConn{Conn: c, l: l, state: statePending}
+		bc.hardTimer = time.AfterFunc(l.hard, bc.expire)
+		bc.byteTimer = time.AfterFunc(l.firstByte, bc.expireIfSilent)
+		bindConns.Store(connKey(c), bc)
+		return bc, nil
 	}
 }
 
-type countedConn struct {
+const (
+	statePending = iota
+	stateEstablished
+	stateDone
+)
+
+// bindConn is a pending or established bind connection. The deadlines are timers that close the
+// connection, because the server and connlimit set the deadlines of the connection themselves.
+type bindConn struct {
 	net.Conn
-	l    *refusingListener
-	once sync.Once
+	l                    *bindListener
+	hardTimer, byteTimer *time.Timer
+	gotByte              atomic.Bool
+
+	mu    sync.Mutex
+	state int
 }
 
-func (c *countedConn) Close() error {
+func (c *bindConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 && c.gotByte.CompareAndSwap(false, true) {
+		c.byteTimer.Stop()
+	}
+	return n, err
+}
+
+func (c *bindConn) expire() {
+	c.mu.Lock()
+	pending := c.state == statePending
+	c.mu.Unlock()
+	if pending {
+		_ = c.Close()
+	}
+}
+
+func (c *bindConn) expireIfSilent() {
+	if !c.gotByte.Load() {
+		c.expire()
+	}
+}
+
+// promote moves a connection from the pending pool to the established connections, when the first
+// request is complete. It reports false when the established cap is full, and then the caller
+// answers 503 and closes the connection.
+func (c *bindConn) promote() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch c.state {
+	case stateEstablished:
+		return true
+	case stateDone:
+		return false
+	}
+	c.hardTimer.Stop()
+	c.byteTimer.Stop()
+	c.l.pending.Add(-1)
+	if c.l.established.Add(1) > c.l.establishedMax {
+		c.l.established.Add(-1)
+		c.state = stateDone
+		return false
+	}
+	c.state = stateEstablished
+	return true
+}
+
+func (c *bindConn) Close() error {
 	err := c.Conn.Close()
-	c.once.Do(func() { c.l.open.Add(-1) })
+	c.mu.Lock()
+	switch c.state {
+	case statePending:
+		c.l.pending.Add(-1)
+	case stateEstablished:
+		c.l.established.Add(-1)
+	}
+	c.state = stateDone
+	c.mu.Unlock()
+	c.hardTimer.Stop()
+	c.byteTimer.Stop()
+	bindConns.Delete(connKey(c.Conn))
 	return err
 }
 

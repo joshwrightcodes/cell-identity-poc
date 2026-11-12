@@ -35,6 +35,9 @@ func TestListenerLimitsOfTheSharedTable(t *testing.T) {
 	if maxConns != 64 || apiMaxAge != 5*time.Minute || bindMaxAge != 15*time.Second || apiGrace != 5*time.Second || bindGrace != 10*time.Second {
 		t.Fatalf("connections %d, API age %s grace %s, bind age %s grace %s", maxConns, apiMaxAge, apiGrace, bindMaxAge, bindGrace)
 	}
+	if maxEstablished != 1024 || maxPendingHandshakes != 1024 || handshakeDeadline != 5*time.Second || firstByteDeadline != time.Second || bindHandlerTimeout != 25*time.Second {
+		t.Fatalf("established %d, pending %d, hard %s, first byte %s, handler %s", maxEstablished, maxPendingHandshakes, handshakeDeadline, firstByteDeadline, bindHandlerTimeout)
+	}
 	if bindMaxAge+bindGrace >= 30*time.Second {
 		t.Fatal("the bind hard deadline must stay below the 30 s attempt timeout of celld")
 	}

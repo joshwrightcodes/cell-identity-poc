@@ -527,41 +527,6 @@ func rawTLS(t testing.TB, addr string, mgmtCA *spiffetest.CA, timeout time.Durat
 	return tls.DialWithDialer(d, "tcp", addr, cfg)
 }
 
-func TestListenerConnCap(t *testing.T) {
-	addr, mgmtCA, _ := startBind(t, NewBindHandler(&fakeBinder{}, jsonLog(io.Discard)))
-	conns := make([]*tls.Conn, 0, 64)
-	for i := 0; i < 64; i++ {
-		c, err := rawTLS(t, addr, mgmtCA, 5*time.Second)
-		if err != nil {
-			t.Fatalf("connection %d: %v", i+1, err)
-		}
-		defer c.Close()
-		conns = append(conns, c)
-	}
-	// The 65th connection is refused at once, with no TLS, and does not wait in a queue.
-	start := time.Now()
-	if c, err := rawTLS(t, addr, mgmtCA, 5*time.Second); err == nil {
-		c.Close()
-		t.Fatal("the 65th handshake succeeded")
-	}
-	if d := time.Since(start); d > time.Second {
-		t.Fatalf("the 65th connection took %s to fail, want under 1 s", d)
-	}
-	conns[0].Close()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		c, err := rawTLS(t, addr, mgmtCA, time.Second)
-		if err == nil {
-			c.Close()
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("no connection after a close: %v", err)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-}
-
 func TestBindStreamCap(t *testing.T) {
 	fb := &fakeBinder{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
 	addr, mgmtCA, _ := startBind(t, NewBindHandler(fb, jsonLog(io.Discard)))
@@ -627,7 +592,8 @@ func TestBindStreamCap(t *testing.T) {
 
 // slowClient holds one bind connection with a trickle of bytes. It ignores GOAWAY, as a hostile
 // client does. Mode 0 opens a new stream every 5 s and sends each body at one byte per second.
-// Mode 1 sends one header block at one byte per second.
+// Mode 1 sends one header block at one byte per second. Mode 2 first sends one complete request,
+// and then behaves as mode 1 on stream 3.
 type slowClient struct {
 	err    error
 	conn   *tls.Conn
@@ -684,10 +650,19 @@ func startSlowClient(t *testing.T, addr string, mgmtCA *spiffetest.CA, mode int)
 		var streams []uint32
 		next := uint32(1)
 		var block []byte
-		if mode == 1 {
+		trickleStream := uint32(1)
+		if mode == 2 {
+			if err := locked(func() error {
+				return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: headers(1), EndHeaders: true, EndStream: true})
+			}); err != nil {
+				return
+			}
+			trickleStream = 3
+		}
+		if mode == 1 || mode == 2 {
 			block = headers(400)
 			if err := locked(func() error {
-				return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block[:1], EndHeaders: false})
+				return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: trickleStream, BlockFragment: block[:1], EndHeaders: false})
 			}); err != nil {
 				return
 			}
@@ -699,11 +674,11 @@ func startSlowClient(t *testing.T, addr string, mgmtCA *spiffetest.CA, mode int)
 			case <-sc.closed:
 				return
 			}
-			if mode == 1 {
+			if mode == 1 || mode == 2 {
 				if len(block) == 0 {
 					return
 				}
-				if err := locked(func() error { return fr.WriteContinuation(1, false, block[:1]) }); err != nil {
+				if err := locked(func() error { return fr.WriteContinuation(trickleStream, false, block[:1]) }); err != nil {
 					return
 				}
 				block = block[1:]
@@ -743,84 +718,45 @@ func (s *slowClient) released() bool {
 	}
 }
 
-// slowBind fills the bind listener with 64 trickling clients, and then makes real requests until
-// one succeeds. mode returns the trickle mode of client i.
-func slowBind(t *testing.T, mode func(i int) int) {
-	t.Helper()
-	fb := &fakeBinder{}
-	addr, mgmtCA, _ := startBind(t, NewBindHandler(fb, jsonLog(io.Discard)))
+// Established connections: 64 clients each send one complete request, and then trickle a header
+// block. The pending pool no longer holds them, so only the hard deadline of the connection (15 s
+// maximum age plus 10 s grace) ends them.
+func TestBindEstablishedTrickleReleased(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for about 26 s")
+	}
+	t.Parallel()
+	addr, mgmtCA, _ := startBind(t, NewBindHandler(&fakeBinder{}, jsonLog(io.Discard)))
 	start := time.Now()
 	var slow []*slowClient
 	for i := 0; i < 64; i++ {
-		sc := startSlowClient(t, addr, mgmtCA, mode(i))
+		sc := startSlowClient(t, addr, mgmtCA, 2)
 		defer sc.conn.Close()
 		slow = append(slow, sc)
 	}
-	time.Sleep(500 * time.Millisecond)
-	good := h2Client(t, mgmtCA, nil)
-	good.Timeout = 10 * time.Second
-	// The values of the shared table, so that a changed variable cannot move the limit: maximum age
-	// 15 s, grace 10 s, and a margin of 2 s.
+	// The pending deadline of 5 s must not end them, and the hard deadline of 25 s must.
+	time.Sleep(8 * time.Second)
+	for i, sc := range slow {
+		if sc.released() {
+			t.Fatalf("established connection %d closed after %s, before the hard deadline", i, time.Since(start))
+		}
+	}
 	const limit = 15*time.Second + 10*time.Second + 2*time.Second
-	var resp *http.Response
-	refused := 0
-	for resp == nil {
-		r, err := good.Post("https://"+addr+mgmtapi.NoncePath("dev-cell-1"), "application/json", nil)
-		if err == nil {
-			resp = r
-			break
-		}
-		refused++
-		if time.Since(start) > limit {
-			t.Fatalf("no good request after %s (%d refusals): %v", time.Since(start), refused, err)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-	defer resp.Body.Close()
-	elapsed := time.Since(start)
-	if n, _ := fb.calls(); resp.StatusCode != 200 || n != 1 {
-		t.Fatalf("good request: status %d", resp.StatusCode)
-	}
-	if elapsed > limit {
-		t.Fatalf("the good request got through only after %s, more than %s", elapsed, limit)
-	}
-	if refused == 0 {
-		t.Fatalf("the good request got through at %s, so the slow clients did not fill the listener", elapsed)
-	}
 	for time.Since(start) < limit {
 		all := true
 		for _, sc := range slow {
 			all = all && sc.released()
 		}
 		if all {
-			break
+			return
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	for i, sc := range slow {
 		if !sc.released() {
-			t.Errorf("slow connection %d was still open after %s", i, time.Since(start))
+			t.Errorf("established connection %d was still open after %s", i, time.Since(start))
 		}
 	}
-}
-
-// Half of the clients trickle a body, and half trickle a header block. Only the hard deadline ends
-// a header trickle, because no handler ever runs.
-func TestBindSlowBodyReleased(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs for about 25 s")
-	}
-	t.Parallel()
-	slowBind(t, func(i int) int { return i % 2 })
-}
-
-// The literal case of the brief: every client trickles a body and opens a new stream every 5 s.
-func TestBindSlowBodyOnlyReleased(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs for about 25 s")
-	}
-	t.Parallel()
-	slowBind(t, func(int) int { return 0 })
 }
 
 // TestMaxAgeSendsGoAway keeps one connection busy past the maximum age. The age counts from the

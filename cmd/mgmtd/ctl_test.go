@@ -210,3 +210,58 @@ func TestListenAdminDirectory(t *testing.T) {
 	must(t, err)
 	ln.Close()
 }
+
+// The admin directory must belong to the process, unless it has the sticky bit.
+func TestListenAdminRefusesAForeignDirectory(t *testing.T) {
+	base, err := os.MkdirTemp("", "fo")
+	must(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	dir := filepath.Join(base, "d")
+	must(t, os.Mkdir(dir, 0o700))
+	oldEuid := euid
+	euid = func() int { return os.Geteuid() + 1 }
+	t.Cleanup(func() { euid = oldEuid })
+	if _, err := listenAdmin(filepath.Join(dir, "a.sock")); err == nil {
+		t.Fatal("a directory of another uid was accepted")
+	}
+	must(t, os.Chmod(dir, 0o700|os.ModeSticky))
+	ln, err := listenAdmin(filepath.Join(dir, "a.sock"))
+	if err != nil {
+		t.Fatalf("a sticky directory was refused: %v", err)
+	}
+	ln.Close()
+}
+
+// A directory that changes between the check and the bind is refused.
+func TestListenAdminRechecksTheDirectory(t *testing.T) {
+	base, err := os.MkdirTemp("", "re")
+	must(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(base) })
+	dir := filepath.Join(base, "d")
+	must(t, os.Mkdir(dir, 0o700))
+	afterListen = func() {
+		must(t, os.Rename(dir, filepath.Join(base, "moved")))
+		must(t, os.Mkdir(dir, 0o700))
+	}
+	t.Cleanup(func() { afterListen = nil })
+	if ln, err := listenAdmin(filepath.Join(dir, "a.sock")); err == nil {
+		ln.Close()
+		t.Fatal("a swapped directory was accepted")
+	}
+}
+
+// ctl refuses a socket that another user owns, and a path that is not a socket.
+func TestCtlRefusesAForeignSocket(t *testing.T) {
+	ctl, _ := newAdminRig(t, nil)
+	if code, out := ctl("status"); code != 0 {
+		t.Fatalf("own socket: %d %s", code, out)
+	}
+	oldEuid := euid
+	euid = func() int { return os.Geteuid() + 1 }
+	t.Cleanup(func() { euid = oldEuid })
+	code, out := ctl("status")
+	lines := jsonLines(t, out)
+	if code != 1 || len(lines) != 1 || !strings.Contains(lines[0]["error"].(string), "owned by uid") {
+		t.Fatalf("foreign socket: %d %q", code, out)
+	}
+}
