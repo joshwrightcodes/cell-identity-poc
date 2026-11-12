@@ -81,6 +81,7 @@ type fakeKeys struct {
 	errs     map[string]error
 	calls    map[string]int
 	gate     chan struct{}
+	gateCell string
 }
 
 func newFakeKeys() *fakeKeys {
@@ -129,6 +130,9 @@ func (f *fakeKeys) Keys(ctx context.Context, name string) (mgmtapi.ClusterKeys, 
 	f.mu.Lock()
 	f.calls[name]++
 	gate := f.gate
+	if f.gateCell != "" && f.gateCell != name {
+		gate = nil
+	}
 	c, ok := f.clusters[name]
 	err := f.errs[name]
 	f.mu.Unlock()
@@ -220,7 +224,7 @@ func newRig(t *testing.T, cells ...string) *rig {
 
 func (r *rig) config() Config {
 	cfg := Config{
-		Intent:  r.intent,
+		Intent:  cloneIntent(r.intent),
 		KeyPath: filepath.Join(r.dir, "ed25519.key"),
 		Store:   r.store,
 		Keys:    r.keys,
@@ -232,6 +236,15 @@ func (r *rig) config() Config {
 		r.mod(&cfg)
 	}
 	return cfg
+}
+
+func cloneIntent(in Intent) Intent {
+	out := in
+	out.Cells = make([]IntentCell, len(in.Cells))
+	for i, c := range in.Cells {
+		out.Cells[i] = IntentCell{Name: c.Name, Subjects: append([]record.Subject(nil), c.Subjects...)}
+	}
+	return out
 }
 
 func (r *rig) start() {
@@ -1126,17 +1139,21 @@ func TestStateSavedBeforeServe(t *testing.T) {
 	if !bytes.Equal(stateBefore, r.stateBytes()) {
 		t.Fatal("the state file changed")
 	}
+	keyBefore, _ := os.ReadFile(filepath.Join(r.dir, "ed25519.key"))
 	if _, err := r.plane.RotateKey(t.Context()); err == nil {
 		t.Fatal("rotation succeeded with a failing store")
 	}
 	if marshal(t, r.plane.Spec()) != specBefore {
 		t.Fatal("a failed rotation changed what is served")
 	}
+	if keyAfter, _ := os.ReadFile(filepath.Join(r.dir, "ed25519.key")); !bytes.Equal(keyBefore, keyAfter) {
+		t.Fatal("a failed rotation left the new key in the key file")
+	}
 
 	fs.fail.Store(false)
-	resp, err := r.bind(cell2, r.signers[cell2])
+	resp, err := r.plane.Bind(t.Context(), cell2, req)
 	if err != nil || resp.Status != mgmtapi.StatusBound {
-		t.Fatalf("retry after the store recovers: %+v, %v", resp, err)
+		t.Fatalf("retry with the same nonce after the store recovers: %+v, %v", resp, err)
 	}
 }
 
@@ -1219,7 +1236,8 @@ func TestKeyFetchDoesNotBlockSpec(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	r.keys.mu.Lock()
-	r.keys.gate = make(chan struct{})
+	r.keys.gate, r.keys.gateCell = make(chan struct{}), cell2
+	gate := r.keys.gate
 	r.keys.mu.Unlock()
 	n := r.nonce(cell2)
 	req := mgmtapi.BindRequest{Nonce: n, Token: r.token(cell2, n, r.signers[cell2], nil)}
@@ -1244,10 +1262,66 @@ func TestKeyFetchDoesNotBlockSpec(t *testing.T) {
 	if d := time.Since(start); d > 10*time.Millisecond {
 		t.Fatalf("reads took %v during a key fetch", d)
 	}
-	// A change for another cell commits while the fetch blocks.
+
+	// Every kind of change commits while the fetch blocks.
+	changed := make(chan error, 1)
+	go func() {
+		_, err := r.bind(cell1, r.signers[cell1])
+		if err == nil {
+			err = r.plane.Restore(0)
+		}
+		if err == nil {
+			_, err = r.plane.RotateKey(t.Context())
+		}
+		changed <- err
+	}()
+	select {
+	case err := <-changed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a change waited for a key fetch of another cell")
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKeyCheckFetchDoesNotBlockChanges(t *testing.T) {
+	r := newRig(t, cell1, cell2, cell3)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.clk.Advance(61 * time.Second)
 	r.keys.mu.Lock()
+	r.keys.gate, r.keys.gateCell = make(chan struct{}), cell1
 	gate := r.keys.gate
 	r.keys.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.plane.KeyCheck(t.Context(), cell1)
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for r.keys.count(cell1) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the check never reached the key source")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	changed := make(chan error, 1)
+	go func() {
+		_, err := r.bind(cell3, r.signers[cell3])
+		changed <- err
+	}()
+	select {
+	case err := <-changed:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a bind waited for the key fetch of a check")
+	}
 	close(gate)
 	if err := <-done; err != nil {
 		t.Fatal(err)
@@ -1270,47 +1344,126 @@ func TestCheckSeqConflict(t *testing.T) {
 	}
 }
 
+// release gives envd's report of the signed revision to the plane.
+func (r *rig) release() spec.Revision {
+	r.t.Helper()
+	last := r.status().Signed
+	r.plane.Report(mgmtapi.StatusReport{Applied: last})
+	return last
+}
+
 func TestIntentDropsOneCellPerRevision(t *testing.T) {
 	r := newRig(t, cell1, cell2, cell3)
 	for _, c := range []string{cell1, cell2, cell3} {
 		r.mustBind(c, r.signers[c], mgmtapi.StatusBound)
 	}
 	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	if s := r.verifySpec(); s.Revision != rev(1, 4) || len(s.Cells) != 3 || len(s.Retired) != 0 {
+		t.Fatalf("a restart signed a drop: %+v", s)
+	}
+	if got := r.status().PendingDrops; !slices.Equal(got, []string{cell2, cell3}) {
+		t.Fatalf("pending drops %v", got)
+	}
+
+	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 3)})
+	if r.verifySpec().Revision != rev(1, 4) {
+		t.Fatal("a drop ran before envd applied the signed revision")
+	}
+	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 9)})
+	if r.verifySpec().Revision != rev(1, 4) {
+		t.Fatal("a drop ran on a report above the signed revision")
+	}
+	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 4)})
 	s := r.verifySpec()
 	if s.Revision != rev(1, 5) || len(s.Cells) != 2 || len(s.Retired) != 1 || s.Retired[0].Name != cell2 || s.Retired[0].Revision != rev(1, 3) {
-		t.Fatalf("first spec %+v", s)
-	}
-	if got := r.status().PendingDrops; !slices.Equal(got, []string{cell3}) {
-		t.Fatalf("pending drops %v", got)
+		t.Fatalf("first drop %+v", s)
 	}
 	if _, ok := r.plane.Records()[cell2]; ok {
 		t.Fatal("the dropped cell still has a record")
 	}
-
 	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 4)})
 	if r.verifySpec().Revision != rev(1, 5) {
 		t.Fatal("the second drop ran before envd applied the first")
 	}
-	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 5)})
+	r.release()
 	s = r.verifySpec()
-	if s.Revision != rev(1, 6) || len(s.Cells) != 1 || len(s.Retired) != 2 {
-		t.Fatalf("second spec %+v", s)
-	}
-	if s.Retired[0].Name != cell2 || s.Retired[1].Name != cell3 || s.Retired[1].Revision != rev(1, 4) {
-		t.Fatalf("retired %+v", s.Retired)
+	if s.Revision != rev(1, 6) || len(s.Cells) != 1 || len(s.Retired) != 2 || s.Retired[1].Name != cell3 || s.Retired[1].Revision != rev(1, 4) {
+		t.Fatalf("second drop %+v", s)
 	}
 	if got := r.status().PendingDrops; len(got) != 0 {
 		t.Fatalf("pending drops %v", got)
 	}
-	// A restart with a pending drop waits for a report, too.
-	r2 := newRig(t, cell1, cell2, cell3)
+}
+
+// Every restart signs no drop. The queue survives restarts and waits for a report.
+func TestRestartsNeverDropEarly(t *testing.T) {
+	r := newRig(t, cell1, cell2, cell3)
 	for _, c := range []string{cell1, cell2, cell3} {
-		r2.mustBind(c, r2.signers[c], mgmtapi.StatusBound)
+		r.mustBind(c, r.signers[c], mgmtapi.StatusBound)
 	}
-	r2.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
-	r2.restart(nil)
-	if r2.verifySpec().Revision != rev(1, 5) || len(r2.status().PendingDrops) != 1 {
-		t.Fatalf("a restart dropped again: %+v", r2.status())
+	r.release()
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:2] })
+	r.release() // envd applies the signed revision, and the first drop goes out
+	dropped := r.status().Signed
+	if got := r.verifySpec(); len(got.Retired) != 1 || got.Retired[0].Name != cell3 {
+		t.Fatalf("first drop %+v", got)
+	}
+	// envd has not applied the drop. The operator removes another cell and restarts twice.
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	r.restart(nil)
+	if got := r.status(); got.Signed != dropped || !slices.Equal(got.PendingDrops, []string{cell2}) {
+		t.Fatalf("a restart signed a second drop before envd applied the first: %+v", got)
+	}
+	r.plane.Report(mgmtapi.StatusReport{Applied: rev(1, 4)})
+	if r.status().Signed != dropped {
+		t.Fatal("a report of an older revision released a drop")
+	}
+	r.release()
+	if got := r.verifySpec(); len(got.Retired) != 2 || len(got.Cells) != 1 {
+		t.Fatalf("second drop %+v", got)
+	}
+	if got := r.status().PendingDrops; len(got) != 0 {
+		t.Fatalf("pending drops %v", got)
+	}
+}
+
+type slowStore struct {
+	Store
+	delay time.Duration
+}
+
+func (s *slowStore) Save(st *State) error {
+	time.Sleep(s.delay)
+	return s.Store.Save(st)
+}
+
+// Two Reports of one applied revision release one drop.
+func TestConcurrentReportsReleaseOneDrop(t *testing.T) {
+	const cell4 = "dev-cell-4"
+	r := newRig(t, cell1, cell2, cell3, cell4)
+	r.signers[cell4] = newSigner(t, "kid-1")
+	r.keys.set(cell4, "https://"+cell4+".test", r.signers[cell4])
+	for _, c := range []string{cell1, cell2, cell3, cell4} {
+		r.mustBind(c, r.signers[c], mgmtapi.StatusBound)
+	}
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	r.release()
+	if got := r.status(); len(got.PendingDrops) != 2 {
+		t.Fatalf("setup: %+v", got)
+	}
+	r.plane.cfg.Store = &slowStore{Store: r.store, delay: 50 * time.Millisecond}
+	applied := r.status().Signed
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.plane.Report(mgmtapi.StatusReport{Applied: applied})
+		}()
+	}
+	wg.Wait()
+	if got := r.status(); got.Signed != rev(1, applied.Counter+1) || len(got.PendingDrops) != 1 {
+		t.Fatalf("three reports of %v: signed %v, pending %v", applied, got.Signed, got.PendingDrops)
 	}
 }
 
@@ -1319,6 +1472,7 @@ func TestIntentReAddAfterDrop(t *testing.T) {
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
 	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	r.release()
 	s := r.verifySpec()
 	if len(s.Retired) != 1 || s.Retired[0].Name != cell2 {
 		t.Fatalf("spec %+v", s)
@@ -1354,6 +1508,66 @@ func TestIntentReAddAfterDrop(t *testing.T) {
 	}
 }
 
+func TestOversizedKeySetsRefused(t *testing.T) {
+	r := newRig(t, cell1, cell2)
+	many := make([]*kubetoken.Signer, 400)
+	for i := range many {
+		many[i] = newSigner(t, "k"+string(rune('a'+i%26))+strings.Repeat("x", i/26))
+	}
+	r.keys.set(cell1, "https://dev-cell-1.test", many...)
+	stateBefore := r.stateBytes()
+	_, err := r.bind(cell1, many[0])
+	if ReasonOf(err) != mgmtapi.ReasonKeysUntrusted {
+		t.Fatalf("first bind with 400 keys: %v", err)
+	}
+	if !bytes.Equal(stateBefore, r.stateBytes()) {
+		t.Fatal("a refused bind changed the state")
+	}
+	// Another cell is not affected.
+	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
+	for _, raw := range r.plane.Records() {
+		if len(raw) > 48<<10 {
+			t.Fatalf("a signed record has %d bytes", len(raw))
+		}
+	}
+}
+
+func TestKeySetGrowthStopsAtTheCap(t *testing.T) {
+	r := newRig(t, cell1, cell2)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
+	set := []*kubetoken.Signer{r.signers[cell1]}
+	for i := range 3 {
+		set = append(set, newSigner(t, "g"+string(rune('a'+i))+"1"), newSigner(t, "g"+string(rune('a'+i))+"2"))
+		r.keys.set(cell1, "https://dev-cell-1.test", set...)
+		r.clk.Advance(61 * time.Second)
+		if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUpdated {
+			t.Fatalf("growth step %d: %v, %v", i, res, err)
+		}
+	}
+	before := r.status().Signed
+	set = append(set, newSigner(t, "gz1"), newSigner(t, "gz2"))
+	r.keys.set(cell1, "https://dev-cell-1.test", set...)
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUntrusted {
+		t.Fatalf("past the cap: %v, %v", res, err)
+	}
+	if r.status().Signed != before || len(cellStatus(r.status(), cell1).Kids) != 7 {
+		t.Fatal("a refused check changed the record")
+	}
+	// A bind with a key of the oversized set is refused, too, and other cells still change.
+	r.clk.Advance(61 * time.Second)
+	if _, err := r.bind(cell1, set[len(set)-1]); ReasonOf(err) != mgmtapi.ReasonKeysUntrusted {
+		t.Fatalf("bind past the cap: %v", err)
+	}
+	r.keys.set(cell2, "https://dev-cell-2.test", r.signers[cell2], newSigner(t, "kid-b"))
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell2); err != nil || res != CheckKeysUpdated {
+		t.Fatalf("another cell: %v, %v", res, err)
+	}
+	r.verifyRecord(cell1)
+}
+
 func TestRotateKeyNewEpoch(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
@@ -1386,9 +1600,6 @@ func TestRotateKeyNewEpoch(t *testing.T) {
 	onDisk, created, err := LoadOrCreateKey(filepath.Join(r.dir, "ed25519.key"))
 	if err != nil || created || !onDisk.Public().(ed25519.PublicKey).Equal(pub) {
 		t.Fatalf("key on disk: %v %v", created, err)
-	}
-	if err := r.plane.Restore(1); err != nil && r.status().RestoreActive {
-		t.Fatal(err)
 	}
 	r.restart(nil)
 	if r.verifySpec().Revision != rev(2, 1) {

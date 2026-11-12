@@ -41,7 +41,8 @@ type Signed struct {
 }
 
 // State is the persistent state of the plane. Seq is the compare-and-swap version and rises at every
-// saved change. Served is the counter of a restored revision, and 0 means the latest.
+// saved change. DropRevision is the revision that released the last drop; the queue in PendingDrops
+// releases its next drop only after envd reports a revision at or above it. Served is the counter of a restored revision, and 0 means the latest.
 type State struct {
 	Version      uint64                   `json:"version"`
 	Seq          uint64                   `json:"seq"`
@@ -50,6 +51,7 @@ type State struct {
 	Cells        map[string]*CellState    `json:"cells"`
 	Retired      map[string]spec.Revision `json:"retired"`
 	PendingDrops []string                 `json:"pendingDrops"`
+	DropRevision spec.Revision            `json:"dropRevision"`
 	History      []Signed                 `json:"history"`
 	Served       uint64                   `json:"served"`
 }
@@ -131,8 +133,13 @@ type FileStore struct {
 	Now  func() time.Time
 }
 
+// ErrStateInvalid means the state file parses but fails validation, for example a version that this
+// binary does not know. Load never moves such a file aside.
+var ErrStateInvalid = errors.New("state_invalid")
+
 // Load reads the state. A file that does not parse moves to Path.corrupt-<unix time>, and Load
-// then answers as for an absent file.
+// then answers as for an absent file. A file that parses but fails validation is an error that
+// wraps ErrStateInvalid, and it stays in place.
 func (f *FileStore) Load() (*State, error) {
 	data, err := os.ReadFile(f.Path)
 	switch {
@@ -143,6 +150,9 @@ func (f *FileStore) Load() (*State, error) {
 	}
 	st, perr := parseState(data)
 	if perr == nil {
+		if err := st.validate(); err != nil {
+			return nil, fmt.Errorf("%w: %v; the file stays in place at %s; restore the state volume from a backup (the Task 11 restore runbook step) or run rotate-signing-key", ErrStateInvalid, err, f.Path)
+		}
 		return st, nil
 	}
 	now := time.Now
@@ -153,26 +163,25 @@ func (f *FileStore) Load() (*State, error) {
 	if err := os.Rename(f.Path, dest); err != nil {
 		return nil, fmt.Errorf("state does not parse (%v) and cannot move aside: %w", perr, err)
 	}
-	log := f.Log
-	if log == nil {
-		log = slog.Default()
-	}
-	log.Error("state_corrupt", "moved_to", dest, "error", perr.Error())
+	f.logger().Error("state_corrupt", "moved_to", dest, "error", perr.Error())
 	return nil, nil
+}
+
+func (f *FileStore) logger() *slog.Logger {
+	if f.Log != nil {
+		return f.Log
+	}
+	return slog.New(slog.NewJSONHandler(os.Stdout, nil))
 }
 
 func parseState(data []byte) (*State, error) {
 	var st State
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&st); err != nil {
 		return nil, err
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, errors.New("trailing data after the state")
-	}
-	if err := st.validate(); err != nil {
-		return nil, err
 	}
 	return &st, nil
 }
