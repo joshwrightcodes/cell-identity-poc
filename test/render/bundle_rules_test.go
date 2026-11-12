@@ -251,7 +251,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// The collector comes at wave 3 in every cluster. The uplink is a harness component in dev-cp (the
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
-		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system"},
+		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system", "link mgmt-api 0 mgmt-system"},
 		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
 		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
@@ -453,7 +453,8 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 		"mesh-view-hub Deployment mesh-view-system/mesh-view-hub cell-proxy", "mesh-view-hub Deployment mesh-view-system/mesh-view-hub spire-agent",
 		"mesh-view-hub Deployment mesh-view-system/kiali kiali", "mesh-view Deployment mesh-view-system/mesh-view cell-proxy",
 		"mesh-view Deployment mesh-view-system/mesh-view spire-agent", "mesh-view Deployment mesh-view-system/mesh-view install-agent-plugin",
-		"observability-store Deployment observability-system/prom-readonly cell-proxy"} {
+		"observability-store Deployment observability-system/prom-readonly cell-proxy",
+		"mgmt-api StatefulSet mgmt-system/mgmtd mgmtd", "mgmt-api StatefulSet mgmt-system/mgmtd spire-agent"} {
 		if !seen[name] {
 			t.Errorf("no render holds the container %q", name)
 		}
@@ -480,6 +481,9 @@ func TestNoEmptyPeerList(t *testing.T) {
 			if cluster != "management" && !seen[cluster+" otel-uplink"] {
 				t.Errorf("the loop saw no uplink policy in %s", cluster)
 			}
+		}
+		if !seen["management mgmtd"] {
+			t.Error("the loop saw no mgmtd policy in management")
 		}
 	}()
 	for _, cr := range renderAll(t) {
@@ -558,6 +562,7 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"observability-system", script("observability-system", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"otel-uplink of a cell", script("otel-uplink", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
+		{"mgmt-api", script("mgmt-api", "management"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 	}
 	for _, tc := range cases {
 		for _, v := range tc.vars {

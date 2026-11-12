@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4 [go test arguments]
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4 [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern}_BUDGET_MINUTES"
@@ -60,6 +60,15 @@ if [[ "$milestone" == m3 ]]; then
     done <<<"$workloads"
   done
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# The M4 tests run against mgmtd and the host service. An earlier run can leave the host service with
+# another pin or root, or mgmtd with no replica. mgmtd must run the image that `mise run images -- mgmtd`
+# recorded. The check covers mgmtd only: the other workloads keep the digests that the M3 gate checks.
+if [[ "$milestone" == m4 ]]; then
+  "$ROOT/scripts/gate-m4-repair.sh" --check || exit 1
+  found="$(live_image_mismatches management mgmt-system statefulset/mgmtd)" || die "could not read statefulset/mgmtd in management"
+  [[ -z "$found" ]] || die "the deployed image differs from build/images.env:"$'\n'"$found"$'\n'"Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
 fi
 
 # go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,

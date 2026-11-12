@@ -2,6 +2,9 @@
 # Check each base cell rule against the running cluster. Prints PASS or FAIL per check and
 # exits non-zero if any check fails.
 source "$(dirname "$0")/lib.sh"
+source "$ROOT/components/lib/peer-root.sh"
+source "$ROOT/components/lib/hostsvc-pin.sh"
+source "$ROOT/components/lib/mgmt-key.sh"
 set +e
 
 failures=0
@@ -1207,6 +1210,88 @@ check_hub_tunnels() {
   done
 }
 
+# mgmtd copies the certificate of the host service, the address of the host service, the node address of
+# VIEW_CONTROL_PLANE and its root, and the host service copies the root of management. Each can fall behind
+# a restart of the host service or a rebuild. A mismatch prints the command that brings it up to date.
+check_mgmt_hostsvc_pin() {
+  local live got status want
+  live="$("$ROOT/scripts/hostsvc-serve.sh" pin 2>&1)" || { echo "$live"; echo "Run: $(dependents_of hostsvc)"; return 1; }
+  got="$(k -n mgmt-system get configmap hostsvc-pin -o jsonpath='{.data.hostsvc\.crt}')" \
+    || { echo "could not read ConfigMap mgmt-system/hostsvc-pin"; return 1; }
+  if [[ "$(pem_lines <<<"$got")" != "$(pem_lines <<<"$live")" ]]; then
+    echo "ConfigMap mgmt-system/hostsvc-pin holds another certificate than the host service presents."
+    echo "Run: $(dependents_of hostsvc)"
+    return 1
+  fi
+  status="$("$ROOT/scripts/hostsvc-serve.sh" status)" || return 1
+  want="$(jq -r '.cert_sha256' <<<"$status")"
+  got="$(k -n mgmt-system get pod mgmtd-0 -o jsonpath='{.metadata.annotations.poc\.internal/hostsvc-pin-sha256}')" \
+    || { echo "could not read the pod mgmtd-0"; return 1; }
+  if [[ "$got" != "$want" ]]; then
+    echo "mgmtd-0 carries the pin digest '$got', and the host service presents $want."
+    echo "Run: $(dependents_of hostsvc)"
+    return 1
+  fi
+}
+
+check_mgmt_hostsvc_root() {
+  local status have live
+  status="$("$ROOT/scripts/hostsvc-serve.sh" status)" || return 1
+  have="$(jq -r '.root_sha256' <<<"$status")"
+  live="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN" | pem_der_sha256)" || { echo "could not read the live root of $CELL_NAME"; return 1; }
+  if [[ "$have" != "$live" ]]; then
+    echo "the host service trusts the management root $have, and the live root is $live."
+    echo "Run: $(dependents_of hostsvc)"
+    return 1
+  fi
+}
+
+check_mgmt_hostsvc_address() {
+  local want got arg
+  want="$(hostsvc_address "$CELL_NAME" 2>&1)" || { echo "$want"; return 1; }
+  got="$(k -n mgmt-system get networkpolicy mgmtd -o json \
+    | jq -r --argjson p "$HOSTSVC_PORT" '[.spec.egress[] | select(any(.ports[]; .port == $p)) | .to[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy mgmt-system/mgmtd"; return 1; }
+  arg="$(k -n mgmt-system get statefulset mgmtd -o json | jq -r '.spec.template.spec.containers[] | select(.name == "mgmtd") | .args[] | select(startswith("--hostsvc-addr="))')"
+  if [[ "$got" != "$want/32" || "$arg" != "--hostsvc-addr=$want:$HOSTSVC_PORT" ]]; then
+    echo "host.docker.internal is $want in the node, but the policy admits '$got' and mgmtd runs '$arg'."
+    echo "Run: $(fix_command mgmt-api)"
+    return 1
+  fi
+}
+
+check_mgmt_env_address() {
+  local want got port
+  if ! kind get clusters 2>/dev/null | grep -qx "$VIEW_CONTROL_PLANE"; then
+    got="$(k -n mgmt-system get networkpolicy mgmtd -o json | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8446 or .port == 8447)) | .from[].ipBlock.cidr] | join(" ")')"
+    [[ -z "$got" ]] || { echo "$VIEW_CONTROL_PLANE does not exist, but the API and bind ports admit '$got'."; echo "Run: $(fix_command mgmt-api)"; return 1; }
+    return 0
+  fi
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  for port in 8446 8447; do
+    got="$(k -n mgmt-system get networkpolicy mgmtd -o json \
+      | jq -r --argjson p "$port" '[.spec.ingress[] | select(any(.ports[]; .port == $p)) | .from[].ipBlock.cidr] | join(" ")')" \
+      || { echo "could not read NetworkPolicy mgmt-system/mgmtd"; return 1; }
+    if [[ "$got" != "$want/32" ]]; then
+      echo "the $VIEW_CONTROL_PLANE node is $want, but port $port admits '$got'."
+      echo "Run: $(fix_command mgmt-api)"
+      return 1
+    fi
+  done
+}
+
+check_mgmt_peer_root() {
+  local live got
+  live="$(peer_root_pem "$VIEW_CONTROL_PLANE" dev.env.poc.internal 2>&1)" || { echo "$live"; return 1; }
+  got="$(k -n mgmt-system get configmap peer-root -o jsonpath='{.data.root\.crt}' 2>/dev/null | pem_lines)"
+  if [[ -z "$got" || "$got" != "$(pem_lines <<<"$live")" ]]; then
+    echo "ConfigMap mgmt-system/peer-root is absent or holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: $(fix_command mgmt-api)"
+    return 1
+  fi
+  peer_root_pods_current mgmt-system mgmtd peer-root "$(fix_command mgmt-api)" || return 1
+}
+
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.
 for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
@@ -1216,6 +1301,14 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$bundle" 2>/dev/null | sort -u); do
     check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
   done
+  if [[ "$comp" == mgmt-api ]]; then
+    check "ConfigMap hostsvc-pin equals the certificate that the host service presents" check_mgmt_hostsvc_pin
+    check "The host service trusts the live root of $CELL_NAME" check_mgmt_hostsvc_root
+    check "The host service address in the policy and in mgmtd is the one that the node resolves" check_mgmt_hostsvc_address
+    check "The API and bind ports admit the current $VIEW_CONTROL_PLANE node address" check_mgmt_env_address
+    check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_mgmt_peer_root
+    check "ConfigMap mgmt-signing-pub equals the key that mgmtd signs with" mgmt_signing_pub
+  fi
   if [[ "$comp" == central-view ]]; then
     check "The view listener admits the current $VIEW_CONTROL_PLANE node address" check_view_env_address
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root

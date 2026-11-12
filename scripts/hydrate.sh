@@ -4,7 +4,8 @@
 # The renders of link components read the live roots and node addresses of other clusters, so
 # CELL_UP_SKIP_LINK=1 skips them, and HYDRATE_ONLY=link renders only them. The harness components in
 # LATE_HARNESS read the SPIRE server of their own cluster: CELL_UP_SKIP_LATE=1 skips them, and
-# HYDRATE_ONLY=late renders only them.
+# HYDRATE_ONLY=late renders only them. LINK_ONLY=<component> narrows HYDRATE_ONLY=link to that one
+# link component, and an unknown name fails.
 source "$(dirname "$0")/lib.sh"
 
 [[ -f "$FACTS" ]] || "$ROOT/scripts/facts.sh"
@@ -24,12 +25,14 @@ case "${HYDRATE_ONLY:-}" in
       for e in "${entries[@]}"; do [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]] || kept+=("$e"); done
       entries=("${kept[@]}")
     fi ;;
-  link) entries=(${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}) ;;
+  link) linked="$(link_entries)" || exit 1
+    while read -r e; do [[ -z "$e" ]] || entries+=("$e"); done <<<"$linked" ;;
   late) for e in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
       if [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]]; then entries+=("$e"); fi
     done ;;
   *) die "HYDRATE_ONLY '$HYDRATE_ONLY' is not link or late" ;;
 esac
+[[ -z "${LINK_ONLY:-}" || "${HYDRATE_ONLY:-}" == link ]] || die "LINK_ONLY applies only with HYDRATE_ONLY=link"
 
 # The render writes into a temporary directory. A failed render leaves the last good bundle in place.
 for entry in ${entries[@]+"${entries[@]}"}; do

@@ -79,7 +79,8 @@ while read -r i t; do cat "$STUB_STATE/pem/$i"; done <"$STUB_STATE/x509.bundle" 
 			cmd := exec.Command(filepath.Join(root, "scripts", "mgmt-rotate-ca.sh"))
 			cmd.Env = append([]string{"PATH=" + s.dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 				"CELL=management", "STUB_DIR=" + s.dir, "STUB_STATE=" + s.state, "STUB_LOG=" + filepath.Join(s.dir, "calls"),
-				"MGMT_ROTATE_TAINT_WAIT=0", "MGMT_ROTATE_WAIT=5", "POC_BUILD_ROOT=" + filepath.Join(root, "build")}, env...)
+				"MGMT_ROTATE_TAINT_WAIT=0", "MGMT_ROTATE_WAIT=5", "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
+				"HOSTSVC_SERVE=" + filepath.Join(s.dir, "hostsvc-serve")}, env...)
 			out, err := cmd.CombinedOutput()
 			refreshes, _ := os.ReadFile(refreshLog)
 			calls, _ := os.ReadFile(filepath.Join(s.dir, "calls"))

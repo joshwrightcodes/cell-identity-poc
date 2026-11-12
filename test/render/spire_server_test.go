@@ -104,7 +104,9 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 // kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. It answers
 // "api-resources" with a fixed table, or fails with STUB_NO_API. STUB_NO_SERVER
 // makes it fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line
-// that is not PEM.
+// that is not PEM. It answers "get statefulset spire-server" with the name, or with nothing under
+// STUB_NO_STS, whatever STUB_NO_SERVER says. STUB_NO_SERVER_IN=<cluster> makes it fail the way
+// STUB_NO_SERVER does, but only in that cluster.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
@@ -132,6 +134,14 @@ authorizationpolicies               ap           security.istio.io/v1           
 TABLE
   exit 0
 fi
+if [[ " $* " == *" get statefulset spire-server "* ]]; then
+  [[ -n "${STUB_NO_STS:-}" ]] || echo statefulset.apps/spire-server
+  exit 0
+fi
+if [[ -n "${STUB_NO_SERVER_IN:-}" && " $* " == *" --context kind-$STUB_NO_SERVER_IN "* ]]; then
+  echo "Error from server (NotFound): pods \"spire-server-0\" not found" >&2
+  exit 1
+fi
 if [[ -n "${STUB_NO_SERVER:-}" ]]; then
   echo 'Error from server (NotFound): pods "spire-server-0" not found' >&2
   exit 1
@@ -146,17 +156,49 @@ cat "$STUB_BUNDLE_FILE"
 
 // stubDocker answers the node checks of scripts/gate-traces.sh. Every node has the address 10.9.0.7
 // unless STUB_DOCKER_IP sets another one. STUB_KEYTEST_TRACE names a cell whose node holds a trace of
-// the key rotation test.
+// the key rotation test. It also answers getent for host.docker.internal in a node container.
 const stubDocker = `#!/usr/bin/env bash
 set -euo pipefail
 echo "docker $*" >>"$STUB_LOG"
 case "$1" in
   inspect) echo "${STUB_DOCKER_IP:-10.9.0.7} " ;;
   exec)
+    if [[ " $* " == *" getent ahostsv4 host.docker.internal "* ]]; then
+      # STUB_GETENT replaces the answer. The default is one address in three socket types.
+      printf '%b' "${STUB_GETENT:-192.168.5.2 STREAM host.docker.internal\\n192.168.5.2 DGRAM\\n192.168.5.2 RAW\\n}"
+      exit 0
+    fi
     if [[ "$2" == "${STUB_KEYTEST_TRACE:-none}-control-plane" ]]; then
       echo "/etc/kubernetes/manifests/kube-apiserver.yaml names the test key"
     fi ;;
   *) exit 1 ;;
+esac
+`
+
+// stubKind answers "kind get clusters" with the five clusters of the harness, or with the names in
+// STUB_KIND_CLUSTERS (one for each word). STUB_KIND_CLUSTERS=none prints kind's message for no cluster.
+const stubKind = `#!/usr/bin/env bash
+set -euo pipefail
+echo "kind $*" >>"$STUB_LOG"
+[[ "$*" == "get clusters" ]] || exit 2
+case "${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue}" in
+  none) echo "No kind clusters found." >&2 ;;
+  *) printf '%s\n' ${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue} ;;
+esac
+`
+
+// stubHostsvcServe stands for scripts/hostsvc-serve.sh. It runs no process: start does nothing,
+// status prints a fixed certificate SHA-256 (STUB_HOSTSVC_SHA overrides it), and pin prints the
+// certificate in STUB_PIN_FILE. STUB_HOSTSVC_FAIL makes start fail.
+const stubHostsvcServe = `#!/usr/bin/env bash
+set -euo pipefail
+echo "hostsvc-serve $*" >>"$STUB_LOG"
+case "$1" in
+  start) [[ -z "${STUB_HOSTSVC_FAIL:-}" ]] || { echo "the host service does not start" >&2; exit 1; } ;;
+  status) printf '{"running":true,"pid":4242,"cert_sha256":"%s","root_sha256":"","expires_soon":false,"last_error":""}\n' \
+    "${STUB_HOSTSVC_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" ;;
+  pin) cat "$STUB_PIN_FILE" ;;
+  *) exit 2 ;;
 esac
 `
 
@@ -311,6 +353,8 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("oras", stubOras, 0o755)
 	write("kubectl", stubKubectl, 0o755)
 	write("docker", stubDocker, 0o755)
+	write("kind", stubKind, 0o755)
+	hostsvcServe := write("hostsvc-serve", stubHostsvcServe, 0o755)
 	layerBytes := layerTarGz(t, binary)
 	layer := write("layer.tar.gz", string(layerBytes), 0o644)
 	manifestBytes := []byte(`{"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{"digest":"sha256:0000"},{"digest":"` + digestOf(layerBytes) + `"}]}`)
@@ -318,7 +362,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -367,6 +411,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
+		"HOSTSVC_SERVE="+hostsvcServe, "STUB_PIN_FILE="+write("hostsvc.crt", caPEM(t, "host.docker.internal"), 0o644),
 		"POC_ENV="+commonEnv(t, "POC_ENV"))
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
@@ -1179,6 +1224,7 @@ var managementWorkloads = map[string]string{
 	"argocd/principal": "central-view-system/argocd-agent-principal",
 	"telemetry":        "observability-system/telemetry-gateway",
 	"kiali":            "mesh-view-system/mesh-view-hub",
+	"api":              "mgmt-system/mgmtd",
 }
 
 // TestSpireServerRenderManagement renders the management plane server with cells/management.env.

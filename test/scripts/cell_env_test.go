@@ -23,7 +23,7 @@ func TestLibDropsTheSettingsOfAnotherCluster(t *testing.T) {
 	}
 	for _, tc := range []struct{ cell, want string }{
 		{"dev-cell-1", "COLLECTOR_STORE=|VIEW_CELLS=|SPIRE_LOCAL_WORKLOADS=|CELL_NAME=dev-cell-1"},
-		{"management", "COLLECTOR_STORE=lgtm.observability-system.svc.cluster.local:4317|VIEW_CELLS=dev-cell-1 dev-cell-2|SPIRE_LOCAL_WORKLOADS=argocd/principal=central-view-system/argocd-agent-principal telemetry=observability-system/telemetry-gateway kiali=mesh-view-system/mesh-view-hub|CELL_NAME=management"},
+		{"management", "COLLECTOR_STORE=lgtm.observability-system.svc.cluster.local:4317|VIEW_CELLS=dev-cell-1 dev-cell-2|SPIRE_LOCAL_WORKLOADS=argocd/principal=central-view-system/argocd-agent-principal telemetry=observability-system/telemetry-gateway kiali=mesh-view-system/mesh-view-hub api=mgmt-system/mgmtd|CELL_NAME=management"},
 	} {
 		t.Run(tc.cell, func(t *testing.T) {
 			cmd := exec.Command("bash", "-c", `source "$1"; echo "COLLECTOR_STORE=${COLLECTOR_STORE:-}|VIEW_CELLS=${VIEW_CELLS:-}|SPIRE_LOCAL_WORKLOADS=${SPIRE_LOCAL_WORKLOADS:-}|CELL_NAME=$CELL_NAME"`, "_", lib)

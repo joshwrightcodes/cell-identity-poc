@@ -120,9 +120,10 @@ The table also covers a new root that no one planned. For a planned change of th
 
 | Rebuilt cluster | Then run | Reason |
 | --- | --- | --- |
-| `management` | `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. |
+| `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. |
 | `dev-cp` | `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. |
 | a cell | `CELL=dev-cp mise run cell:up` | The relay and the SPIRE node port admit the node addresses of the cells. |
+| the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
@@ -165,6 +166,60 @@ The last `cell:link` copies the new `dev-cp` root and node address into the cent
 The server keeps its datastore, so the agents keep their identities.
 On 2026-11-09 the new server pod was Ready about 2 seconds after the old pod stopped. No agent of a cell restarted.
 A `cell:restart` of `dev-cp` took 3 seconds from the delete to a Ready new pod. The agents of both cells ran on for 75 seconds after it with no restart, longer than one SVID lifetime.
+
+## Host service and mgmtd
+
+The host service runs on this Mac.
+It answers the key requests of `mgmtd` on `127.0.0.1:17443`.
+Pods reach it at the address that `host.docker.internal` has in the node container of `management`.
+
+The service accepts one client.
+The client must present the SVID `spiffe://mgmt.poc.internal/api` that chains to the live root of `management`.
+The service makes a new certificate at each start.
+`mgmtd` trusts only the certificate in ConfigMap `hostsvc-pin`.
+
+```sh
+mise run hostsvc:serve -- start
+mise run hostsvc:serve -- status
+mise run hostsvc:serve -- restart
+mise run hostsvc:serve -- stop
+```
+
+`start` fetches the live root of `management` and writes it to `build/hostsvc/mgmt-root.crt`.
+It builds `build/bin/hostsvc` and runs it in the background.
+The pid file is `build/hostsvc/serve.pid`, and the log is `build/hostsvc/serve.log`.
+`start` fails when another process holds the port.
+`restart` stops the service, starts it, and links `mgmt-api` again, so `mgmtd` gets the new pin.
+`stop` ends only a process with the command line `build/bin/hostsvc serve`.
+A logout or a reboot of the Mac stops the service.
+`harness:down` stops it last.
+
+`mgmtd` runs in namespace `mgmt-system` as StatefulSet `mgmtd`.
+The link component `mgmt-api` renders it.
+Run the first pass before `dev-cp` exists:
+
+```sh
+mise run images -- mgmtd
+CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
+```
+
+`LINK_ONLY` makes `cell:link` handle one link component and skip the checks of the other clusters.
+A link run that stops prints one command for the failed component and for each later one.
+`mise run images -- mgmtd` builds one image and changes only its line in `build/images.env`.
+`cell:restart` of `management` also restarts `mgmtd`.
+
+Use `mise run mgmt -- status` to read the state of `mgmtd`.
+The other arguments are `records`, `pubkey`, `keys --cell <cell>`, `keycheck --cell <cell>`, `restore` and `rotate-key`.
+The command prints one JSON line.
+When `mgmtd-0` is absent or not Ready, it prints one JSON error line with the link command.
+
+`cell:verify` of `management` checks the host service copies.
+The checks cover the pin, the root, the host address, the `dev-cp` node address, ConfigMap `peer-root` and ConfigMap `mgmt-signing-pub`.
+Each failed check prints the command that repairs it.
+`mise run gate:m4:repair` starts the host service again and sets the replicas of `mgmtd` back to 1.
+With `--check`, it only reports.
+`mise run mgmt:rotate-ca` restarts the host service in both refresh steps.
 
 ## Central Argo CD view
 

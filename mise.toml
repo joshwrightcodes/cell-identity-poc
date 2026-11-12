@@ -157,6 +157,16 @@ run = "scripts/pki-rotate-intermediate.sh"
 description = "Run the host service: up, down or facts, with the arguments after --"
 run = "go run ./cmd/hostsvc"
 
+[tasks."hostsvc:serve"]
+description = "Run the host service on this Mac, which answers the key requests of mgmtd on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status or pin"
+env = { CELL = "management" }
+run = "scripts/hostsvc-serve.sh"
+
+[tasks.mgmt]
+description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key"
+env = { CELL = "management" }
+run = "scripts/mgmt.sh"
+
 [tasks."harness:up"]
 description = "Check the tool versions, create all five clusters through the host service, build the images, then run cell:up on each cluster that has components. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
 depends = ["harness:preflight"]
@@ -208,6 +218,14 @@ run = "scripts/gate.sh m3"
 [tasks."gate:m3:repair"]
 description = "Delete the objects and the firewall rules on the dev-cp node that a gate:m3 run left when it stopped before its cleanups. With --check, only list them. Safe to run again"
 run = "scripts/gate-m3-repair.sh"
+
+[tasks."gate:m4"]
+description = "Run the M4 end-to-end tests against the management plane stand-in, plus the go test arguments after --. The task builds no image: run mise run images -- mgmtd first"
+run = "scripts/gate.sh m4"
+
+[tasks."gate:m4:repair"]
+description = "Start the host service again and link mgmt-api when the pin or the root drifted, and set the replicas of mgmtd back to 1. With --check, only report, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m4-repair.sh"
 
 [tasks."mgmt:rotate-ca"]
 description = "Replace the CA of the SPIRE server in CELL (default management) with a new root: prepare, refresh every peer copy, activate, revoke the old root, refresh again"

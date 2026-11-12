@@ -1,0 +1,234 @@
+# The management plane stand-in. render.sh fills in the @...@ values, adds the SPIRE agent sidecar
+# (components/lib/spire-sidecar.sh) and the harness label, and prints the ConfigMaps and the
+# NetworkPolicies.
+#
+# mgmtd signs the spec and the records of the environment. It serves the spec to envd on the API
+# NodePort, binds the cells on the bind NodePort, and reads the keys of each cell from the host
+# service on this Mac. Its SVID is spiffe://mgmt.poc.internal/api. The signing key lives on the data
+# volume only, and no Secret exists in the namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mgmt-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mgmtd
+  namespace: mgmt-system
+automountServiceAccountToken: false
+---
+# mgmtd publishes its public key as ConfigMap mgmt-signing-pub. Create cannot name the object, and
+# get and update name only that one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mgmtd-publish
+  namespace: mgmt-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [mgmt-signing-pub]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mgmtd-publish
+  namespace: mgmt-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mgmtd-publish
+subjects:
+  - kind: ServiceAccount
+    name: mgmtd
+    namespace: mgmt-system
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mgmtd
+  namespace: mgmt-system
+  labels:
+    app.kubernetes.io/name: mgmtd
+spec:
+  replicas: 1
+  serviceName: mgmtd
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mgmtd
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 64Mi
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mgmtd
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/hostsvc-pin-sha256: "@HOSTSVC_PIN_SHA256@"
+        poc.internal/intent-sha256: "@INTENT_SHA256@"
+    spec:
+      serviceAccountName: mgmtd
+      # Only the mgmtd container mounts the token, as the projected volume mgmtd-api-token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: mgmtd
+          image: "@MGMTD_IMAGE@"
+          args:
+            - serve
+            - --intent=/etc/mgmtd/intent/intent.json
+            - --data-dir=/var/lib/mgmtd
+            - --peer-bundle=/etc/mgmtd/peer-root/root.crt
+            - --peer-trust-domain=@PEER_TRUST_DOMAIN@
+            - --allow-id=spiffe://@PEER_TRUST_DOMAIN@/envd
+            - --hostsvc-addr=@HOSTSVC_ADDR@
+            - --hostsvc-server-name=host.docker.internal
+            - --hostsvc-pin=/etc/mgmtd/hostsvc-pin/hostsvc.crt
+            - --public-configmap=mgmt-system/mgmt-signing-pub
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: mgmtd
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: api
+              containerPort: 8446
+            - name: bind
+              containerPort: 8447
+            - name: health
+              containerPort: 8080
+          # The kubelet reaches the health port from the node (flow N23). The liveness probe answers while
+          # mgmtd waits for its first SVID, and the readiness probe answers after the state is loaded.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: state
+              mountPath: /var/lib/mgmtd
+            - name: intent
+              mountPath: /etc/mgmtd/intent
+              readOnly: true
+            - name: peer-root
+              mountPath: /etc/mgmtd/peer-root
+              readOnly: true
+            - name: hostsvc-pin
+              mountPath: /etc/mgmtd/hostsvc-pin
+              readOnly: true
+            # The admin socket lives at /run/mgmtd/ctl/admin.sock. Only this container mounts the volume.
+            - name: admin
+              mountPath: /run/mgmtd
+            - name: mgmtd-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: intent
+          configMap:
+            name: mgmt-intent
+        # The ConfigMap exists once the dev-cp server answers. Until then mgmtd binds cells and refuses the API.
+        - name: peer-root
+          configMap:
+            name: peer-root
+            optional: true
+        - name: hostsvc-pin
+          configMap:
+            name: hostsvc-pin
+        - name: admin
+          emptyDir:
+            sizeLimit: 1Mi
+        - name: mgmtd-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+# Flow N26: envd in dev-cp reaches the API through the node port. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the dev-cp node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mgmt-api
+  namespace: mgmt-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: mgmtd
+  ports:
+    - name: api
+      port: 8446
+      targetPort: 8446
+      nodePort: 31446
+---
+# Flow N27: relay-bind in dev-cp passes the bind requests of the cells through this node port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mgmt-bind
+  namespace: mgmt-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: mgmtd
+  ports:
+    - name: bind
+      port: 8447
+      targetPort: 8447
+      nodePort: 31447
