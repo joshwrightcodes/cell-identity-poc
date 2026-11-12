@@ -50,8 +50,8 @@
 | Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
 | Run the host service on this Mac (see README "Host service and mgmtd"): `start`, `stop`, `restart`, `status` or `pin` | `mise run hostsvc:serve -- status` |
 | Run `mgmtd ctl` in `mgmtd-0`: `status`, `pubkey`, `keys`, `keycheck`, `restore`, `rotate-key` | `mise run mgmt -- status` |
-| Run the M4 end-to-end gate (build `mgmtd` first with `mise run images -- mgmtd`) | `mise run gate:m4` |
-| Start the host service again and set the replicas of `mgmtd` back to 1 (`--check` only reports) | `mise run gate:m4:repair` |
+| Run the M4 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m4` |
+| Start the host service again and set the replicas of `mgmtd` and `envd` back to 1 (`--check` only reports) | `mise run gate:m4:repair` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References

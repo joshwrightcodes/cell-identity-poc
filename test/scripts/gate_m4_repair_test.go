@@ -19,6 +19,7 @@ case " $* " in
   *" exec spire-server-0 "*) cat "$STUB_DIR/live-root.pem" ;;
   *" get configmap hostsvc-pin "*) cat "$STUB_DIR/pin.pem" ;;
   *" get statefulset mgmtd -o jsonpath="*) [[ -z "${STUB_NO_STS:-}" ]] || exit 1; printf '%s' "${STUB_REPLICAS:-1}" ;;
+  *" get deployment envd -o jsonpath="*) [[ -z "${STUB_NO_ENVD:-}" ]] || exit 1; printf '%s' "${STUB_ENVD_REPLICAS:-1}" ;;
   *" rollout status "*) echo "rollout $*" >>"$STUB_DIR/calls" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
@@ -41,8 +42,8 @@ echo "harness-replicas $*" >>"$STUB_DIR/calls"
 `
 
 // TestGateM4Repair: gate-m4-repair.sh restarts the host service and links mgmt-api when the service does not run,
-// or serves another pin or another management root than the deployed ones, and it sets the replicas of mgmtd back
-// to 1 through harness-replicas.sh. With --check it only reports each drift with the repair command.
+// or serves another pin or another management root than the deployed ones, and it sets the replicas of mgmtd and
+// envd back to 1 through harness-replicas.sh. With --check it only reports each drift with the repair command.
 func TestGateM4Repair(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash", "base64")
 	root := t.TempDir()
@@ -95,6 +96,7 @@ func TestGateM4Repair(t *testing.T) {
 		name, want, call string
 		env              []string
 	}{
+		{"envd replicas", "Deployment envd has 0 replicas. " + repair, "harness-replicas dev-cp envd-system deployment/envd 1", []string{"STUB_ENVD_REPLICAS=0"}},
 		{"replicas", "StatefulSet mgmtd has 0 replicas. " + repair, "harness-replicas management mgmt-system statefulset/mgmtd 1", []string{"STUB_REPLICAS=0"}},
 		{"another pin", "holds the certificate " + hex.EncodeToString(pinSum[:]) + ", and the host service presents " + strings.Repeat("a", 64), "hostsvc-serve restart", []string{"STUB_CERT=" + strings.Repeat("a", 64)}},
 		{"another root", "the host service trusts the management root " + strings.Repeat("b", 64), "hostsvc-serve restart", []string{"STUB_ROOT=" + strings.Repeat("b", 64)}},
@@ -114,5 +116,9 @@ func TestGateM4Repair(t *testing.T) {
 	out, _, err := run([]string{"--check"}, "STUB_NO_STS=1")
 	if err == nil || !strings.Contains(out, "StatefulSet mgmtd is absent in management. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link") {
 		t.Fatalf("an absent StatefulSet: err %v, output %q", err, out)
+	}
+	out, _, err = run([]string{"--check"}, "STUB_NO_ENVD=1")
+	if err == nil || !strings.Contains(out, "Deployment envd is absent in dev-cp. Run: CELL=dev-cp mise run cell:up") {
+		t.Fatalf("an absent Deployment envd: err %v, output %q", err, out)
 	}
 }

@@ -3,7 +3,7 @@
 # the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
 # store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
-# for their rollouts. UP_WAIT sets the bound of the Application wait in seconds (default 900).
+# for their rollouts (scripts/attest-wait.sh for cell-identity). UP_WAIT sets the bound of the Application wait in seconds (default 900).
 # Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 source "$(dirname "$0")/lib.sh"
 
@@ -66,8 +66,16 @@ HYDRATE_ONLY=late "$ROOT/scripts/hydrate.sh"
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   harness_apply "${entry%%:*}"
 done
+# celld cannot become Ready before its record reaches the SPIRE server, so attest-wait.sh waits for
+# each stage of the first attestation and names the stage that fails. The other components keep the
+# plain rollout wait.
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  harness_rollout_wait "${entry%%:*}" "${entry#*:}"
+  if [[ "${entry%%:*}" == cell-identity ]]; then
+    harness_workloads cell-identity "${entry#*:}" >/dev/null || exit 1
+    "$ROOT/scripts/attest-wait.sh" "$CELL_NAME"
+  else
+    harness_rollout_wait "${entry%%:*}" "${entry#*:}"
+  fi
   log "harness component ${entry%%:*} is rolled out"
 done
 if ((${#LINK_COMPONENTS[@]} > 0)); then

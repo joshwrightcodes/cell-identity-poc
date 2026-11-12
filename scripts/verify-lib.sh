@@ -120,3 +120,154 @@ check_mgmt_peer_root() {
   peer_root_pods_current mgmt-system mgmtd peer-root "$(fix_command mgmt-api)" || return 1
 }
 
+
+# missing_cell_hint <cell> prints the two ways out when an agent cell has no cluster.
+missing_cell_hint() {
+  echo "Create the cluster: mise run hostsvc -- up --only $1, then run CELL=$1 mise run cell:up and CELL=$CELL_NAME mise run cell:up."
+  echo "Or remove $1 from SPIRE_AGENT_CELLS in cells/$CELL_NAME.env, then run CELL=$CELL_NAME mise run cell:up."
+}
+
+# record_jwks <cluster> <cell> prints the sorted keys that the signed record of the cell in ConfigMap
+# spire-system/cell-records holds. It fails when the ConfigMap or the record is absent.
+record_jwks() {
+  local cm raw
+  cm="$(kubectl --context "kind-$1" -n spire-system get configmap cell-records -o json 2>/dev/null)" || return 1
+  raw="$(jq -er --arg key "$2.dsse.json" '.data[$key]' <<<"$cm")" || return 1
+  jq -er .payload <<<"$raw" | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)'
+}
+
+# The SPIRE server renders the node address of each agent cell. envd writes the signed record of each cell
+# into ConfigMap cell-records. A rebuilt cell has a new service account key, and it can have a new node
+# address. A record that holds other keys than the cell publishes is a key check for the management plane.
+check_agent_cells_current() {
+  local cell ip facts want got cidrs traces want_cidrs=() stale=() keycheck=()
+  for cell in $SPIRE_AGENT_CELLS; do
+    ip="$(node_ip "$cell")" || { echo "$ip."; missing_cell_hint "$cell"; return 1; }
+    want_cidrs+=("$ip/32")
+    facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"
+    want="$(jq -cS '.jwks.keys | sort_by(.kid)' <<<"$facts")"
+    got="$(record_jwks "$CELL_NAME" "$cell")" || got=""
+    if [[ -z "$want" || "$got" != "$want" ]]; then
+      stale+=("the record of $cell in ConfigMap cell-records holds other service account keys than $cell publishes")
+      keycheck+=("mise run mgmt -- keycheck --cell $cell")
+    fi
+  done
+  cidrs="$(k -n spire-system get networkpolicy spire-server-agents -o json | jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")')"
+  # jq sorts both sides, so the comparison does not depend on the locale of sort.
+  want="$(printf '%s\n' "${want_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
+  [[ "$cidrs" == "$want" ]] || stale+=("the NetworkPolicy admits '$cidrs', but the agent cell nodes are '$want'")
+  if ((${#stale[@]} > 0)); then
+    printf '%s\n' "${stale[@]}"
+    # While the key rotation test has changed a cell, its keys include the test key, so the node must be
+    # repaired first. A node that cannot be read counts as one that needs the repair.
+    for cell in $SPIRE_AGENT_CELLS; do
+      if ! traces="$(keytest_leftover "$cell")" || [[ -n "$traces" ]]; then
+        printf '%s\n' "$traces"
+        echo "Run: mise run gate:m2:repair, and then CELL=$CELL_NAME mise run cell:verify again"
+        return 1
+      fi
+    done
+    if ((${#keycheck[@]} > 0)); then
+      printf 'Run: %s\n' "${keycheck[@]}"
+    else
+      echo "Run: CELL=$CELL_NAME mise run cell:up"
+    fi
+    return 1
+  fi
+}
+
+# The M2 key rotation test changes the API server of a cell on its node. The node must hold no trace
+# of it, and the API server must publish exactly the keys that the record of the cell holds.
+check_keytest_clean() {
+  local traces live record
+  # The node traces come first, because the API server may not answer while the node holds them.
+  if ! traces="$(keytest_leftover "$CELL_NAME")" || [[ -n "$traces" ]]; then
+    printf '%s\n' "$traces"
+    echo "Run: mise run gate:m2:repair"
+    return 1
+  fi
+  live="$(k get --raw /openid/v1/jwks | jq -cS '.keys | sort_by(.kid)')" || { echo "could not read the JWKS of $CELL_NAME"; return 1; }
+  record="$(record_jwks "$SPIRE_SERVER_CLUSTER" "$CELL_NAME")" || { echo "could not read the record of $CELL_NAME in ConfigMap cell-records of $SPIRE_SERVER_CLUSTER"; return 1; }
+  if [[ -z "$live" || "$live" != "$record" ]]; then
+    echo "the API server of $CELL_NAME publishes other keys than its record in $SPIRE_SERVER_CLUSTER."
+    echo "Run: mise run mgmt -- keycheck --cell $CELL_NAME"
+    return 1
+  fi
+}
+
+# envd writes the signed counter of the spec as the annotation poc.internal/spec-counter of ConfigMap
+# cell-records. The counter must equal the one that mgmtd signed last.
+check_envd_applied() {
+  local status signed epoch cm counter stored_epoch
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>&1)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  signed="$(jq -er '.signed.counter' <<<"$status")" && epoch="$(jq -er '.signed.epoch' <<<"$status")" \
+    || { echo "mgmtd reports no signed revision: $status"; return 1; }
+  cm="$(k -n spire-system get configmap cell-records -o json 2>&1)" \
+    || { echo "ConfigMap spire-system/cell-records is absent: $cm"; echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"; return 1; }
+  counter="$(jq -r '.metadata.annotations["poc.internal/spec-counter"] // "none"' <<<"$cm")"
+  stored_epoch="$(jq -r '.metadata.annotations["poc.internal/spec-epoch"] // "none"' <<<"$cm")"
+  if [[ "$counter" != "$signed" || "$stored_epoch" != "$epoch" ]]; then
+    echo "cell-records holds the spec revision $stored_epoch/$counter, and mgmtd signed $epoch/$signed."
+    echo "Read the status of envd: mise run mgmt -- status, and its log: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"
+    return 1
+  fi
+}
+
+# The SPIRE server and envd pin the public key of mgmtd: record_public_keys in the server config, and
+# ConfigMap mgmt-spec-key. Both must equal ConfigMap mgmt-signing-pub in management.
+check_spec_key_pinned() {
+  local live conf pinned stored
+  live="$(mgmt_signing_pub 2>&1)" || { echo "$live"; return 1; }
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  pinned="$(sed -n 's/^ *record_public_keys = \[\(.*\)\]$/\1/p' <<<"$conf" | tr -d ' "')"
+  stored="$(k -n envd-system get configmap mgmt-spec-key -o jsonpath='{.data.spec\.pub}')" || { echo "could not read ConfigMap envd-system/mgmt-spec-key"; return 1; }
+  if [[ "$pinned" != "$live" || "$stored" != "$live" ]]; then
+    echo "mgmt-signing-pub holds $live, the server config pins '$pinned', and mgmt-spec-key holds '$stored'."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# envd copies the node address of RELAY_TARGET into its upstream argument, and the NetworkPolicy of
+# flow N30 admits it. Docker can give a rebuilt node a new address.
+check_envd_mgmt_address() {
+  local want arg cidrs
+  want="$(node_ip "$RELAY_TARGET")" || { echo "$want"; return 1; }
+  arg="$(k -n envd-system get deployment envd -o json \
+    | jq -r '[.spec.template.spec.containers[] | select(.name == "envd") | .args[] | select(startswith("--upstream="))] | join(" ")')" \
+    || { echo "could not read deployment/envd"; return 1; }
+  cidrs="$(k -n envd-system get networkpolicy envd -o json \
+    | jq -r '[.spec.egress[] | select(any(.ports[]; .port == 31446)) | .to[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy envd-system/envd"; return 1; }
+  if [[ "$arg" != "--upstream=$want:31446" || "$cidrs" != "$want/32" ]]; then
+    echo "the $RELAY_TARGET node is $want, but envd runs '$arg' and the policy admits '$cidrs'."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# ConfigMap envd-system/peer-root must hold the live roots of management, and the pod must carry their digest.
+check_envd_peer_root() {
+  local live got
+  live="$(peer_root_pem "$RELAY_TARGET" mgmt.poc.internal 2>&1)" || { echo "$live"; return 1; }
+  got="$(k -n envd-system get configmap peer-root -o jsonpath='{.data.root\.crt}' 2>/dev/null | pem_lines)"
+  if [[ -z "$got" || "$got" != "$(pem_lines <<<"$live")" ]]; then
+    echo "ConfigMap envd-system/peer-root is absent or holds other roots than the live bundle of $RELAY_TARGET."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  peer_root_pods_current envd-system envd peer-root "CELL=$CELL_NAME mise run cell:up" || return 1
+}
+
+# celld trusts the bind answer of mgmtd only through ConfigMap cell-identity-system/mgmt-root.
+check_celld_mgmt_root() {
+  local live got
+  live="$(peer_root_pem management mgmt.poc.internal 2>&1)" || { echo "$live"; return 1; }
+  got="$(k -n cell-identity-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}' 2>/dev/null | pem_lines)"
+  if [[ -z "$got" || "$got" != "$(pem_lines <<<"$live")" ]]; then
+    echo "ConfigMap cell-identity-system/mgmt-root is absent or holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  peer_root_pods_current cell-identity-system celld mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
+}

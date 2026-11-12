@@ -62,13 +62,26 @@ if [[ "$milestone" == m3 ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
-# The M4 tests run against mgmtd and the host service. An earlier run can leave the host service with
-# another pin or root, or mgmtd with no replica. mgmtd must run the image that `mise run images -- mgmtd`
-# recorded. The check covers mgmtd only: the other workloads keep the digests that the M3 gate checks.
+# The M4 tests run against mgmtd, envd, the SPIRE server of dev-cp, celld and the host service. An earlier
+# run can leave the host service with another pin or root, or mgmtd or envd with no replica. Each of these
+# workloads must run the images that `mise run images` recorded: mgmtd, envd, celld (with its agent plugin
+# cluster-jwt-agent) and the SPIRE server (with its plugin cluster-jwt-server). The other workloads keep the
+# digests that the M3 gate checks.
 if [[ "$milestone" == m4 ]]; then
   "$ROOT/scripts/gate-m4-repair.sh" --check || exit 1
-  found="$(live_image_mismatches management mgmt-system statefulset/mgmtd)" || die "could not read statefulset/mgmtd in management"
-  [[ -z "$found" ]] || die "the deployed image differs from build/images.env:"$'\n'"$found"$'\n'"Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+    targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
+  done
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
 # go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,

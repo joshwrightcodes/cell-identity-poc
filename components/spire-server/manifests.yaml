@@ -1,5 +1,5 @@
 # The SPIRE server of one trust domain. render.sh fills in the plugin image, the config checksum,
-# the record volume, the agent node addresses and the local workload peers. It drops each object,
+# the agent node addresses and the local workload peers. It drops each object,
 # container and volume that the cluster does not need:
 #   - with no agent cell: the plugin installer, the record volume, the node port and the policy
 #     for the agent nodes.
@@ -119,7 +119,8 @@ spec:
       labels:
         app.kubernetes.io/name: spire-server
       annotations:
-        # SPIRE reads its configuration and the cell records only at start. A change restarts the pod.
+        # SPIRE reads its configuration only at start, and a change restarts the pod. The cluster_jwt plugin
+        # reloads the cell records from the volume records while the server runs.
         cell.poc.internal/config-checksum: "@SPIRE_CONFIG_CHECKSUM@"
     spec:
       serviceAccountName: spire-server
@@ -260,10 +261,13 @@ spec:
                 path: intermediate.crt
               - key: root-cert
                 path: root.crt
-        # Every record ConfigMap uses the key record.dsse.json, so each item gets the file name <cell>.dsse.json.
+        # envd writes ConfigMap cell-records: the signed spec and the signed record of each cell. The
+        # ConfigMap does not exist until envd has pulled the first spec, and the plugin accepts no cell
+        # until then.
         - name: records
-          projected:
-            sources: "@SPIRE_RECORD_SOURCES@"
+          configMap:
+            name: cell-records
+            optional: true
         # The same files as the automatic token mount, for the server container only.
         - name: api-token
           projected:

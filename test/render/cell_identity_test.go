@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -113,12 +114,15 @@ func TestRenderCellIdentity(t *testing.T) {
 		}
 		var ttl float64
 		for _, v := range get[[]any](t, pod, "volumes") {
+			if v.(map[string]any)["name"] != "api-token" {
+				continue
+			}
 			if e, ok := lookup(v, "projected", "sources", 0, "serviceAccountToken", "expirationSeconds"); ok {
 				ttl = e.(float64)
 			}
 		}
 		if ttl != 600 {
-			t.Fatalf("API token lifetime is %v seconds, want 600", ttl)
+			t.Fatalf("API token lifetime of the agent is %v seconds, want 600", ttl)
 		}
 		if got := get[string](t, inits[0], "image"); got != "localhost:5001/cluster-jwt-agent@"+r.digest {
 			t.Fatalf("plugin image is %q", got)
@@ -130,7 +134,8 @@ func TestRenderCellIdentity(t *testing.T) {
 			t.Fatalf("config checksum annotation is %q", ann)
 		}
 
-		// Only the agent mounts the API token, and only celld and the agent share the socket.
+		// Each of the two containers that call the API server mounts a projected token of its own, and only celld
+		// and the agent share the socket. TestRenderCellIdentityBindFlags checks the celld volumes.
 		mounts := func(name string) []string {
 			var out []string
 			for _, m := range get[[]any](t, named(t, mains, name), "volumeMounts") {
@@ -138,7 +143,7 @@ func TestRenderCellIdentity(t *testing.T) {
 			}
 			return out
 		}
-		if m := mounts("celld"); !slices.Equal(m, []string{"agent-socket"}) {
+		if m := mounts("celld"); !slices.Equal(m, []string{"agent-socket", "mgmt-root", "celld-api-token"}) {
 			t.Fatalf("celld mounts %v", m)
 		}
 		if m := mounts("spire-agent"); !slices.Contains(m, "api-token") || !slices.Contains(m, "agent-socket") || !slices.Contains(m, "trust-bundle") {
@@ -216,7 +221,7 @@ func TestRenderCellIdentity(t *testing.T) {
 		}
 	})
 
-	t.Run("network policy allows only the SPIRE node port, the API server and the collector", func(t *testing.T) {
+	t.Run("network policy allows only the SPIRE and bind node ports, the API server and the collector", func(t *testing.T) {
 		var names []string
 		for key := range objs {
 			if name, ok := strings.CutPrefix(key, "NetworkPolicy/"); ok {
@@ -258,7 +263,7 @@ func TestRenderCellIdentity(t *testing.T) {
 			}
 			rules = append(rules, strings.Join(peers, ",")+" "+strings.Join(ports, ","))
 		}
-		want := []string{"10.9.0.9/32 TCP/30081", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system/app=otel-collector TCP/4317"}
+		want := []string{"10.9.0.9/32 TCP/30081,TCP/30447", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system/app=otel-collector TCP/4317"}
 		if !slices.Equal(rules, want) {
 			t.Fatalf("egress rules are %v, want %v", rules, want)
 		}
@@ -267,6 +272,85 @@ func TestRenderCellIdentity(t *testing.T) {
 			t.Fatalf("DNS service peer is %q", cidr)
 		}
 	})
+}
+
+// TestRenderCellIdentityBindFlags checks what celld needs to bind its cell to the management plane: the four
+// flags, the four pod variables, a read-only projected API token that only celld and the agent mount, the
+// mgmt-root mount, and the checksum of the management root on the pod template.
+func TestRenderCellIdentityBindFlags(t *testing.T) {
+	r := renderCellIdentity(t)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := docsIn(t, r.stdout, "cell-identity-system")
+	dep := objs["Deployment/celld"]
+	pod := get[map[string]any](t, dep, "spec", "template", "spec")
+	celld := named(t, get[[]any](t, pod, "containers"), "celld")
+	if got, want := fmt.Sprint(get[[]any](t, celld, "args")), fmt.Sprint([]string{
+		"--cell=dev-cell-1", "--bind-upstream=10.9.0.9:30447", "--bind-expect-id=spiffe://mgmt.poc.internal/api",
+		"--bind-peer-bundle=/run/celld/mgmt-root/root.crt"}); got != want {
+		t.Errorf("celld args are %s, want %s", got, want)
+	}
+	fields := map[string]string{}
+	for _, e := range get[[]any](t, celld, "env") {
+		if path, ok := lookup(e, "valueFrom", "fieldRef", "fieldPath"); ok {
+			fields[get[string](t, e, "name")] = path.(string)
+		}
+	}
+	if want := map[string]string{"POD_NAME": "metadata.name", "POD_UID": "metadata.uid", "POD_NAMESPACE": "metadata.namespace", "SERVICE_ACCOUNT": "spec.serviceAccountName"}; !reflect.DeepEqual(fields, want) {
+		t.Errorf("celld pod variables are %v, want %v", fields, want)
+	}
+	mounts := map[string]map[string]any{}
+	for _, m := range get[[]any](t, celld, "volumeMounts") {
+		mounts[get[string](t, m, "name")] = m.(map[string]any)
+	}
+	for name, path := range map[string]string{"mgmt-root": "/run/celld/mgmt-root", "celld-api-token": "/var/run/secrets/kubernetes.io/serviceaccount"} {
+		m := mounts[name]
+		if m == nil || m["mountPath"] != path || m["readOnly"] != true {
+			t.Errorf("celld mount %s is %v, want a read-only mount at %s", name, m, path)
+		}
+	}
+	volumes := get[[]any](t, pod, "volumes")
+	root := named(t, volumes, "mgmt-root")
+	if get[string](t, root, "configMap", "name") != "mgmt-root" {
+		t.Errorf("volume mgmt-root is %v, want ConfigMap mgmt-root", root)
+	}
+	token := named(t, volumes, "celld-api-token")
+	if get[float64](t, token, "projected", "sources", 0, "serviceAccountToken", "expirationSeconds") != 3600 || get[string](t, token, "projected", "sources", 0, "serviceAccountToken", "path") != "token" {
+		t.Errorf("volume celld-api-token is %v, want a projected token with the path token and 3600 s", token)
+	}
+	// The token goes only to the containers that call the API server: celld for its bind token request,
+	// and the agent for its own. The installer gets none.
+	for _, c := range append(slices.Clone(get[[]any](t, pod, "initContainers")), get[[]any](t, pod, "containers")...) {
+		name := get[string](t, c, "name")
+		for _, m := range get[[]any](t, c, "volumeMounts") {
+			if get[string](t, m, "mountPath") == "/var/run/secrets/kubernetes.io/serviceaccount" && name != "celld" && name != "spire-agent" {
+				t.Errorf("container %s mounts the API token", name)
+			}
+		}
+	}
+	cm := objs["ConfigMap/mgmt-root"]
+	if cm == nil || get[string](t, cm, "data", "root.crt") == "" {
+		t.Fatal("the render prints no ConfigMap mgmt-root with the key root.crt")
+	}
+	if got := get[string](t, cm, "data", "root.crt"); !strings.Contains(got, "BEGIN CERTIFICATE") || strings.TrimSpace(got) == strings.TrimSpace(r.bundle) {
+		t.Errorf("mgmt-root holds %q, want the root of the management trust domain and not the one of dev-cp", got)
+	}
+	sum := get[string](t, dep, "spec", "template", "metadata", "annotations", "poc.internal/peer-root-sha256")
+	if want := sha256.Sum256([]byte(strings.TrimRight(get[string](t, cm, "data", "root.crt"), "\n"))); sum != hex.EncodeToString(want[:]) {
+		t.Errorf("the pod carries the root digest %s, want the SHA-256 of mgmt-root", sum)
+	}
+	for _, want := range []string{"kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server bundle show"} {
+		if !strings.Contains(r.log, want) {
+			t.Errorf("render did not run %q; it ran:\n%s", want, r.log)
+		}
+	}
+	// A render in another cell names that cell.
+	r2 := renderCellIdentity(t, "CELL_NAME=dev-cell-2")
+	celld2 := named(t, get[[]any](t, get[map[string]any](t, docsIn(t, r2.stdout, "cell-identity-system")["Deployment/celld"], "spec", "template", "spec"), "containers"), "celld")
+	if args := fmt.Sprint(get[[]any](t, celld2, "args")); !strings.Contains(args, "--cell=dev-cell-2") {
+		t.Errorf("celld args in dev-cell-2 are %s", args)
+	}
 }
 
 func TestRenderCellIdentityChecksumDiffersByCell(t *testing.T) {
@@ -293,6 +377,7 @@ func TestRenderCellIdentityFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
+		{"no management SPIRE server", []string{"STUB_NO_SERVER_IN=management"}, "could not read the trust bundle from spire-server-0 in management. Run CELL=management mise run cell:up first"},
 		{"no SPIRE server", []string{"STUB_NO_SERVER=1"}, "could not read the trust bundle from spire-server-0 in dev-cp. Run CELL=dev-cp mise run cell:up first"},
 		{"bundle with other text", []string{"STUB_BAD_BUNDLE=1"}, "trust bundle holds text other than PEM certificates"},
 		{"bundle of another trust domain", []string{"STUB_TRUST_DOMAIN=rogue.example"}, "want spiffe://dev.env.poc.internal"},

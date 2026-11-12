@@ -111,6 +111,14 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# envd pulls the signed spec and records from mgmtd and writes ConfigMap spire-system/cell-records, which
+# the SPIRE server of dev-cp reads. It owns the namespace envd-system, and its Role and RoleBinding live
+# in spire-system, next to the objects of the spire-server bundle. Its render reads the live SPIRE server
+# of its own cluster, so it renders after the waves.
+ENVD_HARNESS=(
+  "envd:envd-system"
+)
+
 # The mesh-view tunnel of a cell reads the roots of management and of SPIRE_SERVER_CLUSTER, which
 # exist before the cell, so it renders with the other harness components. It owns the namespace
 # mesh-view-system, which only this cluster uses for the tunnel.
@@ -122,7 +130,7 @@ MESH_VIEW_HARNESS=(
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
 # (CELL_UP_SKIP_LATE=1).
-LATE_HARNESS=(otel-uplink)
+LATE_HARNESS=(otel-uplink envd)
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
@@ -167,6 +175,7 @@ for set_name in $set_names; do
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
+    envd) HARNESS_COMPONENTS+=("${ENVD_HARNESS[@]}") ;;
     mgmt-plane) LINK_COMPONENTS+=("${MGMT_PLANE_LINK[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
@@ -461,11 +470,11 @@ check_relay_current() {
     cell_cidrs+=("$ip/32")
   done
   want_cells="$(printf '%s\n' "${cell_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
-  for name in relay-view relay-telemetry; do
-    json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; return 1; }
+  for name in relay-view relay-telemetry relay-bind; do
+    json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
-    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; return 1; }
+    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     cidrs="$(jq -r '[.spec.egress[0].to[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
     [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
     cidrs="$(jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
@@ -797,8 +806,8 @@ check_plane_pods() {
 # its own field manager. Each object of the bundle must have only the field manager kubectl,
 # kube-controller-manager for status, and validatingadmissionpolicy-status for the status of a
 # ValidatingAdmissionPolicy, which the API server writes for its type check.
-#   - When the bundle holds the Namespace, the component owns it: for each kind that the bundle
-#     holds in the namespace, the namespace must hold exactly the objects of the bundle, apart from
+#   - When the bundle holds the Namespace, the component owns it: for each namespaced kind that the bundle
+#     holds, the namespace must hold exactly the objects of the bundle in it, apart from
 #     objects that only system controllers write, for example kube-root-ca.crt. The Namespace must
 #     have only kubectl.
 #   - Otherwise the namespace is shared with a bundle, whose Application owns the Namespace and its
@@ -852,7 +861,9 @@ check_harness_objects() {
           and (["StatefulSet", "Deployment"] | index($o.kind) != null) and .fieldsV1 == {"f:spec": {"f:replicas": {}}}) | not)
       | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$1"
   }
-  for kind in $(NS="$ns" yq -N -r 'select(.kind != null and .metadata.namespace == strenv(NS)) | .kind' "$bundle" | sort -u); do
+  # The kinds are those that the bundle holds in any namespace, so a bundle that spans two namespaces (envd:
+  # its Deployment in envd-system, its Role in spire-system) also finds a stray object of such a kind here.
+  for kind in $(yq -N -r 'select(.kind != null and (.metadata.namespace // "") != "") | .kind' "$bundle" | sort -u); do
     want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
     runtime="$(runtime_objects "$comp" "$ns" "$kind")"

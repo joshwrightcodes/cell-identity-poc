@@ -220,11 +220,11 @@ description = "Delete the objects and the firewall rules on the dev-cp node that
 run = "scripts/gate-m3-repair.sh"
 
 [tasks."gate:m4"]
-description = "Run the M4 end-to-end tests against the management plane stand-in, plus the go test arguments after --. The task builds no image: run mise run images -- mgmtd first"
+description = "Run the M4 end-to-end tests against the management plane stand-in, envd and the cells, plus the go test arguments after --. The task builds no image: run mise run images first, or mise run images -- <name> for one image"
 run = "scripts/gate.sh m4"
 
 [tasks."gate:m4:repair"]
-description = "Start the host service again and link mgmt-api when the pin or the root drifted, and set the replicas of mgmtd back to 1. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Start the host service again and link mgmt-api when the pin or the root drifted, and set the replicas of mgmtd and envd back to 1. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m4-repair.sh"
 
 [tasks."mgmt:rotate-ca"]

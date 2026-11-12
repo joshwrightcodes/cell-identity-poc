@@ -33,10 +33,13 @@ import (
 
 const stubBinary = "stub plugin binary"
 
+// stubMgmtKey is the public key of mgmtd that the stub ConfigMap mgmt-signing-pub holds: the bytes 1 to 32.
+const stubMgmtKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+
 // stubMise answers "mise run hostsvc -- facts" and "mise run record:fixture" for the cells below,
 // and runs the real pkigen for "mise run pki". The cell bad-facts fails the way hostsvc fails, and
 // no-ip has no node address. STUB_RANDOM_KEYS gives each record a new signature and key, as the
-// real record:fixture does.
+// real record:fixture does. Only the registry renders still call record:fixture.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
@@ -100,7 +103,10 @@ esac
 if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 `
 
-// stubKubectl answers "spire-server bundle show" with the file STUB_BUNDLE_FILE, and in the context
+// stubKubectl answers "get configmap mgmt-signing-pub" with the key stubMgmtKey (STUB_MGMT_KEY
+// replaces it, and STUB_NO_MGMT_KEY makes the ConfigMap absent), and "get pod mgmtd-0" with no
+// status, so the key helper makes no call to mgmtd. It answers "spire-server bundle show" with the
+// file STUB_BUNDLE_FILE, and in the context
 // kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. It answers
 // "api-resources" with a fixed table, or fails with STUB_NO_API. STUB_NO_SERVER
 // makes it fail the way kubectl does when the pod is missing, and STUB_BAD_BUNDLE adds a line
@@ -110,6 +116,17 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
+if [[ " $* " == *" get configmap mgmt-signing-pub "* ]]; then
+  if [[ -n "${STUB_NO_MGMT_KEY:-}" ]]; then
+    echo 'Error from server (NotFound): configmaps "mgmt-signing-pub" not found' >&2
+    exit 1
+  fi
+  printf '{"data":{"spec.pub":"%s"}}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"
+  exit 0
+fi
+if [[ " $* " == *" get pod mgmtd-0 "* ]]; then
+  exit 0
+fi
 if [[ " $* " == *" get node "* ]]; then
   echo 10.9.0.7
   exit 0
@@ -362,7 +379,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd", "envd"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -554,17 +571,18 @@ func TestRenderSpireServer(t *testing.T) {
 	}
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
-	t.Run("k8s_psat admits the plane workload cp/otel", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink"})
+	t.Run("k8s_psat admits the plane workloads cp/otel and envd", func(t *testing.T) {
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd"})
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
 		t.Fatalf("render left tokens %v", left)
 	}
-	for _, want := range []string{"run hostsvc -- facts --cluster dev-cell-1", "run record:fixture -- --cluster dev-cell-2 --subject cell-identity-system/celld"} {
-		if !strings.Contains(r.log, want) {
-			t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
-		}
+	if want := "run hostsvc -- facts --cluster dev-cell-1"; !strings.Contains(r.log, want) {
+		t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
+	}
+	if strings.Contains(r.log, "record:fixture") {
+		t.Fatalf("render signs a record itself; it ran:\n%s", r.log)
 	}
 
 	// The external-secrets bundle holds Namespace spire-system, because the Role of the operator
@@ -653,18 +671,19 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 
 		volumes := get[[]any](t, pod, "volumes")
-		var items []string
-		for _, src := range get[[]any](t, named(t, volumes, "records"), "projected", "sources") {
-			name := get[string](t, src, "configMap", "name")
-			if _, ok := objs["ConfigMap/"+name]; !ok {
-				t.Fatalf("records volume uses %s, which the render does not print", name)
-			}
-			for _, it := range get[[]any](t, src, "configMap", "items") {
-				items = append(items, get[string](t, it, "key")+"->"+get[string](t, it, "path"))
-			}
+		// envd writes ConfigMap cell-records, so the records volume is an optional ConfigMap volume, and
+		// the render prints no ConfigMap cell-record-*.
+		records := named(t, volumes, "records")
+		if get[string](t, records, "configMap", "name") != "cell-records" || get[bool](t, records, "configMap", "optional") != true {
+			t.Fatalf("the records volume is %v, want the optional ConfigMap cell-records", records)
 		}
-		if !slices.Equal(items, []string{"record.dsse.json->dev-cell-1.dsse.json", "record.dsse.json->dev-cell-2.dsse.json"}) {
-			t.Fatalf("record items are %v", items)
+		if _, ok := records["projected"]; ok {
+			t.Fatalf("the records volume is projected: %v", records)
+		}
+		for key := range objs {
+			if strings.HasPrefix(key, "ConfigMap/cell-record") {
+				t.Fatalf("the render prints %s", key)
+			}
 		}
 		upstream := named(t, volumes, "upstream")
 		if get[string](t, upstream, "secret", "secretName") != "spire-upstream" {
@@ -721,7 +740,10 @@ func TestRenderSpireServer(t *testing.T) {
 		sum := sha256.Sum256([]byte(stubBinary))
 		for _, want := range []string{
 			`plugin_checksum = "` + hex.EncodeToString(sum[:]) + `"`,
-			`record_public_keys = ["stubkey1=", "stubkey2="]`,
+			// Only the key of mgmtd signs records, and the plugin reloads and keeps its marks on the data volume.
+			`record_public_keys = ["` + stubMgmtKey + `"]`,
+			`reload_interval = "10s"`,
+			`marks_file = "/run/spire/data/cluster_jwt-marks.json"`,
 			`UpstreamAuthority "disk"`,
 			`bundle_file_path = "/run/spire/upstream/root.crt"`,
 			`records_dir = "/run/spire/records"`,
@@ -804,7 +826,7 @@ func TestRenderSpireServer(t *testing.T) {
 		data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 		subjects := map[string]string{"celld": "cell-identity-system:celld", "argocd-agent": "argocd:argocd-agent",
 			"otel": "observability-system:otel-uplink", "mesh-view": "mesh-view-system:mesh-view"}
-		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml"}
+		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml", "agents-envd-system-envd.yaml", "workload-envd.yaml"}
 		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 			for role := range subjects {
 				wantKeys = append(wantKeys, cell+"-agents-"+role+".yaml", cell+"-"+role+".yaml")
@@ -844,20 +866,17 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
-	t.Run("each record lists every subject", func(t *testing.T) {
-		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-			want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --subject argocd/argocd-agent" +
-				" --subject observability-system/otel-uplink --subject mesh-view-system/mesh-view --env "
-			if !strings.Contains(r.log, want) {
-				t.Fatalf("the render signed the record of %s without the four subjects; want %q in:\n%s", cell, want, r.log)
-			}
-		}
-	})
-
 	t.Run("pod mounts only rendered config maps", func(t *testing.T) {
 		pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
 		for _, v := range get[[]any](t, pod, "volumes") {
 			if name, ok := lookup(v, "configMap", "name"); ok {
+				// cell-records is the one ConfigMap that envd makes at run time, so the volume must be optional.
+				if name == "cell-records" {
+					if opt, _ := lookup(v, "configMap", "optional"); opt != true {
+						t.Fatalf("volume uses ConfigMap cell-records without optional: true: %v", v)
+					}
+					continue
+				}
 				if _, found := objs["ConfigMap/"+name.(string)]; !found {
 					t.Fatalf("volume uses ConfigMap %v, which the render does not print", name)
 				}
@@ -917,6 +936,8 @@ func TestRenderFailsClosed(t *testing.T) {
 		{"one ServiceAccount twice", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld cell-identity-system/celld=other"}, "names the ServiceAccount cell-identity-system/celld twice"},
 		{"the alias path as a role", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=agents"}, "the path of the node aliases"},
 		{"a role that names an alias entry", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS=cell-identity-system/celld=agents-celld"}, "the path of the node aliases, or names an alias entry"},
+		{"no management signing key", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_NO_MGMT_KEY=1"}, "ConfigMap mgmt-system/mgmt-signing-pub is absent. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
+		{"management signing key of the wrong size", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_MGMT_KEY=c2hvcnQ="}, "is not the base64 of 32 bytes"},
 		{"key test trace on an agent cell", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_KEYTEST_TRACE=dev-cell-2"}, "Run: mise run gate:m2:repair"},
 		{"docker reaches another daemon", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_DOCKER_IP=10.0.0.99"}, "reports '10.9.0.7'"},
 		{"unset SVID lifetime", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL="}, "SPIRE_SVID_TTL"},

@@ -218,9 +218,45 @@ When `mgmtd-0` is absent or not Ready, it prints one JSON error line with the li
 `cell:verify` of `management` checks the host service copies.
 The checks cover the pin, the root, the host address, the `dev-cp` node address, ConfigMap `peer-root` and ConfigMap `mgmt-signing-pub`.
 Each failed check prints the command that repairs it.
-`mise run gate:m4:repair` starts the host service again and sets the replicas of `mgmtd` back to 1.
+`mise run gate:m4:repair` starts the host service again and sets the replicas of `mgmtd` and `envd` back to 1.
 With `--check`, it only reports.
 `mise run mgmt:rotate-ca` restarts the host service in both refresh steps.
+
+## Signed records and envd
+
+`mgmtd` signs the spec and the record of each cell. `envd` delivers them to the SPIRE server of `dev-cp`.
+`envd` runs in namespace `envd-system` of `dev-cp`, as the harness component `envd`.
+It pulls the signed spec from the API of `mgmtd` on node port 31446, and verifies it under the key in ConfigMap `mgmt-spec-key`.
+Then it writes the spec and the records to ConfigMap `cell-records` in `spire-system`.
+Its Role allows `create` on ConfigMaps, and `get`, `update` and `patch` on `cell-records` only.
+
+The SPIRE server of `dev-cp` trusts only the key of `mgmtd` in `record_public_keys`.
+The pod mounts `cell-records` as an optional volume.
+The `cluster_jwt` plugin reloads the records every 10 seconds, and it keeps its marks in `/run/spire/data/cluster_jwt-marks.json`.
+Until `envd` writes the ConfigMap, no new agent can attest.
+Running agents keep renewing their SVIDs.
+
+`celld` binds the cell issuer to `mgmtd` through the relay `relay-bind` in `dev-cp`.
+The flags are `--cell`, `--bind-upstream`, `--bind-expect-id` and `--bind-peer-bundle`.
+ConfigMap `mgmt-root` in `cell-identity-system` holds the root of `management`.
+
+`cell:up` of a cell runs `scripts/attest-wait.sh` for `cell-identity`.
+The script waits for four stages in turn:
+
+| Stage | Meaning | Limit |
+| --- | --- | --- |
+| `bound` | `mise run mgmt -- status` shows the cell as bound | 120 s |
+| `applied` | `cell-records` holds the revision of the record of the cell | 60 s |
+| `reloaded` | The server log has `records reloaded` with the cell | 150 s |
+| `ready` | The rollout of `celld` finishes | 300 s |
+
+A failing stage prints its name, the reason and the next command.
+When `mise run mgmt -- status` does not answer, the script prints `CELL=management LINK_ONLY=mgmt-api mise run cell:link` and does not wait.
+At the start of `ready`, the script deletes a `celld` pod once when its `spire-agent` container is in `CrashLoopBackOff`.
+
+`cell:verify` of `dev-cp` checks the key pins, the revision in `cell-records`, the node address of `management` and the envd objects.
+`cell:verify` of a cell reads its record in `cell-records`.
+A record with other keys than the cell publishes prints `mise run mgmt -- keycheck --cell <cell>`.
 
 ## Central Argo CD view
 
@@ -272,6 +308,7 @@ Only the repo server reaches the bundle store.
 The relay in `dev-cp` is the bundle `relay-system` at wave 8.
 Deployment `relay-view` passes node ports 30443 and 30445 to node ports 31443 and 31445 of `management`.
 Deployment `relay-telemetry` passes node port 30444 to node port 31444.
+Deployment `relay-bind` passes node port 30447 to node port 31447, the bind listener of `mgmtd`.
 The relay ends no TLS. It holds at most 256 connections, and 16 from one client address.
 The NetworkPolicy admits the node addresses of the cells. Every pod of a cell that no policy limits reaches the relay through its node address, so cell-proxy, and not the network, decides who is a peer.
 
@@ -549,6 +586,8 @@ Each stream has hops. Read the log of the first hop that fails, from the source 
 | Telemetry | Collector | any | `otel-collector` |
 | Telemetry | Uplink | cell, `dev-cp` | `otel-uplink` |
 | Telemetry | Relay | `dev-cp` | `relay-telemetry` |
+| Records | Relay | `dev-cp` | `relay-bind` |
+| Records | Executor of the environment | `dev-cp` | `envd` |
 | Telemetry | Gateway | `management` | `telemetry-gateway` |
 | Telemetry | Store | `management` | `lgtm` |
 | Mesh view | Tunnel pod | cell | `mesh-view` |

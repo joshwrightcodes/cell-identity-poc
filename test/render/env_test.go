@@ -23,7 +23,7 @@ func pluginEnv(t *testing.T, text string) string {
 
 // TestEnvironmentNameHasOneSource renders the server, the agent and the central view with POC_ENV
 // from cells/common.env and with another value. The server plugin, the agent plugin, the record
-// signers, the principal --auth pattern and the agent namespaces must follow the variable in both
+// signers of the registry, the principal --auth pattern and the agent namespaces must follow the variable in both
 // cases, so no render holds its own copy of the name.
 func TestEnvironmentNameHasOneSource(t *testing.T) {
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
@@ -36,12 +36,8 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 			if got := pluginEnv(t, conf); got != env {
 				t.Fatalf("server plugin env is %q, want %q", got, env)
 			}
-			for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-				want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --subject argocd/argocd-agent" +
-					" --subject observability-system/otel-uplink --subject mesh-view-system/mesh-view --env " + env
-				if !strings.Contains(server.log, want) {
-					t.Fatalf("the render did not sign the record of %s for env %s; want %q in:\n%s", cell, env, want, server.log)
-				}
+			if strings.Contains(server.log, "record:fixture") {
+				t.Fatalf("the server render signs a record itself, and the management plane signs the records:\n%s", server.log)
 			}
 
 			agent := renderCellIdentity(t, "POC_ENV="+env)

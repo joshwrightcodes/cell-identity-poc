@@ -252,7 +252,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
 		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system", "link mgmt-api 0 mgmt-system"},
-		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
+		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness envd 0 envd-system"},
 		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 	}
@@ -328,10 +328,11 @@ func TestRootBundleWaveOrder(t *testing.T) {
 					}
 					ns, _ := lookup(o, "metadata", "namespace")
 					for _, spec := range podSpecs(o) {
-						for _, ctr := range containersOf(spec) {
-							if image, _ := ctr["image"].(string); strings.HasPrefix(image, "ghcr.io/spiffe/spire-agent:") && (!hasSpire || c.wave <= spireWave) {
-								t.Errorf("%s in bundle %s (wave %d) runs a SPIRE agent, and is not above the spire-server wave of %s", objName(o), c.name, c.wave, cr.name)
-							}
+						if runsSpireAgent(spec) && (!hasSpire || c.wave <= spireWave) {
+							t.Errorf("%s in bundle %s (wave %d) runs a SPIRE agent, and is not above the spire-server wave of %s", objName(o), c.name, c.wave, cr.name)
+						}
+						for _, bad := range requiredRecordsMounts(spec) {
+							t.Errorf("%s in bundle %s mounts ConfigMap cell-records without optional: true (%s)", objName(o), c.name, bad)
 						}
 						for _, ref := range podRefs(spec) {
 							key := fmt.Sprintf("%s %v/%s", ref[0], ns, ref[1])
@@ -343,6 +344,77 @@ func TestRootBundleWaveOrder(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// runsSpireAgent reports whether a container of the pod runs the SPIRE agent image. A bundle pod that does
+// needs a SPIRE server of its own cluster, which only a later wave or a harness component can provide.
+func runsSpireAgent(spec map[string]any) bool {
+	for _, ctr := range containersOf(spec) {
+		if image, _ := ctr["image"].(string); strings.HasPrefix(image, "ghcr.io/spiffe/spire-agent:") {
+			return true
+		}
+	}
+	return false
+}
+
+// requiredRecordsMounts returns one description for each mount of ConfigMap cell-records that lacks
+// optional: true. envd makes that ConfigMap at run time, so no bundle may wait for it, and it is the one
+// ConfigMap that a bundle pod may mount without a render that prints it.
+func requiredRecordsMounts(spec map[string]any) []string {
+	var bad []string
+	volumes, _ := spec["volumes"].([]any)
+	for _, v := range volumes {
+		if name, ok := lookup(v, "configMap", "name"); ok && name == "cell-records" {
+			if opt, _ := lookup(v, "configMap", "optional"); opt != true {
+				bad = append(bad, fmt.Sprintf("volume %v", lookupOr(v, "name")))
+			}
+		}
+		sources, _ := lookup(v, "projected", "sources")
+		list, _ := sources.([]any)
+		for _, src := range list {
+			if name, ok := lookup(src, "configMap", "name"); ok && name == "cell-records" {
+				if opt, _ := lookup(src, "configMap", "optional"); opt != true {
+					bad = append(bad, fmt.Sprintf("projected volume %v", lookupOr(v, "name")))
+				}
+			}
+		}
+	}
+	return bad
+}
+
+// TestCellRecordsMountMustBeOptional pins the two rules that the wave test applies to a bundle pod: the mount
+// of cell-records must be optional, and a SPIRE agent sidecar of its own cluster stays refused.
+func TestCellRecordsMountMustBeOptional(t *testing.T) {
+	pod := func(volume string) map[string]any {
+		var spec map[string]any
+		if err := yaml.Unmarshal([]byte(volume), &spec); err != nil {
+			t.Fatal(err)
+		}
+		return spec
+	}
+	for _, tc := range []struct {
+		name, spec string
+		bad        int
+	}{
+		{"optional ConfigMap volume", "volumes: [{name: records, configMap: {name: cell-records, optional: true}}]", 0},
+		{"required ConfigMap volume", "volumes: [{name: records, configMap: {name: cell-records}}]", 1},
+		{"explicitly required volume", "volumes: [{name: records, configMap: {name: cell-records, optional: false}}]", 1},
+		{"required projected source", "volumes: [{name: records, projected: {sources: [{configMap: {name: cell-records}}]}}]", 1},
+		{"optional projected source", "volumes: [{name: records, projected: {sources: [{configMap: {name: cell-records, optional: true}}]}}]", 0},
+		{"another ConfigMap", "volumes: [{name: other, configMap: {name: spire-server}}]", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requiredRecordsMounts(pod(tc.spec)); len(got) != tc.bad {
+				t.Errorf("requiredRecordsMounts found %v, want %d", got, tc.bad)
+			}
+		})
+	}
+	if !runsSpireAgent(pod("containers: [{name: spire-agent, image: 'ghcr.io/spiffe/spire-agent:1.15.5@sha256:abc'}]")) {
+		t.Error("a pod with the SPIRE agent image is not recognised")
+	}
+	if runsSpireAgent(pod("containers: [{name: app, image: 'localhost:5001/celld@sha256:abc'}]")) {
+		t.Error("a pod with another image counts as a SPIRE agent")
 	}
 }
 
@@ -443,7 +515,8 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
+	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay", "relay-system Deployment relay-system/relay-bind relay",
+		"envd Deployment envd-system/envd envd", "envd Deployment envd-system/envd spire-agent",
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
 		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
 		"observability-store StatefulSet observability-system/lgtm lgtm", "telemetry-gateway Deployment observability-system/telemetry-gateway cell-proxy",
@@ -484,6 +557,9 @@ func TestNoEmptyPeerList(t *testing.T) {
 		}
 		if !seen["management mgmtd"] {
 			t.Error("the loop saw no mgmtd policy in management")
+		}
+		if !seen["dev-cp envd"] || !seen["dev-cp relay-bind"] {
+			t.Error("the loop saw no envd or relay-bind policy in dev-cp")
 		}
 	}()
 	for _, cr := range renderAll(t) {
@@ -563,6 +639,8 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"otel-uplink of a cell", script("otel-uplink", "dev-cell-1"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
 		{"mgmt-api", script("mgmt-api", "management"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"envd", script("envd", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"relay-system with relay-bind", script("relay-system", "dev-cp"), []string{"NODE_IPS"}},
 	}
 	for _, tc := range cases {
 		for _, v := range tc.vars {

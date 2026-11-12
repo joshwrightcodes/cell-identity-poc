@@ -162,18 +162,23 @@ source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"; set +
 	}
 }
 
-// TestGateM4PreCheck: gate.sh m4 runs the repair check and compares the image of statefulset mgmtd only. It stops
-// before the tests on a drift or a stale image.
+// TestGateM4PreCheck: gate.sh m4 runs the repair check and compares the images of the workloads that the M4 tests use:
+// mgmtd, envd, the SPIRE server of dev-cp (with its plugin) and celld in each cell (with the agent plugin). It stops
+// before the tests on a drift or on a stale image, and names the command that brings the workload up to date.
 func TestGateM4PreCheck(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
-		name, image string
+		name, stale string
 		repairFails bool
 		want        string
 	}{
-		{name: "healthy", image: "good"},
-		{name: "a stale image", image: "stale", want: "Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
-		{name: "a drift", image: "good", repairFails: true, want: "drift reported"},
+		{name: "healthy"},
+		{name: "a stale mgmtd", stale: "mgmtd", want: "Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
+		{name: "a stale envd", stale: "envd", want: "Run: mise run images -- envd, then CELL=dev-cp mise run cell:up"},
+		{name: "a stale SPIRE server plugin", stale: "cluster-jwt-server", want: "Run: mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up"},
+		{name: "a stale celld in the second cell", stale: "celld@dev-cell-2", want: "Run: mise run images -- celld cluster-jwt-agent, then CELL=dev-cell-2 mise run cell:up"},
+		{name: "a stale agent plugin", stale: "cluster-jwt-agent@dev-cell-1", want: "Run: mise run images -- celld cluster-jwt-agent, then CELL=dev-cell-1 mise run cell:up"},
+		{name: "a drift", repairFails: true, want: "drift reported"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
@@ -189,25 +194,38 @@ func TestGateM4PreCheck(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			good := "localhost:5001/mgmtd@sha256:" + strings.Repeat("a", 64)
-			stale := "localhost:5001/mgmtd@sha256:" + strings.Repeat("b", 64)
-			running := good
-			if tc.image == "stale" {
-				running = stale
+			ref := func(name, c string) string { return "localhost:5001/" + name + "@sha256:" + strings.Repeat(c, 64) }
+			var env strings.Builder
+			for _, n := range []string{"mgmtd", "envd", "celld", "cluster-jwt-server", "cluster-jwt-agent"} {
+				fmt.Fprintf(&env, "IMAGE_%s=%s\n", strings.ToUpper(strings.ReplaceAll(n, "-", "_")), ref(n, "a"))
 			}
-			write("build/images.env", "IMAGE_MGMTD="+good+"\n")
+			write("build/images.env", env.String())
 			repair := "exit 0"
 			if tc.repairFails {
 				repair = "echo 'drift reported'; exit 1"
 			}
 			write("scripts/gate-m4-repair.sh", "#!/usr/bin/env bash\n"+repair+"\n")
 			write("bin/go", "#!/usr/bin/env bash\necho \"go $*\" >>\"$STUB_LOG\"\n")
+			// The fake answers "get <workload> -o json" for the cluster in --context. Each workload runs the images that
+			// build/images.env records, except the one that STUB_STALE names, as <image> or <image>@<cluster>.
 			write("bin/kubectl", `#!/usr/bin/env bash
-printf '{"spec":{"template":{"spec":{"containers":[{"name":"mgmtd","image":"%s"}]}}}}\n' "$STUB_RUNNING"
+cluster="${2#kind-}"
+img() { # img <name> prints the reference that the workload runs
+  local c=a
+  [[ "$STUB_STALE" == "$1" || "$STUB_STALE" == "$1@$cluster" ]] && c=b
+  printf 'localhost:5001/%s@sha256:%s' "$1" "$(printf "$c%.0s" $(seq 64))"
+}
+case " $* " in
+  *" get statefulset/mgmtd "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"mgmtd","image":"%s"}]}}}}\n' "$(img mgmtd)" ;;
+  *" get deployment/envd "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"envd","image":"%s"}]}}}}\n' "$(img envd)" ;;
+  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
+  *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
 `)
 			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m4")
 			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
-				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_RUNNING=" + running}
+				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
 			ran := strings.Contains(string(calls), "-run M4")

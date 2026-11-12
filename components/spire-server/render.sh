@@ -3,9 +3,12 @@
 #
 # Two attestation paths feed the server. Each loads only when its inputs are set.
 #   - cluster_jwt, for the SPIRE agent sidecars in cells: SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS.
-#     For each cell, the render reads the node address from the host service and signs a test
-#     record of the cell for the subjects. The NetworkPolicy admits only those node addresses on the
-#     node port, and the plugin trusts only those records. ConfigMap spire-entries gets two
+#     For each cell, the render reads the node address from the host service. The NetworkPolicy
+#     admits only those node addresses on the node port. The plugin trusts only records that the
+#     management plane signs: record_public_keys holds the public key of mgmtd, from ConfigMap
+#     mgmt-signing-pub in management (components/lib/mgmt-key.sh). envd writes the signed records into
+#     ConfigMap spire-system/cell-records, which the pod mounts as an optional volume, and the plugin
+#     reloads them while the server runs. ConfigMap spire-entries gets two
 #     ClusterStaticEntry manifests for each subject of each cell: a node alias
 #     spiffe://<td>/cell/<cell>/agents/<role> that matches only the attested agents of that cell and
 #     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias. So the agent of
@@ -43,6 +46,7 @@ die() { printf 'error: spire-server render: %s\n' "$*" >&2; exit 1; }
 source "$root/scripts/ko-image.sh"
 source "$root/scripts/gate-traces.sh"
 source "$root/components/lib/addresses.sh"
+source "$root/components/lib/mgmt-key.sh"
 
 # seconds <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
 seconds() {
@@ -84,16 +88,13 @@ sections=()
 if [[ "$upstream" == disk ]]; then sections+=(keys_memory upstream_disk); else sections+=(keys_disk); fi
 
 peers='[]'
-sources='[]'
 entries='{}'
-keys=()
-records=""
+mgmt_pub=""
 plugin_image=""
 checksum=""
 if ((${#cells[@]} > 0)); then
   sections+=(cluster_jwt)
   # Each subject is <namespace>/<service account>=<role>. A role and a ServiceAccount may appear once.
-  subject_args=()
   seen_roles=" " seen_accounts=" "
   for subject in "${subjects[@]}"; do
     [[ "$subject" =~ ^[a-z0-9-]+/[a-z0-9-]+=[a-z0-9-]+$ ]] || die "SPIRE_CELL_SUBJECTS entry '$subject' is not <namespace>/<service account>=<role>"
@@ -101,8 +102,8 @@ if ((${#cells[@]} > 0)); then
     [[ "$seen_roles" != *" ${subject#*=} "* ]] || die "SPIRE_CELL_SUBJECTS names the role ${subject#*=} twice"
     [[ "$seen_accounts" != *" ${subject%%=*} "* ]] || die "SPIRE_CELL_SUBJECTS names the ServiceAccount ${subject%%=*} twice"
     seen_roles+="${subject#*=} " seen_accounts+="${subject%%=*} "
-    subject_args+=(--subject "${subject%%=*}")
   done
+  mgmt_pub="$(mgmt_signing_pub)" || exit 1
 
   # The plugin image and the checksum of the binary in it.
   plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
@@ -115,26 +116,13 @@ if ((${#cells[@]} > 0)); then
     if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
       die "no host service facts for $cell: ${facts:-no output}. Create the cluster: mise run hostsvc -- up --only $cell, then run CELL=$cell mise run cell:up. Or remove $cell from SPIRE_AGENT_CELLS in cells/dev-cp.env"
     fi
-    # The record signs the keys that the cell publishes. While the M2 key rotation test has changed the
-    # cell, those keys include the test key, so the render stops until the node is repaired.
+    # While the M2 key rotation test has changed the cell, its API server publishes the test key, so
+    # the render stops until the node is repaired.
     traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
     [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
     ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
     [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
     peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
-
-    if ! record="$(cd "$root" && mise run record:fixture -- --cluster "$cell" "${subject_args[@]}" --env "$POC_ENV" 2>/dev/null)"; then
-      die "could not sign the record of $cell: ${record:-no output}"
-    fi
-    name="cell-record-$cell"
-    yq -e ".kind == \"ConfigMap\" and .metadata.name == \"$name\" and (.data.\"record.dsse.json\" | length) > 0" <<<"$record" >/dev/null \
-      || die "record:fixture printed no ConfigMap $name"
-    key="$(yq -r '.data."signer.pub"' <<<"$record")"
-    [[ "$key" =~ ^[A-Za-z0-9+/]+=*$ ]] || die "record:fixture printed no base64 public key for $cell"
-    keys+=("$key")
-    records+="---"$'\n'"$(yq ".metadata.namespace = \"$namespace\"" <<<"$record")"$'\n'
-    sources="$(jq -c --arg name "$name" --arg path "$cell.dsse.json" \
-      '. + [{configMap: {name: $name, items: [{key: "record.dsse.json", path: $path}]}}]' <<<"$sources")"
 
     # The cluster_jwt plugin gives an attested agent the selectors cluster_jwt:cell:<cell> and
     # cluster_jwt:sa:<namespace>:<service account>. Each alias matches both, for one subject. The
@@ -201,10 +189,7 @@ if ((${#local_workloads[@]} > 0)); then
 fi
 
 key_list="[]"
-if ((${#keys[@]} > 0)); then
-  key_list="$(printf '"%s", ' "${keys[@]}")"
-  key_list="[${key_list%, }]"
-fi
+[[ -z "$mgmt_pub" ]] || key_list="[\"$mgmt_pub\"]"
 account_list="$(jq -r 'map("\"" + . + "\"") | "[" + join(", ") + "]"' <<<"$psat_accounts")"
 # Each section of server.conf starts with "# section: <name>" and ends with "# end: <name>". The
 # render keeps the sections of this cluster without their marker lines.
@@ -224,7 +209,7 @@ config_map() {
     | .data[strenv(KEY)] = strenv(VALUE) | .data[strenv(KEY)] style="literal"'
 }
 config_maps="$(config_map spire-server server.conf "$server_conf"; echo "---"; config_map spire-controller-manager config.yaml "$controller_conf")"
-config_checksum="$(printf '%s\n%s' "$config_maps" "$records" | sha256)"
+config_checksum="$(printf '%s' "$config_maps" | sha256)"
 
 # The objects, containers and volumes that this cluster does not need.
 drop_objects=()
@@ -256,9 +241,8 @@ for o in ${drop_objects[@]+"${drop_objects[@]}"}; do
 done
 
 # Each entry becomes one YAML file in the ConfigMap, as spire-controller-manager expects.
-PEERS="$peers" SOURCES="$sources" ENTRIES="$entries" WORKLOAD_PEERS="$workload_peers" API_PEERS="$api_peers" API_PORT="${API_SERVER_PORT:-0}" yq "
-  (select(.kind == \"StatefulSet\") | .spec.template.spec.volumes[] | select(.name == \"records\") | .projected.sources) = (env(SOURCES) | ... style=\"\")
-  | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-agents\") | .spec.ingress[0].from) = (env(PEERS) | ... style=\"\")
+PEERS="$peers" ENTRIES="$entries" WORKLOAD_PEERS="$workload_peers" API_PEERS="$api_peers" API_PORT="${API_SERVER_PORT:-0}" yq "
+  (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-agents\") | .spec.ingress[0].from) = (env(PEERS) | ... style=\"\")
   | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-workloads\") | .spec.ingress[0].from) = (env(WORKLOAD_PEERS) | ... style=\"\")
   | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-api\") | .spec.egress[0]) |= (.to = (env(API_PEERS) | ... style=\"\") | .ports[0].port = env(API_PORT))
   | (select(.kind == \"ConfigMap\" and .metadata.name == \"spire-entries\") | .data) = (env(ENTRIES) | ... style=\"\" | map_values(to_yaml) | .[] style=\"literal\")
@@ -268,4 +252,3 @@ PEERS="$peers" SOURCES="$sources" ENTRIES="$entries" WORKLOAD_PEERS="$workload_p
   | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_image|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|" -e "s|@API_SERVICE_IP@|${API_SERVICE_IP:-}|"
 echo "---"
 echo "$config_maps"
-printf '%s' "$records"
