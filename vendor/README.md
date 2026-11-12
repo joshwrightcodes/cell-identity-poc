@@ -1286,11 +1286,23 @@ Rows 3 and 4 of the M3 verify table (2026-11-11):
 
 ## Kiali v2.34.0 and the kiali-server chart (2026-11-12)
 
-The mesh view in `management` runs Kiali v2.34.0 from the chart `kiali-server` 2.34.0. The release is
-dated 2026-10-25, and the chart archive was committed to the Kiali chart repository on 2026-10-27, so
-both are more than two weeks old as of 2026-11-12. `vendor:fetch` pulls the archive from
-`https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart into
-`charts/kiali-server-2.34.0/`.
+The mesh view in `management` runs Kiali v2.34.0 from the chart `kiali-server` 2.34.0. `vendor:fetch`
+pulls the archive from `https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart
+into `charts/kiali-server-2.34.0/`.
+
+Artefact dates against the owner cut of 2026-10-26 (release from GitHub, image from the Quay tag API,
+chart archive from the git history of the Kiali chart repository):
+
+| Version | Release | Image | Chart archive | Verdict |
+| --- | --- | --- | --- | --- |
+| v2.34.1 | 2026-11-02 | 2026-11-02 | 2026-11-02 | after the cut |
+| v2.34.0 | 2026-10-25 | 2026-10-25 | 2026-10-27 | the chart is one day after the cut |
+| v2.33.0 | 2026-10-04 | 2026-10-04 | 2026-10-06 | within the cut |
+
+The chart archive of v2.34.0 is dated one day after the cut, so no compliant chart exists for the version in
+use. The change to v2.33.0 or the exception for the chart needs a decision of the owner. Version v2.34.1 is a
+security release of 2026-11-02 that adds namespace authorization to the health, ztunnel log and config dump
+APIs. Upgrade to it once the owner accepts a version dated after the cut.
 
 | Item | Digest |
 | --- | --- |
@@ -1324,6 +1336,14 @@ The review read every template of the chart in a scratch directory and ran nothi
 - The Deployment mounts the Secret `kiali-multi-cluster-secret` at
   `/kiali-remote-cluster-secrets/`, where Kiali reads one kubeconfig for each cluster at start. Kiali
   names each cluster after the cluster entry of its kubeconfig.
+
+### Version call of Kiali
+
+Kiali v2.34.0 reads the version of each `istiod` of a remote cluster through a port forward
+(`istio/version.go`, `GetVersion`). The source holds no setting that turns this call off, so the hub refuses it
+and the Kiali log shows one error and one warning for each cell and minute. Kiali ends with a fatal error when the
+discovery of one remote cluster fails at start (live run of 2026-11-12: four restarts in 200 seconds), so it cannot
+start while one cell is down.
 
 ### Prometheus reads
 

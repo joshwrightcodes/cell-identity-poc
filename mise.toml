@@ -90,6 +90,11 @@ description = "Serve the read-only Kiali mesh view of management on http://127.0
 env = { CELL = "management" }
 run = "scripts/mesh-ui.sh"
 
+[tasks."mesh:status"]
+description = "Report the mesh view of management: the tunnel of each cell at the hub, the tunnel pod in each cell, and Kiali. Exit status 1 when a part is not up"
+env = { CELL = "management" }
+run = "scripts/mesh-status.sh"
+
 [tasks."view:rotate-keys"]
 description = "Make new view keys in management: new agent CA and certificates, JWT key and server key, a new central Redis password, then restart argocd-redis, argocd-repo-server, the principal and argocd-server"
 env = { CELL = "management" }

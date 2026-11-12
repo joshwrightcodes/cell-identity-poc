@@ -563,6 +563,32 @@ link_preflight() {
   done
 }
 
+# blackhole_rules <management node address> prints the two firewall rules that TestM3KeepaliveBlackhole puts
+# in the FORWARD chain of the dev-cp node, one for each direction, as arguments for iptables.
+blackhole_rules() {
+  echo "FORWARD -p tcp -d $1 --dport 31445 -j DROP"
+  echo "FORWARD -p tcp -s $1 --sport 31445 -j DROP"
+}
+
+# blackhole_present <node container> <management node address> prints each blackhole rule that the node holds.
+blackhole_present() {
+  local rule
+  while read -r rule; do
+    # shellcheck disable=SC2086
+    docker exec "$1" iptables -C $rule 2>/dev/null && echo "$rule"
+  done < <(blackhole_rules "$2")
+}
+
+# hub_cell_up <cell> reads the log of the hub on standard input and succeeds when the hub holds an open
+# tunnel of the cell. A tunnel is open when its tunnel_up line has no tunnel_down line with the same
+# conn_id. The test works on conn_id, because the new tunnel of a cell can log tunnel_up before the older
+# one logs tunnel_down with replaced true.
+hub_cell_up() {
+  CELL_ARG="$1" jq -Rn '[inputs | fromjson? | select(.cell == env.CELL_ARG and (.msg == "tunnel_up" or .msg == "tunnel_down"))]
+    | ([.[] | select(.msg == "tunnel_up") | .conn_id] - [.[] | select(.msg == "tunnel_down") | .conn_id]) | length > 0' \
+    | grep -qx true
+}
+
 # new_ready_pods <namespace> <selector> <old UIDs> prints the UIDs of the Ready pods that are not old.
 new_ready_pods() {
   k -n "$1" get pods -l "$2" -o json | jq -r --arg old " $3 " '

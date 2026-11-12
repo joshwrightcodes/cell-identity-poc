@@ -6,9 +6,10 @@
 # spiffe://mgmt.poc.internal/kiali, chained to the roots in ConfigMap mgmt-root. It serves the
 # requests that arrive through the tunnel to the Kubernetes API of the cell, with the token of its
 # own pod. The allow-list of the tunnel and the ClusterRole mesh-view-read both limit those
-# requests to reads of the kinds that Kiali shows. The pod mounts the token only in the cell-proxy
-# container, as a projected volume. The default token mount stays off, so the SPIRE agent reads no
-# API token of this ServiceAccount.
+# requests to reads of the kinds that Kiali shows. The default token mount stays off, and the
+# cell-proxy container mounts the token as a projected volume. The SPIRE agent sidecar mounts a token of
+# the same ServiceAccount too (components/lib/spire-sidecar.sh), for its cluster_jwt plugin. The guard
+# mesh-view-read-only (guard.yaml) limits what that token can create.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

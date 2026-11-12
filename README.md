@@ -354,13 +354,23 @@ The tunnel allows only reads of the kinds that Kiali shows. The allow-list and t
 Secrets, logs, `exec`, port forwards and every write get the answer `403 denied` from the tunnel.
 The cell Role grants ConfigMaps in `istio-system` only.
 Kiali has no log view in this PoC. The tunnel answers `403 denied` to `pods/log` by design, and the feature flag `logs-tab` is off.
-Kiali also tries to read the version of each `istiod` through a port forward, and the tunnel refuses it.
+Kiali also tries to read the version of each `istiod` through a port forward. The hub refuses it, because the port forward needs a protocol upgrade.
 The Kiali log then holds the lines `Failing starting the port forwarding` and `Unable to get version info`, and the page shows no Istio version. This is expected.
+Kiali v2.34.0 has no setting that stops this call, so an alert on Kiali errors sees one error line for each cell and minute.
 The hub and each tunnel run one replica with the strategy `Recreate`.
 The hub reads the registry of cells at start, so a revoked cell stays connected until the hub pod starts again.
 `CELL=management mise run cell:link` renders the registry again, and it starts the hub pod when the content changed.
 The hub passes only the headers `Accept`, `Accept-Encoding`, `Content-Type` and `User-Agent`.
 The allow-list of the cell tunnel is the control that limits the requests, and the hub does not repeat it.
+
+The mesh view has these residual limits:
+
+- Code that runs inside the tunnel pod of a cell can use the SVID of that pod. The guard `mesh-view-read-only` limits what its token can write.
+- The hub ports are plain HTTP, and Kiali has no SVID. The NetworkPolicy admits only Kiali, but a request through the API server proxy of `management` arrives from a node address, which the policy does not stop.
+- The tunnel and `mesh-view-read` read every namespace of a cell, while Kiali reads only `MESH_VIEW_NAMESPACES`.
+- `prom-readonly` passes every query expression, because it does not enforce the `query_scope` label. The path is read-only.
+- A cell that answers with errors, or not at all, stops the mesh view for every cell, as the next steps describe.
+- The login signing key derives from the root of `management`, and the render refuses any strategy but `anonymous`.
 
 Create the mesh view in this order, because Kiali reads its cluster list once at start:
 
@@ -373,7 +383,12 @@ CELL=management mise run cell:link
 
 `cell:link` applies the hub first and waits up to 300 seconds until the hub logs `tunnel_up` for each cell.
 It then applies Kiali. A timeout fails the task and names each cell without a tunnel.
-Kiali starts again if you delete its pod. When a tunnel is down at that time, Kiali waits until it is up.
+Kiali needs every cell to answer at start, and it has no setting that skips a cluster.
+When one cell is absent, Kiali exits with a fatal error at the discovery of that cell (`failed to get server groups: the server is currently unable to handle the request`).
+The kubelet starts it again, with a longer wait each time, up to five minutes. The mesh view of the other cell is down too.
+Kiali stays up when a cell goes away after it started.
+Run `mise run mesh:status` to see which cell, the hub or Kiali is not up. When the cell is back, Kiali starts within five minutes.
+An absent cell takes the mesh view down for every cell. This is a residual limit of the PoC. The fallback is one Kiali for each cell.
 
 Open Kiali on `http://127.0.0.1:20001/kiali`. The page is anonymous and read-only:
 
@@ -386,7 +401,7 @@ While `mesh:ui` runs, every pod on the VM can reach the page through `host.docke
 
 `cell:verify` of a cell checks the tunnel objects, its images, the `dev-cp` node address and ConfigMap `mgmt-root`.
 `cell:verify` of `management` also checks the hub listener address, ConfigMap `peer-root` and the tunnel of each cell.
-When a tunnel is down, read the state with `mise run harness:verify`, and run `CELL=<cell> mise run cell:up` for the cell.
+When a tunnel is down, read the state with `mise run mesh:status`, and run `CELL=<cell> mise run cell:up` for the cell.
 For the Prometheus path, run `mise run obs:uplink-status management`.
 
 ## Add or remove a cell
@@ -530,7 +545,7 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It starts test pods in fresh namespaces of every cluster, and it deletes them.
 - It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
 - It deletes the `relay-view` pod in `dev-cp` and the Kiali pod in `management`. It scales `mesh-view` to zero in both cells for up to 30 seconds, and then applies the bundle again.
-- It adds a firewall rule on the `dev-cp` node that drops the packets from the relay to the hub, for about two minutes. The rule is removed at the end. If a run stops before that, run `docker exec dev-cp-control-plane iptables -D FORWARD -p tcp -d <management node address> --dport 31445 -j DROP`.
+- It adds two firewall rules on the `dev-cp` node that drop the packets between the relay and the hub, for up to four minutes in total. The test removes them, and a timer in the node removes them after 150 seconds. If a run stops hard, `mise run cell:verify` of `dev-cp` fails and names the repair. Run `mise run gate:m3:repair`, which also removes these rules.
 - It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers for 48 hours, then each component deletes them.
 
 A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.

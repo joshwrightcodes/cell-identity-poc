@@ -134,10 +134,16 @@ func probeHTTP(t *testing.T, cluster, ns, pod, method, url string, extra ...stri
 	return res.Status, res.Body, took
 }
 
-// TestM3NoWorkloadCanPortForward checks, through can-i, that no ServiceAccount of the plane
-// namespaces may create pods/portforward in any namespace of management. The viewer Role of the
-// Kiali chart grants it, and the render deletes that rule.
+// TestM3NoWorkloadCanPortForward checks, through can-i with the subresource flag, that no ServiceAccount of the
+// plane namespaces may create pods/portforward, cluster-wide or in any namespace of management. A namespaced
+// Role, which the Kiali chart renders, satisfies only a check in its own namespace, so the test asks each
+// namespace in turn. The viewer Role of the chart grants it, and the render deletes that rule.
 func TestM3NoWorkloadCanPortForward(t *testing.T) {
+	nsOut, err := kubectl(t, mgmtCluster, "", "get", "namespaces", "-o", "jsonpath={.items[*].metadata.name}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespaces := strings.Fields(nsOut)
 	for _, ns := range []string{viewNamespace, obsNamespace, meshNamespace} {
 		out, err := kubectl(t, mgmtCluster, "", "-n", ns, "get", "serviceaccounts", "-o", "jsonpath={.items[*].metadata.name}")
 		if err != nil {
@@ -149,9 +155,17 @@ func TestM3NoWorkloadCanPortForward(t *testing.T) {
 		}
 		for _, sa := range accounts {
 			as := "system:serviceaccount:" + ns + ":" + sa
-			if canI(t, mgmtCluster, as, "create", "pods/portforward", "") {
-				t.Errorf("%s can create pods/portforward in a namespace", as)
-			}
+			t.Run(ns+"/"+sa, func(t *testing.T) {
+				t.Parallel()
+				if canISub(t, mgmtCluster, as, "create", "pods", "portforward", "") {
+					t.Errorf("%s can create pods/portforward in every namespace", as)
+				}
+				for _, target := range namespaces {
+					if canISub(t, mgmtCluster, as, "create", "pods", "portforward", target) {
+						t.Errorf("%s can create pods/portforward in %s", as, target)
+					}
+				}
+			})
 		}
 	}
 }
@@ -278,23 +292,18 @@ func tunnelDowns(log, cell string) int {
 	return n
 }
 
-// tunnelState returns, for a cell, the msg of the last tunnel_up or tunnel_down line in a hub log,
-// and the number of tunnel_up lines.
+// tunnelState returns "tunnel_up" when a cell has an open tunnel in a hub log, and "tunnel_down" otherwise,
+// with the number of tunnel_up lines. A tunnel is open when its conn_id has no tunnel_down line, because the
+// new tunnel of a cell logs tunnel_up before the replaced one logs tunnel_down.
 func tunnelState(log, cell string) (last string, ups int) {
-	for l := range strings.SplitSeq(log, "\n") {
-		var rec struct{ Msg, Cell string }
-		if json.Unmarshal([]byte(l), &rec) != nil || rec.Cell != cell {
-			continue
-		}
-		switch rec.Msg {
-		case "tunnel_up":
-			last = rec.Msg
-			ups++
-		case "tunnel_down":
-			last = rec.Msg
+	all, downs, _ := hubConnIDs(log, cell)
+	last = "tunnel_down"
+	for _, id := range all {
+		if !downs[id] {
+			last = "tunnel_up"
 		}
 	}
-	return last, ups
+	return last, len(all)
 }
 
 // waitHubTunnel waits until the hub log has more than after tunnel_up lines for a cell, with the
@@ -310,10 +319,43 @@ func waitHubTunnel(t *testing.T, cell string, after int, within time.Duration) i
 	return ups
 }
 
-// TestM3KeepaliveBlackhole drops the packets between the relay of dev-cp and the hub without closing
-// a connection, as a dead path does. The hub and the tunnel must find the dead connection by their own
-// pings, and the tunnel must be up again when the path returns. The rule on the dev-cp node goes away
-// when the test ends.
+// hubConnIDs returns the conn_id of each tunnel_up line of a cell in a hub log, and the conn_ids that have a
+// tunnel_down line and a tunnel_expired line.
+func hubConnIDs(log, cell string) (ups []int, downs, expired map[int]bool) {
+	downs, expired = map[int]bool{}, map[int]bool{}
+	for l := range strings.SplitSeq(log, "\n") {
+		var rec struct {
+			Msg, Cell string
+			ConnID    int `json:"conn_id"`
+		}
+		if json.Unmarshal([]byte(l), &rec) != nil || rec.Cell != cell {
+			continue
+		}
+		switch rec.Msg {
+		case "tunnel_up":
+			ups = append(ups, rec.ConnID)
+		case "tunnel_down":
+			downs[rec.ConnID] = true
+		case "tunnel_expired":
+			expired[rec.ConnID] = true
+		}
+	}
+	return ups, downs, expired
+}
+
+// TestM3KeepaliveBlackhole drops the packets on one direction between the relay of dev-cp and the hub, as a dead path
+// does, and requires that a side finds the dead tunnel by its own pings, not by the SVID expiry. Two phases:
+//
+//   - relay to hub dropped: the pings of the hub get no answer. The hub logs a tunnel_down for the tunnel with no
+//     tunnel_expired line, so only the hub pings can have ended it. A hub with no pings fails this phase.
+//   - hub to relay dropped: the pings of the cell get no answer. The tunnel pod logs a tunnel_closed line after the
+//     drop starts and no tunnel_expired line, so only the cell pings can have ended it.
+//
+// One direction is enough, and it keeps the other side from learning of the close. Each phase starts right after a
+// new tunnel, so the ping path (30 s idle and 15 s for the answer) can win against an SVID of 1 minute, and it tries
+// again when the expiry wins. The test reads only the lines that the pods wrote after the drop starts. Two
+// safeguards remove the rules: the cleanup of the test, and a timer in the dev-cp node that runs when the test dies
+// with no cleanup. gate:m3:repair removes them too.
 func TestM3KeepaliveBlackhole(t *testing.T) {
 	cell := meshCells(t)[0]
 	mgmtIP := clusterFacts(t, mgmtCluster).NodeIP
@@ -321,48 +363,95 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 		t.Fatalf("management node address %q", mgmtIP)
 	}
 	node := envCluster + "-control-plane"
-	rule := []string{"FORWARD", "-p", "tcp", "-d", mgmtIP, "--dport", strconv.Itoa(meshNodePort), "-j", "DROP"}
-	// An SVID of 1 minute ends a tunnel every minute, and the cell dials again within seconds. So the
-	// test waits for a tunnel that is up before it starts.
-	var before int
-	waitFor(t, "the hub tunnel of "+cell+" to be up before the test", time.Minute, func() (bool, string) {
-		last, n := tunnelState(hubLog(t), cell)
-		before = n
-		return last == "tunnel_up", fmt.Sprintf("last tunnel line %q", last)
-	})
-	removed := false
-	remove := func() {
-		if removed {
-			return
-		}
-		removed = true
-		if _, err := dockerExec(t, node, "", append([]string{"iptables", "-D"}, rule...)...); err != nil {
-			t.Errorf("remove the blackhole rule from %s: %v. Run: docker exec %s iptables -D %s", node, err, node, strings.Join(rule, " "))
+	rules := [][]string{
+		{"FORWARD", "-p", "tcp", "-d", mgmtIP, "--dport", strconv.Itoa(meshNodePort), "-j", "DROP"},
+		{"FORWARD", "-p", "tcp", "-s", mgmtIP, "--sport", strconv.Itoa(meshNodePort), "-j", "DROP"},
+	}
+	removeRules := func() {
+		for _, r := range rules {
+			// -C checks that the rule exists, so a rule that the timer removed already is no error.
+			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-C"}, r...)...); err != nil {
+				continue
+			}
+			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-D"}, r...)...); err != nil {
+				t.Errorf("remove the rule %v from %s: %v. Run: mise run gate:m3:repair", r, node, err)
+			}
 		}
 	}
-	if _, err := dockerExec(t, node, "", append([]string{"iptables", "-I"}, rule...)...); err != nil {
-		t.Fatalf("insert the blackhole rule in %s: %v", node, err)
+	t.Cleanup(removeRules)
+	defer removeRules()
+
+	// newTunnel waits for a hub tunnel of the cell that the hub saw less than 8 seconds ago, and returns its conn_id.
+	newTunnel := func() int {
+		var connID int
+		waitFor(t, "a new hub tunnel of "+cell, 2*time.Minute, func() (bool, string) {
+			log := hubLog(t)
+			ups, downs, _ := hubConnIDs(log, cell)
+			if len(ups) == 0 || downs[ups[len(ups)-1]] {
+				return false, "no open tunnel"
+			}
+			connID = ups[len(ups)-1]
+			for l := range strings.SplitSeq(log, "\n") {
+				var rec struct {
+					Msg    string
+					Time   time.Time
+					ConnID int `json:"conn_id"`
+				}
+				if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "tunnel_up" && rec.ConnID == connID {
+					return time.Since(rec.Time) < 8*time.Second, fmt.Sprintf("tunnel %d is %s old", connID, time.Since(rec.Time).Round(time.Second))
+				}
+			}
+			return false, "no tunnel_up line"
+		})
+		return connID
 	}
-	t.Cleanup(remove)
-	start := time.Now()
-	// The hub pings after 30 seconds of silence and waits 15 seconds for the answer.
-	waitFor(t, "the hub to find the dead tunnel of "+cell, 90*time.Second, func() (bool, string) {
-		last, _ := tunnelState(hubLog(t), cell)
-		return last == "tunnel_down", fmt.Sprintf("last tunnel line %q", last)
-	})
-	t.Logf("the hub found the dead tunnel of %s after %s", cell, time.Since(start).Round(time.Second))
-	cellPod, _ := readyPodIn(t, cell, meshNamespace, tunnelName)
-	waitFor(t, "the tunnel pod of "+cell+" to log the end of the tunnel", 90*time.Second, func() (bool, string) {
-		out, err := kubectl(t, cell, "", "-n", meshNamespace, "logs", cellPod, "-c", "cell-proxy")
-		if err != nil {
-			return false, err.Error()
+	for _, phase := range []struct {
+		name string
+		rule int
+	}{{"the hub pings", 0}, {"the cell pings", 1}} {
+		found := false
+		for attempt := 1; attempt <= 4 && !found; attempt++ {
+			connID := newTunnel()
+			cellPod, _ := readyPodIn(t, cell, meshNamespace, tunnelName)
+			since := time.Now().UTC()
+			r := rules[phase.rule]
+			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-I"}, r...)...); err != nil {
+				t.Fatalf("insert the rule %v in %s: %v", r, node, err)
+			}
+			// The timer in the node removes the rule after 150 seconds, whatever happens to the test.
+			if _, err := dockerExec(t, node, "", "sh", "-c", "nohup sh -c 'sleep 150; iptables -C "+strings.Join(r, " ")+" 2>/dev/null && iptables -D "+strings.Join(r, " ")+"' >/dev/null 2>&1 &"); err != nil {
+				t.Logf("start the timer in %s: %v", node, err)
+			}
+			var hubDown, hubExpired, cellClosed, cellExpired bool
+			deadline := time.Now().Add(75 * time.Second)
+			for time.Now().Before(deadline) {
+				_, downs, exp := hubConnIDs(hubLog(t), cell)
+				hubDown, hubExpired = downs[connID], exp[connID]
+				cellLog, _ := kubectl(t, cell, "", "-n", meshNamespace, "logs", cellPod, "-c", "cell-proxy", "--since-time="+since.Format(time.RFC3339))
+				cellClosed, cellExpired = strings.Contains(cellLog, `"msg":"tunnel_closed"`), strings.Contains(cellLog, `"msg":"tunnel_expired"`)
+				if (phase.rule == 0 && hubDown) || (phase.rule == 1 && cellClosed) {
+					break
+				}
+				time.Sleep(2 * time.Second)
+			}
+			took := time.Since(since).Round(time.Second)
+			removeRules()
+			switch {
+			case phase.rule == 0 && hubDown && !hubExpired:
+				found = true
+			case phase.rule == 1 && cellClosed && !cellExpired:
+				found = true
+			}
+			t.Logf("%s, attempt %d: tunnel %d, hub down %v expired %v, cell closed %v expired %v, after %s", phase.name, attempt, connID, hubDown, hubExpired, cellClosed, cellExpired, took)
+			waitHubTunnel(t, cell, len(mustUps(hubConnIDs(hubLog(t), cell))), 3*time.Minute)
 		}
-		return strings.Contains(out, `"msg":"tunnel_closed"`), "no tunnel_closed line yet"
-	})
-	remove()
-	waitHubTunnel(t, cell, before, 3*time.Minute)
-	t.Logf("the tunnel of %s was up again %s after the start", cell, time.Since(start).Round(time.Second))
+		if !found {
+			t.Errorf("in 4 attempts, %s never ended a tunnel: each ended by its SVID expiry or by nothing", phase.name)
+		}
+	}
 }
+
+func mustUps(ups []int, _, _ map[int]bool) []int { return ups }
 
 // meshNamespaces are the namespaces that Kiali reads in each cell (MESH_VIEW_NAMESPACES, and its own).
 var meshNamespaces = []string{"apps-demo", "istio-egress", "istio-system", "mesh-view-system"}
@@ -574,6 +663,7 @@ func TestM3KialiSeparateMeshes(t *testing.T) {
 		echoTraffic(t, cell, 5)
 	}
 	addr := kialiForward(t)
+	waitFor(t, "the graph of apps-demo to hold one cluster box for each cell", 5*time.Minute, func() (bool, string) { return meshBoxes(addr, cells) })
 	var want []string
 	for _, cell := range cells {
 		want = append(want, cell+".mesh.poc.internal")
@@ -650,19 +740,25 @@ func TestM3KialiCannotChange(t *testing.T) {
 	waitFor(t, "Kiali to list both cells", 3*time.Minute, func() (bool, string) { return kialiSeesCells(addr) })
 
 	t.Run("through the Kiali API", func(t *testing.T) {
-		for _, tc := range []struct{ name, method, path, body string }{
-			{"delete pod echo", "DELETE", "/api/namespaces/apps-demo/pods/" + echo + "?clusterName=" + cell, ""},
+		since := time.Now().UTC().Add(-2 * time.Second)
+		// Each route answers one status. Kiali v2.34.0 has no route that deletes a pod, so that case pins the
+		// absence of the route: a Kiali that adds one fails the test on purpose, and the case then needs a
+		// real write check. A Kiali that sends the write to the cell gets the 403 of the tunnel, and answers 500.
+		for _, tc := range []struct {
+			name, method, path, body string
+			status                   int
+			contains                 string
+		}{
+			{"delete pod echo (no such route)", "DELETE", "/api/namespaces/apps-demo/pods/" + echo + "?clusterName=" + cell, "", 404, "page not found"},
 			{"patch AuthorizationPolicy", "PATCH", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell,
-				`[{"op":"replace","path":"/spec/action","value":"DENY"}]`},
-			{"delete AuthorizationPolicy", "DELETE", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell, ""},
+				`[{"op":"replace","path":"/spec/action","value":"DENY"}]`, 500, "unknown (patch authorizationpolicies"},
+			{"delete AuthorizationPolicy", "DELETE", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell, "", 500, "unknown (delete authorizationpolicies"},
 		} {
 			code, body, err := kialiCall(tc.method, addr, tc.path, tc.body)
 			if err != nil {
 				t.Errorf("%s: %v", tc.name, err)
-			} else if code < 400 {
-				t.Errorf("%s answers %d %.200s, want a failure", tc.name, code, body)
-			} else {
-				t.Logf("%s answers %d %.120s", tc.name, code, body)
+			} else if code != tc.status || !strings.Contains(string(body), tc.contains) {
+				t.Errorf("%s answers %d %.200s, want %d with %q", tc.name, code, body, tc.status, tc.contains)
 			}
 		}
 		if got := resourceVersion(t, cell, "apps-demo", "pod", echo); got != podRV {
@@ -670,6 +766,25 @@ func TestM3KialiCannotChange(t *testing.T) {
 		}
 		if got := resourceVersion(t, cell, "apps-demo", "authorizationpolicy.security.istio.io", "echo-allow-client"); got != policyRV {
 			t.Errorf("AuthorizationPolicy echo-allow-client has the resourceVersion %s, was %s", got, policyRV)
+		}
+		// The tunnel of the cell refused both writes: its log has a request denied line for each method.
+		pod, _ := readyPodIn(t, cell, meshNamespace, tunnelName)
+		out, err := kubectl(t, cell, "", "-n", meshNamespace, "logs", pod, "-c", "cell-proxy", "--since-time="+since.Format(time.RFC3339))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, method := range []string{"PATCH", "DELETE"} {
+			found := false
+			for l := range strings.SplitSeq(out, "\n") {
+				var rec struct{ Msg, Reason, Method, Path string }
+				if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "request denied" && rec.Reason == "request_not_allowed" &&
+					rec.Method == method && strings.Contains(rec.Path, "authorizationpolicies") {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("the tunnel pod of %s logged no refused %s of an AuthorizationPolicy since %s", cell, method, since.Format(time.RFC3339))
+			}
 		}
 	})
 
@@ -731,25 +846,62 @@ func TestM3KialiCannotChange(t *testing.T) {
 	}
 }
 
-// TestM3TunnelRecovers deletes the relay-view pod in dev-cp, which ends the tunnel of each cell. Kiali
-// lists dev-cell-1 again within 2 minutes, and its pod neither restarts nor changes.
+// TestM3TunnelRecovers deletes the relay-view pod in dev-cp, which ends the tunnel of each cell. The test takes the
+// conn_id of the current tunnel of dev-cell-1, and requires its tunnel_down with no tunnel_expired line, so an
+// expiry cycle cannot pass for the delete, and then a tunnel with a higher conn_id. Kiali lists dev-cell-1 as
+// accessible again within 2 minutes, and its pod neither restarts nor changes.
 func TestM3TunnelRecovers(t *testing.T) {
 	addr := kialiForward(t)
 	waitFor(t, "Kiali to list both cells", 3*time.Minute, func() (bool, string) { return kialiSeesCells(addr) })
 	uid, restarts := kialiPodState(t)
-	log := hubLog(t)
-	_, before := tunnelState(log, "dev-cell-1")
-	downsBefore := tunnelDowns(log, "dev-cell-1")
+	// Start right after a new tunnel, so that its SVID expiry is far away.
+	var connID int
+	waitFor(t, "a new hub tunnel of dev-cell-1", 2*time.Minute, func() (bool, string) {
+		ups, downs, _ := hubConnIDs(hubLog(t), "dev-cell-1")
+		if len(ups) == 0 || downs[ups[len(ups)-1]] {
+			return false, "no open tunnel"
+		}
+		connID = ups[len(ups)-1]
+		for l := range strings.SplitSeq(hubLog(t), "\n") {
+			var rec struct {
+				Msg    string
+				Time   time.Time
+				ConnID int `json:"conn_id"`
+			}
+			if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "tunnel_up" && rec.ConnID == connID {
+				return time.Since(rec.Time) < 10*time.Second, "the tunnel is not new"
+			}
+		}
+		return false, "no tunnel_up line"
+	})
 	if _, err := kubectl(t, envCluster, "", "-n", relayNamespace, "delete", "pod", "-l", "app.kubernetes.io/name=relay-view", "--wait=true"); err != nil {
 		t.Fatal(err)
 	}
 	start := time.Now()
-	t.Logf("deleted the relay-view pod at %s", start.UTC().Format(time.RFC3339))
+	t.Logf("deleted the relay-view pod at %s, while tunnel %d was open", start.UTC().Format(time.RFC3339), connID)
+	waitFor(t, "the hub to end tunnel "+strconv.Itoa(connID)+" and open a newer one", 2*time.Minute, func() (bool, string) {
+		ups, downs, expired := hubConnIDs(hubLog(t), "dev-cell-1")
+		if !downs[connID] {
+			return false, "tunnel is still open"
+		}
+		if expired[connID] {
+			t.Fatalf("tunnel %d ended by its SVID expiry, so it never saw the delete of the relay: the test started too late", connID)
+		}
+		return len(ups) > 0 && ups[len(ups)-1] > connID && !downs[ups[len(ups)-1]], "no newer open tunnel"
+	})
 	waitFor(t, "Kiali to list both cells again", 2*time.Minute, func() (bool, string) { return kialiSeesCells(addr) })
 	t.Logf("Kiali listed both cells again %s after the delete", time.Since(start).Round(time.Second))
-	waitHubTunnel(t, "dev-cell-1", before, 2*time.Minute)
-	if got := tunnelDowns(hubLog(t), "dev-cell-1"); got <= downsBefore {
-		t.Errorf("the hub logged %d tunnel_down lines for dev-cell-1 after the delete of the relay pod, and %d before: the tunnel never went down", got, downsBefore)
+	code, body, err := kialiCall("GET", addr, "/api/config", "")
+	if err != nil || code != 200 || !strings.Contains(string(body), `"dev-cell-1"`) {
+		t.Fatalf("GET /api/config: %d %v", code, err)
+	}
+	var conf struct {
+		Clusters map[string]struct {
+			Accessible bool `json:"accessible"`
+		} `json:"clusters"`
+	}
+	if err := json.Unmarshal(body, &conf); err != nil || !conf.Clusters["dev-cell-1"].Accessible {
+		t.Errorf("Kiali does not list dev-cell-1 as accessible: %v %s", err, body)
 	}
 	if uid2, restarts2 := kialiPodState(t); uid2 != uid || restarts2 != restarts {
 		t.Errorf("the Kiali pod changed: UID %s to %s, restarts %d to %d", uid, uid2, restarts, restarts2)
@@ -811,4 +963,191 @@ func TestM3KialiBeforeTunnels(t *testing.T) {
 	}
 	addr := kialiForward(t)
 	waitFor(t, "Kiali to list both cells", 3*time.Minute, func() (bool, string) { return kialiSeesCells(addr) })
+}
+
+// TestM3MeshPortsFromFreshNamespace dials the plain HTTP ports of the mesh view from a pod that is not Kiali:
+// the hub ports of each cell, the Kiali port and the prom-readonly port. Each dial must time out, after a control
+// dial that connects. The hub node port 8444 admits the dev-cp node only, so a pod of management times out there
+// too.
+func TestM3MeshPortsFromFreshNamespace(t *testing.T) {
+	needProbeImage(t)
+	hub, _ := readyPod(t, meshNamespace, hubName)
+	kiali, _ := readyPod(t, meshNamespace, kialiName)
+	prom, _ := readyPod(t, obsNamespace, promProxyName)
+	type target struct {
+		name, ip string
+		port     int
+	}
+	targets := []target{{"hub 8444", mgmtPodIP(t, meshNamespace, hub), 8444}, {"kiali 20001", mgmtPodIP(t, meshNamespace, kiali), 20001},
+		{"prom-readonly 9091", mgmtPodIP(t, obsNamespace, prom), 9091}}
+	for _, cell := range meshCells(t) {
+		targets = append(targets, target{"hub " + cell, mgmtPodIP(t, meshNamespace, hub), hubPort(t, cell)})
+	}
+	for _, tg := range targets {
+		t.Run(tg.name, func(t *testing.T) {
+			t.Parallel()
+			if err := probeFromFreshNamespace(t, mgmtCluster, tg.ip, tg.port, 4*time.Second); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+}
+
+// meshBoxes checks the graph of apps-demo with the cluster boxes that an operator uses: one box for each cell, and
+// every workload of apps-demo inside the box of its own cluster.
+func meshBoxes(addr string, cells []string) (bool, string) {
+	code, body, err := kialiCall("GET", addr, "/api/namespaces/graph?namespaces=apps-demo&graphType=workload&duration=10m&boxBy=cluster&includeIdleEdges=true", "")
+	if err != nil || code != 200 {
+		return false, fmt.Sprintf("%d %v", code, err)
+	}
+	var g struct {
+		Elements struct {
+			Nodes []struct {
+				Data struct {
+					ID, Cluster, Namespace, Parent, NodeType, Workload string
+					IsBox                                              string `json:"isBox"`
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal(body, &g); err != nil {
+		return false, err.Error()
+	}
+	boxes := map[string]string{}
+	for _, n := range g.Elements.Nodes {
+		if n.Data.IsBox == "cluster" {
+			boxes[n.Data.ID] = n.Data.Cluster
+		}
+	}
+	var got []string
+	for _, c := range boxes {
+		got = append(got, c)
+	}
+	slices.Sort(got)
+	want := slices.Clone(cells)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		return false, fmt.Sprintf("cluster boxes %v, want %v", got, want)
+	}
+	for _, n := range g.Elements.Nodes {
+		if n.Data.NodeType == "workload" && n.Data.Namespace == "apps-demo" && boxes[n.Data.Parent] != n.Data.Cluster {
+			return false, fmt.Sprintf("workload %s of %s sits in the box of %q", n.Data.Workload, n.Data.Cluster, boxes[n.Data.Parent])
+		}
+	}
+	return true, ""
+}
+
+const meshGuardPolicy = "mesh-view-read-only"
+
+func requireMeshDenied(t *testing.T, what, message string, err error) {
+	t.Helper()
+	switch {
+	case err == nil:
+		t.Errorf("%s succeeded, want a denial by %s", what, meshGuardPolicy)
+	case !strings.Contains(err.Error(), meshGuardPolicy) || !strings.Contains(err.Error(), message):
+		t.Errorf("%s failed, but not with the denial %q of %s: %v", what, message, meshGuardPolicy, err)
+	default:
+		t.Logf("%s: denied by %s: %s", what, meshGuardPolicy, message)
+	}
+}
+
+const meshGuardTestRole = `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: mesh-guard-test
+  namespace: mesh-view-system
+  labels: {poc.internal/test: view-guard}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps, serviceaccounts]
+    verbs: [get, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mesh-guard-test
+  namespace: mesh-view-system
+  labels: {poc.internal/test: view-guard}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: mesh-guard-test
+subjects:
+  - kind: Group
+    name: poc:guard-test
+    apiGroup: rbac.authorization.k8s.io
+`
+
+// TestM3MeshGuardDeniesWithoutRBAC proves the policy mesh-view-read-only on its own. A temporary Role gives the test
+// group every write that the guard must still deny, and each request goes out as the ServiceAccount mesh-view with that
+// group (kubectl --as and --as-group), as a server-side dry run. The real account never holds the grant.
+func TestM3MeshGuardDeniesWithoutRBAC(t *testing.T) {
+	const account = "system:serviceaccount:mesh-view-system:mesh-view"
+	for _, cell := range meshCells(t) {
+		t.Run(cell, func(t *testing.T) {
+			t.Cleanup(func() { repairGuardObjects(t, cell) })
+			if _, err := kubectl(t, cell, meshGuardTestRole, "apply", "-f", "-"); err != nil {
+				t.Fatal(err)
+			}
+			asArgs := []string{"--as", account, "--as-group", guardTestGroup}
+			waitFor(t, "RBAC allows the test group to update ConfigMaps", time.Minute, func() (bool, string) {
+				out, _ := kubectl(t, cell, "", append([]string{"auth", "can-i", "update", "configmaps", "-n", meshNamespace}, asArgs...)...)
+				return strings.TrimSpace(out) == "yes", strings.TrimSpace(out)
+			})
+			if out, _ := kubectl(t, cell, "", "auth", "can-i", "update", "configmaps", "-n", meshNamespace, "--as="+account); strings.TrimSpace(out) != "no" {
+				t.Fatalf("the account alone can update ConfigMaps in %s: %q, so the test would touch the real grant", cell, strings.TrimSpace(out))
+			}
+			as := func(args ...string) error {
+				_, err := kubectl(t, cell, "", append(append([]string{}, asArgs...), append([]string{"-n", meshNamespace}, args...)...)...)
+				return err
+			}
+			podOut, err := kubectl(t, cell, "", "-n", meshNamespace, "get", "pods", "-l", "app.kubernetes.io/name="+tunnelName, "-o", "jsonpath={.items[0].metadata.name} {.items[0].metadata.uid}")
+			if err != nil || len(strings.Fields(podOut)) != 2 {
+				t.Fatalf("pod of %s in %s: %q %v", tunnelName, cell, podOut, err)
+			}
+			podName, podUID := strings.Fields(podOut)[0], strings.Fields(podOut)[1]
+			t.Run("update", func(t *testing.T) {
+				requireMeshDenied(t, "patch a ConfigMap", "cannot update an object", as("patch", "configmap", "mgmt-root", "--type", "merge", "-p", `{"data":{"guard-test":"1"}}`, "--dry-run=server"))
+			})
+			t.Run("create", func(t *testing.T) {
+				requireMeshDenied(t, "create a ConfigMap", "creates only the bound token", as("create", "configmap", "guard-test", "--dry-run=server"))
+			})
+			t.Run("delete", func(t *testing.T) {
+				requireMeshDenied(t, "delete a ConfigMap", "cannot delete an object or connect", as("delete", "configmap", "mgmt-root", "--dry-run=server"))
+			})
+			t.Run("connect", func(t *testing.T) {
+				requireMeshDenied(t, "exec in the tunnel pod", "cannot delete an object or connect", as("exec", podName, "-c", "cell-proxy", "--", "true"))
+			})
+			token := func(extra bool, args ...string) error {
+				full := []string{"create", "token", "mesh-view"}
+				if extra {
+					full = append(full, "--as-user-extra=authentication.kubernetes.io/pod-name="+podName, "--as-user-extra=authentication.kubernetes.io/pod-uid="+podUID)
+				}
+				return as(append(full, args...)...)
+			}
+			bound := []string{"--bound-object-kind=Pod", "--bound-object-name=" + podName, "--bound-object-uid=" + podUID, "--duration=10m"}
+			audience := func(a string) []string { return append([]string{"--audience=" + a}, bound...) }
+			t.Run("token", func(t *testing.T) {
+				if err := token(true, audience("spire-"+pocEnv+"/abc_DEF-123")...); err != nil {
+					t.Errorf("the bound token that the SPIRE agent asks for was refused: %v", err)
+				}
+				const msg = "creates only the bound token"
+				requireMeshDenied(t, "a token for the API server audience", msg, token(true, audience("https://kubernetes.default.svc")...))
+				requireMeshDenied(t, "a token with no bound object", msg, token(true, "--audience=spire-"+pocEnv+"/abc", "--duration=10m"))
+				requireMeshDenied(t, "a token with no pod extras", msg, token(false, audience("spire-"+pocEnv+"/abc")...))
+				requireMeshDenied(t, "a token bound to a Secret", msg, token(true, "--audience=spire-"+pocEnv+"/abc", "--bound-object-kind=Secret", "--bound-object-name=mgmt-root", "--duration=10m"))
+				requireMeshDenied(t, "a token for another account", msg, as(append([]string{"create", "token", "default",
+					"--as-user-extra=authentication.kubernetes.io/pod-name=" + podName, "--as-user-extra=authentication.kubernetes.io/pod-uid=" + podUID}, audience("spire-"+pocEnv+"/abc")...)...))
+			})
+		})
+	}
 }

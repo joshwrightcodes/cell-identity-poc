@@ -23,6 +23,24 @@ leftovers() {
 }
 
 status=0
+# TestM3KeepaliveBlackhole drops the packets between the relay of dev-cp and the hub with two firewall
+# rules on the dev-cp node. The test removes them, and a timer in the node removes them too. A run that
+# stopped hard can leave them, and they cut the tunnel of every cell.
+mgmt_ip="$(cd "$ROOT" && mise run hostsvc -- facts --cluster management 2>/dev/null | jq -r '.nodeIP // ""')" || mgmt_ip=""
+if [[ -n "$mgmt_ip" ]] && docker inspect dev-cp-control-plane >/dev/null 2>&1; then
+  while read -r rule; do
+    [[ -n "$rule" ]] || continue
+    status=1
+    if ((check)); then
+      echo "dev-cp: the firewall rule '$rule' drops the mesh tunnels. Run: mise run gate:m3:repair"
+      continue
+    fi
+    log "deleting the firewall rule '$rule' on the dev-cp node"
+    # shellcheck disable=SC2086
+    docker exec dev-cp-control-plane iptables -D $rule || die "could not delete the firewall rule '$rule' on the dev-cp node"
+    status=0
+  done < <(blackhole_present dev-cp-control-plane "$mgmt_ip")
+fi
 for cell in $cells; do
   found="$(leftovers "$cell")" || die "could not list the objects with the label $GUARD_TEST_LABEL in $cell"
   [[ -n "$found" ]] || continue

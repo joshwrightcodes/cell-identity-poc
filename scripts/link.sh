@@ -21,16 +21,14 @@ job_state() {
     | select(.type == "Complete" or .type == "Failed") | .type][0] // ""'
 }
 
-# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. The hub logs
-# tunnel_up when a cell connects and tunnel_down when it leaves, so the last of the two for a cell
-# gives its state.
+# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. hub_cell_up
+# (scripts/lib.sh) reads the log of the hub by conn_id.
 tunnel_gaps() {
-  local logs cell entry state
+  local logs entry cell
   logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>/dev/null)" || logs=""
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
-    state="$(CELL_ARG="$cell" jq -R -r 'fromjson? | select(.cell == env.CELL_ARG and (.msg == "tunnel_up" or .msg == "tunnel_down")) | .msg' <<<"$logs" | tail -n 1)"
-    [[ "$state" == tunnel_up ]] || echo "$cell"
+    hub_cell_up "$cell" <<<"$logs" || echo "$cell"
   done
 }
 
@@ -41,7 +39,7 @@ wait_for_tunnels() {
   local end=$((SECONDS + ${LINK_TUNNEL_WAIT:-300})) missing
   until missing="$(tunnel_gaps)" && [[ -z "$missing" ]]; do
     if ((SECONDS >= end)); then
-      die "after ${LINK_TUNNEL_WAIT:-300}s the hub has no tunnel from: $(paste -sd' ' - <<<"$missing"). Run CELL=<cell> mise run cell:up for each of them. To read the hub log: mise x -- kubectl --context kind-$CELL_NAME -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy"
+      die "after ${LINK_TUNNEL_WAIT:-300}s the hub has no tunnel from: $(paste -sd' ' - <<<"$missing"). Run CELL=<cell> mise run cell:up for each of them. To read the tunnel state: mise run mesh:status"
     fi
     sleep "${LINK_TUNNEL_POLL:-5}"
   done

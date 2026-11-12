@@ -792,6 +792,15 @@ check_mesh_view_peer_root() {
   fi
 }
 
+# A gate test drops the packets between the relay and the hub with firewall rules on the dev-cp node. A run
+# that stopped hard can leave them, and they cut the mesh tunnel of every cell.
+check_no_blackhole() {
+  local ip found
+  ip="$(node_ip "$RELAY_TARGET")" || { echo "$ip"; return 1; }
+  found="$(blackhole_present "$CELL_NAME-control-plane" "$ip")"
+  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//$'\n'/; }"; echo "Run: mise run gate:m3:repair"; return 1; }
+}
+
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
@@ -920,6 +929,10 @@ if has_harness otel-uplink; then
     check_live_images observability-system deployment/otel-uplink "CELL=$CELL_NAME mise run cell:up"
   check "The uplink and its NetworkPolicy use the current node address of its upstream cluster" check_uplink_env_address
   check "The peer root ConfigMap of the uplink holds the live roots of management" check_uplink_peer_root
+fi
+
+if [[ -n "${RELAY_TARGET:-}" ]]; then
+  check "The node of $CELL_NAME holds no firewall rule of a gate test between the relay and the hub" check_no_blackhole
 fi
 
 if has_harness mesh-view; then
@@ -1108,15 +1121,13 @@ check_hub_peer_root() {
   fi
 }
 
-# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose last tunnel line in the hub log is not
-# tunnel_up.
+# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not open (see hub_cell_up).
 hub_tunnel_gaps() {
-  local logs entry cell state
+  local logs entry cell
   logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>&1)" || { echo "could not read the log of the hub: $logs"; return 1; }
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
-    state="$(CELL_ARG="$cell" jq -R -r 'fromjson? | select(.cell == env.CELL_ARG and (.msg == "tunnel_up" or .msg == "tunnel_down")) | .msg' <<<"$logs" | tail -n 1)"
-    [[ "$state" == tunnel_up ]] || echo "$cell"
+    hub_cell_up "$cell" <<<"$logs" || echo "$cell"
   done
 }
 
@@ -1128,7 +1139,8 @@ check_hub_tunnels() {
   until down="$(hub_tunnel_gaps)" && [[ -z "$down" ]]; do
     if ((SECONDS >= end)); then
       echo "the hub has no tunnel from: $(paste -sd' ' - <<<"$down")."
-      echo "Run: CELL=<cell> mise run cell:up for each of them, and read the log: mise x -- kubectl --context kind-$CELL_NAME -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy"
+      echo "Run: CELL=<cell> mise run cell:up for each of them, and read the state: mise run mesh:status"
+      echo "If every cell is down at once, a test may have left its firewall rule: mise run gate:m3:repair"
       return 1
     fi
     sleep 3

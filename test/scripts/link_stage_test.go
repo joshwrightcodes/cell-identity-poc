@@ -82,8 +82,8 @@ func runStage(t *testing.T, root, calls string, env ...string) (string, string, 
 	return string(out), string(log), err
 }
 
-const hubLogBoth = `{"msg":"tunnel_up","cell":"dev-cell-1"}
-{"msg":"tunnel_up","cell":"dev-cell-2"}`
+const hubLogBoth = `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}
+{"msg":"tunnel_up","cell":"dev-cell-2","conn_id":2}`
 
 // The link phase applies the hub first, waits until the hub logs tunnel_up for each cell, and then
 // applies Kiali.
@@ -110,8 +110,8 @@ func TestLinkAppliesKialiAfterTheTunnels(t *testing.T) {
 // Kiali. A cell whose last line is tunnel_down counts as missing.
 func TestLinkNamesTheCellsWithoutATunnel(t *testing.T) {
 	for name, hubLog := range map[string]string{
-		"no line":     `{"msg":"tunnel_up","cell":"dev-cell-1"}`,
-		"tunnel down": hubLogBoth + "\n" + `{"msg":"tunnel_down","cell":"dev-cell-2"}`,
+		"no line":     `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}`,
+		"tunnel down": hubLogBoth + "\n" + `{"msg":"tunnel_down","cell":"dev-cell-2","conn_id":2}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			root, calls := stageRoot(t)
@@ -126,5 +126,18 @@ func TestLinkNamesTheCellsWithoutATunnel(t *testing.T) {
 				t.Errorf("link.sh applied Kiali without a tunnel:\n%s", log)
 			}
 		})
+	}
+}
+
+// The new tunnel of a cell logs tunnel_up before the replaced one logs tunnel_down, so the last line of the
+// cell is a tunnel_down. The cell has an open tunnel all the same, and the link phase goes on.
+func TestLinkCountsAReplacedTunnelAsUp(t *testing.T) {
+	root, calls := stageRoot(t)
+	log := `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}
+{"msg":"tunnel_up","cell":"dev-cell-2","conn_id":2}
+{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":3}
+{"msg":"tunnel_down","cell":"dev-cell-1","conn_id":1,"replaced":true}`
+	if out, got, err := runStage(t, root, calls, "STUB_HUB_LOG="+log); err != nil {
+		t.Fatalf("link.sh failed: %v\n%s\ncalls:\n%s", err, out, got)
 	}
 }

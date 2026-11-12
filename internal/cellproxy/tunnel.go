@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -91,19 +93,85 @@ func RunTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 
 func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, c tunnelClock) error {
 	srv := newTunnelServer()
-	backoff := tunnelMinBackoff
-	for {
-		if conn, err := dial(ctx); err == nil {
-			start := c.now()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	serve := func(conn net.Conn) chan struct{} {
+		ended := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(ended)
 			serveTunnel(ctx, srv, conn, h)
-			if c.now().Sub(start) >= tunnelStableAfter {
-				backoff = tunnelMinBackoff
+		}()
+		return ended
+	}
+	backoff := tunnelMinBackoff
+	// The current tunnel: its end, its start, when to dial the next one, and how long it must live to
+	// count as stable. A connection with an Expiry method (the TLS connection of a cell) is renewed
+	// before it ends: the next tunnel opens at 60 percent of the remaining life, with the SVID that
+	// the source holds by then, and the hub closes the older tunnel when the newer one arrives.
+	var ended chan struct{}
+	var start, renewAt time.Time
+	stable := tunnelStableAfter
+	connect := func() bool {
+		conn, err := dial(ctx)
+		if err != nil {
+			return false
+		}
+		start = c.now()
+		ended = serve(conn)
+		renewAt, stable = time.Time{}, tunnelStableAfter
+		if e, ok := conn.(interface{ Expiry() time.Time }); ok && !e.Expiry().IsZero() {
+			life := e.Expiry().Sub(start)
+			renewAt = start.Add(life * 6 / 10)
+			stable = min(tunnelStableAfter, life/2)
+		}
+		return true
+	}
+	for {
+		if ended == nil {
+			if !connect() {
+				if c.sleep(ctx, jitter(backoff)) != nil {
+					return nil
+				}
+				backoff = min(2*backoff, tunnelMaxBackoff)
+				continue
 			}
 		}
-		if c.sleep(ctx, jitter(backoff)) != nil {
+		var renew <-chan time.Time
+		var timer *time.Timer
+		if !renewAt.IsZero() {
+			timer = time.NewTimer(max(0, renewAt.Sub(c.now())))
+			renew = timer.C
+		}
+		select {
+		case <-ended:
+			if timer != nil {
+				timer.Stop()
+			}
+			if c.now().Sub(start) >= stable {
+				backoff = tunnelMinBackoff
+			}
+			ended = nil
+			if c.sleep(ctx, jitter(backoff)) != nil {
+				return nil
+			}
+			backoff = min(2*backoff, tunnelMaxBackoff)
+		case <-renew:
+			old, oldStart, oldStable := ended, start, stable
+			if connect() {
+				backoff = tunnelMinBackoff
+			} else {
+				ended, start, stable = old, oldStart, oldStable
+				renewAt = c.now().Add(jitter(backoff))
+				backoff = min(2*backoff, tunnelMaxBackoff)
+			}
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return nil
 		}
-		backoff = min(2*backoff, tunnelMaxBackoff)
 	}
 }
 
@@ -146,7 +214,21 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			log.Warn("tunnel_dial_failed", "reason", string(UpstreamUnavailable), "upstream", addr, "error", err.Error())
 			return nil, err
 		}
-		conn := tls.Client(raw, cfg)
+		// own records the expiry of the client certificate that the handshake sends.
+		var own time.Time
+		cc := cfg.Clone()
+		if orig := cfg.GetClientCertificate; orig != nil {
+			cc.GetClientCertificate = func(ri *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+				cert, err := orig(ri)
+				if err == nil && len(cert.Certificate) > 0 {
+					if x, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
+						own = x.NotAfter
+					}
+				}
+				return cert, err
+			}
+		}
+		conn := tls.Client(raw, cc)
 		hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 		err = conn.HandshakeContext(hctx)
 		cancel()
@@ -162,7 +244,22 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			}
 			return nil, err
 		}
-		return &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result}, nil
+		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result}
+		// The cell ends the tunnel at the earlier expiry of its own leaf and the leaf of the hub, so a
+		// hub that never closes cannot keep the access past a credential.
+		if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
+			cn.expiry = certs[0].NotAfter
+		}
+		if !own.IsZero() && (cn.expiry.IsZero() || own.Before(cn.expiry)) {
+			cn.expiry = own
+		}
+		if !cn.expiry.IsZero() {
+			cn.timer = time.AfterFunc(time.Until(cn.expiry), func() {
+				log.Info("tunnel_expired", "side", sideCell, "upstream", addr, "not_after", cn.expiry.UTC().Format(time.RFC3339))
+				_ = cn.Close()
+			})
+		}
+		return cn, nil
 	}
 }
 
@@ -174,6 +271,9 @@ type cellConn struct {
 	upstream string
 	up       *atomic.Bool
 	result   func(context.Context, string)
+
+	expiry time.Time
+	timer  *time.Timer
 
 	mu         sync.Mutex
 	acceptedAt time.Time
@@ -210,7 +310,13 @@ func refusalDetail(err error) string {
 	return err.Error()
 }
 
+// Expiry is the earlier expiry of the leaf of the cell and the leaf of the hub.
+func (c *cellConn) Expiry() time.Time { return c.expiry }
+
 func (c *cellConn) Close() error {
+	if c.timer != nil {
+		c.timer.Stop()
+	}
 	c.mu.Lock()
 	c.closing = true
 	acceptedAt, peerErr := c.acceptedAt, c.peerErr
@@ -262,7 +368,7 @@ func NewCellHandler(api *url.URL, rt http.RoundTripper, log *slog.Logger, opts .
 			}
 			log.Info("request canceled", "method", r.Method, "path", r.URL.Path)
 		},
-		ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+		ErrorLog: proxyErrorLog(log),
 	}
 	return h
 }
@@ -560,7 +666,7 @@ func (h *TunnelHub) Handler(cell string) http.Handler {
 				}
 				refuseHub(w, r, UpstreamUnavailable, err.Error())
 			},
-			ErrorLog: slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+			ErrorLog: proxyErrorLog(log),
 		}
 		proxy.ServeHTTP(w, r)
 	})
@@ -618,7 +724,7 @@ func (h *TunnelHub) newServer(cell string) *http.Server {
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       hubIdleTimeout,
 		MaxHeaderBytes:    hubMaxHeaderBytes,
-		ErrorLog:          slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
+		ErrorLog:          proxyErrorLog(h.log),
 	}
 }
 
@@ -665,3 +771,19 @@ func (b *tunnelBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) e
 
 // Run serves the local listeners of the hub until ctx ends.
 func (b *tunnelBackend) Run(ctx context.Context) error { return b.hub.Run(ctx) }
+
+// levelWriter sends the lines of a standard library logger to log. The errors that every ended tunnel
+// makes in the reverse proxy go to Debug, and every other line goes to Warn.
+type levelWriter struct{ log *slog.Logger }
+
+func (w levelWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	level := slog.LevelWarn
+	if strings.Contains(msg, "force closed via ClientConn.Close") || strings.Contains(msg, "use of closed network connection") {
+		level = slog.LevelDebug
+	}
+	w.log.Log(context.Background(), level, msg)
+	return len(p), nil
+}
+
+func proxyErrorLog(log *slog.Logger) *stdlog.Logger { return stdlog.New(levelWriter{log}, "", 0) }

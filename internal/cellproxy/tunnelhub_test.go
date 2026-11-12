@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -297,19 +298,42 @@ func TestHubLogsReplacement(t *testing.T) {
 	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "conn_id": 1, "replaced": true}, 5*time.Second)
 }
 
-func TestTunnelClosesAtSVIDExpiry(t *testing.T) {
+// The cell opens the next tunnel before the SVID of the current one ends, so the hub replaces the old
+// tunnel and no request waits for a new dial. The hub timer at the expiry never has to fire.
+func TestTunnelRenewsBeforeSVIDExpiry(t *testing.T) {
 	h := newTunnelHarness(t, 5*time.Second)
 	src := &rotatingSource{svids: []*x509svid.SVID{
-		h.env.svidUntil(t, meshViewID1, time.Now().Add(2*time.Second)),
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(5*time.Second)),
 		h.env.svidUntil(t, meshViewID1, time.Now().Add(time.Hour)),
 	}}
 	startCell(t, h.dialerWith(src), h.cellHandler(t))
 	h.waitTunnels(t, 1, 5*time.Second)
-	findLog(t, h.hubLog, "tunnel_expired", map[string]any{"cell": "dev-cell-1", "conn_id": 1}, 5*time.Second)
-	h.waitTunnels(t, 2, 5*time.Second)
+	findLog(t, h.hubLog, "tunnel_replaced", map[string]any{"cell": "dev-cell-1"}, 5*time.Second)
+	if n := countLog(t, h.hubLog, "tunnel_expired"); n != 0 {
+		t.Fatalf("%d tunnel_expired lines: the old tunnel ran into its expiry, so the cell did not renew early:\n%s", n, h.hubLog.String())
+	}
 	if code, body := h.get(t, "/api/v1/pods"); code != http.StatusOK {
 		t.Fatalf("after the new SVID: status %d, body %s", code, body)
 	}
+}
+
+// A hub that never closes cannot keep the access past its own SVID: the cell ends the tunnel at the
+// earlier expiry of the two leaves.
+func TestCellEndsTunnelAtHubSVIDExpiry(t *testing.T) {
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, hubLeafLife: 3 * time.Second})
+	startCell(t, h.dialer(t), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, 6*time.Second)
+	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "conn_id": 1}, 3*time.Second)
+}
+
+// A tunnel that ends with a short cell SVID does not push the next dial to the backoff cap.
+func TestCellEndsTunnelAtOwnSVIDExpiry(t *testing.T) {
+	h := newTunnelHarness(t, 5*time.Second)
+	src := &rotatingSource{svids: []*x509svid.SVID{h.env.svidUntil(t, meshViewID1, time.Now().Add(2*time.Second))}}
+	startCell(t, h.dialerWith(src), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, 5*time.Second)
 }
 
 func TestTunnelLogsHubAcceptance(t *testing.T) {
@@ -401,5 +425,31 @@ func TestHubListenerLimits(t *testing.T) {
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
 		t.Fatalf("a header over %d bytes got status %d, want 431", hubMaxHeaderBytes, resp.StatusCode)
+	}
+}
+
+// The errors that every ended tunnel makes in the reverse proxy go to Debug. Any other error of the proxy
+// goes to Warn, so a real failure still shows at the level that an operator reads.
+func TestProxyErrorLogLevels(t *testing.T) {
+	out := &syncBuffer{}
+	log := proxyErrorLog(slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	log.Print("httputil: ReverseProxy read error during body copy: http2: client connection force closed via ClientConn.Close")
+	log.Print("http: proxy error: use of closed network connection")
+	log.Print("http: proxy error: tls: bad record MAC")
+	levels := map[string]string{}
+	for _, l := range logLines(t, out) {
+		levels[fmt.Sprint(l["msg"])] = fmt.Sprint(l["level"])
+	}
+	if len(levels) != 3 {
+		t.Fatalf("lines %v", levels)
+	}
+	for msg, level := range levels {
+		want := "DEBUG"
+		if strings.Contains(msg, "bad record MAC") {
+			want = "WARN"
+		}
+		if level != want {
+			t.Errorf("%q logged at %s, want %s", msg, level, want)
+		}
 	}
 }

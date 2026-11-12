@@ -151,8 +151,13 @@ clusters_secret="$(DATA="$kubeconfigs" NS="$namespace" yq -n '
 # objects of the chart, replaces the image tag by the pinned digest, and removes the Istio proxy
 # annotation. Pods/portforward leaves the viewer Role: no workload of the plane may forward a port.
 # The chart makes a new random login signing key at each render, which would restart Kiali at each
-# link phase. The anonymous login signs no token, so the key is a fixed value without a secret.
-signing_key="$(printf 'kiali anonymous login of %s' "$namespace" | sha256 | cut -c1-32)"
+# link phase. The render derives a key from the root of the trust domain of this cluster, so each
+# install has its own key, and none is in the repository. The External Secrets Operator of this
+# cluster serves one namespace, observability-system, so it cannot make this Secret. The key signs
+# nothing under the anonymous strategy. The render refuses any other strategy, because a key that
+# derives from public roots must never protect a login.
+[[ "$(yq -r '.auth.strategy' "$here/kiali-values.yaml")" == anonymous ]] || die "auth.strategy in kiali-values.yaml is not anonymous, and the login signing key is derived from public roots"
+signing_key="$(printf 'kiali login of %s\n%s' "$namespace" "$own_bundle" | sha256 | cut -c1-32)"
 kiali="$(helm template kiali "$chart" --namespace "$namespace" --kube-version 1.37.0 --values "$here/kiali-values.yaml" \
     --set "login_token.signing_key=$signing_key" \
   | KIALI_IMAGE="$KIALI_IMAGE" SUM="$clusters_sum" yq 'select(.kind != null)
@@ -177,10 +182,13 @@ kinds="$(yq -N '.kind' <<<"$kiali" | sort | paste -sd' ' -)"
 
 # The home cluster cache of Kiali watches each namespace of the list too, even with
 # ignore_home_cluster, and it stops when the API server refuses one. So the viewer Role and its
-# binding exist in each namespace of the list in management.
+# binding exist in each namespace of the list in management. The home manager does not cache
+# ConfigMaps, so the copies of the Role grant none.
 viewer_roles="$(for n in "${mesh_namespaces[@]}"; do
   [[ "$n" == "$namespace" ]] && continue
-  NS="$n" yq 'select(.kind == "Role" or .kind == "RoleBinding") | .metadata.namespace = strenv(NS)' <<<"$kiali"
+  NS="$n" yq 'select(.kind == "Role" or .kind == "RoleBinding") | .metadata.namespace = strenv(NS)
+    | (select(.kind == "Role") | .rules[].resources) |= map(select(. != "configmaps"))
+    | (select(.kind == "Role") | .rules) |= map(select(.resources | length > 0))' <<<"$kiali"
   echo "---"
 done)"
 

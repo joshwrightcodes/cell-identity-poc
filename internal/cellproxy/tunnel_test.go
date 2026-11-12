@@ -204,6 +204,8 @@ type tunnelHarnessConfig struct {
 	metrics  *TunnelMetrics
 	// maxStreams is the stream cap of the hub. Zero means the default.
 	maxStreams int
+	// hubLeafLife is the lifetime of the SVID of the hub. Zero means a long one.
+	hubLeafLife time.Duration
 }
 
 func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
@@ -235,8 +237,12 @@ func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness 
 	}
 	h.accepted = &trackListener{Listener: ln}
 	h.server = ln.Addr().String()
+	hubSVID := h.mgmt.svid(t, kialiID)
+	if cfg.hubLeafLife > 0 {
+		hubSVID = h.mgmt.svidUntil(t, kialiID, time.Now().Add(cfg.hubLeafLife))
+	}
 	srv := NewServer(ServerConfig{
-		TLS: ServerTLS(source(h.mgmt.svid(t, kialiID)), h.env.bundle(), regexp.MustCompile(cfg.allow), cfg.registry, log),
+		TLS: ServerTLS(source(hubSVID), h.env.bundle(), regexp.MustCompile(cfg.allow), cfg.registry, log),
 	}, NewTunnelBackend(h.hub), log)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stopServer, h.serverDone = cancel, make(chan struct{})
@@ -597,8 +603,12 @@ type lifeConn struct {
 	net.Conn
 	clock *fakeClock
 	life  time.Duration
-	once  sync.Once
+	// expiry is the SVID expiry that the connection reports. Zero means it reports none.
+	expiry time.Time
+	once   sync.Once
 }
+
+func (c *lifeConn) Expiry() time.Time { return c.expiry }
 
 func (c *lifeConn) Read([]byte) (int, error) {
 	c.once.Do(func() { c.clock.advance(c.life) })
@@ -608,7 +618,7 @@ func (c *lifeConn) Read([]byte) (int, error) {
 func (c *lifeConn) Write(p []byte) (int, error) { return len(p), nil }
 
 func TestTunnelBackoffResets(t *testing.T) {
-	run := func(t *testing.T, life time.Duration) []time.Duration {
+	run := func(t *testing.T, life time.Duration, svidLife ...time.Duration) []time.Duration {
 		t.Helper()
 		clock := &fakeClock{t: time.Unix(0, 0)}
 		ctx, cancel := context.WithCancel(t.Context())
@@ -623,7 +633,11 @@ func TestTunnelBackoffResets(t *testing.T) {
 			case step == 6:
 				a, b := net.Pipe()
 				t.Cleanup(func() { _ = a.Close(); _ = b.Close() })
-				return &lifeConn{Conn: a, clock: clock, life: life}, nil
+				lc := &lifeConn{Conn: a, clock: clock, life: life}
+				if len(svidLife) > 0 {
+					lc.expiry = clock.now().Add(svidLife[0])
+				}
+				return lc, nil
 			}
 			cancel()
 			return nil, errors.New("stopped")
@@ -656,6 +670,13 @@ func TestTunnelBackoffResets(t *testing.T) {
 		sleeps := run(t, 30*time.Second)
 		if d := sleeps[5]; d < time.Second || d > 1500*time.Millisecond {
 			t.Fatalf("sleep after a 30-second connection is %s, want 1 second plus jitter", d)
+		}
+	})
+	// With an SVID of 20 seconds, a tunnel that lived 10 seconds, half of that life, is stable.
+	t.Run("half of a short SVID life", func(t *testing.T) {
+		sleeps := run(t, 10*time.Second, 20*time.Second)
+		if d := sleeps[5]; d < time.Second || d > 1500*time.Millisecond {
+			t.Fatalf("sleep after a tunnel that lived half of its SVID life is %s, want 1 second plus jitter", d)
 		}
 	})
 	t.Run("after 29 seconds", func(t *testing.T) {

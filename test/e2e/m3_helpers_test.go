@@ -224,7 +224,17 @@ func listenAddrs(t *testing.T, cluster, ns, pod, container string) []string {
 // canI runs kubectl auth can-i as a user. An empty ns asks for every namespace.
 func canI(t *testing.T, cluster, as, verb, resource, ns string) bool {
 	t.Helper()
+	return canISub(t, cluster, as, verb, resource, "", ns)
+}
+
+// canISub is canI for a subresource. kubectl reads "pods/portforward" as the pod named portforward, so a
+// subresource needs its own flag.
+func canISub(t *testing.T, cluster, as, verb, resource, subresource, ns string) bool {
+	t.Helper()
 	args := []string{"--context", "kind-" + cluster, "auth", "can-i", verb, resource, "--as", as}
+	if subresource != "" {
+		args = append(args, "--subresource="+subresource)
+	}
 	if ns == "" {
 		args = append(args, "--all-namespaces")
 	} else {

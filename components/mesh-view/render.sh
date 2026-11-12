@@ -4,8 +4,8 @@
 #
 # The bundle holds Namespace mesh-view-system with a default deny, the tunnel Deployment with
 # cell-proxy and a cluster_jwt SPIRE agent sidecar (tunnel.yaml), ConfigMap mgmt-root, the
-# ClusterRole mesh-view-read and its binding, the Role for ConfigMaps in istio-system, and the
-# NetworkPolicies of flows N22, N24 and N11. Every object and the pod template carry the harness
+# ClusterRole mesh-view-read and its binding, the Role for ConfigMaps in istio-system, the read-only
+# guard of the ServiceAccount (guard.yaml), and the NetworkPolicies of flows N22, N24 and N11. Every object and the pod template carry the harness
 # label cell.poc.internal/harness=mesh-view.
 #
 # The render reads these facts from outside the cell:
@@ -167,6 +167,8 @@ EOF2
   policies
   echo "---"
   yq 'select(.kind != "Deployment")' <<<"$manifests"
+  echo "---"
+  sed "s|@POC_ENV@|$POC_ENV|g" "$here/guard.yaml"
   echo "---"
   echo "$deployment"
   echo "---"

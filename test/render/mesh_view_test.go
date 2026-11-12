@@ -125,6 +125,32 @@ func TestMeshViewCellRender(t *testing.T) {
 					t.Errorf("no %s", name)
 				}
 			}
+			// The guard denies update, delete and connect, and every create but the bound token of its own
+			// SPIRE agent and the access review of the allow-list.
+			vap := objs["ValidatingAdmissionPolicy mesh-view-read-only"]
+			if vap == nil || objs["ValidatingAdmissionPolicyBinding mesh-view-read-only"] == nil {
+				t.Fatal("no ValidatingAdmissionPolicy and binding mesh-view-read-only")
+			}
+			if got := get[string](t, vap, "spec", "matchConditions", 0, "expression"); !strings.Contains(got, `"system:serviceaccount:mesh-view-system:mesh-view"`) {
+				t.Errorf("the guard matches %s, want the ServiceAccount mesh-view", got)
+			}
+			ops := fmt.Sprint(lookupOr(vap, "spec", "matchConstraints", "resourceRules", 0, "operations"))
+			if ops != "[CREATE UPDATE DELETE CONNECT]" || lookupOr(vap, "spec", "failurePolicy") != "Fail" {
+				t.Errorf("the guard covers %s with failurePolicy %v", ops, lookupOr(vap, "spec", "failurePolicy"))
+			}
+			var all strings.Builder
+			for _, v := range get[[]any](t, vap, "spec", "validations") {
+				all.WriteString(get[string](t, v, "expression") + "\n")
+			}
+			for _, want := range []string{"'DELETE', 'CONNECT'", "request.operation != 'UPDATE'", "request.namespace == 'mesh-view-system'", "request.name == 'mesh-view'",
+				"object.spec.audiences.size() == 1", "^spire-" + commonEnv(t, "POC_ENV") + "/", "boundObjectRef.kind == 'Pod'", "authentication.kubernetes.io/pod-uid", "selfsubjectaccessreviews"} {
+				if !strings.Contains(all.String(), want) {
+					t.Errorf("the guard expressions lack %q:\n%s", want, all.String())
+				}
+			}
+			if strings.Contains(all.String(), "@POC_ENV@") {
+				t.Error("the guard keeps a token")
+			}
 		})
 	}
 }
@@ -329,6 +355,22 @@ func TestKialiRender(t *testing.T) {
 		if slices.Contains(res, "pods/portforward") || slices.Contains(res, "secrets") {
 			t.Errorf("the viewer Role grants %v", res)
 		}
+	}
+	// The home manager does not cache ConfigMaps, so the Roles in management grant none.
+	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress"} {
+		for _, rule := range get[[]any](t, objs["Role "+ns+"/kiali-viewer"], "rules") {
+			if len(strList(t, lookupOr(rule, "resources"))) == 0 {
+				t.Errorf("the viewer Role in %s has a rule with no resource, which the API server refuses", ns)
+			}
+			if slices.Contains(strList(t, lookupOr(rule, "resources")), "configmaps") {
+				t.Errorf("the viewer Role in %s grants ConfigMaps", ns)
+			}
+		}
+	}
+	// The login signing key is not a fixed value of the repository, and it follows the cluster root.
+	if got := get[map[string]any](t, objs["ConfigMap mesh-view-system/kiali"], "data"); !strings.Contains(fmt.Sprint(got["config.yaml"]), "signing_key:") ||
+		strings.Contains(fmt.Sprint(got["config.yaml"]), "0d89aa340a280b663793fcd998d76be6") {
+		t.Error("the Kiali config has no signing key, or the old fixed one")
 	}
 	// The home cluster cache of Kiali watches each namespace of the list, so each has the viewer Role.
 	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"} {
