@@ -54,6 +54,11 @@ func rootPEM(t *testing.T, o rootOpts) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
+func pemBytes(p []byte) []byte {
+	b, _ := pem.Decode(p)
+	return b.Bytes
+}
+
 func writeTemp(t *testing.T, data []byte) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), "roots.pem")
@@ -106,6 +111,7 @@ func TestLoadClientRootsRefuses(t *testing.T) {
 		"leading text":    append([]byte("junk\n"), good...),
 		"wrong block":     pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("x")}),
 		"not a cert":      pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("x")}),
+		"block headers":   pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"a": "b"}, Bytes: pemBytes(good)}),
 		"empty":           nil,
 		"whitespace only": []byte("\n\n"),
 	}

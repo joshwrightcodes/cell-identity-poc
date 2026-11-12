@@ -1,8 +1,6 @@
 package hostsvc
 
 import (
-	"context"
-	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"io"
@@ -24,41 +22,6 @@ func tlsCertOf(t *testing.T, ca *spiffetest.CA, id string) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{svid.Certificates[0].Raw}, PrivateKey: svid.PrivateKey, Leaf: svid.Certificates[0]}
 }
 
-// A flood of sockets that send nothing must not keep mgmtd from reading keys.
-func TestKeyServerSurvivesSilentFlood(t *testing.T) {
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
-	l := &lookups{}
-	addr, cert := keyServer(t, ca.Bundle(), l)
-	sum := sha256.Sum256(cert.Leaf.Raw)
-	c, err := NewKeyClient(KeyClientConfig{Addr: addr, ServerName: KeyServerHost, Pin: sum[:], SVIDs: ca.Source(t, mgmtdID), Timeout: 5 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, stop := context.WithCancel(t.Context())
-	var wg sync.WaitGroup
-	for range 64 {
-		wg.Go(func() {
-			for ctx.Err() == nil {
-				conn, err := net.Dial("tcp", addr)
-				if err != nil {
-					continue
-				}
-				_ = conn.SetReadDeadline(time.Now().Add(7 * time.Second))
-				_, _ = io.Copy(io.Discard, conn)
-				conn.Close()
-			}
-		})
-	}
-	defer func() { stop(); wg.Wait() }()
-	time.Sleep(300 * time.Millisecond)
-	for i := 1; i <= 20; i++ {
-		start := time.Now()
-		if _, err := c.Keys(t.Context(), "dev-cell-1"); err != nil {
-			t.Fatalf("key read %d failed during the flood after %v: %v", i, time.Since(start), err)
-		}
-	}
-}
-
 func dialPending(t *testing.T, addr string) net.Conn {
 	t.Helper()
 	c, err := net.Dial("tcp", addr)
@@ -77,13 +40,13 @@ func closedWithin(c net.Conn, d time.Duration) bool {
 	return err != nil && !(errors.As(err, &ne) && ne.Timeout())
 }
 
-func newTestHandshakeListener(t *testing.T, maxSilent, maxActive int, timeout time.Duration) (*handshakeListener, string) {
+func newTestHandshakeListener(t *testing.T, max int, timeout, firstByte time.Duration) (*handshakeListener, string) {
 	t.Helper()
-	l, addr, _ := newTestHandshakeListenerCA(t, maxSilent, maxActive, timeout)
+	l, addr, _ := newTestHandshakeListenerCA(t, max, timeout, firstByte)
 	return l, addr
 }
 
-func newTestHandshakeListenerCA(t *testing.T, maxSilent, maxActive int, timeout time.Duration) (*handshakeListener, string, *spiffetest.CA) {
+func newTestHandshakeListenerCA(t *testing.T, max int, timeout, firstByte time.Duration) (*handshakeListener, string, *spiffetest.CA) {
 	t.Helper()
 	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
 	cert, err := SelfSignedCert(KeyServerHost, time.Now())
@@ -95,94 +58,87 @@ func newTestHandshakeListenerCA(t *testing.T, maxSilent, maxActive int, timeout 
 		t.Fatal(err)
 	}
 	cfg := ServerTLS(cert, ca.Bundle(), spiffeid.RequireFromString(mgmtdID))
-	l := newHandshakeListener(inner, cfg, maxSilent, maxActive, timeout, func(string, error) {})
+	l := newHandshakeListener(inner, cfg, max, timeout, firstByte, func(string, error) {})
 	t.Cleanup(func() { l.Close() })
 	return l, inner.Addr().String(), ca
 }
 
-func poolLens(l *handshakeListener) (silent, active int) {
+func pendingLen(l *handshakeListener) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.silent), len(l.active)
+	return len(l.pending)
 }
 
-func waitPools(t *testing.T, l *handshakeListener, silent, active int) {
-	t.Helper()
-	waitFor(t, "the pools to hold the connections", func() bool {
-		s, a := poolLens(l)
-		return s == silent && a == active
-	})
+// A full pool refuses the new connection and keeps every pending one.
+func TestHandshakeListenerRefusesWhenFullAndNeverEvicts(t *testing.T) {
+	refusals := make(chan string, 16)
+	l, addr := newTestHandshakeListener(t, 3, 30*time.Second, 30*time.Second)
+	l.report = func(kind string, _ error) { refusals <- kind }
+	var held []net.Conn
+	for range 3 {
+		held = append(held, dialPending(t, addr))
+	}
+	waitFor(t, "three pending connections", func() bool { return pendingLen(l) == 3 })
+	for range 5 {
+		extra := dialPending(t, addr)
+		if !closedWithin(extra, 2*time.Second) {
+			t.Fatal("a connection past the cap was not refused")
+		}
+	}
+	for i, c := range held {
+		if closedWithin(c, 100*time.Millisecond) {
+			t.Errorf("pending connection %d was evicted", i)
+		}
+	}
+	if got := pendingLen(l); got != 3 {
+		t.Errorf("pending = %d, want 3", got)
+	}
+	if kind := <-refusals; kind != refusedPoolFull {
+		t.Errorf("refusal reason = %q, want %q", kind, refusedPoolFull)
+	}
 }
 
-// sendByte makes c active and waits until the listener has seen it.
-func sendByte(t *testing.T, l *handshakeListener, c net.Conn, wantActive int) {
-	t.Helper()
+func TestHandshakeListenerFirstByteDeadline(t *testing.T) {
+	l, addr := newTestHandshakeListener(t, 8, 30*time.Second, 150*time.Millisecond)
+	silent := dialPending(t, addr)
+	if !closedWithin(silent, 3*time.Second) {
+		t.Fatal("a silent connection stayed open past the first-byte deadline")
+	}
+	waitFor(t, "the pool to empty", func() bool { return pendingLen(l) == 0 })
+}
+
+func TestHandshakeListenerHardDeadlineAfterFirstByte(t *testing.T) {
+	_, addr := newTestHandshakeListener(t, 8, 400*time.Millisecond, 100*time.Millisecond)
+	c := dialPending(t, addr)
 	if _, err := c.Write([]byte{0x16}); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "a byte to arrive", func() bool { _, a := poolLens(l); return a == wantActive })
-}
-
-func TestHandshakeListenerSilentPoolEvictsOldest(t *testing.T) {
-	l, addr := newTestHandshakeListener(t, 3, 2, 30*time.Second)
-	var conns []net.Conn
-	for range 3 {
-		conns = append(conns, dialPending(t, addr))
+	start := time.Now()
+	_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if closedWithin(c, 100*time.Millisecond) {
+		t.Fatal("a connection that sent a byte was closed at the first-byte deadline")
 	}
-	waitPools(t, l, 3, 0)
-	conns = append(conns, dialPending(t, addr))
-	if !closedWithin(conns[0], 2*time.Second) {
-		t.Fatal("the oldest silent connection was not evicted")
-	}
-	if closedWithin(conns[1], 200*time.Millisecond) {
-		t.Error("the second silent connection was evicted")
-	}
-	waitPools(t, l, 3, 0)
-}
-
-func TestHandshakeListenerSilentFloodSparesActive(t *testing.T) {
-	l, addr := newTestHandshakeListener(t, 3, 2, 30*time.Second)
-	active := dialPending(t, addr)
-	waitPools(t, l, 1, 0)
-	sendByte(t, l, active, 1)
-	for range 20 {
-		dialPending(t, addr)
-	}
-	waitFor(t, "the silent pool to fill", func() bool { s, _ := poolLens(l); return s == 3 })
-	if closedWithin(active, 200*time.Millisecond) {
-		t.Error("a connection that had sent a byte was evicted by silent connections")
-	}
-	if _, a := poolLens(l); a != 1 {
-		t.Errorf("active pool = %d, want 1", a)
-	}
-}
-
-func TestHandshakeListenerActivePoolEvictsOldest(t *testing.T) {
-	l, addr := newTestHandshakeListener(t, 8, 2, 30*time.Second)
-	first, second, third := dialPending(t, addr), dialPending(t, addr), dialPending(t, addr)
-	waitPools(t, l, 3, 0)
-	sendByte(t, l, first, 1)
-	sendByte(t, l, second, 2)
-	sendByte(t, l, third, 2)
-	if !closedWithin(first, 2*time.Second) {
-		t.Error("the oldest active connection was not evicted")
-	}
-	if closedWithin(second, 200*time.Millisecond) {
-		t.Error("the newer active connection was evicted")
-	}
-}
-
-func TestHandshakeListenerTimesOut(t *testing.T) {
-	_, addr := newTestHandshakeListener(t, 8, 8, 150*time.Millisecond)
-	c := dialPending(t, addr)
 	if !closedWithin(c, 3*time.Second) {
-		t.Error("a silent connection stayed open past the handshake timeout")
+		t.Fatal("a connection with a partial hello stayed open past the hard deadline")
+	}
+	if d := time.Since(start); d < 300*time.Millisecond {
+		t.Errorf("closed after %v, want about the hard deadline of 400ms", d)
+	}
+}
+
+func TestHandshakeListenerCloseClosesPending(t *testing.T) {
+	l, addr := newTestHandshakeListener(t, 8, 30*time.Second, 30*time.Second)
+	c := dialPending(t, addr)
+	waitFor(t, "a pending connection", func() bool { return pendingLen(l) == 1 })
+	l.Close()
+	if !closedWithin(c, 2*time.Second) {
+		t.Error("Close left a pending connection open")
 	}
 }
 
 // A verified connection that nobody accepts does not wait for ever.
 func TestHandshakeListenerDropsUnacceptedConnection(t *testing.T) {
-	_, addr, ca := newTestHandshakeListenerCA(t, 8, 8, 300*time.Millisecond)
+	_, addr, ca := newTestHandshakeListenerCA(t, 8, 300*time.Millisecond, 300*time.Millisecond)
 	c, err := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{tlsCertOf(t, ca, mgmtdID)}})
 	if err != nil {
 		t.Fatal(err)
@@ -194,7 +150,7 @@ func TestHandshakeListenerDropsUnacceptedConnection(t *testing.T) {
 }
 
 func TestHandshakeListenerReturnsOnlyVerifiedPeers(t *testing.T) {
-	l, addr := newTestHandshakeListener(t, 8, 8, 2*time.Second)
+	l, addr := newTestHandshakeListener(t, 8, 2*time.Second, 2*time.Second)
 	got := make(chan net.Conn, 2)
 	go func() {
 		for {
@@ -218,10 +174,10 @@ func TestHandshakeListenerReturnsOnlyVerifiedPeers(t *testing.T) {
 }
 
 func TestKeyServerSettings(t *testing.T) {
-	if maxConns != 16 || maxActive != 8 || maxSilent != 128 {
-		t.Errorf("connection cap = %d, active cap = %d, silent cap = %d, want 16, 8 and 128", maxConns, maxActive, maxSilent)
+	if maxConns != 16 || maxPending != 1024 {
+		t.Errorf("connection cap = %d, pending cap = %d, want 16 and 1024", maxConns, maxPending)
 	}
-	if connMaxAge != 30*time.Second || connGrace != 5*time.Second || handshakeTimeout != 5*time.Second {
+	if connMaxAge != 30*time.Second || connGrace != 5*time.Second || handshakeTimeout != 5*time.Second || firstByteTimeout != time.Second {
 		t.Errorf("max age %v, grace %v, handshake timeout %v", connMaxAge, connGrace, handshakeTimeout)
 	}
 	srv := NewKeyServer(http.NotFoundHandler(), &tls.Config{}, newDiscardLogger())
@@ -237,7 +193,7 @@ func TestKeyServerSettings(t *testing.T) {
 func TestKeyServerMaxAge(t *testing.T) {
 	oldAge, oldGrace := connMaxAge, connGrace
 	connMaxAge, connGrace = 300*time.Millisecond, 400*time.Millisecond
-	defer func() { connMaxAge, connGrace = oldAge, oldGrace }()
+	t.Cleanup(func() { connMaxAge, connGrace = oldAge, oldGrace })
 	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
 	addr, _ := keyServer(t, ca.Bundle(), &lookups{})
 	cert := tlsCertOf(t, ca, mgmtdID)

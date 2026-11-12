@@ -21,10 +21,11 @@ import (
 // stuckRuntime blocks one runtime call until release closes, and counts the calls that run.
 type stuckRuntime struct {
 	*fakeRuntime
-	stuck   string
-	release chan struct{}
-	running atomic.Int32
-	started atomic.Int32
+	stuck       string
+	release     chan struct{}
+	running     atomic.Int32
+	kubeconfigs atomic.Int32
+	started     atomic.Int32
 }
 
 func (s *stuckRuntime) hang(name string) {
@@ -40,6 +41,7 @@ func (s *stuckRuntime) hang(name string) {
 func (s *stuckRuntime) List() ([]string, error)          { s.hang("List"); return s.fakeRuntime.List() }
 func (s *stuckRuntime) Create(c *v1alpha4.Cluster) error { return s.fakeRuntime.Create(c) }
 func (s *stuckRuntime) Kubeconfig(n string) (string, error) {
+	s.kubeconfigs.Add(1)
 	s.hang("Kubeconfig")
 	return s.fakeRuntime.Kubeconfig(n)
 }

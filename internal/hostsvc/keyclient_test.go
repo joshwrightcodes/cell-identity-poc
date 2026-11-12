@@ -301,3 +301,16 @@ func TestKeyClientRefusesExpiredPinnedLeaf(t *testing.T) {
 		t.Errorf("the server saw %d requests, want 0", hits.Load())
 	}
 }
+
+func newNoCertTransport() *http.Transport {
+	return &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}, DisableKeepAlives: true}
+}
+
+func newMgmtClient(t *testing.T, ca *spiffetest.CA) *http.Client {
+	t.Helper()
+	cert := tlsCertOf(t, ca, mgmtdID)
+	return &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}},
+	}}
+}

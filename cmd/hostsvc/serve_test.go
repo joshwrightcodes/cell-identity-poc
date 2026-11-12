@@ -12,6 +12,8 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"io"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -24,7 +26,13 @@ import (
 	"testing"
 	"time"
 
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 const topologyFile = "../../harness/topology.yaml"
@@ -572,4 +580,112 @@ func tlsServer(t *testing.T) (tls.Certificate, string) {
 		}
 	}()
 	return cert, ln.Addr().String()
+}
+
+func TestServeRefusesLowFileLimit(t *testing.T) {
+	old := nofileSoftLimit
+	nofileSoftLimit = func() (uint64, error) { return 256, nil }
+	t.Cleanup(func() { nofileSoftLimit = old })
+	ca := newMgmtCA(t)
+	var out syncBuffer
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	code := execute(ctx, []string{"serve", "--listen", "127.0.0.1:0", "--client-bundle", writeBundle(t, ca), "--topology", topologyFile}, &out)
+	if code != 2 {
+		t.Errorf("exit code = %d, want 2", code)
+	}
+	lines := jsonLines(t, out.String())
+	msg, _ := lines[0]["error"].(string)
+	if len(lines) != 1 || !strings.Contains(msg, "RLIMIT_NOFILE") || !strings.Contains(msg, "256") {
+		t.Errorf("output = %q, want one error line that names the limit", out.String())
+	}
+}
+
+func TestServeAcceptsEnoughFiles(t *testing.T) {
+	old := nofileSoftLimit
+	nofileSoftLimit = func() (uint64, error) { return hostsvc.FilesNeeded(), nil }
+	t.Cleanup(func() { nofileSoftLimit = old })
+	startServe(t, writeBundle(t, newMgmtCA(t)))
+}
+
+// With an OTLP endpoint, serve installs the instrumented handler and counts refused handshakes.
+func TestServeInstallsInstrumentedHandler(t *testing.T) {
+	rec := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(rec))
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	old := startTelemetry
+	startTelemetry = func(context.Context, string, io.Writer) (*telemetry.T, error) {
+		return &telemetry.T{Log: slog.Default(), Tracer: tp.Tracer("t"), Meter: mp.Meter("m"), Shutdown: func(context.Context) error { return nil }}, nil
+	}
+	t.Cleanup(func() { startTelemetry = old })
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+
+	ca := newMgmtCA(t)
+	r := startServe(t, writeBundle(t, ca))
+	cert := mgmtClientCert(t, ca)
+	client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
+		DisableKeepAlives: true,
+		TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}},
+	}}
+	resp, err := client.Get("https://" + r.addr + "/v1/clusters/rogue/keys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	bad := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{
+		DisableKeepAlives: true, TLSClientConfig: &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13},
+	}}
+	if resp, err := bad.Get("https://" + r.addr + "/x"); err == nil {
+		resp.Body.Close()
+	}
+
+	var outcome bool
+	for _, s := range rec.Ended() {
+		for _, a := range s.Attributes() {
+			if a.Key == "outcome" && a.Value.AsString() == "unknown_cluster" {
+				outcome = true
+			}
+		}
+	}
+	if !outcome {
+		t.Errorf("no span with outcome unknown_cluster among %d spans", len(rec.Ended()))
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var failed, requests int64
+	for time.Now().Before(deadline) {
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(context.Background(), &rm); err != nil {
+			t.Fatal(err)
+		}
+		failed, requests = 0, 0
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				sum, ok := m.Data.(metricdata.Sum[int64])
+				if !ok {
+					continue
+				}
+				for _, dp := range sum.DataPoints {
+					v, _ := dp.Attributes.Value("reason")
+					o, _ := dp.Attributes.Value("outcome")
+					if m.Name == "hostsvc.key.handshake.refusals" && v.AsString() == "handshake_failed" {
+						failed += dp.Value
+					}
+					if m.Name == "hostsvc.key.requests" && o.AsString() == "unknown_cluster" {
+						requests += dp.Value
+					}
+				}
+			}
+		}
+		if failed >= 1 && requests >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if failed < 1 || requests < 1 {
+		t.Errorf("handshake_failed refusals = %d, unknown_cluster requests = %d, want at least 1 each", failed, requests)
+	}
 }

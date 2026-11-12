@@ -25,6 +25,10 @@ import (
 	"strings"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
+
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
@@ -43,8 +47,7 @@ const (
 	MgmtTrustDomain = "mgmt.poc.internal"
 
 	maxConns        = 16
-	maxActive       = 8
-	maxSilent       = 128
+	filesMargin     = 64
 	denialWindow    = 10 * time.Second
 	denialMaxKeys   = 16
 	shutdownTimeout = 5 * time.Second
@@ -55,7 +58,23 @@ var (
 	connMaxAge       = 30 * time.Second
 	connGrace        = 5 * time.Second
 	handshakeTimeout = 5 * time.Second
+	firstByteTimeout = 1 * time.Second
+	// maxPending is the size of the pool of connections that have not finished the TLS handshake.
+	maxPending = 1024
 )
+
+// FilesNeeded returns the number of open files that the server may need at once: the pending pool,
+// the verified connections and a margin for the rest of the process.
+func FilesNeeded() uint64 { return uint64(maxPending + maxConns + filesMargin) }
+
+// CheckFileLimit returns an error when the soft limit on open files is below FilesNeeded.
+func CheckFileLimit(soft uint64) error {
+	if need := FilesNeeded(); soft < need {
+		return fmt.Errorf("soft limit on open files (RLIMIT_NOFILE) is %d, below the %d that the key server needs (%d pending connections, %d verified connections and %d more)",
+			soft, need, maxPending, maxConns, filesMargin)
+	}
+	return nil
+}
 
 // SelfSignedCert makes an ECDSA P-256 key and a server certificate for host that is valid from one
 // minute before now for 90 days. The key stays in memory.
@@ -269,8 +288,10 @@ func NewKeyServer(h http.Handler, tc *tls.Config, logger *slog.Logger) *http.Ser
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    8 << 10,
-		ConnContext:       connlimit.ConnContext,
-		ErrorLog:          errLog,
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return connContext(ctx, c, connlimit.ConnContext)
+		},
+		ErrorLog: errLog,
 	}
 }
 
@@ -279,19 +300,29 @@ type writerFunc func([]byte) (int, error)
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
 // ServeKeys serves srv on ln, with TLS from srv.TLSConfig. The TLS handshake and the check of the
-// client certificate run before a connection takes one of the 16 connection slots, in a small pool
-// of pending handshakes (see newHandshakeListener). The slots count only verified peers, and each
-// connection has a maximum age. It returns nil after ctx ends and the server has shut down. Failed
-// and evicted handshakes go to log, at most one line of each kind in each window.
-func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener, logger *slog.Logger) error {
+// client certificate run before a connection takes one of the 16 connection slots, in one pool of
+// pending handshakes (see newHandshakeListener). The slots count only verified peers, and each
+// connection has a maximum age. Handlers see the verified peer through PeerID, and Request.TLS is
+// nil. It returns nil after ctx ends and the server has shut down. Refused handshakes go to logger
+// at most one line of each reason in each window, and to the counter hostsvc.key.handshake.refusals
+// of meter, labelled by reason. A nil meter counts nothing.
+func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener, logger *slog.Logger, meter metric.Meter) error {
+	if meter == nil {
+		meter = metricnoop.NewMeterProvider().Meter("hostsvc")
+	}
+	refusals, err := meter.Int64Counter("hostsvc.key.handshake.refusals", metric.WithDescription("Refused connections by reason."))
+	if err != nil {
+		return err
+	}
 	limit := lograte.New(denialWindow, denialMaxKeys, time.Now)
 	report := func(kind string, err error) {
+		refusals.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", kind)))
 		_, ok, suppressed, _ := limit.Allow(kind)
 		if ok {
 			logger.Warn("handshake refused", "reason", kind, "error", err.Error(), "suppressed", suppressed)
 		}
 	}
-	hl := newHandshakeListener(ln, srv.TLSConfig, maxSilent, maxActive, handshakeTimeout, report)
+	hl := newHandshakeListener(ln, srv.TLSConfig, maxPending, handshakeTimeout, firstByteTimeout, report)
 	limited := connlimit.Listen(hl, maxConns, connMaxAge, connGrace, nil)
 	done := make(chan struct{})
 	defer close(done)
@@ -306,7 +337,7 @@ func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener, logger *s
 		case <-done:
 		}
 	}()
-	err := srv.Serve(limited)
+	err = srv.Serve(limited)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

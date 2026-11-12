@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
@@ -47,8 +48,38 @@ func main() {
 // A failure is one JSON error line on stdout, so the facts command prints only data on success.
 func execute(ctx context.Context, args []string, stdout io.Writer) int {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(stdout, nil)))
-	return cli.Run(stdout, "hostsvc", func(out io.Writer) error { return run(ctx, args, out, stdout) })
+	var exit *exitError
+	code := cli.Run(stdout, "hostsvc", func(out io.Writer) error {
+		err := run(ctx, args, out, stdout)
+		errors.As(err, &exit)
+		return err
+	})
+	if code != 0 && exit != nil {
+		return exit.code
+	}
+	return code
 }
+
+// exitError is an error with its own exit code.
+type exitError struct {
+	code int
+	err  error
+}
+
+func (e *exitError) Error() string { return e.err.Error() }
+func (e *exitError) Unwrap() error { return e.err }
+
+// Hooks that tests replace.
+var (
+	startTelemetry  = telemetry.Start
+	nofileSoftLimit = func() (uint64, error) {
+		var r syscall.Rlimit
+		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &r); err != nil {
+			return 0, err
+		}
+		return uint64(r.Cur), nil
+	}
+)
 
 // run runs one command. It writes data to out, and the logs of serve go to logOut.
 func run(ctx context.Context, args []string, out, logOut io.Writer) error {
@@ -126,6 +157,13 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 	if err := hostsvc.CheckLoopbackAddr(listen); err != nil {
 		return err
 	}
+	soft, err := nofileSoftLimit()
+	if err != nil {
+		return fmt.Errorf("read the limit on open files: %w", err)
+	}
+	if err := hostsvc.CheckFileLimit(soft); err != nil {
+		return &exitError{code: 2, err: err}
+	}
 	id, err := spiffeid.FromString(clientID)
 	if err != nil {
 		return fmt.Errorf("client id: %w", err)
@@ -153,7 +191,7 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 	log := slog.Default()
 	var tel *telemetry.T
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
-		t, err := telemetry.Start(ctx, "hostsvc", logOut)
+		t, err := startTelemetry(ctx, "hostsvc", logOut)
 		if err != nil {
 			return fmt.Errorf("start telemetry: %w", err)
 		}
@@ -180,7 +218,11 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 	certSum := sha256.Sum256(cert.Leaf.Raw)
 	log.Info("serving", "addr", ln.Addr().String(), "cert_sha256", hex.EncodeToString(certSum[:]),
 		"root_sha256", roots.SHA256(), "pid", os.Getpid(), "client_id", id.String(), "clusters", cells)
-	return hostsvc.ServeKeys(ctx, srv, ln, log)
+	var meter metric.Meter
+	if tel != nil {
+		meter = tel.Meter
+	}
+	return hostsvc.ServeKeys(ctx, srv, ln, log, meter)
 }
 
 // pin makes one handshake that accepts any certificate, and prints the leaf as one PEM block.

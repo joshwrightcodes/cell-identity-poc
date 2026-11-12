@@ -1,70 +1,91 @@
 package hostsvc
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 )
 
-// errEvicted is the reason for a pending handshake that a newer connection pushed out.
-var errEvicted = errors.New("handshake evicted by a newer connection")
+// Reasons of a refused connection, as logged and as the label of the refusal metric.
+const (
+	refusedPoolFull  = "pool_full"
+	refusedTimeout   = "handshake_timeout"
+	refusedFailed    = "handshake_failed"
+	refusedUndeliver = "not_accepted"
+)
+
+// peerIDs maps a verified connection (by its two addresses) to the SPIFFE ID of its peer, from the
+// end of the handshake until ConnContext reads it.
+var peerIDs sync.Map
+
+type peerCtxKey struct{}
+
+func connKey(c net.Conn) string { return c.LocalAddr().String() + ">" + c.RemoteAddr().String() }
+
+// PeerID returns the SPIFFE ID of the verified client of a request. The server runs the TLS
+// handshake before the HTTP server sees the connection, so Request.TLS is nil and a handler reads
+// the peer from the request context instead.
+func PeerID(ctx context.Context) (spiffeid.ID, bool) {
+	id, ok := ctx.Value(peerCtxKey{}).(spiffeid.ID)
+	return id, ok
+}
 
 // handshakeListener runs the TLS handshake of each accepted connection, and returns only
 // connections whose handshake succeeded. The TLS config checks the client certificate during the
 // handshake, so every connection that Accept returns has a verified peer.
 //
-// Connections that have not finished the handshake live in two pools, and each has the timeout to
-// finish. A connection starts in the silent pool, which holds at most maxSilent connections, because
-// a client that has sent no byte costs the server only a socket. A connection moves to the active
-// pool when its first byte arrives. The active pool holds at most maxActive connections, the
-// handshakes in progress. A full pool evicts its oldest connection, so a client that sends its hello
-// at once always gets a turn, and silent sockets can never push an active handshake out. Accept
-// never blocks on the pools, so a flood cannot keep a later connection waiting in the kernel queue.
+// Connections that have not finished the handshake share one pool of at most max. A full pool
+// refuses the new connection at once and never evicts a pending one, so a flood costs the real
+// client nothing until the pool is full. A pending connection has firstByte to send its first byte
+// and timeout in all, counted from accept, to finish the handshake. Accept never blocks on the
+// pool, so a flood cannot keep a later connection waiting in the kernel queue.
 type handshakeListener struct {
 	net.Listener
 	cfg       *tls.Config
-	maxSilent int
-	maxActive int
+	max       int
 	timeout   time.Duration
+	firstByte time.Duration
 	report    func(kind string, err error)
 
 	out       chan net.Conn
 	done      chan struct{}
 	closeOnce sync.Once
 
-	mu     sync.Mutex
-	silent []*pendingConn
-	active []*pendingConn
+	mu      sync.Mutex
+	pending map[*pendingConn]struct{}
 }
 
 type pendingConn struct {
-	conn    net.Conn
-	evicted atomic.Bool
-	moved   atomic.Bool
+	conn net.Conn
+	seen atomic.Bool
+	hard time.Time
 }
 
-// watchConn tells the listener that the peer sent a byte.
+// watchConn extends the deadline of a connection to its hard deadline when the first byte arrives.
 type watchConn struct {
 	net.Conn
 	p *pendingConn
-	l *handshakeListener
 }
 
 func (w watchConn) Read(b []byte) (int, error) {
 	n, err := w.Conn.Read(b)
-	if n > 0 && w.p.moved.CompareAndSwap(false, true) {
-		w.l.activate(w.p)
+	if n > 0 && w.p.seen.CompareAndSwap(false, true) {
+		_ = w.Conn.SetDeadline(w.p.hard)
 	}
 	return n, err
 }
 
-func newHandshakeListener(inner net.Listener, cfg *tls.Config, maxSilent, maxActive int, timeout time.Duration, report func(kind string, err error)) *handshakeListener {
+func newHandshakeListener(inner net.Listener, cfg *tls.Config, max int, timeout, firstByte time.Duration, report func(kind string, err error)) *handshakeListener {
 	l := &handshakeListener{
-		Listener: inner, cfg: cfg, maxSilent: maxSilent, maxActive: maxActive, timeout: timeout, report: report,
-		out: make(chan net.Conn), done: make(chan struct{}),
+		Listener: inner, cfg: cfg, max: max, timeout: timeout, firstByte: firstByte, report: report,
+		out: make(chan net.Conn), done: make(chan struct{}), pending: map[*pendingConn]struct{}{},
 	}
 	go l.acceptLoop()
 	return l
@@ -90,90 +111,75 @@ func (l *handshakeListener) acceptLoop() {
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		p := &pendingConn{conn: c}
-		l.admit(p)
+		p := &pendingConn{conn: c, hard: time.Now().Add(l.timeout)}
+		l.mu.Lock()
+		full := len(l.pending) >= l.max
+		if !full {
+			l.pending[p] = struct{}{}
+		}
+		l.mu.Unlock()
+		if full {
+			_ = c.Close()
+			l.report(refusedPoolFull, errors.New("pool of pending handshakes is full"))
+			continue
+		}
 		go l.handshake(p)
 	}
 }
 
-// push adds p to pool, and returns the oldest connection of pool when the pool was full.
-func push(pool []*pendingConn, max int, p *pendingConn) ([]*pendingConn, *pendingConn) {
-	var victim *pendingConn
-	if len(pool) >= max {
-		victim, pool = pool[0], pool[1:]
-	}
-	return append(pool, p), victim
-}
-
-func (l *handshakeListener) evict(victim *pendingConn) {
-	if victim != nil {
-		victim.evicted.Store(true)
-		_ = victim.conn.Close()
-	}
-}
-
-// admit puts a new connection in the silent pool.
-func (l *handshakeListener) admit(p *pendingConn) {
+func (l *handshakeListener) release(p *pendingConn) {
 	l.mu.Lock()
-	var victim *pendingConn
-	l.silent, victim = push(l.silent, l.maxSilent, p)
+	delete(l.pending, p)
 	l.mu.Unlock()
-	l.evict(victim)
-}
-
-// activate moves p from the silent pool to the active pool.
-func (l *handshakeListener) activate(p *pendingConn) {
-	l.mu.Lock()
-	var victim *pendingConn
-	if remove(&l.silent, p) {
-		l.active, victim = push(l.active, l.maxActive, p)
-	}
-	l.mu.Unlock()
-	l.evict(victim)
-}
-
-func remove(pool *[]*pendingConn, p *pendingConn) bool {
-	for i, q := range *pool {
-		if q == p {
-			*pool = append((*pool)[:i], (*pool)[i+1:]...)
-			return true
-		}
-	}
-	return false
-}
-
-// release removes p from both pools, and reports whether p was still in one of them.
-func (l *handshakeListener) release(p *pendingConn) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return remove(&l.silent, p) || remove(&l.active, p)
 }
 
 func (l *handshakeListener) handshake(p *pendingConn) {
 	raw := p.conn
-	_ = raw.SetDeadline(time.Now().Add(l.timeout))
-	tc := tls.Server(watchConn{Conn: raw, p: p, l: l}, l.cfg)
-	err := tc.Handshake()
-	if !l.release(p) && err == nil {
-		err = errEvicted
+	first := time.Now().Add(l.firstByte)
+	if first.After(p.hard) {
+		first = p.hard
 	}
+	_ = raw.SetDeadline(first)
+	tc := tls.Server(watchConn{Conn: raw, p: p}, l.cfg)
+	err := tc.Handshake()
+	l.release(p)
 	if err != nil {
 		_ = raw.Close()
-		if p.evicted.Load() {
-			l.report("handshake_evicted", errEvicted)
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			l.report(refusedTimeout, err)
 		} else {
-			l.report("handshake_failed", err)
+			l.report(refusedFailed, err)
 		}
 		return
 	}
 	_ = tc.SetDeadline(time.Time{})
+	key := connKey(tc)
+	if cs := tc.ConnectionState(); len(cs.PeerCertificates) > 0 {
+		if id, err := x509svid.IDFromCert(cs.PeerCertificates[0]); err == nil {
+			peerIDs.Store(key, id)
+		}
+	}
 	select {
 	case l.out <- tc:
 	case <-time.After(l.timeout):
+		peerIDs.Delete(key)
 		_ = tc.Close()
+		l.report(refusedUndeliver, errors.New("verified connection was not accepted"))
 	case <-l.done:
+		peerIDs.Delete(key)
 		_ = tc.Close()
 	}
+}
+
+// connContext is the ConnContext of the key server. It marks the connection for the maximum age
+// and adds the verified peer to the context.
+func connContext(ctx context.Context, c net.Conn, base func(context.Context, net.Conn) context.Context) context.Context {
+	ctx = base(ctx, c)
+	if v, ok := peerIDs.LoadAndDelete(connKey(c)); ok {
+		ctx = context.WithValue(ctx, peerCtxKey{}, v.(spiffeid.ID))
+	}
+	return ctx
 }
 
 func (l *handshakeListener) Accept() (net.Conn, error) {
@@ -191,10 +197,10 @@ func (l *handshakeListener) Close() error {
 		close(l.done)
 		err = l.Listener.Close()
 		l.mu.Lock()
-		for _, p := range append(l.silent, l.active...) {
+		for p := range l.pending {
 			_ = p.conn.Close()
 		}
-		l.silent, l.active = nil, nil
+		l.pending = map[*pendingConn]struct{}{}
 		l.mu.Unlock()
 	})
 	return err

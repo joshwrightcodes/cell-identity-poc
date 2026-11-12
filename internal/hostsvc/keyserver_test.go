@@ -23,6 +23,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
@@ -223,6 +224,11 @@ func TestKeyHandlerLimitsDenialLogs(t *testing.T) {
 // keyServer starts the key server on loopback with fake lookups.
 func keyServer(t *testing.T, roots x509bundle.Source, l *lookups) (addr string, cert tls.Certificate) {
 	t.Helper()
+	return keyServerMeter(t, roots, l, nil)
+}
+
+func keyServerMeter(t *testing.T, roots x509bundle.Source, l *lookups, meter metric.Meter) (addr string, cert tls.Certificate) {
+	t.Helper()
 	cert, err := SelfSignedCert(KeyServerHost, time.Now())
 	if err != nil {
 		t.Fatal(err)
@@ -237,7 +243,7 @@ func keyServer(t *testing.T, roots x509bundle.Source, l *lookups) (addr string, 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeKeys(ctx, srv, ln, log) }()
+	go func() { done <- ServeKeys(ctx, srv, ln, log, meter) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
