@@ -423,6 +423,7 @@ func serveTelemetry(ctx context.Context, stdout io.Writer, fn func(context.Conte
 		cli.Fail(stdout, name, fmt.Errorf("start telemetry: %w", err))
 		return 1
 	}
+	cellproxy.BridgeStdLog(tel.Log)
 	defer func() {
 		// ctx may have ended, so the flush gets a context of its own.
 		sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)

@@ -30,6 +30,10 @@ const (
 	ProtocolNotH2 Reason = "protocol_not_h2"
 	// HandshakeFailed: the handshake failed for another reason, for example a timeout.
 	HandshakeFailed Reason = "handshake_failed"
+	// PingTimeout: a ping on a tunnel got no answer, so the tunnel ends.
+	PingTimeout Reason = "ping_timeout"
+	// LibraryLog: a line that a library wrote to its logger.
+	LibraryLog Reason = "library_log"
 )
 
 // GRPCCode is the status for a refused request. A peer reason ends the handshake, so no status

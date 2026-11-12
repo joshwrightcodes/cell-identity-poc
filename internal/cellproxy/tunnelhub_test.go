@@ -119,7 +119,7 @@ func (h *tunnelHarness) serveFixed(t *testing.T, dial func(context.Context) (net
 	}
 	done := make(chan struct{})
 	go func() {
-		serveTunnel(t.Context(), newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler)
+		serveTunnel(t.Context(), newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler, &http.Server{})
 		close(done)
 	}()
 	t.Cleanup(func() { _ = conn.Close(); <-done })
@@ -334,7 +334,7 @@ func TestCellEndsTunnelAtHubSVIDExpiry(t *testing.T) {
 // A tunnel that ends with a short cell SVID does not push the next dial to the backoff cap.
 func TestCellEndsTunnelAtOwnSVIDExpiry(t *testing.T) {
 	h := newTunnelHarness(t, 5*time.Second)
-	src := &rotatingSource{svids: []*x509svid.SVID{h.env.svidUntil(t, meshViewID1, time.Now().Add(2*time.Second))}}
+	src := &rotatingSource{svids: []*x509svid.SVID{h.env.svidUntil(t, meshViewID1, time.Now().Add(4*time.Second))}}
 	startCell(t, h.dialerWith(src), h.cellHandler(t))
 	h.waitTunnels(t, 1, 5*time.Second)
 	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, 5*time.Second)
@@ -504,7 +504,7 @@ func TestHubStatusFollowsTheTunnels(t *testing.T) {
 
 // A tunnel that a hub never closes ends at the SVID expiry of the hub, and each side names that cause.
 func TestTunnelStatusNamesTheCause(t *testing.T) {
-	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, hubLeafLife: 2 * time.Second})
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, hubLeafLife: 4 * time.Second})
 	st := NewTunnelState()
 	dial := TunnelDialer(h.server, ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog), WithState(st))
 	startCell(t, dial, h.cellHandler(t))

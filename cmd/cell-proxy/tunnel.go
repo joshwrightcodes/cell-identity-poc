@@ -185,7 +185,7 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 			}
 		}()
 		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m), cellproxy.WithState(state))
-		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cellproxy.WithKeepalive(cfg.readIdle, cfg.pingTimeout))
+		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cellproxy.WithKeepalive(cfg.readIdle, cfg.pingTimeout), cellproxy.WithLogger(tel.Log))
 	})
 }
 
@@ -243,12 +243,10 @@ func serveHTTP(ctx context.Context, ln net.Listener, h http.Handler, log *slog.L
 	return nil
 }
 
-// runTunnelStatus prints the tunnel state that the process of this container serves. With --max-down it
-// fails when a cell has been down for longer than that, so a probe tolerates the short gap of a renewal.
+// runTunnelStatus prints the tunnel state that the process of this container serves.
 func runTunnelStatus(ctx context.Context, args []string, stdout io.Writer) int {
 	fs := newFlags("tunnel-status")
 	addr := fs.String("addr", cellproxy.DefaultStatusAddr, "address of the status listener")
-	maxDown := fs.Duration("max-down", 0, "fail when a tunnel has been down for longer than this; 0 never fails on the state")
 	if err := parseFlags(fs, args); err != nil {
 		cli.Fail(stdout, name, err)
 		return exitConfig
@@ -258,16 +256,6 @@ func runTunnelStatus(ctx context.Context, args []string, stdout io.Writer) int {
 		if err != nil {
 			return err
 		}
-		if err := json.NewEncoder(out).Encode(st); err != nil {
-			return err
-		}
-		if *maxDown > 0 {
-			for cell, c := range st.Cells {
-				if !c.Up && time.Duration(c.DownSeconds*float64(time.Second)) > *maxDown {
-					return fmt.Errorf("the tunnel of %s has been down for %.0f seconds", cell, c.DownSeconds)
-				}
-			}
-		}
-		return nil
+		return json.NewEncoder(out).Encode(st)
 	})
 }

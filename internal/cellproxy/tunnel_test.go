@@ -772,7 +772,7 @@ func TestHubNewestConnWins(t *testing.T) {
 		done := make(chan struct{})
 		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, name) })
 		go func() {
-			serveTunnel(ctx, newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler)
+			serveTunnel(ctx, newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler, &http.Server{})
 			close(done)
 		}()
 		t.Cleanup(func() { _ = conn.Close(); <-done })

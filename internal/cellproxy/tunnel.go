@@ -2,6 +2,7 @@ package cellproxy
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -97,6 +98,7 @@ func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 
 func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, c tunnelClock, o tunnelOptions) error {
 	srv := newTunnelServer(o.keepalive())
+	base := &http.Server{ErrorLog: proxyErrorLog(cmp.Or(o.log, slog.Default()))}
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	serve := func(conn net.Conn) chan struct{} {
@@ -105,7 +107,7 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 		go func() {
 			defer wg.Done()
 			defer close(ended)
-			serveTunnel(ctx, srv, conn, h)
+			serveTunnel(ctx, srv, conn, h, base)
 		}()
 		return ended
 	}
@@ -116,27 +118,39 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 	// the source holds by then, and the hub closes the older tunnel when the newer one arrives.
 	var ended chan struct{}
 	var cur net.Conn
-	var start, renewAt time.Time
+	var start, renewAt, expiry time.Time
 	stable := tunnelStableAfter
-	connect := func() bool {
+	// connect dials and serves the new tunnel. With no tunnel open, a connection with an Expiry that leaves
+	// less than two minimum backoffs counts as a failed dial: the leaf of the cell is expired, or the agent
+	// does not renew it, and a new dial would give the same short life. A renewal keeps such a connection,
+	// because the hub already made it the tunnel of the cell.
+	connect := func(renewing bool) bool {
 		conn, err := dial(ctx)
 		if err != nil {
 			return false
 		}
-		start = c.now()
-		cur = conn
+		now := c.now()
+		var exp time.Time
+		if e, ok := conn.(interface{ Expiry() time.Time }); ok {
+			exp = e.Expiry()
+		}
+		if !renewing && !exp.IsZero() && exp.Sub(now) < 2*tunnelMinBackoff {
+			_ = conn.Close()
+			return false
+		}
+		start, cur, expiry = now, conn, exp
 		ended = serve(conn)
 		renewAt, stable = time.Time{}, tunnelStableAfter
-		if e, ok := conn.(interface{ Expiry() time.Time }); ok && !e.Expiry().IsZero() {
-			life := e.Expiry().Sub(start)
-			renewAt = start.Add(life * 6 / 10)
+		if !exp.IsZero() {
+			life := exp.Sub(start)
+			renewAt = start.Add(max(life*6/10, tunnelMinBackoff))
 			stable = min(tunnelStableAfter, life/2)
 		}
 		return true
 	}
 	for {
 		if ended == nil {
-			if !connect() {
+			if !connect(false) {
 				if c.sleep(ctx, jitter(backoff)) != nil {
 					return nil
 				}
@@ -164,15 +178,17 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 			}
 			backoff = min(2*backoff, tunnelMaxBackoff)
 		case <-renew:
-			old, oldStart, oldStable := ended, start, stable
+			old, oldStart, oldStable, oldExpiry := ended, start, stable, expiry
 			oldConn := cur
-			if connect() {
-				if r, ok := oldConn.(interface{ MarkRenewed() }); ok {
-					r.MarkRenewed()
+			if connect(true) {
+				markRenewedAfterAccept(oldConn, cur, ended)
+				if expiry.After(oldExpiry) {
+					backoff = tunnelMinBackoff
+				} else {
+					renewAt = start.Add(max(renewAt.Sub(start), jitter(backoff)))
 				}
-				backoff = tunnelMinBackoff
 			} else {
-				ended, start, stable = old, oldStart, oldStable
+				ended, start, stable, expiry = old, oldStart, oldStable, oldExpiry
 				renewAt = c.now().Add(jitter(backoff))
 				backoff = min(2*backoff, tunnelMaxBackoff)
 			}
@@ -185,6 +201,34 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 	}
 }
 
+// markRenewedAfterAccept marks the old tunnel as renewed when the hub accepts the new one, which the
+// new connection shows with its first read. A new tunnel that the hub refuses leaves the old one
+// unmarked, so its end is not logged as a planned renewal.
+func markRenewedAfterAccept(old, next net.Conn, nextEnded <-chan struct{}) {
+	r, ok := old.(interface{ MarkRenewed() })
+	if !ok {
+		return
+	}
+	a, ok := next.(interface{ Accepted() <-chan struct{} })
+	if !ok {
+		r.MarkRenewed()
+		return
+	}
+	go func() {
+		select {
+		case <-a.Accepted():
+			r.MarkRenewed()
+			return
+		default:
+		}
+		select {
+		case <-a.Accepted():
+			r.MarkRenewed()
+		case <-nextEnded:
+		}
+	}()
+}
+
 func jitter(d time.Duration) time.Duration {
 	return min(d+rand.N(d/2+1), tunnelMaxBackoff)
 }
@@ -194,10 +238,12 @@ func newTunnelServer(readIdle, pingTimeout time.Duration) *http2.Server {
 	return &http2.Server{MaxConcurrentStreams: tunnelMaxStreams, ReadIdleTimeout: readIdle, PingTimeout: pingTimeout}
 }
 
-func serveTunnel(ctx context.Context, srv *http2.Server, conn net.Conn, h http.Handler) {
+// serveTunnel serves h on conn. base carries the error logger of the HTTP/2 server, which writes to the
+// standard logger when it has none.
+func serveTunnel(ctx context.Context, srv *http2.Server, conn net.Conn, h http.Handler, base *http.Server) {
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
-	srv.ServeConn(conn, &http2.ServeConnOpts{Context: ctx, Handler: h})
+	srv.ServeConn(conn, &http2.ServeConnOpts{Context: ctx, Handler: h, BaseConfig: base})
 	_ = conn.Close()
 }
 
@@ -210,6 +256,7 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 	o := applyOptions(opts)
 	m, state := o.metrics, o.state
 	up := &atomic.Bool{}
+	limiter := newLogLimiter()
 	series := attribute.NewSet(attribute.String("side", sideCell), attribute.String("upstream", addr))
 	if err := m.observeUp(func() map[attribute.Set]bool { return map[attribute.Set]bool{series: up.Load()} }); err != nil {
 		log.Warn("tunnel metric not registered", "error", err.Error())
@@ -255,7 +302,7 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			}
 			return nil, err
 		}
-		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result, state: state}
+		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result, state: state, limiter: limiter, accepted: make(chan struct{})}
 		// The cell ends the tunnel at the earlier expiry of its own leaf and the leaf of the hub, so a
 		// hub that never closes cannot keep the access past a credential.
 		if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
@@ -265,11 +312,13 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			cn.expiry = own
 		}
 		if !cn.expiry.IsZero() {
+			cn.mu.Lock()
 			cn.timer = time.AfterFunc(time.Until(cn.expiry), func() {
 				log.Info("tunnel_expired", "side", sideCell, "upstream", addr, "not_after", cn.expiry.UTC().Format(time.RFC3339))
 				cn.expired.Store(true)
 				_ = cn.Close()
 			})
+			cn.mu.Unlock()
 		}
 		return cn, nil
 	}
@@ -284,12 +333,17 @@ type cellConn struct {
 	up       *atomic.Bool
 	result   func(context.Context, string)
 
-	expiry  time.Time
+	expiry time.Time
+	// timer ends the tunnel at expiry. mu guards it, because the callback of the timer can run
+	// before the dial stores it.
 	timer   *time.Timer
 	expired atomic.Bool
 	renewed atomic.Bool
 	state   *TunnelState
 	stateID uint64
+	// limiter holds back repeated tunnel_refused lines. accepted closes at the first bytes of the hub.
+	limiter  *logLimiter
+	accepted chan struct{}
 
 	mu         sync.Mutex
 	acceptedAt time.Time
@@ -310,12 +364,17 @@ func (c *cellConn) Read(p []byte) (int, error) {
 		}
 		c.result(context.Background(), dialConnected)
 		c.log.Info("tunnel_connected", "upstream", c.upstream)
+		if c.accepted != nil {
+			close(c.accepted)
+		}
 	}
 	if err != nil && !c.closing && c.peerErr == nil {
 		c.peerErr = err
 		if c.acceptedAt.IsZero() {
 			c.result(context.Background(), dialRefusedByHub)
-			c.log.Warn("tunnel_refused", "reason", string(PeerNotAllowed), "upstream", c.upstream, "error", refusalDetail(err))
+			if ok, suppressed, _ := c.limiter.allow(c.log, "tunnel_refused", nil); ok {
+				c.log.Warn("tunnel_refused", "reason", string(PeerNotAllowed), "upstream", c.upstream, "error", refusalDetail(err), "suppressed", suppressed)
+			}
 		}
 	}
 	return n, err
@@ -329,6 +388,9 @@ func refusalDetail(err error) string {
 	return err.Error()
 }
 
+// Accepted closes when the first bytes of the hub arrive, which shows that the hub accepted the tunnel.
+func (c *cellConn) Accepted() <-chan struct{} { return c.accepted }
+
 // MarkRenewed says that the cell opened a newer tunnel, so the end of this one is planned.
 func (c *cellConn) MarkRenewed() { c.renewed.Store(true) }
 
@@ -336,13 +398,13 @@ func (c *cellConn) MarkRenewed() { c.renewed.Store(true) }
 func (c *cellConn) Expiry() time.Time { return c.expiry }
 
 func (c *cellConn) Close() error {
-	if c.timer != nil {
-		c.timer.Stop()
-	}
 	c.mu.Lock()
 	c.closing = true
-	acceptedAt, peerErr, stateID := c.acceptedAt, c.peerErr, c.stateID
+	acceptedAt, peerErr, stateID, timer := c.acceptedAt, c.peerErr, c.stateID, c.timer
 	c.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
+	}
 	if c.state != nil && stateID != 0 {
 		switch {
 		case c.expired.Load():
@@ -896,18 +958,31 @@ func (b *tunnelBackend) Serve(ctx context.Context, conn *tls.Conn, src Source) e
 // Run serves the local listeners of the hub until ctx ends.
 func (b *tunnelBackend) Run(ctx context.Context) error { return b.hub.Run(ctx) }
 
-// levelWriter sends the lines of a standard library logger to log. The errors that every ended tunnel
-// makes in the reverse proxy go to Debug, and every other line goes to Warn.
+// levelWriter sends the lines of a standard library logger to log, each with a reason. The errors that every
+// ended tunnel makes in the reverse proxy go to Debug, and so does the failed preface of a refused TLS client,
+// which tunnel_refused already reports. A ping without an answer is a Warn line of its own.
 type levelWriter struct{ log *slog.Logger }
 
 func (w levelWriter) Write(p []byte) (int, error) {
 	msg := strings.TrimSpace(string(p))
-	level := slog.LevelWarn
-	if strings.Contains(msg, "force closed via ClientConn.Close") || strings.Contains(msg, "use of closed network connection") {
-		level = slog.LevelDebug
+	switch {
+	case strings.Contains(msg, "timeout waiting for PING response"):
+		w.log.Warn("tunnel_ping_timeout", "reason", string(PingTimeout), "detail", msg)
+	case strings.Contains(msg, "error reading preface from client"):
+		w.log.Debug(msg, "reason", string(HandshakeFailed))
+	case strings.Contains(msg, "force closed via ClientConn.Close") || strings.Contains(msg, "use of closed network connection"):
+		w.log.Debug(msg, "reason", string(LibraryLog))
+	default:
+		w.log.Warn(msg, "reason", string(LibraryLog))
 	}
-	w.log.Log(context.Background(), level, msg)
 	return len(p), nil
 }
 
 func proxyErrorLog(log *slog.Logger) *stdlog.Logger { return stdlog.New(levelWriter{log}, "", 0) }
+
+// BridgeStdLog sends the lines of the standard library logger to log. The HTTP/2 client of the hub
+// has no error logger of its own and writes to the standard logger.
+func BridgeStdLog(log *slog.Logger) {
+	stdlog.SetFlags(0)
+	stdlog.SetOutput(levelWriter{log})
+}

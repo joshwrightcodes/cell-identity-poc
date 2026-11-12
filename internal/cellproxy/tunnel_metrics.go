@@ -3,6 +3,7 @@ package cellproxy
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -69,7 +70,11 @@ type tunnelOptions struct {
 	// readIdle and pingTimeout set the keepalive of the tunnel: after readIdle with no frame, a side sends a ping and
 	// closes the connection when the answer takes longer than pingTimeout. Zero means the default.
 	readIdle, pingTimeout time.Duration
+	log                   *slog.Logger
 }
+
+// WithLogger gives the tunnel the logger for the lines that the HTTP/2 server of the cell writes.
+func WithLogger(log *slog.Logger) TunnelOption { return func(o *tunnelOptions) { o.log = log } }
 
 // WithKeepalive sets how long a tunnel connection may be idle before a ping, and how long the answer may take.
 func WithKeepalive(readIdle, pingTimeout time.Duration) TunnelOption {
