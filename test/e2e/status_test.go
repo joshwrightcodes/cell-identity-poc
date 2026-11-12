@@ -15,6 +15,9 @@ import (
 // statusSampleMax is the age limit of a Prometheus sample in harness:status.
 const statusSampleMax = 5 * time.Minute
 
+// statusRetryWindow is how long TestM3StatusHealthy waits for a healthy status.
+const statusRetryWindow = 10 * time.Minute
+
 // runMise runs a mise task in the repository root, with CELL set when cell is not empty. It returns the
 // standard output, the standard error and the exit status.
 func runMise(t *testing.T, cell string, args ...string) (stdout, stderr string, code int) {
@@ -75,14 +78,16 @@ func statusOnce(t *testing.T) (map[string]statusObject, string, int) {
 
 // TestM3StatusHealthy checks that harness:status exits 0 on a healthy harness. The management object lists
 // both agents, a Prometheus sample younger than 5 minutes for each registered cluster, and both cells in
-// Kiali. An earlier test can leave a pod that restarts, so the test reads the status again for a short time.
+// Kiali. obs:uplink-status counts the exporter failures of the last 5 minutes, and the restart of the management
+// SPIRE server in an earlier test causes some, so the test reads the status again for up to 10 minutes.
 func TestM3StatusHealthy(t *testing.T) {
 	var objs map[string]statusObject
 	var stdout string
 	var code int
-	for attempt := 1; attempt <= 3; attempt++ {
+	deadline := time.Now().Add(statusRetryWindow)
+	for attempt := 1; ; attempt++ {
 		objs, stdout, code = statusOnce(t)
-		if code == 0 {
+		if code == 0 || time.Now().After(deadline) {
 			break
 		}
 		t.Logf("attempt %d: harness:status exited %d:\n%s", attempt, code, stdout)
