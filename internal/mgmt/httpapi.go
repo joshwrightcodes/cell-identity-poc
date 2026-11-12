@@ -189,6 +189,10 @@ func (h *apiHandler) status(w http.ResponseWriter, r *http.Request) {
 // of celld.
 var bindHandlerTimeout = 25 * time.Second
 
+// bindWriteMargin is the time that the write timeout of a bind stream adds to the handler deadline,
+// so that a request that ends at the deadline still gets its answer.
+const bindWriteMargin = 2 * time.Second
+
 type bindHandler struct {
 	p     Binder
 	log   *slog.Logger
@@ -610,7 +614,7 @@ func NewServers(api, bind http.Handler, apiTLS, bindTLS *tls.Config) (apiSrv, bi
 	bindSrv = &http.Server{
 		Handler: connlimit.MaxAge(bind), TLSConfig: bindTLS, Protocols: bindProtos,
 		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: bindStreams},
-		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 30 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: 10 * time.Second, WriteTimeout: bindHandlerTimeout + bindWriteMargin, IdleTimeout: 30 * time.Second,
 		MaxHeaderBytes: maxHeaderBytes, ConnContext: connContext,
 	}
 	return apiSrv, bindSrv

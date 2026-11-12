@@ -51,7 +51,7 @@ func TestListenerLimitsOfTheSharedTable(t *testing.T) {
 		read, write, idle time.Duration
 	}{
 		{"api", api, 4, 15 * time.Second, 15 * time.Second, 60 * time.Second},
-		{"bind", bind, 2, 10 * time.Second, 15 * time.Second, 30 * time.Second},
+		{"bind", bind, 2, 10 * time.Second, bindHandlerTimeout + 2*time.Second, 30 * time.Second},
 	} {
 		s := tc.srv
 		if s.HTTP2 == nil || int32(s.HTTP2.MaxConcurrentStreams) != tc.streams || s.ReadTimeout != tc.read || s.WriteTimeout != tc.write ||

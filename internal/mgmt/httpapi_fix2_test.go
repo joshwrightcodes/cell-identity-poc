@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -180,5 +181,39 @@ func TestBindHandlerDeadline(t *testing.T) {
 	rec := do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(marshal(t, mgmtapi.BindRequest{Nonce: "n", Token: "t"})))
 	if time.Since(start) > 3*time.Second || rec.Code < 400 {
 		t.Fatalf("the request ran %s and answered %d", time.Since(start), rec.Code)
+	}
+}
+
+// The bind write timeout lies above the handler deadline, so a request that runs longer than the
+// old 15 s limit and ends before the deadline still gets its answer.
+func TestBindAnswersAfterMoreThan15Seconds(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs about 17 s")
+	}
+	addr, ca, _ := startBind(t, NewBindHandler(&slowBinder{delay: 17 * time.Second}, jsonLog(io.Discard)))
+	c := h2Client(t, ca, nil)
+	c.Timeout = 30 * time.Second
+	resp, err := c.Post("https://"+addr+mgmtapi.BindPath("dev-cell-1"), "application/json", strings.NewReader(marshal(t, mgmtapi.BindRequest{Nonce: "n", Token: "t"})))
+	if err != nil {
+		t.Fatalf("a 17 s bind request failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+}
+
+// slowBinder answers a bind request after delay.
+type slowBinder struct {
+	fakeBinder
+	delay time.Duration
+}
+
+func (b *slowBinder) Bind(ctx context.Context, _ string, _ mgmtapi.BindRequest) (mgmtapi.BindResponse, error) {
+	select {
+	case <-time.After(b.delay):
+		return mgmtapi.BindResponse{Status: mgmtapi.StatusBound}, nil
+	case <-ctx.Done():
+		return mgmtapi.BindResponse{}, ctx.Err()
 	}
 }

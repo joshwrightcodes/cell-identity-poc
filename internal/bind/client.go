@@ -16,6 +16,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -23,6 +24,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 )
@@ -35,11 +37,13 @@ const (
 	DefaultAttemptTimeout = 30 * time.Second
 	DefaultRecheckEvery   = 5 * time.Minute
 
-	tokenTTL      = 600 * time.Second
-	maxResponse   = 64 << 10
-	pingIdle      = 15 * time.Second
-	pingTimeout   = 10 * time.Second
-	recheckSpread = 0.2
+	tokenTTL       = 600 * time.Second
+	maxResponse    = 64 << 10
+	maxHeaderBytes = 16 << 10
+	maxIDLength    = 32
+	pingIdle       = 15 * time.Second
+	pingTimeout    = 10 * time.Second
+	recheckSpread  = 0.2
 )
 
 // TokenFunc returns a token whose only audience is audience.
@@ -168,10 +172,16 @@ func NewClient(cfg Config) *Client {
 		TLSClientConfig:   cfg.TLS,
 		Protocols:         protos,
 		DisableKeepAlives: true,
-		HTTP2:             &http.HTTP2Config{SendPingTimeout: pingIdle, PingTimeout: pingTimeout},
-		DialContext:       cfg.dial,
+		// The limit is far below the default of 10 MiB, for a pod with a small memory limit.
+		MaxResponseHeaderBytes: maxHeaderBytes,
+		HTTP2:                  &http.HTTP2Config{SendPingTimeout: pingIdle, PingTimeout: pingTimeout},
+		DialContext:            cfg.dial,
 	}
-	return &Client{cell: cfg.Cell, base: "https://" + cfg.Upstream, tr: tr, http: &http.Client{Transport: tr}}
+	return &Client{cell: cfg.Cell, base: "https://" + cfg.Upstream, tr: tr, http: &http.Client{
+		Transport: tr,
+		// A redirect would send the token to a host that the SPIFFE ID check never covered.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 // Close drops idle connections.
@@ -191,8 +201,13 @@ func (c *Client) Bind(ctx context.Context, req mgmtapi.BindRequest) (mgmtapi.Bin
 		return mgmtapi.BindResponse{}, err
 	}
 	var out mgmtapi.BindResponse
-	err = c.post(ctx, mgmtapi.BindPath(c.cell), body, &out)
-	return out, err
+	if err = c.post(ctx, mgmtapi.BindPath(c.cell), body, &out); err != nil {
+		return mgmtapi.BindResponse{}, err
+	}
+	if !knownStatus(out.Status) {
+		return mgmtapi.BindResponse{}, errors.New("the bind response holds no known status")
+	}
+	return out, nil
 }
 
 func (c *Client) post(ctx context.Context, path string, body []byte, out any) error {
@@ -208,9 +223,12 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponse+1))
 	if err != nil {
 		return err
+	}
+	if len(raw) > maxResponse {
+		return fmt.Errorf("the response is too large: more than %d bytes", maxResponse)
 	}
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -221,21 +239,47 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
 	case http.StatusForbidden:
 		var d mgmtapi.Denied
 		_ = json.Unmarshal(raw, &d)
-		return &Refused{RequestID: d.RequestID}
+		return &Refused{RequestID: cleanID(d.RequestID)}
 	default:
 		return &StatusError{Code: resp.StatusCode}
 	}
 }
 
-// CheckNonce reports an error unless n is a usable nonce for cell.
-func CheckNonce(cell string, n mgmtapi.NonceResponse) error {
-	if n.Nonce == "" {
-		return errors.New("the nonce response holds no nonce")
+// cleanID keeps the leading characters of a request ID that a log line or a command output can
+// carry safely.
+func cleanID(id string) string {
+	var b strings.Builder
+	for _, r := range id {
+		if b.Len() >= maxIDLength {
+			break
+		}
+		if r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r == '-' || r == '_' {
+			b.WriteRune(r)
+		}
 	}
-	if want := mgmtapi.BindAudience(cell, n.Nonce); n.Audience != want {
-		return fmt.Errorf("the nonce response names audience %q, want %q", n.Audience, want)
+	return b.String()
+}
+
+// CheckNonce reports an error unless n is a usable nonce for cell: a nonce of base64url
+// characters, at most 128 bytes long, and the bind audience of that nonce. The error text never
+// repeats a value from the answer.
+func CheckNonce(cell string, n mgmtapi.NonceResponse) error {
+	if !clusterjwt.ValidNonce(n.Nonce) {
+		return errors.New("the nonce response holds no valid nonce")
+	}
+	if n.Audience != mgmtapi.BindAudience(cell, n.Nonce) {
+		return errors.New("the audience of the nonce response is not the bind audience of this cell and nonce")
 	}
 	return nil
+}
+
+// knownStatus reports whether status is a result that a bind can have.
+func knownStatus(status string) bool {
+	switch status {
+	case mgmtapi.StatusBound, mgmtapi.StatusAlreadyBound, mgmtapi.StatusKeysUpdated:
+		return true
+	}
+	return false
 }
 
 // Once binds the cell: it requests a nonce, mints a token for the audience of the nonce, and sends
@@ -323,6 +367,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 }
 
 func recheck(ctx context.Context, cfg Config) error {
+	var refused *Refused
 	wait := jitter(cfg.RecheckEvery, recheckSpread, -recheckSpread/2)
 	for failures := 0; ; {
 		if err := cfg.Sleep(ctx, wait); err != nil {
@@ -332,6 +377,9 @@ func recheck(ctx context.Context, cfg Config) error {
 		switch {
 		case err != nil && ctx.Err() != nil:
 			return ctx.Err()
+		case errors.As(err, &refused):
+			wait, failures = jitter(cfg.RefusedBackoff, 0.1, 0), 0
+			cfg.Log.WarnContext(ctx, "bind recheck refused", "cell", cfg.Cell, "request_id", refused.RequestID, "retry_in", wait.String())
 		case err != nil:
 			wait = backoff(cfg, failures)
 			failures++

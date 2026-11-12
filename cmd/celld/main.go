@@ -24,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
@@ -102,9 +101,6 @@ func parseOptions(args []string, lookupEnv func(string) (string, bool)) (options
 		return o, fmt.Errorf("--bind-expect-id: %w", err)
 	}
 	o.expectID = id
-	if _, err := x509bundle.Load(id.TrustDomain(), o.peerBundle); err != nil {
-		return o, fmt.Errorf("--bind-peer-bundle: %w", err)
-	}
 	for _, e := range []struct {
 		name string
 		dst  *string

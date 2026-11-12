@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -53,7 +54,7 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func okNonce(bound bool) func(http.ResponseWriter, *http.Request, int) {
 	return func(w http.ResponseWriter, r *http.Request, n int) {
-		nonce := "nonce" + string(rune('a'+n))
+		nonce := fmt.Sprintf("nonce%d", n)
 		writeJSON(w, 200, mgmtapi.NonceResponse{Nonce: nonce, Audience: mgmtapi.BindAudience(testCel, nonce), Bound: bound})
 	}
 }
@@ -142,7 +143,7 @@ func TestOnceBinds(t *testing.T) {
 	if resp.Status != mgmtapi.StatusBound || resp.Record != (spec.Revision{Epoch: 1, Counter: 2}) {
 		t.Fatalf("response %+v", resp)
 	}
-	if gotReq.Nonce != "noncea" || gotReq.Token != "tok:"+mgmtapi.BindAudience(testCel, "noncea") {
+	if gotReq.Nonce != "nonce0" || gotReq.Token != "tok:"+mgmtapi.BindAudience(testCel, "nonce0") {
 		t.Fatalf("bind request %+v", gotReq)
 	}
 	if b := f.nonceBody[0]; b != "" && b != "{}" {
@@ -205,12 +206,9 @@ func TestClientTLSSettings(t *testing.T) {
 	}
 }
 
+// The fake keeps the connection open after the nonce. A client that reuses it handshakes once.
 func TestOnceUsesFreshConnectionForBind(t *testing.T) {
 	f := newServer(t, apiID)
-	f.nonce = func(w http.ResponseWriter, r *http.Request, n int) {
-		w.Header().Set("Connection", "close")
-		okNonce(false)(w, r, n)
-	}
 	if _, err := Once(t.Context(), f.config(t, apiID)); err != nil {
 		t.Fatal(err)
 	}
@@ -254,41 +252,65 @@ func (l *pipeListener) Accept() (net.Conn, error) {
 func (l *pipeListener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
 func (l *pipeListener) Addr() net.Addr { return &net.TCPAddr{} }
 
+// TestOnceAttemptTimeout stalls each stage in turn. The whole attempt ends after 30 s of fake time.
 func TestOnceAttemptTimeout(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		ca := spiffetest.NewCA(t, mgmtTD)
-		scfg := tlsconfig.TLSServerConfig(ca.Source(t, apiID))
-		scfg.NextProtos = []string{"h2"}
-		pl := &pipeListener{ch: make(chan net.Conn), done: make(chan struct{})}
-		release := make(chan struct{})
-		protos := new(http.Protocols)
-		protos.SetHTTP2(true)
-		srv := &http.Server{Protocols: protos, Handler: http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release })}
-		go func() { _ = srv.Serve(tls.NewListener(pl, scfg)) }()
+	for _, stage := range []string{"nonce", "token", "bind"} {
+		t.Run(stage, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ca := spiffetest.NewCA(t, mgmtTD)
+				scfg := tlsconfig.TLSServerConfig(ca.Source(t, apiID))
+				scfg.NextProtos = []string{"h2"}
+				pl := &pipeListener{ch: make(chan net.Conn), done: make(chan struct{})}
+				release := make(chan struct{})
+				mux := http.NewServeMux()
+				mux.HandleFunc(mgmtapi.NoncePattern, func(w http.ResponseWriter, _ *http.Request) {
+					if stage == "nonce" {
+						<-release
+					}
+					okNonce(false)(w, nil, 0)
+				})
+				mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+					if stage == "bind" {
+						<-release
+					}
+					okBind(w, r, mgmtapi.BindRequest{}, 0)
+				})
+				protos := new(http.Protocols)
+				protos.SetHTTP2(true)
+				srv := &http.Server{Protocols: protos, Handler: mux}
+				go func() { _ = srv.Serve(tls.NewListener(pl, scfg)) }()
 
-		cfg := Config{
-			Cell: testCel, Upstream: "mgmt.test:443", TLS: ClientTLS(ca.Bundle(), spiffeid.RequireFromString(apiID)),
-			Tokens: func(context.Context, string) (string, error) { return "t", nil },
-			Log:    slog.New(slog.DiscardHandler),
-			dial: func(context.Context, string, string) (net.Conn, error) {
-				c, s := net.Pipe()
-				pl.ch <- s
-				return c, nil
-			},
-		}
-		start := time.Now()
-		_, err := Once(t.Context(), cfg)
-		elapsed := time.Since(start)
-		close(release)
-		_ = srv.Close()
-		_ = pl.Close()
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("err = %v, want deadline exceeded", err)
-		}
-		if elapsed != 30*time.Second {
-			t.Fatalf("attempt ended after %v, want 30s of fake time", elapsed)
-		}
-	})
+				cfg := Config{
+					Cell: testCel, Upstream: "mgmt.test:443", TLS: ClientTLS(ca.Bundle(), spiffeid.RequireFromString(apiID)),
+					Tokens: func(ctx context.Context, _ string) (string, error) {
+						if stage == "token" {
+							<-ctx.Done()
+							return "", ctx.Err()
+						}
+						return "t", nil
+					},
+					Log: slog.New(slog.DiscardHandler),
+					dial: func(context.Context, string, string) (net.Conn, error) {
+						c, s := net.Pipe()
+						pl.ch <- s
+						return c, nil
+					},
+				}
+				start := time.Now()
+				_, err := Once(t.Context(), cfg)
+				elapsed := time.Since(start)
+				close(release)
+				_ = srv.Close()
+				_ = pl.Close()
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("err = %v, want deadline exceeded", err)
+				}
+				if elapsed != 30*time.Second {
+					t.Fatalf("attempt ended after %v, want 30s of fake time", elapsed)
+				}
+			})
+		})
+	}
 }
 
 // sleepRecorder replaces Config.Sleep. It records each wait and calls stop for the wait that stop
@@ -393,7 +415,7 @@ func TestRunRebindsWhenUnbound(t *testing.T) {
 	// Calls 0 and 1 answer bound:false: the first starts the bind, and the second is the recheck
 	// after a restore. Call 2 starts the second bind. Later calls answer bound:true.
 	f.nonce = func(w http.ResponseWriter, r *http.Request, n int) {
-		nonce := "nonce" + string(rune('a'+n))
+		nonce := fmt.Sprintf("nonce%d", n)
 		writeJSON(w, 200, mgmtapi.NonceResponse{Nonce: nonce, Audience: mgmtapi.BindAudience(testCel, nonce), Bound: n >= 3})
 	}
 	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 3 }}
@@ -422,5 +444,186 @@ func TestRunLogsBoundAndObserves(t *testing.T) {
 	}
 	if len(results) != 1 || results[0] != mgmtapi.StatusBound {
 		t.Fatalf("results %v", results)
+	}
+}
+
+func TestOnceDoesNotFollowRedirects(t *testing.T) {
+	for _, code := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		for _, stage := range []string{"nonce", "bind"} {
+			t.Run(fmt.Sprintf("%d %s", code, stage), func(t *testing.T) {
+				var sinkBytes atomic.Int64
+				sink, err := net.Listen("tcp", "127.0.0.1:0")
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = sink.Close() })
+				go func() {
+					for {
+						c, err := sink.Accept()
+						if err != nil {
+							return
+						}
+						go func() {
+							n, _ := io.Copy(io.Discard, c)
+							sinkBytes.Add(n)
+							_ = c.Close()
+						}()
+					}
+				}()
+				f := newServer(t, apiID)
+				away := "http://" + sink.Addr().String() + "/steal"
+				redirect := func(w http.ResponseWriter) {
+					w.Header().Set("Location", away)
+					w.WriteHeader(code)
+				}
+				if stage == "nonce" {
+					f.nonce = func(w http.ResponseWriter, _ *http.Request, _ int) { redirect(w) }
+				} else {
+					f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) { redirect(w) }
+				}
+				cfg := f.config(t, apiID)
+				cfg.AttemptTimeout = 2 * time.Second
+				_, err = Once(t.Context(), cfg)
+				var se *StatusError
+				if !errors.As(err, &se) || se.Code != code {
+					t.Fatalf("err = %v, want a transient StatusError %d", err, code)
+				}
+				time.Sleep(100 * time.Millisecond)
+				if n := sinkBytes.Load(); n != 0 {
+					t.Fatalf("the redirect target received %d bytes", n)
+				}
+			})
+		}
+	}
+}
+
+func TestOnceRedirectToSameServerSendsOneBind(t *testing.T) {
+	f := newServer(t, apiID)
+	f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+		w.Header().Set("Location", "/again")
+		w.WriteHeader(http.StatusPermanentRedirect)
+	}
+	if _, err := Once(t.Context(), f.config(t, apiID)); err == nil {
+		t.Fatal("a redirect counted as success")
+	}
+	if _, b := f.counts(); b != 1 {
+		t.Fatalf("%d bind requests, want 1", b)
+	}
+}
+
+func TestOnceRefusesBadNonceAnswers(t *testing.T) {
+	long := strings.Repeat("a", 200)
+	for name, n := range map[string]mgmtapi.NonceResponse{
+		"empty nonce":     {Nonce: "", Audience: mgmtapi.BindAudience(testCel, "")},
+		"attest audience": {Nonce: "abc", Audience: "spire-dev/abc"},
+		"oversized nonce": {Nonce: long, Audience: mgmtapi.BindAudience(testCel, long)},
+		"newline nonce":   {Nonce: "ab\ncd", Audience: mgmtapi.BindAudience(testCel, "ab\ncd")},
+		"slash nonce":     {Nonce: "ab/cd", Audience: mgmtapi.BindAudience(testCel, "ab/cd")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newServer(t, apiID)
+			f.nonce = func(w http.ResponseWriter, _ *http.Request, _ int) { writeJSON(w, 200, n) }
+			cfg := f.config(t, apiID)
+			cfg.Tokens = func(context.Context, string) (string, error) { t.Error("a token was minted"); return "t", nil }
+			if _, err := Once(t.Context(), cfg); err == nil {
+				t.Fatal("Once accepted the nonce answer")
+			}
+			if err := CheckNonce(testCel, n); err == nil {
+				t.Fatal("CheckNonce accepted the nonce answer")
+			}
+			if _, b := f.counts(); b != 0 {
+				t.Fatalf("%d binds", b)
+			}
+		})
+	}
+	if err := CheckNonce(testCel, mgmtapi.NonceResponse{Nonce: "abc", Audience: mgmtapi.BindAudience(testCel, "abc")}); err != nil {
+		t.Fatalf("a good answer failed: %v", err)
+	}
+}
+
+func TestOnceRefusesUnknownBindStatus(t *testing.T) {
+	for _, status := range []string{"", "pwned", strings.Repeat("x", 100)} {
+		f := newServer(t, apiID)
+		f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+			writeJSON(w, 200, mgmtapi.BindResponse{Status: status})
+		}
+		if _, err := Once(t.Context(), f.config(t, apiID)); err == nil {
+			t.Fatalf("status %q counted as success", status)
+		}
+	}
+	for _, status := range []string{mgmtapi.StatusBound, mgmtapi.StatusAlreadyBound, mgmtapi.StatusKeysUpdated} {
+		f := newServer(t, apiID)
+		f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+			writeJSON(w, 200, mgmtapi.BindResponse{Status: status})
+		}
+		if resp, err := Once(t.Context(), f.config(t, apiID)); err != nil || resp.Status != status {
+			t.Fatalf("status %q: %v", status, err)
+		}
+	}
+	f := newServer(t, apiID)
+	f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{}")
+	}
+	if _, err := Once(t.Context(), f.config(t, apiID)); err == nil {
+		t.Fatal("a 200 with {} counted as success")
+	}
+}
+
+func TestRefusedRequestIDIsClipped(t *testing.T) {
+	f := newServer(t, apiID)
+	f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+		writeJSON(w, 403, mgmtapi.Denied{Error: "denied", RequestID: "ab\nbound:bound" + strings.Repeat("z", 500)})
+	}
+	_, err := Once(t.Context(), f.config(t, apiID))
+	var ref *Refused
+	if !errors.As(err, &ref) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(ref.RequestID) > 32 || strings.ContainsAny(ref.RequestID, "\n\r :") {
+		t.Fatalf("request ID %q", ref.RequestID)
+	}
+}
+
+func TestOnceRefusesOversizedBody(t *testing.T) {
+	f := newServer(t, apiID)
+	f.nonce = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"pad":"`+strings.Repeat("p", 70<<10)+`","nonce":"abc","audience":"`+mgmtapi.BindAudience(testCel, "abc")+`"}`)
+	}
+	if _, err := Once(t.Context(), f.config(t, apiID)); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("err = %v, want a size error", err)
+	}
+}
+
+func TestRunRecheckWaits(t *testing.T) {
+	f := newServer(t, apiID)
+	// Call 0 starts the bind. Calls 1 to 4 are rechecks: bound, a 503, a 403, bound.
+	f.nonce = func(w http.ResponseWriter, r *http.Request, n int) {
+		switch n {
+		case 2:
+			writeJSON(w, 503, map[string]string{"error": "busy"})
+		case 3:
+			denied(w)
+		default:
+			okNonce(n >= 1)(w, r, n)
+		}
+	}
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 5 }}
+	cfg, ctx := runCfg(t, f, rec)
+	_ = Run(ctx, cfg)
+	if len(rec.waits) != 5 {
+		t.Fatalf("waits %v, want 5", rec.waits)
+	}
+	for i, r := range []struct{ min, max time.Duration }{
+		{4*time.Minute + 30*time.Second, 5*time.Minute + 30*time.Second},
+		{4*time.Minute + 30*time.Second, 5*time.Minute + 30*time.Second},
+		{time.Second, 30 * time.Second},
+		{60 * time.Second, 66 * time.Second},
+		{4*time.Minute + 30*time.Second, 5*time.Minute + 30*time.Second},
+	} {
+		if d := rec.waits[i]; d < r.min || d > r.max {
+			t.Errorf("wait %d is %v, want between %v and %v", i, d, r.min, r.max)
+		}
 	}
 }

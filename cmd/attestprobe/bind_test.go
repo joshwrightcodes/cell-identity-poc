@@ -26,6 +26,7 @@ type bindServer struct {
 	bundlePath string
 	mu         sync.Mutex
 	nonces     int
+	nonceReply func(cell string) mgmtapi.NonceResponse
 	binds      []mgmtapi.BindRequest
 	bindStatus func(n int) (int, any)
 }
@@ -55,6 +56,10 @@ func newBindServer(t *testing.T) *bindServer {
 		s.mu.Lock()
 		s.nonces++
 		s.mu.Unlock()
+		if s.nonceReply != nil {
+			reply(w, 200, s.nonceReply(r.PathValue("cell")))
+			return
+		}
 		reply(w, 200, mgmtapi.NonceResponse{Nonce: "n1", Audience: mgmtapi.BindAudience(r.PathValue("cell"), "n1")})
 	})
 	mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
@@ -252,5 +257,24 @@ func TestAttestprobeDefaultTargetIsSpire(t *testing.T) {
 	cfg, err := parse(append([]string{"--variant", "good"}, baseArgs...), podEnv(nil))
 	if err != nil || cfg.target != "spire" {
 		t.Fatalf("target %q, err %v", cfg.target, err)
+	}
+}
+
+func TestAttestprobeBindChecksTheNonceAnswer(t *testing.T) {
+	s := newBindServer(t)
+	s.nonceReply = func(cell string) mgmtapi.NonceResponse {
+		return mgmtapi.NonceResponse{Nonce: "ab\nbound:bound", Audience: mgmtapi.BindAudience(cell, "ab\nbound:bound")}
+	}
+	code, out := runProbe(t, newTestDeps(t), s.args("--nonce-only"))
+	if code != 1 || strings.Count(out, "\n") != 1 || strings.Contains(out, "nonce:") || len(s.binds) != 0 {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+}
+
+func TestAttestprobeBindRefusesUnknownStatus(t *testing.T) {
+	s := newBindServer(t)
+	s.bindStatus = func(int) (int, any) { return 200, mgmtapi.BindResponse{Status: "pwned"} }
+	if code, out := runProbe(t, newTestDeps(t), s.args("--variant", "good")); code != 1 || strings.Contains(out, "bound:") {
+		t.Fatalf("exit %d, output %q", code, out)
 	}
 }

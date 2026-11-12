@@ -111,6 +111,9 @@ func runBind(ctx context.Context, cfg config, d deps) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("request a nonce: %w", err)
 		}
+		if err := bind.CheckNonce(cfg.cell, n); err != nil {
+			return "", err
+		}
 		nonce = n.Nonce
 		lines = append(lines, "nonce:"+n.Nonce+" "+n.Audience)
 		if cfg.bind.nonceOnly {
