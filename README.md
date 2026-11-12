@@ -467,11 +467,12 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 41 minutes. This is 1.5 times the slowest run, 1,616 seconds on 2026-11-12, rounded up to the next minute.
-The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
+The budget is 49 minutes. This is 1.5 times the slowest run, 1,940 seconds on 2026-11-12, rounded up to the next minute.
+The test timeout of `go test` is the budget plus 15 minutes, so the budget check reports a slow run before the timeout ends it.
+The tests of the mesh view add about six minutes. The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
 It prints the twelve slowest tests at the end.
-The slowest tests are the management CA rotation (409 seconds) and the rogue telemetry test (245 seconds).
+The slowest tests are the management CA rotation (438 seconds) and the rogue telemetry test (246 seconds).
 The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take 97 seconds.
 The budgets do not cover `harness:up`.
 
