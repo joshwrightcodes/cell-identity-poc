@@ -70,7 +70,7 @@ These stay in the target architecture, and come in later increments:
 - Observability uses the `otel-lgtm` all-in-one image, with local storage and no HA.
 - Until M4, the test-signed record from M2 is the management plane's registry of cells.
 - Upstream components keep their Prometheus endpoints. Only the collector in the same cluster scrapes them, and signals leave a cluster only as OTLP.
-- The External Secrets Operator is the provider-neutral sync from the secret manager into each cluster. A cluster gets its own install when it first needs a secret. In M2, only `dev-cp` has one.
+- The External Secrets Operator is the provider-neutral sync from the secret manager into each cluster. A cluster gets its own install when it first needs a secret. In M2, only `dev-cp` has one. In M3, `management` has an operator with no store, for its Password generator.
 
 ## Bespoke components
 
@@ -100,9 +100,9 @@ it exists.
 | M0 | Base cell | Done |
 | M1 | Harness | The host service creates all five clusters twice from clean, with storage and one registry mirror. A pod in `rogue` reaches no port on a cell's node except the residual ports 2379, 2380, 6443, 10250 and 10256 |
 | M2 | Attestor | Against a test-signed record, `celld` gets an SVID. Pod-bound, lifetime, audience, subject and unknown key ID tests fail as expected. A sidecar renews without a new token |
-| M3 | Central view and observability | `management` shows both cells in one Argo CD UI, with live manifests. Writes, annotation changes, `.operation`, exec and Secret reads through the view fail. A cell's SVID cannot pose as the management plane's principal. Grafana shows logs, metrics and traces from all five clusters, each tagged with its cluster, plane, environment and cell. A cell that labels its signals as another cell's is corrected at the gateway, and telemetry from `rogue` fails. Kiali shows the mesh of each cell, and cannot change it |
+| M3 | Central view and observability | `management` shows both cells in one Argo CD UI, with live manifests. Writes, annotation changes, `.operation`, exec and Secret reads through the view fail. A cell's SVID cannot pose as the management plane's principal. Grafana shows logs, metrics and traces from every registered cluster, each tagged with its cluster, plane, environment and cell. A cell that labels its signals as another cell's is corrected at the gateway, and telemetry from `rogue` fails. Kiali shows the mesh of each cell, and cannot change it |
 | M4 | Management plane stand-in and specs | envd pulls signed specs, and refuses unsigned or older ones. The management plane binds issuers and checks keys. The test-signed record fixture is deleted |
-| M5 | Signed work | `celld` claims, verifies and applies operations once. Forged, replayed, expired and wrong-target items fail. `dev-cp` cannot pose as a cell to the management plane |
+| M5 | Signed work | `celld` claims, verifies and applies operations once. Forged, replayed, expired and wrong-target items fail. `dev-cp` cannot pose as a cell to the management plane on the view, telemetry and mesh view streams |
 | M6 | Provisioning end to end | Checks 1–3 pass from one portal request. A step with no management plane signature fails |
 | M7 | Malicious cell and MITM | Check 4 passes. A rogue cluster, a rogue JWKS, TLS interception at each hop, and a relay that alters bytes all fail |
 | M8 | Bundles | Bundles that the management plane signs reach Argo CD in each cell. A bundle outside its allow-list fails, and a rollback restores the last good root |
@@ -126,12 +126,13 @@ macOS still sleeps when the lid closes on battery power.
 - Until signed bundles in M8, a bundle in the store of `dev-cp` is the root of every identity in `dev.env.poc.internal`. The `spire-server` bundle holds the server config, the records and the record public keys together, and nothing signs it. A writer to that bundle can add a record or a key, or change an entry, and so issue any identity in the trust domain. The bundle store admits only the repo server of `argocd` on port 5000. The AppProject allows every namespace and kind, so a bundle that names an object in another namespace can change it.
 - The SPIRE server NetworkPolicy admits by the node address of each agent cell, so admission is per node, not per workload. Each pod that the policies of its own namespace let out reaches the SPIRE port, and the token checks of the plugin decide which pod attests.
 - kindnet accepts each packet of a root process in the host network (`meta skuid 0`) before it checks a NetworkPolicy. Because of this, NetworkPolicy does not constrain root processes on a node, or root host network pods. On the `dev-cp` node, every root process reaches the SPIRE server port 8081 with no check. Examples are host network pods in `kube-system`, and the `pods/proxy` and `services/proxy` paths of the API server.
-- One shared vault and one access token serve every PoC cluster. Because of this, a compromised cluster can read every PoC secret, including the SPIRE intermediate key. Production uses a vault and a token for each cluster.
+- One shared vault and one access token serve `dev-cp`. `management` holds no token. Because of this, a compromised `dev-cp` can read every PoC secret, including the SPIRE intermediate key. Production gives each cluster its own token and vault.
 - The External Secrets Operator in `dev-cp` reads and writes only the Secrets of `spire-system`. Its NetworkPolicy still admits DNS and every public address on TCP port 443, so the operator can reach any public host on that port.
+- The External Secrets Operator in `management` reads and writes every Secret in `observability-system`, Secret `grafana-admin` included. Its NetworkPolicy admits only DNS and the API server.
 - The relay cannot close a revoked cell's streams. The management plane closes them.
 - The relay limits open connections to 256 in all and 16 for each client address. A cell node address stands for every pod of that cell, so one pod can use the 16 slots of its cell. One limiter serves every route of a relay, so silent connections on one route use slots of the other routes too. The management view listener keeps 64 handshake slots for all cells, and a client that sends one byte takes one for 10 seconds. Two cells with 16 connections each cannot fill them, but the relay has no limit for each cell beyond the address.
 - Every pod of a cell that no NetworkPolicy limits reaches the relay node ports through the node address of its cell. In `dev-cp`, such a pod reaches `management` on 31443 directly. An address spoofed on the `kind` bridge reaches the same ports. Identity at cell-proxy is the control, as for the SPIRE node port.
-- The identities `argocd/argocd-agent` and `observability-system/otel-uplink` follow the same rule as `celld`: any identity that can create a pod in the namespace can run it as that service account. The agent pod can request a token for its own service account, so it can attest as a node. The agent exposes `/debug/pprof` on its health port, and the pod admits no ingress to it. ConfigMap `mgmt-root` can be overwritten by a bundle that writes to `argocd`, and the new root applies at the next pod start.
+- The identities `argocd/argocd-agent`, `observability-system/otel-uplink` and `mesh-view-system/mesh-view` follow the same rule as `celld`: any identity that can create a pod in the namespace can run it as that service account. The agent pod can request a token for its own service account, so it can attest as a node. The agent exposes `/debug/pprof` on its health port, and the pod admits no ingress to it. ConfigMap `mgmt-root` can be overwritten by a bundle that writes to `argocd`, and the new root applies at the next pod start.
 - The agent can list and watch every Secret of `argocd`, because it does not start without that access. The admission policy limits the Secret names and not their contents.
 - A revoked record stops new attestations only. The plugin reads the records when the server starts, and the running agents of a revoked cell renew until an operator evicts them. M9 needs a ban of those agents.
 - The SPIRE node port has no limiter before authentication, which the target architecture requires for each plane listener. SPIRE also limits no attestation per address (`ratelimit { attestation = false }` in `server.conf`). The plugin limits each cell only after a token validates, and it limits no failed attestation. A payload with an unknown cell name ends before the in-flight cap. Because of this, failed attestations have no rate limit.
@@ -142,3 +143,46 @@ macOS still sleeps when the lid closes on battery power.
 - No CRD carries an Argo CD tracking ID, so Argo CD never prunes a CRD that leaves a bundle. On 2026-11-09 the CRDs of the External Secrets Operator in `dev-cp` had no tracking annotation. A CRD that a bundle drops stays in the cluster, with its objects, until a person deletes it. `eso:migrate` deletes the ClusterSecretStore CRD for this reason.
 - The harness apply does not prune. An object that leaves a harness bundle stays in the cluster until a person deletes it. `cell:verify` reports an extra object of a kind that the bundle holds, but not an extra object of another kind.
 - Argo CD still comes from a bundle in its own Application. No admission policy stops a bundle from writing to `argocd` or `cell-identity-system` yet, because the project allows every namespace and kind. A bundle that names an object there can change it.
+- The principal resource proxy, Redis proxy, metrics and health ports bind every interface, so NetworkPolicy is their only limit.
+- The collectors read no container log files, so upstream stdout logs stay in each cluster.
+- Until M5, a compromised `dev-cp` can mint a cell SVID. With it, the attacker can send telemetry as that cell. The attacker can also open a view stream that displaces the principal session of the cell. The attacker can take over the mesh tunnel of the cell too, because the newest connection wins. Then the attacker serves fabricated Kiali responses and a fabricated central view of that cell.
+- The CA of the management plane has no offline root key in the PoC. Production roots it offline.
+- The CA key of the SPIRE server in `management` rests unencrypted on the data volume, on the disk of the VM. The volume directory has mode 0777, so a pod that mounts the host path can read it.
+- In `management`, the local-path provisioner service account can create host path pods. The Argo CD application controller can use `pods/exec` in `spire-system`. Either right gives access to the CA key, and so to every `mgmt.poc.internal` identity.
+- A management CA rotation needs every view cell to be up, because its refresh runs the link phase of each cell. A new data volume in `management` gives a new root, and each peer copy fails until `cell:up` runs again.
+- In a namespace that a harness or link component shares with a bundle, `cell:verify` compares only the labelled objects with the harness bundle.
+- The SPIRE server role of `management` and `dev-cp` can read any pod and node of its cluster. The Prometheus port 9988 of both servers binds every address.
+- The SPIRE listeners are dual-stack. Any process in the host network namespace reaches ports 8081 and 9988 over the pod IPv6 link-local address. A root process is not required, because the kindnet IPv6 pod set is empty.
+- A cell can make the `dev-cp` SPIRE server send TokenReview calls to its API through `k8s_psat`, with no rate limit. The port 30081 of `dev-cp` admits every cell node address.
+- A pod that can create pods with a plane service account gets the SVID of that plane identity. `cell:verify` detects such a pod and does not prevent it.
+- The principal Redis proxy serves cell cache reads to `argocd-server` with no authentication.
+- `argocd-server` can read every Secret in `central-view-system`, including the Agent JWT signing key, the Redis password and the client keys. The principal and `argocd-server` read the Applications of every namespace.
+- Any holder of `pods/proxy` in `central-view-system`, and any root host process, can reach the pprof endpoint on the principal port 8003.
+- `pods/portforward`, `pods/exec` or `pods/ephemeralcontainers` on the principal pod reach `127.0.0.1:8443`. They can set `x-cell-agent` for any agent and so bypass `cell-proxy`.
+- The principal and agent images are Alpine with a shell and busybox, not distroless. The principal binary links Argo CD v3.5.1 and the server runs v3.6.1. The review did not read 172 modules of the principal.
+- The agent Role can update and patch Applications in `argocd-apps`. The view can read ConfigMaps in `argocd`, `istio-system` and `observability-system`, and CRDs, ClusterRoles and webhook configurations in every namespace.
+- A bundle writer can change the copy of AppProject `cell` in `argocd-apps`, and the principal mirrors the change. `check_cell_subject_pods` does not see a bare Pod in an owned namespace.
+- The canary Secret `view-canary` in the published `apps-demo` bundle holds a literal test marker. Any bundle reader can see it.
+- A central view read can fail with an empty HTTP 500 for up to 3 minutes (upstream Argo CD Agent issue 1107). This happens when a cache key expires in the Redis of a cell. The tests retry it. The UI shows an error until the controller writes the key again.
+- While `view:ui`, `mesh:ui` or `obs:ui` runs, every pod can read that UI through the Mac loopback. This includes pods in `rogue`. The central UI and Kiali are anonymous.
+- A rule that admits the `dev-cp` node address admits every pod in `dev-cp`, because pod egress leaves through the node address.
+- The namespace-wide DNS rule lets any pod send data out in DNS queries.
+- Node addresses reach the collector port 4317 and the uplink port 4319 for the kubelet probes. They also reach the Argo CD, `istiod` and Envoy metrics ports.
+- `otel-uplink` accepts plaintext OTLP on the pod network, and NetworkPolicy limits it to the collector pod. The collector pod sends its own telemetry on loopback, which no NetworkPolicy covers. `lgtm` accepts plaintext OTLP on port 4317 from two pod selectors.
+- A connection to `cell-proxy` or the uplink outlives the SVID that authorised it.
+- The gateway has no rate or cardinality limit for each sender.
+- Signals can carry personal data, and no processor filters it.
+- The gateway counts a dropped hostile resource as at least one rejected record, not as an exact number. A record larger than the batch bound of 101,000 to 129,000 bytes is dropped by the exporter batcher.
+- The readiness probe of the gateway covers the first connection to the store only. A later store outage leaves the pod Ready, and senders get `Unavailable`.
+- The gateway exports its own metrics straight to `lgtm`, and the OTel SDK retries them in memory only.
+- The collector of `management` has no gateway, so its scraped Envoy `source_cluster` and `destination_cluster` labels get no second check.
+- The filter for the gateway alarm series matches the metric name and the name with its unit. A name and unit pair that Prometheus rewrites, for example the unit `s`, can still forge the series.
+- Every pod with `get` on Secrets in `observability-system` can read the Grafana admin password. If someone deletes `grafana-admin` and keeps the Grafana database, `obs:password` is wrong until `obs:rotate-password restore` runs.
+- Grafana blocks the user `admin` for 5 minutes after 5 failed logins, and the block also refuses the right password. Several negative login checks in a row trigger it.
+- `lgtm` runs six processes in one pod without a mesh proxy. Its 10Gi `local-path` volume has no backup, and the data is lost with the volume. Nobody inspected the collector image layers.
+- Code that runs inside the tunnel pod can use the SVID of that pod. The API server proxy of `management` reaches the hub listeners from a node address, because the listeners use plain HTTP.
+- The tunnel role reads every namespace of a cell, not only `MESH_VIEW_NAMESPACES`.
+- A hostile cell can crash-loop the shared Kiali. One absent cell stops Kiali from starting, and it recovers about 5 minutes after the cell returns.
+- `prom-readonly` does not enforce `query_scope`, and the path is read-only. The Kiali signing key is predictable and unused under the `anonymous` strategy.
+- The tunnel state comes from the hub log, and the tunnel probe runs `whoami`. A pod that started in the same second as a newer view key, and did not read it, counts as current.
+- `harness:status` reads the current principal log, so a log rotation can hide connected agents.

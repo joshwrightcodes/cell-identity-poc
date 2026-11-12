@@ -30,9 +30,11 @@
 | New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |
 | Grafana of `management` on 127.0.0.1:3300, and its admin password (see README "Telemetry store") | `mise run obs:ui`, `mise run obs:password` |
 | New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |
+| Report each hop of the telemetry path of one cluster, and the first failing hop (see README "Collectors and uplinks") | `mise run obs:uplink-status dev-cell-1` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
+| Remove what the `cell:ui` server wrote into `argocd` | `mise run cell:ui:clean` |
 | Delete the cell | `mise run cell:down` |
 | Fetch upstream files for review | `mise run vendor:fetch` |
 | Connect the External Secrets Operator to the secret manager (see README "Keys"; `CELL` defaults to `dev-cp` here) | `mise run secrets:connect` |
@@ -44,6 +46,7 @@
 | Run the M1 end-to-end gate | `mise run gate:m1` |
 | Run the M2 end-to-end gate against the SPIRE server in `dev-cp` | `mise run gate:m2` |
 | Run the M3 end-to-end gate against the management plane and `dev-cp` | `mise run gate:m3` |
+| Repair the objects and firewall rules that a `gate:m3` run left when it stopped before its cleanups (`--check` only lists them) | `mise run gate:m3:repair` |
 | Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
