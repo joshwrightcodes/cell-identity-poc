@@ -1064,6 +1064,34 @@ check_view_cert_expiry() {
   fi
 }
 
+# The principal and argocd-server read the view keys from the API at start, and they mount no copy.
+# A run of link.sh that stopped after viewkeys made new keys leaves both on the old ones. The main
+# container of each pod must have started after the newest view key Secret. viewkeys deletes and
+# creates a Secret to change it, so its creation time is the time of its content.
+check_view_pods_current() {
+  local ns=central-view-system secrets newest name started pod at late=()
+  secrets="$(k -n "$ns" get secrets argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret -o json)" \
+    || { echo "could not read the view key Secrets of $ns"; return 1; }
+  newest="$(jq -r '[.items[].metadata.creationTimestamp | fromdateiso8601] | max | todateiso8601' <<<"$secrets")"
+  for name in argocd-agent-principal argocd-server; do
+    started="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$name" -o json \
+      | jq -r --arg name "$name" '.items[] | .metadata.name as $pod | .status.containerStatuses[]? | select(.name == $name)
+        | "\($pod) \(.state.running.startedAt // "")"')" || { echo "could not read the pods of $name in $ns"; return 1; }
+    [[ -n "$started" ]] || { echo "$name has no pod in $ns"; return 1; }
+    while read -r pod at; do
+      if [[ -z "$at" || "$at" < "$newest" ]]; then
+        late+=("$pod started at ${at:-no time}")
+      fi
+    done <<<"$started"
+  done
+  if ((${#late[@]} > 0)); then
+    printf '%s, before the newest view key at %s.\n' "${late[@]}" "$newest"
+    echo "The pod reads the keys only at start, so it may hold old certificates."
+    echo "Run: mise run view:rotate-keys"
+    return 1
+  fi
+}
+
 # The telemetry gateway copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the
 # central view does.
 check_gateway_env_address() {
@@ -1159,6 +1187,7 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root
     check "central-view-system holds only the Secrets of the view" check_view_secrets
     check "The view certificates are valid for 30 days or more" check_view_cert_expiry
+    check "The principal and argocd-server started after the newest view key" check_view_pods_current
   fi
   if [[ "$comp" == telemetry-gateway ]]; then
     check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address

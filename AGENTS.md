@@ -14,7 +14,9 @@
 | --- | --- |
 | Start or stop the Colima VM | `mise run vm:up`, `mise run vm:down` |
 | Create all five clusters, build the images and set up each cluster with components | `mise run harness:up` |
+| Report whether the PoC is healthy: one JSON object for each cluster (see README "Operator status and logs") | `mise run harness:status` |
 | Run `cell:verify` on every cluster with components | `mise run harness:verify` |
+| Print the JSON logs of pods by label selector, with a `cluster` field | `mise run harness:logs all app.kubernetes.io/name=otel-uplink` |
 | Build the in-cluster images and record their digests in `build/images.env` | `mise run images` |
 | Delete all five clusters | `mise run harness:down` |
 | Set up one cell (`CELL` defaults to `dev-cell-1`) | `CELL=management mise run cell:up` |

@@ -166,6 +166,19 @@ run = "scripts/harness.sh up"
 description = "Run cell:verify on every cluster that has components, and print one PASS or FAIL line for each"
 run = "scripts/harness-verify.sh"
 
+[tasks."harness:status"]
+description = "Report whether the PoC is healthy. Print one JSON object for each cluster with components: Applications, cell:verify, telemetry, and for management the agents, the Prometheus samples, Kiali and the mesh view. Exit status 1 when a value is bad"
+env = { CELL = "management" }
+run = "scripts/status.sh"
+
+[tasks."harness:logs"]
+description = "Print the JSON log lines of the pods that match a label selector, each with the field cluster. The first argument is a cluster or all. For example: mise run harness:logs all app.kubernetes.io/name=argocd-agent-principal"
+usage = '''
+arg "<cluster>" help="A cluster with components, or all"
+arg "<selector>" help="A label selector"
+'''
+run = 'scripts/logs.sh "${usage_cluster?}" "${usage_selector?}"'
+
 [tasks."harness:down"]
 description = "Delete all five clusters through the host service"
 run = "scripts/harness.sh down"

@@ -57,7 +57,7 @@ Follow these steps for the first setup:
 
    ```sh
    mise run harness:up
-   mise run harness:verify
+   mise run harness:status
    ```
 
 Step 5 of [Keys](#keys), `secrets:connect`, needs the cluster, so it comes during or after `harness:up`.
@@ -82,6 +82,7 @@ Last, `cell:up` runs the link phase of a cluster with link components, as [Centr
 Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
 `cell:verify` runs the checks of one cluster and prints PASS or FAIL for each.
 `harness:verify` runs `cell:verify` on each cluster with components, and prints one line for each cluster at the end.
+`harness:status` answers the wider question "is the PoC healthy". [Operator status and logs](#operator-status-and-logs) describes it.
 
 `harness:up` stops at the first cluster that fails, so a failure in `dev-cp` also stops the cells.
 It then prints the commands for the remaining clusters. Fix the cause, and run them in topology order:
@@ -108,6 +109,19 @@ To set up the base cell of `management` alone, run `CELL_UP_SKIP_LINK=1 CELL=man
 A rebuilt cluster can get a new node address from Docker, and a rebuilt cell gets a new service account key.
 Renders read both facts once, so the other clusters keep the old values until they render again.
 `cell:verify` compares the deployed values with the host service, and it prints the command to run when they differ.
+
+Renders copy values from other clusters, so a rebuild needs these commands in this order.
+Use the same order for a change of a root:
+
+| Rebuilt cluster | Then run | Reason |
+| --- | --- | --- |
+| `management` | `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. |
+| `dev-cp` | `cell:up` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. |
+| a cell | `CELL=dev-cp mise run cell:up` | The relay and the SPIRE node port admit the node addresses of the cells. |
+
+A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
+A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
+`mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the matching command.
 
 To rebuild a cell, for example `dev-cell-1`, create the cluster first.
 Then `dev-cp` can sign a record with the new key before the cell agent attests:
@@ -137,7 +151,7 @@ CELL=dev-cell-2 mise run cell:up
 CELL=dev-cell-1 mise run cell:restart
 CELL=dev-cell-2 mise run cell:restart
 CELL=management mise run cell:link
-mise run harness:verify
+mise run harness:status
 ```
 
 The last `cell:link` copies the new `dev-cp` root and node address into the central view.
@@ -218,6 +232,9 @@ If the task stops before its end, run it again. It is safe to run again, and onl
 The client certificates of the view are valid for 180 days. `cell:verify` fails 30 days before they expire. Run `view:rotate-keys` then.
 `viewkeys` keeps no CA key. When a certificate Secret is missing or does not match the CA, for example after a new cell in `VIEW_CELLS`, `cell:link` makes a new CA and new certificates, and starts the principal and `argocd-server` again.
 `cell:verify` of `management` also compares the view listener address and ConfigMap `peer-root` with the live values of `dev-cp`. After a rebuild of `dev-cp`, it prints `CELL=management mise run cell:link`.
+The principal and `argocd-server` read the view keys from the API at start, and they mount no copy.
+A `cell:link` that stopped after `viewkeys` made new keys can leave both pods on the old certificates.
+`cell:verify` of `management` compares the start time of each pod with the creation time of the newest view key Secret. When a pod is older, it prints `mise run view:rotate-keys`.
 
 ## Telemetry store
 
@@ -401,8 +418,96 @@ While `mesh:ui` runs, every pod on the VM can reach the page through `host.docke
 
 `cell:verify` of a cell checks the tunnel objects, its images, the `dev-cp` node address and ConfigMap `mgmt-root`.
 `cell:verify` of `management` also checks the hub listener address, ConfigMap `peer-root` and the tunnel of each cell.
-When a tunnel is down, read the state with `mise run mesh:status`, and run `CELL=<cell> mise run cell:up` for the cell.
+When a tunnel is down, read the state with `mise run mesh:status`, and run `CELL=<cell> mise run cell:up` for the cell. `mise run harness:status` names the absent cell in the field `kiali.note`.
 For the Prometheus path, run `mise run obs:uplink-status management`.
+
+## Operator status and logs
+
+Run this task to learn whether the PoC is healthy:
+
+```sh
+mise run harness:status
+```
+
+The task prints one JSON object on each line of standard output, one for each cluster with components, in the order of `harness/topology.yaml`.
+The `rogue` cluster has no components, so it has no object.
+Progress lines go to standard error. The exit status is 1 when any value is bad.
+The task reads all clusters at the same time. It takes about two minutes, because it runs `cell:verify` on each cluster.
+It reads the checks of `cell:verify`, the hops of `obs:uplink-status` and the parts of `mesh:status` from those tasks. Use them for the detail of one part.
+
+Every object has these fields. Later milestones can add fields, but they keep these names:
+
+| Field | Meaning |
+| --- | --- |
+| `cluster` | The name of the cluster. |
+| `ok` | `true` when every value below is good. |
+| `applications` | `total` is the number of Argo CD Applications. `bad` holds one text for each Application that is not Synced and Healthy. |
+| `verify` | `ok` is the result of `cell:verify`. `failed` holds the name of each failed check. |
+| `telemetry` | `ok` is the result of `obs:uplink-status`. `verdict` names the first hop that fails. |
+| `problems` | One sentence for each bad value, with the command to run. |
+
+The object of `management` has these fields too:
+
+| Field | Meaning |
+| --- | --- |
+| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. |
+| `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
+| `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
+| `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `note` is empty, or says what to do. |
+| `mesh` | `ok` is the exit status of `mesh:status`. `lines` holds its output. |
+
+While a cell is down, Kiali cannot start. It stops during discovery and restarts with longer waits.
+It recovers about five minutes after the cell returns.
+In this state, `kiali.ready` is `false`, `kiali.down_cells` names the absent cell, and `kiali.note` says that and names the command `CELL=<cell> mise run cell:up`.
+The same sentence appears in `problems`.
+
+To read the logs of a hop, run this task with a cluster, or `all`, and a label selector:
+
+```sh
+mise run harness:logs all app.kubernetes.io/name=argocd-agent-principal
+```
+
+The task prints the JSON log lines of the matching pods, one on each line, with the added field `cluster`.
+A line that is not JSON becomes `{"cluster": ..., "raw": ...}`.
+A line that already has a `cluster` field keeps its value in `source_cluster`.
+A cluster that the task cannot read gives one error line with its name, and the exit status is 1 at the end.
+`LOGS_TAIL` sets the number of lines for each container, 200 by default, and `LOGS_SINCE` limits their age, for example `10m`.
+
+Each stream has hops. Read the log of the first hop that fails, from the source to the store:
+
+| Stream | Hop | Cluster | Selector `app.kubernetes.io/name=` |
+| --- | --- | --- | --- |
+| View | Agent and its `cell-proxy` | cell | `argocd-agent` |
+| View | Relay | `dev-cp` | `relay-view` |
+| View | `cell-proxy` and principal | `management` | `argocd-agent-principal` |
+| Telemetry | Collector | any | `otel-collector` |
+| Telemetry | Uplink | cell, `dev-cp` | `otel-uplink` |
+| Telemetry | Relay | `dev-cp` | `relay-telemetry` |
+| Telemetry | Gateway | `management` | `telemetry-gateway` |
+| Telemetry | Store | `management` | `lgtm` |
+| Mesh view | Tunnel pod | cell | `mesh-view` |
+| Mesh view | Relay | `dev-cp` | `relay-view` |
+| Mesh view | Hub | `management` | `mesh-view-hub` |
+| Mesh view | Kiali | `management` | `kiali` |
+
+The `cell-proxy` logs carry a `reason` field when they refuse a peer or a request. The values are:
+
+| Reason | Meaning |
+| --- | --- |
+| `peer_untrusted` | The certificate of the peer does not chain to the peer bundle. A copy of a root is old. |
+| `peer_not_allowed` | The ID of the peer is not the expected ID, or the registry does not list it. |
+| `subject_mismatch` | The token of a request names another agent than the connection. |
+| `request_not_allowed` | The request is not one that the backend serves. |
+| `upstream_unavailable` | The backend cannot reach its upstream. |
+| `overloaded` | The server holds its maximum number of connections. |
+| `no_client_cert` | The client sent no certificate, as a probe does. |
+| `protocol_not_h2` | The handshake did not agree on HTTP/2. |
+| `handshake_failed` | The handshake failed for another reason, for example a timeout. |
+| `request_too_large` | The gateway refused an export that is over a size limit of the gateway or of its upstream. |
+| `resource_refused` | One resource of an export is over a size limit. The gateway drops it and forwards the other resources. |
+
+The hub and each tunnel pod also log the end of a tunnel as `tunnel_down` with a `cause`: `expiry`, `replaced`, `peer_closed`, `ping_timeout` or `local_close`.
+A tunnel that the hub replaced with a newer one never counts as down.
 
 ## Add or remove a cell
 
@@ -423,10 +528,10 @@ To add a cell, for example `dev-cell-3`, follow these steps:
    CELL=dev-cp mise run cell:up
    CELL=dev-cell-3 mise run cell:up
    CELL=management mise run cell:link
-   mise run harness:verify
+   mise run harness:status
    ```
 
-`harness:up`, `harness:verify`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
+`harness:up`, `harness:verify`, `harness:status`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
 The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, because each test gives one of them its own role.
 
 To remove a cell, remove it from `SPIRE_AGENT_CELLS`, `VIEW_CELLS` and `MESH_VIEW_CELLS`.
@@ -801,7 +906,7 @@ Run the one migration command, with the settings of `secrets:connect` in place:
 
 ```sh
 mise run eso:migrate
-mise run harness:verify
+mise run harness:status
 ```
 
 First, the task annotates Namespace `spire-system` with `Prune=false,Delete=false`, and it reads the annotation back.

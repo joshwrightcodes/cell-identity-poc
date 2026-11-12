@@ -142,4 +142,4 @@ if k get crd clustersecretstores.external-secrets.io >/dev/null 2>&1; then
   k delete crd clustersecretstores.external-secrets.io --ignore-not-found >/dev/null || die "could not delete the ClusterSecretStore CRD"
 fi
 log "deleted the token copy in external-secrets, ClusterSecretStore $SECRET_STORE and its CRD"
-log "eso:migrate is complete. Run: mise run harness:verify"
+log "eso:migrate is complete. Run: mise run harness:status"
