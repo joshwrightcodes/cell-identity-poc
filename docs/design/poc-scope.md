@@ -158,6 +158,7 @@ macOS still sleeps when the lid closes on battery power.
 - The principal Redis proxy serves cell cache reads to `argocd-server` with no authentication.
 - `argocd-server` can read every Secret in `central-view-system`, including the Agent JWT signing key, the Redis password and the client keys. The principal and `argocd-server` read the Applications of every namespace.
 - Any holder of `pods/proxy` in `central-view-system`, and any root host process, can reach the pprof endpoint on the principal port 8003.
+- Some upstream images from before M3 run by tag, not by digest, and some of their containers have no CPU or memory bounds. `TestRenderedPodsPinnedAndBounded` lists them, and every new container is pinned and bounded.
 - `pods/portforward`, `pods/exec` or `pods/ephemeralcontainers` on the principal pod reach `127.0.0.1:8443`. They can set `x-cell-agent` for any agent and so bypass `cell-proxy`.
 - The principal and agent images are Alpine with a shell and busybox, not distroless. The principal binary links Argo CD v3.5.1 and the server runs v3.6.1. The review did not read 172 modules of the principal.
 - The agent Role can update and patch Applications in `argocd-apps`. The view can read ConfigMaps in `argocd`, `istio-system` and `observability-system`, and CRDs, ClusterRoles and webhook configurations in every namespace.
