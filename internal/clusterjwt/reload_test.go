@@ -791,7 +791,6 @@ func TestMarksFileCellAndRetiredMarksSurviveRestart(t *testing.T) {
 func TestMarksFileOfAnotherEnvOrKeyFailsClosed(t *testing.T) {
 	for name, d := range map[string]marksDoc{
 		"other_env": {Env: "prod"},
-		"other_key": {KeySHA256: strings.Repeat("ab", 32)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newFixture(t, fixtureOptions{marks: true})
@@ -1147,4 +1146,99 @@ func TestConfigureBaseBelowMarksIsNotKept(t *testing.T) {
 			t.Fatalf("a retired cell serves again\n%s", f.logs.String())
 		}
 	})
+}
+
+// A signing key rotation re-signs at (epoch + 1, 1), so marks written under the old key still guard the
+// new key. The plugin keeps them, and needs no operator step.
+func TestMarksSurviveAKeyRotation(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signed := func(name string, epoch, counter uint64) ([]byte, envspec.Entry) {
+		rec := f.keys.record(t)
+		rec.Name, rec.Epoch, rec.Counter = name, epoch, counter
+		env, err := record.Sign(rec, newPriv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := json.Marshal(rec)
+		return env, envspec.Entry{Name: name, Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)}
+	}
+	r1, e1 := signed("dev-cell-1", 2, 1)
+	r2, e2 := signed("dev-cell-2", 2, 1)
+	f.cm.write(map[string][]byte{
+		specFile:                    signSpec(t, newPriv, testEnv, 2, 1, []envspec.Entry{e1, e2}, nil),
+		"dev-cell-1" + recordSuffix: r1,
+		"dev-cell-2" + recordSuffix: r2,
+	})
+	logs := &syncBuffer{}
+	p := New()
+	p.now = func() time.Time { return testNow }
+	p.log = hclog.New(&hclog.LoggerOptions{Level: hclog.Debug, Output: logs, JSONFormat: true})
+	t.Cleanup(func() { _ = p.Close() })
+	hcl := strings.Replace(f.base, base64.StdEncoding.EncodeToString(f.pub), base64.StdEncoding.EncodeToString(newPub), 1)
+	if _, err := p.Configure(context.Background(), &configv1.ConfigureRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain}, HclConfiguration: hcl}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(p.st.Load().records); n != 2 {
+		t.Fatalf("%d records after a key rotation, want 2\n%s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), `"@message":"marks_key_changed"`); n != 1 {
+		t.Fatalf("%d marks_key_changed lines, want 1\n%s", n, logs.String())
+	}
+	if strings.Contains(logs.String(), "marks_foreign") {
+		t.Fatalf("a changed key was treated as a foreign marks file\n%s", logs.String())
+	}
+	b, _ := os.ReadFile(f.marksPath)
+	if !strings.Contains(string(b), keyFingerprint([]ed25519.PublicKey{newPub})) || !strings.Contains(string(b), `"epoch":2`) {
+		t.Fatalf("the marks file was not rewritten under the new key: %s", b)
+	}
+
+	// An older epoch is refused under the new key as well.
+	oldR1, oldE1 := signed("dev-cell-1", 1, 1)
+	f.cm.write(map[string][]byte{
+		specFile:                    signSpec(t, newPriv, testEnv, 1, 5, []envspec.Entry{oldE1}, nil),
+		"dev-cell-1" + recordSuffix: oldR1,
+	})
+	before := p.st.Load()
+	p.reload()
+	if p.st.Load() != before || !strings.Contains(logs.String(), "spec_older_ignored") {
+		t.Fatalf("a spec of an older epoch was not refused after the rotation\n%s", logs.String())
+	}
+}
+
+// A spec at or below the persisted mark is refused under any key.
+func TestMarksGuardUnderANewKey(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	newPub, newPriv, _ := ed25519.GenerateKey(rand.Reader)
+	f.writeMarks(marksDoc{
+		KeySHA256: keyFingerprint([]ed25519.PublicKey{f.pub}),
+		Spec:      envspec.Revision{Epoch: 2, Counter: 1},
+		Cells:     map[string]envspec.Revision{},
+	})
+	rec := f.keys.record(t)
+	rec.Name, rec.Epoch, rec.Counter = "dev-cell-1", 1, 5
+	env, _ := record.Sign(rec, newPriv)
+	body, _ := json.Marshal(rec)
+	entry := envspec.Entry{Name: "dev-cell-1", Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)}
+	f.cm.write(map[string][]byte{
+		specFile:                    signSpec(t, newPriv, testEnv, 1, 5, []envspec.Entry{entry}, nil),
+		"dev-cell-1" + recordSuffix: env,
+	})
+	logs := &syncBuffer{}
+	p := New()
+	p.now = func() time.Time { return testNow }
+	p.log = hclog.New(&hclog.LoggerOptions{Level: hclog.Debug, Output: logs, JSONFormat: true})
+	t.Cleanup(func() { _ = p.Close() })
+	hcl := strings.Replace(f.base, base64.StdEncoding.EncodeToString(f.pub), base64.StdEncoding.EncodeToString(newPub), 1)
+	if _, err := p.Configure(context.Background(), &configv1.ConfigureRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain}, HclConfiguration: hcl}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(p.st.Load().records); n != 0 || !strings.Contains(logs.String(), "spec_older_ignored") {
+		t.Fatalf("%d records; a spec below the persisted mark was accepted under a new key\n%s", n, logs.String())
+	}
 }

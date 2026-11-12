@@ -110,9 +110,14 @@ func (p *Plugin) ensureMarks(cfg *state, note func(func(string, ...any), string,
 		note(p.log.Error, "marks_unreadable", path, "reason", err.Error())
 		return false
 	}
-	if doc.Env != cfg.env || doc.KeySHA256 != keyFingerprint(cfg.keys) {
-		note(p.log.Error, "marks_foreign", path, "reason", "the marks file belongs to another environment or record key pin", "marks_env", doc.Env)
+	if doc.Env != cfg.env {
+		note(p.log.Error, "marks_foreign", path, "reason", "the marks file belongs to another environment", "marks_env", doc.Env)
 		return false
+	}
+	if doc.KeySHA256 != keyFingerprint(cfg.keys) {
+		// A rotation re-signs at a higher epoch, so the marks stay correct guards under the new key.
+		// The file is rewritten with the new fingerprint when the first spec above the mark is accepted.
+		p.log.Warn("marks_key_changed", "file", path, "reason", "the pinned record keys differ from those of the marks file")
 	}
 	p.marksReady, p.marksPath = true, path
 	p.specMark = doc.Spec
