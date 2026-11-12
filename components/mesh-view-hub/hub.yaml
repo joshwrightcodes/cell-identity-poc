@@ -56,6 +56,9 @@ spec:
             - --peer-bundle=/run/cell-proxy/peer-root/root.crt
             - --peer-trust-domain=@PEER_TRUST_DOMAIN@
             - "--tunnel-cell=@TUNNEL_CELL@"
+            # A dead path ends a tunnel after 15 seconds, well inside one SVID life of 1 minute.
+            - --tunnel-read-idle=10s
+            - --tunnel-ping-timeout=5s
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock

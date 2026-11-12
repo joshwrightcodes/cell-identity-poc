@@ -152,12 +152,17 @@ func assertDenied(t *testing.T, code int, body []byte) {
 // trackListener records each accepted connection, so a test can drop them.
 type trackListener struct {
 	net.Listener
+	// wrap, when set, replaces each accepted connection, for a test that blackholes it.
+	wrap  func(net.Conn) net.Conn
 	mu    sync.Mutex
 	conns []net.Conn
 }
 
 func (l *trackListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
+	if err == nil && l.wrap != nil {
+		c = l.wrap(c)
+	}
 	if err == nil {
 		l.mu.Lock()
 		l.conns = append(l.conns, c)
@@ -206,6 +211,10 @@ type tunnelHarnessConfig struct {
 	maxStreams int
 	// hubLeafLife is the lifetime of the SVID of the hub. Zero means a long one.
 	hubLeafLife time.Duration
+	// readIdle and pingTimeout set the keepalive of the hub. Zero means the default.
+	readIdle, pingTimeout time.Duration
+	// holes wraps each connection that the hub accepts, so a test can blackhole it.
+	holes *holes
 }
 
 func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
@@ -230,12 +239,15 @@ func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness 
 	for _, c := range cfg.cells {
 		cells[c] = "127.0.0.1:0"
 	}
-	h.hub = NewTunnelHub(cells, cfg.wait, log, WithMetrics(cfg.metrics), WithMaxStreams(cfg.maxStreams))
+	h.hub = NewTunnelHub(cells, cfg.wait, log, WithMetrics(cfg.metrics), WithMaxStreams(cfg.maxStreams), WithKeepalive(cfg.readIdle, cfg.pingTimeout))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	h.accepted = &trackListener{Listener: ln}
+	if cfg.holes != nil {
+		h.accepted.wrap = cfg.holes.wrap
+	}
 	h.server = ln.Addr().String()
 	hubSVID := h.mgmt.svid(t, kialiID)
 	if cfg.hubLeafLife > 0 {
@@ -286,11 +298,11 @@ func (h *tunnelHarness) cellHandler(t *testing.T) http.Handler {
 }
 
 // startCell runs the cell side with dial and handler until the test ends or stop is called.
-func startCell(t *testing.T, dial func(context.Context) (net.Conn, error), handler http.Handler) (stop func()) {
+func startCell(t *testing.T, dial func(context.Context) (net.Conn, error), handler http.Handler, opts ...TunnelOption) (stop func()) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
-	go func() { _ = RunTunnel(ctx, dial, handler); close(done) }()
+	go func() { _ = RunTunnel(ctx, dial, handler, opts...); close(done) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -759,7 +771,10 @@ func TestHubNewestConnWins(t *testing.T) {
 		}
 		done := make(chan struct{})
 		handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, name) })
-		go func() { serveTunnel(ctx, newTunnelServer(), conn, handler); close(done) }()
+		go func() {
+			serveTunnel(ctx, newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler)
+			close(done)
+		}()
 		t.Cleanup(func() { _ = conn.Close(); <-done })
 		return done
 	}
@@ -823,5 +838,63 @@ func tunnelThroughSpiffeClient(t *testing.T) {
 	}
 	if n := h.api.hits.Load(); n != 1 {
 		t.Fatalf("API hits %d, want 1", n)
+	}
+}
+
+// bhConn is a connection that can stop delivering: once on, a read blocks until the connection closes, and a write
+// is dropped, as on a path that lost every packet in both directions.
+type bhConn struct {
+	net.Conn
+	on     atomic.Bool
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newBHConn(c net.Conn) *bhConn { return &bhConn{Conn: c, closed: make(chan struct{})} }
+
+func (c *bhConn) Read(p []byte) (int, error) {
+	if c.on.Load() {
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	n, err := c.Conn.Read(p)
+	if c.on.Load() {
+		<-c.closed
+		return 0, net.ErrClosed
+	}
+	return n, err
+}
+
+func (c *bhConn) Write(p []byte) (int, error) {
+	if c.on.Load() {
+		return len(p), nil
+	}
+	return c.Conn.Write(p)
+}
+
+func (c *bhConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return c.Conn.Close()
+}
+
+// holes keeps the connections that a hub accepted through it.
+type holes struct {
+	mu    sync.Mutex
+	conns []*bhConn
+}
+
+func (h *holes) wrap(c net.Conn) net.Conn {
+	b := newBHConn(c)
+	h.mu.Lock()
+	h.conns = append(h.conns, b)
+	h.mu.Unlock()
+	return b
+}
+
+func (h *holes) blackhole() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, c := range h.conns {
+		c.on.Store(true)
 	}
 }

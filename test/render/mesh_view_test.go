@@ -64,7 +64,7 @@ func TestMeshViewCellRender(t *testing.T) {
 			}
 			ctr := named(t, get[[]any](t, spec, "containers"), "cell-proxy")
 			want := []string{"tunnel", "--upstream=10.9.0.9:30445", "--expect-id=spiffe://mgmt.poc.internal/kiali",
-				"--peer-bundle=/run/cell-proxy/mgmt-root/root.crt", "--peer-trust-domain=mgmt.poc.internal"}
+				"--peer-bundle=/run/cell-proxy/mgmt-root/root.crt", "--peer-trust-domain=mgmt.poc.internal", "--read-idle=10s", "--ping-timeout=5s"}
 			if got := argsOf(t, ctr); !slices.Equal(got, want) {
 				t.Errorf("args %q, want %q", got, want)
 			}
@@ -221,7 +221,7 @@ func TestMeshViewHubRender(t *testing.T) {
 	want := []string{"spiffe-server", "--listen=:8444", "--backend=tunnel",
 		`--allow-id=^spiffe://dev\.env\.poc\.internal/cell/([a-z0-9-]+)/mesh-view$`, "--registry-dir=/run/cell-proxy/registry",
 		"--peer-bundle=/run/cell-proxy/peer-root/root.crt", "--peer-trust-domain=dev.env.poc.internal",
-		"--tunnel-cell=dev-cell-1=:18001", "--tunnel-cell=dev-cell-2=:18002"}
+		"--tunnel-read-idle=10s", "--tunnel-ping-timeout=5s", "--tunnel-cell=dev-cell-1=:18001", "--tunnel-cell=dev-cell-2=:18002"}
 	if got := argsOf(t, ctr); !slices.Equal(got, want) {
 		t.Errorf("args %q, want %q", got, want)
 	}

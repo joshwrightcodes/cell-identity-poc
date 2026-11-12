@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -117,7 +118,10 @@ func (h *tunnelHarness) serveFixed(t *testing.T, dial func(context.Context) (net
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
-	go func() { serveTunnel(t.Context(), newTunnelServer(), conn, handler); close(done) }()
+	go func() {
+		serveTunnel(t.Context(), newTunnelServer(upstreamReadIdle, upstreamPingTimeout), conn, handler)
+		close(done)
+	}()
 	t.Cleanup(func() { _ = conn.Close(); <-done })
 	return done
 }
@@ -510,4 +514,85 @@ func TestTunnelStatusNamesTheCause(t *testing.T) {
 		return c.LastEnd != nil && c.LastEnd.Cause == "expiry"
 	})
 	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "cause": "peer_closed"}, 3*time.Second)
+}
+
+// The cell finds a dead path with its own pings. With the path blackholed after the tunnel is up, the cell closes the
+// tunnel after the idle time and the ping timeout, and its state names the cause local_close. A cell with no pings
+// (ReadIdleTimeout 0 in newTunnelServer) never closes it, so this test fails for that mutation.
+func TestCellPingsFindABlackholedTunnel(t *testing.T) {
+	h := newTunnelHarness(t, 5*time.Second)
+	state := NewTunnelState()
+	inner := TunnelDialer(h.server, ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog), WithState(state))
+	var hole atomic.Pointer[bhConn]
+	dial := func(ctx context.Context) (net.Conn, error) {
+		c, err := inner(ctx)
+		if err != nil {
+			return nil, err
+		}
+		b := newBHConn(c)
+		hole.Store(b)
+		return b, nil
+	}
+	startCell(t, dial, h.cellHandler(t), WithKeepalive(300*time.Millisecond, 300*time.Millisecond))
+	waitStatus(t, "the cell state up", 5*time.Second, func() bool { return state.Status().Up })
+	hole.Load().on.Store(true)
+	waitStatus(t, "the cell to close the blackholed tunnel by its pings", 3*time.Second, func() bool {
+		e := state.Status().Cells["self"].LastEnd
+		return e != nil && e.Cause == "local_close"
+	})
+	findLog(t, h.cellLog, "tunnel_closed", map[string]any{"closed_by": "cell"}, time.Second)
+}
+
+// The hub finds a dead path with its own pings. With the connection of the hub blackholed after the tunnel is up, the hub
+// closes the tunnel after the idle time and the ping timeout, and logs the cause local_close. A hub with no pings
+// (ReadIdleTimeout 0 on its transport) never closes it, so this test fails for that mutation.
+func TestHubPingsFindABlackholedTunnel(t *testing.T) {
+	hs := &holes{}
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, readIdle: 300 * time.Millisecond, pingTimeout: 300 * time.Millisecond, holes: hs})
+	startCell(t, h.dialer(t), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	hs.blackhole()
+	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "cause": "local_close"}, 3*time.Second)
+}
+
+// A renewal drains the older tunnel: a watch in flight on it goes on, and ends only when the API ends it. The cell never
+// reads as down while it happens.
+func TestRenewalKeepsAWatchInFlight(t *testing.T) {
+	h := newTunnelHarness(t, 5*time.Second)
+	src := &rotatingSource{svids: []*x509svid.SVID{
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(8*time.Second)),
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(time.Hour)),
+	}}
+	startCell(t, h.dialerWith(src), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	resp, err := http.Get(h.hubURL + "/api/v1/pods?watch=true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	findLog(t, h.hubLog, "tunnel_replaced", map[string]any{"cell": "dev-cell-1"}, 6*time.Second)
+	// The older tunnel has its leaf for a few more seconds. The watch ends by itself, before that.
+	time.Sleep(500 * time.Millisecond)
+	h.api.releaseWatches()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("the watch was cut by the renewal: %v (read %q)", err, body)
+	}
+	if n := strings.Count(string(body), `"ADDED"`); n != 3 {
+		t.Fatalf("the watch delivered %d events, want 3: %q", n, body)
+	}
+}
+
+// The end of a tunnel that the cell replaced is planned: it logs at info with closed_by renewal.
+func TestRenewalLogsAtInfo(t *testing.T) {
+	h := newTunnelHarness(t, 5*time.Second)
+	src := &rotatingSource{svids: []*x509svid.SVID{
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(5*time.Second)),
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(time.Hour)),
+	}}
+	startCell(t, h.dialerWith(src), h.cellHandler(t))
+	line := findLog(t, h.cellLog, "tunnel_closed", map[string]any{"closed_by": "renewal"}, 8*time.Second)
+	if line["level"] != "INFO" {
+		t.Fatalf("a renewal logged at %v, want INFO", line["level"])
+	}
 }

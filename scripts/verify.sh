@@ -795,10 +795,9 @@ check_mesh_view_peer_root() {
 # A gate test drops the packets between the relay and the hub with firewall rules on the dev-cp node. A run
 # that stopped hard can leave them, and they cut the mesh tunnel of every cell.
 check_no_blackhole() {
-  local ip found
-  ip="$(node_ip "$RELAY_TARGET")" || { echo "$ip"; return 1; }
-  found="$(blackhole_present "$CELL_NAME-control-plane" "$ip")"
-  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//$'\n'/; }"; echo "Run: mise run gate:m3:repair"; return 1; }
+  local found
+  found="$(blackhole_present "$CELL_NAME-control-plane")" || { echo "the node of $CELL_NAME does not answer"; return 1; }
+  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//-D /}"; echo "Run: mise run gate:m3:repair"; return 1; }
 }
 
 log "checking cell $CELL_NAME"

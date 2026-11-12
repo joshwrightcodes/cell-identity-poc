@@ -23,23 +23,24 @@ leftovers() {
 }
 
 status=0
-# TestM3KeepaliveBlackhole drops the packets between the relay of dev-cp and the hub with two firewall
-# rules on the dev-cp node. The test removes them, and a timer in the node removes them too. A run that
-# stopped hard can leave them, and they cut the tunnel of every cell.
-mgmt_ip="$(cd "$ROOT" && mise run hostsvc -- facts --cluster management 2>/dev/null | jq -r '.nodeIP // ""')" || mgmt_ip=""
-if [[ -n "$mgmt_ip" ]] && docker inspect dev-cp-control-plane >/dev/null 2>&1; then
+# TestM3KeepaliveBlackhole drops the packets between the relay of dev-cp and the hub with firewall rules on the
+# dev-cp node. Each rule carries a comment that starts with gate-m3-blackhole-. The test removes them, and a timer
+# in the node removes them too. A run that stopped hard can leave them, and they cut the tunnel of every cell.
+# The match is the comment, so it needs no address. When the node does not answer, the script stops with the reason.
+if docker inspect dev-cp-control-plane >/dev/null 2>&1; then
+  rules="$(blackhole_present dev-cp-control-plane)" || die "the dev-cp node does not answer, so the firewall rules of a gate test cannot be checked. Run: CELL=dev-cp mise run cell:verify"
   while read -r rule; do
     [[ -n "$rule" ]] || continue
     status=1
     if ((check)); then
-      echo "dev-cp: the firewall rule '$rule' drops the mesh tunnels. Run: mise run gate:m3:repair"
+      echo "dev-cp: the firewall rule '${rule#-D }' drops the mesh tunnels. Run: mise run gate:m3:repair"
       continue
     fi
-    log "deleting the firewall rule '$rule' on the dev-cp node"
+    log "deleting the firewall rule '${rule#-D }' on the dev-cp node"
     # shellcheck disable=SC2086
-    docker exec dev-cp-control-plane iptables -D $rule || die "could not delete the firewall rule '$rule' on the dev-cp node"
+    docker exec dev-cp-control-plane iptables $rule || die "could not delete the firewall rule '${rule#-D }' on the dev-cp node"
     status=0
-  done < <(blackhole_present dev-cp-control-plane "$mgmt_ip")
+  done <<<"$rules"
 fi
 for cell in $cells; do
   found="$(leftovers "$cell")" || die "could not list the objects with the label $GUARD_TEST_LABEL in $cell"

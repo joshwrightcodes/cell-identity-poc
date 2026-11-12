@@ -1328,9 +1328,10 @@ The review read every template of the chart in a scratch directory and ran nothi
   namespace of Kiali only, and no ClusterRole exists.
 - The viewer Role grants `pods/portforward` with the verb `create`. The render deletes that rule, and
   `TestKialiRender` and `TestM3NoWorkloadCanPortForward` check the result.
-- The chart makes a new random `login_token.signing_key` at each render. The render sets a fixed
-  value, because the anonymous login signs no token and a new key would restart Kiali at each link
-  phase.
+- The chart makes a new random `login_token.signing_key` at each render, which would restart Kiali at each
+  link phase. The render derives a key from the public root of the trust domain of `management`. That key is
+  predictable, and no login uses it under the strategy `anonymous`. The render refuses any other strategy, in
+  the values and in the rendered ConfigMap.
 - The chart sets the annotation `proxy.istio.io/config`, which the render deletes, because the
   namespace has no mesh proxy. It also adds a NetworkPolicy, which the values turn off, because
   `components/mesh-view-hub/hub.yaml` holds the policies of the namespace.

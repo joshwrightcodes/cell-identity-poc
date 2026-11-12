@@ -54,6 +54,9 @@ spec:
             - --expect-id=spiffe://mgmt.poc.internal/kiali
             - --peer-bundle=/run/cell-proxy/mgmt-root/root.crt
             - --peer-trust-domain=mgmt.poc.internal
+            # A dead path ends the tunnel after 15 seconds, well inside one SVID life of 1 minute.
+            - --read-idle=10s
+            - --ping-timeout=5s
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock

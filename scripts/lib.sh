@@ -563,20 +563,13 @@ link_preflight() {
   done
 }
 
-# blackhole_rules <management node address> prints the two firewall rules that TestM3KeepaliveBlackhole puts
-# in the FORWARD chain of the dev-cp node, one for each direction, as arguments for iptables.
-blackhole_rules() {
-  echo "FORWARD -p tcp -d $1 --dport 31445 -j DROP"
-  echo "FORWARD -p tcp -s $1 --sport 31445 -j DROP"
-}
-
-# blackhole_present <node container> <management node address> prints each blackhole rule that the node holds.
+# blackhole_present <node container> prints each firewall rule that TestM3KeepaliveBlackhole put in the FORWARD
+# chain of the dev-cp node, as arguments for iptables -D. The test tags every rule with a comment that starts
+# with gate-m3-blackhole-, so the match needs no address. It fails when the node does not answer.
 blackhole_present() {
-  local rule
-  while read -r rule; do
-    # shellcheck disable=SC2086
-    docker exec "$1" iptables -C $rule 2>/dev/null && echo "$rule"
-  done < <(blackhole_rules "$2")
+  local rules
+  rules="$(docker exec "$1" iptables -S FORWARD)" || return 1
+  grep -- '--comment "\{0,1\}gate-m3-blackhole-' <<<"$rules" | sed 's/^-A /-D /' || true
 }
 
 # hub_cell_up <cell> reads the log of the hub on standard input and succeeds when the hub holds an open

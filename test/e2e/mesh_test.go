@@ -375,10 +375,11 @@ type cellproxyStatus struct {
 	Side  string `json:"side"`
 	Up    bool   `json:"up"`
 	Cells map[string]struct {
-		Up          bool    `json:"up"`
-		ConnID      int     `json:"conn_id"`
-		AgeSeconds  float64 `json:"age_seconds"`
-		DownSeconds float64 `json:"down_seconds"`
+		Up          bool       `json:"up"`
+		ConnID      int        `json:"conn_id"`
+		AgeSeconds  float64    `json:"age_seconds"`
+		ExpiresAt   *time.Time `json:"expires_at"`
+		DownSeconds float64    `json:"down_seconds"`
 		LastEnd     *struct {
 			Cause, Detail string
 			At            time.Time
@@ -415,19 +416,23 @@ func TestM3TunnelStatus(t *testing.T) {
 	}
 }
 
+// keepaliveBound is the time that a side needs to find a dead path: the read idle time and the ping timeout in
+// components/mesh-view/tunnel.yaml and hub.yaml (10 s and 5 s).
+const keepaliveBound = 15 * time.Second
+
 // TestM3KeepaliveBlackhole drops the packets on one direction between the relay of dev-cp and the hub, as a dead path
 // does, and requires that a side finds the dead tunnel by its own pings, not by the SVID expiry. Two phases:
 //
-//   - relay to hub dropped: the pings of the hub get no answer. The hub logs a tunnel_down for the tunnel with no
-//     tunnel_expired line, so only the hub pings can have ended it. A hub with no pings fails this phase.
-//   - hub to relay dropped: the pings of the cell get no answer. The tunnel pod logs a tunnel_closed line after the
-//     drop starts and no tunnel_expired line, so only the cell pings can have ended it.
+//   - relay to hub dropped: the pings of the hub get no answer. The hub logs a tunnel_down with the cause local_close
+//     within twice the keepalive bound. A hub with no pings fails this phase.
+//   - hub to relay dropped: the pings of the cell get no answer. The state of the tunnel pod shows a tunnel that ended
+//     with the cause local_close after the drop started. A cell with no pings fails this phase.
 //
-// One direction is enough, and it keeps the other side from learning of the close. Each phase starts right after a
-// new tunnel, so the ping path (30 s idle and 15 s for the answer) can win against an SVID of 1 minute, and it tries
-// again when the expiry wins. The test reads only the lines that the pods wrote after the drop starts. Two
-// safeguards remove the rules: the cleanup of the test, and a timer in the dev-cp node that runs when the test dies
-// with no cleanup. gate:m3:repair removes them too.
+// The drop starts only when the SVID that remains outlives the keepalive bound by a clear margin (the bound again), so
+// the expiry never races the detection. Otherwise the test waits for the next renewal. Each attempt tags its rule with a
+// comment of its own, and its timer in the node deletes only that rule, so one attempt cannot remove the rule of another.
+// A timer in the node removes the rule after 120 seconds even when the test dies, and gate:m3:repair removes any rule with
+// the tag prefix gate-m3-blackhole-.
 func TestM3KeepaliveBlackhole(t *testing.T) {
 	cell := meshCells(t)[0]
 	mgmtIP := clusterFacts(t, mgmtCluster).NodeIP
@@ -435,101 +440,96 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 		t.Fatalf("management node address %q", mgmtIP)
 	}
 	node := envCluster + "-control-plane"
-	rules := [][]string{
-		{"FORWARD", "-p", "tcp", "-d", mgmtIP, "--dport", strconv.Itoa(meshNodePort), "-j", "DROP"},
-		{"FORWARD", "-p", "tcp", "-s", mgmtIP, "--sport", strconv.Itoa(meshNodePort), "-j", "DROP"},
+	var tags []string
+	ruleArgs := func(tag string, rule int) []string {
+		dir := []string{"-d", mgmtIP, "--dport", strconv.Itoa(meshNodePort)}
+		if rule == 1 {
+			dir = []string{"-s", mgmtIP, "--sport", strconv.Itoa(meshNodePort)}
+		}
+		return append(append([]string{"FORWARD", "-p", "tcp"}, dir...), "-m", "comment", "--comment", tag, "-j", "DROP")
 	}
-	removeRules := func() {
-		for _, r := range rules {
-			// -C checks that the rule exists, so a rule that the timer removed already is no error.
-			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-C"}, r...)...); err != nil {
-				continue
-			}
-			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-D"}, r...)...); err != nil {
-				t.Errorf("remove the rule %v from %s: %v. Run: mise run gate:m3:repair", r, node, err)
-			}
+	remove := func(tag string, rule int) {
+		r := ruleArgs(tag, rule)
+		// -C checks that the rule exists, so a rule that the timer removed already is no error.
+		if _, err := dockerExec(t, node, "", append([]string{"iptables", "-C"}, r...)...); err != nil {
+			return
+		}
+		if _, err := dockerExec(t, node, "", append([]string{"iptables", "-D"}, r...)...); err != nil {
+			t.Errorf("remove the rule %v from %s: %v. Run: mise run gate:m3:repair", r, node, err)
 		}
 	}
-	t.Cleanup(removeRules)
-	defer removeRules()
+	removeAll := func() {
+		for _, tag := range tags {
+			remove(tag, 0)
+			remove(tag, 1)
+		}
+	}
+	t.Cleanup(removeAll)
+	defer removeAll()
 
-	// newTunnel waits for a hub tunnel of the cell that the hub saw less than 8 seconds ago, and returns its conn_id.
-	newTunnel := func() int {
+	// headroom waits for an open tunnel of the cell whose SVID outlives twice the keepalive bound, and returns its
+	// conn_id and the name of the tunnel pod.
+	headroom := func() (int, string) {
 		var connID int
-		waitFor(t, "a new hub tunnel of "+cell, 2*time.Minute, func() (bool, string) {
-			log := hubLog(t)
-			ups, downs, _ := hubConnIDs(log, cell)
+		var pod string
+		waitFor(t, "a hub tunnel of "+cell+" with headroom", 3*time.Minute, func() (bool, string) {
+			ups, downs, _ := hubConnIDs(hubLog(t), cell)
 			if len(ups) == 0 || downs[ups[len(ups)-1]] {
 				return false, "no open tunnel"
 			}
-			connID = ups[len(ups)-1]
-			for l := range strings.SplitSeq(log, "\n") {
-				var rec struct {
-					Msg    string
-					Time   time.Time
-					ConnID int `json:"conn_id"`
-				}
-				if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "tunnel_up" && rec.ConnID == connID {
-					return time.Since(rec.Time) < 8*time.Second, fmt.Sprintf("tunnel %d is %s old", connID, time.Since(rec.Time).Round(time.Second))
-				}
+			pod, _ = readyPodIn(t, cell, meshNamespace, tunnelName)
+			self := cellTunnelState(t, cell, pod).Cells["self"]
+			if !self.Up || self.ExpiresAt == nil {
+				return false, "the tunnel pod reports no open tunnel"
 			}
-			return false, "no tunnel_up line"
+			left := time.Until(*self.ExpiresAt)
+			connID = ups[len(ups)-1]
+			return left >= 2*keepaliveBound, fmt.Sprintf("tunnel %d has %s left, want %s", connID, left.Round(time.Second), 2*keepaliveBound)
 		})
-		return connID
+		return connID, pod
 	}
 	for _, phase := range []struct {
 		name string
 		rule int
 	}{{"the hub pings", 0}, {"the cell pings", 1}} {
 		found := false
-		for attempt := 1; attempt <= 4 && !found; attempt++ {
-			connID := newTunnel()
-			cellPod, _ := readyPodIn(t, cell, meshNamespace, tunnelName)
+		for attempt := 1; attempt <= 3 && !found; attempt++ {
+			connID, cellPod := headroom()
+			tag := "gate-m3-blackhole-" + randomHex(t, 4)
+			tags = append(tags, tag)
 			since := time.Now().UTC()
-			r := rules[phase.rule]
+			r := ruleArgs(tag, phase.rule)
 			if _, err := dockerExec(t, node, "", append([]string{"iptables", "-I"}, r...)...); err != nil {
 				t.Fatalf("insert the rule %v in %s: %v", r, node, err)
 			}
-			// The timer in the node removes the rule after 150 seconds, whatever happens to the test.
-			if _, err := dockerExec(t, node, "", "sh", "-c", "nohup sh -c 'sleep 150; iptables -C "+strings.Join(r, " ")+" 2>/dev/null && iptables -D "+strings.Join(r, " ")+"' >/dev/null 2>&1 &"); err != nil {
+			// The timer deletes only the rule of this attempt, by its tag.
+			if _, err := dockerExec(t, node, "", "sh", "-c", "nohup sh -c 'sleep 120; iptables -C "+strings.Join(r, " ")+" 2>/dev/null && iptables -D "+strings.Join(r, " ")+"' >/dev/null 2>&1 &"); err != nil {
 				t.Logf("start the timer in %s: %v", node, err)
 			}
-			var hubDown, hubExpired, cellClosed, cellExpired bool
 			var hubCause, cellCause string
-			deadline := time.Now().Add(75 * time.Second)
+			deadline := time.Now().Add(2 * keepaliveBound)
 			for time.Now().Before(deadline) {
-				log := hubLog(t)
-				_, downs, exp := hubConnIDs(log, cell)
-				hubDown, hubExpired, hubCause = downs[connID], exp[connID], hubDownCause(log, cell, connID)
-				cellLog, _ := kubectl(t, cell, "", "-n", meshNamespace, "logs", cellPod, "-c", "cell-proxy", "--since-time="+since.Format(time.RFC3339))
-				cellClosed, cellExpired = strings.Contains(cellLog, `"msg":"tunnel_closed"`), strings.Contains(cellLog, `"msg":"tunnel_expired"`)
-				if cellClosed {
-					if e := cellTunnelState(t, cell, cellPod).Cells["self"].LastEnd; e != nil && e.At.After(since) {
-						cellCause = e.Cause
-					}
+				if phase.rule == 0 {
+					hubCause = hubDownCause(hubLog(t), cell, connID)
+				} else if e := cellTunnelState(t, cell, cellPod).Cells["self"].LastEnd; e != nil && e.At.After(since) {
+					cellCause = e.Cause
 				}
-				if (phase.rule == 0 && hubDown) || (phase.rule == 1 && cellClosed) {
+				if hubCause != "" || cellCause != "" {
 					break
 				}
-				time.Sleep(2 * time.Second)
+				time.Sleep(time.Second)
 			}
 			took := time.Since(since).Round(time.Second)
-			removeRules()
-			t.Logf("%s: hub cause %q, cell cause %q", phase.name, hubCause, cellCause)
-			// The cause is the one that the side that pings closes with: a failed ping closes the connection
-			// on that side, which the log calls local_close. An expiry, a replaced tunnel or an error from
-			// the peer is another cause.
-			switch {
-			case phase.rule == 0 && hubDown && !hubExpired && hubCause == "local_close":
-				found = true
-			case phase.rule == 1 && cellClosed && !cellExpired && cellCause == "local_close":
-				found = true
+			remove(tag, phase.rule)
+			t.Logf("%s, attempt %d (%s): tunnel %d, hub cause %q, cell cause %q, after %s", phase.name, attempt, tag, connID, hubCause, cellCause, took)
+			found = (phase.rule == 0 && hubCause == "local_close") || (phase.rule == 1 && cellCause == "local_close")
+			if !found {
+				t.Logf("not a ping close: the SVID had headroom, so this attempt does not count")
 			}
-			t.Logf("%s, attempt %d: tunnel %d, hub down %v expired %v, cell closed %v expired %v, after %s", phase.name, attempt, connID, hubDown, hubExpired, cellClosed, cellExpired, took)
 			waitHubTunnel(t, cell, len(mustUps(hubConnIDs(hubLog(t), cell))), 3*time.Minute)
 		}
 		if !found {
-			t.Errorf("in 4 attempts, %s never ended a tunnel: each ended by its SVID expiry or by nothing", phase.name)
+			t.Errorf("in 3 attempts with headroom, %s never closed the tunnel with the cause local_close: keepalive does not find the dead path", phase.name)
 		}
 	}
 }
@@ -970,6 +970,11 @@ func TestM3TunnelRecovers(t *testing.T) {
 		if expired[connID] {
 			t.Fatalf("tunnel %d ended by its SVID expiry, so it never saw the delete of the relay: the test started too late", connID)
 		}
+		// The delete of the relay ends the tunnel from the outside: the hub sees the peer close it, or its own ping fail.
+		// A replacement by the early renewal of the cell would not prove the delete.
+		if cause := hubDownCause(hubLog(t), "dev-cell-1", connID); cause != "peer_closed" && cause != "local_close" {
+			t.Fatalf("tunnel %d ended with the cause %q, want peer_closed or local_close: the relay delete did not end it", connID, cause)
+		}
 		return len(ups) > 0 && ups[len(ups)-1] > connID && !downs[ups[len(ups)-1]], "no newer open tunnel"
 	})
 	waitFor(t, "Kiali to list both cells again", 2*time.Minute, func() (bool, string) { return kialiSeesCells(addr) })
@@ -1232,5 +1237,70 @@ func TestM3MeshGuardDeniesWithoutRBAC(t *testing.T) {
 					"--as-user-extra=authentication.kubernetes.io/pod-name=" + podName, "--as-user-extra=authentication.kubernetes.io/pod-uid=" + podUID}, audience("spire-"+pocEnv+"/abc")...)...))
 			})
 		})
+	}
+}
+
+// TestM3MeshViewCannotReadOrEscalate asks the API server what the ServiceAccount mesh-view may do in each cell. It
+// reads pods in apps-demo (the positive control), and may mint the bound token of its own SPIRE agent. Every other answer
+// is no: Secrets, exec, attach, port forward, proxies, logs, writes, impersonation, escalate and bind, and the admission
+// objects. The guard mesh-view-read-only sees only the requests that reach admission, so the grants of impersonate,
+// escalate, bind and the writes to the admission objects are what these checks keep out of RBAC.
+func TestM3MeshViewCannotReadOrEscalate(t *testing.T) {
+	const account = "system:serviceaccount:mesh-view-system:mesh-view"
+	type check struct {
+		name, verb, resource, sub, ns string
+		want                          bool
+	}
+	checks := []check{{"get pods in apps-demo", "get", "pods", "", "apps-demo", true}}
+	for _, ns := range []string{"mesh-view-system", "istio-system", "apps-demo", "argocd"} {
+		for _, verb := range []string{"get", "list", "watch"} {
+			checks = append(checks, check{fmt.Sprintf("%s secrets in %s", verb, ns), verb, "secrets", "", ns, false})
+		}
+	}
+	for _, sub := range []string{"exec", "attach", "portforward"} {
+		checks = append(checks, check{"create pods/" + sub + " in apps-demo", "create", "pods", sub, "apps-demo", false})
+	}
+	for _, r := range []string{"pods", "services"} {
+		checks = append(checks, check{"get " + r + "/proxy in apps-demo", "get", r, "proxy", "apps-demo", false})
+	}
+	checks = append(checks,
+		check{"get pods/log in apps-demo", "get", "pods", "log", "apps-demo", false},
+		check{"get nodes/proxy", "get", "nodes", "proxy", "", false},
+		check{"create serviceaccounts/token for default in mesh-view-system", "create", "serviceaccounts/default", "token", "mesh-view-system", false},
+		check{"create serviceaccounts/token for mesh-view in mesh-view-system", "create", "serviceaccounts/mesh-view", "token", "mesh-view-system", true},
+	)
+	for _, verb := range []string{"create", "update", "patch", "delete"} {
+		checks = append(checks, check{verb + " deployments in apps-demo", verb, "deployments.apps", "", "apps-demo", false})
+	}
+	for _, r := range []string{"users", "groups", "serviceaccounts"} {
+		checks = append(checks, check{"impersonate " + r, "impersonate", r, "", "", false})
+	}
+	for _, r := range []string{"roles", "clusterroles"} {
+		for _, verb := range []string{"escalate", "bind"} {
+			checks = append(checks, check{verb + " " + r, verb, r + ".rbac.authorization.k8s.io", "", "", false})
+		}
+	}
+	for _, r := range []string{"validatingadmissionpolicies", "validatingadmissionpolicybindings"} {
+		for _, verb := range []string{"create", "update", "patch", "delete"} {
+			checks = append(checks, check{verb + " " + r, verb, r + ".admissionregistration.k8s.io", "", "", false})
+		}
+	}
+	for _, cell := range meshCells(t) {
+		for _, c := range checks {
+			t.Run(cell+"/"+c.name, func(t *testing.T) {
+				t.Parallel()
+				args := []string{"auth", "can-i", c.verb, c.resource, "--as=" + account}
+				if c.sub != "" {
+					args = append(args, "--subresource="+c.sub)
+				}
+				if c.ns != "" {
+					args = append(args, "-n", c.ns)
+				}
+				out, _ := kubectl(t, cell, "", args...)
+				if got := strings.TrimSpace(out); got != map[bool]string{true: "yes", false: "no"}[c.want] {
+					t.Errorf("can-i %s: %q, want %v", strings.Join(args[2:], " "), got, c.want)
+				}
+			})
+		}
 	}
 }

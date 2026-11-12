@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Report the state of the mesh view of management, one line for each part, so that an operator finds the
-# part that fails. The hub log gives the tunnel state of each cell by conn_id (hub_cell_up in
-# scripts/lib.sh). The tunnel pod is read in its own cell. Exit status 1 when a part is not up.
+# part that fails. The hub process serves the tunnel state of each cell, and the tunnel pod serves its own
+# state in its cell (cell-proxy tunnel-status). The log of the hub by conn_id is the fallback (hub_cell_up in
+# scripts/lib.sh). Exit status 1 when a part is not up.
 source "$(dirname "$0")/lib.sh"
 
 [[ -n "${MESH_VIEW_CELLS:-}" ]] || die "cluster $CELL_NAME has no MESH_VIEW_CELLS. Run: CELL=management mise run mesh:status"
@@ -42,7 +43,7 @@ ready="$(k -n mesh-view-system get deployment kiali -o jsonpath='{.status.readyR
 if [[ "${ready:-0}" == 1 ]]; then
   echo "kiali  $CELL_NAME: Ready"
 else
-  echo "kiali  $CELL_NAME: not Ready. Kiali waits for every cell tunnel before it serves. Run: CELL=management mise run cell:link"
+  echo "kiali  $CELL_NAME: not Ready. Kiali needs every cell at start and restarts until all answer, for up to five minutes after the last cell returns. Run CELL=<cell> mise run cell:up for a cell that is down"
   status=1
 fi
 exit "$status"

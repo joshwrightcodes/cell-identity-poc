@@ -87,12 +87,16 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 // wait between dials starts at 1 second, doubles up to 30 seconds, and has up to half of itself
 // added as jitter, within the 30-second cap. A connection that lived for 30 seconds resets the
 // wait to 1 second. RunTunnel returns nil when ctx ends.
-func RunTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler) error {
-	return runTunnel(ctx, dial, h, realClock)
+func RunTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, opts ...TunnelOption) error {
+	return runTunnelWith(ctx, dial, h, realClock, applyOptions(opts))
 }
 
 func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, c tunnelClock) error {
-	srv := newTunnelServer()
+	return runTunnelWith(ctx, dial, h, c, tunnelOptions{})
+}
+
+func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, error), h http.Handler, c tunnelClock, o tunnelOptions) error {
+	srv := newTunnelServer(o.keepalive())
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	serve := func(conn net.Conn) chan struct{} {
@@ -111,6 +115,7 @@ func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 	// before it ends: the next tunnel opens at 60 percent of the remaining life, with the SVID that
 	// the source holds by then, and the hub closes the older tunnel when the newer one arrives.
 	var ended chan struct{}
+	var cur net.Conn
 	var start, renewAt time.Time
 	stable := tunnelStableAfter
 	connect := func() bool {
@@ -119,6 +124,7 @@ func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 			return false
 		}
 		start = c.now()
+		cur = conn
 		ended = serve(conn)
 		renewAt, stable = time.Time{}, tunnelStableAfter
 		if e, ok := conn.(interface{ Expiry() time.Time }); ok && !e.Expiry().IsZero() {
@@ -159,7 +165,11 @@ func runTunnel(ctx context.Context, dial func(context.Context) (net.Conn, error)
 			backoff = min(2*backoff, tunnelMaxBackoff)
 		case <-renew:
 			old, oldStart, oldStable := ended, start, stable
+			oldConn := cur
 			if connect() {
+				if r, ok := oldConn.(interface{ MarkRenewed() }); ok {
+					r.MarkRenewed()
+				}
 				backoff = tunnelMinBackoff
 			} else {
 				ended, start, stable = old, oldStart, oldStable
@@ -180,8 +190,8 @@ func jitter(d time.Duration) time.Duration {
 }
 
 // newTunnelServer pings an idle tunnel, so that the cell finds a dead connection and dials again.
-func newTunnelServer() *http2.Server {
-	return &http2.Server{MaxConcurrentStreams: tunnelMaxStreams, ReadIdleTimeout: upstreamReadIdle, PingTimeout: upstreamPingTimeout}
+func newTunnelServer(readIdle, pingTimeout time.Duration) *http2.Server {
+	return &http2.Server{MaxConcurrentStreams: tunnelMaxStreams, ReadIdleTimeout: readIdle, PingTimeout: pingTimeout}
 }
 
 func serveTunnel(ctx context.Context, srv *http2.Server, conn net.Conn, h http.Handler) {
@@ -277,6 +287,7 @@ type cellConn struct {
 	expiry  time.Time
 	timer   *time.Timer
 	expired atomic.Bool
+	renewed atomic.Bool
 	state   *TunnelState
 	stateID uint64
 
@@ -295,7 +306,7 @@ func (c *cellConn) Read(p []byte) (int, error) {
 		c.acceptedAt = time.Now()
 		c.up.Store(true)
 		if c.state != nil {
-			c.stateID = c.state.opened()
+			c.stateID = c.state.opened(c.expiry)
 		}
 		c.result(context.Background(), dialConnected)
 		c.log.Info("tunnel_connected", "upstream", c.upstream)
@@ -318,6 +329,9 @@ func refusalDetail(err error) string {
 	return err.Error()
 }
 
+// MarkRenewed says that the cell opened a newer tunnel, so the end of this one is planned.
+func (c *cellConn) MarkRenewed() { c.renewed.Store(true) }
+
 // Expiry is the earlier expiry of the leaf of the cell and the leaf of the hub.
 func (c *cellConn) Expiry() time.Time { return c.expiry }
 
@@ -333,6 +347,8 @@ func (c *cellConn) Close() error {
 		switch {
 		case c.expired.Load():
 			c.state.closed(stateID, "expiry", "")
+		case c.renewed.Load():
+			c.state.closed(stateID, "renewal", "")
 		case peerErr != nil:
 			c.state.closed(stateID, "peer_closed", peerErr.Error())
 		default:
@@ -349,7 +365,10 @@ func (c *cellConn) Close() error {
 		if peerErr != nil {
 			closedBy = "hub"
 			attrs = append(attrs, "error", peerErr.Error())
-			if lived < tunnelStableAfter {
+			if c.renewed.Load() {
+				// The hub closed this tunnel for the newer one that the cell opened: a planned end.
+				closedBy = "renewal"
+			} else if lived < tunnelStableAfter {
 				level = slog.LevelWarn
 			}
 		}
@@ -493,19 +512,20 @@ func refuse(w http.ResponseWriter, r *http.Request, log *slog.Logger, reason Rea
 // connection for each cell, over the connection that the cell dialed, and serves a local
 // handler for each cell that sends requests through it.
 type TunnelHub struct {
-	cells      map[string]string
-	wait       time.Duration
-	log        *slog.Logger
-	metrics    *TunnelMetrics
-	maxStreams int
-	statusAddr string
-	started    time.Time
-	ids        atomic.Uint64
-	mu         sync.Mutex
-	conns      map[string]*tunnelConn
-	ends       map[string]*EndInfo
-	downAt     map[string]time.Time
-	changed    chan struct{}
+	cells                 map[string]string
+	wait                  time.Duration
+	log                   *slog.Logger
+	metrics               *TunnelMetrics
+	maxStreams            int
+	statusAddr            string
+	readIdle, pingTimeout time.Duration
+	started               time.Time
+	ids                   atomic.Uint64
+	mu                    sync.Mutex
+	conns                 map[string]*tunnelConn
+	ends                  map[string]*EndInfo
+	downAt                map[string]time.Time
+	changed               chan struct{}
 }
 
 type tunnelConn struct {
@@ -514,6 +534,7 @@ type tunnelConn struct {
 	done     <-chan struct{}
 	remote   string
 	start    time.Time
+	notAfter time.Time
 	replaced atomic.Bool
 }
 
@@ -537,7 +558,9 @@ func NewTunnelHub(cells map[string]string, wait time.Duration, log *slog.Logger,
 	if o.maxStreams <= 0 {
 		o.maxStreams = hubMaxStreams
 	}
+	idle, ping := o.keepalive()
 	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: o.metrics, maxStreams: o.maxStreams, statusAddr: o.statusAddr, started: time.Now(),
+		readIdle: idle, pingTimeout: ping,
 		conns: map[string]*tunnelConn{}, ends: map[string]*EndInfo{}, downAt: map[string]time.Time{}, changed: make(chan struct{})}
 	if err := h.metrics.observeUp(h.upSeries); err != nil {
 		log.Warn("tunnel metric not registered", "error", err.Error())
@@ -574,17 +597,18 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 		return
 	}
 	nc := &notifyConn{Conn: conn, done: make(chan struct{})}
-	t := &http2.Transport{ReadIdleTimeout: upstreamReadIdle, PingTimeout: upstreamPingTimeout}
+	t := &http2.Transport{ReadIdleTimeout: h.readIdle, PingTimeout: h.pingTimeout}
 	cc, err := t.NewClientConn(nc)
 	if err != nil {
 		log.Warn("tunnel_failed", "reason", string(UpstreamUnavailable), "error", err.Error())
 		_ = nc.Close()
 		return
 	}
-	tc := &tunnelConn{id: h.ids.Add(1), cc: cc, done: nc.done, remote: conn.RemoteAddr().String(), start: time.Now()}
+	tc := &tunnelConn{id: h.ids.Add(1), cc: cc, done: nc.done, remote: conn.RemoteAddr().String(), start: time.Now(), notAfter: time.Now().Add(2 * time.Minute)}
 	log = log.With("conn_id", tc.id)
 	if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
 		notAfter := certs[0].NotAfter
+		tc.notAfter = notAfter
 		expiry := time.AfterFunc(time.Until(notAfter), func() {
 			log.Info("tunnel_expired", "not_after", notAfter.UTC().Format(time.RFC3339))
 			nc.expired.Store(true)
@@ -602,7 +626,14 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 		old.replaced.Store(true)
 		log.Info("tunnel_replaced", "old_conn_id", old.id, "new_conn_id", tc.id, "old_remote", old.remote, "new_remote", tc.remote,
 			"old_age_seconds", time.Since(old.start).Seconds(), "new_age_seconds", time.Since(tc.start).Seconds())
-		_ = old.cc.Close()
+		// The older tunnel drains: it takes no new request, and its streams in flight end on their own. The
+		// connection closes when the last one ends, or at the expiry of the older leaf, whichever comes first.
+		go func() {
+			ctx, cancel := context.WithDeadline(context.Background(), old.notAfter)
+			defer cancel()
+			_ = old.cc.Shutdown(ctx)
+			_ = old.cc.Close()
+		}()
 	}
 	h.metrics.connect(context.Background(), attribute.String("side", sideHub), attribute.String("cell", s.Cell),
 		attribute.String("result", "accepted"), attribute.Bool("replaced", old != nil))
@@ -775,6 +806,8 @@ func (h *TunnelHub) Status() TunnelStatus {
 		c := CellStatus{LastEnd: h.ends[cell]}
 		if tc := h.conns[cell]; tc != nil && tc.usable() {
 			c.Up, c.ConnID, c.AgeSeconds = true, tc.id, time.Since(tc.start).Seconds()
+			na := tc.notAfter
+			c.ExpiresAt = &na
 		} else {
 			since := h.started
 			if t, ok := h.downAt[cell]; ok {

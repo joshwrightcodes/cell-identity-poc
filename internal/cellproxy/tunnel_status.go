@@ -33,11 +33,13 @@ type EndInfo struct {
 type CellStatus struct {
 	// Up is true when a usable tunnel exists. A tunnel that the hub replaced with a newer one never makes
 	// the cell read as down.
-	Up          bool     `json:"up"`
-	ConnID      uint64   `json:"conn_id,omitempty"`
-	AgeSeconds  float64  `json:"age_seconds,omitempty"`
-	DownSeconds float64  `json:"down_seconds,omitempty"`
-	LastEnd     *EndInfo `json:"last_end,omitempty"`
+	Up     bool   `json:"up"`
+	ConnID uint64 `json:"conn_id,omitempty"`
+	// ExpiresAt is when the open tunnel ends at the latest: the earlier expiry of the two leaves.
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	AgeSeconds  float64    `json:"age_seconds,omitempty"`
+	DownSeconds float64    `json:"down_seconds,omitempty"`
+	LastEnd     *EndInfo   `json:"last_end,omitempty"`
 }
 
 // TunnelStatus is the document that the status listener serves.
@@ -55,6 +57,7 @@ type TunnelState struct {
 	mu      sync.Mutex
 	started time.Time
 	open    map[uint64]time.Time
+	expires map[uint64]time.Time
 	next    uint64
 	last    *EndInfo
 	downAt  time.Time
@@ -62,14 +65,15 @@ type TunnelState struct {
 
 // NewTunnelState returns the state of a cell that has had no tunnel yet.
 func NewTunnelState() *TunnelState {
-	return &TunnelState{started: time.Now(), downAt: time.Now(), open: map[uint64]time.Time{}}
+	return &TunnelState{started: time.Now(), downAt: time.Now(), open: map[uint64]time.Time{}, expires: map[uint64]time.Time{}}
 }
 
-func (s *TunnelState) opened() uint64 {
+func (s *TunnelState) opened(expiry time.Time) uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.next++
 	s.open[s.next] = time.Now()
+	s.expires[s.next] = expiry
 	return s.next
 }
 
@@ -81,6 +85,7 @@ func (s *TunnelState) closed(id uint64, cause, detail string) {
 		return
 	}
 	delete(s.open, id)
+	delete(s.expires, id)
 	s.last = &EndInfo{Cause: cause, Detail: detail, At: time.Now(), AgeSeconds: time.Since(at).Seconds()}
 	if len(s.open) == 0 {
 		s.downAt = time.Now()
@@ -98,6 +103,9 @@ func (s *TunnelState) Status() TunnelStatus {
 			newest = max(newest, id)
 		}
 		c.ConnID, c.AgeSeconds = newest, time.Since(s.open[newest]).Seconds()
+		if e := s.expires[newest]; !e.IsZero() {
+			c.ExpiresAt = &e
+		}
 	} else {
 		c.DownSeconds = time.Since(s.downAt).Seconds()
 	}

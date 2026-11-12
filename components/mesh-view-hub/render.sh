@@ -176,6 +176,8 @@ kiali="$(NAMESPACES="$namespaces_json" yq '
 config_text="$(yq -N 'select(.kind == "ConfigMap" and .metadata.name == "kiali") | .data."config.yaml"' <<<"$kiali")"
 config_sum="$(printf '%s' "$config_text" | sha256)"
 kiali="$(SUM="$config_sum" yq '(select(.kind == "Deployment") | .spec.template.metadata.annotations["checksum/config"]) = strenv(SUM)' <<<"$kiali")"
+rendered_strategy="$(yq -N 'select(.kind == "ConfigMap" and .metadata.name == "kiali") | .data."config.yaml"' <<<"$kiali" | yq -r '.auth.strategy')"
+[[ "$rendered_strategy" == anonymous ]] || die "the rendered Kiali config sets auth.strategy '$rendered_strategy', not anonymous, and the login signing key is predictable"
 kinds="$(yq -N '.kind' <<<"$kiali" | sort | paste -sd' ' -)"
 [[ "$kinds" == "ConfigMap Deployment Role RoleBinding Service ServiceAccount" ]] || die "the kiali-server chart renders '$kinds', and the hub expects ConfigMap Deployment Role RoleBinding Service ServiceAccount"
 ! yq -N 'select(.kind == "Role") | .rules[].resources[]' <<<"$kiali" | grep -qx 'pods/portforward' \

@@ -193,7 +193,7 @@ depends = ["images"]
 run = "scripts/gate.sh m3"
 
 [tasks."gate:m3:repair"]
-description = "Delete the objects that a gate:m3 run left in the cells when it stopped before its cleanups. With --check, only list them. Safe to run again"
+description = "Delete the objects and the firewall rules on the dev-cp node that a gate:m3 run left when it stopped before its cleanups. With --check, only list them. Safe to run again"
 run = "scripts/gate-m3-repair.sh"
 
 [tasks."mgmt:rotate-ca"]

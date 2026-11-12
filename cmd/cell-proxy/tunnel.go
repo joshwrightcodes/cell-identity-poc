@@ -38,6 +38,8 @@ func registerTunnelFlags(fs *flag.FlagSet) func(listen string) (func(*telemetry.
 	cells := map[string]string{}
 	fs.Func("tunnel-cell", "<cell>=<listen addr> of a tunnel listener; repeat for each cell", tunnelCellFlag(cells))
 	wait := fs.Duration("tunnel-wait", 10*time.Second, "how long a tunnel request waits for the tunnel of its cell")
+	readIdle := fs.Duration("tunnel-read-idle", 30*time.Second, "how long a tunnel connection may be idle before the hub pings it")
+	pingTimeout := fs.Duration("tunnel-ping-timeout", 15*time.Second, "how long the hub waits for the answer to a ping before it closes the tunnel")
 	statusAddr := fs.String("tunnel-status", cellproxy.DefaultStatusAddr, "loopback address where the hub serves its tunnel state, read by cell-proxy tunnel-status")
 	return func(listen string) (func(*telemetry.T) (cellproxy.Backend, error), error) {
 		if err := checkTunnelCells(cells, *wait, listen); err != nil {
@@ -48,7 +50,7 @@ func registerTunnelFlags(fs *flag.FlagSet) func(listen string) (func(*telemetry.
 			if err != nil {
 				return nil, fmt.Errorf("tunnel metrics: %w", err)
 			}
-			return cellproxy.NewTunnelBackend(cellproxy.NewTunnelHub(cells, *wait, tel.Log, cellproxy.WithMetrics(m), cellproxy.WithStatusAddr(*statusAddr))), nil
+			return cellproxy.NewTunnelBackend(cellproxy.NewTunnelHub(cells, *wait, tel.Log, cellproxy.WithMetrics(m), cellproxy.WithStatusAddr(*statusAddr), cellproxy.WithKeepalive(*readIdle, *pingTimeout))), nil
 		}, nil
 	}
 }
@@ -114,10 +116,11 @@ func serveBackend(ctx context.Context, srv *cellproxy.Server, ln net.Listener, b
 }
 
 type tunnelModeConfig struct {
-	statusAddr string
-	upstream   string
-	expect     spiffeid.ID
-	peer       *x509bundle.Bundle
+	readIdle, pingTimeout time.Duration
+	statusAddr            string
+	upstream              string
+	expect                spiffeid.ID
+	peer                  *x509bundle.Bundle
 }
 
 func parseTunnel(args []string) (tunnelModeConfig, error) {
@@ -126,6 +129,8 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the tunnel hub")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the management plane trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the management plane")
+	readIdle := fs.Duration("read-idle", 30*time.Second, "how long the tunnel connection may be idle before the cell pings it")
+	pingTimeout := fs.Duration("ping-timeout", 15*time.Second, "how long the cell waits for the answer to a ping before it closes the tunnel")
 	status := fs.String("status-listen", cellproxy.DefaultStatusAddr, "loopback address where the tunnel serves its state, read by cell-proxy tunnel-status")
 	if err := parseFlags(fs, args); err != nil {
 		return tunnelModeConfig{}, err
@@ -144,7 +149,7 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	if err != nil {
 		return tunnelModeConfig{}, err
 	}
-	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status}, nil
+	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status, readIdle: *readIdle, pingTimeout: *pingTimeout}, nil
 }
 
 // runTunnel is the cell side of the mesh-view tunnel. It reads the Kubernetes API with the
@@ -180,7 +185,7 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 			}
 		}()
 		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m), cellproxy.WithState(state))
-		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)))
+		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cellproxy.WithKeepalive(cfg.readIdle, cfg.pingTimeout))
 	})
 }
 

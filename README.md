@@ -381,7 +381,7 @@ CELL=dev-cell-2 mise run cell:up
 CELL=management mise run cell:link
 ```
 
-`cell:link` applies the hub first and waits up to 300 seconds until the hub logs `tunnel_up` for each cell.
+`cell:link` applies the hub first and waits up to 300 seconds until the hub reports the tunnel of each cell up. It reads the state that the hub process serves.
 It then applies Kiali. A timeout fails the task and names each cell without a tunnel.
 Kiali needs every cell to answer at start, and it has no setting that skips a cluster.
 When one cell is absent, Kiali exits with a fatal error at the discovery of that cell (`failed to get server groups: the server is currently unable to handle the request`).

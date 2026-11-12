@@ -3,6 +3,7 @@ package cellproxy
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -65,6 +66,25 @@ type tunnelOptions struct {
 	maxStreams int
 	state      *TunnelState
 	statusAddr string
+	// readIdle and pingTimeout set the keepalive of the tunnel: after readIdle with no frame, a side sends a ping and
+	// closes the connection when the answer takes longer than pingTimeout. Zero means the default.
+	readIdle, pingTimeout time.Duration
+}
+
+// WithKeepalive sets how long a tunnel connection may be idle before a ping, and how long the answer may take.
+func WithKeepalive(readIdle, pingTimeout time.Duration) TunnelOption {
+	return func(o *tunnelOptions) { o.readIdle, o.pingTimeout = readIdle, pingTimeout }
+}
+
+func (o tunnelOptions) keepalive() (time.Duration, time.Duration) {
+	idle, ping := o.readIdle, o.pingTimeout
+	if idle <= 0 {
+		idle = upstreamReadIdle
+	}
+	if ping <= 0 {
+		ping = upstreamPingTimeout
+	}
+	return idle, ping
 }
 
 // WithState records the state of the tunnel of a cell in s, for the status listener.
