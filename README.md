@@ -251,7 +251,7 @@ Its data lives on a 10 GiB volume.
 
 The store receives OTLP on port 4317 from two senders only. The pod listens on more ports (3100, 3200, 4040, 4318, and 9090, which also accepts remote write), and the NetworkPolicy admits no pod to any of them:
 
-- The collector `otel-collector` in `management`. It deletes every form of the source attributes at every level that it reaches, then sets `k8s.cluster.name` and `platform.plane` to `management`, and exports to `lgtm`. The section "Collectors and uplinks" gives the details. Its NetworkPolicy admits only `COLLECTOR_SENDERS` of `cells/management.env` and the gateway, so no other pod can forge the signals of a cell.
+- The collector `otel-collector` in `management`. It deletes every form of the source attributes at every level that it reaches, then sets `k8s.cluster.name` and `platform.plane` to `management`, and exports to `lgtm`. The section "Collectors and uplinks" gives the details. Its NetworkPolicy admits only `COLLECTOR_SENDERS` of `cells/management.env`, so no other pod can forge the signals of a cell. The gateway sends its own telemetry straight to `lgtm`, and this collector drops the counter that raises the spoof alarm from every sender.
 - The telemetry gateway, the link component `telemetry-gateway`. It runs `cell-proxy` with the `otlp` backend and a SPIRE agent in one pod.
   It accepts SPIFFE mTLS on node port 31444 from the `dev-cp` node only, and its ID is `spiffe://mgmt.poc.internal/telemetry`.
   It admits `spiffe://dev.env.poc.internal/cell/<cell>/otel` for a registered cell, and `spiffe://dev.env.poc.internal/cp/otel`.
@@ -423,7 +423,7 @@ While `mesh:ui` runs, every pod on the VM can reach the page through `host.docke
 
 `cell:verify` of a cell checks the tunnel objects, its images, the `dev-cp` node address and ConfigMap `mgmt-root`.
 `cell:verify` of `management` also checks the hub listener address, ConfigMap `peer-root` and the tunnel of each cell.
-When a tunnel is down, read the state with `mise run mesh:status`, and run `CELL=<cell> mise run cell:up` for the cell. `mise run harness:status` names the absent cell in the field `kiali.note`.
+When a tunnel is down, read the state with `mise run mesh:status`. A cell is absent only when its own API does not answer, and then the task names `CELL=<cell> mise run cell:up`. Otherwise the task names `CELL=dev-cp mise run cell:verify`, which finds a left-over firewall rule. `mise run harness:status` names the absent cell in the field `kiali.note`.
 For the Prometheus path, run `mise run obs:uplink-status management`.
 
 ## Operator status and logs
@@ -455,7 +455,7 @@ The object of `management` has these fields too:
 
 | Field | Description |
 | --- | --- |
-| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. |
+| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal, because no other source is verified. After the kubelet rotates that log, an agent that connected before and did not reconnect reads as missing. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
 | `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
 | `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
 | `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `absent_cells` holds the cells among them whose own API does not answer. `note` is empty, or says what to do. |
@@ -546,6 +546,8 @@ The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, be
 
 To remove a cell, remove it from `SPIRE_AGENT_CELLS`, `VIEW_CELLS` and `MESH_VIEW_CELLS`.
 Then run `CELL=dev-cp mise run cell:up`, which also takes the cell out of the relay admit lists, and `CELL=management mise run cell:link`, which removes the view record of the cell.
+The link keeps the agent namespace `<env>-<cell>` in `management`. Delete it with `mise x -- kubectl --context kind-management delete namespace <env>-<cell>`.
+Then run `CELL=management mise run cell:verify`, which passes when no object of the cell is left.
 Then delete the cluster with `CELL=<cell> mise run cell:down`, and remove its entry and its `cells/<cell>.env`.
 The server keeps the entries of the old agents of that cell until they expire and it prunes them.
 To end them at once, evict each agent of the cell:
@@ -662,7 +664,7 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
 - It deletes the `relay-view` pod in `dev-cp` and the Kiali pod in `management`. It scales `mesh-view` to zero in both cells for up to 30 seconds, and then applies the bundle again.
 - It changes ConfigMap `mesh-view-system/mgmt-root` in `dev-cell-1` for about 80 seconds, so that `cell:verify` can show the drift. The running tunnel keeps its roots. If a run stops hard, the next start of the tunnel pod fails to verify the hub. Run `mise run gate:m3:repair`, which applies the live roots of `management` again.
-- It adds two firewall rules on the `dev-cp` node that drop the packets between the relay and the hub, for up to four minutes in total. The test removes them, and a timer in the node removes them after 150 seconds. If a run stops hard, `mise run cell:verify` of `dev-cp` fails and names the repair. Run `mise run gate:m3:repair`, which also removes these rules.
+- It adds two firewall rules on the `dev-cp` node that drop the packets between the relay and the hub, for up to four minutes in total. The test removes them, and a timer in the node removes them after 120 seconds. If a run stops hard, `mise run cell:verify` of `dev-cp` fails and names the repair. Run `mise run gate:m3:repair`, which also removes these rules.
 - It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers for 48 hours, then each component deletes them.
 
 A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.

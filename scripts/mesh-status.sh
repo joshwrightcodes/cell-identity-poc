@@ -7,6 +7,16 @@ source "$(dirname "$0")/lib.sh"
 
 [[ -n "${MESH_VIEW_CELLS:-}" ]] || die "cluster $CELL_NAME has no MESH_VIEW_CELLS. Run: CELL=management mise run mesh:status"
 status=0
+# down_hint <cell> says what to run for a hub tunnel that is down. A cell is absent only when its own API does
+# not answer, the same rule as harness:status. Otherwise a left-over firewall rule, relay-view or a hub restart is
+# the more likely cause, and cell:up of the cell does not remove them.
+down_hint() {
+  if kubectl --context "kind-$1" --request-timeout=10s get --raw /readyz >/dev/null 2>&1; then
+    echo "The API of $1 answers. Run: CELL=dev-cp mise run cell:verify, and then mise run mesh:status"
+  else
+    echo "Run: CELL=$1 mise run cell:up"
+  fi
+}
 # The state comes from the hub process itself (cell-proxy tunnel-status). The log of the hub by conn_id is
 # the fallback when the process does not answer.
 hub_json="$(hub_status)" || hub_json=""
@@ -19,13 +29,13 @@ for entry in $MESH_VIEW_CELLS; do
     if CELL_ARG="$cell" jq -e '.cells[env.CELL_ARG].up == true' <<<"$hub_json" >/dev/null; then
       echo "hub    $cell: $line"
     else
-      echo "hub    $cell: $line. Run: CELL=$cell mise run cell:up"
+      echo "hub    $cell: $line. $(down_hint "$cell")"
       status=1
     fi
   elif hub_cell_up "$cell" <<<"$logs"; then
     echo "hub    $cell: tunnel up (from the hub log, the hub process did not answer)"
   else
-    echo "hub    $cell: no open tunnel (from the hub log). Run: CELL=$cell mise run cell:up"
+    echo "hub    $cell: no open tunnel (from the hub log). $(down_hint "$cell")"
     status=1
   fi
   refused="$(CELL_ARG="$cell" jq -Rr 'fromjson? | select(.cell == env.CELL_ARG and .msg == "tunnel_refused") | "\(.time) \(.reason)"' <<<"$logs" | tail -n 1)"
@@ -43,7 +53,7 @@ ready="$(k -n mesh-view-system get deployment kiali -o jsonpath='{.status.readyR
 if [[ "${ready:-0}" == 1 ]]; then
   echo "kiali  $CELL_NAME: Ready"
 else
-  echo "kiali  $CELL_NAME: not Ready. Kiali needs every cell at start and restarts until all answer, for up to five minutes after the last cell returns. Run CELL=<cell> mise run cell:up for a cell that is down"
+  echo "kiali  $CELL_NAME: not Ready. Kiali needs every cell at start and restarts until all answer, for up to five minutes after the last cell returns. Run CELL=<cell> mise run cell:up for a cell that does not answer"
   status=1
 fi
 exit "$status"

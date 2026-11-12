@@ -547,3 +547,51 @@ func TestPeerRootCheckComparesThePodDigest(t *testing.T) {
 		})
 	}
 }
+
+// meshKubectlStub answers the reads of mesh:status. STUB_CELL_DOWN names the clusters whose API does not answer.
+const meshKubectlStub = `#!/usr/bin/env bash
+ctx=""; prev=""
+for a in "$@"; do [[ "$prev" == --context ]] && ctx="$a"; prev="$a"; done
+case " $* " in
+  *" get --raw /readyz "*) [[ " ${STUB_CELL_DOWN:-} " == *" ${ctx#kind-} "* ]] && { echo "no answer" >&2; exit 1; }; echo ok ;;
+  *" logs deploy/mesh-view-hub "*) ;;
+  *" exec deploy/mesh-view-hub "*) printf '%s' "${STUB_HUB:-}" ;;
+  *" exec deploy/mesh-view "*) ;;
+  *" get deployment "*) printf '%s' 1 ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`
+
+// TestMeshStatusNamesCellUpOnlyForAnAbsentCell checks the same rule as harness:status: a cell is absent only when its own API
+// does not answer. A tunnel that is down while the API answers has another cause, and cell:up of that cell does not fix it.
+func TestMeshStatusNamesCellUpOnlyForAnAbsentCell(t *testing.T) {
+	hub := `{"cells":{"dev-cell-1":{"up":false,"down_seconds":12},"dev-cell-2":{"up":true,"conn_id":1,"age_seconds":5}}}`
+	run := func(down string) string {
+		out, stderr, code := runScript(t, "mesh-status.sh", map[string]string{"kubectl": meshKubectlStub},
+			[]string{"CELL=management", "STUB_HUB=" + hub, "STUB_CELL_DOWN=" + down})
+		if code != 1 {
+			t.Fatalf("exit %d, want 1 for a tunnel that is down:\n%s\n%s", code, out, stderr)
+		}
+		return out
+	}
+	var line string
+	pick := func(out string) {
+		line = ""
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, "hub    dev-cell-1: no open tunnel") {
+				line = l
+			}
+		}
+		if line == "" {
+			t.Fatalf("no hub line for dev-cell-1 in:\n%s", out)
+		}
+	}
+	pick(run(""))
+	if !strings.Contains(line, "CELL=dev-cp mise run cell:verify") || strings.Contains(line, "cell:up") {
+		t.Errorf("the API of the cell answers, so the line %q must name cell:verify of dev-cp and no cell:up", line)
+	}
+	pick(run("dev-cell-1"))
+	if !strings.Contains(line, "CELL=dev-cell-1 mise run cell:up") {
+		t.Errorf("the cell is absent, so the line %q must name cell:up", line)
+	}
+}

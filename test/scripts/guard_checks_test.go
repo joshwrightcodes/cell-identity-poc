@@ -29,6 +29,7 @@ case "$args" in
   *" delete "*) touch "$STUB_LOG.deleted" ;;
   *" exec spire-server-0 "*) printf '%s\n' "${STUB_PEM_LIVE:-PEM-A}" ;;
   *" get configmap mgmt-root "*) printf '%s' "${STUB_PEM_CM:-PEM-A}" ;;
+  *" get deployment mesh-view "*) printf '%s' "${STUB_REPLICAS:-1}" ;;
   *" apply --server-side "*) cat >"$STUB_LOG.applied" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
@@ -147,35 +148,89 @@ func TestGateM3Repair(t *testing.T) {
 			t.Fatalf("err %v, output %q, calls %q; want a delete of the Role and the Namespace", err, out, calls)
 		}
 	})
-	t.Run("mgmt-root of the drift test is restored", func(t *testing.T) {
+	// bundle is the rendered mesh-view bundle of a cell. The harness applied it with the label and the digest
+	// annotation that cell:verify compares, so a repair that applies less strips them.
+	const bundle = `apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mgmt-root
+  namespace: mesh-view-system
+  labels:
+    cell.poc.internal/harness: mesh-view
+  annotations:
+    poc.internal/peer-root-sha256: 0123abcd
+data:
+  root.crt: PEM-A
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-view
+  namespace: mesh-view-system
+  labels:
+    cell.poc.internal/harness: mesh-view
+spec:
+  replicas: 1
+`
+	runRepair := func(t *testing.T, bundleText string, env []string, args ...string) (string, string, error) {
+		t.Helper()
 		dir := t.TempDir()
 		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(guardKubectl), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		logFile := filepath.Join(dir, "kubectl.log")
-		runDrift := func(args ...string) (string, error) {
-			cmd := exec.Command("bash", append([]string{script}, args...)...)
-			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
-				"POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_LOG=" + logFile, "GATE_M3_CELLS=dev-cell-1",
-				"STUB_PEM_LIVE=PEM-A", "STUB_PEM_CM=PEM-CHANGED"}
-			var out bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &out, &out
-			err := cmd.Run()
-			return out.String(), err
+		if bundleText != "" {
+			bdir := filepath.Join(dir, "build", "dev-cell-1", "bundles", "mesh-view")
+			if err := os.MkdirAll(bdir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bdir, "manifests.yaml"), []byte(bundleText), 0o644); err != nil {
+				t.Fatal(err)
+			}
 		}
-		out, err := runDrift("--check")
+		logFile := filepath.Join(dir, "kubectl.log")
+		cmd := exec.Command("bash", append([]string{script}, args...)...)
+		cmd.Env = append([]string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			"POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_LOG=" + logFile, "GATE_M3_CELLS=dev-cell-1"}, env...)
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		err := cmd.Run()
+		applied, _ := os.ReadFile(logFile + ".applied")
+		return out.String(), string(applied), err
+	}
+	t.Run("mgmt-root of the drift test is restored with its label and annotation", func(t *testing.T) {
+		env := []string{"STUB_PEM_LIVE=PEM-A", "STUB_PEM_CM=PEM-CHANGED"}
+		out, applied, err := runRepair(t, bundle, env, "--check")
 		if err == nil || !strings.Contains(out, "dev-cell-1: ConfigMap mesh-view-system/mgmt-root holds other roots") {
 			t.Fatalf("check: err %v, output %q; want a failure that names the ConfigMap", err, out)
 		}
-		if _, statErr := os.Stat(logFile + ".applied"); statErr == nil {
-			t.Fatalf("--check applied the ConfigMap")
+		if applied != "" {
+			t.Fatalf("--check applied %q", applied)
 		}
-		if out, err = runDrift(); err != nil {
+		out, applied, err = runRepair(t, bundle, env)
+		if err != nil {
 			t.Fatalf("repair failed: %v\n%s", err, out)
 		}
-		applied, _ := os.ReadFile(logFile + ".applied")
-		if !strings.Contains(string(applied), `"root.crt":"PEM-A"`) || !strings.Contains(string(applied), `"name":"mgmt-root"`) {
-			t.Fatalf("applied %q, want ConfigMap mgmt-root with the live roots", applied)
+		for _, want := range []string{"name: mgmt-root", "root.crt: PEM-A", "cell.poc.internal/harness: mesh-view", "poc.internal/peer-root-sha256: 0123abcd"} {
+			if !strings.Contains(applied, want) {
+				t.Errorf("applied object lacks %q:\n%s", want, applied)
+			}
+		}
+	})
+	t.Run("a rendered mgmt-root with other roots than management stops the repair", func(t *testing.T) {
+		out, applied, err := runRepair(t, bundle, []string{"STUB_PEM_LIVE=PEM-NEW", "STUB_PEM_CM=PEM-CHANGED"})
+		if err == nil || !strings.Contains(out, "does not hold the live roots") || !strings.Contains(out, "cell:up") || applied != "" {
+			t.Fatalf("err %v, applied %q, output %q; want a stop that names cell:up and applies nothing", err, applied, out)
+		}
+	})
+	t.Run("a mesh-view left at zero replicas is applied again", func(t *testing.T) {
+		env := []string{"STUB_REPLICAS=0"}
+		out, _, err := runRepair(t, bundle, env, "--check")
+		if err == nil || !strings.Contains(out, "dev-cell-1: Deployment mesh-view-system/mesh-view has no replica") {
+			t.Fatalf("check: err %v, output %q; want a failure that names the Deployment", err, out)
+		}
+		out, applied, err := runRepair(t, bundle, env)
+		if err != nil || !strings.Contains(applied, "kind: Deployment") || !strings.Contains(applied, "replicas: 1") || !strings.Contains(applied, "cell.poc.internal/harness: mesh-view") {
+			t.Fatalf("err %v, applied %q, output %q; want the Deployment of the bundle", err, applied, out)
 		}
 	})
 	t.Run("no leftover, no delete", func(t *testing.T) {

@@ -65,10 +65,27 @@ for cell in $cells; do
     status=0
   fi
 done
+# bundle_object <cell> <kind> <name> prints that object of the rendered mesh-view bundle of a cell. The harness
+# applied the same file with the labels, the annotations and the field manager that cell:verify checks, so the
+# repair applies the object from it and not a reduced copy.
+bundle_object() {
+  local file="$BUILD_ROOT/$1/bundles/mesh-view/manifests.yaml" obj
+  [[ -f "$file" ]] || die "there is no rendered bundle $file. Run: CELL=$1 mise run cell:up"
+  obj="$(KIND="$2" NAME="$3" yq 'select(.kind == strenv(KIND) and .metadata.name == strenv(NAME) and .metadata.namespace == "mesh-view-system")' "$file")" \
+    || die "could not read $file"
+  [[ -n "$obj" ]] || die "the rendered bundle $file has no $2 $3. Run: CELL=$1 mise run cell:up"
+  printf '%s\n' "$obj"
+}
+# apply_bundle_object <cell> <kind> <name> applies that object like the harness does.
+apply_bundle_object() {
+  bundle_object "$1" "$2" "$3" | kubectl --context "kind-$1" apply --server-side --force-conflicts -f - >/dev/null \
+    || die "could not apply $2 $3 in $1"
+}
+
 # TestM3VerifyDetectsPeerRootDrift changes ConfigMap mesh-view-system/mgmt-root in GATE_M3_ROOT_CELL (default
 # dev-cell-1) for about 80 seconds. A run that stopped hard leaves it changed, and the next start of the tunnel
-# pod then fails to verify the hub. The repair applies the live roots of management again. An empty
-# GATE_M3_ROOT_CELL skips this step.
+# pod then fails to verify the hub. The repair applies the object of the rendered bundle again, after it checks
+# that the bundle holds the live roots of management. An empty GATE_M3_ROOT_CELL skips this step.
 root_cell="${GATE_M3_ROOT_CELL-dev-cell-1}"
 if [[ -n "$root_cell" ]]; then
   live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
@@ -82,11 +99,26 @@ if [[ -n "$root_cell" ]]; then
     if ((check)); then
       echo "$root_cell: ConfigMap mesh-view-system/mgmt-root holds other roots than management. Run: mise run gate:m3:repair"
     else
-      log "applying the live roots of management to mesh-view-system/mgmt-root in $root_cell"
-      jq -nc --arg pem "$live" '{apiVersion: "v1", kind: "ConfigMap", metadata: {name: "mgmt-root", namespace: "mesh-view-system"}, data: {"root.crt": $pem}}' \
-        | kubectl --context "kind-$root_cell" apply --server-side --force-conflicts -f - >/dev/null || die "could not apply mgmt-root in $root_cell"
+      [[ "$(bundle_object "$root_cell" ConfigMap mgmt-root | yq -r '.data["root.crt"]')" == "$(printf '%s' "$live")" ]] \
+        || die "the rendered mgmt-root of $root_cell does not hold the live roots of management. Run: CELL=$root_cell mise run cell:up"
+      log "applying the rendered mgmt-root to mesh-view-system/mgmt-root in $root_cell"
+      apply_bundle_object "$root_cell" ConfigMap mgmt-root
       status=0
     fi
   fi
 fi
+# TestM3KialiBeforeTunnels scales the Deployment mesh-view to zero in each cell and applies it again. A run that
+# stopped in between leaves the tunnel down. A cell with no Deployment mesh-view is skipped.
+for cell in $cells; do
+  replicas="$(kubectl --context "kind-$cell" -n mesh-view-system get deployment mesh-view -o jsonpath='{.spec.replicas}' 2>/dev/null)" || continue
+  [[ "$replicas" == 0 ]] || continue
+  status=1
+  if ((check)); then
+    echo "$cell: Deployment mesh-view-system/mesh-view has no replica, so the tunnel is down. Run: mise run gate:m3:repair"
+    continue
+  fi
+  log "applying the rendered Deployment mesh-view in $cell"
+  apply_bundle_object "$cell" Deployment mesh-view
+  status=0
+done
 exit "$status"
