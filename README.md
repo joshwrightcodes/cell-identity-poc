@@ -578,16 +578,28 @@ The rest of each run creates the five clusters, in about 100 seconds, and builds
 `harness:verify` passed every check in both runs.
 After each run, `gate:m1` took 104 and 105 seconds, and `gate:m2` took 400 and 401 seconds.
 
-After the clusters were healthy, the five node containers used about 8 GiB of memory in total:
+A run from clean on 2026-11-13, with the M3 components, took 21 minutes 53 seconds and needed no manual step.
+`secrets:connect` ran inside the `dev-cp` step.
+
+| Run | `harness:up` | `management` | `dev-cp` | `dev-cell-1` | `dev-cell-2` |
+| --- | --- | --- | --- | --- | --- |
+| 2026-11-13 | 21 minutes 53 seconds | 281 s | 231 s | 211 s | 244 s |
+
+The image build took 25 seconds. The rest of the run creates the five clusters and runs the link phase of `management`.
+`harness:status` and `harness:verify` passed.
+After the run, `gate:m1` took 131 seconds, `gate:m2` took 453 seconds, and `gate:m3` took 2,611 and 2,613 seconds.
+
+After the second `gate:m3` run, the five node containers used about 11 GiB of memory in total:
 
 | Container | Memory | CPU |
 | --- | --- | --- |
-| `dev-cp` | 2.0 to 2.1 GiB | 9 percent |
-| `management`, `dev-cell-1`, `dev-cell-2` (each) | 1.75 to 1.9 GiB | 8 to 16 percent |
-| `rogue` | 0.6 GiB | 5 to 6 percent |
-| `registry-mirror` | 70 MiB | 0 percent |
+| `management` | 3.7 GiB | 11 percent |
+| `dev-cp` | 2.3 GiB | 35 percent |
+| `dev-cell-1`, `dev-cell-2` (each) | 2.1 to 2.2 GiB | 13 to 20 percent |
+| `rogue` | 0.6 GiB | 4 percent |
+| `registry-mirror` | 60 MiB | 0 percent |
 
-The VM reports 8.9 GB of 40 GB in use, and 18 GB more in the file cache.
+The VM reports 11.6 GB of 40 GB in use, and 22 GB more in the file cache.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slowest run of 104 seconds, rounded up to the next minute.
@@ -599,10 +611,10 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 64 minutes. This is 1.5 times the slowest run, 2,560 seconds on 2026-11-12, rounded up to the next minute.
+The budget is 66 minutes. This is 1.5 times the slower of two runs, 2,613 seconds on 2026-11-13, rounded up to the next minute.
 The test timeout of `go test` is twice the budget, with a floor of 30 minutes.
 Because of this, the budget check reports a slow run before the timeout ends it.
-This gives `gate:m1` and `gate:m2` 30 minutes, and `gate:m3` 128 minutes.
+This gives `gate:m1` and `gate:m2` 30 minutes, and `gate:m3` 132 minutes.
 `TestM3StatusHealthy` takes about seven minutes. Earlier tests restart the SPIRE server of `management`, and `obs:uplink-status` counts exporter failures of the last five minutes. `TestM3VerifyDetectsPeerRootDrift` takes about 80 seconds.
 The tests of the mesh view add about ten minutes. The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
