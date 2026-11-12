@@ -21,6 +21,33 @@ job_state() {
     | select(.type == "Complete" or .type == "Failed") | .type][0] // ""'
 }
 
+# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. The hub logs
+# tunnel_up when a cell connects and tunnel_down when it leaves, so the last of the two for a cell
+# gives its state.
+tunnel_gaps() {
+  local logs cell entry state
+  logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>/dev/null)" || logs=""
+  for entry in $MESH_VIEW_CELLS; do
+    cell="${entry%%=*}"
+    state="$(CELL_ARG="$cell" jq -R -r 'fromjson? | select(.cell == env.CELL_ARG and (.msg == "tunnel_up" or .msg == "tunnel_down")) | .msg' <<<"$logs" | tail -n 1)"
+    [[ "$state" == tunnel_up ]] || echo "$cell"
+  done
+}
+
+# wait_for_tunnels waits up to 300 seconds for the hub to log tunnel_up for each cell of
+# MESH_VIEW_CELLS. Kiali reads its remote clusters once at start, so it must come after the tunnels.
+# LINK_TUNNEL_WAIT and LINK_TUNNEL_POLL change the bound and the poll interval, for the tests.
+wait_for_tunnels() {
+  local end=$((SECONDS + ${LINK_TUNNEL_WAIT:-300})) missing
+  until missing="$(tunnel_gaps)" && [[ -z "$missing" ]]; do
+    if ((SECONDS >= end)); then
+      die "after ${LINK_TUNNEL_WAIT:-300}s the hub has no tunnel from: $(paste -sd' ' - <<<"$missing"). Run CELL=<cell> mise run cell:up for each of them. To read the hub log: mise x -- kubectl --context kind-$CELL_NAME -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy"
+    fi
+    sleep "${LINK_TUNNEL_POLL:-5}"
+  done
+  log "the hub holds a tunnel from each cell of MESH_VIEW_CELLS"
+}
+
 for entry in "${LINK_COMPONENTS[@]}"; do
   comp="${entry%%:*}" ns="${entry#*:}"
   bundle="$BUNDLES/$comp/manifests.yaml"
@@ -31,6 +58,19 @@ for entry in "${LINK_COMPONENTS[@]}"; do
     k -n "$ns" delete job "$job" --ignore-not-found --wait=true --timeout=120s >/dev/null \
       || die "could not delete Job $job in $ns"
   done
+  # The objects with the annotation poc.internal/link-stage=after-tunnels wait until the tunnels of the
+  # cells are up. The other objects, the hub among them, come first.
+  if [[ -n "$(yq -N 'select(.metadata.annotations["poc.internal/link-stage"] == "after-tunnels") | .kind' "$bundle")" ]]; then
+    [[ "$comp" == mesh-view-hub ]] || die "the bundle $comp has objects that wait for tunnels, and only mesh-view-hub says how to wait"
+    conflicts="$(harness_conflicts "$comp")" || die "$conflicts"
+    [[ -z "$conflicts" ]] || die "the link component $comp renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the render or remove it from the other owner. Then run: $(fix_command "$comp")"
+    first="$BUILD/$comp.first.yaml"
+    yq 'select(.metadata.annotations["poc.internal/link-stage"] != "after-tunnels")' "$bundle" >"$first"
+    out="$(k apply --server-side --force-conflicts -f "$first" 2>&1)" || die "could not apply the first part of $comp: $out"
+    log "applied the hub part of $comp"
+    k -n "$ns" rollout status deployment/mesh-view-hub --timeout=300s >/dev/null || die "deployment/mesh-view-hub in $ns did not finish its rollout in 300s"
+    wait_for_tunnels
+  fi
   harness_apply "$comp"
   new_ca=""
   for job in $jobs; do

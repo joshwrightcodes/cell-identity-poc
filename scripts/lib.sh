@@ -111,6 +111,13 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# The mesh-view tunnel of a cell reads the roots of management and of SPIRE_SERVER_CLUSTER, which
+# exist before the cell, so it renders with the other harness components. It owns the namespace
+# mesh-view-system, which only this cluster uses for the tunnel.
+MESH_VIEW_HARNESS=(
+  "mesh-view:mesh-view-system"
+)
+
 # LATE_HARNESS names the harness components whose render reads a live SPIRE server of the cluster
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
@@ -131,6 +138,12 @@ TELEMETRY_GATEWAY_LINK=(
   "telemetry-gateway:observability-system"
 )
 
+# The hub of the mesh view in management, with Kiali. It owns the namespace mesh-view-system, and its
+# render reads the live roots of VIEW_CONTROL_PLANE and the cells of MESH_VIEW_CELLS.
+MESH_VIEW_HUB_LINK=(
+  "mesh-view-hub:mesh-view-system"
+)
+
 # Read the component sets of $CELL from the topology. An unknown set name is an error.
 COMPONENTS=()
 HARNESS_COMPONENTS=()
@@ -145,9 +158,11 @@ for set_name in $set_names; do
     observability-store) COMPONENTS+=("${OBSERVABILITY_STORE_COMPONENTS[@]}") ;;
     cell-identity) HARNESS_COMPONENTS+=("${CELL_IDENTITY_HARNESS[@]}") ;;
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
+    mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
+    mesh-view-hub) LINK_COMPONENTS+=("${MESH_VIEW_HUB_LINK[@]}") ;;
     *) die "unknown component set '$set_name' for cell $CELL in harness/topology.yaml" ;;
   esac
 done

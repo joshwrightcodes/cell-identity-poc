@@ -989,7 +989,7 @@ func aliasSelectors(t *testing.T, alias string) []string {
 // of its entries. No second plane pod shares a namespace yet, so the test reads the selectors of
 // each alias from the SPIRE server as well.
 func TestM3WorkloadAPIOwnSVIDOnly(t *testing.T) {
-	for _, w := range []struct{ ns, sa string }{{viewNamespace, principalName}, {obsNamespace, gatewayName}} {
+	for _, w := range []struct{ ns, sa string }{{viewNamespace, principalName}, {obsNamespace, gatewayName}, {meshNamespace, hubName}} {
 		want := []string{"k8s_psat:agent_ns:" + w.ns, "k8s_psat:agent_sa:" + w.sa, "k8s_psat:cluster:" + mgmtCluster}
 		if got := aliasSelectors(t, "/agents/"+w.ns+"/"+w.sa); !slices.Equal(got, want) {
 			t.Errorf("the alias of %s/%s has the selectors %v, want %v", w.ns, w.sa, got, want)
@@ -997,9 +997,11 @@ func TestM3WorkloadAPIOwnSVIDOnly(t *testing.T) {
 	}
 	principal, _, _ := principalPod(t)
 	gateway, _ := readyPod(t, obsNamespace, gatewayName)
+	hub, _ := readyPod(t, meshNamespace, hubName)
 	for _, tc := range []struct{ ns, pod, container, want string }{
 		{viewNamespace, principal, viewCellProxy, "spiffe://mgmt.poc.internal/argocd/principal"},
 		{obsNamespace, gateway, gatewayProxy, "spiffe://mgmt.poc.internal/telemetry"},
+		{meshNamespace, hub, "cell-proxy", hubID},
 	} {
 		out, err := kubectl(t, mgmtCluster, "", "-n", tc.ns, "exec", tc.pod, "-c", tc.container, "--", "/ko-app/cell-proxy", "whoami")
 		if err != nil {
@@ -1016,6 +1018,10 @@ func TestM3WorkloadAPIOwnSVIDOnly(t *testing.T) {
 	// The uplink of each cluster gets only its own otel ID too.
 	for _, cluster := range []string{envCluster, "dev-cell-1", "dev-cell-2"} {
 		t.Run("uplink "+cluster, func(t *testing.T) { uplinkOwnSVID(t, cluster) })
+	}
+	// The tunnel of each cell gets only its own mesh-view ID.
+	for _, cell := range meshCells(t) {
+		t.Run("mesh-view "+cell, func(t *testing.T) { meshOwnSVID(t, cell) })
 	}
 }
 

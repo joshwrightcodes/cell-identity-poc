@@ -761,6 +761,37 @@ check_uplink_peer_root() {
   fi
 }
 
+# The mesh-view tunnel of a cell copies the node address of SPIRE_SERVER_CLUSTER into its
+# cell-proxy argument and its NetworkPolicy, and the roots of management into ConfigMap mgmt-root.
+check_mesh_view_env_address() {
+  local want got
+  want="$(node_ip "$SPIRE_SERVER_CLUSTER")" || { echo "$want"; return 1; }
+  got="$(k -n mesh-view-system get deployment mesh-view -o json \
+    | jq -r '[.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[] | select(startswith("--upstream="))] | join(" ")')" \
+    || { echo "could not read deployment/mesh-view"; return 1; }
+  if [[ "$got" != "--upstream=$want:30445" ]]; then
+    echo "the $SPIRE_SERVER_CLUSTER node is $want, but the tunnel has '$got', want --upstream=$want:30445."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  got="$(k -n mesh-view-system get networkpolicy mesh-view -o json \
+    | jq -r '[.spec.egress[].to[]?.ipBlock.cidr // empty] | join(" ")')" || { echo "could not read the NetworkPolicy mesh-view"; return 1; }
+  [[ " $got " == *" $want/32 "* ]] || { echo "the NetworkPolicy mesh-view admits egress to '$got', want $want/32. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+check_mesh_view_peer_root() {
+  local live got
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n mesh-view-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap mesh-view-system/mgmt-root holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
@@ -889,6 +920,15 @@ if has_harness otel-uplink; then
     check_live_images observability-system deployment/otel-uplink "CELL=$CELL_NAME mise run cell:up"
   check "The uplink and its NetworkPolicy use the current node address of its upstream cluster" check_uplink_env_address
   check "The peer root ConfigMap of the uplink holds the live roots of management" check_uplink_peer_root
+fi
+
+if has_harness mesh-view; then
+  check "The mesh-view objects match the bundle" check_harness_drift mesh-view
+  check "mesh-view-system has exactly the mesh-view objects of the bundle, with no other field manager" check_harness_objects mesh-view mesh-view-system
+  check "The mesh-view tunnel runs the images that build/images.env records" \
+    check_live_images mesh-view-system deployment/mesh-view "CELL=$CELL_NAME mise run cell:up"
+  check "The mesh-view tunnel and its NetworkPolicy use the current node address of $SPIRE_SERVER_CLUSTER" check_mesh_view_env_address
+  check "The peer root ConfigMap of the mesh-view tunnel holds the live roots of management" check_mesh_view_peer_root
 fi
 
 if has_harness argocd-agent; then
@@ -1040,6 +1080,61 @@ check_gateway_peer_root() {
   fi
 }
 
+# The hub copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the gateway does. It
+# also holds one tunnel for each cell of MESH_VIEW_CELLS, and Kiali needs them all.
+check_hub_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n mesh-view-system get networkpolicy mesh-view-hub -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy mesh-view-system/mesh-view-hub"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the hub listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_hub_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n mesh-view-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap mesh-view-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose last tunnel line in the hub log is not
+# tunnel_up.
+hub_tunnel_gaps() {
+  local logs entry cell state
+  logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>&1)" || { echo "could not read the log of the hub: $logs"; return 1; }
+  for entry in $MESH_VIEW_CELLS; do
+    cell="${entry%%=*}"
+    state="$(CELL_ARG="$cell" jq -R -r 'fromjson? | select(.cell == env.CELL_ARG and (.msg == "tunnel_up" or .msg == "tunnel_down")) | .msg' <<<"$logs" | tail -n 1)"
+    [[ "$state" == tunnel_up ]] || echo "$cell"
+  done
+}
+
+# check_hub_tunnels succeeds when the last tunnel line of the hub for each cell of MESH_VIEW_CELLS is
+# tunnel_up. A tunnel ends when the SVID of the cell expires and starts again within seconds, so the
+# check waits up to 30 seconds for a cell that is between two tunnels.
+check_hub_tunnels() {
+  local end=$((SECONDS + 30)) down
+  until down="$(hub_tunnel_gaps)" && [[ -z "$down" ]]; do
+    if ((SECONDS >= end)); then
+      echo "the hub has no tunnel from: $(paste -sd' ' - <<<"$down")."
+      echo "Run: CELL=<cell> mise run cell:up for each of them, and read the log: mise x -- kubectl --context kind-$CELL_NAME -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.
 for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
@@ -1058,6 +1153,11 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   if [[ "$comp" == telemetry-gateway ]]; then
     check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address
     check "ConfigMap peer-root of observability-system holds the live roots of $VIEW_CONTROL_PLANE" check_gateway_peer_root
+  fi
+  if [[ "$comp" == mesh-view-hub ]]; then
+    check "The hub listener admits the current $VIEW_CONTROL_PLANE node address" check_hub_env_address
+    check "ConfigMap peer-root of mesh-view-system holds the live roots of $VIEW_CONTROL_PLANE" check_hub_peer_root
+    check "The hub holds a tunnel from each cell of MESH_VIEW_CELLS" check_hub_tunnels
   fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
       | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))

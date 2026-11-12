@@ -35,6 +35,15 @@ const (
 	defaultTunnelWait = 10 * time.Second
 	maxReviewBody     = 64 << 10
 	readHeaderTimeout = 10 * time.Second
+	// hubIdleTimeout closes a listener connection that sits idle between requests. A watch is a
+	// request in progress, so it never counts as idle.
+	hubIdleTimeout = 2 * time.Minute
+	// hubMaxHeaderBytes bounds the request header that a client of a cell listener may send.
+	hubMaxHeaderBytes = 64 << 10
+	// hubMaxStreams is the number of requests that one cell listener passes into the tunnel at the
+	// same time. It stays below tunnelMaxStreams, so a flood is refused at the hub and never queues
+	// in the HTTP/2 client connection.
+	hubMaxStreams = 200
 )
 
 // forwardHeaders are the only request headers that cross the tunnel and reach the Kubernetes
@@ -234,7 +243,8 @@ type cellHandler struct {
 }
 
 // NewCellHandler serves the requests that arrive through the tunnel. It passes a request to the
-// Kubernetes API at api only when the path is canonical and Allowed admits it. The upstream URL
+// Kubernetes API at api only when the path is canonical and Allowed admits it. A list or watch of the
+// ConfigMaps of every namespace goes to istio-system only. The upstream URL
 // holds the checked path and the allowed query keys only, encoded again. The request carries only
 // the headers in forwardHeaders, so rt sets the token of the pod, and no client header reaches
 // the API. A refusal is HTTP 403 with {"error":"denied","request_id":"<id>"}, and a log line with
@@ -280,6 +290,10 @@ func (h *cellHandler) refuse(w http.ResponseWriter, r *http.Request, reason Reas
 
 func (h *cellHandler) rewrite(pr *httputil.ProxyRequest) {
 	p, _ := CanonicalPath(pr.In.URL)
+	if p == allConfigMapsPath {
+		// The ConfigMaps of every other namespace stay out of reach, and so does the RBAC rule for them.
+		p = "/api/v1/namespaces/" + configMapNS + "/" + configMapsName
+	}
 	q, _ := url.ParseQuery(pr.In.URL.RawQuery)
 	kept := url.Values{}
 	for k, v := range q {
@@ -355,14 +369,15 @@ func refuse(w http.ResponseWriter, r *http.Request, log *slog.Logger, reason Rea
 // connection for each cell, over the connection that the cell dialed, and serves a local
 // handler for each cell that sends requests through it.
 type TunnelHub struct {
-	cells   map[string]string
-	wait    time.Duration
-	log     *slog.Logger
-	metrics *TunnelMetrics
-	ids     atomic.Uint64
-	mu      sync.Mutex
-	conns   map[string]*tunnelConn
-	changed chan struct{}
+	cells      map[string]string
+	wait       time.Duration
+	log        *slog.Logger
+	metrics    *TunnelMetrics
+	maxStreams int
+	ids        atomic.Uint64
+	mu         sync.Mutex
+	conns      map[string]*tunnelConn
+	changed    chan struct{}
 }
 
 type tunnelConn struct {
@@ -390,7 +405,11 @@ func NewTunnelHub(cells map[string]string, wait time.Duration, log *slog.Logger,
 	if wait == 0 {
 		wait = defaultTunnelWait
 	}
-	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: applyOptions(opts).metrics, conns: map[string]*tunnelConn{}, changed: make(chan struct{})}
+	o := applyOptions(opts)
+	if o.maxStreams <= 0 {
+		o.maxStreams = hubMaxStreams
+	}
+	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: o.metrics, maxStreams: o.maxStreams, conns: map[string]*tunnelConn{}, changed: make(chan struct{})}
 	if err := h.metrics.observeUp(h.upSeries); err != nil {
 		log.Warn("tunnel metric not registered", "error", err.Error())
 	}
@@ -489,10 +508,13 @@ func (h *TunnelHub) await(ctx context.Context, cell string) *tunnelConn {
 	}
 }
 
-// Handler sends each request through the tunnel of cell, with only the headers in forwardHeaders. With no tunnel, it waits for one up to the wait of the hub, then answers 503 with
-// upstream_unavailable. It refuses a protocol upgrade, which HTTP/2 cannot carry.
+// Handler sends each request through the tunnel of cell, with only the headers in forwardHeaders.
+// With no tunnel, it waits for one up to the wait of the hub, then answers 503 with
+// upstream_unavailable. It passes at most the stream cap of requests at once, and answers 503 with
+// overloaded to the next one. It refuses a protocol upgrade, which HTTP/2 cannot carry.
 func (h *TunnelHub) Handler(cell string) http.Handler {
 	log := h.log.With("cell", cell)
+	streams := make(chan struct{}, h.maxStreams)
 	cellAttr := attribute.String("cell", cell)
 	refuseHub := func(w http.ResponseWriter, r *http.Request, reason Reason, detail string) {
 		h.metrics.refusedRequest(r.Context(), attribute.String("side", sideHub), cellAttr, attribute.String("reason", string(reason)))
@@ -501,6 +523,13 @@ func (h *TunnelHub) Handler(cell string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "" {
 			refuseHub(w, r, RequestNotAllowed, "protocol upgrade")
+			return
+		}
+		select {
+		case streams <- struct{}{}:
+			defer func() { <-streams }()
+		default:
+			refuseHub(w, r, Overloaded, fmt.Sprintf("the listener of cell %s holds %d requests", cell, cap(streams)))
 			return
 		}
 		tc := h.await(r.Context(), cell)
@@ -556,11 +585,7 @@ func (h *TunnelHub) Run(ctx context.Context) error {
 			return fmt.Errorf("listen for cell %s: %w", c, err)
 		}
 		lns = append(lns, ln)
-		servers = append(servers, &http.Server{
-			Handler:           h.Handler(c),
-			ReadHeaderTimeout: readHeaderTimeout,
-			ErrorLog:          slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
-		})
+		servers = append(servers, h.newServer(c))
 	}
 	errc := make(chan error, len(servers))
 	var wg sync.WaitGroup
@@ -582,6 +607,19 @@ func (h *TunnelHub) Run(ctx context.Context) error {
 	}
 	wg.Wait()
 	return err
+}
+
+// newServer returns the HTTP server of the listener of cell. It sets no read or write timeout,
+// because a watch is one long response, and bounds the header time, the idle time and the header
+// size.
+func (h *TunnelHub) newServer(cell string) *http.Server {
+	return &http.Server{
+		Handler:           h.Handler(cell),
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       hubIdleTimeout,
+		MaxHeaderBytes:    hubMaxHeaderBytes,
+		ErrorLog:          slog.NewLogLogger(h.log.Handler(), slog.LevelWarn),
+	}
 }
 
 // notifyConn closes done when the connection closes or its read fails.

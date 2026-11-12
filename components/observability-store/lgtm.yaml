@@ -152,7 +152,8 @@ spec:
           requests:
             storage: 10Gi
 ---
-# Flow N10 uses 4317. The ports 9090 (Task 11) and 3000 (the port-forward of obs:ui) admit no pod.
+# Flow N10 uses 4317, and flow N12 uses 9090 for the read-only proxy prom-readonly. Port 3000 (the
+# port-forward of obs:ui) admits no pod.
 apiVersion: v1
 kind: Service
 metadata:
@@ -177,8 +178,8 @@ spec:
       targetPort: prometheus
       appProtocol: http
 ---
-# Flow N10: the collector and the telemetry gateway send OTLP on 4317. No pod reaches 3000 or 9090,
-# and the pod has no egress. The namespace policy allow-dns leaves lgtm out.
+# Flow N10: the collector and the telemetry gateway send OTLP on 4317. Flow N12: only prom-readonly
+# reaches 9090. No pod reaches 3000, and the pod has no egress. The namespace policy allow-dns leaves lgtm out.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -200,4 +201,11 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prom-readonly
+      ports:
+        - protocol: TCP
+          port: 9090
   egress: []

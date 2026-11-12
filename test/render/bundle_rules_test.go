@@ -43,7 +43,7 @@ var bundleFacts = []string{"POD_CIDR=10.11.0.0/16", "SERVICE_CIDR=10.111.0.0/16"
 	"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", "API_SERVICE_IP=10.111.0.1", "DNS_SERVICE_IP=10.111.0.10"}
 
 // stubBinaries names the binary that the stub image must hold for each render that checks one.
-var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent", "argocd-agent": "/ko-app/cluster-jwt-agent", "otel-uplink": "/ko-app/cluster-jwt-agent"}
+var stubBinaries = map[string]string{"spire-server": "/ko-app/cluster-jwt-server", "cell-identity": "/ko-app/cluster-jwt-agent", "argocd-agent": "/ko-app/cluster-jwt-agent", "otel-uplink": "/ko-app/cluster-jwt-agent", "mesh-view": "/ko-app/cluster-jwt-agent"}
 
 var (
 	renderAllMu  sync.Mutex
@@ -251,10 +251,10 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// The collector comes at wave 3 in every cluster. The uplink is a harness component in dev-cp (the
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
-		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system"},
+		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system"},
 		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
-		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
-		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system"},
+		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
+		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 	}
 	for _, cr := range renderAll(t) {
 		if ws, ok := want[cr.name]; ok {
@@ -449,7 +449,11 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 		"observability-store StatefulSet observability-system/lgtm lgtm", "telemetry-gateway Deployment observability-system/telemetry-gateway cell-proxy",
 		"observability-system StatefulSet observability-system/otel-collector otel-collector", "otel-uplink Deployment observability-system/otel-uplink cell-proxy",
 		"otel-uplink Deployment observability-system/otel-uplink spire-agent", "otel-uplink Deployment observability-system/otel-uplink install-agent-plugin",
-		"telemetry-gateway Deployment observability-system/telemetry-gateway spire-agent"} {
+		"telemetry-gateway Deployment observability-system/telemetry-gateway spire-agent",
+		"mesh-view-hub Deployment mesh-view-system/mesh-view-hub cell-proxy", "mesh-view-hub Deployment mesh-view-system/mesh-view-hub spire-agent",
+		"mesh-view-hub Deployment mesh-view-system/kiali kiali", "mesh-view Deployment mesh-view-system/mesh-view cell-proxy",
+		"mesh-view Deployment mesh-view-system/mesh-view spire-agent", "mesh-view Deployment mesh-view-system/mesh-view install-agent-plugin",
+		"observability-store Deployment observability-system/prom-readonly cell-proxy"} {
 		if !seen[name] {
 			t.Errorf("no render holds the container %q", name)
 		}

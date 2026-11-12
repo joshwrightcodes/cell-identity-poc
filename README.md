@@ -332,14 +332,72 @@ The metric `otelcol_exporter_queue_size` of a cell reaches Prometheus through th
 
 To add a sender of OTLP, add its namespace to `COLLECTOR_SENDERS` in the env file of the cluster, then run `cell:up`.
 
+## Mesh view
+
+The `management` cluster holds one read-only Kiali for both cells, in `mesh-view-system`.
+Kiali shows the Istio mesh of each cell, with its namespaces, workloads and traffic graph.
+It sees each cell as a separate cluster with its own mesh, and it joins no mesh to another.
+
+The mesh view has these parts:
+
+- Harness component `mesh-view` in each cell, with `cell-proxy` in tunnel mode and a SPIRE agent in the same pod.
+  The tunnel dials the relay in `dev-cp` on node port 30445. It accepts only the server ID `spiffe://mgmt.poc.internal/kiali`.
+  It serves the requests that come back through the tunnel to the Kubernetes API of the cell, with the token of its own pod.
+- Link component `mesh-view-hub` in `management`. The hub is `cell-proxy` with a SPIRE agent.
+  It accepts SPIFFE mTLS on node port 31445 from the `dev-cp` node only, and it admits only `spiffe://dev.env.poc.internal/cell/<cell>/mesh-view` for a registered cell.
+  For each cell of `MESH_VIEW_CELLS` it opens one plain HTTP port, where only Kiali connects.
+- Kiali from the vendored `kiali-server` chart. Kiali reads the Kubernetes API of a cell through the hub port of that cell.
+  It reads metrics from `prom-readonly`, a read-only Prometheus proxy in `observability-system`.
+  Port 9090 of the store `lgtm` admits only that proxy.
+
+The tunnel allows only reads of the kinds that Kiali shows. The allow-list and the ClusterRole `mesh-view-read` hold the same kinds.
+Secrets, logs, `exec`, port forwards and every write get the answer `403 denied` from the tunnel.
+The cell Role grants ConfigMaps in `istio-system` only.
+Kiali has no log view in this PoC. The tunnel answers `403 denied` to `pods/log` by design, and the feature flag `logs-tab` is off.
+Kiali also tries to read the version of each `istiod` through a port forward, and the tunnel refuses it.
+The Kiali log then holds the lines `Failing starting the port forwarding` and `Unable to get version info`, and the page shows no Istio version. This is expected.
+The hub and each tunnel run one replica with the strategy `Recreate`.
+The hub reads the registry of cells at start, so a revoked cell stays connected until the hub pod starts again.
+`CELL=management mise run cell:link` renders the registry again, and it starts the hub pod when the content changed.
+The hub passes only the headers `Accept`, `Accept-Encoding`, `Content-Type` and `User-Agent`.
+The allow-list of the cell tunnel is the control that limits the requests, and the hub does not repeat it.
+
+Create the mesh view in this order, because Kiali reads its cluster list once at start:
+
+```sh
+CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
+CELL=management mise run cell:link
+```
+
+`cell:link` applies the hub first and waits up to 300 seconds until the hub logs `tunnel_up` for each cell.
+It then applies Kiali. A timeout fails the task and names each cell without a tunnel.
+Kiali starts again if you delete its pod. When a tunnel is down at that time, Kiali waits until it is up.
+
+Open Kiali on `http://127.0.0.1:20001/kiali`. The page is anonymous and read-only:
+
+```sh
+mise run mesh:ui
+```
+
+`kubectl port-forward` enters the Kiali pod through the kubelet, so the NetworkPolicy, which admits no pod on port 20001, does not block it.
+While `mesh:ui` runs, every pod on the VM can reach the page through `host.docker.internal`. Stop it with Ctrl-C when you are done.
+
+`cell:verify` of a cell checks the tunnel objects, its images, the `dev-cp` node address and ConfigMap `mgmt-root`.
+`cell:verify` of `management` also checks the hub listener address, ConfigMap `peer-root` and the tunnel of each cell.
+When a tunnel is down, read the state with `mise run harness:verify`, and run `CELL=<cell> mise run cell:up` for the cell.
+For the Prometheus path, run `mise run obs:uplink-status management`.
+
 ## Add or remove a cell
 
 A cell is an entry in `harness/topology.yaml` and a file `cells/<cell>.env`.
 To add a cell, for example `dev-cell-3`, follow these steps:
 
-1. Add the cluster to `harness/topology.yaml`, with pod and service subnets that overlap no other subnet, and the component sets `base-cell`, `cell-identity` and `argocd-agent`.
+1. Add the cluster to `harness/topology.yaml`, with pod and service subnets that overlap no other subnet, and the component sets `base-cell`, `cell-identity`, `argocd-agent`, `otel-uplink` and `mesh-view`.
 2. Copy `cells/dev-cell-2.env` to `cells/dev-cell-3.env`. Set `CELL_NAME`, `CELL_MESH_TRUST_DOMAIN`, and a `CELL_BUNDLE_STORE_PORT` that no other cell uses.
-3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`, and to `VIEW_CELLS` in `cells/management.env`.
+3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`, and to `VIEW_CELLS` and `MESH_VIEW_CELLS` in `cells/management.env`.
+   Give the cell a hub port in `MESH_VIEW_CELLS` that no other cell uses. Add `mesh-view-system` to `COLLECTOR_SENDERS` in the env file of the cell.
    The SPIRE server signs a record of the cell for each subject of `SPIRE_CELL_SUBJECTS`, and renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject.
    The relay admits the node address of the cell.
 4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
@@ -356,7 +414,7 @@ To add a cell, for example `dev-cell-3`, follow these steps:
 `harness:up`, `harness:verify`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
 The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, because each test gives one of them its own role.
 
-To remove a cell, remove it from `SPIRE_AGENT_CELLS` and from `VIEW_CELLS`.
+To remove a cell, remove it from `SPIRE_AGENT_CELLS`, `VIEW_CELLS` and `MESH_VIEW_CELLS`.
 Then run `CELL=dev-cp mise run cell:up`, which also takes the cell out of the relay admit lists, and `CELL=management mise run cell:link`, which removes the view record of the cell.
 Then delete the cluster with `CELL=<cell> mise run cell:down`, and remove its entry and its `cells/<cell>.env`.
 The server keeps the entries of the old agents of that cell until they expire and it prunes them.
@@ -470,6 +528,8 @@ If the precheck reports a missing `celld-token` RoleBinding, run `CELL=<cell> mi
 - It rotates the view keys of the principal, rotates the CA of the SPIRE server in `management`, and restarts that server. The agents connect again within two minutes.
 - It starts test pods in fresh namespaces of every cluster, and it deletes them.
 - It rotates the Grafana admin password in `management` once. The Secret `grafana-admin` then holds a new value, and the old value stops working.
+- It deletes the `relay-view` pod in `dev-cp` and the Kiali pod in `management`. It scales `mesh-view` to zero in both cells for up to 30 seconds, and then applies the bundle again.
+- It adds a firewall rule on the `dev-cp` node that drops the packets from the relay to the hub, for about two minutes. The rule is removed at the end. If a run stops before that, run `docker exec dev-cp-control-plane iptables -D FORWARD -p tcp -d <management node address> --dport 31445 -j DROP`.
 - It sends test metrics, logs and spans through the telemetry gateway as `dev-cell-1` and `dev-cp`. The store keeps them under unique markers for 48 hours, then each component deletes them.
 
 A run that stops before its cleanups can leave objects with the label `poc.internal/test` in a cell.

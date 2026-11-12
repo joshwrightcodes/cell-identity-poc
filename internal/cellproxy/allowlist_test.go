@@ -78,6 +78,8 @@ var allowedExamples = []example{
 	{"list configmaps in istio-system", "GET", "/api/v1/namespaces/istio-system/configmaps"},
 	{"get one configmap in istio-system", "GET", "/api/v1/namespaces/istio-system/configmaps/istio"},
 	{"watch configmaps in istio-system", "GET", "/api/v1/namespaces/istio-system/configmaps?watch=true"},
+	{"list configmaps of every namespace", "GET", "/api/v1/configmaps"},
+	{"watch configmaps of every namespace", "GET", "/api/v1/configmaps?watch=true"},
 
 	{"POST selfsubjectaccessreviews", "POST", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews"},
 }
@@ -107,8 +109,6 @@ var deniedExamples = []example{
 
 	{"configmaps in argocd", "GET", "/api/v1/namespaces/argocd/configmaps"},
 	{"one configmap in argocd", "GET", "/api/v1/namespaces/argocd/configmaps/argocd-cm"},
-	{"configmaps cluster-wide", "GET", "/api/v1/configmaps"},
-	{"configmaps watch cluster-wide", "GET", "/api/v1/configmaps?watch=true"},
 
 	{"legacy watch pods", "GET", "/api/v1/watch/pods"},
 	{"legacy watch pods in a namespace", "GET", "/api/v1/watch/namespaces/apps-demo/pods"},

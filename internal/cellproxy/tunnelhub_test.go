@@ -338,3 +338,68 @@ func TestTunnelLogsHubAcceptance(t *testing.T) {
 		}
 	})
 }
+
+// A flood of watches ends at the stream cap: the next request gets 503 with overloaded, the
+// refusal counts as a hub refusal, and a request that follows the end of a watch passes again.
+func TestHubCapsStreams(t *testing.T) {
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, maxStreams: 2})
+	startCell(t, h.dialer(t), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	var bodies []io.ReadCloser
+	for range 2 {
+		resp, err := http.Get(h.hubURL + "/api/v1/pods?watch=true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("a watch under the cap got status %d", resp.StatusCode)
+		}
+		bodies = append(bodies, resp.Body)
+	}
+	code, body := h.get(t, "/api/v1/pods")
+	assertRefusal(t, code, body, http.StatusServiceUnavailable, "overloaded")
+	findLog(t, h.hubLog, "request denied", map[string]any{"reason": "overloaded", "cell": "dev-cell-1"}, 5*time.Second)
+	h.api.releaseWatches()
+	for _, b := range bodies {
+		_, _ = io.Copy(io.Discard, b)
+		_ = b.Close()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		code, body := h.get(t, "/api/v1/pods")
+		if code == http.StatusOK {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the cap still refuses after the watches ended: %d %s", code, body)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The listener bounds the header time, the idle time and the header size. It sets no read or write
+// timeout, because a watch is one long response.
+func TestHubListenerLimits(t *testing.T) {
+	h := NewTunnelHub(map[string]string{"dev-cell-1": "127.0.0.1:0"}, time.Second, jsonLog(&syncBuffer{}))
+	srv := h.newServer("dev-cell-1")
+	if srv.ReadHeaderTimeout != readHeaderTimeout || srv.IdleTimeout != hubIdleTimeout || srv.MaxHeaderBytes != hubMaxHeaderBytes {
+		t.Errorf("header timeout %s, idle timeout %s, header bytes %d", srv.ReadHeaderTimeout, srv.IdleTimeout, srv.MaxHeaderBytes)
+	}
+	if srv.ReadTimeout != 0 || srv.WriteTimeout != 0 {
+		t.Errorf("read timeout %s and write timeout %s end a watch", srv.ReadTimeout, srv.WriteTimeout)
+	}
+	ts := httptest.NewUnstartedServer(srv.Handler)
+	ts.Config = srv
+	ts.Start()
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/pods", nil)
+	req.Header.Set("X-Big", strings.Repeat("a", hubMaxHeaderBytes+8192))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Fatalf("a header over %d bytes got status %d, want 431", hubMaxHeaderBytes, resp.StatusCode)
+	}
+}

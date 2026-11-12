@@ -202,6 +202,8 @@ type tunnelHarnessConfig struct {
 	allow    string
 	registry *Registry
 	metrics  *TunnelMetrics
+	// maxStreams is the stream cap of the hub. Zero means the default.
+	maxStreams int
 }
 
 func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
@@ -226,7 +228,7 @@ func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness 
 	for _, c := range cfg.cells {
 		cells[c] = "127.0.0.1:0"
 	}
-	h.hub = NewTunnelHub(cells, cfg.wait, log, WithMetrics(cfg.metrics))
+	h.hub = NewTunnelHub(cells, cfg.wait, log, WithMetrics(cfg.metrics), WithMaxStreams(cfg.maxStreams))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -419,6 +421,34 @@ func TestCellHandlerNormalisesQuery(t *testing.T) {
 				t.Fatalf("the API got query %q, want %q", u.RawQuery, want)
 			}
 		})
+	}
+}
+
+// The informer of Kiali lists and watches the ConfigMaps of every namespace. The API must get the
+// request for istio-system only, with the query kept.
+func TestCellHandlerLimitsConfigMapsToIstioSystem(t *testing.T) {
+	api := newFakeAPI(t)
+	h := NewCellHandler(api.url(), api.transport(t), jsonLog(&syncBuffer{}))
+	for raw, want := range map[string]string{
+		"/api/v1/configmaps?limit=500":                    "limit=500",
+		"/api/v1/configmaps?watch=true&resourceVersion=7": "resourceVersion=7&watch=true",
+	} {
+		t.Run(raw, func(t *testing.T) {
+			rec := serveCell(t, h, http.MethodGet, raw, nil, nil)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d, body %s", rec.Code, rec.Body.String())
+			}
+			_, u, _ := api.last()
+			if u.Path != "/api/v1/namespaces/istio-system/configmaps" || u.RawQuery != want {
+				t.Fatalf("the API got %s?%s, want /api/v1/namespaces/istio-system/configmaps?%s", u.Path, u.RawQuery, want)
+			}
+		})
+	}
+	// A path for another namespace is still refused, and a request for it never reaches the API.
+	hits := api.hits.Load()
+	rec := serveCell(t, h, http.MethodGet, "/api/v1/namespaces/argocd/configmaps", nil, nil)
+	if rec.Code != http.StatusForbidden || api.hits.Load() != hits {
+		t.Fatalf("a read of ConfigMaps in argocd got %d and %d new API hits", rec.Code, api.hits.Load()-hits)
 	}
 }
 

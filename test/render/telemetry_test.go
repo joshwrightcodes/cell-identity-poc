@@ -125,8 +125,8 @@ func TestLgtmRender(t *testing.T) {
 		t.Errorf("lgtm has egress rules %v, want none", eg)
 	}
 	ing := get[[]any](t, np, "spec", "ingress")
-	if len(ing) != 1 {
-		t.Fatalf("lgtm has %d ingress rules, want 1", len(ing))
+	if len(ing) != 2 {
+		t.Fatalf("lgtm has %d ingress rules, want 2", len(ing))
 	}
 	var from []string
 	for _, f := range get[[]any](t, ing[0], "from") {
@@ -134,6 +134,11 @@ func TestLgtmRender(t *testing.T) {
 	}
 	if !slices.Equal(from, []string{"otel-collector", "telemetry-gateway"}) || fmt.Sprint(lookupOr(get[[]any](t, ing[0], "ports")[0], "port")) != "4317" || len(get[[]any](t, ing[0], "ports")) != 1 {
 		t.Errorf("lgtm ingress admits %v on %v, want otel-collector and telemetry-gateway on 4317 only", from, lookupOr(ing[0], "ports"))
+	}
+	// Flow N12: only prom-readonly reaches the Prometheus port.
+	if got := fmt.Sprint(lookupOr(ing[1], "from")); got != "[map[podSelector:map[matchLabels:map[app.kubernetes.io/name:prom-readonly]]]]" ||
+		len(get[[]any](t, ing[1], "ports")) != 1 || fmt.Sprint(lookupOr(get[[]any](t, ing[1], "ports")[0], "port")) != "9090" {
+		t.Errorf("lgtm admits %v on %v, want prom-readonly on 9090 only", got, lookupOr(ing[1], "ports"))
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 )
 
@@ -16,15 +17,18 @@ const (
 )
 
 const (
-	reviewGroup    = "authorization.k8s.io"
-	reviewPath     = "/apis/" + reviewGroup + "/v1/selfsubjectaccessreviews"
-	configMapNS    = "istio-system"
-	configMapsName = "configmaps"
+	allConfigMapsPath = "/api/v1/" + configMapsName
+	reviewGroup       = "authorization.k8s.io"
+	reviewPath        = "/apis/" + reviewGroup + "/v1/selfsubjectaccessreviews"
+	configMapNS       = "istio-system"
+	configMapsName    = "configmaps"
 )
 
 // coreResources are the resources under /api/v1 that Kiali v2.34.0 reads from a remote cluster:
-// informers (pods, services) and direct reads (namespaces, replicationcontrollers, ConfigMaps).
-// ConfigMaps are allowed only in istio-system, where Kiali reads the mesh config.
+// informers (pods, services, ConfigMaps) and direct reads (namespaces, replicationcontrollers).
+// ConfigMaps are allowed only in istio-system, where Kiali reads the mesh config. The informer of
+// a remote cluster lists and watches ConfigMaps of every namespace, so the allow-list admits the
+// collection path /api/v1/configmaps, and NewCellHandler sends it to istio-system alone.
 var coreResources = map[string]scope{
 	"pods":                   namespaced,
 	"services":               namespaced,
@@ -133,7 +137,7 @@ func resourceAllowed(resources map[string]scope, rest []string) bool {
 		return true
 	case 1:
 		_, ok := resources[rest[0]]
-		return ok && rest[0] != configMapsName
+		return ok
 	case 2:
 		s, ok := resources[rest[0]]
 		return ok && s == clusterWide
@@ -148,4 +152,33 @@ func resourceAllowed(resources map[string]scope, rest []string) bool {
 		return rest[2] != configMapsName || rest[1] == configMapNS
 	}
 	return false
+}
+
+// ReadResource is the set of resources of one API group that the tunnel allow-list reads. The core
+// group has the name "". Resources are plural names, sorted.
+type ReadResource struct {
+	Group     string
+	Resources []string
+}
+
+// ReadResources lists every resource that the allow-list reads, by API group and sorted, without
+// the ConfigMaps, which Allowed admits only in istio-system. The ClusterRole of the cell tunnel
+// grants exactly these resources.
+func ReadResources() []ReadResource {
+	collect := func(group string, m map[string]scope) ReadResource {
+		r := ReadResource{Group: group}
+		for name := range m {
+			if name != configMapsName {
+				r.Resources = append(r.Resources, name)
+			}
+		}
+		slices.Sort(r.Resources)
+		return r
+	}
+	out := []ReadResource{collect("", coreResources)}
+	for group, m := range groupResources {
+		out = append(out, collect(group, m))
+	}
+	slices.SortFunc(out, func(a, b ReadResource) int { return strings.Compare(a.Group, b.Group) })
+	return out
 }

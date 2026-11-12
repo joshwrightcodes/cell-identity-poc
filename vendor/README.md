@@ -1283,3 +1283,59 @@ Rows 3 and 4 of the M3 verify table (2026-11-11):
   Prometheus with their names and labels, with `source_cluster` and `destination_cluster` equal to the
   cell. `TestM3IstioMetricsSurviveOTLP` shows this. The value `telemetry.v2.prometheus.enabled: false`
   had turned the Envoy metrics off, so the cell showed no Istio metric at all before this task.
+
+## Kiali v2.34.0 and the kiali-server chart (2026-11-12)
+
+The mesh view in `management` runs Kiali v2.34.0 from the chart `kiali-server` 2.34.0. The release is
+dated 2026-10-25, and the chart archive was committed to the Kiali chart repository on 2026-10-27, so
+both are more than two weeks old as of 2026-11-12. `vendor:fetch` pulls the archive from
+`https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart into
+`charts/kiali-server-2.34.0/`.
+
+| Item | Digest |
+| --- | --- |
+| `kiali-server-2.34.0.tgz` | SHA-256 `370a9b21d8844f8024e320ab1dff4e6383e6d41ea4ee3f1e2579bd0acbfe5c40` (`KIALI_CHART_SHA256`), equal to the `digest` of the chart index |
+| `quay.io/kiali/kiali:v2.34.0` index | `sha256:5db2fd9c95064c61fb23099269db56d0ed964589acc7641a556de6fa7ff58d2a` (`KIALI_IMAGE`) |
+| arm64 manifest | `sha256:dd420fcb386313fbfd3bdb9cdbdec9a74d8722db6634cc17548cbaae59e5a1b3` |
+| amd64 manifest | `sha256:fddae60acd45e3ca4c00f294050b56f2ba61a5b973a4db62faf3a63b5049edad` |
+
+### Support matrix
+
+The Kiali prerequisites page lists Istio 1.30 for Kiali 2.26 and higher. Kiali v2.34.0 therefore
+supports Istio 1.30.8, the version of the PoC.
+
+### Chart
+
+The review read every template of the chart in a scratch directory and ran nothing from it.
+
+- No hidden Unicode and no other non-ASCII character. No encoded string, and no `curl`, `wget`,
+  `sudo`, `eval` or `base64` call. The only URLs are comments, the chart metadata and the icon.
+- The chart creates a ServiceAccount, a ConfigMap, a Service, a Deployment, and a viewer Role and
+  RoleBinding. With `deployment.cluster_wide_access: false` the Role and RoleBinding exist in the
+  namespace of Kiali only, and no ClusterRole exists.
+- The viewer Role grants `pods/portforward` with the verb `create`. The render deletes that rule, and
+  `TestKialiRender` and `TestM3NoWorkloadCanPortForward` check the result.
+- The chart makes a new random `login_token.signing_key` at each render. The render sets a fixed
+  value, because the anonymous login signs no token and a new key would restart Kiali at each link
+  phase.
+- The chart sets the annotation `proxy.istio.io/config`, which the render deletes, because the
+  namespace has no mesh proxy. It also adds a NetworkPolicy, which the values turn off, because
+  `components/mesh-view-hub/hub.yaml` holds the policies of the namespace.
+- The Deployment mounts the Secret `kiali-multi-cluster-secret` at
+  `/kiali-remote-cluster-secrets/`, where Kiali reads one kubeconfig for each cluster at start. Kiali
+  names each cluster after the cluster entry of its kubeconfig.
+
+### Prometheus reads
+
+The review read `prometheus/client.go`, `prometheus/lazy_client.go` and `business/istio_status.go` of
+the tag. Kiali calls `Query`, `QueryRange`, `LabelValues("__name__")`, `Buildinfo`, `Config` and
+`Runtimeinfo` of the Prometheus client, and probes `<url>/-/healthy` when `health_check_url` is empty.
+`promql-proxy` passes exactly these paths. Kiali sends `query_scope` as a label matcher in each query.
+
+### Image
+
+The image is an index with arm64 and amd64 manifests among others. The review did not check a
+signature, and it did not inspect the layers or the binary. The image runs with these limits.
+The NetworkPolicy lets it reach only the hub, `prom-readonly` and the API server of `management`.
+The root file system is read-only, and no capability remains. The Role of the pod covers its own
+namespace only. The review read no source line of Kiali beyond the files above.

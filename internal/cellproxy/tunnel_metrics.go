@@ -60,11 +60,21 @@ func NewTunnelMetrics(m metric.Meter) (*TunnelMetrics, error) {
 // TunnelOption configures a tunnel component.
 type TunnelOption func(*tunnelOptions)
 
-type tunnelOptions struct{ metrics *TunnelMetrics }
+type tunnelOptions struct {
+	metrics    *TunnelMetrics
+	maxStreams int
+}
 
 // WithMetrics records the metrics of the component in m.
 func WithMetrics(m *TunnelMetrics) TunnelOption {
 	return func(o *tunnelOptions) { o.metrics = m }
+}
+
+// WithMaxStreams sets how many requests each cell listener of a hub passes into its tunnel at the
+// same time. The default is hubMaxStreams. A request over the cap gets 503 with the reason
+// overloaded.
+func WithMaxStreams(n int) TunnelOption {
+	return func(o *tunnelOptions) { o.maxStreams = n }
 }
 
 func applyOptions(opts []TunnelOption) tunnelOptions {

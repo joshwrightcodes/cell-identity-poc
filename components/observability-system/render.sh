@@ -406,8 +406,8 @@ spec:
           port: 53
 ---
 # Flow N23: the kubelet probes each pod from a node address. The store and the gateway probe
-# themselves inside the pod, so they admit no node address. The collector and the uplink admit a node
-# address on their probe port only.
+# themselves inside the pod, so they admit no node address. The collector, the uplink and prom-readonly
+# admit a node address on their probe port only.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -418,7 +418,7 @@ spec:
     matchExpressions:
       - key: app.kubernetes.io/name
         operator: NotIn
-        values: [lgtm, telemetry-gateway, otel-collector, otel-uplink]
+        values: [lgtm, telemetry-gateway, otel-collector, otel-uplink, prom-readonly]
   policyTypes: [Ingress]
   ingress:
     - from:

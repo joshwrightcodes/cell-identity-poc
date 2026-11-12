@@ -85,6 +85,11 @@ description = "Serve the read-only central Argo CD UI of management on http://12
 env = { CELL = "management" }
 run = "scripts/view-ui.sh"
 
+[tasks."mesh:ui"]
+description = "Serve the read-only Kiali mesh view of management on http://127.0.0.1:20001/kiali"
+env = { CELL = "management" }
+run = "scripts/mesh-ui.sh"
+
 [tasks."view:rotate-keys"]
 description = "Make new view keys in management: new agent CA and certificates, JWT key and server key, a new central Redis password, then restart argocd-redis, argocd-repo-server, the principal and argocd-server"
 env = { CELL = "management" }

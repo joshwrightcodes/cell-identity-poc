@@ -38,6 +38,7 @@ case "$args" in
     [[ -n "${STUB_NO_LABEL:-}" ]] || echo deployment.apps/celld ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=argocd-agent -o name "*) ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=otel-uplink -o name "*) ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=mesh-view -o name "*) ;;
   *" get deployments -o name "*|*" get deployments,statefulsets -o name "*) printf 'deployment.apps/argocd-repo-server\ndeployment.apps/celld\n' ;;
   *" get Deployment -o json --show-managed-fields "*) echo "{\"items\":[$labelled,$argo]}" ;;
   *" get ConfigMap -o json --show-managed-fields "*)
@@ -139,6 +140,14 @@ func runHarnessScript(t *testing.T, owned bool, snippet string, env ...string) (
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(agent, "manifests.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mgmt-root\n  namespace: argocd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// It also has the harness component mesh-view, with a fixture bundle that holds no workload.
+	mesh := filepath.Join(build, "dev-cell-1", "bundles", "mesh-view")
+	if err := os.MkdirAll(mesh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mesh, "manifests.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: mgmt-root\n  namespace: mesh-view-system\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	// It also has the harness component otel-uplink, with a fixture bundle that holds no workload.

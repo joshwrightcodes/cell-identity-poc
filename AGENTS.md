@@ -23,6 +23,7 @@
 | Start the sidecars of a cluster again, so each has the cell name as its cluster ID (see README "Collectors and uplinks") | `CELL=dev-cell-1 mise run cell:restart-mesh` |
 | Run the link phase of `management`: the central Argo CD view (see README "Central Argo CD view") | `mise run cell:link` |
 | Central read-only Argo CD UI on 127.0.0.1:8090 | `mise run view:ui` |
+| Read-only Kiali mesh view on 127.0.0.1:20001/kiali (see README "Mesh view") | `mise run mesh:ui` |
 | New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |
 | Grafana of `management` on 127.0.0.1:3300, and its admin password (see README "Telemetry store") | `mise run obs:ui`, `mise run obs:password` |
 | New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |

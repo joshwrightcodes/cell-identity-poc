@@ -6,9 +6,9 @@ import (
 )
 
 // notStoreSelector is the selector of allow-from-nodes in observability-system: the store and the gateway
-// probe themselves inside the pod, and the collector and the uplink admit a node address on their probe
-// port only, through their own policies.
-const notStoreSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm telemetry-gateway otel-collector otel-uplink]]]]"
+// probe themselves inside the pod, and the collector, the uplink and prom-readonly admit a node address
+// on their probe port only, through their own policies.
+const notStoreSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[lgtm telemetry-gateway otel-collector otel-uplink prom-readonly]]]]"
 
 const notAgentSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name operator:NotIn values:[argocd-agent]]]]"
 

@@ -1,0 +1,169 @@
+# The read-only Prometheus proxy of management. render.sh fills in @CELL_PROXY_IMAGE@.
+#
+# cell-proxy in promql-proxy mode passes only the Prometheus reads that Kiali makes to the store,
+# and answers every other request with 403. The OTLP write path and the admin paths of Prometheus
+# stay closed. Port 9090 of lgtm admits only this pod, and the pod admits only Kiali and the kubelet.
+# The kubelet probes GET /-/healthy, the one path of /-/ that the proxy passes upstream.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prom-readonly
+  namespace: observability-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prom-readonly
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: prom-readonly
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prom-readonly
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prom-readonly
+    spec:
+      serviceAccountName: prom-readonly
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - promql-proxy
+            - --listen=:9091
+            - --upstream=http://lgtm.observability-system.svc:9090
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-prom-readonly
+            # Each pod gets its own metric series, so a counter that starts again after a restart
+            # never continues the series of the pod before it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.instance.id=$(POD_NAME)
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: promql
+              containerPort: 9091
+          readinessProbe:
+            httpGet:
+              path: /-/healthy
+              port: promql
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: promql
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# Flow N12: Kiali reads Prometheus through this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: prom-readonly
+  namespace: observability-system
+  labels:
+    app.kubernetes.io/name: prom-readonly
+spec:
+  selector:
+    app.kubernetes.io/name: prom-readonly
+  ports:
+    - name: http-promql
+      port: 9091
+      targetPort: promql
+      appProtocol: http
+---
+# Flows N12, N11 and N23. Kiali and the kubelet reach port 9091. The pod reaches the store on 9090 and
+# the collector on 4317.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prom-readonly
+  namespace: observability-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prom-readonly
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: mesh-view-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kiali
+      ports:
+        - protocol: TCP
+          port: 9091
+    - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 9091
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: lgtm
+      ports:
+        - protocol: TCP
+          port: 9090
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+# Flow N11: the collector admits the OTLP of the proxy. The policy collector of the namespace admits
+# the named senders, and this policy adds the proxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: collector-from-prom-readonly
+  namespace: observability-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: otel-collector
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prom-readonly
+      ports:
+        - protocol: TCP
+          port: 4317

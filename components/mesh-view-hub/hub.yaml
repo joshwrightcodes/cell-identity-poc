@@ -1,0 +1,307 @@
+# The tunnel hub of the mesh view in management. render.sh fills in the @...@ values and one
+# --tunnel-cell argument for each cell of MESH_VIEW_CELLS, and components/lib/spire-sidecar.sh adds
+# the k8s_psat SPIRE agent, which gives cell-proxy the SVID spiffe://mgmt.poc.internal/kiali.
+#
+# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the ID of the cell tunnel and the
+# cell registry, and keeps one HTTP/2 tunnel for each cell. For each cell it serves one plaintext
+# HTTP listener, where only Kiali connects. The hub passes a request through the tunnel with only
+# the headers Accept, Accept-Encoding, Content-Type and User-Agent. The allow-list of the cell
+# tunnel decides which reads reach the Kubernetes API of the cell, so the hub does not repeat it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mesh-view-hub
+  namespace: mesh-view-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mesh-view-hub
+  namespace: mesh-view-system
+  labels:
+    app.kubernetes.io/name: mesh-view-hub
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mesh-view-hub
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mesh-view-hub
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/registry-content-sha256: "@REGISTRY_SHA256@"
+    spec:
+      serviceAccountName: mesh-view-hub
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # The kiali entry selects unix:uid:65532, the user of the ko base image. The registry is read
+        # at start, so a revoked cell needs a new pod: cell:link renders a new registry and starts it.
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - spiffe-server
+            - --listen=:8444
+            - --backend=tunnel
+            - "--allow-id=@ALLOW_ID@"
+            - --registry-dir=/run/cell-proxy/registry
+            - --peer-bundle=/run/cell-proxy/peer-root/root.crt
+            - --peer-trust-domain=@PEER_TRUST_DOMAIN@
+            - "--tunnel-cell=@TUNNEL_CELL@"
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-mesh-hub
+            # Each pod gets its own metric series, so a counter that starts again after a restart
+            # never continues the series of the pod before it.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.instance.id=$(POD_NAME)
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: tunnel
+              containerPort: 8444
+          # The probe makes one handshake with no client certificate and checks the server ID. It
+          # starts no tunnel and needs no node address.
+          startupProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/kiali
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/kiali
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command:
+                - /ko-app/cell-proxy
+                - probe
+                - --upstream=127.0.0.1:8444
+                - --expect-id=spiffe://mgmt.poc.internal/kiali
+                - --peer-bundle=/run/cell-proxy/own-root/bundle.crt
+                - --peer-trust-domain=mgmt.poc.internal
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 4
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: registry
+              mountPath: /run/cell-proxy/registry
+              readOnly: true
+            - name: peer-root
+              mountPath: /run/cell-proxy/peer-root
+              readOnly: true
+            - name: own-root
+              mountPath: /run/cell-proxy/own-root
+              readOnly: true
+      volumes:
+        - name: registry
+          configMap:
+            name: cell-registry
+        - name: peer-root
+          configMap:
+            name: peer-root
+        - name: own-root
+          configMap:
+            name: spire-trust-bundle-mesh-view-hub
+---
+# Flow N3: the dev-cp relay reaches cell-proxy on the node port. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the dev-cp node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-view-listener
+  namespace: mesh-view-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: mesh-view-hub
+  ports:
+    - name: tunnel
+      port: 8444
+      targetPort: 8444
+      nodePort: 31445
+---
+# Flow N13: Kiali reaches the HTTP listener of each cell. render.sh adds one port for each cell.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mesh-view-hub
+  namespace: mesh-view-system
+spec:
+  selector:
+    app.kubernetes.io/name: mesh-view-hub
+  ports: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: mesh-view-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Flow N24: every pod resolves the Service names of its peers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: mesh-view-system
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - ipBlock:
+            cidr: "@DNS_SERVICE_IP@/32"
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mesh-view-hub
+  namespace: mesh-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: mesh-view-hub
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N3: the dev-cp relay, through node port 31445 with the local traffic policy. The probes run
+    # inside the pod (N23), so no node address needs another port.
+    - from: "@ENV_NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8444
+    # N13: only Kiali reaches the HTTP listener of a cell. render.sh sets the ports.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kiali
+      ports: "@CELL_PORTS@"
+  egress:
+    # N8: the SPIRE agent sidecar attests to the SPIRE server of management.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spire-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: spire-server
+      ports:
+        - protocol: TCP
+          port: 8081
+    # N11: cell-proxy exports its own OTLP to the collector of the cluster.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+# Kiali reads three peers and nothing else. The kubelet probes its API port from a node address (flow
+# N23). No pod reaches port 20001, and kubectl port-forward enters the pod through the kubelet (flow
+# N25).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kiali
+  namespace: mesh-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kiali
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 20001
+  egress:
+    # N13: the HTTP listener of each cell on the hub.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: mesh-view-hub
+      ports: "@CELL_PORTS@"
+    # N12: the read-only Prometheus proxy.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prom-readonly
+      ports:
+        - protocol: TCP
+          port: 9091
+    # N14: the API server of management.
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443
