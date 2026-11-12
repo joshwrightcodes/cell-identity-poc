@@ -9,6 +9,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 // CheckResult is the outcome of a key check.
@@ -16,7 +17,16 @@ type CheckResult string
 
 // KeyCheck compares the keys that the issuer publishes with the keys of the record. An error means
 // the check could not run; a refusal is a result.
-func (p *Plane) KeyCheck(ctx context.Context, cell string) (res CheckResult, err error) {
+func (p *Plane) KeyCheck(ctx context.Context, cell string) (CheckResult, error) {
+	return p.keyCheck(ctx, cell, nil)
+}
+
+// KeyCheck is Plane.KeyCheck, guarded by the state version.
+func (g SeqGuard) KeyCheck(ctx context.Context, cell string) (CheckResult, error) {
+	return g.p.keyCheck(ctx, cell, &g.seq)
+}
+
+func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res CheckResult, err error) {
 	defer func() {
 		if err == nil {
 			p.checkResults.Add(ctx, 1, metric.WithAttributes(attribute.String("result", string(res))))
@@ -24,6 +34,9 @@ func (p *Plane) KeyCheck(ctx context.Context, cell string) (res CheckResult, err
 	}()
 	if _, ok := p.intent[cell]; !ok {
 		return "", refuse(mgmtapi.ReasonCellUnknown, "")
+	}
+	if expect != nil && p.snapshotSeq() != *expect {
+		return "", refuse(mgmtapi.ReasonConflict, "state version changed")
 	}
 	pre := p.snap.Load().st.Cells[cell]
 	switch {
@@ -44,6 +57,9 @@ func (p *Plane) KeyCheck(ctx context.Context, cell string) (res CheckResult, err
 		return res, nil
 	}
 	err = p.commit(func(t *txn) error {
+		if err := t.expectSeq(expect); err != nil {
+			return err
+		}
 		cs := t.st.Cells[cell]
 		switch {
 		case cs == nil:
@@ -99,8 +115,9 @@ func (p *Plane) judge(t *txn, cell string, cs *CellState, keys mgmtapi.ClusterKe
 		if ReasonOf(err) != mgmtapi.ReasonKeysUntrusted {
 			return "", err
 		}
-		// The new set does not fit a record. The cell keeps its last good record.
+		// The new set does not fit a record. The cell keeps its last good record and no revision is signed.
 		*cs = old
+		t.revised, t.rev = false, spec.Revision{}
 		return settle(CheckKeysUntrusted)
 	}
 	return CheckKeysUpdated, nil

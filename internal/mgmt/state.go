@@ -151,7 +151,7 @@ func (f *FileStore) Load() (*State, error) {
 	st, perr := parseState(data)
 	if perr == nil {
 		if err := st.validate(); err != nil {
-			return nil, fmt.Errorf("%w: %v; the file stays in place at %s; restore the state volume from a backup (the Task 11 restore runbook step) or run rotate-signing-key", ErrStateInvalid, err, f.Path)
+			return nil, fmt.Errorf("%w: %v; the file stays in place at %s; follow the README runbook section \"Recover lost management state\"", ErrStateInvalid, err, f.Path)
 		}
 		return st, nil
 	}

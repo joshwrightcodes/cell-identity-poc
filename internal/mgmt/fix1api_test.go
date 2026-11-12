@@ -101,7 +101,8 @@ func TestStateFileThatFailsValidationIsNotMovedAside(t *testing.T) {
 				t.Fatal(err)
 			}
 			_, err := NewPlane(r.config())
-			if !errors.Is(err, ErrStateInvalid) || !strings.Contains(err.Error(), "state_invalid") {
+			if !errors.Is(err, ErrStateInvalid) || !strings.Contains(err.Error(), "state_invalid") ||
+				!strings.Contains(err.Error(), "Recover lost management state") || strings.Contains(err.Error(), "rotate-signing-key") {
 				t.Fatalf("NewPlane: %v", err)
 			}
 			if got, _ := os.ReadFile(path); !bytes.Equal(got, b) {

@@ -22,7 +22,6 @@ import (
 	"github.com/go-jose/go-jose/v4"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/kubetoken"
 )
 
 func TestUnknownKidRefetchesOncePer10s(t *testing.T) {
@@ -100,6 +99,7 @@ func TestPendingDropsGetNoKeyCheck(t *testing.T) {
 func TestBoundBadSignatureNoFetch(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.clk.Advance(61 * time.Second) // a warm cache would hide a fetch
 	calls := r.keys.total()
 	n := r.nonce(cell1)
 	tok := r.token(cell1, n, newSigner(t, "kid-1"), nil)
@@ -187,8 +187,12 @@ func TestRecordSizeCap(t *testing.T) {
 	r.clk.Advance(61 * time.Second)
 	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"))
 	maxRecordBytes = 300
+	signed := r.status().Signed
 	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUntrusted {
 		t.Fatalf("check above the cap: %v, %v", res, err)
+	}
+	if got := r.status().Signed; got != signed || r.verifySpec().Revision != signed {
+		t.Fatalf("a refused check signed a new revision: %v to %v", signed, got)
 	}
 	if got := cellStatus(r.status(), cell1).Kids; len(got) != 1 {
 		t.Fatalf("kids %v", got)
@@ -249,6 +253,7 @@ func TestSameCellBindRaceBindsOnce(t *testing.T) {
 	gate := r.keys.gate
 	r.keys.mu.Unlock()
 	type out struct {
+		req  mgmtapi.BindRequest
 		resp mgmtapi.BindResponse
 		err  error
 	}
@@ -258,7 +263,7 @@ func TestSameCellBindRaceBindsOnce(t *testing.T) {
 		req := mgmtapi.BindRequest{Nonce: n, Token: r.token(cell1, n, r.signers[cell1], nil)}
 		go func() {
 			resp, err := r.plane.Bind(t.Context(), cell1, req)
-			res <- out{resp, err}
+			res <- out{req, resp, err}
 		}()
 	}
 	for r.keys.count(cell1) == 0 {
@@ -266,16 +271,24 @@ func TestSameCellBindRaceBindsOnce(t *testing.T) {
 	}
 	close(gate)
 	got := []string{}
+	var answeredBound mgmtapi.BindRequest
 	for range 2 {
 		o := <-res
 		if o.err != nil {
 			t.Fatal(o.err)
 		}
 		got = append(got, o.resp.Status)
+		if o.resp.Status == mgmtapi.StatusAlreadyBound {
+			answeredBound = o.req
+		}
 	}
 	slices.Sort(got)
 	if !slices.Equal(got, []string{mgmtapi.StatusAlreadyBound, mgmtapi.StatusBound}) || r.status().Signed != rev(1, 2) {
 		t.Fatalf("results %v, signed %v", got, r.status().Signed)
+	}
+	// The request that was answered already_bound consumed its nonce.
+	if _, err := r.plane.Bind(t.Context(), cell1, answeredBound); ReasonOf(err) != mgmtapi.ReasonNonceInvalid {
+		t.Fatalf("replay of an already_bound request: %v", err)
 	}
 }
 
@@ -348,9 +361,6 @@ func TestRepeatedLogsAreRateLimited(t *testing.T) {
 	if got := r.logs.count("bind_refused"); got != 1 {
 		t.Fatalf("%d bind_refused lines for one cell and reason", got)
 	}
-	if err := r.plane.Restore(2); err != nil && r.status().Signed.Counter > 1 {
-		t.Fatal(err)
-	}
 	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
 	if err := r.plane.Restore(2); err != nil {
 		t.Fatal(err)
@@ -389,8 +399,6 @@ func TestGaugeReportsTheLag(t *testing.T) {
 
 func newKey() (ed25519.PublicKey, ed25519.PrivateKey, error) { return ed25519.GenerateKey(rand.Reader) }
 
-var _ = kubetoken.Claims{}
-
 func TestFailedFetchIsNotCached(t *testing.T) {
 	r := newRig(t)
 	r.keys.fail(cell1, errors.New("down"))
@@ -399,4 +407,24 @@ func TestFailedFetchIsNotCached(t *testing.T) {
 	}
 	r.keys.fail(cell1, nil)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+}
+
+func TestUnknownCellsDoNotStarveLogs(t *testing.T) {
+	r := newRig(t, cell1, cell2)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	fs := &flakyStore{Store: r.store}
+	r.plane.cfg.Store = fs
+	for i := range 300 {
+		_, _ = r.plane.Bind(t.Context(), "invented-"+strings.Repeat("x", i%7)+string(rune('a'+i%26))+string(rune('a'+i/26)), mgmtapi.BindRequest{Nonce: "n", Token: "t"})
+	}
+	if got := r.logs.count("bind_refused"); got > 1 {
+		t.Fatalf("%d bind_refused lines for invented cell names", got)
+	}
+	fs.fail.Store(true)
+	r.release()
+	if got := r.logs.count("drop_failed"); got != 1 {
+		t.Fatalf("%d drop_failed lines after 300 unknown names", got)
+	}
 }

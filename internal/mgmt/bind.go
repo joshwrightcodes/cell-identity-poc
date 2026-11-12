@@ -167,7 +167,11 @@ func (p *Plane) countBind(ctx context.Context, cell string, resp mgmtapi.BindRes
 		if result == "" {
 			result = "error"
 		}
-		p.logLimited(ctx, slog.LevelInfo, "bind_refused/"+cell+"/"+result, "bind_refused", "cell", cell, "reason", result, "error", err.Error())
+		key := "bind_refused/" + cell + "/" + result
+		if result == mgmtapi.ReasonCellUnknown {
+			key = "bind_refused/unknown_cell" // one key, so invented names cannot fill the limiter
+		}
+		p.logLimited(ctx, slog.LevelInfo, key, "bind_refused", "cell", cell, "reason", result, "error", err.Error())
 	} else if resp.Status != mgmtapi.StatusAlreadyBound {
 		p.cfg.Log.InfoContext(ctx, "bind", "cell", cell, "result", result, "record_epoch", resp.Record.Epoch, "record_counter", resp.Record.Counter)
 	}
