@@ -136,7 +136,7 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 	if bundlePath == "" {
 		return errors.New("serve needs --client-bundle")
 	}
-	roots, err := hostsvc.NewBundleFile(bundlePath, id.TrustDomain())
+	roots, err := hostsvc.LoadClientRoots(bundlePath, id.TrustDomain(), time.Now())
 	if err != nil {
 		return err
 	}
@@ -151,12 +151,13 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 	defer ln.Close()
 
 	log := slog.Default()
+	var tel *telemetry.T
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		t, err := telemetry.Start(ctx, "hostsvc", logOut)
 		if err != nil {
 			return fmt.Errorf("start telemetry: %w", err)
 		}
-		log = t.Log
+		tel, log = t, t.Log
 		defer func() {
 			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -168,12 +169,18 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, l
 
 	cells := topo.WithComponent(keyedComponent)
 	cache := hostsvc.NewKeyCache(svc.Facts, hostsvc.KeyTTL, hostsvc.KeyMaxInFlight, nil)
-	handler := hostsvc.NewKeyHandler(cache, func(n string) bool { return slices.Contains(cells, n) }, log)
+	isKnown := func(n string) bool { return slices.Contains(cells, n) }
+	handler := hostsvc.NewKeyHandler(cache, isKnown, log)
+	if tel != nil {
+		if handler, err = hostsvc.NewInstrumentedKeyHandler(cache, isKnown, log, tel.Tracer, tel.Meter); err != nil {
+			return fmt.Errorf("instrument key handler: %w", err)
+		}
+	}
 	srv := hostsvc.NewKeyServer(handler, hostsvc.ServerTLS(cert, roots, id), log)
 	certSum := sha256.Sum256(cert.Leaf.Raw)
 	log.Info("serving", "addr", ln.Addr().String(), "cert_sha256", hex.EncodeToString(certSum[:]),
-		"root_sha256", roots.RootSHA256(), "pid", os.Getpid(), "client_id", id.String(), "clusters", cells)
-	return hostsvc.ServeKeys(ctx, srv, ln)
+		"root_sha256", roots.SHA256(), "pid", os.Getpid(), "client_id", id.String(), "clusters", cells)
+	return hostsvc.ServeKeys(ctx, srv, ln, log)
 }
 
 // pin makes one handshake that accepts any certificate, and prints the leaf as one PEM block.

@@ -26,7 +26,8 @@ const kindNetwork = "kind"
 const limaHostPrefix = "192.168.5.0/24"
 
 // apiCallTimeout bounds each call to the API server and each docker lookup of the reserved prefixes.
-const apiCallTimeout = 10 * time.Second
+// Tests shorten it.
+var apiCallTimeout = 10 * time.Second
 
 // KindRuntime runs clusters through the kind library and its Docker provider.
 // The Docker provider runs the docker command line, so docker must be on PATH.
@@ -138,7 +139,6 @@ func (HTTPProber) Probe(ctx context.Context, kubeconfig string) (Observed, error
 		return Observed{}, fmt.Errorf("load client certificate: %w", err)
 	}
 	client := &http.Client{
-		Timeout: apiCallTimeout,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{
 			RootCAs: pool, Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12,
 		}},

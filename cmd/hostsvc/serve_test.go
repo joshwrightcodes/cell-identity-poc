@@ -14,6 +14,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -24,7 +25,6 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
 const topologyFile = "../../harness/topology.yaml"
@@ -46,13 +46,61 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-func writeBundle(t *testing.T, ca *spiffetest.CA) string {
+// testCA is a root CA of trust domain mgmt.poc.internal with the URI SAN that SPIRE roots carry.
+type testCA struct {
+	cert *x509.Certificate
+	key  *ecdsa.PrivateKey
+}
+
+func newMgmtCA(t *testing.T) *testCA {
 	t.Helper()
-	data, err := ca.Bundle().Marshal()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return writeFile(t, "bundle.pem", data)
+	u, _ := url.Parse("spiffe://mgmt.poc.internal")
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), Subject: pkix.Name{CommonName: "root"}, URIs: []*url.URL{u},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &testCA{cert: cert, key: key}
+}
+
+func (ca *testCA) pem() []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.cert.Raw})
+}
+
+// svid issues a client certificate with the SPIFFE ID id.
+func (ca *testCA) svid(t *testing.T, id string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, _ := url.Parse(id)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()), NotBefore: time.Now().Add(-time.Minute), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, URIs: []*url.URL{u},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.cert, &key.PublicKey, ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
+func writeBundle(t *testing.T, ca *testCA) string {
+	t.Helper()
+	return writeFile(t, "bundle.pem", ca.pem())
 }
 
 func writeFile(t *testing.T, name string, data []byte) string {
@@ -71,9 +119,13 @@ func caForDomain(t *testing.T, domain string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	u, _ := url.Parse("spiffe://" + domain)
+	var uris []*url.URL
+	if domain != "" {
+		u, _ := url.Parse("spiffe://" + domain)
+		uris = append(uris, u)
+	}
 	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "root"}, URIs: []*url.URL{u},
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "root"}, URIs: uris,
 		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
 		IsCA: true, BasicConstraintsValid: true, KeyUsage: x509.KeyUsageCertSign,
 	}
@@ -131,14 +183,13 @@ func startServe(t *testing.T, bundle string, extra ...string) *running {
 	return nil
 }
 
-func mgmtClientCert(t *testing.T, ca *spiffetest.CA) tls.Certificate {
+func mgmtClientCert(t *testing.T, ca *testCA) tls.Certificate {
 	t.Helper()
-	svid := ca.SVID(t, "spiffe://mgmt.poc.internal/api")
-	return tls.Certificate{Certificate: [][]byte{svid.Certificates[0].Raw}, PrivateKey: svid.PrivateKey}
+	return ca.svid(t, "spiffe://mgmt.poc.internal/api")
 }
 
 func TestServeRefusesNonLoopback(t *testing.T) {
-	bundle := writeBundle(t, spiffetest.NewCA(t, "mgmt.poc.internal"))
+	bundle := writeBundle(t, newMgmtCA(t))
 	for _, addr := range []string{"0.0.0.0:0", "[::]:0", ":0", "192.168.5.2:17443", "localhost:17443", "10.0.0.1:1"} {
 		var out syncBuffer
 		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
@@ -156,13 +207,14 @@ func TestServeRefusesNonLoopback(t *testing.T) {
 }
 
 func TestServeRequiresClientBundle(t *testing.T) {
-	good := writeBundle(t, spiffetest.NewCA(t, "mgmt.poc.internal"))
+	good := writeBundle(t, newMgmtCA(t))
 	cases := map[string][]string{
 		"no flag":        {"serve", "--listen", "127.0.0.1:0"},
 		"missing file":   {"serve", "--listen", "127.0.0.1:0", "--client-bundle", filepath.Join(t.TempDir(), "none.pem")},
 		"not PEM":        {"serve", "--listen", "127.0.0.1:0", "--client-bundle", writeFile(t, "x.pem", []byte("hello"))},
 		"empty file":     {"serve", "--listen", "127.0.0.1:0", "--client-bundle", writeFile(t, "x.pem", nil)},
 		"other domain":   {"serve", "--listen", "127.0.0.1:0", "--client-bundle", writeFile(t, "x.pem", caForDomain(t, "dev.env.poc.internal"))},
+		"no URI SAN":     {"serve", "--listen", "127.0.0.1:0", "--client-bundle", writeFile(t, "x.pem", caForDomain(t, ""))},
 		"other id":       {"serve", "--listen", "127.0.0.1:0", "--client-bundle", good, "--client-id", "spiffe://dev.env.poc.internal/api"},
 		"domain as id":   {"serve", "--listen", "127.0.0.1:0", "--client-bundle", good, "--client-id", "spiffe://mgmt.poc.internal"},
 		"bad id":         {"serve", "--listen", "127.0.0.1:0", "--client-bundle", good, "--client-id", "nope"},
@@ -193,7 +245,7 @@ func leafPEM(t *testing.T) []byte {
 }
 
 func TestServeTLS13Only(t *testing.T) {
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	r := startServe(t, writeBundle(t, ca))
 	cert := mgmtClientCert(t, ca)
 	conn, err := tls.Dial("tcp", r.addr, &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12, Certificates: []tls.Certificate{cert}})
@@ -208,11 +260,12 @@ func TestServeTLS13Only(t *testing.T) {
 	conn.Close()
 }
 
+// The cap counts connections that passed the handshake and the client check. The 17th verified
+// client finishes its handshake, but its request gets no answer until a slot frees.
 func TestServeConnCap(t *testing.T) {
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	r := startServe(t, writeBundle(t, ca))
-	cert := mgmtClientCert(t, ca)
-	cfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}
+	cfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{mgmtClientCert(t, ca)}}
 	var held []*tls.Conn
 	defer func() {
 		for _, c := range held {
@@ -224,28 +277,121 @@ func TestServeConnCap(t *testing.T) {
 		if err != nil {
 			t.Fatalf("client %d: %v", i, err)
 		}
+		if _, err := c.Write([]byte("GET /none HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if n, err := c.Read(make([]byte, 64)); err != nil || n == 0 {
+			t.Fatalf("client %d got no answer: %v", i, err)
+		}
 		held = append(held, c)
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
-	defer cancel()
-	c, err := (&tls.Dialer{Config: cfg}).DialContext(ctx, "tcp", r.addr)
-	if err == nil {
-		c.Close()
-		t.Fatal("the 17th client completed its handshake while 16 connections were open")
+	seventeen, err := tls.Dial("tcp", r.addr, cfg)
+	if err != nil {
+		t.Fatalf("17th client: %v", err)
+	}
+	defer seventeen.Close()
+	if _, err := seventeen.Write([]byte("GET /none HTTP/1.1\r\nHost: x\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_ = seventeen.SetReadDeadline(time.Now().Add(time.Second))
+	if n, err := seventeen.Read(make([]byte, 64)); err == nil {
+		t.Fatalf("the 17th client got %d bytes while 16 connections were open", n)
 	}
 	held[0].Close()
 	held = held[1:]
-	c, err = tls.Dial("tcp", r.addr, cfg)
-	if err != nil {
-		t.Fatalf("client after a slot freed: %v", err)
+	_ = seventeen.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if n, err := seventeen.Read(make([]byte, 64)); err != nil || n == 0 {
+		t.Fatalf("the 17th client got no answer after a slot freed: %v", err)
 	}
-	c.Close()
+}
+
+// A client with no credential does not take a slot: 16 verified clients fit beside any number of
+// silent sockets.
+func TestServeSilentSocketsTakeNoSlot(t *testing.T) {
+	ca := newMgmtCA(t)
+	r := startServe(t, writeBundle(t, ca))
+	var silent []net.Conn
+	defer func() {
+		for _, c := range silent {
+			c.Close()
+		}
+	}()
+	for range 40 {
+		c, err := net.Dial("tcp", r.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		silent = append(silent, c)
+	}
+	cfg := &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{mgmtClientCert(t, ca)}}
+	for i := 1; i <= 16; i++ {
+		c, err := tls.Dial("tcp", r.addr, cfg)
+		if err != nil {
+			t.Fatalf("verified client %d: %v", i, err)
+		}
+		defer c.Close()
+		_, _ = c.Write([]byte("GET /none HTTP/1.1\r\nHost: x\r\n\r\n"))
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		if n, err := c.Read(make([]byte, 64)); err != nil || n == 0 {
+			t.Fatalf("verified client %d got no answer beside silent sockets: %v", i, err)
+		}
+	}
+}
+
+// The server trusts the roots that it read at start. A new root in the file changes nothing.
+func TestServeIgnoresBundleChangesAfterStart(t *testing.T) {
+	ca, other := newMgmtCA(t), newMgmtCA(t)
+	bundle := writeBundle(t, ca)
+	r := startServe(t, bundle)
+	if err := os.WriteFile(bundle, other.pem(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	status := func(cert tls.Certificate) (int, error) {
+		client := &http.Client{Timeout: 3 * time.Second, Transport: &http.Transport{
+			DisableKeepAlives: true,
+			TLSClientConfig:   &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{cert}},
+		}}
+		resp, err := client.Get("https://" + r.addr + "/none")
+		if err != nil {
+			return 0, err
+		}
+		resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+	if code, err := status(mgmtClientCert(t, ca)); err != nil || code != http.StatusNotFound {
+		t.Errorf("client of the first root: %d, %v", code, err)
+	}
+	if code, err := status(mgmtClientCert(t, other)); err == nil {
+		t.Errorf("client of the new root got %d after the file changed", code)
+	}
+}
+
+func TestServeRootSHA256IsTheBundle(t *testing.T) {
+	ca := newMgmtCA(t)
+	r := startServe(t, writeBundle(t, ca))
+	sum := sha256.Sum256(ca.cert.Raw)
+	m := jsonLines(t, lineWith(t, r.out, `"msg":"serving"`))[0]
+	if m["root_sha256"] != hex.EncodeToString(sum[:]) {
+		t.Errorf("root_sha256 = %v, want %x", m["root_sha256"], sum)
+	}
+}
+
+func lineWith(t *testing.T, out *syncBuffer, sub string) string {
+	t.Helper()
+	for _, l := range strings.Split(out.String(), "\n") {
+		if strings.Contains(l, sub) {
+			return l
+		}
+	}
+	t.Fatalf("no line with %s: %s", sub, out.String())
+	return ""
 }
 
 var hexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
 func TestServeLogsAreJSON(t *testing.T) {
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	stderr := captureStderr(t)
 	r := startServe(t, writeBundle(t, ca))
 	conn, err := tls.Dial("tcp", r.addr, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
@@ -255,7 +401,7 @@ func TestServeLogsAreJSON(t *testing.T) {
 		conn.Close()
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(r.out.String(), `"msg":"server error"`) && time.Now().Before(deadline) {
+	for !strings.Contains(r.out.String(), `"msg":"handshake refused"`) && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	r.finish(t)
@@ -268,7 +414,7 @@ func TestServeLogsAreJSON(t *testing.T) {
 		switch m["msg"] {
 		case "serving":
 			serving = m
-		case "server error":
+		case "handshake refused":
 			sawServerError = true
 		}
 	}
@@ -289,7 +435,7 @@ func TestServeLogsAreJSON(t *testing.T) {
 }
 
 func TestServeCertSHA256IsTheLeaf(t *testing.T) {
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	r := startServe(t, writeBundle(t, ca))
 	var out bytes.Buffer
 	if err := pin(t.Context(), r.addr, "", &out); err != nil {
@@ -307,7 +453,7 @@ func countingListener(t *testing.T, addr string) (net.Listener, *int32Counter) {
 	t.Helper()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, nil
+		t.Fatal(err)
 	}
 	c := &int32Counter{}
 	go func() {
@@ -336,26 +482,27 @@ func (c *int32Counter) get() int {
 	return c.n
 }
 
+// Without OTEL_EXPORTER_OTLP_ENDPOINT the server starts no exporter. The per-signal endpoints point
+// at a counting listener, so a started exporter would connect there at shutdown at the latest.
 func TestServeNoExporterWithoutEndpoint(t *testing.T) {
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "")
 	_ = os.Unsetenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	_, c := countingListener(t, "localhost:4317")
-	if c == nil {
-		t.Skip("localhost:4317 is in use, so connections cannot be counted")
+	ln, c := countingListener(t, "127.0.0.1:0")
+	for _, sig := range []string{"TRACES", "METRICS", "LOGS"} {
+		t.Setenv("OTEL_EXPORTER_OTLP_"+sig+"_ENDPOINT", "http://"+ln.Addr().String())
 	}
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	r := startServe(t, writeBundle(t, ca))
-	time.Sleep(2500 * time.Millisecond)
 	r.finish(t)
 	if n := c.get(); n != 0 {
-		t.Errorf("%d connections to localhost:4317 without OTEL_EXPORTER_OTLP_ENDPOINT, want 0", n)
+		t.Errorf("%d connections to the signal endpoints without OTEL_EXPORTER_OTLP_ENDPOINT, want 0", n)
 	}
 }
 
 func TestServeExportsWhenEndpointSet(t *testing.T) {
 	ln, c := countingListener(t, "127.0.0.1:0")
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://"+ln.Addr().String())
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := newMgmtCA(t)
 	r := startServe(t, writeBundle(t, ca))
 	r.finish(t)
 	if c.get() == 0 {

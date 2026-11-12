@@ -1,6 +1,7 @@
 package hostsvc
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -11,6 +12,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"log"
@@ -21,7 +23,6 @@ import (
 	"net/netip"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
@@ -42,11 +43,18 @@ const (
 	MgmtTrustDomain = "mgmt.poc.internal"
 
 	maxConns        = 16
-	maxConnAge      = 30 * time.Second
-	maxConnGrace    = 5 * time.Second
+	maxActive       = 8
+	maxSilent       = 128
 	denialWindow    = 10 * time.Second
 	denialMaxKeys   = 16
 	shutdownTimeout = 5 * time.Second
+)
+
+// Connection timing of the key server. Tests shorten these values.
+var (
+	connMaxAge       = 30 * time.Second
+	connGrace        = 5 * time.Second
+	handshakeTimeout = 5 * time.Second
 )
 
 // SelfSignedCert makes an ECDSA P-256 key and a server certificate for host that is valid from one
@@ -106,91 +114,87 @@ func CheckLoopbackAddr(addr string) error {
 	return nil
 }
 
-// BundleFile serves the X.509 roots of one trust domain from a file. It reads the file again
-// when the file changes, and keeps the last good roots when a new read fails.
-type BundleFile struct {
-	path string
-	td   spiffeid.TrustDomain
-
-	mu     sync.Mutex
-	mod    time.Time
-	size   int64
+// ClientRoots holds the X.509 roots that a client certificate must chain to. LoadClientRoots reads
+// them from a file once.
+type ClientRoots struct {
+	td     spiffeid.TrustDomain
 	bundle *x509bundle.Bundle
+	sum    string
 }
 
-// NewBundleFile reads and checks the file. It fails when the file is missing, is not PEM
-// certificates, holds no root, or holds a root that is not a CA or that names another trust domain.
-func NewBundleFile(path string, td spiffeid.TrustDomain) (*BundleFile, error) {
-	b := &BundleFile{path: path, td: td}
-	if err := b.reload(); err != nil {
-		return nil, err
-	}
-	return b, nil
-}
-
-func (b *BundleFile) reload() error {
-	info, err := os.Stat(b.path)
+// LoadClientRoots reads a PEM file of roots for trust domain td. Each root must be a CA that is
+// valid now and carries exactly one URI SAN, spiffe://<td>, as `pkigen trust-bundle` writes it. The
+// file must hold nothing else.
+func LoadClientRoots(path string, td spiffeid.TrustDomain, now time.Time) (*ClientRoots, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("client bundle: %w", err)
+		return nil, fmt.Errorf("client bundle: %w", err)
 	}
-	data, err := os.ReadFile(b.path)
-	if err != nil {
-		return fmt.Errorf("client bundle: %w", err)
-	}
-	bundle, err := x509bundle.Parse(b.td, data)
-	if err != nil {
-		return fmt.Errorf("client bundle %s: %w", b.path, err)
-	}
-	if bundle.Empty() {
-		return fmt.Errorf("client bundle %s holds no root certificate", b.path)
-	}
-	for _, c := range bundle.X509Authorities() {
-		if !c.IsCA {
-			return fmt.Errorf("client bundle %s holds a certificate that is not a CA", b.path)
+	want := "spiffe://" + td.Name()
+	var certs []*x509.Certificate
+	h := sha256.New()
+	for rest := data; len(bytes.TrimSpace(rest)) > 0; {
+		if i := bytes.Index(rest, []byte("-----BEGIN ")); i > 0 && len(bytes.TrimSpace(rest[:i])) != 0 {
+			return nil, fmt.Errorf("client bundle %s holds something other than PEM certificates", path)
 		}
-		for _, u := range c.URIs {
-			if u.Scheme == "spiffe" && !strings.EqualFold(u.Host, b.td.Name()) {
-				return fmt.Errorf("client bundle %s is for trust domain %q, want %q", b.path, u.Host, b.td.Name())
-			}
+		block, next := pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			return nil, fmt.Errorf("client bundle %s holds something other than PEM certificates", path)
 		}
+		n := len(certs) + 1
+		c, err := x509.ParseCertificate(block.Bytes)
+		switch {
+		case err != nil:
+			return nil, fmt.Errorf("client bundle %s: certificate %d: %w", path, n, err)
+		case !c.BasicConstraintsValid || !c.IsCA || c.KeyUsage&x509.KeyUsageCertSign == 0:
+			return nil, fmt.Errorf("client bundle %s: certificate %d is not a CA", path, n)
+		case len(c.URIs) != 1 || c.URIs[0].String() != want:
+			return nil, fmt.Errorf("client bundle %s: certificate %d has URI SAN %v, want %s", path, n, c.URIs, want)
+		case now.Before(c.NotBefore) || now.After(c.NotAfter):
+			return nil, fmt.Errorf("client bundle %s: certificate %d is not valid now", path, n)
+		}
+		certs = append(certs, c)
+		h.Write(c.Raw)
+		rest = next
 	}
-	b.bundle, b.mod, b.size = bundle, info.ModTime(), info.Size()
-	return nil
+	if len(certs) == 0 {
+		return nil, fmt.Errorf("client bundle %s holds no certificate", path)
+	}
+	return &ClientRoots{td: td, bundle: x509bundle.FromX509Authorities(td, certs), sum: hex.EncodeToString(h.Sum(nil))}, nil
 }
 
 // GetX509BundleForTrustDomain implements x509bundle.Source.
-func (b *BundleFile) GetX509BundleForTrustDomain(td spiffeid.TrustDomain) (*x509bundle.Bundle, error) {
-	if td != b.td {
+func (r *ClientRoots) GetX509BundleForTrustDomain(td spiffeid.TrustDomain) (*x509bundle.Bundle, error) {
+	if td != r.td {
 		return nil, fmt.Errorf("no bundle for trust domain %q", td)
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if info, err := os.Stat(b.path); err == nil && (!info.ModTime().Equal(b.mod) || info.Size() != b.size) {
-		_ = b.reload()
-	}
-	return b.bundle, nil
+	return r.bundle, nil
 }
 
-// RootSHA256 returns the hex SHA-256 of the DER bytes of the roots, one after the other.
-func (b *BundleFile) RootSHA256() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	h := sha256.New()
-	for _, c := range b.bundle.X509Authorities() {
-		h.Write(c.Raw)
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
+// SHA256 returns the hex SHA-256 of the DER bytes of the roots, in file order, one after the other.
+func (r *ClientRoots) SHA256() string { return r.sum }
 
 // NewKeyHandler serves GET /v1/clusters/<name>/keys from cache. A name that known refuses gets
 // 404 before any lookup. Other methods get 405, and a failed lookup gets 502 with a fixed JSON
 // error. Denial log lines are limited to one for each reason in each window.
 func NewKeyHandler(cache *KeyCache, known func(string) bool, log *slog.Logger) http.Handler {
-	h := &keyHandler{cache: cache, known: known, log: log, limit: lograte.New(denialWindow, denialMaxKeys, cache.now)}
+	return newKeyHandler(cache, known, log).routes()
+}
+
+func newKeyHandler(cache *KeyCache, known func(string) bool, log *slog.Logger) *keyHandler {
+	return &keyHandler{cache: cache, known: known, log: log, ins: noopInstruments(),
+		limit: lograte.New(denialWindow, denialMaxKeys, cache.now)}
+}
+
+func (h *keyHandler) routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc(mgmtapi.KeysPattern, h.keys)
+	mux.HandleFunc(mgmtapi.KeysPattern, func(w http.ResponseWriter, r *http.Request) {
+		h.observe(w, r, h.keys)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		h.deny(w, r, http.StatusNotFound, "not_found", nil)
+		h.observe(w, r, func(w http.ResponseWriter, r *http.Request, outcome *string) {
+			h.deny(w, r, http.StatusNotFound, "not_found", nil, outcome)
+		})
 	})
 	return mux
 }
@@ -200,28 +204,30 @@ type keyHandler struct {
 	known func(string) bool
 	log   *slog.Logger
 	limit *lograte.Limiter
+	ins   *instruments
 }
 
-func (h *keyHandler) keys(w http.ResponseWriter, r *http.Request) {
+func (h *keyHandler) keys(w http.ResponseWriter, r *http.Request, outcome *string) {
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", http.MethodGet)
-		h.deny(w, r, http.StatusMethodNotAllowed, "method_not_allowed", nil)
+		h.deny(w, r, http.StatusMethodNotAllowed, "method_not_allowed", nil, outcome)
 		return
 	}
 	cluster := r.PathValue("cluster")
 	if !h.known(cluster) {
-		h.deny(w, r, http.StatusNotFound, "unknown_cluster", nil)
+		h.deny(w, r, http.StatusNotFound, "unknown_cluster", nil, outcome)
 		return
 	}
 	keys, err := h.cache.Get(r.Context(), cluster)
 	if err != nil {
-		h.deny(w, r, http.StatusBadGateway, "lookup_failed", err)
+		h.deny(w, r, http.StatusBadGateway, "lookup_failed", err, outcome)
 		return
 	}
 	writeJSON(w, http.StatusOK, keys)
 }
 
-func (h *keyHandler) deny(w http.ResponseWriter, r *http.Request, status int, reason string, err error) {
+func (h *keyHandler) deny(w http.ResponseWriter, r *http.Request, status int, reason string, err error, outcome *string) {
+	*outcome = reason
 	writeJSON(w, status, map[string]string{"error": reason})
 	_, ok, suppressed, held := h.limit.Allow(reason)
 	for _, k := range held {
@@ -245,9 +251,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // NewKeyServer returns the HTTP server of the key handler, with the limits of the host service.
-// Errors of the server go to log as JSON, at most one line in each window.
+// Errors of the server go to logger as JSON, at most one line in each window.
 func NewKeyServer(h http.Handler, tc *tls.Config, logger *slog.Logger) *http.Server {
-	limit := lograte.New(denialWindow, 1, time.Now)
+	limit := lograte.New(denialWindow, denialMaxKeys, time.Now)
 	errLog := log.New(writerFunc(func(p []byte) (int, error) {
 		_, ok, suppressed, _ := limit.Allow("server_error")
 		if ok {
@@ -272,10 +278,21 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
-// ServeKeys serves srv on ln, with TLS from srv.TLSConfig, at most 16 connections and a maximum
-// connection age. It returns nil after ctx ends and the server has shut down.
-func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener) error {
-	limited := connlimit.Listen(ln, maxConns, maxConnAge, maxConnGrace, nil)
+// ServeKeys serves srv on ln, with TLS from srv.TLSConfig. The TLS handshake and the check of the
+// client certificate run before a connection takes one of the 16 connection slots, in a small pool
+// of pending handshakes (see newHandshakeListener). The slots count only verified peers, and each
+// connection has a maximum age. It returns nil after ctx ends and the server has shut down. Failed
+// and evicted handshakes go to log, at most one line of each kind in each window.
+func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener, logger *slog.Logger) error {
+	limit := lograte.New(denialWindow, denialMaxKeys, time.Now)
+	report := func(kind string, err error) {
+		_, ok, suppressed, _ := limit.Allow(kind)
+		if ok {
+			logger.Warn("handshake refused", "reason", kind, "error", err.Error(), "suppressed", suppressed)
+		}
+	}
+	hl := newHandshakeListener(ln, srv.TLSConfig, maxSilent, maxActive, handshakeTimeout, report)
+	limited := connlimit.Listen(hl, maxConns, connMaxAge, connGrace, nil)
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -289,7 +306,7 @@ func ServeKeys(ctx context.Context, srv *http.Server, ln net.Listener) error {
 		case <-done:
 		}
 	}()
-	err := srv.Serve(tls.NewListener(limited, srv.TLSConfig))
+	err := srv.Serve(limited)
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

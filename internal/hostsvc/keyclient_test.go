@@ -3,6 +3,7 @@ package hostsvc
 import (
 	"crypto/sha256"
 	"crypto/tls"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"net"
@@ -36,6 +37,11 @@ func pinnedServer(t *testing.T, handler http.Handler) (KeyClientConfig, *atomic.
 	if err != nil {
 		t.Fatal(err)
 	}
+	return pinnedServerCert(t, handler, cert)
+}
+
+func pinnedServerCert(t *testing.T, handler http.Handler, cert tls.Certificate) (KeyClientConfig, *atomic.Int32) {
+	t.Helper()
 	var hits atomic.Int32
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -59,7 +65,11 @@ func answer(body string) http.Handler {
 	})
 }
 
-const goodKeys = `{"name":"dev-cell-1","issuer":"https://dev-cell-1.issuer.poc.internal","jwks":{"keys":[]}}`
+func keysBody(name, issuer string, jwks json.RawMessage, extra string) string {
+	return `{"name":"` + name + `","issuer":"` + issuer + `","jwks":` + string(jwks) + extra + `}`
+}
+
+var goodKeys = keysBody("dev-cell-1", "https://dev-cell-1.issuer.poc.internal", testJWKS(), "")
 
 func TestKeyClientPinned(t *testing.T) {
 	cfg, hits := pinnedServer(t, answer(goodKeys))
@@ -102,17 +112,31 @@ func TestKeyClientUnavailable(t *testing.T) {
 		case mgmtapi.KeysPath("gateway"):
 			http.Error(w, "no", http.StatusBadGateway)
 		case mgmtapi.KeysPath("redirect"):
-			http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			http.Redirect(w, r, mgmtapi.KeysPath("dev-cell-1"), http.StatusFound)
+		case mgmtapi.KeysPath("dev-cell-1"):
+			_, _ = w.Write([]byte(goodKeys))
 		case mgmtapi.KeysPath("html"):
 			_, _ = w.Write([]byte("<html>"))
 		case mgmtapi.KeysPath("extra"):
-			_, _ = w.Write([]byte(`{"name":"extra","issuer":"i","jwks":{"keys":[]},"admin":true}`))
+			_, _ = w.Write([]byte(keysBody("extra", "i", testJWKS(), `,"admin":true`)))
 		case mgmtapi.KeysPath("nokeys"):
 			_, _ = w.Write([]byte(`{"name":"nokeys","issuer":"i","jwks":{"other":1}}`))
 		case mgmtapi.KeysPath("notset"):
 			_, _ = w.Write([]byte(`{"name":"notset","issuer":"i","jwks":{"keys":"x"}}`))
 		case mgmtapi.KeysPath("array"):
 			_, _ = w.Write([]byte(`{"name":"array","issuer":"i","jwks":[1]}`))
+		case mgmtapi.KeysPath("emptykeys"):
+			_, _ = w.Write([]byte(keysBody("emptykeys", "i", json.RawMessage(`{"keys":[]}`), "")))
+		case mgmtapi.KeysPath("nullkeys"):
+			_, _ = w.Write([]byte(keysBody("nullkeys", "i", json.RawMessage(`{"keys":null}`), "")))
+		case mgmtapi.KeysPath("noissuer"):
+			_, _ = w.Write([]byte(keysBody("noissuer", "", testJWKS(), "")))
+		case mgmtapi.KeysPath("octkey"):
+			_, _ = w.Write([]byte(keysBody("octkey", "i", json.RawMessage(`{"keys":[{"kty":"oct","kid":"k","k":"c2VjcmV0"}]}`), "")))
+		case mgmtapi.KeysPath("privatekey"):
+			_, _ = w.Write([]byte(keysBody("privatekey", "i", privateJWKS(), "")))
+		case mgmtapi.KeysPath("encuse"):
+			_, _ = w.Write([]byte(keysBody("encuse", "i", useJWKS("enc"), "")))
 		case mgmtapi.KeysPath("nojwks"):
 			_, _ = w.Write([]byte(`{"name":"nojwks","issuer":"i"}`))
 		}
@@ -122,7 +146,7 @@ func TestKeyClientUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"slow", "missing", "gateway", "redirect", "html", "extra", "nokeys", "notset", "array", "nojwks"} {
+	for _, name := range []string{"slow", "missing", "gateway", "redirect", "html", "extra", "nokeys", "notset", "array", "nojwks", "emptykeys", "nullkeys", "noissuer", "octkey", "privatekey", "encuse"} {
 		t.Run(name, func(t *testing.T) {
 			_, err := c.Keys(t.Context(), name)
 			wantKeyError(t, err, mgmtapi.ReasonIssuerUnavailable)
@@ -147,7 +171,7 @@ func TestKeyClientUnavailable(t *testing.T) {
 }
 
 func TestKeyClientBodyLimit(t *testing.T) {
-	big := `{"name":"dev-cell-1","issuer":"i","jwks":{"keys":[]},"pad":"` + strings.Repeat("a", maxKeysBody) + `"}`
+	big := keysBody("dev-cell-1", "i", testJWKS(), `,"pad":"`+strings.Repeat("a", maxKeysBody)+`"`)
 	cfg, _ := pinnedServer(t, answer(big))
 	c, err := NewKeyClient(cfg)
 	if err != nil {
@@ -161,8 +185,9 @@ func TestKeyClientBodyLimit(t *testing.T) {
 }
 
 func TestKeyClientBodyJustUnderLimit(t *testing.T) {
-	pad := strings.Repeat("a", maxKeysBody-len(`{"name":"dev-cell-1","issuer":"","jwks":{"keys":[]},"x":""}`))
-	body := `{"name":"dev-cell-1","issuer":"` + pad + `","jwks":{"keys":[]}}`
+	jwks := testJWKS()
+	pad := strings.Repeat("a", maxKeysBody-len(keysBody("dev-cell-1", "", jwks, "")))
+	body := keysBody("dev-cell-1", pad, jwks, "")
 	if len(body) > maxKeysBody {
 		t.Fatalf("test body is %d bytes", len(body))
 	}
@@ -174,7 +199,7 @@ func TestKeyClientBodyJustUnderLimit(t *testing.T) {
 }
 
 func TestKeyClientNameMismatch(t *testing.T) {
-	cfg, _ := pinnedServer(t, answer(`{"name":"dev-cell-2","issuer":"i","jwks":{"keys":[]}}`))
+	cfg, _ := pinnedServer(t, answer(keysBody("dev-cell-2", "i", testJWKS(), "")))
 	c, err := NewKeyClient(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -248,7 +273,31 @@ func TestPinFromPEM(t *testing.T) {
 	if err != nil || string(got) != string(want[:]) {
 		t.Errorf("pin = %x, %v", got, err)
 	}
-	if _, err := PinFromPEM([]byte("nope")); err == nil {
-		t.Error("want an error for text that is not PEM")
+	for name, bad := range map[string][]byte{
+		"text":          []byte("nope"),
+		"empty":         nil,
+		"wrong type":    pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: cert.Leaf.Raw}),
+		"not a cert":    pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")}),
+		"two blocks":    append(append([]byte{}, p...), p...),
+		"trailing text": append(append([]byte{}, p...), []byte("extra")...),
+		"block headers": pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Headers: map[string]string{"a": "b"}, Bytes: cert.Leaf.Raw}),
+	} {
+		if _, err := PinFromPEM(bad); err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}
+
+func TestKeyClientRefusesExpiredPinnedLeaf(t *testing.T) {
+	cert, err := SelfSignedCert(KeyServerHost, time.Now().Add(-100*24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, hits := pinnedServerCert(t, answer(goodKeys), cert)
+	c, _ := NewKeyClient(cfg)
+	_, err = c.Keys(t.Context(), "dev-cell-1")
+	wantKeyError(t, err, mgmtapi.ReasonIssuerUnavailable)
+	if hits.Load() != 0 {
+		t.Errorf("the server saw %d requests, want 0", hits.Load())
 	}
 }

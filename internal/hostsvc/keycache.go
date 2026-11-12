@@ -26,11 +26,26 @@ type KeyCache struct {
 	now           func() time.Time
 	lookupTimeout time.Duration
 	slots         chan struct{}
+	observer      CacheObserver
 
 	mu      sync.Mutex
 	entries map[string]cachedKeys
 	flights map[string]*flight
 }
+
+// CacheObserver receives the events of a KeyCache. Set it before the cache is in use.
+type CacheObserver interface {
+	Hit()
+	Lookup(took time.Duration, err error)
+}
+
+// SetObserver sets the observer of the cache.
+func (c *KeyCache) SetObserver(o CacheObserver) { c.observer = o }
+
+type noObserver struct{}
+
+func (noObserver) Hit()                        {}
+func (noObserver) Lookup(time.Duration, error) {}
 
 type cachedKeys struct {
 	keys mgmtapi.ClusterKeys
@@ -53,7 +68,7 @@ func NewKeyCache(facts func(ctx context.Context, cluster string) (Facts, error),
 		now = time.Now
 	}
 	return &KeyCache{
-		facts: facts, ttl: ttl, now: now, lookupTimeout: KeyLookupTimeout,
+		facts: facts, ttl: ttl, now: now, lookupTimeout: KeyLookupTimeout, observer: noObserver{},
 		slots:   make(chan struct{}, maxInFlight),
 		entries: map[string]cachedKeys{}, flights: map[string]*flight{},
 	}
@@ -65,6 +80,7 @@ func (c *KeyCache) Get(ctx context.Context, cluster string) (mgmtapi.ClusterKeys
 	c.mu.Lock()
 	if e, ok := c.entries[cluster]; ok && c.now().Sub(e.at) < c.ttl {
 		c.mu.Unlock()
+		c.observer.Hit()
 		return e.keys, nil
 	}
 	f, joined := c.flights[cluster]
@@ -84,7 +100,9 @@ func (c *KeyCache) Get(ctx context.Context, cluster string) (mgmtapi.ClusterKeys
 
 // lookup runs one lookup under the slot limit and the deadline, then publishes the result.
 func (c *KeyCache) lookup(cluster string, f *flight) {
+	start := time.Now()
 	keys, err := c.fetch(cluster)
+	c.observer.Lookup(time.Since(start), err)
 	c.mu.Lock()
 	if err == nil {
 		c.entries[cluster] = cachedKeys{keys: keys, at: c.now()}

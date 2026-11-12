@@ -60,6 +60,30 @@ func testJWKS() json.RawMessage {
 	return b
 }
 
+func privateJWKS() json.RawMessage {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	b, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: key, KeyID: "k1", Algorithm: "ES256", Use: "sig"}}})
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+func useJWKS(use string) json.RawMessage {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	b, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "ES256", Use: use}}})
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 func knownCells(n string) bool { return n == "dev-cell-1" || n == "dev-cell-2" }
 
 func newHandler(l *lookups, clock *fakeClock) http.Handler {
@@ -213,7 +237,7 @@ func keyServer(t *testing.T, roots x509bundle.Source, l *lookups) (addr string, 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeKeys(ctx, srv, ln) }()
+	go func() { done <- ServeKeys(ctx, srv, ln, log) }()
 	t.Cleanup(func() {
 		cancel()
 		if err := <-done; err != nil {
@@ -318,3 +342,5 @@ func TestCheckLoopbackAddr(t *testing.T) {
 		}
 	}
 }
+
+func newDiscardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }

@@ -62,11 +62,20 @@ type Service struct {
 	Prober   Prober
 	Reserved ReservedFunc
 	Docker   DockerFunc
+
+	// lookups holds one token for each Facts call whose runtime calls have not returned.
+	lookups chan struct{}
 }
+
+// MaxFactsInFlight is the number of Facts calls that may run their runtime calls at once.
+const MaxFactsInFlight = 2
+
+// ErrLookupBusy means that MaxFactsInFlight lookups are still running, so Facts did not start one.
+var ErrLookupBusy = errors.New("too many cluster lookups in flight")
 
 // New returns a Service that uses the real prober and the Docker reserved prefixes.
 func New(rt Runtime, t *topology.Topology) *Service {
-	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker}
+	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker, lookups: make(chan struct{}, MaxFactsInFlight)}
 }
 
 func (s *Service) lookup(name string) (topology.Cluster, error) {
@@ -77,29 +86,8 @@ func (s *Service) lookup(name string) (topology.Cluster, error) {
 	return c, nil
 }
 
-// callCtx runs f and returns its result, or the error of ctx when ctx ends first. The runtime
-// calls take no context, so an abandoned call finishes in the background.
-func callCtx[T any](ctx context.Context, f func() (T, error)) (T, error) {
-	type result struct {
-		v   T
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		v, err := f()
-		ch <- result{v, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.v, r.err
-	case <-ctx.Done():
-		var zero T
-		return zero, ctx.Err()
-	}
-}
-
-func (s *Service) exists(ctx context.Context, name string) (bool, error) {
-	names, err := callCtx(ctx, s.rt.List)
+func (s *Service) exists(name string) (bool, error) {
+	names, err := s.rt.List()
 	if err != nil {
 		return false, fmt.Errorf("list clusters: %w", err)
 	}
@@ -123,7 +111,7 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 	if err := s.EnsureRegistry(ctx); err != nil {
 		return Facts{}, err
 	}
-	found, err := s.exists(ctx, name)
+	found, err := s.exists(name)
 	if err != nil {
 		return Facts{}, err
 	}
@@ -159,11 +147,11 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 }
 
 // Down deletes the cluster. An absent cluster is not an error.
-func (s *Service) Down(ctx context.Context, name string) error {
+func (s *Service) Down(_ context.Context, name string) error {
 	if _, err := s.lookup(name); err != nil {
 		return err
 	}
-	found, err := s.exists(ctx, name)
+	found, err := s.exists(name)
 	if err != nil {
 		return err
 	}
@@ -178,20 +166,49 @@ func (s *Service) Down(ctx context.Context, name string) error {
 	return nil
 }
 
-// Facts describes a running topology cluster. Each step stops when ctx ends, so a deadline on ctx
-// bounds the whole lookup.
+// Facts describes a running topology cluster. It returns when the lookup is done or ctx ends. The
+// runtime calls (the kind library runs docker without a context) cannot be cancelled, so the lookup
+// keeps its token until they really return. When MaxFactsInFlight lookups hold a token, Facts fails
+// at once with ErrLookupBusy, and a hung docker cannot pile up processes.
 func (s *Service) Facts(ctx context.Context, name string) (Facts, error) {
 	if _, err := s.lookup(name); err != nil {
 		return Facts{}, err
 	}
-	found, err := s.exists(ctx, name)
+	select {
+	case s.lookups <- struct{}{}:
+	default:
+		return Facts{}, ErrLookupBusy
+	}
+	type result struct {
+		f   Facts
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-s.lookups }()
+		f, err := s.facts(ctx, name)
+		done <- result{f, err}
+	}()
+	select {
+	case r := <-done:
+		return r.f, r.err
+	case <-ctx.Done():
+		return Facts{}, ctx.Err()
+	}
+}
+
+func (s *Service) facts(ctx context.Context, name string) (Facts, error) {
+	found, err := s.exists(name)
 	if err != nil {
 		return Facts{}, err
 	}
 	if !found {
 		return Facts{}, fmt.Errorf("cluster %q does not exist", name)
 	}
-	kc, err := callCtx(ctx, func() (string, error) { return s.rt.Kubeconfig(name) })
+	if err := ctx.Err(); err != nil {
+		return Facts{}, err
+	}
+	kc, err := s.rt.Kubeconfig(name)
 	if err != nil {
 		return Facts{}, fmt.Errorf("read kubeconfig of %s: %w", name, err)
 	}
@@ -199,7 +216,7 @@ func (s *Service) Facts(ctx context.Context, name string) (Facts, error) {
 	if err != nil {
 		return Facts{}, fmt.Errorf("probe cluster %s: %w", name, err)
 	}
-	ip, err := callCtx(ctx, func() (string, error) { return s.rt.NodeIP(name) })
+	ip, err := s.rt.NodeIP(name)
 	if err != nil {
 		return Facts{}, fmt.Errorf("read node address of %s: %w", name, err)
 	}

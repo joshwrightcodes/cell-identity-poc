@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -38,11 +39,18 @@ type KeyClientConfig struct {
 	Timeout    time.Duration
 }
 
-// PinFromPEM returns the SHA-256 of the DER bytes of the first certificate in pemBytes.
+// PinFromPEM returns the SHA-256 of the DER bytes of the certificate in pemBytes. The text must be
+// exactly one PEM CERTIFICATE block that parses as a certificate.
 func PinFromPEM(pemBytes []byte) ([]byte, error) {
-	block, _ := pem.Decode(pemBytes)
-	if block == nil || block.Type != "CERTIFICATE" {
+	block, rest := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
 		return nil, errors.New("pin is not a PEM certificate")
+	}
+	if len(bytes.TrimSpace(rest)) != 0 {
+		return nil, errors.New("pin holds more than one PEM block")
+	}
+	if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		return nil, fmt.Errorf("pin certificate: %w", err)
 	}
 	sum := sha256.Sum256(block.Bytes)
 	return sum[:], nil
@@ -156,13 +164,17 @@ func (c *KeyClient) fetch(ctx context.Context, cluster string) (mgmtapi.ClusterK
 			Err:    fmt.Errorf("answer is for cluster %q, want %q", keys.Name, cluster),
 		}
 	}
+	if keys.Issuer == "" {
+		return mgmtapi.ClusterKeys{}, errors.New("answer has no issuer")
+	}
 	if err := checkKeySet(keys.JWKS); err != nil {
 		return mgmtapi.ClusterKeys{}, err
 	}
 	return keys, nil
 }
 
-// checkKeySet requires a JSON object with a keys member that go-jose reads as a key set.
+// checkKeySet requires a JSON object whose keys member is a non-empty set of valid public
+// signing keys.
 func checkKeySet(raw json.RawMessage) error {
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
@@ -174,6 +186,14 @@ func checkKeySet(raw json.RawMessage) error {
 	var set jose.JSONWebKeySet
 	if err := json.Unmarshal(raw, &set); err != nil {
 		return fmt.Errorf("jwks is not a key set: %w", err)
+	}
+	if len(set.Keys) == 0 {
+		return errors.New("jwks holds no key")
+	}
+	for i, k := range set.Keys {
+		if !k.Valid() || !k.IsPublic() || (k.Use != "" && k.Use != "sig") {
+			return fmt.Errorf("jwks key %d is not a public signing key", i+1)
+		}
 	}
 	return nil
 }

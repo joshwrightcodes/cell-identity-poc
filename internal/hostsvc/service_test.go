@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"slices"
 	"testing"
-	"time"
 
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/yaml"
@@ -206,32 +205,5 @@ func TestDownDeletesAndRefusesUnknown(t *testing.T) {
 	}
 	if !slices.Equal(rt.deleted, []string{"rogue"}) {
 		t.Errorf("deleted = %v", rt.deleted)
-	}
-}
-
-type blockingRuntime struct {
-	*fakeRuntime
-	release chan struct{}
-}
-
-func (b blockingRuntime) List() ([]string, error) {
-	<-b.release
-	return b.fakeRuntime.List()
-}
-
-func TestFactsStopsWhenContextEnds(t *testing.T) {
-	rt := blockingRuntime{fakeRuntime: &fakeRuntime{clusters: map[string]bool{"rogue": true}}, release: make(chan struct{})}
-	defer close(rt.release)
-	s := newTestService(rt.fakeRuntime, matchingObs())
-	s.rt = rt
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
-	defer cancel()
-	start := time.Now()
-	_, err := s.Facts(ctx, "rogue")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Facts error = %v, want deadline exceeded", err)
-	}
-	if time.Since(start) > 2*time.Second {
-		t.Errorf("Facts took %v", time.Since(start))
 	}
 }
