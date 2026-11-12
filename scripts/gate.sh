@@ -69,10 +69,9 @@ events="$BUILD_ROOT/gate-$milestone.json"
 durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS
 status=0
-# The test timeout must stay above the budget, so the budget check reports a slow run and the Go
-# timeout never ends the run first. It is 30 minutes or the budget plus 15 minutes, whichever is more.
-test_timeout=30
-[[ -z "$budget_minutes" ]] || ((budget_minutes + 15 <= test_timeout)) || test_timeout=$((budget_minutes + 15))
+# The test timeout is twice the budget, with a floor of 30 minutes, so the budget check reports a
+# slow run and the Go timeout never ends the run first.
+test_timeout="$(gate_test_timeout "$budget_minutes")"
 go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$pattern" "$@" \
   | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))

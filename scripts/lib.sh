@@ -874,3 +874,11 @@ check_no_last_applied_secret() {
     return 1
   }
 }
+
+# gate_test_timeout <budget minutes> prints the go test timeout of a gate in minutes: twice the budget,
+# and never below 30. An empty budget gives 30.
+gate_test_timeout() {
+  local budget="${1:-}" timeout=30
+  [[ -z "$budget" ]] || ((budget * 2 <= timeout)) || timeout=$((budget * 2))
+  printf '%s\n' "$timeout"
+}
