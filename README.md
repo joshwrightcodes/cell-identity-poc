@@ -356,7 +356,7 @@ The cell Role grants ConfigMaps in `istio-system` only.
 Kiali has no log view in this PoC. The tunnel answers `403 denied` to `pods/log` by design, and the feature flag `logs-tab` is off.
 Kiali also tries to read the version of each `istiod` through a port forward. The hub refuses it, because the port forward needs a protocol upgrade.
 The Kiali log then holds the lines `Failing starting the port forwarding` and `Unable to get version info`, and the page shows no Istio version. This is expected.
-Kiali v2.34.0 has no setting that stops this call, so an alert on Kiali errors sees one error line for each cell and minute.
+Kiali v2.34.1 has no setting that stops this call, so an alert on Kiali errors sees one error line for each cell and minute.
 The hub and each tunnel run one replica with the strategy `Recreate`.
 The hub reads the registry of cells at start, so a revoked cell stays connected until the hub pod starts again.
 `CELL=management mise run cell:link` renders the registry again, and it starts the hub pod when the content changed.
@@ -370,7 +370,7 @@ The mesh view has these residual limits:
 - The tunnel and `mesh-view-read` read every namespace of a cell, while Kiali reads only `MESH_VIEW_NAMESPACES`.
 - `prom-readonly` passes every query expression, because it does not enforce the `query_scope` label. The path is read-only.
 - A cell that answers with errors, or not at all, stops the mesh view for every cell, as the next steps describe.
-- The login signing key derives from the root of `management`, and the render refuses any strategy but `anonymous`.
+- The login signing key of Kiali is predictable, because it derives from the public root of `management`. No login uses it under the strategy `anonymous`, and the render refuses any other strategy. Kiali can read the key from a Secret, but the External Secrets Operator of `management` serves one namespace only.
 
 Create the mesh view in this order, because Kiali reads its cluster list once at start:
 
@@ -387,7 +387,7 @@ Kiali needs every cell to answer at start, and it has no setting that skips a cl
 When one cell is absent, Kiali exits with a fatal error at the discovery of that cell (`failed to get server groups: the server is currently unable to handle the request`).
 The kubelet starts it again, with a longer wait each time, up to five minutes. The mesh view of the other cell is down too.
 Kiali stays up when a cell goes away after it started.
-Run `mise run mesh:status` to see which cell, the hub or Kiali is not up. When the cell is back, Kiali starts within five minutes.
+Run `mise run mesh:status` to see which cell, the hub or Kiali is not up. The hub and each tunnel pod serve their own tunnel state on a loopback address, and the task reads it. The state names the cause of the last end of a tunnel: `expiry`, `replaced`, `peer_closed` or `local_close`. A tunnel that the hub replaced with a newer one never reads as down. When the cell is back, Kiali starts within five minutes.
 An absent cell takes the mesh view down for every cell. This is a residual limit of the PoC. The fallback is one Kiali for each cell.
 
 Open Kiali on `http://127.0.0.1:20001/kiali`. The page is anonymous and read-only:

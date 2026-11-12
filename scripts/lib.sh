@@ -589,6 +589,23 @@ hub_cell_up() {
     | grep -qx true
 }
 
+# hub_status prints the tunnel state that the hub process serves, one JSON object. It fails when the pod does
+# not answer, and the caller then reads the log of the hub.
+hub_status() {
+  k -n mesh-view-system exec deploy/mesh-view-hub -c cell-proxy -- /ko-app/cell-proxy tunnel-status 2>/dev/null
+}
+
+# hub_cell_state <cell> succeeds when the tunnel of the cell is up. It reads the state of the hub process
+# (hub_status), and falls back to the log of the hub (hub_cell_up) when the process does not answer.
+hub_cell_state() {
+  local status
+  if status="$(hub_status)" && [[ -n "$status" ]]; then
+    CELL_ARG="$1" jq -e '.cells[env.CELL_ARG].up == true' <<<"$status" >/dev/null
+    return
+  fi
+  k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>/dev/null | hub_cell_up "$1"
+}
+
 # new_ready_pods <namespace> <selector> <old UIDs> prints the UIDs of the Ready pods that are not old.
 new_ready_pods() {
   k -n "$1" get pods -l "$2" -o json | jq -r --arg old " $3 " '

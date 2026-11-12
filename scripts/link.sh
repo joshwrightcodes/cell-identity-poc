@@ -21,14 +21,13 @@ job_state() {
     | select(.type == "Complete" or .type == "Failed") | .type][0] // ""'
 }
 
-# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. hub_cell_up
-# (scripts/lib.sh) reads the log of the hub by conn_id.
+# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. hub_cell_state
+# (scripts/lib.sh) reads the state that the hub process serves.
 tunnel_gaps() {
-  local logs entry cell
-  logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>/dev/null)" || logs=""
+  local entry cell
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
-    hub_cell_up "$cell" <<<"$logs" || echo "$cell"
+    hub_cell_state "$cell" || echo "$cell"
   done
 }
 

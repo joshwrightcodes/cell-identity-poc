@@ -60,6 +60,7 @@ case "$args" in
     echo "apply $(yq -N '.metadata.name' "$f" | paste -sd, -)" >>"$STUB_LOG" ;;
   *" rollout status "*) echo "rollout ${*: -2:1}" >>"$STUB_LOG" ;;
   *" logs "*) echo "logs" >>"$STUB_LOG"; printf '%s\n' "${STUB_HUB_LOG:-}" ;;
+  *" exec "*) [[ -n "${STUB_STATUS:-}" ]] || exit 1; printf '%s\n' "$STUB_STATUS" ;;
   *" get pod spire-server-0 "*) echo Running ;;
   *" get -f "*) echo '{"kind":"List","items":[]}' ;;
   *" get deployments,statefulsets "*) printf 'deployment.apps/kiali\ndeployment.apps/mesh-view-hub\n' ;;
@@ -100,7 +101,7 @@ func TestLinkAppliesKialiAfterTheTunnels(t *testing.T) {
 			seq = append(seq, l)
 		}
 	}
-	want := []string{"apply mesh-view-hub", "rollout deployment/mesh-view-hub", "logs", "apply mesh-view-hub,kiali"}
+	want := []string{"apply mesh-view-hub", "rollout deployment/mesh-view-hub", "logs", "logs", "apply mesh-view-hub,kiali"}
 	if len(seq) < len(want) || strings.Join(seq[:len(want)], "|") != strings.Join(want, "|") {
 		t.Fatalf("calls:\n%s\nwant the sequence %q first", log, want)
 	}
@@ -139,5 +140,21 @@ func TestLinkCountsAReplacedTunnelAsUp(t *testing.T) {
 {"msg":"tunnel_down","cell":"dev-cell-1","conn_id":1,"replaced":true}`
 	if out, got, err := runStage(t, root, calls, "STUB_HUB_LOG="+log); err != nil {
 		t.Fatalf("link.sh failed: %v\n%s\ncalls:\n%s", err, out, got)
+	}
+}
+
+// The link phase reads the state that the hub process serves, and the log is only the fallback. A hub
+// that reports a cell down stops the link phase even when its log has a tunnel_up line for the cell.
+func TestLinkReadsTheStateOfTheHub(t *testing.T) {
+	both := `{"side":"hub","up":true,"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":true}}}`
+	root, calls := stageRoot(t)
+	if out, got, err := runStage(t, root, calls, "STUB_STATUS="+both); err != nil {
+		t.Fatalf("link.sh failed with both cells up in the status: %v\n%s\n%s", err, out, got)
+	}
+	root, calls = stageRoot(t)
+	one := `{"side":"hub","up":false,"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":false,"down_seconds":90}}}`
+	out, _, err := runStage(t, root, calls, "STUB_STATUS="+one, "STUB_HUB_LOG="+hubLogBoth)
+	if err == nil || !strings.Contains(out, "no tunnel from: dev-cell-2.") || strings.Contains(out, "dev-cell-1.") {
+		t.Fatalf("err %v, output:\n%s\nwant a stop that names dev-cell-2 only", err, out)
 	}
 }

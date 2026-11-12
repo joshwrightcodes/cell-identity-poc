@@ -453,3 +453,61 @@ func TestProxyErrorLogLevels(t *testing.T) {
 		}
 	}
 }
+
+func waitStatus(t *testing.T, what string, within time.Duration, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("waited %s for %s", within, what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// The hub serves the state of each tunnel from its own connections. A cell with a newer tunnel reads as
+// up when the hub closes the older one for it, and the end of the older tunnel reads as replaced.
+func TestHubStatusFollowsTheTunnels(t *testing.T) {
+	h := newTunnelHarness(t, 5*time.Second)
+	if st := h.hub.Status(); st.Up || st.Cells["dev-cell-1"].Up {
+		t.Fatalf("status %+v before any tunnel, want down", st)
+	}
+	src := &rotatingSource{svids: []*x509svid.SVID{
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(5*time.Second)),
+		h.env.svidUntil(t, meshViewID1, time.Now().Add(time.Hour)),
+	}}
+	stop := startCell(t, h.dialerWith(src), h.cellHandler(t))
+	h.waitTunnels(t, 1, 5*time.Second)
+	waitStatus(t, "the status of the first tunnel", 5*time.Second, func() bool { return h.hub.Status().Up })
+	findLog(t, h.hubLog, "tunnel_replaced", map[string]any{"cell": "dev-cell-1"}, 5*time.Second)
+	// While the older tunnel ends for the newer one, the cell never reads as down.
+	for range 50 {
+		if st := h.hub.Status(); !st.Up || !st.Cells["dev-cell-1"].Up {
+			t.Fatalf("status %+v during the replacement, want up", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	waitStatus(t, "the end of the older tunnel", 5*time.Second, func() bool {
+		e := h.hub.Status().Cells["dev-cell-1"].LastEnd
+		return e != nil && e.Cause == "replaced"
+	})
+	stop()
+	waitStatus(t, "the status down after the cell stops", 5*time.Second, func() bool {
+		c := h.hub.Status().Cells["dev-cell-1"]
+		return !c.Up && c.LastEnd != nil && c.LastEnd.Cause == "peer_closed"
+	})
+}
+
+// A tunnel that a hub never closes ends at the SVID expiry of the hub, and each side names that cause.
+func TestTunnelStatusNamesTheCause(t *testing.T) {
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, hubLeafLife: 2 * time.Second})
+	st := NewTunnelState()
+	dial := TunnelDialer(h.server, ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog), WithState(st))
+	startCell(t, dial, h.cellHandler(t))
+	waitStatus(t, "the cell state up", 5*time.Second, func() bool { return st.Status().Up })
+	waitStatus(t, "the cell state down at the hub expiry", 6*time.Second, func() bool {
+		c := st.Status().Cells["self"]
+		return c.LastEnd != nil && c.LastEnd.Cause == "expiry"
+	})
+	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "cause": "peer_closed"}, 3*time.Second)
+}

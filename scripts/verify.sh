@@ -1121,13 +1121,12 @@ check_hub_peer_root() {
   fi
 }
 
-# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not open (see hub_cell_up).
+# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not up, by the state that the hub serves.
 hub_tunnel_gaps() {
-  local logs entry cell
-  logs="$(k -n mesh-view-system logs deploy/mesh-view-hub -c cell-proxy 2>&1)" || { echo "could not read the log of the hub: $logs"; return 1; }
+  local entry cell
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
-    hub_cell_up "$cell" <<<"$logs" || echo "$cell"
+    hub_cell_state "$cell" || echo "$cell"
   done
 }
 

@@ -93,7 +93,7 @@ func main() {
 // execute runs one mode and returns the exit status.
 func execute(ctx context.Context, args []string, stdout io.Writer) int {
 	if len(args) == 0 {
-		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, tunnel, promql-proxy, probe or whoami"))
+		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, tunnel, tunnel-status, promql-proxy, probe or whoami"))
 		return exitConfig
 	}
 	switch args[0] {
@@ -103,6 +103,8 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 		return runServer(ctx, args[1:], stdout)
 	case "tunnel":
 		return runTunnel(ctx, args[1:], stdout)
+	case "tunnel-status":
+		return runTunnelStatus(ctx, args[1:], stdout)
 	case "promql-proxy":
 		return runPromProxy(ctx, args[1:], stdout)
 	case "probe":

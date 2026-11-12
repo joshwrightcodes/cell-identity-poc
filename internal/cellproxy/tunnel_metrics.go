@@ -63,7 +63,15 @@ type TunnelOption func(*tunnelOptions)
 type tunnelOptions struct {
 	metrics    *TunnelMetrics
 	maxStreams int
+	state      *TunnelState
+	statusAddr string
 }
+
+// WithState records the state of the tunnel of a cell in s, for the status listener.
+func WithState(s *TunnelState) TunnelOption { return func(o *tunnelOptions) { o.state = s } }
+
+// WithStatusAddr makes the hub serve its tunnel state on a loopback address, in Run.
+func WithStatusAddr(addr string) TunnelOption { return func(o *tunnelOptions) { o.statusAddr = addr } }
 
 // WithMetrics records the metrics of the component in m.
 func WithMetrics(m *TunnelMetrics) TunnelOption {

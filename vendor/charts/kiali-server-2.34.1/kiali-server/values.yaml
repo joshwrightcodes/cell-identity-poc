@@ -95,7 +95,7 @@ deployment:
   image_name: quay.io/kiali/kiali
   image_pull_policy: "Always"
   image_pull_secrets: []
-  image_version: v2.34.0 # version like "v1.39" (see: https://quay.io/repository/kiali/kiali?tab=tags) or a digest hash
+  image_version: v2.34.1 # version like "v1.39" (see: https://quay.io/repository/kiali/kiali?tab=tags) or a digest hash
   ingress:
     additional_labels: {} # Labels added here are silently ignored on collision with standard Kiali labels (standard labels win).
     class_name: "nginx"
@@ -149,7 +149,7 @@ deployment:
     source: ""
   tolerations: []
   topology_spread_constraints: []
-  version_label: v2.34.0 # v1.39 # v1.39.0 # see: https://quay.io/repository/kiali/kiali?tab=tags
+  version_label: v2.34.1 # v1.39 # v1.39.0 # see: https://quay.io/repository/kiali/kiali?tab=tags
   view_only_mode: false
 
 external_services:

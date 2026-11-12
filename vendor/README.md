@@ -1284,36 +1284,37 @@ Rows 3 and 4 of the M3 verify table (2026-11-11):
   cell. `TestM3IstioMetricsSurviveOTLP` shows this. The value `telemetry.v2.prometheus.enabled: false`
   had turned the Envoy metrics off, so the cell showed no Istio metric at all before this task.
 
-## Kiali v2.34.0 and the kiali-server chart (2026-11-12)
+## Kiali v2.34.1 and the kiali-server chart (2026-11-12)
 
-The mesh view in `management` runs Kiali v2.34.0 from the chart `kiali-server` 2.34.0. `vendor:fetch`
-pulls the archive from `https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart
-into `charts/kiali-server-2.34.0/`.
+The mesh view in `management` runs Kiali v2.34.1 from the chart `kiali-server` 2.34.1. `vendor:fetch` pulls the
+archive from `https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart into
+`charts/kiali-server-2.34.1/`.
 
-Artefact dates against the owner cut of 2026-10-26 (release from GitHub, image from the Quay tag API,
-chart archive from the git history of the Kiali chart repository):
+This is an owner exception (2026-11-12) to the cut-off of 2026-10-26. Kiali v2.34.1 is a security release. It adds
+namespace authorization to the health, ztunnel log and config dump APIs, and makes the namespace accessibility checks
+consistent. The chart of v2.34.0, the version before, is dated 2026-10-27, so no version with a chart on or before the
+cut-off is newer than v2.33.0.
 
-| Version | Release | Image | Chart archive | Verdict |
-| --- | --- | --- | --- | --- |
-| v2.34.1 | 2026-11-02 | 2026-11-02 | 2026-11-02 | after the cut |
-| v2.34.0 | 2026-10-25 | 2026-10-25 | 2026-10-27 | the chart is one day after the cut |
-| v2.33.0 | 2026-10-04 | 2026-10-04 | 2026-10-06 | within the cut |
+| Artefact | Date | Digest |
+| --- | --- | --- |
+| GitHub release v2.34.1 | 2026-11-02 | |
+| `kiali-server-2.34.1.tgz`, commit in the chart repository | 2026-11-02 | SHA-256 `e0219681933f85428be50fae18747778dd81ee621272473683fb3e62538f418f` (`KIALI_CHART_SHA256`) |
+| `quay.io/kiali/kiali:v2.34.1` index, Quay tag | 2026-11-02 | `sha256:88d96c7b7b9bd9ceaf3b2a8097c0b0d2c5ae15f8d3a17017a5f3a163f5115d2c` (`KIALI_IMAGE`) |
 
-The chart archive of v2.34.0 is dated one day after the cut, so no compliant chart exists for the version in
-use. The change to v2.33.0 or the exception for the chart needs a decision of the owner. Version v2.34.1 is a
-security release of 2026-11-02 that adds namespace authorization to the health, ztunnel log and config dump
-APIs. Upgrade to it once the owner accepts a version dated after the cut.
+Dates of the versions near the cut-off: v2.34.0 release, image and chart 2026-10-25, 2026-10-25 and 2026-10-27;
+v2.33.0 2026-10-04, 2026-10-04 and 2026-10-06.
 
-| Item | Digest |
-| --- | --- |
-| `kiali-server-2.34.0.tgz` | SHA-256 `370a9b21d8844f8024e320ab1dff4e6383e6d41ea4ee3f1e2579bd0acbfe5c40` (`KIALI_CHART_SHA256`), equal to the `digest` of the chart index |
-| `quay.io/kiali/kiali:v2.34.0` index | `sha256:5db2fd9c95064c61fb23099269db56d0ed964589acc7641a556de6fa7ff58d2a` (`KIALI_IMAGE`) |
-| arm64 manifest | `sha256:dd420fcb386313fbfd3bdb9cdbdec9a74d8722db6634cc17548cbaae59e5a1b3` |
-| amd64 manifest | `sha256:fddae60acd45e3ca4c00f294050b56f2ba61a5b973a4db62faf3a63b5049edad` |
+Review of the change from v2.34.0 to v2.34.1, read as third-party code in a scratch directory: `diff -ru` of the two
+unpacked charts shows four changed lines in two files. `Chart.yaml` changes `appVersion` and `version`, and
+`values.yaml` changes `image_version` and `version_label`, each from v2.34.0 to v2.34.1. No template changed. The
+change adds no hidden Unicode and no other non-ASCII character, no encoded string, no URL, no new RBAC rule, no
+privilege change and no new image. The review did not inspect the layers or the binary of the image. The two
+workarounds of the render, the ConfigMap path and the namespace list with the viewer Roles, and the failure of Kiali
+with one cell down, were checked again on v2.34.1 (see the report of the task).
 
 ### Support matrix
 
-The Kiali prerequisites page lists Istio 1.30 for Kiali 2.26 and higher. Kiali v2.34.0 therefore
+The Kiali prerequisites page lists Istio 1.30 for Kiali 2.26 and higher. Kiali v2.34.1 therefore
 supports Istio 1.30.8, the version of the PoC.
 
 ### Chart
@@ -1339,7 +1340,7 @@ The review read every template of the chart in a scratch directory and ran nothi
 
 ### Version call of Kiali
 
-Kiali v2.34.0 reads the version of each `istiod` of a remote cluster through a port forward
+Kiali v2.34.1 reads the version of each `istiod` of a remote cluster through a port forward
 (`istio/version.go`, `GetVersion`). The source holds no setting that turns this call off, so the hub refuses it
 and the Kiali log shows one error and one warning for each cell and minute. Kiali ends with a fatal error when the
 discovery of one remote cluster fails at start (live run of 2026-11-12: four restarts in 200 seconds), so it cannot

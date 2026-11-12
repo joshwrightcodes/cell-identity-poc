@@ -319,7 +319,7 @@ func TestKialiRender(t *testing.T) {
 		"kiali_feature_flags.disabled_features":     []any{"logs-tab"},
 		"deployment.logger.log_format":              "json",
 		"deployment.image_name":                     "quay.io/kiali/kiali",
-		"deployment.version_label":                  "v2.34.0",
+		"deployment.version_label":                  "v2.34.1",
 		"deployment.discovery_selectors": map[string]any{"default": []any{map[string]any{"matchExpressions": []any{map[string]any{
 			"key": "kubernetes.io/metadata.name", "operator": "In", "values": []any{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"}}}}}},
 		"server.observability.metrics.enabled":           false,
@@ -573,7 +573,7 @@ func TestRenderMeshViewHubFailsClosed(t *testing.T) {
 		{"MESH_VIEW_CELLS=dev-cell-1", "is not <cell>=<port>"},
 		{"MESH_VIEW_CELLS=bad-facts=18001", "could not sign the record of bad-facts"},
 		{"MESH_VIEW_NAMESPACES=Bad_Name", "is not a namespace name"},
-		{"KIALI_IMAGE=quay.io/kiali/kiali:v2.34.0", "pinned by digest"},
+		{"KIALI_IMAGE=quay.io/kiali/kiali:v2.34.1", "pinned by digest"},
 		{"KIALI_VERSION=v9.9.9", "pinned by digest"},
 		{"STUB_NO_SERVER=1", "could not read the trust bundle"},
 	} {

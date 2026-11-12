@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -37,6 +38,7 @@ func registerTunnelFlags(fs *flag.FlagSet) func(listen string) (func(*telemetry.
 	cells := map[string]string{}
 	fs.Func("tunnel-cell", "<cell>=<listen addr> of a tunnel listener; repeat for each cell", tunnelCellFlag(cells))
 	wait := fs.Duration("tunnel-wait", 10*time.Second, "how long a tunnel request waits for the tunnel of its cell")
+	statusAddr := fs.String("tunnel-status", cellproxy.DefaultStatusAddr, "loopback address where the hub serves its tunnel state, read by cell-proxy tunnel-status")
 	return func(listen string) (func(*telemetry.T) (cellproxy.Backend, error), error) {
 		if err := checkTunnelCells(cells, *wait, listen); err != nil {
 			return nil, err
@@ -46,7 +48,7 @@ func registerTunnelFlags(fs *flag.FlagSet) func(listen string) (func(*telemetry.
 			if err != nil {
 				return nil, fmt.Errorf("tunnel metrics: %w", err)
 			}
-			return cellproxy.NewTunnelBackend(cellproxy.NewTunnelHub(cells, *wait, tel.Log, cellproxy.WithMetrics(m))), nil
+			return cellproxy.NewTunnelBackend(cellproxy.NewTunnelHub(cells, *wait, tel.Log, cellproxy.WithMetrics(m), cellproxy.WithStatusAddr(*statusAddr))), nil
 		}, nil
 	}
 }
@@ -112,9 +114,10 @@ func serveBackend(ctx context.Context, srv *cellproxy.Server, ln net.Listener, b
 }
 
 type tunnelModeConfig struct {
-	upstream string
-	expect   spiffeid.ID
-	peer     *x509bundle.Bundle
+	statusAddr string
+	upstream   string
+	expect     spiffeid.ID
+	peer       *x509bundle.Bundle
 }
 
 func parseTunnel(args []string) (tunnelModeConfig, error) {
@@ -123,6 +126,7 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the tunnel hub")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the management plane trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the management plane")
+	status := fs.String("status-listen", cellproxy.DefaultStatusAddr, "loopback address where the tunnel serves its state, read by cell-proxy tunnel-status")
 	if err := parseFlags(fs, args); err != nil {
 		return tunnelModeConfig{}, err
 	}
@@ -140,7 +144,7 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	if err != nil {
 		return tunnelModeConfig{}, err
 	}
-	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer}, nil
+	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status}, nil
 }
 
 // runTunnel is the cell side of the mesh-view tunnel. It reads the Kubernetes API with the
@@ -169,7 +173,13 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 			return fmt.Errorf("tunnel metrics: %w", err)
 		}
 		tel.Log.Info("tunnel_starting", "upstream", cfg.upstream, "expect_id", cfg.expect.String(), "api", api.Host)
-		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m))
+		state := cellproxy.NewTunnelState()
+		go func() {
+			if err := cellproxy.ServeStatus(ctx, cfg.statusAddr, state.Status, tel.Log); err != nil {
+				tel.Log.Warn("tunnel status listener ended", "error", err.Error())
+			}
+		}()
+		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m), cellproxy.WithState(state))
 		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)))
 	})
 }
@@ -226,4 +236,33 @@ func serveHTTP(ctx context.Context, ln net.Listener, h http.Handler, log *slog.L
 	_ = srv.Shutdown(sctx)
 	<-errc
 	return nil
+}
+
+// runTunnelStatus prints the tunnel state that the process of this container serves. With --max-down it
+// fails when a cell has been down for longer than that, so a probe tolerates the short gap of a renewal.
+func runTunnelStatus(ctx context.Context, args []string, stdout io.Writer) int {
+	fs := newFlags("tunnel-status")
+	addr := fs.String("addr", cellproxy.DefaultStatusAddr, "address of the status listener")
+	maxDown := fs.Duration("max-down", 0, "fail when a tunnel has been down for longer than this; 0 never fails on the state")
+	if err := parseFlags(fs, args); err != nil {
+		cli.Fail(stdout, name, err)
+		return exitConfig
+	}
+	return cli.Run(stdout, name, func(out io.Writer) error {
+		st, err := cellproxy.FetchStatus(ctx, *addr)
+		if err != nil {
+			return err
+		}
+		if err := json.NewEncoder(out).Encode(st); err != nil {
+			return err
+		}
+		if *maxDown > 0 {
+			for cell, c := range st.Cells {
+				if !c.Up && time.Duration(c.DownSeconds*float64(time.Second)) > *maxDown {
+					return fmt.Errorf("the tunnel of %s has been down for %.0f seconds", cell, c.DownSeconds)
+				}
+			}
+		}
+		return nil
+	})
 }

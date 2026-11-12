@@ -343,6 +343,78 @@ func hubConnIDs(log, cell string) (ups []int, downs, expired map[int]bool) {
 	return ups, downs, expired
 }
 
+// hubDownCause returns the cause that the hub logged in the tunnel_down line of a conn_id, or "".
+func hubDownCause(log, cell string, connID int) string {
+	for l := range strings.SplitSeq(log, "\n") {
+		var rec struct {
+			Msg, Cell, Cause string
+			ConnID           int `json:"conn_id"`
+		}
+		if json.Unmarshal([]byte(l), &rec) == nil && rec.Msg == "tunnel_down" && rec.Cell == cell && rec.ConnID == connID {
+			return rec.Cause
+		}
+	}
+	return ""
+}
+
+// cellTunnelState reads the state that the tunnel process of a cell serves.
+func cellTunnelState(t *testing.T, cell, pod string) cellproxyStatus {
+	t.Helper()
+	out, err := kubectl(t, cell, "", "-n", meshNamespace, "exec", pod, "-c", "cell-proxy", "--", "/ko-app/cell-proxy", "tunnel-status")
+	if err != nil {
+		t.Fatalf("tunnel-status in %s/%s: %v", cell, pod, err)
+	}
+	var st cellproxyStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &st); err != nil {
+		t.Fatalf("tunnel-status printed %q: %v", out, err)
+	}
+	return st
+}
+
+type cellproxyStatus struct {
+	Side  string `json:"side"`
+	Up    bool   `json:"up"`
+	Cells map[string]struct {
+		Up          bool    `json:"up"`
+		ConnID      int     `json:"conn_id"`
+		AgeSeconds  float64 `json:"age_seconds"`
+		DownSeconds float64 `json:"down_seconds"`
+		LastEnd     *struct {
+			Cause, Detail string
+			At            time.Time
+			AgeSeconds    float64 `json:"age_seconds"`
+		} `json:"last_end"`
+	} `json:"cells"`
+}
+
+// TestM3TunnelStatus reads the tunnel state from the tunnel processes themselves: the hub reports both cells up, and the
+// tunnel pod of each cell reports its tunnel up.
+func TestM3TunnelStatus(t *testing.T) {
+	hub, _ := readyPod(t, meshNamespace, hubName)
+	out, err := kubectl(t, mgmtCluster, "", "-n", meshNamespace, "exec", hub, "-c", "cell-proxy", "--", "/ko-app/cell-proxy", "tunnel-status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st cellproxyStatus
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &st); err != nil || st.Side != "hub" {
+		t.Fatalf("hub tunnel-status printed %q: %v", out, err)
+	}
+	for _, cell := range meshCells(t) {
+		waitFor(t, "the hub to report the tunnel of "+cell+" up", time.Minute, func() (bool, string) {
+			o, err := kubectl(t, mgmtCluster, "", "-n", meshNamespace, "exec", hub, "-c", "cell-proxy", "--", "/ko-app/cell-proxy", "tunnel-status")
+			var s cellproxyStatus
+			if err != nil || json.Unmarshal([]byte(strings.TrimSpace(o)), &s) != nil {
+				return false, fmt.Sprint(err)
+			}
+			return s.Cells[cell].Up, o
+		})
+		pod, _ := readyPodIn(t, cell, meshNamespace, tunnelName)
+		waitFor(t, "the tunnel pod of "+cell+" to report its tunnel up", time.Minute, func() (bool, string) {
+			return cellTunnelState(t, cell, pod).Cells["self"].Up, "down"
+		})
+	}
+}
+
 // TestM3KeepaliveBlackhole drops the packets on one direction between the relay of dev-cp and the hub, as a dead path
 // does, and requires that a side finds the dead tunnel by its own pings, not by the SVID expiry. Two phases:
 //
@@ -423,12 +495,19 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 				t.Logf("start the timer in %s: %v", node, err)
 			}
 			var hubDown, hubExpired, cellClosed, cellExpired bool
+			var hubCause, cellCause string
 			deadline := time.Now().Add(75 * time.Second)
 			for time.Now().Before(deadline) {
-				_, downs, exp := hubConnIDs(hubLog(t), cell)
-				hubDown, hubExpired = downs[connID], exp[connID]
+				log := hubLog(t)
+				_, downs, exp := hubConnIDs(log, cell)
+				hubDown, hubExpired, hubCause = downs[connID], exp[connID], hubDownCause(log, cell, connID)
 				cellLog, _ := kubectl(t, cell, "", "-n", meshNamespace, "logs", cellPod, "-c", "cell-proxy", "--since-time="+since.Format(time.RFC3339))
 				cellClosed, cellExpired = strings.Contains(cellLog, `"msg":"tunnel_closed"`), strings.Contains(cellLog, `"msg":"tunnel_expired"`)
+				if cellClosed {
+					if e := cellTunnelState(t, cell, cellPod).Cells["self"].LastEnd; e != nil && e.At.After(since) {
+						cellCause = e.Cause
+					}
+				}
 				if (phase.rule == 0 && hubDown) || (phase.rule == 1 && cellClosed) {
 					break
 				}
@@ -436,10 +515,14 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 			}
 			took := time.Since(since).Round(time.Second)
 			removeRules()
+			t.Logf("%s: hub cause %q, cell cause %q", phase.name, hubCause, cellCause)
+			// The cause is the one that the side that pings closes with: a failed ping closes the connection
+			// on that side, which the log calls local_close. An expiry, a replaced tunnel or an error from
+			// the peer is another cause.
 			switch {
-			case phase.rule == 0 && hubDown && !hubExpired:
+			case phase.rule == 0 && hubDown && !hubExpired && hubCause == "local_close":
 				found = true
-			case phase.rule == 1 && cellClosed && !cellExpired:
+			case phase.rule == 1 && cellClosed && !cellExpired && cellCause == "local_close":
 				found = true
 			}
 			t.Logf("%s, attempt %d: tunnel %d, hub down %v expired %v, cell closed %v expired %v, after %s", phase.name, attempt, connID, hubDown, hubExpired, cellClosed, cellExpired, took)
@@ -743,7 +826,7 @@ func TestM3KialiCannotChange(t *testing.T) {
 		since := time.Now().UTC().Add(-2 * time.Second)
 		// Each route answers one status. Kiali v2.34.0 has no route that deletes a pod, so that case pins the
 		// absence of the route: a Kiali that adds one fails the test on purpose, and the case then needs a
-		// real write check. A Kiali that sends the write to the cell gets the 403 of the tunnel, and answers 500.
+		// real write check. A Kiali that sends the write to the cell gets the 403 of the tunnel, and answers 403 since v2.34.1 (500 before).
 		for _, tc := range []struct {
 			name, method, path, body string
 			status                   int
@@ -751,8 +834,8 @@ func TestM3KialiCannotChange(t *testing.T) {
 		}{
 			{"delete pod echo (no such route)", "DELETE", "/api/namespaces/apps-demo/pods/" + echo + "?clusterName=" + cell, "", 404, "page not found"},
 			{"patch AuthorizationPolicy", "PATCH", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell,
-				`[{"op":"replace","path":"/spec/action","value":"DENY"}]`, 500, "unknown (patch authorizationpolicies"},
-			{"delete AuthorizationPolicy", "DELETE", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell, "", 500, "unknown (delete authorizationpolicies"},
+				`[{"op":"replace","path":"/spec/action","value":"DENY"}]`, 403, "unknown (patch authorizationpolicies"},
+			{"delete AuthorizationPolicy", "DELETE", "/api/namespaces/apps-demo/istio/security.istio.io/v1/AuthorizationPolicy/echo-allow-client?clusterName=" + cell, "", 403, "unknown (delete authorizationpolicies"},
 		} {
 			code, body, err := kialiCall(tc.method, addr, tc.path, tc.body)
 			if err != nil {

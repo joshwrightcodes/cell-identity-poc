@@ -197,7 +197,8 @@ func serveTunnel(ctx context.Context, srv *http2.Server, conn net.Conn, h http.H
 // tunnel_connected only when the first HTTP/2 bytes of the hub arrive. A hub that ends the
 // connection before that is logged as tunnel_refused with reason peer_not_allowed.
 func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...TunnelOption) func(context.Context) (net.Conn, error) {
-	m := applyOptions(opts).metrics
+	o := applyOptions(opts)
+	m, state := o.metrics, o.state
 	up := &atomic.Bool{}
 	series := attribute.NewSet(attribute.String("side", sideCell), attribute.String("upstream", addr))
 	if err := m.observeUp(func() map[attribute.Set]bool { return map[attribute.Set]bool{series: up.Load()} }); err != nil {
@@ -244,7 +245,7 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			}
 			return nil, err
 		}
-		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result}
+		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result, state: state}
 		// The cell ends the tunnel at the earlier expiry of its own leaf and the leaf of the hub, so a
 		// hub that never closes cannot keep the access past a credential.
 		if certs := conn.ConnectionState().PeerCertificates; len(certs) > 0 {
@@ -256,6 +257,7 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 		if !cn.expiry.IsZero() {
 			cn.timer = time.AfterFunc(time.Until(cn.expiry), func() {
 				log.Info("tunnel_expired", "side", sideCell, "upstream", addr, "not_after", cn.expiry.UTC().Format(time.RFC3339))
+				cn.expired.Store(true)
 				_ = cn.Close()
 			})
 		}
@@ -272,8 +274,11 @@ type cellConn struct {
 	up       *atomic.Bool
 	result   func(context.Context, string)
 
-	expiry time.Time
-	timer  *time.Timer
+	expiry  time.Time
+	timer   *time.Timer
+	expired atomic.Bool
+	state   *TunnelState
+	stateID uint64
 
 	mu         sync.Mutex
 	acceptedAt time.Time
@@ -289,6 +294,9 @@ func (c *cellConn) Read(p []byte) (int, error) {
 	if n > 0 && c.acceptedAt.IsZero() {
 		c.acceptedAt = time.Now()
 		c.up.Store(true)
+		if c.state != nil {
+			c.stateID = c.state.opened()
+		}
 		c.result(context.Background(), dialConnected)
 		c.log.Info("tunnel_connected", "upstream", c.upstream)
 	}
@@ -319,8 +327,18 @@ func (c *cellConn) Close() error {
 	}
 	c.mu.Lock()
 	c.closing = true
-	acceptedAt, peerErr := c.acceptedAt, c.peerErr
+	acceptedAt, peerErr, stateID := c.acceptedAt, c.peerErr, c.stateID
 	c.mu.Unlock()
+	if c.state != nil && stateID != 0 {
+		switch {
+		case c.expired.Load():
+			c.state.closed(stateID, "expiry", "")
+		case peerErr != nil:
+			c.state.closed(stateID, "peer_closed", peerErr.Error())
+		default:
+			c.state.closed(stateID, "local_close", "")
+		}
+	}
 	c.once.Do(func() {
 		if acceptedAt.IsZero() {
 			return
@@ -480,9 +498,13 @@ type TunnelHub struct {
 	log        *slog.Logger
 	metrics    *TunnelMetrics
 	maxStreams int
+	statusAddr string
+	started    time.Time
 	ids        atomic.Uint64
 	mu         sync.Mutex
 	conns      map[string]*tunnelConn
+	ends       map[string]*EndInfo
+	downAt     map[string]time.Time
 	changed    chan struct{}
 }
 
@@ -515,7 +537,8 @@ func NewTunnelHub(cells map[string]string, wait time.Duration, log *slog.Logger,
 	if o.maxStreams <= 0 {
 		o.maxStreams = hubMaxStreams
 	}
-	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: o.metrics, maxStreams: o.maxStreams, conns: map[string]*tunnelConn{}, changed: make(chan struct{})}
+	h := &TunnelHub{cells: cells, wait: wait, log: log, metrics: o.metrics, maxStreams: o.maxStreams, statusAddr: o.statusAddr, started: time.Now(),
+		conns: map[string]*tunnelConn{}, ends: map[string]*EndInfo{}, downAt: map[string]time.Time{}, changed: make(chan struct{})}
 	if err := h.metrics.observeUp(h.upSeries); err != nil {
 		log.Warn("tunnel metric not registered", "error", err.Error())
 	}
@@ -564,6 +587,7 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 		notAfter := certs[0].NotAfter
 		expiry := time.AfterFunc(time.Until(notAfter), func() {
 			log.Info("tunnel_expired", "not_after", notAfter.UTC().Format(time.RFC3339))
+			nc.expired.Store(true)
 			_ = nc.Close()
 		})
 		defer expiry.Stop()
@@ -584,13 +608,19 @@ func (h *TunnelHub) Accept(conn *tls.Conn, s Source) {
 		attribute.String("result", "accepted"), attribute.Bool("replaced", old != nil))
 	log.Info("tunnel_up", "env", s.Env, "remote", tc.remote)
 	<-nc.done
+	cause, detail := nc.cause()
+	if tc.replaced.Load() {
+		cause = "replaced"
+	}
 	h.mu.Lock()
 	if h.conns[s.Cell] == tc {
 		delete(h.conns, s.Cell)
+		h.downAt[s.Cell] = time.Now()
 	}
+	h.ends[s.Cell] = &EndInfo{Cause: cause, Detail: detail, At: time.Now(), AgeSeconds: time.Since(tc.start).Seconds()}
 	h.mu.Unlock()
 	_ = cc.Close()
-	log.Info("tunnel_down", "replaced", tc.replaced.Load(), "age_seconds", time.Since(tc.start).Seconds())
+	log.Info("tunnel_down", "replaced", tc.replaced.Load(), "age_seconds", time.Since(tc.start).Seconds(), "cause", cause, "detail", detail)
 }
 
 // await returns a usable tunnel of cell, or nil when none comes within the wait of the hub.
@@ -703,6 +733,13 @@ func (h *TunnelHub) Run(ctx context.Context) error {
 			}
 		})
 	}
+	if h.statusAddr != "" {
+		go func() {
+			if err := ServeStatus(ctx, h.statusAddr, h.Status, h.log); err != nil {
+				h.log.Warn("tunnel status listener ended", "error", err.Error())
+			}
+		}()
+	}
 	var err error
 	select {
 	case <-ctx.Done():
@@ -728,11 +765,55 @@ func (h *TunnelHub) newServer(cell string) *http.Server {
 	}
 }
 
+// Status returns the tunnel state of each cell, from the connections that the hub holds now. A replaced
+// tunnel is not in the map, so a cell with a newer tunnel never reads as down.
+func (h *TunnelHub) Status() TunnelStatus {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	st := TunnelStatus{Side: sideHub, Up: true, Cells: map[string]CellStatus{}}
+	for cell := range h.cells {
+		c := CellStatus{LastEnd: h.ends[cell]}
+		if tc := h.conns[cell]; tc != nil && tc.usable() {
+			c.Up, c.ConnID, c.AgeSeconds = true, tc.id, time.Since(tc.start).Seconds()
+		} else {
+			since := h.started
+			if t, ok := h.downAt[cell]; ok {
+				since = t
+			}
+			c.DownSeconds = time.Since(since).Seconds()
+			st.Up = false
+		}
+		st.Cells[cell] = c
+	}
+	return st
+}
+
 // notifyConn closes done when the connection closes or its read fails.
 type notifyConn struct {
 	net.Conn
-	once sync.Once
-	done chan struct{}
+	once    sync.Once
+	done    chan struct{}
+	expired atomic.Bool
+	mu      sync.Mutex
+	readErr error
+	// localFirst is true when this side closed the connection before any read error: the transport closes
+	// the connection after a read error too, so only the order tells the two apart.
+	localFirst bool
+}
+
+// cause says why the connection ended: expiry (the timer of the SVID), peer_closed (a read error or an
+// end of the stream from the peer, with the error), or local_close (this side closed it: a failed ping,
+// a replaced tunnel or a shutdown).
+func (c *notifyConn) cause() (string, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case c.expired.Load():
+		return "expiry", ""
+	case !c.localFirst && c.readErr != nil:
+		return "peer_closed", c.readErr.Error()
+	}
+	return "local_close", ""
 }
 
 func (c *notifyConn) signal() { c.once.Do(func() { close(c.done) }) }
@@ -742,6 +823,11 @@ func (c *notifyConn) Read(p []byte) (int, error) {
 	if err != nil {
 		var ne net.Error
 		if !errors.As(err, &ne) || !ne.Timeout() {
+			c.mu.Lock()
+			if c.readErr == nil {
+				c.readErr = err
+			}
+			c.mu.Unlock()
 			c.signal()
 		}
 	}
@@ -749,6 +835,11 @@ func (c *notifyConn) Read(p []byte) (int, error) {
 }
 
 func (c *notifyConn) Close() error {
+	c.mu.Lock()
+	if c.readErr == nil {
+		c.localFirst = true
+	}
+	c.mu.Unlock()
 	c.signal()
 	return c.Conn.Close()
 }

@@ -69,10 +69,10 @@ spec:
               value: service.instance.id=$(POD_NAME)
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
-          # The tunnel mode opens no port. whoami asks the Workload API for the SVIDs of the pod, so
-          # the probe passes while the SPIRE agent sidecar serves the identity that the tunnel
-          # needs. The tunnel itself is visible in the metric cell_proxy.tunnel.up and in the log
-          # lines tunnel_connected and tunnel_closed.
+          # The tunnel serves its own state on 127.0.0.1:18099, and mise run mesh:status reads it with
+          # cell-proxy tunnel-status. The probes run whoami, which asks the Workload API for the SVIDs of the pod, so
+          # a SPIRE agent that stops serves no identity and restarts the container. They do not read the tunnel
+          # state: a cell that starts before the hub has no tunnel, and it must still become Ready.
           startupProbe:
             exec:
               command: [/ko-app/cell-proxy, whoami]
