@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-hclog"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
@@ -406,10 +407,44 @@ func TestReloadRefusesRecordThatDiffersFromItsEntry(t *testing.T) {
 	_, other := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Subjects = nil })
 	f.publish(f.specAt(2, []envspec.Entry{other}), map[string][]byte{"dev-cell-1": r1})
 	f.reload()
-	if got := f.plugin.st.Load().records["dev-cell-1"].Counter; got != 1 {
-		t.Fatalf("a record with another digest than its entry loaded (counter %d)", got)
+	if rec, ok := f.plugin.st.Load().records["dev-cell-1"]; ok {
+		t.Fatalf("a cell whose entry has no matching record is active at counter %d", rec.Counter)
 	}
 	f.wantLog(`"@message":"record_mismatch"`)
+	f.wantUnknown("dev-cell-1")
+}
+
+// The accepted spec replaced the record, so a record below the entry must not serve the cell, whatever
+// the reason that the new record is missing.
+func TestReloadWithheldRecordDoesNotKeepTheOldOne(t *testing.T) {
+	revoke := func(c *record.Cell) { c.Revoked = true }
+	for _, tc := range []struct {
+		name string
+		file func(f *fixture, old []byte) []byte
+	}{
+		{"old_file", func(f *fixture, old []byte) []byte { return old }},
+		{"absent_file", func(f *fixture, old []byte) []byte { return nil }},
+		{"corrupt_file", func(f *fixture, old []byte) []byte { return []byte("{}") }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{ticker: true})
+			old, _ := f.recordAt("dev-cell-1", 1)
+			_, revoked := f.recordAt("dev-cell-1", 2, revoke)
+			r2, e2 := f.recordAt("dev-cell-2", 1)
+			recs := map[string][]byte{"dev-cell-2": r2}
+			if file := tc.file(f, old); file != nil {
+				recs["dev-cell-1"] = file
+			}
+			f.publish(f.specAt(2, []envspec.Entry{revoked, e2}), recs)
+			f.reload()
+			if rec, ok := f.plugin.st.Load().records["dev-cell-1"]; ok {
+				t.Fatalf("the replaced record (counter %d, revoked %v) still serves the cell\n%s", rec.Counter, rec.Revoked, f.logs.String())
+			}
+			f.wantUnknown("dev-cell-1")
+			f.wantAttests("dev-cell-2")
+			f.wantLog(`"@message":"record_missing"`)
+		})
+	}
 }
 
 func TestReloadRefusesOlderSpec(t *testing.T) {
@@ -509,5 +544,371 @@ func TestReloadLogsARefusalOnce(t *testing.T) {
 	}
 	if n := strings.Count(f.logs.String(), `"@message":"record_unindexed"`); n != 1 {
 		t.Fatalf("%d record_unindexed lines for one unchanged file, want 1", n)
+	}
+}
+
+// restart returns a new plugin that Configures from the same files and settings as f.
+func (f *fixture) restart() (*Plugin, *syncBuffer) {
+	f.t.Helper()
+	logs := &syncBuffer{}
+	p := New()
+	p.now = func() time.Time { return testNow }
+	p.log = hclog.New(&hclog.LoggerOptions{Level: hclog.Debug, Output: logs, JSONFormat: true})
+	f.t.Cleanup(func() { _ = p.Close() })
+	_, err := p.Configure(context.Background(), &configv1.ConfigureRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain},
+		HclConfiguration:  f.base,
+	})
+	if err != nil {
+		f.t.Fatalf("configure after restart: %v", err)
+	}
+	return p, logs
+}
+
+func TestReloadRestartKeepsMarks(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	oldR1, oldE1 := f.recordAt("dev-cell-1", 1)
+	oldR2, oldE2 := f.recordAt("dev-cell-2", 1)
+	newR1, newE1 := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Revoked = true })
+	f.publish(f.specAt(2, []envspec.Entry{newE1, oldE2}), map[string][]byte{"dev-cell-1": newR1, "dev-cell-2": oldR2})
+	f.reload()
+	if rec := f.plugin.st.Load().records["dev-cell-1"]; !rec.Revoked {
+		t.Fatal("the revocation did not load")
+	}
+	// A writer replays the spec from before the revocation.
+	f.publish(f.specAt(1, []envspec.Entry{oldE1, oldE2}), map[string][]byte{"dev-cell-1": oldR1, "dev-cell-2": oldR2})
+	f.reload()
+	f.wantLog(`"@message":"spec_older_ignored"`)
+
+	p, logs := f.restart()
+	if rec, ok := p.st.Load().records["dev-cell-1"]; ok && !rec.Revoked {
+		t.Fatalf("after a restart the replayed spec brought back the revoked cell\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "spec_older_ignored") {
+		t.Fatalf("the replayed spec was not refused as older after the restart:\n%s", logs.String())
+	}
+}
+
+func TestMarksFileIsWrittenBeforeTheStateSwap(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	fi, err := os.Stat(f.marksPath)
+	if err != nil {
+		t.Fatalf("the first Configure wrote no marks file: %v", err)
+	}
+	if fi.Mode().Perm() != 0o600 {
+		t.Fatalf("marks file mode = %v, want 0600", fi.Mode().Perm())
+	}
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	r2, e2 := f.recordAt("dev-cell-2", 1)
+	f.publish(f.specAt(7, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
+	var seen []byte
+	before := f.plugin.st.Load()
+	f.plugin.afterLoad = func() {
+		if f.plugin.st.Load() == before {
+			seen, _ = os.ReadFile(f.marksPath)
+		}
+	}
+	f.reload()
+	if !strings.Contains(string(seen), `"counter":7`) {
+		t.Fatalf("the marks file lacked the raised spec mark when the state was about to swap: %q", seen)
+	}
+	if entries, _ := os.ReadDir(filepath.Dir(f.marksPath)); len(entries) != 1 {
+		t.Fatalf("temporary files remain beside the marks file: %v", entries)
+	}
+}
+
+func TestMarksFileCorruptFailsClosed(t *testing.T) {
+	for name, content := range map[string]string{
+		"garbage":       "not json",
+		"truncated":     `{"spec":{"epoch":1,"counter":`,
+		"unknown_field": `{"spec":{"epoch":1,"counter":1},"cells":{},"retired":[],"extra":1}`,
+		"zero_spec":     `{"spec":{"epoch":0,"counter":0},"cells":{},"retired":[]}`,
+		"empty":         ``,
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{marks: true})
+			if err := os.WriteFile(f.marksPath, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p, logs := f.restart()
+			if n := len(p.st.Load().records); n != 0 {
+				t.Fatalf("%d records served with a corrupt marks file", n)
+			}
+			if !strings.Contains(logs.String(), `"@message":"marks_unreadable"`) {
+				t.Fatalf("no marks_unreadable log:\n%s", logs.String())
+			}
+			if got, _ := os.ReadFile(f.marksPath); string(got) != content {
+				t.Fatal("the plugin overwrote a corrupt marks file")
+			}
+		})
+	}
+}
+
+func TestMarksFileAbsentIsAFirstStart(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	if err := os.Remove(f.marksPath); err != nil {
+		t.Fatal(err)
+	}
+	p, _ := f.restart()
+	if n := len(p.st.Load().records); n != 2 {
+		t.Fatalf("%d records after a first start, want 2", n)
+	}
+	if _, err := os.Stat(f.marksPath); err != nil {
+		t.Fatalf("a first start wrote no marks file: %v", err)
+	}
+}
+
+func TestMarksFileUnwritableFailsClosed(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	before := f.plugin.st.Load()
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	r2, e2 := f.recordAt("dev-cell-2", 1)
+	r3, e3 := f.recordAt("dev-cell-3", 1)
+	f.publish(f.specAt(2, []envspec.Entry{e1, e2, e3}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2, "dev-cell-3": r3})
+	dir := filepath.Dir(f.marksPath)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	f.reload()
+	if f.plugin.st.Load() != before {
+		t.Fatal("raised marks that could not be saved still changed the state")
+	}
+	f.plugin.markMu.Lock()
+	mark := f.plugin.specMark
+	f.plugin.markMu.Unlock()
+	if mark.Counter != 1 {
+		t.Fatalf("the in-memory spec mark rose to %v although it was not saved", mark)
+	}
+	f.wantLog(`"@message":"marks_unwritable"`)
+}
+
+func TestMarksFileEmptyWarnsOnce(t *testing.T) {
+	f := newFixture(t, fixtureOptions{})
+	f.reconfigure(t, "")
+	f.reconfigure(t, "")
+	if n := strings.Count(f.logs.String(), `"@message":"marks_memory_only"`); n != 1 {
+		t.Fatalf("%d marks_memory_only warnings, want 1", n)
+	}
+}
+
+func TestConfigureReloadsAgainstTheCurrentState(t *testing.T) {
+	t.Run("older_spec", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{ticker: true})
+		_, e1 := f.recordAt("dev-cell-1", 1)
+		r1, _ := f.recordAt("dev-cell-1", 1)
+		f.publish(f.specAt(5, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+		f.reload()
+		f.wantCells("dev-cell-1")
+		r2, e2 := f.recordAt("dev-cell-2", 1)
+		f.publish(f.specAt(3, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
+		f.reconfigure(t, `challenge_timeout = "9s"`)
+		f.wantCells("dev-cell-1")
+	})
+	t.Run("equal_revision_conflict", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{ticker: true})
+		want := f.plugin.st.Load().digests["dev-cell-2"]
+		r1, e1 := f.recordAt("dev-cell-1", 1)
+		r2, e2 := f.recordAt("dev-cell-2", 1, func(c *record.Cell) { c.Issuer = "https://other.example" })
+		f.publish(f.specAt(2, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
+		f.reconfigure(t, `challenge_timeout = "9s"`)
+		if got := f.plugin.st.Load().digests["dev-cell-2"]; got != want {
+			t.Fatal("a Configure accepted a record that conflicts at an equal revision")
+		}
+	})
+}
+
+func TestReloadReconfigureAppliesTheInterval(t *testing.T) {
+	t.Run("test_ticker", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{ticker: true})
+		f.reconfigure(t, `reload_interval = "0s"`)
+		r1, e1 := f.recordAt("dev-cell-1", 1)
+		f.publish(f.specAt(2, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+		f.tick <- time.Now()
+		time.Sleep(200 * time.Millisecond)
+		if len(f.reloaded) != 0 || len(f.cells()) != 2 {
+			t.Fatal("a plugin reconfigured to 0s kept reloading")
+		}
+		f.reconfigure(t, `reload_interval = "1s"`)
+		f.reload()
+		f.wantCells("dev-cell-1")
+	})
+	t.Run("real_ticker", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{})
+		f.reconfigure(t, `reload_interval = "10s"`)
+		if got := time.Duration(f.plugin.tickEvery.Load()); got != 10*time.Second {
+			t.Fatalf("interval in effect = %v, want 10s", got)
+		}
+		f.reconfigure(t, `reload_interval = "3s"`)
+		if got := time.Duration(f.plugin.tickEvery.Load()); got != 3*time.Second {
+			t.Fatalf("interval in effect = %v, want 3s", got)
+		}
+		f.reconfigure(t, `reload_interval = "0s"`)
+		if got := f.plugin.tickEvery.Load(); got != 0 {
+			t.Fatalf("interval in effect = %v, want 0", got)
+		}
+		f.wantLog(`"reload_interval":"0s"`)
+	})
+}
+
+func waitLoops(t *testing.T, p *Plugin, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for p.loops.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d reload goroutines, want %d", p.loops.Load(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestReloadGoroutineLifecycle(t *testing.T) {
+	t.Run("one_for_many_configures_and_close_ends_it", func(t *testing.T) {
+		f := newFixture(t, fixtureOptions{extraHCL: `reload_interval = "10s"`})
+		f.reconfigure(t, `reload_interval = "10s"`)
+		f.reconfigure(t, `reload_interval = "10s"`)
+		waitLoops(t, f.plugin, 1)
+		if err := f.plugin.Close(); err != nil {
+			t.Fatal(err)
+		}
+		waitLoops(t, f.plugin, 0)
+		if err := f.plugin.Close(); err != nil {
+			t.Fatalf("second Close: %v", err)
+		}
+	})
+	t.Run("stop_channel_ends_it", func(t *testing.T) {
+		stop := make(chan struct{})
+		p := newWithTicker(make(chan time.Time), stop)
+		p.applyInterval(time.Second)
+		waitLoops(t, p, 1)
+		close(stop)
+		waitLoops(t, p, 0)
+	})
+}
+
+func TestReloadForeignEnvSpecRaisesNoMark(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true})
+	before := f.plugin.st.Load()
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	f.publish(signSpec(t, f.priv, "prod", 1, 99, []envspec.Entry{e1}, nil), map[string][]byte{"dev-cell-1": r1})
+	f.reload()
+	f.wantLog(`"@message":"spec_env_mismatch"`)
+	if f.plugin.st.Load() != before {
+		t.Fatal("a spec for another environment changed the state")
+	}
+	r2, e2 := f.recordAt("dev-cell-2", 1)
+	f.publish(f.specAt(2, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
+	f.reload()
+	f.wantCells("dev-cell-1", "dev-cell-2")
+	f.plugin.markMu.Lock()
+	defer f.plugin.markMu.Unlock()
+	if f.plugin.specMark.Counter != 2 {
+		t.Fatalf("spec mark = %v, want counter 2", f.plugin.specMark)
+	}
+}
+
+func TestReloadInvalidSpecKeepsState(t *testing.T) {
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	for name, make := range map[string]func(f *fixture) []byte{
+		"foreign_key": func(f *fixture) []byte { return signSpec(f.t, other, testEnv, 1, 9, nil, nil) },
+		"garbage":     func(f *fixture) []byte { return []byte("garbage") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{ticker: true})
+			before := f.plugin.st.Load()
+			f.publish(make(f), nil)
+			f.reload()
+			f.wantLog(`"@message":"spec_invalid"`)
+			if f.plugin.st.Load() != before {
+				t.Fatal("an invalid spec changed the state")
+			}
+			f.wantAttests("dev-cell-1")
+		})
+	}
+}
+
+func TestValidateDoesNotRaiseMarks(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true})
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	f.publish(f.specAt(9, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+	v, err := f.plugin.Validate(context.Background(), &configv1.ValidateRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain}, HclConfiguration: f.base})
+	if err != nil || !v.GetValid() {
+		t.Fatalf("Validate = %v, %v", v, err)
+	}
+	f.plugin.markMu.Lock()
+	defer f.plugin.markMu.Unlock()
+	if f.plugin.specMark.Counter != 1 || len(f.plugin.marks) != 2 {
+		t.Fatalf("Validate raised the marks: spec %v, cells %v", f.plugin.specMark, f.plugin.marks)
+	}
+}
+
+func TestConfigureFailsOnUnreadableSpec(t *testing.T) {
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	dir := t.TempDir()
+	if err := os.Symlink("missing", filepath.Join(dir, specFile)); err != nil {
+		t.Fatal(err)
+	}
+	p := New()
+	t.Cleanup(func() { _ = p.Close() })
+	_, err := p.Configure(context.Background(), &configv1.ConfigureRequest{
+		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain},
+		HclConfiguration: fmt.Sprintf("env = \"dev\"\ntrust_domain = %q\nrecords_dir = %q\nrecord_public_keys = [%q]\nreload_interval = \"0s\"\n",
+			testTrustDomain, dir, base64.StdEncoding.EncodeToString(pub)),
+	})
+	if err == nil {
+		t.Fatal("Configure accepted a spec that it cannot read")
+	}
+}
+
+func TestReloadLogsUnsignedTextShortened(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true})
+	for i, kind := range []string{"A", "B"} {
+		body := fmt.Sprintf(`{"payloadType":%q,"payload":"","signatures":[]}`, strings.Repeat(kind, 100_000))
+		f.publish([]byte(body), nil)
+		f.reload()
+		for _, line := range strings.Split(f.logs.String(), "\n") {
+			if len(line) > 2000 {
+				t.Fatalf("log line of %d bytes after reload %d", len(line), i+1)
+			}
+		}
+	}
+	if n := strings.Count(f.logs.String(), `"@message":"spec_invalid"`); n != 2 {
+		t.Fatalf("%d spec_invalid lines, want one for each distinct reason", n)
+	}
+}
+
+func TestReloadUnreadableIsLoggedOncePerWindow(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true})
+	gone := f.cm.root + ".gone"
+	if err := os.Rename(f.cm.root, gone); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		f.reload()
+	}
+	if n := strings.Count(f.logs.String(), `"@message":"records_unreadable"`); n != 1 {
+		t.Fatalf("%d records_unreadable lines, want 1", n)
+	}
+	if err := os.Rename(gone, f.cm.root); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A path that blocks a read must not block a Configure, so the load reads every file before it takes
+// the lock of the marks.
+func TestLoadReadsFilesWithoutHoldingTheMarksLock(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true})
+	var free bool
+	f.plugin.afterResolve = func() {
+		free = f.plugin.markMu.TryLock()
+		if free {
+			f.plugin.markMu.Unlock()
+		}
+	}
+	f.reload()
+	f.plugin.afterResolve = nil
+	if !free {
+		t.Fatal("the load held the marks lock while it read the directory")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +22,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
@@ -45,6 +47,7 @@ const (
 	defaultTimeout   = "30s"
 	defaultReload    = "10s"
 	minReload        = time.Second
+	repeatWindow     = 5 * time.Minute
 	recordSuffix     = ".dsse.json"
 	maxKIDLogLength  = 64
 	maxRecordFileLen = 1 << 20
@@ -66,12 +69,13 @@ type pluginConfig struct {
 	PerCellInflight  int      `hcl:"per_cell_inflight"`
 	ChallengeTimeout string   `hcl:"challenge_timeout"`
 	ReloadInterval   string   `hcl:"reload_interval"`
+	MarksFile        string   `hcl:"marks_file"`
 }
 
 var configKeys = map[string]bool{
 	"env": true, "trust_domain": true, "records_dir": true, "record_public_keys": true,
 	"per_cell_rate": true, "per_cell_burst": true, "per_cell_inflight": true, "challenge_timeout": true,
-	"reload_interval": true,
+	"reload_interval": true, "marks_file": true,
 }
 
 // state is the immutable result of one Configure call.
@@ -85,6 +89,7 @@ type state struct {
 	dir         string
 	keys        []ed25519.PublicKey
 	reloadEvery time.Duration
+	marksFile   string
 	rate        float64
 	burst       int
 	maxInflight int
@@ -102,11 +107,16 @@ type Plugin struct {
 	st     atomic.Pointer[state]
 	active atomic.Int64
 
-	// tick and stop drive the reload goroutine. A nil tick means a real ticker that runs for the
-	// process life.
-	tick    <-chan time.Time
-	stop    <-chan struct{}
-	started atomic.Bool
+	// tick and stop drive the reload goroutine. A nil tick means a real ticker. Close ends the
+	// goroutine and stops the ticker.
+	tick      <-chan time.Time
+	stop      <-chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+	// tickMu guards ticker and started.
+	tickMu  sync.Mutex
+	ticker  *time.Ticker
+	started bool
 
 	// markMu guards the fields below. They only grow for the process life.
 	markMu sync.Mutex
@@ -117,16 +127,29 @@ type Plugin struct {
 	specMark envspec.Revision
 	// noted holds the refusals that the last load logged, so a repeated refusal is logged once.
 	noted map[string]bool
+	// marksPath is the file that holds the marks. It is set by the first Configure and stays. The
+	// marks are ready after the file is read, or found absent, or when the plugin keeps them in memory.
+	marksPath   string
+	marksReady  bool
+	marksDirty  bool
+	marksWarned bool
+	// lim limits the log lines that a fault repeats on every tick.
+	lim *lograte.Limiter
 
 	// Test seams. They stay nil in production.
 	afterResolve func()
 	afterLoad    func()
 	afterReload  func()
+	// loops counts the running reload goroutines. tickEvery is the interval in effect, in nanoseconds.
+	loops     atomic.Int32
+	tickEvery atomic.Int64
 }
 
 // New returns a plugin that is not configured yet. It reloads the records on a real ticker.
 func New() *Plugin {
-	return &Plugin{now: time.Now, log: hclog.NewNullLogger()}
+	p := &Plugin{now: time.Now, log: hclog.NewNullLogger(), done: make(chan struct{})}
+	p.lim = lograte.New(repeatWindow, 32, func() time.Time { return p.now() })
+	return p
 }
 
 // newWithTicker returns a plugin that reloads the records on each value of tick until stop closes.
@@ -157,8 +180,8 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 		st.limit, st.gate = old.limit, old.gate
 	}
 	p.st.Store(st)
+	p.applyInterval(st.reloadEvery)
 	p.log.Info("configured", "env", st.env, "records", len(st.records), "reload_interval", st.reloadEvery.String())
-	p.startReload(st.reloadEvery)
 	return &configv1.ConfigureResponse{}, nil
 }
 
@@ -168,7 +191,13 @@ func (p *Plugin) build(text, coreTrustDomain string, commit bool) (*state, error
 	if err != nil {
 		return nil, err
 	}
-	snap, err := p.load(st, nil, commit)
+	// A Configure that keeps the directory and the keys loads against the current state, so the
+	// conflict rule and the kept records still apply.
+	var base *state
+	if old := p.st.Load(); commit && old != nil && old.dir == st.dir && slices.EqualFunc(old.keys, st.keys, func(a, b ed25519.PublicKey) bool { return a.Equal(b) }) {
+		base = old
+	}
+	snap, err := p.load(st, base, commit)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +252,7 @@ func (p *Plugin) parse(text, coreTrustDomain string) (*state, error) {
 	}
 	return &state{
 		env: cfg.Env, trustDomain: cfg.TrustDomain, timeout: timeout,
-		dir: cfg.RecordsDir, keys: keys, reloadEvery: every,
+		dir: cfg.RecordsDir, keys: keys, reloadEvery: every, marksFile: cfg.MarksFile,
 		rate: cfg.PerCellRate, burst: cfg.PerCellBurst, maxInflight: cfg.PerCellInflight,
 		limit: newLimiter(cfg.PerCellRate, cfg.PerCellBurst, p.now),
 		gate:  newGate(cfg.PerCellInflight),

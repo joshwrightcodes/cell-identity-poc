@@ -18,6 +18,12 @@ import (
 // specFile is the key of the signed spec in the records directory.
 const specFile = "spec-envelope.json"
 
+// maxLogText is the longest unsigned text that a log line carries.
+const maxLogText = 256
+
+// errMarksWrite means the plugin could not save raised marks.
+var errMarksWrite = errors.New("marks file not saved")
+
 // snapshot is the record set that one load accepted.
 type snapshot struct {
 	records map[string]record.Cell
@@ -38,31 +44,100 @@ func keepOf(base *state) *snapshot {
 	return s
 }
 
-// startReload starts the reload goroutine on the first call with a positive interval.
-func (p *Plugin) startReload(every time.Duration) {
-	if every <= 0 || !p.started.CompareAndSwap(false, true) {
+// Close stops the reload goroutine and its ticker.
+func (p *Plugin) Close() error {
+	p.closeOnce.Do(func() {
+		close(p.done)
+		p.tickMu.Lock()
+		defer p.tickMu.Unlock()
+		if p.ticker != nil {
+			p.ticker.Stop()
+		}
+	})
+	return nil
+}
+
+// applyInterval puts the reload interval of a Configure into effect. The goroutine starts at the
+// first positive interval. A later value resets the ticker, and 0s stops the polling.
+func (p *Plugin) applyInterval(every time.Duration) {
+	p.tickMu.Lock()
+	defer p.tickMu.Unlock()
+	select {
+	case <-p.done:
+		return
+	default:
+	}
+	p.tickEvery.Store(int64(every))
+	if p.tick == nil {
+		switch {
+		case p.ticker != nil && every == 0:
+			p.ticker.Stop()
+		case p.ticker != nil:
+			p.ticker.Reset(every)
+		case every > 0:
+			p.ticker = time.NewTicker(every)
+		}
+	}
+	if every == 0 || p.started {
 		return
 	}
+	p.started = true
 	tick := p.tick
 	if tick == nil {
-		tick = time.NewTicker(every).C
+		tick = p.ticker.C
 	}
-	stop := p.stop
-	go func() {
-		for {
-			select {
-			case <-tick:
+	p.loops.Add(1)
+	go p.loop(tick)
+}
+
+func (p *Plugin) loop(tick <-chan time.Time) {
+	defer p.loops.Add(-1)
+	for {
+		select {
+		case <-tick:
+			if p.tickEvery.Load() > 0 {
 				p.reload()
-			case <-stop:
-				return
 			}
+		case <-p.stop:
+			return
+		case <-p.done:
+			return
 		}
-	}()
+	}
+}
+
+// clip shortens the string values of a log line, because they can carry text that no key signed.
+func clip(kv []any) []any {
+	out := make([]any, len(kv))
+	for i, v := range kv {
+		if s, ok := v.(string); ok && len(s) > maxLogText {
+			v = strings.ToValidUTF8(s[:maxLogText], "") + "..."
+		}
+		out[i] = v
+	}
+	return out
+}
+
+func clipString(s string) string {
+	return clip([]any{s})[0].(string)
+}
+
+// logLimited logs a fault that repeats on every tick, once for each window and reason.
+func (p *Plugin) logLimited(level func(string, ...any), msg, reason string, kv ...any) {
+	_, ok, suppressed, _ := p.lim.Allow(msg + "|" + clipString(reason))
+	if !ok {
+		return
+	}
+	kv = append(kv, "reason", reason)
+	if suppressed > 0 {
+		kv = append(kv, "suppressed", suppressed)
+	}
+	level(msg, clip(kv)...)
 }
 
 // reload loads the records again and swaps them into the state. A Configure that lands between the
 // load and the swap wins, and the reload retries once from the state that Configure stored. A failure
-// to read the directory keeps the state.
+// to read the directory, or to save raised marks, keeps the state.
 func (p *Plugin) reload() {
 	if p.afterReload != nil {
 		defer p.afterReload()
@@ -74,7 +149,11 @@ func (p *Plugin) reload() {
 		}
 		snap, err := p.load(cur, cur, true)
 		if err != nil {
-			p.log.Error("records_unreadable", "reason", err.Error())
+			msg := "records_unreadable"
+			if errors.Is(err, errMarksWrite) {
+				msg = "marks_unwritable"
+			}
+			p.logLimited(p.log.Error, msg, err.Error())
 			return
 		}
 		if p.afterLoad != nil {
@@ -90,7 +169,7 @@ func (p *Plugin) reload() {
 			return
 		}
 	}
-	p.log.Warn("reload_superseded", "reason", "Configure replaced the state during two reloads")
+	p.logLimited(p.log.Warn, "reload_superseded", "Configure replaced the state during two reloads")
 }
 
 func (p *Plugin) logReloaded(old *state, snap *snapshot) {
@@ -139,17 +218,24 @@ func readSmall(path string) ([]byte, error) {
 	return os.ReadFile(path)
 }
 
-// load reads the spec and the record files of cfg.dir and returns the records that pass every check.
-// base holds the records to keep when a file or the spec cannot be used. When commit is set, load
-// raises the marks of the plugin, and it never lowers them.
-//
-// An absent spec gives no record. A spec that does not verify, names another environment or sits
-// below the spec mark leaves the records of base as they are. A record counts only when its spec
-// entry has the same name, revision and digest, it is not below the mark of its cell, and it does not
-// share a revision with another record or a retired mark. An indexed cell without an accepted record
-// keeps the record of base, and a cell that the spec no longer indexes drops out.
-func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
-	dir, err := resolveDir(cfg.dir)
+// rawFile is one record file as read from disk, before any check.
+type rawFile struct {
+	name string
+	data []byte
+	err  error
+}
+
+// rawLoad is the content of one version of the records directory.
+type rawLoad struct {
+	specAbsent bool
+	spec       []byte
+	files      []rawFile
+}
+
+// readVersion reads the spec and every record file from one version of the directory. It holds no
+// lock, so a path that blocks the read cannot block a Configure.
+func (p *Plugin) readVersion(dir string) (*rawLoad, error) {
+	dir, err := resolveDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read records_dir: %w", err)
 	}
@@ -160,6 +246,39 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read records_dir: %w", err)
 	}
+	raw := &rawLoad{}
+	specPath := filepath.Join(dir, specFile)
+	if _, err := os.Lstat(specPath); errors.Is(err, fs.ErrNotExist) {
+		raw.specAbsent = true
+	} else if raw.spec, err = readSmall(specPath); err != nil {
+		return nil, fmt.Errorf("read %s: %w", specFile, err)
+	}
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), recordSuffix) {
+			continue
+		}
+		data, err := readSmall(filepath.Join(dir, e.Name()))
+		raw.files = append(raw.files, rawFile{name: e.Name(), data: data, err: err})
+	}
+	return raw, nil
+}
+
+// load reads the spec and the record files of cfg.dir and returns the records that pass every check.
+// base holds the records to keep when the spec cannot be used, or when a cell has no new record that
+// is at least as new as its entry. When commit is set, load raises the marks of the plugin and saves
+// them, and it never lowers them.
+//
+// An absent spec gives no record. A spec that does not verify, names another environment or sits
+// below the spec mark leaves the records of base as they are. A record counts only when its spec
+// entry has the same name, revision and digest, it is not below the mark of its cell, and it does not
+// share a revision with another record or a retired mark. A cell that the spec indexes and that has no
+// accepted record keeps its record from base only while that record is not below the entry. A cell
+// that the spec no longer indexes drops out. An unreadable marks file gives no record.
+func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
+	raw, err := p.readVersion(cfg.dir)
+	if err != nil {
+		return nil, err
+	}
 
 	p.markMu.Lock()
 	defer p.markMu.Unlock()
@@ -167,25 +286,29 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 	if commit {
 		defer func() { p.noted = seen }()
 	}
-	// note logs a refusal once, until a load stops reporting it.
+	// note logs a refusal once, until a load stops reporting it or its reason changes.
 	note := func(level func(string, ...any), msg, file string, kv ...any) {
-		key := msg + "|" + file
+		reason := ""
+		for i := 0; i+1 < len(kv); i += 2 {
+			if kv[i] == "reason" {
+				reason, _ = kv[i+1].(string)
+			}
+		}
+		key := msg + "|" + file + "|" + clipString(reason)
 		seen[key] = true
 		if !commit || !p.noted[key] {
-			level(msg, append([]any{"file", file}, kv...)...)
+			level(msg, clip(append([]any{"file", file}, kv...))...)
 		}
 	}
 
-	specPath := filepath.Join(dir, specFile)
-	if _, err := os.Lstat(specPath); errors.Is(err, fs.ErrNotExist) {
+	if commit && !p.ensureMarks(cfg.marksFile, note) {
+		return emptySnapshot(), nil
+	}
+	if raw.specAbsent {
 		note(p.log.Warn, "spec_absent", specFile)
 		return emptySnapshot(), nil
 	}
-	raw, err := readSmall(specPath)
-	if err != nil {
-		return nil, fmt.Errorf("read %s: %w", specFile, err)
-	}
-	sp, _, err := envspec.Verify(raw, cfg.keys)
+	sp, _, err := envspec.Verify(raw.spec, cfg.keys)
 	switch {
 	case err != nil:
 		note(p.log.Error, "spec_invalid", specFile, "reason", err.Error())
@@ -218,21 +341,17 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 
 	out := emptySnapshot()
 	out.spec = sp.Revision
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, recordSuffix) {
-			continue
-		}
-		data, err := readSmall(filepath.Join(dir, name))
-		if err != nil {
+	for _, f := range raw.files {
+		name := f.name
+		if f.err != nil {
 			reason := "unreadable"
-			if errors.Is(err, errNotSmallFile) {
+			if errors.Is(f.err, errNotSmallFile) {
 				reason = errNotSmallFile.Error()
 			}
 			note(p.log.Warn, "skipped record file", name, "reason", reason)
 			continue
 		}
-		rec, payload, err := record.VerifyWithPayload(data, cfg.keys)
+		rec, payload, err := record.VerifyWithPayload(f.data, cfg.keys)
 		switch {
 		case err != nil:
 			note(p.log.Error, "record file failed verification", name, "file_cell", strings.TrimSuffix(name, recordSuffix), "reason", err.Error())
@@ -271,17 +390,22 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 		}
 		out.records[rec.Name], out.digests[rec.Name] = rec, digest
 	}
-	if base != nil {
-		for _, e := range sp.Cells {
-			if _, ok := out.records[e.Name]; ok {
+	for _, e := range sp.Cells {
+		if _, ok := out.records[e.Name]; ok {
+			continue
+		}
+		if base != nil {
+			if cur, ok := base.records[e.Name]; ok && envspec.RecordRevision(cur).Compare(e.Revision) >= 0 {
+				out.records[e.Name], out.digests[e.Name] = cur, base.digests[e.Name]
 				continue
 			}
-			if cur, ok := base.records[e.Name]; ok {
-				out.records[e.Name], out.digests[e.Name] = cur, base.digests[e.Name]
-			}
 		}
+		note(p.log.Warn, "record_missing", e.Name+recordSuffix, "cell", e.Name, "epoch", e.Revision.Epoch, "counter", e.Revision.Counter)
 	}
 	if commit {
+		if err := p.saveMarks(marks, retired, sp.Revision); err != nil {
+			return nil, err
+		}
 		p.marks, p.retired, p.specMark = marks, retired, sp.Revision
 	}
 	return out, nil

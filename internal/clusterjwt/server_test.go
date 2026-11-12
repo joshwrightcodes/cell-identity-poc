@@ -48,18 +48,19 @@ func (s *syncBuffer) String() string {
 }
 
 type fixture struct {
-	t        *testing.T
-	plugin   *Plugin
-	client   *nodeattestorv1.NodeAttestorPluginClient
-	logs     *syncBuffer
-	keys     keys
-	pub      ed25519.PublicKey
-	priv     ed25519.PrivateKey
-	cfg      *configv1.ConfigServiceClient
-	base     string
-	cm       *cmDir
-	tick     chan time.Time
-	reloaded chan struct{}
+	t         *testing.T
+	plugin    *Plugin
+	client    *nodeattestorv1.NodeAttestorPluginClient
+	logs      *syncBuffer
+	keys      keys
+	pub       ed25519.PublicKey
+	priv      ed25519.PrivateKey
+	cfg       *configv1.ConfigServiceClient
+	base      string
+	marksPath string
+	cm        *cmDir
+	tick      chan time.Time
+	reloaded  chan struct{}
 	// specCounter is the counter of the spec that the fixture wrote.
 	specCounter uint64
 }
@@ -71,6 +72,8 @@ type fixtureOptions struct {
 	revoked        map[string]bool
 	// mutate changes the record of a cell before it is signed.
 	mutate func(rec *record.Cell)
+	// marks gives the plugin a marks_file in a temporary directory.
+	marks bool
 	// ticker gives the plugin a test ticker, which fixture.reload drives.
 	ticker bool
 }
@@ -144,7 +147,15 @@ trust_domain = %q
 records_dir = %q
 record_public_keys = [%q]
 `, testTrustDomain, dir, base64.StdEncoding.EncodeToString(pub))
+	if o.marks {
+		f.marksPath = filepath.Join(t.TempDir(), "marks.json")
+		hcl += fmt.Sprintf("marks_file = %q\n", f.marksPath)
+	}
+	if !o.ticker && !strings.Contains(o.extraHCL, "reload_interval") {
+		hcl += "reload_interval = \"0s\"\n"
+	}
 	f.base = hcl
+	t.Cleanup(func() { _ = p.Close() })
 	hcl += o.extraHCL + "\n"
 	_, err = cfg.Configure(context.Background(), &configv1.ConfigureRequest{
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain},
@@ -549,7 +560,7 @@ func TestReconfigureKeepsLimiterState(t *testing.T) {
 	}
 }
 
-func TestRevokedRecordWinsATie(t *testing.T) {
+func TestOnlyTheIndexedRecordOfATieLoads(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
 	k := newKeys(t)
 	for _, order := range [][2]string{{"a", "b"}, {"b", "a"}} {
@@ -576,7 +587,7 @@ func TestRevokedRecordWinsATie(t *testing.T) {
 			t.Fatal(err)
 		}
 		recs := snap.records
-		if !recs["dev-cell-1"].Revoked {
+		if len(recs) != 1 || !recs["dev-cell-1"].Revoked {
 			t.Fatalf("order %v: revoked record lost the tie", order)
 		}
 	}
