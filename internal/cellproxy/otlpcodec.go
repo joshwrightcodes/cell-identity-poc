@@ -401,7 +401,13 @@ func (c *otlpCodec) Unmarshal(data mem.BufferSlice, v any) error {
 	buf := data.MaterializeToBuffer(mem.DefaultBufferPool())
 	defer buf.Free()
 	b, drop, err := c.scanRequest(buf.ReadOnlyData(), m.ProtoReflect().Descriptor())
-	if err != nil && !errors.Is(err, errMalformed) {
+	if errors.Is(err, errMalformed) {
+		// The scan reads every level that proto.Unmarshal reads, so bad framing fails the decode too. The
+		// decode would first build every resource that the scan dropped, which costs far more than the request.
+		c.refused.Store(m, &decodeError{err})
+		return nil
+	}
+	if err != nil {
 		c.refused.Store(m, err)
 		return nil
 	}

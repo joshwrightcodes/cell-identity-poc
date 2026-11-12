@@ -311,24 +311,42 @@ func TestManagementCollectorDropsTheAlarmSeries(t *testing.T) {
 				t.Errorf("filter/alarm has error_mode %v, want propagate", lookupOr(f, "error_mode"))
 			}
 			conds := get[[]any](t, f, "metrics", "metric")
-			if len(conds) != 1 {
-				t.Fatalf("filter/alarm has the conditions %v, want one", conds)
+			if len(conds) != 2 {
+				t.Fatalf("filter/alarm has the conditions %v, want two", conds)
 			}
-			m := regexp.MustCompile(`^IsMatch\(name, "(.*)"\)$`).FindStringSubmatch(conds[0].(string))
-			if m == nil {
-				t.Fatalf("condition %q is not IsMatch(name, ...)", conds[0])
+			var res []*regexp.Regexp
+			for i, form := range []string{`^IsMatch\(name, "(.*)"\)$`, `^IsMatch\(Concat\(\[name, "_", unit\], ""\), "(.*)"\)$`} {
+				m := regexp.MustCompile(form).FindStringSubmatch(conds[i].(string))
+				if m == nil {
+					t.Fatalf("condition %d %q does not match the form %s", i, conds[i], form)
+				}
+				res = append(res, regexp.MustCompile(m[1]))
 			}
-			re := regexp.MustCompile(m[1])
-			for _, name := range []string{cellproxy.OverwriteCounterName, "cellproxy_gateway_attribute_overwrites", "cellproxy_gateway_attribute_overwrites_total",
-				"cellproxy.gateway.attribute.overwrites.total", "cellproxy/gateway/attribute/overwrites", "CellProxy:Gateway:Attribute:Overwrites_total", "cellproxy gateway attribute overwrites"} {
-				if !re.MatchString(name) {
-					t.Errorf("filter/alarm does not drop the metric %q", name)
+			// Prometheus drops a unit in braces, so the name alone matters then. Any other unit joins the name.
+			drops := func(name, unit string) bool {
+				return res[0].MatchString(name) || res[1].MatchString(name+"_"+unit)
+			}
+			// Prometheus builds the series name from the name, the unit and _total, so the filter reads the name
+			// and the unit together. Each pair below maps to cellproxy_gateway_attribute_overwrites_total.
+			for _, nu := range [][2]string{
+				{cellproxy.OverwriteCounterName, ""}, {"cellproxy_gateway_attribute_overwrites", ""}, {"cellproxy_gateway_attribute_overwrites_total", ""},
+				{"cellproxy.gateway.attribute.overwrites.total", ""}, {"cellproxy/gateway/attribute/overwrites", ""},
+				{"CellProxy:Gateway:Attribute:Overwrites_total", ""}, {"cellproxy gateway attribute overwrites", ""},
+				{"cellproxy.gateway.attribute", "overwrites"}, {"cellproxy.gateway", "attribute.overwrites"},
+				{"cellproxy", "gateway_attribute_overwrites"}, {"cellproxy.gateway.attribute", "overwrites_total"},
+				{"cellproxy\u212agateway.attribute.overwrites", ""}, {"cellproxy.gateway\u017fattribute.overwrites", ""},
+				{cellproxy.OverwriteCounterName, "{override}"},
+			} {
+				if !drops(nu[0], nu[1]) {
+					t.Errorf("filter/alarm does not drop the metric %q with the unit %q", nu[0], nu[1])
 				}
 			}
-			for _, name := range []string{"cellproxy.gateway.exports.denied", "cellproxy.gateway.attribute.overwritesx", "xcellproxy.gateway.attribute.overwrites",
-				"cellproxy.gateway.attribute", "http.server.duration"} {
-				if re.MatchString(name) {
-					t.Errorf("filter/alarm drops the unrelated metric %q", name)
+			for _, nu := range [][2]string{
+				{"cellproxy.gateway.exports.denied", ""}, {"cellproxy.gateway.attribute.overwritesx", ""}, {"xcellproxy.gateway.attribute.overwrites", ""},
+				{"cellproxy.gateway.attribute", ""}, {"http.server.duration", "s"}, {"cellproxy.gateway.attribute", "bytes"},
+			} {
+				if drops(nu[0], nu[1]) {
+					t.Errorf("filter/alarm drops the unrelated metric %q with the unit %q", nu[0], nu[1])
 				}
 			}
 		})
@@ -371,10 +389,10 @@ func checkStripRegexp(t *testing.T, what string, re *regexp.Regexp, all bool) {
 	sources := [][]string{{"k8s", "cluster", "name"}, {"platform", "plane"}, {"platform", "cell"}, {"deployment", "environment", "name"}}
 	istio := [][]string{{"source", "cluster"}, {"destination", "cluster"}}
 	for _, parts := range sources {
-		for _, sep := range []string{".", "_", "-", "/", ":", " ", "__", "/.", "@", "\u00b7"} {
+		for _, sep := range []string{".", "_", "-", "/", ":", " ", "__", "/.", "@", "\u00b7", "\u212a", "\u017f", "\u212a\u017f"} {
 			for _, edge := range []string{"", "_", ".", "-", "/", " ", ":"} {
 				key := edge + strings.Join(parts, sep) + edge
-				for _, k := range []string{key, strings.ToUpper(key)} {
+				for _, k := range []string{key, asciiUpper(key)} {
 					if !re.MatchString(k) {
 						t.Errorf("%s: the expression does not match %q", what, k)
 					}
@@ -394,6 +412,17 @@ func checkStripRegexp(t *testing.T, what string, re *regexp.Regexp, all bool) {
 			t.Errorf("%s: the expression matches the unrelated key %q", what, k)
 		}
 	}
+}
+
+// asciiUpper upper-cases ASCII letters only. strings.ToUpper turns U+212A and U+017F into K and S, which
+// are letters and not the separators that the test means.
+func asciiUpper(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' {
+			return r - 'a' + 'A'
+		}
+		return r
+	}, s)
 }
 
 // TestCollectorPolicies pins flow N11 in, and the flows out of the collector. Only the named

@@ -98,14 +98,27 @@ else
   exporter_endpoint="$UPLINK_ENDPOINT"
 fi
 
-# The five source attributes and the Istio destination label, in every flattened form. Prometheus turns
-# each character outside [a-zA-Z0-9_] into an underscore, so any run of other characters is a separator.
-RE_ALL='(?i)^[^a-z0-9]*(k8s[^a-z0-9]+cluster[^a-z0-9]+name|platform[^a-z0-9]+plane|platform[^a-z0-9]+cell|deployment[^a-z0-9]+environment[^a-z0-9]+name|source[^a-z0-9]+cluster|destination[^a-z0-9]+cluster)[^a-z0-9]*$'
-RE_SOURCE='(?i)^[^a-z0-9]*(k8s[^a-z0-9]+cluster[^a-z0-9]+name|platform[^a-z0-9]+plane|platform[^a-z0-9]+cell|deployment[^a-z0-9]+environment[^a-z0-9]+name)[^a-z0-9]*$'
-# The name of the gateway counter that raises the spoof alarm, in every form that Prometheus maps to the
-# series cellproxy_gateway_attribute_overwrites_total. The gateway sends its own metrics straight to the
-# store, so the management collector drops this name from every sender.
-RE_ALARM='(?i)^cellproxy[^a-z0-9]+gateway[^a-z0-9]+attribute[^a-z0-9]+overwrites([^a-z0-9]+total)*$'
+# ci <word> spells each letter of word as an ASCII class, so a pattern needs no (?i). Go folds case inside a
+# class under (?i), which takes U+212A and U+017F out of a negated class, and Prometheus maps both to an underscore.
+ci() {
+  local w="$1" out="" c i
+  for ((i = 0; i < ${#w}; i++)); do
+    c="${w:i:1}"
+    if [[ "$c" =~ [A-Za-z] ]]; then out+="[$(tr A-Z a-z <<<"$c")$(tr a-z A-Z <<<"$c")]"; else out+="$c"; fi
+  done
+  printf '%s' "$out"
+}
+# SEP is any character outside [A-Za-z0-9], a non-ASCII rune included. Prometheus turns each such character into an
+# underscore, so any run of them is a separator.
+SEP='[^A-Za-z0-9]'
+words() { local out="" w; for w in "$@"; do out+="${out:+$SEP+}$(ci "$w")"; done; printf '%s' "$out"; }
+# The four source attributes and the two Istio labels, in every flattened form.
+src_forms="$(words k8s cluster name)|$(words platform plane)|$(words platform cell)|$(words deployment environment name)"
+RE_ALL="^$SEP*($src_forms|$(words source cluster)|$(words destination cluster))$SEP*\$"
+RE_SOURCE="^$SEP*($src_forms)$SEP*\$"
+# The gateway counter that raises the spoof alarm. The filter reads the name and the unit joined by an underscore,
+# because Prometheus builds the series cellproxy_gateway_attribute_overwrites_total from the name, the unit and _total.
+RE_ALARM="^$(words cellproxy gateway attribute overwrites)($SEP+$(ci total))*$SEP*\$"
 
 # strip <regex> <context>... prints one statement list for each of the given contexts.
 strip() {
@@ -281,7 +294,7 @@ $(strip "$RE_ALL" resource scope log)
     error_mode: propagate
     metric_statements:
 $(strip "$RE_SOURCE" resource scope datapoint)
-$([[ "$plane" == management ]] && printf '  filter/alarm:\n    error_mode: propagate\n    metrics:\n      metric:\n        - '"'"'IsMatch(name, "%s")'"'"'' "$RE_ALARM")
+$([[ "$plane" == management ]] && printf '  filter/alarm:\n    error_mode: propagate\n    metrics:\n      metric:\n        - '"'"'IsMatch(name, "%s")'"'"'\n        - '"'"'IsMatch(Concat([name, "_", unit], ""), "%s")'"'"'' "$RE_ALARM" "$RE_ALARM")
   resource:
     attributes:
 $(resource_attributes)
@@ -355,8 +368,8 @@ collector="$(CONFIG="$config" IMAGE="$K8S_COLLECTOR_IMAGE" SUM="$(printf '%s' "$
   | (select(.kind == "StatefulSet") | .spec.template.metadata.annotations["poc.internal/collector-config-sha256"]) = strenv(SUM)' "$here/collector.yaml")"
 echo "$collector"
 
-# uplink_ingress prints the rule that admits the uplink of a cell or of dev-cp. The management gateway sends
-# its own telemetry to the store, so the management collector admits no gateway.
+# uplink_ingress prints the rule that admits the uplink of a cell or of dev-cp. In management, the collector
+# admits only COLLECTOR_SENDERS.
 uplink_ingress() {
   [[ -z "$store" ]] || return 0
   cat <<'EOF'

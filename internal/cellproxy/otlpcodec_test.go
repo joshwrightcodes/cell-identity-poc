@@ -2,7 +2,9 @@ package cellproxy
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"runtime"
 	"testing"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -390,4 +392,39 @@ func TestGatewayCountsRejectedItemsExactly(t *testing.T) {
 			t.Errorf("partial success %v, want 5 rejected records and the upstream message", ps)
 		}
 	})
+}
+
+// TestOTLPCodecDoesNotDecodeADroppedBombBeforeATruncatedTail checks that a request whose first resource the scan
+// drops, and whose tail is truncated, is refused without a decode. protobuf-go would decode the dropped resource in
+// full before it reached the tail: about 196 MiB for a request under the receive limit.
+func TestOTLPCodecDoesNotDecodeADroppedBombBeforeATruncatedTail(t *testing.T) {
+	bomb := resourceWithAttrValue(emptyValues(1_834_000))
+	if len(bomb) > MaxRecvMsgBytes {
+		t.Fatalf("the bomb has %d bytes, more than the receive limit", len(bomb))
+	}
+	wire := append(bomb, 0x0a, 0x05, 0x01)
+	c := newOTLPCodec()
+	m := &collogspb.ExportLogsServiceRequest{}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	err := c.Unmarshal(mem.BufferSlice{mem.SliceBuffer(wire)}, m)
+	runtime.ReadMemStats(&after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	refused := c.refusal(m)
+	var de *decodeError
+	if !errors.As(refused, &de) {
+		t.Fatalf("refusal %v, want a decodeError", refused)
+	}
+	if alloc := (after.TotalAlloc - before.TotalAlloc) >> 20; alloc > 16 {
+		t.Errorf("the codec allocated %d MiB for a refused request, want at most 16 MiB", alloc)
+	}
+	if n := c.decoded.Load(); n != 0 {
+		t.Errorf("the codec decoded %d requests, want none", n)
+	}
+	if n, r := mapLen(&c.dropped), mapLen(&c.refused); n != 0 || r != 0 {
+		t.Errorf("the codec holds %d drops and %d refusals", n, r)
+	}
 }

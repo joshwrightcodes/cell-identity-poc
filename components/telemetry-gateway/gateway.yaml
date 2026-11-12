@@ -71,8 +71,8 @@ spec:
                 fieldRef:
                   fieldPath: metadata.name
             # The gateway sends its own telemetry straight to the store, not through the collector. The
-            # collector drops the alarm counter of the gateway from every other sender, so no pod can forge
-            # the alarm. The resource attributes are the row that the collector sets for management.
+            # collector drops each metric whose name, joined to its unit, maps to the alarm series. The
+            # resource attributes are the row that the collector sets for management.
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.instance.id=$(POD_NAME),k8s.cluster.name=management,platform.plane=management
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
