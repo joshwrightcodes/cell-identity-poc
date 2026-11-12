@@ -140,6 +140,7 @@ type Plugin struct {
 	afterResolve func()
 	afterLoad    func()
 	afterReload  func()
+	beforeStore  func()
 	// loops counts the running reload goroutines. tickEvery is the interval in effect, in nanoseconds.
 	loops     atomic.Int32
 	tickEvery atomic.Int64
@@ -164,37 +165,54 @@ func (p *Plugin) SetLogger(l hclog.Logger) { p.log = l }
 
 // Validate checks a configuration without applying it.
 func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
-	if _, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), false); err != nil {
+	if _, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), false, nil); err != nil {
 		return &configv1.ValidateResponse{Valid: false, Notes: []string{err.Error()}}, nil
 	}
 	return &configv1.ValidateResponse{Valid: true}, nil
 }
 
-// Configure loads the signed cell records and applies the configuration.
+// maxConfigureAttempts bounds the retries of a Configure that a reload overtakes.
+const maxConfigureAttempts = 4
+
+// Configure loads the signed cell records and applies the configuration. It stores the state with a
+// compare-and-swap from the state that it loaded against, so a reload that swapped in between cannot be
+// overwritten with records that the marks have since refused. A Configure that loses retries.
 func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*configv1.ConfigureResponse, error) {
-	st, err := p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), true)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "cluster_jwt: %v", err)
+	var st *state
+	for attempt := 1; ; attempt++ {
+		old := p.st.Load()
+		var err error
+		st, err = p.build(req.GetHclConfiguration(), req.GetCoreConfiguration().GetTrustDomain(), true, old)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "cluster_jwt: %v", err)
+		}
+		if old != nil && old.rate == st.rate && old.burst == st.burst && old.maxInflight == st.maxInflight {
+			st.limit, st.gate = old.limit, old.gate
+		}
+		if p.beforeStore != nil {
+			p.beforeStore()
+		}
+		if p.st.CompareAndSwap(old, st) {
+			break
+		}
+		if attempt == maxConfigureAttempts {
+			return nil, status.Error(codes.Aborted, "cluster_jwt: the state changed during every attempt to configure")
+		}
 	}
-	if old := p.st.Load(); old != nil && old.rate == st.rate && old.burst == st.burst && old.maxInflight == st.maxInflight {
-		st.limit, st.gate = old.limit, old.gate
-	}
-	p.st.Store(st)
 	p.applyInterval(st.reloadEvery)
 	p.log.Info("configured", "env", st.env, "records", len(st.records), "reload_interval", st.reloadEvery.String())
 	return &configv1.ConfigureResponse{}, nil
 }
 
 // build parses the configuration and loads the records. Only a build with commit set raises the marks.
-func (p *Plugin) build(text, coreTrustDomain string, commit bool) (*state, error) {
+// The old state is the base of the load when the directory and the keys stay the same.
+func (p *Plugin) build(text, coreTrustDomain string, commit bool, old *state) (*state, error) {
 	st, err := p.parse(text, coreTrustDomain)
 	if err != nil {
 		return nil, err
 	}
-	// A Configure that keeps the directory and the keys loads against the current state, so the
-	// conflict rule and the kept records still apply.
 	var base *state
-	if old := p.st.Load(); commit && old != nil && old.dir == st.dir && slices.EqualFunc(old.keys, st.keys, func(a, b ed25519.PublicKey) bool { return a.Equal(b) }) {
+	if commit && old != nil && old.dir == st.dir && slices.EqualFunc(old.keys, st.keys, func(a, b ed25519.PublicKey) bool { return a.Equal(b) }) {
 		base = old
 	}
 	snap, err := p.load(st, base, commit)

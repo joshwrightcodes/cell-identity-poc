@@ -27,6 +27,8 @@ type cmDir struct {
 	t    *testing.T
 	root string
 	gen  int
+	// keepOld leaves the previous version directory in place, as kubelet does for a short time.
+	keepOld bool
 }
 
 func (d *cmDir) write(files map[string][]byte) {
@@ -62,7 +64,7 @@ func (d *cmDir) write(files map[string][]byte) {
 			}
 		}
 	}
-	if old != "" {
+	if old != "" && !d.keepOld {
 		if err := os.RemoveAll(filepath.Join(d.root, old)); err != nil {
 			d.t.Fatal(err)
 		}
@@ -468,15 +470,15 @@ func TestReloadRefusesEqualRevisionConflict(t *testing.T) {
 	f := newFixture(t, fixtureOptions{ticker: true})
 	before := f.plugin.st.Load().digests["dev-cell-2"]
 	r1, e1 := f.recordAt("dev-cell-1", 1)
-	r2, e2 := f.recordAt("dev-cell-2", 1, func(c *record.Cell) { c.Issuer = "https://other.example" })
+	r2, e2 := f.recordAt("dev-cell-2", 1, func(c *record.Cell) { c.Revoked = true })
 	f.publish(f.specAt(2, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
 	f.reload()
 	f.wantLog(`"@message":"record_conflict"`)
 	st := f.plugin.st.Load()
-	if st.digests["dev-cell-2"] != before || st.records["dev-cell-2"].Issuer == "https://other.example" {
-		t.Fatal("a second record at the same revision replaced the first")
+	if rec, ok := st.records["dev-cell-2"]; ok {
+		t.Fatalf("a record that the accepted spec does not index serves the cell (digest kept %v, revoked %v)", st.digests["dev-cell-2"] == before, rec.Revoked)
 	}
-	f.wantAttests("dev-cell-2")
+	f.wantUnknown("dev-cell-2")
 }
 
 func TestReloadKeepsRecordOnUnreadableFile(t *testing.T) {
@@ -587,6 +589,9 @@ func TestReloadRestartKeepsMarks(t *testing.T) {
 	if !strings.Contains(logs.String(), "spec_older_ignored") {
 		t.Fatalf("the replayed spec was not refused as older after the restart:\n%s", logs.String())
 	}
+	if !strings.Contains(logs.String(), f.marksPath) {
+		t.Fatalf("the refusal does not name the marks file as the source of the mark:\n%s", logs.String())
+	}
 }
 
 func TestMarksFileIsWrittenBeforeTheStateSwap(t *testing.T) {
@@ -658,21 +663,35 @@ func TestMarksFileAbsentIsAFirstStart(t *testing.T) {
 	}
 }
 
-func TestMarksFileUnwritableFailsClosed(t *testing.T) {
+// unwritable makes the directory of the marks file read-only until the test ends or restore runs.
+func (f *fixture) unwritable() (restore func()) {
+	f.t.Helper()
+	dir := filepath.Dir(f.marksPath)
+	if err := os.Chmod(dir, 0o500); err != nil {
+		f.t.Fatal(err)
+	}
+	restore = func() { _ = os.Chmod(dir, 0o700) }
+	f.t.Cleanup(restore)
+	return restore
+}
+
+func (f *fixture) cellRecord(name string) (record.Cell, bool) {
+	rec, ok := f.plugin.st.Load().records[name]
+	return rec, ok
+}
+
+// While the marks file cannot be written, a change that admits a record or raises a mark waits.
+func TestMarksUnwritableHoldsAdmissions(t *testing.T) {
 	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
 	before := f.plugin.st.Load()
 	r1, e1 := f.recordAt("dev-cell-1", 1)
 	r2, e2 := f.recordAt("dev-cell-2", 1)
 	r3, e3 := f.recordAt("dev-cell-3", 1)
 	f.publish(f.specAt(2, []envspec.Entry{e1, e2, e3}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2, "dev-cell-3": r3})
-	dir := filepath.Dir(f.marksPath)
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	f.unwritable()
 	f.reload()
 	if f.plugin.st.Load() != before {
-		t.Fatal("raised marks that could not be saved still changed the state")
+		t.Fatal("a change that admits a record changed the state although the marks could not be saved")
 	}
 	f.plugin.markMu.Lock()
 	mark := f.plugin.specMark
@@ -681,6 +700,113 @@ func TestMarksFileUnwritableFailsClosed(t *testing.T) {
 		t.Fatalf("the in-memory spec mark rose to %v although it was not saved", mark)
 	}
 	f.wantLog(`"@message":"marks_unwritable"`)
+	f.wantUnknown("dev-cell-3")
+}
+
+// Probe RR2: a revocation needs no persisted mark to be safe, so it applies, and the process keeps it
+// against a replay while the file cannot be written.
+func TestMarksUnwritableStillRevokes(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	oldR1, oldE1 := f.recordAt("dev-cell-1", 1)
+	oldR2, oldE2 := f.recordAt("dev-cell-2", 1)
+	revR1, revE1 := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Revoked = true })
+	restore := f.unwritable()
+	f.publish(f.specAt(2, []envspec.Entry{revE1, oldE2}), map[string][]byte{"dev-cell-1": revR1, "dev-cell-2": oldR2})
+	f.reload()
+	if rec, ok := f.cellRecord("dev-cell-1"); !ok || !rec.Revoked {
+		t.Fatalf("the revocation did not apply while the marks file was unwritable\n%s", f.logs.String())
+	}
+	_, err := f.attest("dev-cell-1", f.goodToken)
+	wantDenied(t, err, Revoked)
+	f.wantAttests("dev-cell-2")
+	f.wantLog(`"@message":"marks_unwritable"`)
+
+	f.publish(f.specAt(1, []envspec.Entry{oldE1, oldE2}), map[string][]byte{"dev-cell-1": oldR1, "dev-cell-2": oldR2})
+	f.reload()
+	if rec, ok := f.cellRecord("dev-cell-1"); ok && !rec.Revoked {
+		t.Fatal("a replay brought the revoked cell back while the marks file was unwritable")
+	}
+
+	restore()
+	f.publish(f.specAt(2, []envspec.Entry{revE1, oldE2}), map[string][]byte{"dev-cell-1": revR1, "dev-cell-2": oldR2})
+	f.reload()
+	if b, _ := os.ReadFile(f.marksPath); !strings.Contains(string(b), `"counter":2`) {
+		t.Fatalf("the marks were not saved after the file became writable: %s", b)
+	}
+}
+
+func TestMarksUnwritableIsLoggedOnce(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	if err := os.Remove(f.marksPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(f.marksPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	r2, e2 := f.recordAt("dev-cell-2", 1)
+	r3, e3 := f.recordAt("dev-cell-3", 1)
+	f.publish(f.specAt(2, []envspec.Entry{e1, e2, e3}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2, "dev-cell-3": r3})
+	for range 4 {
+		f.reload()
+	}
+	if n := strings.Count(f.logs.String(), `"@message":"marks_unwritable"`); n != 1 {
+		t.Fatalf("%d marks_unwritable lines in one window, want 1", n)
+	}
+}
+
+// writeMarks puts a marks file in place for the plugin of f.
+func (f *fixture) writeMarks(d marksDoc) {
+	f.t.Helper()
+	if d.Env == "" {
+		d.Env = testEnv
+	}
+	if d.KeySHA256 == "" {
+		d.KeySHA256 = keyFingerprint([]ed25519.PublicKey{f.pub})
+	}
+	b, _ := json.Marshal(d)
+	if err := os.WriteFile(f.marksPath, b, 0o600); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+func TestMarksFileCellAndRetiredMarksSurviveRestart(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	f.writeMarks(marksDoc{
+		Spec:    envspec.Revision{Epoch: 1, Counter: 1},
+		Cells:   map[string]envspec.Revision{"dev-cell-1": {Epoch: 1, Counter: 5}, "dev-cell-2": {Epoch: 1, Counter: 1}},
+		Retired: []string{"dev-cell-2"},
+	})
+	p, logs := f.restart()
+	for _, want := range []string{`"@message":"record_older_ignored"`, `"@message":"record_retired"`} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("log lacks %s:\n%s", want, logs.String())
+		}
+	}
+	if n := len(p.st.Load().records); n != 0 {
+		t.Fatalf("%d records served below the persisted marks", n)
+	}
+}
+
+func TestMarksFileOfAnotherEnvOrKeyFailsClosed(t *testing.T) {
+	for name, d := range map[string]marksDoc{
+		"other_env": {Env: "prod"},
+		"other_key": {KeySHA256: strings.Repeat("ab", 32)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{marks: true})
+			d.Spec = envspec.Revision{Epoch: 1, Counter: 1}
+			d.Cells = map[string]envspec.Revision{}
+			f.writeMarks(d)
+			p, logs := f.restart()
+			if n := len(p.st.Load().records); n != 0 {
+				t.Fatalf("%d records served with a marks file of another environment or key", n)
+			}
+			if l := logs.String(); !strings.Contains(l, `"@message":"marks_foreign"`) || !strings.Contains(l, f.marksPath) {
+				t.Fatalf("no marks_foreign line with the path:\n%s", l)
+			}
+		})
+	}
 }
 
 func TestMarksFileEmptyWarnsOnce(t *testing.T) {
@@ -712,8 +838,8 @@ func TestConfigureReloadsAgainstTheCurrentState(t *testing.T) {
 		r2, e2 := f.recordAt("dev-cell-2", 1, func(c *record.Cell) { c.Issuer = "https://other.example" })
 		f.publish(f.specAt(2, []envspec.Entry{e1, e2}), map[string][]byte{"dev-cell-1": r1, "dev-cell-2": r2})
 		f.reconfigure(t, `challenge_timeout = "9s"`)
-		if got := f.plugin.st.Load().digests["dev-cell-2"]; got != want {
-			t.Fatal("a Configure accepted a record that conflicts at an equal revision")
+		if got, ok := f.plugin.st.Load().digests["dev-cell-2"]; ok {
+			t.Fatalf("a Configure kept or accepted a record that conflicts at an equal revision (kept original %v)", got == want)
 		}
 	})
 }
@@ -911,4 +1037,114 @@ func TestLoadReadsFilesWithoutHoldingTheMarksLock(t *testing.T) {
 	if !free {
 		t.Fatal("the load held the marks lock while it read the directory")
 	}
+}
+
+// Probe RR4: a Configure that resolved the old ConfigMap version while a reload applied a revocation
+// must not store records below the persisted marks, and a later replay must not bring them back.
+func TestConfigureDuringReloadKeepsTheRevocation(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	f.cm.keepOld = true
+	oldR1, oldE1 := f.recordAt("dev-cell-1", 1)
+	oldR2, oldE2 := f.recordAt("dev-cell-2", 1)
+	revR1, revE1 := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Revoked = true })
+	f.plugin.afterResolve = func() {
+		f.plugin.afterResolve = nil
+		f.publish(f.specAt(2, []envspec.Entry{revE1, oldE2}), map[string][]byte{"dev-cell-1": revR1, "dev-cell-2": oldR2})
+		f.plugin.reload()
+	}
+	f.reconfigure(t, `challenge_timeout = "9s"`)
+	f.plugin.afterResolve = nil
+	if rec, ok := f.cellRecord("dev-cell-1"); ok && !rec.Revoked {
+		t.Fatalf("Configure stored a record below the persisted mark\n%s", f.logs.String())
+	}
+	for range 3 {
+		f.publish(f.specAt(1, []envspec.Entry{oldE1, oldE2}), map[string][]byte{"dev-cell-1": oldR1, "dev-cell-2": oldR2})
+		f.reload()
+	}
+	if rec, ok := f.cellRecord("dev-cell-1"); ok && !rec.Revoked {
+		t.Fatal("a replayed spec kept the stale record in place")
+	}
+	f.wantUnknownOrRevoked("dev-cell-1")
+}
+
+func (f *fixture) wantUnknownOrRevoked(cell string) {
+	f.t.Helper()
+	if _, err := f.attest(cell, f.goodToken); err == nil {
+		f.t.Fatalf("%s attests", cell)
+	}
+}
+
+// A reload that swaps its state in after a Configure loaded, and before the Configure stores, must not
+// be overwritten by the older load of that Configure.
+func TestConfigureThatLosesTheSwapRetries(t *testing.T) {
+	f := newFixture(t, fixtureOptions{ticker: true, marks: true})
+	oldR2, oldE2 := f.recordAt("dev-cell-2", 1)
+	revR1, revE1 := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Revoked = true })
+	calls := 0
+	f.plugin.beforeStore = func() {
+		calls++
+		if calls == 1 {
+			f.publish(f.specAt(2, []envspec.Entry{revE1, oldE2}), map[string][]byte{"dev-cell-1": revR1, "dev-cell-2": oldR2})
+			f.plugin.reload()
+		}
+	}
+	f.reconfigure(t, `challenge_timeout = "9s"`)
+	f.plugin.beforeStore = nil
+	rec, ok := f.cellRecord("dev-cell-1")
+	if !ok || !rec.Revoked {
+		t.Fatalf("a Configure overwrote the state that a reload swapped in (present %v)\n%s", ok, f.logs.String())
+	}
+	if calls != 2 {
+		t.Fatalf("the Configure stored after %d attempts, want 2", calls)
+	}
+	if f.plugin.st.Load().timeout != 9*time.Second {
+		t.Fatal("the retried Configure lost its settings")
+	}
+}
+
+// A Configure that runs after a reload loaded and raised the marks, but before that reload swapped its
+// state, finds a base below the marks. A replayed older spec then leaves nothing to repair it, so the
+// base must be filtered against the marks.
+func TestConfigureBaseBelowMarksIsNotKept(t *testing.T) {
+	setup := func(t *testing.T) (f *fixture, replay func()) {
+		f = newFixture(t, fixtureOptions{ticker: true, marks: true})
+		oldR1, oldE1 := f.recordAt("dev-cell-1", 1)
+		oldR2, oldE2 := f.recordAt("dev-cell-2", 1)
+		replay = func() {
+			f.publish(f.specAt(1, []envspec.Entry{oldE1, oldE2}), map[string][]byte{"dev-cell-1": oldR1, "dev-cell-2": oldR2})
+		}
+		return f, replay
+	}
+	run := func(t *testing.T, f *fixture, replay func()) {
+		calls := 0
+		f.plugin.afterLoad = func() {
+			calls++
+			if calls == 1 {
+				replay()
+				f.reconfigure(t, `challenge_timeout = "9s"`)
+			}
+		}
+		f.reload()
+		f.plugin.afterLoad = nil
+	}
+	t.Run("revoked_cell", func(t *testing.T) {
+		f, replay := setup(t)
+		revR1, revE1 := f.recordAt("dev-cell-1", 2, func(c *record.Cell) { c.Revoked = true })
+		r2, e2 := f.recordAt("dev-cell-2", 1)
+		f.publish(f.specAt(2, []envspec.Entry{revE1, e2}), map[string][]byte{"dev-cell-1": revR1, "dev-cell-2": r2})
+		run(t, f, replay)
+		if rec, ok := f.cellRecord("dev-cell-1"); ok && !rec.Revoked {
+			t.Fatalf("a record below the persisted mark serves the cell\n%s", f.logs.String())
+		}
+	})
+	t.Run("retired_cell", func(t *testing.T) {
+		f, replay := setup(t)
+		r1, e1 := f.recordAt("dev-cell-1", 1)
+		_, e2 := f.recordAt("dev-cell-2", 1)
+		f.publish(f.specAt(2, []envspec.Entry{e1}, envspec.Retired{Name: "dev-cell-2", Revision: e2.Revision}), map[string][]byte{"dev-cell-1": r1})
+		run(t, f, replay)
+		if _, ok := f.cellRecord("dev-cell-2"); ok {
+			t.Fatalf("a retired cell serves again\n%s", f.logs.String())
+		}
+	})
 }

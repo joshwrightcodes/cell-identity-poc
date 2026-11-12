@@ -2,6 +2,9 @@ package clusterjwt
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +20,26 @@ import (
 
 // marksDoc is the content of the marks file.
 type marksDoc struct {
-	Spec    envspec.Revision            `json:"spec"`
-	Cells   map[string]envspec.Revision `json:"cells"`
-	Retired []string                    `json:"retired"`
+	Env       string                      `json:"env"`
+	KeySHA256 string                      `json:"keySHA256"`
+	Spec      envspec.Revision            `json:"spec"`
+	Cells     map[string]envspec.Revision `json:"cells"`
+	Retired   []string                    `json:"retired"`
+}
+
+// keyFingerprint returns the lowercase hex SHA-256 of the pinned keys, joined in order.
+func keyFingerprint(keys []ed25519.PublicKey) string {
+	h := sha256.New()
+	for _, k := range keys {
+		h.Write(k)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (d marksDoc) validate() error {
+	if d.Env == "" || len(d.KeySHA256) != 64 {
+		return errors.New("marks file needs an env and a key fingerprint")
+	}
 	if d.Spec.Epoch < 1 || d.Spec.Counter < 1 {
 		return errors.New("spec mark needs an epoch and a counter of at least 1")
 	}
@@ -68,7 +85,8 @@ func readMarks(path string) (marksDoc, error) {
 // anything. It reports false when the file exists and cannot be used, so the caller serves no record
 // until an operator acts. An absent file is a first start. An empty path keeps the marks in memory.
 // The caller holds markMu.
-func (p *Plugin) ensureMarks(path string, note func(func(string, ...any), string, string, ...any)) bool {
+func (p *Plugin) ensureMarks(cfg *state, note func(func(string, ...any), string, string, ...any)) bool {
+	path := cfg.marksFile
 	if p.marksReady {
 		if path != p.marksPath {
 			note(p.log.Warn, "marks_file_ignored", path, "reason", "the marks file is set by the first Configure")
@@ -92,6 +110,10 @@ func (p *Plugin) ensureMarks(path string, note func(func(string, ...any), string
 		note(p.log.Error, "marks_unreadable", path, "reason", err.Error())
 		return false
 	}
+	if doc.Env != cfg.env || doc.KeySHA256 != keyFingerprint(cfg.keys) {
+		note(p.log.Error, "marks_foreign", path, "reason", "the marks file belongs to another environment or record key pin", "marks_env", doc.Env)
+		return false
+	}
 	p.marksReady, p.marksPath = true, path
 	p.specMark = doc.Spec
 	p.marks = maps.Clone(doc.Cells)
@@ -108,14 +130,14 @@ func (p *Plugin) ensureMarks(path string, note func(func(string, ...any), string
 // saveMarks writes the marks before the caller adopts them, so a state that serves attestation never
 // has a mark that a restart could lose. The sequence is a temporary file with mode 0600, a sync, a
 // rename and a sync of the directory. It writes only when a mark changed. The caller holds markMu.
-func (p *Plugin) saveMarks(marks map[string]envspec.Revision, retired map[string]bool, spec envspec.Revision) error {
+func (p *Plugin) saveMarks(cfg *state, marks map[string]envspec.Revision, retired map[string]bool, spec envspec.Revision) error {
 	if p.marksPath == "" {
 		return nil
 	}
 	if !p.marksDirty && spec == p.specMark && maps.Equal(marks, p.marks) && maps.Equal(retired, p.retired) {
 		return nil
 	}
-	doc := marksDoc{Spec: spec, Cells: marks, Retired: slices.Sorted(maps.Keys(retired))}
+	doc := marksDoc{Env: cfg.env, KeySHA256: keyFingerprint(cfg.keys), Spec: spec, Cells: marks, Retired: slices.Sorted(maps.Keys(retired))}
 	if err := writeFileAtomic(p.marksPath, doc); err != nil {
 		return fmt.Errorf("%w: %v", errMarksWrite, err)
 	}

@@ -124,7 +124,8 @@ func clipString(s string) string {
 
 // logLimited logs a fault that repeats on every tick, once for each window and reason.
 func (p *Plugin) logLimited(level func(string, ...any), msg, reason string, kv ...any) {
-	_, ok, suppressed, _ := p.lim.Allow(msg + "|" + clipString(reason))
+	// The key holds only the message: the reason can carry text that changes on each attempt.
+	_, ok, suppressed, _ := p.lim.Allow(msg)
 	if !ok {
 		return
 	}
@@ -301,9 +302,10 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 		}
 	}
 
-	if commit && !p.ensureMarks(cfg.marksFile, note) {
+	if commit && !p.ensureMarks(cfg, note) {
 		return emptySnapshot(), nil
 	}
+	base = p.aboveMarks(base)
 	if raw.specAbsent {
 		note(p.log.Warn, "spec_absent", specFile)
 		return emptySnapshot(), nil
@@ -318,7 +320,7 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 		return keepOf(base), nil
 	case sp.Revision.Compare(p.specMark) < 0:
 		note(p.log.Warn, "spec_older_ignored", specFile, "spec_epoch", sp.Revision.Epoch, "spec_counter", sp.Revision.Counter,
-			"mark_epoch", p.specMark.Epoch, "mark_counter", p.specMark.Counter)
+			"mark_epoch", p.specMark.Epoch, "mark_counter", p.specMark.Counter, "mark_source", p.markSource())
 		return keepOf(base), nil
 	}
 
@@ -395,7 +397,10 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 			continue
 		}
 		if base != nil {
-			if cur, ok := base.records[e.Name]; ok && envspec.RecordRevision(cur).Compare(e.Revision) >= 0 {
+			// The kept record must be the one that the entry names, or a newer one.
+			cur, ok := base.records[e.Name]
+			c := envspec.RecordRevision(cur).Compare(e.Revision)
+			if ok && (c > 0 || (c == 0 && base.digests[e.Name] == e.RecordSHA256)) {
 				out.records[e.Name], out.digests[e.Name] = cur, base.digests[e.Name]
 				continue
 			}
@@ -403,10 +408,78 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 		note(p.log.Warn, "record_missing", e.Name+recordSuffix, "cell", e.Name, "epoch", e.Revision.Epoch, "counter", e.Revision.Counter)
 	}
 	if commit {
-		if err := p.saveMarks(marks, retired, sp.Revision); err != nil {
-			return nil, err
+		if err := p.saveMarks(cfg, marks, retired, sp.Revision); err != nil {
+			narrowed, held := narrow(base, out)
+			if narrowed == nil {
+				return nil, err
+			}
+			p.logLimited(p.log.Error, "marks_unwritable", err.Error())
+			if !held {
+				// Nothing waits, so the process keeps the raised marks and refuses a replay. The file
+				// stays behind until a save succeeds.
+				p.marks, p.retired, p.specMark, p.marksDirty = marks, retired, sp.Revision, true
+			}
+			return narrowed, nil
 		}
 		p.marks, p.retired, p.specMark = marks, retired, sp.Revision
 	}
 	return out, nil
+}
+
+// markSource names where the spec mark comes from, for the log of a refused spec.
+func (p *Plugin) markSource() string {
+	if p.marksPath == "" {
+		return "memory"
+	}
+	return "marks_file " + p.marksPath
+}
+
+// aboveMarks returns base without the records that the persisted marks refuse: a record below the mark
+// of its cell, or at the mark of a retired cell. A Configure or reload that read its base before another
+// load raised the marks would otherwise serve them again. The caller holds markMu.
+func (p *Plugin) aboveMarks(base *state) *state {
+	if base == nil {
+		return nil
+	}
+	var drop []string
+	for name, rec := range base.records {
+		c := envspec.RecordRevision(rec).Compare(p.marks[name])
+		if c < 0 || (c == 0 && p.retired[name]) {
+			drop = append(drop, name)
+		}
+	}
+	if len(drop) == 0 {
+		return base
+	}
+	out := *base
+	out.records, out.digests = maps.Clone(base.records), maps.Clone(base.digests)
+	for _, name := range drop {
+		delete(out.records, name)
+		delete(out.digests, name)
+	}
+	return &out
+}
+
+// narrow keeps the part of a load that cannot admit anything new, for the case that the marks cannot
+// be saved: a record that stays as it is, a revoked record, and a dropped cell. A cell whose new record
+// would admit something keeps its record from base. held reports that such a cell exists. It returns
+// nil when base is nil, because then the whole load admits.
+func narrow(base *state, out *snapshot) (res *snapshot, held bool) {
+	if base == nil {
+		return nil, false
+	}
+	res = emptySnapshot()
+	res.spec = out.spec
+	for name, rec := range out.records {
+		d := out.digests[name]
+		if bd, ok := base.digests[name]; (ok && bd == d) || rec.Revoked {
+			res.records[name], res.digests[name] = rec, d
+			continue
+		}
+		held = true
+		if b, ok := base.records[name]; ok {
+			res.records[name], res.digests[name] = b, base.digests[name]
+		}
+	}
+	return res, held
 }
