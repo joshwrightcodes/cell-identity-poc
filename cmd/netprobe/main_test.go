@@ -33,7 +33,16 @@ func TestScanFindsOpenPort(t *testing.T) {
 	}
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
+	// Other tests of the same run open ports on the loopback address, so the neighbours of port may be open too.
+	// The range scan checks that port is found and that the result is in order. The single-port scan is exact.
 	got, err := scan(context.Background(), "127.0.0.1", port-2, port+2, 300*time.Millisecond, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(got, port) || !slices.IsSorted(got) {
+		t.Errorf("open = %v, want an ordered list that holds %d", got, port)
+	}
+	got, err = scan(context.Background(), "127.0.0.1", port, port, 300*time.Millisecond, 8)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -3,14 +3,11 @@
 package e2e
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +18,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 const (
@@ -699,13 +698,9 @@ subjects:
 // gone, and fails when one stays.
 func repairGuardObjects(t *testing.T, cell string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m3-repair.sh")
-	cmd.Env = append(os.Environ(), "GATE_M3_CELLS="+cell)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Errorf("gate-m3-repair.sh in %s: %v\n%s", cell, err, out)
+	res, err := cmdrun.Run(5*time.Minute, "", []string{"GATE_M3_CELLS=" + cell}, "bash", "../../scripts/gate-m3-repair.sh")
+	if err != nil || res.Code != 0 {
+		t.Errorf("gate-m3-repair.sh in %s: %v, exit %d\n%s%s", cell, err, res.Code, res.Stdout, res.Stderr)
 	}
 	if left, lerr := kubectl(t, cell, "", "get", "roles,rolebindings,clusterroles,clusterrolebindings,namespaces,serviceaccounts", "-A",
 		"-l", "poc.internal/test", "-o", "name"); lerr != nil || strings.TrimSpace(left) != "" {

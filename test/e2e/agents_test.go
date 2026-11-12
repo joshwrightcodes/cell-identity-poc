@@ -594,12 +594,8 @@ func TestM3AgentsSurviveKeyRotation(t *testing.T) {
 		requireViewConnected(t, agentName(cell))
 	}
 	since := time.Now()
-	cmd := exec.Command("mise", "run", "view:rotate-keys")
-	cmd.Dir = "../.."
-	var stderr lockedBuffer
-	cmd.Stderr = &stderr
-	if _, err := cmd.Output(); err != nil {
-		t.Fatalf("view:rotate-keys: %v\n%s", err, stderr.String())
+	if _, stderr, code := runMiseBounded(t, miseRotateMax, "", "view:rotate-keys"); code != 0 {
+		t.Fatalf("view:rotate-keys exited with %d\n%s", code, stderr)
 	}
 	waitAgentsConnected(t, since)
 }

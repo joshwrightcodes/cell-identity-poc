@@ -11,8 +11,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
-	"os/exec"
 	"slices"
 	"strconv"
 	"strings"
@@ -30,6 +28,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 const (
@@ -1029,25 +1029,22 @@ func TestM3WorkloadAPIOwnSVIDOnly(t *testing.T) {
 // 401 and the password in Secret grafana-admin gets 200.
 func TestM3GrafanaPasswordRotates(t *testing.T) {
 	old := grafanaPassword(t)
-	cmd := exec.Command("mise", "run", "obs:rotate-password")
-	cmd.Dir = "../.."
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("mise run obs:rotate-password: %v\nstdout: %s\nstderr: %s", err, stdout.String(), stderr.String())
+	stdout, stderr, code := runMiseBounded(t, miseRotateMax, "", "obs:rotate-password")
+	if code != 0 {
+		t.Fatalf("mise run obs:rotate-password exited with %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
 	var res struct{ Rotated bool }
-	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &res); err != nil || !res.Rotated {
-		t.Fatalf("obs:rotate-password printed %q, want one JSON line with rotated true", stdout.String())
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &res); err != nil || !res.Rotated {
+		t.Fatalf("obs:rotate-password printed %q, want one JSON line with rotated true", stdout)
 	}
-	if strings.Contains(stdout.String()+stderr.String(), old) {
+	if strings.Contains(stdout+stderr, old) {
 		t.Errorf("the output of obs:rotate-password holds the old password")
 	}
 	fresh := grafanaPassword(t)
 	if fresh == old || len(fresh) != 32 {
 		t.Fatalf("Secret grafana-admin holds a password of length %d that equals the old one: %v", len(fresh), fresh == old)
 	}
-	if strings.Contains(stdout.String()+stderr.String(), fresh) {
+	if strings.Contains(stdout+stderr, fresh) {
 		t.Errorf("the output of obs:rotate-password holds the new password")
 	}
 	// A client-side apply would copy the password into this annotation.
@@ -1073,25 +1070,20 @@ func TestM3GrafanaRestoreCommand(t *testing.T) {
 	if code, out := grafanaCall(t, "admin:"+secretPW, "PUT", "/api/user/password", string(body)); code != 200 {
 		t.Fatalf("PUT /api/user/password answers HTTP %d: %s", code, out)
 	}
-	show := exec.Command("bash", "scripts/obs-rotate-password.sh", "--restore-command")
-	show.Dir = "../.."
-	show.Env = append(os.Environ(), "CELL=management")
-	command, err := show.Output()
-	if err != nil {
-		t.Fatalf("obs-rotate-password.sh --restore-command: %v", err)
+	show, err := cmdrun.Run(time.Minute, "../..", []string{"CELL=management"}, "bash", "scripts/obs-rotate-password.sh", "--restore-command")
+	if err != nil || show.Code != 0 {
+		t.Fatalf("obs-rotate-password.sh --restore-command: %v, exit %d\n%s", err, show.Code, show.Stderr)
 	}
-	restore := exec.Command("bash", "-c", strings.TrimSpace(string(command)))
-	restore.Dir = "../.."
-	var out bytes.Buffer
-	restore.Stdout, restore.Stderr = &out, &out
-	if err := restore.Run(); err != nil {
-		t.Fatalf("the restore command failed: %v\n%s", err, out.String())
+	restore, err := cmdrun.Run(miseRotateMax, "../..", nil, "bash", "-c", strings.TrimSpace(show.Stdout))
+	if err != nil || restore.Code != 0 {
+		t.Fatalf("the restore command failed: %v, exit %d\n%s%s", err, restore.Code, restore.Stdout, restore.Stderr)
 	}
-	if strings.Contains(out.String(), secretPW) || strings.Contains(out.String(), other) {
+	out := restore.Stdout + restore.Stderr
+	if strings.Contains(out, secretPW) || strings.Contains(out, other) {
 		t.Errorf("the output of the restore command holds a password")
 	}
 	if code, _ := grafanaCall(t, "admin:"+secretPW, "GET", "/api/user", ""); code != 200 {
-		t.Errorf("after the restore, the Secret password gets HTTP %d, want 200\n%s", code, out.String())
+		t.Errorf("after the restore, the Secret password gets HTTP %d, want 200\n%s", code, out)
 	}
 }
 

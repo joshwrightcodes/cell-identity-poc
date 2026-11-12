@@ -3,14 +3,13 @@
 package e2e
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
-	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 // statusAttemptMax bounds one run of a mise task in this file. harness:status takes about 2 minutes.
@@ -22,27 +21,29 @@ const statusSampleMax = 5 * time.Minute
 // statusRetryWindow is how long TestM3StatusHealthy waits for a healthy status.
 const statusRetryWindow = 10 * time.Minute
 
-// runMise runs a mise task in the repository root, with CELL set when cell is not empty. It returns the
-// standard output, the standard error and the exit status.
+// miseRotateMax bounds the tasks that rotate a key or a password. Each one restarts workloads and waits for them.
+const miseRotateMax = 10 * time.Minute
+
+// runMiseBounded runs a mise task in the repository root under limit, with CELL set when cell is not empty. It ends
+// the whole process group of the task when the limit passes, and fails the test then. It returns the standard output,
+// the standard error and the exit status.
+func runMiseBounded(t *testing.T, limit time.Duration, cell string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	var env []string
+	if cell != "" {
+		env = []string{"CELL=" + cell}
+	}
+	res, err := cmdrun.Run(limit, "../..", env, "mise", append([]string{"run"}, args...)...)
+	if err != nil {
+		t.Fatalf("mise run %s: %v\nstdout: %s\nstderr: %s", strings.Join(args, " "), err, res.Stdout, res.Stderr)
+	}
+	return res.Stdout, res.Stderr, res.Code
+}
+
+// runMise runs a mise task for at most statusAttemptMax.
 func runMise(t *testing.T, cell string, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), statusAttemptMax)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "mise", append([]string{"run"}, args...)...)
-	cmd.Dir = "../.."
-	cmd.Env = append(cmd.Environ(), "CELL="+cell)
-	if cell == "" {
-		cmd.Env = cmd.Environ()
-	}
-	var out, errBuf lockedBuffer
-	cmd.Stdout, cmd.Stderr = &out, &errBuf
-	err := cmd.Run()
-	if ee := (*exec.ExitError)(nil); errors.As(err, &ee) {
-		code = ee.ExitCode()
-	} else if err != nil {
-		t.Fatalf("mise run %s: %v (the limit is %s)", strings.Join(args, " "), err, statusAttemptMax)
-	}
-	return out.String(), errBuf.String(), code
+	return runMiseBounded(t, statusAttemptMax, cell, args...)
 }
 
 // statusObject is the part of one object of harness:status that the test reads.

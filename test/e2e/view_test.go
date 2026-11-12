@@ -17,7 +17,6 @@ import (
 	"math/big"
 	"net"
 	"net/url"
-	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -506,16 +505,12 @@ func TestM3ViewKeysRotate(t *testing.T) {
 		before[n] = secretSum(t, n)
 	}
 	principalUID, serverUID := podUID(t, principalName), podUID(t, "argocd-server")
-	cmd := exec.Command("mise", "run", "view:rotate-keys")
-	cmd.Dir = "../.."
-	var stderr lockedBuffer
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("view:rotate-keys: %v\n%s", err, stderr.String())
+	out, stderr, code := runMiseBounded(t, miseRotateMax, "", "view:rotate-keys")
+	if code != 0 {
+		t.Fatalf("view:rotate-keys exited with %d\n%s", code, stderr)
 	}
 	// mise prints its own lines on standard error, so standard output is the data line alone.
-	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	lines := strings.Split(strings.TrimSpace(out), "\n")
 	var res struct{ Restarted []string }
 	if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &res) != nil || len(res.Restarted) != 4 {
 		t.Fatalf("view:rotate-keys printed %q, want one JSON line with four restarted workloads", out)
