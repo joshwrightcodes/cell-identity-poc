@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 )
 
 // collectorClusters are the clusters that run the collector, with the plane and the scrape jobs that
@@ -225,8 +227,12 @@ func TestCollectorRender(t *testing.T) {
 			pipes := get[map[string]any](t, conf, "service", "pipelines")
 			for name, p := range map[string]string{"traces": "transform/otlp", "logs": "transform/otlp", "metrics": "transform/otlp", "metrics/scrape": "transform/scrape"} {
 				got := fmt.Sprint(lookupOr(pipes[name], "processors"))
-				if got != "[memory_limiter "+p+" resource]" {
-					t.Errorf("pipeline %s runs %s, want [memory_limiter %s resource]", name, got, p)
+				want := "[memory_limiter " + p + " resource]"
+				if cl.name == "management" && strings.HasPrefix(name, "metrics") {
+					want = "[memory_limiter filter/alarm " + p + " resource]"
+				}
+				if got != want {
+					t.Errorf("pipeline %s runs %s, want %s", name, got, want)
 				}
 				if fmt.Sprint(lookupOr(pipes[name], "exporters")) != "[otlp_grpc]" {
 					t.Errorf("pipeline %s exports to %v", name, lookupOr(pipes[name], "exporters"))
@@ -283,6 +289,52 @@ func TestCollectorRender(t *testing.T) {
 	}
 }
 
+// TestManagementCollectorDropsTheAlarmSeries checks that the management collector drops every metric whose name maps
+// to the series of the spoof alarm, and that no other collector has the filter. The gateway sends its own metrics
+// straight to the store, so it never passes this filter.
+func TestManagementCollectorDropsTheAlarmSeries(t *testing.T) {
+	for _, cl := range collectorClusters {
+		t.Run(cl.name, func(t *testing.T) {
+			conf := collectorConfig(t, clusterComponent(t, cl.name, "observability-system"))
+			procs := get[map[string]any](t, conf, "processors")
+			f, ok := procs["filter/alarm"]
+			if cl.name != "management" {
+				if ok {
+					t.Errorf("the collector of %s has the processor filter/alarm", cl.name)
+				}
+				return
+			}
+			if !ok {
+				t.Fatal("the management collector has no processor filter/alarm")
+			}
+			if get[string](t, f, "error_mode") != "propagate" {
+				t.Errorf("filter/alarm has error_mode %v, want propagate", lookupOr(f, "error_mode"))
+			}
+			conds := get[[]any](t, f, "metrics", "metric")
+			if len(conds) != 1 {
+				t.Fatalf("filter/alarm has the conditions %v, want one", conds)
+			}
+			m := regexp.MustCompile(`^IsMatch\(name, "(.*)"\)$`).FindStringSubmatch(conds[0].(string))
+			if m == nil {
+				t.Fatalf("condition %q is not IsMatch(name, ...)", conds[0])
+			}
+			re := regexp.MustCompile(m[1])
+			for _, name := range []string{cellproxy.OverwriteCounterName, "cellproxy_gateway_attribute_overwrites", "cellproxy_gateway_attribute_overwrites_total",
+				"cellproxy.gateway.attribute.overwrites.total", "cellproxy/gateway/attribute/overwrites", "CellProxy:Gateway:Attribute:Overwrites_total", "cellproxy gateway attribute overwrites"} {
+				if !re.MatchString(name) {
+					t.Errorf("filter/alarm does not drop the metric %q", name)
+				}
+			}
+			for _, name := range []string{"cellproxy.gateway.exports.denied", "cellproxy.gateway.attribute.overwritesx", "xcellproxy.gateway.attribute.overwrites",
+				"cellproxy.gateway.attribute", "http.server.duration"} {
+				if re.MatchString(name) {
+					t.Errorf("filter/alarm drops the unrelated metric %q", name)
+				}
+			}
+		})
+	}
+}
+
 // rowOfCluster returns the resource attributes that the collector of a cluster sets, in order.
 func rowOfCluster(cluster string) []string {
 	switch cluster {
@@ -319,8 +371,8 @@ func checkStripRegexp(t *testing.T, what string, re *regexp.Regexp, all bool) {
 	sources := [][]string{{"k8s", "cluster", "name"}, {"platform", "plane"}, {"platform", "cell"}, {"deployment", "environment", "name"}}
 	istio := [][]string{{"source", "cluster"}, {"destination", "cluster"}}
 	for _, parts := range sources {
-		for _, sep := range []string{".", "_", "-"} {
-			for _, edge := range []string{"", "_", ".", "-"} {
+		for _, sep := range []string{".", "_", "-", "/", ":", " ", "__", "/.", "@", "\u00b7"} {
+			for _, edge := range []string{"", "_", ".", "-", "/", " ", ":"} {
 				key := edge + strings.Join(parts, sep) + edge
 				for _, k := range []string{key, strings.ToUpper(key)} {
 					if !re.MatchString(k) {
@@ -337,7 +389,7 @@ func checkStripRegexp(t *testing.T, what string, re *regexp.Regexp, all bool) {
 			}
 		}
 	}
-	for _, k := range []string{"platform.cellar", "k8s.cluster.names", "pod", "namespace", "service.name", "xplatform.cell", "k8s.cluster"} {
+	for _, k := range []string{"platform.cellar", "k8s.cluster.names", "pod", "namespace", "service.name", "xplatform.cell", "k8s.cluster", "platformcell", "platform/cellar", "9platform.cell"} {
 		if re.MatchString(k) {
 			t.Errorf("%s: the expression matches the unrelated key %q", what, k)
 		}
@@ -353,31 +405,45 @@ func TestCollectorPolicies(t *testing.T) {
 		t.Run(cl.name, func(t *testing.T) {
 			objs := clusterComponent(t, cl.name, "observability-system")
 			senders := strings.Fields(cellEnv(t, cl.name, "COLLECTOR_SENDERS"))
-			sender := "otel-uplink"
 			target := "otel-uplink 4319"
 			if cl.name == "management" {
-				sender, target = "telemetry-gateway", "lgtm 4317"
+				target = "lgtm 4317"
 			}
 			col := objs["NetworkPolicy observability-system/collector"]
 			if fmt.Sprint(lookupOr(col, "spec", "podSelector", "matchLabels")) != "map[app.kubernetes.io/name:otel-collector]" || fmt.Sprint(lookupOr(col, "spec", "policyTypes")) != "[Ingress]" {
 				t.Fatalf("the collector policy selects %v", lookupOr(col, "spec", "podSelector"))
 			}
 			in := peerRules(t, col, "ingress")
-			if len(in) != 4 {
-				t.Fatalf("the collector admits %d rules, want 4: %v", len(in), in)
+			// The management gateway sends its own telemetry to the store, so only a cell or dev-cp
+			// collector admits an uplink.
+			wantRules := 4
+			if cl.name == "management" {
+				wantRules = 3
+			}
+			if len(in) != wantRules {
+				t.Fatalf("the collector admits %d rules, want %d: %v", len(in), wantRules, in)
 			}
 			ns := "[map[namespaceSelector:map[matchExpressions:[map[key:kubernetes.io/metadata.name operator:In values:[" + strings.Join(senders, " ") + "]]]]]] 4317"
 			if in[0].String() != ns {
 				t.Errorf("rule 0 is %q, want %q", in[0], ns)
 			}
-			if want := "[map[podSelector:map[matchLabels:map[app.kubernetes.io/name:" + sender + "]]]] 4317"; in[1].String() != want {
-				t.Errorf("rule 1 is %q, want %q", in[1], want)
+			rest := in[1:]
+			if cl.name != "management" {
+				if want := "[map[podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-uplink]]]] 4317"; in[1].String() != want {
+					t.Errorf("rule 1 is %q, want %q", in[1], want)
+				}
+				rest = in[2:]
 			}
-			if want := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:bundle-store]]]] 4318"; in[2].String() != want {
-				t.Errorf("rule 2 is %q, want %q", in[2], want)
+			if want := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:bundle-store]]]] 4318"; rest[0].String() != want {
+				t.Errorf("the bundle store rule is %q, want %q", rest[0], want)
 			}
-			if !strings.HasPrefix(in[3].String(), "[map[ipBlock:map[cidr:") || !strings.HasSuffix(in[3].String(), "/32]]] 4317") {
-				t.Errorf("rule 3 is %q, want node addresses on 4317", in[3])
+			if !strings.HasPrefix(rest[1].String(), "[map[ipBlock:map[cidr:") || !strings.HasSuffix(rest[1].String(), "/32]]] 4317") {
+				t.Errorf("the node rule is %q, want node addresses on 4317", rest[1])
+			}
+			for _, r := range in {
+				if strings.Contains(r.peers, "telemetry-gateway") {
+					t.Errorf("the collector admits the gateway: %q", r)
+				}
 			}
 			for _, r := range in {
 				if strings.Contains(r.peers, "namespaceSelector:map[]") || strings.Contains(r.peers, "podSelector:map[]") {

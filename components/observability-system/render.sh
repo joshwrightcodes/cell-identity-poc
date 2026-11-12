@@ -98,9 +98,14 @@ else
   exporter_endpoint="$UPLINK_ENDPOINT"
 fi
 
-# The five source attributes and the Istio destination label, in every flattened form.
-RE_ALL='(?i)^[_.-]*(k8s[._-]cluster[._-]name|platform[._-]plane|platform[._-]cell|deployment[._-]environment[._-]name|source[._-]cluster|destination[._-]cluster)[_.-]*$'
-RE_SOURCE='(?i)^[_.-]*(k8s[._-]cluster[._-]name|platform[._-]plane|platform[._-]cell|deployment[._-]environment[._-]name)[_.-]*$'
+# The five source attributes and the Istio destination label, in every flattened form. Prometheus turns
+# each character outside [a-zA-Z0-9_] into an underscore, so any run of other characters is a separator.
+RE_ALL='(?i)^[^a-z0-9]*(k8s[^a-z0-9]+cluster[^a-z0-9]+name|platform[^a-z0-9]+plane|platform[^a-z0-9]+cell|deployment[^a-z0-9]+environment[^a-z0-9]+name|source[^a-z0-9]+cluster|destination[^a-z0-9]+cluster)[^a-z0-9]*$'
+RE_SOURCE='(?i)^[^a-z0-9]*(k8s[^a-z0-9]+cluster[^a-z0-9]+name|platform[^a-z0-9]+plane|platform[^a-z0-9]+cell|deployment[^a-z0-9]+environment[^a-z0-9]+name)[^a-z0-9]*$'
+# The name of the gateway counter that raises the spoof alarm, in every form that Prometheus maps to the
+# series cellproxy_gateway_attribute_overwrites_total. The gateway sends its own metrics straight to the
+# store, so the management collector drops this name from every sender.
+RE_ALARM='(?i)^cellproxy[^a-z0-9]+gateway[^a-z0-9]+attribute[^a-z0-9]+overwrites([^a-z0-9]+total)*$'
 
 # strip <regex> <context>... prints one statement list for each of the given contexts.
 strip() {
@@ -227,6 +232,8 @@ EXPORT_MAX_BYTES=$((RESOURCE_BUDGET * min_resource))
 [[ -z "$store" ]] || EXPORT_MAX_BYTES=$EXPORT_BYTES_CAP
 EXPORT_MIN_BYTES=$((EXPORT_MAX_BYTES / 2))
 
+alarm_filter=""
+[[ "$plane" != management ]] || alarm_filter="filter/alarm, "
 config="$(cat <<YAML
 extensions:
   file_storage:
@@ -274,6 +281,7 @@ $(strip "$RE_ALL" resource scope log)
     error_mode: propagate
     metric_statements:
 $(strip "$RE_SOURCE" resource scope datapoint)
+$([[ "$plane" == management ]] && printf '  filter/alarm:\n    error_mode: propagate\n    metrics:\n      metric:\n        - '"'"'IsMatch(name, "%s")'"'"'' "$RE_ALARM")
   resource:
     attributes:
 $(resource_attributes)
@@ -328,11 +336,11 @@ service:
       exporters: [otlp_grpc]
     metrics:
       receivers: [otlp]
-      processors: [memory_limiter, transform/otlp, resource]
+      processors: [memory_limiter, ${alarm_filter}transform/otlp, resource]
       exporters: [otlp_grpc]
     metrics/scrape:
       receivers: [prometheus]
-      processors: [memory_limiter, transform/scrape, resource]
+      processors: [memory_limiter, ${alarm_filter}transform/scrape, resource]
       exporters: [otlp_grpc]
 YAML
 )"
@@ -347,6 +355,20 @@ collector="$(CONFIG="$config" IMAGE="$K8S_COLLECTOR_IMAGE" SUM="$(printf '%s' "$
   | (select(.kind == "StatefulSet") | .spec.template.metadata.annotations["poc.internal/collector-config-sha256"]) = strenv(SUM)' "$here/collector.yaml")"
 echo "$collector"
 
+# uplink_ingress prints the rule that admits the uplink of a cell or of dev-cp. The management gateway sends
+# its own telemetry to the store, so the management collector admits no gateway.
+uplink_ingress() {
+  [[ -z "$store" ]] || return 0
+  cat <<'EOF'
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-uplink
+      ports:
+        - protocol: TCP
+          port: 4317
+EOF
+}
 node_peers() {
   local ip
   for ip in $node_ips; do
@@ -445,13 +467,7 @@ $(namespace_in "${senders[@]}")
       ports:
         - protocol: TCP
           port: 4317
-    - from:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: $([[ -n "$store" ]] && echo telemetry-gateway || echo otel-uplink)
-      ports:
-        - protocol: TCP
-          port: 4317
+$(uplink_ingress)
     - from:
         - namespaceSelector:
             matchLabels:

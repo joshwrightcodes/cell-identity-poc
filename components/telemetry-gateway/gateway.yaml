@@ -70,10 +70,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # The gateway sends its own telemetry straight to the store, not through the collector. The
+            # collector drops the alarm counter of the gateway from every other sender, so no pod can forge
+            # the alarm. The resource attributes are the row that the collector sets for management.
             - name: OTEL_RESOURCE_ATTRIBUTES
-              value: service.instance.id=$(POD_NAME)
+              value: service.instance.id=$(POD_NAME),k8s.cluster.name=management,platform.plane=management
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: http://otel-collector.observability-system.svc.cluster.local:4317
+              value: http://lgtm.observability-system.svc.cluster.local:4317
             # The worst decoded request holds about 50 MiB, and the gateway serves 16 calls at once,
             # so the heap peaks near 860 MiB. The Go runtime collects harder at 1000 MiB, below the
             # memory limit of 1280 MiB.
@@ -204,19 +207,11 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
-    # N10: the gateway forwards OTLP to the store.
+    # N10: the gateway forwards OTLP to the store, and sends its own OTLP there too.
     - to:
         - podSelector:
             matchLabels:
               app.kubernetes.io/name: lgtm
-      ports:
-        - protocol: TCP
-          port: 4317
-    # N11: cell-proxy exports its own OTLP to the collector of the cluster.
-    - to:
-        - podSelector:
-            matchLabels:
-              app.kubernetes.io/name: otel-collector
       ports:
         - protocol: TCP
           port: 4317

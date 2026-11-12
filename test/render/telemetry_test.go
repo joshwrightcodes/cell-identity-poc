@@ -298,7 +298,7 @@ func TestTelemetryGatewayRender(t *testing.T) {
 	if env := envOf(t, ctr); env["GOMEMLIMIT"] != "1000MiB" || get[string](t, ctr, "resources", "limits", "memory") != "1280Mi" {
 		t.Errorf("GOMEMLIMIT %q and limit %v, want 1000MiB below 1280Mi", env["GOMEMLIMIT"], lookupOr(ctr, "resources", "limits", "memory"))
 	}
-	if env := envOf(t, ctr); env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME)" || get[string](t, named(t, get[[]any](t, ctr, "env"), "POD_NAME"), "valueFrom", "fieldRef", "fieldPath") != "metadata.name" {
+	if env := envOf(t, ctr); !strings.HasPrefix(env["OTEL_RESOURCE_ATTRIBUTES"], "service.instance.id=$(POD_NAME),") || get[string](t, named(t, get[[]any](t, ctr, "env"), "POD_NAME"), "valueFrom", "fieldRef", "fieldPath") != "metadata.name" {
 		t.Errorf("the gateway must carry its pod name as service.instance.id, got %q", env["OTEL_RESOURCE_ATTRIBUTES"])
 	}
 	for _, p := range []string{"startupProbe", "readinessProbe", "livenessProbe"} {
@@ -329,10 +329,17 @@ func TestTelemetryGatewayRender(t *testing.T) {
 		app := fmt.Sprint(lookupOr(to, "podSelector", "matchLabels", "app.kubernetes.io/name"))
 		flows = append(flows, "out:"+app+":"+fmt.Sprint(lookupOr(get[[]any](t, r, "ports")[0], "port")))
 	}
-	if len(flows) != 4 || !strings.HasSuffix(flows[0], "/32:8444") || !strings.HasPrefix(flows[0], "in:") {
-		t.Errorf("gateway flows %v, want one ingress from a node address on 8444 and three egress rules", flows)
+	if len(flows) != 3 || !strings.HasSuffix(flows[0], "/32:8444") || !strings.HasPrefix(flows[0], "in:") {
+		t.Errorf("gateway flows %v, want one ingress from a node address on 8444 and two egress rules", flows)
 	}
-	if !slices.Contains(flows, "out:lgtm:4317") || !slices.Contains(flows, "out:spire-server:8081") || !slices.Contains(flows, "out:otel-collector:4317") {
-		t.Errorf("gateway flows %v lack N8, N10 or N11", flows)
+	if !slices.Contains(flows, "out:lgtm:4317") || !slices.Contains(flows, "out:spire-server:8081") || slices.Contains(flows, "out:otel-collector:4317") {
+		t.Errorf("gateway flows %v lack N8 or N10, or reach the collector", flows)
+	}
+	// The gateway sends its own telemetry straight to the store, and sets the row of the management collector itself.
+	env := envOf(t, named(t, get[[]any](t, spec, "containers"), "cell-proxy"))
+	if env["OTEL_EXPORTER_OTLP_ENDPOINT"] != "http://lgtm.observability-system.svc.cluster.local:4317" ||
+		env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME),k8s.cluster.name=management,platform.plane=management" {
+		t.Errorf("the gateway exports to %q with the resource %q, want the store and the management row",
+			env["OTEL_EXPORTER_OTLP_ENDPOINT"], env["OTEL_RESOURCE_ATTRIBUTES"])
 	}
 }
