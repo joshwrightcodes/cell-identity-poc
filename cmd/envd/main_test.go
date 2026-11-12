@@ -310,3 +310,33 @@ func TestLogsAreJSON(t *testing.T) {
 		t.Errorf("last line %q", lines[len(lines)-1])
 	}
 }
+
+func TestRunRefusesExpectIDOutsideTrustDomain(t *testing.T) {
+	s := newSigner(t)
+	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	pem, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := filepath.Join(t.TempDir(), "peer.pem")
+	if err := os.WriteFile(peer, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	args := func(id string) []string {
+		return []string{"--upstream", "x:1", "--expect-id", id, "--peer-bundle", peer, "--peer-trust-domain", "mgmt.poc.internal",
+			"--spec-key-file", s.keyFile(), "--env", "dev", "--output-configmap", "a/b"}
+	}
+	if _, err := parseRun(args("spiffe://mgmt.poc.internal/api")); err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if _, err := parseRun(args("spiffe://other.poc.internal/api")); err == nil || !strings.Contains(err.Error(), "--expect-id") {
+		t.Fatalf("expect-id outside the trust domain: %v", err)
+	}
+}
+
+func TestHealthServerLimits(t *testing.T) {
+	srv := newHealthServer(http.NewServeMux())
+	if srv.ReadHeaderTimeout <= 0 || srv.ReadTimeout <= 0 || srv.WriteTimeout <= 0 || srv.IdleTimeout <= 0 {
+		t.Fatalf("limits %v %v %v %v", srv.ReadHeaderTimeout, srv.ReadTimeout, srv.WriteTimeout, srv.IdleTimeout)
+	}
+}

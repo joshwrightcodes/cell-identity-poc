@@ -8,7 +8,9 @@ import (
 	"errors"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/go-jose/go-jose/v4"
 
@@ -342,6 +344,26 @@ func TestAcceptRefuses(t *testing.T) {
 			its = slices.DeleteFunc(its, func(x item) bool { return x.name == "b" })
 			return f.bundle(next, its, []spec.Retired{{Name: "b", Revision: rev(1, 3)}, {Name: "r", Revision: rev(1, 3)}})
 		}},
+		{"drop_without_retired", mgmtapi.ReasonSpecInvalid, func() mgmtapi.SpecBundle {
+			return f.bundle(next, without("b"), retiredBase)
+		}},
+		{"lower_retired_mark", mgmtapi.ReasonSpecInvalid, func() mgmtapi.SpecBundle {
+			return f.bundle(next, same(), []spec.Retired{{Name: "r", Revision: rev(1, 1)}})
+		}},
+		{"record_too_large", mgmtapi.ReasonRecordInvalid, func() mgmtapi.SpecBundle {
+			c := f.cell("a", rev(1, 6), false)
+			c.Issuer = "https://" + strings.Repeat("x", MaxRecordBytes) + ".example"
+			return f.bundle(next, with("a", f.item(c)), retiredBase)
+		}},
+		{"record_five_signatures", mgmtapi.ReasonRecordInvalid, func() mgmtapi.SpecBundle {
+			it := f.item(f.cell("a", rev(1, 6), false))
+			var m map[string]any
+			_ = json.Unmarshal(it.env, &m)
+			sig := m["signatures"].([]any)[0]
+			m["signatures"] = []any{sig, sig, sig, sig, sig}
+			it.env, _ = json.Marshal(m)
+			return f.bundle(next, with("a", it), retiredBase)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -373,6 +395,16 @@ func TestAcceptRefuses(t *testing.T) {
 			t.Error("Accept changed cur")
 		}
 	})
+	t.Run("already_revoked_then_dropped", func(t *testing.T) {
+		revoked, _, err := Accept(cur, f.bundle(next, with("a", f.item(f.cell("a", next, true))), retiredBase), testEnv, f.keys())
+		if err != nil {
+			t.Fatal(err)
+		}
+		bundle := f.bundle(rev(1, 7), without("a", "b"), []spec.Retired{{Name: "a", Revision: next}, {Name: "b", Revision: rev(1, 3)}, {Name: "r", Revision: rev(1, 3)}})
+		if _, changed, err := Accept(revoked, bundle, testEnv, f.keys()); err != nil || !changed {
+			t.Fatalf("changed=%v err=%v: a cell that was already revoked counts as newly invalid", changed, err)
+		}
+	})
 	t.Run("readd_above_mark", func(t *testing.T) {
 		st, changed, err := Accept(cur, f.bundle(next, append(same(), f.item(f.cell("r", next, false))), nil), testEnv, f.keys())
 		if err != nil || !changed {
@@ -382,4 +414,29 @@ func TestAcceptRefuses(t *testing.T) {
 			t.Errorf("marks %v cells %d", st.Marks, len(st.Cells))
 		}
 	})
+}
+
+func TestAcceptBoundsUnverifiedStrings(t *testing.T) {
+	f := newFx(t)
+	cur, items := f.base()
+	huge := strings.Repeat("é", 1<<19)
+
+	b := f.bundle(rev(1, 6), items, []spec.Retired{{Name: "r", Revision: rev(1, 3)}})
+	b.Spec = tamper(t, b.Spec, func(p []byte) []byte { return p })
+	var m map[string]any
+	_ = json.Unmarshal(b.Spec, &m)
+	m["payloadType"] = huge
+	b.Spec, _ = json.Marshal(m)
+	_, _, err := Accept(cur, b, testEnv, f.keys())
+	var r *Refused
+	if !errors.As(err, &r) || len(r.Detail) > MaxLoggedBytes || !utf8.ValidString(r.Detail) || len(r.Error()) > MaxLoggedBytes+64 {
+		t.Fatalf("payload type detail: %v", err)
+	}
+
+	b = f.bundle(rev(1, 6), items, []spec.Retired{{Name: "r", Revision: rev(1, 3)}})
+	b.Records[huge] = b.Records["a"]
+	_, _, err = Accept(cur, b, testEnv, f.keys())
+	if !errors.As(err, &r) || r.Reason != mgmtapi.ReasonRecordUnindexed || len(r.Cell) > MaxLoggedBytes || len(r.Detail) > MaxLoggedBytes {
+		t.Fatalf("record key: %v", err)
+	}
 }

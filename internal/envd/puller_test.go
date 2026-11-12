@@ -3,6 +3,7 @@ package envd
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
@@ -33,9 +34,25 @@ type memStore struct {
 	state    *State
 	saved    []spec.Revision
 	failSave int
+	// commitThenFail makes Save store the state and still return an error.
+	commitThenFail bool
+	loadErr        error
+	blockLoad      bool
+	loads          int
 }
 
-func (m *memStore) Load(context.Context) (*State, error) {
+func (m *memStore) Load(ctx context.Context) (*State, error) {
+	m.mu.Lock()
+	m.loads++
+	block, loadErr := m.blockLoad, m.loadErr
+	m.mu.Unlock()
+	if block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if loadErr != nil {
+		return nil, loadErr
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.state == nil {
@@ -48,12 +65,25 @@ func (m *memStore) Save(_ context.Context, s *State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.saved = append(m.saved, s.Revision)
+	if m.commitThenFail {
+		m.state = s
+		return errors.New("connection reset after the write")
+	}
 	if m.failSave > 0 {
 		m.failSave--
 		return errors.New("apiserver unavailable")
 	}
 	m.state = s
 	return nil
+}
+
+func (m *memStore) Peek(context.Context) (*State, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.state == nil {
+		return Empty(), true, nil
+	}
+	return m.state, true, nil
 }
 
 func (m *memStore) saves() []spec.Revision {
@@ -71,6 +101,9 @@ type upstream struct {
 	url     string
 	client  *http.Client
 	hs      atomic.Int32
+	cert    *x509.Certificate
+	failGet atomic.Bool
+	delay   atomic.Int64
 }
 
 func newUpstream(t *testing.T, b mgmtapi.SpecBundle, tlsCfg *tls.Config) *upstream {
@@ -79,11 +112,17 @@ func newUpstream(t *testing.T, b mgmtapi.SpecBundle, tlsCfg *tls.Config) *upstre
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+mgmtapi.SpecPattern, func(w http.ResponseWriter, r *http.Request) {
 		u.hits.Add(1)
+		time.Sleep(time.Duration(u.delay.Load()))
+		if u.failGet.Load() {
+			http.Error(w, "unavailable", http.StatusInternalServerError)
+			return
+		}
 		u.mu.Lock()
 		defer u.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(u.bundle)
 	})
 	mux.HandleFunc("POST "+mgmtapi.StatusPattern, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Duration(u.delay.Load()))
 		var rep mgmtapi.StatusReport
 		if err := json.NewDecoder(r.Body).Decode(&rep); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -116,8 +155,15 @@ func newUpstream(t *testing.T, b mgmtapi.SpecBundle, tlsCfg *tls.Config) *upstre
 	srv.TLS = &tls.Config{GetConfigForClient: counted}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
-	u.url, u.client = srv.URL, srv.Client()
+	u.url, u.client, u.cert = srv.URL, srv.Client(), srv.Certificate()
 	return u
+}
+
+// shipped returns the client that cmd/envd uses, trusting only the certificate of u.
+func (u *upstream) shipped() *http.Client {
+	pool := x509.NewCertPool()
+	pool.AddCert(u.cert)
+	return NewClient(&tls.Config{RootCAs: pool})
 }
 
 func (u *upstream) set(b mgmtapi.SpecBundle) {
@@ -231,6 +277,11 @@ func TestPullerRefusalReported(t *testing.T) {
 	if saves := h.store.saves(); len(saves) != 0 {
 		t.Fatalf("a refusal saved %v", saves)
 	}
+	for _, d := range h.clk.slept() {
+		if d != 10*time.Second {
+			t.Errorf("waited %v after a refusal, want the interval", d)
+		}
+	}
 	reps := h.up.got()
 	if len(reps) != 12 {
 		t.Fatalf("reports %d", len(reps))
@@ -302,8 +353,8 @@ func TestPullerIslandKeepsState(t *testing.T) {
 	prev := time.Duration(0)
 	for i, d := range clk.slept() {
 		want := time.Second << i
-		if d < want/2 || d > want {
-			t.Errorf("backoff %d = %v, want within [%v, %v]", i, d, want/2, want)
+		if d < want || d > min(2*want, 30*time.Second) {
+			t.Errorf("backoff %d = %v, want within [%v, %v]", i, d, want, min(2*want, 30*time.Second))
 		}
 		if d < prev/2 {
 			t.Errorf("backoff shrank: %v after %v", d, prev)
@@ -394,7 +445,7 @@ func TestPullerRetriesFailedSave(t *testing.T) {
 	if reps[1].StoreError != "" || reps[1].Applied != rev(1, 4) {
 		t.Errorf("second report %+v", reps[1])
 	}
-	if d := h.clk.slept()[0]; d > 10*time.Second || d < 500*time.Millisecond {
+	if d := h.clk.slept()[0]; d >= 10*time.Second || d < time.Second {
 		t.Errorf("wait after a failed save: %v", d)
 	}
 }
@@ -436,12 +487,57 @@ func TestPullerRoundDeadline(t *testing.T) {
 }
 
 func TestPullerNewHandshakeEachRound(t *testing.T) {
-	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { return firstBundle(f, rev(1, 2)), nil }, nil)
+	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { return firstBundle(f, rev(1, 2)), nil },
+		nil)
+	h.p.cfg.Client = h.up.shipped()
 	runRounds(t, h.p, h.clk)
 	if n := h.up.hs.Load(); n != 3 {
 		t.Fatalf("handshakes %d, want 3", n)
 	}
 	if n := h.up.hits.Load(); n != 3 {
 		t.Fatalf("pulls %d, want 3", n)
+	}
+}
+
+// A round whose pull fails sends no report, so only CloseIdleConnections ends its connection.
+func TestPullerNewHandshakeAfterFailedPull(t *testing.T) {
+	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { return firstBundle(f, rev(1, 2)), nil }, nil)
+	h.up.failGet.Store(true)
+	h.p.cfg.Client = h.up.shipped()
+	runRounds(t, h.p, h.clk)
+	if n := h.up.hs.Load(); n != 3 {
+		t.Fatalf("handshakes %d, want 3", n)
+	}
+	if len(h.up.got()) != 0 {
+		t.Error("a failed pull sent a report")
+	}
+}
+
+func TestPullerRefusesUntrustedServers(t *testing.T) {
+	f := newFx(t)
+	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	clientCA := spiffetest.NewCA(t, "dev.env.poc.internal")
+	client := clientCA.Source(t, "spiffe://dev.env.poc.internal/envd")
+	want := spiffeid.RequireFromString("spiffe://mgmt.poc.internal/api")
+	for name, serverCA := range map[string]*spiffetest.CA{
+		"foreign_ca":         spiffetest.NewCA(t, "mgmt.poc.internal"),
+		"other_trust_domain": spiffetest.NewCA(t, "other.poc.internal"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			id := "spiffe://mgmt.poc.internal/api"
+			if name == "other_trust_domain" {
+				id = "spiffe://other.poc.internal/api"
+			}
+			cfg := tlsconfig.MTLSServerConfig(serverCA.Source(t, id), clientCA.Bundle(), tlsconfig.AuthorizeAny())
+			u := newUpstream(t, firstBundle(f, rev(1, 2)), cfg)
+			clk := newClock(2)
+			store := &memStore{}
+			p := NewPuller(PullerConfig{Client: NewClient(cellproxy.ClientTLS(client, ca.Bundle(), want)), BaseURL: u.url,
+				Env: testEnv, Keys: f.keys(), Store: store, Log: newLog(io.Discard), Now: clk.Now, Sleep: clk.Sleep})
+			runRounds(t, p, clk)
+			if len(store.saves()) != 0 || u.hits.Load() != 0 {
+				t.Fatalf("saves %v, requests %d", store.saves(), u.hits.Load())
+			}
+		})
 	}
 }

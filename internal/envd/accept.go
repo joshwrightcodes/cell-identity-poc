@@ -7,11 +7,26 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
+
+// MaxRecordBytes is the largest record envelope that Accept stores.
+const MaxRecordBytes = 64 << 10
+
+// MaxLoggedBytes bounds each string from an unverified source that Refused keeps for a log line.
+const MaxLoggedBytes = 256
+
+// clip cuts s to at most MaxLoggedBytes bytes of valid UTF-8.
+func clip(s string) string {
+	if len(s) <= MaxLoggedBytes {
+		return s
+	}
+	return strings.ToValidUTF8(s[:MaxLoggedBytes], "")
+}
 
 // Code is the outward reason of every refusal.
 const Code = mgmtapi.ReasonSpecInvalid
@@ -70,10 +85,10 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		if errors.Is(err, record.ErrSignature) {
 			reason = mgmtapi.ReasonSignatureInvalid
 		}
-		return nil, false, &Refused{Reason: reason, Detail: err.Error()}
+		return nil, false, &Refused{Reason: reason, Detail: clip(err.Error())}
 	}
 	refuse := func(reason, cell, format string, args ...any) error {
-		return &Refused{Reason: reason, Cell: cell, Revision: s.Revision, Detail: fmt.Sprintf(format, args...)}
+		return &Refused{Reason: reason, Cell: clip(cell), Revision: s.Revision, Detail: clip(fmt.Sprintf(format, args...))}
 	}
 	if s.Env != env {
 		return nil, false, refuse(mgmtapi.ReasonEnvMismatch, "", "spec env %q, want %q", s.Env, env)
@@ -89,12 +104,33 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		return nil, false, refuse(mgmtapi.ReasonRevisionConflict, "", "another spec at revision %v", s.Revision)
 	}
 
+	retired := make(map[string]spec.Revision, len(s.Retired))
+	for _, r := range s.Retired {
+		retired[r.Name] = r.Revision
+	}
+	listed := make(map[string]bool, len(s.Cells))
+	for _, e := range s.Cells {
+		listed[e.Name] = true
+	}
+	for name, mark := range cur.Marks {
+		if r, ok := retired[name]; ok {
+			if r.Compare(mark) < 0 {
+				return nil, false, refuse(mgmtapi.ReasonSpecInvalid, name, "retired mark %v is below the mark %v", r, mark)
+			}
+		} else if !listed[name] {
+			return nil, false, refuse(mgmtapi.ReasonSpecInvalid, name, "cell has a mark %v and is in neither list", mark)
+		}
+	}
+
 	cells := make(map[string]record.Cell, len(s.Cells))
 	records := make(map[string][]byte, len(s.Cells))
 	for _, e := range s.Cells {
 		raw, ok := b.Records[e.Name]
 		if !ok {
 			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "bundle has no record")
+		}
+		if len(raw) > MaxRecordBytes {
+			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "record envelope has %d bytes, the limit is %d", len(raw), MaxRecordBytes)
 		}
 		c, recPayload, err := record.VerifyWithPayload(raw, keys)
 		if err != nil {

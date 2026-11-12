@@ -53,6 +53,8 @@ const (
 	sourceTimeout = 30 * time.Second
 	// shutdownTimeout bounds the whole telemetry flush.
 	shutdownTimeout = 15 * time.Second
+	// loadTimeout bounds the read of the stored state by check.
+	loadTimeout = 15 * time.Second
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
 )
@@ -296,6 +298,7 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		Interval: cfg.interval,
 		Log:      tel.Log,
 		Meter:    tel.Meter,
+		Tracer:   tel.Tracer,
 	})
 
 	ln, err := net.Listen("tcp", cfg.healthListen)
@@ -304,7 +307,7 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", envd.HealthHandler(puller))
-	health := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	health := newHealthServer(mux)
 	go func() { _ = health.Serve(ln) }()
 	defer func() { _ = health.Close() }()
 
@@ -314,6 +317,17 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	return nil
+}
+
+// newHealthServer returns the server of the health endpoint, with limits on every phase of a request.
+func newHealthServer(h http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       30 * time.Second,
+	}
 }
 
 type checkConfig struct {
@@ -374,7 +388,9 @@ func checkCommand(ctx context.Context, cfg checkConfig, stdin io.Reader, stdout 
 		}
 		keys := []ed25519.PublicKey{cfg.key}
 		store := envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, slog.New(slog.DiscardHandler))
-		cur, err := store.Load(ctx)
+		lctx, cancel := context.WithTimeout(ctx, loadTimeout)
+		defer cancel()
+		cur, err := store.Load(lctx)
 		if err != nil {
 			return err
 		}
