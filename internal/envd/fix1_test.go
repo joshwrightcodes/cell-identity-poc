@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -41,6 +42,8 @@ func writeOutside(t *testing.T, c *fake.Clientset, st *State, pin string) {
 		cm.Data[name+RecordSuffix] = string(raw)
 	}
 	cm.Annotations[AnnotationKeySHA] = pin
+	cm.Annotations[AnnotationEpoch] = strconv.FormatUint(st.Revision.Epoch, 10)
+	cm.Annotations[AnnotationCounter] = strconv.FormatUint(st.Revision.Counter, 10)
 	if _, err := c.CoreV1().ConfigMaps(testNS).Update(t.Context(), cm, metav1.UpdateOptions{}); err != nil {
 		t.Fatal(err)
 	}
@@ -325,18 +328,19 @@ func TestPullerRewritesStrayKeys(t *testing.T) {
 }
 
 func TestPullerReportsStateUnverifiable(t *testing.T) {
-	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { return firstBundle(f, rev(1, 2)), nil }, nil)
+	var bad mgmtapi.SpecBundle
+	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { bad = firstBundle(newFx(t), rev(1, 2)); return bad, nil }, nil)
 	h.store.loadErr = fmt.Errorf("%w: tampered", ErrStateUnverifiable)
 	runRounds(t, h.p, h.clk)
 	if h.p.Ready() {
 		t.Fatal("Ready")
 	}
-	if h.up.hits.Load() != 0 {
-		t.Error("pulled with an unverifiable state")
+	if len(h.store.saves()) != 0 {
+		t.Error("saved a refused bundle")
 	}
 	reps := h.up.got()
-	if len(reps) != 3 {
-		t.Fatalf("reports %d", len(reps))
+	if len(reps) != 4 {
+		t.Fatalf("reports %d, want one from the load and one for each round", len(reps))
 	}
 	for _, r := range reps {
 		if r.StoreError != mgmtapi.ReasonStateUnverifiable {

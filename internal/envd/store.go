@@ -48,9 +48,12 @@ type Store interface {
 	// Save writes s as the whole content of the store. It writes against the version that it last
 	// read and refuses to lower a verified stored revision.
 	Save(ctx context.Context, s *State) error
+	// Replace writes s like Save, but without the check on the stored revision. envd uses it only
+	// when it has refused the stored state.
+	Replace(ctx context.Context, s *State) error
 	// Peek returns the verified stored state and whether the stored content is exactly the canonical
-	// form of that state, with no extra keys. A stored state that does not verify gives an error that
-	// wraps ErrStateUnverifiable.
+	// form of that state, with no extra keys. The caller owns the returned state. A stored state that
+	// does not verify gives an error that wraps ErrStateUnverifiable.
 	Peek(ctx context.Context) (live *State, clean bool, err error)
 }
 
@@ -156,7 +159,16 @@ func (s *configMapStore) Peek(ctx context.Context) (*State, bool, error) {
 	return s.decode(cm)
 }
 
-func (s *configMapStore) Save(ctx context.Context, st *State) error {
+func (s *configMapStore) Save(ctx context.Context, st *State) error { return s.write(ctx, st, true) }
+
+func (s *configMapStore) Replace(ctx context.Context, st *State) error {
+	return s.write(ctx, st, false)
+}
+
+func (s *configMapStore) write(ctx context.Context, st *State, guard bool) error {
+	if len(st.SpecEnvelope) == 0 {
+		return errors.New("refusing to write a state with no spec")
+	}
 	data := make(map[string]string, len(st.Records)+1)
 	data[SpecKey] = string(st.SpecEnvelope)
 	for name, raw := range st.Records {
@@ -188,7 +200,7 @@ func (s *configMapStore) Save(ctx context.Context, st *State) error {
 			}
 			return nil
 		}
-		if stored, _, derr := s.decode(live); derr == nil && stored.Revision.Compare(st.Revision) > 0 {
+		if stored, _, derr := s.decode(live); guard && derr == nil && stored.Revision.Compare(st.Revision) > 0 {
 			return fmt.Errorf("%w: stored %v, saving %v", ErrStoreNewer, stored.Revision, st.Revision)
 		}
 		next := live.DeepCopy()

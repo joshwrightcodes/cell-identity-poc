@@ -86,6 +86,8 @@ func (m *memStore) Peek(context.Context) (*State, bool, error) {
 	return m.state, true, nil
 }
 
+func (m *memStore) Replace(ctx context.Context, s *State) error { return m.Save(ctx, s) }
+
 func (m *memStore) saves() []spec.Revision {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -81,9 +81,13 @@ type Puller struct {
 	lastPair string
 	pairGen  int
 	storeErr string
-	logs     *lograte.Limiter
-	counter  metric.Int64Gauge
-	refusals metric.Int64Counter
+	// unverifiable is true from a Load that failed with ErrStateUnverifiable until the first save.
+	unverifiable bool
+	// refusedNow is true when the round has already recorded a refusal.
+	refusedNow bool
+	logs       *lograte.Limiter
+	counter    metric.Int64Gauge
+	refusals   metric.Int64Counter
 }
 
 // NewPuller returns a Puller for cfg.
@@ -163,11 +167,14 @@ func (p *Puller) Run(ctx context.Context) error {
 			p.ready.Store(true)
 			break
 		}
-		failures++
 		p.logLimited(ctx, "load failed", "load", "error", clip(err.Error()))
 		if errors.Is(err, ErrStateUnverifiable) {
+			p.state = Empty()
+			p.unverifiable = true
 			p.report(ctx, mgmtapi.StatusReport{StoreError: mgmtapi.ReasonStateUnverifiable})
+			break
 		}
+		failures++
 		if err := p.cfg.Sleep(ctx, p.backoff(failures)); err != nil {
 			return err
 		}
@@ -221,6 +228,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	rctx, cancel := context.WithTimeout(ctx, p.cfg.RoundTimeout)
 	defer cancel()
 	p.storeErr = ""
+	p.refusedNow = false
 	p.syncStore(rctx)
 
 	bundle, err := p.fetch(rctx)
@@ -243,33 +251,48 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 		failed = true
 	case changed:
 		sctx, saveSpan := p.cfg.Tracer.Start(rctx, "envd.save")
-		if err := p.cfg.Store.Save(sctx, next); err != nil {
+		saveErr := p.cfg.Store.Save(sctx, next)
+		if saveErr != nil && p.unverifiable && errors.Is(saveErr, ErrStoreNewer) {
+			saveErr = p.cfg.Store.Replace(sctx, next)
+		}
+		if err := saveErr; err != nil {
 			fail(saveSpan, err)
 			p.storeErr = mgmtapi.ReasonStoreFailed
 			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
 		} else {
 			p.state = next
-			p.refusal = nil
-			p.lastPair = ""
+			p.storeErr = ""
+			p.unverifiable = false
+			p.ready.Store(true)
+			if !p.refusedNow {
+				p.refusal = nil
+				p.lastPair = ""
+			}
 			p.setApplied(ctx, next.Revision)
 			p.cfg.Log.InfoContext(ctx, "spec applied", "epoch", next.Revision.Epoch, "counter", next.Revision.Counter, "cells", len(next.Cells))
 		}
 		saveSpan.End()
 	default:
-		p.refusal = nil
-		p.lastPair = ""
+		if !p.refusedNow {
+			p.refusal = nil
+			p.lastPair = ""
+		}
 	}
 	acceptSpan.End()
 	if p.storeErr != "" {
 		failed = true
 	}
-	p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: p.storeErr})
+	storeErr := p.storeErr
+	if storeErr == "" && p.unverifiable {
+		storeErr = mgmtapi.ReasonStateUnverifiable
+	}
+	p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr})
 	return failed
 }
 
 // sameContent reports whether two states hold the same signed spec and records.
 func sameContent(a, b *State) bool {
-	if a.SpecSHA256 != b.SpecSHA256 || len(a.Records) != len(b.Records) {
+	if a.SpecSHA256 != b.SpecSHA256 || !bytes.Equal(a.SpecEnvelope, b.SpecEnvelope) || len(a.Records) != len(b.Records) {
 		return false
 	}
 	for k, v := range a.Records {
@@ -280,10 +303,13 @@ func sameContent(a, b *State) bool {
 	return true
 }
 
-// syncStore compares the store with the accepted state. A higher verified stored revision, for
-// example from a save whose answer was lost, becomes the accepted state. Any other difference,
-// including extra keys and a state that does not verify, is rewritten from the accepted state.
-// Applied is the revision that the store holds.
+// syncStore compares the store with the accepted state. Before the first accept it writes nothing
+// and only reads Applied from the store. Afterwards, a higher verified stored revision becomes the
+// accepted state only when Accept passes it against the current state, for example after a save
+// whose answer was lost. Any other difference, including extra keys, a spec envelope with other
+// bytes and a state that does not verify, is rewritten from the accepted state. When Accept refuses
+// the stored state, envd reports that refusal and replaces the store. Applied is the revision that
+// the store holds.
 func (p *Puller) syncStore(ctx context.Context) {
 	ctx, span := p.cfg.Tracer.Start(ctx, "envd.sync")
 	defer span.End()
@@ -297,23 +323,44 @@ func (p *Puller) syncStore(ctx context.Context) {
 		p.logLimited(ctx, "store read failed", "peek", "error", clip(err.Error()))
 		return
 	}
-	if live.Revision.Compare(p.state.Revision) > 0 {
-		for k, v := range p.state.Marks {
-			if v.Compare(live.Marks[k]) > 0 {
-				live.Marks[k] = v
-			}
-		}
-		p.cfg.Log.WarnContext(ctx, "state_adopted", "epoch", live.Revision.Epoch, "counter", live.Revision.Counter)
-		p.state = live
+	if len(p.state.SpecEnvelope) == 0 {
+		p.setApplied(ctx, live.Revision)
+		return
 	}
-	if clean && sameContent(live, p.state) {
+	replace := false
+	if live.Revision.Compare(p.state.Revision) > 0 {
+		b := mgmtapi.SpecBundle{Spec: live.SpecEnvelope, Records: make(map[string]json.RawMessage, len(live.Records))}
+		for k, v := range live.Records {
+			b.Records[k] = v
+		}
+		next, changed, aerr := Accept(p.state, b, p.cfg.Env, p.cfg.Keys)
+		var refused *Refused
+		switch {
+		case errors.As(aerr, &refused):
+			p.refuse(ctx, refused)
+			replace = true
+		case aerr != nil:
+			fail(span, aerr)
+			p.storeErr = mgmtapi.ReasonStoreFailed
+			p.logLimited(ctx, "store check failed", "peek", "error", clip(aerr.Error()))
+			return
+		case changed:
+			p.cfg.Log.WarnContext(ctx, "state_adopted", "epoch", next.Revision.Epoch, "counter", next.Revision.Counter)
+			p.state = next
+		}
+	}
+	if !replace && clean && sameContent(live, p.state) {
 		p.setApplied(ctx, live.Revision)
 		return
 	}
 	p.setApplied(ctx, live.Revision)
 	p.cfg.Log.WarnContext(ctx, "state_drift", "stored_epoch", live.Revision.Epoch, "stored_counter", live.Revision.Counter,
 		"epoch", p.state.Revision.Epoch, "counter", p.state.Revision.Counter, "clean", clean)
-	if err := p.cfg.Store.Save(ctx, p.state); err != nil {
+	write := p.cfg.Store.Save
+	if replace {
+		write = p.cfg.Store.Replace
+	}
+	if err := write(ctx, p.state); err != nil {
 		fail(span, err)
 		p.storeErr = mgmtapi.ReasonStoreFailed
 		p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
@@ -326,6 +373,7 @@ func (p *Puller) syncStore(ctx context.Context) {
 // last refusal, and again once in each window for the same one.
 func (p *Puller) refuse(ctx context.Context, r *Refused) {
 	p.refusals.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", r.Reason)))
+	p.refusedNow = true
 	p.refusal = &mgmtapi.Refusal{Reason: r.Reason, Revision: r.Revision, At: p.cfg.Now().UTC()}
 	pair := fmt.Sprintf("%s/%d.%d", r.Reason, r.Revision.Epoch, r.Revision.Counter)
 	if pair != p.lastPair {
