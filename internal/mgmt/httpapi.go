@@ -18,6 +18,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -128,21 +129,23 @@ func NewAPIHandler(p SpecServer, env string, allow spiffeid.ID, log *slog.Logger
 	return cleanPathOnly(h)
 }
 
-// requestPeer returns the verified SPIFFE ID of the client of r.
-func requestPeer(r *http.Request) (spiffeid.ID, bool) {
+// requestPeer returns the verified SPIFFE ID of the client of r and the end of its certificate.
+func requestPeer(r *http.Request) (peerInfo, bool) {
 	if r.TLS != nil {
 		if len(r.TLS.PeerCertificates) == 0 {
-			return spiffeid.ID{}, false
+			return peerInfo{}, false
 		}
-		id, err := x509svid.IDFromCert(r.TLS.PeerCertificates[0])
-		return id, err == nil
+		leaf := r.TLS.PeerCertificates[0]
+		id, err := x509svid.IDFromCert(leaf)
+		return peerInfo{ID: id, NotAfter: leaf.NotAfter}, err == nil
 	}
 	return peerFromContext(r.Context())
 }
 
 func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	id, ok := requestPeer(r)
-	if !ok || id != h.allow {
+	peer, ok := requestPeer(r)
+	id := peer.ID
+	if !ok || id != h.allow || time.Now().After(peer.NotAfter) {
 		reqID := newRequestID()
 		writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: reqID})
 		if _, ok, suppressed, _ := h.limit.Allow("peer"); ok {
@@ -305,10 +308,17 @@ func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) 
 	return cleanPathOnly(mux)
 }
 
+// ReasonNotFound is the reason of a restore for a revision that the plane does not hold.
+const ReasonNotFound = "not_found"
+
 func adminError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	out := map[string]any{"error": err.Error()}
-	if reason := ReasonOf(err); reason != "" {
+	if ReasonOf(err) == "" && strings.HasPrefix(err.Error(), "no stored revision") {
+		// The plane reports an unknown counter as a plain error with this text.
+		out["reason"] = ReasonNotFound
+		status = http.StatusNotFound
+	} else if reason := ReasonOf(err); reason != "" {
 		out["reason"] = reason
 		switch reason {
 		case mgmtapi.ReasonConflict:
@@ -525,7 +535,7 @@ const (
 func connContext(ctx context.Context, c net.Conn) context.Context {
 	ctx = connlimit.ConnContext(ctx, c)
 	if v, ok := peerIDs.LoadAndDelete(connKey(c)); ok {
-		ctx = context.WithValue(ctx, peerCtxKey{}, v.(spiffeid.ID))
+		ctx = context.WithValue(ctx, peerCtxKey{}, v.(peerInfo))
 	}
 	return ctx
 }

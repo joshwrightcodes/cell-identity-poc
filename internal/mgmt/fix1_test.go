@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
@@ -367,14 +368,20 @@ func TestRepeatedLogsAreRateLimited(t *testing.T) {
 	}
 	r.clk.Advance(61 * time.Second)
 	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"))
-	ctx := t.Context()
-	go func() { _ = r.plane.RunChecks(ctx) }()
+	ctx, cancel := context.WithCancel(t.Context())
+	stopped := make(chan struct{})
+	go func() { defer close(stopped); _ = r.plane.RunChecks(ctx) }()
+	// The pass in progress finishes before the temporary directory goes away.
+	defer func() { cancel(); <-stopped }()
 	r.clk.Advance(16 * time.Minute)
 	for range 10 {
 		r.clk.Advance(20 * time.Second)
 		r.ticks <- r.clk.Now()
 		r.ticks <- r.clk.Now()
 	}
+	// The ticks channel has no buffer. This send returns only after RunChecks finished the pass
+	// for the last tick above, so the count below cannot read a pass in progress.
+	r.ticks <- r.clk.Now()
 	if got := r.logs.count("key_check_failed"); got != 1 {
 		t.Fatalf("%d key_check_failed lines in a restore", got)
 	}

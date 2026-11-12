@@ -2,7 +2,7 @@
 // environment, serves the spec to envd over mTLS, binds cells through a server-only TLS listener,
 // and answers local commands on an admin socket.
 //
-//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--bind-listen :8447] [--health-listen :8080] [--admin-socket /run/mgmtd/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m]
+//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--bind-listen :8447] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m]
 //	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
@@ -50,9 +50,11 @@ const (
 	name = "mgmtd"
 	// sourceTimeout bounds the wait for the first SVID from the Workload API.
 	sourceTimeout = 30 * time.Second
-	// shutdownTimeout bounds the stop of each server and the telemetry flush.
-	shutdownTimeout = 15 * time.Second
-	exitConfig      = 2
+	// serverStopTimeout is the one budget for the stop of the three servers, and flushTimeout bounds
+	// the telemetry flush. Together they stay below the 30 s termination grace of a pod.
+	serverStopTimeout = 8 * time.Second
+	flushTimeout      = 10 * time.Second
+	exitConfig        = 2
 )
 
 // deps holds what a test replaces.
@@ -61,6 +63,8 @@ type deps struct {
 	kube      func() (kubernetes.Interface, error)
 	svids     func(ctx context.Context) (x509svid.Source, func(), error)
 	nofile    func() (uint64, error)
+	// beforePlane runs before the plane loads. Tests use it to hold the load.
+	beforePlane func()
 }
 
 func realDeps() deps {
@@ -248,13 +252,47 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		logger, meter = tel.Log, tel.Meter
 		defer func() {
 			// ctx may have ended, so the flush gets a context of its own.
-			sctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+			sctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
 			defer cancel()
 			if err := tel.Shutdown(sctx); err != nil {
 				slog.New(slog.NewJSONHandler(stdout, nil)).Warn("telemetry shutdown", "error", err.Error())
 			}
 		}()
 	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	errc := make(chan error, 8)
+	spawn := func(what string, f func() error) {
+		wg.Go(func() {
+			if err := f(); err != nil {
+				errc <- fmt.Errorf("%s: %w", what, err)
+			}
+		})
+	}
+
+	// Liveness answers as soon as the process runs, also during the wait for the first SVID.
+	// Readiness follows the plane: 503 until it has loaded.
+	var ready atomic.Bool
+	healthLn, err := net.Listen("tcp", cfg.healthListen)
+	if err != nil {
+		return fmt.Errorf("health listener: %w", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		if !ready.Load() {
+			http.Error(w, "loading", http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = io.WriteString(w, "ok\n")
+	})
+	health := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
+	logger.Info("health_listening", "addr", healthLn.Addr().String())
+	spawn("health", func() error { return ignoreClosed(health.Serve(healthLn)) })
+	defer health.Close()
 
 	soft, err := d.nofile()
 	if err != nil {
@@ -292,37 +330,9 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		return &configError{err}
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	var wg sync.WaitGroup
-	defer wg.Wait()
-	errc := make(chan error, 8)
-	spawn := func(what string, f func() error) {
-		wg.Go(func() {
-			if err := f(); err != nil {
-				errc <- fmt.Errorf("%s: %w", what, err)
-			}
-		})
+	if d.beforePlane != nil {
+		d.beforePlane()
 	}
-
-	// Health answers before the plane loads, with 503 until then, so a slow start is visible.
-	var ready atomic.Bool
-	healthLn, err := net.Listen("tcp", cfg.healthListen)
-	if err != nil {
-		return fmt.Errorf("health listener: %w", err)
-	}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if !ready.Load() {
-			http.Error(w, "loading", http.StatusServiceUnavailable)
-			return
-		}
-		_, _ = io.WriteString(w, "ok\n")
-	})
-	health := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 30 * time.Second}
-	spawn("health", func() error { return ignoreClosed(health.Serve(healthLn)) })
-	defer health.Close()
-
 	plane, err := mgmt.NewPlane(mgmt.Config{
 		Intent:     intent,
 		KeyPath:    filepath.Join(cfg.dataDir, "ed25519.key"),
@@ -354,17 +364,9 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		return fmt.Errorf("bind listener: %w", err)
 	}
 
-	nudge := make(chan struct{}, 1)
-	publish := func(ctx context.Context, pub ed25519.PublicKey) error {
-		err := PublishPublicKey(ctx, kube, cfg.cmNamespace, cfg.cmName, pub)
-		if err != nil {
-			select {
-			case nudge <- struct{}{}:
-			default:
-			}
-		}
-		return err
-	}
+	publisher := newKeyPublisher(plane.PublicKey, func(ctx context.Context, pub ed25519.PublicKey) error {
+		return PublishPublicKey(ctx, kube, cfg.cmNamespace, cfg.cmName, pub)
+	})
 	adminLn, err := listenAdmin(cfg.adminSocket)
 	if err != nil {
 		_ = apiRaw.Close()
@@ -373,10 +375,10 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	}
 
 	spawn("api", func() error { return ignoreClosed(apiSrv.Serve(mgmt.ListenAPI(apiRaw, apiSrv.TLSConfig, logger))) })
-	spawn("bind", func() error { return ignoreClosed(bindSrv.Serve(mgmt.ListenBind(bindRaw, bindSrv.TLSConfig))) })
-	spawn("admin", func() error { return serveAdmin(ctx, adminLn, mgmt.NewAdminHandler(plane, publish)) })
+	spawn("bind", func() error { return ignoreClosed(bindSrv.Serve(mgmt.ListenBind(bindRaw, bindSrv.TLSConfig, logger))) })
+	spawn("admin", func() error { return serveAdmin(ctx, adminLn, mgmt.NewAdminHandler(plane, publisher.adminPublish)) })
 	wg.Go(func() { _ = plane.RunChecks(ctx) })
-	wg.Go(func() { runPublisher(ctx, plane.PublicKey, publish, nudge, logger, time.Second, 5*time.Minute) })
+	wg.Go(func() { publisher.run(ctx, logger, time.Second, 5*time.Minute) })
 
 	logger.Info("listening", "env", intent.Env, "api", apiRaw.Addr().String(), "bind", bindRaw.Addr().String(),
 		"health", healthLn.Addr().String(), "admin", cfg.adminSocket, "cells", cellNames(intent))
@@ -387,7 +389,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	case failure = <-errc:
 	}
 	cancel()
-	sctx, stop := context.WithTimeout(context.Background(), shutdownTimeout)
+	sctx, stop := context.WithTimeout(context.Background(), serverStopTimeout)
 	defer stop()
 	for _, s := range []*http.Server{apiSrv, bindSrv, health} {
 		if s.Shutdown(sctx) != nil {

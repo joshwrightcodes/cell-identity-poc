@@ -513,7 +513,7 @@ func startBind(t *testing.T, h http.Handler) (addr string, mgmtCA *spiffetest.CA
 	if err != nil {
 		t.Fatal(err)
 	}
-	ln := ListenBind(raw, bind.TLSConfig)
+	ln := ListenBind(raw, bind.TLSConfig, jsonLog(io.Discard))
 	go func() { _ = bind.Serve(ln) }()
 	t.Cleanup(func() { _ = bind.Close() })
 	return raw.Addr().String(), mgmtCA, bind
@@ -538,27 +538,27 @@ func TestListenerConnCap(t *testing.T) {
 		defer c.Close()
 		conns = append(conns, c)
 	}
-	done := make(chan error, 1)
-	go func() {
-		c, err := rawTLS(t, addr, mgmtCA, 10*time.Second)
-		if err == nil {
-			defer c.Close()
-		}
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		t.Fatalf("the 65th handshake finished within 1 s: %v", err)
-	case <-time.After(1 * time.Second):
+	// The 65th connection is refused at once, with no TLS, and does not wait in a queue.
+	start := time.Now()
+	if c, err := rawTLS(t, addr, mgmtCA, 5*time.Second); err == nil {
+		c.Close()
+		t.Fatal("the 65th handshake succeeded")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("the 65th connection took %s to fail, want under 1 s", d)
 	}
 	conns[0].Close()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("the 65th handshake after a close: %v", err)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c, err := rawTLS(t, addr, mgmtCA, time.Second)
+		if err == nil {
+			c.Close()
+			return
 		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("the 65th handshake did not finish within 1 s after a close")
+		if time.Now().After(deadline) {
+			t.Fatalf("no connection after a close: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -732,10 +732,10 @@ func startSlowClient(t *testing.T, addr string, mgmtCA *spiffetest.CA, mode int)
 	return sc
 }
 
+// released reports that the server closed the connection. A GOAWAY alone does not count, because
+// the slot stays taken until the connection closes.
 func (s *slowClient) released() bool {
 	select {
-	case <-s.away:
-		return true
 	case <-s.closed:
 		return true
 	default:
@@ -743,43 +743,49 @@ func (s *slowClient) released() bool {
 	}
 }
 
-func TestBindSlowBodyReleased(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs for about 22 s")
-	}
-	t.Parallel()
+// slowBind fills the bind listener with 64 trickling clients, and then makes real requests until
+// one succeeds. mode returns the trickle mode of client i.
+func slowBind(t *testing.T, mode func(i int) int) {
+	t.Helper()
 	fb := &fakeBinder{}
 	addr, mgmtCA, _ := startBind(t, NewBindHandler(fb, jsonLog(io.Discard)))
 	start := time.Now()
 	var slow []*slowClient
 	for i := 0; i < 64; i++ {
-		sc := startSlowClient(t, addr, mgmtCA, i%2)
+		sc := startSlowClient(t, addr, mgmtCA, mode(i))
 		defer sc.conn.Close()
 		slow = append(slow, sc)
 	}
 	time.Sleep(500 * time.Millisecond)
-	nonceCalls := func() int { n, _ := fb.calls(); return n }
 	good := h2Client(t, mgmtCA, nil)
-	good.Timeout = 30 * time.Second
+	good.Timeout = 10 * time.Second
+	// The values of the shared table, so that a changed variable cannot move the limit: maximum age
+	// 15 s, grace 10 s, and a margin of 2 s.
+	const limit = 15*time.Second + 10*time.Second + 2*time.Second
 	var resp *http.Response
-	var err error
+	refused := 0
 	for resp == nil {
-		resp, err = good.Post("https://"+addr+mgmtapi.NoncePath("dev-cell-1"), "application/json", nil)
-		if err != nil {
-			t.Fatalf("good bind after %s: %v", time.Since(start), err)
+		r, err := good.Post("https://"+addr+mgmtapi.NoncePath("dev-cell-1"), "application/json", nil)
+		if err == nil {
+			resp = r
+			break
 		}
+		refused++
+		if time.Since(start) > limit {
+			t.Fatalf("no good request after %s (%d refusals): %v", time.Since(start), refused, err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 	defer resp.Body.Close()
 	elapsed := time.Since(start)
-	if resp.StatusCode != 200 || nonceCalls() != 1 {
+	if n, _ := fb.calls(); resp.StatusCode != 200 || n != 1 {
 		t.Fatalf("good request: status %d", resp.StatusCode)
 	}
-	const limit = 15*time.Second + 5*time.Second + 2*time.Second
 	if elapsed > limit {
-		t.Fatalf("the good request took %s, more than %s", elapsed, limit)
+		t.Fatalf("the good request got through only after %s, more than %s", elapsed, limit)
 	}
-	if elapsed < 10*time.Second {
-		t.Fatalf("the good request took only %s, so the slow clients did not fill the listener", elapsed)
+	if refused == 0 {
+		t.Fatalf("the good request got through at %s, so the slow clients did not fill the listener", elapsed)
 	}
 	for time.Since(start) < limit {
 		all := true
@@ -793,47 +799,67 @@ func TestBindSlowBodyReleased(t *testing.T) {
 	}
 	for i, sc := range slow {
 		if !sc.released() {
-			t.Errorf("slow connection %d got neither GOAWAY nor a close after %s", i, elapsed)
+			t.Errorf("slow connection %d was still open after %s", i, time.Since(start))
 		}
 	}
 }
 
-func TestMaxAgeSendsGoAway(t *testing.T) {
+// Half of the clients trickle a body, and half trickle a header block. Only the hard deadline ends
+// a header trickle, because no handler ever runs.
+func TestBindSlowBodyReleased(t *testing.T) {
 	if testing.Short() {
-		t.Skip("runs for about 17 s")
+		t.Skip("runs for about 25 s")
 	}
 	t.Parallel()
+	slowBind(t, func(i int) int { return i % 2 })
+}
+
+// The literal case of the brief: every client trickles a body and opens a new stream every 5 s.
+func TestBindSlowBodyOnlyReleased(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for about 25 s")
+	}
+	t.Parallel()
+	slowBind(t, func(int) int { return 0 })
+}
+
+// TestMaxAgeSendsGoAway keeps one connection busy past the maximum age. The age counts from the
+// first request, and the switch must come before the hard deadline, so that only GOAWAY explains it.
+func TestMaxAgeSendsGoAway(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for about 16 s")
+	}
 	addr, mgmtCA, _ := startBind(t, NewBindHandler(&fakeBinder{}, jsonLog(io.Discard)))
 	c := h2Client(t, mgmtCA, nil)
-	start := time.Now()
 	var first net.Conn
+	var firstAt time.Time
 	var switched time.Duration
-	for time.Since(start) < 17*time.Second && switched == 0 {
+	for switched == 0 {
 		var got net.Conn
 		trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) { got = i.Conn }}
 		req, _ := http.NewRequest("POST", "https://"+addr+mgmtapi.NoncePath("dev-cell-1"), nil)
 		resp, err := c.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
 		if err != nil {
-			t.Fatalf("request at %s: %v", time.Since(start), err)
+			t.Fatalf("request at %s: %v", time.Since(firstAt), err)
 		}
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
-			t.Fatalf("status %d at %s", resp.StatusCode, time.Since(start))
+			t.Fatalf("status %d", resp.StatusCode)
 		}
-		age := time.Since(start)
 		switch {
 		case first == nil:
-			first = got
-		case got != first && switched == 0:
-			switched = age
+			first, firstAt = got, time.Now()
+		case got != first:
+			switched = time.Since(firstAt)
+		}
+		if time.Since(firstAt) > 25*time.Second {
+			t.Fatalf("the client was still on its first connection after %s", time.Since(firstAt))
 		}
 		time.Sleep(time.Second)
 	}
-	if switched == 0 {
-		t.Fatal("the client never moved to a new connection")
-	}
-	if switched < 14*time.Second || switched > 17*time.Second {
+	// GOAWAY comes with the first response after 15 s. A close by the hard deadline would come at 25 s.
+	if switched < 14*time.Second || switched > 19*time.Second {
 		t.Fatalf("the client moved to a new connection after %s, want about 15 s", switched)
 	}
 }

@@ -27,10 +27,11 @@ func silentConn(t *testing.T, addr string) net.Conn {
 	return c
 }
 
-// An unauthenticated peer cannot deny envd. Silent connections fill only the pending pool. A full
-// pool refuses a new connection at once and evicts none, and every pending connection ends at its
-// first-byte deadline.
-func TestAPIPendingHandshakesCannotDenyEnvd(t *testing.T) {
+// Below the cap of the pending pool, silent connections never deny envd, and they do not take a
+// verified slot. At the cap, a full pool refuses a new connection at once and evicts none, so envd
+// waits while a flood holds the whole pool. Every pending connection ends at its first-byte
+// deadline.
+func TestAPIPendingBelowCapNeverDeniesEnvd(t *testing.T) {
 	setPending(t, 4, 3*time.Second, 1200*time.Millisecond)
 	rig := startAPI(t, NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	envd := rig.devCA.Source(t, envdSPIFFE)

@@ -127,6 +127,9 @@ func NewPlane(cfg Config) (*Plane, error) {
 		if key, created, err = LoadOrCreateKey(cfg.KeyPath); err != nil {
 			return nil, err
 		}
+		if created {
+			cfg.Log.Info("signing_key_created")
+		}
 	} else if len(key) != ed25519.PrivateKeySize {
 		return nil, errors.New("signing key has the wrong size")
 	}
@@ -157,9 +160,6 @@ func NewPlane(cfg Config) (*Plane, error) {
 		p.snap.Store(&snapshot{st: st, pub: pub})
 		if err := p.commit(func(t *txn) error { return t.revise() }); err != nil {
 			return nil, fmt.Errorf("sign the first spec: %w", err)
-		}
-		if created {
-			cfg.Log.Info("signing_key_created")
 		}
 	case st.KeySHA256 != fp:
 		p.snap.Store(&snapshot{st: st, pub: pub})

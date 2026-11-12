@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 )
 
 const (
@@ -98,12 +101,15 @@ func runPublisher(ctx context.Context, current func() ed25519.PublicKey, publish
 	nudge <-chan struct{}, log *slog.Logger, backoff, resync time.Duration) {
 	wait := backoff
 	announce := true
+	limit := lograte.New(time.Minute, 4, time.Now)
 	for {
 		err := publish(ctx, current())
 		var next <-chan time.Time
 		switch {
 		case err != nil:
-			log.Warn("public_key_publish_failed", "error", err.Error(), "retry_in", wait.String())
+			if _, ok, suppressed, _ := limit.Allow("publish_failed"); ok {
+				log.Warn("public_key_publish_failed", "error", err.Error(), "retry_in", wait.String(), "suppressed", suppressed)
+			}
 			announce = true
 			next = time.After(wait + time.Duration(rand.Int64N(int64(wait)/4+1)))
 			if wait *= 2; wait > maxPublishBackoff {
@@ -124,4 +130,42 @@ func runPublisher(ctx context.Context, current func() ed25519.PublicKey, publish
 		case <-next:
 		}
 	}
+}
+
+// keyPublisher writes the current public key of the plane. One mutex serializes the writes, and
+// each write reads the current key inside the lock, so a rotation that lands during a write is
+// never undone by a write of the older key.
+type keyPublisher struct {
+	mu      sync.Mutex
+	current func() ed25519.PublicKey
+	write   func(context.Context, ed25519.PublicKey) error
+	nudge   chan struct{}
+}
+
+func newKeyPublisher(current func() ed25519.PublicKey, write func(context.Context, ed25519.PublicKey) error) *keyPublisher {
+	return &keyPublisher{current: current, write: write, nudge: make(chan struct{}, 1)}
+}
+
+// publish writes the current key. The argument is ignored.
+func (p *keyPublisher) publish(ctx context.Context, _ ed25519.PublicKey) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.write(ctx, p.current())
+}
+
+// adminPublish is publish for the admin handler. A failure wakes the background loop.
+func (p *keyPublisher) adminPublish(ctx context.Context, pub ed25519.PublicKey) error {
+	err := p.publish(ctx, pub)
+	if err != nil {
+		select {
+		case p.nudge <- struct{}{}:
+		default:
+		}
+	}
+	return err
+}
+
+// run is the background loop.
+func (p *keyPublisher) run(ctx context.Context, log *slog.Logger, backoff, resync time.Duration) {
+	runPublisher(ctx, p.current, p.publish, p.nudge, log, backoff, resync)
 }

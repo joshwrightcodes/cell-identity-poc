@@ -3,11 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
+	"crypto/ed25519"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,8 +27,10 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	ktesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -310,8 +316,22 @@ func TestServeEndToEnd(t *testing.T) {
 		t.Fatal("no log lines")
 	}
 	block, _ := pem.Decode(keyPEM)
-	if strings.Contains(r.out.String(), string(block.Bytes)) || strings.Contains(r.out.String(), "PRIVATE KEY") {
-		t.Fatal("the logs hold the private key")
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	must(t, err)
+	priv := parsed.(ed25519.PrivateKey)
+	for _, raw := range [][]byte{block.Bytes, priv, priv.Seed()} {
+		for name, form := range map[string]string{
+			"bytes": string(raw), "hex": hex.EncodeToString(raw), "std64": base64.StdEncoding.EncodeToString(raw),
+			"raw64": base64.RawStdEncoding.EncodeToString(raw), "url64": base64.URLEncoding.EncodeToString(raw),
+			"rawurl64": base64.RawURLEncoding.EncodeToString(raw),
+		} {
+			if strings.Contains(r.out.String(), form) {
+				t.Fatalf("the logs hold the private key in the form %s", name)
+			}
+		}
+	}
+	if strings.Contains(r.out.String(), "PRIVATE KEY") {
+		t.Fatal("the logs hold a key block")
 	}
 	if !strings.Contains(r.out.String(), "signing_key_created") {
 		t.Fatalf("no signing_key_created line: %s", r.out.String())
@@ -325,23 +345,145 @@ func mustSPIFFE(t testing.TB, s string) spiffeid.ID {
 	return id
 }
 
+// Every line on stdout is JSON, and nothing reaches the standard logger, which writes to stderr.
+// A refused handshake on each listener produces a line on stdout.
 func TestLogsAreJSON(t *testing.T) {
+	var stderr lockedBuffer
+	log.SetOutput(&stderr)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
 	f := newFixture(t)
 	r := f.start(t)
-	// A refused handshake and a bad request both log JSON.
 	c, err := net.Dial("tcp", r.addrs["api"])
 	must(t, err)
 	_, _ = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
 	_ = c.Close()
-	tc, err := tls.Dial("tcp", r.addrs["bind"], &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
-	if err == nil {
-		tc.Close()
+	bc, err := net.Dial("tcp", r.addrs["bind"])
+	must(t, err)
+	_, _ = bc.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
+	_, _ = io.Copy(io.Discard, bc)
+	_ = bc.Close()
+	deadline := time.Now().Add(3 * time.Second)
+	for !strings.Contains(r.out.String(), `"msg":"server_error"`) || !strings.Contains(r.out.String(), `"msg":"handshake_refused"`) {
+		if time.Now().After(deadline) {
+			t.Fatalf("no server_error and handshake_refused lines: %s", r.out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	time.Sleep(300 * time.Millisecond)
 	r.stop(t)
-	lines := jsonLines(t, r.out.String())
-	if len(lines) < 2 {
-		t.Fatalf("only %d lines", len(lines))
+	if len(jsonLines(t, r.out.String())) < 4 {
+		t.Fatalf("too few lines: %s", r.out.String())
+	}
+	if stderr.String() != "" {
+		t.Fatalf("the standard logger wrote: %q", stderr.String())
+	}
+}
+
+// Liveness answers while the process waits for its first SVID. Readiness is 503 until the plane has
+// loaded.
+func TestLivenessBeforeSVIDAndReadinessAfterPlane(t *testing.T) {
+	f := newFixture(t)
+	currentT = t
+	d := f.deps()
+	releaseSVID, releasePlane := make(chan struct{}), make(chan struct{})
+	inner := d.svids
+	d.svids = func(ctx context.Context) (x509svid.Source, func(), error) {
+		<-releaseSVID
+		return inner(ctx)
+	}
+	d.beforePlane = func() { <-releasePlane }
+	ctx, cancel := context.WithCancel(t.Context())
+	out := &lockedBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, f.argv(), out, d) }()
+	// release closes a gate once, and ignores a second close.
+	release := func(c chan struct{}) { defer func() { _ = recover() }(); close(c) }
+	defer func() {
+		release(releaseSVID)
+		release(releasePlane)
+		cancel()
+		<-done
+	}()
+	addr := waitField(t, out, "health_listening", "addr")
+	status := func(path string) int {
+		resp, err := http.Get("http://" + addr + path)
+		must(t, err)
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if status("/livez") != 200 || status("/healthz") != 503 {
+		t.Fatal("while the SVID is missing, /livez must be 200 and /healthz 503")
+	}
+	release(releaseSVID)
+	time.Sleep(100 * time.Millisecond)
+	if status("/healthz") != 503 {
+		t.Fatal("/healthz was not 503 while the plane loads")
+	}
+	release(releasePlane)
+	deadline := time.Now().Add(5 * time.Second)
+	for status("/healthz") != 200 {
+		if time.Now().After(deadline) {
+			t.Fatal("/healthz never became 200")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func waitField(t *testing.T, out *lockedBuffer, msg, field string) string {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, l := range strings.Split(out.String(), "\n") {
+			var m map[string]any
+			if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == msg {
+				v, _ := m[field].(string)
+				return v
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no %q line: %s", msg, out.String())
+	return ""
+}
+
+// Readiness does not depend on the key publish: every write fails and /healthz stays 200.
+func TestHealthzStaysUpWhilePublishFails(t *testing.T) {
+	f := newFixture(t)
+	for _, verb := range []string{"get", "create", "update"} {
+		f.kube.PrependReactor(verb, "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+			return true, nil, errors.New("forbidden")
+		})
+	}
+	r := f.start(t)
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(r.out.String(), "public_key_publish_failed") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no publish failure line: %s", r.out.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	resp, err := http.Get("http://" + r.addrs["health"] + "/healthz")
+	must(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/healthz %d while the publish fails", resp.StatusCode)
+	}
+}
+
+func TestShutdownBudgetStaysBelowTheGracePeriod(t *testing.T) {
+	if serverStopTimeout+flushTimeout >= 25*time.Second {
+		t.Fatalf("shutdown budget %s", serverStopTimeout+flushTimeout)
+	}
+}
+
+func TestServeRefusesNonPositiveIntervals(t *testing.T) {
+	f := newFixture(t)
+	currentT = t
+	for _, tc := range [][]string{{"--hostsvc-timeout", "0s"}, {"--check-every", "0s"}, {"--check-every", "-1m"}} {
+		var out bytes.Buffer
+		argv := append(f.argv("hostsvc-timeout"), tc...)
+		if code := execute(t.Context(), argv, &out, f.deps()); code != 2 {
+			t.Errorf("%v: exit %d, want 2", tc, code)
+		}
 	}
 }
 

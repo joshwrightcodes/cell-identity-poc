@@ -150,3 +150,76 @@ func TestPublisherRetriesUntilItSucceeds(t *testing.T) {
 		t.Fatalf("log: %s", logs.String())
 	}
 }
+
+// The background loop must back off after a failure. Probe of the backend review: the loop is wired
+// as serve wires it, and every write fails.
+func TestPublisherBacksOffAfterFailure(t *testing.T) {
+	pub, _ := newKey(t)
+	var calls atomic.Int32
+	p := newKeyPublisher(func() ed25519.PublicKey { return pub }, func(context.Context, ed25519.PublicKey) error {
+		calls.Add(1)
+		return errors.New("forbidden")
+	})
+	var logs lockedBuffer
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	p.run(ctx, jsonLogger(&logs), 500*time.Millisecond, time.Hour)
+	// Backoff 0.5 s, 1 s, then the end: about 3 calls in 2 s.
+	if n := calls.Load(); n > 5 {
+		t.Fatalf("%d publishes in 2 s with a 500 ms backoff", n)
+	}
+	if n := strings.Count(logs.String(), "public_key_publish_failed"); n > 2 {
+		t.Fatalf("%d warning lines in 2 s", n)
+	}
+}
+
+// A rotation between the read of the key and the write never puts the old key back.
+func TestPublisherWritesTheCurrentKey(t *testing.T) {
+	oldKey, _ := newKey(t)
+	newer, _ := newKey(t)
+	var cur atomic.Pointer[ed25519.PublicKey]
+	cur.Store(&oldKey)
+	var written []ed25519.PublicKey
+	var mu sync.Mutex
+	p := newKeyPublisher(func() ed25519.PublicKey { return *cur.Load() }, func(_ context.Context, k ed25519.PublicKey) error {
+		mu.Lock()
+		defer mu.Unlock()
+		written = append(written, k)
+		return nil
+	})
+	cur.Store(&newer)
+	// The caller passes the key that it read before the rotation.
+	if err := p.publish(t.Context(), oldKey); err != nil {
+		t.Fatal(err)
+	}
+	if len(written) != 1 || !written[0].Equal(newer) {
+		t.Fatalf("wrote %d keys, the first is not the current one", len(written))
+	}
+}
+
+func TestPublisherResyncs(t *testing.T) {
+	pub, _ := newKey(t)
+	var calls atomic.Int32
+	p := newKeyPublisher(func() ed25519.PublicKey { return pub }, func(context.Context, ed25519.PublicKey) error { calls.Add(1); return nil })
+	ctx, cancel := context.WithTimeout(t.Context(), 400*time.Millisecond)
+	defer cancel()
+	p.run(ctx, jsonLogger(&lockedBuffer{}), time.Millisecond, 50*time.Millisecond)
+	if calls.Load() < 3 {
+		t.Fatalf("%d publishes in 400 ms with a 50 ms resync", calls.Load())
+	}
+}
+
+func TestPublishRepairsLabelDrift(t *testing.T) {
+	client := fake.NewClientset()
+	pub, _ := newKey(t)
+	must(t, PublishPublicKey(t.Context(), client, "mgmt-system", "c", pub))
+	cm, _ := client.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "c", metav1.GetOptions{})
+	cm.Labels = map[string]string{}
+	_, err := client.CoreV1().ConfigMaps("mgmt-system").Update(t.Context(), cm, metav1.UpdateOptions{})
+	must(t, err)
+	must(t, PublishPublicKey(t.Context(), client, "mgmt-system", "c", pub))
+	cm, _ = client.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "c", metav1.GetOptions{})
+	if cm.Labels["poc.internal/made-by"] != "mgmtd" {
+		t.Fatalf("labels %v", cm.Labels)
+	}
+}

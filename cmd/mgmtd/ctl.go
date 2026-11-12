@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"syscall"
 	"time"
@@ -20,7 +22,7 @@ import (
 )
 
 const (
-	defaultSocket  = "/run/mgmtd/admin.sock"
+	defaultSocket  = "/run/mgmtd/ctl/admin.sock"
 	ctlTimeout     = 60 * time.Second
 	maxCtlResponse = 16 << 20
 	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key"
@@ -29,8 +31,21 @@ const (
 // listenAdmin listens on the unix socket at path. The socket is made under a restrictive umask and
 // then set to mode 0600, and a stale socket file is removed first.
 func listenAdmin(path string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	switch info, err := os.Stat(dir); {
+	case errors.Is(err, fs.ErrNotExist):
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("admin socket directory: %w", err)
+		}
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("admin socket directory mode: %w", err)
+		}
+	case err != nil:
 		return nil, fmt.Errorf("admin socket directory: %w", err)
+	case !info.IsDir():
+		return nil, fmt.Errorf("admin socket directory %s is not a directory", dir)
+	case info.Mode().Perm()&0o022 != 0:
+		return nil, fmt.Errorf("admin socket directory %s is writable by group or others (mode %v); another container could replace the socket, so mgmtd creates its own directory under the shared volume", dir, info.Mode().Perm())
 	}
 	if fi, err := os.Lstat(path); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
@@ -102,6 +117,10 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		}
 		query = "?expect-seq=" + *expect
 	}
+	if query != "" && !slices.Contains([]string{"keycheck", "restore", "rotate-key"}, rest[0]) {
+		cli.Fail(stdout, name, fmt.Errorf("--expect-seq applies only to keycheck, restore and rotate-key, not %s", rest[0]))
+		return exitConfig
+	}
 	var method, path string
 	switch rest[0] {
 	case "status":
@@ -161,11 +180,9 @@ func ctlRequest(ctx context.Context, socket, method, path string, out io.Writer)
 		return fmt.Errorf("read the answer: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
-		var e struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(body, &e) == nil && e.Error != "" {
-			return errors.New(e.Error)
+		var e adminFailure
+		if json.Unmarshal(body, &e) == nil && e.Message != "" {
+			return &e
 		}
 		return fmt.Errorf("admin socket answered %s", resp.Status)
 	}
@@ -176,4 +193,25 @@ func ctlRequest(ctx context.Context, socket, method, path string, out io.Writer)
 	line.WriteByte('\n')
 	_, err = out.Write(line.Bytes())
 	return err
+}
+
+// adminFailure is an error answer of the admin socket. LogAttrs puts the reason and the rotated
+// flag on the error line, so that a script matches a field and not the text.
+type adminFailure struct {
+	Message string `json:"error"`
+	Reason  string `json:"reason"`
+	Rotated bool   `json:"rotated"`
+}
+
+func (e *adminFailure) Error() string { return e.Message }
+
+func (e *adminFailure) LogAttrs() []any {
+	var a []any
+	if e.Reason != "" {
+		a = append(a, "reason", e.Reason)
+	}
+	if e.Rotated {
+		a = append(a, "rotated", true)
+	}
+	return a
 }

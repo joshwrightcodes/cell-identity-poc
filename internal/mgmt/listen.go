@@ -27,10 +27,13 @@ var (
 	handshakeDeadline = 5 * time.Second
 	firstByteDeadline = 1 * time.Second
 
-	maxConns   = 64
-	apiMaxAge  = 5 * time.Minute
+	maxConns  = 64
+	apiMaxAge = 5 * time.Minute
+	apiGrace  = 5 * time.Second
+	// bindMaxAge plus bindGrace is the hard deadline of a bind connection. It stays below the 30 s
+	// attempt timeout of celld, and above the maximum age plus a 10 s key fetch.
 	bindMaxAge = 15 * time.Second
-	connGrace  = 5 * time.Second
+	bindGrace  = 10 * time.Second
 )
 
 const (
@@ -70,14 +73,60 @@ func ListenAPI(ln net.Listener, cfg *tls.Config, log *slog.Logger) net.Listener 
 		}
 	}
 	hl := newHandshakeListener(ln, cfg, maxPendingHandshakes, handshakeDeadline, firstByteDeadline, report)
-	return connlimit.Listen(hl, maxConns, apiMaxAge, connGrace, nil)
+	return connlimit.Listen(hl, maxConns, apiMaxAge, apiGrace, nil)
 }
 
-// ListenBind wraps ln for the bind server. The cap on connections counts every accepted connection,
-// because a cell has no certificate to prove at the TLS layer. A connection ends at its maximum age
-// plus the grace at the latest. The TLS handshake runs inside the server, under its timeouts.
-func ListenBind(ln net.Listener, cfg *tls.Config) net.Listener {
-	return tls.NewListener(connlimit.Listen(ln, maxConns, bindMaxAge, connGrace, nil), cfg)
+// ListenBind wraps ln for the bind server. A cell has no certificate to prove at the TLS layer, so
+// every connection counts against the cap of 64. A connection beyond the cap is closed at once with
+// no TLS, so a real cell fails fast and retries, and no connection waits in the kernel queue. A
+// connection ends at its maximum age plus the grace at the latest. The TLS handshake runs inside
+// the server, under its timeouts. Refusals go to log, at most one line in each window.
+func ListenBind(ln net.Listener, cfg *tls.Config, log *slog.Logger) net.Listener {
+	limit := lograte.New(refuseWindow, refuseKeys, time.Now)
+	rl := &refusingListener{Listener: ln, max: int32(maxConns), refused: func() {
+		if _, ok, suppressed, _ := limit.Allow("bind_full"); ok {
+			log.Warn("connection_refused", "reason", "listener_full", "suppressed", suppressed)
+		}
+	}}
+	// connlimit holds one more slot than the cap, so that one Accept always waits on rl and a
+	// refusal never depends on the timing of the server's accept loop.
+	return tls.NewListener(connlimit.Listen(rl, maxConns+1, bindMaxAge, bindGrace, nil), cfg)
+}
+
+// refusingListener closes each connection beyond max open connections as soon as it accepts it.
+type refusingListener struct {
+	net.Listener
+	max     int32
+	open    atomic.Int32
+	refused func()
+}
+
+func (l *refusingListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		if l.open.Add(1) > l.max {
+			l.open.Add(-1)
+			_ = c.Close()
+			l.refused()
+			continue
+		}
+		return &countedConn{Conn: c, l: l}, nil
+	}
+}
+
+type countedConn struct {
+	net.Conn
+	l    *refusingListener
+	once sync.Once
+}
+
+func (c *countedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() { c.l.open.Add(-1) })
+	return err
 }
 
 // peerIDs maps a verified API connection, by its two addresses, to the SPIFFE ID of its client,
@@ -85,6 +134,12 @@ func ListenBind(ln net.Listener, cfg *tls.Config) net.Listener {
 var peerIDs sync.Map
 
 type peerCtxKey struct{}
+
+// peerInfo is the verified client of an API connection and the end of its certificate.
+type peerInfo struct {
+	ID       spiffeid.ID
+	NotAfter time.Time
+}
 
 func connKey(c net.Conn) string { return c.LocalAddr().String() + ">" + c.RemoteAddr().String() }
 
@@ -200,19 +255,41 @@ func (l *handshakeListener) handshake(p *pendingConn) {
 	key := connKey(tc)
 	if cs := tc.ConnectionState(); len(cs.PeerCertificates) > 0 {
 		if id, err := x509svid.IDFromCert(cs.PeerCertificates[0]); err == nil {
-			peerIDs.Store(key, id)
+			peerIDs.Store(key, peerInfo{ID: id, NotAfter: cs.PeerCertificates[0].NotAfter})
 		}
 	}
+	var out net.Conn = tc
+	if cs := tc.ConnectionState(); len(cs.PeerCertificates) > 0 {
+		out = newExpiringConn(tc, cs.PeerCertificates[0].NotAfter)
+	}
 	select {
-	case l.out <- tc:
+	case l.out <- out:
 	case <-time.After(l.timeout):
 		peerIDs.Delete(key)
-		_ = tc.Close()
+		_ = out.Close()
 		l.report(refusedNotAccepted, errors.New("verified connection was not accepted"))
 	case <-l.done:
 		peerIDs.Delete(key)
-		_ = tc.Close()
+		_ = out.Close()
 	}
+}
+
+// expiringConn closes the connection when the client certificate expires, so a connection never
+// outlives the SVID that opened it.
+type expiringConn struct {
+	net.Conn
+	timer *time.Timer
+}
+
+func newExpiringConn(c net.Conn, notAfter time.Time) net.Conn {
+	e := &expiringConn{Conn: c}
+	e.timer = time.AfterFunc(time.Until(notAfter), func() { _ = c.Close() })
+	return e
+}
+
+func (e *expiringConn) Close() error {
+	e.timer.Stop()
+	return e.Conn.Close()
 }
 
 func (l *handshakeListener) Accept() (net.Conn, error) {
@@ -239,7 +316,7 @@ func (l *handshakeListener) Close() error {
 	return err
 }
 
-func peerFromContext(ctx interface{ Value(any) any }) (spiffeid.ID, bool) {
-	id, ok := ctx.Value(peerCtxKey{}).(spiffeid.ID)
-	return id, ok
+func peerFromContext(ctx interface{ Value(any) any }) (peerInfo, bool) {
+	p, ok := ctx.Value(peerCtxKey{}).(peerInfo)
+	return p, ok
 }
