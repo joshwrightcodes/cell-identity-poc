@@ -1568,7 +1568,7 @@ func normalResource(marker string) *logspb.ResourceLogs {
 // treats as permanent, would let one workload drop the data of the others. The gateway forwards the
 // other resources and answers with a partial success. A request with no other resource is still refused.
 func TestGatewayDropsOnlyTheHostileResource(t *testing.T) {
-	for _, shape := range []string{"attributes", "scopes", "depth"} {
+	for shape, wantRejected := range map[string]int64{"attributes": 1, "scopes": 0, "depth": 1} {
 		t.Run(shape, func(t *testing.T) {
 			h := newGWHarness(t, &otlpUpstream{})
 			conn := h.serve(t, otelPattern, otelID1)
@@ -1578,8 +1578,8 @@ func TestGatewayDropsOnlyTheHostileResource(t *testing.T) {
 			if err != nil {
 				t.Fatalf("the gateway refused the request: %v, want the normal resources forwarded", err)
 			}
-			if ps := resp.GetPartialSuccess(); ps.GetRejectedLogRecords() < 1 || ps.GetErrorMessage() == "" {
-				t.Errorf("partial success %v, want a rejected count and a message", ps)
+			if ps := resp.GetPartialSuccess(); ps.GetRejectedLogRecords() != wantRejected || ps.GetErrorMessage() == "" {
+				t.Errorf("partial success %v, want %d rejected log records and a message", ps, wantRejected)
 			}
 			h.up.mu.Lock()
 			defer h.up.mu.Unlock()
@@ -1618,7 +1618,7 @@ func TestGatewayDropsOnlyTheHostileResourceOfEverySignal(t *testing.T) {
 		resp, err := coltracepb.NewTraceServiceClient(conn).Export(t.Context(), &coltracepb.ExportTraceServiceRequest{ResourceSpans: []*tracepb.ResourceSpans{
 			{Resource: res("ok"), ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{Name: "ok"}}}}},
 			{Resource: res("bad"), ScopeSpans: []*tracepb.ScopeSpans{{Spans: []*tracepb.Span{{Name: "bad", Attributes: attrs}}}}}}})
-		if err != nil || resp.GetPartialSuccess().GetRejectedSpans() < 1 {
+		if err != nil || resp.GetPartialSuccess().GetRejectedSpans() != 1 {
 			t.Fatalf("err %v, partial success %v, want one rejected span", err, resp.GetPartialSuccess())
 		}
 		if len(h.up.traces) != 1 || len(h.up.traces[0].ResourceSpans) != 1 {
@@ -1634,7 +1634,7 @@ func TestGatewayDropsOnlyTheHostileResourceOfEverySignal(t *testing.T) {
 		resp, err := colmetricspb.NewMetricsServiceClient(conn).Export(t.Context(), &colmetricspb.ExportMetricsServiceRequest{ResourceMetrics: []*metricspb.ResourceMetrics{
 			{Resource: res("ok"), ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{point(nil)}}}},
 			{Resource: res("bad"), ScopeMetrics: []*metricspb.ScopeMetrics{{Metrics: []*metricspb.Metric{point(attrs)}}}}}})
-		if err != nil || resp.GetPartialSuccess().GetRejectedDataPoints() < 1 {
+		if err != nil || resp.GetPartialSuccess().GetRejectedDataPoints() != 1 {
 			t.Fatalf("err %v, partial success %v, want one rejected point", err, resp.GetPartialSuccess())
 		}
 		if len(h.up.metrics) != 1 || len(h.up.metrics[0].ResourceMetrics) != 1 {

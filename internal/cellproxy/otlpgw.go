@@ -74,9 +74,12 @@ const (
 	// RequestTooLarge: the request passes a shape cap, or passes the upstream limit after the
 	// reset. The status is ResourceExhausted.
 	RequestTooLarge Reason = "request_too_large"
-	// ResourceRefused: one resource of a request passes a shape cap of one resource. The gateway drops
-	// it, forwards the other resources, and reports a partial success.
+	// ResourceRefused: one resource of a request passes a shape cap of one resource, or holds a string
+	// that is not valid UTF-8. The gateway drops it, forwards the other resources, and reports a partial success.
 	ResourceRefused Reason = "resource_refused"
+	// RequestMalformed: the request does not decode, for example truncated wire bytes, or a string that
+	// is not valid UTF-8 in every resource.
+	RequestMalformed Reason = "request_malformed"
 
 	meshSourceCluster      = "source_cluster"
 	meshDestinationCluster = "destination_cluster"
@@ -640,7 +643,9 @@ func (g *Gateway) ExportLogs(ctx context.Context, req *collogspb.ExportLogsServi
 			r.PartialSuccess = &collogspb.ExportLogsPartialSuccess{}
 		}
 		r.PartialSuccess.RejectedLogRecords += n
-		r.PartialSuccess.ErrorMessage = msg
+		if r.PartialSuccess.ErrorMessage == "" {
+			r.PartialSuccess.ErrorMessage = msg
+		}
 		return r
 	})
 }
@@ -655,7 +660,9 @@ func (g *Gateway) ExportTraces(ctx context.Context, req *coltracepb.ExportTraceS
 			r.PartialSuccess = &coltracepb.ExportTracePartialSuccess{}
 		}
 		r.PartialSuccess.RejectedSpans += n
-		r.PartialSuccess.ErrorMessage = msg
+		if r.PartialSuccess.ErrorMessage == "" {
+			r.PartialSuccess.ErrorMessage = msg
+		}
 		return r
 	})
 }
@@ -670,7 +677,9 @@ func (g *Gateway) ExportMetrics(ctx context.Context, req *colmetricspb.ExportMet
 			r.PartialSuccess = &colmetricspb.ExportMetricsPartialSuccess{}
 		}
 		r.PartialSuccess.RejectedDataPoints += n
-		r.PartialSuccess.ErrorMessage = msg
+		if r.PartialSuccess.ErrorMessage == "" {
+			r.PartialSuccess.ErrorMessage = msg
+		}
 		return r
 	})
 }
@@ -783,6 +792,10 @@ func forward[Req proto.Message, Resp any](ctx context.Context, g *Gateway, signa
 	}
 	log = log.With("sender_cluster", src.Cluster, "spiffe_id", id)
 	if refused != nil {
+		var de *decodeError
+		if errors.As(refused, &de) {
+			return zero, g.deny(ctx, log, signal, src, RequestMalformed, codes.InvalidArgument, refused.Error())
+		}
 		return zero, g.deny(ctx, log, signal, src, RequestTooLarge, codes.ResourceExhausted, refused.Error())
 	}
 	if ows := reset(req, src); len(ows) > 0 {
