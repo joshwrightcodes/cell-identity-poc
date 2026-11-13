@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,6 +53,9 @@ type Config struct {
 	Ticks func(d time.Duration) <-chan time.Time
 	Log   *slog.Logger
 	Meter metric.Meter
+	// OnRecords is called with the served record envelopes and the signing public key after each
+	// commit that changes a record, and once after NewPlane. A failed save never calls it.
+	OnRecords func(records map[string]json.RawMessage, pub ed25519.PublicKey)
 
 	NonceTTL, CheckEvery, KeyUpdateGap, KeyCacheTTL, NonceKeyEvery time.Duration
 	HistoryLen                                                     int
@@ -102,8 +109,13 @@ type Plane struct {
 
 	rmu sync.Mutex
 	rep reports
+	rt  liveState
 
-	bindResults, checkResults metric.Int64Counter
+	cbmu  sync.Mutex // serializes OnRecords calls
+	ready atomic.Bool
+	bg    sync.WaitGroup // background hint checks
+
+	bindResults, checkResults, reportItems, retryUnknownKID metric.Int64Counter
 }
 
 // NewPlane loads the key and the state, signs the first spec of a fresh store, re-signs after a key
@@ -144,6 +156,9 @@ func NewPlane(cfg Config) (*Plane, error) {
 	}
 	p.bindResults, _ = cfg.Meter.Int64Counter("mgmtd.bind.results")
 	p.checkResults, _ = cfg.Meter.Int64Counter("mgmtd.keycheck.results")
+	p.reportItems, _ = cfg.Meter.Int64Counter("mgmtd.report.items")
+	p.retryUnknownKID, _ = cfg.Meter.Int64Counter("mgmtd.report.retry_unknown_kid")
+	p.rt.cells = map[string]*cellRuntime{}
 	if _, err := cfg.Meter.Int64ObservableGauge("mgmtd.spec.revision.lag", metric.WithInt64Callback(p.observeLag)); err != nil {
 		return nil, err
 	}
@@ -183,10 +198,15 @@ func NewPlane(cfg Config) (*Plane, error) {
 		p.snap.Store(&snapshot{st: st, pub: pub})
 	}
 
+	if err := p.checkStaged(); err != nil {
+		return nil, err
+	}
 	if err := p.commit(p.reconcile); err != nil {
 		return nil, fmt.Errorf("apply the intent: %w", err)
 	}
 	p.noteLag()
+	p.ready.Store(true)
+	p.notifyRecords()
 	return p, nil
 }
 
@@ -216,7 +236,8 @@ func (p *Plane) checkStored(st *State, pub ed25519.PublicKey) error {
 	return nil
 }
 
-// RotateKey makes a new signing key, writes it, and re-signs every record and the spec at the first
+// RotateKey makes the staged signing key the signing key, or a new key when none is staged. It
+// writes the key, and re-signs every record, the spec and every open operation at the first
 // revision of the next epoch. A failed change puts the old key file back.
 func (p *Plane) RotateKey(ctx context.Context) (ed25519.PublicKey, error) { return p.rotate(ctx, nil) }
 
@@ -224,13 +245,16 @@ func (p *Plane) rotate(ctx context.Context, expect *uint64) (ed25519.PublicKey, 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	_, next, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		return nil, fmt.Errorf("make signing key: %w", err)
-	}
-	err = p.commit(func(t *txn) error {
+	err := p.commit(func(t *txn) error {
 		if err := t.expectSeq(expect); err != nil {
 			return err
+		}
+		next, staged := p.stagedKey(t.st)
+		if !staged {
+			var err error
+			if _, next, err = ed25519.GenerateKey(rand.Reader); err != nil {
+				return fmt.Errorf("make signing key: %w", err)
+			}
 		}
 		old := t.key
 		t.onFail = append(t.onFail, func() {
@@ -242,13 +266,96 @@ func (p *Plane) rotate(ctx context.Context, expect *uint64) (ed25519.PublicKey, 
 			return err
 		}
 		t.key = next
-		return p.resignAll(fingerprint(next.Public().(ed25519.PublicKey)))(t)
+		if err := p.resignAll(fingerprint(next.Public().(ed25519.PublicKey)))(t); err != nil {
+			return err
+		}
+		if staged {
+			t.st.StagedKeySHA256 = ""
+			t.after = append(t.after, func() {
+				if err := os.Remove(p.nextKeyPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					p.cfg.Log.Error("staged_key_remove_failed", "error", err.Error())
+				}
+			})
+		}
+		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 	p.cfg.Log.Warn("signing_key_rotated", "epoch", p.snap.Load().st.Last.Epoch)
 	return p.PublicKey(), nil
+}
+
+// nextKeyFile is the name of the staged signing key, next to the signing key file.
+const nextKeyFile = "ed25519.next.key"
+
+func (p *Plane) nextKeyPath() string { return filepath.Join(filepath.Dir(p.cfg.KeyPath), nextKeyFile) }
+
+// stagedKey returns the staged key when the state names it and the file holds that key.
+func (p *Plane) stagedKey(st *State) (ed25519.PrivateKey, bool) {
+	if st.StagedKeySHA256 == "" {
+		return nil, false
+	}
+	key, err := loadKey(p.nextKeyPath())
+	if err != nil || fingerprint(key.Public().(ed25519.PublicKey)) != st.StagedKeySHA256 {
+		return nil, false
+	}
+	return key, true
+}
+
+// StageKey writes the next signing key to ed25519.next.key and returns its public key. A second
+// call returns the same key. RotateKey then makes it the signing key.
+func (p *Plane) StageKey(ctx context.Context) (ed25519.PublicKey, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var pub ed25519.PublicKey
+	err := p.commit(func(t *txn) error {
+		if key, ok := p.stagedKey(t.st); ok {
+			pub = key.Public().(ed25519.PublicKey)
+			return nil
+		}
+		_, key, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			return fmt.Errorf("make signing key: %w", err)
+		}
+		if err := WriteKey(p.nextKeyPath(), key); err != nil {
+			return err
+		}
+		t.onFail = append(t.onFail, func() { _ = os.Remove(p.nextKeyPath()) })
+		pub = key.Public().(ed25519.PublicKey)
+		t.st.StagedKeySHA256 = fingerprint(pub)
+		t.dirty = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(pub), nil
+}
+
+// checkStaged keeps the staged key file only while the state names it. Any other file moves aside,
+// because it can be a key from a state that no longer exists. A name without a file is cleared.
+func (p *Plane) checkStaged() error {
+	st := p.snap.Load().st
+	_, statErr := os.Stat(p.nextKeyPath())
+	exists := statErr == nil
+	_, valid := p.stagedKey(st)
+	if exists && !valid {
+		dest := p.nextKeyPath() + ".stale-" + strconv.FormatInt(p.cfg.Now().Unix(), 10)
+		if err := os.Rename(p.nextKeyPath(), dest); err != nil {
+			return fmt.Errorf("move the unnamed staged key aside: %w", err)
+		}
+		p.cfg.Log.Warn("staged_key_moved_aside", "moved_to", dest)
+	}
+	if st.StagedKeySHA256 != "" && !valid {
+		return p.commit(func(t *txn) error {
+			t.st.StagedKeySHA256 = ""
+			t.dirty = true
+			return nil
+		})
+	}
+	return nil
 }
 
 // Restore serves the stored revision with the given counter, and 0 serves the latest. While an older

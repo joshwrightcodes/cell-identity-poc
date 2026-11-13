@@ -838,27 +838,72 @@ func TestKeyCheck(t *testing.T) {
 }
 
 func TestKeyCheckRateLimited(t *testing.T) {
-	r := newRig(t)
-	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
-	r.clk.Advance(61 * time.Second)
-	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckUnchanged {
-		t.Fatalf("first: %v, %v", res, err)
+	setup := func(t *testing.T) *rig {
+		r := newRig(t)
+		r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+		r.clk.Advance(61 * time.Second)
+		if res, err := r.plane.KeyCheckVia(t.Context(), cell1, ViaPeriodic); err != nil || res != CheckUnchanged {
+			t.Fatalf("first: %v, %v", res, err)
+		}
+		return r
 	}
-	calls := r.keys.count(cell1)
-	r.clk.Advance(30 * time.Second)
-	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckRateLimited {
-		t.Fatalf("second within 60 s: %v, %v", res, err)
-	}
-	if r.keys.count(cell1) != calls {
-		t.Fatal("a rate limited check fetched keys")
-	}
-	r.clk.Advance(31 * time.Second)
-	if res, _ := r.plane.KeyCheck(t.Context(), cell1); res != CheckUnchanged {
-		t.Fatalf("after the gap: %v", res)
-	}
-	if _, err := r.plane.KeyCheck(t.Context(), "dev-cell-9"); ReasonOf(err) != mgmtapi.ReasonCellUnknown {
-		t.Fatalf("unknown cell: %v", err)
-	}
+	t.Run("second_check_within_60s", func(t *testing.T) {
+		r := setup(t)
+		calls := r.keys.count(cell1)
+		r.clk.Advance(30 * time.Second)
+		for _, via := range []string{ViaPeriodic, ViaHint} {
+			if res, err := r.plane.KeyCheckVia(t.Context(), cell1, via); err != nil || res != CheckUnchanged {
+				t.Fatalf("%s within 60 s: %v, %v", via, res, err)
+			}
+		}
+		if r.keys.count(cell1) != calls {
+			t.Fatal("a check within 60 s of the last fetch asked the key source")
+		}
+		r.clk.Advance(31 * time.Second)
+		if res, _ := r.plane.KeyCheckVia(t.Context(), cell1, ViaPeriodic); res != CheckUnchanged || r.keys.count(cell1) != calls+1 {
+			t.Fatalf("after the cache TTL: %v, %d fetches", res, r.keys.count(cell1)-calls)
+		}
+	})
+	t.Run("update_within_60s_of_update", func(t *testing.T) {
+		r := setup(t)
+		r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"))
+		if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUpdated {
+			t.Fatalf("update: %v, %v", res, err)
+		}
+		before := r.verifySpec().Revision
+		r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"), newSigner(t, "kid-c"))
+		r.clk.Advance(30 * time.Second)
+		if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckRateLimited {
+			t.Fatalf("second update within 60 s: %v, %v", res, err)
+		}
+		if r.verifySpec().Revision != before {
+			t.Fatal("a rate limited check signed a revision")
+		}
+		r.clk.Advance(31 * time.Second)
+		if res, _ := r.plane.KeyCheck(t.Context(), cell1); res != CheckKeysUpdated {
+			t.Fatalf("after the gap: %v", res)
+		}
+	})
+	t.Run("manual_check_bypasses_cache", func(t *testing.T) {
+		r := setup(t)
+		calls := r.keys.count(cell1)
+		r.clk.Advance(5 * time.Second)
+		if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckUnchanged {
+			t.Fatalf("manual: %v, %v", res, err)
+		}
+		if got := r.keys.count(cell1) - calls; got != 1 {
+			t.Fatalf("a manual check made %d fetches, want 1", got)
+		}
+	})
+	t.Run("unknown_cell_and_source", func(t *testing.T) {
+		r := setup(t)
+		if _, err := r.plane.KeyCheck(t.Context(), "dev-cell-9"); ReasonOf(err) != mgmtapi.ReasonCellUnknown {
+			t.Fatalf("unknown cell: %v", err)
+		}
+		if _, err := r.plane.KeyCheckVia(t.Context(), cell1, "other"); err == nil {
+			t.Fatal("an unknown source ran a check")
+		}
+	})
 }
 
 func TestRunChecksEvery15m(t *testing.T) {

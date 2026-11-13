@@ -3,6 +3,7 @@ package mgmt
 import (
 	"context"
 	"log/slog"
+	"slices"
 	"sort"
 	"time"
 
@@ -31,6 +32,15 @@ type Status struct {
 	PendingDrops       []string         `json:"pendingDrops"`
 	StateBehindApplied bool             `json:"stateBehindApplied"`
 	Cells              []CellStatus     `json:"cells"`
+
+	// Gateway is the last gateway status that envd reported. DroppedAt is the time that the dropped
+	// count last rose, and EpochChangedAt the time that the queue epoch last changed. StagedKey is
+	// the fingerprint of the staged signing key.
+	Gateway        *mgmtapi.GatewayStatus `json:"gateway,omitempty"`
+	GatewayAt      time.Time              `json:"gatewayAt,omitzero"`
+	DroppedAt      time.Time              `json:"droppedAt,omitzero"`
+	EpochChangedAt time.Time              `json:"epochChangedAt,omitzero"`
+	StagedKey      string                 `json:"stagedKey,omitempty"`
 }
 
 // CellStatus is the status of one intent cell.
@@ -42,6 +52,19 @@ type CellStatus struct {
 	Record    spec.Revision `json:"record"`
 	CheckedAt time.Time     `json:"checkedAt,omitzero"`
 	LastCheck string        `json:"lastCheck"`
+
+	LastStatusAt       time.Time    `json:"lastStatusAt,omitzero"`
+	LastStatusPod      string       `json:"lastStatusPod,omitempty"`
+	Unreported         uint64       `json:"unreported"`
+	OldestUnreportedAt time.Time    `json:"oldestUnreportedAt,omitzero"`
+	Records            uint64       `json:"records"`
+	OpenOps            int          `json:"openOps"`
+	ExpiredOps         int          `json:"expiredOps"`
+	LastResultAt       time.Time    `json:"lastResultAt,omitzero"`
+	LastRefusal        *ItemRefusal `json:"lastRefusal,omitempty"`
+	ForgedSeen         int          `json:"forgedSeen"`
+	HintAt             time.Time    `json:"hintAt,omitzero"`
+	LastHintCheck      string       `json:"lastHintCheck,omitempty"`
 }
 
 type reports struct {
@@ -52,6 +75,11 @@ type reports struct {
 	refusal      *mgmtapi.Refusal
 	storeError   string
 	behindLogged bool
+
+	gateway        *mgmtapi.GatewayStatus
+	gatewayAt      time.Time
+	droppedAt      time.Time
+	epochChangedAt time.Time
 }
 
 func servedRevision(st *State) spec.Revision {
@@ -61,7 +89,29 @@ func servedRevision(st *State) spec.Revision {
 	return st.Last
 }
 
+// noteGateway keeps the gateway status, and the times that its dropped count last rose and its
+// epoch last changed. A time that the gateway reports wins when it is later. Without one, a rise
+// since the last report counts from now. The caller holds rmu.
+func (p *Plane) noteGateway(g *mgmtapi.GatewayStatus, now time.Time) {
+	prev := p.rep.gateway
+	cp := *g
+	cp.KeyHints = slices.Clone(g.KeyHints)
+	p.rep.gateway, p.rep.gatewayAt = &cp, now
+	if g.DroppedAt.After(p.rep.droppedAt) {
+		p.rep.droppedAt = g.DroppedAt
+	} else if prev != nil && g.Dropped > prev.Dropped {
+		p.rep.droppedAt = now
+	}
+	if g.EpochChangedAt.After(p.rep.epochChangedAt) {
+		p.rep.epochChangedAt = g.EpochChangedAt
+	} else if prev != nil && g.Epoch != prev.Epoch {
+		p.rep.epochChangedAt = now
+	}
+}
+
 // Report stores what envd reported. A report of the signed revision releases the next pending drop.
+// Each key hint, from the report or from the gateway, queues at most one background hint check for
+// its cell in 60 s, so Report returns at once.
 func (p *Plane) Report(r mgmtapi.StatusReport) {
 	now := p.cfg.Now()
 	p.rmu.Lock()
@@ -76,6 +126,11 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		cp := *r.LastRefusal
 		p.rep.refusal = &cp
 	}
+	hints := slices.Clone(r.KeyHints)
+	if r.Gateway != nil {
+		p.noteGateway(r.Gateway, now)
+		hints = append(hints, r.Gateway.KeyHints...)
+	}
 	p.lagLocked(st, now)
 	logBehind := behind && !p.rep.behindLogged
 	p.rep.behindLogged = behind
@@ -83,6 +138,9 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 	if logBehind {
 		p.cfg.Log.Error("state_behind_applied", "applied_epoch", r.Applied.Epoch, "applied_counter", r.Applied.Counter,
 			"signed_epoch", st.Last.Epoch, "signed_counter", st.Last.Counter)
+	}
+	for _, h := range hints {
+		p.queueHint(h.Cell)
 	}
 	if len(st.PendingDrops) > 0 && r.Applied == st.Last {
 		if err := p.dropNext(r.Applied); err != nil && ReasonOf(err) != mgmtapi.ReasonRestoreActive {
@@ -129,7 +187,13 @@ func (p *Plane) Status() Status {
 	st := p.snap.Load().st
 	p.rmu.Lock()
 	rep := p.rep
+	if rep.gateway != nil {
+		cp := *rep.gateway
+		rep.gateway = &cp
+	}
+	live := p.rt.snapshot()
 	p.rmu.Unlock()
+	now := p.cfg.Now()
 	s := Status{
 		Env: p.cfg.Intent.Env, Seq: st.Seq, Signed: st.Last, Served: servedRevision(st), RestoreActive: st.Served != 0,
 		Applied: rep.applied, AppliedAt: rep.appliedAt, LagSince: rep.lagSince, LastReportAt: rep.lastReportAt,
@@ -137,6 +201,8 @@ func (p *Plane) Status() Status {
 		PendingDrops:       append([]string{}, st.PendingDrops...),
 		StateBehindApplied: rep.applied.Compare(st.Last) > 0,
 		Cells:              []CellStatus{},
+		Gateway:            rep.gateway, GatewayAt: rep.gatewayAt, DroppedAt: rep.droppedAt, EpochChangedAt: rep.epochChangedAt,
+		StagedKey: st.StagedKeySHA256,
 	}
 	names := sortedKeys(p.intent)
 	for name := range st.Cells {
@@ -151,6 +217,7 @@ func (p *Plane) Status() Status {
 			cs.Bound, cs.Issuer, cs.Kids, cs.Record = true, c.Issuer, kidsOf(c.JWKS), c.Record
 			cs.CheckedAt, cs.LastCheck = c.CheckedAt, c.LastCheck
 		}
+		cs.fill(live[name], st, now)
 		s.Cells = append(s.Cells, cs)
 	}
 	return s

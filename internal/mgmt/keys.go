@@ -173,14 +173,10 @@ func (p *Plane) cachedKeys(ctx context.Context, cell string, mode fetchMode) (ke
 	return keys, now, false, nil
 }
 
-// gapActive reports whether a key update for cs would fall inside KeyUpdateGap of the last proven
-// update or key check.
+// gapActive reports whether a key update for cs would fall inside KeyUpdateGap of the last key
+// update. A key check that changes nothing does not start the gap.
 func (p *Plane) gapActive(cs *CellState, now time.Time) bool {
-	last := cs.KeysUpdatedAt
-	if cs.CheckedAt.After(last) {
-		last = cs.CheckedAt
-	}
-	return !last.IsZero() && now.Sub(last) < p.cfg.KeyUpdateGap
+	return !cs.KeysUpdatedAt.IsZero() && now.Sub(cs.KeysUpdatedAt) < p.cfg.KeyUpdateGap
 }
 
 func (p *Plane) cellRecord(cell string, issuer string, jwks json.RawMessage) record.Cell {

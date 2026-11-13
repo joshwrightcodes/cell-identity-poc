@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
@@ -40,6 +41,23 @@ type Signed struct {
 	Bundle   mgmtapi.SpecBundle `json:"bundle"`
 }
 
+// OpState is one operation that the plane signed. Envelopes holds the SHA-256 of every envelope
+// signed for the operation, and Envelope is the current one. KeyEpoch is State.Last.Epoch at the
+// time of that signing. Final is the outcome of the final result, or abandoned.
+type OpState struct {
+	Cell      string     `json:"cell"`
+	Envelopes []string   `json:"envelopes"`
+	Envelope  []byte     `json:"envelope"`
+	KeyEpoch  uint64     `json:"keyEpoch"`
+	IssuedAt  time.Time  `json:"issuedAt"`
+	ExpiresAt time.Time  `json:"expiresAt"`
+	ExpiredAt time.Time  `json:"expiredAt,omitzero"`
+	Served    bool       `json:"served"`
+	Result    *op.Result `json:"result,omitempty"`
+	ResultAt  time.Time  `json:"resultAt,omitzero"`
+	Final     string     `json:"final,omitempty"`
+}
+
 // State is the persistent state of the plane. Seq is the compare-and-swap version and rises at every
 // saved change. DropRevision is the revision that released the last drop; the queue in PendingDrops
 // releases its next drop only after envd reports a revision at or above it. Served is the counter of a restored revision, and 0 means the latest.
@@ -54,10 +72,15 @@ type State struct {
 	DropRevision spec.Revision            `json:"dropRevision"`
 	History      []Signed                 `json:"history"`
 	Served       uint64                   `json:"served"`
+	// Ops holds the operations by ID and OpOrder their IDs, oldest first. StagedKeySHA256 is the
+	// fingerprint of the staged signing key; the plane trusts the staged key file only while it names it.
+	Ops             map[string]*OpState `json:"ops,omitempty"`
+	OpOrder         []string            `json:"opOrder,omitempty"`
+	StagedKeySHA256 string              `json:"stagedKeySHA256,omitempty"`
 }
 
 func newState(keySHA string) *State {
-	return &State{Version: stateVersion, KeySHA256: keySHA, Cells: map[string]*CellState{}, Retired: map[string]spec.Revision{}}
+	return &State{Version: stateVersion, KeySHA256: keySHA, Cells: map[string]*CellState{}, Retired: map[string]spec.Revision{}, Ops: map[string]*OpState{}}
 }
 
 // clone copies the parts that a change mutates. Byte slices and bundles are never mutated in place,
@@ -75,6 +98,13 @@ func (s *State) clone() *State {
 	}
 	c.PendingDrops = slices.Clone(s.PendingDrops)
 	c.History = slices.Clone(s.History)
+	c.Ops = make(map[string]*OpState, len(s.Ops))
+	for k, v := range s.Ops {
+		o := *v
+		o.Envelopes = slices.Clone(v.Envelopes)
+		c.Ops[k] = &o
+	}
+	c.OpOrder = slices.Clone(s.OpOrder)
 	return &c
 }
 
@@ -111,6 +141,22 @@ func (s *State) validate() error {
 	for name, c := range s.Cells {
 		if c == nil {
 			return fmt.Errorf("cell %q has no state", name)
+		}
+	}
+	if s.Ops == nil {
+		s.Ops = map[string]*OpState{}
+	}
+	for id, o := range s.Ops {
+		if o == nil {
+			return fmt.Errorf("operation %q has no state", id)
+		}
+	}
+	if len(s.OpOrder) != len(s.Ops) {
+		return errors.New("operation order does not match the operations")
+	}
+	for _, id := range s.OpOrder {
+		if s.Ops[id] == nil {
+			return fmt.Errorf("operation order names unknown operation %q", id)
 		}
 	}
 	if l := s.latest(); l == nil || l.Revision != s.Last {
