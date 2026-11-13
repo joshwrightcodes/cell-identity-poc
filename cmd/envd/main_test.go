@@ -10,7 +10,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +26,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -31,6 +34,7 @@ import (
 	"k8s.io/client-go/kubernetes/fake"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/envd"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
@@ -411,7 +415,7 @@ func TestEnvdRequiresGatewayFlags(t *testing.T) {
 	if code != exitConfig || started != 0 || !strings.Contains(msg, "--gateway") || !strings.Contains(msg, "--hints-configmap") {
 		t.Fatalf("exit %d, started %d, error %q", code, started, msg)
 	}
-	for name, val := range map[string]string{"http_scheme": "http://cell-gateway:8452", "no_host": "https://", "with_path": "https://g:1/x", "not_a_url": "::"} {
+	for name, val := range map[string]string{"http_scheme": "http://cell-gateway:8452", "query": "https://g:1?x=y", "empty_query": "https://g:1?", "fragment": "https://g:1#f", "user": "https://u@g:1", "no_host": "https://", "with_path": "https://g:1/x", "not_a_url": "::"} {
 		args := append(slices.Clone(base), "--gateway", val, "--gateway-id", "spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap", "a/b")
 		if _, err := parseRun(args); err == nil {
 			t.Errorf("%s: --gateway %q accepted", name, val)
@@ -489,5 +493,70 @@ func TestTracedClientAddsTraceparent(t *testing.T) {
 	_ = resp.Body.Close()
 	if tp := got.Get("Traceparent"); !strings.Contains(tp, span.SpanContext().TraceID().String()) {
 		t.Fatalf("traceparent %q", tp)
+	}
+}
+
+// The gateway client of serve authorizes --gateway-id and no other ID, trusts the bundle of the envd
+// trust domain, and adds the traceparent header.
+func TestNewClientsBuildsGatewayClient(t *testing.T) {
+	envCA := spiffetest.NewCA(t, "dev.env.poc.internal")
+	mgmtCA := spiffetest.NewCA(t, "mgmt.poc.internal")
+	const gwID = "spiffe://dev.env.poc.internal/cp/gateway"
+	var mu sync.Mutex
+	var headers []http.Header
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		headers = append(headers, r.Header.Clone())
+		mu.Unlock()
+		_, _ = io.WriteString(w, `{"items":[],"status":{}}`)
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: h, ErrorLog: log.New(io.Discard, "", 0),
+		TLSConfig: tlsconfig.MTLSServerConfig(envCA.Source(t, gwID), envCA.Bundle(), tlsconfig.AuthorizeAny())}
+	go func() { _ = srv.ServeTLS(ln, "", "") }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	cfg := runConfig{expect: spiffeid.RequireFromString("spiffe://mgmt.poc.internal/api"), peer: mgmtCA.Bundle(),
+		gateway: "https://" + ln.Addr().String(), gatewayID: spiffeid.RequireFromString(gwID)}
+	src := workloadSource(t, envCA)
+	svids, closeFn, _ := src(t.Context())
+	defer closeFn()
+	mgmt, gw, err := newClients(svids, cfg)
+	if err != nil || mgmt == nil {
+		t.Fatalf("newClients: %v", err)
+	}
+	ctx, span := sdktrace.NewTracerProvider().Tracer("t").Start(t.Context(), "round")
+	defer span.End()
+	if _, err := gw.Sync(ctx, gwapi.SyncRequest{}); err != nil {
+		t.Fatalf("sync with the gateway ID that --gateway-id names: %v", err)
+	}
+	mu.Lock()
+	if len(headers) != 1 || !strings.Contains(headers[0].Get("Traceparent"), span.SpanContext().TraceID().String()) {
+		t.Errorf("gateway request headers %v carry no traceparent of the round", headers)
+	}
+	mu.Unlock()
+
+	// Another workload ID in the same trust domain is refused.
+	cfg.gatewayID = spiffeid.RequireFromString("spiffe://dev.env.poc.internal/cp/other")
+	_, other, err := newClients(svids, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.Sync(ctx, gwapi.SyncRequest{}); err == nil {
+		t.Error("a gateway with another ID was accepted")
+	}
+
+	// --gateway-id outside the trust domain of the SVID is a configuration error.
+	cfg.gatewayID = spiffeid.RequireFromString("spiffe://other.poc.internal/cp/gateway")
+	if _, _, err := newClients(svids, cfg); err == nil || !strings.Contains(err.Error(), "--gateway-id") {
+		t.Errorf("gateway ID in another trust domain: %v", err)
+	}
+	// A source with no bundles is a configuration error too.
+	cfg.gatewayID = spiffeid.RequireFromString(gwID)
+	if _, _, err := newClients(envCA.Source(t, "spiffe://dev.env.poc.internal/envd"), cfg); err == nil {
+		t.Error("a source with no bundles was accepted")
 	}
 }

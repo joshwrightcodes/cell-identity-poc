@@ -21,13 +21,15 @@ import (
 )
 
 const (
-	// LabelMadeBy marks an object that a process of this PoC wrote at runtime.
-	LabelMadeBy = "poc.internal/made-by"
-	// MadeByEnvd is the value of LabelMadeBy on the hints ConfigMap.
-	MadeByEnvd = "envd"
+	// labelMadeBy marks an object that a process of this PoC wrote at runtime.
+	labelMadeBy = "poc.internal/made-by"
+	// madeByEnvd is the value of labelMadeBy on the hints ConfigMap.
+	madeByEnvd = "envd"
 
 	maxHintValue = 256
 	maxHints     = 64
+	// hintsTimeout bounds the read of the hints ConfigMap.
+	hintsTimeout = 5 * time.Second
 )
 
 // HintSource gives envd the key hints that the plugin of the SPIRE server wrote.
@@ -66,7 +68,7 @@ func (h *configMapHints) New(ctx context.Context) ([]mgmtapi.KeyHint, error) {
 	cm, err := cms.Get(ctx, h.name, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		cm, err = cms.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
-			Name: h.name, Namespace: h.namespace, Labels: map[string]string{LabelMadeBy: MadeByEnvd}}}, metav1.CreateOptions{})
+			Name: h.name, Namespace: h.namespace, Labels: map[string]string{labelMadeBy: madeByEnvd}}}, metav1.CreateOptions{})
 		if apierrors.IsAlreadyExists(err) {
 			cm, err = cms.Get(ctx, h.name, metav1.GetOptions{})
 		}
@@ -124,15 +126,21 @@ func decodeHint(cell, raw string) (time.Time, bool) {
 }
 
 // pendingHints merges the hints of the source with those of the gateway status. It keeps the newest
-// hint of each cell and drops every hint that a successful report has already carried.
+// hint of each cell and drops every hint that a successful report has already carried. A time in the
+// future counts as now, so one bad value cannot silence the later hints of a cell.
 func (p *Puller) pendingHints(ctx context.Context, gw *mgmtapi.GatewayStatus) []mgmtapi.KeyHint {
 	var all []mgmtapi.KeyHint
 	if p.cfg.Hints != nil {
-		h, err := p.cfg.Hints.New(ctx)
-		if err != nil {
-			p.logLimited(ctx, "hints read failed", "hints", "error", clip(err.Error()))
-		}
-		all = append(all, h...)
+		_ = p.leg(ctx, "envd.hints", func(lctx context.Context) error {
+			lctx, cancel := context.WithTimeout(lctx, min(hintsTimeout, p.cfg.RoundTimeout))
+			defer cancel()
+			h, err := p.cfg.Hints.New(lctx)
+			if err != nil {
+				p.logLimited(ctx, "hints read failed", "hints", "error", clip(err.Error()))
+			}
+			all = append(all, h...)
+			return err
+		})
 	}
 	if gw != nil {
 		all = append(all, gw.KeyHints...)
@@ -146,8 +154,13 @@ func (p *Puller) pendingHints(ctx context.Context, gw *mgmtapi.GatewayStatus) []
 			newest[k.Cell] = k.At
 		}
 	}
+	now := p.cfg.Now()
+	p.hintPending = newest
 	var out []mgmtapi.KeyHint
 	for cell, at := range newest {
+		if at.After(now) {
+			at = now
+		}
 		out = append(out, mgmtapi.KeyHint{Cell: cell, At: at})
 	}
 	slices.SortFunc(out, func(a, b mgmtapi.KeyHint) int { return strings.Compare(a.Cell, b.Cell) })
@@ -157,11 +170,12 @@ func (p *Puller) pendingHints(ctx context.Context, gw *mgmtapi.GatewayStatus) []
 	return out
 }
 
-// forwarded raises the marks after a status report that carried hints succeeded.
+// forwarded raises the marks after a status report that carried hints succeeded. The mark of a cell
+// is the unclamped time of its hint, so a hint in the future does not go out again at each round.
 func (p *Puller) forwarded(hints []mgmtapi.KeyHint) {
 	for _, k := range hints {
-		if k.At.After(p.hintMarks[k.Cell]) {
-			p.hintMarks[k.Cell] = k.At
+		if raw := p.hintPending[k.Cell]; raw.After(p.hintMarks[k.Cell]) {
+			p.hintMarks[k.Cell] = raw
 		}
 	}
 	if p.cfg.Hints != nil && len(hints) > 0 {

@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,6 +79,8 @@ type fakeMgmt struct {
 	repCode  int
 	statCode int
 	decide   func(mgmtapi.ReportItem) mgmtapi.ItemOutcome
+	specWait time.Duration
+	opsWait  time.Duration
 	batches  [][]byte
 	statuses []mgmtapi.StatusReport
 	srv      *http.Server
@@ -107,11 +110,19 @@ func newFakeMgmt(t *testing.T, cl *callLog, cfg *tls.Config, b mgmtapi.SpecBundl
 	mux.HandleFunc("GET "+mgmtapi.SpecPattern, func(w http.ResponseWriter, r *http.Request) {
 		cl.add("spec")
 		m.mu.Lock()
+		wait := m.specWait
+		m.mu.Unlock()
+		time.Sleep(wait)
+		m.mu.Lock()
 		defer m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(m.bundle)
 	})
 	mux.HandleFunc("GET "+mgmtapi.OpsPattern, func(w http.ResponseWriter, r *http.Request) {
 		cl.add("ops")
+		m.mu.Lock()
+		wait := m.opsWait
+		m.mu.Unlock()
+		time.Sleep(wait)
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		if m.opsCode != 200 {
@@ -184,6 +195,7 @@ type fakeGateway struct {
 	status   mgmtapi.GatewayStatus
 	syncCode int
 	ackCode  int
+	hs       atomic.Int32
 	syncs    []gwapi.SyncRequest
 	acks     []gwapi.AckRequest
 	url      string
@@ -192,6 +204,10 @@ type fakeGateway struct {
 func newFakeGateway(t *testing.T, cl *callLog, cfg *tls.Config) *fakeGateway {
 	t.Helper()
 	g := &fakeGateway{log: cl, syncCode: 200, ackCode: 204}
+	cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+		g.hs.Add(1)
+		return nil, nil
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST "+gwapi.SyncPath, func(w http.ResponseWriter, r *http.Request) {
 		cl.add("sync")
@@ -302,7 +318,11 @@ func (r *rig) metric(name string) metricdata.Aggregation {
 }
 
 func outItem(id string, kind, cell string, body string) gwapi.OutItem {
-	return gwapi.OutItem{ID: gwapi.ItemID(id), Item: gwapi.Item{Kind: kind, Cell: cell, Body: json.RawMessage(body), Token: "tok-" + id}}
+	it := gwapi.Item{Kind: kind, Cell: cell, Body: json.RawMessage(body), Token: "tok-" + id}
+	if kind == gwapi.KindResult {
+		it.OpID = "op-" + id
+	}
+	return gwapi.OutItem{ID: gwapi.ItemID(id), Item: it}
 }
 
 func hexID(n int) string { return fmt.Sprintf("%032x", n) }
@@ -343,11 +363,11 @@ func TestRoundRelaysOpsAndReports(t *testing.T) {
 	if err := json.Unmarshal(bodies[0], &b); err != nil {
 		t.Fatal(err)
 	}
-	if len(b.Items) != 2 || b.Items[0].ID != hexID(1) || b.Items[0].Kind != "result" || b.Items[0].Token != "tok-"+hexID(1) ||
+	if len(b.Items) != 2 || b.Items[0].OpID != "op-"+hexID(1) || b.Items[1].OpID != "" || b.Items[0].ID != hexID(1) || b.Items[0].Kind != "result" || b.Items[0].Token != "tok-"+hexID(1) ||
 		b.Items[1].Cell != "b" || string(b.Items[1].Body) != `{"y":2}` {
 		t.Errorf("batch %+v", b)
 	}
-	if len(acks) != 1 || len(acks[0].Outcomes) != 2 || acks[0].Outcomes[0].ID != hexID(1) || acks[0].Outcomes[1].Outcome != mgmtapi.OutcomeAccepted {
+	if len(acks) != 1 || len(acks[0].Outcomes) != 2 || acks[0].Outcomes[0].ID != hexID(1) || acks[0].Outcomes[0].OpID != "op-"+hexID(1) || acks[0].Outcomes[1].Outcome != mgmtapi.OutcomeAccepted {
 		t.Errorf("acks %+v", acks)
 	}
 	reps := r.mgmt.reports()
@@ -387,7 +407,6 @@ func TestRoundIslandStillSyncsGateway(t *testing.T) {
 func TestRoundDoesNotAckOnReportFailure(t *testing.T) {
 	for name, mutate := range map[string]func(m *fakeMgmt){
 		"reports_500": func(m *fakeMgmt) { m.repCode = 500 },
-		"ops_failed":  func(m *fakeMgmt) { m.opsCode = 500 },
 	} {
 		t.Run(name, func(t *testing.T) {
 			r := newRig(t, 2)
@@ -398,9 +417,6 @@ func TestRoundDoesNotAckOnReportFailure(t *testing.T) {
 			r.run()
 			if _, acks := r.gw.seen(); len(acks) != 0 {
 				t.Fatalf("acks %+v", acks)
-			}
-			if name == "ops_failed" && r.cl.count("reports") != 0 {
-				t.Errorf("a round whose ops pull failed posted reports")
 			}
 			if name == "reports_500" && r.cl.count("reports") != 2 {
 				t.Errorf("report posts %d, want one each round", r.cl.count("reports"))
@@ -415,6 +431,20 @@ func TestRoundDoesNotAckOnReportFailure(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// An ops pull that fails does not stop the report leg: mgmtd verifies each item on its own.
+func TestRoundReportsDespiteOpsFailure(t *testing.T) {
+	r := newRig(t, 1)
+	r.mgmt.set(func(m *fakeMgmt) { m.opsCode = 500 })
+	r.gw.set(func(g *fakeGateway) {
+		g.items = []gwapi.OutItem{outItem(hexID(1), gwapi.KindResult, "a", `{"x":1}`)}
+	})
+	r.run()
+	_, acks := r.gw.seen()
+	if r.cl.count("reports") != 1 || len(acks) != 1 || len(acks[0].Outcomes) != 1 {
+		t.Fatalf("report posts %d, acks %+v", r.cl.count("reports"), acks)
 	}
 }
 
@@ -490,12 +520,21 @@ func TestRoundAcksOnlyDecidedItems(t *testing.T) {
 
 // The body of an item reaches mgmtd with the bytes that celld signed, also when it holds < and &.
 func TestReportBodyBytesReachMgmtdUnchanged(t *testing.T) {
-	body, err := json.Marshal(map[string]any{"line": "a<b && c>d", "u": " "})
+	// Fields out of alphabetical order, an integer above 2^53 and HTML characters: a re-encode that
+	// sorts keys, rounds numbers or drops the escapes changes these bytes.
+	type resultBody struct {
+		Z string `json:"z"`
+		A uint64 `json:"a"`
+		U string `json:"u"`
+		M string `json:"m"`
+	}
+	body, err := json.Marshal(resultBody{Z: "a<b && c>d", A: 18446744073709551615, U: "\u2028", M: "k"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if bytes.ContainsAny(body, "<>&") || !bytes.Contains(body, []byte(`\u003c`)) || !bytes.Contains(body, []byte(`\u0026`)) {
-		t.Fatalf("control: Marshal output %s does not escape < and &", body)
+	if bytes.ContainsAny(body, "<>&") || !bytes.Contains(body, []byte(`\u003c`)) || !bytes.Contains(body, []byte(`\u0026`)) ||
+		bytes.Index(body, []byte(`"z"`)) > bytes.Index(body, []byte(`"a"`)) {
+		t.Fatalf("control: Marshal output %s", body)
 	}
 	r := newRig(t, 1)
 	r.gw.set(func(g *fakeGateway) {
@@ -582,8 +621,27 @@ func TestGatewayClientBodyLimit(t *testing.T) {
 	}
 }
 
-// Every leg runs under its own deadline: a slow gateway does not leave the status leg without time.
+// Every leg runs under its own deadline: the spec and ops legs use most of the round time, and the
+// gateway sync and the status post still get a full deadline.
 func TestRoundLegsHaveOwnDeadline(t *testing.T) {
+	r := newRig(t, 1)
+	r.cfg.RoundTimeout = 500 * time.Millisecond
+	r.mgmt.set(func(m *fakeMgmt) {
+		m.specWait, m.opsWait = 400*time.Millisecond, 300*time.Millisecond
+		m.ops = mgmtapi.OpsBundle{Ops: []json.RawMessage{json.RawMessage(`{"o":1}`)}}
+	})
+	r.run()
+	syncs, _ := r.gw.seen()
+	if len(syncs) != 1 || len(syncs[0].Ops) != 1 {
+		t.Fatalf("syncs %+v: the ops leg or the sync ran out of time", syncs)
+	}
+	if reps := r.mgmt.reports(); len(reps) != 1 || reps[0].Gateway == nil {
+		t.Fatalf("status reports %+v", reps)
+	}
+}
+
+// A slow gateway does not leave the status leg without time.
+func TestRoundSlowGatewayStillReportsStatus(t *testing.T) {
 	r := newRig(t, 1)
 	r.cfg.RoundTimeout = 500 * time.Millisecond
 	r.cfg.Gateway = slowGateway{d: 700 * time.Millisecond}
@@ -607,6 +665,15 @@ func (s slowGateway) Sync(ctx context.Context, _ gwapi.SyncRequest) (gwapi.SyncR
 	}
 }
 func (slowGateway) Ack(context.Context, gwapi.AckRequest) error { return nil }
+func (slowGateway) CloseIdleConnections()                       {}
+
+// bareGateway has no CloseIdleConnections.
+type bareGateway struct{}
+
+func (bareGateway) Sync(context.Context, gwapi.SyncRequest) (gwapi.SyncResponse, error) {
+	return gwapi.SyncResponse{}, nil
+}
+func (bareGateway) Ack(context.Context, gwapi.AckRequest) error { return nil }
 
 // A log line of a round carries trace_id, also in the gateway legs.
 func TestRoundGatewayLogCarriesTraceID(t *testing.T) {
@@ -645,7 +712,7 @@ func hintCells(h []mgmtapi.KeyHint) []string {
 }
 
 func TestHintsForwardOnce(t *testing.T) {
-	t0 := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC) // before the fake clock, which starts at 09:00
 	kube := fake.NewClientset(hintCM(map[string]string{"dev-cell-1": hintJSON(t0)}))
 	r := newRig(t, 4)
 	r.cfg.Hints = NewConfigMapHints(kube, "spire-system", "attest-hints", newLog(io.Discard))
@@ -682,7 +749,7 @@ func TestHintsForwardOnce(t *testing.T) {
 }
 
 func TestHintsMergeGatewayHints(t *testing.T) {
-	t0 := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC) // before the fake clock, which starts at 09:00
 	r := newRig(t, 3)
 	r.gw.set(func(g *fakeGateway) {
 		g.status = mgmtapi.GatewayStatus{KeyHints: []mgmtapi.KeyHint{{Cell: "dev-cell-1", At: t0}, {Cell: "Not A Label", At: t0}}}
@@ -705,7 +772,7 @@ func TestHintsMergeGatewayHints(t *testing.T) {
 // A gateway hint and a ConfigMap hint for one cell go out as one hint, the newer one, and the
 // mark covers both sources.
 func TestHintsMergeUnderOneMark(t *testing.T) {
-	t0 := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC) // before the fake clock, which starts at 09:00
 	kube := fake.NewClientset(hintCM(map[string]string{"dev-cell-1": hintJSON(t0)}))
 	r := newRig(t, 2)
 	r.cfg.Hints = NewConfigMapHints(kube, "spire-system", "attest-hints", newLog(io.Discard))
@@ -720,7 +787,7 @@ func TestHintsMergeUnderOneMark(t *testing.T) {
 }
 
 func TestHintsIgnoreMalformed(t *testing.T) {
-	t0 := time.Date(2026, 11, 12, 9, 0, 0, 0, time.UTC)
+	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC) // before the fake clock, which starts at 09:00
 	kube := fake.NewClientset(hintCM(map[string]string{
 		"dev-cell-1":    hintJSON(t0),
 		"Not_A_Label":   hintJSON(t0),
@@ -770,5 +837,135 @@ func TestEnsureHintsCreates(t *testing.T) {
 	kube = fake.NewClientset(hintCM(map[string]string{"dev-cell-1": hintJSON(time.Now())}))
 	if got, err := NewConfigMapHints(kube, "spire-system", "attest-hints", newLog(io.Discard)).New(t.Context()); err != nil || len(got) != 1 {
 		t.Fatalf("existing: %+v, %v", got, err)
+	}
+}
+
+// Each round dials the gateway again, so the handshake uses the current SVID.
+func TestRoundNewGatewayHandshakeEachRound(t *testing.T) {
+	r := newRig(t, 3)
+	r.run()
+	if n := r.gw.hs.Load(); n != 3 {
+		t.Fatalf("gateway handshakes %d, want 3", n)
+	}
+}
+
+// A gateway client that cannot drop its connections is a start error, not a silent skip.
+func TestRunRefusesGatewayWithoutCloseIdleConnections(t *testing.T) {
+	r := newRig(t, 1)
+	r.cfg.Gateway = bareGateway{}
+	err := NewPuller(r.cfg).Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "CloseIdleConnections") {
+		t.Fatalf("Run returned %v", err)
+	}
+	if r.cl.count("spec") != 0 {
+		t.Error("a round ran")
+	}
+}
+
+// A hint source that blocks until its context ends costs one deadline, not the round.
+func TestRoundHintsReadHasOwnDeadline(t *testing.T) {
+	r := newRig(t, 1)
+	r.cfg.RoundTimeout = 300 * time.Millisecond
+	r.cfg.Hints = stalledHints{}
+	start := time.Now()
+	r.run()
+	if took := time.Since(start); took > 3*time.Second {
+		t.Fatalf("round took %v", took)
+	}
+	if reps := r.mgmt.reports(); len(reps) != 1 || len(reps[0].KeyHints) != 0 {
+		t.Fatalf("status reports %+v", reps)
+	}
+}
+
+type stalledHints struct{}
+
+func (stalledHints) New(ctx context.Context) ([]mgmtapi.KeyHint, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (stalledHints) Forwarded([]mgmtapi.KeyHint) {}
+
+// While no spec is accepted, neither the ops leg nor the sync runs, and one info line says so.
+func TestRoundWithoutSpecSkipsOpsAndLogsOnce(t *testing.T) {
+	r := newRig(t, 3)
+	r.store.state = nil
+	r.mgmt.set(func(m *fakeMgmt) {
+		m.bundle = mgmtapi.SpecBundle{Spec: []byte(`{"payloadType":"x","payload":"","signatures":[]}`)}
+	})
+	r.run()
+	if r.cl.count("ops") != 0 || r.cl.count("sync") != 0 {
+		t.Errorf("calls %v", r.cl.all())
+	}
+	if n := r.logs.count("relay skipped: no accepted spec"); n != 1 {
+		t.Errorf("skip log lines %d, want 1", n)
+	}
+}
+
+// A hint in the future counts as now, goes out once, and does not silence later hints.
+func TestHintsClampFutureTime(t *testing.T) {
+	r := newRig(t, 3)
+	now := r.clk.Now()
+	kube := fake.NewClientset(hintCM(map[string]string{"dev-cell-1": hintJSON(now.Add(time.Hour))}))
+	r.cfg.Hints = NewConfigMapHints(kube, "spire-system", "attest-hints", newLog(io.Discard))
+	r.gw.set(func(g *fakeGateway) {
+		g.status = mgmtapi.GatewayStatus{KeyHints: []mgmtapi.KeyHint{{Cell: "dev-cell-2", At: now.Add(2 * time.Hour)}}}
+	})
+	rounds := 0
+	inner := r.cfg.Sleep
+	r.cfg.Sleep = func(ctx context.Context, d time.Duration) error {
+		rounds++
+		if rounds == 2 {
+			// A real hint, after the clamped one, still goes out.
+			cm, _ := kube.CoreV1().ConfigMaps("spire-system").Get(ctx, "attest-hints", metav1.GetOptions{})
+			cm.Data["dev-cell-3"] = hintJSON(r.clk.Now().Add(time.Second))
+			_, _ = kube.CoreV1().ConfigMaps("spire-system").Update(ctx, cm, metav1.UpdateOptions{})
+		}
+		return inner(ctx, d)
+	}
+	r.run()
+	reps := r.mgmt.reports()
+	if len(reps) != 3 {
+		t.Fatalf("reports %d", len(reps))
+	}
+	if got := hintCells(reps[0].KeyHints); !slices.Equal(got, []string{"dev-cell-1", "dev-cell-2"}) {
+		t.Fatalf("first report hints %v", got)
+	}
+	for _, k := range reps[0].KeyHints {
+		if k.At.After(now) {
+			t.Errorf("hint %+v is in the future", k)
+		}
+	}
+	if len(reps[1].KeyHints) != 0 {
+		t.Errorf("a clamped hint went out again: %+v", reps[1].KeyHints)
+	}
+	if got := hintCells(reps[2].KeyHints); !slices.Equal(got, []string{"dev-cell-3"}) {
+		t.Errorf("third report hints %v", got)
+	}
+}
+
+// An item that mgmtd leaves without an outcome stays unacknowledged and is logged at debug level.
+func TestRoundLogsItemWithoutOutcome(t *testing.T) {
+	r := newRig(t, 1)
+	r.cfg.Log = slog.New(slog.NewJSONHandler(r.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	r.gw.set(func(g *fakeGateway) {
+		g.items = []gwapi.OutItem{outItem(hexID(1), gwapi.KindResult, "a", `{}`), outItem(hexID(2), gwapi.KindResult, "a", `{}`)}
+	})
+	r.mgmt.set(func(m *fakeMgmt) {
+		m.decide = func(it mgmtapi.ReportItem) mgmtapi.ItemOutcome {
+			if it.ID == hexID(2) {
+				return mgmtapi.ItemOutcome{ID: hexID(1), Outcome: mgmtapi.OutcomeDuplicate}
+			}
+			return accepted(it)
+		}
+	})
+	r.run()
+	var found bool
+	for _, l := range r.logs.lines() {
+		if l["msg"] == "report item has no outcome" && l["item"] == hexID(2) && l["level"] == "DEBUG" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no debug line for the item without an outcome: %v", r.logs.lines())
 	}
 }

@@ -96,6 +96,10 @@ type Puller struct {
 	outbox     metric.Int64Gauge
 	// hintMarks holds, for each cell, the newest hint that a status report has carried.
 	hintMarks map[string]time.Time
+	// hintPending holds the unclamped time of each hint of the last status report.
+	hintPending map[string]time.Time
+	// relaySkipped is true while the relay legs wait for the first accepted spec.
+	relaySkipped bool
 }
 
 // NewPuller returns a Puller for cfg.
@@ -168,6 +172,11 @@ func HealthHandler(p *Puller) http.Handler {
 // Run loads the state, then pulls until ctx ends. It returns ctx.Err(). While the stored state does
 // not verify, Run still pulls, stays not Ready, and reports state_unverifiable until the first spec is accepted.
 func (p *Puller) Run(ctx context.Context) error {
+	if p.cfg.Gateway != nil {
+		if _, ok := p.cfg.Gateway.(interface{ CloseIdleConnections() }); !ok {
+			return errors.New("the gateway client has no CloseIdleConnections, so a round cannot dial the gateway again")
+		}
+	}
 	failures := 0
 	for p.state == nil {
 		lctx, cancel := context.WithTimeout(ctx, p.cfg.RoundTimeout)

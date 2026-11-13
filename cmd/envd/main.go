@@ -1,7 +1,10 @@
 // Command envd pulls the signed spec and cell records of one environment from the management plane,
 // verifies them, keeps them in a ConfigMap and reports its status.
 //
-//	envd run --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> --spec-key-file <file> --env <env> --output-configmap <ns>/<name> --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name> [--interval 10s] [--health-listen :8080]
+//	envd run --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
+//	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
+//	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
+//	  [--interval 10s] [--health-listen :8080]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
 // run takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET and trusts the management plane
@@ -58,6 +61,8 @@ const (
 	shutdownTimeout = 15 * time.Second
 	// loadTimeout bounds the read of the stored state by check.
 	loadTimeout = 15 * time.Second
+	// kubeTimeout bounds each request to the Kubernetes API.
+	kubeTimeout = 15 * time.Second
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
 )
@@ -79,6 +84,7 @@ func realDeps() deps {
 			if err != nil {
 				return nil, fmt.Errorf("in-cluster config: %w", err)
 			}
+			cfg.Timeout = kubeTimeout
 			return kubernetes.NewForConfig(cfg)
 		},
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
@@ -263,8 +269,9 @@ func parseRun(args []string) (runConfig, error) {
 		return runConfig{}, err
 	}
 	gwURL, err := url.Parse(*gateway)
-	if err != nil || gwURL.Scheme != "https" || gwURL.Host == "" || gwURL.Path != "" && gwURL.Path != "/" {
-		return runConfig{}, errors.New("--gateway must be an https URL with a host and no path")
+	if err != nil || gwURL.Scheme != "https" || gwURL.Host == "" || gwURL.Path != "" && gwURL.Path != "/" ||
+		gwURL.RawQuery != "" || gwURL.ForceQuery || gwURL.Fragment != "" || gwURL.User != nil {
+		return runConfig{}, errors.New("--gateway must be an https URL with a host and no path, query, fragment or user")
 	}
 	gwID, err := spiffeid.FromString(*gatewayID)
 	if err != nil {
@@ -312,20 +319,18 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	}
 	defer closeSVIDs()
 
-	// The gateway runs in the trust domain of envd, so its roots come from the Workload API.
-	bundles, ok := svids.(x509bundle.Source)
-	if !ok {
-		return errors.New("the workload api source holds no trust bundles")
+	mgmtClient, gateway, err := newClients(svids, cfg)
+	if err != nil {
+		return err
 	}
-
 	keys := []ed25519.PublicKey{cfg.key}
 	puller := envd.NewPuller(envd.PullerConfig{
-		Client:   tracedClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect)),
+		Client:   mgmtClient,
 		BaseURL:  "https://" + cfg.upstream,
 		Env:      cfg.env,
 		Keys:     keys,
 		Store:    envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
-		Gateway:  envd.NewGatewayClient(tracedClient(cellproxy.ClientTLS(svids, bundles, cfg.gatewayID)), cfg.gateway),
+		Gateway:  gateway,
 		Hints:    envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
 		Interval: cfg.interval,
 		Log:      tel.Log,
@@ -349,6 +354,26 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	return nil
+}
+
+// newClients builds the client of the management plane and the client of the gateway. The gateway
+// runs in the trust domain of envd, so its roots come from the Workload API, and it must carry
+// --gateway-id exactly. A --gateway-id outside the trust domain of the SVID is a configuration error.
+func newClients(svids x509svid.Source, cfg runConfig) (*http.Client, envd.GatewayClient, error) {
+	bundles, ok := svids.(x509bundle.Source)
+	if !ok {
+		return nil, nil, errors.New("the workload api source holds no trust bundles")
+	}
+	own, err := svids.GetX509SVID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("envd svid: %w", err)
+	}
+	if own.ID.TrustDomain() != cfg.gatewayID.TrustDomain() {
+		return nil, nil, fmt.Errorf("--gateway-id %s is outside the trust domain %s of the envd svid", cfg.gatewayID, own.ID.TrustDomain())
+	}
+	mgmt := tracedClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect))
+	gateway := envd.NewGatewayClient(tracedClient(cellproxy.ClientTLS(svids, bundles, cfg.gatewayID)), cfg.gateway)
+	return mgmt, gateway, nil
 }
 
 // tracedClient returns the envd HTTP client for tlsCfg. Its transport adds the traceparent header, so

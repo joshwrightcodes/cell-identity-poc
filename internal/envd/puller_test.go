@@ -520,6 +520,8 @@ func (g *memGateway) Sync(_ context.Context, r gwapi.SyncRequest) (gwapi.SyncRes
 
 func (g *memGateway) Ack(context.Context, gwapi.AckRequest) error { return nil }
 
+func (g *memGateway) CloseIdleConnections() {}
+
 func (g *memGateway) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()

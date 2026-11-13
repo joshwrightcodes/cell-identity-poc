@@ -24,6 +24,8 @@ const (
 	// MaxReportItems and MaxReportBytes bound one report batch.
 	MaxReportItems = 100
 	MaxReportBytes = 1 << 20
+	// MaxReportResultBytes is the largest report result that the puller reads.
+	MaxReportResultBytes = 1 << 20
 )
 
 // GatewayClient is the envd side of the gateway API.
@@ -109,9 +111,21 @@ func (p *Puller) leg(ctx context.Context, name string, f func(ctx context.Contex
 }
 
 // relay runs the legs after the spec leg: ops, gateway sync, reports and gateway ack. A failed leg
-// stops only the legs that need its output. It returns the status of the gateway, or nil when the
+// stops only the legs that need its output. The report leg does not need the ops bundle, because
+// mgmtd verifies each item on its own. It returns the status of the gateway, or nil when the
 // sync failed or did not run.
 func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
+	if len(p.state.SpecEnvelope) == 0 {
+		if !p.relaySkipped {
+			p.relaySkipped = true
+			p.cfg.Log.InfoContext(ctx, "relay skipped: no accepted spec")
+		}
+		return nil
+	}
+	if p.relaySkipped {
+		p.relaySkipped = false
+		p.cfg.Log.InfoContext(ctx, "relay resumed: a spec is accepted")
+	}
 	var ops mgmtapi.OpsBundle
 	opsErr := p.leg(ctx, "envd.ops", func(lctx context.Context) error {
 		var err error
@@ -121,9 +135,6 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 	if opsErr != nil {
 		ops = mgmtapi.OpsBundle{}
 		p.logLimited(ctx, "ops pull failed", "ops", "error", clip(opsErr.Error()))
-	}
-	if len(p.state.SpecEnvelope) == 0 {
-		return nil
 	}
 	req := gwapi.SyncRequest{
 		SpecEnvelope: p.state.SpecEnvelope,
@@ -150,7 +161,7 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 		return nil
 	}
 	p.outbox.Record(ctx, int64(resp.Status.OutboxItems))
-	if len(resp.Items) > 0 && opsErr == nil {
+	if len(resp.Items) > 0 {
 		p.relayItems(ctx, resp.Items)
 	}
 	return &resp.Status
@@ -233,6 +244,9 @@ func (p *Puller) relayItems(ctx context.Context, items []gwapi.OutItem) {
 		ack.Outcomes = append(ack.Outcomes, o)
 		p.relayCount.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", o.Outcome)))
 	}
+	for id := range sent {
+		p.cfg.Log.DebugContext(ctx, "report item has no outcome", "item", id)
+	}
 	if len(ack.Outcomes) == 0 {
 		return
 	}
@@ -265,11 +279,11 @@ func (p *Puller) postReports(ctx context.Context, b mgmtapi.ReportBatch) (mgmtap
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return res, fmt.Errorf("post reports: status %d", resp.StatusCode)
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxOpsBytes+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxReportResultBytes+1))
 	if err != nil {
 		return res, fmt.Errorf("read report result: %w", err)
 	}
-	if len(body) > MaxOpsBytes {
+	if len(body) > MaxReportResultBytes {
 		return res, errors.New("report result is too large")
 	}
 	if err := json.Unmarshal(body, &res); err != nil {
