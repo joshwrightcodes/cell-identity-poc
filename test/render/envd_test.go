@@ -118,7 +118,7 @@ func TestEnvdRender(t *testing.T) {
 			name := get[string](t, c, "name")
 			has := false
 			for _, m := range get[[]any](t, c, "volumeMounts") {
-				if get[string](t, m, "mountPath") == tokenPath {
+				if get[string](t, m, "mountPath") == tokenPath || get[string](t, m, "name") == "envd-api-token" {
 					has = true
 					if get[bool](t, m, "readOnly") != true {
 						t.Errorf("%s mounts the token read-write", name)
@@ -169,7 +169,7 @@ func TestEnvdRender(t *testing.T) {
 			}
 			rules = append(rules, fmt.Sprintf("%v %v %v %v", lookupOr(rule, "apiGroups"), lookupOr(rule, "resources"), lookupOr(rule, "resourceNames"), lookupOr(rule, "verbs")))
 		}
-		if want := []string{"[] [configmaps] <nil> [create]", "[] [configmaps] [cell-records] [get update patch]"}; !slices.Equal(rules, want) {
+		if want := []string{"[] [configmaps] <nil> [create]", "[] [configmaps] [cell-records] [get update]"}; !slices.Equal(rules, want) {
 			t.Errorf("rules are %v, want %v", rules, want)
 		}
 		rb := objs["RoleBinding spire-system/envd-records"]

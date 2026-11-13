@@ -1242,3 +1242,21 @@ func TestMarksGuardUnderANewKey(t *testing.T) {
 		t.Fatalf("%d records; a spec below the persisted mark was accepted under a new key\n%s", n, logs.String())
 	}
 }
+
+// The configured line names the revision of the spec that the plugin loaded, so an operator tool can tell a
+// server that started with the current records from one that holds old ones.
+func TestConfiguredLogNamesTheSpecRevision(t *testing.T) {
+	f := newFixture(t, fixtureOptions{})
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	f.publish(f.specAt(7, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+	f.reconfigure(t, "")
+	var line string
+	for l := range strings.SplitSeq(f.logs.String(), "\n") {
+		if strings.Contains(l, `"@message":"configured"`) {
+			line = l
+		}
+	}
+	if !strings.Contains(line, `"spec_epoch":1`) || !strings.Contains(line, `"spec_counter":7`) || !strings.Contains(line, `"records":1`) {
+		t.Fatalf("the last configured line is %q, want records 1 and spec revision 1/7", line)
+	}
+}

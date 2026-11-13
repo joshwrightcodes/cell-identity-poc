@@ -74,8 +74,9 @@ deployment="$(yq 'select(.kind == "Deployment")' <<<"$manifests" \
     SPIRE_SIDECAR_TRUST_DOMAIN="$SPIRE_TRUST_DOMAIN" SPIRE_SIDECAR_BUNDLE="$own_bundle" SPIRE_SIDECAR_CLUSTER="$CELL_NAME" \
     spire_sidecar envd k8s_psat)" || die "the SPIRE sidecar of envd failed"
 
-# The envd policy. Flow N30 reaches the API node port of mgmtd. Flows N31 and N35 reach the API server
-# for ConfigMap cell-records: its node address and the ClusterIP of its Service. Flow N8 reaches the
+# The envd policy. Flow N30 reaches the API node port of mgmtd. Flow N31 reaches the API server for
+# ConfigMap cell-records: its node address, and the ClusterIP of its Service on 443. Flow N35 is allow-dns,
+# which the namespace has apart from this policy. Flow N8 reaches the
 # SPIRE server for the sidecar, and N11 the collector. Flow N23 admits the node addresses on the health
 # port for the kubelet probes.
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }

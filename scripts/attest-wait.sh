@@ -51,14 +51,28 @@ poll_until() {
   done
 }
 
+# live_kids prints the sorted key IDs that the API server of the cell publishes now, from the host service
+# (the source of check_agent_cells_current).
+live_kids() {
+  (cd "$ROOT" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null) | jq -r '[.jwks.keys[]?.kid] | sort | join(" ")'
+}
+
+# cell_bound succeeds when mgmtd shows the cell as bound with the keys that the cell publishes now. A status
+# from before a rebuild of the cell shows the old key IDs.
 status_json=""
 cell_bound() {
+  local kids live
   status_json="$(mgmt_status)" || return 1
-  jq -e --arg cell "$cell" 'any(.cells[]?; .name == $cell and .bound == true)' <<<"$status_json" >/dev/null
+  jq -e --arg cell "$cell" 'any(.cells[]?; .name == $cell and .bound == true)' <<<"$status_json" >/dev/null || return 1
+  kids="$(jq -r --arg cell "$cell" '[.cells[] | select(.name == $cell)][0].kids // [] | sort | join(" ")' <<<"$status_json")"
+  live="$(live_kids)" || return 1
+  [[ -n "$live" && "$kids" == "$live" ]]
 }
 
 if ! status_json="$(mgmt_status)"; then
   printf 'warning: attest-wait %s: mise run mgmt -- status does not answer, so no bind can happen and the wait is skipped. Run: %s\n' "$cell" "$link" >&2
+  # The one line on standard output tells cell:up that nothing was waited for.
+  echo skipped
   exit 0
 fi
 
@@ -91,26 +105,28 @@ if ! poll_until "${ATTEST_APPLIED_WAIT:-60}" records_applied; then
 fi
 log "attest-wait $cell: stage applied took $((SECONDS - stage_start))s"
 
-# records_reloaded succeeds when the plugin of the server holds the record of the cell. The plugin logs
-# "records reloaded" with the cells only when a record changes, so the line can lie far back in the log, and
-# a cell that is bound again after a restart of the server never gets one. A server that started with the
-# record in place logs "configured" with its number of records. That number must reach the number of
-# records in the ConfigMap, and the ConfigMap must hold the record of the cell.
+# records_reloaded succeeds when the plugin of the server holds the record of the cell at the revision that
+# stage applied waited for or a later one. The plugin logs "records reloaded" with the cells and the spec
+# revision only when a record changes, and "configured" with the spec revision and the number of records at
+# start. A line below the revision is old and does not count. The rule reads the log since the last record
+# change, so it needs that line to be in the pod log still: after a log rotation, or a restart of the pod
+# without the records in place, the stage fails and names this.
 records_reloaded() {
-  local logs cm want got
+  local logs cm want
   logs="$(ctx "$server_cluster" -n spire-system logs spire-server-0 -c spire-server 2>/dev/null)" || return 1
-  if grep -F 'records reloaded' <<<"$logs" | grep -qF "\"$cell\""; then
+  if jq -R -e --arg cell "$cell" --argjson e "$want_epoch" --argjson c "$want_counter" 'fromjson? | select(.msg == "records reloaded"
+      and ((.cells // []) | index($cell)) != null and ((.spec_epoch // -1) > $e or ((.spec_epoch // -1) == $e and (.spec_counter // -1) >= $c)))' <<<"$logs" >/dev/null; then
     return 0
   fi
   cm="$(ctx "$server_cluster" -n spire-system get configmap cell-records -o json 2>/dev/null)" || return 1
   jq -e --arg key "$cell.dsse.json" '.data[$key] != null' <<<"$cm" >/dev/null || return 1
   want="$(jq -r '[.data | keys[] | select(endswith(".dsse.json"))] | length' <<<"$cm")"
-  got="$(grep -F '"msg":"configured"' <<<"$logs" | tail -n 1 | jq -r '.records // empty' 2>/dev/null)" || return 1
-  [[ -n "$got" ]] && ((got >= want))
+  jq -R -s -e --argjson want "$want" --argjson e "$want_epoch" --argjson c "$want_counter" '[split("\n")[] | fromjson? | select(.msg == "configured")] | last
+      | select(. != null and (.records // -1) >= $want and ((.spec_epoch // -1) > $e or ((.spec_epoch // -1) == $e and (.spec_counter // -1) >= $c)))' <<<"$logs" >/dev/null
 }
 stage_start=$SECONDS
 if ! poll_until "${ATTEST_RELOADED_WAIT:-150}" records_reloaded; then
-  fail reloaded "the plugin of the SPIRE server in $server_cluster does not hold the record of $cell (no 'records reloaded' with it, and no 'configured' line with enough records) after $((SECONDS - stage_start))s. The kubelet syncs the ConfigMap volume of the server pod before the plugin reloads it (verify row 1: the time from the write to the log line; row 5: a volume that was absent at pod start)" \
+  fail reloaded "the plugin of the SPIRE server in $server_cluster does not hold the record of $cell at the revision $want_epoch/$want_counter (no 'records reloaded' with it, and no 'configured' line with enough records) after $((SECONDS - stage_start))s. The kubelet syncs the ConfigMap volume of the server pod before the plugin reloads it (verify row 1: the time from the write to the log line; row 5: a volume that was absent at pod start). The check reads the log of the server since the last record change, so a log that has rotated away fails here too" \
     "mise x -- kubectl --context kind-$server_cluster -n spire-system logs spire-server-0 -c spire-server --tail=100, then CELL=$server_cluster mise run cell:restart"
 fi
 log "attest-wait $cell: stage reloaded took $((SECONDS - stage_start))s"

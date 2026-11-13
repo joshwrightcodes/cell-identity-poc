@@ -31,6 +31,7 @@ esac
 
 const attestMise = `#!/usr/bin/env bash
 echo "mise $*" >>"$STUB_DIR/calls"
+if [[ "$1 $2 $3 $4" == "run hostsvc -- facts" ]]; then cat "$STUB_DIR/facts.json"; exit 0; fi
 [[ "$1 $2 $3 $4" == "run mgmt -- status" ]] || { echo "unexpected mise call: $*" >&2; exit 2; }
 [[ -f "$STUB_DIR/status.json" ]] || exit 1
 cat "$STUB_DIR/status.json"
@@ -64,15 +65,16 @@ func TestAttestWaitStages(t *testing.T) {
 			b = "true"
 		}
 		return `{"signed":{"epoch":1,"counter":7},"lastRefusal":{"reason":"spec_invalid","revision":{"epoch":1,"counter":7}},"storeError":"update refused",` +
-			`"cells":[{"name":"dev-cell-1","bound":` + b + `,"record":{"epoch":1,"counter":7}},{"name":"dev-cell-2","bound":true,"record":{"epoch":1,"counter":7}}]}`
+			`"cells":[{"name":"dev-cell-1","bound":` + b + `,"kids":["a","b"],"record":{"epoch":1,"counter":7}},{"name":"dev-cell-2","bound":true,"record":{"epoch":1,"counter":7}}]}`
 	}
 	records := func(counter string) string {
 		return `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"` + counter + `"}},"data":{"spec-envelope.json":"{}","dev-cell-1.dsse.json":"{}","dev-cell-2.dsse.json":"{}"}}`
 	}
 	healthy := map[string]string{
 		"status.json":       status(true),
+		"facts.json":        `{"nodeIP":"10.9.0.1","jwks":{"keys":[{"kid":"b"},{"kid":"a"}]}}`,
 		"cell-records.json": records("7"),
-		"server.log":        `{"msg":"records reloaded","cells":["dev-cell-1","dev-cell-2"]}` + "\n",
+		"server.log":        `{"msg":"records reloaded","spec_epoch":1,"spec_counter":7,"cells":["dev-cell-1","dev-cell-2"]}` + "\n",
 		"celld.log":         `{"msg":"bind refused","cell":"dev-cell-1"}` + "\n",
 		"mgmtd.log":         `{"msg":"bind_denied","reason":"cell_unknown","cell":"dev-cell-1"}` + "\n",
 		"pods.json":         `{"items":[{"metadata":{"name":"celld-abc"},"status":{"containerStatuses":[{"name":"spire-agent","state":{"running":{}}}]}}]}`,
@@ -87,7 +89,7 @@ func TestAttestWaitStages(t *testing.T) {
 		check  func(t *testing.T, calls, deleted string)
 	}{
 		{name: "healthy", want: []string{"stage bound took", "stage applied took", "stage reloaded took", "stage ready took"}, deny: []string{"error:"}},
-		{name: "management does not answer", change: map[string]string{"status.json": ""}, want: []string{"warning: attest-wait dev-cell-1", "CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
+		{name: "management does not answer", change: map[string]string{"status.json": ""}, want: []string{"warning: attest-wait dev-cell-1", "CELL=management LINK_ONLY=mgmt-api mise run cell:link", "\nskipped\n"},
 			deny: []string{"stage bound"}, check: func(t *testing.T, calls, _ string) {
 				if strings.Contains(calls, "kubectl") {
 					t.Errorf("the script called kubectl with no management plane:\n%s", calls)
@@ -100,12 +102,24 @@ func TestAttestWaitStages(t *testing.T) {
 			want: []string{"stage applied failed", "does not reach the revision 1/7", `lastRefusal: {"reason":"spec_invalid"`, "storeError: update refused", "Next: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd"}},
 		{name: "no ConfigMap yet", change: map[string]string{"cell-records.json": ""}, code: 1, want: []string{"stage applied failed"}},
 		{name: "a later revision counts", change: map[string]string{"cell-records.json": records("9")}, want: []string{"stage applied took"}},
-		{name: "the reload line is far back in the log", change: map[string]string{"server.log": `{"msg":"records reloaded","cells":["dev-cell-1"]}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
+		{name: "the reload line is far back in the log", change: map[string]string{"server.log": `{"msg":"records reloaded","spec_epoch":1,"spec_counter":7,"cells":["dev-cell-1"]}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
 			want: []string{"stage reloaded took"}},
-		{name: "the server started with the records in place", change: map[string]string{"server.log": `{"msg":"configured","records":2}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
+		{name: "the server started with the records in place", change: map[string]string{"server.log": `{"msg":"configured","records":2,"spec_epoch":1,"spec_counter":7}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
 			want: []string{"stage reloaded took"}},
-		{name: "the server started with fewer records than the ConfigMap holds", change: map[string]string{"server.log": `{"msg":"configured","records":1}` + "\n"}, code: 1,
+		{name: "the server started with fewer records than the ConfigMap holds", change: map[string]string{"server.log": `{"msg":"configured","records":1,"spec_epoch":1,"spec_counter":7}` + "\n"}, code: 1,
 			want: []string{"stage reloaded failed"}},
+		{name: "an old reload line that names the cell", change: map[string]string{"server.log": `{"msg":"records reloaded","spec_epoch":1,"spec_counter":3,"cells":["dev-cell-1"]}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed", "revision 1/7", "log of the server since the last record change"}},
+		{name: "an old reload line of an earlier epoch", change: map[string]string{"server.log": `{"msg":"records reloaded","spec_epoch":0,"spec_counter":99,"cells":["dev-cell-1"]}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed"}},
+		{name: "a later epoch counts", change: map[string]string{"server.log": `{"msg":"records reloaded","spec_epoch":2,"spec_counter":1,"cells":["dev-cell-1"]}` + "\n"},
+			want: []string{"stage reloaded took"}},
+		{name: "a configured line below the revision", change: map[string]string{"server.log": `{"msg":"configured","records":2,"spec_epoch":1,"spec_counter":3}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed"}},
+		{name: "a configured line with no revision", change: map[string]string{"server.log": `{"msg":"configured","records":2}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed"}},
+		{name: "the status kids are from before a rebuild", change: map[string]string{"facts.json": `{"nodeIP":"10.9.0.1","jwks":{"keys":[{"kid":"new"}]}}`}, code: 1,
+			want: []string{"stage bound failed"}},
 		{name: "the ConfigMap holds no record of the cell", change: map[string]string{"cell-records.json": `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"7"}},"data":{"spec-envelope.json":"{}","dev-cell-2.dsse.json":"{}"},"x":1}`, "server.log": `{"msg":"configured","records":1}` + "\n"}, code: 1,
 			want: []string{"stage reloaded failed"}},
 		{name: "not reloaded", change: map[string]string{"server.log": `{"msg":"records reloaded","cells":["dev-cell-2"]}` + "\n"}, code: 1,

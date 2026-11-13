@@ -72,7 +72,12 @@ done
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   if [[ "${entry%%:*}" == cell-identity ]]; then
     harness_workloads cell-identity "${entry#*:}" >/dev/null || exit 1
-    "$ROOT/scripts/attest-wait.sh" "$CELL_NAME"
+    # The script prints "skipped" on standard output when the management plane does not answer.
+    waited="$("$ROOT/scripts/attest-wait.sh" "$CELL_NAME")"
+    if [[ "$waited" == skipped ]]; then
+      log "harness component cell-identity was not waited for, so it may not be Ready. Link management first, then run: CELL=$CELL_NAME mise run cell:up"
+      continue
+    fi
   else
     harness_rollout_wait "${entry%%:*}" "${entry#*:}"
   fi

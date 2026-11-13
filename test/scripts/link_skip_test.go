@@ -256,6 +256,9 @@ func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
 	if !strings.Contains(upOut, "warning: attest-wait dev-cell-1") || !strings.Contains(upOut, "CELL=management LINK_ONLY=mgmt-api mise run cell:link") {
 		t.Fatalf("up.sh did not run attest-wait.sh for cell-identity:\n%s", upOut)
 	}
+	if strings.Contains(upOut, "harness component cell-identity is rolled out") || !strings.Contains(upOut, "cell-identity was not waited for") {
+		t.Fatalf("up.sh says that cell-identity rolled out after the wait was skipped:\n%s", upOut)
+	}
 	lines := strings.Split(strings.TrimSpace(calls), "\n")
 	index := func(prefix string, from int) int {
 		for i := from; i < len(lines); i++ {

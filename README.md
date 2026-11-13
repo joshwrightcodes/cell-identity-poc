@@ -228,7 +228,7 @@ With `--check`, it only reports.
 `envd` runs in namespace `envd-system` of `dev-cp`, as the harness component `envd`.
 It pulls the signed spec from the API of `mgmtd` on node port 31446, and verifies it under the key in ConfigMap `mgmt-spec-key`.
 Then it writes the spec and the records to ConfigMap `cell-records` in `spire-system`.
-Its Role allows `create` on ConfigMaps, and `get`, `update` and `patch` on `cell-records` only.
+Its Role allows `create` on ConfigMaps, and `get` and `update` on `cell-records` only.
 
 The SPIRE server of `dev-cp` trusts only the key of `mgmtd` in `record_public_keys`.
 The pod mounts `cell-records` as an optional volume.
@@ -247,9 +247,10 @@ The script waits for four stages in turn:
 | --- | --- | --- |
 | `bound` | `mise run mgmt -- status` shows the cell as bound | 120 s |
 | `applied` | `cell-records` holds the revision of the record of the cell | 60 s |
-| `reloaded` | The server log has `records reloaded` with the cell | 150 s |
+| `reloaded` | The server log shows the record of the cell at that revision or a later one | 150 s |
 | `ready` | The rollout of `celld` finishes | 300 s |
 
+The `reloaded` stage reads the server log since the last record change. A log that has rotated away makes it fail.
 A failing stage prints its name, the reason and the next command.
 When `mise run mgmt -- status` does not answer, the script prints `CELL=management LINK_ONLY=mgmt-api mise run cell:link` and does not wait.
 At the start of `ready`, the script deletes a `celld` pod once when its `spire-agent` container is in `CrashLoopBackOff`.

@@ -84,6 +84,8 @@ type state struct {
 	trustDomain string
 	timeout     time.Duration
 	records     map[string]record.Cell
+	// spec is the revision of the spec that the load read, or zero when there was none.
+	spec envspec.Revision
 	// digests holds the digest of the signed payload of each record.
 	digests     map[string]string
 	dir         string
@@ -200,7 +202,7 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 		}
 	}
 	p.applyInterval(st.reloadEvery)
-	p.log.Info("configured", "env", st.env, "records", len(st.records), "reload_interval", st.reloadEvery.String())
+	p.log.Info("configured", "env", st.env, "records", len(st.records), "spec_epoch", st.spec.Epoch, "spec_counter", st.spec.Counter, "reload_interval", st.reloadEvery.String())
 	return &configv1.ConfigureResponse{}, nil
 }
 
@@ -219,7 +221,7 @@ func (p *Plugin) build(text, coreTrustDomain string, commit bool, old *state) (*
 	if err != nil {
 		return nil, err
 	}
-	st.records, st.digests = snap.records, snap.digests
+	st.records, st.digests, st.spec = snap.records, snap.digests, snap.spec
 	return st, nil
 }
 

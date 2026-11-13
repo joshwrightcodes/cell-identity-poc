@@ -40,6 +40,10 @@ case "$args" in
     [[ -z "${STUB_UNLABELLED:-}" ]] || other='{"metadata":{"name":"spire-server-reader","managedFields":[{"manager":"argocd-controller","operation":"Update"}]}},'
     list "$other$(item envd-records)$(extra Role spire-system)" ;;
   *" -n spire-system get RoleBinding -o json "*) list "$(item envd-records)$(extra RoleBinding spire-system)" ;;
+  *" -n spire-system get ServiceAccount -o json "*) list "$(extra ServiceAccount spire-system | sed 's/^,//')" ;;
+  *" -n spire-system get Deployment -o json "*) list "$(extra Deployment spire-system | sed 's/^,//')" ;;
+  *" -n spire-system get ConfigMap -o json "*) list "$(extra ConfigMap spire-system | sed 's/^,//')" ;;
+  *" -n spire-system get NetworkPolicy -o json "*) list "$(extra NetworkPolicy spire-system | sed 's/^,//')" ;;
   *" -n spire-system get "*) list "" ;;
   *" get Namespace -l cell.poc.internal/harness=envd -o json "*) list "$(item envd-system)" ;;
   *" get namespace envd-system -o json "*) echo "{\"metadata\":{\"name\":\"envd-system\",$mine}}" ;;
@@ -122,6 +126,8 @@ func TestHarnessObjectsByNamespace(t *testing.T) {
 		{name: "an extra Role in spire-system", extra: "Role/envd-extra@spire-system", fail: map[string]string{"spire-system": "'envd-extra envd-records'"}},
 		{name: "an extra RoleBinding in spire-system", extra: "RoleBinding/envd-extra@spire-system", fail: map[string]string{"spire-system": "'envd-extra envd-records'"}},
 		{name: "an extra Role in envd-system", extra: "Role/envd-extra@envd-system", fail: map[string]string{"envd-system": "Role objects 'envd-extra'"}},
+		{name: "a stray NetworkPolicy in spire-system, a kind that the bundle holds only in envd-system", extra: "NetworkPolicy/envd-stray@spire-system", fail: map[string]string{"spire-system": "NetworkPolicy objects 'envd-stray'"}},
+		{name: "a stray ServiceAccount in spire-system", extra: "ServiceAccount/envd-stray@spire-system", fail: map[string]string{"spire-system": "ServiceAccount objects 'envd-stray'"}},
 		{name: "an extra ConfigMap in envd-system", extra: "ConfigMap/envd-extra@envd-system", fail: map[string]string{"envd-system": "'envd-extra mgmt-spec-key peer-root'"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
