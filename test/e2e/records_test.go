@@ -256,15 +256,30 @@ func TestM4RelayBindRoute(t *testing.T) {
 	}
 }
 
-// envdPod returns the name of the live envd pod.
+// envdPod returns the name of the live envd pod: the one that has no deletion timestamp.
 func envdPod(t *testing.T) string {
 	t.Helper()
-	out, err := kubectl(t, spireCluster, "", "-n", envdNamespace, "get", "pods", "-l", "app.kubernetes.io/name="+envdDeployment,
-		"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp==null)]}{.metadata.name}{"\n"}{end}`)
+	out, err := kubectl(t, spireCluster, "", "-n", envdNamespace, "get", "pods", "-l", "app.kubernetes.io/name="+envdDeployment, "-o", "json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	names := strings.Fields(out)
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name              string  `json:"name"`
+				DeletionTimestamp *string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &list); err != nil {
+		t.Fatalf("decode the envd pods: %v", err)
+	}
+	var names []string
+	for _, p := range list.Items {
+		if p.Metadata.DeletionTimestamp == nil {
+			names = append(names, p.Metadata.Name)
+		}
+	}
 	if len(names) != 1 {
 		t.Fatalf("want one envd pod, got %v", names)
 	}

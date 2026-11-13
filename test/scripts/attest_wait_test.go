@@ -21,6 +21,7 @@ case " $* " in
   *" logs mgmtd-0 "*) cat "$d/mgmtd.log" ;;
   *" get pods -l app.kubernetes.io/name=celld "*) cat "$d/pods.json" ;;
   *" delete pod "*) echo "delete $*" >>"$d/deleted" ;;
+  *" wait --for=delete "*) echo "wait $*" >>"$d/deleted" ;;
   *" rollout status "*) exit "${STUB_ROLLOUT_RC:-0}" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
@@ -104,6 +105,9 @@ func TestAttestWaitStages(t *testing.T) {
 			want: []string{"CrashLoopBackOff, so the pod is deleted once (verify row 2)", "stage ready took"}, check: func(t *testing.T, _, deleted string) {
 				if n := strings.Count(deleted, "delete pod celld-abc"); n != 1 {
 					t.Errorf("the pod was deleted %d times, want once:\n%s", n, deleted)
+				}
+				if !strings.Contains(deleted, "wait --for=delete pod/celld-abc") {
+					t.Errorf("the script did not wait for the old pod to go away:\n%s", deleted)
 				}
 			}},
 		{name: "a crash-looping celld container only", change: map[string]string{"pods.json": `{"items":[{"metadata":{"name":"celld-abc"},"status":{"containerStatuses":[{"name":"celld","state":{"waiting":{"reason":"CrashLoopBackOff"}}}]}}]}`},

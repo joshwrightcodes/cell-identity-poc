@@ -40,7 +40,7 @@ const envdVerifyMise = `#!/usr/bin/env bash
 d="$STUB_DIR"
 case "$1 $2 $3 $4" in
   "run pki -- trust-bundle") cat ;;
-  "run mgmt -- status") [[ -s "$d/status.json" ]] || exit 1; cat "$d/status.json" ;;
+  "run mgmt -- status") echo '[mgmt] $ scripts/mgmt.sh status' >&2; [[ -s "$d/status.json" ]] || exit 1; cat "$d/status.json" ;;
   "run mgmt -- pubkey") printf '{"spec.pub":"%s"}\n' "$(cat "$d/signing-pub")" ;;
   "run hostsvc -- facts")
     cell="$6"

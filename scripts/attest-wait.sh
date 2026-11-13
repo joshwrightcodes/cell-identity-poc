@@ -107,6 +107,8 @@ crashing="$(k -n cell-identity-system get pods -l app.kubernetes.io/name=celld -
 for pod in $crashing; do
   log "attest-wait $cell: spire-agent in $pod is in CrashLoopBackOff, so the pod is deleted once (verify row 2)"
   k -n cell-identity-system delete pod "$pod" --wait=false >/dev/null || fail ready "could not delete the pod $pod" "mise x -- kubectl --context kind-$cell -n cell-identity-system delete pod $pod"
+  # The rollout status of the Deployment can still show the old pod as the one that counts, so wait until it is gone.
+  k -n cell-identity-system wait --for=delete "pod/$pod" --timeout=120s >/dev/null 2>&1 || fail ready "the pod $pod did not go away in 120s" "mise x -- kubectl --context kind-$cell -n cell-identity-system describe pod $pod"
 done
 if ! k -n cell-identity-system rollout status deployment/celld --timeout="${ATTEST_READY_WAIT:-300}s" >/dev/null 2>&1; then
   fail ready "deployment/celld in $cell did not finish its rollout in ${ATTEST_READY_WAIT:-300}s" \

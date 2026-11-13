@@ -199,7 +199,7 @@ check_keytest_clean() {
 # cell-records. The counter must equal the one that mgmtd signed last.
 check_envd_applied() {
   local status signed epoch cm counter stored_epoch
-  status="$(cd "$ROOT" && mise run mgmt -- status 2>&1)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
   signed="$(jq -er '.signed.counter' <<<"$status")" && epoch="$(jq -er '.signed.epoch' <<<"$status")" \
     || { echo "mgmtd reports no signed revision: $status"; return 1; }
   cm="$(k -n spire-system get configmap cell-records -o json 2>&1)" \
