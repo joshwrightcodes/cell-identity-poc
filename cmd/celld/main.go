@@ -16,6 +16,8 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,9 +31,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"crypto/ed25519"
-	"encoding/base64"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"

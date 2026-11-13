@@ -69,6 +69,10 @@ func okBind(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int
 	writeJSON(w, http.StatusAccepted, gwapi.BindAccepted{ID: fakeBindID})
 }
 
+func boundNow(w http.ResponseWriter, _ *http.Request, _ int) {
+	writeJSON(w, 200, gwapi.BindResult{Status: mgmtapi.StatusBound})
+}
+
 // pendingThenBound answers pending to the first poll and bound to every later one.
 func pendingThenBound(w http.ResponseWriter, _ *http.Request, n int) {
 	if n == 0 {
@@ -84,7 +88,7 @@ func denied(w http.ResponseWriter) {
 
 func newServer(t *testing.T, serverID string) *fakeServer {
 	t.Helper()
-	f := &fakeServer{ca: spiffetest.NewCA(t, mgmtTD), nonce: okNonce(false), bind: okBind, result: pendingThenBound}
+	f := &fakeServer{ca: spiffetest.NewCA(t, mgmtTD), nonce: okNonce(false), bind: okBind, result: boundNow}
 	cfg := tlsconfig.TLSServerConfig(f.ca.Source(t, serverID))
 	cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
 	cfg.NextProtos = []string{"h2"}
@@ -240,6 +244,7 @@ func TestClientTLSSettings(t *testing.T) {
 // sends requests.
 func TestOnceUsesFreshConnectionForEachRequest(t *testing.T) {
 	f := newServer(t, apiID)
+	f.result = pendingThenBound
 	if _, err := Once(t.Context(), f.config(t, apiID)); err != nil {
 		t.Fatal(err)
 	}
@@ -326,27 +331,57 @@ func TestBindDeniedUsesLongBackoff(t *testing.T) {
 	}
 }
 
-// A cut response can leave a bind that the gateway answers with a refusal although the cell is
-// bound. Run then checks the nonce answer and does not bind again.
-func TestRunChecksBoundAfterDenied(t *testing.T) {
+// A denial of a cell that the nonce answer calls bound, as a key_update_gap denial is, still waits
+// the refused backoff and then binds again with a fresh nonce.
+func TestRunBindsAgainAfterDenialOfBoundCell(t *testing.T) {
 	f := newServer(t, apiID)
-	f.nonce = func(w http.ResponseWriter, r *http.Request, n int) { okNonce(n >= 1)(w, r, n) }
-	f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
-		writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "abc123"})
+	f.nonce = okNonce(true)
+	f.result = func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "abc123"})
+			return
+		}
+		writeJSON(w, 200, gwapi.BindResult{Status: mgmtapi.StatusKeysUpdated})
 	}
-	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	var results []string
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 2 }}
 	cfg, ctx := runCfg(t, f, rec)
-	var out bytes.Buffer
-	cfg.Log = slog.New(slog.NewJSONHandler(&out, nil))
+	cfg.Observe = func(_ context.Context, r string) { results = append(results, r) }
 	_ = Run(ctx, cfg)
-	if _, b := f.counts(); b != 1 {
-		t.Fatalf("%d binds, want 1", b)
+	if _, b := f.counts(); b != 2 {
+		t.Fatalf("%d binds, want 2", b)
 	}
-	if d := rec.waits[0]; d > 6*time.Minute {
-		t.Fatalf("first wait %v is a refused backoff, want the recheck wait", d)
+	if d := rec.waits[0]; d < 60*time.Second || d > 120*time.Second {
+		t.Fatalf("first wait %v, want the refused backoff", d)
 	}
-	if !strings.Contains(out.String(), "cell is bound") {
-		t.Fatalf("log %s", out.String())
+	if len(results) < 2 || results[0] != "refused" || results[1] != mgmtapi.StatusKeysUpdated {
+		t.Fatalf("results %v, want refused then keys_updated", results)
+	}
+}
+
+func TestBindPollWaitsThroughConfigSleep(t *testing.T) {
+	f := newServer(t, apiID)
+	f.result = pendingThenBound
+	var waits []time.Duration
+	cfg := f.config(t, apiID)
+	cfg.PollEvery = 2 * time.Second
+	cfg.Sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+	if _, err := Once(t.Context(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(waits) != 1 || waits[0] != 2*time.Second {
+		t.Fatalf("poll waits %v, want one wait of 2s through Config.Sleep", waits)
+	}
+}
+
+func TestBindAcceptsOnly202(t *testing.T) {
+	f := newServer(t, apiID)
+	f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+		writeJSON(w, 200, gwapi.BindAccepted{ID: fakeBindID})
+	}
+	var se *StatusError
+	if _, err := Once(t.Context(), f.config(t, apiID)); !errors.As(err, &se) || se.Code != 200 {
+		t.Fatalf("err = %v, want a StatusError 200", err)
 	}
 }
 

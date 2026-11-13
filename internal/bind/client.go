@@ -206,7 +206,7 @@ func (c *Client) Bind(ctx context.Context, req mgmtapi.BindRequest) (gwapi.ItemI
 		return "", err
 	}
 	var out gwapi.BindAccepted
-	if err = c.do(ctx, http.MethodPost, gwapi.BindPath(c.cell), body, &out, http.StatusAccepted, http.StatusOK); err != nil {
+	if err = c.do(ctx, http.MethodPost, gwapi.BindPath(c.cell), body, &out, http.StatusAccepted); err != nil {
 		return "", err
 	}
 	if !out.ID.Valid() {
@@ -230,9 +230,12 @@ func (c *Client) Result(ctx context.Context, id gwapi.ItemID) (gwapi.BindResult,
 	return gwapi.BindResult{}, errors.New("the bind result holds no known status")
 }
 
-// BindWait posts a bind request and polls its result every poll until a final status. A pending
+// BindWait posts a bind request and polls its result every poll until a final status, waiting with wait (nil takes a timer). A pending
 // result and a poll that fails in transfer or with an HTTP status are tried again until ctx ends. A denied result is a *Refused error.
-func (c *Client) BindWait(ctx context.Context, req mgmtapi.BindRequest, poll time.Duration) (mgmtapi.BindResponse, error) {
+func (c *Client) BindWait(ctx context.Context, req mgmtapi.BindRequest, poll time.Duration, wait func(context.Context, time.Duration) error) (mgmtapi.BindResponse, error) {
+	if wait == nil {
+		wait = sleep
+	}
 	id, err := c.Bind(ctx, req)
 	if err != nil {
 		return mgmtapi.BindResponse{}, fmt.Errorf("send the bind request: %w", err)
@@ -251,7 +254,7 @@ func (c *Client) BindWait(ctx context.Context, req mgmtapi.BindRequest, poll tim
 		case res.Status != gwapi.BindPending:
 			return mgmtapi.BindResponse{Status: res.Status}, nil
 		}
-		if err := sleep(ctx, poll); err != nil {
+		if err := wait(ctx, poll); err != nil {
 			if last != nil {
 				err = errors.Join(err, last)
 			}
@@ -364,7 +367,7 @@ func Once(ctx context.Context, cfg Config) (mgmtapi.BindResponse, error) {
 	if err != nil {
 		return mgmtapi.BindResponse{}, fmt.Errorf("mint a token: %w", err)
 	}
-	return c.BindWait(ctx, mgmtapi.BindRequest{Nonce: n.Nonce, Token: token}, cfg.PollEvery)
+	return c.BindWait(ctx, mgmtapi.BindRequest{Nonce: n.Nonce, Token: token}, cfg.PollEvery, cfg.Sleep)
 }
 
 // Run repeats Once until a bind succeeds, with no limit. After a success it asks for a nonce every
@@ -417,11 +420,6 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 		var refused *Refused
 		result := "error"
 		if errors.As(err, &refused) {
-			if bound, berr := checkBound(ctx, cfg); berr == nil && bound {
-				cfg.observe(ctx, mgmtapi.StatusAlreadyBound)
-				cfg.Log.WarnContext(actx, "bind denied but the cell is bound", "cell", cfg.Cell, "request_id", refused.RequestID)
-				return nil
-			}
 			result, wait = "refused", jitter(cfg.RefusedBackoff, 0.1, 0)
 			failures = 0
 		} else {

@@ -39,6 +39,7 @@ type loop struct {
 	nextClaimOK, claimAt, statusAt      time.Time
 	resendAt, pingAt, pongDue           time.Time
 	ackDue                              []time.Time
+	claimDue                            time.Time
 	lastForged                          time.Time
 }
 
@@ -129,6 +130,9 @@ func (l *loop) next() time.Time {
 			t = c
 		}
 	}
+	if !l.claimDue.IsZero() && l.claimDue.Before(t) {
+		t = l.claimDue
+	}
 	if len(l.ackDue) > 0 && l.ackDue[0].Before(t) {
 		t = l.ackDue[0]
 	}
@@ -148,6 +152,7 @@ func (l *loop) fire(now time.Time) error {
 			return err
 		}
 		l.wantClaim, l.claimInFlight = false, true
+		l.claimDue = now.Add(c.AckTimeout)
 		l.nextClaimOK = now.Add(time.Duration(float64(time.Second) / c.ClaimsPerSecond))
 	}
 	if !now.Before(l.statusAt) {
@@ -174,6 +179,8 @@ func (l *loop) fire(now time.Time) error {
 	switch {
 	case !l.pongDue.IsZero() && !now.Before(l.pongDue):
 		return errors.New("no pong from the gateway")
+	case !l.claimDue.IsZero() && !now.Before(l.claimDue):
+		return errors.New("no answer to a claim from the gateway")
 	case len(l.ackDue) > 0 && !now.Before(l.ackDue[0]):
 		return errors.New("no ack from the gateway")
 	}
@@ -188,6 +195,7 @@ func (l *loop) handle(f gwapi.Frame) error {
 			c.Log.WarnContext(l.ctx, "lease without a claim", "lease_id", f.LeaseID)
 			return nil
 		}
+		l.claimDue = time.Time{}
 		if len(f.Envelope) == 0 {
 			l.claimInFlight = false
 			return nil
@@ -196,6 +204,7 @@ func (l *loop) handle(f gwapi.Frame) error {
 		go func() { l.exec <- execOutcome{res: c.Exec.Execute(l.parent, f.Envelope, f.Fence), leaseID: f.LeaseID} }()
 	case gwapi.TypeNone:
 		l.claimInFlight = false
+		l.claimDue = time.Time{}
 	case gwapi.TypeWork:
 		l.wantClaim = true
 	case gwapi.TypeAck:
@@ -207,12 +216,24 @@ func (l *loop) handle(f gwapi.Frame) error {
 	case gwapi.TypePing:
 		return l.send(gwapi.Frame{Type: gwapi.TypePong})
 	case gwapi.TypeFinal:
-		if err := c.Exec.MarkReported(l.ctx, f.OpID); err != nil && !apierrors.IsNotFound(err) {
+		kctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
+		err := c.Exec.MarkReported(kctx, f.OpID)
+		cancel()
+		if err != nil && !apierrors.IsNotFound(err) {
 			c.Log.WarnContext(l.ctx, "mark reported failed", "op_id", f.OpID, "error", err.Error())
 		}
+		c.resent.forget(f.OpID)
 	case gwapi.TypeRetry:
 		return l.resendPending(f.OpID)
 	case gwapi.TypeRefused:
+		// A refusal for overload answers one item. Every other reason ends the stream.
+		if f.Reason == gwapi.ReasonOverloaded {
+			if len(l.ackDue) > 0 {
+				l.ackDue = l.ackDue[1:]
+			}
+			c.Log.WarnContext(l.ctx, "the gateway refused an item as overloaded")
+			return nil
+		}
 		return fmt.Errorf("the gateway refused the stream: %s", f.Reason)
 	}
 	return nil
@@ -271,19 +292,30 @@ func (l *loop) sendStatus() error {
 }
 
 // resendPending sends again each unreported result, or only the one for opID when it is not empty.
+// An op goes up again at most once in minResendGap.
 func (l *loop) resendPending(opID string) error {
-	pending, err := l.cfg.Exec.Pending(l.ctx)
+	ctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
+	pending, err := l.cfg.Exec.Pending(ctx)
+	cancel()
 	if err != nil {
 		l.cfg.Log.WarnContext(l.ctx, "read the pending results failed", "error", err.Error())
 		return nil
 	}
+	found := false
 	for _, res := range pending {
 		if opID != "" && res.OpID != opID {
+			continue
+		}
+		found = true
+		if !l.cfg.resent.allow(res.OpID, l.cfg.Now()) {
 			continue
 		}
 		if err := l.sendResult(res, ""); err != nil {
 			return err
 		}
+	}
+	if opID != "" && !found {
+		l.cfg.Log.InfoContext(l.ctx, "retry without a pending result", "op_id", opID)
 	}
 	return nil
 }

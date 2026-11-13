@@ -8,14 +8,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	mrand "math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
-	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -74,13 +75,13 @@ func TestStreamOneClaimInFlight(t *testing.T) {
 		f := newFixture(t)
 		defer f.stop()
 		f.g.handler = func(s *gwStream) {
-			// The gateway reads claims and does not answer the first one for 35 s.
+			// The gateway reads claims and does not answer the first one for 25 s.
 			answered := false
 			s.loop(func(fr gwapi.Frame) bool {
 				if fr.Type == gwapi.TypeClaim && !answered {
 					answered = true
 					go func() {
-						time.Sleep(35 * time.Second)
+						time.Sleep(25 * time.Second)
 						_ = s.send(gwapi.Frame{Type: gwapi.TypeNone})
 					}()
 					return true
@@ -89,7 +90,7 @@ func TestStreamOneClaimInFlight(t *testing.T) {
 			})
 		}
 		f.start()
-		time.Sleep(34 * time.Second)
+		time.Sleep(24 * time.Second)
 		if n := len(f.g.frames(gwapi.TypeClaim)); n != 1 {
 			t.Fatalf("%d claims while the first is unanswered, want 1", n)
 		}
@@ -237,6 +238,10 @@ func TestStreamReconnectsWithBackoff(t *testing.T) {
 	}
 	if sleeps[len(sleeps)-1] < 15*time.Second {
 		t.Fatalf("the backoff did not grow: %v", sleeps)
+	}
+	// From the sixth failure on the base is the cap, and the jitter stays.
+	if distinct := len(slices.Compact(slices.Sorted(slices.Values(sleeps[6:])))); distinct < 2 {
+		t.Fatalf("the sleeps at the cap are all equal: %v", sleeps[6:])
 	}
 }
 
@@ -390,7 +395,7 @@ func TestStreamExecutionSurvivesSVIDUpdate(t *testing.T) {
 
 func TestStreamResendsUntilFinal(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 20 * time.Second })
+		f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 31 * time.Second })
 		defer f.stop()
 		l, id := f.lease("s1.1", fence(1, 5))
 		f.g.offer(l)
@@ -414,14 +419,14 @@ func TestStreamResendsUntilFinal(t *testing.T) {
 		}
 
 		// The ack came at once. Two resend periods later the record is still applied.
-		time.Sleep(45 * time.Second)
+		time.Sleep(70 * time.Second)
 		pending, err := f.exec.Pending(t.Context())
 		if err != nil || len(pending) != 1 {
 			t.Fatalf("pending %v, %v after an ack, want the one result", pending, err)
 		}
 		results := f.g.frames(gwapi.TypeResult)
 		if len(results) < 3 {
-			t.Fatalf("%d result frames after 45 s, want the first and two resends", len(results))
+			t.Fatalf("%d result frames after 70 s, want the first and two resends", len(results))
 		}
 		for _, r := range results[1:] {
 			if r.f.LeaseID != "" {
@@ -438,7 +443,7 @@ func TestStreamResendsUntilFinal(t *testing.T) {
 			return len(p) == 0
 		})
 		n := len(f.g.frames(gwapi.TypeResult))
-		time.Sleep(65 * time.Second)
+		time.Sleep(95 * time.Second)
 		if got := len(f.g.frames(gwapi.TypeResult)); got != n {
 			t.Fatalf("%d result frames after final, want no more than %d", got, n)
 		}
@@ -447,7 +452,7 @@ func TestStreamResendsUntilFinal(t *testing.T) {
 
 func TestStreamResendsAfterRetry(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		f := newFixture(t) // the resend period stays 60 s
+		f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 24 * time.Hour })
 		defer f.stop()
 		l, id := f.lease("s1.1", fence(1, 5))
 		f.g.offer(l)
@@ -464,7 +469,7 @@ func TestStreamResendsAfterRetry(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i, reason := range reasons {
-			time.Sleep(time.Second)
+			time.Sleep(31 * time.Second)
 			_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeRetry, OpID: id, Reason: reason})
 			waitFor(t, 5*time.Second, "a result after a retry with reason "+reason, func() bool {
 				return len(f.g.frames(gwapi.TypeResult)) >= i+2
@@ -577,4 +582,223 @@ func TestStreamLogCarriesTraceID(t *testing.T) {
 	})
 }
 
-var _ = spiffeid.RequireFromString
+func streamsStarted(f *streamFixture) int { return len(f.g.frames(gwapi.TypeHello)) }
+
+// A status that the gateway refuses as overloaded answers that item only. The stream stays, and
+// its next status and claim go on it.
+func TestStreamOverloadedStatusKeepsTheStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, func(c *StreamConfig) { c.StatusEvery = 5 * time.Second })
+		defer f.stop()
+		refused := false
+		f.g.handler = func(s *gwStream) {
+			s.loop(func(fr gwapi.Frame) bool {
+				if fr.Type == gwapi.TypeStatus && !refused {
+					refused = true
+					_ = s.send(gwapi.Frame{Type: gwapi.TypeRefused, Reason: gwapi.ReasonOverloaded})
+					return true
+				}
+				return false
+			})
+		}
+		f.start()
+		time.Sleep(75 * time.Second) // past the ack timeout of the refused item
+		if n := streamsStarted(f); n != 1 {
+			t.Fatalf("%d streams, want the first to stay open", n)
+		}
+		if n := len(f.g.frames(gwapi.TypeStatus)); n < 5 {
+			t.Fatalf("%d status frames, want the stream to go on", n)
+		}
+	})
+}
+
+func TestStreamLevelRefusalEndsTheStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		sent := false
+		f.g.handler = func(s *gwStream) {
+			s.loop(func(fr gwapi.Frame) bool {
+				if fr.Type == gwapi.TypeClaim && !sent {
+					sent = true
+					_ = s.send(gwapi.Frame{Type: gwapi.TypeRefused, Reason: gwapi.ReasonReauth})
+					return true
+				}
+				return false
+			})
+		}
+		f.start()
+		waitFor(t, 10*time.Second, "a second stream", func() bool { return streamsStarted(f) >= 2 })
+	})
+}
+
+// final marks the record of its own op and no other.
+func TestStreamFinalMarksOnlyItsOp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 31 * time.Second })
+		defer f.stop()
+		a, idA := f.lease("s1.1", fence(1, 1))
+		b, idB := f.lease("s1.2", fence(1, 2))
+		f.g.offer(a, b)
+		f.start()
+		waitFor(t, 10*time.Second, "two results", func() bool { return len(f.g.frames(gwapi.TypeResult)) >= 2 })
+		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: idA, Outcome: op.OutcomeApplied})
+		waitFor(t, 5*time.Second, "A to be reported", func() bool {
+			p, _ := f.exec.Pending(t.Context())
+			return len(p) == 1
+		})
+		p, _ := f.exec.Pending(t.Context())
+		if len(p) != 1 || p[0].OpID != idB {
+			t.Fatalf("pending %+v, want only the result of B", p)
+		}
+		before := len(f.g.frames(gwapi.TypeResult))
+		time.Sleep(70 * time.Second)
+		var again, forA int
+		for _, r := range f.g.frames(gwapi.TypeResult)[before:] {
+			switch resultOf(t, r.f).OpID {
+			case idB:
+				again++
+			case idA:
+				forA++
+			}
+		}
+		if again == 0 || forA != 0 {
+			t.Fatalf("after final for A: %d resends of B, %d of A, want some and none", again, forA)
+		}
+	})
+}
+
+// Each check that ends a dead stream has its own test. The others are set far away.
+func TestStreamAppPongTimeoutAlone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		f.g.handler = func(s *gwStream) { s.loop(func(fr gwapi.Frame) bool { return fr.Type == gwapi.TypePing }) }
+		f.start()
+		time.Sleep(35 * time.Second)
+		if n := streamsStarted(f); n != 1 {
+			t.Fatalf("%d streams after 35 s, want the pong wait of 30 s from the first ping at 10 s to run on", n)
+		}
+		waitFor(t, 15*time.Second, "a new stream after the pong timeout", func() bool { return streamsStarted(f) >= 2 })
+	})
+}
+
+func TestStreamH2PingTimeoutAlone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, func(c *StreamConfig) { c.PongTimeout, c.AckTimeout = time.Hour, time.Hour })
+		defer f.stop()
+		f.start()
+		waitFor(t, 5*time.Second, "the first stream", func() bool { return len(f.g.frames(gwapi.TypeClaim)) > 0 })
+		f.g.mu.Lock()
+		f.g.conns[0].freeze()
+		f.g.mu.Unlock()
+		waitFor(t, 45*time.Second, "a second stream from the transport ping alone", func() bool { return streamsStarted(f) >= 2 })
+	})
+}
+
+func TestStreamAckTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, func(c *StreamConfig) { c.StatusEvery, c.AckTimeout = 5*time.Second, 12*time.Second })
+		defer f.stop()
+		f.g.handler = func(s *gwStream) { s.loop(func(fr gwapi.Frame) bool { return fr.Type == gwapi.TypeStatus }) }
+		f.start()
+		waitFor(t, 40*time.Second, "a new stream after an unacked status", func() bool { return streamsStarted(f) >= 2 })
+	})
+}
+
+func TestStreamLeaseWithoutClaimIsIgnored(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		l, _ := f.lease("s1.1", fence(1, 1))
+		f.g.handler = func(s *gwStream) {
+			sent := false
+			s.loop(func(fr gwapi.Frame) bool {
+				if fr.Type == gwapi.TypeClaim && !sent {
+					sent = true
+					_ = s.send(gwapi.Frame{Type: gwapi.TypeNone})
+					_ = s.send(l)
+					return true
+				}
+				return false
+			})
+		}
+		f.start()
+		time.Sleep(6 * time.Second)
+		if n := f.rig.cnt.count(); n != 0 {
+			t.Fatalf("%d effects ran for a lease that no claim asked for", n)
+		}
+		if n := len(f.g.frames(gwapi.TypeResult)); n != 0 {
+			t.Fatalf("%d result frames", n)
+		}
+	})
+}
+
+// A claim that gets no answer ends the stream.
+func TestStreamClaimWithoutAnswerEnds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		f.g.handler = func(s *gwStream) { s.loop(func(fr gwapi.Frame) bool { return fr.Type == gwapi.TypeClaim }) }
+		f.start()
+		time.Sleep(25 * time.Second)
+		if n := streamsStarted(f); n != 1 {
+			t.Fatalf("%d streams after 25 s, want the claim wait of 30 s to run on", n)
+		}
+		waitFor(t, 15*time.Second, "a new stream after the claim wait", func() bool { return streamsStarted(f) >= 2 })
+	})
+}
+
+// Whatever sends a result again, the same op goes at most once in 30 s, also across streams.
+func TestStreamResendLimitedPerOp(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 24 * time.Hour })
+		defer f.stop()
+		l, id := f.lease("s1.1", fence(1, 5))
+		f.g.offer(l)
+		f.start()
+		waitFor(t, 5*time.Second, "the result", func() bool { return len(f.g.frames(gwapi.TypeResult)) > 0 })
+		results := func() int { return len(f.g.frames(gwapi.TypeResult)) }
+		time.Sleep(3 * time.Second)
+		retry := func() { _ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeRetry, OpID: id, Reason: "internal"}) }
+		retry()
+		waitFor(t, 5*time.Second, "the first resend", func() bool { return results() == 2 })
+		time.Sleep(2 * time.Second)
+		retry()
+		time.Sleep(3 * time.Second)
+		if n := results(); n != 2 {
+			t.Fatalf("%d result frames after a second retry within 30 s, want 2", n)
+		}
+		f.updates <- struct{}{}
+		waitFor(t, 5*time.Second, "a second stream", func() bool { return streamsStarted(f) >= 2 })
+		time.Sleep(3 * time.Second)
+		if n := results(); n != 2 {
+			t.Fatalf("%d result frames after a new stream within 30 s, want 2", n)
+		}
+		time.Sleep(30 * time.Second)
+		retry()
+		waitFor(t, 5*time.Second, "a resend after 30 s", func() bool { return results() == 3 })
+	})
+}
+
+func TestStreamRetryWithoutRecordIsLogged(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var out syncBuf
+		f := newFixture(t)
+		f.cfg.Log = slog.New(slog.NewJSONHandler(&out, nil))
+		defer f.stop()
+		f.start()
+		waitFor(t, 5*time.Second, "a claim", func() bool { return len(f.g.frames(gwapi.TypeClaim)) > 0 })
+		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeRetry, OpID: "0123456789abcdef0123456789abcdef", Reason: "unknown_kid"})
+		waitFor(t, 5*time.Second, "the log line", func() bool {
+			for _, l := range bytes.Split(out.bytes(), []byte("\n")) {
+				var m map[string]any
+				if json.Unmarshal(l, &m) == nil && m["level"] == "INFO" && m["op_id"] == "0123456789abcdef0123456789abcdef" &&
+					strings.Contains(m["msg"].(string), "retry") {
+					return true
+				}
+			}
+			return false
+		})
+	})
+}

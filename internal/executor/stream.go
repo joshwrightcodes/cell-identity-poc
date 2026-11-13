@@ -50,6 +50,8 @@ const (
 	gcEvery         = time.Hour
 	statusSpread    = 0.2
 	backoffSpread   = 0.5
+	kubeTimeout     = 5 * time.Second
+	minResendGap    = 30 * time.Second
 )
 
 // StreamConfig holds the settings of RunStream. A zero duration, ClaimsPerSecond, Log, Tracer, Now,
@@ -74,7 +76,8 @@ type StreamConfig struct {
 	Sleep  func(context.Context, time.Duration) error
 	Rand   func() float64
 
-	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	resent *resendLog
+	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
 	// pingEvery is the application ping interval of a test. Zero takes the 10 s default.
 	pingEvery time.Duration
 }
@@ -141,6 +144,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	}
 	if c.Rand == nil {
 		c.Rand = rand.Float64
+	}
+	if c.resent == nil {
+		c.resent = &resendLog{last: map[string]time.Time{}}
 	}
 	if c.dial == nil {
 		c.dial = (&net.Dialer{Timeout: dialTimeout}).DialContext
@@ -233,15 +239,18 @@ func (c StreamConfig) wait(ctx context.Context, d time.Duration) error {
 	return err
 }
 
-// backoff returns MinBackoff doubled for each earlier failure up to MaxBackoff, plus up to half
-// again, and never more than MaxBackoff.
+// backoff returns MinBackoff doubled for each earlier failure up to MaxBackoff, with jitter. Below
+// the cap the wait lies between d and 1.5 d. At the cap it lies between two thirds of MaxBackoff and
+// MaxBackoff, so a long outage keeps its jitter.
 func (c StreamConfig) backoff(failures int) time.Duration {
 	d := c.MinBackoff
 	for i := 0; i < failures && d < c.MaxBackoff; i++ {
 		d *= 2
 	}
 	d = min(d, c.MaxBackoff)
-	return min(time.Duration(float64(d)*(1+backoffSpread*c.Rand())), c.MaxBackoff)
+	high := min(time.Duration(float64(d)*(1+backoffSpread)), c.MaxBackoff)
+	low := min(d, high*2/3)
+	return low + time.Duration(c.Rand()*float64(high-low))
 }
 
 func (c StreamConfig) runGC(ctx context.Context) {
@@ -313,7 +322,9 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("mint the hello token: %w", err)
 	}
-	last, err := c.Exec.lastFence(ctx)
+	kctx, kcancel := context.WithTimeout(ctx, kubeTimeout)
+	last, err := c.Exec.lastFence(kctx)
+	kcancel()
 	if err != nil {
 		return fmt.Errorf("read the records: %w", err)
 	}
@@ -370,4 +381,27 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 	_ = resp.Body.Close()
 	l.finish()
 	return err
+}
+
+// resendLog keeps when each result went up again, so that no op goes more than once in minResendGap,
+// whatever opens or retries the streams.
+type resendLog struct {
+	mu   sync.Mutex
+	last map[string]time.Time
+}
+
+func (r *resendLog) allow(opID string, now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t, ok := r.last[opID]; ok && now.Sub(t) < minResendGap {
+		return false
+	}
+	r.last[opID] = now
+	return true
+}
+
+func (r *resendLog) forget(opID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.last, opID)
 }

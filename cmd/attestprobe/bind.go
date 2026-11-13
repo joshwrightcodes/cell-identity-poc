@@ -129,7 +129,7 @@ func runBind(ctx context.Context, cfg config, d deps) (string, error) {
 		sends = 2
 	}
 	for range sends {
-		resp, err := client.BindWait(ctx, mgmtapi.BindRequest{Nonce: nonce, Token: token}, bind.DefaultPollEvery)
+		resp, err := client.BindWait(ctx, mgmtapi.BindRequest{Nonce: nonce, Token: token}, bind.DefaultPollEvery, nil)
 		var refused *bind.Refused
 		switch {
 		case errors.As(err, &refused):
