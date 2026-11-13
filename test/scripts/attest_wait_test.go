@@ -16,7 +16,9 @@ d="$STUB_DIR"
 echo "kubectl $*" >>"$d/calls"
 case " $* " in
   *" get configmap cell-records "*) [[ -f "$d/cell-records.json" ]] || exit 1; cat "$d/cell-records.json" ;;
-  *" logs spire-server-0 "*) cat "$d/server.log" ;;
+  *" logs spire-server-0 "*)
+    n="$(sed -n 's/.*--tail=\([0-9]*\).*/\1/p' <<<"$*")"
+    if [[ -n "$n" ]]; then tail -n "$n" "$d/server.log"; else cat "$d/server.log"; fi ;;
   *" logs deploy/celld "*) cat "$d/celld.log" ;;
   *" logs mgmtd-0 "*) cat "$d/mgmtd.log" ;;
   *" get pods -l app.kubernetes.io/name=celld "*) cat "$d/pods.json" ;;
@@ -65,7 +67,7 @@ func TestAttestWaitStages(t *testing.T) {
 			`"cells":[{"name":"dev-cell-1","bound":` + b + `,"record":{"epoch":1,"counter":7}},{"name":"dev-cell-2","bound":true,"record":{"epoch":1,"counter":7}}]}`
 	}
 	records := func(counter string) string {
-		return `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"` + counter + `"}}}`
+		return `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"` + counter + `"}},"data":{"spec-envelope.json":"{}","dev-cell-1.dsse.json":"{}","dev-cell-2.dsse.json":"{}"}}`
 	}
 	healthy := map[string]string{
 		"status.json":       status(true),
@@ -98,6 +100,14 @@ func TestAttestWaitStages(t *testing.T) {
 			want: []string{"stage applied failed", "does not reach the revision 1/7", `lastRefusal: {"reason":"spec_invalid"`, "storeError: update refused", "Next: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd"}},
 		{name: "no ConfigMap yet", change: map[string]string{"cell-records.json": ""}, code: 1, want: []string{"stage applied failed"}},
 		{name: "a later revision counts", change: map[string]string{"cell-records.json": records("9")}, want: []string{"stage applied took"}},
+		{name: "the reload line is far back in the log", change: map[string]string{"server.log": `{"msg":"records reloaded","cells":["dev-cell-1"]}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
+			want: []string{"stage reloaded took"}},
+		{name: "the server started with the records in place", change: map[string]string{"server.log": `{"msg":"configured","records":2}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
+			want: []string{"stage reloaded took"}},
+		{name: "the server started with fewer records than the ConfigMap holds", change: map[string]string{"server.log": `{"msg":"configured","records":1}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed"}},
+		{name: "the ConfigMap holds no record of the cell", change: map[string]string{"cell-records.json": `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"7"}},"data":{"spec-envelope.json":"{}","dev-cell-2.dsse.json":"{}"},"x":1}`, "server.log": `{"msg":"configured","records":1}` + "\n"}, code: 1,
+			want: []string{"stage reloaded failed"}},
 		{name: "not reloaded", change: map[string]string{"server.log": `{"msg":"records reloaded","cells":["dev-cell-2"]}` + "\n"}, code: 1,
 			want: []string{"stage reloaded failed", "kubelet syncs the ConfigMap volume", "verify row 1", "CELL=dev-cp mise run cell:restart"}},
 		{name: "not ready", env: []string{"STUB_ROLLOUT_RC=1"}, code: 1, want: []string{"stage ready failed", "did not finish its rollout"}},

@@ -9,8 +9,9 @@
 #   bound     mgmt -- status shows the cell bound, within 120 s.
 #   applied   ConfigMap cell-records in the SPIRE server cluster holds the spec revision of the record
 #             of the cell, within 60 s.
-#   reloaded  the log of the SPIRE server has "records reloaded" with the cell, within 150 s. The
-#             kubelet syncs the ConfigMap volume, and the plugin reloads it every 10 s.
+#   reloaded  the plugin of the SPIRE server holds the record of the cell, within 150 s: its log has
+#             "records reloaded" with the cell, or its last "configured" line counts as many records as
+#             the ConfigMap holds. The kubelet syncs the ConfigMap volume, and the plugin reloads it every 10 s.
 #   ready     the rollout of celld finishes, within 300 s. A spire-agent container in CrashLoopBackOff at the
 #             start of this stage gets its pod deleted once, because the back-off grows with each crash.
 # Each stage prints its time. A failing stage prints its name, the reason and the next command, and
@@ -90,13 +91,26 @@ if ! poll_until "${ATTEST_APPLIED_WAIT:-60}" records_applied; then
 fi
 log "attest-wait $cell: stage applied took $((SECONDS - stage_start))s"
 
+# records_reloaded succeeds when the plugin of the server holds the record of the cell. The plugin logs
+# "records reloaded" with the cells only when a record changes, so the line can lie far back in the log, and
+# a cell that is bound again after a restart of the server never gets one. A server that started with the
+# record in place logs "configured" with its number of records. That number must reach the number of
+# records in the ConfigMap, and the ConfigMap must hold the record of the cell.
 records_reloaded() {
-  ctx "$server_cluster" -n spire-system logs spire-server-0 -c spire-server --tail=500 2>/dev/null \
-    | grep -F 'records reloaded' | grep -qF "\"$cell\""
+  local logs cm want got
+  logs="$(ctx "$server_cluster" -n spire-system logs spire-server-0 -c spire-server 2>/dev/null)" || return 1
+  if grep -F 'records reloaded' <<<"$logs" | grep -qF "\"$cell\""; then
+    return 0
+  fi
+  cm="$(ctx "$server_cluster" -n spire-system get configmap cell-records -o json 2>/dev/null)" || return 1
+  jq -e --arg key "$cell.dsse.json" '.data[$key] != null' <<<"$cm" >/dev/null || return 1
+  want="$(jq -r '[.data | keys[] | select(endswith(".dsse.json"))] | length' <<<"$cm")"
+  got="$(grep -F '"msg":"configured"' <<<"$logs" | tail -n 1 | jq -r '.records // empty' 2>/dev/null)" || return 1
+  [[ -n "$got" ]] && ((got >= want))
 }
 stage_start=$SECONDS
 if ! poll_until "${ATTEST_RELOADED_WAIT:-150}" records_reloaded; then
-  fail reloaded "the log of the SPIRE server in $server_cluster has no 'records reloaded' with $cell after $((SECONDS - stage_start))s. The kubelet syncs the ConfigMap volume of the server pod before the plugin reloads it (verify row 1: the time from the write to the log line; row 5: a volume that was absent at pod start)" \
+  fail reloaded "the plugin of the SPIRE server in $server_cluster does not hold the record of $cell (no 'records reloaded' with it, and no 'configured' line with enough records) after $((SECONDS - stage_start))s. The kubelet syncs the ConfigMap volume of the server pod before the plugin reloads it (verify row 1: the time from the write to the log line; row 5: a volume that was absent at pod start)" \
     "mise x -- kubectl --context kind-$server_cluster -n spire-system logs spire-server-0 -c spire-server --tail=100, then CELL=$server_cluster mise run cell:restart"
 fi
 log "attest-wait $cell: stage reloaded took $((SECONDS - stage_start))s"
