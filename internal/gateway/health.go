@@ -6,11 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
-
-func cellAttr(cell string) attribute.KeyValue { return attribute.String("cell", cell) }
 
 const healthTimeout = 3 * time.Second
 

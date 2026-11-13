@@ -337,7 +337,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	})
 	bindH := gateway.NewBindHandler(st, gateway.BindConfig{CellNodes: cfg.nodes, Subject: celldSubject, Log: logger, Meter: meter})
 	envdH := gateway.NewEnvdHandler(st, []ed25519.PublicKey{cfg.key}, cfg.envd, streamH.Streams, bindH.LastRefusals, logger,
-		gateway.WithKeyHints(streamH.TakeHints))
+		gateway.WithKeyHints(streamH.TakeHints), gateway.WithEnv(cfg.env))
 	if err := gateway.RegisterGauges(meter, st, streamH.Streams); err != nil {
 		return fmt.Errorf("register metrics: %w", err)
 	}

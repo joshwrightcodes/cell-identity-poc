@@ -36,6 +36,14 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
+// Real-time limits of the stream. Tests shorten the variables before they start a server.
+var (
+	writeTimeout    = 10 * time.Second
+	workEvery       = 5 * time.Second
+	sendPingTimeout = 30 * time.Second
+	pingTimeout     = 10 * time.Second
+)
+
 // CelldRole is the last path segment of the SPIFFE ID of a celld stream peer.
 const CelldRole = "celld"
 
@@ -54,12 +62,11 @@ const (
 	noRequestTimeout  = 5 * time.Second
 	streamIdleTimeout = 30 * time.Second
 	streamHeaderLimit = 5 * time.Second
-	sendPingTimeout   = 30 * time.Second
-	pingTimeout       = 10 * time.Second
-	writeTimeout      = 10 * time.Second
 	pollEvery         = time.Second
-	workEvery         = 5 * time.Second
 	hintGap           = 60 * time.Second
+	// maxFenceAhead is how far above the current time in seconds a hello may report an epoch. The
+	// epoch starts at the Unix time of the file and rises by one for each raise.
+	maxFenceAhead = 24 * 60 * 60
 )
 
 // StreamConfig holds the settings of the stream handler. A zero value gets the default of its
@@ -94,6 +101,9 @@ func newInstruments(m metric.Meter) *instruments {
 	claims, _ := m.Int64Counter("cellgw.claims", metric.WithDescription("Claims that gave a lease, by cell"))
 	return &instruments{refusals: refusals, claims: claims}
 }
+
+// cellAttr is the cell attribute of the gauges and counters.
+func cellAttr(cell string) attribute.KeyValue { return attribute.String("cell", cell) }
 
 func (i *instruments) refused(ctx context.Context, reason string) {
 	i.refusals.Add(ctx, 1, metric.WithAttributes(attribute.String("reason", reason)))
@@ -353,7 +363,15 @@ func (h *StreamHandler) serve(w http.ResponseWriter, r *http.Request) {
 		refuse(reason, "detail", detail)
 		return
 	}
+	if hello.LastFence.Epoch > uint64(h.cfg.Now().Unix())+maxFenceAhead {
+		refuse(mgmtapi.ReasonPayloadInvalid, "what", "fence_epoch", "pod", claims.PodUID, "epoch", hello.LastFence.Epoch)
+		return
+	}
 	if err := h.st.RaiseEpoch(ctx, hello.LastFence); err != nil {
+		if errors.Is(err, ErrEpochOutOfRange) {
+			refuse(mgmtapi.ReasonPayloadInvalid, "what", "fence_epoch", "pod", claims.PodUID)
+			return
+		}
 		h.log.ErrorContext(ctx, "stream_store_failed", "cell", cell, "error", err.Error())
 		return
 	}
@@ -465,6 +483,10 @@ func (h *StreamHandler) loop(ctx context.Context, cell string, me *stream, o out
 				return
 			}
 		case <-poll.C:
+			if h.cellGone(ctx, cell) {
+				refuse(gwapi.ReasonCellRevoked, "pod", me.pod)
+				return
+			}
 			next, err := h.forward(ctx, cell, cursor, o.send)
 			if err != nil {
 				fail("outcomes", err)
@@ -508,6 +530,10 @@ func (h *StreamHandler) handle(ctx context.Context, cell string, me *stream, o o
 	case gwapi.TypePing:
 		return o.send(gwapi.Frame{Type: gwapi.TypePong})
 	case gwapi.TypeClaim:
+		if h.cellGone(ctx, cell) {
+			refuse(gwapi.ReasonCellRevoked, "pod", me.pod)
+			return errEndStream
+		}
 		l, err := h.st.Claim(ctx, cell, me.pod)
 		if err != nil {
 			return err
@@ -515,7 +541,7 @@ func (h *StreamHandler) handle(ctx context.Context, cell string, me *stream, o o
 		if l == nil {
 			return o.send(gwapi.Frame{Type: gwapi.TypeNone})
 		}
-		h.ins.claims.Add(ctx, 1, metric.WithAttributes(attribute.String("cell", cell)))
+		h.ins.claims.Add(ctx, 1, metric.WithAttributes(cellAttr(cell)))
 		return o.send(gwapi.Frame{Type: gwapi.TypeLease, LeaseID: l.ID, OpID: l.OpID, Envelope: json.RawMessage(l.Envelope), Fence: l.Fence, Until: l.Until})
 	case gwapi.TypeResult:
 		if f.Item == nil || f.Item.Kind != gwapi.KindResult || f.Item.Cell != cell {
@@ -549,6 +575,17 @@ func (h *StreamHandler) handle(ctx context.Context, cell string, me *stream, o o
 	}
 	h.log.InfoContext(ctx, "stream_frame_unexpected", "cell", cell, "pod", me.pod, "type", f.Type)
 	return errEndStream
+}
+
+// cellGone reports whether the record of cell is revoked or missing now. A store failure is not an
+// answer, so the stream goes on.
+func (h *StreamHandler) cellGone(ctx context.Context, cell string) bool {
+	rec, found, err := h.st.Cell(ctx, cell)
+	if err != nil {
+		h.log.WarnContext(ctx, "stream_cell_check_failed", "cell", cell, "error", err.Error())
+		return false
+	}
+	return !found || rec.Revoked
 }
 
 // forward sends final or retry for each outcome after cursor, then forgets the retry outcomes that
@@ -608,24 +645,43 @@ func NewStreamServer(h http.Handler, cfg *tls.Config, tracer trace.Tracer) *http
 		},
 		ReadHeaderTimeout: streamHeaderLimit, IdleTimeout: streamIdleTimeout, MaxHeaderBytes: 16 << 10,
 	}
-	srv.ConnState = closeWithoutRequest(noRequestTimeout)
+	guard := &noRequestGuard{d: noRequestTimeout}
+	srv.ConnState, srv.ConnContext = guard.connState, guard.connContext
+	srv.Handler = guard.handler(srv.Handler)
 	return srv
 }
 
-// closeWithoutRequest returns a ConnState hook that closes a connection which has opened no
-// request within d of its accept.
-func closeWithoutRequest(d time.Duration) func(net.Conn, http.ConnState) {
-	var timers sync.Map
-	return func(c net.Conn, state http.ConnState) {
-		switch state {
-		case http.StateNew:
-			timers.Store(c, time.AfterFunc(d, func() { _ = c.Close() }))
-		case http.StateActive, http.StateClosed, http.StateHijacked:
-			if t, ok := timers.LoadAndDelete(c); ok {
-				t.(*time.Timer).Stop()
-			}
+// noRequestGuard closes a connection that has opened no request within d of its accept. The timer
+// stops at the first request, whatever the HTTP/2 preface did before it.
+type noRequestGuard struct {
+	d      time.Duration
+	timers sync.Map
+}
+
+type guardKey struct{}
+
+func (g *noRequestGuard) connState(c net.Conn, state http.ConnState) {
+	switch state {
+	case http.StateClosed, http.StateHijacked:
+		if t, ok := g.timers.LoadAndDelete(c); ok {
+			t.(*time.Timer).Stop()
 		}
 	}
+}
+
+func (g *noRequestGuard) connContext(ctx context.Context, c net.Conn) context.Context {
+	// The server calls ConnContext before it reports StateNew, so the timer starts here.
+	t, _ := g.timers.LoadOrStore(c, time.AfterFunc(g.d, func() { _ = c.Close() }))
+	return context.WithValue(ctx, guardKey{}, t.(*time.Timer))
+}
+
+func (g *noRequestGuard) handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if t, ok := r.Context().Value(guardKey{}).(*time.Timer); ok {
+			t.Stop()
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func orNoop(t trace.Tracer) trace.Tracer {

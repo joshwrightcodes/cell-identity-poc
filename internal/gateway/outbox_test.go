@@ -280,13 +280,18 @@ func TestOutboxStatusDropStaysInCell(t *testing.T) {
 	for range 3 {
 		f.appendItem(item(gwapi.KindStatus, cell2, "", 1))
 	}
-	for _, kind := range []string{gwapi.KindResult, gwapi.KindStatus} {
-		if _, err := f.s.Append(ctx, item(kind, cell1, opID(1), 1)); !errors.Is(err, gwapi.ErrOverloaded) {
-			t.Fatalf("%s of cell 1 into an outbox full of cell 2 status items: %v", kind, err)
-		}
+	// A status item of another cell is refused. A result of another cell displaces the oldest
+	// status item of the cell with the most bytes.
+	if _, err := f.s.Append(ctx, item(gwapi.KindStatus, cell1, "", 1)); !errors.Is(err, gwapi.ErrOverloaded) {
+		t.Fatalf("status of cell 1 into an outbox full of cell 2 status items: %v", err)
 	}
 	if got, _ := f.s.Peek(ctx, 10, 1<<20); len(got) != 3 {
 		t.Fatalf("outbox holds %d items, want the 3 status items of cell 2", len(got))
+	}
+	f.appendItem(item(gwapi.KindResult, cell1, opID(1), 1))
+	got, _ := f.s.Peek(ctx, 10, 1<<20)
+	if len(got) != 3 || got[2].Kind != gwapi.KindResult {
+		t.Fatalf("outbox after a result of cell 1: %+v", got)
 	}
 }
 

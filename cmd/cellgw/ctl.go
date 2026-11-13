@@ -29,8 +29,9 @@ const (
 // euid is replaced by tests.
 var euid = os.Geteuid
 
-// listenAdmin listens on the unix socket at path. The socket is made under a restrictive umask and
-// then set to mode 0600, and a stale socket file is removed first.
+// listenAdmin listens on the unix socket at path. It makes the directory with mode 0700 when it is
+// missing, sets the socket to mode 0600, and removes a stale socket file first. The process umask
+// stays as it is.
 func listenAdmin(path string) (net.Listener, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("admin socket directory: %w", err)
@@ -43,9 +44,7 @@ func listenAdmin(path string) (net.Listener, error) {
 			return nil, fmt.Errorf("remove stale admin socket: %w", err)
 		}
 	}
-	old := syscall.Umask(0o177)
 	ln, err := net.Listen("unix", path)
-	syscall.Umask(old)
 	if err != nil {
 		return nil, fmt.Errorf("admin socket: %w", err)
 	}

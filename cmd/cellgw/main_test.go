@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -293,4 +294,25 @@ func TestAdminCommandsPrintOneLine(t *testing.T) {
 		t.Fatalf("missing socket: exit %d", code)
 	}
 	oneJSONLine(t, out2.String())
+}
+
+func TestListenAdminModes(t *testing.T) {
+	dir := shortDir(t)
+	old := syscall.Umask(0o022)
+	defer syscall.Umask(old)
+	sock := filepath.Join(dir, "run", "admin.sock")
+	ln, err := listenAdmin(sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	for path, want := range map[string]os.FileMode{filepath.Dir(sock): 0o700, sock: 0o600} {
+		fi, err := os.Stat(path)
+		if err != nil || fi.Mode().Perm() != want {
+			t.Fatalf("%s: mode %v, %v; want %v", path, fi, err, want)
+		}
+	}
+	if got := syscall.Umask(0o022); got != 0o022 {
+		t.Fatalf("the process umask is %o after listenAdmin", got)
+	}
 }

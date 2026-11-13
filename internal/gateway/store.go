@@ -32,6 +32,7 @@ const (
 	MaxOutboxItems   = 10_000
 	MaxOutboxBytes   = 64 << 20
 	MaxItemsPerCell  = 2_000
+	MaxBytesPerCell  = 16 << 20
 	MaxPendingBinds  = 4
 	MaxPeekItems     = 100
 	MaxPeekBytes     = 900 << 10
@@ -49,7 +50,7 @@ type Store struct {
 	epoch   atomic.Uint64
 	storeID string
 
-	maxItems, maxBytes, perCell, maxBinds int
+	maxItems, maxBytes, perCell, perCellBytes, maxBinds int
 }
 
 const schema = `
@@ -117,7 +118,7 @@ func Open(ctx context.Context, path string, n *gwapi.Notifier, now func() time.T
 	}
 	db.SetMaxOpenConns(1)
 	s := &Store{db: db, n: n, now: now, log: log,
-		maxItems: MaxOutboxItems, maxBytes: MaxOutboxBytes, perCell: MaxItemsPerCell, maxBinds: MaxPendingBinds}
+		maxItems: MaxOutboxItems, maxBytes: MaxOutboxBytes, perCell: MaxItemsPerCell, perCellBytes: MaxBytesPerCell, maxBinds: MaxPendingBinds}
 	if err := s.tx(ctx, s.initSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("open queue %s: %w", path, err)

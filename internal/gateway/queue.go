@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -204,9 +205,20 @@ func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it g
 	return id, nil
 }
 
+// ErrEpochOutOfRange means a fence epoch is too high to raise the epoch to one above it.
+var ErrEpochOutOfRange = errors.New("fence epoch is out of range")
+
+// MaxRaisableEpoch is the highest epoch that RaiseEpoch accepts as seen. The stored epoch then
+// stays at or below math.MaxInt64 - 1, so one more raise never wraps or leaves the database range.
+const MaxRaisableEpoch = math.MaxInt64 - 2
+
 // RaiseEpoch lifts the epoch to one above seen.Epoch when seen.Epoch is at or above it. A hello
-// reports the last fence that a cell saw.
+// reports the last fence that a cell saw. It refuses a seen.Epoch above MaxRaisableEpoch with
+// ErrEpochOutOfRange and changes nothing.
 func (s *Store) RaiseEpoch(ctx context.Context, seen op.Fence) error {
+	if seen.Epoch > MaxRaisableEpoch {
+		return fmt.Errorf("%w: %d", ErrEpochOutOfRange, seen.Epoch)
+	}
 	var next uint64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		next = 0

@@ -170,7 +170,8 @@ func (h *BindHandler) deny(w http.ResponseWriter, r *http.Request, cell, reason,
 	id := newRequestID()
 	writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: id})
 	h.ins.refused(r.Context(), reason)
-	if _, known := h.nodes[cell]; known {
+	// A source mismatch says nothing about the claimed cell, so it never hides its real last refusal.
+	if _, known := h.nodes[cell]; known && reason != gwapi.ReasonSourceMismatch {
 		h.mu.Lock()
 		h.refusals[cell] = mgmtapi.BindRefusal{Reason: reason, RequestID: id, At: h.cfg.Now().UTC()}
 		h.mu.Unlock()

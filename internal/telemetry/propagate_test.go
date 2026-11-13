@@ -54,3 +54,22 @@ func TestHandlerAndTransportPropagateTheTrace(t *testing.T) {
 		t.Fatalf("log line %q (%v), want a new trace_id", out.String(), err)
 	}
 }
+
+// The wrapped writer keeps its Flush, so a streaming handler can flush under Handler.
+func TestHandlerWriterFlushes(t *testing.T) {
+	tracer := sdktrace.NewTracerProvider().Tracer("test")
+	flushed := make(chan bool, 1)
+	h := Handler(tracer, "x", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f, ok := w.(http.Flusher)
+		flushed <- ok
+		if ok {
+			_, _ = w.Write([]byte("a"))
+			f.Flush()
+		}
+	}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if !<-flushed || !rec.Flushed {
+		t.Fatalf("the writer under Handler does not flush: Flusher %v, recorder flushed %v", rec.Flushed, rec.Flushed)
+	}
+}

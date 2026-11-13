@@ -138,9 +138,9 @@ func TestBindListenerSourceMustMatchCell(t *testing.T) {
 	bind := b.bindBody(cell1, "n1", nil)
 	// The node of cell-2 may not use the routes of cell-1.
 	code, body := b.fromCell2(http.MethodGet, gwapi.NoncePath(cell1), nil)
-	d := requireDenied(t, code, body)
-	if r := b.h.LastRefusals()[cell1]; r.Reason != gwapi.ReasonSourceMismatch || r.RequestID != d.RequestID {
-		t.Fatalf("last refusal %+v, want source_mismatch %s", r, d.RequestID)
+	requireDenied(t, code, body)
+	if r, ok := b.h.LastRefusals()[cell1]; ok {
+		t.Fatalf("a source mismatch is the last refusal of the claimed cell: %+v", r)
 	}
 	code, body = b.fromCell2(http.MethodPost, gwapi.BindPath(cell1), bind)
 	requireDenied(t, code, body)
@@ -268,7 +268,7 @@ func TestBindListenerRateAndCap(t *testing.T) {
 			// A post from the wrong source is a mismatch and does not count toward the rate.
 			code, body := b.fromCell2(http.MethodPost, gwapi.BindPath(cell1), bad)
 			requireDenied(t, code, body)
-			if r := b.lastReason(cell1); r != gwapi.ReasonSourceMismatch {
+			if r := b.lastReason(cell1); r != "" {
 				t.Fatalf("mismatch post %d: reason %q", i, r)
 			}
 		}

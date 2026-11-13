@@ -37,10 +37,10 @@ type envdSetup struct {
 	hints   func() []mgmtapi.KeyHint
 }
 
-func newEnvdFixture(t *testing.T, e *gwEnv, s envdSetup) *envdFixture {
+func newEnvdFixture(t *testing.T, e *gwEnv, s envdSetup, extra ...EnvdOption) *envdFixture {
 	t.Helper()
 	id, _ := spiffeid.FromString(envdID)
-	var opts []EnvdOption
+	opts := extra
 	if s.hints != nil {
 		opts = append(opts, WithKeyHints(s.hints))
 	}

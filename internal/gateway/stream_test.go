@@ -642,7 +642,7 @@ func TestStreamWorkOnEnqueue(t *testing.T) {
 }
 
 func TestStreamWorkRepeatsWhileQueued(t *testing.T) {
-	t.Parallel()
+	setVar(t, &workEvery, time.Second)
 	e := newGwEnv(t)
 	_, addr := e.serveStream(StreamConfig{})
 	e.enqueue(1, cell1)
@@ -655,8 +655,8 @@ func TestStreamWorkRepeatsWhileQueued(t *testing.T) {
 		select {
 		case fr := <-c.frames:
 			if fr.err == nil && fr.f.Type == gwapi.TypeWork {
-				if d := time.Since(start); d < 4*time.Second || d > 8*time.Second {
-					t.Fatalf("second work frame after %v, want about 5 s", d)
+				if d := time.Since(start); d < 500*time.Millisecond || d > 4500*time.Millisecond {
+					t.Fatalf("second work frame after %v, want 1 to 2 s", d)
 				}
 				return
 			}
@@ -927,7 +927,7 @@ func TestStreamFrameLimit(t *testing.T) {
 
 // A write deadline must not outlive its write: a quiet stream stays open and answers later.
 func TestStreamSurvivesQuietWrites(t *testing.T) {
-	t.Parallel()
+	setVar(t, &writeTimeout, time.Second)
 	e := newGwEnv(t)
 	_, addr := e.serveStream(StreamConfig{})
 	c := e.join(addr, cell1, "uid-a")
@@ -981,9 +981,11 @@ func TestStreamClosesAtLeafExpiry(t *testing.T) {
 }
 
 func TestStreamDeadPodFreesCap(t *testing.T) {
-	t.Parallel()
+	// The HTTP/2 ping alone frees the slot: the frame idle limit is out of reach.
+	setVar(t, &sendPingTimeout, 500*time.Millisecond)
+	setVar(t, &pingTimeout, 500*time.Millisecond)
 	e := newGwEnv(t)
-	_, addr := e.serveStream(StreamConfig{ReplicaCap: 1})
+	_, addr := e.serveStream(StreamConfig{ReplicaCap: 1, FrameIdle: time.Hour})
 	dead := e.join(addr, cell1, "uid-dead")
 	dead.stall.Store(true) // the client stops answering from now on
 	start := time.Now()
@@ -995,10 +997,25 @@ func TestStreamDeadPodFreesCap(t *testing.T) {
 		if err == nil && f.Type == gwapi.TypeWelcome {
 			break
 		}
-		if time.Since(start) > 45*time.Second {
+		if time.Since(start) > 8*time.Second {
 			t.Fatalf("the slot of a silent pod is still taken after %v (last %+v, %v)", time.Since(start), f, err)
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// setVar sets a package variable for one test.
+func setVar[T any](t *testing.T, v *T, val T) {
+	t.Helper()
+	old := *v
+	*v = val
+	t.Cleanup(func() { *v = old })
+}
+
+func TestStreamRealTimeLimits(t *testing.T) {
+	if writeTimeout != 10*time.Second || workEvery != 5*time.Second || sendPingTimeout != 30*time.Second ||
+		pingTimeout != 10*time.Second || noRequestTimeout != 5*time.Second {
+		t.Fatal("a limit differs from the shared table")
 	}
 }
 

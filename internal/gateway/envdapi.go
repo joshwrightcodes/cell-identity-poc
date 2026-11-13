@@ -38,6 +38,11 @@ const (
 	peekItems    = 100
 	peekBytes    = 900 << 10
 	maxAdminBody = 1 << 20
+	// maxEnvelopeBytes keeps a lease frame, which carries the envelope, below gwapi.MaxFrame.
+	maxEnvelopeBytes = gwapi.MaxFrame - 4<<10
+	// envdConnAge is the hard end of an envd connection. connlimit needs a positive age, and envd
+	// dials again when a connection ends.
+	envdConnAge = 24 * time.Hour
 )
 
 // EnvdOption changes the envd handler.
@@ -49,7 +54,14 @@ func WithKeyHints(take func() []mgmtapi.KeyHint) EnvdOption {
 	return func(h *envdHandler) { h.hints = take }
 }
 
+// WithEnv pins the environment: a spec of another env is refused with env_mismatch, also when the
+// store has seen no spec yet.
+func WithEnv(env string) EnvdOption {
+	return func(h *envdHandler) { h.env = env }
+}
+
 type envdHandler struct {
+	env          string
 	st           *Store
 	keys         []ed25519.PublicKey
 	envd         spiffeid.ID
@@ -164,6 +176,13 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": bad})
 		return
 	}
+	if h.env != "" {
+		if sp, _, err := spec.Verify(req.SpecEnvelope, h.keys); err == nil && sp.Env != h.env {
+			h.log.WarnContext(ctx, "sync_refused", "error", "spec env differs from the pinned env", "spec_env", sp.Env)
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "spec env differs from the pinned env", "reason": mgmtapi.ReasonEnvMismatch})
+			return
+		}
+	}
 	if err := h.st.ApplySync(ctx, req.SpecEnvelope, req.Records, h.keys); err != nil {
 		if isRefusal(err) {
 			h.log.WarnContext(ctx, "sync_refused", "error", err.Error())
@@ -242,6 +261,10 @@ func refusalReason(err error) string {
 // skipped. A done row that meets a re-signed envelope is an expected event after a key rotation.
 // Only a store failure is returned.
 func (h *envdHandler) enqueue(ctx context.Context, env json.RawMessage) error {
+	if len(env) > maxEnvelopeBytes {
+		h.log.WarnContext(ctx, "sync_op_too_large", "bytes", len(env), "limit", maxEnvelopeBytes)
+		return nil
+	}
 	_, cell, _, err := op.Peek(env)
 	if err != nil {
 		h.log.WarnContext(ctx, "sync_op_skipped", "error", err.Error())
@@ -291,7 +314,7 @@ func EnvdServerTLS(svids x509svid.Source, bundles x509bundle.Source, envd spiffe
 
 // ListenEnvd wraps ln for the envd server, with at most 8 connections.
 func ListenEnvd(ln net.Listener, cfg *tls.Config) net.Listener {
-	return tls.NewListener(connlimit.Listen(ln, envdConns, 24*time.Hour, 0, nil), cfg)
+	return tls.NewListener(connlimit.Listen(ln, envdConns, envdConnAge, 0, nil), cfg)
 }
 
 // NewEnvdServer returns the HTTP/2 server of the envd listener.

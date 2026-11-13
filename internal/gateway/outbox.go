@@ -53,15 +53,30 @@ func (s *Store) appendItem(tx *sql.Tx, it gwapi.Item) (gwapi.ItemID, error) {
 	}
 	dropped := 0
 	for {
-		var items, cellItems, bytes int
-		if err := tx.QueryRow(`SELECT count(*), coalesce(sum(size), 0), coalesce(sum(cell = ?), 0) FROM outbox`, it.Cell).
-			Scan(&items, &bytes, &cellItems); err != nil {
+		var items, cellItems, bytes, cellBytes int
+		if err := tx.QueryRow(`SELECT count(*), coalesce(sum(size), 0), coalesce(sum(cell = ?), 0), coalesce(sum(CASE WHEN cell = ? THEN size ELSE 0 END), 0) FROM outbox`, it.Cell, it.Cell).
+			Scan(&items, &bytes, &cellItems, &cellBytes); err != nil {
 			return "", err
 		}
-		if items < s.maxItems && cellItems < s.perCell && bytes+size <= s.maxBytes {
+		globalOK := items < s.maxItems && bytes+size <= s.maxBytes
+		cellOK := cellItems < s.perCell && cellBytes+size <= s.perCellBytes
+		if globalOK && cellOK {
 			break
 		}
-		res, err := tx.Exec(`DELETE FROM outbox WHERE seq = (SELECT min(seq) FROM outbox WHERE cell = ? AND kind = ?)`, it.Cell, gwapi.KindStatus)
+		// A cell that is over its own share gives up its own oldest status item. When only the
+		// whole outbox is full, a result displaces the oldest status item of the cell that holds
+		// the most bytes, so that no cell can keep another cell's result out.
+		victim := it.Cell
+		if cellOK && it.Kind == gwapi.KindResult {
+			err := tx.QueryRow(`SELECT cell FROM outbox GROUP BY cell HAVING sum(kind = ?) > 0 ORDER BY sum(size) DESC, cell LIMIT 1`, gwapi.KindStatus).Scan(&victim)
+			if errors.Is(err, sql.ErrNoRows) {
+				return "", gwapi.ErrOverloaded
+			}
+			if err != nil {
+				return "", err
+			}
+		}
+		res, err := tx.Exec(`DELETE FROM outbox WHERE seq = (SELECT min(seq) FROM outbox WHERE cell = ? AND kind = ?)`, victim, gwapi.KindStatus)
 		if err != nil {
 			return "", err
 		}

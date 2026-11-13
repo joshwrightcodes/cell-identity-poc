@@ -57,6 +57,13 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Flush flushes the wrapped writer when it can.
+func (w *statusWriter) Flush() {
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 // Unwrap lets http.ResponseController reach the writer below.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
