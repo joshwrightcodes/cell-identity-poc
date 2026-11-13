@@ -14,6 +14,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 )
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -385,6 +386,70 @@ func TestPathsAndPatterns(t *testing.T) {
 		mux.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tc.path, nil))
 		if cell != tc.cell || id != tc.id {
 			t.Errorf("%s: cell %q id %q", tc.pattern, cell, id)
+		}
+	}
+}
+
+// TestReportBodyBytesSurviveEveryHop makes a body the way celld does, with json.Marshal, and checks
+// that the proof audience input is the same on the celld side, after the stream, and after the
+// json.Marshal of ReportBatch, OutItem and SyncResponse on the envd side.
+func TestReportBodyBytesSurviveEveryHop(t *testing.T) {
+	body, err := json.Marshal(op.Result{OpID: "o1", Cell: "dev-cell-1", Outcome: op.OutcomeApplied, Reason: "a<b & c > d", EnvelopeSHA256: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(body, []byte(`\u003c`)) || !bytes.Contains(body, []byte(`\u0026`)) {
+		t.Fatalf("test body has no escapes: %s", body)
+	}
+	want := proof.ReportAudience("dev-cell-1", KindResult, body)
+
+	var buf bytes.Buffer
+	if err := Encode(&buf, Frame{Type: TypeResult, Item: &Item{Kind: KindResult, Cell: "dev-cell-1", Body: body, Token: "t"}}); err != nil {
+		t.Fatal(err)
+	}
+	f, err := NewDecoder(&buf).Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := proof.ReportAudience("dev-cell-1", KindResult, f.Item.Body); got != want {
+		t.Fatalf("after the stream: %s", f.Item.Body)
+	}
+
+	out := OutItem{ID: NewItemID(), Item: *f.Item}
+	rawSync, err := json.Marshal(SyncResponse{Items: []OutItem{out}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sync SyncResponse
+	if err := json.Unmarshal(rawSync, &sync); err != nil {
+		t.Fatal(err)
+	}
+	if got := proof.ReportAudience("dev-cell-1", KindResult, sync.Items[0].Body); got != want {
+		t.Fatalf("after SyncResponse: %s", sync.Items[0].Body)
+	}
+
+	rawBatch, err := json.Marshal(mgmtapi.ReportBatch{Items: []mgmtapi.ReportItem{{
+		ID: string(out.ID), Cell: out.Cell, Kind: out.Kind, Body: sync.Items[0].Body, Token: out.Token,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var batch mgmtapi.ReportBatch
+	if err := json.Unmarshal(rawBatch, &batch); err != nil {
+		t.Fatal(err)
+	}
+	if got := proof.ReportAudience("dev-cell-1", KindResult, batch.Items[0].Body); got != want {
+		t.Fatalf("after ReportBatch: %s", batch.Items[0].Body)
+	}
+}
+
+func TestProofReasonsMatch(t *testing.T) {
+	for _, tc := range []struct{ name, proofs, gw, mgmt string }{
+		{"missing", proof.ReasonMissing, ReasonProofMissing, mgmtapi.ReasonProofMissing},
+		{"invalid", proof.ReasonInvalid, ReasonProofInvalid, mgmtapi.ReasonProofInvalid},
+	} {
+		if tc.proofs != tc.gw || tc.proofs != tc.mgmt {
+			t.Errorf("%s differs: %q %q %q", tc.name, tc.proofs, tc.gw, tc.mgmt)
 		}
 	}
 }

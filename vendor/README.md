@@ -1364,11 +1364,10 @@ namespace only. The review read no source line of Kiali beyond the files above.
 
 ## modernc.org/sqlite v1.61.0 and its requirements (2026-11-14)
 
-The gateway queue uses `modernc.org/sqlite`, a pure Go driver, so ko can build it with CGO off for a
-distroless image. The review read the module in the Go module cache, not in a scratch clone. `go mod verify`
-checked the cache against `go.sum`, and nothing ran during the review. The module sources and the
-transpiled code carry the same files that a scratch clone of the tag holds, but the review did not
-compare them. The tests ran only after the review.
+The gateway queue uses `modernc.org/sqlite`, a pure Go driver. Because of this, ko can build it with CGO
+off for a distroless image. The review read the module in the Go module cache, not in a scratch clone.
+`go mod verify` checked the cache against `go.sum`, and nothing ran during the review. The review did not
+compare the cache with a scratch clone of the tag: not verified. The tests ran only after the review.
 
 ### Dates
 
@@ -1405,19 +1404,19 @@ The first attempt, `modernc.org/sqlite` v1.61.0, passed, so no older release was
 The plan named `modernc.org/libc` and `golang.org/x/sys`. The requirement tree also bumps
 `github.com/mattn/go-isatty` from v0.0.20 to v0.0.24, because `modernc.org/libc` v1.79.0 requires v0.0.24.
 `go mod tidy` adds the `go.sum` only modules because it reads the tests of `modernc.org/sqlite`. No binary
-of the PoC links them. `go list -deps` for linux/arm64, linux/amd64 and darwin/arm64 shows that the
-build graph holds only the modules marked "in every build" and the two for macOS.
+of the PoC links them. `go list -deps` ran for linux/arm64, linux/amd64 and darwin/arm64. The build graph
+holds only the modules marked "in every build" and the two for macOS.
 The newest `modernc.org/sqlite` releases at the time of the check were v1.61.1 (2026-10-31) and
 v1.62.0 (2026-11-07). Both are after the cut-off, so the PoC does not use them.
 
-The first build of `modernc.org/sqlite` with an empty Go build cache took 3.6 s wall time on an 18-core Mac
-(8.4 s of user CPU, darwin/arm64). The CI time on a 2-CPU runner is not recorded, because the review has no
-CI run. The first CI run of Task 1 must record it here.
+The first build of `modernc.org/sqlite` with an empty Go build cache took 3.6 s wall time on an 18-core
+Mac (darwin/arm64). It used 8.4 s of user CPU. The CI time on a 2-CPU runner is not recorded, because the review
+has no CI run. The first CI run of Task 1 must record it here.
 
 ### What the review checked
 
-- Hidden Unicode: no bidirectional control, zero-width or soft hyphen character in any of the modules
-  above, except two zero-width spaces in one comment of `golang.org/x/tools` v0.52.0 (`go/cfg/cfg.go`, line 245).
+- Hidden Unicode: no bidirectional control, zero-width or soft hyphen character appears in the modules
+  above. The one exception is two zero-width spaces in one comment of `golang.org/x/tools` v0.52.0 (`go/cfg/cfg.go`, line 245).
   That module is `go.sum` only.
 - `modernc.org/sqlite` v1.61.0, hand-written files of the root package, `vfs`, `vtab` and `pcache`:
   the only `net` import is `net/url` to read the DSN. There is no `os/exec`, `net/http`, `plugin` or
@@ -1427,11 +1426,12 @@ CI run. The first CI run of Task 1 must record it here.
   transpiled library. No `sudo`, `curl` or `wget` appears in code (only in test data and `VERIFYING.md`).
 - The module has a `CLAUDE.md` file with instructions for coding agents. The review read it as data and
   followed none of it. It describes the repository and its build commands.
-- Transpiled library for linux/arm64 (the ko target on the Apple Silicon VM): the 127 files of
+- Transpiled library for linux/arm64, the ko target on the Apple Silicon VM. The 127 files of
   `modernc.org/sqlite/lib` import `unsafe`, `sync`, `sync/atomic`, `reflect`, `runtime/debug`, `syscall` and
   `modernc.org/libc`. The `syscall` import only reads the page size, and `runtime/debug` only sets the
-  panic-on-fault mode. They contain no `os/exec` or `net` import. The generated code calls 89 `libc` functions. Among these, none is `system`, a socket
-  call, `fork`, `exec`, `getaddrinfo` or `popen`. Two are worth a note. `dlopen` and `dlsym` are in the
+  panic-on-fault mode. They contain no `os/exec` or `net` import.
+  The generated code calls 89 `libc` functions. None of them is `system`, a socket call, `fork`, `exec`,
+  `getaddrinfo` or `popen`. Two are worth a note. `dlopen` and `dlsym` are in the
   list, and the `libc` implementation of both returns 0, so SQLite cannot load an extension. `getenv` is in
   the list, because SQLite reads the temporary directory settings.
 - `modernc.org/libc` v1.79.0 for linux/arm64: the hand-written files import `os/exec` once, in
@@ -1443,14 +1443,15 @@ CI run. The first CI run of Task 1 must record it here.
 - `modernc.org/memory`, `modernc.org/mathutil`, `bigfft`, `go-humanize`, `go-strftime` and `go-isatty`: no
   `os/exec`, `net`, `net/http` or environment read in non-test code. `memory` and `go-isatty` use
   `golang.org/x/sys` for `mmap` and `ioctl`. `mathutil` has `init` functions that build tables.
-- `golang.org/x/sys` v0.48.0 to v0.49.0: the review compared the two trees. The non-generated changes are
-  an alignment wrapper for `Getdents` on Linux, new `cpu` feature flags for x86, a `//go:build` widening for
-  `ppc64`, a pointer form of `fcntl` on Darwin, and zOS and sparc64 files. The changed `Dockerfile` of the
-  generator clones the Linux kernel and glibc from `kernel.googlesource.com` and `sourceware.org`, which is
-  generator input and does not run in a build. The added lines hold no `os/exec`, `net`, environment read or
-  `init` function.
-- `github.com/mattn/go-isatty` v0.0.20 to v0.0.24: the diff changes the build tags of the fallback file,
-  swaps the Linux check from `TCGETS` to `TIOCGWINSZ` and updates Windows files and workflows.
+- `golang.org/x/sys` v0.48.0 to v0.49.0: the review compared the two trees.
+  The non-generated changes are an alignment wrapper for `Getdents` on Linux and new `cpu` feature flags
+  for x86. They also hold a `//go:build` widening for `ppc64`, a pointer form of `fcntl` on Darwin, and
+  zOS and sparc64 files.
+  The changed `Dockerfile` of the generator clones the Linux kernel and glibc from `kernel.googlesource.com`
+  and `sourceware.org`. This is generator input and does not run in a build.
+  The added lines hold no `os/exec`, `net`, environment read or `init` function.
+- `github.com/mattn/go-isatty` v0.0.20 to v0.0.24: the diff changes the build tags of the fallback file.
+  It swaps the Linux check from `TCGETS` to `TIOCGWINSZ`. It also updates Windows files and workflows.
 - `go mod verify` printed "all modules verified" after the change.
 
 ### What the review did not check
@@ -1462,7 +1463,7 @@ CI run. The first CI run of Task 1 must record it here.
 - The review did not read the modules marked `go.sum` only, apart from the Unicode scan.
 - The review did not read `modernc.org/libc` code that `sqlite/lib` never calls, and did not read the
   `libc` files of other platforms.
-- The review did not run `govulncheck` or read advisories for the modules above.
+- The review did not run `govulncheck`. It did not read advisories for the modules above.
 
 ### Provenance and later releases
 

@@ -24,7 +24,9 @@ type OpsBundle struct {
 }
 
 // ReportItem is one item that a cell sent up. Body holds the exact bytes that the proof audience
-// covers, and every hop keeps them unchanged.
+// covers, and every hop keeps them unchanged. The body must be the output of the standard
+// encoding/json Marshal, which escapes <, > and & and has no extra whitespace. Marshal of a
+// ReportBatch then keeps each body byte for byte. A body with a raw < or & would change at this hop.
 type ReportItem struct {
 	ID    string          `json:"id"`
 	Cell  string          `json:"cell"`

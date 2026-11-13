@@ -75,7 +75,9 @@ type Frame struct {
 }
 
 // Item is one report item that celld sends up through the gateway. Body holds the exact bytes that
-// the proof audience covers.
+// the proof audience covers. celld must make Body with the standard encoding/json Marshal, which
+// escapes <, > and & and has no extra whitespace. Such a body is unchanged by each later Marshal, so
+// every hop keeps its bytes. A body made in another way can change at a hop, and the proof then fails.
 type Item struct {
 	Kind  string          `json:"kind"`
 	Cell  string          `json:"cell"`
@@ -114,7 +116,8 @@ func NewDecoder(r io.Reader) *Decoder {
 }
 
 // Decode reads the next frame. It returns io.EOF at the end of the stream, and ErrFrameTooLarge
-// when a line passes MaxFrame bytes without ending. Every other decode failure wraps
+// when a line passes MaxFrame bytes without ending. After ErrFrameTooLarge the rest of the line
+// stays in the buffer, so the caller must close the stream. Every other decode failure wraps
 // record.ErrDecode.
 func (d *Decoder) Decode() (Frame, error) {
 	d.buf = d.buf[:0]
@@ -146,7 +149,9 @@ func (d *Decoder) Decode() (Frame, error) {
 }
 
 // Encode writes f as one line, in a single write, and flushes w when it is an http.Flusher. It
-// does not escape HTML, so a compact body in an item keeps its bytes.
+// does not escape HTML. A body that the standard encoding/json Marshal made already holds the
+// escapes for <, > and &, so it keeps its bytes. A body with a raw < or & also keeps its bytes here,
+// but a later Marshal of a ReportBatch rewrites it, so celld must not make such a body.
 func Encode(w io.Writer, f Frame) error {
 	if err := f.validate(); err != nil {
 		return err
@@ -223,17 +228,17 @@ func ReasonOf(err error) string {
 
 // The gateway reasons. The ones that mgmtapi or op also define have the same string.
 const (
-	ReasonCellUnknown      = "cell_unknown"
+	ReasonCellUnknown      = mgmtapi.ReasonCellUnknown
 	ReasonCellRevoked      = "cell_revoked"
 	ReasonHelloTimeout     = "hello_timeout"
-	ReasonProofMissing     = "proof_missing"
-	ReasonProofInvalid     = "proof_invalid"
+	ReasonProofMissing     = mgmtapi.ReasonProofMissing
+	ReasonProofInvalid     = mgmtapi.ReasonProofInvalid
 	ReasonReplicaCap       = "replica_cap"
 	ReasonSuperseded       = "superseded"
 	ReasonReauth           = "reauth"
 	ReasonSourceMismatch   = "source_mismatch"
-	ReasonNonceInvalid     = "nonce_invalid"
-	ReasonTokenInvalid     = "token_invalid"
+	ReasonNonceInvalid     = mgmtapi.ReasonNonceInvalid
+	ReasonTokenInvalid     = mgmtapi.ReasonTokenInvalid
 	ReasonOverloaded       = "overloaded"
 	ReasonLeaseLost        = "lease_lost"
 	ReasonRecordOld        = "record_old"

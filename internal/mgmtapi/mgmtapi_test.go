@@ -84,6 +84,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		ReasonStoreFailed, ReasonStateUnverifiable, ReasonSpecInvalid,
 		ReasonCellUnknown, ReasonNonceInvalid, ReasonTokenInvalid, ReasonIssuerUntrusted, ReasonIssuerUnavailable,
 		ReasonKeysUntrusted, ReasonRateLimited, ReasonRestoreActive, ReasonNotBound, ReasonConflict,
+		ReasonProofMissing, ReasonProofInvalid, ReasonStale,
 	}
 	want := []string{
 		"signature_invalid", "payload_invalid", "env_mismatch", "revision_old", "revision_conflict",
@@ -91,6 +92,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		"store_failed", "state_unverifiable", "spec_invalid",
 		"cell_unknown", "nonce_invalid", "token_invalid", "issuer_untrusted", "issuer_unavailable",
 		"keys_untrusted", "rate_limited", "restore_active", "not_bound", "conflict",
+		"proof_missing", "proof_invalid", "stale",
 	}
 	seen := map[string]bool{}
 	for i, r := range all {
@@ -221,7 +223,7 @@ func TestOpsPaths(t *testing.T) {
 	}
 }
 
-func TestItemStringsAreDistinct(t *testing.T) {
+func TestItemOutcomeStrings(t *testing.T) {
 	outcomes := map[string]string{
 		OutcomeAccepted: "accepted", OutcomeDuplicate: "duplicate", OutcomeUnknownOp: "unknown_op",
 		OutcomeForgedSeen: "forged_seen", OutcomeRefused: "refused", OutcomeRetry: "retry",
@@ -233,26 +235,5 @@ func TestItemStringsAreDistinct(t *testing.T) {
 	}
 	if len(outcomes) != 6 {
 		t.Errorf("two outcome constants share a string: %v", outcomes)
-	}
-	// The M5 reasons join the M4 reasons in one set, so none may repeat a string.
-	all := []string{
-		ReasonSignatureInvalid, ReasonPayloadInvalid, ReasonEnvMismatch, ReasonRevisionOld, ReasonRevisionConflict,
-		ReasonRecordInvalid, ReasonRecordUnindexed, ReasonRecordOld, ReasonRecordConflict, ReasonTooManyInvalidated,
-		ReasonStoreFailed, ReasonStateUnverifiable, ReasonSpecInvalid,
-		ReasonCellUnknown, ReasonNonceInvalid, ReasonTokenInvalid, ReasonIssuerUntrusted, ReasonIssuerUnavailable,
-		ReasonKeysUntrusted, ReasonRateLimited, ReasonRestoreActive, ReasonNotBound, ReasonConflict,
-		ReasonProofMissing, ReasonProofInvalid, ReasonStale,
-	}
-	seen := map[string]bool{}
-	for _, r := range all {
-		if seen[r] {
-			t.Errorf("duplicate %q", r)
-		}
-		seen[r] = true
-	}
-	for got, want := range map[string]string{ReasonProofMissing: "proof_missing", ReasonProofInvalid: "proof_invalid", ReasonStale: "stale"} {
-		if got != want {
-			t.Errorf("got %q, want %q", got, want)
-		}
 	}
 }
