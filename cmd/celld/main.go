@@ -169,6 +169,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 			Cell: opts.cell, Upstream: opts.upstream, Log: tel.Log,
 			TLS:    bind.ClientTLS(bind.FileBundle(opts.peerBundle, opts.expectID.TrustDomain()), opts.expectID),
 			Tokens: bind.PodTokenFunc(tokens, opts.pod.namespace, opts.pod.serviceAccount, opts.pod.name, opts.pod.uid),
+			Tracer: tel.Tracer,
 			Observe: func(ctx context.Context, result string) {
 				attempts.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
 			},

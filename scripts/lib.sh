@@ -939,7 +939,7 @@ pem_der_sha256() {
 # hostsvc for a restart of the host service. The README section "Rebuild one cluster" holds the same table.
 # No step waits until every cell is bound: a cell binds on its own once its cell:up has run.
 dependents_of() {
-  local cell cells
+  local cell cells comp
   # The cells are the clusters that dev-cp lists in SPIRE_AGENT_CELLS.
   cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
   case "$1" in
@@ -953,6 +953,8 @@ dependents_of() {
       echo "CELL=management mise run cell:link" ;;
     dev-cp)
       echo "CELL=dev-cp mise run cell:up"
+      # mgmtd admits envd by the dev-cp root and by the node address, so the link of mgmt-api follows the cell:up of dev-cp.
+      echo "CELL=management LINK_ONLY=mgmt-api mise run cell:link"
       for cell in $cells; do echo "CELL=$cell mise run cell:up"; done
       for cell in $cells; do echo "CELL=$cell mise run cell:restart"; done
       echo "CELL=management mise run cell:link" ;;
@@ -961,6 +963,8 @@ dependents_of() {
         [[ "$cell" == "$1" ]] || continue
         echo "CELL=dev-cp mise run cell:up"
         echo "CELL=$cell mise run cell:up"
+        # A new cell record changes the registries, and a registry follows the records only at a link.
+        for comp in central-view telemetry-gateway mesh-view-hub; do echo "CELL=management LINK_ONLY=$comp mise run cell:link"; done
         return
       done
       die "dependents_of knows management, dev-cp, hostsvc and $cells, not '$1'" ;;

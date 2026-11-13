@@ -115,9 +115,14 @@ func (p *Plugin) ensureMarks(cfg *state, note func(func(string, ...any), string,
 		return false
 	}
 	if doc.KeySHA256 != keyFingerprint(cfg.keys) {
-		// A rotation re-signs at a higher epoch, so the marks stay correct guards under the new key.
-		// The file is rewritten with the new fingerprint when the first spec above the mark is accepted.
-		p.log.Warn("marks_key_changed", "file", path, "reason", "the pinned record keys differ from those of the marks file")
+		// An envelope under the old key no longer verifies, so a reset opens no replay. A management rebuild
+		// or a lost management state restarts the epoch under the new key. The file is rewritten at the next save.
+		p.log.Warn("marks_key_changed", "file", path, "reason", "the pinned record keys differ from those of the marks file, so the marks restart")
+		p.marksReady, p.marksPath, p.marksDirty = true, path, true
+		p.specMark = envspec.Revision{}
+		p.marks = map[string]envspec.Revision{}
+		p.retired = map[string]bool{}
+		return true
 	}
 	p.marksReady, p.marksPath = true, path
 	p.specMark = doc.Spec

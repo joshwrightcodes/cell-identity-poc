@@ -4,7 +4,7 @@
 # references and never resolve a tag, so a tag that another client pushes cannot change a render.
 # With no argument, the script builds every image. With image names, it builds and pushes only those
 # images and replaces only their lines, so each other image keeps its digest, and the checks of the
-# deployed images stay green.
+# deployed images stay green. It keeps the `# commit` line too, unless the names cover every image.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,7 +38,15 @@ trap 'rm -f "$tmp"' EXIT
 # The binaries carry no VCS stamp, so the commit is a note for people. Readers skip comment lines.
 commit="$(git -C "$root" rev-parse HEAD 2>/dev/null || echo unknown)"
 git -C "$root" diff --quiet HEAD -- 2>/dev/null || commit+=" with local changes"
-printf '# commit %s\n' "$commit" >"$tmp"
+# A build of some images keeps the commit line of the file, because the other digests come from that commit.
+old_commit=""
+if ((named)); then
+  old_commit="$(grep -m1 '^# commit ' "$out_file" || true)"
+  all_named=1
+  for name in "${all[@]}"; do [[ " ${images[*]} " == *" $name "* ]] || all_named=0; done
+  ((all_named)) && old_commit=""
+fi
+if [[ -n "$old_commit" ]]; then printf '%s\n' "$old_commit" >"$tmp"; else printf '# commit %s\n' "$commit" >"$tmp"; fi
 # line_for <name> prints the new IMAGE_<NAME>=<reference> line.
 line_for() {
   local ref var

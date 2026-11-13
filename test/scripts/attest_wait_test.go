@@ -20,6 +20,8 @@ case " $* " in
     n="$(sed -n 's/.*--tail=\([0-9]*\).*/\1/p' <<<"$*")"
     if [[ -n "$n" ]]; then tail -n "$n" "$d/server.log"; else cat "$d/server.log"; fi ;;
   *" logs deploy/celld "*) cat "$d/celld.log" ;;
+  *" logs deploy/envd "*) cat "$d/envd.log" 2>/dev/null || true ;;
+  *" get configmap peer-root "*) [[ -f "$d/no-peer-root" ]] || echo configmap/peer-root ;;
   *" logs mgmtd-0 "*) cat "$d/mgmtd.log" ;;
   *" get pods -l app.kubernetes.io/name=celld "*) cat "$d/pods.json" ;;
   *" delete pod "*) echo "delete $*" >>"$d/deleted" ;;
@@ -100,6 +102,10 @@ func TestAttestWaitStages(t *testing.T) {
 			want: []string{"stage bound failed", "Last celld bind log line: {\"msg\":\"bind refused\"", "Last mgmtd denial for dev-cell-1: {\"msg\":\"bind_denied\",\"reason\":\"cell_unknown\"", "Next: mise x -- kubectl --context kind-dev-cell-1 -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"}},
 		{name: "not applied", change: map[string]string{"cell-records.json": records("6")}, code: 1,
 			want: []string{"stage applied failed", "does not reach the revision 1/7", `lastRefusal: {"reason":"spec_invalid"`, "storeError: update refused", "Next: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd"}},
+		{name: "mgmtd has no root of dev-cp", change: map[string]string{"cell-records.json": records("6"), "no-peer-root": "1"}, code: 1,
+			want: []string{"stage applied failed", "Next: CELL=management LINK_ONLY=mgmt-api mise run cell:link, then mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd"}},
+		{name: "envd logs a TLS refusal", change: map[string]string{"cell-records.json": records("6"), "envd.log": `{"msg":"pull failed","error":"remote error: tls: bad certificate"}` + "\n"}, code: 1,
+			want: []string{"stage applied failed", "Next: CELL=management LINK_ONLY=mgmt-api mise run cell:link, then", "bad certificate"}},
 		{name: "no ConfigMap yet", change: map[string]string{"cell-records.json": ""}, code: 1, want: []string{"stage applied failed"}},
 		{name: "a later revision counts", change: map[string]string{"cell-records.json": records("9")}, want: []string{"stage applied took"}},
 		{name: "the reload line is far back in the log", change: map[string]string{"server.log": `{"msg":"records reloaded","spec_epoch":1,"spec_counter":7,"cells":["dev-cell-1"]}` + "\n" + strings.Repeat(`{"msg":"attested"}`+"\n", 700)},
@@ -149,7 +155,7 @@ func TestAttestWaitStages(t *testing.T) {
 			for k, v := range tc.change {
 				files[k] = v
 			}
-			for _, f := range []string{"calls", "deleted"} {
+			for _, f := range []string{"calls", "deleted", "no-peer-root", "envd.log"} {
 				_ = os.Remove(filepath.Join(stub, f))
 			}
 			for k, v := range files {

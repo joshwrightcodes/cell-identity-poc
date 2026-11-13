@@ -11,7 +11,8 @@
 # It then makes mgmtd serve its latest spec (mgmt -- restore --revision latest) when a test left an older revision
 # active, deletes the test namespaces m4-bind and m4-probe-* with the Jobs, NetworkPolicies, Secrets and ConfigMaps of the attestprobe
 # label in every cluster, and runs the repair of gate:m2 (scripts/gate-m2-repair.sh), because the M4 tests change the
-# API server of dev-cell-1 through the M2 helpers.
+# API server of dev-cell-1 through the M2 helpers. Last, it renders a registry again (CELL=management LINK_ONLY=<component> mise run cell:link) when
+# ConfigMap cell-registry holds another record than mgmtd serves.
 # HOSTSVC_SERVE names another host service script, and GATE_M2_REPAIR another M2 repair script, for the tests.
 export CELL=management
 source "$(dirname "$0")/lib.sh"
@@ -136,4 +137,24 @@ if ((check)); then
 else
   "${GATE_M2_REPAIR:-$ROOT/scripts/gate-m2-repair.sh}" || die "the repair of gate:m2 failed. Run: mise run gate:m2:repair"
 fi
+
+# The registries copy the records of mgmtd at a link. The tests and the key check of the M2 repair change records, so a registry
+# can be behind. This step runs after the M2 repair, which can change a record.
+source "$ROOT/scripts/verify-lib.sh"
+for entry in central-view-system:central-view observability-system:telemetry-gateway mesh-view-system:mesh-view-hub; do
+  ns="${entry%%:*}" comp="${entry#*:}"
+  if reason="$(check_registry_current "$ns" "$comp")"; then
+    continue
+  fi
+  status=1
+  if ((check)); then
+    echo "$reason" | head -n 1
+    echo "Run: $repair"
+  else
+    log "ConfigMap cell-registry of $ns is behind the records of mgmtd, so $comp renders again"
+    (cd "$ROOT" && CELL=management LINK_ONLY="$comp" mise run cell:link >&2) \
+      || die "could not render $comp again. Run: CELL=management LINK_ONLY=$comp mise run cell:link"
+    status=0
+  fi
+done
 exit "$status"

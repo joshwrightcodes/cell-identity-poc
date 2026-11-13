@@ -76,11 +76,16 @@ func TestDependentsManagementOrder(t *testing.T) {
 	}
 }
 
+// registryLinks are the links that render the registries from the records of mgmtd.
+const registryLinks = "CELL=management LINK_ONLY=central-view mise run cell:link\nCELL=management LINK_ONLY=telemetry-gateway mise run cell:link\nCELL=management LINK_ONLY=mesh-view-hub mise run cell:link"
+
+// dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
+// admits envd by the dev-cp root and the node address. A rebuilt cell links the three registries.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
 		"dependents_of hostsvc":    "mise run hostsvc:serve -- restart",
-		"dependents_of dev-cell-1": "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up",
-		"dependents_of dev-cp":     "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
+		"dependents_of dev-cell-1": "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\n" + registryLinks,
+		"dependents_of dev-cp":     "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)
 		if err != nil || strings.TrimSpace(out) != want {
@@ -133,7 +138,8 @@ func runHarness(t *testing.T, root, calls, verb string, env ...string) (string, 
 }
 
 // harness:up follows the rebuild order: the first link of mgmt-api comes right after the cell:up of
-// management, before dev-cp. harness:down stops the host service last.
+// management, before dev-cp. The second comes right after the cell:up of dev-cp, with the dev-cp root.
+// harness:down stops the host service last.
 func TestHarnessUpOrderAndDown(t *testing.T) {
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "up")
@@ -146,6 +152,7 @@ func TestHarnessUpOrderAndDown(t *testing.T) {
 		"mise run cell:up | CELL=management LINK_ONLY= SKIP=1",
 		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
 		"mise run cell:up | CELL=dev-cp LINK_ONLY= SKIP=",
+		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
 		"mise run cell:up | CELL=dev-cell-1 LINK_ONLY= SKIP=",
 		"mise run cell:up | CELL=dev-cell-2 LINK_ONLY= SKIP=",
 		"mise run cell:link | CELL=management LINK_ONLY= SKIP=",
@@ -172,11 +179,12 @@ func TestHarnessUpHintListsAllSteps(t *testing.T) {
 		"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
 		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
 		"CELL=dev-cp mise run cell:up",
+		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
 		"CELL=dev-cell-1 mise run cell:up",
 		"CELL=dev-cell-2 mise run cell:up",
 		"CELL=management mise run cell:link",
 	}
-	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2, "dev-cell-2/cell:up/": 4} {
+	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2, "dev-cell-2/cell:up/": 5} {
 		t.Run(failAt, func(t *testing.T) {
 			root, calls := harnessRoot(t)
 			_, errOut, err := runHarness(t, root, calls, "up", "STUB_FAIL_AT="+failAt)
@@ -431,6 +439,24 @@ func TestImagesNamed(t *testing.T) {
 	if len(changed) != 1 || !strings.HasPrefix(changed[0], "IMAGE_MGMTD=localhost:5001/mgmtd@sha256:0000") || !strings.HasSuffix(changed[0], "2") {
 		t.Fatalf("changed lines %v, want only IMAGE_MGMTD with the new digest", changed)
 	}
+	// A partial build keeps the commit line of the file. A build of every image writes a new one.
+	if err := os.WriteFile(envFile, []byte("# commit abc123\n"+string(after)[strings.Index(string(after), "\n")+1:]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run("5", "mgmtd", "celld"); err != nil {
+		t.Fatalf("images.sh mgmtd celld failed: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(envFile); !strings.HasPrefix(string(got), "# commit abc123\n") {
+		t.Fatalf("a partial build rewrote the commit line:\n%s", got)
+	}
+	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd")
+	if out, err := run("6", allNames...); err != nil {
+		t.Fatalf("images.sh with every name failed: %v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(envFile); strings.HasPrefix(string(got), "# commit abc123") {
+		t.Fatalf("a build of every image kept the old commit line:\n%s", got)
+	}
+	after, _ = os.ReadFile(envFile)
 	// An unknown name and a missing file fail, and the file stays as it is.
 	if out, err := run("3", "nothing"); err == nil || !strings.Contains(out, "unknown image 'nothing'") {
 		t.Fatalf("err %v, output %q", err, out)

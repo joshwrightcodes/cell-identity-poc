@@ -31,13 +31,17 @@ const rotateKeyMise = `#!/usr/bin/env bash
 case "$*" in
   "run mgmt -- pubkey")
     echo "mgmt pubkey" >>"$STUB_DIR/calls"
-    if [[ -e "$STUB_DIR/rotated" ]]; then pub="$STUB_NEW_PUB"; else pub="$STUB_OLD_PUB"; fi
+    if [[ -e "$STUB_DIR/rotated" ]]; then
+      [[ -z "${STUB_PUBKEY_FAIL_AFTER:-}" ]] || { echo "exec failed" >&2; exit 1; }
+      pub="$STUB_NEW_PUB"
+    else pub="$STUB_OLD_PUB"; fi
     printf '{"spec.pub":"%s"}\n' "$pub" ;;
   "run mgmt -- status") echo '{"signed":{"epoch":2,"counter":1}}' ;;
   "run mgmt -- rotate-key")
     echo "mgmt rotate-key" >>"$STUB_DIR/calls"
     if [[ -n "${STUB_ROTATE_FAIL:-}" ]]; then echo '{"level":"ERROR","msg":"mgmtd failed","error":"conflict","reason":"conflict"}'; exit 1; fi
     touch "$STUB_DIR/rotated"
+    if [[ -n "${STUB_ROTATE_LOST:-}" ]]; then exit 1; fi
     if [[ -n "${STUB_ROTATE_PUBLISH_FAIL:-}" ]]; then echo '{"level":"ERROR","msg":"mgmtd failed","error":"the key rotated, but its public half did not publish: api down","rotated":true}'; exit 1; fi
     printf '{"spec.pub":"%s","signed":{"epoch":2,"counter":1},"seq":9}\n' "$STUB_NEW_PUB" ;;
   "run cell:up"|"run cell:link"|"run cell:verify")
@@ -192,6 +196,26 @@ func TestRotateKeyOrder(t *testing.T) {
 			if strings.Contains(c, "cell:") {
 				t.Fatalf("%q ran after a failed rotation", c)
 			}
+		}
+	})
+
+	// The key rotated, but the answer of the exec was lost: no output at all. The script reads the key again and goes on.
+	t.Run("rotated and the answer was lost", func(t *testing.T) {
+		out, errOut, err := run("mgmt-rotate-key.sh", "STUB_ROTATE_LOST=1")
+		if err != nil {
+			t.Fatalf("%v\n%s", err, errOut)
+		}
+		if res := oneLine(t, out); !res.Rotated || res.New != sha(newKey) || res.Epoch != 2 {
+			t.Fatalf("result %+v, want rotated with the new key at epoch 2", res)
+		}
+	})
+
+	// The key rotated and the new key cannot be read: the error line holds rotated as a JSON boolean.
+	t.Run("rotated is a boolean when the key cannot be read", func(t *testing.T) {
+		out, _, err := run("mgmt-rotate-key.sh", "STUB_ROTATE_PUBLISH_FAIL=1", "STUB_PUBKEY_FAIL_AFTER=1")
+		var line map[string]any
+		if err == nil || json.Unmarshal([]byte(out), &line) != nil || line["rotated"] != true {
+			t.Fatalf("err %v, stdout %q; want one error line with rotated true as a boolean", err, out)
 		}
 	})
 

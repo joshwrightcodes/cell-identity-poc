@@ -102,7 +102,8 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 
 // stubKubectl answers "get configmap mgmt-signing-pub" with the key stubMgmtKey (STUB_MGMT_KEY
 // replaces it, and STUB_NO_MGMT_KEY makes the ConfigMap absent), and "get pod mgmtd-0" with no
-// status, so the key helper makes no call to mgmtd. It answers "spire-server bundle show" with the
+// status, so the key helper makes no call to mgmtd. It answers "get configmap mgmt-spec-key" with
+// STUB_PINNED_KEY, which is empty by default, so the key is a first pin. It answers "spire-server bundle show" with the
 // file STUB_BUNDLE_FILE, and in the context
 // kind-management with STUB_MGMT_BUNDLE_FILE, the root of mgmt.poc.internal. It answers
 // "api-resources" with a fixed table, or fails with STUB_NO_API. STUB_NO_SERVER
@@ -119,6 +120,10 @@ if [[ " $* " == *" get configmap mgmt-signing-pub "* ]]; then
     exit 1
   fi
   printf '{"data":{"spec.pub":"%s"}}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"
+  exit 0
+fi
+if [[ " $* " == *" get configmap mgmt-spec-key "* ]]; then
+  printf '%s' "${STUB_PINNED_KEY:-}"
   exit 0
 fi
 if [[ " $* " == *" get pod mgmtd-0 "* ]]; then
@@ -966,8 +971,9 @@ func TestRenderFailsClosed(t *testing.T) {
 	}
 }
 
-// goldenSpireDevCP holds the dev-cp render of M2 at commit 2d8cb64, with the stub image digest
-// replaced by stubDigest.
+// goldenSpireDevCP holds the dev-cp render of M2 at commit 2d8cb64 and the changes that M4 made on purpose:
+// the records volume, record_public_keys, reload_interval and marks_file in server.conf, and two ConfigMaps
+// less. The stub image digest is replaced by stubDigest. The tests compare the parts that matter.
 const goldenSpireDevCP = "testdata/spire-server-dev-cp.golden.yaml"
 
 // psatOnly matches the lines that the k8s_psat path and the telemetry block add to server.conf.

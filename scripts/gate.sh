@@ -13,6 +13,17 @@ budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 budget_minutes="${!budget_var:-}"
 
+# The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
+# the bundles, published.env and facts.env. A new worktree has none of it, so a test would fail late with another message.
+if [[ "$milestone" != m1 ]]; then
+  [[ -f "$BUILD_ROOT/images.env" ]] \
+    || die "$BUILD_ROOT/images.env is missing. Run: mise run images, or copy it from the checkout that set up the clusters: cp <that checkout>/build/images.env $BUILD_ROOT/"
+  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+    [[ -d "$BUILD_ROOT/$cluster" ]] \
+      || die "$BUILD_ROOT/$cluster is missing. Copy it from the checkout that set up the clusters: cp -R <that checkout>/build/$cluster $BUILD_ROOT/"
+  done
+fi
+
 # Build the test binary first, so that the budget covers only the test run.
 build_start=$SECONDS
 go test -tags e2e -count=1 -run '^$' ./test/e2e/ >/dev/null || die "the end-to-end tests do not build"

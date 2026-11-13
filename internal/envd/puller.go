@@ -154,7 +154,7 @@ func HealthHandler(p *Puller) http.Handler {
 }
 
 // Run loads the state, then pulls until ctx ends. It returns ctx.Err(). While the stored state does
-// not verify, Run pulls nothing, stays not Ready, and reports state_unverifiable.
+// not verify, Run still pulls, stays not Ready, and reports state_unverifiable until the first spec is accepted.
 func (p *Puller) Run(ctx context.Context) error {
 	failures := 0
 	for p.state == nil {

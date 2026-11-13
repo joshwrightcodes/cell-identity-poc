@@ -4,7 +4,8 @@
 # in topology order. cell:up of dev-cp also connects its secret store, as scripts/up.sh says.
 # A cluster with link components (management) comes first with the link phase skipped, because its
 # links need the other clusters. Its first link step runs only mgmt-api, right after its cell:up and
-# before dev-cp, and its full link phase runs last, with cell:link. When a step fails, the script
+# before dev-cp. The same step runs again right after the cell:up of dev-cp, which adds the dev-cp
+# root that mgmtd needs to accept envd. The full link phase runs last, with cell:link. When a step fails, the script
 # prints that step and every later one. harness:down stops the host service last.
 source "$(dirname "$0")/lib.sh"
 
@@ -19,13 +20,19 @@ case "${1:-}" in
     names="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology has components"
     read -r -a order <<<"$(echo $names)"
-    linked=() early=()
+    linked=() early=() again=()
     for name in "${order[@]}"; do
       comps="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; printf "%s\n" ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"}' _ "$ROOT")" \
         || die "could not read the component sets of $name"
       [[ -z "$comps" ]] || linked+=("$name")
       # mgmt-api runs right after the cluster is up, before dev-cp exists, because dev-cp reads its key.
-      ! grep -qx mgmt-api <<<"$comps" || early+=("$name")
+      if grep -qx mgmt-api <<<"$comps"; then
+        early+=("$name")
+        # The cluster that holds the SPIRE server whose root mgmt-api needs, as <cluster>:<link cluster>.
+        vcp="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; printf "%s" "${VIEW_CONTROL_PLANE:-}"' _ "$ROOT")" \
+          || die "could not read VIEW_CONTROL_PLANE of $name"
+        [[ -z "$vcp" ]] || again+=("$vcp:$name")
+      fi
     done
     # steps holds the commands of the order, as <environment>|<task>.
     steps=()
@@ -36,6 +43,9 @@ case "${1:-}" in
         steps+=("CELL=$name|cell:up")
       fi
       [[ " ${early[*]-} " != *" $name "* ]] || steps+=("CELL=$name LINK_ONLY=mgmt-api|cell:link")
+      for pair in ${again[@]+"${again[@]}"}; do
+        [[ "${pair%%:*}" != "$name" ]] || steps+=("CELL=${pair#*:} LINK_ONLY=mgmt-api|cell:link")
+      done
     done
     for name in ${linked[@]+"${linked[@]}"}; do steps+=("CELL=$name|cell:link"); done
     for i in "${!steps[@]}"; do

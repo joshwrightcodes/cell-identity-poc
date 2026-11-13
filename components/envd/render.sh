@@ -107,7 +107,7 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Flow N36: every pod of the namespace resolves names through the cluster DNS.
+# Flow N35: every pod of the namespace resolves names through the cluster DNS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

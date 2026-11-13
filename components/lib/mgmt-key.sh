@@ -4,10 +4,12 @@ MGMT_KEY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # mgmt_signing_pub prints the public key of mgmtd: key spec.pub of ConfigMap mgmt-system/mgmt-signing-pub
 # in management, the standard base64 of 32 bytes. Whenever mgmtd-0 is Ready, the value must equal
-# the answer of `mise run mgmt -- pubkey`. The helper fails with the reason on standard error, and
-# with the link command when the ConfigMap is absent.
+# the answer of `mise run mgmt -- pubkey`. When mgmtd-0 is not Ready, the value must equal the key that
+# ConfigMap envd-system/mgmt-spec-key in dev-cp already pins, unless nothing is pinned yet or
+# MGMT_KEY_ACCEPT_CHANGE=1 allows a deliberate change. The helper fails with the reason on standard
+# error, and with the link command when the ConfigMap is absent.
 mgmt_signing_pub() {
-  local cm pub live ready
+  local cm pub live ready pinned
   if ! cm="$(kubectl --context kind-management -n mgmt-system get configmap mgmt-signing-pub -o json 2>/dev/null)"; then
     printf 'error: ConfigMap mgmt-system/mgmt-signing-pub is absent. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' >&2
     return 1
@@ -23,6 +25,17 @@ mgmt_signing_pub() {
     live="$(cd "$MGMT_KEY_ROOT" && mise run mgmt -- pubkey 2>/dev/null | jq -r '."spec.pub" // ""')" || live=""
     if [[ "$live" != "$pub" ]]; then
       printf 'error: ConfigMap mgmt-signing-pub holds %s, and mgmtd-0 signs with %s. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' "$pub" "${live:-no key}" >&2
+      return 1
+    fi
+  fi
+  if [[ "$ready" != True && "${MGMT_KEY_ACCEPT_CHANGE:-}" != 1 ]]; then
+    if ! pinned="$(kubectl --context kind-dev-cp -n envd-system get configmap mgmt-spec-key --ignore-not-found \
+      -o jsonpath='{.data.spec\.pub}' 2>/dev/null)"; then
+      printf 'error: mgmtd-0 is not Ready and the key that dev-cp pins could not be read, so mgmt-signing-pub is unchecked. Start mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link. To accept the key anyway, set MGMT_KEY_ACCEPT_CHANGE=1\n' >&2
+      return 1
+    fi
+    if [[ -n "$pinned" && "$pinned" != "$pub" ]]; then
+      printf 'error: mgmtd-0 is not Ready, and ConfigMap mgmt-signing-pub holds %s, but dev-cp pins %s. Start mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link. After a lost state, run: mise run mgmt -- reset-state. To accept the new key, set MGMT_KEY_ACCEPT_CHANGE=1\n' "$pub" "$pinned" >&2
       return 1
     fi
   fi

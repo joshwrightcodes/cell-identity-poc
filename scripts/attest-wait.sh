@@ -8,7 +8,8 @@
 # Otherwise it runs four stages, each with its own limit:
 #   bound     mgmt -- status shows the cell bound, within 120 s.
 #   applied   ConfigMap cell-records in the SPIRE server cluster holds the spec revision of the record
-#             of the cell, within 60 s.
+#             of the cell, within 60 s. A failure prints the link command of mgmt-api first when mgmtd has no
+#             peer-root for the SPIRE server cluster, or envd logs a TLS refusal.
 #   reloaded  the plugin of the SPIRE server holds the record of the cell, within 150 s: its log has
 #             "records reloaded" with the cell, or its last "configured" line counts as many records as
 #             the ConfigMap holds. The kubelet syncs the ConfigMap volume, and the plugin reloads it every 10 s.
@@ -100,8 +101,15 @@ if ! poll_until "${ATTEST_APPLIED_WAIT:-60}" records_applied; then
   now="$(mgmt_status || true)"
   refusal="$(jq -c '.lastRefusal // "none"' <<<"${now:-null}" 2>/dev/null || echo none)"
   store_error="$(jq -r '.storeError // "none"' <<<"${now:-null}" 2>/dev/null || echo none)"
-  fail applied "ConfigMap cell-records in $server_cluster does not reach the revision $want_epoch/$want_counter of the record of $cell after $((SECONDS - stage_start))s. lastRefusal: $refusal. storeError: $store_error" \
-    "mise x -- kubectl --context kind-$server_cluster -n envd-system logs deploy/envd -c envd, and mise run mgmt -- status"
+  next="mise x -- kubectl --context kind-$server_cluster -n envd-system logs deploy/envd -c envd, and mise run mgmt -- status"
+  # mgmtd admits envd only under the roots of ConfigMap peer-root, which the link of mgmt-api renders after dev-cp has a SPIRE server.
+  peer_root="$(ctx management -n mgmt-system get configmap peer-root --ignore-not-found -o name 2>/dev/null || true)"
+  tls_line="$(ctx "$server_cluster" -n envd-system logs deploy/envd -c envd --tail=100 2>&1 | grep -iE 'tls|certificate|x509' | tail -n 1 || true)"
+  if [[ -z "$peer_root" || -n "$tls_line" ]]; then
+    next="$link, then $next"
+    store_error+=". mgmtd has no root of $server_cluster in ConfigMap mgmt-system/peer-root, or refuses the mTLS of envd (${tls_line:-no envd log line}), so envd cannot pull the spec"
+  fi
+  fail applied "ConfigMap cell-records in $server_cluster does not reach the revision $want_epoch/$want_counter of the record of $cell after $((SECONDS - stage_start))s. lastRefusal: $refusal. storeError: $store_error" "$next"
 fi
 log "attest-wait $cell: stage applied took $((SECONDS - stage_start))s"
 

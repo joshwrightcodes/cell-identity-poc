@@ -63,19 +63,28 @@ stop() {
   exit 1
 }
 
-# The first step fails with nothing changed unless the ctl error line says rotated:true. Then the key rotated, but its public half
-# did not publish: mgmtd retries the publish, so the script goes on with the wait.
+# The first step can fail with nothing changed, or after the key rotated: the ctl error line then says rotated:true, or the answer
+# of the exec was lost. So after any failure the script reads the public key again. A key that differs from the old one means the
+# key rotated. Its public half may not have published, and mgmtd retries the publish, so the script goes on with the wait.
 rotated="$(mise run mgmt -- rotate-key)" && ok=1 || ok=0
 if ((ok)); then
   new_pub="$(jq -er '."spec.pub"' <<<"$rotated")" || json_fail mgmt-rotate-key "mgmtd ctl rotate-key printed no spec.pub: $rotated"
   epoch="$(jq -er '.signed.epoch' <<<"$rotated")" || json_fail mgmt-rotate-key "mgmtd ctl rotate-key printed no signed epoch: $rotated"
 else
-  jq -e '.rotated == true' <<<"$rotated" >/dev/null 2>&1 || json_fail mgmt-rotate-key "mgmtd ctl rotate-key failed: ${rotated:-no output}"
   after="$(mise run mgmt -- pubkey)" && new_pub="$(jq -er '."spec.pub"' <<<"$after")" || new_pub=""
-  [[ -n "$new_pub" ]] || json_fail mgmt-rotate-key "mgmtd ctl rotate-key rotated the key, and the new public key could not be read. Run: mise run mgmt -- pubkey" rotated=true
-  epoch="$(mise run mgmt -- status | jq -er '.signed.epoch')" || epoch=0
-  new_fp="$(fingerprint "$new_pub")"
-  log "mgmtd rotated the key, but its public half did not publish at once: $(jq -r '.error // ""' <<<"$rotated")"
+  said_rotated=0
+  jq -e '.rotated == true' <<<"$rotated" >/dev/null 2>&1 && said_rotated=1
+  if ((said_rotated)) || { [[ -n "$new_pub" ]] && [[ "$new_pub" != "$old_pub" ]]; }; then
+    if [[ -z "$new_pub" ]]; then
+      jq -nc --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg error "mgmtd ctl rotate-key rotated the key, and the new public key could not be read. Run: mise run mgmt -- pubkey" \
+        '{time: $time, level: "ERROR", msg: "mgmt-rotate-key failed", error: $error, rotated: true}'
+      exit 1
+    fi
+    epoch="$(mise run mgmt -- status | jq -er '.signed.epoch')" || epoch=0
+    log "mgmtd rotated the key, but the answer or the publish of its public half did not arrive: $(jq -r '.error // ""' <<<"$rotated" 2>/dev/null || true)"
+  else
+    json_fail mgmt-rotate-key "mgmtd ctl rotate-key failed: ${rotated:-no output}"
+  fi
 fi
 [[ "$new_pub" != "$old_pub" ]] || json_fail mgmt-rotate-key "the key did not change"
 new_fp="$(fingerprint "$new_pub")"

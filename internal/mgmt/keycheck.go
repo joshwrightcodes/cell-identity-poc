@@ -51,7 +51,7 @@ func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res 
 		if ReasonOf(ferr) == mgmtapi.ReasonIssuerUntrusted {
 			res = CheckIssuerUntrusted
 		}
-		if err := p.noteCheck(cell, res); err != nil {
+		if err := p.noteCheck(ctx, cell, res, ferr); err != nil {
 			return res, err
 		}
 		return res, nil
@@ -124,15 +124,22 @@ func (p *Plane) judge(t *txn, cell string, cs *CellState, keys mgmtapi.ClusterKe
 }
 
 // noteCheck records a check that learned nothing about the keys, so that status shows it. It does
-// not start the update gap.
-func (p *Plane) noteCheck(cell string, res CheckResult) error {
-	return p.commit(func(t *txn) error {
+// not start the update gap. It logs a line when the outcome of the cell changes, so a host service
+// that stays down gives one line, and not one for each check.
+func (p *Plane) noteCheck(ctx context.Context, cell string, res CheckResult, cause error) error {
+	changed := false
+	err := p.commit(func(t *txn) error {
 		if cs := t.st.Cells[cell]; cs != nil && cs.LastCheck != string(res) {
 			cs.LastCheck = string(res)
 			t.dirty = true
+			changed = true
 		}
 		return nil
 	})
+	if err == nil && changed {
+		p.cfg.Log.WarnContext(ctx, "key_check_"+string(res), "cell", cell, "result", string(res), "error", cause.Error())
+	}
+	return err
 }
 
 // RunChecks checks each bound cell whose last check is older than CheckEvery. It runs on a tick every

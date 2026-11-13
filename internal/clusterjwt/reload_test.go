@@ -1210,24 +1210,9 @@ func TestMarksSurviveAKeyRotation(t *testing.T) {
 	}
 }
 
-// A spec at or below the persisted mark is refused under any key.
-func TestMarksGuardUnderANewKey(t *testing.T) {
-	f := newFixture(t, fixtureOptions{marks: true})
-	newPub, newPriv, _ := ed25519.GenerateKey(rand.Reader)
-	f.writeMarks(marksDoc{
-		KeySHA256: keyFingerprint([]ed25519.PublicKey{f.pub}),
-		Spec:      envspec.Revision{Epoch: 2, Counter: 1},
-		Cells:     map[string]envspec.Revision{},
-	})
-	rec := f.keys.record(t)
-	rec.Name, rec.Epoch, rec.Counter = "dev-cell-1", 1, 5
-	env, _ := record.Sign(rec, newPriv)
-	body, _ := json.Marshal(rec)
-	entry := envspec.Entry{Name: "dev-cell-1", Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)}
-	f.cm.write(map[string][]byte{
-		specFile:                    signSpec(t, newPriv, testEnv, 1, 5, []envspec.Entry{entry}, nil),
-		"dev-cell-1" + recordSuffix: env,
-	})
+// configureUnderKey starts a plugin on the fixture's marks file with newPub pinned instead of the fixture key.
+func (f *fixture) configureUnderKey(t *testing.T, newPub ed25519.PublicKey) (*Plugin, *syncBuffer) {
+	t.Helper()
 	logs := &syncBuffer{}
 	p := New()
 	p.now = func() time.Time { return testNow }
@@ -1238,8 +1223,66 @@ func TestMarksGuardUnderANewKey(t *testing.T) {
 		CoreConfiguration: &configv1.CoreConfiguration{TrustDomain: testTrustDomain}, HclConfiguration: hcl}); err != nil {
 		t.Fatal(err)
 	}
+	return p, logs
+}
+
+// A new pinned key resets the marks, so a management rebuild or a lost management state that restarts the
+// epoch below the old mark still applies its specs.
+func TestMarksResetUnderANewKey(t *testing.T) {
+	for _, rev := range []envspec.Revision{{Epoch: 1, Counter: 1}, {Epoch: 2, Counter: 1}, {Epoch: 1, Counter: 11}} {
+		t.Run(fmt.Sprintf("spec_%d_%d", rev.Epoch, rev.Counter), func(t *testing.T) {
+			f := newFixture(t, fixtureOptions{marks: true})
+			newPub, newPriv, _ := ed25519.GenerateKey(rand.Reader)
+			f.writeMarks(marksDoc{
+				KeySHA256: keyFingerprint([]ed25519.PublicKey{f.pub}),
+				Spec:      envspec.Revision{Epoch: 2, Counter: 7},
+				Cells:     map[string]envspec.Revision{"dev-cell-1": {Epoch: 2, Counter: 7}, "dev-cell-2": {Epoch: 2, Counter: 3}},
+				Retired:   []string{"dev-cell-2"},
+			})
+			rec := f.keys.record(t)
+			rec.Name, rec.Epoch, rec.Counter = "dev-cell-1", rev.Epoch, rev.Counter
+			env, _ := record.Sign(rec, newPriv)
+			body, _ := json.Marshal(rec)
+			entry := envspec.Entry{Name: "dev-cell-1", Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)}
+			f.cm.write(map[string][]byte{
+				specFile:                    signSpec(t, newPriv, testEnv, rev.Epoch, rev.Counter, []envspec.Entry{entry}, nil),
+				"dev-cell-1" + recordSuffix: env,
+			})
+			p, logs := f.configureUnderKey(t, newPub)
+			if n := len(p.st.Load().records); n != 1 || strings.Contains(logs.String(), "spec_older_ignored") {
+				t.Fatalf("%d records under a new key; the old marks were kept\n%s", n, logs.String())
+			}
+			b, _ := os.ReadFile(f.marksPath)
+			if !strings.Contains(string(b), keyFingerprint([]ed25519.PublicKey{newPub})) || strings.Contains(string(b), "dev-cell-2") {
+				t.Fatalf("the marks file was not reset under the new key: %s", b)
+			}
+		})
+	}
+}
+
+// Under the same key, a spec below the persisted mark is still ignored after a restart.
+func TestMarksHoldUnderTheSameKey(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	f.writeMarks(marksDoc{Spec: envspec.Revision{Epoch: 2, Counter: 7}, Cells: map[string]envspec.Revision{}})
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	f.publish(f.specAt(3, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+	p, logs := f.restart()
 	if n := len(p.st.Load().records); n != 0 || !strings.Contains(logs.String(), "spec_older_ignored") {
-		t.Fatalf("%d records; a spec below the persisted mark was accepted under a new key\n%s", n, logs.String())
+		t.Fatalf("%d records; an older spec was accepted under the same key\n%s", n, logs.String())
+	}
+}
+
+// After the key change, a spec that the old key signed no longer verifies.
+func TestOldKeySpecRefusedAfterKeyChange(t *testing.T) {
+	f := newFixture(t, fixtureOptions{marks: true})
+	newPub, newPriv, _ := ed25519.GenerateKey(rand.Reader)
+	f.writeMarks(marksDoc{Spec: envspec.Revision{Epoch: 1, Counter: 1}, Cells: map[string]envspec.Revision{}})
+	r1, e1 := f.recordAt("dev-cell-1", 1)
+	f.publish(f.specAt(5, []envspec.Entry{e1}), map[string][]byte{"dev-cell-1": r1})
+	p, logs := f.configureUnderKey(t, newPub)
+	_ = newPriv
+	if n := len(p.st.Load().records); n != 0 {
+		t.Fatalf("%d records from an envelope signed by the old key\n%s", n, logs.String())
 	}
 }
 

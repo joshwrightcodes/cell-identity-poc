@@ -3,11 +3,13 @@
 // and answers local commands on an admin socket.
 //
 //	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--bind-listen :8447] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m]
+//	mgmtd reset-state [--data-dir /var/lib/mgmtd]
 //	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
 // JSON on stdout. Logs, traces and metrics also go out as OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is
-// set. The signing key stays in the data directory and never reaches logs, arguments or the
+// set. reset-state renames the state file and the key file in the data directory, so the next serve starts fresh
+// under a new key. The signing key stays in the data directory and never reaches logs, arguments or the
 // environment.
 package main
 
@@ -36,6 +38,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"go.opentelemetry.io/otel/metric"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
@@ -109,7 +112,7 @@ func main() {
 
 func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 	if len(args) == 0 {
-		cli.Fail(stdout, name, errors.New("usage: mgmtd serve|ctl [flags]"))
+		cli.Fail(stdout, name, errors.New("usage: mgmtd serve|ctl|reset-state [flags]"))
 		return exitConfig
 	}
 	switch args[0] {
@@ -133,8 +136,10 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		}
 	case "ctl":
 		return ctlCommand(ctx, args[1:], stdout)
+	case "reset-state":
+		return resetCommand(args[1:], stdout, time.Now)
 	}
-	cli.Fail(stdout, name, fmt.Errorf("unknown command %q; usage: mgmtd serve|ctl [flags]", args[0]))
+	cli.Fail(stdout, name, fmt.Errorf("unknown command %q; usage: mgmtd serve|ctl|reset-state [flags]", args[0]))
 	return exitConfig
 }
 
@@ -244,12 +249,13 @@ func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error {
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 	var meter metric.Meter
+	tracer := tracenoop.NewTracerProvider().Tracer(name)
 	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
 		tel, err := d.telemetry(ctx, stdout)
 		if err != nil {
 			return fmt.Errorf("start telemetry: %w", err)
 		}
-		logger, meter = tel.Log, tel.Meter
+		logger, meter, tracer = tel.Log, tel.Meter, tel.Tracer
 		defer func() {
 			// ctx may have ended, so the flush gets a context of its own.
 			sctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
@@ -335,8 +341,8 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	}
 	plane, err := mgmt.NewPlane(mgmt.Config{
 		Intent:     intent,
-		KeyPath:    filepath.Join(cfg.dataDir, "ed25519.key"),
-		Store:      &mgmt.FileStore{Path: filepath.Join(cfg.dataDir, "state.json"), Log: logger},
+		KeyPath:    filepath.Join(cfg.dataDir, keyFileName),
+		Store:      &mgmt.FileStore{Path: filepath.Join(cfg.dataDir, stateFileName), Log: logger},
 		Keys:       keyClient,
 		Log:        logger,
 		Meter:      meter,
@@ -349,8 +355,8 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 
 	apiTLS := mgmt.APIServerTLS(svids, mgmt.FileBundleSource(cfg.peerBundle, cfg.peerTD), cfg.allow)
 	apiSrv, bindSrv := mgmt.NewServers(
-		mgmt.NewAPIHandler(plane, intent.Env, cfg.allow, logger),
-		mgmt.NewBindHandler(plane, logger),
+		telemetry.Handler(tracer, "mgmtd.api", mgmt.NewAPIHandler(plane, intent.Env, cfg.allow, logger)),
+		telemetry.Handler(tracer, "mgmtd.bind", mgmt.NewBindHandler(plane, logger)),
 		apiTLS, mgmt.BindServerTLS(svids))
 	apiSrv.ErrorLog, bindSrv.ErrorLog = limitedErrorLog(logger), limitedErrorLog(logger)
 

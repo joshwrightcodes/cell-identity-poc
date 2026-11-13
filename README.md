@@ -82,7 +82,10 @@ After that it runs `cell:up` for each cluster that has the `base-cell` component
 In `dev-cp`, that wait also runs `secrets:connect` once, or prints the command above, while the secret store is not connected.
 Then `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
 Last, `cell:up` runs the link phase of a cluster with link components, as [Central Argo CD view](#central-argo-cd-view) describes.
-`harness:up` sets up `management` first with `CELL_UP_SKIP_LINK=1`, and runs `CELL=management mise run cell:link` after the cells.
+`harness:up` sets up `management` first with `CELL_UP_SKIP_LINK=1`.
+It runs `CELL=management LINK_ONLY=mgmt-api mise run cell:link` after `management`, and again after `dev-cp`.
+The second run adds the `dev-cp` root, so `mgmtd` admits `envd`.
+The full `CELL=management mise run cell:link` runs after the cells.
 Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
 `cell:verify` runs the checks of one cluster and prints PASS or FAIL for each.
 `harness:verify` runs `cell:verify` on each cluster with components, and prints one line for each cluster at the end.
@@ -93,7 +96,9 @@ It then prints the commands for the remaining clusters. Fix the cause, and run t
 
 ```sh
 CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
 CELL=dev-cp mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
 CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
 CELL=management mise run cell:link
@@ -121,8 +126,8 @@ The table also covers a new root that no one planned. For a planned change of th
 | Rebuilt cluster | Then run | Reason |
 | --- | --- | --- |
 | `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. |
-| `dev-cp` | `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. |
-| a cell | `CELL=dev-cp mise run cell:up` | The relay and the SPIRE node port admit the node addresses of the cells. |
+| `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
+| a cell | `CELL=dev-cp mise run cell:up`, `CELL=<cell> mise run cell:up`, then `CELL=management LINK_ONLY=<component> mise run cell:link` for `central-view`, `telemetry-gateway` and `mesh-view-hub` | The relay and the SPIRE node port admit the node addresses of the cells. A rebuilt cell binds with a new key, and each registry copies its record only at a link. |
 | the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
@@ -152,6 +157,7 @@ The new server has an empty datastore, so it knows no earlier agent.
 CELL=dev-cp mise run cell:down
 CELL=dev-cp mise run cell:up            # first shell
 CELL=dev-cp mise run secrets:connect    # second shell, only without POC_SECRET_TOKEN_CMD
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
 CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
 CELL=dev-cell-1 mise run cell:restart
@@ -197,7 +203,7 @@ The service runs in its own process group, so a Ctrl-C of the task that started 
 
 `mgmtd` runs in namespace `mgmt-system` as StatefulSet `mgmtd`.
 The link component `mgmt-api` renders it.
-Run the first pass before `dev-cp` exists:
+Run the first pass before `dev-cp` exists, and run the link again after the `cell:up` of `dev-cp`:
 
 ```sh
 mise run images -- mgmtd
@@ -213,8 +219,10 @@ A link run that stops prints one command for the failed component and for each l
 Use `mise run mgmt -- status` to read the state of `mgmtd`.
 The other arguments are `records`, `pubkey`, `keys --cell <cell>`, `keycheck --cell <cell>`, `restore` and `rotate-key`.
 `rotate-signing-key` is the argument that also renders the new key. See "Rotate the signing key of mgmtd".
+`reset-state` starts `mgmtd` with a fresh state. See "Recover lost management state".
 The command prints one JSON line.
 When `mgmtd-0` is absent or not Ready, it prints one JSON error line with the link command.
+When `kubectl exec` fails and prints nothing, it prints one JSON error line with the exit code.
 
 `cell:verify` of `management` checks the host service copies.
 The checks cover the pin, the root, the host address, the `dev-cp` node address, ConfigMap `peer-root` and ConfigMap `mgmt-signing-pub`.
@@ -238,7 +246,7 @@ The SPIRE server of `dev-cp` trusts only the key of `mgmtd` in `record_public_ke
 The pod mounts `cell-records` as an optional volume.
 The `cluster_jwt` plugin reloads the records every 10 seconds, and it keeps its marks in `/run/spire/data/cluster_jwt-marks.json`.
 Until `envd` writes the ConfigMap, no new agent can attest.
-Running agents keep renewing their SVIDs.
+Agents that already run still renew their SVIDs.
 
 `celld` binds the cell issuer to `mgmtd` through the relay `relay-bind` in `dev-cp`.
 The flags are `--cell`, `--bind-upstream`, `--bind-expect-id` and `--bind-peer-bundle`.
@@ -255,8 +263,9 @@ The script waits for four stages in turn:
 | `ready` | The rollout of `celld` finishes | 300 s |
 
 The `reloaded` stage reads the server log since the last record change. A log that has rotated away makes it fail.
-A failing stage prints its name, the reason and the next command.
+A stage that fails prints its name, the reason and the next command.
 When `mise run mgmt -- status` does not answer, the script prints `CELL=management LINK_ONLY=mgmt-api mise run cell:link` and does not wait.
+When `mgmtd` has no `peer-root` for `dev-cp`, or `envd` logs a TLS refusal, the `applied` failure names the same command first.
 At the start of `ready`, the script deletes a `celld` pod once when its `spire-agent` container is in `CrashLoopBackOff`.
 
 `cell:verify` of `dev-cp` checks the key pins, the revision in `cell-records`, the node address of `management` and the envd objects.
@@ -329,6 +338,7 @@ Common reasons:
 | --- | --- | --- |
 | `signature_invalid` | The spec does not verify under the key that `envd` pins | Render `dev-cp` again: `CELL=dev-cp mise run cell:up`. After a rotation, use `mise run mgmt -- rotate-signing-key` |
 | `revision_old` | The spec is older than the revision that `envd` holds | Run `mise run mgmt -- status`. When `restoreActive` is true, run `mise run mgmt -- restore --revision latest`. When `stateBehindApplied` is true, see "Recover lost management state" |
+| `spec_invalid` | The spec drops a cell that has a mark and is not retired, or retires a cell below its mark | Read `lastRefusal` and the log of `envd` in `dev-cp` |
 | `store_failed`, `state_unverifiable` | `envd` cannot write or verify `cell-records` | Read the log of `envd` in `dev-cp` |
 
 `envd` keeps its last good records after a refusal, so agents that run and new attestations continue.
@@ -349,7 +359,7 @@ In two gaps, new agents cannot attest. Agents that already run still renew their
 - From the render of `dev-cp` until each cell binds, the SPIRE server holds no record of that cell. After the bind, `envd` writes the records, and the server reloads them.
   The measured span from the `envd` write to the log line `records reloaded` was 50 and 60 seconds.
   That span covers the kubelet sync of the ConfigMap volume and the reload that runs every 10 seconds.
-- During a signing key rotation, the plugin holds no records from the restart of the server until `envd` writes the first spec under the new key. The measured gap was 71 seconds.
+- In a signing key rotation, the plugin holds no records between the server restart and the first new spec. The measured gap was 71 seconds.
 
 `attest-wait.sh` shows which stage of the first gap is slow. A `celld` pod that starts in a gap can restart its agent container until the record lands.
 
@@ -365,19 +375,44 @@ A revocation or a new cell reaches the views only after the link.
 
 ### Recover lost management state
 
-`mgmtd` keeps its state in a file on its data volume.
-When the file is absent or does not parse, `mgmtd` starts with a new state at epoch 1 and counter 1.
+`mgmtd` keeps its state and its signing key in two files on its data volume.
+When the state file is absent or does not parse, `mgmtd` starts with a new state at epoch 1 and counter 1.
+It also makes a new signing key.
 A file that does not parse moves to `state.json.corrupt-<unix time>` first.
-A file that parses but fails validation stays in place, and `mgmtd` does not start. The log names the file.
-Keep that file, and read the error before any other step.
+A file that parses but fails validation stays in place, and `mgmtd` does not start with `state_invalid`.
+The image has no shell, so one command does the recovery:
 
-`envd` holds a higher revision than the new state, so it refuses each spec with `revision_old`.
-`mise run mgmt -- status` then shows `"stateBehindApplied": true`, and `mgmtd` logs `state_behind_applied`.
-To recover, run `mise run mgmt -- rotate-signing-key` once.
-The new key changes the key fingerprint that `envd` pins, and `envd` then resets its stored high-water mark.
-It accepts the new epoch at once, so no second rotation is needed.
+```sh
+mise run mgmt -- reset-state
+```
+
+The command runs these steps in order:
+
+1. It scales `mgmtd` to 0 and waits until `mgmtd-0` stops.
+2. It runs a one-shot Job with the `mgmtd` image.
+   The Job renames `state.json` and `ed25519.key` on the volume to `<name>.reset-<unix time>`. It deletes nothing.
+3. It deletes the Job and scales `mgmtd` to 1.
+4. It waits until `mgmtd-0` is Ready.
+
+The command prints one JSON line with the moved files and the next commands.
+A failure in step 2 scales `mgmtd` back to 1 and leaves the files in place.
+Run the printed commands in this order:
+
+```sh
+CELL=dev-cp mise run cell:up
+CELL=management mise run cell:link
+```
+
+The fresh state starts with a new signing key.
+The `dev-cp` render pins that key, so `envd` and the plugin of the SPIRE server both start their marks again.
+`dev-cp` then applies the records of the new key, and no rotation is needed.
 Each cell binds again on its own, because `celld` repeats its bind until `mgmtd` holds a record.
+A new `celld` pod in each cell then attests.
 Then run `CELL=management mise run cell:verify` and `CELL=dev-cp mise run cell:verify`.
+
+When `mgmtd-0` is not Ready, a `dev-cp` render refuses a `mgmt-signing-pub` key that differs from the key that `dev-cp` pins.
+The error prints the command that starts `mgmtd`.
+To accept a deliberate change of the key, set `MGMT_KEY_ACCEPT_CHANGE=1` for that `cell:up`.
 
 ## Central Argo CD view
 
@@ -981,7 +1016,10 @@ Each image reaches its cluster through one command:
 `cell:verify` fails when a running image differs from that file.
 `mise run images` builds without VCS stamps, so a digest changes only when the sources of that image change.
 A comment line in `build/images.env` records the commit of the build.
+`mise run images -- <name>` keeps that line, unless the names cover every image.
 `gate:m1` and `gate:m2` run `mise run images` first.
+A new worktree has no build output. Before a live gate, copy `build/images.env` and each `build/<cluster>` directory from the checkout that set up the clusters.
+The gate stops at once and prints the copy command when they are absent.
 After a change under `cmd/` or `internal/`, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
 `gate:m2` first compares the deployed images with `build/images.env`, and it prints the `cell:up` commands when they differ.
 

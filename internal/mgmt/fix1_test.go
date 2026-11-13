@@ -435,3 +435,30 @@ func TestUnknownCellsDoNotStarveLogs(t *testing.T) {
 		t.Fatalf("%d drop_failed lines after 300 unknown names", got)
 	}
 }
+
+// A key check that cannot reach the host service logs once for each change of outcome of the cell, and not once for each check.
+func TestUnavailableKeyCheckLogsOncePerChange(t *testing.T) {
+	r := newRig(t)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.keys.fail(cell1, errors.New("down"))
+	for range 3 {
+		r.clk.Advance(61 * time.Second)
+		if res, _ := r.plane.KeyCheck(t.Context(), cell1); res != CheckIssuerUnavailable {
+			t.Fatal(res)
+		}
+	}
+	if n := r.logs.count("key_check_issuer_unavailable"); n != 1 {
+		t.Fatalf("%d lines for three failed checks, want 1", n)
+	}
+	r.keys.fail(cell1, nil)
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckUnchanged {
+		t.Fatalf("%v, %v", res, err)
+	}
+	r.keys.fail(cell1, errors.New("down again"))
+	r.clk.Advance(61 * time.Second)
+	_, _ = r.plane.KeyCheck(t.Context(), cell1)
+	if n := r.logs.count("key_check_issuer_unavailable"); n != 2 {
+		t.Fatalf("%d lines after a second outage, want 2", n)
+	}
+}

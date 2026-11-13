@@ -218,6 +218,9 @@ func TestGateM4PreCheck(t *testing.T) {
 				fmt.Fprintf(&env, "IMAGE_%s=%s\n", strings.ToUpper(strings.ReplaceAll(n, "-", "_")), ref(n, "a"))
 			}
 			write("build/images.env", env.String())
+			for _, cluster := range []string{"management", "dev-cp", "dev-cell-1", "dev-cell-2"} {
+				write("build/"+cluster+"/facts.env", "")
+			}
 			repair := "exit 0"
 			if tc.repairFails {
 				repair = "echo 'drift reported'; exit 1"

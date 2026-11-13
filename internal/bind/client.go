@@ -22,11 +22,13 @@ import (
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"go.opentelemetry.io/otel/trace"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 // Defaults of Config.
@@ -90,6 +92,9 @@ type Config struct {
 	// Observe, when set, receives the result of each Once that Run makes: a bind status,
 	// "refused" or "error".
 	Observe func(ctx context.Context, result string)
+	// Tracer, when set, starts a span for each bind attempt, so the log lines of the attempt carry trace_id and
+	// the requests carry the traceparent header.
+	Tracer trace.Tracer
 
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
@@ -178,7 +183,7 @@ func NewClient(cfg Config) *Client {
 		DialContext:            cfg.dial,
 	}
 	return &Client{cell: cfg.Cell, base: "https://" + cfg.Upstream, tr: tr, http: &http.Client{
-		Transport: tr,
+		Transport: telemetry.Transport(tr),
 		// A redirect would send the token to a host that the SPIFFE ID check never covered.
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}}
@@ -331,6 +336,15 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 }
 
+// attempt starts the span of one bind attempt. The returned function ends it.
+func (c Config) attempt(ctx context.Context) (context.Context, func()) {
+	if c.Tracer == nil {
+		return ctx, func() {}
+	}
+	ctx, span := c.Tracer.Start(ctx, "celld.bind")
+	return ctx, func() { span.End() }
+}
+
 func (c Config) observe(ctx context.Context, result string) {
 	if c.Observe != nil {
 		c.Observe(ctx, result)
@@ -339,10 +353,12 @@ func (c Config) observe(ctx context.Context, result string) {
 
 func bindUntilDone(ctx context.Context, cfg Config) error {
 	for failures := 0; ; failures++ {
-		resp, err := Once(ctx, cfg)
+		actx, end := cfg.attempt(ctx)
+		resp, err := Once(actx, cfg)
+		end()
 		if err == nil {
 			cfg.observe(ctx, resp.Status)
-			cfg.Log.InfoContext(ctx, "bound", "cell", cfg.Cell, "status", resp.Status,
+			cfg.Log.InfoContext(actx, "bound", "cell", cfg.Cell, "status", resp.Status,
 				"record_epoch", resp.Record.Epoch, "record_counter", resp.Record.Counter)
 			return nil
 		}
@@ -359,7 +375,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 			wait = backoff(cfg, failures)
 		}
 		cfg.observe(ctx, result)
-		cfg.Log.WarnContext(ctx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "retry_in", wait.String())
+		cfg.Log.WarnContext(actx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "retry_in", wait.String())
 		if err := cfg.Sleep(ctx, wait); err != nil {
 			return err
 		}

@@ -154,6 +154,15 @@ func NewPlane(cfg Config) (*Plane, error) {
 	if err != nil {
 		return nil, err
 	}
+	if st == nil && !created && cfg.Key == nil {
+		// A fresh state over an old key would sign revisions that the key signed before. A new key makes
+		// the plugin start its marks again.
+		if key, pub, fp, err = replaceKey(cfg); err != nil {
+			return nil, err
+		}
+		p.key = key
+		cfg.Log.Warn("signing_key_replaced", "reason", "no state exists for the key file")
+	}
 	switch {
 	case st == nil:
 		st = newState(fp)
@@ -179,6 +188,19 @@ func NewPlane(cfg Config) (*Plane, error) {
 	}
 	p.noteLag()
 	return p, nil
+}
+
+// replaceKey writes a new signing key over the key file.
+func replaceKey(cfg Config) (ed25519.PrivateKey, ed25519.PublicKey, string, error) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, nil, "", fmt.Errorf("make signing key: %w", err)
+	}
+	if err := WriteKey(cfg.KeyPath, key); err != nil {
+		return nil, nil, "", err
+	}
+	pub := key.Public().(ed25519.PublicKey)
+	return key, pub, fingerprint(pub), nil
 }
 
 // checkStored makes sure the last signed spec verifies under the key and names this environment.

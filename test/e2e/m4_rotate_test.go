@@ -4,15 +4,14 @@ package e2e
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 // rotateWait bounds the whole command: the render of dev-cp, the link of management and two verify runs.
@@ -38,13 +37,9 @@ func serverStart(t *testing.T) time.Time {
 // cellVerify runs `mise run cell:verify` for a cluster.
 func cellVerify(t *testing.T, cell string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "mise", "run", "cell:verify")
-	cmd.Dir = "../.."
-	cmd.Env = append(os.Environ(), "CELL="+cell)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Errorf("CELL=%s mise run cell:verify: %v\n%s", cell, err, out)
+	res, err := cmdrun.Run(10*time.Minute, "../..", []string{"CELL=" + cell}, "mise", "run", "cell:verify")
+	if err != nil || res.Code != 0 {
+		t.Errorf("CELL=%s mise run cell:verify: %v (exit %d)\n%s%s", cell, err, res.Code, res.Stdout, res.Stderr)
 	}
 }
 
@@ -58,12 +53,13 @@ func TestRotationSigningKey(t *testing.T) {
 	oldPub := mgmtSigningPub(t)
 	started := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), rotateWait)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "mise", "run", "mgmt", "--", "rotate-signing-key")
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	res0, err := cmdrun.Run(rotateWait, "", nil, "mise", "run", "mgmt", "--", "rotate-signing-key")
+	stdout.WriteString(res0.Stdout)
+	stderr.WriteString(res0.Stderr)
+	if err == nil && res0.Code != 0 {
+		err = fmt.Errorf("exit status %d", res0.Code)
+	}
 	took := time.Since(started)
 	t.Logf("rotate-signing-key took %s", took.Round(time.Second))
 	if err != nil {

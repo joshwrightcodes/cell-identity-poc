@@ -3,14 +3,12 @@
 package e2e
 
 import (
-	"bytes"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
-	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -18,6 +16,7 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 )
@@ -42,13 +41,11 @@ func mgmtCtl(t *testing.T, args ...string) string {
 }
 
 func mgmtCtlErr(args ...string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "mise", append([]string{"run", "mgmt", "--"}, args...)...)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	err := cmd.Run()
-	return strings.TrimSpace(stdout.String()), err
+	res, err := cmdrun.Run(2*time.Minute, "", nil, "mise", append([]string{"run", "mgmt", "--"}, args...)...)
+	if err == nil && res.Code != 0 {
+		err = fmt.Errorf("exit status %d", res.Code)
+	}
+	return strings.TrimSpace(res.Stdout), err
 }
 
 // mgmtStatus returns the status that mgmtd ctl status prints.

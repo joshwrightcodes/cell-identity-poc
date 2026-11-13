@@ -20,6 +20,8 @@ case " $* " in
   *" get configmap hostsvc-pin "*) cat "$STUB_DIR/pin.pem" ;;
   *" get statefulset mgmtd -o jsonpath="*) [[ -z "${STUB_NO_STS:-}" ]] || exit 1; printf '%s' "${STUB_REPLICAS:-1}" ;;
   *" get deployment envd -o jsonpath="*) [[ -z "${STUB_NO_ENVD:-}" ]] || exit 1; printf '%s' "${STUB_ENVD_REPLICAS:-1}" ;;
+  *" get configmap cell-registry "*)
+    if [[ -n "${STUB_REGISTRY_STALE:-}" ]]; then printf '{"data":{"dev-cell-1.dsse.json":"{\\"p\\":2}"}}\n'; else printf '{"data":{"dev-cell-1.dsse.json":"{\\"p\\":1}"}}\n'; fi ;;
   *" rollout status "*) echo "rollout $*" >>"$STUB_DIR/calls" ;;
   *" get namespaces -o json"*) cat "$STUB_DIR/namespaces.json" 2>/dev/null || echo '{"items":[]}' ;;
   *" get jobs,networkpolicies,secrets,configmaps -A "*) cat "$STUB_DIR/objects.json" 2>/dev/null || echo '{"items":[]}' ;;
@@ -35,6 +37,8 @@ if [[ "$1 $2 $3 $4" == "run mgmt -- status" ]]; then
   printf '{"restoreActive":%s}\n' "${STUB_RESTORE_ACTIVE:-false}"
   exit 0
 fi
+if [[ "$1 $2 $3 $4" == "run mgmt -- records" ]]; then echo '{"dev-cell-1":{"p":1}}'; exit 0; fi
+if [[ "$1 $2" == "run cell:link" ]]; then echo "link CELL=$CELL LINK_ONLY=$LINK_ONLY" >>"$STUB_DIR/calls"; exit 0; fi
 if [[ "$1 $2 $3 $4 $5 $6" == "run mgmt -- restore --revision latest" ]]; then echo "mgmt restore $*" >>"$STUB_DIR/calls"; exit 0; fi
 echo "unexpected mise call: $*" >&2; exit 2
 `
@@ -129,7 +133,21 @@ func TestGateM4Repair(t *testing.T) {
 			}
 		})
 	}
-	out, _, err := run([]string{"--check"}, "STUB_NO_STS=1")
+	// A registry that holds another record than mgmtd serves is reported, and each of the three links renders it again.
+	out, calls, err := run([]string{"--check"}, "STUB_REGISTRY_STALE=1")
+	if err == nil || !strings.Contains(out, "cell-registry holds another record than mgmtd serves for: dev-cell-1") || !strings.Contains(out, repair) || calls != "" {
+		t.Fatalf("a stale registry: err %v, output %q, calls %q; want a report that names the repair and changes nothing", err, out, calls)
+	}
+	out, calls, err = run(nil, "STUB_REGISTRY_STALE=1")
+	if err != nil {
+		t.Fatalf("repair of a stale registry: %v\n%s", err, out)
+	}
+	for _, comp := range []string{"central-view", "telemetry-gateway", "mesh-view-hub"} {
+		if !strings.Contains(calls, "link CELL=management LINK_ONLY="+comp+"\n") {
+			t.Errorf("the repair did not render %s again:\n%s", comp, calls)
+		}
+	}
+	out, _, err = run([]string{"--check"}, "STUB_NO_STS=1")
 	if err == nil || !strings.Contains(out, "StatefulSet mgmtd is absent in management. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link") {
 		t.Fatalf("an absent StatefulSet: err %v, output %q", err, out)
 	}

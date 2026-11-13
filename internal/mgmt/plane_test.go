@@ -941,10 +941,17 @@ func TestStateRoundTripAndAtomic(t *testing.T) {
 func TestStateCorruptMovedAside(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	oldPub := r.plane.PublicKey()
 	if err := os.WriteFile(filepath.Join(r.dir, "state.json"), []byte(`{"Version":1,"Seq":`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	r.restart(nil)
+	if newPub := r.plane.PublicKey(); bytes.Equal(newPub, oldPub) {
+		t.Fatal("a fresh state kept the old signing key")
+	}
+	if n := r.logs.count("signing_key_replaced"); n != 1 {
+		t.Fatalf("%d signing_key_replaced lines", n)
+	}
 	if got := r.status().Signed; got != rev(1, 1) {
 		t.Fatalf("fresh state at %v", got)
 	}

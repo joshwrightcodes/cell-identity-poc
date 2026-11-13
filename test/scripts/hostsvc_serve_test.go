@@ -524,6 +524,7 @@ case " $* " in
   *" get configmap mgmt-signing-pub "*)
     [[ -z "${STUB_NO_CM:-}" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
     printf '{"data":{"spec.pub":"%s"}}\n' "$STUB_CM_PUB" ;;
+  *" get configmap mgmt-spec-key "*) [[ -z "${STUB_PIN_ERR:-}" ]] || exit 1; printf '%s' "${STUB_PINNED:-}" ;;
   *" get pod mgmtd-0 "*) printf '%s' "${STUB_READY:-True}" ;;
   *) exit 2 ;;
 esac
@@ -559,6 +560,13 @@ func TestMgmtSigningPub(t *testing.T) {
 		{"ready and equal", good, []string{"STUB_CM_PUB=" + good, "STUB_LIVE_PUB=" + good}, ""},
 		{"ready and different", "", []string{"STUB_CM_PUB=" + good, "STUB_LIVE_PUB=" + other}, "mgmtd-0 signs with " + other},
 		{"not ready skips the comparison", good, []string{"STUB_CM_PUB=" + good, "STUB_LIVE_PUB=" + other, "STUB_READY=False"}, ""},
+		{"not ready and pinned equal", good, []string{"STUB_CM_PUB=" + good, "STUB_READY=False", "STUB_PINNED=" + good}, ""},
+		{"not ready and nothing pinned", good, []string{"STUB_CM_PUB=" + good, "STUB_READY=False"}, ""},
+		{"not ready and pinned different", "", []string{"STUB_CM_PUB=" + good, "STUB_READY=False", "STUB_PINNED=" + other},
+			"Start mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
+		{"not ready and pin unreadable", "", []string{"STUB_CM_PUB=" + good, "STUB_READY=False", "STUB_PIN_ERR=1"}, "MGMT_KEY_ACCEPT_CHANGE=1"},
+		{"not ready and pinned different with the override", good, []string{"STUB_CM_PUB=" + good, "STUB_READY=False", "STUB_PINNED=" + other, "MGMT_KEY_ACCEPT_CHANGE=1"}, ""},
+		{"ready and pinned different is not checked", good, []string{"STUB_CM_PUB=" + good, "STUB_LIVE_PUB=" + good, "STUB_PINNED=" + other}, ""},
 		{"the ConfigMap is absent", "", []string{"STUB_NO_CM=1"}, "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
 		{"31 bytes", "", []string{"STUB_CM_PUB=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHg==", "STUB_READY=False"}, "not the base64 of 32 bytes"},
 		{"not base64", "", []string{"STUB_CM_PUB=not-a-key", "STUB_READY=False"}, "not the base64 of 32 bytes"},

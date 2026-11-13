@@ -289,8 +289,11 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	defer closeSVIDs()
 
 	keys := []ed25519.PublicKey{cfg.key}
+	// The transport adds the traceparent header, so a trace of a round continues in the logs of mgmtd.
+	client := envd.NewClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect))
+	client.Transport = telemetry.Transport(client.Transport)
 	puller := envd.NewPuller(envd.PullerConfig{
-		Client:   envd.NewClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect)),
+		Client:   client,
 		BaseURL:  "https://" + cfg.upstream,
 		Env:      cfg.env,
 		Keys:     keys,

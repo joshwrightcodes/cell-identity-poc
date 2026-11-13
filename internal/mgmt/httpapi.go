@@ -148,7 +148,7 @@ func (h *apiHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		reqID := newRequestID()
 		writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: reqID})
 		if _, ok, suppressed, _ := h.limit.Allow("peer"); ok {
-			h.log.Warn("api_denied", "reason", "peer_not_allowed", "peer", id.String(), "request_id", reqID, "suppressed", suppressed)
+			h.log.WarnContext(r.Context(), "api_denied", "reason", "peer_not_allowed", "peer", id.String(), "request_id", reqID, "suppressed", suppressed)
 		}
 		return
 	}
@@ -241,12 +241,12 @@ func (h *bindHandler) nonce(w http.ResponseWriter, r *http.Request) {
 		defer release()
 	}
 	if bad != "" {
-		h.deny(w, cell, "request_invalid", bad)
+		h.deny(w, r, cell, "request_invalid", bad)
 		return
 	}
 	resp, err := h.p.Nonce(cell)
 	if err != nil {
-		h.fail(w, cell, err)
+		h.fail(w, r, cell, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -272,14 +272,14 @@ func (h *bindHandler) bind(w http.ResponseWriter, r *http.Request) {
 		defer release()
 	}
 	if bad != "" {
-		h.deny(w, cell, "request_invalid", bad)
+		h.deny(w, r, cell, "request_invalid", bad)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), bindHandlerTimeout)
 	defer cancel()
 	resp, err := h.p.Bind(ctx, cell, req)
 	if err != nil {
-		h.fail(w, cell, err)
+		h.fail(w, r, cell, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -291,46 +291,46 @@ func (h *bindHandler) bind(w http.ResponseWriter, r *http.Request) {
 // connection, and the cell retries with backoff.
 func (h *bindHandler) admit(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
 	if bc, found := r.Context().Value(bindConnKey{}).(*bindConn); found && !bc.promote() {
-		h.busy(w, "established_full")
+		h.busy(w, r, "established_full")
 		return nil, false
 	}
 	select {
 	case h.slots <- struct{}{}:
 		return func() { <-h.slots }, true
 	default:
-		h.busy(w, "slots_full")
+		h.busy(w, r, "slots_full")
 		return nil, false
 	}
 }
 
-func (h *bindHandler) busy(w http.ResponseWriter, reason string) {
+func (h *bindHandler) busy(w http.ResponseWriter, r *http.Request, reason string) {
 	id := newRequestID()
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Retry-After", "1")
 	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy", "reason": reason, "request_id": id})
 	if _, ok, suppressed, _ := h.limit.Allow("busy"); ok {
-		h.log.Warn("bind_busy", "reason", reason, "request_id", id, "suppressed", suppressed)
+		h.log.WarnContext(r.Context(), "bind_busy", "reason", reason, "request_id", id, "suppressed", suppressed)
 	}
 }
 
-func (h *bindHandler) fail(w http.ResponseWriter, cell string, err error) {
+func (h *bindHandler) fail(w http.ResponseWriter, r *http.Request, cell string, err error) {
 	var e *Error
 	if errors.As(err, &e) {
-		h.deny(w, cell, e.Reason, e.Detail)
+		h.deny(w, r, cell, e.Reason, e.Detail)
 		return
 	}
 	id := newRequestID()
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "request_id": id})
 	if _, ok, suppressed, _ := h.limit.Allow("internal"); ok {
-		h.log.Error("bind_failed", "cell", clip(cell), "request_id", id, "error", err.Error(), "suppressed", suppressed)
+		h.log.ErrorContext(r.Context(), "bind_failed", "cell", clip(cell), "request_id", id, "error", err.Error(), "suppressed", suppressed)
 	}
 }
 
-func (h *bindHandler) deny(w http.ResponseWriter, cell, reason, detail string) {
+func (h *bindHandler) deny(w http.ResponseWriter, r *http.Request, cell, reason, detail string) {
 	id := newRequestID()
 	writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: id})
 	if _, ok, suppressed, _ := h.limit.Allow(reason); ok {
-		h.log.Warn("bind_denied", "reason", reason, "detail", detail, "cell", clip(cell), "request_id", id, "suppressed", suppressed)
+		h.log.WarnContext(r.Context(), "bind_denied", "reason", reason, "detail", detail, "cell", clip(cell), "request_id", id, "suppressed", suppressed)
 	}
 }
 
