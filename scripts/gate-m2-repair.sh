@@ -253,11 +253,11 @@ replace_pod() {
 }
 if ((${#stale[@]} > 0)); then
   uids="$(printf '%s\n' "${stale[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
-  # kindnet enforces NetworkPolicy, so its pods come first.
+  # kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start, so their pods come first.
   while read -r ns pod kind owner; do
     replace_pod "$ns" "$pod" "$kind" "$owner" </dev/null
   done < <(k get pods -A -o json | jq -r --argjson uids "$uids" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if (.metadata.ownerReferences[0].name // "") == "kindnet" then 0 else 1 end)
+    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy")) then 0 else 1 end)
     | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"')
 fi
 
