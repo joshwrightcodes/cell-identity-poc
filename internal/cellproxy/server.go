@@ -42,6 +42,9 @@ type ServerConfig struct {
 	TLS                                             *tls.Config
 	HandshakeTimeout, FirstByteTimeout, IdleTimeout time.Duration
 	MaxHandshakes, MaxConns, MaxConnsPerSource      int
+	// Proof, when set, makes the server read and verify a proof frame from each cell source after
+	// the connection slots are taken and before the backend runs. Environment sources skip it.
+	Proof *ProofCheck
 }
 
 // Server ends TLS for each connection and hands the verified peer to its backend.
@@ -138,6 +141,12 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 		return
 	}
 	defer release()
+	if s.cfg.Proof != nil && src.Plane == PlaneCell {
+		if err := s.cfg.Proof.check(conn, src, id); err != nil {
+			s.refusals.write("proof refused", ReasonOf(err), remote, id, err)
+			return
+		}
+	}
 	log := s.log.With("spiffe_id", id, "remote", remote)
 	log.Info("peer accepted")
 	if err := s.backend.Serve(withIdleTimeout(ctx, s.cfg.IdleTimeout), conn, src); err != nil {

@@ -581,8 +581,10 @@ func (h *gwHarness) serve(t *testing.T, allow, id string, opts ...grpc.DialOptio
 		t.Fatal(err)
 	}
 	log := jsonLog(h.log)
+	reg := testRegistry(t)
 	srv := NewServer(ServerConfig{
-		TLS: ServerTLS(source(mgmt.svid(t, telemetryID)), env.bundle(), regexp.MustCompile(allow), testRegistry(t), log),
+		TLS:   ServerTLS(source(mgmt.svid(t, telemetryID)), env.bundle(), regexp.MustCompile(allow), reg, log),
+		Proof: testProofCheck(reg),
 	}, backend, log)
 	srvDone := make(chan struct{})
 	go func() { _ = srv.Serve(ctx, srvLn); close(srvDone) }()
@@ -591,7 +593,7 @@ func (h *gwHarness) serve(t *testing.T, allow, id string, opts ...grpc.DialOptio
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli := &Client{TLS: ClientTLS(source(env.svid(t, id)), mgmt.bundle(), spiffeIDOf(telemetryID)), Upstream: srvLn.Addr().String(), Log: jsonLog(&syncBuffer{})}
+	cli := &Client{TLS: ClientTLS(source(env.svid(t, id)), mgmt.bundle(), spiffeIDOf(telemetryID)), Upstream: srvLn.Addr().String(), Log: jsonLog(&syncBuffer{}), Proof: proofFor(t, id)}
 	cliDone := make(chan struct{})
 	go func() { _ = cli.Serve(ctx, cliLn); close(cliDone) }()
 	h.client = cliLn.Addr().String()

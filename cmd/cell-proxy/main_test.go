@@ -230,6 +230,7 @@ func serverArgs(t *testing.T, envCA testCA) []string {
 		"--peer-bundle", envCA.bundleFile(t), "--peer-trust-domain", "dev.env.poc.internal",
 		"--allow-id", viewPattern, "--registry-dir", registryDir(t),
 		"--backend", "grpc-header", "--upstream", "127.0.0.1:1", "--identity-header", "x-cell-agent",
+		"--proof-subject", "argocd-agent=cell-identity-system/celld",
 	}
 }
 
@@ -634,4 +635,102 @@ func TestServerOTLPWaitsForUpstream(t *testing.T) {
 			t.Fatal("the server did not stop")
 		}
 	})
+}
+
+func TestServerRequiresProofSubjectFlag(t *testing.T) {
+	envCA := newCA(t, "dev.env.poc.internal")
+	args := serverArgs(t, envCA)
+	noSubject := without(args, "--proof-subject")
+	assertConfigError(t, noSubject)
+
+	cases := map[string][]string{
+		"environment only": with(noSubject, "--allow-id", `^spiffe://dev\.env\.poc\.internal/cp/otel$`),
+		"one subject":      args,
+	}
+	for name, a := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseServer(a[1:]); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	bad := map[string][]string{
+		"no namespace":     with(args, "--proof-subject", "argocd-agent=celld"),
+		"no role":          with(args, "--proof-subject", "=ns/sa"),
+		"capitals":         with(args, "--proof-subject", "argocd-agent=NS/sa"),
+		"same role twice":  append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
+		"reload no signer": append(slices.Clone(args), "--registry-reload", "5s"),
+	}
+	for name, a := range bad {
+		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
+	}
+}
+
+func TestServerRegistrySignerFlag(t *testing.T) {
+	envCA := newCA(t, "dev.env.poc.internal")
+	args := serverArgs(t, envCA)
+	dir := args[slices.Index(args, "--registry-dir")+1]
+	signer := filepath.Join(t.TempDir(), "signers.pub")
+	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signer, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := parseServer(append(slices.Clone(args), "--registry-signer", signer)[1:])
+	if err != nil || cfg.signer != signer || cfg.reload != 10*time.Second {
+		t.Fatalf("got %+v %v, want the signer and the 10 s default", cfg, err)
+	}
+	other := filepath.Join(t.TempDir(), "other.pub")
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte(base64.StdEncoding.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertConfigError(t, append(slices.Clone(args), "--registry-signer", other))
+}
+
+func TestMayAdmitCell(t *testing.T) {
+	for p, want := range map[string]bool{
+		viewPattern: true,
+		`^spiffe://dev\.env\.poc\.internal/(?:cp/otel|cell/[a-z0-9-]+/otel)$`: true,
+		`^spiffe://dev\.env\.poc\.internal/.*$`:                               true,
+		`^spiffe://dev\.env\.poc\.internal/[^x]+$`:                            true,
+		`^spiffe://dev\.env\.poc\.internal/cp/otel$`:                          false,
+		`^spiffe://dev\.env\.poc\.internal/cp/(?:otel|argocd-agent)$`:         false,
+	} {
+		if got := mayAdmitCell(p); got != want {
+			t.Errorf("%s: got %v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestServerRunsWithRegistryWatcher(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+	serveWorkloadAPI(t, mgmt, principalID)
+	args := serverArgs(t, envCA)
+	dir := args[slices.Index(args, "--registry-dir")+1]
+	signer := filepath.Join(t.TempDir(), "signers.pub")
+	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(signer, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := &syncBuffer{}
+	stop := runUntilCanceled(t, append(args, "--registry-signer", signer, "--registry-reload", "50ms"), out)
+	waitLine(t, out, "listening")
+	// A record that does not verify keeps the last good registry, and the server logs it.
+	if err := os.WriteFile(filepath.Join(dir, "dev-cell-1.dsse.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitLine(t, out, "registry_reload_failed")
+	stop()
 }

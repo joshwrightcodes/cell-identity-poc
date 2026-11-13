@@ -215,6 +215,8 @@ type tunnelHarnessConfig struct {
 	readIdle, pingTimeout time.Duration
 	// holes wraps each connection that the hub accepts, so a test can blackhole it.
 	holes *holes
+	// proof makes the hub require a proof from cell sources. A test then sends it through a Client with Proof.
+	proof bool
 }
 
 func newTunnelHarness(t *testing.T, wait time.Duration) *tunnelHarness {
@@ -253,9 +255,11 @@ func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness 
 	if cfg.hubLeafLife > 0 {
 		hubSVID = h.mgmt.svidUntil(t, kialiID, time.Now().Add(cfg.hubLeafLife))
 	}
-	srv := NewServer(ServerConfig{
-		TLS: ServerTLS(source(hubSVID), h.env.bundle(), regexp.MustCompile(cfg.allow), cfg.registry, log),
-	}, NewTunnelBackend(h.hub), log)
+	scfg := ServerConfig{TLS: ServerTLS(source(hubSVID), h.env.bundle(), regexp.MustCompile(cfg.allow), cfg.registry, log)}
+	if cfg.proof {
+		scfg.Proof = testProofCheck(cfg.registry)
+	}
+	srv := NewServer(scfg, NewTunnelBackend(h.hub), log)
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stopServer, h.serverDone = cancel, make(chan struct{})
 	go func() { _ = srv.Serve(ctx, h.accepted); close(h.serverDone) }()
@@ -817,13 +821,13 @@ func tlsServerConn(c net.Conn) *tls.Conn { return tls.Server(c, &tls.Config{}) }
 // tunnelThroughSpiffeClient runs the cell side over a plaintext dial to spiffe-client, which
 // pipes it to spiffe-server with the tunnel backend.
 func tunnelThroughSpiffeClient(t *testing.T) {
-	h := newTunnelHarness(t, 5*time.Second)
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, proof: true})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	cli := &Client{TLS: ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), Upstream: h.server, Log: jsonLog(h.cellLog)}
+	cli := &Client{TLS: ClientTLS(source(h.env.svid(t, meshViewID1)), h.mgmt.bundle(), spiffeIDOf(kialiID)), Upstream: h.server, Log: jsonLog(h.cellLog), Proof: proofFor(t, meshViewID1)}
 	done := make(chan struct{})
 	go func() { _ = cli.Serve(ctx, ln); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })

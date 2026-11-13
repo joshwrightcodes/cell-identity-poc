@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
@@ -28,6 +29,37 @@ const (
 type Registry struct {
 	cells   []record.Cell
 	signers int
+	keys    []ed25519.PublicKey
+}
+
+// RegistrySource gives the registry that is current now. A *Registry is its own source, and a
+// *RegistryWatcher gives the last good reload.
+type RegistrySource interface{ Current() *Registry }
+
+// Current returns r.
+func (r *Registry) Current() *Registry { return r }
+
+// Record returns the record of the cell with the highest revision. It reports false when the
+// registry holds no record of that name, or when any record of that name is revoked.
+func (r *Registry) Record(cell string) (record.Cell, bool) {
+	var best record.Cell
+	found := false
+	for _, c := range r.cells {
+		if c.Name != cell {
+			continue
+		}
+		if c.Revoked {
+			return record.Cell{}, false
+		}
+		if !found || revisionOf(c).Compare(revisionOf(best)) > 0 {
+			best, found = c, true
+		}
+	}
+	return best, found
+}
+
+func revisionOf(c record.Cell) spec.Revision {
+	return spec.Revision{Epoch: c.Epoch, Counter: c.Counter}
 }
 
 // LoadRegistry reads signers.pub, one base64 Ed25519 key for each line, and every *.dsse.json
@@ -42,7 +74,7 @@ func LoadRegistry(dir string) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	reg := &Registry{signers: len(keys)}
+	reg := &Registry{signers: len(keys), keys: keys}
 	for _, path := range paths {
 		data, err := readBounded(path)
 		if err != nil {

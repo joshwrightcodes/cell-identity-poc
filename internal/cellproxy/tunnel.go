@@ -309,6 +309,17 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			}
 			return nil, err
 		}
+		if o.proof != nil {
+			pctx, pcancel := context.WithTimeout(ctx, handshakeTimeout)
+			err := o.proof(pctx, conn)
+			pcancel()
+			if err != nil {
+				_ = conn.Close()
+				result(ctx, dialFailed)
+				log.Warn("tunnel_dial_failed", "reason", "proof_failed", "upstream", addr, "error", err.Error())
+				return nil, err
+			}
+		}
 		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result, state: state, limiter: limiter, accepted: make(chan struct{})}
 		// The cell ends the tunnel at the earlier expiry of its own leaf and the leaf of the hub, so a
 		// hub that never closes cannot keep the access past a credential.

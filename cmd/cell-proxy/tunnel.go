@@ -121,6 +121,7 @@ type tunnelModeConfig struct {
 	upstream              string
 	expect                spiffeid.ID
 	peer                  *x509bundle.Bundle
+	proof                 bool
 }
 
 func parseTunnel(args []string) (tunnelModeConfig, error) {
@@ -132,6 +133,7 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	readIdle := fs.Duration("read-idle", 30*time.Second, "how long the tunnel connection may be idle before the cell pings it")
 	pingTimeout := fs.Duration("ping-timeout", 15*time.Second, "how long the cell waits for the answer to a ping before it closes the tunnel")
 	status := fs.String("status-listen", cellproxy.DefaultStatusAddr, "loopback address where the tunnel serves its state, read by cell-proxy tunnel-status")
+	withProof := fs.Bool("proof", false, "send a pod-bound service account token as a second proof on each tunnel connection")
 	if err := parseFlags(fs, args); err != nil {
 		return tunnelModeConfig{}, err
 	}
@@ -149,7 +151,7 @@ func parseTunnel(args []string) (tunnelModeConfig, error) {
 	if err != nil {
 		return tunnelModeConfig{}, err
 	}
-	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status, readIdle: *readIdle, pingTimeout: *pingTimeout}, nil
+	return tunnelModeConfig{upstream: *upstream, expect: id, peer: peer, statusAddr: *status, readIdle: *readIdle, pingTimeout: *pingTimeout, proof: *withProof}, nil
 }
 
 // runOptions are the options of cellproxy.RunTunnel: the keepalive, and the logger for the lines of the HTTP/2 server.
@@ -189,7 +191,15 @@ func runTunnel(ctx context.Context, args []string, stdout io.Writer) int {
 				tel.Log.Warn("tunnel status listener ended", "error", err.Error())
 			}
 		}()
-		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, cellproxy.WithMetrics(m), cellproxy.WithState(state))
+		dialOpts := []cellproxy.TunnelOption{cellproxy.WithMetrics(m), cellproxy.WithState(state)}
+		if cfg.proof {
+			p, err := newProofFunc(svids, kc)
+			if err != nil {
+				return err
+			}
+			dialOpts = append(dialOpts, cellproxy.WithProof(p))
+		}
+		dial := cellproxy.TunnelDialer(cfg.upstream, cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), tel.Log, dialOpts...)
 		return cellproxy.RunTunnel(ctx, dial, cellproxy.NewCellHandler(api, rt, tel.Log, cellproxy.WithMetrics(m)), cfg.runOptions(tel.Log)...)
 	})
 }

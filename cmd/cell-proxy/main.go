@@ -1,10 +1,11 @@
 // Command cell-proxy carries streams between the planes over SPIFFE mTLS.
 //
-//	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
+//	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> [--proof]
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
 //	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port> [--upstream-wait <duration>]
 //	cell-proxy spiffe-server ... --backend tunnel --tunnel-cell <cell>=<listen addr> [--tunnel-cell ...] [--tunnel-wait 10s]
-//	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
+//	cell-proxy spiffe-server ... --proof-subject <role>=<namespace>/<service account> [--proof-subject ...] [--registry-signer <file> [--registry-reload 10s]]
+//	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> [--proof]
 //	cell-proxy promql-proxy --listen <addr> --upstream <url>
 //	cell-proxy probe --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy whoami
@@ -19,6 +20,14 @@
 // They log compact JSON to stdout and export OTLP, as package internal/telemetry describes. A
 // configuration error is one JSON error line and exit status 2. promql-proxy passes only the
 // Prometheus reads of Kiali to --upstream, and has no SVID.
+//
+// With --proof, spiffe-client and tunnel send a second proof before the first payload byte: a
+// service account token of their pod, bound to the TLS session of the connection. They need the
+// in-cluster configuration and the pod environment. spiffe-server checks the proof of each cell
+// source against the live registry and the service account that --proof-subject names for the role
+// of the source. An --allow-id that can admit a cell source needs at least one --proof-subject.
+// With --registry-signer, spiffe-server reloads the registry every --registry-reload, refuses a
+// registry whose signers.pub differs from that file, and keeps the last good registry on an error.
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
 // whoami prints the sorted IDs of the X.509 SVIDs of this process. Neither starts telemetry. A
@@ -55,14 +64,19 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -79,6 +93,8 @@ const (
 	// upstreamMaxBackoff bounds the wait between two connection attempts to the OTLP upstream, so
 	// the gateway follows a store that comes back.
 	upstreamMaxBackoff = 5 * time.Second
+	// registryReload is the default of --registry-reload.
+	registryReload = 10 * time.Second
 )
 
 func main() {
@@ -189,6 +205,7 @@ type clientConfig struct {
 	listen, upstream string
 	expect           spiffeid.ID
 	peer             *x509bundle.Bundle
+	proof            bool
 }
 
 func parseClient(args []string) (clientConfig, error) {
@@ -198,6 +215,7 @@ func parseClient(args []string) (clientConfig, error) {
 	expect := fs.String("expect-id", "", "the exact SPIFFE ID of the server")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the server trust domain")
 	td := fs.String("peer-trust-domain", "", "trust domain of the server")
+	withProof := fs.Bool("proof", false, "send a pod-bound service account token as a second proof before the first payload byte")
 	if err := parseFlags(fs, args); err != nil {
 		return clientConfig{}, err
 	}
@@ -212,7 +230,7 @@ func parseClient(args []string) (clientConfig, error) {
 	if err != nil {
 		return clientConfig{}, err
 	}
-	return clientConfig{listen: *listen, upstream: *upstream, expect: id, peer: peer}, nil
+	return clientConfig{listen: *listen, upstream: *upstream, expect: id, peer: peer, proof: *withProof}, nil
 }
 
 func runClient(ctx context.Context, args []string, stdout io.Writer) int {
@@ -222,11 +240,20 @@ func runClient(ctx context.Context, args []string, stdout io.Writer) int {
 		return exitConfig
 	}
 	return serve(ctx, stdout, func(ctx context.Context, tel *telemetry.T, svids *workloadapi.X509Source) error {
+		c := &cellproxy.Client{TLS: cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), Upstream: cfg.upstream, Log: tel.Log}
+		if cfg.proof {
+			kc, err := rest.InClusterConfig()
+			if err != nil {
+				return fmt.Errorf("in-cluster config: %w", err)
+			}
+			if c.Proof, err = newProofFunc(svids, kc); err != nil {
+				return err
+			}
+		}
 		ln, err := net.Listen("tcp", cfg.listen)
 		if err != nil {
 			return err
 		}
-		c := &cellproxy.Client{TLS: cellproxy.ClientTLS(svids, cfg.peer, cfg.expect), Upstream: cfg.upstream, Log: tel.Log}
 		return c.Serve(ctx, ln)
 	})
 }
@@ -236,6 +263,11 @@ type serverConfig struct {
 	peer     *x509bundle.Bundle
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
+	// registryDir, signer and reload set the watcher. An empty signer loads the registry once.
+	registryDir, signer string
+	reload              time.Duration
+	// subjects maps a role to the service account that sends its proof.
+	subjects map[string]record.Subject
 	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
 	// waitUpstream, when set, blocks until the first upstream connection is ready. The server
 	// opens its listener after that, so a readiness probe of the listener covers the upstream.
@@ -249,6 +281,10 @@ func parseServer(args []string) (serverConfig, error) {
 	td := fs.String("peer-trust-domain", "", "trust domain of the clients")
 	allow := fs.String("allow-id", "", "anchored regular expression for the client SPIFFE IDs")
 	registryDir := fs.String("registry-dir", "", "directory with signers.pub and the *.dsse.json cell records")
+	signer := fs.String("registry-signer", "", "file with the pinned signer keys: the registry is reloaded, and a registry whose signers.pub differs from this file is refused")
+	reload := fs.Duration("registry-reload", registryReload, "how often to reload the registry. Needs --registry-signer")
+	subjects := map[string]record.Subject{}
+	fs.Func("proof-subject", "<role>=<namespace>/<service account> that sends the proof of that role; repeat for each role", proofSubjectFlag(subjects))
 	backend := fs.String("backend", "", "backend for each connection: grpc-header, otlp or tunnel")
 	upstream := fs.String("upstream", "", "backend upstream as host:port")
 	upstreamWait := fs.Duration("upstream-wait", 0, "otlp backend: wait this long for the first upstream connection before the listener opens, and fail after that. 0 does not wait")
@@ -271,11 +307,30 @@ func parseServer(args []string) (serverConfig, error) {
 	if err != nil {
 		return serverConfig{}, fmt.Errorf("--allow-id: %w", err)
 	}
-	reg, err := cellproxy.LoadRegistry(*registryDir)
-	if err != nil {
+	if len(subjects) == 0 && mayAdmitCell(*allow) {
+		return serverConfig{}, errors.New("--allow-id can admit a cell source, so at least one --proof-subject <role>=<namespace>/<service account> is required")
+	}
+	reloadSet := false
+	fs.Visit(func(f *flag.Flag) { reloadSet = reloadSet || f.Name == "registry-reload" })
+	switch {
+	case *signer == "" && reloadSet:
+		return serverConfig{}, errors.New("--registry-reload needs --registry-signer")
+	case *reload < 0:
+		return serverConfig{}, errors.New("--registry-reload must not be negative")
+	}
+	var reg *cellproxy.Registry
+	if *signer != "" {
+		reg, _, err = cellproxy.LoadPinnedRegistry(*registryDir, *signer)
+		if err != nil {
+			return serverConfig{}, fmt.Errorf("--registry-dir with --registry-signer: %w", err)
+		}
+	} else if reg, err = cellproxy.LoadRegistry(*registryDir); err != nil {
 		return serverConfig{}, fmt.Errorf("--registry-dir: %w", err)
 	}
-	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg}
+	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg, registryDir: *registryDir, signer: *signer, reload: *reload}
+	if len(subjects) > 0 {
+		cfg.subjects = subjects
+	}
 	if *upstreamWait != 0 && *backend != "otlp" {
 		return serverConfig{}, errors.New("--upstream-wait applies to --backend otlp only")
 	}
@@ -395,8 +450,19 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		if err != nil {
 			return err
 		}
-		tlsCfg := cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, cfg.registry, tel.Log)
-		return serveBackend(ctx, cellproxy.NewServer(cellproxy.ServerConfig{TLS: tlsCfg}, backend, tel.Log), ln, backend)
+		var reg cellproxy.RegistrySource = cfg.registry
+		if cfg.signer != "" {
+			w, err := cellproxy.WatchRegistry(ctx, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
+			if err != nil {
+				return fmt.Errorf("watch registry: %w", err)
+			}
+			reg = w
+		}
+		scfg := cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log)}
+		if len(cfg.subjects) > 0 {
+			scfg.Proof = &cellproxy.ProofCheck{Registry: reg, Subjects: cfg.subjects}
+		}
+		return serveBackend(ctx, cellproxy.NewServer(scfg, backend, tel.Log), ln, backend)
 	})
 }
 
@@ -529,4 +595,77 @@ func whoami(ctx context.Context, out io.Writer) error {
 	return json.NewEncoder(out).Encode(struct {
 		IDs []string `json:"ids"`
 	}{slices.Compact(ids)})
+}
+
+var subjectName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
+
+// proofSubjectFlag parses one --proof-subject <role>=<namespace>/<service account> into subjects.
+func proofSubjectFlag(subjects map[string]record.Subject) func(string) error {
+	return func(v string) error {
+		role, rest, ok := strings.Cut(v, "=")
+		ns, sa, ok2 := strings.Cut(rest, "/")
+		if !ok || !ok2 || !subjectName.MatchString(role) || !subjectName.MatchString(ns) || !subjectName.MatchString(sa) {
+			return fmt.Errorf("%q is not <role>=<namespace>/<service account>", v)
+		}
+		if _, dup := subjects[role]; dup {
+			return fmt.Errorf("role %s is given twice", role)
+		}
+		subjects[role] = record.Subject{Namespace: ns, ServiceAccount: sa}
+		return nil
+	}
+}
+
+// mayAdmitCell reports whether the anchored pattern p can admit an ID with a cell/ path. It says
+// no only when the pattern names the /cp/ path as a literal, spells no cell/ literal, and holds no
+// element that can match a slash by itself. When it is unsure it says yes.
+func mayAdmitCell(p string) bool {
+	re, err := syntax.Parse(p, syntax.Perl)
+	if err != nil {
+		return true
+	}
+	var cp, cell, wild bool
+	var walk func(*syntax.Regexp)
+	walk = func(r *syntax.Regexp) {
+		switch r.Op {
+		case syntax.OpLiteral:
+			lit := string(r.Rune)
+			cp = cp || strings.Contains(lit, "/cp/")
+			cell = cell || strings.Contains(lit, "cell")
+		case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
+			wild = true
+		case syntax.OpCharClass:
+			for i := 0; i+1 < len(r.Rune); i += 2 {
+				if r.Rune[i] <= '/' && '/' <= r.Rune[i+1] {
+					wild = true
+				}
+			}
+		}
+		for _, s := range r.Sub {
+			walk(s)
+		}
+	}
+	walk(re)
+	return !cp || cell || wild
+}
+
+// newProofFunc makes the ProofFunc of this process: a token of the pod for the cell and role in
+// its SVID. It reads the pod identity from the environment and asks the cell API server for tokens.
+func newProofFunc(svids x509svid.Source, kc *rest.Config) (cellproxy.ProofFunc, error) {
+	svid, err := svids.GetX509SVID()
+	if err != nil {
+		return nil, fmt.Errorf("--proof: svid: %w", err)
+	}
+	src, err := cellproxy.ParseSource(svid.ID)
+	if err != nil || src.Plane != cellproxy.PlaneCell {
+		return nil, fmt.Errorf("--proof needs the SVID of a cell workload, not %s", svid.ID)
+	}
+	api, err := corev1client.NewForConfig(kc)
+	if err != nil {
+		return nil, fmt.Errorf("--proof: kubernetes client: %w", err)
+	}
+	tokens, err := satoken.PodTokenFuncFromEnv(api)
+	if err != nil {
+		return nil, fmt.Errorf("--proof: %w", err)
+	}
+	return cellproxy.NewProofWriter(tokens, src.Cell, src.Role), nil
 }

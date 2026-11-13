@@ -72,7 +72,12 @@ type tunnelOptions struct {
 	// closes the connection when the answer takes longer than pingTimeout. Zero means the default.
 	readIdle, pingTimeout time.Duration
 	log                   *slog.Logger
+	proof                 ProofFunc
 }
+
+// WithProof makes TunnelDialer run p on each new connection, after the handshake and before the
+// connection is handed to the tunnel.
+func WithProof(p ProofFunc) TunnelOption { return func(o *tunnelOptions) { o.proof = p } }
 
 // WithLogger gives the tunnel the logger for the lines that the HTTP/2 server of the cell writes.
 func WithLogger(log *slog.Logger) TunnelOption { return func(o *tunnelOptions) { o.log = log } }

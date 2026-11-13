@@ -22,6 +22,8 @@ type Client struct {
 	TLS      *tls.Config
 	Upstream string
 	Log      *slog.Logger
+	// Proof, when set, runs after the handshake and before the first payload byte.
+	Proof ProofFunc
 
 	once     sync.Once
 	refusals *refusalLog
@@ -58,6 +60,15 @@ func (c *Client) handle(ctx context.Context, down net.Conn) {
 			c.refusals.write("handshake failed", HandshakeFailed, c.Upstream, "", err)
 		}
 		return
+	}
+	if c.Proof != nil {
+		pctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
+		err := c.Proof(pctx, up)
+		cancel()
+		if err != nil {
+			c.Log.Warn("proof failed", "upstream", c.Upstream, "error", err.Error())
+			return
+		}
 	}
 	pipe(ctx, down, up)
 }
