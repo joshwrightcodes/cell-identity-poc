@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -26,8 +25,6 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/hpack"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
@@ -52,23 +49,52 @@ func mustID(t testing.TB, s string) spiffeid.ID {
 
 func jsonLog(w io.Writer) *slog.Logger { return slog.New(slog.NewJSONHandler(w, nil)) }
 
-// fakeSpec is a SpecServer.
-type fakeSpec struct {
-	mu      sync.Mutex
-	bundle  mgmtapi.SpecBundle
-	reports []mgmtapi.StatusReport
+// fakeAPI is an APIServer. reportFn replaces the default answer of Reports, which is one accepted
+// outcome for each item.
+type fakeAPI struct {
+	mu       sync.Mutex
+	bundle   mgmtapi.SpecBundle
+	reports  []mgmtapi.StatusReport
+	ops      mgmtapi.OpsBundle
+	opsCalls int
+	batches  []mgmtapi.ReportBatch
+	reportFn func(context.Context, mgmtapi.ReportBatch) mgmtapi.ReportResult
+	ctxs     []context.Context
 }
 
-func (f *fakeSpec) Spec() mgmtapi.SpecBundle { return f.bundle }
-func (f *fakeSpec) Report(r mgmtapi.StatusReport) {
+func (f *fakeAPI) Spec() mgmtapi.SpecBundle { return f.bundle }
+func (f *fakeAPI) Report(r mgmtapi.StatusReport) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reports = append(f.reports, r)
 }
-func (f *fakeSpec) got() []mgmtapi.StatusReport {
+func (f *fakeAPI) got() []mgmtapi.StatusReport {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]mgmtapi.StatusReport(nil), f.reports...)
+}
+
+func (f *fakeAPI) OpenOps() mgmtapi.OpsBundle {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.opsCalls++
+	return f.ops
+}
+
+func (f *fakeAPI) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.ReportResult {
+	f.mu.Lock()
+	f.batches = append(f.batches, b)
+	f.ctxs = append(f.ctxs, ctx)
+	fn := f.reportFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, b)
+	}
+	res := mgmtapi.ReportResult{Outcomes: []mgmtapi.ItemOutcome{}}
+	for _, it := range b.Items {
+		res.Outcomes = append(res.Outcomes, mgmtapi.ItemOutcome{ID: it.ID, Outcome: mgmtapi.OutcomeAccepted})
+	}
+	return res
 }
 
 func testBundle() mgmtapi.SpecBundle {
@@ -78,55 +104,11 @@ func testBundle() mgmtapi.SpecBundle {
 	}
 }
 
-// fakeBinder is a Binder that counts its calls.
-type fakeBinder struct {
-	mu                  sync.Mutex
-	nonceCalls, binds   int
-	nonceErr, bindErr   error
-	gate                chan struct{}
-	entered             chan struct{}
-	lastCell, lastNonce string
-}
-
-func (f *fakeBinder) Nonce(cell string) (mgmtapi.NonceResponse, error) {
-	f.mu.Lock()
-	f.nonceCalls++
-	err := f.nonceErr
-	f.lastCell = cell
-	f.mu.Unlock()
-	if err != nil {
-		return mgmtapi.NonceResponse{}, err
-	}
-	return mgmtapi.NonceResponse{Nonce: "n1", Audience: mgmtapi.BindAudience(cell, "n1"), ExpiresAt: time.Unix(1700000000, 0).UTC(), Bound: false}, nil
-}
-
-func (f *fakeBinder) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) (mgmtapi.BindResponse, error) {
-	f.mu.Lock()
-	f.binds++
-	err := f.bindErr
-	gate, entered := f.gate, f.entered
-	f.lastCell, f.lastNonce = cell, req.Nonce
-	f.mu.Unlock()
-	if entered != nil {
-		entered <- struct{}{}
-	}
-	if gate != nil {
-		select {
-		case <-gate:
-		case <-ctx.Done():
-			return mgmtapi.BindResponse{}, ctx.Err()
-		}
-	}
-	if err != nil {
-		return mgmtapi.BindResponse{}, err
-	}
-	return mgmtapi.BindResponse{Status: mgmtapi.StatusBound, Record: spec.Revision{Epoch: 1, Counter: 2}}, nil
-}
-
-func (f *fakeBinder) calls() (int, int) {
+// calls returns the number of Reports and OpenOps calls.
+func (f *fakeAPI) calls() (reports, ops int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.nonceCalls, f.binds
+	return len(f.batches), f.opsCalls
 }
 
 func do(h http.Handler, method, target string, body ...io.Reader) *httptest.ResponseRecorder {
@@ -164,7 +146,7 @@ func startAPI(t *testing.T, h http.Handler, peer func(devCA *spiffetest.CA) x509
 	if tweak != nil {
 		tweak(apiTLS)
 	}
-	api, _ := NewServers(h, http.NotFoundHandler(), apiTLS, BindServerTLS(svids))
+	api := NewServers(h, apiTLS)
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -200,7 +182,7 @@ func h2Client(t *testing.T, mgmtCA *spiffetest.CA, svid x509svid.Source) *http.C
 func (r *apiRig) specURL(env string) string { return "https://" + r.addr + mgmtapi.SpecPath(env) }
 
 func TestAPIServesSpecToEnvdOnly(t *testing.T) {
-	fs := &fakeSpec{bundle: testBundle()}
+	fs := &fakeAPI{bundle: testBundle()}
 	rig := startAPI(t, NewAPIHandler(fs, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	other := spiffetest.NewCA(t, devTD)
 
@@ -253,7 +235,7 @@ func TestAPIServesSpecToEnvdOnly(t *testing.T) {
 }
 
 func TestAPIStatusReport(t *testing.T) {
-	fs := &fakeSpec{bundle: testBundle()}
+	fs := &fakeAPI{bundle: testBundle()}
 	rig := startAPI(t, NewAPIHandler(fs, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	c := rig.client(t, rig.devCA.Source(t, envdSPIFFE))
 	url := "https://" + rig.addr + mgmtapi.StatusPath("dev")
@@ -295,7 +277,7 @@ func TestAPIStatusReport(t *testing.T) {
 }
 
 func TestAPIOtherEnv(t *testing.T) {
-	fs := &fakeSpec{bundle: testBundle()}
+	fs := &fakeAPI{bundle: testBundle()}
 	rig := startAPI(t, NewAPIHandler(fs, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	c := rig.client(t, rig.devCA.Source(t, envdSPIFFE))
 	for _, tc := range []struct{ method, path string }{
@@ -306,7 +288,14 @@ func TestAPIOtherEnv(t *testing.T) {
 		{"POST", mgmtapi.SpecPath("dev")},
 		{"GET", mgmtapi.StatusPath("dev")},
 		{"DELETE", mgmtapi.SpecPath("dev")},
-		{"POST", mgmtapi.NoncePath("dev-cell-1")},
+		{"POST", "/v1/cells/dev-cell-1/nonce"},
+		{"POST", "/v1/cells/dev-cell-1/bind"},
+		{"GET", mgmtapi.OpsPath("prod")},
+		{"POST", mgmtapi.ReportsPath("prod")},
+		{"POST", mgmtapi.OpsPath("dev")},
+		{"DELETE", mgmtapi.OpsPath("dev")},
+		{"GET", mgmtapi.ReportsPath("dev")},
+		{"PUT", mgmtapi.ReportsPath("dev")},
 	} {
 		req, _ := http.NewRequest(tc.method, "https://"+rig.addr+tc.path, strings.NewReader("{}"))
 		resp, err := c.Do(req)
@@ -321,11 +310,14 @@ func TestAPIOtherEnv(t *testing.T) {
 	if len(fs.got()) != 0 {
 		t.Fatal("a report reached the plane")
 	}
+	if nr, no := fs.calls(); nr != 0 || no != 0 {
+		t.Fatalf("%d report and %d ops calls reached the plane", nr, no)
+	}
 }
 
 func TestAPIHandlerChecksPeerID(t *testing.T) {
 	ca := spiffetest.NewCA(t, devTD)
-	h := NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard))
+	h := NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard))
 	req := func(id string) *http.Request {
 		r := httptest.NewRequest("GET", mgmtapi.SpecPath("dev"), nil)
 		if id != "" {
@@ -352,68 +344,6 @@ func TestAPIHandlerChecksPeerID(t *testing.T) {
 	}
 }
 
-func TestBindHandlerFlow(t *testing.T) {
-	logs := &lockedBuf{}
-	fb := &fakeBinder{}
-	h := NewBindHandler(fb, jsonLog(logs))
-
-	rec := do(h, "POST", mgmtapi.NoncePath("dev-cell-1"), nil)
-	if rec.Code != 200 {
-		t.Fatalf("nonce: %d %s", rec.Code, rec.Body)
-	}
-	var n mgmtapi.NonceResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &n); err != nil || n.Nonce != "n1" || n.Audience != "mgmt-bind/dev-cell-1/n1" {
-		t.Fatalf("nonce body %s: %v", rec.Body, err)
-	}
-	if rec = do(h, "POST", mgmtapi.NoncePath("dev-cell-1"), strings.NewReader("{}")); rec.Code != 200 {
-		t.Fatalf("nonce with an empty object: %d", rec.Code)
-	}
-
-	const token = "eyJTRUNSRVQtVE9LRU4tVkFMVUU.payload.sig"
-	body := marshal(t, mgmtapi.BindRequest{Nonce: "n1", Token: token})
-	rec = do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(body))
-	var br mgmtapi.BindResponse
-	if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &br) != nil || br.Status != mgmtapi.StatusBound || br.Record != (spec.Revision{Epoch: 1, Counter: 2}) {
-		t.Fatalf("bind: %d %s", rec.Code, rec.Body)
-	}
-	if fb.lastCell != "dev-cell-1" || fb.lastNonce != "n1" {
-		t.Fatalf("binder got cell %q nonce %q", fb.lastCell, fb.lastNonce)
-	}
-
-	fb.bindErr = &Error{Reason: mgmtapi.ReasonTokenInvalid, Detail: "bad_signature"}
-	rec = do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(body))
-	if rec.Code != 403 {
-		t.Fatalf("denied bind: %d", rec.Code)
-	}
-	var d mgmtapi.Denied
-	if err := json.Unmarshal(rec.Body.Bytes(), &d); err != nil || d.Error != mgmtapi.DeniedError || !reqIDRE.MatchString(d.RequestID) {
-		t.Fatalf("denied body %s: %v", rec.Body, err)
-	}
-	if strings.Contains(rec.Body.String(), "bad_signature") || strings.Contains(rec.Body.String(), "token_invalid") {
-		t.Fatalf("the body leaks the reason: %s", rec.Body)
-	}
-	line := lastLogLine(t, logs, "bind_denied")
-	if line["reason"] != mgmtapi.ReasonTokenInvalid || line["detail"] != "bad_signature" || line["cell"] != "dev-cell-1" || line["request_id"] != d.RequestID {
-		t.Fatalf("log line %v", line)
-	}
-	logs.mu.Lock()
-	logged := logs.buf.String()
-	logs.mu.Unlock()
-	if strings.Contains(logged, token) || strings.Contains(logged, "SECRET-TOKEN") {
-		t.Fatalf("the log holds the token: %s", logged)
-	}
-
-	fb.nonceErr = &Error{Reason: mgmtapi.ReasonCellUnknown}
-	if rec = do(h, "POST", mgmtapi.NoncePath("nope")); rec.Code != 403 {
-		t.Fatalf("unknown cell nonce: %d", rec.Code)
-	}
-	fb.bindErr = errors.New("disk full")
-	rec = do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(body))
-	if rec.Code != 500 || strings.Contains(rec.Body.String(), "disk") {
-		t.Fatalf("internal error: %d %s", rec.Code, rec.Body)
-	}
-}
-
 func do2(h http.Handler, method, target string) *httptest.ResponseRecorder {
 	return do(h, method, target)
 }
@@ -433,371 +363,6 @@ func lastLogLine(t *testing.T, logs *lockedBuf, msg string) map[string]any {
 		t.Fatalf("no %q line in %s", msg, logs.buf.String())
 	}
 	return found
-}
-
-func TestBindMethodAndPath(t *testing.T) {
-	fb := &fakeBinder{}
-	h := NewBindHandler(fb, jsonLog(io.Discard))
-	for _, tc := range []struct {
-		method, path string
-		want         int
-	}{
-		{"GET", mgmtapi.NoncePath("dev-cell-1"), 405},
-		{"PUT", mgmtapi.BindPath("dev-cell-1"), 405},
-		{"GET", mgmtapi.BindPath("dev-cell-1"), 405},
-		{"POST", "/", 404},
-		{"POST", "/v1/cells/dev-cell-1", 404},
-		{"POST", "/v1/cells/dev-cell-1/other", 404},
-		{"POST", "/v1/cells//bind", 404},
-		{"POST", mgmtapi.SpecPath("dev"), 404},
-		{"POST", mgmtapi.KeysPath("dev-cell-1"), 404},
-		{"GET", "/healthz", 404},
-	} {
-		if rec := do2(h, tc.method, tc.path); rec.Code != tc.want {
-			t.Errorf("%s %s: %d, want %d", tc.method, tc.path, rec.Code, tc.want)
-		}
-	}
-	if n, b := fb.calls(); n != 0 || b != 0 {
-		t.Fatalf("binder called %d, %d times", n, b)
-	}
-}
-
-func TestBindBodyLimit(t *testing.T) {
-	fb := &fakeBinder{}
-	logs := &lockedBuf{}
-	h := NewBindHandler(fb, jsonLog(logs))
-	big := marshal(t, mgmtapi.BindRequest{Nonce: "n", Token: strings.Repeat("a", 17<<10)})
-	if rec := do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(big)); rec.Code != 403 {
-		t.Fatalf("a body of %d bytes: status %d, want 403", len(big), rec.Code)
-	}
-	// A body without Content-Length is limited as well.
-	req := httptest.NewRequest("POST", mgmtapi.BindPath("dev-cell-1"), io.MultiReader(strings.NewReader(big)))
-	req.ContentLength = -1
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != 403 {
-		t.Fatalf("a streamed body: status %d, want 403", rec.Code)
-	}
-	for name, body := range map[string]string{
-		"unknown_field": `{"nonce":"n","token":"t","x":1}`,
-		"not_json":      `token`,
-		"trailing":      `{"nonce":"n","token":"t"}{}`,
-		"duplicate":     `{"nonce":"n","nonce":"m","token":"t"}`,
-		"array":         `[]`,
-	} {
-		if rec := do(h, "POST", mgmtapi.BindPath("dev-cell-1"), strings.NewReader(body)); rec.Code != 403 {
-			t.Errorf("%s: status %d, want 403", name, rec.Code)
-		}
-	}
-	if rec := do(h, "POST", mgmtapi.NoncePath("dev-cell-1"), strings.NewReader(`{"x":1}`)); rec.Code != 403 {
-		t.Errorf("nonce with a field: status %d, want 403", rec.Code)
-	}
-	if n, b := fb.calls(); n != 0 || b != 0 {
-		t.Fatalf("binder called %d nonce and %d bind times, want none", n, b)
-	}
-	logs.mu.Lock()
-	echoed := strings.Contains(logs.buf.String(), "aaaaaaaa")
-	logs.mu.Unlock()
-	if echoed {
-		t.Fatal("the log echoes the body")
-	}
-}
-
-func startBind(t *testing.T, h http.Handler) (addr string, mgmtCA *spiffetest.CA, srv *http.Server) {
-	t.Helper()
-	mgmtCA = spiffetest.NewCA(t, mgmtTD)
-	svids := mgmtCA.Source(t, mgmtSPIFFE)
-	dummy := spiffetest.NewCA(t, devTD)
-	_, bind := NewServers(http.NotFoundHandler(), h, APIServerTLS(svids, dummy.Bundle(), mustID(t, envdSPIFFE)), BindServerTLS(svids))
-	raw, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ln := ListenBind(raw, bind.TLSConfig, jsonLog(io.Discard))
-	go func() { _ = bind.Serve(ln) }()
-	t.Cleanup(func() { _ = bind.Close() })
-	return raw.Addr().String(), mgmtCA, bind
-}
-
-func rawTLS(t testing.TB, addr string, mgmtCA *spiffetest.CA, timeout time.Duration) (*tls.Conn, error) {
-	t.Helper()
-	cfg := tlsconfig.TLSClientConfig(mgmtCA.Bundle(), tlsconfig.AuthorizeID(mustID(t, mgmtSPIFFE)))
-	cfg.NextProtos = []string{"h2"}
-	d := &net.Dialer{Timeout: timeout}
-	return tls.DialWithDialer(d, "tcp", addr, cfg)
-}
-
-func TestBindStreamCap(t *testing.T) {
-	fb := &fakeBinder{gate: make(chan struct{}), entered: make(chan struct{}, 8)}
-	addr, mgmtCA, _ := startBind(t, NewBindHandler(fb, jsonLog(io.Discard)))
-	c, err := rawTLS(t, addr, mgmtCA, 5*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	cc, err := (&http2.Transport{}).NewClientConn(c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Until the server settings arrive, the client assumes a larger limit.
-	for deadline := time.Now().Add(3 * time.Second); cc.State().MaxConcurrentStreams != 2; time.Sleep(5 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("MAX_CONCURRENT_STREAMS %d, want 2", cc.State().MaxConcurrentStreams)
-		}
-	}
-	body := marshal(t, mgmtapi.BindRequest{Nonce: "n", Token: "t"})
-	send := func() <-chan error {
-		ch := make(chan error, 1)
-		go func() {
-			req, _ := http.NewRequest("POST", "https://"+addr+mgmtapi.BindPath("dev-cell-1"), strings.NewReader(body))
-			resp, err := cc.RoundTrip(req)
-			if err == nil {
-				resp.Body.Close()
-			}
-			ch <- err
-		}()
-		return ch
-	}
-	var results []<-chan error
-	for i := 0; i < 3; i++ {
-		results = append(results, send())
-	}
-	for i := 0; i < 2; i++ {
-		select {
-		case <-fb.entered:
-		case <-time.After(3 * time.Second):
-			t.Fatalf("only %d streams reached the handler", i)
-		}
-	}
-	select {
-	case <-fb.entered:
-		t.Fatal("a third concurrent stream reached the handler")
-	case <-time.After(700 * time.Millisecond):
-	}
-	if got := cc.State().MaxConcurrentStreams; got != 2 {
-		t.Fatalf("MAX_CONCURRENT_STREAMS %d, want 2", got)
-	}
-	close(fb.gate)
-	for i, ch := range results {
-		select {
-		case err := <-ch:
-			if err != nil {
-				t.Errorf("request %d: %v", i, err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Fatalf("request %d did not finish", i)
-		}
-	}
-}
-
-// slowClient holds one bind connection with a trickle of bytes. It ignores GOAWAY, as a hostile
-// client does. Mode 0 opens a new stream every 5 s and sends each body at one byte per second.
-// Mode 1 sends one header block at one byte per second. Mode 2 first sends one complete request,
-// and then behaves as mode 1 on stream 3.
-type slowClient struct {
-	err    error
-	conn   *tls.Conn
-	away   chan struct{}
-	closed chan struct{}
-}
-
-func startSlowClient(t *testing.T, addr string, mgmtCA *spiffetest.CA, mode int) *slowClient {
-	t.Helper()
-	conn, err := rawTLS(t, addr, mgmtCA, 10*time.Second)
-	if err != nil {
-		t.Fatalf("slow client: %v", err)
-	}
-	sc := &slowClient{conn: conn, away: make(chan struct{}), closed: make(chan struct{})}
-	var wmu sync.Mutex
-	fr := http2.NewFramer(conn, conn)
-	if _, err := conn.Write([]byte(http2.ClientPreface)); err != nil {
-		t.Fatal(err)
-	}
-	if err := fr.WriteSettings(); err != nil {
-		t.Fatal(err)
-	}
-	go func() {
-		defer close(sc.closed)
-		var once sync.Once
-		for {
-			f, err := fr.ReadFrame()
-			if err != nil {
-				sc.err = err
-				return
-			}
-			switch f.(type) {
-			case *http2.GoAwayFrame:
-				once.Do(func() { close(sc.away) })
-			}
-		}
-	}()
-	headers := func(pad int) []byte {
-		var buf bytes.Buffer
-		enc := hpack.NewEncoder(&buf)
-		for _, h := range [][2]string{{":method", "POST"}, {":scheme", "https"}, {":authority", addr}, {":path", mgmtapi.BindPath("dev-cell-1")}, {"content-type", "application/json"}, {"x-pad", strings.Repeat("p", pad)}} {
-			_ = enc.WriteField(hpack.HeaderField{Name: h[0], Value: h[1]})
-		}
-		return buf.Bytes()
-	}
-	locked := func(f func() error) error {
-		wmu.Lock()
-		defer wmu.Unlock()
-		return f()
-	}
-	go func() {
-		tick := time.NewTicker(time.Second)
-		defer tick.Stop()
-		var streams []uint32
-		next := uint32(1)
-		var block []byte
-		trickleStream := uint32(1)
-		if mode == 2 {
-			if err := locked(func() error {
-				return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: headers(1), EndHeaders: true, EndStream: true})
-			}); err != nil {
-				return
-			}
-			trickleStream = 3
-		}
-		if mode == 1 || mode == 2 {
-			block = headers(400)
-			if err := locked(func() error {
-				return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: trickleStream, BlockFragment: block[:1], EndHeaders: false})
-			}); err != nil {
-				return
-			}
-			block = block[1:]
-		}
-		for n := 0; ; n++ {
-			select {
-			case <-tick.C:
-			case <-sc.closed:
-				return
-			}
-			if mode == 1 || mode == 2 {
-				if len(block) == 0 {
-					return
-				}
-				if err := locked(func() error { return fr.WriteContinuation(trickleStream, false, block[:1]) }); err != nil {
-					return
-				}
-				block = block[1:]
-				continue
-			}
-			if n%5 == 0 {
-				id := next
-				next += 2
-				if err := locked(func() error {
-					return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: headers(1), EndHeaders: true})
-				}); err != nil {
-					return
-				}
-				streams = append(streams, id)
-				if len(streams) > 2 {
-					streams = streams[1:]
-				}
-			}
-			for _, id := range streams {
-				if err := locked(func() error { return fr.WriteData(id, false, []byte{'{'}) }); err != nil {
-					return
-				}
-			}
-		}
-	}()
-	return sc
-}
-
-// released reports that the server closed the connection. A GOAWAY alone does not count, because
-// the slot stays taken until the connection closes.
-func (s *slowClient) released() bool {
-	select {
-	case <-s.closed:
-		return true
-	default:
-		return false
-	}
-}
-
-// Established connections: 64 clients each send one complete request, and then trickle a header
-// block. The pending pool no longer holds them, so only the hard deadline of the connection (15 s
-// maximum age plus 10 s grace) ends them.
-func TestBindEstablishedTrickleReleased(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs for about 26 s")
-	}
-	t.Parallel()
-	addr, mgmtCA, _ := startBind(t, NewBindHandler(&fakeBinder{}, jsonLog(io.Discard)))
-	start := time.Now()
-	var slow []*slowClient
-	for i := 0; i < 64; i++ {
-		sc := startSlowClient(t, addr, mgmtCA, 2)
-		defer sc.conn.Close()
-		slow = append(slow, sc)
-	}
-	// The pending deadline of 5 s must not end them, and the hard deadline of 25 s must.
-	time.Sleep(8 * time.Second)
-	for i, sc := range slow {
-		if sc.released() {
-			t.Fatalf("established connection %d closed after %s, before the hard deadline", i, time.Since(start))
-		}
-	}
-	const limit = 15*time.Second + 10*time.Second + 2*time.Second
-	for time.Since(start) < limit {
-		all := true
-		for _, sc := range slow {
-			all = all && sc.released()
-		}
-		if all {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	for i, sc := range slow {
-		if !sc.released() {
-			t.Errorf("established connection %d was still open after %s", i, time.Since(start))
-		}
-	}
-}
-
-// TestMaxAgeSendsGoAway keeps one connection busy past the maximum age. The age counts from the
-// first request, and the switch must come before the hard deadline, so that only GOAWAY explains it.
-func TestMaxAgeSendsGoAway(t *testing.T) {
-	if testing.Short() {
-		t.Skip("runs for about 16 s")
-	}
-	addr, mgmtCA, _ := startBind(t, NewBindHandler(&fakeBinder{}, jsonLog(io.Discard)))
-	c := h2Client(t, mgmtCA, nil)
-	var first net.Conn
-	var firstAt time.Time
-	var switched time.Duration
-	for switched == 0 {
-		var got net.Conn
-		trace := &httptrace.ClientTrace{GotConn: func(i httptrace.GotConnInfo) { got = i.Conn }}
-		req, _ := http.NewRequest("POST", "https://"+addr+mgmtapi.NoncePath("dev-cell-1"), nil)
-		resp, err := c.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
-		if err != nil {
-			t.Fatalf("request at %s: %v", time.Since(firstAt), err)
-		}
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		if resp.StatusCode != 200 {
-			t.Fatalf("status %d", resp.StatusCode)
-		}
-		switch {
-		case first == nil:
-			first, firstAt = got, time.Now()
-		case got != first:
-			switched = time.Since(firstAt)
-		}
-		if time.Since(firstAt) > 25*time.Second {
-			t.Fatalf("the client was still on its first connection after %s", time.Since(firstAt))
-		}
-		time.Sleep(time.Second)
-	}
-	// GOAWAY comes with the first response after 15 s. A close by the hard deadline would come at 25 s.
-	if switched < 14*time.Second || switched > 19*time.Second {
-		t.Fatalf("the client moved to a new connection after %s, want about 15 s", switched)
-	}
 }
 
 func TestRotateKeyPublishes(t *testing.T) {
@@ -948,7 +513,7 @@ func writeBundleFile(t *testing.T, path string, ca *spiffetest.CA) {
 
 func TestAPIPeerRootLoadsLater(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "peer-root.pem")
-	fs := &fakeSpec{bundle: testBundle()}
+	fs := &fakeAPI{bundle: testBundle()}
 	var rig *apiRig
 	rig = startAPI(t, NewAPIHandler(fs, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), func(*spiffetest.CA) x509bundle.Source {
 		return FileBundleSource(path, mustID(t, envdSPIFFE).TrustDomain())

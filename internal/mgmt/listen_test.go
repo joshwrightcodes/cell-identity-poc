@@ -33,7 +33,7 @@ func silentConn(t *testing.T, addr string) net.Conn {
 // deadline.
 func TestAPIPendingBelowCapNeverDeniesEnvd(t *testing.T) {
 	setPending(t, 4, 3*time.Second, 1200*time.Millisecond)
-	rig := startAPI(t, NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
+	rig := startAPI(t, NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	envd := rig.devCA.Source(t, envdSPIFFE)
 	get := func() error {
 		resp, err := rig.client(t, envd).Get(rig.specURL("dev"))
@@ -91,7 +91,7 @@ func TestAPIPendingBelowCapNeverDeniesEnvd(t *testing.T) {
 // A trickle that sends its first byte in time still ends at the hard deadline.
 func TestAPIPendingHardDeadline(t *testing.T) {
 	setPending(t, 4, 800*time.Millisecond, 300*time.Millisecond)
-	rig := startAPI(t, NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
+	rig := startAPI(t, NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 	c := silentConn(t, rig.addr)
 	if _, err := c.Write([]byte{0x16}); err != nil {
 		t.Fatal(err)

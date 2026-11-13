@@ -76,3 +76,32 @@ func TestResetStateRefusesAnExistingTarget(t *testing.T) {
 		t.Fatal("an existing target was overwritten")
 	}
 }
+
+// A staged key that survives a reset would become a trusted signer of the new state (B-02), so reset
+// moves it aside with the stamp of the other files.
+func TestResetStateMovesTheStagedKeyAside(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{"state.json": "{}", "ed25519.key": "KEY", "ed25519.next.key": "NEXT"}
+	for n, body := range files {
+		must(t, os.WriteFile(filepath.Join(dir, n), []byte(body), 0o400))
+	}
+	moved, err := resetState(dir, resetNow())
+	if err != nil || len(moved) != 3 {
+		t.Fatalf("moved %v, err %v", moved, err)
+	}
+	for n, body := range files {
+		if _, err := os.Stat(filepath.Join(dir, n)); !os.IsNotExist(err) {
+			t.Fatalf("%s still in place: %v", n, err)
+		}
+		if b, err := os.ReadFile(filepath.Join(dir, n+".reset-1700000000")); err != nil || string(b) != body {
+			t.Fatalf("%s moved content %q, err %v", n, b, err)
+		}
+	}
+	// With no staged key, the reset moves the other two files and finds nothing to complain about.
+	dir = t.TempDir()
+	must(t, os.WriteFile(filepath.Join(dir, "state.json"), []byte("{}"), 0o600))
+	must(t, os.WriteFile(filepath.Join(dir, "ed25519.key"), []byte("KEY"), 0o400))
+	if moved, err = resetState(dir, resetNow()); err != nil || len(moved) != 2 {
+		t.Fatalf("moved %v, err %v", moved, err)
+	}
+}

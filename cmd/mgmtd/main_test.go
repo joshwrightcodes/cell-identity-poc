@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -90,7 +92,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { _ = os.RemoveAll(f.sockDir) })
 	f.args = map[string]string{
 		"intent": intent, "data-dir": filepath.Join(f.dir, "data"),
-		"api-listen": "127.0.0.1:0", "bind-listen": "127.0.0.1:0", "health-listen": "127.0.0.1:0",
+		"api-listen": "127.0.0.1:0", "health-listen": "127.0.0.1:0",
 		"admin-socket": filepath.Join(f.sockDir, "a.sock"), "peer-bundle": bundle,
 		"peer-trust-domain": "dev.env.poc.internal", "allow-id": envdID,
 		"hostsvc-addr": "127.0.0.1:1", "hostsvc-server-name": "host.docker.internal", "hostsvc-pin": pin,
@@ -183,7 +185,7 @@ func (f *fixture) start(t *testing.T) *running {
 			var m map[string]any
 			if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == "listening" {
 				r.addrs = map[string]string{}
-				for _, k := range []string{"api", "bind", "health", "admin"} {
+				for _, k := range []string{"api", "health", "admin"} {
 					r.addrs[k], _ = m[k].(string)
 				}
 				return r
@@ -263,17 +265,23 @@ func TestServeEndToEnd(t *testing.T) {
 		t.Fatalf("spec: %d", resp.StatusCode)
 	}
 
-	// The bind listener answers a cell with server-only TLS and the SVID of mgmtd.
-	bcfg := tlsconfig.TLSClientConfig(f.mgmtCA.Bundle(), auth)
-	btr := &http.Transport{TLSClientConfig: bcfg, ForceAttemptHTTP2: true}
-	defer btr.CloseIdleConnections()
-	resp, err = (&http.Client{Transport: btr, Timeout: 5 * time.Second}).Post("https://"+r.addrs["bind"]+mgmtapi.NoncePath("dev-cell-1"), "application/json", nil)
+	// envd pulls the open operations and the cell nonces, and posts a report batch.
+	ac := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	resp, err = ac.Get("https://" + r.addrs["api"] + mgmtapi.OpsPath("dev"))
 	must(t, err)
-	var nonce mgmtapi.NonceResponse
-	must(t, json.NewDecoder(resp.Body).Decode(&nonce))
+	var ops mgmtapi.OpsBundle
+	must(t, json.NewDecoder(resp.Body).Decode(&ops))
 	resp.Body.Close()
-	if resp.StatusCode != 200 || nonce.Bound {
-		t.Fatalf("nonce: %d %+v", resp.StatusCode, nonce)
+	if resp.StatusCode != 200 || len(ops.Cells) != 1 || ops.Cells[0].Name != "dev-cell-1" || ops.Cells[0].Nonce == "" || ops.Cells[0].Bound {
+		t.Fatalf("ops: %d %+v", resp.StatusCode, ops)
+	}
+	resp, err = ac.Post("https://"+r.addrs["api"]+mgmtapi.ReportsPath("dev"), "application/json", strings.NewReader(`{"items":[{"id":"x","cell":"dev-cell-1","kind":"weird","body":{},"token":""}]}`))
+	must(t, err)
+	var rr mgmtapi.ReportResult
+	must(t, json.NewDecoder(resp.Body).Decode(&rr))
+	resp.Body.Close()
+	if resp.StatusCode != 200 || len(rr.Outcomes) != 1 || rr.Outcomes[0].ID != "x" || rr.Outcomes[0].Outcome != mgmtapi.OutcomeRefused {
+		t.Fatalf("reports: %d %+v", resp.StatusCode, rr)
 	}
 
 	// The admin socket has mode 0600, and ctl reads the public key through it.
@@ -346,7 +354,7 @@ func mustSPIFFE(t testing.TB, s string) spiffeid.ID {
 }
 
 // Every line on stdout is JSON, and nothing reaches the standard logger, which writes to stderr.
-// A refused handshake on each listener produces a line on stdout.
+// A refused handshake and a verified client that sends no HTTP/2 each produce a line on stdout.
 func TestLogsAreJSON(t *testing.T) {
 	var stderr lockedBuffer
 	log.SetOutput(&stderr)
@@ -357,11 +365,15 @@ func TestLogsAreJSON(t *testing.T) {
 	must(t, err)
 	_, _ = c.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
 	_ = c.Close()
-	bc, err := net.Dial("tcp", r.addrs["bind"])
+	auth := tlsconfig.AuthorizeID(mustSPIFFE(t, mgmtID))
+	cfg := tlsconfig.MTLSClientConfig(f.devCA.Source(t, envdID), f.mgmtCA.Bundle(), auth)
+	cfg.NextProtos = []string{"h2"}
+	tc, err := tls.Dial("tcp", r.addrs["api"], cfg)
 	must(t, err)
-	_, _ = bc.Write([]byte("GET / HTTP/1.1\r\n\r\n"))
-	_, _ = io.Copy(io.Discard, bc)
-	_ = bc.Close()
+	// The preface, then a SETTINGS frame on stream 1, which is a connection error.
+	_, _ = tc.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x01"))
+	_, _ = io.Copy(io.Discard, tc)
+	_ = tc.Close()
 	deadline := time.Now().Add(3 * time.Second)
 	for !strings.Contains(r.out.String(), `"msg":"server_error"`) || !strings.Contains(r.out.String(), `"msg":"handshake_refused"`) {
 		if time.Now().After(deadline) {
@@ -370,7 +382,7 @@ func TestLogsAreJSON(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	r.stop(t)
-	if len(jsonLines(t, r.out.String())) < 4 {
+	if len(jsonLines(t, r.out.String())) < 3 {
 		t.Fatalf("too few lines: %s", r.out.String())
 	}
 	if stderr.String() != "" {
@@ -561,3 +573,182 @@ func TestServeStartsTelemetryWithEndpoint(t *testing.T) {
 }
 
 var _ = x509.NewCertPool
+
+// The M4 bind listener is gone: no flag, no port, no log field.
+func TestBindListenerRemoved(t *testing.T) {
+	f := newFixture(t)
+	currentT = t
+	var out bytes.Buffer
+	argv := append(f.argv(), "--bind-listen", "127.0.0.1:0")
+	code := execute(t.Context(), argv, &out, f.deps())
+	lines := jsonLines(t, out.String())
+	if code != exitConfig || len(lines) != 1 || !strings.Contains(lines[0]["error"].(string), "bind-listen") {
+		t.Fatalf("--bind-listen: exit %d, output %q", code, out.String())
+	}
+	r := f.start(t)
+	for _, l := range jsonLines(t, r.out.String()) {
+		if l["msg"] != "listening" {
+			continue
+		}
+		if _, ok := l["bind"]; ok {
+			t.Fatalf("the listening line names a bind address: %v", l)
+		}
+	}
+	// Only the API, the health and the admin listeners exist, and a bind post to the API is a 404.
+	auth := tlsconfig.AuthorizeID(mustSPIFFE(t, mgmtID))
+	tr := &http.Transport{TLSClientConfig: tlsconfig.MTLSClientConfig(f.devCA.Source(t, envdID), f.mgmtCA.Bundle(), auth), ForceAttemptHTTP2: true}
+	defer tr.CloseIdleConnections()
+	for _, p := range []string{"/v1/cells/dev-cell-1/nonce", "/v1/cells/dev-cell-1/bind"} {
+		resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Post("https://"+r.addrs["api"]+p, "application/json", strings.NewReader("{}"))
+		must(t, err)
+		resp.Body.Close()
+		if resp.StatusCode != 404 {
+			t.Fatalf("POST %s: %d, want 404", p, resp.StatusCode)
+		}
+	}
+}
+
+// --registry-namespaces defaults to empty, and an empty list publishes nothing.
+func TestRegistryNamespacesDefaultEmpty(t *testing.T) {
+	f := newFixture(t)
+	cfg, err := parseServe(f.argv()[1:])
+	must(t, err)
+	if len(cfg.registryNamespaces) != 0 {
+		t.Fatalf("namespaces %v", cfg.registryNamespaces)
+	}
+	var writes atomic.Int32
+	f.kube.PrependReactor("*", "configmaps", func(a ktesting.Action) (bool, runtime.Object, error) {
+		if a.GetNamespace() != "mgmt-system" {
+			writes.Add(1)
+		}
+		return false, nil, nil
+	})
+	r := f.start(t)
+	time.Sleep(300 * time.Millisecond)
+	r.stop(t)
+	if writes.Load() != 0 {
+		t.Fatalf("%d configmap calls outside mgmt-system with no namespace set", writes.Load())
+	}
+	for list, want := range map[string][]string{
+		"central-view-system,observability-system,mesh-view-system": {"central-view-system", "observability-system", "mesh-view-system"},
+		" a , b,a": {"a", "b"},
+	} {
+		got, err := parseNamespaces(list)
+		if err != nil || !slices.Equal(got, want) {
+			t.Errorf("%q: %v, %v", list, got, err)
+		}
+	}
+	for _, bad := range []string{"a,,b", "Bad", "a/b", "-a", strings.Repeat("a", 64)} {
+		if _, err := parseNamespaces(bad); err == nil {
+			t.Errorf("%q was accepted", bad)
+		}
+	}
+}
+
+// With namespaces set, serve publishes the registry to each, and follows a commit of the plane.
+func TestServePublishesRegistry(t *testing.T) {
+	f := newFixture(t)
+	f.args["registry-namespaces"] = "central-view-system,mesh-view-system"
+	r := f.start(t)
+	get := func(ns string) (*metav1.ObjectMeta, map[string]string, bool) {
+		cm, err := f.kube.CoreV1().ConfigMaps(ns).Get(t.Context(), "cell-registry", metav1.GetOptions{})
+		if err != nil {
+			return nil, nil, false
+		}
+		return &cm.ObjectMeta, cm.Data, true
+	}
+	pubOf := func() string {
+		var out bytes.Buffer
+		if code := execute(t.Context(), []string{"ctl", "--socket", f.args["admin-socket"], "pubkey"}, &out, f.deps()); code != 0 {
+			t.Fatalf("ctl pubkey: %d %s", code, out.String())
+		}
+		var pk map[string]string
+		must(t, json.Unmarshal(out.Bytes(), &pk))
+		return pk["spec.pub"]
+	}
+	waitFor(t, "ConfigMap cell-registry in each namespace", func() bool {
+		_, _, a := get("central-view-system")
+		_, _, b := get("mesh-view-system")
+		return a && b
+	})
+	if _, _, ok := get("observability-system"); ok {
+		t.Fatal("a namespace that is not in the list got a registry")
+	}
+	meta, _, _ := get("central-view-system")
+	if len(meta.Labels) != 1 || meta.Labels["poc.internal/made-by"] != "mgmtd" {
+		t.Fatalf("labels %v", meta.Labels)
+	}
+	// A rotation commits at once, and the registry follows it without a restart.
+	var out bytes.Buffer
+	if code := execute(t.Context(), []string{"ctl", "--socket", f.args["admin-socket"], "rotate-key", "--emergency"}, &out, f.deps()); code != 0 {
+		t.Fatalf("rotate: %d %s", code, out.String())
+	}
+	newPub := pubOf()
+	waitFor(t, "the registry to carry the new key", func() bool {
+		_, d, ok := get("mesh-view-system")
+		return ok && strings.TrimSpace(d["signers.pub"]) == newPub
+	})
+	r.stop(t)
+}
+
+// Readiness does not depend on the registry publish: a stuck write leaves /healthz at 200.
+func TestHealthzStaysUpWhileRegistryPublishIsStuck(t *testing.T) {
+	f := newFixture(t)
+	f.args["registry-namespaces"] = "central-view-system"
+	gate := make(chan struct{})
+	var stuck atomic.Int32
+	f.kube.PrependReactor("*", "configmaps", func(a ktesting.Action) (bool, runtime.Object, error) {
+		if a.GetNamespace() == "central-view-system" {
+			stuck.Add(1)
+			<-gate
+		}
+		return false, nil, nil
+	})
+	defer close(gate)
+	r := f.start(t)
+	waitFor(t, "a stuck registry write", func() bool { return stuck.Load() > 0 })
+	resp, err := http.Get("http://" + r.addrs["health"] + "/healthz")
+	must(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("/healthz %d while the registry publish is stuck", resp.StatusCode)
+	}
+}
+
+// A staged key reaches next.pub, and the commit takes it out again.
+func TestServeStageThenCommitPublishesNextPub(t *testing.T) {
+	f := newFixture(t)
+	r := f.start(t)
+	ctl := func(args ...string) map[string]any {
+		t.Helper()
+		var out bytes.Buffer
+		if code := execute(t.Context(), append([]string{"ctl", "--socket", f.args["admin-socket"]}, args...), &out, f.deps()); code != 0 {
+			t.Fatalf("ctl %v: %d %s", args, code, out.String())
+		}
+		var m map[string]any
+		must(t, json.Unmarshal(out.Bytes(), &m))
+		return m
+	}
+	data := func() map[string]string {
+		cm, err := f.kube.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "mgmt-signing-pub", metav1.GetOptions{})
+		must(t, err)
+		return cm.Data
+	}
+	waitFor(t, "spec.pub", func() bool {
+		cm, err := f.kube.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "mgmt-signing-pub", metav1.GetOptions{})
+		return err == nil && cm.Data["spec.pub"] != ""
+	})
+	old := data()["spec.pub"]
+	staged := ctl("rotate-key", "--stage")
+	if d := data(); len(d) != 2 || d["spec.pub"] != old || d["next.pub"] != staged["next.pub"] {
+		t.Fatalf("after the stage: %v, stage answer %v", d, staged)
+	}
+	committed := ctl("rotate-key", "--commit")
+	if committed["spec.pub"] != staged["next.pub"] {
+		t.Fatalf("commit answer %v, staged %v", committed, staged)
+	}
+	if d := data(); len(d) != 1 || d["spec.pub"] != staged["next.pub"] {
+		t.Fatalf("after the commit: %v", d)
+	}
+	r.stop(t)
+}
