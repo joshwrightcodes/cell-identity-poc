@@ -235,10 +235,30 @@ func TestFinalOutcomesCursor(t *testing.T) {
 	if len(again) != 0 || cur2 != cur {
 		t.Fatalf("a read after the cursor gave %+v, %d", again, cur2)
 	}
-	// A new stream starts at cursor 0: the final outcome returns again, the retry outcome does not.
+	// FinalOutcomes deletes nothing: a new stream reads both outcomes again.
 	fresh, _, _ := f.s.FinalOutcomes(ctx, cell1, 0)
+	if len(fresh) != 2 {
+		t.Fatalf("second stream read %+v, want both outcomes", fresh)
+	}
+	// ForgetRetries drops the retry outcomes of that cell up to the cursor, and only those.
+	if err := f.s.ForgetRetries(ctx, cell2, cur); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, _, _ = f.s.FinalOutcomes(ctx, cell1, 0); len(fresh) != 2 {
+		t.Fatalf("a forget for another cell removed outcomes: %+v", fresh)
+	}
+	if err := f.s.ForgetRetries(ctx, cell1, cur-1); err != nil {
+		t.Fatal(err)
+	}
+	if fresh, _, _ = f.s.FinalOutcomes(ctx, cell1, 0); len(fresh) != 2 {
+		t.Fatalf("a forget below the cursor removed the retry: %+v", fresh)
+	}
+	if err := f.s.ForgetRetries(ctx, cell1, cur); err != nil {
+		t.Fatal(err)
+	}
+	fresh, _, _ = f.s.FinalOutcomes(ctx, cell1, 0)
 	if len(fresh) != 1 || fresh[0].Outcome != mgmtapi.OutcomeAccepted {
-		t.Fatalf("second stream read %+v, want only the final outcome", fresh)
+		t.Fatalf("after ForgetRetries %+v, want only the final outcome", fresh)
 	}
 	r3 := f.appendItem(item(gwapi.KindResult, cell1, opID(4), 1))
 	if err := f.s.Ack(ctx, ackAccepted(r3)); err != nil {
@@ -250,5 +270,40 @@ func TestFinalOutcomesCursor(t *testing.T) {
 	}
 	if _, ok, _ := f.s.Outcome(ctx, cell1, b); !ok {
 		t.Fatal("a bind outcome is still readable by ID")
+	}
+}
+
+func TestOutboxStatusDropStaysInCell(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.s.maxItems = 3
+	for range 3 {
+		f.appendItem(item(gwapi.KindStatus, cell2, "", 1))
+	}
+	for _, kind := range []string{gwapi.KindResult, gwapi.KindStatus} {
+		if _, err := f.s.Append(ctx, item(kind, cell1, opID(1), 1)); !errors.Is(err, gwapi.ErrOverloaded) {
+			t.Fatalf("%s of cell 1 into an outbox full of cell 2 status items: %v", kind, err)
+		}
+	}
+	if got, _ := f.s.Peek(ctx, 10, 1<<20); len(got) != 3 {
+		t.Fatalf("outbox holds %d items, want the 3 status items of cell 2", len(got))
+	}
+}
+
+func TestOutboxRefusalRollsBackDrops(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.s.maxBytes = 2500
+	s1 := f.appendItem(item(gwapi.KindStatus, cell1, "", 1))
+	r1 := f.appendItem(item(gwapi.KindResult, cell1, opID(1), 2000))
+	if _, err := f.s.Append(ctx, item(gwapi.KindResult, cell1, opID(2), 2000)); !errors.Is(err, gwapi.ErrOverloaded) {
+		t.Fatalf("a result that needs more than the status item frees: %v", err)
+	}
+	got, _ := f.s.Peek(ctx, 10, 1<<20)
+	if len(got) != 2 || got[0].ID != s1 || got[1].ID != r1 {
+		t.Fatalf("outbox %+v: the refusal must not keep the drop", got)
+	}
+	if st, _ := f.s.Stats(ctx); st.Dropped != 0 {
+		t.Fatalf("dropped %d, want 0", st.Dropped)
 	}
 }

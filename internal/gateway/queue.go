@@ -7,14 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
-// Lease is one claimed operation. ID names the queue row for the life of the row, so a result
-// finds its row after a later claim has given the row a new fence.
+// Lease is one claimed operation. ID is the store ID of the database file and the queue row ID.
+// It stays the same for the life of the row, so a result finds its row after a later claim has
+// given the row a new fence, and a lease from another file never matches a row.
 type Lease struct {
 	ID       string
 	OpID     string
@@ -28,6 +30,10 @@ type Lease struct {
 // lower stored key epoch takes the new bytes and keeps its lease and fence; other different bytes
 // give gwapi.ErrEnvelopeConflict. added is true only for a new row. The subscribers of cell get a
 // signal when the queue changes.
+//
+// A done row meets a re-signed envelope of a higher key epoch after a key rotation, when its result
+// has not yet reached the management plane. That gives ErrEnvelopeConflict for that operation. It
+// is an expected event of one operation and not a failed sync.
 func (s *Store) Enqueue(ctx context.Context, cell string, envelope []byte) (id string, added bool, err error) {
 	id, keyEpoch, err := peekFor(cell, envelope)
 	if err != nil {
@@ -122,13 +128,17 @@ func (s *Store) Claim(ctx context.Context, cell, holder string) (*Lease, error) 
 		if err != nil {
 			return err
 		}
-		f := op.Fence{Epoch: s.Epoch(), Counter: uint64(counter)}
+		epoch, err := metaInt(tx, "epoch")
+		if err != nil {
+			return err
+		}
+		f := op.Fence{Epoch: uint64(epoch), Counter: uint64(counter)}
 		until := now.Add(LeaseTTL)
 		if _, err := tx.Exec(`UPDATE queue SET holder = ?, lease_until = ?, fence_epoch = ?, fence_counter = ?, claims = claims + 1
 			WHERE seq = ?`, holder, until.UnixNano(), f.Epoch, f.Counter, seq); err != nil {
 			return err
 		}
-		l = &Lease{ID: strconv.FormatInt(seq, 10), OpID: opID, Envelope: env, Fence: f, Until: until.UTC()}
+		l = &Lease{ID: s.storeID + "." + strconv.FormatInt(seq, 10), OpID: opID, Envelope: env, Fence: f, Until: until.UTC()}
 		return nil
 	})
 	if err != nil {
@@ -140,7 +150,9 @@ func (s *Store) Claim(ctx context.Context, cell, holder string) (*Lease, error) 
 // CompleteWithItem appends the result item and finds the queue row by leaseID, never by it.OpID.
 // It marks the row done when f is at or above the lease fence of the row. It returns
 // gwapi.ErrLeaseLost, with the item still appended and its ID returned, only when a live lease
-// holds a higher fence. An empty leaseID only appends.
+// holds a higher fence. A call only appends, and never marks a row, when leaseID is empty, does not
+// parse, names another store file, names a row of another cell, or when it.OpID is not empty and
+// differs from the op ID of the row.
 func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it gwapi.Item, f op.Fence) (gwapi.ItemID, error) {
 	if it.Cell != cell {
 		return "", fmt.Errorf("complete: item is for cell %q, not %q", it.Cell, cell)
@@ -156,20 +168,25 @@ func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it g
 		if leaseID == "" {
 			return nil
 		}
-		seq, err := strconv.ParseInt(leaseID, 10, 64)
-		if err != nil {
+		seq, ok := s.parseLease(cell, leaseID)
+		if !ok {
 			return nil
 		}
 		var cur op.Fence
 		var until int64
 		var done bool
-		err = tx.QueryRow(`SELECT fence_epoch, fence_counter, lease_until, done FROM queue WHERE seq = ? AND cell = ?`, seq, cell).
-			Scan(&cur.Epoch, &cur.Counter, &until, &done)
+		var rowOp string
+		err = tx.QueryRow(`SELECT fence_epoch, fence_counter, lease_until, done, op_id FROM queue WHERE seq = ? AND cell = ?`, seq, cell).
+			Scan(&cur.Epoch, &cur.Counter, &until, &done, &rowOp)
 		if errors.Is(err, sql.ErrNoRows) || (err == nil && done) {
 			return nil
 		}
 		if err != nil {
 			return err
+		}
+		if it.OpID != "" && it.OpID != rowOp {
+			s.log.Warn("lease_op_mismatch", "cell", cell, "lease_op", rowOp, "item_op", it.OpID)
+			return nil
 		}
 		if f.Compare(cur) < 0 && until > s.now().UnixNano() {
 			lost = true
@@ -231,4 +248,24 @@ func (s *Store) Prune(ctx context.Context) error {
 		_, err := tx.Exec(`DELETE FROM outcomes WHERE at < ?`, now.Add(-OutcomeRetention).UnixNano())
 		return err
 	})
+}
+
+// parseLease returns the row ID of a lease ID of this store file. It logs the other cases, which
+// only append.
+func (s *Store) parseLease(cell, leaseID string) (int64, bool) {
+	id, rest, found := strings.Cut(leaseID, ".")
+	if !found {
+		s.log.Warn("lease_id_invalid", "cell", cell)
+		return 0, false
+	}
+	seq, err := strconv.ParseInt(rest, 10, 64)
+	if err != nil {
+		s.log.Warn("lease_id_invalid", "cell", cell)
+		return 0, false
+	}
+	if id != s.storeID {
+		s.log.Warn("lease_other_store", "cell", cell)
+		return 0, false
+	}
+	return seq, true
 }

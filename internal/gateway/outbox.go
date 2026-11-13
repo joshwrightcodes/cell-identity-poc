@@ -142,8 +142,8 @@ func (s *Store) Ack(ctx context.Context, outcomes []mgmtapi.ItemOutcome) error {
 			if _, err := tx.Exec(`DELETE FROM outbox WHERE seq = ?`, seq); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(`INSERT OR REPLACE INTO outcomes (seq, id, cell, op_id, body, at) VALUES (?, ?, ?, ?, ?, ?)`,
-				seq, o.ID, cell, opID, body, at); err != nil {
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO outcomes (seq, id, cell, op_id, outcome, body, at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				seq, o.ID, cell, opID, o.Outcome, body, at); err != nil {
 				return err
 			}
 		}
@@ -176,15 +176,19 @@ func (s *Store) Outcome(ctx context.Context, cell string, id gwapi.ItemID) (mgmt
 
 // FinalOutcomes returns the outcomes of the result items of cell with an outbox row ID above
 // after, oldest first, at most 100, and the highest row ID that it returned (after when it
-// returned none). The stream keeps that cursor. An outcome of retry is deleted as it is returned,
-// because the cell sends the result again.
+// returned none). The stream keeps that cursor. It deletes nothing: after the stream has written
+// the frames, it calls ForgetRetries with the cursor.
+//
+// The cursor is the outbox row ID, which follows the order of Peek. Peek returns the oldest prefix,
+// one Ack stores the outcomes of a whole batch in one transaction, and the row ID is AUTOINCREMENT,
+// so a later batch has only higher IDs. An outcome below the cursor can appear only when a caller
+// breaks that order, for example with a partial ack, and the resend of the cell then heals it.
 func (s *Store) FinalOutcomes(ctx context.Context, cell string, after int64) ([]mgmtapi.ItemOutcome, int64, error) {
 	var outs []mgmtapi.ItemOutcome
 	cursor := after
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		outs, cursor = nil, after
-		var retry []int64
-		err := scanRows(tx, `SELECT seq, body FROM outcomes WHERE cell = ? AND op_id != '' AND seq > ? ORDER BY seq LIMIT 100`,
+		return scanRows(tx, `SELECT seq, body FROM outcomes WHERE cell = ? AND op_id != '' AND seq > ? ORDER BY seq LIMIT 100`,
 			func(r *sql.Rows) error {
 				var seq int64
 				var body []byte
@@ -197,23 +201,21 @@ func (s *Store) FinalOutcomes(ctx context.Context, cell string, after int64) ([]
 				}
 				outs = append(outs, o)
 				cursor = seq
-				if o.Outcome == mgmtapi.OutcomeRetry {
-					retry = append(retry, seq)
-				}
 				return nil
 			}, cell, after)
-		if err != nil {
-			return err
-		}
-		for _, seq := range retry {
-			if _, err := tx.Exec(`DELETE FROM outcomes WHERE seq = ?`, seq); err != nil {
-				return err
-			}
-		}
-		return nil
 	})
 	if err != nil {
 		return nil, after, err
 	}
 	return outs, cursor, nil
+}
+
+// ForgetRetries deletes the retry outcomes of cell with an outbox row ID up to upTo. The stream
+// calls it with the cursor of FinalOutcomes after it wrote the frames, because the cell then sends
+// the result again.
+func (s *Store) ForgetRetries(ctx context.Context, cell string, upTo int64) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.Exec(`DELETE FROM outcomes WHERE cell = ? AND seq <= ? AND op_id != '' AND outcome = ?`, cell, upTo, mgmtapi.OutcomeRetry)
+		return err
+	})
 }

@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -207,6 +208,13 @@ func TestEnqueueReplacesHigherKeyEpoch(t *testing.T) {
 	}
 	if d, _ := f.s.Depth(ctx, cell); d != 2 {
 		t.Fatalf("depth %d, want 2: a replacement adds no row", d)
+	}
+	if again, _ := f.s.Claim(ctx, cell, "pod-2"); again != nil {
+		t.Fatalf("the replacement dropped the live lease: %+v", again)
+	}
+	older := op.Fence{Epoch: l.Fence.Epoch, Counter: l.Fence.Counter - 1}
+	if _, err := f.s.CompleteWithItem(ctx, cell, l.ID, resultItem(cell, l.OpID), older); !errors.Is(err, gwapi.ErrLeaseLost) {
+		t.Fatalf("the replacement dropped the fence: a lower fence gave %v", err)
 	}
 	if _, err := f.s.CompleteWithItem(ctx, cell, l.ID, resultItem(cell, l.OpID), l.Fence); err != nil {
 		t.Fatalf("the holder of the replaced item keeps its fence: %v", err)
@@ -434,5 +442,109 @@ func TestPruneDone(t *testing.T) {
 	f.s.Prune(ctx)
 	if _, added, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(1), cell1, 1)); err != nil || !added {
 		t.Fatalf("a done item older than 24 h was kept: %v, %v", added, err)
+	}
+}
+
+func TestCompleteLeaseFromOtherStore(t *testing.T) {
+	ctx := context.Background()
+	a := newFixture(t)
+	a.enqueue(1, cell1)
+	la, _ := a.s.Claim(ctx, cell1, "pod")
+	// The store is wiped and made again: row 1 now holds another operation of the same cell.
+	b := newFixture(t)
+	b.enqueue(2, cell1)
+	if _, err := b.s.CompleteWithItem(ctx, cell1, la.ID, resultItem(cell1, la.OpID), la.Fence); err != nil {
+		t.Fatal(err)
+	}
+	// A result with no op ID cannot be told apart by the op ID guard: the store ID alone must refuse it.
+	if _, err := b.s.CompleteWithItem(ctx, cell1, la.ID, resultItem(cell1, ""), la.Fence); err != nil {
+		t.Fatal(err)
+	}
+	lb, _ := b.s.Claim(ctx, cell1, "pod")
+	if lb == nil || lb.OpID != opID(2) {
+		t.Fatalf("a lease of another store file marked the new row done: %+v", lb)
+	}
+	if items, _ := b.s.Peek(ctx, 10, 1<<20); len(items) != 2 {
+		t.Fatalf("the resent results were not appended: %d items", len(items))
+	}
+}
+
+func TestCompleteOtherOpIDIsResend(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	l, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l.ID, resultItem(cell1, opID(77)), l.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatal("a result for another op ID marked the row done")
+	}
+}
+
+func TestCompleteUnparsableLeaseIsResend(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	f.s.Claim(ctx, cell1, "pod")
+	for _, id := range []string{"x", "1", f.s.storeID + ".x", "."} {
+		if _, err := f.s.CompleteWithItem(ctx, cell1, id, resultItem(cell1, ""), op.Fence{Epoch: 1 << 40, Counter: 1}); err != nil {
+			t.Fatalf("lease %q: %v", id, err)
+		}
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatal("an unparsable lease marked a row done")
+	}
+	if !strings.Contains(f.logs.String(), `"msg":"lease_id_invalid"`) || !strings.Contains(f.logs.String(), cell1) {
+		t.Fatalf("no warn log for an unparsable lease: %s", f.logs.String())
+	}
+}
+
+func TestCompleteOtherCellRow(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell2)
+	l2, _ := f.s.Claim(ctx, cell2, "pod")
+	high := op.Fence{Epoch: l2.Fence.Epoch + 1, Counter: 1 << 40}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l2.ID, resultItem(cell1, ""), high); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell2); d != 1 {
+		t.Fatal("a pod of cell 1 completed a row of cell 2")
+	}
+}
+
+func TestQueueLateCompletionExpiredLease(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod-a")
+	f.clk.Advance(61 * time.Second)
+	b, _ := f.s.Claim(ctx, cell1, "pod-b")
+	f.clk.Advance(61 * time.Second)
+	if b.Fence.Compare(a.Fence) <= 0 {
+		t.Fatal("test setup: fence did not rise")
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence); err != nil {
+		t.Fatalf("a result under an expired lease of a higher fence: %v", err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatal("the late result did not mark the row done")
+	}
+}
+
+func TestClaimReadsEpochInTransaction(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	old := f.s.Epoch()
+	if err := f.s.RaiseEpoch(ctx, op.Fence{Epoch: old + 5}); err != nil {
+		t.Fatal(err)
+	}
+	// The window between the commit of RaiseEpoch and the memory update: memory holds the old epoch.
+	f.s.epoch.Store(old)
+	l, _ := f.s.Claim(ctx, cell1, "pod")
+	if l == nil || l.Fence.Epoch != old+6 {
+		t.Fatalf("claim fence %+v, want epoch %d", l, old+6)
 	}
 }

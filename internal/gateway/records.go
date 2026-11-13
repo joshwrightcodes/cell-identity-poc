@@ -30,6 +30,12 @@ var (
 	ErrRecordOld = errors.New("record revision is below its mark")
 	// ErrRecordConflict means another record has the revision of the mark of its cell.
 	ErrRecordConflict = errors.New("another record has the revision of the mark")
+	// ErrEnvMismatch means the spec env differs from the env of the stored spec.
+	ErrEnvMismatch = errors.New("spec env differs from the stored spec")
+	// ErrMarkUnlisted means a cell with a mark is in neither list of the spec.
+	ErrMarkUnlisted = errors.New("cell has a mark and is in neither list of the spec")
+	// ErrRetiredBelowMark means a retired revision is below the mark of its cell.
+	ErrRetiredBelowMark = errors.New("retired revision is below the mark of the cell")
 	// ErrRecordUnindexed means the bundle has a record that the spec does not index.
 	ErrRecordUnindexed = errors.New("bundle has a record that the spec does not index")
 )
@@ -84,7 +90,7 @@ func (s *Store) resetOnKeyChange(tx *sql.Tx, fp string) error {
 	if stored != "" {
 		s.log.Warn("state_reset", "stored_key_sha256", stored, "pinned_key_sha256", fp)
 	}
-	for _, q := range []string{`DELETE FROM records`, `DELETE FROM marks`, `DELETE FROM meta WHERE key IN ('spec_envelope', 'spec_sha256', 'spec_epoch', 'spec_counter')`} {
+	for _, q := range []string{`DELETE FROM records`, `DELETE FROM marks`, `DELETE FROM meta WHERE key IN ('spec_envelope', 'spec_sha256', 'spec_env', 'spec_epoch', 'spec_counter')`} {
 		if _, err := tx.Exec(q); err != nil {
 			return err
 		}
@@ -111,6 +117,13 @@ func (s *Store) applySync(tx *sql.Tx, specEnvelope []byte, records map[string]js
 	curSHA, err := metaString(tx, "spec_sha256")
 	if err != nil {
 		return nil, err
+	}
+	curEnv, err := metaString(tx, "spec_env")
+	if err != nil {
+		return nil, err
+	}
+	if curEnv != "" && curEnv != sp.Env {
+		return fmt.Errorf("%w: spec env %q, stored %q", ErrEnvMismatch, sp.Env, curEnv), nil
 	}
 	switch sp.Revision.Compare(spec.Revision{Epoch: uint64(curEpoch), Counter: uint64(curCounter)}) {
 	case -1:
@@ -143,6 +156,24 @@ func (s *Store) applySync(tx *sql.Tx, specEnvelope []byte, records map[string]js
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+
+	retiredRev := make(map[string]spec.Revision, len(sp.Retired))
+	for _, r := range sp.Retired {
+		retiredRev[r.Name] = r.Revision
+	}
+	listed := make(map[string]bool, len(sp.Cells))
+	for _, e := range sp.Cells {
+		listed[e.Name] = true
+	}
+	for name, mark := range marks {
+		if r, ok := retiredRev[name]; ok {
+			if r.Compare(mark) < 0 {
+				return fmt.Errorf("%w: %q retired at %v, mark %v", ErrRetiredBelowMark, name, r, mark), nil
+			}
+		} else if !listed[name] {
+			return fmt.Errorf("%w: %q, mark %v", ErrMarkUnlisted, name, mark), nil
+		}
 	}
 
 	type accepted struct {
@@ -220,7 +251,7 @@ func (s *Store) applySync(tx *sql.Tx, specEnvelope []byte, records map[string]js
 			return nil, err
 		}
 	}
-	for k, v := range map[string]any{"spec_envelope": []byte(specEnvelope), "spec_sha256": digest,
+	for k, v := range map[string]any{"spec_envelope": []byte(specEnvelope), "spec_sha256": digest, "spec_env": sp.Env,
 		"spec_epoch": sp.Revision.Epoch, "spec_counter": sp.Revision.Counter} {
 		if err := setMeta(tx, k, v); err != nil {
 			return nil, err
@@ -229,8 +260,9 @@ func (s *Store) applySync(tx *sql.Tx, specEnvelope []byte, records map[string]js
 	return nil, nil
 }
 
-// Cell returns the verified record of the named cell.
-func (s *Store) Cell(ctx context.Context, name string) (record.Cell, bool) {
+// Cell returns the verified record of the named cell. A store failure is an error, and an unknown
+// cell is found false.
+func (s *Store) Cell(ctx context.Context, name string) (record.Cell, bool, error) {
 	var c record.Cell
 	var found bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
@@ -246,9 +278,9 @@ func (s *Store) Cell(ctx context.Context, name string) (record.Cell, bool) {
 		return json.Unmarshal(body, &c)
 	})
 	if err != nil {
-		return record.Cell{}, false
+		return record.Cell{}, false, fmt.Errorf("read record of %q: %w", name, err)
 	}
-	return c, found
+	return c, found, nil
 }
 
 // SetCells replaces the cell information with cells. A cell whose nonce changes keeps the old
@@ -295,9 +327,9 @@ func (s *Store) SetCells(ctx context.Context, cells []mgmtapi.CellInfo) error {
 }
 
 // CellInfo returns the latest and previous information of a cell. previous is the zero value when
-// the cell has no earlier nonce.
-func (s *Store) CellInfo(ctx context.Context, name string) (latest, previous mgmtapi.CellInfo, ok bool) {
-	err := s.tx(ctx, func(tx *sql.Tx) error {
+// the cell has no earlier nonce. A store failure is an error, and an unknown cell is ok false.
+func (s *Store) CellInfo(ctx context.Context, name string) (latest, previous mgmtapi.CellInfo, ok bool, err error) {
+	err = s.tx(ctx, func(tx *sql.Tx) error {
 		var l, p []byte
 		err := tx.QueryRow(`SELECT latest, previous FROM cell_info WHERE name = ?`, name).Scan(&l, &p)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -318,7 +350,7 @@ func (s *Store) CellInfo(ctx context.Context, name string) (latest, previous mgm
 		return nil
 	})
 	if err != nil {
-		return mgmtapi.CellInfo{}, mgmtapi.CellInfo{}, false
+		return mgmtapi.CellInfo{}, mgmtapi.CellInfo{}, false, fmt.Errorf("read cell info of %q: %w", name, err)
 	}
-	return latest, previous, ok
+	return latest, previous, ok, nil
 }

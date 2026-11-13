@@ -24,6 +24,7 @@ type signer struct {
 	priv ed25519.PrivateKey
 	pub  ed25519.PublicKey
 	jwks json.RawMessage
+	env  string
 }
 
 func newSigner(t *testing.T) *signer {
@@ -38,7 +39,7 @@ func newSigner(t *testing.T) *signer {
 		t.Fatal(err)
 	}
 	jwks, _ := json.Marshal(map[string]any{"keys": []json.RawMessage{raw}})
-	return &signer{t: t, priv: priv, pub: pub, jwks: jwks}
+	return &signer{t: t, priv: priv, pub: pub, jwks: jwks, env: "dev"}
 }
 
 func (g *signer) keys() []ed25519.PublicKey { return []ed25519.PublicKey{g.pub} }
@@ -52,13 +53,13 @@ type bundle struct {
 func (g *signer) bundle(sr spec.Revision, cells map[string]spec.Revision, retired ...spec.Retired) bundle {
 	g.t.Helper()
 	b := bundle{records: map[string]json.RawMessage{}}
-	sp := spec.Spec{Env: "dev", Revision: sr, Retired: retired}
+	sp := spec.Spec{Env: g.env, Revision: sr, Retired: retired}
 	for _, name := range []string{"dev-cell-1", "dev-cell-2", "dev-cell-3"} {
 		r, ok := cells[name]
 		if !ok {
 			continue
 		}
-		c := record.Cell{Name: name, Env: "dev", Issuer: "https://" + name + ".example", JWKS: g.jwks,
+		c := record.Cell{Name: name, Env: g.env, Issuer: "https://" + name + ".example", JWKS: g.jwks,
 			Subjects: []record.Subject{{Namespace: "ns", ServiceAccount: "sa"}}, Epoch: r.Epoch, Counter: r.Counter}
 		env, err := record.Sign(c, g.priv)
 		if err != nil {
@@ -90,7 +91,7 @@ func TestRecordsMarksNeverDrop(t *testing.T) {
 	if err := f.apply(g, g.bundle(rev(1, 5), map[string]spec.Revision{"dev-cell-1": rev(1, 3), "dev-cell-2": rev(1, 5)})); err != nil {
 		t.Fatal(err)
 	}
-	c, ok := f.s.Cell(ctx, "dev-cell-1")
+	c, ok, _ := f.s.Cell(ctx, "dev-cell-1")
 	if !ok || c.Name != "dev-cell-1" || c.Counter != 3 {
 		t.Fatalf("cell %+v, %v", c, ok)
 	}
@@ -98,7 +99,7 @@ func TestRecordsMarksNeverDrop(t *testing.T) {
 	if err := f.apply(g, g.bundle(rev(1, 6), map[string]spec.Revision{"dev-cell-1": rev(1, 6)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)})); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := f.s.Cell(ctx, "dev-cell-2"); ok {
+	if _, ok, _ := f.s.Cell(ctx, "dev-cell-2"); ok {
 		t.Fatal("a retired cell still has a record")
 	}
 	// A cell comes back below its mark: refused, and the store keeps its state.
@@ -111,10 +112,10 @@ func TestRecordsMarksNeverDrop(t *testing.T) {
 		t.Fatalf("record at the mark of a retired cell: %v", err)
 	}
 	// An older spec is refused, and another spec at the same revision too.
-	if err := f.apply(g, g.bundle(rev(1, 5), map[string]spec.Revision{"dev-cell-1": rev(1, 3)})); !errors.Is(err, ErrSpecOld) {
+	if err := f.apply(g, g.bundle(rev(1, 5), map[string]spec.Revision{"dev-cell-1": rev(1, 3)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)})); !errors.Is(err, ErrSpecOld) {
 		t.Fatalf("older spec: %v", err)
 	}
-	if err := f.apply(g, g.bundle(rev(1, 6), map[string]spec.Revision{"dev-cell-1": rev(1, 5)})); !errors.Is(err, ErrSpecConflict) {
+	if err := f.apply(g, g.bundle(rev(1, 6), map[string]spec.Revision{"dev-cell-1": rev(1, 5)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)})); !errors.Is(err, ErrSpecConflict) {
 		t.Fatalf("same spec revision, other content: %v", err)
 	}
 	st, _ := f.s.Stats(ctx)
@@ -122,18 +123,18 @@ func TestRecordsMarksNeverDrop(t *testing.T) {
 		t.Fatalf("stats %+v", st)
 	}
 	f.reopen()
-	err = f.apply(g, g.bundle(rev(1, 8), map[string]spec.Revision{"dev-cell-1": rev(1, 2)}))
+	err = f.apply(g, g.bundle(rev(1, 8), map[string]spec.Revision{"dev-cell-1": rev(1, 2)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)}))
 	if !errors.Is(err, ErrRecordOld) {
 		t.Fatalf("marks after reopen: %v", err)
 	}
 	// Another record at the held revision is a conflict.
 	f2 := newSigner(t)
 	f2.pub, f2.priv = g.pub, g.priv
-	b := g.bundle(rev(1, 8), map[string]spec.Revision{"dev-cell-1": rev(1, 6)})
+	b := g.bundle(rev(1, 8), map[string]spec.Revision{"dev-cell-1": rev(1, 6)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)})
 	if err := f.apply(g, b); err != nil {
 		t.Fatalf("the same revision and digest again: %v", err)
 	}
-	other := f2.bundle(rev(1, 9), map[string]spec.Revision{"dev-cell-1": rev(1, 6)})
+	other := f2.bundle(rev(1, 9), map[string]spec.Revision{"dev-cell-1": rev(1, 6)}, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 5)})
 	if err := f.apply(g, other); !errors.Is(err, ErrRecordConflict) {
 		t.Fatalf("another record at the mark: %v", err)
 	}
@@ -171,13 +172,13 @@ func TestRecordsRequireIndex(t *testing.T) {
 	if err := f.apply(g, bundle{spec: forged.spec, records: forged.records}); !errors.Is(err, record.ErrSignature) {
 		t.Fatalf("spec of another key: %v", err)
 	}
-	if _, ok := f.s.Cell(ctx, "dev-cell-1"); ok {
+	if _, ok, _ := f.s.Cell(ctx, "dev-cell-1"); ok {
 		t.Fatal("a refused sync left a record behind")
 	}
 	if err := f.apply(g, g.bundle(rev(1, 2), map[string]spec.Revision{"dev-cell-1": rev(1, 2)})); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := f.s.Cell(ctx, "dev-cell-1"); !ok {
+	if _, ok, _ := f.s.Cell(ctx, "dev-cell-1"); !ok {
 		t.Fatal("record not stored")
 	}
 	big := g.bundle(rev(1, 3), map[string]spec.Revision{"dev-cell-1": rev(1, 3)})
@@ -205,10 +206,10 @@ func TestRecordsResetOnKeyChange(t *testing.T) {
 	if !strings.Contains(f.logs.String(), `"msg":"state_reset"`) {
 		t.Fatalf("no state_reset log: %s", f.logs.String())
 	}
-	if _, ok := f.s.Cell(ctx, "dev-cell-1"); ok {
+	if _, ok, _ := f.s.Cell(ctx, "dev-cell-1"); ok {
 		t.Fatal("a record of the old key survived")
 	}
-	if c, ok := f.s.Cell(ctx, "dev-cell-2"); !ok || c.Counter != 2 {
+	if c, ok, _ := f.s.Cell(ctx, "dev-cell-2"); !ok || c.Counter != 2 {
 		t.Fatalf("new record %+v, %v", c, ok)
 	}
 	if err := f.apply(h, h.bundle(rev(1, 3), map[string]spec.Revision{"dev-cell-2": rev(1, 1)})); !errors.Is(err, ErrRecordOld) {
@@ -219,14 +220,14 @@ func TestRecordsResetOnKeyChange(t *testing.T) {
 func TestCellInfoNonces(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
-	if _, _, ok := f.s.CellInfo(ctx, cell1); ok {
+	if _, _, ok, _ := f.s.CellInfo(ctx, cell1); ok {
 		t.Fatal("unknown cell found")
 	}
 	a := mgmtapi.CellInfo{Name: cell1, Nonce: "n1", NonceExpiresAt: t0, Bound: true}
 	if err := f.s.SetCells(ctx, []mgmtapi.CellInfo{a, {Name: cell2, Nonce: "m1"}}); err != nil {
 		t.Fatal(err)
 	}
-	l, p, ok := f.s.CellInfo(ctx, cell1)
+	l, p, ok, _ := f.s.CellInfo(ctx, cell1)
 	if !ok || l.Nonce != "n1" || p.Nonce != "" || !l.Bound || !l.NonceExpiresAt.Equal(t0) {
 		t.Fatalf("first set: %+v %+v %v", l, p, ok)
 	}
@@ -235,16 +236,16 @@ func TestCellInfoNonces(t *testing.T) {
 	if err := f.s.SetCells(ctx, []mgmtapi.CellInfo{b}); err != nil {
 		t.Fatal(err)
 	}
-	if l, p, _ = f.s.CellInfo(ctx, cell1); l.Nonce != "n2" || p.Nonce != "n1" {
+	if l, p, _, _ = f.s.CellInfo(ctx, cell1); l.Nonce != "n2" || p.Nonce != "n1" {
 		t.Fatalf("after rotation: %+v %+v", l, p)
 	}
 	if err := f.s.SetCells(ctx, []mgmtapi.CellInfo{b}); err != nil {
 		t.Fatal(err)
 	}
-	if l, p, _ = f.s.CellInfo(ctx, cell1); l.Nonce != "n2" || p.Nonce != "n1" {
+	if l, p, _, _ = f.s.CellInfo(ctx, cell1); l.Nonce != "n2" || p.Nonce != "n1" {
 		t.Fatalf("same nonce again must keep the previous one: %+v %+v", l, p)
 	}
-	if _, _, ok := f.s.CellInfo(ctx, cell2); ok {
+	if _, _, ok, _ := f.s.CellInfo(ctx, cell2); ok {
 		t.Fatal("a cell that left the list is still known")
 	}
 	if err := f.s.MarkSynced(ctx, t0.Add(5)); err != nil {
@@ -252,5 +253,51 @@ func TestCellInfoNonces(t *testing.T) {
 	}
 	if st, _ := f.s.Stats(ctx); !st.SyncedAt.Equal(t0.Add(5)) {
 		t.Fatalf("synced at %v", st.SyncedAt)
+	}
+}
+
+func TestRecordsRefuseEnvAndMarkRules(t *testing.T) {
+	f := newFixture(t)
+	g := newSigner(t)
+	one := map[string]spec.Revision{"dev-cell-1": rev(1, 3)}
+	two := map[string]spec.Revision{"dev-cell-1": rev(1, 3), "dev-cell-2": rev(1, 3)}
+	if err := f.apply(g, g.bundle(rev(1, 3), two)); err != nil {
+		t.Fatal(err)
+	}
+	// A marked cell that is in neither list.
+	if err := f.apply(g, g.bundle(rev(1, 4), one)); !errors.Is(err, ErrMarkUnlisted) {
+		t.Fatalf("marked cell in neither list: %v", err)
+	}
+	// A retired revision below the mark.
+	if err := f.apply(g, g.bundle(rev(1, 4), one, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 2)})); !errors.Is(err, ErrRetiredBelowMark) {
+		t.Fatalf("retired below the mark: %v", err)
+	}
+	if err := f.apply(g, g.bundle(rev(1, 4), one, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 3)})); err != nil {
+		t.Fatalf("retired at the mark: %v", err)
+	}
+	// Another env than the stored spec.
+	g.env = "prod"
+	if err := f.apply(g, g.bundle(rev(1, 5), one, spec.Retired{Name: "dev-cell-2", Revision: rev(1, 3)})); !errors.Is(err, ErrEnvMismatch) {
+		t.Fatalf("other env: %v", err)
+	}
+}
+
+func TestCellReadsReportStoreErrors(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if _, ok, err := f.s.Cell(ctx, "dev-cell-1"); ok || err != nil {
+		t.Fatalf("unknown cell: %v, %v", ok, err)
+	}
+	if _, _, ok, err := f.s.CellInfo(ctx, cell1); ok || err != nil {
+		t.Fatalf("unknown cell info: %v, %v", ok, err)
+	}
+	if err := f.s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.s.Cell(ctx, "dev-cell-1"); err == nil {
+		t.Fatal("Cell on a closed store gave no error")
+	}
+	if _, _, _, err := f.s.CellInfo(ctx, cell1); err == nil {
+		t.Fatal("CellInfo on a closed store gave no error")
 	}
 }

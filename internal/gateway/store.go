@@ -4,7 +4,9 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -40,11 +42,12 @@ const (
 // Store is the SQLite state of the gateway. Every method runs in one immediate transaction on the
 // only connection.
 type Store struct {
-	db    *sql.DB
-	n     *gwapi.Notifier
-	now   func() time.Time
-	log   *slog.Logger
-	epoch atomic.Uint64
+	db      *sql.DB
+	n       *gwapi.Notifier
+	now     func() time.Time
+	log     *slog.Logger
+	epoch   atomic.Uint64
+	storeID string
 
 	maxItems, maxBytes, perCell, maxBinds int
 }
@@ -82,6 +85,7 @@ CREATE TABLE outcomes (
   id TEXT NOT NULL UNIQUE,
   cell TEXT NOT NULL,
   op_id TEXT NOT NULL,
+  outcome TEXT NOT NULL,
   body BLOB NOT NULL,
   at INTEGER NOT NULL
 );
@@ -136,7 +140,11 @@ func (s *Store) initSchema(tx *sql.Tx) error {
 			return err
 		}
 		now := s.now()
-		for k, v := range map[string]any{"schema_version": SchemaVersion, "epoch": now.Unix(), "counter": 0, "epoch_changed_at": now.UnixNano()} {
+		var rnd [8]byte
+		if _, err := rand.Read(rnd[:]); err != nil {
+			return err
+		}
+		for k, v := range map[string]any{"store_id": hex.EncodeToString(rnd[:]), "schema_version": SchemaVersion, "epoch": now.Unix(), "counter": 0, "epoch_changed_at": now.UnixNano()} {
 			if err := setMeta(tx, k, v); err != nil {
 				return err
 			}
@@ -154,6 +162,9 @@ func (s *Store) initSchema(tx *sql.Tx) error {
 		return err
 	}
 	s.epoch.Store(uint64(e))
+	if s.storeID, err = metaString(tx, "store_id"); err != nil {
+		return err
+	}
 	return nil
 }
 
