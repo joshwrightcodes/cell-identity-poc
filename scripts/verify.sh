@@ -903,6 +903,21 @@ if has_harness envd; then
   check "ConfigMap cell-records holds the spec revision that mgmtd signed last" check_envd_applied
   check "The SPIRE server and envd pin the key that mgmtd signs with" check_spec_key_pinned
 fi
+if has_harness cell-gateway; then
+  gateway_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
+  check "The cell-gateway objects match the bundle" check_harness_drift cell-gateway
+  check "gateway-system has exactly the cell-gateway objects of the bundle, with no other field manager" check_harness_objects cell-gateway gateway-system
+  check "The cell gateway runs the images that build/images.env records" \
+    check_live_images gateway-system statefulset/cell-gateway "CELL=$CELL_NAME mise run cell:up"
+  check "The cell gateway holds no store error, and envd synced with it in the last 2 minutes" check_gateway_synced
+  check "The cell gateway and its NetworkPolicy use the current node address of each cell" check_gateway_cells
+  check "The cell gateway holds the record revision of each cell in ConfigMap cell-records" check_gateway_records
+  check "The cell gateway pins the key that mgmtd signs with" check_gateway_spec_key
+  for port in 30450 30451; do
+    check "A probe pod in rogue cannot open TCP to the gateway node port $port of $CELL_NAME (steady state)" \
+      expect_dial_blocked rogue default "${gateway_ip:-unknown}:$port"
+  done
+fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
   check "The SPIRE server holds the node alias and the role entry of each subject of $SPIRE_AGENT_CELLS" check_agent_entries
@@ -927,7 +942,7 @@ fi
 if [[ -n "${RELAY_TARGET:-}" ]]; then
   check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and $SPIRE_AGENT_CELLS" check_relay_current
   relay_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
-  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES ${RELAY_BIND_ROUTES:-}; do
+  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES; do
     check "A probe pod in rogue cannot open TCP to the relay node port ${route%%:*} of $CELL_NAME (steady state)" \
       expect_dial_blocked rogue default "${relay_ip:-unknown}:${route%%:*}"
   done
@@ -1140,7 +1155,7 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
     check "ConfigMap hostsvc-pin equals the certificate that the host service presents" check_mgmt_hostsvc_pin
     check "The host service trusts the live root of $CELL_NAME" check_mgmt_hostsvc_root
     check "The host service address in the policy and in mgmtd is the one that the node resolves" check_mgmt_hostsvc_address
-    check "The API and bind ports admit the current $VIEW_CONTROL_PLANE node address" check_mgmt_env_address
+    check "The API port admits the current $VIEW_CONTROL_PLANE node address" check_mgmt_env_address
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_mgmt_peer_root
     check "ConfigMap mgmt-signing-pub equals the key that mgmtd signs with" mgmt_signing_pub
   fi

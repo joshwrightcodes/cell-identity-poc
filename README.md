@@ -248,7 +248,7 @@ The `cluster_jwt` plugin reloads the records every 10 seconds, and it keeps its 
 Until `envd` writes the ConfigMap, no new agent can attest.
 Agents that already run still renew their SVIDs.
 
-`celld` binds the cell issuer to `mgmtd` through the relay `relay-bind` in `dev-cp`.
+`celld` binds the cell issuer to `mgmtd`. The M4 path through the relay `relay-bind` is gone, and the bind goes through the cell gateway of `dev-cp` once the new `celld` runs.
 The flags are `--cell`, `--bind-upstream`, `--bind-expect-id` and `--bind-peer-bundle`.
 ConfigMap `mgmt-root` in `cell-identity-system` holds the root of `management`.
 
@@ -271,6 +271,33 @@ At the start of `ready`, the script deletes a `celld` pod once when its `spire-a
 `cell:verify` of `dev-cp` checks the key pins, the revision in `cell-records`, the node address of `management` and the envd objects.
 `cell:verify` of a cell reads its record in `cell-records`.
 A record with other keys than the cell publishes prints `mise run mgmt -- keycheck --cell <cell>`.
+
+## Cell gateway
+
+The cell gateway runs in `dev-cp`, in namespace `gateway-system`, as the harness component `cell-gateway`.
+It is the StatefulSet `cell-gateway` with one replica and a `k8s_psat` SPIRE agent sidecar.
+Its SVID is `spiffe://dev.env.poc.internal/cp/gateway`.
+The stream listener is on node port 30450, and the bind listener is on node port 30451.
+Both admit only the node addresses of the cells.
+`envd` reaches the API of the gateway through Service `cell-gateway` on port 8452.
+The gateway keeps its queue and its outbox in SQLite on a volume of 256 MiB.
+
+The `cell:up` of `dev-cp` renders the gateway again.
+Run it after a rebuilt cell, and after `vm:up` when `cell:verify` reports a new node address.
+
+Use `mise run gw -- status` to read the state of the gateway.
+The command prints one JSON line.
+Other commands are `queue --cell <cell>`, `outbox`, `enqueue --cell <cell>` and `inject`.
+The last two read standard input.
+
+When the store of the gateway is lost, corrupt or full, run `mise run gw:reset`.
+It sets the replicas to 0, deletes the volume claim, sets the replicas to 1 and waits for the first sync of `envd`.
+It prints one JSON line with the old and the new epoch.
+Use it only for this case, because the queue starts empty.
+
+After each apply, the harness deletes the objects of a component that its render no longer holds.
+This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles and ClusterRoleBindings.
+An object with the label `poc.internal/made-by` stays, because a process wrote it at run time.
 
 ## Refused keys, signing key rotation and lost state
 
@@ -466,7 +493,6 @@ Only the repo server reaches the bundle store.
 The relay in `dev-cp` is the bundle `relay-system` at wave 8.
 Deployment `relay-view` passes node ports 30443 and 30445 to node ports 31443 and 31445 of `management`.
 Deployment `relay-telemetry` passes node port 30444 to node port 31444.
-Deployment `relay-bind` passes node port 30447 to node port 31447, the bind listener of `mgmtd`.
 The relay ends no TLS. It holds at most 256 connections, and 16 from one client address.
 The NetworkPolicy admits the node addresses of the cells. Every pod of a cell that no policy limits reaches the relay through its node address, so cell-proxy, and not the network, decides who is a peer.
 
@@ -744,7 +770,7 @@ Each stream has hops. Read the log of the first hop that fails, from the source 
 | Telemetry | Collector | any | `otel-collector` |
 | Telemetry | Uplink | cell, `dev-cp` | `otel-uplink` |
 | Telemetry | Relay | `dev-cp` | `relay-telemetry` |
-| Records | Relay | `dev-cp` | `relay-bind` |
+| Records | Cell gateway | `dev-cp` | `cell-gateway` |
 | Records | Executor of the environment | `dev-cp` | `envd` |
 | Telemetry | Gateway | `management` | `telemetry-gateway` |
 | Telemetry | Store | `management` | `lgtm` |

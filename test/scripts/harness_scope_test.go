@@ -63,6 +63,7 @@ case "$args" in
     echo "{\"metadata\":{\"name\":\"shared\",\"managedFields\":[{\"manager\":\"${STUB_NS_MANAGER:-argocd-controller}\",\"operation\":\"Apply\"}]}}" ;;
   *" get -f "*" -o json --ignore-not-found "*) printf '%s' "${STUB_LIVE:-}" ;;
   *" apply --server-side "*) ;;
+  *" -A -l cell.poc.internal/harness="*" -o json"*) echo '{"items":[]}' ;;
   *" get deployment.apps/celld -o json "*) echo "$labelled" ;;
   *" get deployment.apps/argocd-repo-server -o json "*) echo "$argo" ;;
   *" get pods -l "*" -o jsonpath="*) echo old-uid ;;

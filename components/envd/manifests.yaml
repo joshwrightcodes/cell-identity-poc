@@ -21,7 +21,8 @@ metadata:
 automountServiceAccountToken: false
 ---
 # envd writes the records as ConfigMap cell-records in spire-system. Create cannot name the object,
-# and get and update name only that one. envd calls Get, Create and Update on the ConfigMap.
+# and get and update name only that one. envd calls Get, Create and Update on the ConfigMap, and Get
+# on ConfigMap attest-hints, which it creates empty and the SPIRE server patches.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -35,6 +36,10 @@ rules:
     resources: [configmaps]
     resourceNames: [cell-records]
     verbs: [get, update]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [attest-hints]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -94,6 +99,9 @@ spec:
             - --spec-key-file=/run/envd/spec-key/spec.pub
             - --env=@POC_ENV@
             - --output-configmap=spire-system/cell-records
+            - --gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452
+            - --gateway-id=spiffe://@POC_TRUST_DOMAIN@/cp/gateway
+            - --hints-configmap=spire-system/attest-hints
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock

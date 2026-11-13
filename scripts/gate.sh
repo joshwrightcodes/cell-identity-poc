@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5 [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5 [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
@@ -89,6 +89,22 @@ if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
     targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
   done
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# The M5 tests run against mgmtd, envd, the cell gateway and the cells. An earlier run can leave a workload with no
+# replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded.
+if [[ "$milestone" == m5 ]]; then
+  "$ROOT/scripts/gate-m5-repair.sh" --check || exit 1
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up")
   for target in "${targets[@]}"; do
     IFS=: read -r cluster ns workload fix <<<"$target"
     found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"

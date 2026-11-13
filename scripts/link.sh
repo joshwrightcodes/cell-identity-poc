@@ -2,7 +2,7 @@
 # The link phase of the cluster $CELL: render each link component with the live facts of the other
 # clusters, apply it, run its Jobs to completion, and wait for its rollouts. cell:up runs it last,
 # unless CELL_UP_SKIP_LINK=1. A link component follows the harness rules: harness_apply stops
-# before it takes an object of another owner, and the apply does not prune.
+# before it takes an object of another owner, and it prunes the objects that left the bundle.
 # LINK_ONLY=<component> runs only that component, with no check of the other clusters. For example,
 # the first pass of mgmt-api runs before dev-cp exists. An unknown name fails. A run that stops
 # prints one command for the component that failed and for each later one.

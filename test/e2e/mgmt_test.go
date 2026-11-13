@@ -349,38 +349,16 @@ func TestM4MgmtAPIIdentity(t *testing.T) {
 	}
 }
 
-// TestM4BindListenerNoClientCert: the bind listener asks for no client certificate, and presents the SVID of mgmtd.
-func TestM4BindListenerNoClientCert(t *testing.T) {
-	addr := portForward(t, mgmtCluster, mgmtNamespace, "svc/mgmt-bind", 8447)
-	conn, err := tls.Dial("tcp", addr, &tls.Config{MinVersion: tls.VersionTLS13, InsecureSkipVerify: true})
-	if err != nil {
-		t.Fatalf("handshake with no client certificate: %v", err)
-	}
-	defer conn.Close()
-	state := conn.ConnectionState()
-	if len(state.PeerCertificates) == 0 || len(state.PeerCertificates[0].URIs) != 1 || state.PeerCertificates[0].URIs[0].String() != mgmtAPIID {
-		t.Fatalf("the bind listener presents %v, want %s", state.PeerCertificates, mgmtAPIID)
-	}
-	roots := x509.NewCertPool()
-	for _, r := range bundleRoots(t, mgmtCluster) {
-		roots.AddCert(r)
-	}
-	if _, err := state.PeerCertificates[0].Verify(x509.VerifyOptions{Roots: roots}); err != nil {
-		t.Errorf("the bind certificate does not chain to the management root: %v", err)
-	}
-}
-
-// TestM4MgmtListenersAdmission: the node ports admit only the dev-cp node. A pod in a fresh namespace of another
-// cell cannot reach the bind node port of management directly. Each cell reaches the bind route only through
-// relay-bind in dev-cp, so a direct dial from a cell node address times out. A dev-cp subtest dials the same ports
-// and must connect. If the ingress of mgmt-bind widens to the cell nodes, the dev-cell-1 and dev-cell-2 subtests both fail.
+// TestM4MgmtListenersAdmission: the API node port admits only the dev-cp node. A pod in a fresh namespace of a
+// cell cannot reach it directly, so a dial from a cell node address times out. A dev-cp subtest dials the same port
+// and must connect. If the ingress of mgmtd widens to the cell nodes, the dev-cell-1 and dev-cell-2 subtests both fail.
 func TestM4MgmtListenersAdmission(t *testing.T) {
 	needProbeImage(t)
 	node := clusterFacts(t, mgmtCluster).NodeIP
-	// The positive half: the dev-cp node reaches both ports. It fails when mgmtd is down, or when the rule names another address.
+	// The positive half: the dev-cp node reaches the port. It fails when mgmtd is down, or when the rule names another address.
 	t.Run("dev-cp", func(t *testing.T) {
 		ns := freshNamespace(t, "dev-cp")
-		for _, port := range []int{31446, 31447} {
+		for _, port := range []int{31446} {
 			if got := dialFrom(t, "dev-cp", ns, node, port, 10*time.Second); got != "connected" {
 				t.Errorf("a pod in dev-cp dials management %s:%d: %s, want connected", node, port, got)
 			}
@@ -388,7 +366,7 @@ func TestM4MgmtListenersAdmission(t *testing.T) {
 	})
 	for _, cell := range clustersWith(t, agentCellSet) {
 		t.Run(cell, func(t *testing.T) {
-			for _, port := range []int{31446, 31447} {
+			for _, port := range []int{31446} {
 				if err := probeFromFreshNamespace(t, cell, node, port, 5*time.Second); err != nil {
 					t.Errorf("a pod in %s reaches management %s:%d: %v", cell, node, port, err)
 				}
@@ -428,7 +406,7 @@ func TestM4MgmtdLogsJSON(t *testing.T) {
 	}
 }
 
-// TestM4MgmtdPortsClosedInside: from a fresh namespace in management, the API, bind and health ports of the mgmtd
+// TestM4MgmtdPortsClosedInside: from a fresh namespace in management, the API and health ports of the mgmtd
 // pod time out. From an ephemeral container in mgmtd-0, the host service port on the host address (17444) and the
 // node port 30081 of the dev-cp node time out.
 func TestM4MgmtdPortsClosedInside(t *testing.T) {
@@ -437,7 +415,7 @@ func TestM4MgmtdPortsClosedInside(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, port := range []int{8446, 8447, 8080} {
+	for _, port := range []int{8446, 8080} {
 		if err := probeFromFreshNamespace(t, mgmtCluster, strings.TrimSpace(ip), port, 5*time.Second); err != nil {
 			t.Errorf("port %d of the mgmtd pod: %v", port, err)
 		}

@@ -57,10 +57,9 @@ done
 k get applications -A
 
 # Harness components stay outside Argo CD. The harness applies them after the root bundle syncs,
-# so no Application from an older root bundle still claims their objects. The apply does not
-# prune: an object that leaves the bundle stays in the cluster. cell:verify reports a
-# NetworkPolicy that the bundle does not hold. harness_apply stops before it takes an object that
-# another owner holds.
+# so no Application from an older root bundle still claims their objects. After each apply,
+# harness_prune deletes the objects that left the bundle (HARNESS_PRUNE_KINDS in scripts/lib.sh).
+# harness_apply stops before it takes an object that another owner holds.
 # The components in LATE_HARNESS read the live SPIRE server of this cluster, which exists now.
 HYDRATE_ONLY=late "$ROOT/scripts/hydrate.sh"
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do

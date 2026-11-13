@@ -85,7 +85,7 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 	pinSHA := hex.EncodeToString(pinSum[:])
 	cpSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimRight(cpRoot, "\n"))))
 	policy := func(host, cp string) string {
-		return fmt.Sprintf(`{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":8446},{"port":8447}]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],
+		return fmt.Sprintf(`{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":8446}]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],
 "egress":[{"to":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":17443}]}]}}`, cp, host)
 	}
 	sts := func(host string) string {
@@ -131,7 +131,7 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 		{"env address: dev-cp has a new node address", "check_mgmt_env_address", map[string]string{"cp-node-ip": "10.9.0.77"}, []string{"the dev-cp node is 10.9.0.77", link}},
 		{"env address: no dev-cp and no rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n",
 			"policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],"egress":[]}}`}, nil},
-		{"env address: no dev-cp but a rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n"}, []string{"does not exist, but the API and bind ports admit", link}},
+		{"env address: no dev-cp but a rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n"}, []string{"does not exist, but the API port admits", link}},
 		{"peer root ok", "check_mgmt_peer_root", nil, nil},
 		{"peer root: dev-cp has a new root", "check_mgmt_peer_root", map[string]string{"cp-root.pem": otherRoot}, []string{"absent or holds other roots", link}},
 		{"peer root: a pod holds an old root", "check_mgmt_peer_root", map[string]string{"pods.json": pods(strings.Repeat("0", 64))}, []string{"carries the root digest", link}},

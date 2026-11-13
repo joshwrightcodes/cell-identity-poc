@@ -186,8 +186,8 @@ func TestMgmtAPIRender(t *testing.T) {
 		t.Error("mgmtd probes must use /livez for liveness and /healthz for readiness")
 	}
 
-	// Both Services keep the source address of the dev-cp node.
-	for name, port := range map[string]float64{"mgmt-api": 31446, "mgmt-bind": 31447} {
+	// The Service keeps the source address of the dev-cp node.
+	for name, port := range map[string]float64{"mgmt-api": 31446} {
 		svc := objs["Service/"+name]
 		if svc == nil {
 			t.Errorf("no Service %s", name)
@@ -219,15 +219,15 @@ func TestMgmtAPIRender(t *testing.T) {
 		t.Errorf("rule 2 is %v, want get and update on mgmt-signing-pub only", rules[1])
 	}
 
-	// The policy of the pod: N26 and N27 from the dev-cp node only, N23 from the own node, and the egress
+	// The policy of the pod: N26 from the dev-cp node only, N23 from the own node, and the egress
 	// of N8, N28, N29 and N11.
 	np := objs["NetworkPolicy/mgmtd"]
 	ing := get[[]any](t, np, "spec", "ingress")
 	if len(ing) != 2 {
 		t.Fatalf("the mgmtd policy has %d ingress rules, want 2", len(ing))
 	}
-	if got := ruleCIDRs(t, ing[0], "from"); !slices.Equal(got, []string{"10.9.0.9/32"}) || !slices.Equal(rulePorts(t, ing[0]), []string{"8446", "8447"}) {
-		t.Errorf("ingress rule 1 admits %v on %v, want the dev-cp node 10.9.0.9/32 on 8446 and 8447", got, rulePorts(t, ing[0]))
+	if got := ruleCIDRs(t, ing[0], "from"); !slices.Equal(got, []string{"10.9.0.9/32"}) || !slices.Equal(rulePorts(t, ing[0]), []string{"8446"}) {
+		t.Errorf("ingress rule 1 admits %v on %v, want the dev-cp node 10.9.0.9/32 on 8446", got, rulePorts(t, ing[0]))
 	}
 	if got := ruleCIDRs(t, ing[1], "from"); !slices.Equal(got, []string{"172.18.0.4/32"}) || !slices.Equal(rulePorts(t, ing[1]), []string{"8080"}) {
 		t.Errorf("ingress rule 2 admits %v on %v, want the own node on 8080 for the kubelet probes", got, rulePorts(t, ing[1]))
@@ -453,5 +453,36 @@ func TestHostsvcAddressSingle(t *testing.T) {
 				t.Fatalf("err %v, stdout %q, stderr %q; want %s", err, stdout.String(), stderr.String(), tc.want)
 			}
 		})
+	}
+}
+
+// TestMgmtAPIRenderNoBindListener checks that the render of management has no bind path: no Service mgmt-bind, no port 8447
+// on the container, the Services or the policy, and no node port 31447.
+func TestMgmtAPIRenderNoBindListener(t *testing.T) {
+	r := renderScript(t, "mgmt-api", "/ko-app/stub", append([]string{"STUB_CELL=management"}, bundleFacts...)...)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	// A ConfigMap holds certificates, whose text can hold any digits.
+	var text strings.Builder
+	for _, o := range objs {
+		if o["kind"] != "ConfigMap" {
+			b, _ := json.Marshal(o)
+			text.Write(b)
+		}
+	}
+	for _, bad := range []string{"mgmt-bind", "8447", "31447", `"name":"bind"`} {
+		if strings.Contains(text.String(), bad) {
+			t.Errorf("the render of mgmt-api mentions %q", bad)
+		}
+	}
+	if objs["Service mgmt-system/mgmt-api"] == nil {
+		t.Errorf("the render holds no Service mgmt-api: %v", keysOfObjects(objs))
+	}
+	for key, o := range objs {
+		if o["kind"] == "Service" && key != "Service mgmt-system/mgmt-api" {
+			t.Errorf("the render holds %s, and only Service mgmt-api may serve a port", key)
+		}
 	}
 }

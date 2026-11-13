@@ -295,7 +295,7 @@ func TestCheckArgocdSecrets(t *testing.T) {
 const relayKubectl = `#!/usr/bin/env bash
 args=" $* "
 for kind in deployment networkpolicy; do
-  for name in relay-view relay-telemetry relay-bind; do
+  for name in relay-view relay-telemetry; do
     if [[ "$args" == *" get $kind $name -o json "* ]]; then
       f="$STUB_DIR/${kind:0:1}-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
     fi
@@ -315,7 +315,7 @@ func relayFixture(t *testing.T, target string, cells ...string) string {
 	for _, c := range cells {
 		from = append(from, `{"ipBlock":{"cidr":"`+c+`/32"}}`)
 	}
-	for name, ports := range map[string][]string{"relay-view": {"8443=" + target + ":31443", "8445=" + target + ":31445"}, "relay-telemetry": {"8444=" + target + ":31444"}, "relay-bind": {"8447=" + target + ":31447"}} {
+	for name, ports := range map[string][]string{"relay-view": {"8443=" + target + ":31443", "8445=" + target + ":31445"}, "relay-telemetry": {"8444=" + target + ":31444"}} {
 		var args []string
 		for _, p := range ports {
 			args = append(args, `"--route"`, `"`+p+`"`)
@@ -341,12 +341,12 @@ func TestCheckRelayCurrent(t *testing.T) {
 		{"current", "172.18.0.3", "172.18.0.6", ""},
 		{"the management node moved", "172.18.0.9", "172.18.0.6", "relay-view routes to '172.18.0.3'"},
 		{"a cell node moved", "172.18.0.3", "172.18.0.7", "the ingress policy of relay-view admits"},
-		{"the bind relay is missing", "172.18.0.3", "172.18.0.6", "cannot read Deployment relay-system/relay-bind"},
+		{"the telemetry relay is missing", "172.18.0.3", "172.18.0.6", "cannot read Deployment relay-system/relay-telemetry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := relayFixture(t, "172.18.0.3", "172.18.0.5", "172.18.0.6")
-			if strings.Contains(tc.name, "bind relay") {
-				_ = os.Remove(filepath.Join(dir, "d-relay-bind.json"))
+			if strings.Contains(tc.name, "telemetry relay") {
+				_ = os.Remove(filepath.Join(dir, "d-relay-telemetry.json"))
 			}
 			snippet := `node_ip() { case "$1" in management) echo "$STUB_MGMT" ;; dev-cell-1) echo 172.18.0.5 ;; dev-cell-2) echo "$STUB_CELL2" ;; esac; }
 RELAY_TARGET=management SPIRE_AGENT_CELLS="dev-cell-1 dev-cell-2" CELL_NAME=dev-cp

@@ -83,7 +83,8 @@ func TestEnvdRender(t *testing.T) {
 		}
 		ctr := named(t, containers, "envd")
 		wantArgs := []string{"run", "--upstream=10.9.0.10:31446", "--expect-id=spiffe://mgmt.poc.internal/api", "--peer-bundle=/run/envd/peer-root/root.crt",
-			"--peer-trust-domain=mgmt.poc.internal", "--spec-key-file=/run/envd/spec-key/spec.pub", "--env=dev", "--output-configmap=spire-system/cell-records"}
+			"--peer-trust-domain=mgmt.poc.internal", "--spec-key-file=/run/envd/spec-key/spec.pub", "--env=dev", "--output-configmap=spire-system/cell-records",
+			"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints"}
 		if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != fmt.Sprint(wantArgs) {
 			t.Errorf("envd args are %s, want %v", got, wantArgs)
 		}
@@ -157,7 +158,7 @@ func TestEnvdRender(t *testing.T) {
 		}
 	})
 
-	t.Run("the Role writes only cell-records", func(t *testing.T) {
+	t.Run("the Role writes only cell-records and reads attest-hints", func(t *testing.T) {
 		role := objs["Role spire-system/envd-records"]
 		if role == nil {
 			t.Fatalf("no Role envd-records in spire-system: %v", keysOfObjects(objs))
@@ -169,7 +170,7 @@ func TestEnvdRender(t *testing.T) {
 			}
 			rules = append(rules, fmt.Sprintf("%v %v %v %v", lookupOr(rule, "apiGroups"), lookupOr(rule, "resources"), lookupOr(rule, "resourceNames"), lookupOr(rule, "verbs")))
 		}
-		if want := []string{"[] [configmaps] <nil> [create]", "[] [configmaps] [cell-records] [get update]"}; !slices.Equal(rules, want) {
+		if want := []string{"[] [configmaps] <nil> [create]", "[] [configmaps] [cell-records] [get update]", "[] [configmaps] [attest-hints] [get]"}; !slices.Equal(rules, want) {
 			t.Errorf("rules are %v, want %v", rules, want)
 		}
 		rb := objs["RoleBinding spire-system/envd-records"]
@@ -198,7 +199,7 @@ func TestEnvdRender(t *testing.T) {
 		for _, rule := range get[[]any](t, np, "spec", "egress") {
 			egress = append(egress, fmt.Sprintf("%s %v", peerList(t, rule, "to"), portList(t, rule)))
 		}
-		want := []string{"10.9.0.10/32 [31446]", "172.18.0.4/32 [6443]", "10.111.0.1/32 [443]", "spire-system/spire-server [8081]", "observability-system/otel-collector [4317]"}
+		want := []string{"10.9.0.10/32 [31446]", "172.18.0.4/32 [6443]", "10.111.0.1/32 [443]", "spire-system/spire-server [8081]", "gateway-system/cell-gateway [8452]", "observability-system/otel-collector [4317]"}
 		if !slices.Equal(egress, want) {
 			t.Errorf("egress rules are %v, want %v", egress, want)
 		}
@@ -248,5 +249,46 @@ func TestEnvdRenderFollowsTheKey(t *testing.T) {
 	}
 	if annotation(a) == annotation(b) || annotation(b) != sha256Hex(other) {
 		t.Errorf("the key annotations are %v and %v, want two digests that follow the key", annotation(a), annotation(b))
+	}
+}
+
+// TestEnvdRenderGatewayFlags checks the three gateway flags of envd, which an envd of Task 5 needs to start, the flow N39
+// rule to the gateway pod on 8452 and nothing else, and the Role rule that reads the hints ConfigMap by name.
+func TestEnvdRenderGatewayFlags(t *testing.T) {
+	r := renderEnvd(t)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	ctr := named(t, get[[]any](t, objs["Deployment envd-system/envd"], "spec", "template", "spec", "containers"), "envd")
+	args := fmt.Sprint(get[[]any](t, ctr, "args"))
+	for _, want := range []string{"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("envd args %s lack %s", args, want)
+		}
+	}
+	np := objs["NetworkPolicy envd-system/envd"]
+	count := 0
+	for _, rule := range get[[]any](t, np, "spec", "egress") {
+		for _, port := range portList(t, rule) {
+			if port == 8452 {
+				count++
+				if got := peerList(t, rule, "to"); got != "gateway-system/cell-gateway" {
+					t.Errorf("the rule on 8452 admits %s, want the pod cell-gateway of gateway-system", got)
+				}
+			}
+		}
+	}
+	if count != 1 {
+		t.Errorf("%d egress rules name 8452, want 1", count)
+	}
+	var found bool
+	for _, rule := range get[[]any](t, objs["Role spire-system/envd-records"], "rules") {
+		if fmt.Sprint(lookupOr(rule, "resourceNames")) == "[attest-hints]" {
+			found = fmt.Sprint(lookupOr(rule, "verbs")) == "[get]" && fmt.Sprint(lookupOr(rule, "resources")) == "[configmaps]"
+		}
+	}
+	if !found {
+		t.Error("the Role has no rule with get on configmaps attest-hints")
 	}
 }

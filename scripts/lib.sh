@@ -122,6 +122,13 @@ ENVD_HARNESS=(
   "envd:envd-system"
 )
 
+# The cell gateway takes the celld streams and binds in dev-cp and syncs with envd. It owns the namespace
+# gateway-system, and its render reads the live SPIRE server of its own cluster, the live signing key of
+# mgmtd and the node address of each cell, so it renders after the waves and after envd.
+CELL_GATEWAY_HARNESS=(
+  "cell-gateway:gateway-system"
+)
+
 # The mesh-view tunnel of a cell reads the roots of management and of SPIRE_SERVER_CLUSTER, which
 # exist before the cell, so it renders with the other harness components. It owns the namespace
 # mesh-view-system, which only this cluster uses for the tunnel.
@@ -133,7 +140,7 @@ MESH_VIEW_HARNESS=(
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
 # (CELL_UP_SKIP_LATE=1).
-LATE_HARNESS=(otel-uplink envd)
+LATE_HARNESS=(otel-uplink envd cell-gateway)
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
@@ -179,6 +186,7 @@ for set_name in $set_names; do
     mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
     envd) HARNESS_COMPONENTS+=("${ENVD_HARNESS[@]}") ;;
+    cell-gateway) HARNESS_COMPONENTS+=("${CELL_GATEWAY_HARNESS[@]}") ;;
     mgmt-plane) LINK_COMPONENTS+=("${MGMT_PLANE_LINK[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
@@ -481,7 +489,7 @@ check_relay_current() {
     cell_cidrs+=("$ip/32")
   done
   want_cells="$(printf '%s\n' "${cell_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
-  for name in relay-view relay-telemetry relay-bind; do
+  for name in relay-view relay-telemetry; do
     json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
@@ -757,15 +765,46 @@ harness_conflicts() {
       else empty end' <<<"$live"
 }
 
-# harness_apply <component> applies the bundle of a harness component. It stops before the apply
-# when another owner holds one of its objects, because a server-side apply with force would take
-# that object, and its owner would then take it back on each sync.
+# HARNESS_PRUNE_KINDS lists the kinds that harness_prune deletes. A Namespace, a Job and a Secret are not here:
+# a Job cannot change in place, and a Namespace or a Secret can hold what a person or a process wrote.
+HARNESS_PRUNE_KINDS=(Deployment StatefulSet DaemonSet Service ConfigMap ServiceAccount Role RoleBinding NetworkPolicy
+  ClusterRole ClusterRoleBinding ValidatingAdmissionPolicy ValidatingAdmissionPolicyBinding)
+
+# harness_prune <component> <rendered file> deletes each object of the kinds in HARNESS_PRUNE_KINDS that carries the
+# label cell.poc.internal/harness=<component>, that the rendered file does not hold, and that has no label
+# poc.internal/made-by. A process writes the objects with that label at run time, so the render never holds them.
+# It lists the objects in every namespace, and a cluster-scoped kind by its label alone. It prints one line for each deletion.
+harness_prune() {
+  local comp="$1" rendered="$2" kind live name ns scope
+  [[ -f "$rendered" ]] || die "harness_prune: no rendered file $rendered"
+  for kind in "${HARNESS_PRUNE_KINDS[@]}"; do
+    live="$(k get "$kind" -A -l "$HARNESS_LABEL=$comp" -o json)" || die "could not list the $kind objects with the label $HARNESS_LABEL=$comp"
+    while IFS='|' read -r ns name; do
+      [[ -n "$name" ]] || continue
+      if KIND="$kind" NAME="$name" NS="$ns" yq -e 'select(.kind == strenv(KIND) and .metadata.name == strenv(NAME) and (.metadata.namespace // "") == strenv(NS))' \
+        "$rendered" >/dev/null 2>&1; then
+        continue
+      fi
+      scope=()
+      [[ -z "$ns" ]] || scope=(-n "$ns")
+      k ${scope[@]+"${scope[@]}"} delete "$kind" "$name" --ignore-not-found --wait=true --timeout=120s >/dev/null \
+        || die "could not delete $kind ${ns:+$ns/}$name, which the render of $comp no longer holds"
+      log "pruned $kind ${ns:+$ns/}$name, which the render of $comp no longer holds"
+    done < <(jq -r --arg marker "poc.internal/made-by" '.items[] | select((.metadata.labels[$marker] // "") == "")
+      | "\(.metadata.namespace // "")|\(.metadata.name)"' <<<"$live")
+  done
+}
+
+# harness_apply <component> applies the bundle of a harness component, then prunes what the bundle no longer
+# holds. It stops before the apply when another owner holds one of its objects, because a server-side apply with
+# force would take that object, and its owner would then take it back on each sync.
 harness_apply() {
   local conflicts
   conflicts="$(harness_conflicts "$1")" || die "$conflicts"
   [[ -z "$conflicts" ]] || die "the harness component $1 renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the harness render or remove it from the other owner, so that one owner holds it. Then run: $(fix_command "$1")"
   apply_bundle "$1"
   release_from_argocd "$BUNDLES/$1/manifests.yaml"
+  harness_prune "$1" "$BUNDLES/$1/manifests.yaml"
 }
 
 # has_component_entry <component> <namespace> succeeds when the cluster has that harness or link
@@ -813,7 +852,7 @@ check_plane_pods() {
 }
 
 # check_harness_objects <component> <namespace> compares the namespace with the bundle of a harness
-# or link component. The harness apply does not prune, and kubectl diff sees only the fields of
+# or link component. The harness apply prunes only the kinds of HARNESS_PRUNE_KINDS, and kubectl diff sees only the fields of
 # its own field manager. Each object of the bundle must have only the field manager kubectl,
 # kube-controller-manager for status, and validatingadmissionpolicy-status for the status of a
 # ValidatingAdmissionPolicy, which the API server writes for its type check.
@@ -946,8 +985,10 @@ pem_der_sha256() {
 }
 
 # dependents_of <name> prints the commands that bring the copies of a change up to date, one command on each
-# line, in the order to run them. The name is a cluster that was rebuilt (management, dev-cp or a cell), or
-# hostsvc for a restart of the host service. The README section "Rebuild one cluster" holds the same table.
+# line, in the order to run them. The name is a cluster that was rebuilt (management, dev-cp or a cell),
+# hostsvc for a restart of the host service, gateway-nodes for a gateway that holds old cell node addresses, or
+# gateway-store for a store of the gateway that is lost, corrupt or full. The cell:up of dev-cp renders the
+# cell gateway again, so the rows of a rebuilt cell and of dev-cp cover it. The README section "Rebuild one cluster" holds the same table.
 # No step waits until every cell is bound: a cell binds on its own once its cell:up has run.
 dependents_of() {
   local cell cells comp
@@ -955,6 +996,10 @@ dependents_of() {
   cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
   case "$1" in
     hostsvc) echo "mise run hostsvc:serve -- restart" ;;
+    # The gateway admits a cell by its node address, and Docker can give a node a new address after vm:up.
+    gateway-nodes) echo "CELL=dev-cp mise run cell:up" ;;
+    # A lost, corrupt or full store of the gateway: gw:reset wipes it, and envd fills it again.
+    gateway-store) echo "mise run gw:reset" ;;
     management)
       echo "mise run hostsvc -- up --only management"
       echo "CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up"
@@ -978,7 +1023,7 @@ dependents_of() {
         for comp in central-view telemetry-gateway mesh-view-hub; do echo "CELL=management LINK_ONLY=$comp mise run cell:link"; done
         return
       done
-      die "dependents_of knows management, dev-cp, hostsvc and $cells, not '$1'" ;;
+      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $cells, not '$1'" ;;
   esac
 }
 

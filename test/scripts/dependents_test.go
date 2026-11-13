@@ -449,7 +449,7 @@ func TestImagesNamed(t *testing.T) {
 	if got, _ := os.ReadFile(envFile); !strings.HasPrefix(string(got), "# commit abc123\n") {
 		t.Fatalf("a partial build rewrote the commit line:\n%s", got)
 	}
-	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd")
+	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cellgw")
 	if out, err := run("6", allNames...); err != nil {
 		t.Fatalf("images.sh with every name failed: %v\n%s", err, out)
 	}
