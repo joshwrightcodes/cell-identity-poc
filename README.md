@@ -263,7 +263,7 @@ A record with other keys than the cell publishes prints `mise run mgmt -- keyche
 
 The `management` cluster holds one read-only Argo CD UI for both cells, in `central-view-system`.
 The link component `central-view` renders it in the link phase, after every other component.
-Its render reads the live root and node address of `dev-cp`, and it reads the signed record of each cell of `VIEW_CELLS` in `cells/management.env` from `mgmtd`.
+Its render reads the live root and node address of `dev-cp`. It reads the signed record of each cell of `VIEW_CELLS` in `cells/management.env` from `mgmtd`.
 Because of this, the cells and `dev-cp` must exist first.
 
 The view has these parts:
@@ -624,7 +624,7 @@ To add a cell, for example `dev-cell-3`, follow these steps:
 2. Copy `cells/dev-cell-2.env` to `cells/dev-cell-3.env`. Set `CELL_NAME`, `CELL_MESH_TRUST_DOMAIN`, and a `CELL_BUNDLE_STORE_PORT` that no other cell uses.
 3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`, and to `VIEW_CELLS` and `MESH_VIEW_CELLS` in `cells/management.env`.
    Give the cell a hub port in `MESH_VIEW_CELLS` that no other cell uses. Add `mesh-view-system` to `COLLECTOR_SENDERS` in the env file of the cell.
-   `mgmtd` signs a record of the cell, and the SPIRE server renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject.
+   The SPIRE server renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject of `SPIRE_CELL_SUBJECTS`. `mgmtd` signs the record of the cell when its `celld` binds.
    The relay admits the node address of the cell.
 4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
 5. Create the cluster, bind it in `mgmtd`, and set it up:

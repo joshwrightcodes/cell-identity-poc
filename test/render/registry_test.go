@@ -129,6 +129,7 @@ func TestRegistryFromManagement(t *testing.T) {
 		{"unbound cell", "Run CELL=bad-facts mise run cell:up, so its celld binds", []string{"VIEW_CELLS=dev-cell-1 bad-facts"}},
 		{"no answer", "could not read the records of mgmtd", []string{"STUB_NO_MGMT=1"}},
 		{"no key", "ConfigMap mgmt-system/mgmt-signing-pub is absent", []string{"STUB_NO_MGMT_KEY=1"}},
+		{"other name", "is not a record of dev-cell-1 in env dev", []string{"STUB_RECORD_NAME=dev-cell-1=dev-cell-2"}},
 		{"other env", "is not a record of dev-cell-1 in env other-env", []string{"POC_ENV=other-env", "STUB_RECORD_ENV=dev"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

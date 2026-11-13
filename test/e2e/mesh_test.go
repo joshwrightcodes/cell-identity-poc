@@ -467,8 +467,19 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 	t.Cleanup(removeAll)
 	defer removeAll()
 
-	// headroom waits for an open tunnel of the cell whose SVID outlives twice the keepalive bound, and returns its
-	// conn_id and the name of the tunnel pod.
+	// renewIn returns the time until the cell opens a new tunnel. The cell renews at 60% of the leaf life, which is
+	// the age of the tunnel plus the time to expiry, so the renewal comes before the SVID expires.
+	renewIn := func(pod string) (time.Duration, bool) {
+		self := cellTunnelState(t, cell, pod).Cells["self"]
+		if !self.Up || self.ExpiresAt == nil {
+			return 0, false
+		}
+		age := time.Duration(self.AgeSeconds * float64(time.Second))
+		life := age + time.Until(*self.ExpiresAt)
+		return life*6/10 - age, true
+	}
+	// headroom waits for an open tunnel of the cell whose next renewal is at least twice the keepalive bound away, and
+	// returns its conn_id and the name of the tunnel pod.
 	headroom := func() (int, string) {
 		var connID int
 		var pod string
@@ -478,13 +489,12 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 				return false, "no open tunnel"
 			}
 			pod, _ = readyPodIn(t, cell, meshNamespace, tunnelName)
-			self := cellTunnelState(t, cell, pod).Cells["self"]
-			if !self.Up || self.ExpiresAt == nil {
+			left, ok := renewIn(pod)
+			if !ok {
 				return false, "the tunnel pod reports no open tunnel"
 			}
-			left := time.Until(*self.ExpiresAt)
 			connID = ups[len(ups)-1]
-			return left >= 2*keepaliveBound, fmt.Sprintf("tunnel %d has %s left, want %s", connID, left.Round(time.Second), 2*keepaliveBound)
+			return left >= 2*keepaliveBound, fmt.Sprintf("tunnel %d renews in %s, want %s", connID, left.Round(time.Second), 2*keepaliveBound)
 		})
 		return connID, pod
 	}
@@ -493,7 +503,10 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 		rule int
 	}{{"the hub pings", 0}, {"the cell pings", 1}} {
 		found := false
-		for attempt := 1; attempt <= 3 && !found; attempt++ {
+		// An attempt that ends on a renewal or an expiry says nothing about keepalive, so it does not count. The
+		// loop stops after 8 attempts in all.
+		counted := 0
+		for attempt := 1; attempt <= 8 && counted < 3 && !found; attempt++ {
 			connID, cellPod := headroom()
 			tag := "gate-m3-blackhole-" + randomHex(t, 4)
 			tags = append(tags, tag)
@@ -505,6 +518,9 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 			// The timer deletes only the rule of this attempt, by its tag.
 			if _, err := dockerExec(t, node, "", "sh", "-c", "nohup sh -c 'sleep 120; iptables -C "+strings.Join(r, " ")+" 2>/dev/null && iptables -D "+strings.Join(r, " ")+"' >/dev/null 2>&1 &"); err != nil {
 				t.Logf("start the timer in %s: %v", node, err)
+			}
+			if left, ok := renewIn(cellPod); ok {
+				t.Logf("%s, attempt %d: the tunnel renews in %s after the rule is in", phase.name, attempt, left.Round(time.Second))
 			}
 			var hubCause, cellCause string
 			deadline := time.Now().Add(2 * keepaliveBound)
@@ -523,13 +539,18 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 			remove(tag, phase.rule)
 			t.Logf("%s, attempt %d (%s): tunnel %d, hub cause %q, cell cause %q, after %s", phase.name, attempt, tag, connID, hubCause, cellCause, took)
 			found = (phase.rule == 0 && hubCause == "local_close") || (phase.rule == 1 && cellCause == "local_close")
-			if !found {
-				t.Logf("not a ping close: the SVID had headroom, so this attempt does not count")
+			switch {
+			case found:
+				counted++
+			case hubCause == "renewal" || hubCause == "expiry" || cellCause == "renewal" || cellCause == "expiry":
+				t.Logf("the tunnel ended on a renewal or an expiry, so this attempt does not count")
+			default:
+				counted++
 			}
 			waitHubTunnel(t, cell, len(mustUps(hubConnIDs(hubLog(t), cell))), 3*time.Minute)
 		}
 		if !found {
-			t.Errorf("in 3 attempts with headroom, %s never closed the tunnel with the cause local_close: keepalive does not find the dead path", phase.name)
+			t.Errorf("in %d counted attempts, %s never closed the tunnel with the cause local_close: keepalive does not find the dead path", counted, phase.name)
 		}
 	}
 }

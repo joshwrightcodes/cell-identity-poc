@@ -39,7 +39,7 @@ const stubMgmtKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 // stubMise answers "mise run hostsvc -- facts" for the cells below, "mise run mgmt -- records" with
 // the records of dev-cell-1 and dev-cell-2, and runs the real pkigen for "mise run pki". The cell
 // bad-facts fails the way hostsvc fails, and no-ip has no node address. STUB_RANDOM_SIG gives each
-// record a new signature, STUB_REVOKED=<cell> revokes one record, and STUB_NO_MGMT makes mgmt fail.
+// record a new signature, STUB_REVOKED=<cell> revokes one record, STUB_RECORD_NAME=<cell>=<name> signs the record of a cell with another name, and STUB_NO_MGMT makes mgmt fail.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
@@ -65,8 +65,10 @@ case "$2" in
       revoked=false
       [[ "${STUB_REVOKED:-}" != "$cell" ]] || revoked=true
       sig="sig-$cell"
+      name="$cell"
+      [[ "${STUB_RECORD_NAME:-}" != "$cell="* ]] || name="${STUB_RECORD_NAME#*=}"
       [[ -z "${STUB_RANDOM_SIG:-}" ]] || sig="$RANDOM$RANDOM"
-      payload="$(printf '{"name":"%s","env":"%s","revoked":%s}' "$cell" "${STUB_RECORD_ENV:-${POC_ENV:-dev}}" "$revoked" | base64 | tr -d '\n')"
+      payload="$(printf '{"name":"%s","env":"%s","revoked":%s}' "$name" "${STUB_RECORD_ENV:-${POC_ENV:-dev}}" "$revoked" | base64 | tr -d '\n')"
       out="$(jq -c --arg c "$cell" --arg p "$payload" --arg s "$sig" '.[$c] = {payloadType: "application/vnd.poc.cell-record+json", payload: $p, signatures: [{keyid: "", sig: $s}]}' <<<"$out")"
     done
     echo "$out"
