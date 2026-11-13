@@ -36,10 +36,10 @@ const stubBinary = "stub plugin binary"
 // stubMgmtKey is the public key of mgmtd that the stub ConfigMap mgmt-signing-pub holds: the bytes 1 to 32.
 const stubMgmtKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
-// stubMise answers "mise run hostsvc -- facts" and "mise run record:fixture" for the cells below,
-// and runs the real pkigen for "mise run pki". The cell bad-facts fails the way hostsvc fails, and
-// no-ip has no node address. STUB_RANDOM_KEYS gives each record a new signature and key, as the
-// real record:fixture does. Only the registry renders still call record:fixture.
+// stubMise answers "mise run hostsvc -- facts" for the cells below, "mise run mgmt -- records" with
+// the records of dev-cell-1 and dev-cell-2, and runs the real pkigen for "mise run pki". The cell
+// bad-facts fails the way hostsvc fails, and no-ip has no node address. STUB_RANDOM_SIG gives each
+// record a new signature, STUB_REVOKED=<cell> revokes one record, and STUB_NO_MGMT makes mgmt fail.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
@@ -54,27 +54,22 @@ case "$2" in
       no-ip) echo '{"name":"no-ip","nodeIP":""}' ;;
       *) echo '{"level":"ERROR","msg":"hostsvc failed","error":"cluster does not exist"}'; exit 1 ;;
     esac ;;
-  record:fixture)
-    cell="$5"
-    if [[ "$cell" == bad-facts ]]; then
-      echo '{"level":"ERROR","msg":"recordgen failed","error":"cluster does not exist"}'
+  mgmt)
+    [[ "$4" == records ]] || exit 2
+    if [[ -n "${STUB_NO_MGMT:-}" ]]; then
+      echo '{"level":"ERROR","msg":"mgmt failed","error":"pod mgmtd-0 is absent or not Ready"}'
       exit 1
     fi
-    key="stubkey${cell##*-}="
-    sig=""
-    if [[ -n "${STUB_RANDOM_KEYS:-}" ]]; then
-      key="$(head -c 32 /dev/urandom | base64)"
-      sig=",\\\"signatures\\\":[\\\"$RANDOM$RANDOM\\\"]"
-    fi
-    cat <<EOF
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cell-record-$cell
-data:
-  record.dsse.json: "{\"payload\":\"$cell\"$sig}"
-  signer.pub: "$key"
-EOF
+    out='{}'
+    for cell in dev-cell-1 dev-cell-2; do
+      revoked=false
+      [[ "${STUB_REVOKED:-}" != "$cell" ]] || revoked=true
+      sig="sig-$cell"
+      [[ -z "${STUB_RANDOM_SIG:-}" ]] || sig="$RANDOM$RANDOM"
+      payload="$(printf '{"name":"%s","env":"%s","revoked":%s}' "$cell" "${STUB_RECORD_ENV:-${POC_ENV:-dev}}" "$revoked" | base64 | tr -d '\n')"
+      out="$(jq -c --arg c "$cell" --arg p "$payload" --arg s "$sig" '.[$c] = {payloadType: "application/vnd.poc.cell-record+json", payload: $p, signatures: [{keyid: "", sig: $s}]}' <<<"$out")"
+    done
+    echo "$out"
     ;;
   pki) shift 3; exec "$STUB_PKIGEN" "$@" ;;
   *) exit 2 ;;
@@ -580,9 +575,6 @@ func TestRenderSpireServer(t *testing.T) {
 	}
 	if want := "run hostsvc -- facts --cluster dev-cell-1"; !strings.Contains(r.log, want) {
 		t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
-	}
-	if strings.Contains(r.log, "record:fixture") {
-		t.Fatalf("render signs a record itself; it ran:\n%s", r.log)
 	}
 
 	// The external-secrets bundle holds Namespace spire-system, because the Role of the operator

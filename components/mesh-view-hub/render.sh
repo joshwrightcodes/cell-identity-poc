@@ -25,7 +25,7 @@
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - a signed record for each cell of MESH_VIEW_CELLS, as ConfigMap cell-registry
-#     (components/lib/registry.sh). The cells must exist. The registry is read at start, so a
+#     (components/lib/registry.sh). Each cell must have a bound celld. The registry is read at start, so a
 #     revoked cell needs a new hub pod: cell:link renders a new registry and starts the pod again.
 #   - the cell-proxy image that `mise run images` built, by digest.
 # Kiali reads only the namespaces of MESH_VIEW_NAMESPACES, in each cluster. The chart with

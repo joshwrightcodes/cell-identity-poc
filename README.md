@@ -99,8 +99,8 @@ CELL=dev-cell-2 mise run cell:up
 CELL=management mise run cell:link
 ```
 
-Each `cell:up` of `dev-cp` signs the test records of the cells again, with a new key.
-The server config changes because of this, so the SPIRE server pod restarts. M4 replaces the test records.
+`mgmtd` signs the records of the cells, and `envd` delivers them to `dev-cp`.
+A `cell:up` of `dev-cp` leaves the records and the server config unchanged.
 
 The `CELL` variable picks the cluster for the `cell:*` tasks. The default is `dev-cell-1`.
 An unknown name fails with a list of the known cells. For example, `CELL=dev-cell-1 mise run cell:up` sets up `dev-cell-1` only.
@@ -130,7 +130,7 @@ A new data volume in `management` makes a new root, so treat it as a rebuild of 
 `mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the command for it.
 
 To rebuild a cell, for example `dev-cell-1`, create the cluster first.
-Then `dev-cp` can sign a record with the new key before the cell agent attests:
+Then `mgmtd` binds the new cell and signs its record, and `envd` delivers the record before the agent attests:
 
 ```sh
 CELL=dev-cell-1 mise run cell:down
@@ -263,7 +263,7 @@ A record with other keys than the cell publishes prints `mise run mgmt -- keyche
 
 The `management` cluster holds one read-only Argo CD UI for both cells, in `central-view-system`.
 The link component `central-view` renders it in the link phase, after every other component.
-Its render reads the live root and node address of `dev-cp`, and it signs a record for each cell of `VIEW_CELLS` in `cells/management.env`.
+Its render reads the live root and node address of `dev-cp`, and it reads the signed record of each cell of `VIEW_CELLS` in `cells/management.env` from `mgmtd`.
 Because of this, the cells and `dev-cp` must exist first.
 
 The view has these parts:
@@ -624,10 +624,10 @@ To add a cell, for example `dev-cell-3`, follow these steps:
 2. Copy `cells/dev-cell-2.env` to `cells/dev-cell-3.env`. Set `CELL_NAME`, `CELL_MESH_TRUST_DOMAIN`, and a `CELL_BUNDLE_STORE_PORT` that no other cell uses.
 3. Add the cell to `SPIRE_AGENT_CELLS` in `cells/dev-cp.env`, and to `VIEW_CELLS` and `MESH_VIEW_CELLS` in `cells/management.env`.
    Give the cell a hub port in `MESH_VIEW_CELLS` that no other cell uses. Add `mesh-view-system` to `COLLECTOR_SENDERS` in the env file of the cell.
-   The SPIRE server signs a record of the cell for each subject of `SPIRE_CELL_SUBJECTS`, and renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject.
+   `mgmtd` signs a record of the cell, and the SPIRE server renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject.
    The relay admits the node address of the cell.
 4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
-5. Create the cluster, sign its record in `dev-cp`, and set it up:
+5. Create the cluster, bind it in `mgmtd`, and set it up:
 
    ```sh
    mise run hostsvc -- up --only dev-cell-3
@@ -738,7 +738,7 @@ The budgets do not cover `harness:up`.
 
 A run that stops before its cleanups, for example after Ctrl-C, a go test timeout or a closed terminal, can leave these changes in place.
 The next `gate:m2` run then stops before its other checks.
-`CELL=dev-cp mise run cell:verify` and `CELL=dev-cell-1 mise run cell:verify` fail, and a render of `dev-cp` refuses to sign the record of a changed cell.
+`CELL=dev-cp mise run cell:verify` and `CELL=dev-cell-1 mise run cell:verify` fail.
 Each of them prints the repair command:
 
 ```sh

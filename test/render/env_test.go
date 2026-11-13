@@ -36,9 +36,6 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 			if got := pluginEnv(t, conf); got != env {
 				t.Fatalf("server plugin env is %q, want %q", got, env)
 			}
-			if strings.Contains(server.log, "record:fixture") {
-				t.Fatalf("the server render signs a record itself, and the management plane signs the records:\n%s", server.log)
-			}
 
 			agent := renderCellIdentity(t, "POC_ENV="+env)
 			if agent.err != nil {
@@ -76,8 +73,9 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				if objs["Namespace "+env+"-"+cell] == nil {
 					t.Fatalf("the view renders no agent namespace %s-%s", env, cell)
 				}
-				if want := "run record:fixture -- --cluster " + cell + " --env " + env; !strings.Contains(view.log, want) {
-					t.Fatalf("the view did not sign the record of %s for env %s; want %q in:\n%s", cell, env, want, view.log)
+				reg := objs["ConfigMap "+viewNS+"/cell-registry"]
+				if reg == nil || get[string](t, reg, "data", cell+".dsse.json") == "" {
+					t.Fatalf("the registry of env %s has no record of %s", env, cell)
 				}
 			}
 		})

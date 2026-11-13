@@ -2,6 +2,7 @@ package render
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"os"
@@ -53,15 +54,13 @@ func principalTemplate(t *testing.T, objs map[string]object) map[string]any {
 	return get[map[string]any](t, d, "spec", "template")
 }
 
-// Two renders, each with new record keys and signatures, give the same registry checksum and the
-// same principal pod template, so a new hydrate with the same cells restarts nothing. The checksum
-// is the SHA-256 of the sorted "<name> <env> <revoked>" lines, as cell-proxy computes it.
+// Two renders, each with new record signatures and a new signing key, give the same registry
+// checksum and the same principal pod template, so a new hydrate with the same cells restarts
+// nothing. A revoked flag changes the checksum. The checksum is the SHA-256 of the sorted
+// "<name> <env> <revoked>" lines, as cell-proxy computes it.
 func TestRegistryChecksumIgnoresSignature(t *testing.T) {
-	var sums []string
-	var templates []string
-	var registries []string
-	for range 2 {
-		r := renderCentralView(t, "STUB_RANDOM_KEYS=1")
+	sumOf := func(r result) (string, string) {
+		t.Helper()
 		if r.err != nil {
 			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 		}
@@ -70,34 +69,74 @@ func TestRegistryChecksumIgnoresSignature(t *testing.T) {
 		if reg == nil {
 			t.Fatal("no ConfigMap cell-registry")
 		}
-		sums = append(sums, get[string](t, reg, "metadata", "annotations", "poc.internal/registry-content-sha256"))
-		data, _ := yaml.Marshal(reg["data"])
-		registries = append(registries, string(data))
-		tmpl, _ := yaml.Marshal(principalTemplate(t, objs))
-		templates = append(templates, string(tmpl))
-		keys := get[string](t, reg, "data", "signers.pub")
-		if n := len(strings.Fields(keys)); n != 2 {
-			t.Fatalf("signers.pub holds %d keys, want one for each of the 2 cells", n)
-		}
-		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-			if _, ok := lookup(reg, "data", cell+".dsse.json"); !ok {
-				t.Fatalf("cell-registry has no %s.dsse.json", cell)
-			}
-		}
-		want := sha256.Sum256([]byte("dev-cell-1 dev false\ndev-cell-2 dev false\n"))
-		if sums[len(sums)-1] != hex.EncodeToString(want[:]) {
-			t.Fatalf("registry checksum %s, want the SHA-256 of the sorted record lines", sums[len(sums)-1])
-		}
+		sum := get[string](t, reg, "metadata", "annotations", "poc.internal/registry-content-sha256")
 		annotation := get[string](t, principalTemplate(t, objs), "metadata", "annotations", "poc.internal/registry-content-sha256")
-		if annotation != sums[len(sums)-1] {
-			t.Fatalf("pod annotation %s, ConfigMap annotation %s", annotation, sums[len(sums)-1])
+		if annotation != sum {
+			t.Fatalf("pod annotation %s, ConfigMap annotation %s", annotation, sum)
+		}
+		tmpl, _ := yaml.Marshal(principalTemplate(t, objs))
+		return sum, string(tmpl)
+	}
+	sha := func(lines string) string {
+		want := sha256.Sum256([]byte(lines))
+		return hex.EncodeToString(want[:])
+	}
+	first, firstTmpl := sumOf(renderCentralView(t))
+	if first != sha("dev-cell-1 dev false\ndev-cell-2 dev false\n") {
+		t.Fatalf("registry checksum %s, want the SHA-256 of the sorted record lines", first)
+	}
+	second, secondTmpl := sumOf(renderCentralView(t, "STUB_RANDOM_SIG=1", "STUB_MGMT_KEY=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="))
+	if first != second || firstTmpl != secondTmpl {
+		t.Fatalf("the renders differ: checksums %s and %s, templates equal %v", first, second, firstTmpl == secondTmpl)
+	}
+	revoked, _ := sumOf(renderCentralView(t, "STUB_REVOKED=dev-cell-2"))
+	if revoked == first || revoked != sha("dev-cell-1 dev false\ndev-cell-2 dev true\n") {
+		t.Fatalf("a revoked record gives checksum %s, and an open one gives %s", revoked, first)
+	}
+}
+
+// The registry holds the records of the management plane unchanged, and its key in signers.pub.
+// A cell without a bound record, or a management plane that cannot answer, stops the render.
+func TestRegistryFromManagement(t *testing.T) {
+	r := renderCentralView(t)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	reg := viewDocs(t, r.stdout)["ConfigMap "+viewNS+"/cell-registry"]
+	if reg == nil {
+		t.Fatal("no ConfigMap cell-registry")
+	}
+	if got := strings.TrimSpace(get[string](t, reg, "data", "signers.pub")); got != stubMgmtKey {
+		t.Fatalf("signers.pub holds %q, want only the stub key %q", got, stubMgmtKey)
+	}
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		payload := base64.StdEncoding.EncodeToString([]byte(`{"name":"` + cell + `","env":"dev","revoked":false}`))
+		want := `{"payloadType":"application/vnd.poc.cell-record+json","payload":"` + payload + `","signatures":[{"keyid":"","sig":"sig-` + cell + `"}]}`
+		if got := get[string](t, reg, "data", cell+".dsse.json"); got != want {
+			t.Errorf("%s.dsse.json is %s, want the record of mgmtd unchanged: %s", cell, got, want)
 		}
 	}
-	if registries[0] == registries[1] {
-		t.Fatal("the two renders signed the same registry, so the test proves nothing")
+	if !strings.Contains(r.log, "run mgmt -- records") {
+		t.Errorf("the render did not read the records through mise run mgmt:\n%s", r.log)
 	}
-	if sums[0] != sums[1] || templates[0] != templates[1] {
-		t.Fatalf("the renders differ: checksums %v, templates equal %v", sums, templates[0] == templates[1])
+	if got := len(get[map[string]any](t, reg, "data")); got != 3 {
+		t.Errorf("the registry holds %d entries, want 2 records and signers.pub", got)
+	}
+	for _, tc := range []struct {
+		name, want string
+		env        []string
+	}{
+		{"unbound cell", "Run CELL=bad-facts mise run cell:up, so its celld binds", []string{"VIEW_CELLS=dev-cell-1 bad-facts"}},
+		{"no answer", "could not read the records of mgmtd", []string{"STUB_NO_MGMT=1"}},
+		{"no key", "ConfigMap mgmt-system/mgmt-signing-pub is absent", []string{"STUB_NO_MGMT_KEY=1"}},
+		{"other env", "is not a record of dev-cell-1 in env other-env", []string{"POC_ENV=other-env", "STUB_RECORD_ENV=dev"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renderCentralView(t, tc.env...)
+			if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
+				t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", r.err, len(r.stdout), r.stderr, tc.want)
+			}
+		})
 	}
 }
 
@@ -274,7 +313,7 @@ func TestRenderCentralViewFailsClosed(t *testing.T) {
 		{"VIEW_CELLS= ", "VIEW_CELLS"},
 		{"ARGOCD_AGENT_IMAGE=quay.io/argoprojlabs/argocd-agent:v0.10.0", "not pinned by digest"},
 		{"STUB_NO_SERVER=1", "could not read the trust bundle"},
-		{"VIEW_CELLS=bad-facts", "could not sign the record of bad-facts"},
+		{"VIEW_CELLS=bad-facts", "Run CELL=bad-facts mise run cell:up, so its celld binds"},
 		{"VIEW_CELLS=" + strings.Repeat("a", 59) + " POC_ENV=" + strings.Repeat("e", 10), ""},
 		{"VIEW_CELLS=dev-cell-1 dev-cell-1-x", "starts with the agent name dev-dev-cell-1 and a dash"},
 		{"VIEW_CELLS=dev-cell-1 dev-cell-1", "names dev-dev-cell-1 twice"},

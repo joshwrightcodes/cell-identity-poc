@@ -68,7 +68,7 @@ These stay in the target architecture, and come in later increments:
 - The relay is a TLS passthrough that routes by port. The management plane has one listener for `dev`.
 - Each cluster gets its own pod and service subnets. Pod networks are not routed between clusters, so cross-cluster traffic uses node addresses on the `kind` network.
 - Observability uses the `otel-lgtm` all-in-one image, with local storage and no HA.
-- Until M4, the test-signed record from M2 is the management plane's registry of cells.
+- The management plane stand-in keeps its key and its state in files on its own persistent volume.
 - Upstream components keep their Prometheus endpoints. Only the collector in the same cluster scrapes them, and signals leave a cluster only as OTLP.
 - The External Secrets Operator is the provider-neutral sync from the secret manager into each cluster. A cluster gets its own install when it first needs a secret. In M2, only `dev-cp` has one. In M3, `management` has an operator with no store, for its Password generator.
 

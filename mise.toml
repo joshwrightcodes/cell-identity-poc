@@ -249,10 +249,6 @@ run = "scripts/size.sh"
 description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
 run = "scripts/restart-check.sh"
 
-[tasks."record:fixture"]
-description = "Print a ConfigMap with a test-signed cell record and its public key: --cluster <name> --subject <ns>/<sa>"
-run = "go run ./cmd/recordgen"
-
 [tasks.pki]
 description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"
 run = "go run ./cmd/pkigen"
