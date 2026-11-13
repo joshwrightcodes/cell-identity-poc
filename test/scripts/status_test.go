@@ -691,7 +691,9 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 	}
 
 	at := func(ago time.Duration) string { return time.Now().Add(-ago).UTC().Format(time.RFC3339Nano) }
-	plane := func(mutate func(m map[string]any)) []string { return []string{"STUB_MGMT_STATUS=" + healthyPlane(mutate)} }
+	plane := func(mutate func(m map[string]any)) []string {
+		return []string{"STUB_MGMT_STATUS=" + healthyPlane(mutate)}
+	}
 	cellCheck := func(name, result string) func(m map[string]any) {
 		return func(m map[string]any) {
 			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
