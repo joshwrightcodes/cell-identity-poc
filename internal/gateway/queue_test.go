@@ -1,0 +1,438 @@
+package gateway
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+)
+
+const cell1, cell2 = "dev-cell-1", "dev-cell-2"
+
+func TestRaiseEpochAboveSeenFence(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	base := f.s.Epoch()
+	if err := f.s.RaiseEpoch(ctx, op.Fence{Epoch: base - 1, Counter: 99}); err != nil {
+		t.Fatal(err)
+	}
+	if f.s.Epoch() != base {
+		t.Fatalf("a lower seen epoch moved the epoch to %d", f.s.Epoch())
+	}
+	if err := f.s.RaiseEpoch(ctx, op.Fence{Epoch: base + 10, Counter: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if f.s.Epoch() != base+11 {
+		t.Fatalf("epoch %d, want one above the seen epoch %d", f.s.Epoch(), base+11)
+	}
+	f.enqueue(1, cell1)
+	l, err := f.s.Claim(ctx, cell1, "pod")
+	if err != nil || l == nil || l.Fence.Epoch != base+11 {
+		t.Fatalf("claim after raise: %+v, %v", l, err)
+	}
+	f.reopen()
+	if f.s.Epoch() != base+11 {
+		t.Fatalf("epoch after reopen %d, want %d", f.s.Epoch(), base+11)
+	}
+	st, err := f.s.Stats(ctx)
+	if err != nil || st.Epoch != base+11 || !st.EpochChangedAt.Equal(t0) {
+		t.Fatalf("stats %+v, %v", st, err)
+	}
+}
+
+func TestQueueClaimOrderAndDedupe(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	for n := 1; n <= 3; n++ {
+		f.enqueue(n, cell1)
+	}
+	f.enqueue(9, cell2)
+	if id, added, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(2), cell1, 1)); err == nil || added || id != opID(2) {
+		t.Fatalf("other bytes, same epoch: %q, %v, %v", id, added, err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 3 {
+		t.Fatalf("depth %d, want 3", d)
+	}
+	var last op.Fence
+	for n := 1; n <= 3; n++ {
+		l, err := f.s.Claim(ctx, cell1, "pod-a")
+		if err != nil || l == nil {
+			t.Fatalf("claim %d: %v, %v", n, l, err)
+		}
+		if l.OpID != opID(n) {
+			t.Fatalf("claim %d returned op %s, want the oldest", n, l.OpID)
+		}
+		if last.Compare(l.Fence) >= 0 {
+			t.Fatalf("fence %v does not rise above %v", l.Fence, last)
+		}
+		if !l.Until.Equal(t0.Add(60 * time.Second)) {
+			t.Fatalf("lease until %v", l.Until)
+		}
+		last = l.Fence
+	}
+	if l, err := f.s.Claim(ctx, cell1, "pod-a"); l != nil || err != nil {
+		t.Fatalf("claim of a drained cell: %v, %v", l, err)
+	}
+	l, err := f.s.Claim(ctx, cell2, "pod-b")
+	if err != nil || l == nil || l.OpID != opID(9) || last.Compare(l.Fence) >= 0 {
+		t.Fatalf("other cell claim %+v, %v: fence must stay global", l, err)
+	}
+	st, err := f.s.Stats(ctx)
+	if err != nil || st.Queued[cell1] != 3 || st.MostClaimed[cell1].Count != 1 {
+		t.Fatalf("stats %+v, %v", st, err)
+	}
+}
+
+func TestQueueLeaseExpiryNewFence(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod-a")
+	f.clk.Advance(59 * time.Second)
+	if l, _ := f.s.Claim(ctx, cell1, "pod-b"); l != nil {
+		t.Fatal("a live lease was claimed again")
+	}
+	f.clk.Advance(2 * time.Second)
+	b, err := f.s.Claim(ctx, cell1, "pod-b")
+	if err != nil || b == nil || b.OpID != a.OpID || b.ID != a.ID {
+		t.Fatalf("claim after expiry: %+v, %v", b, err)
+	}
+	if b.Fence.Compare(a.Fence) <= 0 {
+		t.Fatalf("fence %v after expiry, want above %v", b.Fence, a.Fence)
+	}
+	// The first holder finishes late, with the old fence, under the live lease of the second.
+	_, err = f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence)
+	if !errors.Is(err, gwapi.ErrLeaseLost) {
+		t.Fatalf("late completion: %v, want lease lost", err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatalf("depth %d after a lost lease, want the row still open", d)
+	}
+	if st, _ := f.s.Stats(ctx); st.MostClaimed[cell1].Count != 2 {
+		t.Fatalf("claim count %+v, want 2", st.MostClaimed)
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, b.ID, resultItem(cell1, b.OpID), b.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatalf("depth %d after the live holder finished", d)
+	}
+}
+
+func TestQueueConcurrentClaimsDistinct(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	const n = 12
+	for i := 1; i <= n; i++ {
+		f.enqueue(i, cell1)
+	}
+	var wg sync.WaitGroup
+	leases := make([]*Lease, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l, err := f.s.Claim(ctx, cell1, "pod")
+			if err != nil {
+				t.Error(err)
+			}
+			leases[i] = l
+		}()
+	}
+	wg.Wait()
+	ops, fences := map[string]bool{}, map[op.Fence]bool{}
+	for _, l := range leases {
+		if l == nil {
+			t.Fatal("a claim got no item")
+		}
+		if ops[l.OpID] || fences[l.Fence] {
+			t.Fatalf("duplicate claim or fence: %+v", l)
+		}
+		ops[l.OpID], fences[l.Fence] = true, true
+	}
+	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
+		t.Fatal("more claims than items")
+	}
+}
+
+func TestQueueSurvivesReopen(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	f.enqueue(2, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence); err != nil {
+		t.Fatal(err)
+	}
+	f.reopen()
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatalf("depth %d after reopen, want 1", d)
+	}
+	b, _ := f.s.Claim(ctx, cell1, "pod")
+	if b == nil || b.OpID != opID(2) || b.Fence.Compare(a.Fence) <= 0 {
+		t.Fatalf("claim after reopen %+v: the fence counter must continue above %v", b, a.Fence)
+	}
+	if items, _ := f.s.Peek(ctx, 10, 1<<20); len(items) != 1 {
+		t.Fatalf("outbox has %d items after reopen, want 1", len(items))
+	}
+}
+
+func TestEnqueueReplacesHigherKeyEpoch(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	cell := cell1
+	if _, added, err := f.s.Enqueue(ctx, cell, f.opEnv(opID(1), cell, 1)); err != nil || !added {
+		t.Fatal(added, err)
+	}
+	f.s.Claim(ctx, cell, "pod")
+	e2 := f.opEnv(opID(1), cell, 2)
+	if _, added, err := f.s.Enqueue(ctx, cell, e2); err != nil || added {
+		t.Fatalf("replacement: added %v, %v", added, err)
+	}
+	f.clk.Advance(61 * time.Second)
+	b, _ := f.s.Claim(ctx, cell, "pod")
+	if string(b.Envelope) != string(e2) {
+		t.Fatal("the queued item did not take the epoch-2 bytes")
+	}
+	// Replace while leased keeps the fence: a lease taken now and replaced afterwards.
+	c := f.opEnv(opID(2), cell, 1)
+	f.s.Enqueue(ctx, cell, c)
+	l, _ := f.s.Claim(ctx, cell, "pod")
+	if _, _, err := f.s.Enqueue(ctx, cell, f.opEnv(opID(2), cell, 3)); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell); d != 2 {
+		t.Fatalf("depth %d, want 2: a replacement adds no row", d)
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell, l.ID, resultItem(cell, l.OpID), l.Fence); err != nil {
+		t.Fatalf("the holder of the replaced item keeps its fence: %v", err)
+	}
+	// A lower key epoch never replaces.
+	if _, _, err := f.s.Enqueue(ctx, cell, f.opEnv(opID(1), cell, 1)); !errors.Is(err, gwapi.ErrEnvelopeConflict) {
+		t.Fatalf("lower epoch: %v", err)
+	}
+	// A done item takes no replacement either.
+	if _, err := f.s.CompleteWithItem(ctx, cell, b.ID, resultItem(cell, b.OpID), b.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell, f.opEnv(opID(1), cell, 9)); !errors.Is(err, gwapi.ErrEnvelopeConflict) {
+		t.Fatalf("done item: %v", err)
+	}
+}
+
+func TestEnqueueConflictSameEpoch(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e1 := f.opEnv(opID(1), cell1, 2)
+	if _, _, err := f.s.Enqueue(ctx, cell1, e1); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(1), cell1, 2)); !errors.Is(err, gwapi.ErrEnvelopeConflict) {
+		t.Fatalf("same epoch, other bytes: %v", err)
+	}
+	if id, added, err := f.s.Enqueue(ctx, cell1, e1); err != nil || added || id != opID(1) {
+		t.Fatalf("same bytes: %q, %v, %v", id, added, err)
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell2, e1); err == nil {
+		t.Fatal("an envelope for another cell was queued")
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell1, []byte("junk")); err == nil {
+		t.Fatal("junk was queued")
+	}
+}
+
+func TestEnqueueReplayRequeuesDone(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
+		t.Fatal("a done item was claimed")
+	}
+	if _, err := f.s.EnqueueReplay(ctx, cell1, f.opEnv(opID(1), cell1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := f.s.Claim(ctx, cell1, "pod")
+	if b == nil || b.OpID != opID(1) {
+		t.Fatalf("replay did not requeue: %+v", b)
+	}
+}
+
+func TestEnqueueReplayOtherCellKeepsRow(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	if _, _, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(7), cell1, 1)); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.EnqueueReplay(ctx, cell2, f.opEnv(opID(7), cell2, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatalf("cell 1 depth %d, want its row kept", d)
+	}
+	if d, _ := f.s.Depth(ctx, cell2); d != 1 {
+		t.Fatalf("cell 2 depth %d, want 1", d)
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence); err != nil {
+		t.Fatalf("the cell 1 lease still holds: %v", err)
+	}
+}
+
+func TestCompleteWithItemAtomic(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	id, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence)
+	if err != nil || !id.Valid() {
+		t.Fatalf("complete: %q, %v", id, err)
+	}
+	items, _ := f.s.Peek(ctx, 10, 1<<20)
+	if len(items) != 1 || items[0].ID != id || items[0].Kind != gwapi.KindResult || items[0].OpID != a.OpID {
+		t.Fatalf("outbox %+v, want the appended result", items)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatal("row not done")
+	}
+	// A full outbox refuses the result and leaves the row open: nothing half-done.
+	g := newFixture(t)
+	g.s.maxItems = 0
+	g.enqueue(1, cell1)
+	b, _ := g.s.Claim(ctx, cell1, "pod")
+	if _, err := g.s.CompleteWithItem(ctx, cell1, b.ID, resultItem(cell1, b.OpID), b.Fence); !errors.Is(err, gwapi.ErrOverloaded) {
+		t.Fatalf("full outbox: %v", err)
+	}
+	if d, _ := g.s.Depth(ctx, cell1); d != 1 {
+		t.Fatal("the row was marked done without its result")
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell2, a.ID, resultItem(cell1, a.OpID), a.Fence); err == nil {
+		t.Fatal("an item of another cell was accepted")
+	}
+}
+
+func TestCompleteResendAppendsOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, "", resultItem(cell1, a.OpID), a.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatal("a resend marked the row done")
+	}
+	if items, _ := f.s.Peek(ctx, 10, 1<<20); len(items) != 1 {
+		t.Fatalf("%d items, want the resent result", len(items))
+	}
+}
+
+func TestCompleteEmptyOpIDByLease(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	it := resultItem(cell1, "")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, it, a.Fence); err != nil {
+		t.Fatal(err)
+	}
+	f.clk.Advance(time.Hour)
+	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
+		t.Fatalf("a result with an empty OpID left the row claimable: %+v", l)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatal("row not done")
+	}
+}
+
+func TestEnqueueNotifies(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	c1, stop1 := f.n.Subscribe(cell1)
+	defer stop1()
+	c2, stop2 := f.n.Subscribe(cell2)
+	defer stop2()
+	e1 := f.opEnv(opID(1), cell1, 1)
+	if _, _, err := f.s.Enqueue(ctx, cell1, e1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c1:
+	default:
+		t.Fatal("the subscriber of the cell got no signal")
+	}
+	select {
+	case <-c2:
+		t.Fatal("another cell's subscriber got a signal")
+	default:
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell1, e1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c1:
+		t.Fatal("a known item gave a signal")
+	default:
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(1), cell1, 2)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c1:
+	default:
+		t.Fatal("a replacement gave no signal")
+	}
+	if _, err := f.s.EnqueueReplay(ctx, cell1, f.opEnv(opID(1), cell1, 2)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c1:
+	default:
+		t.Fatal("a replay gave no signal")
+	}
+}
+
+func TestPruneDone(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	a, _ := f.s.Claim(ctx, cell1, "pod")
+	id, err := f.s.CompleteWithItem(ctx, cell1, a.ID, resultItem(cell1, a.OpID), a.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.Ack(ctx, ackAccepted(id)); err != nil {
+		t.Fatal(err)
+	}
+	f.clk.Advance(9*time.Minute + 59*time.Second)
+	if err := f.s.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := f.s.Outcome(ctx, cell1, id); !ok {
+		t.Fatal("outcome pruned before 10 minutes")
+	}
+	f.clk.Advance(2 * time.Second)
+	if err := f.s.Prune(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := f.s.Outcome(ctx, cell1, id); ok {
+		t.Fatal("outcome kept after 10 minutes")
+	}
+	f.clk.Advance(24*time.Hour - 11*time.Minute)
+	f.s.Prune(ctx)
+	if _, added, _ := f.s.Enqueue(ctx, cell1, f.opEnv(opID(1), cell1, 1)); added {
+		t.Fatal("a done item was pruned before 24 h")
+	}
+	f.clk.Advance(time.Minute)
+	f.s.Prune(ctx)
+	if _, added, err := f.s.Enqueue(ctx, cell1, f.opEnv(opID(1), cell1, 1)); err != nil || !added {
+		t.Fatalf("a done item older than 24 h was kept: %v, %v", added, err)
+	}
+}

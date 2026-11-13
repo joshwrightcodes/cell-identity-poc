@@ -1,0 +1,219 @@
+package gateway
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+)
+
+// Append stores an item in the outbox and returns its ID. When the outbox is full, in items, bytes
+// or items of that cell, the oldest status item of the same cell goes first. With none left, the
+// new item gets gwapi.ErrOverloaded and nothing is dropped. A bind item also gets ErrOverloaded
+// when its cell already has four pending binds.
+func (s *Store) Append(ctx context.Context, it gwapi.Item) (gwapi.ItemID, error) {
+	var id gwapi.ItemID
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var err error
+		id, err = s.appendItem(tx, it)
+		return err
+	})
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+func itemSize(it gwapi.Item) int {
+	return len(it.Body) + len(it.Token) + len(it.Cell) + len(it.OpID) + len(it.Kind)
+}
+
+func (s *Store) appendItem(tx *sql.Tx, it gwapi.Item) (gwapi.ItemID, error) {
+	switch it.Kind {
+	case gwapi.KindResult, gwapi.KindStatus, gwapi.KindBind:
+	default:
+		return "", fmt.Errorf("append: unknown item kind %q", it.Kind)
+	}
+	if it.Cell == "" {
+		return "", errors.New("append: item has no cell")
+	}
+	size := itemSize(it)
+	if it.Kind == gwapi.KindBind {
+		var binds int
+		if err := tx.QueryRow(`SELECT count(*) FROM outbox WHERE cell = ? AND kind = ?`, it.Cell, gwapi.KindBind).Scan(&binds); err != nil {
+			return "", err
+		}
+		if binds >= s.maxBinds {
+			return "", gwapi.ErrOverloaded
+		}
+	}
+	dropped := 0
+	for {
+		var items, cellItems, bytes int
+		if err := tx.QueryRow(`SELECT count(*), coalesce(sum(size), 0), coalesce(sum(cell = ?), 0) FROM outbox`, it.Cell).
+			Scan(&items, &bytes, &cellItems); err != nil {
+			return "", err
+		}
+		if items < s.maxItems && cellItems < s.perCell && bytes+size <= s.maxBytes {
+			break
+		}
+		res, err := tx.Exec(`DELETE FROM outbox WHERE seq = (SELECT min(seq) FROM outbox WHERE cell = ? AND kind = ?)`, it.Cell, gwapi.KindStatus)
+		if err != nil {
+			return "", err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return "", gwapi.ErrOverloaded
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		if err := addMeta(tx, "dropped", int64(dropped)); err != nil {
+			return "", err
+		}
+		if err := setMeta(tx, "dropped_at", s.now().UnixNano()); err != nil {
+			return "", err
+		}
+	}
+	id := gwapi.NewItemID()
+	_, err := tx.Exec(`INSERT INTO outbox (id, cell, kind, op_id, body, token, size, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		string(id), it.Cell, it.Kind, it.OpID, []byte(it.Body), it.Token, size, s.now().UnixNano())
+	return id, err
+}
+
+// Peek returns the oldest outbox items, at most maxItems and about maxBytes of encoded items, and
+// never more than 100 items and 900 KiB. It always returns one item when the outbox has one. It
+// does not remove anything.
+func (s *Store) Peek(ctx context.Context, maxItems, maxBytes int) ([]gwapi.OutItem, error) {
+	maxItems, maxBytes = min(maxItems, MaxPeekItems), min(maxBytes, MaxPeekBytes)
+	var out []gwapi.OutItem
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		out = nil
+		total, full := 0, false
+		return scanRows(tx, `SELECT id, cell, kind, op_id, body, token FROM outbox ORDER BY seq LIMIT ?`, func(r *sql.Rows) error {
+			if full || len(out) >= maxItems {
+				return nil
+			}
+			var oi gwapi.OutItem
+			var body []byte
+			if err := r.Scan(&oi.ID, &oi.Cell, &oi.Kind, &oi.OpID, &body, &oi.Token); err != nil {
+				return err
+			}
+			oi.Body = json.RawMessage(body)
+			enc, err := json.Marshal(oi)
+			if err != nil {
+				return err
+			}
+			if len(out) > 0 && total+len(enc) > maxBytes {
+				full = true
+				return nil
+			}
+			total += len(enc)
+			out = append(out, oi)
+			return nil
+		}, MaxPeekItems)
+	})
+	return out, err
+}
+
+// Ack deletes each item that the outcomes name and stores its outcome by item ID and op ID. An ID
+// that the outbox does not hold is ignored.
+func (s *Store) Ack(ctx context.Context, outcomes []mgmtapi.ItemOutcome) error {
+	return s.tx(ctx, func(tx *sql.Tx) error {
+		at := s.now().UnixNano()
+		for _, o := range outcomes {
+			var seq int64
+			var cell, opID string
+			err := tx.QueryRow(`SELECT seq, cell, op_id FROM outbox WHERE id = ?`, o.ID).Scan(&seq, &cell, &opID)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			o.OpID = opID
+			body, err := json.Marshal(o)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DELETE FROM outbox WHERE seq = ?`, seq); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO outcomes (seq, id, cell, op_id, body, at) VALUES (?, ?, ?, ?, ?, ?)`,
+				seq, o.ID, cell, opID, body, at); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// Outcome returns the stored outcome of an item of cell. It never returns the outcome of an item
+// of another cell.
+func (s *Store) Outcome(ctx context.Context, cell string, id gwapi.ItemID) (mgmtapi.ItemOutcome, bool, error) {
+	var o mgmtapi.ItemOutcome
+	var found bool
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		var body []byte
+		err := tx.QueryRow(`SELECT body FROM outcomes WHERE id = ? AND cell = ?`, string(id), cell).Scan(&body)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		found = true
+		return json.Unmarshal(body, &o)
+	})
+	if err != nil {
+		return mgmtapi.ItemOutcome{}, false, err
+	}
+	return o, found, nil
+}
+
+// FinalOutcomes returns the outcomes of the result items of cell with an outbox row ID above
+// after, oldest first, at most 100, and the highest row ID that it returned (after when it
+// returned none). The stream keeps that cursor. An outcome of retry is deleted as it is returned,
+// because the cell sends the result again.
+func (s *Store) FinalOutcomes(ctx context.Context, cell string, after int64) ([]mgmtapi.ItemOutcome, int64, error) {
+	var outs []mgmtapi.ItemOutcome
+	cursor := after
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		outs, cursor = nil, after
+		var retry []int64
+		err := scanRows(tx, `SELECT seq, body FROM outcomes WHERE cell = ? AND op_id != '' AND seq > ? ORDER BY seq LIMIT 100`,
+			func(r *sql.Rows) error {
+				var seq int64
+				var body []byte
+				var o mgmtapi.ItemOutcome
+				if err := r.Scan(&seq, &body); err != nil {
+					return err
+				}
+				if err := json.Unmarshal(body, &o); err != nil {
+					return err
+				}
+				outs = append(outs, o)
+				cursor = seq
+				if o.Outcome == mgmtapi.OutcomeRetry {
+					retry = append(retry, seq)
+				}
+				return nil
+			}, cell, after)
+		if err != nil {
+			return err
+		}
+		for _, seq := range retry {
+			if _, err := tx.Exec(`DELETE FROM outcomes WHERE seq = ?`, seq); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, after, err
+	}
+	return outs, cursor, nil
+}
