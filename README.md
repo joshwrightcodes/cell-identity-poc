@@ -358,7 +358,7 @@ In two gaps, new agents cannot attest. Agents that already run still renew their
 - From the render of `dev-cp` until each cell binds, the SPIRE server holds no record of that cell. After the bind, `envd` writes the records, and the server reloads them.
   The measured span from the `envd` write to the log line `records reloaded` was 50 and 60 seconds.
   That span covers the kubelet sync of the ConfigMap volume and the reload that runs every 10 seconds.
-- In a signing key rotation, the plugin holds no records between the server restart and the first new spec. The measured gap was 71 seconds.
+- In a signing key rotation, the plugin holds no records between the server restart and the first new spec. The measured gaps were 71 and 91 seconds.
 
 `attest-wait.sh` shows which stage of the first gap is slow. A `celld` pod that starts in a gap can restart its agent container until the record lands.
 
@@ -841,7 +841,7 @@ A run from clean on 2026-11-13, with the M3 components, took 21 minutes 53 secon
 The image build took 25 seconds. The rest of the run creates the five clusters and runs the link phase of `management`.
 `harness:status` and `harness:verify` passed.
 After the run, `gate:m1` took 131 seconds, `gate:m2` took 453 seconds, and `gate:m3` took 2,611 and 2,613 seconds.
-A run from clean with the M4 components took TBD-HARNESS-UP for `harness:up`.
+A run from clean with the M4 components took about 26 minutes for `harness:up`, plus about 5 minutes of wait for `secrets:connect`.
 
 After the second `gate:m3` run, the five node containers used about 11 GiB of memory in total:
 
@@ -854,6 +854,8 @@ After the second `gate:m3` run, the five node containers used about 11 GiB of me
 | `registry-mirror` | 60 MiB | 0 percent |
 
 The VM reports 11.6 GB of 40 GB in use, and 22 GB more in the file cache.
+After the M4 rebuild drill, `management` used 3.5 GiB, `dev-cp` 2.4 GiB, and each cell 2.2 GiB.
+The VM then reported 11.7 GB in use.
 
 `gate:m1` prints its elapsed time. It fails when the run takes longer than `GATE_M1_BUDGET_MINUTES`.
 The budget is 3 minutes. This is 1.5 times the slowest run of 104 seconds, rounded up to the next minute.
@@ -872,6 +874,10 @@ This gives `gate:m1` and `gate:m2` 30 minutes, and `gate:m3` 132 minutes.
 `TestM3StatusHealthy` takes about seven minutes. Earlier tests restart the SPIRE server of `management`, and `obs:uplink-status` counts exporter failures of the last five minutes. `TestM3VerifyDetectsPeerRootDrift` takes about 80 seconds.
 The tests of the mesh view add about ten minutes. The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
+`gate:m4` fails when the run takes longer than `GATE_M4_BUDGET_MINUTES`.
+The budget is 40 minutes. This is 1.5 times the slower of two runs, 1,586 seconds on 2026-11-13, rounded up to the next minute.
+The test timeout of `gate:m4` is 80 minutes. `TestM4StatusShowsSpec` takes about 2.5 minutes.
+Each test that changes a cell record links the three registry components again in its cleanup, and that adds gate time.
 It prints the twelve slowest tests at the end.
 The slowest tests are the management CA rotation (574 seconds) and the rogue telemetry test (246 seconds).
 The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take 97 seconds.
@@ -1198,7 +1204,8 @@ The render of `dev-cp` copies that key into ConfigMap `mgmt-spec-key` for `envd`
 A restart of `mgmtd-0` keeps the key.
 A rebuild of `management` makes a new key and an empty state.
 Then `envd` refuses the specs until you render `dev-cp` again, and each cell binds again.
-The rebuild drill took TBD-REBUILD from `cell:down` of `management` to every cell bound.
+On 2026-11-13 the rebuild drill took 13 minutes from `cell:down` of `management` until both cells were bound.
+The last link of the drill ended after 16 minutes.
 `mise run mgmt -- rotate-signing-key` replaces the key as a break-glass action. The runbook describes it.
 
 The host service makes a TLS key in memory at each start, and its certificate lives 90 days.
