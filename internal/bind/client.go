@@ -16,6 +16,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
@@ -36,10 +39,10 @@ const (
 	DefaultMinBackoff     = time.Second
 	DefaultMaxBackoff     = 30 * time.Second
 	DefaultRefusedBackoff = 60 * time.Second
-	DefaultAttemptTimeout = 30 * time.Second
+	DefaultAttemptTimeout = 60 * time.Second
 	DefaultRecheckEvery   = 5 * time.Minute
+	DefaultPollEvery      = 2 * time.Second
 
-	tokenTTL       = 600 * time.Second
 	maxResponse    = 64 << 10
 	maxHeaderBytes = 16 << 10
 	maxIDLength    = 32
@@ -49,17 +52,12 @@ const (
 )
 
 // TokenFunc returns a token whose only audience is audience.
-type TokenFunc func(ctx context.Context, audience string) (string, error)
+type TokenFunc = satoken.TokenFunc
 
 // PodTokenFunc returns a TokenFunc that requests a token of 600 s for the service account, bound
 // to the pod.
 func PodTokenFunc(c corev1client.ServiceAccountsGetter, namespace, serviceAccount, podName, podUID string) TokenFunc {
-	return func(ctx context.Context, audience string) (string, error) {
-		return satoken.Create(ctx, c, satoken.Request{
-			Namespace: namespace, ServiceAccount: serviceAccount, PodName: podName, PodUID: podUID,
-			Audience: audience, TTL: tokenTTL,
-		})
-	}
+	return satoken.PodTokenFunc(c, namespace, serviceAccount, podName, podUID)
 }
 
 // ClientTLS returns the TLS settings for the bind listener: the server must present the SPIFFE ID
@@ -83,8 +81,9 @@ type Config struct {
 	// MinBackoff and MaxBackoff bound the wait after a transient failure. RefusedBackoff is the wait
 	// after the management plane refuses a request.
 	MinBackoff, MaxBackoff, RefusedBackoff time.Duration
-	// AttemptTimeout bounds one Once, or one recheck.
-	AttemptTimeout time.Duration
+	// AttemptTimeout bounds one Once, or one recheck. PollEvery is the wait between two polls of a
+	// bind result.
+	AttemptTimeout, PollEvery time.Duration
 	// RecheckEvery is the interval at which Run asks whether the cell is still bound.
 	RecheckEvery time.Duration
 	// Sleep waits for d or until ctx ends. The default uses a timer.
@@ -119,6 +118,7 @@ func (c Config) withDefaults() (Config, error) {
 	}{
 		{&c.MinBackoff, DefaultMinBackoff}, {&c.MaxBackoff, DefaultMaxBackoff}, {&c.RefusedBackoff, DefaultRefusedBackoff},
 		{&c.AttemptTimeout, DefaultAttemptTimeout}, {&c.RecheckEvery, DefaultRecheckEvery},
+		{&c.PollEvery, DefaultPollEvery},
 	} {
 		if *d.v <= 0 {
 			*d.v = d.def
@@ -144,10 +144,10 @@ func sleep(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// Refused is the error of a definite refusal: the management plane answered HTTP 403.
+// Refused is the error of a definite refusal: the gateway answered HTTP 403.
 type Refused struct{ RequestID string }
 
-func (e *Refused) Error() string { return "the management plane refused the request: " + e.RequestID }
+func (e *Refused) Error() string { return "the gateway refused the request: " + e.RequestID }
 
 // LogAttrs adds the request ID to the error line of a command.
 func (e *Refused) LogAttrs() []any { return []any{"request_id", e.RequestID} }
@@ -156,7 +156,7 @@ func (e *Refused) LogAttrs() []any { return []any{"request_id", e.RequestID} }
 type StatusError struct{ Code int }
 
 func (e *StatusError) Error() string {
-	return fmt.Sprintf("the management plane answered HTTP %d", e.Code)
+	return fmt.Sprintf("the gateway answered HTTP %d", e.Code)
 }
 
 // Client sends the nonce and bind requests of one cell. Each request uses its own connection, so
@@ -192,31 +192,84 @@ func NewClient(cfg Config) *Client {
 // Close drops idle connections.
 func (c *Client) Close() { c.tr.CloseIdleConnections() }
 
-// Nonce requests a nonce. The request body is empty.
+// Nonce requests a nonce.
 func (c *Client) Nonce(ctx context.Context) (mgmtapi.NonceResponse, error) {
 	var out mgmtapi.NonceResponse
-	err := c.post(ctx, mgmtapi.NoncePath(c.cell), nil, &out)
+	err := c.do(ctx, http.MethodGet, gwapi.NoncePath(c.cell), nil, &out, http.StatusOK)
 	return out, err
 }
 
-// Bind sends a bind request.
-func (c *Client) Bind(ctx context.Context, req mgmtapi.BindRequest) (mgmtapi.BindResponse, error) {
+// Bind posts a bind request and returns the ID to poll.
+func (c *Client) Bind(ctx context.Context, req mgmtapi.BindRequest) (gwapi.ItemID, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
-		return mgmtapi.BindResponse{}, err
+		return "", err
 	}
-	var out mgmtapi.BindResponse
-	if err = c.post(ctx, mgmtapi.BindPath(c.cell), body, &out); err != nil {
-		return mgmtapi.BindResponse{}, err
+	var out gwapi.BindAccepted
+	if err = c.do(ctx, http.MethodPost, gwapi.BindPath(c.cell), body, &out, http.StatusAccepted, http.StatusOK); err != nil {
+		return "", err
 	}
-	if !knownStatus(out.Status) {
-		return mgmtapi.BindResponse{}, errors.New("the bind response holds no known status")
+	if !out.ID.Valid() {
+		return "", errors.New("the bind answer holds no valid ID")
 	}
-	return out, nil
+	return out.ID, nil
 }
 
-func (c *Client) post(ctx context.Context, path string, body []byte, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
+// Result reads the result of a bind. A denied result is a *Refused error.
+func (c *Client) Result(ctx context.Context, id gwapi.ItemID) (gwapi.BindResult, error) {
+	var out gwapi.BindResult
+	if err := c.do(ctx, http.MethodGet, gwapi.BindResultPath(c.cell, string(id)), nil, &out, http.StatusOK); err != nil {
+		return out, err
+	}
+	switch {
+	case out.Status == gwapi.BindDenied:
+		return out, &Refused{RequestID: cleanID(out.RequestID)}
+	case out.Status == gwapi.BindPending, knownStatus(out.Status):
+		return out, nil
+	}
+	return gwapi.BindResult{}, errors.New("the bind result holds no known status")
+}
+
+// BindWait posts a bind request and polls its result every poll until a final status. A pending
+// result and a poll that fails in transfer or with an HTTP status are tried again until ctx ends. A denied result is a *Refused error.
+func (c *Client) BindWait(ctx context.Context, req mgmtapi.BindRequest, poll time.Duration) (mgmtapi.BindResponse, error) {
+	id, err := c.Bind(ctx, req)
+	if err != nil {
+		return mgmtapi.BindResponse{}, fmt.Errorf("send the bind request: %w", err)
+	}
+	var last error
+	for {
+		res, err := c.Result(ctx, id)
+		var refused *Refused
+		switch {
+		case errors.As(err, &refused):
+			return mgmtapi.BindResponse{}, err
+		case isTransient(err):
+			last = err
+		case err != nil:
+			return mgmtapi.BindResponse{}, err
+		case res.Status != gwapi.BindPending:
+			return mgmtapi.BindResponse{Status: res.Status}, nil
+		}
+		if err := sleep(ctx, poll); err != nil {
+			if last != nil {
+				err = errors.Join(err, last)
+			}
+			return mgmtapi.BindResponse{}, fmt.Errorf("wait for the bind result: %w", err)
+		}
+	}
+}
+
+// isTransient reports whether a failed poll can be tried again: a failed transfer, or an answer
+// with an HTTP status that is not 403.
+func isTransient(err error) bool {
+	var se *StatusError
+	var ue *url.Error
+	return errors.As(err, &se) || errors.As(err, &ue)
+}
+
+func (c *Client) do(ctx context.Context, method, path string, body []byte, out any, ok ...int) error {
+	req, err := http.NewRequestWithContext(ctx, method, c.base+path, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -235,13 +288,13 @@ func (c *Client) post(ctx context.Context, path string, body []byte, out any) er
 	if len(raw) > maxResponse {
 		return fmt.Errorf("the response is too large: more than %d bytes", maxResponse)
 	}
-	switch resp.StatusCode {
-	case http.StatusOK:
+	switch {
+	case slices.Contains(ok, resp.StatusCode):
 		if err := json.Unmarshal(raw, out); err != nil {
 			return fmt.Errorf("decode the response: %w", err)
 		}
 		return nil
-	case http.StatusForbidden:
+	case resp.StatusCode == http.StatusForbidden:
 		var d mgmtapi.Denied
 		_ = json.Unmarshal(raw, &d)
 		return &Refused{RequestID: cleanID(d.RequestID)}
@@ -287,9 +340,9 @@ func knownStatus(status string) bool {
 	return false
 }
 
-// Once binds the cell: it requests a nonce, mints a token for the audience of the nonce, and sends
-// the bind request. The whole attempt takes at most AttemptTimeout. A *Refused error is a definite
-// refusal. Every other error is transient.
+// Once binds the cell: it requests a nonce, mints a token for the audience of the nonce, posts the
+// bind request, and polls the result every PollEvery until it is final. The whole attempt takes at
+// most AttemptTimeout. A *Refused error is a definite refusal. Every other error is transient.
 func Once(ctx context.Context, cfg Config) (mgmtapi.BindResponse, error) {
 	cfg, err := cfg.withDefaults()
 	if err != nil {
@@ -311,11 +364,7 @@ func Once(ctx context.Context, cfg Config) (mgmtapi.BindResponse, error) {
 	if err != nil {
 		return mgmtapi.BindResponse{}, fmt.Errorf("mint a token: %w", err)
 	}
-	resp, err := c.Bind(ctx, mgmtapi.BindRequest{Nonce: n.Nonce, Token: token})
-	if err != nil {
-		return mgmtapi.BindResponse{}, fmt.Errorf("send the bind request: %w", err)
-	}
-	return resp, nil
+	return c.BindWait(ctx, mgmtapi.BindRequest{Nonce: n.Nonce, Token: token}, cfg.PollEvery)
 }
 
 // Run repeats Once until a bind succeeds, with no limit. After a success it asks for a nonce every
@@ -358,8 +407,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 		end()
 		if err == nil {
 			cfg.observe(ctx, resp.Status)
-			cfg.Log.InfoContext(actx, "bound", "cell", cfg.Cell, "status", resp.Status,
-				"record_epoch", resp.Record.Epoch, "record_counter", resp.Record.Counter)
+			cfg.Log.InfoContext(actx, "bound", "cell", cfg.Cell, "status", resp.Status)
 			return nil
 		}
 		if ctx.Err() != nil {
@@ -369,6 +417,11 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 		var refused *Refused
 		result := "error"
 		if errors.As(err, &refused) {
+			if bound, berr := checkBound(ctx, cfg); berr == nil && bound {
+				cfg.observe(ctx, mgmtapi.StatusAlreadyBound)
+				cfg.Log.WarnContext(actx, "bind denied but the cell is bound", "cell", cfg.Cell, "request_id", refused.RequestID)
+				return nil
+			}
 			result, wait = "refused", jitter(cfg.RefusedBackoff, 0.1, 0)
 			failures = 0
 		} else {

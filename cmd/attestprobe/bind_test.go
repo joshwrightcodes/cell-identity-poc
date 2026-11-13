@@ -5,22 +5,25 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
-// bindServer plays the bind listener of mgmtd for one test.
+// bindServer plays the bind listener of the cell gateway for one test. Bind post number n gets the
+// ID of n, and the poll of that ID gets the result of n.
 type bindServer struct {
 	addr       string
 	bundlePath string
@@ -28,12 +31,16 @@ type bindServer struct {
 	nonces     int
 	nonceReply func(cell string) mgmtapi.NonceResponse
 	binds      []mgmtapi.BindRequest
-	bindStatus func(n int) (int, any)
+	methods    []string
+	postStatus func(n int) (int, any)
+	result     func(n int) gwapi.BindResult
 }
+
+func bindID(n int) gwapi.ItemID { return gwapi.ItemID(fmt.Sprintf("%032x", n)) }
 
 func newBindServer(t *testing.T) *bindServer {
 	t.Helper()
-	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	ca := spiffetest.NewCA(t, "dev.env.poc.internal")
 	pem, err := ca.Bundle().Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -42,18 +49,18 @@ func newBindServer(t *testing.T) *bindServer {
 	if err := os.WriteFile(s.bundlePath, pem, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s.bindStatus = func(int) (int, any) {
-		return 200, mgmtapi.BindResponse{Status: mgmtapi.StatusBound, Record: spec.Revision{Epoch: 1, Counter: 1}}
-	}
-	cfg := tlsconfig.TLSServerConfig(ca.Source(t, "spiffe://mgmt.poc.internal/api"))
+	s.postStatus = func(n int) (int, any) { return 202, gwapi.BindAccepted{ID: bindID(n)} }
+	s.result = func(int) gwapi.BindResult { return gwapi.BindResult{Status: mgmtapi.StatusBound} }
+	cfg := tlsconfig.TLSServerConfig(ca.Source(t, "spiffe://dev.env.poc.internal/cp/gateway"))
 	cfg.MinVersion, cfg.NextProtos = tls.VersionTLS13, []string{"h2"}
 	reply := func(w http.ResponseWriter, code int, v any) {
 		w.WriteHeader(code)
 		_ = json.NewEncoder(w).Encode(v)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc(mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
+		s.methods = append(s.methods, r.Method+" "+r.URL.Path)
 		s.nonces++
 		s.mu.Unlock()
 		if s.nonceReply != nil {
@@ -62,15 +69,27 @@ func newBindServer(t *testing.T) *bindServer {
 		}
 		reply(w, 200, mgmtapi.NonceResponse{Nonce: "n1", Audience: mgmtapi.BindAudience(r.PathValue("cell"), "n1")})
 	})
-	mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		s.mu.Lock()
+		s.methods = append(s.methods, r.Method+" "+r.URL.Path)
 		s.binds = append(s.binds, req)
 		n := len(s.binds) - 1
 		s.mu.Unlock()
-		code, v := s.bindStatus(n)
+		code, v := s.postStatus(n)
 		reply(w, code, v)
+	})
+	mux.HandleFunc("GET "+gwapi.BindResultPattern, func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.methods = append(s.methods, r.Method+" "+r.URL.Path)
+		s.mu.Unlock()
+		var n int
+		if _, err := fmt.Sscanf(r.PathValue("id"), "%032x", &n); err != nil {
+			reply(w, 404, map[string]string{"error": "unknown"})
+			return
+		}
+		reply(w, 200, s.result(n))
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -87,8 +106,8 @@ func newBindServer(t *testing.T) *bindServer {
 
 func (s *bindServer) args(extra ...string) []string {
 	return append([]string{
-		"--target", "mgmt-bind", "--upstream", s.addr, "--expect-id", "spiffe://mgmt.poc.internal/api",
-		"--peer-bundle", s.bundlePath, "--cell", "dev-cell-1",
+		"--target", "gw-bind", "--upstream", s.addr, "--expect-id", "spiffe://dev.env.poc.internal/cp/gateway",
+		"--trust-bundle", s.bundlePath, "--cell", "dev-cell-1",
 	}, extra...)
 }
 
@@ -99,7 +118,7 @@ func runProbe(t *testing.T, td *testDeps, args []string) (int, string) {
 	return code, out.String()
 }
 
-func TestAttestprobeBindVariants(t *testing.T) {
+func TestAttestprobeGatewayVariants(t *testing.T) {
 	pod := testPod()
 	for _, tc := range []struct {
 		variant  string
@@ -139,17 +158,21 @@ func TestAttestprobeBindVariants(t *testing.T) {
 			if len(s.binds) != 1 || s.binds[0].Nonce != "n1" || s.binds[0].Token != "token-1" {
 				t.Fatalf("bind requests %+v", s.binds)
 			}
+			wantReqs := []string{"GET " + gwapi.NoncePath("dev-cell-1"), "POST " + gwapi.BindPath("dev-cell-1"), "GET " + gwapi.BindResultPath("dev-cell-1", string(bindID(0)))}
+			if !slices.Equal(s.methods, wantReqs) {
+				t.Fatalf("requests %v, want %v", s.methods, wantReqs)
+			}
 		})
 	}
 }
 
 func TestAttestprobeBindReuseNonce(t *testing.T) {
 	s := newBindServer(t)
-	s.bindStatus = func(n int) (int, any) {
+	s.result = func(n int) gwapi.BindResult {
 		if n == 0 {
-			return 200, mgmtapi.BindResponse{Status: mgmtapi.StatusBound}
+			return gwapi.BindResult{Status: mgmtapi.StatusBound}
 		}
-		return 403, mgmtapi.Denied{Error: "denied", RequestID: "00000000000000aa"}
+		return gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "00000000000000aa"}
 	}
 	td := newTestDeps(t)
 	code, out := runProbe(t, td, s.args("--variant", "good", "--reuse-nonce"))
@@ -191,8 +214,8 @@ func TestAttestprobeBindWithNonceAndTokenFile(t *testing.T) {
 
 func TestAttestprobeBindDeniedIsAResult(t *testing.T) {
 	s := newBindServer(t)
-	s.bindStatus = func(int) (int, any) {
-		return 403, mgmtapi.Denied{Error: "denied", RequestID: "0123456789abcdef"}
+	s.result = func(int) gwapi.BindResult {
+		return gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "0123456789abcdef"}
 	}
 	code, out := runProbe(t, newTestDeps(t), s.args("--variant", "good"))
 	if code != 0 || out != "nonce:n1 mgmt-bind/dev-cell-1/n1\ndenied:0123456789abcdef\n" {
@@ -202,7 +225,7 @@ func TestAttestprobeBindDeniedIsAResult(t *testing.T) {
 
 func TestAttestprobeBindFailureIsOneJSONLine(t *testing.T) {
 	s := newBindServer(t)
-	s.bindStatus = func(int) (int, any) { return 503, map[string]string{"error": "busy"} }
+	s.postStatus = func(int) (int, any) { return 503, map[string]string{"error": "busy"} }
 	code, out := runProbe(t, newTestDeps(t), s.args("--variant", "good"))
 	if code != 1 || strings.Count(out, "\n") != 1 || strings.Contains(out, "nonce:") {
 		t.Fatalf("exit %d, output %q, want one JSON error line and no data", code, out)
@@ -225,12 +248,16 @@ func TestAttestprobeBindRefusesBadFlags(t *testing.T) {
 		"attest-audience no env":  {"--variant", "attest-audience"},
 		"unexpected argument":     {"--variant", "good", "extra"},
 		"unknown target":          nil,
+		"retired target":          nil,
 		"spire variant in target": {"--variant", "wrong-audience"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			args := s.args(extra...)
 			if name == "unknown target" {
 				args = append([]string{"--target", "other"}, args[2:]...)
+			}
+			if name == "retired target" {
+				args = append([]string{"--target", "mgmt-bind"}, args[2:]...)
 			}
 			if code, out := runProbe(t, newTestDeps(t), args); code != 1 || strings.Count(out, "\n") != 1 {
 				t.Fatalf("exit %d, output %q", code, out)
@@ -244,7 +271,7 @@ func TestAttestprobeBindRefusesWrongServerID(t *testing.T) {
 	args := s.args("--variant", "good")
 	for i, a := range args {
 		if a == "--expect-id" {
-			args[i+1] = "spiffe://mgmt.poc.internal/other"
+			args[i+1] = "spiffe://dev.env.poc.internal/cp/other"
 		}
 	}
 	td := newTestDeps(t)
@@ -273,7 +300,7 @@ func TestAttestprobeBindChecksTheNonceAnswer(t *testing.T) {
 
 func TestAttestprobeBindRefusesUnknownStatus(t *testing.T) {
 	s := newBindServer(t)
-	s.bindStatus = func(int) (int, any) { return 200, mgmtapi.BindResponse{Status: "pwned"} }
+	s.result = func(int) gwapi.BindResult { return gwapi.BindResult{Status: "pwned"} }
 	if code, out := runProbe(t, newTestDeps(t), s.args("--variant", "good")); code != 1 || strings.Contains(out, "bound:") {
 		t.Fatalf("exit %d, output %q", code, out)
 	}

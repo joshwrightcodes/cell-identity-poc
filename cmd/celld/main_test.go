@@ -5,10 +5,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -37,13 +39,14 @@ import (
 	"google.golang.org/grpc"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
-	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bind"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
@@ -119,8 +122,39 @@ func blockingBind(ctx context.Context, _ bind.Config) error {
 	return ctx.Err()
 }
 
-func fakeTokenClient() (corev1client.ServiceAccountsGetter, error) {
-	return fake.NewClientset().CoreV1(), nil
+func fakeKubeClient() (kubernetes.Interface, error) {
+	return fake.NewClientset(), nil
+}
+
+// blockingStream stands in for executor.RunStream: it returns when ctx ends.
+func blockingStream(ctx context.Context, _ executor.StreamConfig) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+const (
+	gwTD   = "dev.env.poc.internal"
+	gwID   = "spiffe://dev.env.poc.internal/cp/gateway"
+	gwAddr = "127.0.0.1:1"
+)
+
+// opKeyDir returns a directory with the key files that a ConfigMap mount holds.
+func opKeyDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	for _, name := range []string{"op.pub", "op.next.pub"} {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(base64.StdEncoding.EncodeToString(pub)+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README"), []byte("not a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }
 
 func testEnv(name string) (string, bool) {
@@ -129,12 +163,12 @@ func testEnv(name string) (string, bool) {
 }
 
 func testDeps(start telemetryStarter) deps {
-	return deps{start: start, lookupEnv: testEnv, tokenClient: fakeTokenClient, bindRun: blockingBind}
+	return deps{start: start, lookupEnv: testEnv, kubeClient: fakeKubeClient, bindRun: blockingBind, streamRun: blockingStream}
 }
 
 func bundleFile(t *testing.T) string {
 	t.Helper()
-	pem, err := spiffetest.NewCA(t, "mgmt.poc.internal").Bundle().Marshal()
+	pem, err := spiffetest.NewCA(t, gwTD).Bundle().Marshal()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,10 +181,17 @@ func bundleFile(t *testing.T) string {
 
 func validArgs(t *testing.T) []string {
 	t.Helper()
-	return []string{"--cell", "dev-cell-1", "--bind-upstream", "127.0.0.1:1", "--bind-expect-id", "spiffe://mgmt.poc.internal/api", "--bind-peer-bundle", bundleFile(t)}
+	return gatewayArgs(gwAddr, "127.0.0.1:2", gwID, bundleFile(t), opKeyDir(t))
 }
 
-func TestCelldRequiresBindFlags(t *testing.T) {
+func gatewayArgs(stream, bindAddr, id, bundle, keys string) []string {
+	return []string{
+		"--cell", "dev-cell-1", "--env", "dev", "--gateway", stream, "--gateway-bind", bindAddr, "--gateway-id", id,
+		"--trust-bundle", bundle, "--op-key-dir", keys, "--ops-namespace", "cell-ops-system",
+	}
+}
+
+func TestCelldRequiresGatewayFlags(t *testing.T) {
 	base := validArgs(t)
 	without := func(flag string) []string {
 		var out []string
@@ -161,15 +202,23 @@ func TestCelldRequiresBindFlags(t *testing.T) {
 		}
 		return out
 	}
+	empty := t.TempDir()
+	badKey := t.TempDir()
+	if err := os.WriteFile(filepath.Join(badKey, "op.pub"), []byte("not base64 of a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cases := map[string][]string{
-		"no arguments":     nil,
-		"missing cell":     without("--cell"),
-		"missing upstream": without("--bind-upstream"),
-		"missing id":       without("--bind-expect-id"),
-		"missing bundle":   without("--bind-peer-bundle"),
-		"positional":       append(slices.Clone(base), "serve"),
-		"unknown flag":     append(slices.Clone(base), "--verbose"),
-		"id not spiffe":    {"--cell", "c", "--bind-upstream", "h:1", "--bind-expect-id", "https://x/api", "--bind-peer-bundle", base[7]},
+		"no arguments":    nil,
+		"positional":      append(slices.Clone(base), "serve"),
+		"unknown flag":    append(slices.Clone(base), "--verbose"),
+		"retired flag":    append(slices.Clone(base), "--bind-upstream", "h:1"),
+		"id not spiffe":   gatewayArgs("h:1", "h:2", "https://x/gw", base[11], base[13]),
+		"no key files":    gatewayArgs("h:1", "h:2", gwID, base[11], empty),
+		"key not a key":   gatewayArgs("h:1", "h:2", gwID, base[11], badKey),
+		"key dir missing": gatewayArgs("h:1", "h:2", gwID, base[11], "/nonexistent/keys"),
+	}
+	for _, flag := range []string{"--cell", "--env", "--gateway", "--gateway-bind", "--gateway-id", "--trust-bundle", "--op-key-dir", "--ops-namespace"} {
+		cases["missing "+flag] = without(flag)
 	}
 	for name, args := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -203,10 +252,30 @@ func TestCelldRequiresBindFlags(t *testing.T) {
 	}
 }
 
-func TestCelldPassesTheBindConfig(t *testing.T) {
-	var got bind.Config
+func TestLoadOpKeysReadsEveryPubFile(t *testing.T) {
+	keys, err := loadOpKeys(opKeyDir(t))
+	if err != nil || len(keys) != 2 {
+		t.Fatalf("%d keys, %v, want the two *.pub files", len(keys), err)
+	}
+}
+
+func TestCelldPassesTheGatewayConfig(t *testing.T) {
+	var gotBind bind.Config
+	var gotStream executor.StreamConfig
+	var mu sync.Mutex
 	d := testDeps(testTelemetry(discard()))
-	d.bindRun = func(ctx context.Context, cfg bind.Config) error { got = cfg; return blockingBind(ctx, cfg) }
+	d.bindRun = func(ctx context.Context, cfg bind.Config) error {
+		mu.Lock()
+		gotBind = cfg
+		mu.Unlock()
+		return blockingBind(ctx, cfg)
+	}
+	d.streamRun = func(ctx context.Context, cfg executor.StreamConfig) error {
+		mu.Lock()
+		gotStream = cfg
+		mu.Unlock()
+		return blockingStream(ctx, cfg)
+	}
 	_, addr := serveWorkloadAPI(t)
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
 	ctx, cancel := context.WithCancel(t.Context())
@@ -216,14 +285,72 @@ func TestCelldPassesTheBindConfig(t *testing.T) {
 	waitForLines(t, out, "watching the workload api", 1)
 	cancel()
 	<-done
-	if got.Cell != "dev-cell-1" || got.Upstream != "127.0.0.1:1" || got.TLS == nil || got.Tokens == nil || got.Log == nil || got.Observe == nil {
-		t.Fatalf("bind config %+v", got)
+	mu.Lock()
+	defer mu.Unlock()
+	if gotBind.Cell != "dev-cell-1" || gotBind.Upstream != "127.0.0.1:2" || gotBind.TLS == nil || gotBind.Tokens == nil || gotBind.Log == nil || gotBind.Observe == nil {
+		t.Fatalf("bind config %+v", gotBind)
+	}
+	if gotStream.Cell != "dev-cell-1" || gotStream.Upstream != gwAddr || gotStream.TLS == nil || gotStream.SVIDUpdates == nil ||
+		gotStream.Tokens == nil || gotStream.Exec == nil || gotStream.Status == nil || gotStream.Tracer == nil {
+		t.Fatalf("stream config %+v", gotStream)
+	}
+	st := gotStream.Status()
+	if st.Cell != "dev-cell-1" || st.Pod != "celld-abc" || st.PodUID != "uid-1" || st.Version == "" {
+		t.Fatalf("status %+v", st)
 	}
 }
 
-// TestCelldServesSVIDWhileBindFails runs the real bind loop against a closed port. The SVID watch
-// keeps running, the loop logs each failure, and the attempt counter counts it.
-func TestCelldServesSVIDWhileBindFails(t *testing.T) {
+// The SVID watcher is the SVID source of the stream. It signals a new SVID once, and gives the stream
+// the SVID and its expiry.
+func TestSVIDWatcherFeedsTheStream(t *testing.T) {
+	ca := newCA(t)
+	var parse = func(serial int64) *x509svid.SVID {
+		resp := ca.svid(t, serial).Svids[0]
+		svid, err := x509svid.ParseRaw(resp.X509Svid, resp.X509SvidKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return svid
+	}
+	first, second := parse(1), parse(2)
+	tel, err := testTelemetry(discard())(t.Context(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, err := newSVIDWatcher(tel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.GetX509SVID(); err == nil {
+		t.Fatal("GetX509SVID gave an SVID before the Workload API sent one")
+	}
+	if !w.expiry().IsZero() {
+		t.Fatal("expiry is not zero before the first SVID")
+	}
+	w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{first}})
+	w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{first}})
+	if got, err := w.GetX509SVID(); err != nil || got != first {
+		t.Fatalf("GetX509SVID = %v, %v", got, err)
+	}
+	if !w.expiry().Equal(first.Certificates[0].NotAfter) {
+		t.Fatalf("expiry %v", w.expiry())
+	}
+	if len(w.signal) != 1 {
+		t.Fatalf("%d signals after a new SVID and a repeat, want 1", len(w.signal))
+	}
+	<-w.signal
+	w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{second}})
+	select {
+	case <-w.signal:
+	default:
+		t.Fatal("no signal for the rotated SVID")
+	}
+}
+
+// TestCelldServesSVIDWhileGatewayDown runs the real bind loop and the real stream against a closed
+// port. The SVID watch keeps running, the bind loop logs each failure, the stream logs each end, and
+// the attempt counter counts the bind failures.
+func TestCelldServesSVIDWhileGatewayDown(t *testing.T) {
 	fake, addr := serveWorkloadAPI(t)
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
 	reader := sdkmetric.NewManualReader()
@@ -236,6 +363,10 @@ func TestCelldServesSVIDWhileBindFails(t *testing.T) {
 	}
 	d := testDeps(start)
 	var bindReturned atomic.Bool
+	d.streamRun = func(ctx context.Context, cfg executor.StreamConfig) error {
+		cfg.Sleep = fastSleep
+		return executor.RunStream(ctx, cfg)
+	}
 	d.bindRun = func(ctx context.Context, cfg bind.Config) error {
 		defer func() {
 			time.Sleep(100 * time.Millisecond)
@@ -262,6 +393,10 @@ func TestCelldServesSVIDWhileBindFails(t *testing.T) {
 	failed := waitForLines(t, out, "bind failed", 3)
 	if failed[0]["cell"] != "dev-cell-1" || failed[0]["result"] != "error" {
 		t.Fatalf("bind failed line is %v", failed[0])
+	}
+	ended := waitForLines(t, out, "stream ended", 3)
+	if ended[0]["cell"] != "dev-cell-1" || ended[0]["error"] == nil {
+		t.Fatalf("stream ended line is %v", ended[0])
 	}
 	cancel()
 	if code := <-done; code != 0 {
@@ -291,7 +426,8 @@ func TestCelldServesSVIDWhileBindFails(t *testing.T) {
 	}
 }
 
-// bindServer is a TLS HTTP/2 server that plays the bind listener and records what reaches it.
+// bindServer is a TLS HTTP/2 server that plays the bind listener of the gateway and records what
+// reaches it.
 type bindServer struct {
 	addr     string
 	mu       sync.Mutex
@@ -300,19 +436,21 @@ type bindServer struct {
 	binds    []mgmtapi.BindRequest
 }
 
+const bindResultID = "0123456789abcdef0123456789abcdef"
+
 func newBindServer(t *testing.T, ca *spiffetest.CA, serverID string) *bindServer {
 	t.Helper()
 	s := &bindServer{}
 	cfg := tlsconfig.TLSServerConfig(ca.Source(t, serverID))
 	cfg.MinVersion, cfg.NextProtos = tls.VersionTLS13, []string{"h2"}
 	mux := http.NewServeMux()
-	mux.HandleFunc(mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.requests++
 		s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(mgmtapi.NonceResponse{Nonce: "nonce1", Audience: mgmtapi.BindAudience(r.PathValue("cell"), "nonce1"), Bound: s.bound.Load()})
 	})
-	mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		s.mu.Lock()
@@ -320,7 +458,14 @@ func newBindServer(t *testing.T, ca *spiffetest.CA, serverID string) *bindServer
 		s.binds = append(s.binds, req)
 		s.mu.Unlock()
 		s.bound.Store(true)
-		_ = json.NewEncoder(w).Encode(mgmtapi.BindResponse{Status: mgmtapi.StatusBound, Record: spec.Revision{Epoch: 1, Counter: 1}})
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(gwapi.BindAccepted{ID: bindResultID})
+	})
+	mux.HandleFunc("GET "+gwapi.BindResultPattern, func(w http.ResponseWriter, r *http.Request) {
+		s.mu.Lock()
+		s.requests++
+		s.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(gwapi.BindResult{Status: mgmtapi.StatusBound})
 	})
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -365,8 +510,8 @@ type tokenCall struct {
 	req                       *authenticationv1.TokenRequest
 }
 
-func (r *tokenRecorder) client() func() (corev1client.ServiceAccountsGetter, error) {
-	return func() (corev1client.ServiceAccountsGetter, error) {
+func (r *tokenRecorder) client() func() (kubernetes.Interface, error) {
+	return func() (kubernetes.Interface, error) {
 		cs := fake.NewClientset()
 		cs.PrependReactor("create", "serviceaccounts", func(a k8stesting.Action) (bool, runtime.Object, error) {
 			ca, ok := a.(k8stesting.CreateActionImpl)
@@ -381,7 +526,7 @@ func (r *tokenRecorder) client() func() (corev1client.ServiceAccountsGetter, err
 			out.Status.Token = "pod-token"
 			return true, out, nil
 		})
-		return cs.CoreV1(), nil
+		return cs, nil
 	}
 }
 
@@ -391,15 +536,18 @@ func (r *tokenRecorder) calls() []tokenCall {
 	return append([]tokenCall(nil), r.reqs...)
 }
 
-func fastBind(ctx context.Context, cfg bind.Config) error {
-	cfg.Sleep = func(ctx context.Context, _ time.Duration) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Millisecond):
-			return nil
-		}
+func fastSleep(ctx context.Context, _ time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(5 * time.Millisecond):
+		return nil
 	}
+}
+
+func fastBind(ctx context.Context, cfg bind.Config) error {
+	cfg.Sleep = fastSleep
+	cfg.PollEvery = 5 * time.Millisecond
 	return bind.Run(ctx, cfg)
 }
 
@@ -416,31 +564,32 @@ func runCelld(t *testing.T, args []string, d deps) (*syncBuffer, func() int) {
 	}
 }
 
-func bindArgs(addr, id, bundle string) []string {
-	return []string{"--cell", "dev-cell-1", "--bind-upstream", addr, "--bind-expect-id", id, "--bind-peer-bundle", bundle}
+func bindArgs(t *testing.T, addr, id, bundle string) []string {
+	t.Helper()
+	return gatewayArgs(gwAddr, addr, id, bundle, opKeyDir(t))
 }
 
-// TestCelldRefusesAWrongServer runs the real flag wiring and the real bind loop. A server with
+// TestCelldRefusesAWrongGateway runs the real flag wiring and the real bind loop. A server with
 // another SPIFFE ID, and a server whose certificate is outside the peer bundle, get no request and
 // no token.
-func TestCelldRefusesAWrongServer(t *testing.T) {
-	mgmtCA := spiffetest.NewCA(t, "mgmt.poc.internal")
-	otherCA := spiffetest.NewCA(t, "mgmt.poc.internal")
+func TestCelldRefusesAWrongGateway(t *testing.T) {
+	mgmtCA := spiffetest.NewCA(t, gwTD)
+	otherCA := spiffetest.NewCA(t, gwTD)
 	for name, tc := range map[string]struct {
 		ca *spiffetest.CA
 		id string
 	}{
-		"other id same ca":              {mgmtCA, "spiffe://mgmt.poc.internal/other"},
-		"certificate not in the bundle": {otherCA, "spiffe://mgmt.poc.internal/api"},
+		"other id same ca":              {mgmtCA, "spiffe://dev.env.poc.internal/cp/other"},
+		"certificate not in the bundle": {otherCA, gwID},
 	} {
 		t.Run(name, func(t *testing.T) {
 			srv := newBindServer(t, tc.ca, tc.id)
 			rec := &tokenRecorder{}
 			d := testDeps(testTelemetry(discard()))
-			d.tokenClient, d.bindRun = rec.client(), fastBind
+			d.kubeClient, d.bindRun = rec.client(), fastBind
 			_, addr := serveWorkloadAPI(t)
 			t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
-			out, stop := runCelld(t, bindArgs(srv.addr, "spiffe://mgmt.poc.internal/api", caBundleFile(t, mgmtCA)), d)
+			out, stop := runCelld(t, bindArgs(t, srv.addr, gwID, caBundleFile(t, mgmtCA)), d)
 			waitForLines(t, out, "bind failed", 3)
 			if code := stop(); code != 0 {
 				t.Fatalf("exit code %d", code)
@@ -460,14 +609,14 @@ func TestCelldRefusesAWrongServer(t *testing.T) {
 
 // TestCelldBindsAsThePod runs the same wiring against the right server and checks the token request.
 func TestCelldBindsAsThePod(t *testing.T) {
-	mgmtCA := spiffetest.NewCA(t, "mgmt.poc.internal")
-	srv := newBindServer(t, mgmtCA, "spiffe://mgmt.poc.internal/api")
+	mgmtCA := spiffetest.NewCA(t, gwTD)
+	srv := newBindServer(t, mgmtCA, gwID)
 	rec := &tokenRecorder{}
 	d := testDeps(testTelemetry(discard()))
-	d.tokenClient, d.bindRun = rec.client(), fastBind
+	d.kubeClient, d.bindRun = rec.client(), fastBind
 	_, addr := serveWorkloadAPI(t)
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
-	out, stop := runCelld(t, bindArgs(srv.addr, "spiffe://mgmt.poc.internal/api", caBundleFile(t, mgmtCA)), d)
+	out, stop := runCelld(t, bindArgs(t, srv.addr, gwID, caBundleFile(t, mgmtCA)), d)
 	bound := waitForLines(t, out, "bound", 1)
 	if bound[0]["status"] != mgmtapi.StatusBound || bound[0]["cell"] != "dev-cell-1" {
 		t.Fatalf("bound line %v", bound[0])
@@ -497,8 +646,8 @@ func TestCelldServesSVIDWithAMissingBundle(t *testing.T) {
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
 	d := testDeps(testTelemetry(discard()))
 	d.bindRun = fastBind
-	srv := newBindServer(t, spiffetest.NewCA(t, "mgmt.poc.internal"), "spiffe://mgmt.poc.internal/api")
-	out, stop := runCelld(t, bindArgs(srv.addr, "spiffe://mgmt.poc.internal/api", "/nonexistent/bundle.pem"), d)
+	srv := newBindServer(t, spiffetest.NewCA(t, gwTD), gwID)
+	out, stop := runCelld(t, bindArgs(t, srv.addr, gwID, "/nonexistent/bundle.pem"), d)
 	fake.responses <- newCA(t).svid(t, 31)
 	waitForLines(t, out, "x509 svid updated", 1)
 	failed := waitForLines(t, out, "bind failed", 2)

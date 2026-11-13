@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,18 +22,20 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
 const (
-	mgmtTD  = "mgmt.poc.internal"
-	apiID   = "spiffe://mgmt.poc.internal/api"
+	mgmtTD  = "dev.env.poc.internal"
+	apiID   = "spiffe://dev.env.poc.internal/cp/gateway"
 	testCel = "dev-cell-1"
 )
 
-// fakeServer plays the bind listener of mgmtd. It records requests and answers through handlers.
+const fakeBindID = "0123456789abcdef0123456789abcdef"
+
+// fakeServer plays the bind listener of the cell gateway. It records requests and answers through handlers.
 type fakeServer struct {
 	addr       string
 	ca         *spiffetest.CA
@@ -42,8 +45,11 @@ type fakeServer struct {
 	nonceBody  []string
 	nonce      func(w http.ResponseWriter, r *http.Request, n int)
 	bind       func(w http.ResponseWriter, r *http.Request, req mgmtapi.BindRequest, n int)
+	result     func(w http.ResponseWriter, r *http.Request, n int)
 	nonceCalls int
 	bindCalls  int
+	resultCall int
+	methods    []string
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -60,7 +66,16 @@ func okNonce(bound bool) func(http.ResponseWriter, *http.Request, int) {
 }
 
 func okBind(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
-	writeJSON(w, 200, mgmtapi.BindResponse{Status: mgmtapi.StatusBound, Record: spec.Revision{Epoch: 1, Counter: 2}})
+	writeJSON(w, http.StatusAccepted, gwapi.BindAccepted{ID: fakeBindID})
+}
+
+// pendingThenBound answers pending to the first poll and bound to every later one.
+func pendingThenBound(w http.ResponseWriter, _ *http.Request, n int) {
+	if n == 0 {
+		writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindPending})
+		return
+	}
+	writeJSON(w, 200, gwapi.BindResult{Status: mgmtapi.StatusBound})
 }
 
 func denied(w http.ResponseWriter) {
@@ -69,7 +84,7 @@ func denied(w http.ResponseWriter) {
 
 func newServer(t *testing.T, serverID string) *fakeServer {
 	t.Helper()
-	f := &fakeServer{ca: spiffetest.NewCA(t, mgmtTD), nonce: okNonce(false), bind: okBind}
+	f := &fakeServer{ca: spiffetest.NewCA(t, mgmtTD), nonce: okNonce(false), bind: okBind, result: pendingThenBound}
 	cfg := tlsconfig.TLSServerConfig(f.ca.Source(t, serverID))
 	cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
 	cfg.NextProtos = []string{"h2"}
@@ -80,9 +95,10 @@ func newServer(t *testing.T, serverID string) *fakeServer {
 		return nil
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc(mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
+		f.methods = append(f.methods, r.Method+" "+r.URL.Path)
 		f.nonceBody = append(f.nonceBody, string(body))
 		n := f.nonceCalls
 		f.nonceCalls++
@@ -90,10 +106,24 @@ func newServer(t *testing.T, serverID string) *fakeServer {
 		f.mu.Unlock()
 		h(w, r, n)
 	})
-	mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+gwapi.BindResultPattern, func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.methods = append(f.methods, r.Method+" "+r.URL.Path)
+		n := f.resultCall
+		f.resultCall++
+		h := f.result
+		f.mu.Unlock()
+		if r.PathValue("id") != fakeBindID {
+			writeJSON(w, 404, map[string]string{"error": "unknown"})
+			return
+		}
+		h(w, r, n)
+	})
+	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
+		f.methods = append(f.methods, r.Method+" "+r.URL.Path)
 		n := f.bindCalls
 		f.bindCalls++
 		h := f.bind
@@ -125,7 +155,7 @@ func (f *fakeServer) config(t *testing.T, expect string) Config {
 	return Config{
 		Cell: testCel, Upstream: f.addr, TLS: ClientTLS(f.ca.Bundle(), id),
 		Tokens: func(_ context.Context, aud string) (string, error) { return "tok:" + aud, nil },
-		Log:    slog.New(slog.DiscardHandler),
+		Log:    slog.New(slog.DiscardHandler), PollEvery: 5 * time.Millisecond,
 	}
 }
 
@@ -140,7 +170,7 @@ func TestOnceBinds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.Status != mgmtapi.StatusBound || resp.Record != (spec.Revision{Epoch: 1, Counter: 2}) {
+	if resp.Status != mgmtapi.StatusBound {
 		t.Fatalf("response %+v", resp)
 	}
 	if gotReq.Nonce != "nonce0" || gotReq.Token != "tok:"+mgmtapi.BindAudience(testCel, "nonce0") {
@@ -170,8 +200,8 @@ func TestOnceRefusesAudienceMismatch(t *testing.T) {
 	}
 }
 
-func TestClientRefusesWrongServerID(t *testing.T) {
-	f := newServer(t, "spiffe://mgmt.poc.internal/other")
+func TestBindRefusesWrongGatewayID(t *testing.T) {
+	f := newServer(t, "spiffe://dev.env.poc.internal/cp/other")
 	if _, err := Once(t.Context(), f.config(t, apiID)); err == nil {
 		t.Fatal("Once accepted a server with another SPIFFE ID of the same trust domain")
 	}
@@ -206,14 +236,117 @@ func TestClientTLSSettings(t *testing.T) {
 	}
 }
 
-// The fake keeps the connection open after the nonce. A client that reuses it handshakes once.
-func TestOnceUsesFreshConnectionForBind(t *testing.T) {
+// The fake keeps each connection open. A client that reuses one handshakes fewer times than it
+// sends requests.
+func TestOnceUsesFreshConnectionForEachRequest(t *testing.T) {
 	f := newServer(t, apiID)
 	if _, err := Once(t.Context(), f.config(t, apiID)); err != nil {
 		t.Fatal(err)
 	}
-	if got := f.handshakes.Load(); got != 2 {
-		t.Fatalf("%d handshakes, want 2: nonce and bind each use their own connection", got)
+	n, b := f.counts()
+	if got, want := int(f.handshakes.Load()), n+b+f.resultCall; got != want || f.resultCall != 2 {
+		t.Fatalf("%d handshakes for %d requests, want one each", got, want)
+	}
+}
+
+// TestBindThroughGatewayPolls checks the gateway flow: GET for the nonce, POST for the bind, then
+// a poll of the result path until it is final.
+func TestBindThroughGatewayPolls(t *testing.T) {
+	f := newServer(t, apiID)
+	f.result = func(w http.ResponseWriter, _ *http.Request, n int) {
+		if n < 3 {
+			writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindPending})
+			return
+		}
+		writeJSON(w, 200, gwapi.BindResult{Status: mgmtapi.StatusKeysUpdated})
+	}
+	resp, err := Once(t.Context(), f.config(t, apiID))
+	if err != nil || resp.Status != mgmtapi.StatusKeysUpdated {
+		t.Fatalf("Once = %+v, %v", resp, err)
+	}
+	want := []string{
+		"GET " + gwapi.NoncePath(testCel), "POST " + gwapi.BindPath(testCel),
+		"GET " + gwapi.BindResultPath(testCel, fakeBindID), "GET " + gwapi.BindResultPath(testCel, fakeBindID),
+		"GET " + gwapi.BindResultPath(testCel, fakeBindID), "GET " + gwapi.BindResultPath(testCel, fakeBindID),
+	}
+	if !slices.Equal(f.methods, want) {
+		t.Fatalf("requests %v, want %v", f.methods, want)
+	}
+}
+
+// A failed poll does not end the attempt: the bind went in, so a new nonce could be refused.
+func TestBindPollSurvivesAFailedPoll(t *testing.T) {
+	f := newServer(t, apiID)
+	f.result = func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, 503, map[string]string{"error": "busy"})
+			return
+		}
+		pendingThenBound(w, r, n-1)
+	}
+	if resp, err := Once(t.Context(), f.config(t, apiID)); err != nil || resp.Status != mgmtapi.StatusBound {
+		t.Fatalf("Once = %+v, %v", resp, err)
+	}
+	if n, b := f.counts(); n != 1 || b != 1 {
+		t.Fatalf("%d nonce and %d bind requests, want 1 and 1", n, b)
+	}
+}
+
+func TestBindDeniedResultIsRefused(t *testing.T) {
+	f := newServer(t, apiID)
+	f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "abc123"})
+	}
+	_, err := Once(t.Context(), f.config(t, apiID))
+	var ref *Refused
+	if !errors.As(err, &ref) || ref.RequestID != "abc123" {
+		t.Fatalf("err = %v, want Refused abc123", err)
+	}
+}
+
+// TestBindDeniedUsesLongBackoff: a denied result waits the refused backoff, and the next attempt
+// binds with a new nonce.
+func TestBindDeniedUsesLongBackoff(t *testing.T) {
+	f := newServer(t, apiID)
+	f.result = func(w http.ResponseWriter, r *http.Request, n int) {
+		if n == 0 {
+			writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "abc123"})
+			return
+		}
+		pendingThenBound(w, r, n)
+	}
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 2 }}
+	cfg, ctx := runCfg(t, f, rec)
+	_ = Run(ctx, cfg)
+	if d := rec.waits[0]; d < 60*time.Second || d > 120*time.Second {
+		t.Fatalf("first wait %v, want between 60s and 120s", d)
+	}
+	if _, b := f.counts(); b != 2 {
+		t.Fatalf("%d binds, want 2", b)
+	}
+}
+
+// A cut response can leave a bind that the gateway answers with a refusal although the cell is
+// bound. Run then checks the nonce answer and does not bind again.
+func TestRunChecksBoundAfterDenied(t *testing.T) {
+	f := newServer(t, apiID)
+	f.nonce = func(w http.ResponseWriter, r *http.Request, n int) { okNonce(n >= 1)(w, r, n) }
+	f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindDenied, RequestID: "abc123"})
+	}
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	cfg, ctx := runCfg(t, f, rec)
+	var out bytes.Buffer
+	cfg.Log = slog.New(slog.NewJSONHandler(&out, nil))
+	_ = Run(ctx, cfg)
+	if _, b := f.counts(); b != 1 {
+		t.Fatalf("%d binds, want 1", b)
+	}
+	if d := rec.waits[0]; d > 6*time.Minute {
+		t.Fatalf("first wait %v is a refused backoff, want the recheck wait", d)
+	}
+	if !strings.Contains(out.String(), "cell is bound") {
+		t.Fatalf("log %s", out.String())
 	}
 }
 
@@ -252,9 +385,9 @@ func (l *pipeListener) Accept() (net.Conn, error) {
 func (l *pipeListener) Close() error   { l.once.Do(func() { close(l.done) }); return nil }
 func (l *pipeListener) Addr() net.Addr { return &net.TCPAddr{} }
 
-// TestOnceAttemptTimeout stalls each stage in turn. The whole attempt ends after 30 s of fake time.
+// TestOnceAttemptTimeout stalls each stage in turn. The whole attempt ends after 60 s of fake time.
 func TestOnceAttemptTimeout(t *testing.T) {
-	for _, stage := range []string{"nonce", "token", "bind"} {
+	for _, stage := range []string{"nonce", "token", "bind", "poll"} {
 		t.Run(stage, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				ca := spiffetest.NewCA(t, mgmtTD)
@@ -263,17 +396,20 @@ func TestOnceAttemptTimeout(t *testing.T) {
 				pl := &pipeListener{ch: make(chan net.Conn), done: make(chan struct{})}
 				release := make(chan struct{})
 				mux := http.NewServeMux()
-				mux.HandleFunc(mgmtapi.NoncePattern, func(w http.ResponseWriter, _ *http.Request) {
+				mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, _ *http.Request) {
 					if stage == "nonce" {
 						<-release
 					}
 					okNonce(false)(w, nil, 0)
 				})
-				mux.HandleFunc(mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+				mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 					if stage == "bind" {
 						<-release
 					}
 					okBind(w, r, mgmtapi.BindRequest{}, 0)
+				})
+				mux.HandleFunc("GET "+gwapi.BindResultPattern, func(w http.ResponseWriter, _ *http.Request) {
+					writeJSON(w, 200, gwapi.BindResult{Status: gwapi.BindPending})
 				})
 				protos := new(http.Protocols)
 				protos.SetHTTP2(true)
@@ -305,8 +441,8 @@ func TestOnceAttemptTimeout(t *testing.T) {
 				if !errors.Is(err, context.DeadlineExceeded) {
 					t.Fatalf("err = %v, want deadline exceeded", err)
 				}
-				if elapsed != 30*time.Second {
-					t.Fatalf("attempt ended after %v, want 30s of fake time", elapsed)
+				if elapsed != 60*time.Second {
+					t.Fatalf("attempt ended after %v, want 60s of fake time", elapsed)
 				}
 			})
 		})
@@ -342,6 +478,7 @@ func runCfg(t *testing.T, f *fakeServer, rec *sleepRecorder) (Config, context.Co
 	cfg := f.config(t, apiID)
 	cfg.Sleep = rec.sleep
 	cfg.MinBackoff, cfg.MaxBackoff, cfg.RefusedBackoff, cfg.AttemptTimeout, cfg.RecheckEvery = time.Second, 30*time.Second, 60*time.Second, 30*time.Second, 5*time.Minute
+	cfg.PollEvery = 5 * time.Millisecond
 	return cfg, ctx
 }
 
@@ -544,8 +681,8 @@ func TestOnceRefusesBadNonceAnswers(t *testing.T) {
 func TestOnceRefusesUnknownBindStatus(t *testing.T) {
 	for _, status := range []string{"", "pwned", strings.Repeat("x", 100)} {
 		f := newServer(t, apiID)
-		f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
-			writeJSON(w, 200, mgmtapi.BindResponse{Status: status})
+		f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
+			writeJSON(w, 200, gwapi.BindResult{Status: status})
 		}
 		if _, err := Once(t.Context(), f.config(t, apiID)); err == nil {
 			t.Fatalf("status %q counted as success", status)
@@ -553,15 +690,15 @@ func TestOnceRefusesUnknownBindStatus(t *testing.T) {
 	}
 	for _, status := range []string{mgmtapi.StatusBound, mgmtapi.StatusAlreadyBound, mgmtapi.StatusKeysUpdated} {
 		f := newServer(t, apiID)
-		f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
-			writeJSON(w, 200, mgmtapi.BindResponse{Status: status})
+		f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
+			writeJSON(w, 200, gwapi.BindResult{Status: status})
 		}
 		if resp, err := Once(t.Context(), f.config(t, apiID)); err != nil || resp.Status != status {
 			t.Fatalf("status %q: %v", status, err)
 		}
 	}
 	f := newServer(t, apiID)
-	f.bind = func(w http.ResponseWriter, _ *http.Request, _ mgmtapi.BindRequest, _ int) {
+	f.result = func(w http.ResponseWriter, _ *http.Request, _ int) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = io.WriteString(w, "{}")
 	}
