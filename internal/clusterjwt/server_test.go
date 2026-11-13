@@ -76,6 +76,10 @@ type fixtureOptions struct {
 	marks bool
 	// ticker gives the plugin a test ticker, which fixture.reload drives.
 	ticker bool
+	// clock replaces the plugin clock, and hints replaces the hint writer.
+	clock     func() time.Time
+	hints     HintWriter
+	afterHint func()
 }
 
 func newFixture(t *testing.T, o fixtureOptions) *fixture {
@@ -131,6 +135,13 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 		p.afterReload = func() { reloaded <- struct{}{} }
 	}
 	p.now = func() time.Time { return testNow }
+	if o.clock != nil {
+		p.now = o.clock
+	}
+	if o.hints != nil {
+		p.newHints = func(string) (HintWriter, error) { return o.hints, nil }
+	}
+	p.afterHint = o.afterHint
 	f := &fixture{t: t, plugin: p, client: new(nodeattestorv1.NodeAttestorPluginClient), logs: logs, keys: k, pub: pub, priv: priv, cm: cm, specCounter: specCounter, tick: tick, reloaded: reloaded}
 	cfg := new(configv1.ConfigServiceClient)
 	f.cfg = cfg
