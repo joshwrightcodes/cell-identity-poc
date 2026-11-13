@@ -3,7 +3,9 @@ package scripts
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -176,6 +179,9 @@ case "$args" in
   *" get --raw /readyz "*) [[ " ${STUB_CELL_DOWN:-} " == *" ${ctx#kind-} "* ]] && { echo "no answer" >&2; exit 1; }; echo ok ;;
   *" get --raw "*) printf '%s' "${STUB_KIALI_CONF:-}" ;;
   *" exec deploy/mesh-view-hub "*) printf '%s' "${STUB_HUB:-}" ;;
+  *" get configmap hostsvc-pin "*) printf '%s' "${STUB_CM_PIN:-$STUB_PIN_PEM}" ;;
+  *" get pod mgmtd-0 "*) printf '%s' "${STUB_POD_PIN:-}" ;;
+  *" exec spire-server-0 "*) printf '%s\n' "${STUB_ROOT_PEM:-}" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -195,6 +201,10 @@ case "$*" in
     if [[ "$3" == "${STUB_UPLINK_BAD:-none}" ]]; then echo '{"cluster":"'$3'","verdict":"gateway or relay: no export"}'; exit 1; fi
     if [[ "$3" == "${STUB_UPLINK_WAIT:-none}" ]]; then echo '{"cluster":"'$3'","verdict":"collector export: the exporter failed and retried 8 times in 5 minutes.","store":{"ok":true}}'; exit 1; fi
     echo '{"cluster":"'$3'","verdict":"every hop is healthy"}' ;;
+  "run mgmt -- status")
+    printf '%s\n' "${STUB_MGMT_STATUS:-}"
+    exit "${STUB_MGMT_RC:-0}" ;;
+  "run pki -- trust-bundle "*) cat ;;
   "run mesh:status")
     printf 'hub    dev-cell-1: tunnel up\n'
     exit "${STUB_MESH_RC:-0}" ;;
@@ -211,10 +221,65 @@ const (
 	stubHubUp     = `{"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":true}}}`
 )
 
-// runStatus runs harness:status with healthy stubs, and the extra variables of the caller after them.
+// statusServe stands in for hostsvc-serve.sh. status prints STUB_SERVE_STATUS, and pin prints STUB_PIN_PEM.
+const statusServe = `#!/usr/bin/env bash
+case "$1" in
+  status) printf '%s\n' "$STUB_SERVE_STATUS" ;;
+  pin) printf '%s\n' "$STUB_PIN_PEM" ;;
+  *) exit 2 ;;
+esac
+`
+
+// derSHA is the SHA-256 of the DER bytes of the first certificate in a PEM text.
+func derSHA(t *testing.T, pemText string) string {
+	t.Helper()
+	block, _ := pem.Decode([]byte(pemText))
+	if block == nil {
+		t.Fatalf("no PEM block in %q", pemText)
+	}
+	sum := sha256.Sum256(block.Bytes)
+	return hex.EncodeToString(sum[:])
+}
+
+// healthyPlane is what mise run mgmt -- status prints on a healthy plane: signed and applied at the same
+// revision, a report from 10 seconds ago, and both cells bound and checked. mutate changes the object.
+func healthyPlane(mutate func(m map[string]any)) string {
+	at := func(ago time.Duration) string { return time.Now().Add(-ago).UTC().Format(time.RFC3339Nano) }
+	rev := map[string]any{"epoch": 1, "counter": 4}
+	cell := func(name string) map[string]any {
+		return map[string]any{"name": name, "bound": true, "lastCheck": "unchanged"}
+	}
+	m := map[string]any{"env": "dev", "signed": rev, "served": rev, "applied": rev, "restoreActive": false, "appliedAt": at(time.Hour),
+		"lastReportAt": at(10 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")}}
+	if mutate != nil {
+		mutate(m)
+	}
+	out, _ := json.Marshal(m)
+	return string(out)
+}
+
+// fakeServeStatus is what hostsvc-serve.sh status prints for a running service with this certificate and root.
+func fakeServeStatus(cert, root string, mutate func(m map[string]any)) string {
+	m := map[string]any{"running": true, "pid": 4242, "cert_sha256": cert, "root_sha256": root, "expires_soon": false, "last_error": ""}
+	if mutate != nil {
+		mutate(m)
+	}
+	out, _ := json.Marshal(m)
+	return string(out)
+}
+
+// runStatus runs harness:status with healthy stubs, and the extra variables of the caller after them. The
+// variables of the caller come last, so they win. The management plane and the host service are healthy.
 func runStatus(t *testing.T, extra ...string) (map[string]map[string]any, []map[string]any, string, int) {
 	t.Helper()
-	env := append([]string{"STUB_PRINCIPAL=" + stubConnected, "STUB_SAMPLES=" + stubSamples, "STUB_KIALI_CONF=" + stubKialiConf, "STUB_HUB=" + stubHubUp}, extra...)
+	pin, root := caPEM(t, 10), caPEM(t, 1)
+	serve := filepath.Join(t.TempDir(), "serve")
+	if err := os.WriteFile(serve, []byte(statusServe), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	env := append([]string{"STUB_PRINCIPAL=" + stubConnected, "STUB_SAMPLES=" + stubSamples, "STUB_KIALI_CONF=" + stubKialiConf, "STUB_HUB=" + stubHubUp,
+		"STUB_MGMT_STATUS=" + healthyPlane(nil), "HOSTSVC_SERVE=" + serve, "STUB_PIN_PEM=" + pin, "STUB_ROOT_PEM=" + root, "STUB_POD_PIN=" + derSHA(t, pin),
+		"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), nil)}, extra...)
 	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub}, env)
 	lines := jsonLines(t, out)
 	byName := map[string]map[string]any{}
@@ -257,7 +322,7 @@ func TestStatusHealthyShape(t *testing.T) {
 	if got := keys(byName["dev-cell-1"]); !slices.Equal(got, common) {
 		t.Errorf("fields of a cell object %v, want %v", got, common)
 	}
-	if got := keys(byName["management"]); !slices.Equal(got, []string{"agents", "applications", "cluster", "kiali", "mesh", "ok", "problems", "samples", "stale_samples", "telemetry", "verify"}) {
+	if got := keys(byName["management"]); !slices.Equal(got, []string{"agents", "applications", "cluster", "kiali", "management", "mesh", "ok", "problems", "samples", "stale_samples", "telemetry", "verify"}) {
 		t.Errorf("fields of the management object %v", got)
 	}
 	m := byName["management"]
@@ -595,4 +660,124 @@ func TestMeshStatusNamesCellUpOnlyForAnAbsentCell(t *testing.T) {
 	if !strings.Contains(line, "CELL=dev-cell-1 mise run cell:up") {
 		t.Errorf("the cell is absent, so the line %q must name cell:up", line)
 	}
+}
+
+// TestStatusReportsTheManagementPlane checks that harness:status shows the signed and applied revisions, the
+// report times, the cells and the host service in the field management of the management object. A healthy plane
+// exits 0. Each bad condition exits 1 with a problem that holds the next command, and no other cluster turns bad.
+func TestStatusReportsTheManagementPlane(t *testing.T) {
+	byName, _, _, code := runStatus(t)
+	if code != 0 {
+		t.Fatalf("exit %d on a healthy plane, want 0: %v", code, byName["management"]["problems"])
+	}
+	m, _ := byName["management"]["management"].(map[string]any)
+	if m == nil {
+		t.Fatalf("the management object has no field management: %v", byName["management"])
+	}
+	for _, f := range []string{"signed", "applied", "lastReportAt", "restoreActive", "pendingDrops", "cells", "hostsvc"} {
+		if _, ok := m[f]; !ok {
+			t.Errorf("management %v has no field %s", keys(m), f)
+		}
+	}
+	if h := m["hostsvc"].(map[string]any); h["running"] != true || h["check"] != "" {
+		t.Errorf("hostsvc %v, want a running service and an empty check", h)
+	}
+
+	at := func(ago time.Duration) string { return time.Now().Add(-ago).UTC().Format(time.RFC3339Nano) }
+	plane := func(mutate func(m map[string]any)) []string { return []string{"STUB_MGMT_STATUS=" + healthyPlane(mutate)} }
+	cellCheck := func(name, result string) func(m map[string]any) {
+		return func(m map[string]any) {
+			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
+				map[string]any{"name": name, "bound": true, "lastCheck": result}}
+		}
+	}
+	pin, root := caPEM(t, 10), caPEM(t, 1)
+	otherPin, otherRoot := caPEM(t, 11), caPEM(t, 2)
+	verifyCP := "CELL=dev-cp mise run cell:verify"
+	restart := "mise run hostsvc:serve -- restart"
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string // substrings of the problems, the next command last
+	}{
+		{"signed is above applied for more than 2 minutes", plane(func(m map[string]any) {
+			m["signed"] = map[string]any{"epoch": 1, "counter": 6}
+			m["lagSince"] = at(3 * time.Minute)
+		}), []string{"signed revision 1.6", "applied 1.4", verifyCP}},
+		{"a refusal is newer than the applied spec", plane(func(m map[string]any) {
+			m["lastRefusal"] = map[string]any{"reason": "unknown_key", "revision": map[string]any{"epoch": 1, "counter": 5}, "at": at(time.Minute)}
+		}), []string{"refused a spec: unknown_key", verifyCP}},
+		{"envd reports a store error", plane(func(m map[string]any) { m["storeError"] = "conflict writing cell-records" }),
+			[]string{"store error: conflict writing cell-records", verifyCP}},
+		{"a restore is active", plane(func(m map[string]any) { m["restoreActive"] = true }),
+			[]string{"restore is active", "mise run mgmt -- restore --revision latest"}},
+		{"the last report is 90 seconds old", plane(func(m map[string]any) { m["lastReportAt"] = at(90 * time.Second) }),
+			[]string{"no report from envd", verifyCP}},
+		{"envd never reported", plane(func(m map[string]any) { delete(m, "lastReportAt") }),
+			[]string{"no report from envd", verifyCP}},
+		{"a cell has untrusted keys", plane(cellCheck("dev-cell-2", "keys_untrusted")),
+			[]string{"dev-cell-2", "keys_untrusted", "mise run mgmt -- keycheck --cell dev-cell-2"}},
+		{"a cell has an untrusted issuer", plane(cellCheck("dev-cell-2", "issuer_untrusted")),
+			[]string{"dev-cell-2", "issuer_untrusted", restart}},
+		{"a cell has an unavailable issuer", plane(cellCheck("dev-cell-2", "issuer_unavailable")),
+			[]string{"dev-cell-2", "issuer_unavailable", "CELL=dev-cell-2 mise run cell:verify"}},
+		{"a cell with cell-identity is unbound", plane(func(m map[string]any) {
+			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
+				map[string]any{"name": "dev-cell-2", "bound": false, "lastCheck": ""}}
+		}), []string{"dev-cell-2 is not bound", "CELL=dev-cell-2 mise run cell:up"}},
+		{"a cell with cell-identity is not in the status", plane(func(m map[string]any) {
+			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"}}
+		}), []string{"dev-cell-2 is not bound", "CELL=dev-cell-2 mise run cell:up"}},
+		{"mgmtd does not answer", []string{"STUB_MGMT_RC=1", `STUB_MGMT_STATUS={"level":"ERROR","msg":"mgmt failed","error":"pod mgmtd-0 is absent or not Ready. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"}`},
+			[]string{"mgmtd status failed", "pod mgmtd-0 is absent", "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"}},
+		{"the host service does not run", []string{"STUB_SERVE_STATUS=" + fakeServeStatus("", "", func(m map[string]any) { m["running"] = false; m["pid"] = nil })},
+			[]string{"host service is not running", "mise run hostsvc:serve -- start"}},
+		{"the pod pin differs from the certificate", []string{"STUB_POD_PIN=" + strings.Repeat("0", 64)},
+			[]string{"carries the pin digest", restart}},
+		{"the ConfigMap pin differs from the certificate", []string{"STUB_CM_PIN=" + otherPin}, []string{"holds another certificate", restart}},
+		{"the host service trusts another root", []string{"STUB_ROOT_PEM=" + otherRoot}, []string{"trusts the management root", restart}},
+		{"the certificate expires soon", []string{"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), func(m map[string]any) { m["expires_soon"] = true })},
+			[]string{"certificate expires soon", restart}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			byName, lines, _, code := runStatus(t, tc.env...)
+			bad := byName["management"]
+			problems := strings.Join(strs(bad["problems"]), "\n")
+			if code != 1 || bad["ok"] != false {
+				t.Fatalf("exit %d, ok %v, problems %q; want exit 1 and ok false", code, bad["ok"], problems)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(problems, w) {
+					t.Errorf("problems %q lack %q", problems, w)
+				}
+			}
+			if strings.ContainsAny(problems, "<>") {
+				t.Errorf("problems %q hold a placeholder, and each command must work as printed", problems)
+			}
+			for _, m := range lines {
+				if m["cluster"] != "management" && m["ok"] != true {
+					t.Errorf("the object of %s is not ok, and only management has a bad value: %v", m["cluster"], m)
+				}
+			}
+		})
+	}
+
+	t.Run("signed above applied for less than 2 minutes is a wait", func(t *testing.T) {
+		_, _, _, code := runStatus(t, plane(func(m map[string]any) {
+			m["signed"] = map[string]any{"epoch": 1, "counter": 6}
+			m["lagSince"] = at(time.Minute)
+		})...)
+		if code != 0 {
+			t.Errorf("exit %d, want 0 while the lag is under 2 minutes", code)
+		}
+	})
+	t.Run("a refusal older than the applied spec is history", func(t *testing.T) {
+		_, _, _, code := runStatus(t, plane(func(m map[string]any) {
+			m["appliedAt"] = at(time.Minute)
+			m["lastRefusal"] = map[string]any{"reason": "unknown_key", "revision": map[string]any{"epoch": 1, "counter": 3}, "at": at(time.Hour)}
+		})...)
+		if code != 0 {
+			t.Errorf("exit %d, want 0 for a refusal before the last apply", code)
+		}
+	})
 }
