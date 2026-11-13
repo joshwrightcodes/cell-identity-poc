@@ -478,8 +478,11 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 		life := age + time.Until(*self.ExpiresAt)
 		return life*6/10 - age, true
 	}
-	// headroom waits for an open tunnel of the cell whose next renewal is at least twice the keepalive bound away, and
-	// returns its conn_id and the name of the tunnel pod.
+	// renewMargin is the time that the checks between the measurement and the rule may take. A leaf of 60 s renews 36 s
+	// after the tunnel opens, so a longer margin leaves no window to catch with a poll every 2 s.
+	const renewMargin = 5 * time.Second
+	// headroom waits for an open tunnel of the cell whose next renewal is at least the keepalive bound and the margin
+	// away, and returns its conn_id and the name of the tunnel pod.
 	headroom := func() (int, string) {
 		var connID int
 		var pod string
@@ -494,7 +497,7 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 				return false, "the tunnel pod reports no open tunnel"
 			}
 			connID = ups[len(ups)-1]
-			return left >= 2*keepaliveBound, fmt.Sprintf("tunnel %d renews in %s, want %s", connID, left.Round(time.Second), 2*keepaliveBound)
+			return left >= keepaliveBound+renewMargin, fmt.Sprintf("tunnel %d renews in %s, want %s", connID, left.Round(time.Second), keepaliveBound+renewMargin)
 		})
 		return connID, pod
 	}
