@@ -27,6 +27,7 @@ import (
 	workloadpb "github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
@@ -656,11 +657,12 @@ func TestServerRequiresProofSubjectFlag(t *testing.T) {
 	}
 
 	bad := map[string][]string{
-		"no namespace":     with(args, "--proof-subject", "argocd-agent=celld"),
-		"no role":          with(args, "--proof-subject", "=ns/sa"),
-		"capitals":         with(args, "--proof-subject", "argocd-agent=NS/sa"),
-		"same role twice":  append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
-		"reload no signer": append(slices.Clone(args), "--registry-reload", "5s"),
+		"no namespace":            with(args, "--proof-subject", "argocd-agent=celld"),
+		"no role":                 with(args, "--proof-subject", "=ns/sa"),
+		"capitals":                with(args, "--proof-subject", "argocd-agent=NS/sa"),
+		"same role twice":         append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
+		"reload no signer":        append(slices.Clone(args), "--registry-reload", "5s"),
+		"reload zero with signer": append(slices.Clone(args), "--registry-signer", filepath.Join(args[slices.Index(args, "--registry-dir")+1], "signers.pub"), "--registry-reload", "0"),
 	}
 	for name, a := range bad {
 		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
@@ -697,11 +699,13 @@ func TestServerRegistrySignerFlag(t *testing.T) {
 func TestMayAdmitCell(t *testing.T) {
 	for p, want := range map[string]bool{
 		viewPattern: true,
-		`^spiffe://dev\.env\.poc\.internal/(?:cp/otel|cell/[a-z0-9-]+/otel)$`: true,
-		`^spiffe://dev\.env\.poc\.internal/.*$`:                               true,
-		`^spiffe://dev\.env\.poc\.internal/[^x]+$`:                            true,
-		`^spiffe://dev\.env\.poc\.internal/cp/otel$`:                          false,
-		`^spiffe://dev\.env\.poc\.internal/cp/(?:otel|argocd-agent)$`:         false,
+		`^spiffe://dev\.env\.poc\.internal/(?:cp/otel|cell/[a-z0-9-]+/otel)$`:       true,
+		`^spiffe://dev\.env\.poc\.internal/.*$`:                                     true,
+		`^spiffe://dev\.env\.poc\.internal/[^x]+$`:                                  true,
+		`^spiffe://dev\.env\.poc\.internal(?:/cp/otel|(?i:/cell)/[a-z0-9-]+/otel)$`: true,
+		`^spiffe://dev\.env\.poc\.internal/cel{2}/[a-z0-9-]+/otel(?:/cp/)?$`:        true,
+		`^spiffe://dev\.env\.poc\.internal/cp/otel$`:                                false,
+		`^spiffe://dev\.env\.poc\.internal/cp/(?:otel|argocd-agent)$`:               false,
 	} {
 		if got := mayAdmitCell(p); got != want {
 			t.Errorf("%s: got %v, want %v", p, got, want)
@@ -733,4 +737,70 @@ func TestServerRunsWithRegistryWatcher(t *testing.T) {
 	}
 	waitLine(t, out, "registry_reload_failed")
 	stop()
+}
+
+// TestServerRefusesCellStreamsWithoutProof runs the server as the binary builds it and dials it
+// with a cell SVID. The proof check must run whatever --allow-id can admit.
+func TestServerRefusesCellStreamsWithoutProof(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	// This pattern admits the cell path, but mayAdmitCell does not see it: a class splits the literal.
+	// The start check is advisory, so the server must refuse the stream itself.
+	hidden := `^spiffe://dev\.env\.poc\.internal(?:/cp/otel|/c[ex]ll/[a-z0-9-]+/otel(?:/cp/)?)$`
+	cases := []struct {
+		name, role string
+		args       func([]string) []string
+		frame      string
+		reason     string
+	}{
+		{"no frame", "argocd-agent", func(a []string) []string { return a }, "", "proof_missing"},
+		{"no subject flag", "otel", func(a []string) []string {
+			return without(with(a, "--allow-id", hidden), "--proof-subject")
+		}, "x", "proof_invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+			serveWorkloadAPI(t, mgmt, principalID)
+			out := &syncBuffer{}
+			args := tc.args(serverArgs(t, envCA))
+			if tc.name == "no subject flag" {
+				if _, err := parseServer(args[1:]); err != nil {
+					t.Fatalf("the test needs a pattern that the start check misses: %v", err)
+				}
+			}
+			stop := runUntilCanceled(t, args, out)
+			defer stop()
+			addr := waitLine(t, out, "listening")["addr"].(string)
+			der, _, key := envCA.leaf(t, "spiffe://dev.env.poc.internal/cell/dev-cell-1/"+tc.role)
+			conn, err := tls.Dial("tcp", addr, &tls.Config{
+				InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"},
+				Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if tc.frame != "" {
+				if err := proof.WriteFrame(conn, tc.frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				for _, l := range jsonLines(t, out.String()) {
+					if l["msg"] == "proof refused" && l["reason"] == tc.reason {
+						return
+					}
+					if l["msg"] == "peer accepted" {
+						t.Fatalf("a cell stream reached the backend with no valid proof:\n%s", out.String())
+					}
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("no proof refused line with reason %s:\n%s", tc.reason, out.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
 }

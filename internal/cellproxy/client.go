@@ -66,7 +66,7 @@ func (c *Client) handle(ctx context.Context, down net.Conn) {
 		err := c.Proof(pctx, up)
 		cancel()
 		if err != nil {
-			c.Log.Warn("proof failed", "upstream", c.Upstream, "error", err.Error())
+			c.refusals.write("proof failed", ProofFailed, c.Upstream, "", err)
 			return
 		}
 	}

@@ -41,7 +41,11 @@ func (r *Registry) Current() *Registry { return r }
 
 // Record returns the record of the cell with the highest revision. It reports false when the
 // registry holds no record of that name, or when any record of that name is revoked.
-func (r *Registry) Record(cell string) (record.Cell, bool) {
+func (r *Registry) Record(cell string) (record.Cell, bool) { return r.recordFor(cell, "") }
+
+// recordFor is Record limited to the records of environment env. An empty env takes any record
+// of the name, and a revoked record of the name hides the cell in every environment.
+func (r *Registry) recordFor(cell, env string) (record.Cell, bool) {
 	var best record.Cell
 	found := false
 	for _, c := range r.cells {
@@ -50,6 +54,9 @@ func (r *Registry) Record(cell string) (record.Cell, bool) {
 		}
 		if c.Revoked {
 			return record.Cell{}, false
+		}
+		if env != "" && c.Env != env {
+			continue
 		}
 		if !found || revisionOf(c).Compare(revisionOf(best)) > 0 {
 			best, found = c, true

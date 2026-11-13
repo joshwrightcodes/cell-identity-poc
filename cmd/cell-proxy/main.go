@@ -266,6 +266,8 @@ type serverConfig struct {
 	// registryDir, signer and reload set the watcher. An empty signer loads the registry once.
 	registryDir, signer string
 	reload              time.Duration
+	// signerSHA256 is the fingerprint of the pinned keys that LoadPinnedRegistry returned.
+	signerSHA256 string
 	// subjects maps a role to the service account that sends its proof.
 	subjects map[string]record.Subject
 	backend  func(tel *telemetry.T) (cellproxy.Backend, error)
@@ -315,19 +317,20 @@ func parseServer(args []string) (serverConfig, error) {
 	switch {
 	case *signer == "" && reloadSet:
 		return serverConfig{}, errors.New("--registry-reload needs --registry-signer")
-	case *reload < 0:
-		return serverConfig{}, errors.New("--registry-reload must not be negative")
+	case *reload < 0 || (*signer != "" && *reload == 0):
+		return serverConfig{}, errors.New("--registry-reload must be positive")
 	}
 	var reg *cellproxy.Registry
+	var fingerprint string
 	if *signer != "" {
-		reg, _, err = cellproxy.LoadPinnedRegistry(*registryDir, *signer)
+		reg, fingerprint, err = cellproxy.LoadPinnedRegistry(*registryDir, *signer)
 		if err != nil {
 			return serverConfig{}, fmt.Errorf("--registry-dir with --registry-signer: %w", err)
 		}
 	} else if reg, err = cellproxy.LoadRegistry(*registryDir); err != nil {
 		return serverConfig{}, fmt.Errorf("--registry-dir: %w", err)
 	}
-	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg, registryDir: *registryDir, signer: *signer, reload: *reload}
+	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg, registryDir: *registryDir, signer: *signer, reload: *reload, signerSHA256: fingerprint}
 	if len(subjects) > 0 {
 		cfg.subjects = subjects
 	}
@@ -452,16 +455,9 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		}
 		var reg cellproxy.RegistrySource = cfg.registry
 		if cfg.signer != "" {
-			w, err := cellproxy.WatchRegistry(ctx, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
-			if err != nil {
-				return fmt.Errorf("watch registry: %w", err)
-			}
-			reg = w
+			reg = cellproxy.WatchLoaded(ctx, cfg.registry, cfg.signerSHA256, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
 		}
-		scfg := cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log)}
-		if len(cfg.subjects) > 0 {
-			scfg.Proof = &cellproxy.ProofCheck{Registry: reg, Subjects: cfg.subjects}
-		}
+		scfg := serverProofConfig(cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log)}, cfg, reg)
 		return serveBackend(ctx, cellproxy.NewServer(scfg, backend, tel.Log), ln, backend)
 	})
 }
@@ -597,6 +593,13 @@ func whoami(ctx context.Context, out io.Writer) error {
 	}{slices.Compact(ids)})
 }
 
+// serverProofConfig sets the proof check on every server, whatever the --allow-id pattern allows.
+// A cell source whose role has no --proof-subject is refused, so the check fails closed.
+func serverProofConfig(scfg cellproxy.ServerConfig, cfg serverConfig, reg cellproxy.RegistrySource) cellproxy.ServerConfig {
+	scfg.Proof = &cellproxy.ProofCheck{Registry: reg, Subjects: cfg.subjects}
+	return scfg
+}
+
 var subjectName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$`)
 
 // proofSubjectFlag parses one --proof-subject <role>=<namespace>/<service account> into subjects.
@@ -616,21 +619,23 @@ func proofSubjectFlag(subjects map[string]record.Subject) func(string) error {
 }
 
 // mayAdmitCell reports whether the anchored pattern p can admit an ID with a cell/ path. It says
-// no only when the pattern names the /cp/ path as a literal, spells no cell/ literal, and holds no
-// element that can match a slash by itself. When it is unsure it says yes.
+// no only when the pattern names the /cp/ path as a literal, the literals of the pattern, joined and
+// folded to lower case, do not spell cell, and no element can match a slash by itself. It only
+// gives an early configuration error: the proof check of the server does not depend on it.
 func mayAdmitCell(p string) bool {
 	re, err := syntax.Parse(p, syntax.Perl)
 	if err != nil {
 		return true
 	}
-	var cp, cell, wild bool
+	var cp, wild bool
+	var all strings.Builder
 	var walk func(*syntax.Regexp)
 	walk = func(r *syntax.Regexp) {
 		switch r.Op {
 		case syntax.OpLiteral:
 			lit := string(r.Rune)
 			cp = cp || strings.Contains(lit, "/cp/")
-			cell = cell || strings.Contains(lit, "cell")
+			all.WriteString(strings.ToLower(lit))
 		case syntax.OpAnyChar, syntax.OpAnyCharNotNL:
 			wild = true
 		case syntax.OpCharClass:
@@ -642,10 +647,13 @@ func mayAdmitCell(p string) bool {
 		}
 		for _, s := range r.Sub {
 			walk(s)
+			if r.Op == syntax.OpRepeat || r.Op == syntax.OpStar || r.Op == syntax.OpPlus {
+				walk(s)
+			}
 		}
 	}
 	walk(re)
-	return !cp || cell || wild
+	return !cp || strings.Contains(all.String(), "cell") || wild
 }
 
 // newProofFunc makes the ProofFunc of this process: a token of the pod for the cell and role in

@@ -316,7 +316,7 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			if err != nil {
 				_ = conn.Close()
 				result(ctx, dialFailed)
-				log.Warn("tunnel_dial_failed", "reason", "proof_failed", "upstream", addr, "error", err.Error())
+				log.Warn("tunnel_dial_failed", "reason", string(ProofFailed), "upstream", addr, "error", err.Error())
 				return nil, err
 			}
 		}

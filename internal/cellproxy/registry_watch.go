@@ -76,13 +76,19 @@ func WatchRegistry(ctx context.Context, dir, signerFile string, every time.Durat
 	if err != nil {
 		return nil, err
 	}
+	return WatchLoaded(ctx, reg, fp, dir, signerFile, every, log), nil
+}
+
+// WatchLoaded is WatchRegistry for a registry that LoadPinnedRegistry has loaded already, with the
+// signer fingerprint that it returned. A zero every starts no reload.
+func WatchLoaded(ctx context.Context, reg *Registry, fp, dir, signerFile string, every time.Duration, log *slog.Logger) *RegistryWatcher {
 	w := &RegistryWatcher{dir: dir, signerFile: signerFile, log: log, signer: fp, marks: highestRevisions(reg)}
 	w.lastSig = registrySignature(reg)
 	w.cur.Store(reg)
 	if every > 0 {
 		go w.run(ctx, every)
 	}
-	return w, nil
+	return w
 }
 
 // Current returns the last good registry.

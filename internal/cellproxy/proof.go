@@ -67,7 +67,7 @@ func (p *ProofCheck) check(conn *tls.Conn, src Source, id string) error {
 	if !ok {
 		return refuse(ProofInvalid, errors.New("no_subject: no proof subject for role "+src.Role))
 	}
-	rec, ok := p.Registry.Current().Record(src.Cell)
+	rec, ok := p.Registry.Current().recordFor(src.Cell, src.Env)
 	if !ok {
 		return refuse(ProofInvalid, errors.New("no_record: the registry has no usable record of cell "+src.Cell))
 	}

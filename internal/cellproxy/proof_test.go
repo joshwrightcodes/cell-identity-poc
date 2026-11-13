@@ -427,3 +427,113 @@ func rewriteRegistry(t *testing.T, dir string, pubs []ed25519.PublicKey, priv ed
 		}
 	}
 }
+
+// TestReloadChangesHandshakeAdmission checks that a reload reaches the TLS authorizer: a cell that a
+// reload adds connects, and a cell that a reload revokes is refused at the handshake, with no restart.
+func TestReloadChangesHandshakeAdmission(t *testing.T) {
+	f := newWatchFixture(t, cell("dev-cell-1", false))
+	b := &holdBackend{sources: make(chan Source, 16)}
+	addr, out, env, _ := proofServer(t, ServerConfig{}, b, f.w)
+	connects := func(id, cellName string) bool {
+		c, err := tls.Dial("tcp", addr, clientConfig(t, env, id))
+		if err != nil {
+			return false
+		}
+		defer func() { _ = c.Close() }()
+		if _, err := c.Write(frameOf(t, testSigner, testSubject, cellName, "otel")(c)); err != nil {
+			return false
+		}
+		select {
+		case <-b.sources:
+			return true
+		case <-time.After(300 * time.Millisecond):
+			return false
+		}
+	}
+	newID := "spiffe://dev.env.poc.internal/cell/dev-cell-2/otel"
+	if connects(newID, "dev-cell-2") {
+		t.Fatal("a cell with no record connected")
+	}
+	waitForLog(t, out, "peer refused", PeerNotAllowed, newID)
+	if !connects(cellID("otel"), "dev-cell-1") {
+		t.Fatal("the cell of the registry did not connect")
+	}
+
+	rewriteRegistry(t, f.dir, []ed25519.PublicKey{f.pub}, f.priv, cell("dev-cell-1", false), cell("dev-cell-2", false))
+	waitFor(t, "the added cell to connect", func() bool { return connects(newID, "dev-cell-2") })
+
+	rewriteRegistry(t, f.dir, []ed25519.PublicKey{f.pub}, f.priv, atRevision("dev-cell-1", 1, 2), revokedCell("dev-cell-2"))
+	waitFor(t, "the revoked cell to be refused", func() bool { return !connects(newID, "dev-cell-2") })
+	if !connects(cellID("otel"), "dev-cell-1") {
+		t.Fatal("the cell that stayed in the registry stopped connecting")
+	}
+}
+
+func revokedCell(name string) record.Cell {
+	c := atRevision(name, 1, 2)
+	c.Revoked = true
+	return c
+}
+
+func waitFor(t *testing.T, what string, ok func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !ok() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// TestProofUsesRecordOfOwnEnvironment checks that a record of the same name in another environment
+// does not give the keys of the proof.
+func TestProofUsesRecordOfOwnEnvironment(t *testing.T) {
+	pub, priv := signerKey(t)
+	prod := atRevision("dev-cell-1", 9, 9)
+	prod.Env = "prod"
+	prod.JWKS = kubetoken.NewSigner(t, "ec-9", jose.ES256).JWKS()
+	reg, err := LoadRegistry(writeRegistry(t, []ed25519.PublicKey{pub}, priv, cell("dev-cell-1", false), prod))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec, ok := reg.Record("dev-cell-1"); !ok || rec.Env != "prod" {
+		t.Fatalf("Record without an environment gave %+v", rec)
+	}
+	b := &holdBackend{sources: make(chan Source, 4)}
+	addr, out, env, _ := proofServer(t, ServerConfig{}, b, reg)
+	dialWithProof(t, addr, env, cellID("otel"), frameOf(t, testSigner, testSubject, "dev-cell-1", "otel"))
+	waitSource(t, b.sources, out)
+}
+
+// TestProofRefusesCellWithoutSubjects checks that a server with a proof check and no subjects
+// refuses every cell stream, also one that carries a frame.
+func TestProofRefusesCellWithoutSubjects(t *testing.T) {
+	reg := testRegistry(t)
+	b := &holdBackend{sources: make(chan Source, 4)}
+	addr, out, env, _ := proofServer(t, ServerConfig{Proof: &ProofCheck{Registry: reg}}, b, reg)
+	dialWithProof(t, addr, env, cellID("otel"), frameOf(t, testSigner, testSubject, "dev-cell-1", "otel"))
+	if got := refusalError(t, out, ProofInvalid); !strings.Contains(got, "no_subject") {
+		t.Fatalf("error %q, want no_subject", got)
+	}
+	noSource(t, b.sources)
+}
+
+func TestClientProofFailureLogsReason(t *testing.T) {
+	b := &firstBytesBackend{n: 1, bytes: make(chan string, 1)}
+	addr, _, env, mgmt := proofServer(t, ServerConfig{}, b, testRegistry(t))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	log := &syncBuffer{}
+	fail := func(context.Context, *tls.Conn) error { return errors.New("no token") }
+	cli := &Client{TLS: ClientTLS(source(env.svid(t, cellID("otel"))), mgmt.bundle(), spiffeIDOf(principalID)), Upstream: addr, Log: jsonLog(log), Proof: fail}
+	done := make(chan struct{})
+	go func() { _ = cli.Serve(ctx, ln); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	c := dialTCP(t, ln.Addr().String())
+	defer func() { _ = c.Close() }()
+	waitForLog(t, log, "proof failed", ProofFailed, "")
+}
