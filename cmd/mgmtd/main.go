@@ -356,7 +356,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	apiTLS := mgmt.APIServerTLS(svids, mgmt.FileBundleSource(cfg.peerBundle, cfg.peerTD), cfg.allow)
 	apiSrv, bindSrv := mgmt.NewServers(
 		telemetry.Handler(tracer, "mgmtd.api", mgmt.NewAPIHandler(plane, intent.Env, cfg.allow, logger)),
-		telemetry.Handler(tracer, "mgmtd.bind", mgmt.NewBindHandler(plane, logger)),
+		telemetry.Handler(tracer, "mgmtd.bind", mgmt.NewBindHandler(plane, logger), telemetry.WithPublicEndpoint()),
 		apiTLS, mgmt.BindServerTLS(svids))
 	apiSrv.ErrorLog, bindSrv.ErrorLog = limitedErrorLog(logger), limitedErrorLog(logger)
 

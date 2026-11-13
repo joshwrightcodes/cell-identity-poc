@@ -15,7 +15,10 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 json_fail() {
   local name="$1" error="$2" pair args=()
   shift 2
-  for pair in "$@"; do args+=(--arg "${pair%%=*}" "${pair#*=}"); done
+  # key:=value passes value as JSON, for example a number. Any other pair passes a string.
+  for pair in "$@"; do
+    if [[ "${pair%%=*}" == *: ]]; then args+=(--argjson "${pair%%:=*}" "${pair#*:=}"); else args+=(--arg "${pair%%=*}" "${pair#*=}"); fi
+  done
   jq -nc --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg msg "$name failed" --arg error "$error" "${args[@]}" \
     '{time: $time, level: "ERROR", msg: $msg, error: $error} + (reduce ($ARGS.named | to_entries[] | select(.key != "time" and .key != "msg" and .key != "error")) as $e ({}; .[$e.key] = $e.value))'
   exit 1
@@ -223,7 +226,15 @@ load_local_settings() {
   local file="${POC_ENVRC_LOCAL:-$ROOT/.envrc.local}" name
   for name in "$@"; do
     if [[ -z "${!name:-}" ]]; then
-      [[ -f "$file" ]] || return 0
+      if [[ ! -f "$file" ]]; then
+        # A new worktree has no .envrc.local, because git ignores it. Name the cause and the fix. The file is never printed.
+        if [[ -n "${POC_ENVRC_LOCAL:-}" ]]; then
+          log "POC_ENVRC_LOCAL names $file, and that file is absent. Set it to the .envrc.local of the checkout that set up the clusters"
+        else
+          log "$file is absent, as in a new worktree. Copy .envrc.local from the checkout that set up the clusters, or set POC_ENVRC_LOCAL to its path"
+        fi
+        return 0
+      fi
       # shellcheck source=/dev/null
       source "$file"
       log "read the settings from $file"

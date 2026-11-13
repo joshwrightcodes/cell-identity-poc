@@ -279,10 +279,9 @@ A record with other keys than the cell publishes prints `mise run mgmt -- keyche
 A new `celld` pod can fail with `unknown_kid` after the API server of its cell gets a new service account key.
 The record of the cell then lists only the old keys. `mgmtd` finds the new key on one of three events:
 
-- A new `celld` pod binds with a token from the new key.
+- A new `celld` pod binds with a token from the new key. This happens when a `celld` pod starts in that cell, for example after `CELL=<cell> mise run cell:restart`.
 - The periodic key check runs. It runs every 15 minutes for each cell.
 - An operator runs a key check.
-- A `celld` pod starts in that cell, for example after `CELL=<cell> mise run cell:restart`.
 
 To check at once, run `mise run mgmt -- keycheck --cell <cell>`.
 The answer `keys_updated` means `mgmtd` signed a new record with both key IDs.
@@ -378,9 +377,10 @@ A revocation or a new cell reaches the views only after the link.
 `mgmtd` keeps its state and its signing key in two files on its data volume.
 When the state file is absent or does not parse, `mgmtd` starts with a new state at epoch 1 and counter 1.
 It also makes a new signing key.
+In these two cases, run only the two commands that this section lists after the Job steps, and skip `reset-state`.
 A file that does not parse moves to `state.json.corrupt-<unix time>` first.
-A file that parses but fails validation stays in place, and `mgmtd` does not start with `state_invalid`.
-The image has no shell, so one command does the recovery:
+A file that parses but fails validation stays in place. `mgmtd` does not start and logs `state_invalid`.
+A state that fails validation needs the move of both files. The image has no shell, so one command does it:
 
 ```sh
 mise run mgmt -- reset-state
@@ -395,7 +395,9 @@ The command runs these steps in order:
 4. It waits until `mgmtd-0` is Ready.
 
 The command prints one JSON line with the moved files and the next commands.
-A failure in step 2 scales `mgmtd` back to 1 and leaves the files in place.
+A failure in step 2, or an interrupt, scales `mgmtd` back to 1. The Job can move one file before it fails on the other, so the files can be partly moved.
+If that happens, `mgmtd` starts with a new state and a new signing key. Run `mise run mgmt -- status` to check.
+An invalid `MGMT_RESET_WAIT` prints one JSON error line.
 Run the printed commands in this order:
 
 ```sh
@@ -407,7 +409,7 @@ The fresh state starts with a new signing key.
 The `dev-cp` render pins that key, so `envd` and the plugin of the SPIRE server both start their marks again.
 `dev-cp` then applies the records of the new key, and no rotation is needed.
 Each cell binds again on its own, because `celld` repeats its bind until `mgmtd` holds a record.
-A new `celld` pod in each cell then attests.
+In the drill, both cells bound again and `harness:status` passed.
 Then run `CELL=management mise run cell:verify` and `CELL=dev-cp mise run cell:verify`.
 
 When `mgmtd-0` is not Ready, a `dev-cp` render refuses a `mgmt-signing-pub` key that differs from the key that `dev-cp` pins.
@@ -1020,6 +1022,8 @@ A comment line in `build/images.env` records the commit of the build.
 `gate:m1` and `gate:m2` run `mise run images` first.
 A new worktree has no build output. Before a live gate, copy `build/images.env` and each `build/<cluster>` directory from the checkout that set up the clusters.
 The gate stops at once and prints the copy command when they are absent.
+A new worktree also has no `.envrc.local`. Copy it from the same checkout, or set `POC_ENVRC_LOCAL` to its path.
+`harness:up` and `secrets:connect` print this fix when the file is absent.
 After a change under `cmd/` or `internal/`, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
 `gate:m2` first compares the deployed images with `build/images.env`, and it prints the `cell:up` commands when they differ.
 

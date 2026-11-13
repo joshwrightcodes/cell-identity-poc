@@ -27,7 +27,7 @@ case "${1:-}" in status | records | pubkey | keys) timeout=(--request-timeout=60
 rc=0
 out="$(kubectl --context "kind-$CELL_NAME" ${timeout[@]+"${timeout[@]}"} -n mgmt-system exec mgmtd-0 -c mgmtd -- /ko-app/mgmtd ctl "$@")" || rc=$?
 if ((rc != 0)) && [[ -z "$out" ]]; then
-  json_fail mgmt "kubectl exec into mgmtd-0 failed with exit code $rc and printed no output. Run: mise run harness:status" kubectl_exit="$rc"
+  json_fail mgmt "kubectl exec into mgmtd-0 failed with exit code $rc and printed no output. Run: mise run harness:status" "kubectl_exit:=$rc"
 fi
 [[ -z "$out" ]] || printf '%s\n' "$out"
 exit "$rc"

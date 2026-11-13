@@ -1,15 +1,20 @@
 package scripts
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 // resetKubectl stands for kubectl in management. It keeps the replicas of StatefulSet mgmtd in $STUB_DIR/replicas, and it
 // logs each call after the context. STUB_JOB_FAIL makes the Job fail, STUB_JOB_HANG keeps it running, and STUB_CREATE_FAIL
-// makes the create fail.
+// makes the create fail. STUB_GET_ERROR makes every pod read fail with a connection error, and STUB_POD_STUCK keeps
+// mgmtd-0 listed after the scale to 0.
 const resetKubectl = `#!/usr/bin/env bash
 shift 2
 echo "$*" >>"$STUB_DIR/calls"
@@ -18,7 +23,9 @@ case "$*" in
   *"get statefulset mgmtd"*) echo "registry.test/mgmtd@sha256:abc" ;;
   *"patch statefulset/mgmtd"*) echo "$*" | sed -n 's/.*"replicas":\([0-9]*\).*/\1/p' >"$STUB_DIR/replicas" ;;
   *"get pod mgmtd-0 -o jsonpath"*) [[ "$(replicas)" == 1 ]] && echo True ;;
-  *"get pod mgmtd-0"*) [[ "$(replicas)" == 1 ]] ;;
+  *"get pod mgmtd-0"*)
+    [[ -z "${STUB_GET_ERROR:-}" ]] || { echo "Unable to connect to the server" >&2; exit 1; }
+    if [[ "$(replicas)" == 1 || -n "${STUB_POD_STUCK:-}" ]]; then echo pod/mgmtd-0; fi ;;
   *"create -f -"*) cat >"$STUB_DIR/job.yaml"; [[ -z "${STUB_CREATE_FAIL:-}" ]] || { echo "denied" >&2; exit 1; } ;;
   *"get job "*)
     if [[ -n "${STUB_JOB_HANG:-}" ]]; then echo "/"; elif [[ -n "${STUB_JOB_FAIL:-}" ]]; then echo "/1"; else echo "1/"; fi ;;
@@ -87,6 +94,8 @@ func TestResetStateFailuresPrintOneErrorLine(t *testing.T) {
 		{"create fails", "STUB_CREATE_FAIL=1", "create-job"},
 		{"job fails", "STUB_JOB_FAIL=1", "run-job"},
 		{"job hangs", "STUB_JOB_HANG=1", "run-job"},
+		{"mgmtd-0 does not stop", "STUB_POD_STUCK=1", "wait-stop"},
+		{"a kubectl error is not a missing pod", "STUB_GET_ERROR=1", "wait-stop"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, _, code, calls := resetRun(t, tc.env)
@@ -115,12 +124,101 @@ esac
 `
 	out, errOut, code := runScript(t, "mgmt.sh", map[string]string{"kubectl": kubectl}, nil, "status")
 	lines := jsonLines(t, out)
-	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["kubectl_exit"] != "1" ||
+	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["kubectl_exit"] != float64(1) ||
 		!strings.Contains(lines[0]["error"].(string), "mise run harness:status") {
 		t.Fatalf("exit %d, stdout %q, stderr %q; want one error line with the exit code and the next command", code, out, errOut)
 	}
 	out, _, code = runScript(t, "mgmt.sh", map[string]string{"kubectl": kubectl}, []string{"STUB_EXEC_LINE=1"}, "status")
 	if code != 1 || strings.TrimSpace(out) != `{"level":"ERROR","msg":"mgmtd failed","error":"conflict"}` {
 		t.Fatalf("exit %d, stdout %q; want the line of mgmtd unchanged", code, out)
+	}
+}
+
+func TestResetStateInvalidWaitPrintsOneErrorLine(t *testing.T) {
+	out, _, code, calls := resetRun(t, "MGMT_RESET_WAIT=soon")
+	lines := jsonLines(t, out)
+	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["step"] != "read-wait" {
+		t.Fatalf("exit %d, stdout %q; want one error line at step read-wait", code, out)
+	}
+	if calls[0] != "" {
+		t.Fatalf("kubectl ran before the check:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+func TestResetStateHintsNameMiseTasksOnly(t *testing.T) {
+	for _, env := range []string{"STUB_POD_STUCK=1", "STUB_JOB_FAIL=1", "STUB_JOB_HANG=1"} {
+		out, _, _, _ := resetRun(t, env)
+		for _, l := range jsonLines(t, out) {
+			if next, _ := l["next"].(string); next != "" && !strings.HasPrefix(next, "mise run ") {
+				t.Errorf("%s: hint %q is not a mise task", env, next)
+			}
+		}
+	}
+}
+
+// An interrupt while the Job runs scales mgmtd back to 1 and deletes the Job.
+func TestResetStateInterruptScalesMgmtdBack(t *testing.T) {
+	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
+		t.Run(sig.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			bin := t.TempDir()
+			if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(resetKubectl), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			path, err := filepath.Abs("../../scripts/mgmt.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", path, "reset-state")
+			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+				"POC_BUILD_ROOT=" + filepath.Join(bin, "build"), "STUB_DIR=" + dir, "STUB_JOB_HANG=1", "MGMT_RESET_WAIT=60"}
+			var out bytes.Buffer
+			cmd.Stdout = &out
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			deadline := time.Now().Add(20 * time.Second)
+			for {
+				b, _ := os.ReadFile(filepath.Join(dir, "calls"))
+				if strings.Contains(string(b), "get job") {
+					break
+				}
+				if time.Now().After(deadline) {
+					_ = cmd.Process.Kill()
+					t.Fatalf("the script never reached the Job wait:\n%s", b)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+			_ = cmd.Process.Signal(sig)
+			select {
+			case <-done:
+			case <-time.After(20 * time.Second):
+				_ = cmd.Process.Kill()
+				t.Fatal("the script did not stop after the signal")
+			}
+			b, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			calls := strings.Split(strings.TrimSpace(string(b)), "\n")
+			if last := indexOf(calls, `"replicas":1`); last < indexOf(calls, `"replicas":0`) || last < 0 {
+				t.Fatalf("mgmtd was not scaled back to 1 after %s:\n%s", sig, b)
+			}
+			if indexOf(calls, "delete job") < 0 {
+				t.Fatalf("the Job was not deleted after %s:\n%s", sig, b)
+			}
+		})
+	}
+}
+
+// A worktree has no .envrc.local, because git ignores it. secrets:connect names the cause and the fix.
+func TestSecretsConnectNamesAnAbsentEnvrcLocal(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), ".envrc.local")
+	_, errOut, code := runScript(t, "secrets-connect.sh", nil,
+		[]string{"CELL=dev-cp", "POC_ENVRC_LOCAL=" + missing})
+	if code == 0 || !strings.Contains(errOut, missing+" is absent") && !strings.Contains(errOut, "POC_ENVRC_LOCAL names "+missing) {
+		t.Fatalf("exit %d, stderr %q; want the absent file named", code, errOut)
+	}
+	if !strings.Contains(errOut, "set up the clusters") || !strings.Contains(errOut, "POC_ENVRC_LOCAL") {
+		t.Fatalf("stderr %q lacks the fix", errOut)
 	}
 }

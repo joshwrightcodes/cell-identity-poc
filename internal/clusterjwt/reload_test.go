@@ -1148,14 +1148,20 @@ func TestConfigureBaseBelowMarksIsNotKept(t *testing.T) {
 	})
 }
 
-// A signing key rotation re-signs at (epoch + 1, 1), so marks written under the old key still guard the
-// new key. The plugin keeps them, and needs no operator step.
-func TestMarksSurviveAKeyRotation(t *testing.T) {
+// A signing key rotation starts the marks again: marks written under the old key, here above the new specs,
+// do not block the first specs of the new key. After that, the new marks guard the new key, and a spec of an
+// older epoch is refused. The plugin needs no operator step.
+func TestKeyRotationRestartsMarksThenGuardsTheNewKey(t *testing.T) {
 	f := newFixture(t, fixtureOptions{marks: true})
 	newPub, newPriv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.writeMarks(marksDoc{
+		KeySHA256: keyFingerprint([]ed25519.PublicKey{f.pub}),
+		Spec:      envspec.Revision{Epoch: 5, Counter: 1},
+		Cells:     map[string]envspec.Revision{"dev-cell-1": {Epoch: 5, Counter: 1}, "dev-cell-2": {Epoch: 5, Counter: 1}},
+	})
 	signed := func(name string, epoch, counter uint64) ([]byte, envspec.Entry) {
 		rec := f.keys.record(t)
 		rec.Name, rec.Epoch, rec.Counter = name, epoch, counter
