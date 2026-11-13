@@ -2,29 +2,26 @@
 # Set up the cell: create the cluster through the host service, apply the bootstrap set, publish
 # the bundles, then wait until Argo CD reports every Application as Synced and Healthy at the
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
-# store, or asks for secrets:connect in a second shell. Last, apply the harness components and wait
-# for their rollouts.
+# store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
+# for their rollouts. UP_WAIT sets the bound of the Application wait in seconds (default 900).
+# Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
+# The link phase comes last, and it needs other clusters. Check them before the first step, so a
+# missing cluster stops cell:up in seconds and not after the base cell.
+if [[ "${CELL_UP_SKIP_LINK:-}" != 1 ]]; then
+  missing="$(link_preflight)"
+  [[ -z "$missing" ]] || die "the link phase of $CELL_NAME needs other clusters:"$'\n'"$missing"$'\n'"Or set up the base cell alone now, and run the link phase later: CELL_UP_SKIP_LINK=1 CELL=$CELL_NAME mise run cell:up, then CELL=$CELL_NAME mise run cell:link"
+fi
 log "creating cluster $CELL_NAME through the host service"
 (cd "$ROOT" && mise run hostsvc -- up --only "$CELL_NAME")
 k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
   || die "the node of $CELL_NAME is not Ready after 300s. Read its state: mise x -- kubectl --context kind-$CELL_NAME describe nodes. Then run CELL=$CELL_NAME mise run cell:up again"
 
 "$ROOT/scripts/facts.sh"
-"$ROOT/scripts/hydrate.sh"
-
-apply_bundle() {
-  local file="$BUNDLES/$1/manifests.yaml"
-  if ! k apply --server-side --force-conflicts -f "$file" >/dev/null 2>&1; then
-    # A bundle can hold a CRD and an object of that kind. The first apply fails for that object.
-    # Wait for the CRD, then apply again. The second apply shows any real error.
-    k wait --for=condition=Established crd --all --timeout=120s >/dev/null
-    k apply --server-side --force-conflicts -f "$file" >/dev/null
-  fi
-  log "applied bundle $1"
-}
+# The link components render in the link phase, after every wave, because they read live facts.
+CELL_UP_SKIP_LINK=1 CELL_UP_SKIP_LATE=1 "$ROOT/scripts/hydrate.sh"
 
 for c in "${BOOTSTRAP[@]}"; do
   apply_bundle "$c"
@@ -39,63 +36,46 @@ log "applied the root Application"
 
 expected=$((${#COMPONENTS[@]} + 1))
 log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
-end=$((SECONDS + 900))
+up_wait="${UP_WAIT:-900}"
+end=$((SECONDS + up_wait))
 store_done=0
 last_hint=-60
 # Without direnv, the token command still comes from .envrc.local.
 [[ -z "${SECRET_STORE_NAMESPACES:-}" ]] || load_local_settings POC_SECRET_TOKEN_CMD
-until apps_at_published >/dev/null 2>&1; do
+until apps_at_published 2>/dev/null; do
   if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)); then
     connect_store_step "$ROOT/scripts/secrets-connect.sh"
   fi
   if ((SECONDS >= end)); then
-    k -n argocd get applications
-    die "Applications did not reach the published revisions, Synced and Healthy, in 900s"
+    k get applications -A
+    apps_at_published >/dev/null || true
+    blockers="$(apps_blockers 2>&1)" || true
+    die "Applications did not reach the published revisions, Synced and Healthy, in ${up_wait}s. Blocked by: ${blockers//$'\n'/; }"
   fi
   sleep 10
 done
-k -n argocd get applications
-
-# release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD
-# Application managed before: the tracking annotation and the argocd-controller field manager.
-# The harness apply then owns every field. Objects without these leftovers stay unchanged.
-release_from_argocd() {
-  local obj kind name ns live patch scope
-  while read -r obj; do
-    kind="$(jq -r .kind <<<"$obj")" name="$(jq -r .name <<<"$obj")" ns="$(jq -r .ns <<<"$obj")"
-    scope=()
-    [[ -n "$ns" ]] && scope=(-n "$ns")
-    live="$(k "${scope[@]}" get "$kind/$name" -o json --show-managed-fields 2>/dev/null)" || continue
-    if jq -e '.metadata.annotations["argocd.argoproj.io/tracking-id"] != null' <<<"$live" >/dev/null; then
-      k "${scope[@]}" annotate "$kind/$name" argocd.argoproj.io/tracking-id- >/dev/null
-      log "removed the Argo CD tracking annotation from $kind/$name"
-    fi
-    if jq -e 'any(.metadata.managedFields[]?; .manager == "argocd-controller")' <<<"$live" >/dev/null; then
-      patch="$(jq -c '[{op: "replace", path: "/metadata/managedFields",
-        value: [.metadata.managedFields[] | select(.manager != "argocd-controller")]}]' <<<"$live")"
-      k "${scope[@]}" patch "$kind/$name" --type=json -p "$patch" >/dev/null
-      log "removed the argocd-controller field manager from $kind/$name"
-    fi
-  done < <(yq -o=json -I=0 'select(.kind != null) | {"kind": .kind, "name": .metadata.name, "ns": (.metadata.namespace // "")}' "$1")
-}
+k get applications -A
 
 # Harness components stay outside Argo CD. The harness applies them after the root bundle syncs,
 # so no Application from an older root bundle still claims their objects. The apply does not
 # prune: an object that leaves the bundle stays in the cluster. cell:verify reports a
-# NetworkPolicy that the bundle does not hold.
+# NetworkPolicy that the bundle does not hold. harness_apply stops before it takes an object that
+# another owner holds.
+# The components in LATE_HARNESS read the live SPIRE server of this cluster, which exists now.
+HYDRATE_ONLY=late "$ROOT/scripts/hydrate.sh"
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  apply_bundle "${entry%%:*}"
-  release_from_argocd "$BUNDLES/${entry%%:*}/manifests.yaml"
+  harness_apply "${entry%%:*}"
 done
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  ns="${entry#*:}"
-  for deployment in $(k -n "$ns" get deployments -o name); do
-    if ! k -n "$ns" rollout status "$deployment" --timeout=300s >/dev/null; then
-      log "read the events: mise x -- kubectl --context kind-$CELL_NAME -n $ns describe $deployment"
-      log "read the logs: mise x -- kubectl --context kind-$CELL_NAME -n $ns logs $deployment --all-containers"
-      die "$deployment in $ns did not finish its rollout in 300s"
-    fi
-  done
+  harness_rollout_wait "${entry%%:*}" "${entry#*:}"
   log "harness component ${entry%%:*} is rolled out"
 done
+if ((${#LINK_COMPONENTS[@]} > 0)); then
+  if [[ "${CELL_UP_SKIP_LINK:-}" == 1 ]]; then
+    log "skipping the link phase, because CELL_UP_SKIP_LINK=1. Run it later: CELL=$CELL_NAME mise run cell:link"
+  else
+    log "running the link phase of $CELL_NAME"
+    "$ROOT/scripts/link.sh"
+  fi
+fi
 log "cell $CELL_NAME is up. Run mise run cell:verify."

@@ -1,0 +1,139 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-agent-params
+data:
+  # agent.mode: The mode this agent should operate in. Valid values are
+  # "autonomous" or "managed".
+  # Default: "autonomous"
+  agent.mode: "autonomous"
+  # agent.creds: Valid credential identifier for this agent. Must be in the
+  # format <method>:<configuration>. Valid values are:
+  # - "userpass:_path_to_encrypted_creds_" where _path_to_encrypted_creds_ is
+  #   the path to the file containing encrypted credential for authenticatiion.
+  # - "mtls:_agent_id_regex_" where _agent_id_regex_ is the regex pattern for
+  #   extracting the agent ID from client cert subject.
+  # Default: ""
+  agent.creds: "userpass:/app/config/creds/userpass.creds"
+  # agent.tls.insecure-plaintext: Connect to the principal without TLS. Only use
+  # when running behind a service mesh (e.g., Istio) that handles mTLS at
+  # the sidecar level.
+  # Default: false
+  agent.tls.insecure-plaintext: "false"
+  # agent.tls.client.insecure: Whether to skip the validation of the remote TLS
+  # credentials. Insecure. Do only use for development purposes.
+  # Default: false
+  agent.tls.client.insecure: "false"
+  # agent.tls.root-ca-secret-name: The name of the secret containing the
+  # certificates for the TLS root certificate authority used to validate the
+  # remote principal.
+  # Default: "argocd-agent-ca"
+  agent.tls.root-ca-secret-name: "argocd-agent-ca"
+  # agent.tls.root-ca-path: The path to a file containing the certificates for
+  # the TLS root certificate authority used to validate the remote principal.
+  # Default: ""
+  agent.tls.root-ca-path: ""
+  # agent.tls.secret-name: The name of the secret containing the agent
+  # certificate.
+  # Default: "argocd-agent-client-tls"
+  agent.tls.secret-name: "argocd-agent-client-tls"
+  # agent.tls.client.cert-path: Path to a file containing the agent's TLS client
+  # certificate.
+  # Default: ""
+  agent.tls.client.cert-path: ""
+  # agent.tls.client.cert-path: Path to a file containing the agent's TLS client
+  # private key.
+  # Default: ""
+  agent.tls.client.key-path: ""
+  # agent.tls.min-version: Minimum TLS version to use when connecting to the principal.
+  # Valid values: tls1.1, tls1.2, tls1.3
+  # Default: "" (use Go default)
+  agent.tls.min-version: ""
+  # agent.tls.max-version: Maximum TLS version to use when connecting to the principal.
+  # Valid values: tls1.1, tls1.2, tls1.3
+  # Default: "" (use highest available)
+  agent.tls.max-version: ""
+  # agent.tls.ciphersuites: Comma-separated list of TLS cipher suites.
+  # Run 'argocd-agent agent --tls-ciphersuites=list' to see available suites.
+  # Default: "" (use Go defaults)
+  agent.tls.ciphersuites: ""
+  # agent.log.level: The log level the agent should use. Valid values are
+  # trace, debug, info, warn and error.
+  # Default: "info"
+  agent.log.level: "info"
+  # agent.namespace: The namespace the agent should operate and manage the
+  # Argo CD resources in.
+  # Default: "argocd"
+  agent.namespace: "argocd"
+  # agent.principal.address: The remote address of the principal to connect
+  # to. Can be a DNS name, an IPv4 address or an IPv6 address.
+  # Default: ""
+  agent.server.address: "argocd-agent-principal.example.com"
+  # agent.server.port: The remote port of the principal to connect to.
+  # Default: "443"
+  agent.server.port: "443"
+  # agent.metrics.port: The port the metrics server should listen on.
+  # Default: 8181
+  agent.metrics.port: "8181"
+  # agent.healthz.port: The port the health check server should listen on.
+  # Default: 8002
+  agent.healthz.port: "8002"
+  # agent.log.format: The log format agent should use. Valid values are
+  # "json" or "text".
+  # Default: "text"
+  agent.log.format: "text"
+  # agent.websocket.enable: Whether to use the websocket to stream events to the
+  # principal.
+  # Default: false
+  agent.websocket.enable: "false"
+  # agent.compression.enable: Whether to use compression while sending data
+  # between Principal and Agent using gRPC
+  # Default: false
+  agent.compression.enable: "false"
+  # agent.keep-alive.interval: The interval at which the agent should send
+  # a ping to the principal to keep the connection alive.
+  # Default: 0
+  agent.keep-alive.interval: "0"
+  # agent.pprof.port: The port the pprof server should listen on.
+  # Default: 0
+  agent.pprof.port: "0"
+  # agent.resource-proxy.enable: Whether to enable the resource proxy.
+  # Default: true
+  agent.resource-proxy.enable: "true"
+  # agent.redis.address: The address of the Redis server.
+  # Default: "argocd-redis:6379"
+  agent.redis.address: "argocd-redis:6379"
+  # agent.destination-based-mapping: Whether to enable destination-based mapping.
+  # When enabled, the agent creates applications in their original namespace
+  # (preserving the namespace from the principal) instead of the agent's own namespace.
+  # Default: false
+  agent.destination-based-mapping: "false"
+  # agent.create-namespace: Whether to create target namespaces automatically
+  # when they don't exist (used with destination-based-mapping).
+  # Default: false
+  agent.create-namespace: "false"
+  # agent.allowed-namespaces: Comma-separated list of additional namespaces
+  # the agent is allowed to manage applications in. Supports glob patterns.
+  # Default: ""
+  agent.allowed-namespaces: ""
+  # agent.label-selector: Kubernetes label selector to restrict which
+  # resources the agent watches. Only matching resources will be
+  # listed, watched, and processed.
+  # Default: ""
+  agent.label-selector: ""
+  # agent.redis.tls.enabled: Whether to enable TLS for Redis connections.
+  # Default: false
+  agent.redis.tls.enabled: "false"
+  # agent.redis.tls.ca-path: Path to CA certificate for Redis TLS.
+  # This should match the mount path in the Deployment.
+  # Set to empty string to use system CAs (not recommended for self-signed certs).
+  # Default: "/app/config/redis-tls/ca.crt"
+  agent.redis.tls.ca-path: "/app/config/redis-tls/ca.crt"
+  # agent.redis.tls.insecure: INSECURE: Do not verify Redis TLS certificate.
+  # Default: false
+  agent.redis.tls.insecure: "false"
+  # agent.informer-sync-timeout: How long the agent waits for its informers
+  # (Application, AppProject, Repository, GPG, Namespace) to complete the
+  # initial sync at startup. Increase on large or high-API-load clusters.
+  # Default: "10s"
+  agent.informer-sync-timeout: "10s"

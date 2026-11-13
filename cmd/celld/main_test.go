@@ -30,8 +30,9 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 const testID = "spiffe://dev.env.poc.internal/cell/dev-cell-1/celld"
@@ -72,13 +73,13 @@ func (h recordHandler) WithGroup(string) slog.Handler      { return h }
 
 // testTelemetry exports nothing. Spans are sampled, so their IDs reach the log lines.
 func testTelemetry(otlp slog.Handler) telemetryStarter {
-	return func(_ context.Context, stdout io.Writer) (*telemetry, error) {
+	return func(_ context.Context, stdout io.Writer) (*telemetry.T, error) {
 		tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
-		return &telemetry{
-			log:      newLogger(stdout, otlp),
-			tracer:   tp.Tracer("test"),
-			meter:    noop.NewMeterProvider().Meter("test"),
-			shutdown: func(timeout time.Duration) error { return withTimeout(timeout, tp.Shutdown) },
+		return &telemetry.T{
+			Log:      telemetry.NewLogger(stdout, otlp),
+			Tracer:   tp.Tracer("test"),
+			Meter:    noop.NewMeterProvider().Meter("test"),
+			Shutdown: tp.Shutdown,
 		}, nil
 	}
 }
@@ -120,27 +121,6 @@ func TestFailsWithoutWorkloadAPISocket(t *testing.T) {
 	last := lines[len(lines)-1]
 	if last["level"] != "ERROR" || !strings.Contains(last["error"].(string), "watch the workload api") {
 		t.Fatalf("last line is %v, want the watch error", last)
-	}
-}
-
-func TestTraceHandlerAddsSpanIDs(t *testing.T) {
-	var out bytes.Buffer
-	log := newLogger(&out, discard())
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSampler(sdktrace.AlwaysSample()))
-	ctx, span := tp.Tracer("test").Start(context.Background(), "op")
-	log.InfoContext(ctx, "with span")
-	span.End()
-	log.Info("without span")
-
-	lines := jsonLines(t, out.String())
-	if len(lines) != 2 {
-		t.Fatalf("got %d lines", len(lines))
-	}
-	if lines[0]["trace_id"] != span.SpanContext().TraceID().String() || lines[0]["span_id"] != span.SpanContext().SpanID().String() {
-		t.Fatalf("line with span is %v", lines[0])
-	}
-	if _, ok := lines[1]["trace_id"]; ok {
-		t.Fatalf("line without span has a trace ID: %v", lines[1])
 	}
 }
 
@@ -307,74 +287,6 @@ func TestLogsEachNewSVIDOnce(t *testing.T) {
 	}
 }
 
-// captureStderr runs f with file descriptor 2 on a pipe and returns what f wrote there. Loggers
-// that kept the original os.Stderr at package init write to that descriptor too.
-func captureStderr(t *testing.T, f func()) string {
-	t.Helper()
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	saved, err := unix.Dup(2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Dup2(int(w.Fd()), 2); err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan string, 1)
-	go func() {
-		b, _ := io.ReadAll(r)
-		done <- string(b)
-	}()
-	restore := func() {
-		_ = unix.Dup2(saved, 2)
-		_ = unix.Close(saved)
-		_ = w.Close()
-	}
-	defer func() {
-		if w != nil {
-			restore()
-		}
-	}()
-	f()
-	restore()
-	w = nil
-	return <-done
-}
-
-func TestTelemetryErrorsStayJSONOnStdout(t *testing.T) {
-	// Port 1 on the loopback address refuses connections, so every export fails.
-	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
-	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
-	out := &syncBuffer{}
-	stderr := captureStderr(t, func() {
-		tel, err := startTelemetry(t.Context(), out)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ctx, span := tel.tracer.Start(context.Background(), "op")
-		tel.log.InfoContext(ctx, "before shutdown")
-		span.End()
-		if err := tel.shutdown(2 * time.Second); err != nil {
-			slog.New(slog.NewJSONHandler(out, nil)).Warn("telemetry shutdown", "error", err.Error())
-		}
-	})
-	if stderr != "" {
-		t.Fatalf("telemetry wrote to stderr: %q", stderr)
-	}
-	lines := jsonLines(t, out.String())
-	var sdkErrors int
-	for _, l := range lines {
-		if l["msg"] == "telemetry error" || l["msg"] == "telemetry shutdown" {
-			sdkErrors++
-		}
-	}
-	if sdkErrors == 0 {
-		t.Fatalf("no JSON line reports the failed export:\n%s", out.String())
-	}
-}
-
 // TestSVIDAgainAfterAGap logs the same SVID again after a gap, as held and not as new. Only a new
 // SVID adds to the counter, so celld.svid.updates counts new SVIDs.
 func TestSVIDAgainAfterAGap(t *testing.T) {
@@ -403,7 +315,7 @@ func TestSVIDAgainAfterAGap(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			tel.meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+			tel.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
 			w, err := newSVIDWatcher(tel)
 			if err != nil {
 				t.Fatal(err)

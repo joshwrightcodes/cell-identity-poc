@@ -13,9 +13,10 @@ import (
 
 // migrateKubectl plays a dev-cp that runs the cluster-scoped operator until the stub publish runs,
 // and the namespaced store after the stub secrets:connect runs. Each call goes to kubectl.log.
-//   STUB_MIGRATED        the cluster runs the scoped operator and the namespaced store already
-//   STUB_ANNOTATE_LOST   the annotate does not reach the Namespace
-//   STUB_NS_UID_CHANGES  the Namespace has a new UID after secrets:connect
+//
+//	STUB_MIGRATED        the cluster runs the scoped operator and the namespaced store already
+//	STUB_ANNOTATE_LOST   the annotate does not reach the Namespace
+//	STUB_NS_UID_CHANGES  the Namespace has a new UID after secrets:connect
 const migrateKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_DIR/kubectl.log"

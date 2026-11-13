@@ -1,6 +1,24 @@
-# The SPIRE server of the environment trust domain. render.sh fills in the plugin image, the
-# config checksum, the record volume and the agent node addresses. The external-secrets bundle
-# holds Namespace spire-system, the store namespace of the operator.
+# The SPIRE server of one trust domain. render.sh fills in the plugin image, the config checksum,
+# the record volume, the agent node addresses and the local workload peers. It drops each object,
+# container and volume that the cluster does not need:
+#   - with no agent cell: the plugin installer, the record volume, the node port and the policy
+#     for the agent nodes.
+#   - with no upstream authority: ExternalSecret spire-upstream and its volume.
+#   - with no local workload: the API token, the k8s_psat RBAC and the policies of flows N8 and N9.
+#   - when the external-secrets bundle holds Namespace spire-system as its store namespace: the
+#     Namespace below.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+  annotations:
+    # A bundle that drops the namespace, or a deleted Application, must not delete it and the CA
+    # key on the data volume.
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -45,6 +63,35 @@ spec:
     - secretKey: root-cert
       remoteRef:
         key: "@CELL_NAME@/spire-server/root-cert"
+---
+# The k8s_psat plugin reviews each agent token, and reads the pod and the node of the agent.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server-psat
+rules:
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-psat
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: spire-server-psat
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire-system
 ---
 # One ClusterStaticEntry per key. Each key name ends in .yaml.
 apiVersion: v1
@@ -153,6 +200,10 @@ spec:
             # go-plugin creates the plugin socket in the temporary directory.
             - name: tmp
               mountPath: /tmp
+            # The k8s_psat plugin uses the in-cluster API client. Only this container gets the token.
+            - name: api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
         - name: spire-controller-manager
           image: ghcr.io/spiffe/spire-controller-manager:0.8.0@sha256:19e418e9d7f23fe82cbabccdc3e71861590f69a1fa8451bfdb267d7371b2b73e
           args: ["--config", "/run/spire/controller-manager/config.yaml"]
@@ -213,6 +264,23 @@ spec:
         - name: records
           projected:
             sources: "@SPIRE_RECORD_SOURCES@"
+        # The same files as the automatic token mount, for the server container only.
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -223,7 +291,8 @@ spec:
             storage: 1Gi
 ---
 # Agents in the cell clusters reach the server API on node port 30081. Local traffic policy keeps
-# the client address, so the NetworkPolicy can match the agent node addresses.
+# the client address, so the NetworkPolicy can match the agent node addresses. Without agent cells
+# the Service has the type ClusterIP, and only the local plane workloads use it.
 apiVersion: v1
 kind: Service
 metadata:
@@ -269,3 +338,67 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
+---
+# Flow N8: the SPIRE agent sidecar of each local plane workload reaches the server API. Each
+# workload pod carries the label app.kubernetes.io/name=<service account>.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-workloads
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Ingress]
+  ingress:
+    - from: "@SPIRE_WORKLOAD_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8081
+---
+# Flow N15: the collector of the cluster scrapes the metrics port, and no other pod reaches it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-metrics
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 9988
+---
+# Flow N9: the k8s_psat plugin reaches the API server for TokenReview and the pod and node reads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-api
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Egress]
+  egress:
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443

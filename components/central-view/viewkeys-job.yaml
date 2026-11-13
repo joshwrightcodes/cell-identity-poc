@@ -1,0 +1,101 @@
+# viewkeys makes the keys of the view inside the cluster: the agent CA (without its key), the
+# resource proxy certificate, the agent JWT key, server.secretkey and one cluster Secret for each
+# agent. scripts/link.sh runs the Job to completion before it waits for the principal. The Job
+# creates only absent Secrets, so a second run changes nothing. mise run view:rotate-keys runs a copy
+# with --rotate.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: viewkeys
+  namespace: central-view-system
+automountServiceAccountToken: false
+---
+# Create cannot name an object, so the Job can create any Secret here. It deletes only the Secrets
+# of the set, for --rotate.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: viewkeys
+  namespace: central-view-system
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: "@VIEWKEYS_SECRETS@"
+    verbs: [get, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: viewkeys
+  namespace: central-view-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: viewkeys
+subjects:
+  - kind: ServiceAccount
+    name: viewkeys
+    namespace: central-view-system
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: viewkeys
+  namespace: central-view-system
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: viewkeys
+    spec:
+      serviceAccountName: viewkeys
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: viewkeys
+          image: "@VIEWKEYS_IMAGE@"
+          args:
+            - --namespace=central-view-system
+            - "--agents=@AGENTS@"
+            - --resource-proxy-host=argocd-agent-resource-proxy.central-view-system.svc
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace

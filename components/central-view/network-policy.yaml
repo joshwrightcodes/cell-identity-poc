@@ -1,0 +1,278 @@
+# NetworkPolicies of central-view-system. Each flow of the plan table has its own rule, with exact
+# pod selectors and ports. render.sh fills in the peer lists: the management node addresses for the
+# kubelet probes, the dev-cp node address for the relay, and the API server endpoints. argocd-server accepts on 8080 only the kubelet probes, and the
+# kubectl port-forward of mise run view:ui, which the kubelet opens inside the pod (flow N25).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: central-view-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Flow N24: every pod resolves the Service names of its peers.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: central-view-system
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - ipBlock:
+            cidr: "@DNS_SERVICE_IP@/32"
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-agent-principal
+  namespace: central-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-agent-principal
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N1: the dev-cp relay, through node port 31443 with the local traffic policy.
+    - from: "@ENV_NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8444
+    # N4: argocd-server reaches the resource proxy and the Redis proxy.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-server
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 6379
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # N6: the principal keeps its state in argocd-redis.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    # N7: the principal watches Applications, namespaces, Secrets and ConfigMaps.
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443
+    # N8: the SPIRE agent sidecar attests to the SPIRE server of management.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: spire-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: spire-server
+      ports:
+        - protocol: TCP
+          port: 8081
+    # N11: cell-proxy exports OTLP to the collector of the cluster.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-server
+  namespace: central-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-server
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N23: the kubelet probes the server port.
+    - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8080
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8083
+  egress:
+    # N4: the resource proxy and the Redis proxy of the principal.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-agent-principal
+      ports:
+        - protocol: TCP
+          port: 9090
+        - protocol: TCP
+          port: 6379
+    # N5: the repo server.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-repo-server
+      ports:
+        - protocol: TCP
+          port: 8081
+    # N7: Applications, AppProjects, Secrets and ConfigMaps.
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-repo-server
+  namespace: central-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-repo-server
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N5: argocd-server.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-server
+      ports:
+        - protocol: TCP
+          port: 8081
+    # N23: the kubelet probes the health port.
+    - from: "@NODE_PEERS@"
+      ports:
+        - protocol: TCP
+          port: 8084
+    # N15: the collector scrapes the metrics port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8084
+  egress:
+    # N6: the repo server cache.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-redis
+  namespace: central-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-redis
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # N6: the principal and the repo server.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-agent-principal
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-repo-server
+      ports:
+        - protocol: TCP
+          port: 6379
+  egress:
+    # N7: the secret-init container creates Secret argocd-redis when it is missing.
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: viewkeys
+  namespace: central-view-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: viewkeys
+  policyTypes: [Egress]
+  egress:
+    # N7: viewkeys creates the Secrets of the view.
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443

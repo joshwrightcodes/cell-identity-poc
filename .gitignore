@@ -12,6 +12,7 @@
 /netprobe
 /pkigen
 /recordgen
+/relay
 
 # Patch and merge leftovers
 *.orig

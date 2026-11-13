@@ -1,0 +1,4 @@
+apiVersion: example.invalid/v1
+kind: NoSuchKind
+metadata:
+  name: the render skips its own bundle

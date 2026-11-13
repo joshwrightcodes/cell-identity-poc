@@ -1,0 +1,267 @@
+# The Argo CD Agent of a cell, a harness component in the namespace argocd. render.sh fills in the
+# @...@ values and the read rules, and components/lib/spire-sidecar.sh adds the cluster_jwt SPIRE
+# agent, which gives cell-proxy the SVID spiffe://dev.env.poc.internal/cell/<cell>/argocd-agent.
+#
+# The agent runs in autonomous mode with the namespace argocd, and sends the child Applications
+# there to the principal in management. It speaks plaintext gRPC to cell-proxy on 127.0.0.1:8443.
+# cell-proxy dials the relay of the environment control plane with SPIFFE mTLS, and accepts only the
+# exact server ID spiffe://mgmt.poc.internal/argocd/principal, chained to ConfigMap mgmt-root.
+# The pod mounts no token for this account. Only the agent container gets a projected API token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-agent
+  namespace: argocd
+automountServiceAccountToken: false
+---
+# The agent watches and mirrors the Applications of argocd, and reads the AppProjects and
+# ConfigMaps there. It has no write verb on Applications. The principal sends an event for each
+# change of a mirrored Application, and the agent would write the Application of the cell for each
+# one. Without the verbs, the agent logs a Forbidden and changes nothing. The policy
+# argocd-agent-read-only denies the same writes a second time. The agent also cannot start without
+# list and watch on Secrets, because it syncs a repository informer. It has no get verb, and the
+# policy argocd-secrets-allowed keeps the Secrets of argocd to a closed set. The agent sends no
+# Secret to the principal.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-agent
+  namespace: argocd
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [get, list, watch]
+  - apiGroups: [argoproj.io]
+    resources: [appprojects]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-agent
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argocd-agent
+subjects:
+  - kind: ServiceAccount
+    name: argocd-agent
+    namespace: argocd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-agent
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-agent
+spec:
+  replicas: 1
+  # The principal holds one session for each agent, so two pods would displace each other.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argocd-agent
+      annotations:
+        poc.internal/peer-root-sha256: "@MGMT_ROOT_SHA256@"
+    spec:
+      serviceAccountName: argocd-agent
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # The image user is 999. gRPC compression stays off: cell-proxy reads the RefreshToken
+        # message, and refuses a compressed one.
+        - name: argocd-agent
+          image: "@ARGOCD_AGENT_IMAGE@"
+          args:
+            - agent
+            - --agent-mode=autonomous
+            - "--creds=header:"
+            - --insecure-plaintext
+            - --server-address=127.0.0.1
+            - --server-port=8443
+            - --namespace=argocd
+            - --redis-addr=argocd-redis:6379
+            - --redis-creds-dir-path=/run/argocd-agent/redis
+            - --enable-compression=false
+            - --metrics-port=8181
+            - --healthz-port=8002
+            - --log-format=json
+          ports:
+            - name: metrics
+              containerPort: 8181
+          # /healthz answers 200 only while the stream to the principal is up. The probes read the
+          # metrics port instead, so a lost stream does not take the pod out of service.
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8181/metrics"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8181/metrics"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: agent-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+            - name: redis-auth
+              mountPath: /run/argocd-agent/redis
+              readOnly: true
+        # The argocd-agent entry selects unix:uid:65532, the user of the ko base image.
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - spiffe-client
+            - --listen=127.0.0.1:8443
+            - "--upstream=@RELAY_ADDRESS@"
+            - --expect-id=spiffe://mgmt.poc.internal/argocd/principal
+            - --peer-bundle=/run/cell-proxy/mgmt-root/root.crt
+            - --peer-trust-domain=mgmt.poc.internal
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-agent
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: mgmt-root
+              mountPath: /run/cell-proxy/mgmt-root
+              readOnly: true
+      volumes:
+        - name: mgmt-root
+          configMap:
+            name: mgmt-root
+        - name: redis-auth
+          secret:
+            secretName: argocd-redis
+            items:
+              - key: auth
+                path: auth
+        - name: agent-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+# Flow N20, on the agent pod only. The namespace policies argocd and allow-from-nodes exclude the
+# agent pod, so this policy and allow-dns hold every rule of the pod. The pod admits the collector of
+# the cluster on the metrics port (flow N15) and no other ingress, so no other pod reaches the metrics
+# port, the health port or the profiling endpoints. Its egress is the
+# relay node port and the SPIRE node port of the environment control plane, the API server, the
+# cell argocd-redis and the collector. It cannot reach the bundle store or any other argocd pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: argocd-agent
+  namespace: argocd
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-agent
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 8181
+  egress:
+    - to:
+        - ipBlock:
+            cidr: "@ENV_NODE_ADDRESS@/32"
+      ports:
+        - protocol: TCP
+          port: 30443
+        - protocol: TCP
+          port: 30081
+    - to: "@API_SERVER_PEERS@"
+      ports:
+        - protocol: TCP
+          port: "@API_SERVER_PORT@"
+    - to:
+        - ipBlock:
+            cidr: "@API_SERVICE_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: argocd-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317

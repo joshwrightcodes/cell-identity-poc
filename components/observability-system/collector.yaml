@@ -1,55 +1,56 @@
-# The in-cluster OpenTelemetry collector. It receives OTLP and prints what it receives.
-# A later milestone forwards to a backend. The collector stays outside the mesh, because
-# Envoy sends traces and access logs to it in plaintext.
+# The in-cluster OpenTelemetry collector. render.sh fills in the config and the image. The collector
+# receives OTLP on 4317, scrapes the metrics endpoints of its own cluster, watches the Kubernetes
+# events, sets the source attributes of the cluster on every signal, and exports through a
+# persistent queue. It stays outside the mesh, because Envoy sends traces and access logs to it in
+# plaintext, and it has no SPIRE sidecar: the uplink carries its signals out of the cluster.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: otel-collector
 automountServiceAccountToken: false
 ---
+# The prometheus receiver lists and watches pods to find its scrape targets, and the k8s_objects receiver
+# lists and watches events.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-collector
+rules:
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-collector
+subjects:
+  - kind: ServiceAccount
+    name: otel-collector
+    namespace: observability-system
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: otel-collector
 data:
-  config.yaml: |
-    receivers:
-      otlp:
-        protocols:
-          grpc:
-            endpoint: 0.0.0.0:4317
-          http:
-            endpoint: 0.0.0.0:4318
-    processors:
-      batch: {}
-    exporters:
-      debug:
-        verbosity: detailed
-    service:
-      telemetry:
-        metrics:
-          level: none
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [debug]
-        logs:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [debug]
-        metrics:
-          receivers: [otlp]
-          processors: [batch]
-          exporters: [debug]
+  config.yaml: "@COLLECTOR_CONFIG@"
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: otel-collector
   labels:
     app.kubernetes.io/name: otel-collector
 spec:
+  serviceName: otel-collector
   replicas: 1
   selector:
     matchLabels:
@@ -60,21 +61,41 @@ spec:
         app.kubernetes.io/name: otel-collector
     spec:
       serviceAccountName: otel-collector
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: otel-collector
-          image: docker.io/otel/opentelemetry-collector:0.165.0@sha256:34b24b740c3c88d3467740e8642a397c13898ef76d7295c5425164c482ed1b73
+          image: "@COLLECTOR_IMAGE@"
           args: ["--config", "/etc/otelcol/config.yaml"]
+          # The Go runtime collects harder at 600 MiB, below the memory limit of 768Mi and above the
+          # limit of the memory_limiter processor (512 MiB).
+          env:
+            - name: GOMEMLIMIT
+              value: 600MiB
           ports:
             - name: otlp-grpc
               containerPort: 4317
             - name: otlp-http
               containerPort: 4318
+          # The receiver opens 4317 after the pipelines start, so the probe covers them. The kubelet
+          # reaches the port from a node address (flow N23).
+          readinessProbe:
+            tcpSocket:
+              port: otlp-grpc
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: otlp-grpc
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -83,16 +104,49 @@ spec:
           resources:
             requests:
               cpu: 50m
-              memory: 128Mi
+              memory: 256Mi
             limits:
-              memory: 512Mi
+              memory: 768Mi
           volumeMounts:
             - name: config
               mountPath: /etc/otelcol
+              readOnly: true
+            - name: queue
+              mountPath: /var/lib/otelcol
+            # The receivers need an API token. Only this container mounts it.
+            - name: api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
       volumes:
         - name: config
           configMap:
             name: otel-collector
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+  # The queue volume holds the file_storage queue and its compaction copy. The claim template is
+  # immutable. README.md says how to resize the volume.
+  volumeClaimTemplates:
+    - metadata:
+        name: queue
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
 ---
 apiVersion: v1
 kind: Service

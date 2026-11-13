@@ -1,0 +1,449 @@
+# The SPIRE server of the environment trust domain. render.sh fills in the plugin image, the
+# config checksum, the record volume and the agent node addresses. The external-secrets bundle
+# holds Namespace spire-system, the store namespace of the operator.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire-system
+automountServiceAccountToken: false
+---
+# The External Secrets Operator copies the upstream CA from the secret manager into Secret
+# spire-upstream. Remote keys follow <cluster>/<service>/<key>. secrets:connect applies
+# SecretStore poc-secrets in this namespace. The CRD comes from the external-secrets bundle in an
+# earlier sync wave.
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata:
+  name: spire-upstream
+  namespace: spire-system
+  annotations:
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: poc-secrets
+  target:
+    name: spire-upstream
+    creationPolicy: Owner
+    deletionPolicy: Retain
+    # With a template, ESO does not copy the labels and annotations of this object, Argo CD
+    # tracking included, to the Secret. The template has no data, so the keys pass through.
+    template:
+      type: Opaque
+      metadata:
+        labels:
+          app.kubernetes.io/name: spire-server
+  data:
+    - secretKey: intermediate-key
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/intermediate-key"
+    - secretKey: intermediate-cert
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/intermediate-cert"
+    - secretKey: root-cert
+      remoteRef:
+        key: "@CELL_NAME@/spire-server/root-cert"
+---
+# One ClusterStaticEntry per key. Each key name ends in .yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-entries
+  namespace: spire-system
+data:
+  dev-cell-1-nodes.yaml: |
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterStaticEntry
+    metadata:
+      name: dev-cell-1-nodes
+    spec:
+      spiffeID: spiffe://dev.env.poc.internal/cell/dev-cell-1/nodes
+      parentID: spiffe://dev.env.poc.internal/spire/server
+      selectors:
+        - cluster_jwt:cell:dev-cell-1
+        - cluster_jwt:sa:cell-identity-system:celld
+  dev-cell-1-celld.yaml: |
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterStaticEntry
+    metadata:
+      name: dev-cell-1-celld
+    spec:
+      spiffeID: spiffe://dev.env.poc.internal/cell/dev-cell-1/celld
+      parentID: spiffe://dev.env.poc.internal/cell/dev-cell-1/nodes
+      selectors:
+        - unix:uid:65532
+  dev-cell-2-nodes.yaml: |
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterStaticEntry
+    metadata:
+      name: dev-cell-2-nodes
+    spec:
+      spiffeID: spiffe://dev.env.poc.internal/cell/dev-cell-2/nodes
+      parentID: spiffe://dev.env.poc.internal/spire/server
+      selectors:
+        - cluster_jwt:cell:dev-cell-2
+        - cluster_jwt:sa:cell-identity-system:celld
+  dev-cell-2-celld.yaml: |
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ClusterStaticEntry
+    metadata:
+      name: dev-cell-2-celld
+    spec:
+      spiffeID: spiffe://dev.env.poc.internal/cell/dev-cell-2/celld
+      parentID: spiffe://dev.env.poc.internal/cell/dev-cell-2/nodes
+      selectors:
+        - unix:uid:65532
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: spire-server
+  namespace: spire-system
+  labels:
+    app.kubernetes.io/name: spire-server
+spec:
+  serviceName: spire-server
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spire-server
+      annotations:
+        # SPIRE reads its configuration and the cell records only at start. A change restarts the pod.
+        cell.poc.internal/config-checksum: "a717a71c4368b9635caf282bd3aba951bbf2463279185427ee871d765c77a50a"
+    spec:
+      serviceAccountName: spire-server
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # The plugin image copies its static binary into the shared plugin volume.
+        - name: install-plugin
+          image: "localhost:5001/cluster-jwt-server@sha256:stub"
+          args: ["install", "/run/spire/plugins"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: plugins
+              mountPath: /run/spire/plugins
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.15.5@sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384
+          args: ["-config", "/run/spire/config/server.conf"]
+          ports:
+            - name: grpc
+              containerPort: 8081
+          # The image has no shell. The probes run the server binary against the admin socket.
+          readinessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck", "-socketPath", "/run/spire/sockets/api.sock"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-server", "healthcheck", "-shallow", "-socketPath", "/run/spire/sockets/api.sock"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /run/spire/config
+              readOnly: true
+            - name: data
+              mountPath: /run/spire/data
+            - name: sockets
+              mountPath: /run/spire/sockets
+            - name: plugins
+              mountPath: /run/spire/plugins
+              readOnly: true
+            - name: upstream
+              mountPath: /run/spire/upstream
+              readOnly: true
+            - name: records
+              mountPath: /run/spire/records
+              readOnly: true
+            # go-plugin creates the plugin socket in the temporary directory.
+            - name: tmp
+              mountPath: /tmp
+        - name: spire-controller-manager
+          image: ghcr.io/spiffe/spire-controller-manager:0.8.0@sha256:19e418e9d7f23fe82cbabccdc3e71861590f69a1fa8451bfdb267d7371b2b73e
+          args: ["--config", "/run/spire/controller-manager/config.yaml"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: controller-manager-config
+              mountPath: /run/spire/controller-manager
+              readOnly: true
+            - name: entries
+              mountPath: /run/spire/entries
+              readOnly: true
+            - name: sockets
+              mountPath: /run/spire/sockets
+      volumes:
+        - name: config
+          configMap:
+            name: spire-server
+        - name: controller-manager-config
+          configMap:
+            name: spire-controller-manager
+        - name: entries
+          configMap:
+            name: spire-entries
+        - name: sockets
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: plugins
+          emptyDir:
+            sizeLimit: 128Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        # The disk UpstreamAuthority reads the intermediate key, the intermediate certificate and the root.
+        - name: upstream
+          secret:
+            secretName: spire-upstream
+            defaultMode: 0440
+            items:
+              - key: intermediate-key
+                path: intermediate.key
+              - key: intermediate-cert
+                path: intermediate.crt
+              - key: root-cert
+                path: root.crt
+        # Every record ConfigMap uses the key record.dsse.json, so each item gets the file name <cell>.dsse.json.
+        - name: records
+          projected:
+            sources:
+              - configMap:
+                  name: cell-record-dev-cell-1
+                  items:
+                    - key: record.dsse.json
+                      path: dev-cell-1.dsse.json
+              - configMap:
+                  name: cell-record-dev-cell-2
+                  items:
+                    - key: record.dsse.json
+                      path: dev-cell-2.dsse.json
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+---
+# Agents in the cell clusters reach the server API on node port 30081. Local traffic policy keeps
+# the client address, so the NetworkPolicy can match the agent node addresses.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire-system
+  labels:
+    app.kubernetes.io/name: spire-server
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: spire-server
+  ports:
+    - name: grpc
+      port: 8081
+      targetPort: grpc
+      nodePort: 30081
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: spire-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Of the pod traffic, only the node addresses of the agent cells reach the server API. kindnet
+# accepts each packet of a root process on the dev-cp node before it checks a policy, so root
+# processes there, host network pods and the API server included, also reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-agents
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - ipBlock:
+            cidr: 10.9.0.1/32
+        - ipBlock:
+            cidr: 10.9.0.2/32
+      ports:
+        - protocol: TCP
+          port: 8081
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: spire-system
+data:
+  server.conf: |-
+    # SPIRE server of the environment trust domain. render.sh replaces the @SPIRE_*@ tokens.
+    # The server API listens on 8081 for agents. Local clients, health checks and
+    # spire-controller-manager use the admin socket.
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = 8081
+      socket_path = "/run/spire/sockets/api.sock"
+      trust_domain = "dev.env.poc.internal"
+      data_dir = "/run/spire/data"
+      log_level = "INFO"
+      log_format = "json"
+      ca_key_type = "ec-p256"
+      ca_ttl = "24h"
+      # SPIRE_SVID_TTL in cells/dev-cp.env sets both SVID lifetimes, and render.sh checks its range.
+      # dev-cp uses 1m, so a gate sees two agent rotations in about a minute. An agent whose SVID
+      # expires exits (pkg/agent/svid/rotator.go), and the restarted container attests as a new agent.
+      default_x509_svid_ttl = "1m"
+      agent_ttl = "1m"
+      # cluster_jwt agents cannot re-attest, so the server prunes them after their SVID expires.
+      prune_attested_nodes_expired_for = "1h"
+      prune_tofu_nodes = true
+      # The per-IP limit would serialise every agent behind one kind node address.
+      # The cluster_jwt plugin applies its own limit per cell.
+      ratelimit {
+        attestation = false
+      }
+    }
+
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+
+      # CA keys stay in memory. After a restart the server signs a new CA through the upstream authority.
+      KeyManager "memory" {
+        plugin_data {}
+      }
+
+      NodeAttestor "cluster_jwt" {
+        plugin_cmd = "/run/spire/plugins/cluster-jwt-server"
+        plugin_checksum = "721e788273376452df6f39e42f7221d50bc210263bb44c9290f77668dede750f"
+        plugin_data {
+          env = "dev"
+          trust_domain = "dev.env.poc.internal"
+          records_dir = "/run/spire/records"
+          record_public_keys = ["stubkey1=", "stubkey2="]
+          # The slowest reply to a challenge in the gate:m2 runs of 2026-11-09 took 9 ms. The bound is
+          # the larger of 10s and three times that time.
+          challenge_timeout = "10s"
+        }
+      }
+
+      # The intermediate CA from Secret spire-upstream signs the server CA.
+      UpstreamAuthority "disk" {
+        plugin_data {
+          key_file_path = "/run/spire/upstream/intermediate.key"
+          cert_file_path = "/run/spire/upstream/intermediate.crt"
+          bundle_file_path = "/run/spire/upstream/root.crt"
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-controller-manager
+  namespace: spire-system
+data:
+  config.yaml: |-
+    # spire-controller-manager in static manifest mode. It reads ClusterStaticEntry files from
+    # ConfigMap spire-entries and reconciles them through the admin socket of the server.
+    apiVersion: spire.spiffe.io/v1alpha1
+    kind: ControllerManagerConfig
+    metrics:
+      bindAddress: "0"
+    health:
+      healthProbeBindAddress: "0"
+    clusterName: "@CELL_NAME@"
+    # Without a value, the controller looks up the cluster domain in DNS.
+    clusterDomain: cluster.local
+    trustDomain: dev.env.poc.internal
+    spireServerSocketPath: /run/spire/sockets/api.sock
+    staticManifestPath: /run/spire/entries
+    # The controller creates, updates and deletes only the entries whose ID starts with "poc.".
+    # Leave entryIDPrefixCleanup unset: an empty value deletes every entry without a prefix.
+    entryIDPrefix: poc
+    logLevel: info
+    logEncoding: json
+    # Federation relationships have no prefix. With reconciliation on, the controller would delete them all.
+    reconcile:
+      clusterSPIFFEIDs: false
+      clusterFederatedTrustDomains: false
+      clusterStaticEntries: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cell-record-dev-cell-1
+  namespace: spire-system
+data:
+  record.dsse.json: "{\"payload\":\"dev-cell-1\"}"
+  signer.pub: "stubkey1="
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cell-record-dev-cell-2
+  namespace: spire-system
+data:
+  record.dsse.json: "{\"payload\":\"dev-cell-2\"}"
+  signer.pub: "stubkey2="

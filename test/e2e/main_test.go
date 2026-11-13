@@ -49,7 +49,12 @@ func precheck(run string) error {
 			return err
 		}
 	}
-	// The other checks concern the M2 tests only, so a run of the M1 tests alone skips them.
+	// The other checks concern the M2 and M3 tests only, so a run of the M1 tests alone skips them.
+	if run == "" || strings.Contains(run, "M3") {
+		if err := precheckM3(); err != nil {
+			return err
+		}
+	}
 	if run != "" && !strings.Contains(run, "M2") {
 		return nil
 	}
@@ -85,6 +90,18 @@ func precheck(run string) error {
 		if _, err := command("", "kubectl", "--context", "kind-"+cell, "-n", celldNamespace, "get", "rolebinding", tokenBinding); err != nil {
 			return fmt.Errorf("%s has no RoleBinding %s, which an interrupted renewal test removes. Run: CELL=%s mise run cell:up", cell, tokenBinding, cell)
 		}
+	}
+	return nil
+}
+
+// precheckM3 checks that the management plane has its SPIRE server, and that its link phase ran.
+// The clock check above covers every cluster.
+func precheckM3() error {
+	if out, err := command("", "kubectl", "--context", "kind-"+mgmtCluster, "-n", spireNamespace, "get", "statefulset", "spire-server", "-o", "name"); err != nil {
+		return fmt.Errorf("%s has no SPIRE server. Run: CELL=%s mise run cell:up\n%s", mgmtCluster, mgmtCluster, out)
+	}
+	if out, err := command("", "kubectl", "--context", "kind-"+mgmtCluster, "-n", viewNamespace, "get", "deployment", principalName, "-o", "name"); err != nil {
+		return fmt.Errorf("%s has no Deployment %s, so its link phase has not run. Run: CELL=%s mise run cell:link\n%s", mgmtCluster, principalName, mgmtCluster, out)
 	}
 	return nil
 }

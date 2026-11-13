@@ -1,0 +1,58 @@
+# Values for the vendored kiali-server chart. render.sh renders the chart with these values, sets the
+# image by digest, drops the pods/portforward rule of the viewer Role, and adds the harness label.
+#
+# Kiali shows the cells through the hub and reads metrics only from the read-only Prometheus proxy.
+# The anonymous login and view_only_mode give a read-only UI. The mesh view is reachable through
+# mise run mesh:ui alone, because no pod and no Service port outside the cluster admits port 20001.
+auth:
+  strategy: anonymous
+
+# The Istio control plane of each cell runs in the cell, so Kiali neither reads the Istio API of the
+# home cluster nor shows it. The remote cluster Secret that render.sh makes lists the cells.
+clustering:
+  ignore_home_cluster: true
+
+kubernetes_config:
+  cluster_name: management
+
+deployment:
+  cluster_wide_access: false
+  view_only_mode: true
+  image_pull_policy: IfNotPresent
+  # Kiali reads its remote cluster Secret only at start, so a restart picks up a changed cell list.
+  strategy:
+    type: Recreate
+  network_policy:
+    enabled: false
+  logger:
+    log_format: json
+    log_level: info
+  resources:
+    requests:
+      cpu: 50m
+      memory: 192Mi
+    limits:
+      memory: 768Mi
+
+external_services:
+  istio:
+    istio_api_enabled: false
+  prometheus:
+    url: http://prom-readonly.observability-system.svc:9091
+    query_scope:
+      platform_plane: cell
+  tracing:
+    enabled: false
+  grafana:
+    enabled: false
+  perses:
+    enabled: false
+
+# The log view needs pods/log in each cell, which the tunnel allow-list does not admit.
+kiali_feature_flags:
+  disabled_features: [logs-tab]
+
+server:
+  observability:
+    metrics:
+      enabled: false

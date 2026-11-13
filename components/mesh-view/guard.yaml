@@ -1,0 +1,58 @@
+# The read-only guard of the mesh-view tunnel in a cell. The policy mesh-view-read-only denies every
+# update, delete and connect request of the ServiceAccount mesh-view that reaches admission, and every
+# create request except two. RBAC already gives the account only read verbs, so this policy is the
+# second control: a role that someone adds later does not open a write path, and the account cannot mint
+# a token that outlives its pod. render.sh replaces @POC_ENV@ with the environment name.
+#
+# The first create is the SelfSubjectAccessReview that the tunnel allow-list forwards. The second is the
+# TokenRequest of the SPIRE agent sidecar. It names the ServiceAccount mesh-view in mesh-view-system and
+# one audience spire-<env>/<nonce>, and it binds the token to the Pod that sends it, by the name and UID
+# that the API server puts in the user extras. A token for another audience, account or Pod is denied.
+# Code that runs inside the tunnel pod can still use the SVID of that pod: a residual of the PoC.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: mesh-view-read-only
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE", "CONNECT"]
+        resources: ["*/*"]
+  matchConditions:
+    - name: requester-is-the-agent
+      expression: 'request.userInfo.username == "system:serviceaccount:mesh-view-system:mesh-view"'
+  validations:
+    - expression: "!(request.operation in ['DELETE', 'CONNECT'])"
+      message: The mesh-view ServiceAccount cannot delete an object or connect to a Pod
+      reason: Forbidden
+    - expression: "request.operation != 'UPDATE'"
+      message: The mesh-view ServiceAccount cannot update an object
+      reason: Forbidden
+    - expression: |-
+        request.operation != 'CREATE' ||
+          (request.resource.group == 'authorization.k8s.io' && request.resource.resource == 'selfsubjectaccessreviews') || (
+          request.resource.group == '' && request.resource.resource == 'serviceaccounts' &&
+          has(request.subResource) && request.subResource == 'token' && request.namespace == 'mesh-view-system' && request.name == 'mesh-view' &&
+          has(object.spec.audiences) && object.spec.audiences.size() == 1 &&
+          object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') &&
+          has(object.spec.boundObjectRef) && has(object.spec.boundObjectRef.kind) &&
+          object.spec.boundObjectRef.kind == 'Pod' &&
+          has(object.spec.boundObjectRef.name) && has(object.spec.boundObjectRef.uid) &&
+          has(request.userInfo.extra) &&
+          'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+          'authentication.kubernetes.io/pod-uid' in request.userInfo.extra &&
+          request.userInfo.extra['authentication.kubernetes.io/pod-name'] == [object.spec.boundObjectRef.name] &&
+          request.userInfo.extra['authentication.kubernetes.io/pod-uid'] == [object.spec.boundObjectRef.uid])
+      message: The mesh-view ServiceAccount creates only the bound token of its own SPIRE agent
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: mesh-view-read-only
+spec:
+  policyName: mesh-view-read-only
+  validationActions: [Deny]

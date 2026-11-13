@@ -1,0 +1,22 @@
+resources:
+- principal-sa.yaml
+- principal-role.yaml
+- principal-clusterrole.yaml
+- principal-rolebinding.yaml
+- principal-clusterrolebinding.yaml
+- principal-deployment.yaml
+- principal-grpc-service.yaml
+- principal-resource-proxy-service.yaml
+- principal-redis-proxy-service.yaml
+- principal-redis-proxy-networkpolicy.yaml
+- principal-params-cm.yaml
+- principal-metrics-service.yaml
+- principal-healthz-service.yaml
+- principal-userpass-secret.yaml
+
+images:
+- name: argocd-agent
+  newName: quay.io/argoprojlabs/argocd-agent
+  newTag: v0.10.0
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization

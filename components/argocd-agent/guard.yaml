@@ -1,0 +1,57 @@
+# The view guard of a cell. The policy argocd-agent-read-only denies every update, delete and connect
+# request of the agent ServiceAccount that reaches admission, and every create request except one.
+# RBAC already gives the agent no write verb, so this policy is the second control: a role that
+# someone adds later does not open a write path for the central view. A grant of impersonate,
+# or of a write to the admission objects, is a grant that this policy cannot see, so the tests ask
+# RBAC that the agent holds none. render.sh replaces @POC_ENV@ with the environment name.
+#
+# The one request that the agent may create is the TokenRequest of its own SPIRE agent sidecar. The
+# request names the ServiceAccount argocd-agent in argocd and one audience spire-<env>/<nonce>. It
+# binds the token to the Pod that sends it, by the name and UID that the API server puts in the
+# user extras of the request. A token for another audience, another account or another Pod is denied.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: argocd-agent-read-only
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["CREATE", "UPDATE", "DELETE", "CONNECT"]
+        resources: ["*/*"]
+  matchConditions:
+    - name: requester-is-the-agent
+      expression: 'request.userInfo.username == "system:serviceaccount:argocd:argocd-agent"'
+  validations:
+    - expression: "!(request.operation in ['DELETE', 'CONNECT'])"
+      message: The agent ServiceAccount of the central view cannot delete an object or connect to a Pod
+      reason: Forbidden
+    - expression: "request.operation != 'UPDATE'"
+      message: The agent ServiceAccount of the central view cannot update an object
+      reason: Forbidden
+    - expression: |-
+        request.operation != 'CREATE' || (
+          request.resource.group == '' && request.resource.resource == 'serviceaccounts' &&
+          has(request.subResource) && request.subResource == 'token' && request.namespace == 'argocd' && request.name == 'argocd-agent' &&
+          has(object.spec.audiences) && object.spec.audiences.size() == 1 &&
+          object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') &&
+          has(object.spec.boundObjectRef) && has(object.spec.boundObjectRef.kind) &&
+          object.spec.boundObjectRef.kind == 'Pod' &&
+          has(object.spec.boundObjectRef.name) && has(object.spec.boundObjectRef.uid) &&
+          has(request.userInfo.extra) &&
+          'authentication.kubernetes.io/pod-name' in request.userInfo.extra &&
+          'authentication.kubernetes.io/pod-uid' in request.userInfo.extra &&
+          request.userInfo.extra['authentication.kubernetes.io/pod-name'] == [object.spec.boundObjectRef.name] &&
+          request.userInfo.extra['authentication.kubernetes.io/pod-uid'] == [object.spec.boundObjectRef.uid])
+      message: The agent ServiceAccount of the central view creates only the bound token of its own SPIRE agent
+      reason: Forbidden
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: argocd-agent-read-only
+spec:
+  policyName: argocd-agent-read-only
+  validationActions: [Deny]

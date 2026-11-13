@@ -9,7 +9,7 @@ health:
 clusterName: "@CELL_NAME@"
 # Without a value, the controller looks up the cluster domain in DNS.
 clusterDomain: cluster.local
-trustDomain: dev.env.poc.internal
+trustDomain: @SPIRE_TRUST_DOMAIN@
 spireServerSocketPath: /run/spire/sockets/api.sock
 staticManifestPath: /run/spire/entries
 # The controller creates, updates and deletes only the entries whose ID starts with "poc.".

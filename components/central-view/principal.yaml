@@ -1,0 +1,302 @@
+# The Argo CD Agent principal behind cell-proxy. render.sh fills in the @...@ values, and
+# components/lib/spire-sidecar.sh adds the k8s_psat SPIRE agent, which gives cell-proxy the SVID
+# spiffe://mgmt.poc.internal/argocd/principal.
+#
+# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the agent ID and the cell
+# registry, and calls the principal on 127.0.0.1:8443 in plaintext gRPC with the header
+# x-cell-agent=<env>-<cell>. The principal takes the agent name from that header only.
+# The pod mounts no token for this account. Only the principal container gets a projected API token.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-agent-principal
+  namespace: central-view-system
+automountServiceAccountToken: false
+---
+# The principal reads its keys, the cluster Secrets and its identity ConfigMap, and stores the
+# AppProjects of autonomous agents in its own namespace. It writes no Secret and no ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-agent-principal
+  namespace: central-view-system
+rules:
+  - apiGroups: [""]
+    resources: [secrets, configmaps]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, list]
+  - apiGroups: [argoproj.io]
+    resources: [appprojects]
+    verbs: [create, get, list, watch, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-agent-principal
+  namespace: central-view-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argocd-agent-principal
+subjects:
+  - kind: ServiceAccount
+    name: argocd-agent-principal
+    namespace: central-view-system
+---
+# The principal lists and watches Applications and namespaces in every namespace. It writes
+# Applications only in the agent namespaces, through the Role that render.sh adds to each one:
+# create, update, patch and delete, for the Applications that each autonomous agent sends.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-agent-principal
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications, appprojects, applicationsets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-agent-principal
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-agent-principal
+subjects:
+  - kind: ServiceAccount
+    name: argocd-agent-principal
+    namespace: central-view-system
+---
+# A fixed principal identity. Without this ConfigMap the principal creates it at start, and the
+# namespace would hold an object that the bundle does not hold.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-agent-principal-identity
+  namespace: central-view-system
+data:
+  principal-uid: "@PRINCIPAL_UID@"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-agent-principal
+  namespace: central-view-system
+  labels:
+    app.kubernetes.io/name: argocd-agent-principal
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-agent-principal
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argocd-agent-principal
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/registry-content-sha256: "@REGISTRY_SHA256@"
+    spec:
+      serviceAccountName: argocd-agent-principal
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        # The image user is 999. The gRPC listener binds 127.0.0.1 only, so only cell-proxy in this
+        # pod reaches it. The resource proxy (9090), the Redis proxy (6379), metrics (8000) and
+        # health (8003) bind every address.
+        - name: argocd-agent-principal
+          image: "@ARGOCD_AGENT_IMAGE@"
+          args:
+            - principal
+            - --namespace=central-view-system
+            - --listen-host=127.0.0.1
+            - --listen-port=8443
+            - --insecure-plaintext
+            - "--auth=@PRINCIPAL_AUTH@"
+            - "--allowed-namespaces=@AGENT_NAMESPACES@"
+            - --namespace-create-enable=false
+            - --enable-resource-proxy=true
+            - --redis-server-address=argocd-redis:6379
+            - --metrics-port=8000
+            - --healthz-port=8003
+            - --log-format=json
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: argocd-redis
+                  key: auth
+          ports:
+            - name: resource-proxy
+              containerPort: 9090
+            - name: redis-proxy
+              containerPort: 6379
+            - name: metrics
+              containerPort: 8000
+            - name: healthz
+              containerPort: 8003
+          # The health server uses the default HTTP mux, where the principal binary also registers
+          # net/http/pprof. The probes run inside the pod, and no NetworkPolicy rule admits a peer on
+          # port 8003. The API server pod proxy and root host processes still reach it.
+          readinessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8003/healthz"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8003/healthz"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            runAsUser: 999
+            runAsGroup: 999
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          volumeMounts:
+            - name: principal-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+        # The principal entry selects unix:uid:65532, the user of the ko base image.
+        - name: cell-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - spiffe-server
+            - --listen=:8444
+            - --backend=grpc-header
+            - --upstream=127.0.0.1:8443
+            - "--allow-id=@ALLOW_ID@"
+            - --registry-dir=/run/cell-proxy/registry
+            - --peer-bundle=/run/cell-proxy/peer-root/root.crt
+            - "--peer-trust-domain=@PEER_TRUST_DOMAIN@"
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-proxy-view
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: view
+              containerPort: 8444
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: registry
+              mountPath: /run/cell-proxy/registry
+              readOnly: true
+            - name: peer-root
+              mountPath: /run/cell-proxy/peer-root
+              readOnly: true
+      volumes:
+        - name: registry
+          configMap:
+            name: cell-registry
+        - name: peer-root
+          configMap:
+            name: peer-root
+        - name: principal-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
+---
+# Flow N1: the dev-cp relay reaches cell-proxy on the node port. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the dev-cp node.
+apiVersion: v1
+kind: Service
+metadata:
+  name: view-listener
+  namespace: central-view-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: argocd-agent-principal
+  ports:
+    - name: view
+      port: 8444
+      targetPort: 8444
+      nodePort: 31443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-agent-resource-proxy
+  namespace: central-view-system
+spec:
+  selector:
+    app.kubernetes.io/name: argocd-agent-principal
+  ports:
+    - name: resource-proxy
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: argocd-agent-redis-proxy
+  namespace: central-view-system
+spec:
+  selector:
+    app.kubernetes.io/name: argocd-agent-principal
+  ports:
+    - name: redis-proxy
+      port: 6379
+      targetPort: 6379
+---
+# argocd-server needs AppProject default at start, and it can create no AppProject. This project
+# allows no source and no destination. The agents bring their own projects.
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: central-view-system
+spec:
+  sourceRepos: []
+  destinations: []

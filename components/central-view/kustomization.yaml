@@ -1,0 +1,60 @@
+# The central Argo CD in management: argocd-server, argocd-repo-server and argocd-redis from the full
+# install of Argo CD v3.6.1. render.sh keeps only those parts. It drops the application
+# controller, the ApplicationSet controller, Dex, notifications, the CRDs and Secret argocd-secret,
+# which viewkeys makes. The core Argo CD of the cluster installs the CRDs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: central-view-system
+resources:
+  - ../../vendor/argocd/v3.6.1/install.yaml
+images:
+  - name: quay.io/argoproj/argocd
+    newTag: v3.6.1@sha256:296e3d74f449b2ce45265613fcb68c18ed7366488360c8ea32f5f2a93d2e5c54
+  - name: public.ecr.aws/docker/library/redis
+    newTag: 8.10.1-alpine@sha256:ef216d85ec44f4fdf7c0e6df2d1757a4734ed32fbb278cabd3181b5a27353b79
+patches:
+  - path: argocd-cm.yaml
+  - path: argocd-rbac-cm.yaml
+  - path: argocd-cmd-params-cm.yaml
+  # argocd-server reads Secrets and ConfigMaps of its namespace and changes none. It reads
+  # Applications in every namespace and changes none, so a refresh in the view fails.
+  - target:
+      kind: Role
+      name: argocd-server
+    patch: |-
+      - op: replace
+        path: /rules
+        value:
+          - apiGroups: [""]
+            resources: [secrets, configmaps]
+            verbs: [get, list, watch]
+          - apiGroups: [argoproj.io]
+            resources: [applications, appprojects, applicationsets]
+            verbs: [get, list, watch]
+          - apiGroups: [""]
+            resources: [events]
+            verbs: [create, list]
+  - target:
+      kind: ClusterRole
+      name: argocd-server
+    patch: |-
+      - op: replace
+        path: /rules
+        value:
+          - apiGroups: [argoproj.io]
+            resources: [applications]
+            verbs: [get, list, watch]
+          - apiGroups: [argoproj.io]
+            resources: [applicationsets]
+            verbs: [get, list, watch]
+  - target:
+      kind: ClusterRoleBinding
+      name: argocd-server
+    patch: |-
+      - op: replace
+        path: /subjects
+        value:
+          - kind: ServiceAccount
+            name: argocd-server
+            namespace: central-view-system
+  - path: deployments.yaml

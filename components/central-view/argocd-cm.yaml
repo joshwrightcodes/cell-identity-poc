@@ -1,0 +1,10 @@
+# The central UI is anonymous and read-only. It opens only through mise run view:ui. Nobody can log
+# in as admin, and the terminal of the UI stays off.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+data:
+  users.anonymous.enabled: "true"
+  admin.enabled: "false"
+  exec.enabled: "false"

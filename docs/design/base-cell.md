@@ -42,7 +42,7 @@ The demo workloads in `apps-demo` take the place of the role set in this milesto
 
 | Namespace | Contents | Mesh | Pod Security |
 | --- | --- | --- | --- |
-| `argocd` | Argo CD core install | No | restricted |
+| `argocd` | Argo CD core install, every Application, and three Secrets | No | restricted |
 | `cell-system` | Bundle store; later the worker and SPIRE agent sidecars | No | restricted |
 | `istio-system` | istiod, istio-cni | Control plane | privileged |
 | `istio-egress` | Egress gateway | Yes | restricted |
@@ -65,8 +65,29 @@ plaintext. Strict mTLS on the collector would reject them.
 - A root Application follows the `current` tag of the root bundle.
 - Bootstrap applies the root Application once. It is the only object that Argo CD does not manage, because a self-managed root waits on itself.
 - Each child Application pins its bundle by digest.
+- Every Application lives in `argocd` and uses the AppProject `cell`. The ValidatingAdmissionPolicy `argocd-cell-project` and its binding deny another project.
+- The AppProject `default` in `argocd` allows no source, no destination and no kind. `admin.enabled` is `false` in `argocd-cm`.
+- `mise run cell:ui` serves the UI of `argocd admin dashboard`. The UI lists every Application, because the local server reads the namespace `argocd`.
+- The same local server writes `server.secretkey` into `argocd-secret`, and an admin password when admin is on. The AppProject `default` stops it from creating a permissive project. `cell:ui` removes the keys when the server stops. `mise run cell:ui:clean` removes them after a killed run.
 - Sync waves order the components. Argo CD reports the health of child Applications, so each wave waits for the one before it.
 - The Istio Applications ignore the webhook fields that istiod writes at run time.
+
+### Secrets in `argocd`
+
+The Argo CD Agent of a cell runs with `--namespace=argocd`. Argo CD Agent v0.10.0 serves the managed resources and the resource tree of an Application only when the Application lives in that namespace. The agent also needs the verbs `list` and `watch` on Secrets there, because it does not start without them.
+
+The guarantee has four parts:
+
+- `argocd` holds a closed set of Secrets: `argocd-redis`, `argocd-secret` and `bundle-store`. `argocd-redis` holds the Redis password. `argocd-secret` holds the signing key while `cell:ui` runs. `bundle-store` holds no credential.
+- The ValidatingAdmissionPolicy `argocd-secrets-allowed` and its binding deny every other Secret in `argocd`, on create and on update, for every user.
+- The Role `argocd-agent` has `list` and `watch` on Secrets and no `get`. RBAC refuses a Secret `get`, and the resource proxy of the agent refuses a Secret list. The agent sends no Secret to the central view.
+- A new Secret in `argocd` needs a change to the policy list. The check `cell:verify` compares the live Secrets with that list.
+
+The set is small, but it is a set of Secrets and not an empty namespace. The agent process can list these Secrets, so it holds the Redis password in its memory.
+
+The root Application carries the label `argocd-agent.argoproj-labs.io/ignore-sync: "true"`. The agent skips it, so the central view mirrors only the child Applications.
+The label hides an Application from the central view. It does not protect it. The protection is that the agent has no write verb on Applications. The principal sends an event for each change of a mirrored Application, and the agent logs a Forbidden for each one. The policy `argocd-agent-read-only` denies the same writes a second time.
+The Redis proxy of the agent still serves the cached resource tree and managed resources of `root`, because it strips the namespace prefix from a cache key and reads any name. These hold no Secret data, because the cell controller masks Secrets before it writes the cache.
 
 ### Bundles
 
@@ -107,6 +128,9 @@ plaintext. Strict mTLS on the collector would reject them.
 | Check | Rule |
 | --- | --- |
 | Every Application is Synced and Healthy | Argo CD manages every component |
+| No Application is outside `argocd`, except the mirrors of the central view | Every Application stays in the namespace that the agent reads |
+| `argocd` holds the AppProjects `cell` and a locked `default`, and no admin password | The dashboard leaves no open project or credential |
+| `argocd` holds only `argocd-redis`, `argocd-secret` and `bundle-store`, the agent can list them but not get or change them, and the policy and binding deny another | The set of Secrets that the agent can list stays closed |
 | No remote clusters, and only the local store as a source | Argo CD stays local |
 | `argocd`, `cell-system` and `observability-system` have no mesh proxies | Platform stays out of the mesh |
 | Demo workloads have mesh proxies, except `plaintext` | Workloads join the mesh |

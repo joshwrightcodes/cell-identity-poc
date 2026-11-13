@@ -1,0 +1,12 @@
+# render.sh sets application.namespaces to the agent namespaces of VIEW_CELLS. argocd-repo-server
+# uses its default Redis, argocd-redis:6379. argocd-server sets the Redis proxy of the principal in
+# its own environment (deployments.yaml).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cmd-params-cm
+data:
+  server.insecure: "true"
+  server.log.format: json
+  reposerver.log.format: json
+  application.namespaces: "@APPLICATION_NAMESPACES@"

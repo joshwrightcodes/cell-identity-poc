@@ -6,6 +6,8 @@ it is committed. `mise run vendor:fetch` downloads the versions that `cells/comm
 | Path | Source | Version |
 | --- | --- | --- |
 | `argocd/v3.6.1/core-install.yaml` | Argo CD repository, `manifests/core-install.yaml` | v3.6.1 |
+| `argocd/v3.6.1/install.yaml` | Argo CD repository, `manifests/install.yaml` (central view only) | v3.6.1 |
+| `argocd-agent/v0.10.0/{principal,agent}` | Argo CD Agent tag archive, `install/kubernetes/` | v0.10.0 |
 | `charts/istio-1.30.8/{base,cni,istiod,gateway}` | `oci://gcr.io/istio-release/charts` | 1.30.8 |
 | `charts/external-secrets-2.14.0/external-secrets` | `oci://ghcr.io/external-secrets/charts/external-secrets` | 2.14.0 |
 
@@ -803,3 +805,559 @@ registry, read on 2026-11-08. The review listed the layer files and ran nothing 
   No file is setuid or setgid.
 - The pod runs the sidecar as user 1000, with a read-only root file system and no capabilities.
 - The review did not compare the binary with a source build, and did not check image signatures.
+
+## M3 version dates (2026-11-09)
+
+Each version that M3 pins must have a publish date on or before 2026-10-26, two weeks before the
+work date. The table gives the date of the release artefact and its source. Read-only `gh api`
+calls and registry queries gave each date.
+
+| Item | Version | Date (UTC) | Source |
+| --- | --- | --- | --- |
+| go-spiffe | v2.9.0 | 2026-10-05T18:26:53Z | GitHub release `published_at` |
+| OpenTelemetry Go | v1.47.0 | 2026-10-02T08:18:45Z | GitHub release `published_at` |
+| grpc-go | v1.84.0 | 2026-09-17T20:03:39Z | GitHub release `published_at` |
+| `google.golang.org/protobuf` | v1.36.12 | 2026-08-10T15:29:56Z | GitHub release `published_at` |
+| `golang.org/x/net` | v0.59.0 | 2026-09-08T19:18:02Z | `proxy.golang.org` version info, because the repository has no GitHub releases |
+| `go.opentelemetry.io/proto/otlp` | v1.11.0 | 2026-07-22T21:40:59Z | `proxy.golang.org` version info |
+| SPIRE | v1.15.5 | 2026-10-20T18:35:18Z | GitHub release; image `spire-server` created 2026-10-20T18:07:27Z |
+| Argo CD | v3.6.1 | 2026-11-04T14:20:31Z | GitHub release; image `quay.io/argoproj/argocd` created 2026-11-04T13:48:52Z |
+| Argo CD Agent | v0.10.0 | 2026-08-26T21:32:56Z | GitHub release; image `quay.io/argoprojlabs/argocd-agent` created 2026-08-26T21:24:06Z |
+| `grafana/otel-lgtm` | v0.38.0 | 2026-10-23T11:18:25Z | GitHub release of `grafana/docker-otel-lgtm`; image created 2026-10-23T11:10:11Z |
+| Kiali | v2.34.0 | 2026-10-25T13:59:52Z | GitHub release; image `quay.io/kiali/kiali` created 2026-10-25T13:59:23Z |
+| kiali-server chart | 2.34.0 | 2026-10-26T16:06:40Z | Commit date of tag `v2.34.0` in `kiali/helm-charts` |
+| Collector Kubernetes distribution | 0.164.0 | 2026-10-26T23:46:44Z | GitHub release; image `opentelemetry-collector-k8s` created 2026-10-26T23:48:32Z |
+| Istio | 1.30.8 | 2026-11-06T19:00:51Z | GitHub release; image `pilot` created 2026-11-06T13:54:46Z; chart `istiod` created 2026-11-06T17:21:39Z |
+| External Secrets Operator | 2.14.0 | 2026-10-23T15:06:48Z | GitHub release; chart release 2026-10-23T16:22:37Z; image created 2026-10-23T13:01:14Z |
+
+- The collector Kubernetes distribution 0.165.0 has a publish date of 2026-11-07, after the
+  cutoff. M3 uses 0.164.0 instead, which has a publish date on the cutoff day.
+- Argo CD v3.6.1 and Istio 1.30.8 have publish dates after the cutoff. Earlier milestones pinned
+  them, and the decision about them belongs to the maintainers. M3 does not change them.
+- The Kiali chart index gives 258 of its 280 entries the same `created` value, 2026-11-02T17:06:56Z.
+  That value is the time of an index build, not a publish date. The table uses the tag commit date.
+
+## cell-proxy modules (2026-11-09)
+
+`internal/cellproxy` makes two modules direct requirements. Both were already in the module graph
+at the same versions, so `go.sum` does not change.
+
+| Module | Version | Commit | Date | Package that cell-proxy uses |
+| --- | --- | --- | --- | --- |
+| `golang.org/x/net` | v0.59.0 | `540d04cfe5028e2655754591a4d3e08c586809f2` | 2026-09-08 | `http2` |
+| `google.golang.org/protobuf` | v1.36.12 | `cdd4c5f7406e82462949c7a65defa9f3029c162d` | 2026-08-10 | `encoding/protowire` |
+
+The review read the files in the Go module cache, and `go mod verify` passes. Nothing ran during
+the review.
+
+- With Go 1.27, `x/net/http2` wraps the HTTP/2 code of `net/http`. The build tag
+  `go1.27 && !http2legacy` selects `server_wrap.go`, `transport_wrap.go` and `clientconn.go`.
+- Those files import only standard library packages. `NewClientConn` uses the connection that the
+  caller gives, and it does not dial.
+- The `init` function in `http2.go` reads only `GODEBUG`, for debug logs and extended CONNECT.
+- `protowire` imports `io`, `math`, `math/bits` and one internal errors package. It has no file,
+  network or environment access.
+- The 71 files of `x/net/http2` and `protowire` have no hidden Unicode. The only other non-ASCII
+  characters are ellipses in comments of `protowire/wire.go`.
+- The files that the review read have no `sudo`, `os/exec`, `unsafe` or `syscall` import.
+- Go 1.27 marks `http2.ClientConn` as deprecated in favour of `net/http.ClientConn`.
+- The tests also use `types/known/wrapperspb` from the protobuf module and `encoding/gzip` from
+  grpc-go. Neither is in the `cell-proxy` binary.
+
+The review did not read the HTTP/2 code of the Go standard library, or the frame and `hpack` code
+of `x/net/http2`.
+
+`internal/telemetry` now holds the OpenTelemetry setup that `cmd/celld` had. It adds no module, so
+the "celld modules" review above covers its exporters, the SDK and `logr`.
+
+## Telemetry gateway modules (2026-11-09)
+
+The `otlp` backend of `cell-proxy` makes `go.opentelemetry.io/proto/otlp` v1.11.0 a direct
+requirement. The module was already in the graph at that version, so `go.sum` does not change.
+The `go list -deps` output for `cmd/cell-proxy` holds the same OTLP, grpc-gateway and gzip
+packages before and after this change, because the OTLP exporters already import them.
+
+The review read the module in the Go module cache, and `go mod verify` passes. Nothing ran during
+the review.
+
+- The module has 14 Go files, all generated by `protoc-gen-go` and `protoc-gen-go-grpc` v1.1.0.
+  Five files hold the message types, and the `collector` packages hold the services.
+- The message and service files import only `context`, `reflect`, `sync`, protobuf runtime
+  packages and grpc-go. Each `init` function registers only the file descriptor.
+- The three `*.pb.gw.go` files import grpc-gateway and `net/http`. They define handler
+  registration functions, and `cell-proxy` calls none of them.
+- No hidden Unicode. The only non-ASCII characters are box characters in a comment of
+  `metrics/v1/metrics.pb.go`.
+- No `os/exec`, `unsafe`, `syscall`, `sudo`, environment reads, file access or network dials.
+
+The gateway server imports `google.golang.org/grpc/encoding/gzip` from grpc-go v1.84.0. That
+package imports only `compress/gzip`, `fmt`, `io`, `sync` and the grpc `encoding` package. Its
+`init` function registers the compressor. It has no non-ASCII characters.
+
+grpc-go v1.84.0 applies `MaxRecvMsgSize` after decompression, in `rpc_util.go` lines 985 to 1040.
+A compressed message larger than the limit fails with `ResourceExhausted`, and a unit test checks
+this.
+
+The review did not read the grpc-gateway runtime line by line. The `celld` review searched it
+together with the other packages of that build.
+
+### Upstream limits of the gateway (2026-11-10)
+
+The gateway receive limit depends on the OTLP receiver of `otel-lgtm` v0.38.0. The review read the
+files of tag `v0.38.0` of `grafana/docker-otel-lgtm` through `gh api`, and ran nothing.
+
+- `docker/Dockerfile` pins `otelcol-contrib` v0.163.1. `docker/download-otelcol.sh` checks the
+  archive with `cosign verify-blob` before it unpacks it.
+- `docker/otelcol-config.yaml` sets the gRPC receiver endpoint `0.0.0.0:4317` and no
+  `max_recv_msg_size_mib`.
+- In collector core v0.163.0, `config/configgrpc/configgrpc.go` lines 358 and 359 add
+  `grpc.MaxRecvMsgSize` only for a value above 0. The receiver therefore keeps the grpc-go default
+  of 4 MiB.
+- The review did not check which core version `otelcol-contrib` v0.163.1 uses. It did not inspect
+  the image contents.
+
+The cell collectors use collector 0.164.0. In that version `exporter/otlpexporter/factory.go`
+lines 41 to 47 set gzip compression by default and no client keepalive.
+
+A gateway test writes raw HTTP/2 frames with the `Framer` of `x/net/http2` (`frame.go`) and the
+`hpack` package, from `x/net` v0.59.0. On 2026-11-10 the review searched both in the module cache
+for the checks below, and ran nothing from them during the review. It did not read the frame
+parsing or the HPACK code line by line.
+
+- `frame.go` imports standard library packages, `x/net/http/httpguts`, `x/net/internal/httpsfv`
+  and `hpack`. It logs frames only when `GODEBUG` sets `http2debug=2`.
+- The `hpack` files import only standard library packages. `gen.go` has the build tag `ignore`,
+  so no build compiles it.
+- No hidden Unicode and no other non-ASCII characters. No `os/exec`, `unsafe`, `syscall`, `sudo`,
+  environment reads or dials, and no `init` function.
+- `go list` shows that both build into `cell-proxy` as part of `x/net/http2`. These searches
+  narrow the gap that the `cell-proxy` modules review above names.
+
+## Argo CD v3.6.1 full install for the central view (2026-11-10)
+
+`argocd/v3.6.1/install.yaml` is the full install of the Argo CD tag `v3.6.1`. Its SHA-256 is
+`7be23ca7d9ca3d3074dee8332f1ca92a933b990cee7c9cf22cf3843ee8c2913e`. `components/central-view` names
+the file directly. The kustomization of the cells keeps `core-install.yaml` alone. The review read
+the file and ran nothing from it.
+
+- No hidden Unicode and no other non-ASCII characters, the same as `core-install.yaml`.
+- The long encoded strings are the SSH host keys that `core-install.yaml` also holds.
+- The URLs are the same as in `core-install.yaml`. No object downloads anything or runs a shell
+  command, apart from the `copyutil` init container of the repo server, which copies the `argocd`
+  binary into a shared volume.
+- No `privileged`, `hostNetwork`, `hostPID`, `hostIPC` or `hostPath`.
+- Images: `quay.io/argoproj/argocd:v3.6.1`, `public.ecr.aws/docker/library/redis:8.10.1-alpine` and,
+  for Dex only, `ghcr.io/dexidp/dex:v2.46.0`. The view pins the index digests
+  `sha256:296e3d74f449b2ce45265613fcb68c18ed7366488360c8ea32f5f2a93d2e5c54` (Argo CD) and
+  `sha256:ef216d85ec44f4fdf7c0e6df2d1757a4734ed32fbb278cabd3181b5a27353b79` (Redis), read from the
+  registries on 2026-11-10. The review did not inspect the image contents.
+
+The view keeps `argocd-server`, `argocd-repo-server` and `argocd-redis` with their ServiceAccounts,
+Services, ConfigMaps and the Roles of the server and Redis. It drops the CRDs, the application
+controller, the ApplicationSet controller, Dex, notifications, Secret `argocd-secret` and the
+upstream NetworkPolicies. `viewkeys` makes `argocd-secret`, because `argocd-server` needs
+`server.secretkey`.
+
+RBAC of `argocd-server`, as the view changes it:
+
+| Rule in v3.6.1 | In the view | Reason |
+| --- | --- | --- |
+| Role: create, get, list, watch, update, patch and delete on Secrets and ConfigMaps | get, list and watch | The server reads its settings, the cluster Secrets and the keys. |
+| Role: every verb on Applications, AppProjects and ApplicationSets | get, list and watch | The view changes no object in its namespace. |
+| Role: create and list on Events | kept | Write that stays: the server records an Event for each user action. |
+| ClusterRole: delete, get and patch on every resource, update on every finalizer | removed | The view reaches cell resources only through the resource proxy. |
+| ClusterRole: get, list and watch on Applications and ApplicationSets | kept | The server lists the Applications of every namespace. |
+| ClusterRole: list Events, get pods and logs, create Jobs and Workflows | removed | The view runs no resource action in management. |
+
+`argocd-server` stops at start when AppProject `default` is missing and it cannot create it
+(observed on 2026-11-10: `appprojects.argoproj.io is forbidden ... cannot create resource`). The
+view renders AppProject `default` with no source and no destination.
+
+The full install starts the Redis password with an init container: `secret-init` in Deployment
+`argocd-redis` runs `argocd admin redis-initial-password`. It creates Secret `argocd-redis` when it is
+missing. v3.6.1 has no Job `argocd-redis-secret-init`. The view gives only that init container a
+projected API token. Role `argocd-redis` keeps get on Secret `argocd-redis` and create on Secrets.
+
+`argocd-server` reads two Redis addresses: `REDIS_SERVER` for its own cache and
+`REPO_SERVER_REDIS_SERVER` for the cache of the repo server (`util/cache/cache.go` line 225 and
+`cmd/argocd-server/commands/argocd_server.go` line 364 of v3.6.1). Without the second one, it uses
+`argocd-redis:6379`. The view sets both to the Redis proxy of the principal.
+
+## Argo CD Agent v0.10.0 (2026-11-10)
+
+The central view runs the principal of Argo CD Agent v0.10.0. The tag `v0.10.0` points at commit
+`78a3788f5aa757707c00e563198f3d4c676fe04b`. The review read a copy of the tag archive in a scratch
+directory and ran nothing from it.
+
+| Item | Digest |
+| --- | --- |
+| Tag archive from `codeload.github.com` | SHA-256 `9060a59f18891b41efd662c09a0c93a824462bf8507f136ebbe4c346075d4d07` |
+| `install/kubernetes/principal` and `agent`, sorted file list | SHA-256 `c0cda6f7fbed368c4b3f7dd085095df47f79436cd4894d22a6cfa9eb0d647c56` (`ARGOCD_AGENT_MANIFESTS_SHA256`) |
+| `quay.io/argoprojlabs/argocd-agent:v0.10.0` index | `sha256:ec9baba6e81555bfa5ce1fa6252f06c6100b56ae7f85273ba2f7e2309303800d` |
+| arm64 manifest | `sha256:a5c9027ff491e05649b159cf6a105de05af0c1cbb84bd54f36575ceb955c696d` |
+| amd64 manifest | `sha256:e262e4ef7da9128d9b72d133383b624bd4fb0ada8ceb127d10ff9e2f72f7a64f` |
+
+`vendor:fetch` downloads the archive, checks the SHA-256 of the file list and copies the two
+directories into `argocd-agent/v0.10.0/`. The view uses its own manifest
+(`components/central-view/principal.yaml`), and so do the cells (`components/argocd-agent/manifests.yaml`).
+The vendored files are the review record.
+
+### Image
+
+These facts come from the registry and from the binary layer, read on 2026-11-10.
+
+- The arm64 image config has user `999`, the entrypoint `/bin/argocd-agent` and no exposed port.
+  The base is Alpine 3.23.5 with `apk upgrade`, so the image holds a shell and busybox.
+- The last layer holds one file, `/bin/argocd-agent`, 116 MB.
+- `go version -m` read the build information of the binary without a run: Go 1.26.3,
+  `CGO_ENABLED=0`, module `github.com/argoproj-labs/argocd-agent` v0.10.0, VCS revision
+  `78a3788f5aa757707c00e563198f3d4c676fe04b` with `vcs.modified=false`. The binary therefore comes
+  from the reviewed commit. It links 172 modules, among them Argo CD v3.5.1.
+- The `Dockerfile` of the tag builds with `golang:1.26.3` and copies the binary into `alpine:3.23`,
+  which matches the image history.
+
+### Manifests
+
+- No hidden Unicode and no other non-ASCII characters. No long encoded strings. No URL.
+- No `privileged`, `hostNetwork`, `hostPID`, `hostIPC` or `hostPath`.
+- The upstream principal ClusterRole can create, update and delete Applications, AppProjects and
+  ApplicationSets in every namespace, and create namespaces. The view lists and watches them in
+  every namespace, writes Applications only through a Role in each agent namespace, and writes
+  AppProjects only in `central-view-system`. Each write that stays has a call in v0.10.0:
+  - Applications in an agent namespace, create: `principal/event.go` line 263 (`appManager.Create`
+    of an Application that an autonomous agent sends; line 846 sets the namespace to the agent).
+  - Applications, update and patch: lines 281 and 306 (`UpdateAutonomousApp`), lines 318 and 418
+    (`UpdateStatus`), and `principal/callbacks.go` line 153 (`RemoveFinalizers`). The backend calls
+    are `Update` and `Patch` in `internal/backend/kubernetes/application/kubernetes.go` lines 157 to 167.
+  - Applications, delete: `principal/event.go` lines 332 and 376.
+  - AppProjects in `central-view-system`, create, update and delete: `principal/event.go` lines 573,
+    592 and 608, after line 568 sets the namespace to the namespace of the principal.
+  - ApplicationSets are written only in HA mode (`principal/ha_integration.go`), so the view grants
+    no write on them.
+- The upstream principal Role can write every Secret and ConfigMap of its namespace. The view
+  grants get, list and watch only.
+- `principal-params-cm.yaml` says that header authentication needs the gRPC listener on
+  `127.0.0.1`. The view sets `--listen-host=127.0.0.1`.
+
+### Source
+
+The review read `cmd/argocd-agent/principal.go`, `principal/server.go`, `principal/resource.go`,
+`principal/event.go`, `pkg/principal/identity.go`, `internal/argocd/cluster/`, `internal/tlsutil/`
+and `cmd/ctl/` (`ca.go`, `jwt.go`, `agent.go`).
+
+- Every flag that the view sets exists in `cmd/argocd-agent/principal.go`: `--namespace`,
+  `--listen-host`, `--listen-port`, `--insecure-plaintext`, `--auth`, `--allowed-namespaces`,
+  `--namespace-create-enable`, `--enable-resource-proxy`, `--redis-server-address`,
+  `--metrics-port`, `--healthz-port` and `--log-format`. `--auth header:<name>:<regex>` takes the
+  first capture group as the agent name, and needs `--insecure-plaintext`
+  (`validateAuthTLSPairing`).
+- Only the gRPC listener takes a host. The resource proxy listens on `0.0.0.0:9090` and the Redis
+  proxy on `0.0.0.0:6379` (`principal/server.go` lines 232 to 236). Metrics listen on `:8000` and
+  health on `:8003`.
+- `cmd/argocd-agent/principal.go` imports `net/http/pprof`, which registers on the default HTTP mux.
+  The health server serves that mux (`principal/server.go` lines 872 to 884). So port 8003 also
+  serves `/debug/pprof/`. On 2026-11-10 `wget http://127.0.0.1:8003/debug/pprof/cmdline` inside the
+  pod printed the arguments of the principal. The view probes the health port from inside the
+  pod, and no NetworkPolicy rule admits a peer on 8003. The API server pod proxy
+  (`pods/<pod>:8003/proxy/debug/pprof/`) and root processes on the node skip NetworkPolicy, so
+  each holder of `pods/proxy` in `central-view-system` can still read and load pprof.
+- The Redis proxy on 6379 answers `get` and `subscribe` on the keys `app|managed-resources|<agent>_*`
+  and `app|resources-tree|<agent>_*` from the agent, before any `AUTH` reaches `argocd-redis`
+  (`principal/redisproxy/redisproxy.go` lines 343 to 440). So a peer that reaches 6379 reads the
+  live state of every cell Application with no password. NetworkPolicy flow N4 is the only control.
+- At start the principal reads ConfigMap `argocd-agent-principal-identity`, and creates it when it
+  is missing (`pkg/principal/identity.go`, `principal/server.go` line 710). The view renders it with
+  a fixed value, so the principal writes no ConfigMap.
+- With `--insecure-plaintext` the principal loads no root CA for agents. The resource proxy reads its
+  certificate from Secret `argocd-agent-resource-proxy-tls`, which must have the type
+  `kubernetes.io/tls`, and its client CA from `tls.crt` and `ca.crt` of `argocd-agent-ca`
+  (`getResourceProxyTLSConfigFromKube`, `internal/tlsutil/kubernetes.go`). No key of the CA is read.
+- The resource proxy takes the agent name from the CN of the client certificate, or from a bearer
+  token that the principal signed (`principal/resource.go`, `extractAgentFromAuth`).
+- The principal writes Secrets only for self-registered agents and in HA mode, which the view leaves
+  off. It keeps cluster state in Redis.
+- `internal/kube/client.go` imports `os/exec` only for an exit error type. No `sudo`, no HTTP client
+  call and no hidden Unicode in the non-test Go code of `cmd`, `principal`, `internal` and `pkg`.
+
+`cmd/viewkeys` copies these formats from `argocd-agentctl`:
+
+- `argocd-agent-jwt`: key `jwt.key`, an RSA key of 4096 bits in PKCS#8 PEM (`cmd/ctl/jwt.go`).
+- `argocd-agent-resource-proxy-tls`: type `kubernetes.io/tls`, `tls.crt` and `tls.key`
+  (`cmd/ctl/ca.go`, `issueAndSaveSecret`).
+- `cluster-<agent>`: label `argocd.argoproj.io/secret-type: cluster`, label
+  `argocd-agent.argoproj-labs.io/agent-name: <agent>`, annotations `managed-by: argocd-agent` and
+  `argocd.argoproj.io/skip-reconcile: "true"`, and keys `name`, `server` and `config`
+  (`cmd/ctl/agent.go`, `internal/argocd/cluster/conversion.go`). The server is
+  `https://<host>:9090?agentName=<agent>`.
+- The validity: 3650 days for the CA and 180 days for each leaf (`internal/tlsutil/generate.go`).
+
+`viewkeys` differs from `argocd-agentctl` in four points. It keeps no CA key, so `argocd-agent-ca`
+has the type `Opaque`, because a `kubernetes.io/tls` Secret needs `tls.key`. It gives each
+certificate a random serial number, where `argocd-agentctl` uses 1. It sets only the key usages that
+each certificate needs. It uses ECDSA P-256 keys for the certificates.
+
+### Agent side (2026-11-10)
+
+The review read `cmd/argocd-agent/agent.go`, `agent/agent.go`, `agent/filters.go`, `agent/tracking.go`,
+`agent/options.go`, the connect and authentication path of `pkg/client/remote.go`,
+`internal/resync/resync.go`, `principal/apis/auth/auth.go`, `principal/apis/eventstream/eventstream.go`
+and the AppProject path of `principal/event.go`, in the same scratch copy. It ran nothing from it.
+
+- Every flag that the cells set exists in `cmd/argocd-agent/agent.go`: `--agent-mode`, `--creds`,
+  `--insecure-plaintext`, `--server-address`, `--server-port`, `--namespace`, `--redis-addr`,
+  `--redis-creds-dir-path`, `--enable-compression`, `--metrics-port`, `--healthz-port` and
+  `--log-format`. `--creds header:` gives the method `header` with no credential (`parseCreds`).
+- `--redis-creds-dir-path` reads the password from the file `auth` in that directory (`redisCreds`).
+  So the agent reads the Redis password of the cell from a Secret volume, and needs no Secret read.
+- The agent watches Applications, AppProjects, repository Secrets and GPG ConfigMaps in its own
+  namespace only, and Namespaces in the cluster (`agent/agent.go` lines 300 to 470). Its settings
+  manager reads `argocd-cm` in that namespace (`agent/tracking.go`).
+- Argo CD reads AppProjects only in its own namespace, and the agent sends only the AppProjects of
+  its namespace, which is `argocd`. So the agent sends AppProject `cell` from `argocd`. The principal
+  stores it as `<agent>-cell` in its namespace, with `sourceNamespaces` set to the agent namespace
+  (`principal/event.go` lines 525 to 545). The central `argocd-server` needs that project, because
+  `getAppEnforceRBAC` loads the project of each Application (`server/application/application.go`
+  lines 248 to 252 of Argo CD v3.6.1).
+- `/healthz` answers 200 only while the stream to the principal is up (`agent/agent.go` lines 736
+  to 743). The cells probe the metrics port instead. The health port must be from 1 to 32767
+  (`WithHealthzPort`), so it cannot be off.
+- `cmd/argocd-agent/agent.go` imports `net/http/pprof`, and the health server serves the default
+  mux (`agent/agent.go` lines 626 to 634). So port 8002 of the agent also serves `/debug/pprof/`,
+  on every address. The namespace-wide policy `argocd` admits every pod of `argocd` to it.
+- The agent sends the access token as the raw `authorization` value, and `RefreshToken` with no
+  `authorization` value (`pkg/client/remote.go`). The principal rejects an agent whose version
+  differs from its own (`principal/apis/auth/auth.go` lines 150 to 153).
+- The principal logs "An agent connected to the subscription stream" and "Closing EventStream"
+  with the field `client` (`principal/apis/eventstream/eventstream.go` lines 190 and 508).
+- No `sudo`, no `os/exec` call, no HTTP client outside the remote and the resource proxy, and no
+  hidden Unicode in the files above.
+
+The review did not read these items:
+
+- The agent resource proxy and Redis proxy line by line, and `agent/inbound*.go` and `agent/outbound*.go`.
+- The Redis proxy and the event stream code line by line, the HA code and the test files.
+- The 172 modules of the binary, and the image signatures.
+- The network behaviour of the binary at run time.
+
+Result: medium concern. The image holds a shell and busybox. The health ports of the principal and
+the agent serve pprof, and the resource and Redis proxies of the principal bind every address.
+NetworkPolicy limits each of them.
+
+## grafana/otel-lgtm v0.38.0 (2026-11-10)
+
+`management` runs `docker.io/grafana/otel-lgtm:0.38.0` as StatefulSet `lgtm`. The repository is
+`grafana/docker-otel-lgtm`. The review read these files of tag `v0.38.0` through `gh api`, in a scratch
+directory, and ran nothing from them before it ended: `docker/Dockerfile`, every `docker/run-*.sh`,
+`docker/download-*.sh`, `docker/install-cosign.sh`, `docker/grafana-plugins.sh`, `docker/common.sh`,
+`docker/logging.sh`, `docker/healthcheck.sh` and every baked config. The review checked these files for
+hidden Unicode, `sudo`, persistence, credential access and obfuscated code. It found none.
+
+| Item | Digest |
+| --- | --- |
+| Index `grafana/otel-lgtm:0.38.0`, pinned by the pod | `sha256:75cdf892daffadf3763ef61c16a6d7f8586216fce0b40bba7874a0b053121084` |
+| arm64 manifest, the one that the VM pulls | `sha256:61ffd7c074d354759207d7541a0361cc2b4a897f0e06003c9672384a6b8cc2f6` |
+| amd64 manifest | `sha256:bf33fa01b1a0314edc88c5bc2a295067e65270cf9c3f678a943a4a2c2a2472fd` |
+
+### What the image holds
+
+- The base is `ubi9-micro` 9.8, pinned by digest, with `curl-minimal` added. The image sets no `USER`.
+- Six processes run in one container: Grafana v13.2.4, Prometheus v3.15.0, Loki v3.7.8, Tempo v3.1.0,
+  Pyroscope v2.4.1 and `otelcol-contrib` v0.163.1. The OBI eBPF agent is off unless `ENABLE_OBI=true`.
+  Grafana also starts 13 backend plugin binaries for its data sources (Elasticsearch, PostgreSQL, MySQL,
+  MSSQL, InfluxDB, OpenTSDB, Cloud Monitoring, Jaeger, Zipkin, Loki, Prometheus, Tempo and Pyroscope),
+  and `run-all.sh` ends with `sleep infinity`. The store uses only four of those data sources.
+  `GF_PLUGINS_DISABLE_PLUGINS` could stop the others. The PoC does not set it, because the list of
+  plugin IDs is not verified for this image.
+- Prometheus runs with `--web.enable-remote-write-receiver` and `--web.enable-otlp-receiver`, so port 9090
+  accepts writes. Loki (3100), Tempo (3200), Pyroscope (4040) and the `otelcol` HTTP receiver (4318) also
+  accept data on `0.0.0.0`. Only the NetworkPolicy keeps pods away from them, and a peer that Task 11
+  admits to 9090 must be `promql-proxy` alone.
+- The image sets no retention for Loki or Pyroscope, 14 days for Tempo and 15 days for Prometheus. The
+  pod sets 48 hours for each, through `loki.yaml`, `TEMPO_EXTRA_ARGS`, `PYROSCOPE_EXTRA_ARGS` and
+  `PROMETHEUS_EXTRA_ARGS`.
+- The build downloads each component from its upstream release page. It checks the SHA-256 file of
+  Loki, Tempo, Prometheus and Pyroscope, and the checksum that `grafana.com` gives for Grafana. It
+  checks `otelcol-contrib` with `cosign verify-blob`, which the build installs from a checked RPM.
+  The review did not check these archives itself.
+- `eval` appears once in `run-all.sh`, and it uses only the fixed component names of the script.
+- `run-otelcol.sh` adds an export to a remote OTLP endpoint only when an `OTEL_EXPORTER_OTLP_*`
+  variable is set. The pod sets none. It writes `otelcol-config-export-http.yaml` into the working
+  directory in that case only, so the read-only root file system does not break the start.
+
+### Start-up downloads and calls to the Internet
+
+- `run-grafana.sh` always sets `GF_PLUGINS_PREINSTALL` to `grafana-llm-app`. Grafana then installs
+  that plugin and the Drilldown apps from `grafana.com` at each start. The pod sets
+  `GF_PLUGINS_PREINSTALL_DISABLED=true` and `GF_PLUGINS_PREINSTALL_AUTO_UPDATE=false`, so Grafana
+  downloads nothing. The live plugin list below shows that none of them is present.
+- Grafana checks for updates and sends usage reports by default. The pod turns each off with
+  `GF_ANALYTICS_REPORTING_ENABLED`, `GF_ANALYTICS_CHECK_FOR_UPDATES` and
+  `GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES`.
+- Loki, Tempo and Pyroscope report usage by default. The Loki override sets
+  `analytics.reporting_enabled: false`. `TEMPO_EXTRA_ARGS=-reporting.enabled=false` and
+  `PYROSCOPE_EXTRA_ARGS=-usage-stats.enabled=false` turn the other two off. Both flags exist in the
+  binaries, which the review checked with `-help` in the running pod.
+- The NetworkPolicy gives the pod no egress, and the namespace policy `allow-dns` leaves it out. A
+  `curl` from the pod to `grafana.com` and to `1.1.1.1` fails, and `TestM3LgtmHardened` checks both.
+
+### Controls
+
+- The pod runs as user and group 10001, with `fsGroup` 10001, `runAsNonRoot`, no capability, no
+  privilege escalation, the `RuntimeDefault` seccomp profile and `readOnlyRootFilesystem: true`.
+  The image starts under these limits without root, and all six components reach their health check.
+- Writable paths: the volume `data` at `/data` (Grafana, Loki, Prometheus, Tempo and Pyroscope), a
+  memory-backed `emptyDir` at `/tmp` (Grafana plugin sockets and `/tmp/ready`) and one at `/var/tempo`.
+- The pod mounts no service account token. Anonymous access is off. The admin password comes from
+  Secret `grafana-admin`.
+
+### Findings
+
+- The brief mandates `GF_SECURITY_ADMIN_PASSWORD__FILE`. The suffix `__FILE` belongs to the
+  `run.sh` of the official Grafana image, and this image starts `./bin/grafana server` directly.
+  On the live pod, Grafana ignored the variable and created the admin user with the password
+  `admin`: `admin:admin` got HTTP 200. The pod therefore sets
+  `GF_SECURITY_ADMIN_PASSWORD=$__file{/run/grafana-admin/password}`. Grafana expands `$__file{}`
+  in a setting itself. With that value, `admin:admin` gets 401 and the generated password gets 200.
+- The image provisions four data sources, not three: Prometheus, Loki and Tempo, and Pyroscope
+  (`docker/grafana-datasources.yaml`). All four pass their health check as user 10001.
+- The Prometheus config of the image already promotes `deployment.environment.name` and
+  `k8s.cluster.name`. The override adds `platform.plane` and `platform.cell`.
+- Data sources are present and healthy with the default log setting, so `ENABLE_LOGS_GRAFANA=true`
+  was not needed.
+
+### Plugins of the running image
+
+`/api/plugins?embedded=0` lists 46 plugins with `GF_PLUGINS_PREINSTALL_DISABLED=true`. They are the
+core plugins of Grafana 13.2.4: `alertlist`, `alertmanager`, `annolist`, `barchart`, `bargauge`,
+`candlestick`, `canvas`, `cloudwatch`, `dashlist`, `elasticsearch`, `flamegraph`, `gauge`, `geomap`,
+`gettingstarted`, `grafana-azure-monitor-datasource`, `grafana-postgresql-datasource`,
+`grafana-pyroscope-datasource`, `grafana-testdata-datasource`, `graphite`, `heatmap`, `histogram`,
+`influxdb`, `jaeger`, `logs`, `logstable`, `loki`, `mssql`, `mysql`, `news`, `nodeGraph`, `opentsdb`,
+`piechart`, `prometheus`, `stackdriver`, `stat`, `state-timeline`, `status-history`, `table`,
+`tempo`, `text`, `timeseries`, `traces`, `trend`, `welcome`, `xychart` and `zipkin`.
+`TestM3LgtmHardened` compares the live list with this one.
+
+### Not inspected
+
+The review did not inspect the layers of the image, the six binaries, the 13 plugin binaries or the image signature. It did
+not compare the downloaded archives with a source build.
+
+### Collector Kubernetes distribution 0.164.0 (2026-11-10)
+
+The collector of `management` uses `docker.io/otel/opentelemetry-collector-k8s:0.164.0`, pinned by the
+index digest `sha256:8f7e5aaac0302f090164d5f9c14e4437d8037c5aaa2d025fc3ad74c1922602eb`. The
+processor `resource` is not in the core image, and the render needs it to set `k8s.cluster.name` and
+`platform.plane`. The review read `distributions/otelcol-k8s/manifest.yaml` of tag `v0.164.0` in
+`open-telemetry/opentelemetry-collector-releases`. The manifest lists `resourceprocessor`,
+`prometheusreceiver`, `k8seventsreceiver`, `k8sobjectsreceiver`, `filestorage` and `otlpexporter`.
+This settles row 10 of the M3 verify table for the component list, not for the image contents. The
+review did not inspect the image.
+
+#### Use in every cluster (2026-11-11)
+
+Task 10 runs this image as the collector of every cluster. The manifest of components was read before
+the image ran, and the image then ran in `management` for several hours. Then the review ran the image with
+`otelcol-k8s components` and `otelcol-k8s validate --config` on a copy of each rendered config. No
+other command ran in the image, and no config for the check reached a network.
+
+- `components` lists the receivers `otlp`, `prometheus` and `k8s_objects`, the processors
+  `memory_limiter`, `resource` and `transform`, the exporter `otlp_grpc`, and the extension
+  `file_storage`. The names differ from the plan: `k8s_objects` is not `k8sobjects`, and the exporter
+  is `otlp_grpc` (the name `otlp` is an alias). All modules show contrib v0.164.1 on core 0.164.0.
+- `validate` accepts the rendered config of `management`, `dev-cp`, `dev-cell-1` and `dev-cell-2`. It
+  also refuses an unknown value (`sizer: bogus`), so the check does decode the queue and batch keys.
+- The pod ran with a persistent queue, compaction at start, the bytes sizer for the queue and the
+  batch, the Prometheus scrape jobs, and the own metrics over OTLP. The review read the log of one
+  pod and found no call to an address outside the cluster. The config holds no such address.
+- Verify row 10 passes: the distribution holds the `prometheus` and `k8s_objects` receivers and the
+  `file_storage` extension. The fallback to contrib is not needed.
+- The review did not inspect the layers or the binary of the image.
+
+Rows 3 and 4 of the M3 verify table (2026-11-11):
+
+- Row 3 passes. The metrics ports of the agent, the principal and the SPIRE server admit the collector
+  pod only. The ports of the Argo CD controller, the repo server, istiod and Envoy also admit the node
+  address, and some admit the pods of their own namespace. `TestM3MetricsEndpointsCollectorOnly` shows that
+  a pod of a fresh namespace times out on each port, and that every scrape job has `up` equal to 1.
+- Row 4 passes. `istio_requests_total` and `istio_request_duration_milliseconds_bucket` reach
+  Prometheus with their names and labels, with `source_cluster` and `destination_cluster` equal to the
+  cell. `TestM3IstioMetricsSurviveOTLP` shows this. The value `telemetry.v2.prometheus.enabled: false`
+  had turned the Envoy metrics off, so the cell showed no Istio metric at all before this task.
+
+## Kiali v2.34.1 and the kiali-server chart (2026-11-12)
+
+The mesh view in `management` runs Kiali v2.34.1 from the chart `kiali-server` 2.34.1. `vendor:fetch` pulls the
+archive from `https://kiali.org/helm-charts` and checks the SHA-256 before it unpacks the chart into
+`charts/kiali-server-2.34.1/`.
+
+This is an owner exception (2026-11-12) to the cut-off of 2026-10-26. Kiali v2.34.1 is a security release. It adds
+namespace authorization to the health, ztunnel log and config dump APIs, and makes the namespace accessibility checks
+consistent. The chart of v2.34.0, the version before, is dated 2026-10-27, so no version with a chart on or before the
+cut-off is newer than v2.33.0.
+
+| Artefact | Date | Digest |
+| --- | --- | --- |
+| GitHub release v2.34.1 | 2026-11-02 | |
+| `kiali-server-2.34.1.tgz`, commit in the chart repository | 2026-11-02 | SHA-256 `e0219681933f85428be50fae18747778dd81ee621272473683fb3e62538f418f` (`KIALI_CHART_SHA256`) |
+| `quay.io/kiali/kiali:v2.34.1` index, Quay tag | 2026-11-02 | `sha256:88d96c7b7b9bd9ceaf3b2a8097c0b0d2c5ae15f8d3a17017a5f3a163f5115d2c` (`KIALI_IMAGE`) |
+
+Dates of the versions near the cut-off: v2.34.0 release, image and chart 2026-10-25, 2026-10-25 and 2026-10-27;
+v2.33.0 2026-10-04, 2026-10-04 and 2026-10-06.
+
+Review of the change from v2.34.0 to v2.34.1, read as third-party code in a scratch directory: `diff -ru` of the two
+unpacked charts shows four changed lines in two files. `Chart.yaml` changes `appVersion` and `version`, and
+`values.yaml` changes `image_version` and `version_label`, each from v2.34.0 to v2.34.1. No template changed. The
+change adds no hidden Unicode and no other non-ASCII character, no encoded string, no URL, no new RBAC rule, no
+privilege change and no new image. The review did not inspect the layers or the binary of the image. The two
+workarounds of the render, the ConfigMap path and the namespace list with the viewer Roles, and the failure of Kiali
+with one cell down, were checked again on v2.34.1 (see the report of the task).
+
+### Support matrix
+
+The Kiali prerequisites page lists Istio 1.30 for Kiali 2.26 and higher. Kiali v2.34.1 therefore
+supports Istio 1.30.8, the version of the PoC.
+
+### Chart
+
+The review read every template of the chart in a scratch directory and ran nothing from it.
+
+- No hidden Unicode and no other non-ASCII character. No encoded string, and no `curl`, `wget`,
+  `sudo`, `eval` or `base64` call. The only URLs are comments, the chart metadata and the icon.
+- The chart creates a ServiceAccount, a ConfigMap, a Service, a Deployment, and a viewer Role and
+  RoleBinding. With `deployment.cluster_wide_access: false` the Role and RoleBinding exist in the
+  namespace of Kiali only, and no ClusterRole exists.
+- The viewer Role grants `pods/portforward` with the verb `create`. The render deletes that rule, and
+  `TestKialiRender` and `TestM3NoWorkloadCanPortForward` check the result.
+- The chart makes a new random `login_token.signing_key` at each render, which would restart Kiali at each
+  link phase. The render derives a key from the public root of the trust domain of `management`. That key is
+  predictable, and no login uses it under the strategy `anonymous`. The render refuses any other strategy, in
+  the values and in the rendered ConfigMap.
+- The chart sets the annotation `proxy.istio.io/config`, which the render deletes, because the
+  namespace has no mesh proxy. It also adds a NetworkPolicy, which the values turn off, because
+  `components/mesh-view-hub/hub.yaml` holds the policies of the namespace.
+- The Deployment mounts the Secret `kiali-multi-cluster-secret` at
+  `/kiali-remote-cluster-secrets/`, where Kiali reads one kubeconfig for each cluster at start. Kiali
+  names each cluster after the cluster entry of its kubeconfig.
+
+### Version call of Kiali
+
+Kiali v2.34.1 reads the version of each `istiod` of a remote cluster through a port forward
+(`istio/version.go`, `GetVersion`). The source holds no setting that turns this call off, so the hub refuses it
+and the Kiali log shows one error and one warning for each cell and minute. Kiali ends with a fatal error when the
+discovery of one remote cluster fails at start (live run of 2026-11-12: four restarts in 200 seconds), so it cannot
+start while one cell is down.
+
+### Prometheus reads
+
+The review read `prometheus/client.go`, `prometheus/lazy_client.go` and `business/istio_status.go` of
+the tag. Kiali calls `Query`, `QueryRange`, `LabelValues("__name__")`, `Buildinfo`, `Config` and
+`Runtimeinfo` of the Prometheus client, and probes `<url>/-/healthy` when `health_check_url` is empty.
+`promql-proxy` passes exactly these paths. Kiali sends `query_scope` as a label matcher in each query.
+
+### Image
+
+The image is an index with arm64 and amd64 manifests among others. The review did not check a
+signature, and it did not inspect the layers or the binary. The image runs with these limits.
+The NetworkPolicy lets it reach only the hub, `prom-readonly` and the API server of `management`.
+The root file system is read-only, and no capability remains. The Role of the pod covers its own
+namespace only. The review read no source line of Kiali beyond the files above.

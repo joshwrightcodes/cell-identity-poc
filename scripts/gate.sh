@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3 [go test arguments]
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3 [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern}_BUDGET_MINUTES"
@@ -42,11 +42,45 @@ if [[ "$milestone" == m2 ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
+# The M3 tests run against the plane servers and the workloads of every cluster. Each Deployment or
+# StatefulSet that runs a local image must run the one that `mise run images` recorded, or the gate
+# tests old code.
+if [[ "$milestone" == m3 ]]; then
+  # An earlier run that stopped before its cleanups can leave a grant for the test group in a cell.
+  "$ROOT/scripts/gate-m3-repair.sh" --check || exit 1
+  stale=""
+  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+    workloads="$(kubectl --context "kind-$cluster" get deployments,statefulsets -A -o json | jq -r '.items[]
+      | select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
+      | "\(.metadata.namespace) \(.kind | ascii_downcase)/\(.metadata.name)"')" || die "could not list the workloads of $cluster"
+    while read -r ns workload; do
+      [[ -n "$ns" ]] || continue
+      found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+      [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'
+    done <<<"$workloads"
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,
+# and the text of the run goes to standard output as it does without -json.
+mkdir -p "$BUILD_ROOT"
+events="$BUILD_ROOT/gate-$milestone.json"
+durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS
 status=0
-go test -tags e2e -count=1 -timeout 30m ./test/e2e/ -run "$pattern" "$@" || status=$?
+# The test timeout is twice the budget, with a floor of 30 minutes, so the budget check reports a
+# slow run and the Go timeout never ends the run first.
+test_timeout="$(gate_test_timeout "$budget_minutes")"
+go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$pattern" "$@" \
+  | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
+# The duration of each top-level test, slowest first.
+jq -Rrn '[inputs | fromjson? | select(.Test != null and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
+    | {test: .Test, action: .Action, elapsed: .Elapsed}] | sort_by(-.elapsed)[] | "\(.elapsed)s \(.action) \(.test)"' "$events" >"$durations" || true
+log "the slowest tests of gate $milestone (every test is in $durations):"
+head -n 12 "$durations" >&2
 
 if [[ -n "$budget_minutes" ]] && ((elapsed > budget_minutes * 60)); then
   printf 'FAIL: gate %s took %ss, over the budget of %s minutes\n' "$milestone" "$elapsed" "$budget_minutes" >&2

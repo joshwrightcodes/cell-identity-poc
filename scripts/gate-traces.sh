@@ -80,9 +80,12 @@ bundle_traces() {
     [[ -n "$want" && "$got" == "$want" ]] || echo "$name:current in the bundle store of $cluster is $got, and build/$cluster/published.env has '${want:-nothing}'"
   done
   store_forward_stop
-  apps="$(kubectl --context "kind-$cluster" -n argocd get applications root spire-server -o json 2>/dev/null)" || {
-    echo "cannot read the Applications root and spire-server in $cluster"; return 1; }
+  apps="$(applications_json kubectl --context "kind-$cluster")" || {
+    echo "cannot read the Applications of $cluster in argocd"; return 1; }
+  jq -e '[.items[] | select(.metadata.name == "root" or .metadata.name == "spire-server")] | length == 2' >/dev/null <<<"$apps" || {
+    echo "$cluster has no Application root or spire-server in argocd"; return 1; }
   jq -r --arg root "$(published_digest "$cluster" root)" --arg spire "$(published_digest "$cluster" spire-server)" '.items[]
+    | select(.metadata.name == "root" or .metadata.name == "spire-server")
     | if .metadata.name == "root" then select(.status.sync.revision != $root)
         | "Application root in \(.metadata.namespace) synced \(.status.sync.revision), and published.env has \($root)"
       else select(.spec.source.targetRevision != $spire or .status.sync.revision != $spire)

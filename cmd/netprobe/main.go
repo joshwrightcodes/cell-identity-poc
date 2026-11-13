@@ -1,5 +1,14 @@
 // Command netprobe is the network probe for the harness tests. It scans TCP ports, reports the
-// peer address of each request, fetches URLs, and reports the result of one TCP connect.
+// peer address of each request, fetches URLs, makes HTTP requests, serves TLS, and reports the
+// result of one TCP connect.
+//
+// get prints the body of one GET and fails on a status of 400 or more. http prints one JSON line
+// {"status", "body"} with the first 4 KiB of the body for any status, so a test can check a 403.
+// It sends the body from standard input with --body-stdin.
+//
+// tlsserve reads a PEM certificate chain and a PEM private key from standard input, and serves
+// TLS 1.3 with ALPN h2 on --addr. It completes each handshake, asks for no client certificate,
+// and then closes the connection when the client sends EOF or after 10 seconds.
 //
 // dial prints {"addr", "result", "error"} with result connected, refused, timeout or error. A
 // NetworkPolicy that drops packets gives timeout. A host that answers with a reset gives refused.
@@ -7,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,6 +37,9 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 )
 
+// stdin is the input of tlsserve and of http --body-stdin. Tests replace it.
+var stdin io.Reader = os.Stdin
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	code := execute(ctx, os.Args[1:], os.Stdout)
@@ -43,7 +56,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: netprobe scan|serve|get|dial")
+		return errors.New("usage: netprobe scan|serve|get|http|tlsserve|dial")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -93,6 +106,28 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			return errors.New("get needs --url")
 		}
 		return get(ctx, *url, stdout, *timeout)
+	case "http":
+		method := fs.String("method", "", "HTTP method, for example GET or POST")
+		url := fs.String("url", "", "URL of the request")
+		bodyStdin := fs.Bool("body-stdin", false, "send standard input as the request body")
+		timeout := fs.Duration("timeout", 10*time.Second, "request timeout")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *method == "" || *url == "" {
+			return errors.New("http needs --method and --url")
+		}
+		var body io.Reader
+		if *bodyStdin {
+			body = stdin
+		}
+		return httpRequest(ctx, *method, *url, body, stdout, *timeout)
+	case "tlsserve":
+		addr := fs.String("addr", ":8443", "listen address")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		return tlsServe(ctx, *addr)
 	case "dial":
 		addr := fs.String("addr", "", "IP address and port")
 		timeout := fs.Duration("timeout", 3*time.Second, "connect timeout")
@@ -199,6 +234,78 @@ func get(ctx context.Context, url string, out io.Writer, timeout time.Duration) 
 	}
 	_, err = io.Copy(out, resp.Body)
 	return err
+}
+
+// bodyLimit is the most of a response body that http prints.
+const bodyLimit = 4 << 10
+
+// httpRequest sends one request and prints {"status", "body"} for any status.
+func httpRequest(ctx context.Context, method, url string, body io.Reader, out io.Writer, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, bodyLimit))
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(out).Encode(struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}{resp.StatusCode, string(b)})
+}
+
+// tlsServe serves TLS 1.3 with the chain and key from stdin until ctx ends.
+func tlsServe(ctx context.Context, addr string) error {
+	in, err := io.ReadAll(io.LimitReader(stdin, 1<<20))
+	if err != nil {
+		return fmt.Errorf("read the chain and key from stdin: %w", err)
+	}
+	// X509KeyPair takes the CERTIFICATE blocks of its first input and the key of its second.
+	cert, err := tls.X509KeyPair(in, in)
+	clear(in)
+	if err != nil {
+		return fmt.Errorf("stdin holds no PEM certificate chain and key: %w", err)
+	}
+	ln, err := tls.Listen("tcp", addr, &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		return err
+	}
+	slog.Info("serving tls", "addr", ln.Addr().String(), "chain_length", len(cert.Certificate))
+	stop := context.AfterFunc(ctx, func() { _ = ln.Close() })
+	defer stop()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil
+			}
+			return err
+		}
+		wg.Go(func() {
+			defer c.Close()
+			_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+			tc := c.(*tls.Conn)
+			if err := tc.HandshakeContext(ctx); err != nil {
+				slog.Info("handshake failed", "remote", c.RemoteAddr().String(), "error", err.Error())
+				return
+			}
+			slog.Info("handshake done", "remote", c.RemoteAddr().String(), "alpn", tc.ConnectionState().NegotiatedProtocol)
+			_, _ = io.Copy(io.Discard, c)
+		})
+	}
 }
 
 // dialClass names the outcome of one TCP connect.

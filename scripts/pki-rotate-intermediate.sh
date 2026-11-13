@@ -22,6 +22,7 @@ for entry in "${COMPONENTS[@]}"; do
   [[ "${entry%%:*}" == spire-server ]] && runs_spire_server=1
 done
 ((runs_spire_server)) || die "cluster $CELL_NAME runs no SPIRE server in harness/topology.yaml. Run: CELL=dev-cp mise run pki:rotate-intermediate"
+[[ "${SPIRE_UPSTREAM:-}" == disk ]] || die "the SPIRE server of $CELL_NAME has no upstream authority, so it has no intermediate CA. Run: CELL=dev-cp mise run pki:rotate-intermediate"
 
 load_local_settings POC_SECRET_READ_CMD POC_SECRET_WRITE_CMD POC_ROOT_CA_BUNDLE
 for name in POC_SECRET_READ_CMD POC_SECRET_WRITE_CMD POC_ROOT_CA_BUNDLE; do

@@ -1,0 +1,16 @@
+# Every user of the central UI, the anonymous one included, gets role:readonly. The deny lines
+# repeat the read-only rule for each write that the UI offers. The guard in each cell is the real
+# control.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+data:
+  policy.default: role:readonly
+  policy.csv: |
+    p, role:readonly, applications, sync, *, deny
+    p, role:readonly, applications, update, *, deny
+    p, role:readonly, applications, delete, *, deny
+    p, role:readonly, applications, override, *, deny
+    p, role:readonly, applications, action/*, *, deny
+    p, role:readonly, exec, create, *, deny

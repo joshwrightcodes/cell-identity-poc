@@ -5,13 +5,27 @@ package cli
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log/slog"
 )
 
-// Fail writes the error line "<name> failed" with the text of err to w.
+// Attrs is an error that adds its own key and value pairs to the error line. The keys time,
+// level, msg and error belong to the line itself, so LogAttrs must not use them.
+type Attrs interface {
+	error
+	LogAttrs() []any
+}
+
+// Fail writes the error line "<name> failed" with the text of err to w. When err or an error that
+// it wraps is an Attrs, the line also carries its pairs.
 func Fail(w io.Writer, name string, err error) {
-	slog.New(slog.NewJSONHandler(w, nil)).Error(name+" failed", "error", err.Error())
+	args := []any{"error", err.Error()}
+	var a Attrs
+	if errors.As(err, &a) {
+		args = append(args, a.LogAttrs()...)
+	}
+	slog.New(slog.NewJSONHandler(w, nil)).Error(name+" failed", args...)
 }
 
 // Run runs fn with a buffer for its data. On success it copies the data to w and returns 0. On

@@ -60,12 +60,65 @@ description = "Run the checks of the cluster CELL: the base cell rules, and the 
 run = "scripts/verify.sh"
 
 [tasks."cell:ui"]
-description = "Serve the Argo CD UI on http://localhost:8080 from this Mac, with no UI in the cluster"
+description = "Serve the Argo CD UI on http://localhost:8080 from this Mac. The UI lists only the root Application, so the task prints the child Applications first"
 run = "scripts/ui.sh"
 
+[tasks."cell:ui:clean"]
+description = "Remove what the server of cell:ui wrote into argocd: the initial admin Secret and the admin and signing keys of argocd-secret. Safe to run again"
+run = "scripts/ui.sh --clean"
+
 [tasks."cell:restart"]
-description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp, restart the SPIRE server"
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
+
+[tasks."cell:restart-mesh"]
+description = "Start the sidecars of the cluster CELL again: delete the pods of every Deployment in each injected namespace, wait for new Ready pods, and check that each istio-proxy has the cell name as ISTIO_META_CLUSTER_ID. Prints one JSON line"
+run = "scripts/restart-mesh.sh"
+
+[tasks."cell:link"]
+description = "Run the link phase of the cluster CELL (default management): render each link component with the live facts of the other clusters, apply it, run its Jobs and wait for its rollouts"
+env = { CELL = "{{get_env(name='CELL', default='management')}}" }
+run = "scripts/link.sh"
+
+[tasks."view:ui"]
+description = "Serve the read-only central Argo CD UI of management on http://127.0.0.1:8090"
+env = { CELL = "management" }
+run = "scripts/view-ui.sh"
+
+[tasks."mesh:ui"]
+description = "Serve the read-only Kiali mesh view of management on http://127.0.0.1:20001/kiali"
+env = { CELL = "management" }
+run = "scripts/mesh-ui.sh"
+
+[tasks."mesh:status"]
+description = "Report the mesh view of management: the tunnel of each cell at the hub, the tunnel pod in each cell, and Kiali. Exit status 1 when a part is not up"
+env = { CELL = "management" }
+run = "scripts/mesh-status.sh"
+
+[tasks."view:rotate-keys"]
+description = "Make new view keys in management: new agent CA and certificates, JWT key and server key, a new central Redis password, then restart argocd-redis, argocd-repo-server, the principal and argocd-server"
+env = { CELL = "management" }
+run = "scripts/view-rotate-keys.sh"
+
+[tasks."obs:ui"]
+description = "Serve Grafana of management on http://127.0.0.1:${OBS_UI_PORT:-3300}. Print the admin password with obs:password. The task prints one JSON line and exits when the port is busy"
+env = { CELL = "management" }
+run = "scripts/obs-ui.sh"
+
+[tasks."obs:password"]
+description = "Print the Grafana admin password of management on standard output, for a pipe to the clipboard. The task writes no file"
+env = { CELL = "management" }
+run = "scripts/obs-password.sh"
+
+[tasks."obs:rotate-password"]
+description = "Rotate the Grafana admin password of management through the Grafana API, replace Secret grafana-admin, and check the new and the old password"
+env = { CELL = "management" }
+run = "scripts/obs-rotate-password.sh"
+
+[tasks."obs:uplink-status"]
+description = "Report each hop of the telemetry path of one cluster: its collector queue and failures, the uplink, the gateway counts for that sender, and the newest sample in the store. Prints one JSON object that names the first failing hop"
+usage = 'arg "<cluster>"'
+run = 'scripts/uplink-status.sh ${usage_cluster?}'
 
 [tasks."cell:down"]
 description = "Delete the cluster through the host service"
@@ -113,6 +166,19 @@ run = "scripts/harness.sh up"
 description = "Run cell:verify on every cluster that has components, and print one PASS or FAIL line for each"
 run = "scripts/harness-verify.sh"
 
+[tasks."harness:status"]
+description = "Report whether the PoC is healthy. Print one JSON object for each cluster with components: Applications, cell:verify, telemetry, and for management the agents, the Prometheus samples, Kiali and the mesh view. Exit status 1 when a value is bad"
+env = { CELL = "management" }
+run = "scripts/status.sh"
+
+[tasks."harness:logs"]
+description = "Print the JSON log lines of the pods that match a label selector, each with the field cluster. The first argument is a cluster or all. For example: mise run harness:logs all app.kubernetes.io/name=argocd-agent-principal"
+usage = '''
+arg "<cluster>" help="A cluster with components, or all"
+arg "<selector>" help="A label selector"
+'''
+run = 'scripts/logs.sh "${usage_cluster?}" "${usage_selector?}"'
+
 [tasks."harness:down"]
 description = "Delete all five clusters through the host service"
 run = "scripts/harness.sh down"
@@ -133,6 +199,20 @@ run = "scripts/gate.sh m1"
 description = "Run the M2 end-to-end tests against the SPIRE server in dev-cp, plus the go test arguments after --"
 depends = ["images"]
 run = "scripts/gate.sh m2"
+
+[tasks."gate:m3"]
+description = "Run the M3 end-to-end tests against the management plane and dev-cp, plus the go test arguments after --"
+depends = ["images"]
+run = "scripts/gate.sh m3"
+
+[tasks."gate:m3:repair"]
+description = "Delete the objects and the firewall rules on the dev-cp node that a gate:m3 run left when it stopped before its cleanups. With --check, only list them. Safe to run again"
+run = "scripts/gate-m3-repair.sh"
+
+[tasks."mgmt:rotate-ca"]
+description = "Replace the CA of the SPIRE server in CELL (default management) with a new root: prepare, refresh every peer copy, activate, revoke the old root, refresh again"
+env = { CELL = "{{get_env(name='CELL', default='management')}}" }
+run = "scripts/mgmt-rotate-ca.sh"
 
 [tasks."gate:m2:repair"]
 description = "Repair dev-cp and dev-cell-1 after any gate:m2 run that stopped before its cleanups. Safe to run again"

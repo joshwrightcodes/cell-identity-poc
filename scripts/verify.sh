@@ -58,26 +58,26 @@ has_proxy() {
 }
 
 check_apps_synced() {
-  k -n argocd get applications -o json | jq -e --argjson n "$((${#COMPONENTS[@]} + 1))" '
+  apps_json | jq -e --argjson n "$((${#COMPONENTS[@]} + 1))" '
     (.items | length) == $n and
     all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")' >/dev/null \
-    || { k -n argocd get applications; return 1; }
+    || { k get applications -A; return 1; }
 }
 
 check_argocd_local_only() {
   local clusters
   clusters="$(k -n argocd get secrets -l argocd.argoproj.io/secret-type=cluster -o name)"
   [[ -z "$clusters" ]] || { echo "remote cluster secrets: $clusters"; return 1; }
-  k -n argocd get applications -o json | jq -e --arg store "oci://$BUNDLE_STORE_HOST/bundles/" '
+  apps_json | jq -e --arg store "oci://$BUNDLE_STORE_HOST/bundles/" '
     all(.items[]; .spec.destination.server == "https://kubernetes.default.svc"
       and (.spec.source.repoURL | startswith($store)))' >/dev/null \
     || { echo "an Application has another destination or source"; return 1; }
 }
 
-# The base platform namespaces, and the namespace of each harness component of this cell.
+# The base platform namespaces, and the namespace of each harness and link component of this cell.
 platform_namespaces=(argocd cell-system observability-system)
-for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  platform_namespaces+=("${entry#*:}")
+for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+  [[ " ${platform_namespaces[*]} " == *" ${entry#*:} "* ]] || platform_namespaces+=("${entry#*:}")
 done
 
 has_harness() {
@@ -139,6 +139,34 @@ check_psa_rejects_privileged() {
 missing_cell_hint() {
   echo "Create the cluster: mise run hostsvc -- up --only $1, then run CELL=$1 mise run cell:up and CELL=$CELL_NAME mise run cell:up."
   echo "Or remove $1 from SPIRE_AGENT_CELLS in cells/$CELL_NAME.env, then run CELL=$CELL_NAME mise run cell:up."
+}
+
+# pem_lines prints each PEM certificate on standard input as one line, sorted.
+pem_lines() {
+  awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
+}
+
+# peer_root_pods_current <namespace> <app> <ConfigMap> <fix command> succeeds when every running pod of the
+# workload carries the digest of the ConfigMap in its annotation poc.internal/peer-root-sha256. The process reads
+# the roots once at start, so a ConfigMap that is right does not show that the pod trusts the same roots.
+peer_root_pods_current() {
+  local ns="$1" app="$2" cm="$3" fix="$4" raw want pods bad
+  raw="$(k -n "$ns" get configmap "$cm" -o jsonpath='{.data.root\.crt}')" || { echo "could not read ConfigMap $ns/$cm"; return 1; }
+  want="$(printf '%s' "$raw" | shasum -a 256 | cut -d' ' -f1)"
+  pods="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$app" -o json)" || { echo "could not read the pods of $app in $ns"; return 1; }
+  bad="$(jq -r --arg want "$want" '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $n
+      | ((.metadata.annotations["poc.internal/peer-root-sha256"] // "") | if . == "" then "none" else . end) as $got | select($got != $want) | "\($n) carries the root digest \($got)"] | .[]' <<<"$pods")"
+  if [[ -z "$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | length | select(. > 0)' <<<"$pods")" ]]; then
+    echo "$app has no running pod in $ns."
+    echo "Run: $fix"
+    return 1
+  fi
+  if [[ -n "$bad" ]]; then
+    echo "$bad"
+    echo "ConfigMap $ns/$cm has the digest $want, and a pod reads the roots only at start."
+    echo "Run: $fix"
+    return 1
+  fi
 }
 
 node_ip() {
@@ -214,7 +242,7 @@ check_celld_svid() {
   fi
   echo "the last identity event of celld is ${line:-missing}, want an SVID for $want with a not_after in the future."
   echo "Read the agent log: mise x -- kubectl --context kind-$CELL_NAME -n cell-identity-system logs deploy/celld -c spire-agent"
-  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify runs the check 'The SPIRE server holds the node alias and celld entries'."
+  echo "Check the entries on the server: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify runs the check 'The SPIRE server holds the node alias and the role entry of each subject'."
   echo "Then run: CELL=$CELL_NAME mise run cell:up"
   return 1
 }
@@ -297,47 +325,14 @@ expect_dial_blocked() {
 # The harness applies its components without Argo CD, so cell:verify compares them with the bundle.
 check_harness_drift() {
   local bundle="$BUNDLES/$1/manifests.yaml" out rc
-  [[ -f "$bundle" ]] || { echo "no $bundle. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$1")"; return 1; }
   out="$(k diff --server-side --force-conflicts -f "$bundle" 2>&1)"
   rc=$?
   case "$rc" in
     0) return 0 ;;
-    1) printf '%s\n' "$out" | head -n 40; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1 ;;
+    1) printf '%s\n' "$out" | head -n 40; echo "Run: $(fix_command "$1")"; return 1 ;;
     *) echo "kubectl diff failed: $out"; return 1 ;;
   esac
-}
-
-# The harness apply does not prune, and kubectl diff sees only the fields of its own field manager.
-# So for each kind in the bundle, the namespace must hold exactly the objects of the bundle, apart
-# from objects that only system controllers write, for example kube-root-ca.crt. Each object of
-# the bundle must have only the field manager kubectl, and kube-controller-manager for status.
-check_harness_objects() {
-  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad problems=()
-  for kind in $(yq -N -r 'select(.kind != null and .kind != "Namespace") | .kind' "$bundle" | sort -u); do
-    want="$(KIND="$kind" yq -o=json -I=0 'select(.kind == strenv(KIND)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
-    live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
-    got="$(jq -r --arg label "cell.poc.internal/harness" '[.items[]
-      | select((.metadata.labels[$label] // "") != ""
-        or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
-      | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
-    [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' that the harness or a person wrote, and the bundle $comp has '$want'")
-    bad="$(jq -r --arg want " $want " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
-      | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
-        or (.manager == "kube-controller-manager" and .subresource == "status") | not)
-      | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$live")" \
-      || { echo "could not read the field managers of $kind in $ns"; return 1; }
-    [[ -z "$bad" ]] || problems+=("$bad")
-  done
-  live="$(k get namespace "$ns" -o json --show-managed-fields)" || { echo "no namespace $ns"; return 1; }
-  bad="$(jq -r --arg ns "$ns" '.metadata.managedFields[]? | select(.manager == "kubectl" and .operation == "Apply" | not)
-    | "Namespace/\($ns) has the field manager \(.manager)"' <<<"$live")" \
-    || { echo "could not read the field managers of $ns"; return 1; }
-  [[ -z "$bad" ]] || problems+=("$bad")
-  if ((${#problems[@]} > 0)); then
-    printf '%s\n' "${problems[@]}"
-    echo "Delete each extra object, and each field that another manager added. Then run: CELL=$CELL_NAME mise run cell:up"
-    return 1
-  fi
 }
 
 # check_live_images <namespace> <kind/name> <command>: every local image of the workload must be the
@@ -478,23 +473,28 @@ expect_rogue_blocked() {
   expect_dial_blocked rogue default "$1"
 }
 
-# The SPIRE server must hold the node alias and the celld entry of each agent cell, with the
-# parents and selectors that the render declares.
+# The SPIRE server must hold, for each agent cell and each subject of SPIRE_CELL_SUBJECTS, the node
+# alias cell/<cell>/agents/<role> and the role entry under it, with the parents and selectors that
+# the render declares.
 check_agent_entries() {
-  local entries cell sa missing=()
+  local entries cell subject sa role missing=()
   entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
     /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
     || { echo "could not read the entries from spire-server-0"; return 1; }
-  sa="${SPIRE_AGENT_SUBJECT/\//:}"
   for cell in $SPIRE_AGENT_CELLS; do
-    jq -e --arg cell "$cell" --arg sa "$sa" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/nodes"
-      and .parent_id.path == "/spire/server"
-      and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
-      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://dev.env.poc.internal/cell/$cell/nodes with the selectors of $cell")
-    jq -e --arg cell "$cell" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/celld"
-      and .parent_id.path == "/cell/\($cell)/nodes"
-      and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
-      <<<"$entries" >/dev/null || missing+=("no celld entry spiffe://dev.env.poc.internal/cell/$cell/celld with selector unix:uid:65532")
+    for subject in $SPIRE_CELL_SUBJECTS; do
+      sa="${subject%%=*}"
+      sa="${sa/\//:}"
+      role="${subject#*=}"
+      jq -e --arg cell "$cell" --arg sa "$sa" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/agents/\($role)"
+        and .parent_id.path == "/spire/server"
+        and ([.selectors[] | "\(.type):\(.value)"] | sort) == (["cluster_jwt:cell:\($cell)", "cluster_jwt:sa:\($sa)"] | sort))' \
+        <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/agents/$role with the selectors of $cell and $sa")
+      jq -e --arg cell "$cell" --arg role "$role" 'any(.entries[]; .spiffe_id.path == "/cell/\($cell)/\($role)"
+        and .parent_id.path == "/cell/\($cell)/agents/\($role)"
+        and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
+        <<<"$entries" >/dev/null || missing+=("no $role entry spiffe://$SPIRE_TRUST_DOMAIN/cell/$cell/$role under its alias with selector unix:uid:65532")
+    done
   done
   if ((${#missing[@]} > 0)); then
     printf '%s\n' "${missing[@]}"
@@ -503,22 +503,335 @@ check_agent_entries() {
   fi
 }
 
-check_traces_received() {
-  local i
-  for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
-  local end=$((SECONDS + 60))
-  # Read the logs into a variable first. With pipefail, grep -q would close the pipe early
-  # and turn a match into a failure.
-  local logs
-  until logs="$(k -n observability-system logs deploy/otel-collector --since=5m)" && grep -q 'echo.apps-demo' <<<"$logs"; do
-    ((SECONDS < end)) || { echo "no span or access log for echo.apps-demo in the collector output"; return 1; }
+# The SPIRE server must be Ready at its current revision, and healthy on its admin socket.
+check_server_healthy() {
+  local out
+  k -n spire-system get statefulset spire-server -o json | jq -e '(.spec.replicas // 1) as $want
+    | (.status.readyReplicas // 0) == $want and (.status.updatedReplicas // 0) == $want
+      and .status.currentRevision == .status.updateRevision' >/dev/null \
+    || { echo "statefulset/spire-server in spire-system is not Ready at its current revision. Read: mise x -- kubectl --context kind-$CELL_NAME -n spire-system describe pod spire-server-0"; return 1; }
+  out="$(k -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server healthcheck -socketPath /run/spire/sockets/api.sock 2>&1)"
+  [[ "$out" == "Server is healthy." ]] || { echo "spire-server healthcheck: ${out:-no output}"; return 1; }
+}
+
+# The SPIRE server must hold the node alias and the entry of each local workload in
+# SPIRE_LOCAL_WORKLOADS, with the parents and selectors that the render declares.
+check_local_entries() {
+  local entries w path sub ns sa missing=()
+  entries="$(k -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not read the entries from spire-server-0"; return 1; }
+  for w in $SPIRE_LOCAL_WORKLOADS; do
+    path="${w%%=*}" sub="${w#*=}"
+    ns="${sub%%/*}" sa="${sub#*/}"
+    jq -e --arg td "$SPIRE_TRUST_DOMAIN" --arg ns "$ns" --arg sa "$sa" --arg cluster "$CELL_NAME" 'any(.entries[];
+      .spiffe_id.trust_domain == $td and .spiffe_id.path == "/agents/\($ns)/\($sa)" and .parent_id.path == "/spire/server"
+      and ([.selectors[] | "\(.type):\(.value)"] | sort)
+        == (["k8s_psat:cluster:\($cluster)", "k8s_psat:agent_ns:\($ns)", "k8s_psat:agent_sa:\($sa)"] | sort))' \
+      <<<"$entries" >/dev/null || missing+=("no node alias entry spiffe://$SPIRE_TRUST_DOMAIN/agents/$ns/$sa with the k8s_psat selectors of $CELL_NAME")
+    jq -e --arg td "$SPIRE_TRUST_DOMAIN" --arg path "/$path" --arg parent "/agents/$ns/$sa" 'any(.entries[];
+      .spiffe_id.trust_domain == $td and .spiffe_id.path == $path and .parent_id.path == $parent
+      and [.selectors[] | "\(.type):\(.value)"] == ["unix:uid:65532"])' \
+      <<<"$entries" >/dev/null || missing+=("no entry spiffe://$SPIRE_TRUST_DOMAIN/$path under the alias of $sub with selector unix:uid:65532")
+  done
+  if ((${#missing[@]} > 0)); then
+    printf '%s\n' "${missing[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# The SPIRE server trusts only its own trust domain, so it holds no federated bundle.
+check_no_federation() {
+  local out
+  out="$(k -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle list -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not list the federated bundles of spire-server-0"; return 1; }
+  jq -e '(.bundles // []) | length == 0' <<<"$out" >/dev/null || { echo "the server holds federated bundles: $(jq -c '[.bundles[].trust_domain]' <<<"$out")"; return 1; }
+}
+
+# A server with no upstream authority keeps its CA key in keys.json on its data volume, so a restart
+# keeps the root. SPIRE prepares the next CA, a new self-signed root, at notAfter minus
+# min(lifetime / 2, 30 days) (pkg/server/ca/manager/slot.go of v1.15.5). Every peer copy must hold
+# that root before SPIRE activates it, so the check fails 7 days before that time.
+check_ca_key_persists() {
+  local conf pv path node state expires lifetime threshold left
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  grep -q '^ *KeyManager "disk" {$' <<<"$conf" || { echo "the server keeps its CA key in memory, so a restart makes a new root. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  pv="$(k -n spire-system get pvc data-spire-server-0 -o jsonpath='{.spec.volumeName}')" || { echo "no PersistentVolumeClaim data-spire-server-0"; return 1; }
+  path="$(k get pv "$pv" -o json | jq -r '.spec.hostPath.path // .spec.local.path // ""')"
+  node="$CELL_NAME-control-plane"
+  [[ -n "$path" ]] && docker exec "$node" test -s "$path/keys.json" \
+    || { echo "the data volume $pv holds no keys.json at '$path' on $node"; return 1; }
+  state="$(k -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority x509 show \
+    -socketPath /run/spire/sockets/api.sock -output json)" || { echo "could not read the X.509 authorities of spire-server-0"; return 1; }
+  expires="$(jq -r '.active.expires_at // 0 | tonumber' <<<"$state")"
+  lifetime="$(seconds_of "${SPIRE_CA_TTL:-24h}")"
+  threshold=$((expires - (lifetime / 2 < 2592000 ? lifetime / 2 : 2592000)))
+  left=$(((threshold - $(date +%s)) / 86400))
+  if ((expires == 0 || left < 7)); then
+    echo "SPIRE prepares a new root in $left days, at $(jq -rn --argjson t "$threshold" '$t | todate'), and activates it later. Run: CELL=$CELL_NAME mise run mgmt:rotate-ca"
+    return 1
+  fi
+}
+
+# seconds_of <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
+seconds_of() {
+  local n="${1%[smh]}"
+  case "$1" in
+    *s) echo "$n" ;;
+    *m) echo $((n * 60)) ;;
+    *h) echo $((n * 3600)) ;;
+  esac
+}
+
+# The server ServiceAccount can review tokens and read pods and nodes. No Secret may hold a token
+# that does not expire for an account in spire-system.
+check_no_token_secrets() {
+  local out
+  out="$(k -n spire-system get secrets --field-selector type=kubernetes.io/service-account-token -o name)" \
+    || { echo "could not list the Secrets in spire-system"; return 1; }
+  [[ -z "$out" ]] || { echo "spire-system holds ServiceAccount token Secrets: ${out//$'\n'/ }. Delete them."; return 1; }
+}
+
+# A cluster with the operator but no secret store holds no store of either kind, no copy of the
+# store token, and an operator that cannot list Secrets in every namespace.
+check_no_secret_store() {
+  local out problems=()
+  out="$(k get secretstores.external-secrets.io -A -o name)" || { echo "could not list the SecretStores"; return 1; }
+  [[ -z "$out" ]] || problems+=("SecretStores: ${out//$'\n'/ }")
+  if out="$(k get clustersecretstores.external-secrets.io -o name 2>&1)"; then
+    [[ -z "$out" ]] || problems+=("ClusterSecretStores: ${out//$'\n'/ }")
+  elif [[ "$out" != *"the server doesn't have a resource type"* ]]; then
+    echo "could not list the ClusterSecretStores: $out"
+    return 1
+  fi
+  out="$(k get secrets -A --field-selector metadata.name=poc-secrets-token -o name)" || { echo "could not list the Secrets named poc-secrets-token"; return 1; }
+  [[ -z "$out" ]] || problems+=("copies of the store token: ${out//$'\n'/ }")
+  out="$(k auth can-i list secrets -A --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
+  [[ "$out" == no ]] || problems+=("the operator can list Secrets in every namespace (can-i: '${out:-unknown}')")
+  # The positive control shows that the account name is right, so the "no" above is not a typo.
+  out="$(k auth can-i get secrets -n "$EXTERNAL_SECRETS_NAMESPACE" --as=system:serviceaccount:external-secrets:external-secrets 2>/dev/null)"
+  [[ "$out" == yes ]] || problems+=("the operator cannot read Secrets in $EXTERNAL_SECRETS_NAMESPACE (can-i: '${out:-unknown}'), so the account name of the check is wrong")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "$CELL_NAME has no secret store. Delete each object above, then run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# check_traces_in_store asks Tempo through Grafana in management for a trace of echo with the cluster
+# name of this cluster. No collector prints what it receives, so the logs of the collector show no
+# span. The signals of every cluster but management reach Grafana through the collector, the uplink,
+# the relay and the gateway, so this check fails while any of them is down. The password stays in
+# memory, and lgtm_curl puts it on the standard input of curl.
+check_traces_in_store() {
+  local LGTM_CLUSTER=management
+  local pw query body out code end=$((SECONDS + 240)) i name="${COLLECTOR_CLUSTER:-$CELL_NAME}"
+  pw="$(CELL=management "$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  query="{ resource.k8s.cluster.name = \"$name\" && resource.service.name =~ \"echo.*\" }"
+  body="$(jq -nc --arg q "$query" '{queries: [{refId: "A", datasource: {type: "tempo", uid: "tempo"}, queryType: "traceql", query: $q,
+    limit: 5, tableType: "traces"}], from: "now-30m", to: "now"}')"
+  grafana_login_ok || return 1
+  until out="$(lgtm_curl "admin:$pw" POST /api/ds/query "$body" 2>&1)" && code="$(tail -n 1 <<<"$out")" && [[ "$code" == 200 ]] \
+      && [[ "$(sed '$d' <<<"$out" | jq -r '[.results.A.frames[]?.data.values[0][]?] | length' 2>/dev/null)" -gt 0 ]]; do
+    for i in 1 2 3; do expect_code client http://echo/hostname 200 >/dev/null; done
+    ((SECONDS < end)) || {
+      echo "Tempo in management holds no trace of echo.apps-demo with k8s.cluster.name $name. The last answer: HTTP ${code:-none}."
+      echo "The collector, the uplink, the relay or the gateway can be down. Read each hop: mise run obs:uplink-status $name"
+      return 1
+    }
     sleep 5
   done
+}
+
+# lgtm must run as user 10001, Grafana must refuse an anonymous read of the data sources, and the pod
+# must not read the Kubernetes API token that the account would give it.
+check_lgtm_hardened() {
+  local uid code
+  uid="$(k -n observability-system exec lgtm-0 -c lgtm -- id -u 2>&1)" || { echo "could not run id in lgtm-0: $uid"; return 1; }
+  [[ "$uid" == 10001 ]] || { echo "lgtm-0 runs as user '$uid', want 10001"; return 1; }
+  code="$(k -n observability-system exec lgtm-0 -c lgtm -- curl -sS -o /dev/null -w '%{http_code}' --max-time 10 http://127.0.0.1:3000/api/datasources 2>&1)" \
+    || { echo "could not call Grafana in lgtm-0: $code"; return 1; }
+  [[ "$code" == 401 ]] || { echo "an anonymous read of /api/datasources answers HTTP '$code', want 401. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  code="$(k -n observability-system exec lgtm-0 -c lgtm -- curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -u admin:admin http://127.0.0.1:3000/api/user 2>&1)" \
+    || { echo "could not call Grafana in lgtm-0: $code"; return 1; }
+  [[ "$code" == 401 ]] || { echo "the default login admin:admin answers HTTP '$code', want 401, so Grafana did not read the generated password"; return 1; }
+  k -n observability-system exec lgtm-0 -c lgtm -- test ! -e /var/run/secrets/kubernetes.io/serviceaccount/token \
+    || { echo "lgtm-0 holds a service account token"; return 1; }
+}
+
+# grafana_login_ok prints nothing and succeeds when Grafana accepts the password of Secret grafana-admin.
+# Otherwise it names the fix, so a 401 does not look like a failure of the store.
+grafana_login_ok() {
+  local pw out code fix lgtm="${LGTM_CLUSTER:-$CELL_NAME}"
+  fix="CELL=$lgtm mise run obs:rotate-password, or, when it fails, the restore command that it prints (CELL=$lgtm scripts/obs-rotate-password.sh --restore-command)"
+  pw="$(CELL="$lgtm" "$ROOT/scripts/obs-password.sh")" || { echo "could not read the Grafana admin password: $pw"; return 1; }
+  out="$(lgtm_curl "admin:$pw" GET /api/user 2>&1)" || { echo "could not call Grafana in lgtm-0: $out"; return 1; }
+  code="$(tail -n 1 <<<"$out")"
+  [[ "$code" == 200 ]] && return 0
+  if [[ "$code" == 401 ]]; then
+    echo "Grafana refuses the password of Secret grafana-admin (HTTP 401), so the Secret and the Grafana database differ, or Grafana blocks the user for 5 minutes after 5 failed logins (wait, then run again). Fix for a difference: $fix"
+  else
+    echo "GET /api/user in Grafana answers HTTP '$code'"
+  fi
+  return 1
+}
+
+# The four data sources of the image must pass their health check.
+check_grafana_datasources() {
+  local pw uid out code
+  grafana_login_ok || return 1
+  pw="$("$ROOT/scripts/obs-password.sh")"
+  for uid in prometheus loki tempo pyroscope; do
+    out="$(lgtm_curl "admin:$pw" GET "/api/datasources/uid/$uid/health" 2>&1)" || { echo "could not call Grafana: $out"; return 1; }
+    code="$(tail -n 1 <<<"$out")"
+    [[ "$code" == 200 && "$(sed '$d' <<<"$out" | jq -r .status 2>/dev/null)" == OK ]] || { echo "data source $uid: HTTP $code: $(sed '$d' <<<"$out" | head -c 200)"; return 1; }
+  done
+}
+
+# The gateway counts each failed forward to the store. Nothing may have failed in the last 5 minutes. A
+# store that the gateway cannot reach, or a policy that drifted on flow N10, shows here first.
+check_gateway_store_path() {
+  local pw out code n
+  grafana_login_ok || return 1
+  pw="$("$ROOT/scripts/obs-password.sh")"
+  out="$(lgtm_curl "admin:$pw" GET '/api/datasources/proxy/uid/prometheus/api/v1/query?query=sum(increase(cellproxy_gateway_upstream_failures_total%7Bk8s_cluster_name%3D%22management%22%7D%5B5m%5D))' 2>&1)" \
+    || { echo "could not query Prometheus: $out"; return 1; }
+  code="$(tail -n 1 <<<"$out")"
+  [[ "$code" == 200 ]] || { echo "the Prometheus query answers HTTP '$code'"; return 1; }
+  n="$(sed '$d' <<<"$out" | jq -r '.data.result[0].value[1] // "0"')"
+  awk -v n="$n" 'BEGIN { exit !(n + 0 < 0.5) }' || { echo "the gateway failed $n forwards to the store in the last 5 minutes. Read: kubectl --context kind-$CELL_NAME -n observability-system logs deploy/telemetry-gateway -c cell-proxy"; return 1; }
+}
+
+# The data volume has no size limit of its own: local-path ignores the 10Gi request, and the files lie on the
+# disk of the VM. Retention keeps each component at 48 hours, so 8 GiB means that a bound failed.
+LGTM_DISK_LIMIT_KB=$((8 * 1024 * 1024))
+check_lgtm_disk() {
+  local kb
+  kb="$(k -n observability-system exec lgtm-0 -c lgtm -- du -sk /data 2>/dev/null | awk '{print $1}')" || { echo "could not run du in lgtm-0"; return 1; }
+  [[ "$kb" =~ ^[0-9]+$ ]] || { echo "du in lgtm-0 printed '$kb'"; return 1; }
+  ((kb < LGTM_DISK_LIMIT_KB)) || { echo "/data of lgtm-0 holds $((kb / 1024)) MiB, over the limit of $((LGTM_DISK_LIMIT_KB / 1024)) MiB. Check the retention settings in components/observability-store"; return 1; }
+}
+
+check_grafana_secret_synced() {
+  k -n observability-system get externalsecret grafana-admin -o json | jq -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True")' >/dev/null \
+    || { echo "ExternalSecret grafana-admin is not Ready. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+check_traces_received() {
+  check_traces_in_store
+}
+
+# The collector is a StatefulSet with one Ready replica and its queue volume. A Deployment of the same
+# name is a leftover of an older bundle: Argo CD prunes it, and a collector from it would run beside
+# the new one with the old config.
+check_collector_workload() {
+  local sts pvc phase size
+  sts="$(k -n observability-system get statefulset otel-collector -o json 2>&1)" || { echo "no StatefulSet otel-collector in observability-system: $sts. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  jq -e '.spec.replicas == 1 and .status.readyReplicas == 1 and .status.updatedReplicas == 1' >/dev/null <<<"$sts" \
+    || { echo "StatefulSet otel-collector has $(jq -r '[.spec.replicas, .status.readyReplicas // 0, .status.updatedReplicas // 0] | "replicas \(.[0]), ready \(.[1]), updated \(.[2])"' <<<"$sts"), want one Ready replica at its update revision"; return 1; }
+  if k -n observability-system get deployment otel-collector >/dev/null 2>&1; then
+    echo "Deployment otel-collector still exists, an object of the old bundle. Wait for Argo CD to prune it, or run: kubectl --context kind-$CELL_NAME -n observability-system delete deployment otel-collector"
+    return 1
+  fi
+  pvc="$(k -n observability-system get pvc queue-otel-collector-0 -o json 2>&1)" || { echo "no PVC queue-otel-collector-0: $pvc"; return 1; }
+  phase="$(jq -r .status.phase <<<"$pvc")" size="$(jq -r '.status.capacity.storage // ""' <<<"$pvc")"
+  want_size="$(yq -N 'select(.kind == "StatefulSet" and .metadata.name == "otel-collector") | .spec.volumeClaimTemplates[0].spec.resources.requests.storage' "$BUNDLES/observability-system/manifests.yaml")"
+  [[ -n "$want_size" && "$want_size" != null ]] || { echo "the bundle observability-system holds no claim template of otel-collector. Run: CELL=$CELL_NAME mise run cell:hydrate"; return 1; }
+  [[ "$phase" == Bound && "$size" == "$want_size" ]] || { echo "PVC queue-otel-collector-0 is $phase with capacity '$size', and the bundle asks for $want_size"; return 1; }
+}
+
+# The uplink copies the node address of its upstream cluster into the cell-proxy argument and its
+# NetworkPolicy. A cell dials the relay of SPIRE_SERVER_CLUSTER on 30444, and dev-cp dials the gateway
+# of RELAY_TARGET on the target port of RELAY_TELEMETRY_ROUTES. Docker can give a rebuilt node a new address.
+uplink_upstream() {
+  case "$COLLECTOR_PLANE" in
+    cell) echo "$SPIRE_SERVER_CLUSTER 30444 mgmt-root" ;;
+    environment) echo "$RELAY_TARGET ${RELAY_TELEMETRY_ROUTES##*=} peer-root" ;;
+    *) return 1 ;;
+  esac
+}
+
+check_uplink_env_address() {
+  local cluster port cm want got
+  read -r cluster port cm <<<"$(uplink_upstream)" || { echo "COLLECTOR_PLANE '$COLLECTOR_PLANE' has no uplink"; return 1; }
+  want="$(node_ip "$cluster")" || { echo "$want"; return 1; }
+  got="$(k -n observability-system get deployment otel-uplink -o json \
+    | jq -r '[.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[] | select(startswith("--upstream="))] | join(" ")')" \
+    || { echo "could not read deployment/otel-uplink"; return 1; }
+  if [[ "$got" != "--upstream=$want:$port" ]]; then
+    echo "the $cluster node is $want, but the uplink has '$got', want --upstream=$want:$port."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  got="$(k -n observability-system get networkpolicy otel-uplink -o json \
+    | jq -r '[.spec.egress[].to[]?.ipBlock.cidr // empty] | join(" ")')" || { echo "could not read the NetworkPolicy otel-uplink"; return 1; }
+  [[ " $got " == *" $want/32 "* ]] || { echo "the NetworkPolicy otel-uplink admits egress to '$got', want $want/32. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+check_uplink_peer_root() {
+  local cluster port cm live got
+  read -r cluster port cm <<<"$(uplink_upstream)" || { echo "COLLECTOR_PLANE '$COLLECTOR_PLANE' has no uplink"; return 1; }
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n observability-system get configmap "$cm" -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap observability-system/$cm holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  peer_root_pods_current observability-system otel-uplink "$cm" "CELL=$CELL_NAME mise run cell:up" || return 1
+}
+
+# The mesh-view tunnel of a cell copies the node address of SPIRE_SERVER_CLUSTER into its
+# cell-proxy argument and its NetworkPolicy, and the roots of management into ConfigMap mgmt-root.
+check_mesh_view_env_address() {
+  local want got
+  want="$(node_ip "$SPIRE_SERVER_CLUSTER")" || { echo "$want"; return 1; }
+  got="$(k -n mesh-view-system get deployment mesh-view -o json \
+    | jq -r '[.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[] | select(startswith("--upstream="))] | join(" ")')" \
+    || { echo "could not read deployment/mesh-view"; return 1; }
+  if [[ "$got" != "--upstream=$want:30445" ]]; then
+    echo "the $SPIRE_SERVER_CLUSTER node is $want, but the tunnel has '$got', want --upstream=$want:30445."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  got="$(k -n mesh-view-system get networkpolicy mesh-view -o json \
+    | jq -r '[.spec.egress[].to[]?.ipBlock.cidr // empty] | join(" ")')" || { echo "could not read the NetworkPolicy mesh-view"; return 1; }
+  [[ " $got " == *" $want/32 "* ]] || { echo "the NetworkPolicy mesh-view admits egress to '$got', want $want/32. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+}
+
+check_mesh_view_peer_root() {
+  local live got
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n mesh-view-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap mesh-view-system/mgmt-root holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  peer_root_pods_current mesh-view-system mesh-view mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
+}
+
+# A gate test drops the packets between the relay and the hub with firewall rules on the dev-cp node. A run
+# that stopped hard can leave them, and they cut the mesh tunnel of every cell.
+check_no_blackhole() {
+  local found
+  found="$(blackhole_present "$CELL_NAME-control-plane")" || { echo "the node of $CELL_NAME does not answer"; return 1; }
+  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//-D /}"; echo "Run: mise run gate:m3:repair"; return 1; }
 }
 
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
+check "No Application is outside argocd, except the mirrors of the central view" check_apps_namespace
+check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
+check "argocd holds no admin password" check_no_admin_credentials
+check "argocd holds only the allowed Secrets, and the agent can list them but not get or change them" check_argocd_secrets
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh
@@ -532,7 +845,16 @@ check "plaintext cannot reach the internet, because of NetworkPolicy" expect_no_
 check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_HOST/v2/"
 check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_HOST/v2/"
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
-check "The collector receives telemetry for echo" check_traces_received
+if [[ -n "${COLLECTOR_STORE:-}" ]]; then
+  check "lgtm runs as user 10001, and Grafana answers 401 to an anonymous read" check_lgtm_hardened
+  check "ExternalSecret grafana-admin is Ready" check_grafana_secret_synced
+  check "No Secret in observability-system carries the annotation last-applied-configuration" check_no_last_applied_secret
+  check "Grafana accepts the password of Secret grafana-admin, and its four data sources are healthy" check_grafana_datasources
+  check "The gateway forwarded to the store with no failure in the last 5 minutes" check_gateway_store_path
+  check "/data of lgtm-0 holds less than 8 GiB" check_lgtm_disk
+fi
+check "The collector is a StatefulSet with a Ready replica and the queue volume of the bundle, and no Deployment of the old bundle remains" check_collector_workload
+check "Tempo in management holds a trace of echo from ${COLLECTOR_CLUSTER:-$CELL_NAME}, so its collector and uplink reach the store" check_traces_received
 
 if has_harness cell-identity; then
   probe_targets+=("$CELL_NAME/cell-identity-system")
@@ -554,10 +876,116 @@ if has_harness cell-identity; then
   check "plaintext cannot reach the SPIRE node port, because of NetworkPolicy" \
     expect_no_tcp plaintext "http://${spire_ip:-unknown}:30081/"
 fi
+# The agent copies the node address of SPIRE_SERVER_CLUSTER into the cell-proxy upstream and the
+# NetworkPolicy. A rebuilt control plane can get a new address.
+check_agent_env_address() {
+  local want args cidrs
+  want="$(node_ip "$SPIRE_SERVER_CLUSTER")" || { echo "$want"; return 1; }
+  args="$(k -n argocd get deployment argocd-agent -o json | jq -r '.spec.template.spec.containers[] | select(.name == "cell-proxy") | .args[]')" \
+    || { echo "could not read deployment/argocd-agent in argocd"; return 1; }
+  cidrs="$(k -n argocd get networkpolicy argocd-agent -o json \
+    | jq -r '[.spec.egress[] | select(any(.ports[]; .port == 30443)) | .to[].ipBlock.cidr] | join(" ")')"
+  if ! grep -qxF -- "--upstream=$want:30443" <<<"$args" || [[ "$cidrs" != "$want/32" ]]; then
+    echo "the $SPIRE_SERVER_CLUSTER node is $want, but cell-proxy dials '$(grep -- '--upstream=' <<<"$args")' and the NetworkPolicy allows '$cidrs'."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# ConfigMap mgmt-root must hold the live roots of the management plane, or cell-proxy refuses the
+# principal after a new management root.
+check_agent_mgmt_root() {
+  local live got
+  live="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of management"; return 1; }
+  got="$(k -n argocd get configmap mgmt-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap argocd/mgmt-root holds other roots than the live bundle of management."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+  peer_root_pods_current argocd argocd-agent mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
+}
+
+# The agent answers 200 on /healthz only while its stream to the principal is up.
+check_agent_connected() {
+  local code
+  code="$(k -n argocd exec deploy/argocd-agent -c argocd-agent -- wget -q -S -O /dev/null http://127.0.0.1:8002/healthz 2>&1 | sed -n 's/^ *HTTP\/[0-9.]* \([0-9]*\).*/\1/p' | tail -n 1)"
+  [[ "$code" == 200 ]] && return 0
+  echo "the agent answers HTTP '${code:-none}' on /healthz, so it holds no stream to the principal."
+  echo "Read the cell-proxy log: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c cell-proxy"
+  echo "A pod that cannot attest: read the SPIRE sidecar log, and look for the guard: mise x -- kubectl --context kind-$CELL_NAME -n argocd logs deploy/argocd-agent -c spire-agent | grep argocd-agent-read-only"
+  echo "If management has no principal yet, run: CELL=management mise run cell:link"
+  echo "If the relay holds old node addresses, run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:verify, and then the command that it prints"
+  return 1
+}
+
+# A pod that runs as the ServiceAccount of a cell subject can attest as that subject. In a namespace
+# that a harness component shares with a bundle, such a pod must belong to the harness component,
+# as check_plane_pods requires in a plane. In a namespace that the component owns,
+# check_harness_objects already compares every workload with the bundle. The subjects come from
+# SPIRE_CELL_SUBJECTS of SPIRE_SERVER_CLUSTER.
+check_cell_subject_pods() {
+  local subjects s ns entry comp accounts=""
+  subjects="$(set -a; source "$ROOT/cells/$SPIRE_SERVER_CLUSTER.env"; echo "$SPIRE_CELL_SUBJECTS")"
+  [[ -n "$subjects" ]] || { echo "cells/$SPIRE_SERVER_CLUSTER.env names no SPIRE_CELL_SUBJECTS"; return 1; }
+  for s in $subjects; do
+    ns="${s%%/*}"
+    for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+      comp="${entry%%:*}"
+      [[ "${entry#*:}" == "$ns" ]] || continue
+      NS="$ns" yq -e 'select(.kind == "Namespace" and .metadata.name == strenv(NS))' "$BUNDLES/$comp/manifests.yaml" >/dev/null 2>&1 \
+        || accounts+="${s#*=}=${s%%=*} "
+    done
+  done
+  [[ -n "$accounts" ]] || return 0
+  SPIRE_LOCAL_WORKLOADS="$accounts" check_plane_pods
+}
+
+if [[ -n "${SPIRE_SERVER_CLUSTER:-}" ]]; then
+  check "Every pod that runs as a ServiceAccount of SPIRE_CELL_SUBJECTS in a shared namespace belongs to its harness component" check_cell_subject_pods
+fi
+
+if has_harness otel-uplink; then
+  check "The otel-uplink objects match the bundle" check_harness_drift otel-uplink
+  check "observability-system has exactly the otel-uplink objects of the bundle, with no other field manager" check_harness_objects otel-uplink observability-system
+  check "The uplink runs the images that build/images.env records" \
+    check_live_images observability-system deployment/otel-uplink "CELL=$CELL_NAME mise run cell:up"
+  check "The uplink and its NetworkPolicy use the current node address of its upstream cluster" check_uplink_env_address
+  check "The peer root ConfigMap of the uplink holds the live roots of management" check_uplink_peer_root
+fi
+
+if [[ -n "${RELAY_TARGET:-}" ]]; then
+  check "The node of $CELL_NAME holds no firewall rule of a gate test between the relay and the hub" check_no_blackhole
+fi
+
+if has_harness mesh-view; then
+  check "The mesh-view objects match the bundle" check_harness_drift mesh-view
+  check "mesh-view-system has exactly the mesh-view objects of the bundle, with no other field manager" check_harness_objects mesh-view mesh-view-system
+  check "The mesh-view tunnel runs the images that build/images.env records" \
+    check_live_images mesh-view-system deployment/mesh-view "CELL=$CELL_NAME mise run cell:up"
+  check "The mesh-view tunnel and its NetworkPolicy use the current node address of $SPIRE_SERVER_CLUSTER" check_mesh_view_env_address
+  check "The peer root ConfigMap of the mesh-view tunnel holds the live roots of management" check_mesh_view_peer_root
+fi
+
+if has_harness argocd-agent; then
+  agent_bundle="$BUNDLES/argocd-agent/manifests.yaml"
+  check "The argocd-agent objects match the bundle" check_harness_drift argocd-agent
+  for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$agent_bundle" 2>/dev/null | sort -u); do
+    check "$ns has exactly the argocd-agent objects of the bundle, with no other field manager" check_harness_objects argocd-agent "$ns"
+  done
+  check "The Argo CD Agent runs the images that build/images.env records" \
+    check_live_images argocd deployment/argocd-agent "CELL=$CELL_NAME mise run cell:up"
+  check "cell-proxy of the agent and its NetworkPolicy use the current $SPIRE_SERVER_CLUSTER node address" check_agent_env_address
+  check "ConfigMap mgmt-root holds the live roots of management" check_agent_mgmt_root
+  check "The ServiceAccount argocd-agent is not managed by Argo CD, so the view cannot reach its token subresource" check_agent_unmanaged
+  check "No object of a gate run is left, and no binding grants the agent more than the render" check_agent_grants
+  check "The Argo CD Agent holds a stream to the principal" check_agent_connected
+fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
-  check "The SPIRE server holds the node alias and celld entries of $SPIRE_AGENT_CELLS" check_agent_entries
-  check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
+  check "The SPIRE server holds the node alias and the role entry of each subject of $SPIRE_AGENT_CELLS" check_agent_entries
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
     check_live_images spire-system statefulset/spire-server "CELL=$CELL_NAME mise run cell:up"
@@ -568,10 +996,249 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE node port of $CELL_NAME has a ready local endpoint, and a probe pod in rogue cannot open TCP to it (steady state)" \
     expect_rogue_blocked "${own_ip:-unknown}:30081"
 fi
+if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
+  check "The SPIRE server is Ready and healthy" check_server_healthy
+  check "The SPIRE server sets the SVID lifetimes of SPIRE_SVID_TTL ($SPIRE_SVID_TTL)" check_svid_ttl
+  check "The SPIRE server of $SPIRE_TRUST_DOMAIN holds no federated bundle" check_no_federation
+fi
+if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" && -z "${SPIRE_UPSTREAM:-}" ]]; then
+  check "The SPIRE server keeps its CA key on its data volume, and the next root is more than 7 days away" check_ca_key_persists
+fi
+if [[ -n "${RELAY_TARGET:-}" ]]; then
+  check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and $SPIRE_AGENT_CELLS" check_relay_current
+  relay_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
+  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES; do
+    check "A probe pod in rogue cannot open TCP to the relay node port ${route%%:*} of $CELL_NAME (steady state)" \
+      expect_dial_blocked rogue default "${relay_ip:-unknown}:${route%%:*}"
+  done
+fi
+if [[ -n "${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
+  check "The SPIRE server holds the node alias and the entry of each local workload in SPIRE_LOCAL_WORKLOADS" check_local_entries
+  check "Every pod that runs as a ServiceAccount of SPIRE_LOCAL_WORKLOADS belongs to its harness or link component" check_plane_pods
+  check "spire-system holds no ServiceAccount token Secret" check_no_token_secrets
+  # Only the local plane workloads reach the server pod, and no pod reaches the metrics port.
+  probe_targets+=("$CELL_NAME/default")
+  server_pod_ip="$(k -n spire-system get pod spire-server-0 -o jsonpath='{.status.podIP}' 2>/dev/null || true)"
+  check "A probe pod in default of $CELL_NAME cannot open TCP to the SPIRE server API on its pod address (steady state)" \
+    expect_dial_blocked "$CELL_NAME" default "${server_pod_ip:-unknown}:8081"
+  check "A probe pod in default of $CELL_NAME cannot open TCP to the SPIRE server metrics port (steady state)" \
+    expect_dial_blocked "$CELL_NAME" default "${server_pod_ip:-unknown}:9988"
+fi
+if [[ -n "${EXTERNAL_SECRETS_NAMESPACE:-}" && -z "${SECRET_STORE_NAMESPACES:-}" ]]; then
+  check "$CELL_NAME has no SecretStore, no ClusterSecretStore and no store token, and the operator cannot list Secrets in every namespace" check_no_secret_store
+fi
 if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]]; then
   check "SecretStore $SECRET_STORE is Ready, and each ExternalSecret that uses it is Ready and refreshed in time" check_secret_store
   check "The External Secrets Operator cannot list Secrets in every namespace, and no token copy lies outside $SECRET_STORE_NAMESPACES" check_operator_scope
 fi
+
+# The central view copies the node address and the trust bundle of VIEW_CONTROL_PLANE. A rebuilt
+# control plane can have new ones, so both must match the live values.
+check_view_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n central-view-system get networkpolicy argocd-agent-principal -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy central-view-system/argocd-agent-principal"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the view listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_view_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n central-view-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap central-view-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+  peer_root_pods_current central-view-system argocd-agent-principal peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
+}
+
+# The Secrets of central-view-system must be exactly the view keys and argocd-redis. An extra
+# cluster Secret would add a cluster that argocd-server shows and calls.
+check_view_secrets() {
+  local want got
+  want="$(printf '%s\n' argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret argocd-redis \
+    $(for c in $VIEW_CELLS; do echo "cluster-$POC_ENV-$c"; done) | sort | paste -sd' ' -)"
+  got="$(k -n central-view-system get secrets -o name | sed 's|^secret/||' | sort | paste -sd' ' -)" \
+    || { echo "could not list the Secrets of central-view-system"; return 1; }
+  if [[ "$got" != "$want" ]]; then
+    echo "central-view-system holds the Secrets '$got', and the view needs '$want'."
+    echo "Delete each extra Secret. For a missing one, run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+# The view certificates live 180 days. The check fails 30 days before the resource proxy
+# certificate expires, and every view certificate has the same lifetime.
+check_view_cert_expiry() {
+  local cert info left
+  cert="$(k -n central-view-system get secret argocd-agent-resource-proxy-tls -o jsonpath='{.data.tls\.crt}' | base64 -d)" \
+    || { echo "could not read Secret central-view-system/argocd-agent-resource-proxy-tls"; return 1; }
+  info="$(cd "$ROOT" && printf '%s\n' "$cert" | mise run pki -- info 2>/dev/null)" || { echo "pkigen could not read the certificate: $info"; return 1; }
+  left="$(jq -r '((.not_after | fromdateiso8601) - now) / 86400 | floor' <<<"$info")"
+  if ((left < 30)); then
+    echo "the view certificates expire at $(jq -r .not_after <<<"$info"), in $left days."
+    echo "Run: mise run view:rotate-keys"
+    return 1
+  fi
+}
+
+# The principal and argocd-server read the view keys from the API at start, and they mount no copy.
+# A run of link.sh that stopped after viewkeys made new keys leaves both on the old ones. The main
+# container of each pod must have started after the newest view key Secret. viewkeys deletes and
+# creates a Secret to change it, so its creation time is the time of its content.
+check_view_pods_current() {
+  local ns=central-view-system secrets newest name started pod at late=()
+  # Only the creation times are read, so no Secret data enters this shell.
+  secrets="$(k -n "$ns" get secrets argocd-agent-ca argocd-agent-resource-proxy-tls argocd-agent-jwt argocd-secret \
+    -o jsonpath='{range .items[*]}{.metadata.creationTimestamp}{"\n"}{end}')" \
+    || { echo "could not read the view key Secrets of $ns. Run: CELL=management mise run cell:link"; return 1; }
+  newest="$(sort <<<"$secrets" | tail -n 1)"
+  [[ -n "$newest" ]] || { echo "the view key Secrets of $ns have no creation time. Run: CELL=management mise run cell:link"; return 1; }
+  for name in argocd-agent-principal argocd-server; do
+    started="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$name" -o json \
+      | jq -r --arg name "$name" '.items[] | .metadata.name as $pod | .status.containerStatuses[]? | select(.name == $name)
+        | "\($pod) \(.state.running.startedAt // "")"')" || { echo "could not read the pods of $name in $ns. Run: CELL=management mise run cell:link"; return 1; }
+    [[ -n "$started" ]] || { echo "$name has no pod in $ns. Run: CELL=management mise run cell:link"; return 1; }
+    while read -r pod at; do
+      if [[ -z "$at" || "$at" < "$newest" ]]; then
+        late+=("$pod started at ${at:-no time}")
+      fi
+    done <<<"$started"
+  done
+  if ((${#late[@]} > 0)); then
+    for pod in "${late[@]}"; do
+      printf '%s, before the newest view key at %s.\n' "$pod" "$newest"
+    done
+    echo "The pod reads the keys only at start, so it may hold old certificates."
+    echo "Run: mise run view:rotate-keys"
+    return 1
+  fi
+}
+
+# The telemetry gateway copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the
+# central view does.
+check_gateway_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n observability-system get networkpolicy telemetry-gateway -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy observability-system/telemetry-gateway"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the gateway listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_gateway_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n observability-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap observability-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+  peer_root_pods_current observability-system telemetry-gateway peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
+}
+
+# The hub copies the node address and the trust bundle of VIEW_CONTROL_PLANE, like the gateway does. It
+# also holds one tunnel for each cell of MESH_VIEW_CELLS, and Kiali needs them all.
+check_hub_env_address() {
+  local want got
+  want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
+  got="$(k -n mesh-view-system get networkpolicy mesh-view-hub -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8444)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy mesh-view-system/mesh-view-hub"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but the hub listener admits '$got'."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+}
+
+check_hub_peer_root() {
+  local live got
+  live="$(kubectl --context "kind-$VIEW_CONTROL_PLANE" -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem 2>/dev/null | pem_lines)" \
+    || { echo "could not read the trust bundle of $VIEW_CONTROL_PLANE"; return 1; }
+  got="$(k -n mesh-view-system get configmap peer-root -o jsonpath='{.data.root\.crt}' | pem_lines)"
+  if [[ -z "$live" || "$got" != "$live" ]]; then
+    echo "ConfigMap mesh-view-system/peer-root holds other roots than the live bundle of $VIEW_CONTROL_PLANE."
+    echo "Run: CELL=$CELL_NAME mise run cell:link"
+    return 1
+  fi
+  peer_root_pods_current mesh-view-system mesh-view-hub peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
+}
+
+# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not up, by the state that the hub serves.
+hub_tunnel_gaps() {
+  local entry cell
+  for entry in $MESH_VIEW_CELLS; do
+    cell="${entry%%=*}"
+    hub_cell_state "$cell" || echo "$cell"
+  done
+}
+
+# check_hub_tunnels succeeds when the last tunnel line of the hub for each cell of MESH_VIEW_CELLS is
+# tunnel_up. A tunnel ends when the SVID of the cell expires and starts again within seconds, so the
+# check waits up to 30 seconds for a cell that is between two tunnels.
+check_hub_tunnels() {
+  local end=$((SECONDS + 30)) down
+  until down="$(hub_tunnel_gaps)" && [[ -z "$down" ]]; do
+    if ((SECONDS >= end)); then
+      echo "the hub has no tunnel from: $(paste -sd' ' - <<<"$down")."
+      echo "Run: CELL=<cell> mise run cell:up for each of them, and read the state: mise run mesh:status"
+      echo "If every cell is down at once, a test may have left its firewall rule: mise run gate:m3:repair"
+      return 1
+    fi
+    sleep 3
+  done
+}
+
+# Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
+# and the images of each workload. cell:link renders them again from the live facts.
+for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+  comp="${entry%%:*}"
+  bundle="$BUNDLES/$comp/manifests.yaml"
+  check "The $comp objects match the bundle" check_harness_drift "$comp"
+  for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$bundle" 2>/dev/null | sort -u); do
+    check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
+  done
+  if [[ "$comp" == central-view ]]; then
+    check "The view listener admits the current $VIEW_CONTROL_PLANE node address" check_view_env_address
+    check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root
+    check "central-view-system holds only the Secrets of the view" check_view_secrets
+    check "The view certificates are valid for 30 days or more" check_view_cert_expiry
+    check "The principal and argocd-server started after the newest view key" check_view_pods_current
+  fi
+  if [[ "$comp" == telemetry-gateway ]]; then
+    check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address
+    check "ConfigMap peer-root of observability-system holds the live roots of $VIEW_CONTROL_PLANE" check_gateway_peer_root
+  fi
+  if [[ "$comp" == mesh-view-hub ]]; then
+    check "The hub listener admits the current $VIEW_CONTROL_PLANE node address" check_hub_env_address
+    check "ConfigMap peer-root of mesh-view-system holds the live roots of $VIEW_CONTROL_PLANE" check_hub_peer_root
+    check "The hub holds a tunnel from each cell of MESH_VIEW_CELLS" check_hub_tunnels
+  fi
+  for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
+      | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
+        | .metadata.namespace + "|" + (.kind | ascii_downcase) + "/" + .metadata.name'); do
+    check "${workload#*|} runs the images that build/images.env records" \
+      check_live_images "${workload%%|*}" "${workload#*|}" "CELL=$CELL_NAME mise run cell:link"
+  done
+done
 
 if ((failures > 0)); then
   log "$failures check(s) failed"
