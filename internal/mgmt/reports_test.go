@@ -271,6 +271,12 @@ func TestReportResultBodyRules(t *testing.T) {
 		got := r.one(it)
 		want(t, got, mgmtapi.OutcomeRefused, mgmtapi.ReasonPayloadInvalid, "body")
 	})
+	t.Run("body_cell_differs_from_item", func(t *testing.T) {
+		x := good
+		x.Cell = cell2
+		it := r.item(cell1, "result", x, r.signers[cell1], nil)
+		want(t, r.one(it), mgmtapi.OutcomeRefused, mgmtapi.ReasonPayloadInvalid, "cell")
+	})
 	// proof.Verify returns the claims and does not compare the pod, so the plane compares it.
 	t.Run("pod_differs_from_token", func(t *testing.T) {
 		x := good
@@ -495,9 +501,19 @@ func TestReportBindItem(t *testing.T) {
 	if !cellStatus(r.status(), cell2).Bound {
 		t.Fatal("the bind item did not bind the cell")
 	}
-	again := r.one(it)
-	want(t, again, mgmtapi.OutcomeRefused, mgmtapi.ReasonNonceInvalid, "consumed")
-	if again.RequestID == "" {
+	// The same request sent again, under another item ID, gets the stored outcome.
+	resend := it
+	resend.ID = "resend"
+	again := r.one(resend)
+	if again.Outcome != mgmtapi.OutcomeAccepted || again.Bind == nil || again.Bind.Status != mgmtapi.StatusBound || again.ID != "resend" {
+		t.Fatalf("resent bind item %+v", again)
+	}
+	// The same nonce with another token is refused, even under the first item ID.
+	req2 := mgmtapi.BindRequest{Nonce: n, Token: r.token(cell2, n, r.signers[cell2], func(c *kubetoken.Claims) { c.PodName = "celld-9" })}
+	other := mgmtapi.ReportItem{ID: it.ID, Cell: cell2, Kind: "bind", Body: json.RawMessage(marshal(t, req2))}
+	refusedAgain := r.one(other)
+	want(t, refusedAgain, mgmtapi.OutcomeRefused, mgmtapi.ReasonNonceInvalid, "consumed")
+	if refusedAgain.RequestID == "" {
 		t.Fatal("a refused bind item has no request ID")
 	}
 	badBody := mgmtapi.ReportItem{ID: "x", Cell: cell1, Kind: "bind", Body: json.RawMessage(`{"nonce":1}`)}
@@ -785,4 +801,102 @@ func TestConcurrentReportsAndBinds(t *testing.T) {
 	if !cellStatus(r.status(), cell2).Bound {
 		t.Fatal("cell2 is not bound")
 	}
+}
+
+func TestBindItemRepeatedAfterNonceTTL(t *testing.T) {
+	r, _ := boundRig(t)
+	n := r.nonce(cell2)
+	req := mgmtapi.BindRequest{Nonce: n, Token: r.token(cell2, n, r.signers[cell2], nil)}
+	it := mgmtapi.ReportItem{ID: "a", Cell: cell2, Kind: "bind", Body: json.RawMessage(marshal(t, req))}
+	if got := r.one(it); got.Outcome != mgmtapi.OutcomeAccepted {
+		t.Fatalf("%+v", got)
+	}
+	r.clk.Advance(3 * time.Minute)
+	it.ID = "b"
+	if got := r.one(it); got.Outcome != mgmtapi.OutcomeRefused {
+		t.Fatalf("a stored outcome outlived the nonce: %+v", got)
+	}
+}
+
+func slowBindRig(t *testing.T, itemTimeout, budget time.Duration) *rig {
+	t.Helper()
+	oi, ob := bindItemTimeout, bindBatchBudget
+	bindItemTimeout, bindBatchBudget = itemTimeout, budget
+	t.Cleanup(func() { bindItemTimeout, bindBatchBudget = oi, ob })
+	r := newRig(t, cell1, cell2, cell3)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.keys.mu.Lock()
+	r.keys.gate, r.keys.gateCell = make(chan struct{}), ""
+	r.keys.mu.Unlock()
+	t.Cleanup(func() {
+		r.keys.mu.Lock()
+		defer r.keys.mu.Unlock()
+		if r.keys.gate != nil {
+			close(r.keys.gate)
+			r.keys.gate = nil
+		}
+	})
+	return r
+}
+
+func (r *rig) bindItem(cell string) mgmtapi.ReportItem {
+	n := r.nonce(cell)
+	req := mgmtapi.BindRequest{Nonce: n, Token: r.token(cell, n, r.signers[cell], nil)}
+	return mgmtapi.ReportItem{ID: fmt.Sprintf("b-%d", itemSeq.Add(1)), Cell: cell, Kind: "bind", Body: json.RawMessage(marshal(r.t, req))}
+}
+
+func TestBindItemsOfOneBatchAreBounded(t *testing.T) {
+	r := slowBindRig(t, 300*time.Millisecond, time.Second)
+	o, e := r.newOp(cell1)
+	var items []mgmtapi.ReportItem
+	for range 4 {
+		items = append(items, r.bindItem(cell2))
+	}
+	for range 4 {
+		items = append(items, r.bindItem(cell3))
+	}
+	items = append(items, r.resultItem(resultFor(o, e, op.OutcomeApplied), r.signers[cell1]))
+	start := time.Now()
+	out := r.plane.Reports(t.Context(), mgmtapi.ReportBatch{Items: items}).Outcomes
+	if d := time.Since(start); d > 1300*time.Millisecond {
+		t.Fatalf("the batch took %v, want at most the budget plus one item deadline", d)
+	}
+	for i, it := range items[:8] {
+		want(t, out[i], mgmtapi.OutcomeRetry, mgmtapi.ReasonIssuerUnavailable, out[i].Detail)
+		if out[i].ID != it.ID {
+			t.Fatalf("outcome %d has ID %q", i, out[i].ID)
+		}
+	}
+	want(t, out[8], mgmtapi.OutcomeAccepted, "", "")
+	for _, c := range []string{cell2, cell3} {
+		if n := r.keys.count(c); n != 1 {
+			t.Fatalf("%s: %d fetches for four bind items, want 1", c, n)
+		}
+	}
+}
+
+func TestBindBatchBudgetStopsFetches(t *testing.T) {
+	r := slowBindRig(t, 5*time.Second, 100*time.Millisecond)
+	items := []mgmtapi.ReportItem{r.bindItem(cell2), r.bindItem(cell3)}
+	start := time.Now()
+	out := r.plane.Reports(t.Context(), mgmtapi.ReportBatch{Items: items}).Outcomes
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("the batch took %v", d)
+	}
+	want(t, out[0], mgmtapi.OutcomeRetry, mgmtapi.ReasonIssuerUnavailable, out[0].Detail)
+	want(t, out[1], mgmtapi.OutcomeRetry, mgmtapi.ReasonIssuerUnavailable, out[1].Detail)
+	if r.keys.count(cell3) != 0 {
+		t.Fatal("a bind item after the budget fetched keys")
+	}
+}
+
+func TestReportsRetryReasonsAreConstants(t *testing.T) {
+	r, _ := boundRig(t)
+	fs := &toggleStore{Store: r.store}
+	r.store = fs
+	r.restart(nil)
+	o, e := r.newOp(cell1)
+	fs.fail.Store(true)
+	got := r.one(r.resultItem(resultFor(o, e, op.OutcomeApplied), r.signers[cell1]))
+	want(t, got, mgmtapi.OutcomeRetry, mgmtapi.ReasonStore, "")
 }

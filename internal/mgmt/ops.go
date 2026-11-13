@@ -100,7 +100,9 @@ func (p *Plane) CreateOp(ctx context.Context, cell, kind string, args json.RawMe
 			IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt, Served: serve,
 		}
 		t.st.OpOrder = append(t.st.OpOrder, id)
-		trimOps(t.st)
+		if !trimOps(t.st, t.now) {
+			return refuse(mgmtapi.ReasonRateLimited, "too_many_open_ops")
+		}
 		t.dirty = true
 		return nil
 	})
@@ -110,17 +112,22 @@ func (p *Plane) CreateOp(ctx context.Context, cell, kind string, args json.RawMe
 	return o, slices.Clone(env), nil
 }
 
-// trimOps drops the oldest final operations until OpHistory remain. When none is final it drops the
-// oldest operation.
-func trimOps(st *State) {
+// trimOps drops operations until OpHistory remain: the oldest final one first, then the oldest one
+// that is no longer open. It never drops an open operation, and reports false when only open
+// operations stand in the way.
+func trimOps(st *State, now time.Time) bool {
 	for len(st.OpOrder) > OpHistory {
 		i := slices.IndexFunc(st.OpOrder, func(id string) bool { return st.Ops[id].Final != "" })
 		if i < 0 {
-			i = 0
+			i = slices.IndexFunc(st.OpOrder, func(id string) bool { return !st.Ops[id].open(now) })
+		}
+		if i < 0 {
+			return false
 		}
 		delete(st.Ops, st.OpOrder[i])
 		st.OpOrder = slices.Delete(st.OpOrder, i, i+1)
 	}
+	return true
 }
 
 // OpenOps returns the envelopes of the served operations that have no final result and are not
@@ -173,7 +180,7 @@ func (p *Plane) CloseOp(ctx context.Context, id string) error {
 			return ErrOpUnknown
 		case o.Final != "":
 			return ErrOpFinal
-		case t.now.Before(o.ExpiresAt):
+		case o.open(t.now):
 			return ErrOpNotExpired
 		}
 		o.Final = OpAbandoned

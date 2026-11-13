@@ -98,8 +98,10 @@ func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) 
 
 func (p *Plane) judge(t *txn, cell string, cs *CellState, keys mgmtapi.ClusterKeys, fetchedAt time.Time) (CheckResult, error) {
 	settle := func(res CheckResult) (CheckResult, error) {
-		cs.CheckedAt, cs.LastCheck = fetchedAt, string(res)
-		t.dirty = true
+		if !cs.CheckedAt.Equal(fetchedAt) || cs.LastCheck != string(res) {
+			cs.CheckedAt, cs.LastCheck = fetchedAt, string(res)
+			t.dirty = true
+		}
 		return res, nil
 	}
 	if keys.Issuer != cs.Issuer {

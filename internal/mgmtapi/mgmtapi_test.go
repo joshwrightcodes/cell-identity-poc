@@ -84,7 +84,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		ReasonStoreFailed, ReasonStateUnverifiable, ReasonSpecInvalid,
 		ReasonCellUnknown, ReasonNonceInvalid, ReasonTokenInvalid, ReasonIssuerUntrusted, ReasonIssuerUnavailable,
 		ReasonKeysUntrusted, ReasonRateLimited, ReasonRestoreActive, ReasonNotBound, ReasonConflict,
-		ReasonProofMissing, ReasonProofInvalid, ReasonStale,
+		ReasonProofMissing, ReasonProofInvalid, ReasonStale, ReasonStore, ReasonInternal,
 	}
 	want := []string{
 		"signature_invalid", "payload_invalid", "env_mismatch", "revision_old", "revision_conflict",
@@ -92,7 +92,7 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		"store_failed", "state_unverifiable", "spec_invalid",
 		"cell_unknown", "nonce_invalid", "token_invalid", "issuer_untrusted", "issuer_unavailable",
 		"keys_untrusted", "rate_limited", "restore_active", "not_bound", "conflict",
-		"proof_missing", "proof_invalid", "stale",
+		"proof_missing", "proof_invalid", "stale", "store", "internal",
 	}
 	seen := map[string]bool{}
 	for i, r := range all {

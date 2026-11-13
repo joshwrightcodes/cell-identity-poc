@@ -341,6 +341,10 @@ func (p *Plane) checkStaged() error {
 	_, statErr := os.Stat(p.nextKeyPath())
 	exists := statErr == nil
 	_, valid := p.stagedKey(st)
+	if valid && st.StagedKeySHA256 == fingerprint(p.snap.Load().pub) {
+		// A rotation that crashed after it wrote the key file: the staged key is the signing key.
+		valid = false
+	}
 	if exists && !valid {
 		dest := p.nextKeyPath() + ".stale-" + strconv.FormatInt(p.cfg.Now().Unix(), 10)
 		if err := os.Rename(p.nextKeyPath(), dest); err != nil {

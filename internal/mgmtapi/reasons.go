@@ -35,6 +35,8 @@ const (
 	ReasonProofMissing      = "proof_missing"
 	ReasonProofInvalid      = "proof_invalid"
 	ReasonStale             = "stale"
+	ReasonStore             = "store"
+	ReasonInternal          = "internal"
 )
 
 // The values of ItemOutcome.Outcome. The reason of an item outcome reuses the detail reasons above.

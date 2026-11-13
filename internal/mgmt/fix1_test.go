@@ -297,6 +297,7 @@ func TestConcurrentChecksMakeOneUpdate(t *testing.T) {
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	r.clk.Advance(61 * time.Second)
 	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"))
+	base := r.keys.count(cell1)
 	r.keys.mu.Lock()
 	r.keys.gate, r.keys.gateCell = make(chan struct{}), cell1
 	gate := r.keys.gate
@@ -308,9 +309,12 @@ func TestConcurrentChecksMakeOneUpdate(t *testing.T) {
 			res <- c
 		}()
 	}
-	for r.keys.count(cell1) < 2 {
+	// One fetch per cell is in flight at a time, so the second check waits for the key slot while the
+	// first holds the gate. Both checks are in the plane before the gate opens.
+	for r.keys.count(cell1) < base+1 {
 		time.Sleep(time.Millisecond)
 	}
+	time.Sleep(50 * time.Millisecond)
 	close(gate)
 	got := []string{string(<-res), string(<-res)}
 	slices.Sort(got)

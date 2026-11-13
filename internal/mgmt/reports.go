@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"log/slog"
 	"regexp"
@@ -41,6 +42,9 @@ const (
 // bindItemTimeout is the deadline of one bind item inside a report batch. A variable so that a test
 // can lower it.
 var bindItemTimeout = 5 * time.Second
+
+// bindBatchBudget is the time that the bind items of one Reports call share.
+var bindBatchBudget = 8 * time.Second
 
 var opIDRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
@@ -82,6 +86,7 @@ type cellRuntime struct {
 
 type liveState struct {
 	cells map[string]*cellRuntime
+	binds map[bindKey]storedBind
 }
 
 func (l *liveState) cell(name string) *cellRuntime {
@@ -141,7 +146,8 @@ func (p *Plane) ForgedSeen(cell string) []ForgedSeen {
 	return nil
 }
 
-// Wait blocks until the background hint checks have finished.
+// Wait blocks until the background hint checks have finished. The caller stops Report and Reports
+// calls first, because a hint that starts while Wait runs at a zero count is not waited for.
 func (p *Plane) Wait() { p.bg.Wait() }
 
 // queueHint starts a hint key check for a bound cell, at most once per hintEvery for each cell. The
@@ -184,11 +190,13 @@ func (p *Plane) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.Repo
 		cell string
 	}
 	var pending []pendingResult
+	binds := &bindBatch{failed: map[string]bool{}}
+	defer binds.stop()
 	for i, it := range b.Items {
 		var o mgmtapi.ItemOutcome
 		switch it.Kind {
 		case kindBind:
-			o = p.reportBind(ctx, it)
+			o = p.reportBind(ctx, it, binds)
 		case kindResult, kindStatus:
 			now := p.cfg.Now()
 			claims, bad := p.verifyItem(it, now)
@@ -242,7 +250,7 @@ func (p *Plane) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.Repo
 		o := mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: outcomes[j]}
 		switch {
 		case err != nil:
-			o = mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: "store"}
+			o = mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: mgmtapi.ReasonStore}
 		case o.Outcome == mgmtapi.OutcomeForgedSeen:
 			p.noteForged(ctx, pr.cell, pr.res)
 		}
@@ -360,25 +368,103 @@ func (p *Plane) reportStatus(it mgmtapi.ReportItem, claims clusterjwt.Claims, no
 	return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeAccepted}
 }
 
-// reportBind runs a bind item through Plane.Bind under a deadline of its own. A key fetch that does
-// not finish in time answers retry, and the other items of the batch go on.
-func (p *Plane) reportBind(ctx context.Context, it mgmtapi.ReportItem) mgmtapi.ItemOutcome {
+// bindBatch is what the bind items of one Reports call share: one time budget, and the cells whose
+// key fetch already failed.
+type bindBatch struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	failed map[string]bool
+}
+
+func (b *bindBatch) stop() {
+	if b.cancel != nil {
+		b.cancel()
+	}
+}
+
+// storedBind is the outcome of a bind that succeeded, kept for NonceTTL so that the same request,
+// sent again after a cut response, gets the same answer.
+type storedBind struct {
+	resp    mgmtapi.BindResponse
+	expires time.Time
+}
+
+type bindKey struct {
+	cell, nonce string
+	token       [sha256.Size]byte
+}
+
+const maxStoredBinds = 4096
+
+func (p *Plane) storeBind(k bindKey, resp mgmtapi.BindResponse) {
+	now := p.cfg.Now()
+	p.rmu.Lock()
+	defer p.rmu.Unlock()
+	if p.rt.binds == nil {
+		p.rt.binds = map[bindKey]storedBind{}
+	}
+	if len(p.rt.binds) >= maxStoredBinds {
+		for key, v := range p.rt.binds {
+			if !now.Before(v.expires) {
+				delete(p.rt.binds, key)
+			}
+		}
+		if len(p.rt.binds) >= maxStoredBinds {
+			return
+		}
+	}
+	p.rt.binds[k] = storedBind{resp: resp, expires: now.Add(p.cfg.NonceTTL)}
+}
+
+func (p *Plane) storedBind(k bindKey) (mgmtapi.BindResponse, bool) {
+	p.rmu.Lock()
+	defer p.rmu.Unlock()
+	v, ok := p.rt.binds[k]
+	if !ok || !p.cfg.Now().Before(v.expires) {
+		return mgmtapi.BindResponse{}, false
+	}
+	return v.resp, true
+}
+
+// reportBind runs a bind item through Plane.Bind under a deadline of its own, inside the budget of
+// the batch. A key fetch that does not finish in time answers retry, and the other items go on. After
+// a cell failed once in a batch, its later bind items answer retry with no fetch.
+func (p *Plane) reportBind(ctx context.Context, it mgmtapi.ReportItem, b *bindBatch) mgmtapi.ItemOutcome {
+	retry := func(detail string) mgmtapi.ItemOutcome {
+		return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: mgmtapi.ReasonIssuerUnavailable, Detail: detail}
+	}
 	var req mgmtapi.BindRequest
 	if err := record.DecodeStrict(it.Body, &req); err != nil {
 		return refused(it, mgmtapi.ReasonPayloadInvalid, "body")
 	}
-	ictx, cancel := context.WithTimeout(ctx, bindItemTimeout)
+	if b.ctx == nil {
+		b.ctx, b.cancel = context.WithTimeout(ctx, bindBatchBudget)
+	}
+	switch {
+	case b.failed[it.Cell]:
+		return retry("batch")
+	case b.ctx.Err() != nil:
+		return retry("budget")
+	}
+	ictx, cancel := context.WithTimeout(b.ctx, bindItemTimeout)
 	defer cancel()
+	key := bindKey{cell: it.Cell, nonce: req.Nonce, token: sha256.Sum256([]byte(req.Token))}
 	resp, err := p.Bind(ictx, it.Cell, req)
 	if err == nil {
+		p.storeBind(key, resp)
 		return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeAccepted, Bind: &resp}
 	}
 	var e *Error
 	switch {
 	case !errors.As(err, &e):
-		return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: "internal"}
+		return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: mgmtapi.ReasonInternal}
 	case e.Reason == mgmtapi.ReasonIssuerUnavailable || ictx.Err() != nil:
-		return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: mgmtapi.ReasonIssuerUnavailable, Detail: e.Detail}
+		b.failed[it.Cell] = true
+		return retry(e.Detail)
+	case e.Reason == mgmtapi.ReasonNonceInvalid && e.Detail == "consumed":
+		if resp, ok := p.storedBind(key); ok {
+			return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeAccepted, Bind: &resp}
+		}
 	}
 	o := refused(it, e.Reason, e.Detail)
 	o.RequestID = newRequestID()

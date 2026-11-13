@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
@@ -225,6 +227,13 @@ func TestCloseOpAbandoned(t *testing.T) {
 		t.Fatalf("close of an unknown operation: %v", err)
 	}
 	r.clk.Advance(6 * time.Second)
+	if err := r.plane.CloseOp(t.Context(), o.ID); !errors.Is(err, ErrOpNotExpired) {
+		t.Fatalf("close inside the 60 s grace: %v", err)
+	}
+	if !r.isOpen(o.ID) {
+		t.Fatal("the operation left the served list inside the grace time")
+	}
+	r.clk.Advance(60 * time.Second)
 	if err := r.plane.CloseOp(t.Context(), o.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +260,34 @@ func TestCloseOpAbandoned(t *testing.T) {
 	}
 }
 
+func TestOpHistoryNeverDropsAnOpenOp(t *testing.T) {
+	now := time.Now()
+	st := newState("fp")
+	add := func(id string, expires time.Time) {
+		st.Ops[id] = &OpState{ExpiresAt: expires}
+		st.OpOrder = append(st.OpOrder, id)
+	}
+	add("long-open", now.Add(time.Hour))
+	for i := range OpHistory {
+		add(fmt.Sprintf("expired-%03d", i), now.Add(-time.Hour))
+	}
+	if !trimOps(st, now) || len(st.OpOrder) != OpHistory {
+		t.Fatalf("trim: %d ids", len(st.OpOrder))
+	}
+	if st.Ops["long-open"] == nil || st.Ops["expired-000"] != nil {
+		t.Fatal("an open operation was dropped before an expired one")
+	}
+	all := newState("fp")
+	for i := range OpHistory + 1 {
+		id := fmt.Sprintf("open-%03d", i)
+		all.Ops[id] = &OpState{ExpiresAt: now.Add(time.Hour)}
+		all.OpOrder = append(all.OpOrder, id)
+	}
+	if trimOps(all, now) || len(all.OpOrder) != OpHistory+1 {
+		t.Fatal("trim dropped an open operation")
+	}
+}
+
 func TestOpHistoryDropsOldestFinalFirst(t *testing.T) {
 	st := newState("fp")
 	add := func(id, final string) {
@@ -261,7 +298,7 @@ func TestOpHistoryDropsOldestFinalFirst(t *testing.T) {
 	for i := range OpHistory + 1 {
 		add(fmt.Sprintf("final-%03d", i), op.OutcomeApplied)
 	}
-	trimOps(st)
+	trimOps(st, time.Now())
 	if len(st.OpOrder) != OpHistory || len(st.Ops) != OpHistory {
 		t.Fatalf("%d ids, %d ops", len(st.OpOrder), len(st.Ops))
 	}
@@ -543,8 +580,9 @@ func TestSeqGuardKeyCheckIsManual(t *testing.T) {
 }
 
 func TestRunChecksUsesPeriodicSource(t *testing.T) {
-	r, _ := boundRig(t)
-	r.mod = func(c *Config) { c.CheckEvery = 10 * time.Second }
+	r, reader := boundRig(t)
+	_, meter := reader, r.plane.cfg.Meter
+	r.mod = func(c *Config) { c.CheckEvery = 10 * time.Second; c.Meter = meter }
 	r.restart(nil)
 	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckUnchanged {
 		t.Fatalf("warm check: %v, %v", res, err)
@@ -555,13 +593,66 @@ func TestRunChecksUsesPeriodicSource(t *testing.T) {
 	calls := r.keys.count(cell1)
 	r.clk.Advance(11 * time.Second)
 	r.ticks <- r.clk.Now()
-	r.ticks <- r.clk.Now()
+	periodic := func() int64 {
+		return counterByAttr(t, reader, "mgmtd.keycheck.results", attribute.String("via", ViaPeriodic))
+	}
+	for deadline := time.Now().Add(5 * time.Second); periodic() == 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
 	if got := r.keys.count(cell1); got != calls {
 		t.Fatalf("a periodic check within the cache time made %d fetches", got-calls)
 	}
-	if c := cellStatus(r.status(), cell1); c.CheckedAt.IsZero() {
-		t.Fatal("no check ran")
+	if n := counterByAttr(t, reader, "mgmtd.keycheck.results", attribute.String("via", ViaPeriodic)); n != 1 {
+		t.Fatalf("%d periodic checks ran, want 1", n)
 	}
 	cancel()
 	<-done
+}
+
+func TestCrashedRotationClearsTheStage(t *testing.T) {
+	r, _ := boundRig(t)
+	staged, err := r.plane.StageKey(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The crash: the key file already holds the staged key, and the state still names it as staged.
+	next, err := loadKey(filepath.Join(r.dir, "ed25519.next.key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteKey(filepath.Join(r.dir, "ed25519.key"), next); err != nil {
+		t.Fatal(err)
+	}
+	r.restart(nil)
+	if !r.plane.PublicKey().Equal(staged) {
+		t.Fatal("the plane does not sign with the key file")
+	}
+	if r.status().StagedKey != "" {
+		t.Fatal("the state still names the signing key as staged")
+	}
+	if _, err := os.Stat(filepath.Join(r.dir, "ed25519.next.key")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the staged file stayed")
+	}
+	again, err := r.plane.StageKey(t.Context())
+	if err != nil || again.Equal(staged) {
+		t.Fatalf("stage returned the signing key: %v", err)
+	}
+}
+
+func TestCachedCheckThatChangesNothingDoesNotSave(t *testing.T) {
+	r, _ := boundRig(t)
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckUnchanged {
+		t.Fatal(res, err)
+	}
+	r.clk.Advance(10 * time.Second)
+	seq := r.plane.snapshotSeq()
+	for _, via := range []string{ViaPeriodic, ViaHint} {
+		if res, err := r.plane.KeyCheckVia(t.Context(), cell1, via); err != nil || res != CheckUnchanged {
+			t.Fatal(res, err)
+		}
+	}
+	if got := r.plane.snapshotSeq(); got != seq {
+		t.Fatalf("cached checks saved the state %d times", got-seq)
+	}
 }
