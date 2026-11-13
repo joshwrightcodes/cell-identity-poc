@@ -118,6 +118,9 @@ type StreamHandler struct {
 	mux   *http.ServeMux
 	hints hintBook
 
+	// beforeClaim runs between the record check and the claim. Tests use it.
+	beforeClaim func()
+
 	mu      sync.Mutex
 	streams map[string]map[string]*stream
 }
@@ -276,8 +279,8 @@ func (o out) send(f gwapi.Frame) error {
 	if err := gwapi.Encode(o.w, f); err != nil {
 		return err
 	}
-	// The telemetry wrapper hides http.Flusher, so Encode may not flush. The controller reaches
-	// the writer below it.
+	// Encode flushes and drops the error. The controller returns the flush error of the HTTP/2
+	// layer, which forward needs before it forgets a retry.
 	return o.rc.Flush()
 }
 
@@ -534,7 +537,14 @@ func (h *StreamHandler) handle(ctx context.Context, cell string, me *stream, o o
 			refuse(gwapi.ReasonCellRevoked, "pod", me.pod)
 			return errEndStream
 		}
-		l, err := h.st.Claim(ctx, cell, me.pod)
+		if h.beforeClaim != nil {
+			h.beforeClaim()
+		}
+		l, err := h.st.ClaimLive(ctx, cell, me.pod)
+		if errors.Is(err, ErrCellNotLive) {
+			refuse(gwapi.ReasonCellRevoked, "pod", me.pod)
+			return errEndStream
+		}
 		if err != nil {
 			return err
 		}

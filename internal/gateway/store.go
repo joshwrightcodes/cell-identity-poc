@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -43,11 +44,13 @@ const (
 // Store is the SQLite state of the gateway. Every method runs in one immediate transaction on the
 // only connection.
 type Store struct {
-	db      *sql.DB
-	n       *gwapi.Notifier
-	now     func() time.Time
-	log     *slog.Logger
-	epoch   atomic.Uint64
+	db    *sql.DB
+	n     *gwapi.Notifier
+	now   func() time.Time
+	log   *slog.Logger
+	epoch atomic.Uint64
+	// raiseMu keeps the commit of a raise and the store of the atomic copy in one order.
+	raiseMu sync.Mutex
 	storeID string
 
 	maxItems, maxBytes, perCell, perCellBytes, maxBinds int

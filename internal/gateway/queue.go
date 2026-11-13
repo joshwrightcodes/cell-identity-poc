@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -107,9 +108,41 @@ func enqueue(tx *sql.Tx, cell, id string, keyEpoch uint64, envelope []byte) (add
 // Claim leases the oldest item of cell that is queued or whose lease has expired, for 60 s, under
 // the next global fence. It returns nil and no error when there is none.
 func (s *Store) Claim(ctx context.Context, cell, holder string) (*Lease, error) {
+	return s.claim(ctx, cell, holder, false)
+}
+
+// ErrCellNotLive means the record of a cell is missing or revoked.
+var ErrCellNotLive = errors.New("cell has no live record")
+
+// ClaimLive is Claim, and it also checks in the same transaction that the cell has a record that is
+// not revoked. It returns ErrCellNotLive and leases nothing otherwise.
+func (s *Store) ClaimLive(ctx context.Context, cell, holder string) (*Lease, error) {
+	return s.claim(ctx, cell, holder, true)
+}
+
+func (s *Store) claim(ctx context.Context, cell, holder string, requireLive bool) (*Lease, error) {
 	var l *Lease
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		l = nil
+		if requireLive {
+			var body []byte
+			err := tx.QueryRow(`SELECT cell FROM records WHERE name = ?`, cell).Scan(&body)
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrCellNotLive
+			}
+			if err != nil {
+				return err
+			}
+			var rec struct {
+				Revoked bool `json:"revoked"`
+			}
+			if err := json.Unmarshal(body, &rec); err != nil {
+				return err
+			}
+			if rec.Revoked {
+				return ErrCellNotLive
+			}
+		}
 		now := s.now()
 		var seq int64
 		var opID string
@@ -219,6 +252,8 @@ func (s *Store) RaiseEpoch(ctx context.Context, seen op.Fence) error {
 	if seen.Epoch > MaxRaisableEpoch {
 		return fmt.Errorf("%w: %d", ErrEpochOutOfRange, seen.Epoch)
 	}
+	s.raiseMu.Lock()
+	defer s.raiseMu.Unlock()
 	var next uint64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		next = 0

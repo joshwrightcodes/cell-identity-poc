@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,6 +36,7 @@ type envdSetup struct {
 	streams func() map[string]int
 	refuse  func() map[string]mgmtapi.BindRefusal
 	hints   func() []mgmtapi.KeyHint
+	log     *slog.Logger
 }
 
 func newEnvdFixture(t *testing.T, e *gwEnv, s envdSetup, extra ...EnvdOption) *envdFixture {
@@ -44,7 +46,7 @@ func newEnvdFixture(t *testing.T, e *gwEnv, s envdSetup, extra ...EnvdOption) *e
 	if s.hints != nil {
 		opts = append(opts, WithKeyHints(s.hints))
 	}
-	h := NewEnvdHandler(e.st, e.g.keys(), id, s.streams, s.refuse, nil, opts...)
+	h := NewEnvdHandler(e.st, e.g.keys(), id, s.streams, s.refuse, s.log, opts...)
 	tlsCfg := EnvdServerTLS(e.ca.Source(t, gwSPIFFE), e.ca.Bundle(), id)
 	srv := NewEnvdServer(h, tlsCfg, nil)
 	ln := ListenEnvd(listenDual(t), tlsCfg)

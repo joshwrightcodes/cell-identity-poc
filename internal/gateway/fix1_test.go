@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"log/slog"
 	"math"
 	"net"
 	"net/http"
@@ -258,7 +259,8 @@ func TestSyncRefusesOtherEnv(t *testing.T) {
 
 func TestSyncSkipsAnEnvelopeThatCannotBeLeased(t *testing.T) {
 	e := newGwEnv(t)
-	f := newEnvdFixture(t, e, envdSetup{})
+	logs := &lockedBuf{}
+	f := newEnvdFixture(t, e, envdSetup{log: slog.New(slog.NewJSONHandler(logs, nil))})
 	big := func(n int, pad int) json.RawMessage {
 		payload, _ := json.Marshal(map[string]any{"id": opID(n), "cell": cell1, "keyEpoch": 1, "pad": strings.Repeat("x", pad)})
 		env, _ := json.Marshal(map[string]any{"payloadType": op.PayloadType, "payload": base64.StdEncoding.EncodeToString(payload), "signatures": []any{}})
@@ -270,9 +272,8 @@ func TestSyncSkipsAnEnvelopeThatCannotBeLeased(t *testing.T) {
 	if resp := decodeSync(t, code, body); resp.Status.Queued[cell1] != 1 {
 		t.Fatalf("queued %+v, want only the small operation", resp.Status.Queued)
 	}
-	if !strings.Contains(e.logs.String(), "sync_op_too_large") {
-		// envd logs go to its own logger; the test handler has none, so look at the queue only.
-		t.Log("log line not captured")
+	if !strings.Contains(logs.String(), "sync_op_too_large") {
+		t.Fatalf("no sync_op_too_large line in %q", logs.String())
 	}
 }
 
