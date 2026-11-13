@@ -76,6 +76,7 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the first key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
+	renderRegistryAtCleanup(t)
 	first := time.Now()
 	before := cellStatusOf(t, cell)
 	if len(before.Kids) != 1 {
@@ -121,6 +122,7 @@ func TestM4BindHealsRotation(t *testing.T) {
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
+	renderRegistryAtCleanup(t)
 	t.Logf("waiting %s, so that the update gap has passed before the rotation", keyUpdateGap)
 	time.Sleep(keyUpdateGap)
 	start := time.Now().Add(-logMargin)
@@ -157,12 +159,13 @@ func mgmtdLog(t *testing.T, since time.Time) string {
 }
 
 // makeRevision signs a new revision for a cell: a key check first, a rotation of the service account key with the M2 helpers, and
-// after the update gap a key check that gives keys_updated. The cleanup of rotateAPIKey repairs the API server when the test ends.
+// after the update gap a key check that gives keys_updated. The cleanup of rotateAPIKey repairs the API server when the test ends, and then the registries follow the record.
 func makeRevision(t *testing.T, cell string) {
 	t.Helper()
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
+	renderRegistryAtCleanup(t)
 	first := time.Now()
 	rotateAPIKey(t, cell)
 	if wait := keyUpdateGap - time.Since(first); wait > 0 {

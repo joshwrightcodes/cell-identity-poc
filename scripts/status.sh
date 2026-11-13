@@ -96,7 +96,7 @@ run_telemetry() {
 # management_plane prints the field management: the status of mgmtd and of the host service. The pin and the root
 # of the host service are checked with the functions of cell:verify, which print the reason and the command.
 management_plane() {
-  local st rc=0 serve hs check=""
+  local st rc=0 serve hs check="" crc=0
   st="$(mise run mgmt -- status 2>/dev/null)" || rc=$?
   if ((rc != 0)) || ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
     jq -Rsc --argjson rc "$rc" '(split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
@@ -107,8 +107,10 @@ management_plane() {
   hs="$("$serve" status 2>/dev/null)" || hs=""
   jq -e 'type == "object"' >/dev/null 2>&1 <<<"$hs" || hs='{"running":false}'
   if jq -e '.running == true and (.expires_soon | not)' >/dev/null <<<"$hs"; then
-    check="$(check_mgmt_hostsvc_pin 2>&1)" || true
-    [[ -n "$check" ]] || check="$(check_mgmt_hostsvc_root 2>&1)" || true
+    check="$(check_mgmt_hostsvc_pin 2>&1)" || crc=$?
+    if ((crc == 0)); then check="$(check_mgmt_hostsvc_root 2>&1)" || crc=$?; fi
+    # A check that fails with no output still counts as a failure.
+    if ((crc != 0)) && [[ -z "$check" ]]; then check="the host service check failed. Run: mise run hostsvc:serve -- status"; fi
   fi
   jq -c --argjson hs "$hs" --arg check "$check" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
     restoreActive, pendingDrops, cells: [.cells[]? | {name, bound, lastCheck}], hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
@@ -126,14 +128,14 @@ management_problems() {
       | [
         (if $sig > $app and .lagSince != null and (now - (.lagSince | ts)) > 120
          then "signed revision \(.signed | rev) is above applied \(.applied | rev) for more than 2 minutes. Run: \(cp)" else empty end),
-        (if .lastRefusal != null and (.lastRefusal.at | ts) > ((.appliedAt // "") | ts)
+        (if .lastRefusal != null and ((.lastRefusal.at | ts) == 0 or (.lastRefusal.at | ts) > ((.appliedAt // "") | ts))
          then "envd refused a spec: \(.lastRefusal.reason) at revision \(.lastRefusal.revision | rev), after the last apply. Run: \(cp)" else empty end),
         (if (.storeError // "") != "" then "envd reports a store error: \(.storeError). Run: \(cp)" else empty end),
         (if .restoreActive then "a restore is active, so mgmtd serves an older revision. Run: mise run mgmt -- restore --revision latest" else empty end),
         (if .lastReportAt == null or (now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
-        (.cells[] | select(.lastCheck == "keys_untrusted") | "the key check of \(.name) is keys_untrusted. Run: mise run mgmt -- keycheck --cell \(.name)"),
+        (.cells[] | select(.lastCheck == "keys_untrusted") | "the key check of \(.name) is keys_untrusted. Run: CELL=\(.name) mise run cell:restart"),
         (.cells[] | select(.lastCheck == "issuer_untrusted") | "the key check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
-        (.cells[] | select(.lastCheck == "issuer_unavailable") | "the key check of \(.name) is issuer_unavailable. Run: CELL=\(.name) mise run cell:verify"),
+        (.cells[] | select(.lastCheck == "issuer_unavailable") | "the key check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
           | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
         (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"

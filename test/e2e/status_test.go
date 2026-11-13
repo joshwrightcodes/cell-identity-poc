@@ -240,7 +240,7 @@ func TestM4StatusShowsSpec(t *testing.T) {
 		t.Errorf("management %+v, want the signed %v and applied %v revisions of mgmtd ctl status", p, live.Signed, live.Applied)
 	}
 	if age := time.Since(p.LastReportAt); p.LastReportAt.IsZero() || age > time.Minute+statusSampleMax {
-		t.Errorf("lastReportAt is %v, want a report from envd in the last minute", p.LastReportAt)
+		t.Errorf("lastReportAt is %v, want a report from envd in the last %v", p.LastReportAt, time.Minute+statusSampleMax)
 	}
 	if p.Restore {
 		t.Error("restoreActive is true, want false")

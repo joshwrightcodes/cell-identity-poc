@@ -14,4 +14,7 @@ fi
 
 ready="$(k -n mgmt-system get pod mgmtd-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
 [[ "$ready" == True ]] || json_fail mgmt "pod mgmtd-0 is absent or not Ready. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
-exec kubectl --context "kind-$CELL_NAME" -n mgmt-system exec mgmtd-0 -c mgmtd -- /ko-app/mgmtd ctl "$@"
+# The reads that harness:status and the tests make carry a request timeout, so a pod that hangs cannot stall them.
+timeout=()
+case "${1:-}" in status | records | pubkey | keys) timeout=(--request-timeout=60s) ;; esac
+exec kubectl --context "kind-$CELL_NAME" ${timeout[@]+"${timeout[@]}"} -n mgmt-system exec mgmtd-0 -c mgmtd -- /ko-app/mgmtd ctl "$@"

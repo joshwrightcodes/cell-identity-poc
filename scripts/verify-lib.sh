@@ -271,3 +271,27 @@ check_celld_mgmt_root() {
   fi
   peer_root_pods_current cell-identity-system celld mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
+
+# check_registry_current <namespace> <component> compares each record in ConfigMap cell-registry of the
+# namespace with the record that mgmtd serves, as compact JSON. The render of the component copies the
+# records, so a record that mgmtd signed after the last link leaves the registry behind. A mismatch prints
+# the link command of the component. LINK_ONLY=<component> renders only that component.
+check_registry_current() {
+  local ns="$1" comp="$2" fix served cm key cell held bad=""
+  fix="CELL=management LINK_ONLY=$comp mise run cell:link"
+  served="$(cd "$ROOT" && mise run mgmt -- records 2>/dev/null)" && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$served" \
+    || { echo "mise run mgmt -- records failed: ${served:-no output}"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  cm="$(k -n "$ns" get configmap cell-registry -o json 2>&1)" || { echo "could not read ConfigMap $ns/cell-registry: $cm"; echo "Run: $fix"; return 1; }
+  while IFS= read -r key; do
+    cell="${key%.dsse.json}"
+    held="$(jq -c --arg k "$key" '.data[$k] | fromjson' <<<"$cm" 2>/dev/null)" || held=""
+    if [[ -z "$held" || "$held" != "$(jq -c --arg c "$cell" '.[$c] // "absent"' <<<"$served")" ]]; then
+      bad+="$cell "
+    fi
+  done < <(jq -r '.data // {} | keys[] | select(endswith(".dsse.json"))' <<<"$cm")
+  if [[ -n "$bad" ]]; then
+    echo "ConfigMap $ns/cell-registry holds another record than mgmtd serves for: ${bad% }."
+    echo "Run: $fix"
+    return 1
+  fi
+}

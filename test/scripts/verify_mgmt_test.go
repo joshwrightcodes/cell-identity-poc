@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -28,6 +29,7 @@ case " $* " in
   *" get statefulset mgmtd "*) cat "$d/sts.json" ;;
   *" get configmap peer-root "*) printf '%s' "$(cat "$d/cm-peer-root.pem")" ;;
   *" get pods -l app.kubernetes.io/name=mgmtd "*) cat "$d/pods.json" ;;
+  *" get configmap cell-registry "*) cat "$d/registry.json" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -35,6 +37,7 @@ esac
 const verifyMise = `#!/usr/bin/env bash
 case "$1 $2 $3 $4" in
   "run pki -- trust-bundle") cat ;;
+  "run mgmt -- records") cat "$STUB_DIR/records.json" ;;
   "run hostsvc -- facts") printf '{"name":"dev-cp","nodeIP":"%s"}\n' "$(cat "$STUB_DIR/cp-node-ip")" ;;
   *) echo "unexpected mise call: $*" >&2; exit 2 ;;
 esac
@@ -91,12 +94,22 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 	pods := func(sha string) string {
 		return fmt.Sprintf(`{"items":[{"metadata":{"name":"mgmtd-0","annotations":{"poc.internal/peer-root-sha256":"%s"}}}]}`, sha)
 	}
+	// registry is ConfigMap cell-registry with the record of dev-cell-1 as given and one of dev-cell-2. The stored JSON has
+	// other spacing than the served one, so only a compact comparison finds them equal.
+	registry := func(cell1 string) string {
+		b, _ := json.Marshal(map[string]any{"data": map[string]string{"dev-cell-1.dsse.json": cell1,
+			"dev-cell-2.dsse.json": `{ "payload": "counter2", "signatures": [1] }`, "signers.pub": "key\n"}})
+		return string(b)
+	}
 	healthy := map[string]string{
 		"mgmt-root.pem": mgmtRoot, "cp-root.pem": cpRoot, "cm-pin.pem": pinPEM, "live-pin.pem": pinPEM, "pod-pin-annotation": pinSHA,
 		"serve-cert-sha": pinSHA, "serve-root-sha": goRootSHA(t, mgmtRoot), "policy.json": policy("192.168.5.2", "10.9.0.9"),
 		"sts.json": sts("192.168.5.2"), "getent": `192.168.5.2 STREAM host.docker.internal\n`, "cp-node-ip": "10.9.0.9",
 		"kind-clusters": "management\ndev-cp\ndev-cell-1\ndev-cell-2\nrogue\n", "cm-peer-root.pem": cpRoot, "pods.json": pods(cpSHA),
+		"records.json":  `{"dev-cell-1":{"payload":"counter7","signatures":[1]},"dev-cell-2":{"payload":"counter2","signatures":[1]}}`,
+		"registry.json": registry(`{"payload":"counter7", "signatures":[1]}`),
 	}
+	registryFix := "CELL=management LINK_ONLY=central-view mise run cell:link"
 	restart := "mise run hostsvc:serve -- restart"
 	link := "CELL=management mise run cell:link"
 	for _, tc := range []struct {
@@ -123,6 +136,11 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 		{"peer root: dev-cp has a new root", "check_mgmt_peer_root", map[string]string{"cp-root.pem": otherRoot}, []string{"absent or holds other roots", link}},
 		{"peer root: a pod holds an old root", "check_mgmt_peer_root", map[string]string{"pods.json": pods(strings.Repeat("0", 64))}, []string{"carries the root digest", link}},
 		{"peer root: the ConfigMap is absent", "check_mgmt_peer_root", map[string]string{"cm-peer-root.pem": ""}, []string{"absent or holds other roots", link}},
+		{"registry ok", "check_registry_current central-view-system central-view", nil, nil},
+		{"registry: a record is older than the one mgmtd serves", "check_registry_current central-view-system central-view",
+			map[string]string{"registry.json": registry(`{"payload":"counter1","signatures":[1]}`)}, []string{"another record than mgmtd serves for: dev-cell-1", registryFix}},
+		{"registry: a record of a cell that mgmtd does not serve", "check_registry_current central-view-system central-view",
+			map[string]string{"records.json": `{"dev-cell-1":{"payload":"counter7","signatures":[1]}}`}, []string{"for: dev-cell-2", registryFix}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := map[string]string{}

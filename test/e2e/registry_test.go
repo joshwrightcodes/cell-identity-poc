@@ -7,7 +7,32 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
+
+// registryLinks are the link components of management that render ConfigMap cell-registry. The registry follows the
+// records of mgmtd only at a link, so a test that changes a cell record renders these again.
+var registryLinks = []string{"central-view", "telemetry-gateway", "mesh-view-hub"}
+
+// registryRenderMax bounds one link component. The hub waits for its tunnels for up to 5 minutes.
+const registryRenderMax = 10 * time.Minute
+
+// renderRegistryAtCleanup makes the cleanup of the test render the registries again, with the command that cell:verify
+// prints for each of them: CELL=management LINK_ONLY=<component> mise run cell:link. A test that changes a cell record
+// calls it before the step that changes it, so that it runs after the cleanups of that step, which settle the record.
+func renderRegistryAtCleanup(t *testing.T) {
+	t.Helper()
+	t.Cleanup(func() {
+		for _, comp := range registryLinks {
+			res, err := cmdrun.Run(registryRenderMax, "../..", []string{"CELL=management", "LINK_ONLY=" + comp}, "mise", "run", "cell:link")
+			if err != nil || res.Code != 0 {
+				t.Errorf("CELL=management LINK_ONLY=%s mise run cell:link: %v (exit %d)\n%s", comp, err, res.Code, res.Stderr)
+			}
+		}
+	})
+}
 
 // TestM4RegistryMatchesManagementRecords: each ConfigMap cell-registry on management holds, for the
 // cells of its component set, the records that mgmtd serves, and holds only the key of mgmtd in

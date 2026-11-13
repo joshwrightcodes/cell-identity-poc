@@ -224,7 +224,14 @@ const (
 // statusServe stands in for hostsvc-serve.sh. status prints STUB_SERVE_STATUS, and pin prints STUB_PIN_PEM.
 const statusServe = `#!/usr/bin/env bash
 case "$1" in
-  status) printf '%s\n' "$STUB_SERVE_STATUS" ;;
+  status)
+    # STUB_COUNT names a file. With STUB_SERVE_STATUS_FAILS_LATER set, every call after the first fails with no output.
+    if [[ -n "${STUB_COUNT:-}" ]]; then
+      n="$(cat "$STUB_COUNT" 2>/dev/null || echo 0)"
+      echo $((n + 1)) >"$STUB_COUNT"
+      [[ -z "${STUB_SERVE_STATUS_FAILS_LATER:-}" || "$n" == 0 ]] || exit 1
+    fi
+    printf '%s\n' "$STUB_SERVE_STATUS" ;;
   pin) printf '%s\n' "$STUB_PIN_PEM" ;;
   *) exit 2 ;;
 esac
@@ -705,8 +712,8 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 			m["lagSince"] = at(3 * time.Minute)
 		}), []string{"signed revision 1.6", "applied 1.4", verifyCP}},
 		{"a refusal is newer than the applied spec", plane(func(m map[string]any) {
-			m["lastRefusal"] = map[string]any{"reason": "unknown_key", "revision": map[string]any{"epoch": 1, "counter": 5}, "at": at(time.Minute)}
-		}), []string{"refused a spec: unknown_key", verifyCP}},
+			m["lastRefusal"] = map[string]any{"reason": "signature_invalid", "revision": map[string]any{"epoch": 1, "counter": 5}, "at": at(time.Minute)}
+		}), []string{"refused a spec: signature_invalid", verifyCP}},
 		{"envd reports a store error", plane(func(m map[string]any) { m["storeError"] = "conflict writing cell-records" }),
 			[]string{"store error: conflict writing cell-records", verifyCP}},
 		{"a restore is active", plane(func(m map[string]any) { m["restoreActive"] = true }),
@@ -716,11 +723,11 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 		{"envd never reported", plane(func(m map[string]any) { delete(m, "lastReportAt") }),
 			[]string{"no report from envd", verifyCP}},
 		{"a cell has untrusted keys", plane(cellCheck("dev-cell-2", "keys_untrusted")),
-			[]string{"dev-cell-2", "keys_untrusted", "mise run mgmt -- keycheck --cell dev-cell-2"}},
+			[]string{"dev-cell-2", "keys_untrusted", "CELL=dev-cell-2 mise run cell:restart"}},
 		{"a cell has an untrusted issuer", plane(cellCheck("dev-cell-2", "issuer_untrusted")),
 			[]string{"dev-cell-2", "issuer_untrusted", restart}},
 		{"a cell has an unavailable issuer", plane(cellCheck("dev-cell-2", "issuer_unavailable")),
-			[]string{"dev-cell-2", "issuer_unavailable", "CELL=dev-cell-2 mise run cell:verify"}},
+			[]string{"dev-cell-2", "issuer_unavailable", "mise run hostsvc:serve -- status"}},
 		{"a cell with cell-identity is unbound", plane(func(m map[string]any) {
 			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
 				map[string]any{"name": "dev-cell-2", "bound": false, "lastCheck": ""}}
@@ -736,6 +743,12 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 			[]string{"carries the pin digest", restart}},
 		{"the ConfigMap pin differs from the certificate", []string{"STUB_CM_PIN=" + otherPin}, []string{"holds another certificate", restart}},
 		{"the host service trusts another root", []string{"STUB_ROOT_PEM=" + otherRoot}, []string{"trusts the management root", restart}},
+		{"a host service check fails with no output", []string{"STUB_COUNT=" + filepath.Join(t.TempDir(), "n"), "STUB_SERVE_STATUS_FAILS_LATER=1"},
+			[]string{"the host service check failed", "mise run hostsvc:serve -- status"}},
+		{"a refusal time does not parse", plane(func(m map[string]any) {
+			m["appliedAt"] = at(time.Minute)
+			m["lastRefusal"] = map[string]any{"reason": "signature_invalid", "revision": map[string]any{"epoch": 1, "counter": 3}, "at": "not a time"}
+		}), []string{"refused a spec: signature_invalid", verifyCP}},
 		{"the certificate expires soon", []string{"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), func(m map[string]any) { m["expires_soon"] = true })},
 			[]string{"certificate expires soon", restart}},
 	} {
@@ -774,7 +787,7 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 	t.Run("a refusal older than the applied spec is history", func(t *testing.T) {
 		_, _, _, code := runStatus(t, plane(func(m map[string]any) {
 			m["appliedAt"] = at(time.Minute)
-			m["lastRefusal"] = map[string]any{"reason": "unknown_key", "revision": map[string]any{"epoch": 1, "counter": 3}, "at": at(time.Hour)}
+			m["lastRefusal"] = map[string]any{"reason": "signature_invalid", "revision": map[string]any{"epoch": 1, "counter": 3}, "at": at(time.Hour)}
 		})...)
 		if code != 0 {
 			t.Errorf("exit %d, want 0 for a refusal before the last apply", code)

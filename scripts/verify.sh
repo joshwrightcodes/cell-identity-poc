@@ -1150,14 +1150,17 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
     check "central-view-system holds only the Secrets of the view" check_view_secrets
     check "The view certificates are valid for 30 days or more" check_view_cert_expiry
     check "The principal and argocd-server started after the newest view key" check_view_pods_current
+    check "ConfigMap cell-registry of central-view-system holds the records that mgmtd serves" check_registry_current central-view-system central-view
   fi
   if [[ "$comp" == telemetry-gateway ]]; then
     check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address
     check "ConfigMap peer-root of observability-system holds the live roots of $VIEW_CONTROL_PLANE" check_gateway_peer_root
+    check "ConfigMap cell-registry of observability-system holds the records that mgmtd serves" check_registry_current observability-system telemetry-gateway
   fi
   if [[ "$comp" == mesh-view-hub ]]; then
     check "The hub listener admits the current $VIEW_CONTROL_PLANE node address" check_hub_env_address
     check "ConfigMap peer-root of mesh-view-system holds the live roots of $VIEW_CONTROL_PLANE" check_hub_peer_root
+    check "ConfigMap cell-registry of mesh-view-system holds the records that mgmtd serves" check_registry_current mesh-view-system mesh-view-hub
     check "The hub holds a tunnel from each cell of MESH_VIEW_CELLS" check_hub_tunnels
   fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
