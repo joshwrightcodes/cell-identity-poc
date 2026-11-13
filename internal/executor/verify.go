@@ -1,15 +1,30 @@
 package executor
 
 import (
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"context"
 	"errors"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
+// recorded reports whether the record of the operation is in state applied or reported. It only
+// reads. An applied operation answers already_applied also after its expiry, so a late redelivery
+// does not race the resend of its applied result.
+func (e *Executor) recorded(ctx context.Context, id string) bool {
+	cm, err := e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace).Get(ctx, recordPrefix+id, metav1.GetOptions{})
+	if err != nil {
+		return false
+	}
+	rec, err := decodeRecord(cm)
+	return err == nil && (rec.State == stateApplied || rec.State == stateReported)
+}
+
 // check verifies the envelope and every rule that needs no cell state. It returns the operation, or
 // the refusal result. It writes nothing.
-func (e *Executor) check(envelope []byte, f op.Fence, sha string) (op.Operation, *op.Result) {
+func (e *Executor) check(ctx context.Context, envelope []byte, f op.Fence, sha string) (op.Operation, *op.Result) {
 	o, _, err := op.Verify(envelope, e.cfg.Keys)
 	if err != nil {
 		reason := op.ReasonPayloadInvalid
@@ -35,6 +50,9 @@ func (e *Executor) check(envelope []byte, f op.Fence, sha string) (op.Operation,
 	case o.IssuedAt.After(now.Add(op.MaxSkew)):
 		return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
 	case !now.Before(o.ExpiresAt):
+		if e.recorded(ctx, o.ID) {
+			return refuse(op.OutcomeAlreadyApplied, "")
+		}
 		return refuse(op.OutcomeExpired, "")
 	}
 	if _, ok := e.cfg.Kinds[o.Kind]; !ok {

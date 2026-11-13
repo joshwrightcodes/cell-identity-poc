@@ -5,8 +5,10 @@ package executor
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -21,11 +23,16 @@ const (
 	// DefaultNamespace holds the operation records and the demo log.
 	DefaultNamespace = "cell-ops-system"
 
-	leaseTerm    = 60 * time.Second
-	renewEvery   = 20 * time.Second
-	maxRecords   = 1000
-	reasonStore  = "store_error"
-	reasonEffect = "effect_failed"
+	leaseTerm  = 60 * time.Second
+	renewEvery = 20 * time.Second
+	maxRecords = 1000
+
+	// ReasonStoreError is the reason of a local lease_lost that follows a failed API call. A cell
+	// never sends it up.
+	ReasonStoreError = "store_error"
+	// ReasonEffectFailed is the reason of a local lease_lost that follows a failed effect. A cell
+	// never sends it up.
+	ReasonEffectFailed = "effect_failed"
 )
 
 // Config holds what an Executor needs.
@@ -44,8 +51,12 @@ type Executor struct {
 	cfg     Config
 	results metric.Int64Counter
 
+	applied, refused, forged atomic.Uint64
+
 	renewEvery time.Duration
 	afterClaim func()
+	// beforeTakeover runs between the read and the update of a takeover.
+	beforeTakeover func()
 }
 
 // New returns an Executor. A zero Namespace, Kinds, Now, Log or Meter takes its default.
@@ -81,6 +92,7 @@ func (e *Executor) result(opID, outcome, reason string, f op.Fence, sha string) 
 // never returns an error: every failure is a result.
 func (e *Executor) Execute(ctx context.Context, envelope []byte, f op.Fence) op.Result {
 	res := e.execute(ctx, envelope, f)
+	e.count(res)
 	e.results.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("outcome", res.Outcome), attribute.String("reason", res.Reason)))
 	e.cfg.Log.LogAttrs(ctx, slog.LevelInfo, "operation result",
@@ -91,7 +103,7 @@ func (e *Executor) Execute(ctx context.Context, envelope []byte, f op.Fence) op.
 
 func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.Result {
 	sha := op.EnvelopeSHA256(envelope)
-	o, refusal := e.check(envelope, f, sha)
+	o, refusal := e.check(ctx, envelope, f, sha)
 	if refusal != nil {
 		return *refusal
 	}
@@ -101,20 +113,48 @@ func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.
 	if e.afterClaim != nil {
 		e.afterClaim()
 	}
-	if _, ok := e.holds(ctx, o.ID, f); !ok {
-		return e.result(o.ID, op.OutcomeLeaseLost, op.ReasonLeaseLost, f, sha)
+	if err := e.renew(ctx, o.ID, f); err != nil {
+		reason := ReasonStoreError
+		if errors.Is(err, errNotHeld) {
+			reason = op.ReasonLeaseLost
+		}
+		return e.result(o.ID, op.OutcomeLeaseLost, reason, f, sha)
 	}
-	stop := e.renewLease(ctx, o.ID, f)
-	err := e.cfg.Kinds[o.Kind](ctx, e, o)
+	effectCtx, stop := e.renewLease(ctx, o.ID, f)
+	err := e.cfg.Kinds[o.Kind](effectCtx, e, o)
 	stop()
 	if err != nil {
 		e.cfg.Log.LogAttrs(ctx, slog.LevelWarn, "effect failed",
 			slog.String("op_id", o.ID), slog.String("error", err.Error()))
-		return e.result(o.ID, op.OutcomeLeaseLost, reasonEffect, f, sha)
+		return e.result(o.ID, op.OutcomeLeaseLost, ReasonEffectFailed, f, sha)
 	}
 	res := e.result(o.ID, op.OutcomeApplied, "", f, sha)
 	if !e.finish(ctx, o.ID, f, res) {
 		return e.result(o.ID, op.OutcomeLeaseLost, op.ReasonLeaseLost, f, sha)
 	}
 	return res
+}
+
+// Counts holds how many results of each kind the executor has returned. ForgedSeen counts the
+// refusals for a bad signature or a wrong target (environment or cell).
+type Counts struct {
+	Applied, Refused, ForgedSeen uint64
+}
+
+// Counts returns the running totals.
+func (e *Executor) Counts() Counts {
+	return Counts{Applied: e.applied.Load(), Refused: e.refused.Load(), ForgedSeen: e.forged.Load()}
+}
+
+func (e *Executor) count(res op.Result) {
+	switch res.Outcome {
+	case op.OutcomeApplied:
+		e.applied.Add(1)
+	case op.OutcomeRefused:
+		e.refused.Add(1)
+		switch res.Reason {
+		case op.ReasonSignatureInvalid, op.ReasonWrongTarget, op.ReasonEnvMismatch:
+			e.forged.Add(1)
+		}
+	}
 }

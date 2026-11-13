@@ -3,7 +3,9 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -61,6 +63,9 @@ func encodeRecord(r storedRecord) string {
 
 // claim writes the record of the operation for this pod. It returns nil when this pod holds the
 // claim, and otherwise the result to return.
+//
+// The cap of maxRecords is soft under concurrency: two pods that both count one record below the cap
+// can both create a record, so the store can briefly hold a few more.
 func (e *Executor) claim(ctx context.Context, o op.Operation, f op.Fence, sha string) *op.Result {
 	lost := func(reason string) *op.Result {
 		r := e.result(o.ID, op.OutcomeLeaseLost, reason, f, sha)
@@ -71,7 +76,7 @@ func (e *Executor) claim(ctx context.Context, o op.Operation, f op.Fence, sha st
 	now := e.cfg.Now()
 	n, err := e.Count(ctx)
 	if err != nil {
-		return lost(reasonStore)
+		return lost(ReasonStoreError)
 	}
 	var existing *corev1.ConfigMap
 	if n >= maxRecords {
@@ -81,7 +86,7 @@ func (e *Executor) claim(ctx context.Context, o op.Operation, f op.Fence, sha st
 			return &r
 		}
 		if err != nil {
-			return lost(reasonStore)
+			return lost(ReasonStoreError)
 		}
 	} else {
 		rec := storedRecord{
@@ -97,33 +102,29 @@ func (e *Executor) claim(ctx context.Context, o op.Operation, f op.Fence, sha st
 			return nil
 		}
 		if !apierrors.IsAlreadyExists(err) {
-			return lost(reasonStore)
+			return lost(ReasonStoreError)
 		}
 		existing, err = cms.Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return lost(reasonStore)
+			return lost(ReasonStoreError)
 		}
 	}
 	rec, err := decodeRecord(existing)
 	if err != nil {
-		return lost(reasonStore)
+		return lost(ReasonStoreError)
 	}
 	switch rec.State {
 	case stateApplied, stateReported:
-		var r op.Result
-		if rec.Result != nil {
-			r = *rec.Result
-		}
-		r.OpID = o.ID
-		r.Outcome = op.OutcomeAlreadyApplied
-		r.Reason = ""
-		r.EnvelopeSHA256 = sha
-		return &r
+		res := e.result(o.ID, op.OutcomeAlreadyApplied, "", f, sha)
+		return &res
 	case stateClaimed:
 		if f.Compare(rec.Fence) > 0 && now.After(rec.LeaseUntil) {
 			rec.Fence, rec.Holder, rec.LeaseUntil = f, e.cfg.PodUID, now.Add(leaseTerm)
 			rec.EnvelopeSHA256, rec.UpdatedAt = sha, now
 			existing.Data[recordKey] = encodeRecord(rec)
+			if e.beforeTakeover != nil {
+				e.beforeTakeover()
+			}
 			if _, err := cms.Update(ctx, existing, metav1.UpdateOptions{}); err != nil {
 				return lost(op.ReasonLeaseLost)
 			}
@@ -146,9 +147,40 @@ func (e *Executor) holds(ctx context.Context, id string, f op.Fence) (*corev1.Co
 	return cm, rec.State == stateClaimed && rec.Holder == e.cfg.PodUID && rec.Fence == f
 }
 
-// renewLease extends the lease every renewEvery until the returned function is called. The
+var errNotHeld = errors.New("this pod does not hold a live lease on the record")
+
+// renew extends the lease by compare-and-swap on the resourceVersion that it read. It succeeds only
+// while this pod holds the record at fence f and leaseUntil is still in the future on the executor
+// clock. It returns errNotHeld when the lease is gone, and the API error otherwise.
+func (e *Executor) renew(ctx context.Context, id string, f op.Fence) error {
+	cms := e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace)
+	cm, err := cms.Get(ctx, recordPrefix+id, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	rec, err := decodeRecord(cm)
+	if err != nil {
+		return err
+	}
+	now := e.cfg.Now()
+	if rec.State != stateClaimed || rec.Holder != e.cfg.PodUID || rec.Fence != f || !now.Before(rec.LeaseUntil) {
+		return errNotHeld
+	}
+	rec.LeaseUntil, rec.UpdatedAt = now.Add(leaseTerm), now
+	cm.Data[recordKey] = encodeRecord(rec)
+	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
+		if apierrors.IsConflict(err) {
+			return errNotHeld
+		}
+		return err
+	}
+	return nil
+}
+
+// renewLease extends the lease every renewEvery until the returned function is called. It returns
+// the context for the effect, which ends when a renewal finds that the lease is gone. The returned
 // function returns after the last renewal ends.
-func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (stop func()) {
+func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (context.Context, func()) {
 	rctx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
 	go func() {
@@ -160,19 +192,20 @@ func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (stop 
 			case <-rctx.Done():
 				return
 			case <-t.C:
-				cm, ok := e.holds(rctx, id, f)
-				if !ok {
+				err := e.renew(rctx, id, f)
+				if err == nil || rctx.Err() != nil {
 					continue
 				}
-				rec, _ := decodeRecord(cm)
-				now := e.cfg.Now()
-				rec.LeaseUntil, rec.UpdatedAt = now.Add(leaseTerm), now
-				cm.Data[recordKey] = encodeRecord(rec)
-				_, _ = e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace).Update(rctx, cm, metav1.UpdateOptions{})
+				e.cfg.Log.LogAttrs(rctx, slog.LevelWarn, "lease renewal failed",
+					slog.String("op_id", id), slog.String("error", err.Error()))
+				if errors.Is(err, errNotHeld) {
+					cancel()
+					return
+				}
 			}
 		}
 	}()
-	return func() { cancel(); <-done }
+	return rctx, func() { cancel(); <-done }
 }
 
 // finish stores the applied result when this pod still holds the claim.
@@ -204,7 +237,8 @@ func (e *Executor) Count(ctx context.Context) (int, error) {
 }
 
 // MarkReported marks the applied record of an operation as reported. A record in another state is
-// left as it is.
+// left as it is. An operation that has no record (a refused or expired one never gets a record)
+// gives an error for which apierrors.IsNotFound is true; the caller treats that as done.
 func (e *Executor) MarkReported(ctx context.Context, id string) error {
 	cms := e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace)
 	var last error
@@ -249,17 +283,27 @@ func (e *Executor) Pending(ctx context.Context) ([]op.Result, error) {
 	return out, nil
 }
 
-// GC deletes the reported records that are older than op.RecordRetention.
+// GC deletes the reported records that are older than op.RecordRetention. It also deletes a claimed
+// record that nothing has touched for op.RecordRetention plus op.MaxTTL: its operation expired long
+// ago, so no delivery can claim it again.
 func (e *Executor) GC(ctx context.Context) error {
 	items, err := e.list(ctx)
 	if err != nil {
 		return err
 	}
-	cutoff := e.cfg.Now().Add(-op.RecordRetention)
+	now := e.cfg.Now()
+	reportedCutoff := now.Add(-op.RecordRetention)
+	claimedCutoff := now.Add(-op.RecordRetention - op.MaxTTL)
 	cms := e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace)
 	for i := range items {
 		rec, err := decodeRecord(&items[i])
-		if err != nil || rec.State != stateReported || !rec.UpdatedAt.Before(cutoff) {
+		if err != nil {
+			continue
+		}
+		switch {
+		case rec.State == stateReported && rec.UpdatedAt.Before(reportedCutoff):
+		case rec.State == stateClaimed && rec.UpdatedAt.Before(claimedCutoff):
+		default:
 			continue
 		}
 		if err := cms.Delete(ctx, items[i].Name, metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {

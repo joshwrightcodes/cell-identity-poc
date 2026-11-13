@@ -2,6 +2,8 @@ package executor
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"errors"
 	"sync"
 	"testing"
@@ -42,7 +44,7 @@ func TestExecuteTwiceAlreadyApplied(t *testing.T) {
 		t.Fatalf("first = %+v", res)
 	}
 	res := e.Execute(ctx, env, fence(1, 2))
-	if res.Outcome != op.OutcomeAlreadyApplied || res.EnvelopeSHA256 != op.EnvelopeSHA256(env) {
+	if res.Outcome != op.OutcomeAlreadyApplied || res.EnvelopeSHA256 != op.EnvelopeSHA256(env) || res.Fence != fence(1, 2) || res.Pod != "celld-uid-a" || !res.At.Equal(r.clock.Now()) {
 		t.Fatalf("second = %+v", res)
 	}
 	if n := r.cnt.count(); n != 1 {
@@ -68,7 +70,7 @@ func TestTakeoverWaitsForLease(t *testing.T) {
 	if res := a.Execute(ctx, env, fence(1, 1)); res.Outcome != op.OutcomeLeaseLost {
 		t.Fatalf("a = %+v", res)
 	}
-	r.clock.Advance(op.MaxSkew - time.Second)
+	r.clock.Advance(leaseTerm - time.Second)
 	res := b.Execute(ctx, env, fence(1, 2))
 	if res.Outcome != op.OutcomeLeaseLost || res.Reason != op.ReasonLeaseLost {
 		t.Fatalf("b = %+v", res)
@@ -105,7 +107,6 @@ func TestExecuteClaimsBeforeEffect(t *testing.T) {
 	env := r.sign(r.operation(testKind, `{}`))
 	var seen storedRecord
 	var id string
-	r.cnt = &counter{}
 	e := r.executor("uid-a")
 	e.cfg.Kinds[testKind] = func(_ context.Context, _ *Executor, o op.Operation) error {
 		id = o.ID
@@ -207,5 +208,197 @@ func TestExecuteCountsResults(t *testing.T) {
 	got := collect(t, reader, "celld.ops.results")
 	if got["applied/"] != 1 || got["refused/kind_unknown"] != 1 {
 		t.Fatalf("counts = %v", got)
+	}
+}
+
+func TestPreEffectRefusesExpiredLease(t *testing.T) {
+	r := newRig(t)
+	a, b := r.executor("uid-a"), r.executor("uid-b")
+	env := r.sign(r.operation(testKind, `{}`))
+	a.afterClaim = func() { r.clock.Advance(61 * time.Second) }
+	res := a.Execute(ctx, env, fence(1, 1))
+	if res.Outcome != op.OutcomeLeaseLost || res.Reason != op.ReasonLeaseLost {
+		t.Fatalf("a = %+v", res)
+	}
+	if n := r.cnt.count(); n != 0 {
+		t.Fatalf("effect ran %d times on an expired lease", n)
+	}
+	if res := b.Execute(ctx, env, fence(1, 2)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("b = %+v", res)
+	}
+	if n := r.cnt.count(); n != 1 {
+		t.Fatalf("count = %d", n)
+	}
+}
+
+func TestPreEffectRenewsLease(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	o := r.operation(testKind, `{}`)
+	var inEffect time.Time
+	e.afterClaim = func() { r.clock.Advance(59 * time.Second) }
+	e.cfg.Kinds[testKind] = func(_ context.Context, _ *Executor, o op.Operation) error {
+		inEffect = r.record(o.ID).LeaseUntil
+		return nil
+	}
+	e.Execute(ctx, r.sign(o), fence(1, 1))
+	if want := r.clock.Now().Add(leaseTerm); !inEffect.Equal(want) {
+		t.Fatalf("leaseUntil in effect = %s, want %s", inEffect, want)
+	}
+}
+
+func seedExpiredClaim(t *testing.T, r *rig, id string, f op.Fence) {
+	t.Helper()
+	seedRecord(t, r, id, storedRecord{
+		State: stateClaimed, Fence: f, Holder: "uid-x",
+		LeaseUntil: r.clock.Now().Add(-time.Second), UpdatedAt: r.clock.Now().Add(-time.Minute),
+	})
+}
+
+// TestTakeoverConflict lands a takeover by pod A between the read and the update of pod B. The
+// update of pod B must fail on resourceVersion.
+func TestTakeoverConflict(t *testing.T) {
+	r := newRig(t)
+	o := r.operation(testKind, `{}`)
+	env := r.sign(o)
+	seedExpiredClaim(t, r, o.ID, fence(1, 1))
+	a, b := r.executor("uid-a"), r.executor("uid-b")
+	b.beforeTakeover = func() {
+		b.beforeTakeover = nil
+		a.Execute(ctx, env, fence(1, 2))
+	}
+	res := b.Execute(ctx, env, fence(1, 3))
+	if res.Outcome != op.OutcomeLeaseLost {
+		t.Fatalf("b = %+v", res)
+	}
+	if n := r.cnt.count(); n != 1 {
+		t.Fatalf("count = %d", n)
+	}
+	if rec := r.record(o.ID); rec.State != stateApplied || rec.Holder != "uid-a" {
+		t.Fatalf("record = %+v", rec)
+	}
+}
+
+func TestConcurrentTakeoverOneEffect(t *testing.T) {
+	for i := 0; i < 20; i++ {
+		r := newRig(t)
+		o := r.operation(testKind, `{}`)
+		env := r.sign(o)
+		seedExpiredClaim(t, r, o.ID, fence(1, 1))
+		var wg sync.WaitGroup
+		for j, uid := range []string{"uid-a", "uid-b"} {
+			e := r.executor(uid)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				e.Execute(ctx, env, fence(1, uint64(j+2)))
+			}()
+		}
+		wg.Wait()
+		if n := r.cnt.count(); n != 1 {
+			t.Fatalf("round %d: count = %d", i, n)
+		}
+	}
+}
+
+func TestTakeoverNeedsHigherFence(t *testing.T) {
+	for _, f := range []op.Fence{fence(1, 5), fence(1, 2), fence(0, 9)} {
+		r := newRig(t)
+		o := r.operation(testKind, `{}`)
+		seedExpiredClaim(t, r, o.ID, fence(1, 5))
+		res := r.executor("uid-b").Execute(ctx, r.sign(o), f)
+		if res.Outcome != op.OutcomeLeaseLost || res.Fence != f {
+			t.Fatalf("fence %v: %+v", f, res)
+		}
+		if n := r.cnt.count(); n != 0 {
+			t.Fatalf("fence %v: count = %d", f, n)
+		}
+		if rec := r.record(o.ID); rec.Holder != "uid-x" {
+			t.Fatalf("fence %v: record = %+v", f, rec)
+		}
+	}
+}
+
+// TestFinishAfterLostClaim: the lease of pod A passes during its effect and pod B takes over and
+// applies. The finish of pod A must leave the record of pod B.
+func TestFinishAfterLostClaim(t *testing.T) {
+	r := newRig(t)
+	a, b := r.executor("uid-a"), r.executor("uid-b")
+	o := r.operation(testKind, `{}`)
+	env := r.sign(o)
+	a.cfg.Kinds[testKind] = func(c context.Context, _ *Executor, _ op.Operation) error {
+		r.clock.Advance(61 * time.Second)
+		b.Execute(ctx, env, fence(1, 2))
+		return nil
+	}
+	res := a.Execute(ctx, env, fence(1, 1))
+	if res.Outcome != op.OutcomeLeaseLost {
+		t.Fatalf("a = %+v", res)
+	}
+	rec := r.record(o.ID)
+	if rec.State != stateApplied || rec.Holder != "uid-b" || rec.Result == nil || rec.Result.Pod != "celld-uid-b" {
+		t.Fatalf("record = %+v", rec)
+	}
+}
+
+func TestLostLeaseCancelsEffect(t *testing.T) {
+	r := newRig(t)
+	a, b := r.executor("uid-a"), r.executor("uid-b")
+	env := r.sign(r.operation(testKind, `{}`))
+	a.renewEvery = 5 * time.Millisecond
+	cancelled := false
+	a.cfg.Kinds[testKind] = func(c context.Context, _ *Executor, _ op.Operation) error {
+		r.clock.Advance(61 * time.Second)
+		b.Execute(ctx, env, fence(1, 2))
+		select {
+		case <-c.Done():
+			cancelled = true
+		case <-time.After(5 * time.Second):
+		}
+		return c.Err()
+	}
+	if res := a.Execute(ctx, env, fence(1, 1)); res.Outcome != op.OutcomeLeaseLost {
+		t.Fatalf("a = %+v", res)
+	}
+	if !cancelled {
+		t.Fatal("the effect context stayed open after the lease was lost")
+	}
+}
+
+func TestAppliedAnswersAfterExpiry(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	o := r.operation(testKind, `{}`)
+	env := r.sign(o)
+	if res := e.Execute(ctx, env, fence(1, 1)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("first = %+v", res)
+	}
+	r.clock.Advance(time.Hour)
+	res := e.Execute(ctx, env, fence(1, 2))
+	if res.Outcome != op.OutcomeAlreadyApplied || res.OpID != o.ID {
+		t.Fatalf("after expiry = %+v", res)
+	}
+	other := r.operation(testKind, `{}`)
+	other.IssuedAt, other.ExpiresAt = r.clock.Now().Add(-time.Hour), r.clock.Now().Add(-time.Minute)
+	if res := e.Execute(ctx, r.sign(other), fence(1, 3)); res.Outcome != op.OutcomeExpired {
+		t.Fatalf("unknown expired op = %+v", res)
+	}
+}
+
+func TestCounts(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
+	forged, _ := op.Sign(r.operation(testKind, `{}`), otherPriv)
+	elsewhere := r.operation(testKind, `{}`)
+	elsewhere.Cell = "cell-2"
+	unknown := r.operation("nope", `{}`)
+	for i, env := range [][]byte{
+		r.sign(r.operation(testKind, `{}`)), forged, r.sign(elsewhere), r.sign(unknown),
+	} {
+		e.Execute(ctx, env, fence(1, uint64(i+1)))
+	}
+	if got := e.Counts(); got != (Counts{Applied: 1, Refused: 3, ForgedSeen: 2}) {
+		t.Fatalf("counts = %+v", got)
 	}
 }

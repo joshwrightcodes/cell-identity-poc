@@ -26,15 +26,19 @@ var configMaps = schema.GroupVersionResource{Version: "v1", Resource: "configmap
 
 // newClient returns a fake client whose ConfigMap writes are atomic: a second create gives
 // AlreadyExists, and update compares resourceVersion and raises it.
+// The resourceVersion comes from one counter, so it rises on every write, also after a delete and
+// a create.
 func newClient() *fake.Clientset {
 	cs := fake.NewSimpleClientset()
 	var mu sync.Mutex
+	version := 0
 	cs.PrependReactor("create", "configmaps", func(a clienttesting.Action) (bool, runtime.Object, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		ca := a.(clienttesting.CreateAction)
 		cm := ca.GetObject().(*corev1.ConfigMap).DeepCopy()
-		cm.ResourceVersion = "1"
+		version++
+		cm.ResourceVersion = strconv.Itoa(version)
 		if err := cs.Tracker().Create(configMaps, cm, ca.GetNamespace()); err != nil {
 			return true, nil, err
 		}
@@ -53,8 +57,8 @@ func newClient() *fake.Clientset {
 		if cm.ResourceVersion != have {
 			return true, nil, apierrors.NewConflict(configMaps.GroupResource(), cm.Name, nil)
 		}
-		n, _ := strconv.Atoi(have)
-		cm.ResourceVersion = strconv.Itoa(n + 1)
+		version++
+		cm.ResourceVersion = strconv.Itoa(version)
 		if err := cs.Tracker().Update(configMaps, cm, ua.GetNamespace()); err != nil {
 			return true, nil, err
 		}
@@ -187,4 +191,23 @@ func (r *rig) record(id string) storedRecord {
 		r.t.Fatal(err)
 	}
 	return rec
+}
+
+func TestFakeResourceVersionRises(t *testing.T) {
+	cs := newClient()
+	cms := cs.CoreV1().ConfigMaps("n")
+	mk := func() *corev1.ConfigMap {
+		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "x", Namespace: "n"}}
+	}
+	c1, _ := cms.Create(context.Background(), mk(), metav1.CreateOptions{})
+	u1, _ := cms.Update(context.Background(), c1, metav1.UpdateOptions{})
+	_ = cms.Delete(context.Background(), "x", metav1.DeleteOptions{})
+	c2, _ := cms.Create(context.Background(), mk(), metav1.CreateOptions{})
+	v := func(cm *corev1.ConfigMap) int { n, _ := strconv.Atoi(cm.ResourceVersion); return n }
+	if !(v(c1) < v(u1) && v(u1) < v(c2)) {
+		t.Fatalf("versions %s, %s, %s do not rise", c1.ResourceVersion, u1.ResourceVersion, c2.ResourceVersion)
+	}
+	if _, err := cms.Update(context.Background(), c1, metav1.UpdateOptions{}); !apierrors.IsConflict(err) {
+		t.Fatalf("stale update err = %v", err)
+	}
 }

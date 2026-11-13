@@ -4,9 +4,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"testing"
 	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
@@ -27,8 +28,7 @@ func TestExecuteRefuses(t *testing.T) {
 		{"tampered", func(r *rig) []byte {
 			o := r.operation(testKind, `{}`)
 			env := r.sign(o)
-			// change one byte of the signed payload text: swap the first "cell-1" in the base64 is
-			// not stable, so re-encode a payload that differs and keep the old signature
+			// keep the signature of o and swap in the payload of a different operation
 			other := r.operation(testKind, `{}`)
 			other.ID = o.ID
 			other.Kind = "demo.append"

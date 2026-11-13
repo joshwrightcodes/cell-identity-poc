@@ -64,10 +64,18 @@ func TestGCKeepsRetention(t *testing.T) {
 	r := newRig(t)
 	e := r.executor("uid-a")
 	now := r.clock.Now()
-	seedRecord(t, r, "a", storedRecord{State: stateReported, UpdatedAt: now.Add(-25 * time.Hour)})
-	seedRecord(t, r, "b", storedRecord{State: stateReported, UpdatedAt: now.Add(-23 * time.Hour)})
-	seedRecord(t, r, "c", storedRecord{State: stateApplied, UpdatedAt: now.Add(-48 * time.Hour)})
-	seedRecord(t, r, "d", storedRecord{State: stateClaimed, UpdatedAt: now.Add(-48 * time.Hour)})
+	day := op.RecordRetention
+	claimedKeep := day + op.MaxTTL
+	for id, rec := range map[string]storedRecord{
+		"a": {State: stateReported, UpdatedAt: now.Add(-day - time.Nanosecond)},
+		"b": {State: stateReported, UpdatedAt: now.Add(-day)},
+		"c": {State: stateApplied, UpdatedAt: now.Add(-48 * time.Hour)},
+		"d": {State: stateClaimed, UpdatedAt: now.Add(-claimedKeep - time.Nanosecond)},
+		"e": {State: stateClaimed, UpdatedAt: now.Add(-claimedKeep)},
+		"f": {State: stateClaimed, UpdatedAt: now.Add(-time.Hour)},
+	} {
+		seedRecord(t, r, id, rec)
+	}
 	if err := e.GC(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +83,7 @@ func TestGCKeepsRetention(t *testing.T) {
 	for _, cm := range r.records() {
 		left = append(left, cm.Name)
 	}
-	if fmt.Sprint(left) != "[op-b op-c op-d]" {
+	if fmt.Sprint(left) != "[op-b op-c op-e op-f]" {
 		t.Fatalf("records left = %v", left)
 	}
 }
