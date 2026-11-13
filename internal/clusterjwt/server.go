@@ -21,6 +21,7 @@ import (
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
@@ -151,6 +152,11 @@ type Plugin struct {
 	afterHint    func()
 	// newHints builds the hint writer for a ConfigMap.
 	newHints func(cm string) (HintWriter, error)
+	// newConfigMaps builds the client that the default hint writer uses.
+	newConfigMaps func() (corev1client.ConfigMapsGetter, error)
+	// hintTick replaces the ticker that retries pending hints. hintExit closes when the hint goroutine ends.
+	hintTick <-chan time.Time
+	hintExit chan struct{}
 	// loops counts the running reload goroutines. tickEvery is the interval in effect, in nanoseconds.
 	loops     atomic.Int32
 	tickEvery atomic.Int64
@@ -169,6 +175,8 @@ func New() *Plugin {
 	p.hintLim = lograte.New(hintLogWindow, 8, func() time.Time { return p.now() })
 	p.hintCh = make(chan string, hintQueueSize)
 	p.newHints = p.defaultHintWriter
+	p.newConfigMaps = inClusterConfigMaps
+	p.hintExit = make(chan struct{})
 	return p
 }
 
@@ -220,7 +228,7 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 	}
 	p.applyInterval(st.reloadEvery)
 	p.startHints(st)
-	p.log.Info("configured", "env", st.env, "records", len(st.records), "spec_epoch", st.spec.Epoch, "spec_counter", st.spec.Counter, "reload_interval", st.reloadEvery.String())
+	p.log.Info("configured", "env", st.env, "records", len(st.records), "spec_epoch", st.spec.Epoch, "spec_counter", st.spec.Counter, "reload_interval", st.reloadEvery.String(), "hint_configmap", st.hintCM, "hint_min_interval", st.hintEvery.String())
 	return &configv1.ConfigureResponse{}, nil
 }
 

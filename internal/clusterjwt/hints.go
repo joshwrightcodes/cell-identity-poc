@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 )
@@ -26,9 +27,14 @@ const (
 	hintQueueSize = 16
 	hintWriteTime = 10 * time.Second
 	hintLogWindow = time.Minute
+	// hintBuildRetry is the shortest time between two attempts to build the hint client.
+	hintBuildRetry = time.Minute
 )
 
-var kubeNameRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
+var (
+	kubeNameRE  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
+	kubeLabelRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+)
 
 // HintWriter tells the management plane that a cell presented a key ID that its record does not hold.
 type HintWriter interface {
@@ -81,7 +87,7 @@ func parseHintConfigMap(s string) (namespace, name string, err error) {
 		return "", "", nil
 	}
 	namespace, name, ok := strings.Cut(s, "/")
-	if !ok || !kubeNameRE.MatchString(namespace) || !kubeNameRE.MatchString(name) {
+	if !ok || !kubeLabelRE.MatchString(namespace) || !kubeNameRE.MatchString(name) {
 		return "", "", errors.New("hint_configmap must be empty or <namespace>/<name>")
 	}
 	return namespace, name, nil
@@ -101,15 +107,24 @@ func (p *Plugin) defaultHintWriter(cm string) (HintWriter, error) {
 	if err != nil {
 		return nil, err
 	}
-	c, err := inClusterClient()
+	c, err := p.newConfigMaps()
 	if err != nil {
 		return nil, err
 	}
-	getter, ok := c.(corev1client.ConfigMapsGetter)
-	if !ok {
-		return nil, errors.New("the Kubernetes client has no ConfigMap access")
+	return newConfigMapHints(c, namespace, name, p.log), nil
+}
+
+// inClusterConfigMaps returns a ConfigMap client that uses the in-cluster credentials.
+func inClusterConfigMaps() (corev1client.ConfigMapsGetter, error) {
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("load in-cluster configuration: %w", err)
 	}
-	return newConfigMapHints(getter, namespace, name, p.log), nil
+	c, err := corev1client.NewForConfig(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create Kubernetes client: %w", err)
+	}
+	return c, nil
 }
 
 // startHints starts the writing goroutine once, at the first Configure that turns hints on.
@@ -144,20 +159,24 @@ func (p *Plugin) queueHint(st *state, cell string) {
 }
 
 func (p *Plugin) hintLogged(key, msg string, kv ...any) {
-	if _, ok, _, _ := p.hintLim.Allow(key); ok {
+	if _, ok, suppressed, _ := p.hintLim.Allow(key); ok {
+		if suppressed > 0 {
+			kv = append(kv, "suppressed", suppressed)
+		}
 		p.log.Warn(msg, clip(kv)...)
 	}
 }
 
+// hintLoop writes the hints. A hint that a limit holds back is kept as pending for its cell, so one
+// write follows when the limits allow it, whatever the agent does next.
 func (p *Plugin) hintLoop() {
-	var (
-		writer   HintWriter
-		writerCM string
-		last     = map[string]time.Time{}
-		lastAny  time.Time
-	)
+	defer close(p.hintExit)
+	l := &hintWork{
+		p: p, last: map[string]time.Time{}, pending: map[string]bool{},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	l.ctx = ctx
 	go func() {
 		select {
 		case <-p.done:
@@ -165,42 +184,88 @@ func (p *Plugin) hintLoop() {
 		case <-ctx.Done():
 		}
 	}()
+	var ticker *time.Ticker
+	defer func() {
+		if ticker != nil {
+			ticker.Stop()
+		}
+	}()
 	for {
-		var cell string
+		var tickC <-chan time.Time
+		if len(l.pending) > 0 {
+			tickC = p.hintTick
+			if tickC == nil {
+				if ticker == nil {
+					ticker = time.NewTicker(hintGap)
+				}
+				tickC = ticker.C
+			}
+		} else if ticker != nil {
+			ticker.Stop()
+			ticker = nil
+		}
 		select {
-		case cell = <-p.hintCh:
+		case cell := <-p.hintCh:
+			l.handle(cell)
+		case <-tickC:
+			for cell := range l.pending {
+				l.handle(cell)
+			}
 		case <-p.stop:
 			return
 		case <-p.done:
 			return
 		}
-		st := p.st.Load()
-		if st != nil && st.hintCM != "" {
-			now := p.now()
-			switch {
-			case now.Sub(lastAny) < hintGap, now.Sub(last[cell]) < st.hintEvery:
-			default:
-				if writer == nil || writerCM != st.hintCM {
-					w, err := p.newHints(st.hintCM)
-					if err != nil {
-						p.hintLogged("hint_client", "hint client unavailable", "error", err.Error())
-						writer = nil
-					} else {
-						writer, writerCM = w, st.hintCM
-					}
-				}
-				if writer != nil {
-					last[cell], lastAny = now, now
-					wctx, wcancel := context.WithTimeout(ctx, hintWriteTime)
-					if err := writer.Hint(wctx, cell, now); err != nil && !apierrors.IsNotFound(err) {
-						p.hintLogged("hint_write", "hint write failed", "cell", cell, "error", err.Error())
-					}
-					wcancel()
-				}
-			}
-		}
 		if p.afterHint != nil {
 			p.afterHint()
 		}
+	}
+}
+
+// hintWork is the state of the writing goroutine.
+type hintWork struct {
+	p         *Plugin
+	ctx       context.Context
+	writer    HintWriter
+	writerCM  string
+	nextBuild time.Time
+	last      map[string]time.Time
+	lastAny   time.Time
+	pending   map[string]bool
+}
+
+func (l *hintWork) handle(cell string) {
+	p := l.p
+	st := p.st.Load()
+	if st == nil || st.hintCM == "" {
+		delete(l.pending, cell)
+		return
+	}
+	now := p.now()
+	if now.Sub(l.lastAny) < hintGap || now.Sub(l.last[cell]) < st.hintEvery {
+		l.pending[cell] = true
+		return
+	}
+	if l.writer == nil || l.writerCM != st.hintCM {
+		l.writer = nil
+		if now.Before(l.nextBuild) {
+			l.pending[cell] = true
+			return
+		}
+		w, err := p.newHints(st.hintCM)
+		if err != nil {
+			l.nextBuild = now.Add(hintBuildRetry)
+			p.hintLogged("hint_client", "hint client unavailable", "error", err.Error())
+			l.pending[cell] = true
+			return
+		}
+		l.writer, l.writerCM = w, st.hintCM
+	}
+	delete(l.pending, cell)
+	l.last[cell], l.lastAny = now, now
+	wctx, wcancel := context.WithTimeout(l.ctx, hintWriteTime)
+	defer wcancel()
+	if err := l.writer.Hint(wctx, cell, now); err != nil && !apierrors.IsNotFound(err) {
+		p.hintLogged("hint_write", "hint write failed", "cell", cell, "error", err.Error())
 	}
 }

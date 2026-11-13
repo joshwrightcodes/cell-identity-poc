@@ -80,6 +80,7 @@ type fixtureOptions struct {
 	clock     func() time.Time
 	hints     HintWriter
 	afterHint func()
+	hintTick  <-chan time.Time
 }
 
 func newFixture(t *testing.T, o fixtureOptions) *fixture {
@@ -142,6 +143,7 @@ func newFixture(t *testing.T, o fixtureOptions) *fixture {
 		p.newHints = func(string) (HintWriter, error) { return o.hints, nil }
 	}
 	p.afterHint = o.afterHint
+	p.hintTick = o.hintTick
 	f := &fixture{t: t, plugin: p, client: new(nodeattestorv1.NodeAttestorPluginClient), logs: logs, keys: k, pub: pub, priv: priv, cm: cm, specCounter: specCounter, tick: tick, reloaded: reloaded}
 	cfg := new(configv1.ConfigServiceClient)
 	f.cfg = cfg

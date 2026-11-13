@@ -15,6 +15,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
+	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	k8stesting "k8s.io/client-go/testing"
 )
 
@@ -29,11 +30,16 @@ type hintCall struct {
 type fakeHints struct {
 	calls chan hintCall
 	block chan struct{}
+	// started receives a value when a call begins.
+	started chan struct{}
 }
 
 func newFakeHints() *fakeHints { return &fakeHints{calls: make(chan hintCall, 64)} }
 
 func (h *fakeHints) Hint(ctx context.Context, cell string, at time.Time) error {
+	if h.started != nil {
+		h.started <- struct{}{}
+	}
 	if h.block != nil {
 		select {
 		case <-h.block:
@@ -88,12 +94,13 @@ type hintFixture struct {
 	hints     *fakeHints
 	clock     *testClock
 	processed chan struct{}
+	tick      chan time.Time
 }
 
 func newHintFixture(t *testing.T, o fixtureOptions) *hintFixture {
 	t.Helper()
-	h := &hintFixture{hints: newFakeHints(), clock: &testClock{t: testNow}, processed: make(chan struct{}, 64)}
-	o.clock, o.hints = h.clock.now, h.hints
+	h := &hintFixture{hints: newFakeHints(), clock: &testClock{t: testNow}, processed: make(chan struct{}, 64), tick: make(chan time.Time)}
+	o.clock, o.hints, o.hintTick = h.clock.now, h.hints, h.tick
 	o.afterHint = func() { h.processed <- struct{}{} }
 	o.extraHCL += "\n" + hintHCL
 	h.fixture = newFixture(t, o)
@@ -107,6 +114,16 @@ func (h *hintFixture) processedOne(t *testing.T) {
 	case <-h.processed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the hint goroutine did not handle the cell")
+	}
+}
+
+// sendTick drives one retry of the pending hints.
+func (h *hintFixture) sendTick(t *testing.T) {
+	t.Helper()
+	select {
+	case h.tick <- h.clock.now():
+	case <-time.After(2 * time.Second):
+		t.Fatal("the hint goroutine has no pending hint to retry")
 	}
 }
 
@@ -235,19 +252,158 @@ func TestNoHintForOtherReasons(t *testing.T) {
 func TestHintNeverBlocksAttest(t *testing.T) {
 	hints := newFakeHints()
 	hints.block = make(chan struct{})
-	h := &hintFixture{hints: hints, clock: &testClock{t: testNow}, processed: make(chan struct{}, 64)}
+	hints.started = make(chan struct{}, 1)
+	h := &hintFixture{hints: hints, clock: &testClock{t: testNow}}
 	h.fixture = newFixture(t, fixtureOptions{clock: h.clock.now, hints: hints, extraHCL: hintHCL})
 	t.Cleanup(func() { close(hints.block) })
-	start := time.Now()
-	// One hint is in the blocked writer and sixteen fill the queue. The rest are dropped.
-	for i := 0; i < 40; i++ {
+	dropped := func() int { return strings.Count(h.logs.String(), "hint dropped") }
+
+	// The writer takes the first cell and stalls. The next sixteen fill the queue without a drop.
+	h.unknownKID(t, "dev-cell-1")
+	select {
+	case <-hints.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the writer did not take the first cell")
+	}
+	for i := 0; i < 16; i++ {
 		h.unknownKID(t, "dev-cell-1")
 	}
-	if d := time.Since(start); d > 8*time.Second {
-		t.Fatalf("40 attestations took %v", d)
+	if n := dropped(); n != 0 {
+		t.Fatalf("%d drop lines while the queue had room", n)
 	}
-	if n := strings.Count(h.logs.String(), "hint dropped"); n != 1 {
-		t.Fatalf("%d drop log lines, want 1 in one minute", n)
+	h.unknownKID(t, "dev-cell-1")
+	if n := dropped(); n != 1 {
+		t.Fatalf("%d drop lines after the 17th queued cell, want 1", n)
+	}
+	// A send on a full queue returns at once, and the drop log stays at one line a minute.
+	st := h.plugin.st.Load()
+	start := time.Now()
+	for i := 0; i < 100; i++ {
+		h.plugin.queueHint(st, "dev-cell-1")
+	}
+	if d := time.Since(start); d > 20*time.Millisecond {
+		t.Fatalf("100 sends on a full queue took %v", d)
+	}
+	if n := dropped(); n != 1 {
+		t.Fatalf("%d drop lines, want 1 in one minute", n)
+	}
+}
+
+func TestRateLimitedHintIsCoalesced(t *testing.T) {
+	h := newHintFixture(t, fixtureOptions{})
+	h.unknownKID(t, "dev-cell-1")
+	h.processedOne(t)
+	h.hints.next(t)
+
+	// A forged hint inside the window writes nothing now, and a tick inside the window writes nothing.
+	h.clock.advance(5 * time.Second)
+	h.unknownKID(t, "dev-cell-1")
+	h.processedOne(t)
+	h.hints.none(t)
+	h.sendTick(t)
+	h.processedOne(t)
+	h.hints.none(t)
+
+	// At the window end the pending hint writes once, with the time of the write.
+	h.clock.advance(56 * time.Second)
+	h.sendTick(t)
+	h.processedOne(t)
+	got := h.hints.next(t)
+	if got.cell != "dev-cell-1" || !got.at.Equal(h.clock.now()) {
+		t.Fatalf("hint = %+v, want dev-cell-1 at %v", got, h.clock.now())
+	}
+	h.hints.none(t)
+}
+
+func TestHintGoroutineEndsOnClose(t *testing.T) {
+	h := newHintFixture(t, fixtureOptions{})
+	h.unknownKID(t, "dev-cell-1")
+	h.processedOne(t)
+	_ = h.plugin.Close()
+	select {
+	case <-h.plugin.hintExit:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hint goroutine did not end on Close")
+	}
+}
+
+func TestHintClientRetryIsLimited(t *testing.T) {
+	var builds int
+	var mu sync.Mutex
+	processed := make(chan struct{}, 16)
+	clock := &testClock{t: testNow}
+	f := newFixture(t, fixtureOptions{clock: clock.now, extraHCL: hintHCL, afterHint: func() { processed <- struct{}{} }})
+	f.plugin.newHints = func(string) (HintWriter, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		builds++
+		return nil, context.DeadlineExceeded
+	}
+	attest := func(cell string) {
+		_, err := f.attest(cell, func(nonce string) string {
+			s := f.keys.good()
+			s.Audience = []string{"spire-" + testEnv + "/" + nonce}
+			s.KID = "other"
+			return s.token(t)
+		})
+		wantDenied(t, err, UnknownKID)
+		<-processed
+	}
+	attest("dev-cell-1")
+	clock.advance(2 * time.Second)
+	attest("dev-cell-2")
+	clock.advance(2 * time.Second)
+	attest("dev-cell-1")
+	mu.Lock()
+	n := builds
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d client builds inside one minute, want 1", n)
+	}
+	clock.advance(time.Minute)
+	attest("dev-cell-1")
+	mu.Lock()
+	n = builds
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d client builds after a minute, want 2", n)
+	}
+}
+
+func TestDefaultHintWriter(t *testing.T) {
+	kube := fake.NewSimpleClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "poc-system", Name: "cell-key-hints"}})
+	p := New()
+	p.newConfigMaps = func() (corev1client.ConfigMapsGetter, error) { return kube.CoreV1(), nil }
+	w, err := p.defaultHintWriter("poc-system/cell-key-hints")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Hint(context.Background(), "dev-cell-1", testNow); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := kube.CoreV1().ConfigMaps("poc-system").Get(context.Background(), "cell-key-hints", metav1.GetOptions{})
+	if cm.Data["dev-cell-1"] == "" {
+		t.Fatalf("no hint in %v", cm.Data)
+	}
+	if _, err := p.defaultHintWriter("bad"); err == nil {
+		t.Fatal("expected an error for a bad ConfigMap name")
+	}
+	p.newConfigMaps = func() (corev1client.ConfigMapsGetter, error) { return nil, context.Canceled }
+	if _, err := p.defaultHintWriter("poc-system/cell-key-hints"); err == nil {
+		t.Fatal("expected the client error")
+	}
+}
+
+func TestHintsSurviveReload(t *testing.T) {
+	h := newHintFixture(t, fixtureOptions{ticker: true})
+	if !strings.Contains(h.logs.String(), "poc-system/cell-key-hints") {
+		t.Fatalf("the configured line does not show the hint settings: %s", h.logs.String())
+	}
+	h.reload()
+	h.unknownKID(t, "dev-cell-1")
+	h.processedOne(t)
+	if got := h.hints.next(t); got.cell != "dev-cell-1" {
+		t.Fatalf("hint for %q, want dev-cell-1", got.cell)
 	}
 }
 
@@ -325,6 +481,8 @@ func TestHintConfigValidation(t *testing.T) {
 		{"below minimum", hintHCL + "hint_min_interval = \"9s\"\n", false},
 		{"not a duration", hintHCL + "hint_min_interval = \"soon\"\n", false},
 		{"no name", "hint_configmap = \"poc-system\"\n", false},
+		{"dotted namespace", "hint_configmap = \"a.b/c\"\n", false},
+		{"long namespace", "hint_configmap = \"" + strings.Repeat("a", 64) + "/c\"\n", false},
 		{"three parts", "hint_configmap = \"a/b/c\"\n", false},
 		{"empty namespace", "hint_configmap = \"/b\"\n", false},
 	}
