@@ -222,6 +222,8 @@ Each failed check prints the command that repairs it.
 `mise run gate:m4:repair` starts the host service again and sets the replicas of `mgmtd` and `envd` back to 1.
 It also serves the latest spec again, deletes the test namespaces and probe objects of `gate:m4`, and runs `gate:m2:repair`.
 With `--check`, it only reports.
+`mise run gate:m4` runs the M4 end-to-end tests. Run `mise run images` first.
+`mise run gate:m4:rotate` rotates the signing key and prints the attestation gap. Run it alone, after `gate:m4`.
 `mise run mgmt:rotate-ca` restarts the host service in both refresh steps.
 
 ## Signed records and envd
@@ -271,6 +273,7 @@ The record of the cell then lists only the old keys. `mgmtd` finds the new key o
 - A new `celld` pod binds with a token from the new key.
 - The periodic key check runs. It runs every 15 minutes for each cell.
 - An operator runs a key check.
+- A `celld` pod starts in that cell, for example after `CELL=<cell> mise run cell:restart`.
 
 To check at once, run `mise run mgmt -- keycheck --cell <cell>`.
 The answer `keys_updated` means `mgmtd` signed a new record with both key IDs.
@@ -290,7 +293,8 @@ The command runs these steps in order:
 4. It runs `cell:link` for `management`.
 5. It runs `cell:verify` for `management` and for `dev-cp`.
 
-The command prints one JSON line with the SHA-256 fingerprint of the old key, of the new key, and the new epoch.
+The command takes about 5 minutes.
+It prints one JSON line with the SHA-256 fingerprint of the old key, of the new key, and the new epoch.
 The line holds public key data only.
 After step 1, a failure prints the commands that remain.
 Run them in the printed order.
@@ -299,6 +303,49 @@ Between the restart of the SPIRE server and the first write of `envd` under the 
 In that time a new pod cannot attest. Running agents keep renewing.
 `mise run gate:m4:rotate` measures this time and prints it as `ATTESTATION_GAP_SECONDS`.
 The rotation sets the counter back to 1, and it clears the stored history. `restore` then has no older revision to serve.
+
+### Check a bind
+
+`celld` binds its cell to `mgmtd` when it starts, and it repeats the bind until `mgmtd` holds a record.
+Run `mise run mgmt -- status` to read the result. Each entry of `cells` shows `bound`, the issuer, the key IDs and `lastCheck`.
+A cell that is not bound has no record, so its new pods cannot attest.
+The refusal reasons of a bind are `cell_unknown`, `nonce_invalid`, `token_invalid`, `issuer_untrusted`, `issuer_unavailable`, `keys_untrusted` and `rate_limited`.
+The reason `issuer_untrusted` after a restart of the host service means that `mgmt-api` still holds the old pin. Run `mise run hostsvc:serve -- restart`.
+The reason `issuer_unavailable` means that the host service did not answer. Run `mise run hostsvc:serve -- status`.
+`mise run harness:status` shows the same fields in its `management` object, and it names the next command for each case.
+
+### Read a refusal of envd
+
+`envd` refuses a spec that does not verify or that is older than the one it holds.
+It logs `spec refused` with a reason, and it reports the refusal to `mgmtd`.
+`mise run mgmt -- status` shows it as `lastRefusal`, with the reason, the revision and the time. A failed write shows as `storeError`.
+Common reasons:
+
+| Reason | Meaning | Next step |
+| --- | --- | --- |
+| `signature_invalid` | The spec does not verify under the key that `envd` pins | Render `dev-cp` again: `CELL=dev-cp mise run cell:up`. After a rotation, use `mise run mgmt -- rotate-signing-key` |
+| `revision_old` | The spec is older than the revision that `envd` holds | Run `mise run mgmt -- status`. When `restoreActive` is true, run `mise run mgmt -- restore --revision latest`. When `stateBehindApplied` is true, see "Recover lost management state" |
+| `store_failed`, `state_unverifiable` | `envd` cannot write or verify `cell-records` | Read the log of `envd` in `dev-cp` |
+
+`envd` keeps its last good records after a refusal, so running agents and new attestations continue.
+`mise run harness:status` exits 1 when the refusal is newer than the last applied revision.
+
+### Serve an older revision
+
+`mise run mgmt -- restore --revision <counter>` makes `mgmtd` serve a stored revision of the current epoch.
+`envd` refuses it with `revision_old` and keeps its newer records.
+While `mgmtd` serves an older revision, `restoreActive` is true and each record change fails with `restore_active`.
+Run `mise run mgmt -- restore --revision latest` to end it. `mise run gate:m4:repair` also does this.
+A signing key rotation clears the stored history, so no older revision remains after it.
+
+### Attestation gaps
+
+Two gaps stop new agents from attesting. Running agents renew their SVIDs in both.
+
+- From the render of `dev-cp` until each cell binds, the SPIRE server holds no record of that cell. After the bind, records reach the server 50 to 60 seconds after `envd` writes them.
+- During a signing key rotation, the plugin holds no records from the restart of the server until `envd` writes the first spec under the new key. The measured gap was 71 seconds.
+
+`attest-wait.sh` shows which stage of the first gap is slow. A `celld` pod that starts in a gap can restart its agent container until the record lands.
 
 ### Recover lost management state
 
@@ -740,6 +787,7 @@ A run from clean on 2026-11-13, with the M3 components, took 21 minutes 53 secon
 
 The image build took 25 seconds. The rest of the run creates the five clusters and runs the link phase of `management`.
 `harness:status` and `harness:verify` passed.
+A run from clean with the M4 components took TBD-HARNESS-UP for `harness:up`.
 After the run, `gate:m1` took 131 seconds, `gate:m2` took 453 seconds, and `gate:m3` took 2,611 and 2,613 seconds.
 
 After the second `gate:m3` run, the five node containers used about 11 GiB of memory in total:
@@ -910,8 +958,10 @@ Each image reaches its cluster through one command:
 | `cluster-jwt-agent` | The init container of the `celld` pod in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
 | `celld` | The `celld` container in each cell | `CELL=<cell> mise run cell:up`, through the harness apply |
 | `attestprobe` | Test Jobs of `gate:m2` in `dev-cell-1` | `mise run gate:m2` |
+| `mgmtd` | StatefulSet `mgmtd` in `mgmt-system` of `management` | `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, after `mise run images -- mgmtd` |
+| `envd` | Deployment `envd` in `envd-system` of `dev-cp` | `CELL=dev-cp mise run cell:up`, through the harness apply |
 
-`mise run images` builds all five and records their digests in `build/images.env`.
+`mise run images` builds every image and records their digests in `build/images.env`.
 `cell:verify` fails when a running image differs from that file.
 `mise run images` builds without VCS stamps, so a digest changes only when the sources of that image change.
 A comment line in `build/images.env` records the commit of the build.
@@ -1078,6 +1128,31 @@ The task then runs these steps:
 The old key stays in `keys.json` until SPIRE prepares a new authority in its place.
 No copy trusts its root after step 5.
 `cell:down` and `cell:up` of `management` remain the last resort, because they also delete the datastore.
+
+### Keys of mgmtd and the host service
+
+The signing key of `mgmtd` is an Ed25519 key.
+It rests in the file `ed25519.key` on the volume of `mgmtd-0`, with mode 0400.
+No Secret holds it, and only `mgmtd-0` mounts the volume. The disk of the VM does not encrypt the file.
+`mgmtd` publishes the public key as ConfigMap `mgmt-signing-pub`.
+The render of `dev-cp` copies that key into ConfigMap `mgmt-spec-key` for `envd`, and into `record_public_keys` of the SPIRE server.
+`cell:verify` checks that the three copies agree.
+A restart of `mgmtd-0` keeps the key.
+A rebuild of `management` makes a new key and an empty state.
+Then `envd` refuses the specs until you render `dev-cp` again, and each cell binds again.
+The rebuild drill took TBD-REBUILD from `cell:down` of `management` to every cell bound.
+`mise run mgmt -- rotate-signing-key` replaces the key as a break-glass action. The runbook describes it.
+
+The host service makes a TLS key in memory at each start, and its certificate lives 90 days.
+ConfigMap `hostsvc-pin` holds the fingerprint of that certificate, and `mgmtd` trusts only that certificate.
+`mise run hostsvc:serve -- status` reports `expires_soon` 14 days before the end, and `harness:status` then exits 1.
+Run `mise run hostsvc:serve -- restart` to make a new certificate and pin it.
+
+The host service checks its client too.
+It accepts only a client with the SVID `spiffe://mgmt.poc.internal/api` that chains to the live root of `management`.
+A client with another SVID, another root or no certificate gets a TLS alert.
+The service keeps a cache of each key answer for 60 seconds, and it runs at most 2 lookups at once.
+After `mgmt:rotate-ca`, the task restarts the service so that it reads the new root.
 
 ## Move a live dev-cp to the scoped operator
 
