@@ -28,6 +28,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
@@ -35,6 +37,7 @@ import (
 	ktesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
@@ -71,6 +74,8 @@ type fixture struct {
 	args              map[string]string
 	telemetryCalls    atomic.Int32
 	telemetryRealCall bool
+	// tracedTelemetry gives the command a tracer and a logger that adds trace_id.
+	tracedTelemetry bool
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -133,6 +138,9 @@ func (f *fixture) deps() deps {
 			f.telemetryCalls.Add(1)
 			if f.telemetryRealCall {
 				return telemetry.Start(ctx, "mgmtd", w)
+			}
+			if f.tracedTelemetry {
+				return &telemetry.T{Log: telemetry.NewLogger(w, slog.DiscardHandler), Tracer: sdktrace.NewTracerProvider().Tracer("test"), Shutdown: func(context.Context) error { return nil }}, nil
 			}
 			return &telemetry.T{Log: jsonLogger(w), Shutdown: func(context.Context) error { return nil }}, nil
 		},
@@ -485,6 +493,10 @@ func TestShutdownBudgetStaysBelowTheGracePeriod(t *testing.T) {
 	if serverStopTimeout+flushTimeout >= 25*time.Second {
 		t.Fatalf("shutdown budget %s", serverStopTimeout+flushTimeout)
 	}
+	// Close waits for a running Reports call only if the stop budget covers its deadline.
+	if serverStopTimeout < mgmt.ReportsHandlerTimeout()+time.Second {
+		t.Fatalf("stop budget %s is below the reports deadline %s plus 1 s", serverStopTimeout, mgmt.ReportsHandlerTimeout())
+	}
 }
 
 func TestServeRefusesNonPositiveIntervals(t *testing.T) {
@@ -645,9 +657,11 @@ func TestRegistryNamespacesDefaultEmpty(t *testing.T) {
 	}
 }
 
-// With namespaces set, serve publishes the registry to each, and follows a commit of the plane.
+// With namespaces set, serve publishes the registry to each, and follows a commit of the plane. A
+// state with no record publishes nothing.
 func TestServePublishesRegistry(t *testing.T) {
 	f := newFixture(t)
+	seedBoundState(t, f)
 	f.args["registry-namespaces"] = "central-view-system,mesh-view-system"
 	r := f.start(t)
 	get := func(ns string) (*metav1.ObjectMeta, map[string]string, bool) {
@@ -657,43 +671,64 @@ func TestServePublishesRegistry(t *testing.T) {
 		}
 		return &cm.ObjectMeta, cm.Data, true
 	}
-	pubOf := func() string {
+	recordOf := func() string {
 		var out bytes.Buffer
-		if code := execute(t.Context(), []string{"ctl", "--socket", f.args["admin-socket"], "pubkey"}, &out, f.deps()); code != 0 {
-			t.Fatalf("ctl pubkey: %d %s", code, out.String())
+		if code := execute(t.Context(), []string{"ctl", "--socket", f.args["admin-socket"], "records"}, &out, f.deps()); code != 0 {
+			t.Fatalf("ctl records: %d %s", code, out.String())
 		}
-		var pk map[string]string
-		must(t, json.Unmarshal(out.Bytes(), &pk))
-		return pk["spec.pub"]
+		var recs map[string]json.RawMessage
+		must(t, json.Unmarshal(out.Bytes(), &recs))
+		return string(recs["dev-cell-1"])
 	}
 	waitFor(t, "ConfigMap cell-registry in each namespace", func() bool {
-		_, _, a := get("central-view-system")
-		_, _, b := get("mesh-view-system")
-		return a && b
+		_, a, okA := get("central-view-system")
+		_, b, okB := get("mesh-view-system")
+		return okA && okB && a["dev-cell-1.dsse.json"] != "" && b["dev-cell-1.dsse.json"] != ""
 	})
 	if _, _, ok := get("observability-system"); ok {
 		t.Fatal("a namespace that is not in the list got a registry")
 	}
-	meta, _, _ := get("central-view-system")
-	if len(meta.Labels) != 1 || meta.Labels["poc.internal/made-by"] != "mgmtd" {
+	meta, data, _ := get("central-view-system")
+	if len(meta.Labels) != 1 || meta.Labels["poc.internal/made-by"] != "mgmtd" || data["dev-cell-1.dsse.json"] != recordOf() {
 		t.Fatalf("labels %v", meta.Labels)
 	}
+	first := data["dev-cell-1.dsse.json"]
 	// A rotation commits at once, and the registry follows it without a restart.
 	var out bytes.Buffer
 	if code := execute(t.Context(), []string{"ctl", "--socket", f.args["admin-socket"], "rotate-key", "--emergency"}, &out, f.deps()); code != 0 {
 		t.Fatalf("rotate: %d %s", code, out.String())
 	}
-	newPub := pubOf()
-	waitFor(t, "the registry to carry the new key", func() bool {
+	waitFor(t, "the registry to carry the re-signed record", func() bool {
 		_, d, ok := get("mesh-view-system")
-		return ok && strings.TrimSpace(d["signers.pub"]) == newPub
+		return ok && d["dev-cell-1.dsse.json"] != first && d["dev-cell-1.dsse.json"] == recordOf()
 	})
+	r.stop(t)
+}
+
+// With no record, serve writes no registry, and an existing one stays.
+func TestServePublishesNoEmptyRegistry(t *testing.T) {
+	f := newFixture(t)
+	f.args["registry-namespaces"] = "central-view-system"
+	_, err := f.kube.CoreV1().ConfigMaps("central-view-system").Create(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cell-registry", Namespace: "central-view-system", Labels: map[string]string{"cell.poc.internal/harness": "x"}},
+		Data:       map[string]string{"dev-cell-1.dsse.json": "old", "signers.pub": "old\n"},
+	}, metav1.CreateOptions{})
+	must(t, err)
+	r := f.start(t)
+	waitFor(t, "the registry_empty line", func() bool { return strings.Contains(r.out.String(), `"msg":"registry_empty"`) })
+	time.Sleep(200 * time.Millisecond)
+	cm, err := f.kube.CoreV1().ConfigMaps("central-view-system").Get(t.Context(), "cell-registry", metav1.GetOptions{})
+	must(t, err)
+	if cm.Data["dev-cell-1.dsse.json"] != "old" || cm.Labels["cell.poc.internal/harness"] != "x" {
+		t.Fatalf("the registry changed: %v %v", cm.Data, cm.Labels)
+	}
 	r.stop(t)
 }
 
 // Readiness does not depend on the registry publish: a stuck write leaves /healthz at 200.
 func TestHealthzStaysUpWhileRegistryPublishIsStuck(t *testing.T) {
 	f := newFixture(t)
+	seedBoundState(t, f)
 	f.args["registry-namespaces"] = "central-view-system"
 	gate := make(chan struct{})
 	var stuck atomic.Int32
@@ -751,4 +786,30 @@ func TestServeStageThenCommitPublishesNextPub(t *testing.T) {
 		t.Fatalf("after the commit: %v", d)
 	}
 	r.stop(t)
+}
+
+// A log line of an API request carries trace_id, because the API handler runs under telemetry.Handler.
+func TestAPILogLineCarriesATraceID(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	f := newFixture(t)
+	f.tracedTelemetry = true
+	r := f.start(t)
+	auth := tlsconfig.AuthorizeID(mustSPIFFE(t, mgmtID))
+	tr := &http.Transport{TLSClientConfig: tlsconfig.MTLSClientConfig(f.devCA.Source(t, envdID), f.mgmtCA.Bundle(), auth), ForceAttemptHTTP2: true}
+	defer tr.CloseIdleConnections()
+	resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Post("https://"+r.addrs["api"]+mgmtapi.ReportsPath("dev"), "application/json", strings.NewReader("not json"))
+	must(t, err)
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	waitFor(t, "a reports_denied line", func() bool { return strings.Contains(r.out.String(), `"msg":"reports_denied"`) })
+	for _, l := range jsonLines(t, r.out.String()) {
+		if l["msg"] == "reports_denied" {
+			if id, _ := l["trace_id"].(string); len(id) != 32 {
+				t.Fatalf("reports_denied line %v has no trace_id", l)
+			}
+			return
+		}
+	}
 }

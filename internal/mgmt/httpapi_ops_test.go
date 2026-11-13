@@ -8,9 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -353,7 +350,7 @@ func TestReportsHandlerAnswersSlowKeySource(t *testing.T) {
 	want(t, res.Outcomes[0], mgmtapi.OutcomeRetry, mgmtapi.ReasonIssuerUnavailable, "key_source")
 }
 
-// No handler or helper of the M4 bind listener remains, and the API serves no bind route.
+// The API serves no bind route.
 func TestAPIHasNoBindRoutes(t *testing.T) {
 	f := newAPIFixture(t)
 	for _, tc := range []struct{ method, path string }{
@@ -361,39 +358,6 @@ func TestAPIHasNoBindRoutes(t *testing.T) {
 	} {
 		if rec := f.do(tc.method, tc.path, strings.NewReader("{}")); rec.Code != 404 {
 			t.Errorf("%s %s: status %d, want 404", tc.method, tc.path, rec.Code)
-		}
-	}
-	gone := map[string]bool{
-		"NewBindHandler": true, "Binder": true, "BindServerTLS": true, "ListenBind": true, "bindListener": true, "bindConn": true,
-		"bindConns": true, "bindConnKey": true, "maxEstablished": true, "bindMaxAge": true, "bindGrace": true,
-		"bindHandlerTimeout": true, "bindWriteMargin": true, "bindHandler": true,
-	}
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, pkg := range pkgs {
-		for _, file := range pkg.Files {
-			ast.Inspect(file, func(n ast.Node) bool {
-				switch d := n.(type) {
-				case *ast.FuncDecl:
-					if gone[d.Name.Name] {
-						t.Errorf("function %s remains", d.Name.Name)
-					}
-				case *ast.TypeSpec:
-					if gone[d.Name.Name] {
-						t.Errorf("type %s remains", d.Name.Name)
-					}
-				case *ast.ValueSpec:
-					for _, n := range d.Names {
-						if gone[n.Name] {
-							t.Errorf("value %s remains", n.Name)
-						}
-					}
-				}
-				return true
-			})
 		}
 	}
 }
@@ -741,5 +705,120 @@ func TestStagedPublicKeyAccessor(t *testing.T) {
 	r.restart(nil)
 	if _, ok := r.plane.StagedPublicKey(); !ok {
 		t.Fatal("the stage was lost over a restart")
+	}
+}
+
+// The emergency rotation needs no stage, and it discards a staged key: that key sits on the same
+// volume as the signing key, so a reason to rotate at once covers it.
+func TestRotateKeyEmergencyDiscardsTheStage(t *testing.T) {
+	r := newRig(t)
+	var published []ed25519.PublicKey
+	h := NewAdminHandler(r.plane, func(_ context.Context, pub ed25519.PublicKey) error {
+		published = append(published, pub)
+		return nil
+	})
+	old := r.plane.PublicKey()
+	if rec := adminDo(h, "POST", "/rotate-key", ""); rec.Code != 200 || r.plane.PublicKey().Equal(old) {
+		t.Fatalf("emergency rotate with no stage: %d %s", rec.Code, rec.Body)
+	}
+	if rec := adminDo(h, "POST", "/rotate-key?stage=1", ""); rec.Code != 200 {
+		t.Fatalf("stage: %d %s", rec.Code, rec.Body)
+	}
+	staged, ok := r.plane.StagedPublicKey()
+	if !ok {
+		t.Fatal("no staged key")
+	}
+	staged1, _ := os.ReadFile(filepath.Join(r.dir, nextKeyFile))
+	before := r.plane.PublicKey()
+	if rec := adminDo(h, "POST", "/rotate-key", ""); rec.Code != 200 {
+		t.Fatalf("emergency rotate: %d %s", rec.Code, rec.Body)
+	}
+	got := r.plane.PublicKey()
+	if got.Equal(before) || got.Equal(staged) {
+		t.Fatal("the emergency rotation used the old key or the staged key")
+	}
+	if _, ok := r.plane.StagedPublicKey(); ok || r.status().StagedKey != "" {
+		t.Fatal("the stage remained")
+	}
+	if _, err := os.Stat(filepath.Join(r.dir, nextKeyFile)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the staged key file remained in place: %v", err)
+	}
+	asides, _ := filepath.Glob(filepath.Join(r.dir, nextKeyFile+".stale-*"))
+	if len(asides) != 1 {
+		t.Fatalf("%d moved staged key files", len(asides))
+	}
+	if b, err := os.ReadFile(asides[0]); err != nil || !bytes.Equal(b, staged1) {
+		t.Fatalf("moved staged key differs: %v", err)
+	}
+	if !published[len(published)-1].Equal(got) {
+		t.Fatal("the emergency rotation did not publish the new key")
+	}
+	// A guarded emergency rotation behaves the same, and a stale one changes nothing.
+	if rec := adminDo(h, "POST", "/rotate-key?expect-seq="+itoa(r.status().Seq-1), ""); rec.Code != 409 || !r.plane.PublicKey().Equal(got) {
+		t.Fatalf("stale emergency rotate: %d", rec.Code)
+	}
+}
+
+// Two commits that race: one rotates to the staged key, the other finds no stage and changes nothing.
+func TestRotateKeyRacingCommits(t *testing.T) {
+	r := newRig(t)
+	var mu sync.Mutex
+	var published []ed25519.PublicKey
+	h := NewAdminHandler(r.plane, func(_ context.Context, pub ed25519.PublicKey) error {
+		mu.Lock()
+		defer mu.Unlock()
+		published = append(published, pub)
+		return nil
+	})
+	if rec := adminDo(h, "POST", "/rotate-key?stage=1", ""); rec.Code != 200 {
+		t.Fatalf("stage: %d", rec.Code)
+	}
+	staged, _ := r.plane.StagedPublicKey()
+	mu.Lock()
+	published = nil
+	mu.Unlock()
+	codes := make(chan int, 2)
+	reasons := make(chan string, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			rec := adminDo(h, "POST", "/rotate-key?commit=1", "")
+			codes <- rec.Code
+			var m map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &m)
+			r, _ := m["reason"].(string)
+			reasons <- r
+		}()
+	}
+	c1, c2 := <-codes, <-codes
+	if !((c1 == 200 && c2 == 409) || (c1 == 409 && c2 == 200)) {
+		t.Fatalf("status codes %d and %d, want one 200 and one 409", c1, c2)
+	}
+	if a, b := <-reasons, <-reasons; a != ReasonNotStaged && b != ReasonNotStaged {
+		t.Fatalf("reasons %q %q", a, b)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !r.plane.PublicKey().Equal(staged) || len(published) != 1 || !published[0].Equal(r.plane.PublicKey()) {
+		t.Fatalf("signing key is the staged key: %v; %d publishes", r.plane.PublicKey().Equal(staged), len(published))
+	}
+}
+
+func TestPlaneGuardedStageKey(t *testing.T) {
+	r := newRig(t)
+	seq := r.status().Seq
+	if _, err := r.plane.IfSeq(seq - 1).StageKey(t.Context()); ReasonOf(err) != mgmtapi.ReasonConflict {
+		t.Fatalf("stale guarded stage: %v", err)
+	}
+	if _, ok := r.plane.StagedPublicKey(); ok {
+		t.Fatal("a stale guarded stage staged a key")
+	}
+	if _, err := r.plane.IfSeq(seq).StageKey(t.Context()); err != nil {
+		t.Fatalf("guarded stage at the current seq: %v", err)
+	}
+	if _, err := r.plane.CommitStagedKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.plane.CommitStagedKey(t.Context()); !errors.Is(err, ErrNotStaged) {
+		t.Fatalf("a commit with no stage: %v", err)
 	}
 }

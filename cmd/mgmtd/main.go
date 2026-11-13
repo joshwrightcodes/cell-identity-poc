@@ -56,7 +56,7 @@ const (
 	sourceTimeout = 30 * time.Second
 	// serverStopTimeout is the one budget for the stop of the two servers, and flushTimeout bounds
 	// the telemetry flush. Together they stay below the 30 s termination grace of a pod.
-	serverStopTimeout = 8 * time.Second
+	serverStopTimeout = 13 * time.Second
 	flushTimeout      = 10 * time.Second
 	exitConfig        = 2
 )
@@ -408,9 +408,6 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	wg.Go(func() { _ = plane.RunChecks(ctx) })
 	wg.Go(func() { publisher.run(ctx, logger, time.Second, 5*time.Minute) })
 	if registry != nil {
-		// The plane calls OnRecords only after a commit, so the first publish starts from the
-		// records that the state already holds.
-		registry.set(plane.Records(), plane.PublicKey())
 		wg.Go(func() { registry.run(ctx, kube, cfg.registryNamespaces, logger, registryBackoff, registryResync) })
 	}
 

@@ -239,9 +239,34 @@ func (p *Plane) checkStored(st *State, pub ed25519.PublicKey) error {
 // RotateKey makes the staged signing key the signing key, or a new key when none is staged. It
 // writes the key, and re-signs every record, the spec and every open operation at the first
 // revision of the next epoch. A failed change puts the old key file back.
-func (p *Plane) RotateKey(ctx context.Context) (ed25519.PublicKey, error) { return p.rotate(ctx, nil) }
+func (p *Plane) RotateKey(ctx context.Context) (ed25519.PublicKey, error) {
+	return p.rotate(ctx, nil, rotateAuto)
+}
 
-func (p *Plane) rotate(ctx context.Context, expect *uint64) (ed25519.PublicKey, error) {
+// ErrNotStaged is the error of CommitStagedKey when no key is staged.
+var ErrNotStaged = errors.New("not_staged")
+
+// CommitStagedKey makes the staged key the signing key, and fails with ErrNotStaged, with no
+// change, when no key is staged. The check and the rotation run in one locked step.
+func (p *Plane) CommitStagedKey(ctx context.Context) (ed25519.PublicKey, error) {
+	return p.rotate(ctx, nil, rotateCommit)
+}
+
+// RotateKeyEmergency makes a new signing key at once. A staged key lives on the same volume as the
+// signing key, so a reason to rotate at once covers it too: it moves aside with a stamp and the
+// stage is cleared.
+func (p *Plane) RotateKeyEmergency(ctx context.Context) (ed25519.PublicKey, error) {
+	return p.rotate(ctx, nil, rotateFresh)
+}
+
+// The ways that a rotation picks the next key.
+const (
+	rotateAuto   = iota // the staged key when one exists, else a new key
+	rotateCommit        // the staged key, or ErrNotStaged
+	rotateFresh         // a new key, and any staged key moves aside
+)
+
+func (p *Plane) rotate(ctx context.Context, expect *uint64, mode int) (ed25519.PublicKey, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -250,6 +275,15 @@ func (p *Plane) rotate(ctx context.Context, expect *uint64) (ed25519.PublicKey, 
 			return err
 		}
 		next, staged := p.stagedKey(t.st)
+		if mode == rotateFresh {
+			if next, staged = nil, false; t.st.StagedKeySHA256 != "" {
+				t.st.StagedKeySHA256 = ""
+				t.after = append(t.after, p.moveStagedAside)
+			}
+		}
+		if mode == rotateCommit && !staged {
+			return ErrNotStaged
+		}
 		if !staged {
 			var err error
 			if _, next, err = ed25519.GenerateKey(rand.Reader); err != nil {
@@ -286,6 +320,16 @@ func (p *Plane) rotate(ctx context.Context, expect *uint64) (ed25519.PublicKey, 
 	return p.PublicKey(), nil
 }
 
+// moveStagedAside renames the staged key file to <name>.stale-<unix time>. An absent file is fine.
+func (p *Plane) moveStagedAside() {
+	dest := p.nextKeyPath() + ".stale-" + strconv.FormatInt(p.cfg.Now().Unix(), 10)
+	if err := os.Rename(p.nextKeyPath(), dest); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		p.cfg.Log.Error("staged_key_move_failed", "error", err.Error())
+		return
+	}
+	p.cfg.Log.Warn("staged_key_moved_aside", "moved_to", dest)
+}
+
 // nextKeyFile is the name of the staged signing key, next to the signing key file.
 const nextKeyFile = "ed25519.next.key"
 
@@ -306,11 +350,28 @@ func (p *Plane) stagedKey(st *State) (ed25519.PrivateKey, bool) {
 // StageKey writes the next signing key to ed25519.next.key and returns its public key. A second
 // call returns the same key. RotateKey then makes it the signing key.
 func (p *Plane) StageKey(ctx context.Context) (ed25519.PublicKey, error) {
+	return p.stage(ctx, nil)
+}
+
+// StagedPublicKey returns the public key of the staged signing key, when the state names a staged
+// key and its file holds that key.
+func (p *Plane) StagedPublicKey() (ed25519.PublicKey, bool) {
+	key, ok := p.stagedKey(p.snap.Load().st)
+	if !ok {
+		return nil, false
+	}
+	return slices.Clone(key.Public().(ed25519.PublicKey)), true
+}
+
+func (p *Plane) stage(ctx context.Context, expect *uint64) (ed25519.PublicKey, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	var pub ed25519.PublicKey
 	err := p.commit(func(t *txn) error {
+		if err := t.expectSeq(expect); err != nil {
+			return err
+		}
 		if key, ok := p.stagedKey(t.st); ok {
 			pub = key.Public().(ed25519.PublicKey)
 			return nil
@@ -402,7 +463,22 @@ func (g SeqGuard) Restore(counter uint64) error { return g.p.restore(counter, &g
 
 // RotateKey is Plane.RotateKey, guarded by the state version.
 func (g SeqGuard) RotateKey(ctx context.Context) (ed25519.PublicKey, error) {
-	return g.p.rotate(ctx, &g.seq)
+	return g.p.rotate(ctx, &g.seq, rotateAuto)
+}
+
+// CommitStagedKey is Plane.CommitStagedKey, guarded by the state version.
+func (g SeqGuard) CommitStagedKey(ctx context.Context) (ed25519.PublicKey, error) {
+	return g.p.rotate(ctx, &g.seq, rotateCommit)
+}
+
+// RotateKeyEmergency is Plane.RotateKeyEmergency, guarded by the state version.
+func (g SeqGuard) RotateKeyEmergency(ctx context.Context) (ed25519.PublicKey, error) {
+	return g.p.rotate(ctx, &g.seq, rotateFresh)
+}
+
+// StageKey is Plane.StageKey, guarded by the state version.
+func (g SeqGuard) StageKey(ctx context.Context) (ed25519.PublicKey, error) {
+	return g.p.stage(ctx, &g.seq)
 }
 
 // CheckSeq returns conflict when seq is not the current state version.

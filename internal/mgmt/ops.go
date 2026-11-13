@@ -233,3 +233,70 @@ func decodeOpUnverified(envelope []byte) (op.Operation, error) {
 	var o op.Operation
 	return o, json.Unmarshal(body, &o)
 }
+
+// OpView is one operation as the admin socket shows it. State is open, expired or final.
+type OpView struct {
+	ID        string          `json:"id"`
+	Cell      string          `json:"cell"`
+	Kind      string          `json:"kind,omitempty"`
+	State     string          `json:"state"`
+	Final     string          `json:"final,omitempty"`
+	Served    bool            `json:"served"`
+	KeyEpoch  uint64          `json:"keyEpoch"`
+	IssuedAt  time.Time       `json:"issuedAt"`
+	ExpiresAt time.Time       `json:"expiresAt"`
+	ExpiredAt time.Time       `json:"expiredAt,omitzero"`
+	ResultAt  time.Time       `json:"resultAt,omitzero"`
+	Result    *op.Result      `json:"result,omitempty"`
+	Envelopes []string        `json:"envelopes,omitempty"`
+	Envelope  json.RawMessage `json:"envelope,omitempty"`
+}
+
+// newOpView describes o. The envelopes are left out when withEnvelope is false.
+func (p *Plane) newOpView(id string, o *OpState, withEnvelope bool) OpView {
+	v := OpView{
+		ID: id, Cell: o.Cell, Served: o.Served, KeyEpoch: o.KeyEpoch, IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt,
+		ExpiredAt: o.ExpiredAt, ResultAt: o.ResultAt, Result: o.Result, Final: o.Final,
+	}
+	switch {
+	case o.Final != "":
+		v.State = "final"
+	case o.open(p.cfg.Now()):
+		v.State = "open"
+	default:
+		v.State = "expired"
+	}
+	if cur, err := decodeOpUnverified(o.Envelope); err == nil {
+		v.Kind = cur.Kind
+	}
+	if withEnvelope {
+		v.Envelopes = slices.Clone(o.Envelopes)
+		v.Envelope = slices.Clone(json.RawMessage(o.Envelope))
+	}
+	return v
+}
+
+// OpView returns the operation with the ID, with its envelope, or ErrOpUnknown.
+func (p *Plane) OpView(id string) (OpView, error) {
+	o := p.snap.Load().st.Ops[id]
+	if o == nil {
+		return OpView{}, ErrOpUnknown
+	}
+	return p.newOpView(id, o, true), nil
+}
+
+// OpViews returns the operations of cell, or every operation when cell is empty, oldest first and
+// without envelopes. An unknown cell is an error.
+func (p *Plane) OpViews(cell string) ([]OpView, error) {
+	if _, ok := p.intent[cell]; cell != "" && !ok {
+		return nil, refuse(mgmtapi.ReasonCellUnknown, "")
+	}
+	st := p.snap.Load().st
+	out := []OpView{}
+	for _, id := range st.OpOrder {
+		if o := st.Ops[id]; cell == "" || o.Cell == cell {
+			out = append(out, p.newOpView(id, o, false))
+		}
+	}
+	return out, nil
+}

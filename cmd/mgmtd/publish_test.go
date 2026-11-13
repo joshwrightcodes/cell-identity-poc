@@ -666,3 +666,71 @@ func TestPublishRegistryRepairsLabelsAndAnnotations(t *testing.T) {
 		}
 	}
 }
+
+// No record, no registry: PublishRegistry refuses an empty set, and the publisher writes nothing
+// and leaves an existing object alone until records arrive.
+func TestRegistryPublisherPublishesNothingWhileEmpty(t *testing.T) {
+	client := fake.NewClientset()
+	pub, priv := newKey(t)
+	if err := PublishRegistry(t.Context(), client, registryNamespaces, map[string]json.RawMessage{}, pub); err == nil {
+		t.Fatal("an empty record set was published")
+	}
+	_, err := client.CoreV1().ConfigMaps("central-view-system").Create(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "cell-registry", Namespace: "central-view-system"},
+		Data:       map[string]string{"dev-cell-1.dsse.json": "old", "signers.pub": "old\n"},
+	}, metav1.CreateOptions{})
+	must(t, err)
+	var writes atomic.Int32
+	for _, verb := range []string{"create", "update"} {
+		client.PrependReactor(verb, "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+			writes.Add(1)
+			return false, nil, nil
+		})
+	}
+	p := newRegistryPublisher()
+	p.set(map[string]json.RawMessage{}, pub)
+	var logs lockedBuffer
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		p.run(ctx, client, registryNamespaces, jsonLogger(&logs), time.Millisecond, 20*time.Millisecond)
+		close(done)
+	}()
+	defer func() { cancel(); <-done }()
+	waitFor(t, "the registry_empty line", func() bool { return strings.Contains(logs.String(), `"msg":"registry_empty"`) })
+	time.Sleep(200 * time.Millisecond)
+	if writes.Load() != 0 || getRegistry(t, client, "central-view-system").Data["dev-cell-1.dsse.json"] != "old" {
+		t.Fatalf("%d writes while no record exists", writes.Load())
+	}
+	if n := strings.Count(logs.String(), `"msg":"registry_empty"`); n != 1 {
+		t.Fatalf("%d registry_empty lines, want 1", n)
+	}
+	records := registryRecords(t, priv, "dev-cell-1")
+	p.set(records, pub)
+	waitFor(t, "the first record", func() bool {
+		return cellFiles(getRegistry(t, client, "central-view-system"))["dev-cell-1.dsse.json"] == string(records["dev-cell-1"])
+	})
+}
+
+// The B-05 drift rule on its own: one unrelated key, or binary data, in an otherwise right ConfigMap.
+func TestPublishPublicKeyUnrelatedKeyIsDrift(t *testing.T) {
+	pub, _ := newKey(t)
+	for name, mod := range map[string]func(*corev1.ConfigMap){
+		"unrelated_key": func(cm *corev1.ConfigMap) { cm.Data["extra"] = "x" },
+		"binary_data":   func(cm *corev1.ConfigMap) { cm.BinaryData = map[string][]byte{"x": []byte("y")} },
+	} {
+		client := fake.NewClientset()
+		must(t, PublishPublicKey(t.Context(), client, "mgmt-system", "c", pub, nil))
+		cm, _ := client.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "c", metav1.GetOptions{})
+		mod(cm)
+		_, err := client.CoreV1().ConfigMaps("mgmt-system").Update(t.Context(), cm, metav1.UpdateOptions{})
+		must(t, err)
+		var writes int
+		client.PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) { writes++; return false, nil, nil })
+		must(t, PublishPublicKey(t.Context(), client, "mgmt-system", "c", pub, nil))
+		got, _ := client.CoreV1().ConfigMaps("mgmt-system").Get(t.Context(), "c", metav1.GetOptions{})
+		if writes != 1 || len(got.Data) != 1 || len(got.BinaryData) != 0 {
+			t.Errorf("%s: %d writes, data %v binary %d", name, writes, got.Data, len(got.BinaryData))
+		}
+	}
+}

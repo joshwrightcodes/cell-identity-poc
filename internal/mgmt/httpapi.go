@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -30,7 +29,6 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/connlimit"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
@@ -48,6 +46,10 @@ const (
 // against the context that it gets, so a slow batch ends with retry outcomes under this deadline.
 // It stays below the write timeout of the API server, so that the answer still goes out.
 var reportsHandlerTimeout = 12 * time.Second
+
+// ReportsHandlerTimeout returns the deadline of one report post. A server stop that waits for
+// running handlers needs a budget above it.
+func ReportsHandlerTimeout() time.Duration { return reportsHandlerTimeout }
 
 // denialWindow and denialKeys bound the denial log lines of a handler.
 const (
@@ -249,6 +251,7 @@ func (h *apiHandler) reports(w http.ResponseWriter, r *http.Request) {
 // ---- Admin
 
 type adminHandler struct {
+	rotMu   sync.Mutex
 	p       *Plane
 	publish func(context.Context, ed25519.PublicKey) error
 }
@@ -260,7 +263,7 @@ const publishTimeout = 30 * time.Second
 // change keys or records take the query expect-seq, and then run only while the state version is
 // that number. POST /rotate-key calls publish before it answers: with the staged key for stage=1,
 // and with the new signing key for commit=1 and for a rotation with no query (the emergency
-// rotation, which needs no stage).
+// rotation, which needs no stage and moves any staged key aside).
 func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) error) http.Handler {
 	h := &adminHandler{p: p, publish: publish}
 	mux := http.NewServeMux()
@@ -446,30 +449,30 @@ func (h *adminHandler) rotate(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, err.Error())
 		return
 	}
+	// One key change at a time, so that a commit cannot meet a stage that another commit used.
+	h.rotMu.Lock()
+	defer h.rotMu.Unlock()
 	if stage {
 		h.stage(w, r, seq, guarded)
 		return
 	}
-	var staged ed25519.PublicKey
-	if commit {
-		var ok bool
-		if staged, ok = h.p.StagedPublicKey(); !ok {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": "no key is staged; run rotate-key --stage first", "reason": ReasonNotStaged})
-			return
-		}
-	}
 	var pub ed25519.PublicKey
-	if guarded {
-		pub, err = h.p.IfSeq(seq).RotateKey(r.Context())
-	} else {
-		pub, err = h.p.RotateKey(r.Context())
+	switch {
+	case commit && guarded:
+		pub, err = h.p.IfSeq(seq).CommitStagedKey(r.Context())
+	case commit:
+		pub, err = h.p.CommitStagedKey(r.Context())
+	case guarded:
+		pub, err = h.p.IfSeq(seq).RotateKeyEmergency(r.Context())
+	default:
+		pub, err = h.p.RotateKeyEmergency(r.Context())
+	}
+	if errors.Is(err, ErrNotStaged) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "no key is staged; run rotate-key --stage first", "reason": ReasonNotStaged})
+		return
 	}
 	if err != nil {
 		adminError(w, err)
-		return
-	}
-	if commit && !pub.Equal(staged) {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "the key that signs is not the staged key", "rotated": true})
 		return
 	}
 	if h.publish != nil {
@@ -488,16 +491,15 @@ func (h *adminHandler) rotate(w http.ResponseWriter, r *http.Request) {
 }
 
 // stage makes the next signing key and publishes its public half as next.pub. The signing key does
-// not change. The guard checks the state version before the stage, which is a no-op while a key is
-// staged.
+// not change.
 func (h *adminHandler) stage(w http.ResponseWriter, r *http.Request, seq uint64, guarded bool) {
+	var pub ed25519.PublicKey
+	var err error
 	if guarded {
-		if err := h.p.CheckSeq(seq); err != nil {
-			adminError(w, err)
-			return
-		}
+		pub, err = h.p.IfSeq(seq).StageKey(r.Context())
+	} else {
+		pub, err = h.p.StageKey(r.Context())
 	}
-	pub, err := h.p.StageKey(r.Context())
 	if err != nil {
 		adminError(w, err)
 		return
@@ -515,63 +517,6 @@ func (h *adminHandler) stage(w http.ResponseWriter, r *http.Request, seq uint64,
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"next.pub": base64.StdEncoding.EncodeToString(pub), "staged": true, "seq": h.p.Status().Seq})
 }
-
-// StagedPublicKey returns the public key of the staged signing key, when the state names a staged
-// key and its file holds that key.
-func (p *Plane) StagedPublicKey() (ed25519.PublicKey, bool) {
-	key, ok := p.stagedKey(p.snap.Load().st)
-	if !ok {
-		return nil, false
-	}
-	return slices.Clone(key.Public().(ed25519.PublicKey)), true
-}
-
-// ---- Admin: operations
-
-// opView is one operation as the admin socket shows it.
-type opView struct {
-	ID        string          `json:"id"`
-	Cell      string          `json:"cell"`
-	Kind      string          `json:"kind,omitempty"`
-	State     string          `json:"state"`
-	Final     string          `json:"final,omitempty"`
-	Served    bool            `json:"served"`
-	KeyEpoch  uint64          `json:"keyEpoch"`
-	IssuedAt  time.Time       `json:"issuedAt"`
-	ExpiresAt time.Time       `json:"expiresAt"`
-	ExpiredAt time.Time       `json:"expiredAt,omitzero"`
-	ResultAt  time.Time       `json:"resultAt,omitzero"`
-	Result    *op.Result      `json:"result,omitempty"`
-	Envelopes []string        `json:"envelopes,omitempty"`
-	Envelope  json.RawMessage `json:"envelope,omitempty"`
-}
-
-// newOpView describes o. The envelope is left out when withEnvelope is false.
-func (p *Plane) newOpView(id string, o *OpState, withEnvelope bool) opView {
-	v := opView{
-		ID: id, Cell: o.Cell, Served: o.Served, KeyEpoch: o.KeyEpoch, IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt,
-		ExpiredAt: o.ExpiredAt, ResultAt: o.ResultAt, Result: o.Result, Final: o.Final,
-	}
-	switch {
-	case o.Final != "":
-		v.State = "final"
-	case o.open(p.cfg.Now()):
-		v.State = "open"
-	default:
-		v.State = "expired"
-	}
-	if cur, err := decodeOpUnverified(o.Envelope); err == nil {
-		v.Kind = cur.Kind
-	}
-	if withEnvelope {
-		v.Envelopes = slices.Clone(o.Envelopes)
-		v.Envelope = slices.Clone(json.RawMessage(o.Envelope))
-	}
-	return v
-}
-
-// maxListedOps is the most operations that GET /ops lists.
-const maxListedOps = OpHistory
 
 type createOpRequest struct {
 	Cell string          `json:"cell"`
@@ -617,40 +562,29 @@ func (h *adminHandler) createOp(w http.ResponseWriter, r *http.Request) {
 		adminError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, opView{
+	writeJSON(w, http.StatusOK, OpView{
 		ID: o.ID, Cell: o.Cell, Kind: o.Kind, State: "open", Served: serve, KeyEpoch: o.KeyEpoch,
 		IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt, Envelope: json.RawMessage(env),
 	})
 }
 
 func (h *adminHandler) getOp(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	o := h.p.snap.Load().st.Ops[id]
-	if o == nil {
-		adminError(w, ErrOpUnknown)
+	v, err := h.p.OpView(r.PathValue("id"))
+	if err != nil {
+		adminError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, h.p.newOpView(id, o, true))
+	writeJSON(w, http.StatusOK, v)
 }
 
 // listOps lists the operations of the query cell, or every operation, oldest first.
 func (h *adminHandler) listOps(w http.ResponseWriter, r *http.Request) {
-	cell := r.URL.Query().Get("cell")
-	if _, ok := h.p.intent[cell]; cell != "" && !ok {
-		adminError(w, refuse(mgmtapi.ReasonCellUnknown, ""))
+	views, err := h.p.OpViews(r.URL.Query().Get("cell"))
+	if err != nil {
+		adminError(w, err)
 		return
 	}
-	st := h.p.snap.Load().st
-	out := []opView{}
-	for _, id := range st.OpOrder {
-		if o := st.Ops[id]; cell == "" || o.Cell == cell {
-			out = append(out, h.p.newOpView(id, o, false))
-		}
-	}
-	if len(out) > maxListedOps {
-		out = out[len(out)-maxListedOps:]
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ops": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ops": views})
 }
 
 func (h *adminHandler) closeOp(w http.ResponseWriter, r *http.Request) {

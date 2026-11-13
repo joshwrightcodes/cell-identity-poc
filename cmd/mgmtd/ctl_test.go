@@ -109,7 +109,9 @@ func TestAdminCommandsPrintOneLine(t *testing.T) {
 	for name, args := range map[string][]string{
 		"no_command": {}, "unknown": {"nope"}, "keys_without_cell": {"keys"},
 		"restore_without_revision": {"restore"}, "bad_expect": {"--expect-seq", "x", "status"},
-		"rotate_without_mode": {"rotate-key"}, "rotate_two_modes": {"rotate-key", "--stage", "--commit"},
+		"rotate_two_modes": {"rotate-key", "--stage", "--commit"}, "rotate_stage_emergency": {"rotate-key", "--stage", "--emergency"},
+		"flag_of_another_command": {"keycheck", "--cell", "dev-cell-1", "--stage"}, "op_flag_on_status": {"status", "--line", "x"},
+		"revision_on_keys": {"keys", "--cell", "dev-cell-1", "--revision", "1"}, "line_on_op_get": {"op", "get", "--line", "x", "--id", "a"},
 		"op_without_command": {"op"}, "op_unknown": {"op", "nope"}, "op_create_without_line": {"op", "create", "--cell", "dev-cell-1"},
 		"op_get_without_id": {"op", "get"}, "op_get_two_ids": {"op", "get", "a", "b"}, "op_list_with_id": {"op", "list", "x"},
 	} {
@@ -277,8 +279,26 @@ func TestCtlRefusesAForeignSocket(t *testing.T) {
 	}
 }
 
-// bindFixture binds dev-cell-1 on plane with a token that a stub key source accepts.
+// bindFixture binds dev-cell-1 and serves the admin socket of that plane.
 func bindFixture(t *testing.T, f *fixture) (func(args ...string) (int, string), *mgmt.Plane) {
+	t.Helper()
+	plane := seedBoundState(t, f)
+	sock := filepath.Join(f.sockDir, "b.sock")
+	ln, err := listenAdmin(sock)
+	must(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go serveAdmin(ctx, ln, mgmt.NewAdminHandler(plane, func(context.Context, ed25519.PublicKey) error { return nil }))
+	return func(args ...string) (int, string) {
+		var out bytes.Buffer
+		code := execute(ctx, append([]string{"ctl", "--socket", sock}, args...), &out, f.deps())
+		return code, out.String()
+	}, plane
+}
+
+// seedBoundState binds dev-cell-1 with a token that a stub key source accepts, and leaves the state
+// and the signing key in the data directory of f, where a serve then finds a record.
+func seedBoundState(t *testing.T, f *fixture) *mgmt.Plane {
 	t.Helper()
 	signer := kubetoken.NewSigner(t, "kid-1", jose.ES256)
 	in, err := mgmt.LoadIntent(f.args["intent"])
@@ -297,17 +317,7 @@ func bindFixture(t *testing.T, f *fixture) (func(args ...string) (int, string), 
 	if resp, err := plane.Bind(t.Context(), "dev-cell-1", mgmtapi.BindRequest{Nonce: nonce.Nonce, Token: tok}); err != nil || resp.Status != mgmtapi.StatusBound {
 		t.Fatalf("bind: %+v %v", resp, err)
 	}
-	sock := filepath.Join(f.sockDir, "b.sock")
-	ln, err := listenAdmin(sock)
-	must(t, err)
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	go serveAdmin(ctx, ln, mgmt.NewAdminHandler(plane, func(context.Context, ed25519.PublicKey) error { return nil }))
-	return func(args ...string) (int, string) {
-		var out bytes.Buffer
-		code := execute(ctx, append([]string{"ctl", "--socket", sock}, args...), &out, f.deps())
-		return code, out.String()
-	}, plane
+	return plane
 }
 
 type signerKeys struct{ s *kubetoken.Signer }
@@ -437,5 +447,28 @@ func TestRotateKeyStageThenCommit(t *testing.T) {
 	mu.Unlock()
 	if n != 2 {
 		t.Fatalf("%d publishes, want 2", n)
+	}
+}
+
+// The bare rotate-key is the emergency rotation of M4: the same answer, and a staged key goes.
+func TestCtlBareRotateKeyIsEmergency(t *testing.T) {
+	ctl, plane := newAdminRig(t, func(context.Context, ed25519.PublicKey) error { return nil })
+	old := plane.PublicKey()
+	got := ctlLine(t, ctl, "rotate-key")
+	if got["spec.pub"] != base64.StdEncoding.EncodeToString(plane.PublicKey()) || plane.PublicKey().Equal(old) || got["signed"] == nil || got["seq"] == nil || len(got) != 3 {
+		t.Fatalf("bare rotate-key: %v", got)
+	}
+	ctlLine(t, ctl, "rotate-key", "--stage")
+	staged, _ := plane.StagedPublicKey()
+	em := ctlLine(t, ctl, "rotate-key", "--emergency")
+	if _, ok := plane.StagedPublicKey(); ok || em["spec.pub"] == base64.StdEncoding.EncodeToString(staged) || len(em) != 3 {
+		t.Fatalf("emergency rotate-key: %v", em)
+	}
+	ctlLine(t, ctl, "rotate-key", "--stage")
+	if bare := ctlLine(t, ctl, "rotate-key"); len(bare) != 3 {
+		t.Fatalf("bare rotate-key after a stage: %v", bare)
+	}
+	if _, ok := plane.StagedPublicKey(); ok {
+		t.Fatal("the bare rotate-key left a staged key")
 	}
 }

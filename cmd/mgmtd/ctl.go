@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,7 +26,7 @@ const (
 	defaultSocket  = "/run/mgmtd/ctl/admin.sock"
 	ctlTimeout     = 60 * time.Second
 	maxCtlResponse = 16 << 20
-	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]"
+	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]"
 )
 
 // Hooks that tests replace.
@@ -166,6 +167,18 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		}
 		*id = sub.Arg(0)
 	}
+	given := map[string]bool{}
+	sub.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	for flagName := range given {
+		if !flagApplies(rest[0], opSub, flagName) {
+			what := rest[0]
+			if opSub != "" {
+				what += " " + opSub
+			}
+			cli.Fail(stdout, name, fmt.Errorf("--%s does not apply to %s; %s", flagName, what, ctlUsage))
+			return exitConfig
+		}
+	}
 	query := ""
 	if *expect != "" {
 		if _, err := strconv.ParseUint(*expect, 10, 64); err != nil {
@@ -212,10 +225,11 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 				modes++
 			}
 		}
-		if modes != 1 {
-			cli.Fail(stdout, name, errors.New("rotate-key needs exactly one of --stage, --commit and --emergency"))
+		if modes > 1 {
+			cli.Fail(stdout, name, errors.New("rotate-key takes at most one of --stage, --commit and --emergency"))
 			return exitConfig
 		}
+		// With no flag the command is the emergency rotation, as it was before the stage.
 		mode := ""
 		switch {
 		case *stage:
@@ -285,6 +299,28 @@ func ctlRequest(ctx context.Context, socket, method, path string, body io.Reader
 	one.WriteByte('\n')
 	_, err = out.Write(one.Bytes())
 	return err
+}
+
+// flagApplies reports whether the subcommand flag applies to the command (and the op subcommand).
+func flagApplies(command, opSub, flagName string) bool {
+	switch command {
+	case "keys", "keycheck":
+		return flagName == "cell"
+	case "restore":
+		return flagName == "revision"
+	case "rotate-key":
+		return flagName == "stage" || flagName == "commit" || flagName == "emergency"
+	case "op":
+		switch opSub {
+		case "create", "sign":
+			return flagName == "cell" || flagName == "line" || flagName == "ttl" || flagName == "kind"
+		case "get", "close":
+			return flagName == "id"
+		case "list":
+			return flagName == "cell"
+		}
+	}
+	return false
 }
 
 // joinQuery adds the query part extra to query, which is empty or starts with ?.
