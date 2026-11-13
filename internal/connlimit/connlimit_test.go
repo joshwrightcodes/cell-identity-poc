@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -426,4 +427,382 @@ func TestListenRefusesBadLimits(t *testing.T) {
 		})
 	}
 	Listen(l, 1, time.Second, 0, nil)
+}
+
+// fakeConn is a connection with a chosen remote address. Close records itself.
+type fakeConn struct {
+	remote   net.Addr
+	closed   chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func newFakeConn(remote net.Addr) *fakeConn {
+	return &fakeConn{remote: remote, closed: make(chan struct{})}
+}
+
+func (c *fakeConn) isClosed() bool {
+	select {
+	case <-c.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *fakeConn) Read([]byte) (int, error)         { <-c.closed; return 0, net.ErrClosed }
+func (c *fakeConn) Write([]byte) (int, error)        { return 0, net.ErrClosed }
+func (c *fakeConn) Close() error                     { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *fakeConn) LocalAddr() net.Addr              { return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 8450} }
+func (c *fakeConn) RemoteAddr() net.Addr             { return c.remote }
+func (c *fakeConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *fakeConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *fakeConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	return nil
+}
+func (c *fakeConn) hasDeadline() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.deadline.IsZero()
+}
+
+// fakeInner hands out the connections that a test pushes, in order.
+type fakeInner struct {
+	ch   chan net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func newFakeInner() *fakeInner {
+	return &fakeInner{ch: make(chan net.Conn, 256), done: make(chan struct{})}
+}
+
+func (f *fakeInner) push(ip string, port int) *fakeConn {
+	c := newFakeConn(&net.TCPAddr{IP: net.ParseIP(ip), Port: port})
+	f.ch <- c
+	return c
+}
+
+func (f *fakeInner) Accept() (net.Conn, error) {
+	select {
+	case c := <-f.ch:
+		return c, nil
+	case <-f.done:
+		return nil, net.ErrClosed
+	}
+}
+func (f *fakeInner) Close() error   { f.once.Do(func() { close(f.done) }); return nil }
+func (f *fakeInner) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: 8450} }
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(bound)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func recvAccept(t *testing.T, ch <-chan acceptResult) acceptResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(bound):
+		t.Fatal("accept did not return in time")
+		return acceptResult{}
+	}
+}
+
+func notAccepted(t *testing.T, ch <-chan acceptResult, why string) {
+	t.Helper()
+	select {
+	case r := <-ch:
+		t.Fatalf("%s (got %v %v)", why, r.c, r.err)
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestListenPerSource(t *testing.T) {
+	clock := &fakeClock{t: time.Unix(1_800_000_000, 0)}
+	newL := func(t *testing.T, maxConns, perSource int) (net.Listener, *fakeInner) {
+		inner := newFakeInner()
+		l := ListenPerSource(inner, maxConns, perSource, time.Hour, time.Hour, clock.Now)
+		t.Cleanup(func() { l.Close() })
+		return l, inner
+	}
+
+	t.Run("forty_from_one_source_admit_four", func(t *testing.T) {
+		l, inner := newL(t, 32, 4)
+		var all []*fakeConn
+		for p := 1; p <= 40; p++ {
+			all = append(all, inner.push("192.0.2.1", 40000+p))
+		}
+		var admitted []net.Conn
+		for i := 0; i < 4; i++ {
+			admitted = append(admitted, accept(t, l))
+		}
+		next := acceptAsync(l)
+		waitFor(t, "36 closed connections", func() bool {
+			n := 0
+			for _, c := range all[4:] {
+				if c.isClosed() {
+					n++
+				}
+			}
+			return n == 36
+		})
+		for i, c := range all[:4] {
+			if c.isClosed() {
+				t.Errorf("admitted connection %d was closed", i)
+			}
+		}
+		notAccepted(t, next, "Accept returned a connection that no source admitted")
+
+		// While A holds its four, source B is admitted, and Accept returns it.
+		b := inner.push("192.0.2.2", 50000)
+		select {
+		case r := <-next:
+			if r.err != nil || r.c.RemoteAddr().String() != b.RemoteAddr().String() {
+				t.Fatalf("got %v %v, want the connection of source B", r.c, r.err)
+			}
+		case <-time.After(bound):
+			t.Fatal("source B was not admitted while A held four")
+		}
+		// A closed connection frees one place for A.
+		admitted[0].Close()
+		a := inner.push("192.0.2.1", 41000)
+		if r := recvAccept(t, acceptAsync(l)); r.err != nil || r.c.RemoteAddr().String() != a.RemoteAddr().String() {
+			t.Fatalf("A was not admitted after a close: %v %v", r.c, r.err)
+		}
+	})
+
+	t.Run("closed_excess_never_counts_toward_max_conns", func(t *testing.T) {
+		l, inner := newL(t, 8, 4)
+		var a []net.Conn
+		var excess []*fakeConn
+		for p := 1; p <= 12; p++ {
+			c := inner.push("192.0.2.1", 40000+p)
+			if p <= 4 {
+				continue
+			}
+			excess = append(excess, c)
+		}
+		for i := 0; i < 4; i++ {
+			a = append(a, accept(t, l))
+		}
+		var others []net.Conn
+		for i := 2; i <= 5; i++ {
+			inner.push(fmt.Sprintf("192.0.2.%d", i), 50000)
+		}
+		for i := 0; i < 4; i++ {
+			others = append(others, accept(t, l))
+		}
+		for _, c := range excess {
+			if !c.isClosed() {
+				t.Fatal("a connection above the per-source cap stayed open")
+			}
+		}
+		// Eight are admitted, so the ninth source waits for a close.
+		inner.push("192.0.2.9", 50000)
+		ninth := acceptAsync(l)
+		notAccepted(t, ninth, "the ninth source was admitted at the cap")
+		a[0].Close()
+		select {
+		case r := <-ninth:
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+		case <-time.After(bound):
+			t.Fatal("the ninth source was not admitted after a close")
+		}
+		_ = others
+	})
+
+	t.Run("eight_sources_of_one_then_ninth_waits", func(t *testing.T) {
+		l, inner := newL(t, 8, 4)
+		var held []net.Conn
+		for i := 1; i <= 8; i++ {
+			inner.push(fmt.Sprintf("192.0.2.%d", i), 40000)
+			held = append(held, accept(t, l))
+		}
+		inner.push("192.0.2.99", 40000)
+		ninth := acceptAsync(l)
+		notAccepted(t, ninth, "the ninth source was admitted at the cap")
+		held[3].Close()
+		select {
+		case r := <-ninth:
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+		case <-time.After(bound):
+			t.Fatal("the ninth source was not admitted after a close")
+		}
+	})
+
+	t.Run("four_in_six_counts_as_its_ipv4_source", func(t *testing.T) {
+		l, inner := newL(t, 32, 4)
+		for p := 1; p <= 2; p++ {
+			inner.push("192.0.2.1", 40000+p)
+			inner.push("::ffff:192.0.2.1", 41000+p)
+		}
+		for i := 0; i < 4; i++ {
+			accept(t, l)
+		}
+		extra := inner.push("::ffff:192.0.2.1", 42000)
+		extra4 := inner.push("192.0.2.1", 42001)
+		next := acceptAsync(l)
+		waitFor(t, "the fifth connection of the source to close", func() bool { return extra.isClosed() && extra4.isClosed() })
+		notAccepted(t, next, "a fifth connection of one IPv4 source was admitted")
+		// A different IPv6 source is a different source.
+		inner.push("2001:db8::1", 1)
+		if r := recvAccept(t, next); r.err != nil {
+			t.Fatal(r.err)
+		}
+	})
+
+	t.Run("string_form_of_a_four_in_six_address", func(t *testing.T) {
+		inner := newFakeInner()
+		l := ListenPerSource(inner, 32, 1, time.Hour, time.Hour, clock.Now)
+		t.Cleanup(func() { l.Close() })
+		mk := func(s string) *fakeConn {
+			c := newFakeConn(stringAddr(s))
+			inner.ch <- c
+			return c
+		}
+		mk("192.0.2.1:1000")
+		accept(t, l)
+		second := mk("[::ffff:192.0.2.1]:2000")
+		next := acceptAsync(l)
+		waitFor(t, "the 4-in-6 connection to close", second.isClosed)
+		notAccepted(t, next, "a 4-in-6 form of A was admitted as a second source")
+	})
+
+	t.Run("zero_max_age_sets_no_deadline", func(t *testing.T) {
+		inner := newInner(t)
+		l := ListenPerSource(inner, 4, 4, 0, time.Second, nil)
+		client := dial(t, l)
+		server := accept(t, l)
+		defer server.Close()
+		if err := server.SetDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if err := server.SetDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			time.Sleep(2 * time.Second)
+			client.Write([]byte("x"))
+		}()
+		buf := make([]byte, 1)
+		start := time.Now()
+		if _, err := server.Read(buf); err != nil || time.Since(start) < 1500*time.Millisecond {
+			t.Fatalf("read ended after %v with %v, want a live connection 2 s past the 1 s grace", time.Since(start), err)
+		}
+	})
+
+	t.Run("zero_max_age_never_expires", func(t *testing.T) {
+		inner := newFakeInner()
+		l := ListenPerSource(inner, 4, 4, 0, time.Second, clock.Now)
+		t.Cleanup(func() { l.Close() })
+		c := inner.push("192.0.2.1", 1)
+		server := accept(t, l)
+		if c.hasDeadline() {
+			t.Fatal("a zero maxAge set a deadline on the connection")
+		}
+		ctx := ConnContext(context.Background(), server)
+		clock.Advance(48 * time.Hour)
+		if Expired(ctx) {
+			t.Fatal("a connection with no maxAge reports expired")
+		}
+	})
+
+	t.Run("positive_max_age_sets_the_hard_deadline", func(t *testing.T) {
+		inner := newFakeInner()
+		l := ListenPerSource(inner, 4, 4, time.Minute, time.Minute, clock.Now)
+		t.Cleanup(func() { l.Close() })
+		c := inner.push("192.0.2.1", 1)
+		server := accept(t, l)
+		if !c.hasDeadline() {
+			t.Fatal("no deadline on a connection with maxAge")
+		}
+		ctx := ConnContext(context.Background(), server)
+		if Expired(ctx) {
+			t.Fatal("expired at once")
+		}
+		clock.Advance(time.Minute)
+		if !Expired(ctx) {
+			t.Fatal("not expired after maxAge")
+		}
+	})
+
+	t.Run("close_wakes_accept_at_the_cap", func(t *testing.T) {
+		l, inner := newL(t, 1, 1)
+		inner.push("192.0.2.1", 1)
+		accept(t, l)
+		got := acceptAsync(l)
+		notAccepted(t, got, "accept returned at the cap")
+		l.Close()
+		select {
+		case r := <-got:
+			if r.err == nil {
+				t.Fatal("accept returned a connection after Close")
+			}
+		case <-time.After(bound):
+			t.Fatal("Close did not wake Accept")
+		}
+	})
+
+	t.Run("double_close_frees_one_place", func(t *testing.T) {
+		l, inner := newL(t, 8, 1)
+		inner.push("192.0.2.1", 1)
+		a := accept(t, l)
+		a.Close()
+		a.Close()
+		inner.push("192.0.2.1", 2)
+		accept(t, l)
+		second := inner.push("192.0.2.1", 3)
+		next := acceptAsync(l)
+		waitFor(t, "the second connection to close", second.isClosed)
+		notAccepted(t, next, "a double Close freed two places")
+	})
+
+	t.Run("inner_error_returns", func(t *testing.T) {
+		l, inner := newL(t, 8, 1)
+		inner.Close()
+		if _, err := l.Accept(); err == nil {
+			t.Fatal("expected the inner error")
+		}
+	})
+}
+
+type stringAddr string
+
+func (stringAddr) Network() string  { return "tcp" }
+func (s stringAddr) String() string { return string(s) }
+
+func TestListenPerSourceRefusesBadLimits(t *testing.T) {
+	l := newInner(t)
+	for name, f := range map[string]func(){
+		"zero_max_conns":   func() { ListenPerSource(l, 0, 1, 0, 0, nil) },
+		"zero_per_source":  func() { ListenPerSource(l, 1, 0, 0, 0, nil) },
+		"negative_max_age": func() { ListenPerSource(l, 1, 1, -time.Second, 0, nil) },
+		"negative_grace":   func() { ListenPerSource(l, 1, 1, time.Second, -time.Second, nil) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("ListenPerSource accepted a bad limit")
+				}
+			}()
+			f()
+		})
+	}
+	ListenPerSource(l, 1, 1, 0, 0, nil)
 }

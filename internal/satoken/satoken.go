@@ -4,6 +4,8 @@ package satoken
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -56,4 +58,42 @@ func Create(ctx context.Context, c corev1client.ServiceAccountsGetter, r Request
 		return "", errors.New("the API returned no token")
 	}
 	return out.Status.Token, nil
+}
+
+// TokenFunc returns a token whose only audience is audience.
+type TokenFunc func(ctx context.Context, audience string) (string, error)
+
+// PodTokenTTL is the lifetime of a token that PodTokenFunc requests.
+const PodTokenTTL = 600 * time.Second
+
+// Names of the downward API variables that identify the pod of celld. They equal the names in
+// package clusterjwt, which imports this package and so cannot be imported here.
+const (
+	EnvPodName        = "POD_NAME"
+	EnvPodUID         = "POD_UID"
+	EnvPodNamespace   = "POD_NAMESPACE"
+	EnvServiceAccount = "SERVICE_ACCOUNT"
+)
+
+// PodTokenFunc returns a TokenFunc that requests a token of 600 s for the service account, bound
+// to the pod. Each call makes a new TokenRequest.
+func PodTokenFunc(c corev1client.ServiceAccountsGetter, namespace, serviceAccount, podName, podUID string) TokenFunc {
+	return func(ctx context.Context, audience string) (string, error) {
+		return Create(ctx, c, Request{
+			Namespace: namespace, ServiceAccount: serviceAccount, PodName: podName, PodUID: podUID,
+			Audience: audience, TTL: PodTokenTTL,
+		})
+	}
+}
+
+// PodTokenFuncFromEnv is PodTokenFunc with the pod identity from the four environment variables of
+// the pod. It fails when any one is empty.
+func PodTokenFuncFromEnv(c corev1client.ServiceAccountsGetter) (TokenFunc, error) {
+	var v [4]string
+	for i, name := range []string{EnvPodNamespace, EnvServiceAccount, EnvPodName, EnvPodUID} {
+		if v[i] = os.Getenv(name); v[i] == "" {
+			return nil, fmt.Errorf("environment variable %s is empty", name)
+		}
+	}
+	return PodTokenFunc(c, v[0], v[1], v[2], v[3]), nil
 }
