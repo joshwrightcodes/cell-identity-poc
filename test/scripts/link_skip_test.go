@@ -236,17 +236,29 @@ func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
 			t.Fatalf("%s: hydrate calls:\n%s\nwant otel-uplink", cell, calls)
 		}
 		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "CELL_UP_SKIP_LATE=1")
-		if strings.Contains(calls, "render otel-uplink") || !strings.Contains(calls, "render spire-server") && cell == "dev-cp" {
+		if strings.Contains(calls, "render otel-uplink") || strings.Contains(calls, "render envd") || !strings.Contains(calls, "render spire-server") && cell == "dev-cp" {
 			t.Fatalf("%s: hydrate with CELL_UP_SKIP_LATE=1 calls:\n%s\nwant no otel-uplink", cell, calls)
 		}
 		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "HYDRATE_ONLY=late")
-		if strings.TrimSpace(calls) != "render otel-uplink" {
-			t.Fatalf("%s: hydrate with HYDRATE_ONLY=late calls:\n%s\nwant otel-uplink only", cell, calls)
+		// dev-cp has two late components: the uplink and envd, which reads the live server of dev-cp.
+		want := "render otel-uplink"
+		if cell == "dev-cp" {
+			want = "render otel-uplink\nrender envd"
+		}
+		if strings.TrimSpace(calls) != want {
+			t.Fatalf("%s: hydrate with HYDRATE_ONLY=late calls:\n%s\nwant %q only", cell, calls, want)
 		}
 	}
 	// Run up.sh for a cell. The first hydrate must skip the uplink, and the uplink must render once, after
 	// the bundles are published and before the harness applies it.
-	_, calls := runLinkScript(t, root, logFile, "up.sh", "CELL=dev-cell-1")
+	upOut, calls := runLinkScript(t, root, logFile, "up.sh", "CELL=dev-cell-1")
+	// cell-identity waits through attest-wait.sh. The fake mise does not answer mgmt -- status, so the script warns and skips.
+	if !strings.Contains(upOut, "warning: attest-wait dev-cell-1") || !strings.Contains(upOut, "CELL=management LINK_ONLY=mgmt-api mise run cell:link") {
+		t.Fatalf("up.sh did not run attest-wait.sh for cell-identity:\n%s", upOut)
+	}
+	if strings.Contains(upOut, "harness component cell-identity is rolled out") || !strings.Contains(upOut, "cell-identity was not waited for") {
+		t.Fatalf("up.sh says that cell-identity rolled out after the wait was skipped:\n%s", upOut)
+	}
 	lines := strings.Split(strings.TrimSpace(calls), "\n")
 	index := func(prefix string, from int) int {
 		for i := from; i < len(lines); i++ {

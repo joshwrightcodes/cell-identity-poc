@@ -16,7 +16,10 @@
 #   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory,
 #      runs a container that started after the API server, and waits for a ready kube-scheduler;
 #   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
-#      a time, and waits for every workload.
+#      a time, and waits for every workload;
+#   5. runs the key check of mgmtd for dev-cell-1, and repeats it after 61 s while the answer is rate_limited, up to
+#      three checks. The record of the cell must then list the key IDs that the API server publishes. A mgmtd
+#      that does not answer skips this step.
 # Each wait has a bound, and the log names it.
 export CELL=dev-cell-1
 source "$(dirname "$0")/lib.sh"
@@ -81,6 +84,8 @@ if [[ "${1:-}" == "--check" ]]; then
   else
     kids="$(api_kids 2>/dev/null)" || die "cannot read the JWKS of $CELL_NAME"
     [[ "$kids" != *" "* ]] || found+=("the API server of $CELL_NAME publishes the keys $kids")
+    record_trace="$(record_kids_trace "$CELL_NAME" "$kids")"
+    [[ -z "$record_trace" ]] || found+=("$record_trace")
   fi
   cp_traces="$(bundle_traces "$cp")" || die "$cp_traces"
   [[ -z "$cp_traces" ]] || found+=("$cp_traces")
@@ -250,12 +255,10 @@ replace_pod() {
 }
 if ((${#stale[@]} > 0)); then
   uids="$(printf '%s\n' "${stale[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
-  # kindnet enforces NetworkPolicy, so its pods come first.
+  # kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start, so their pods come first.
   while read -r ns pod kind owner; do
     replace_pod "$ns" "$pod" "$kind" "$owner" </dev/null
-  done < <(k get pods -A -o json | jq -r --argjson uids "$uids" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if (.metadata.ownerReferences[0].name // "") == "kindnet" then 0 else 1 end)
-    | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"')
+  done < <(k get pods -A -o json | repair_order_pods "$uids")
 fi
 
 all_ready() {
@@ -268,4 +271,22 @@ all_ready() {
 }
 wait_until 180 "every workload of $CELL_NAME is ready" all_ready
 on_node rm -f "$KEYTEST_SAVED"
+
+# Step 5: the key check of the record of the cell.
+mgmt() { (cd "$ROOT" && mise run mgmt -- "$@" 2>/dev/null); }
+if mgmt status >/dev/null; then
+  for attempt in 1 2 3; do
+    out="$(mgmt keycheck --cell "$CELL_NAME")" || die "the key check of $CELL_NAME failed: ${out:-no output}"
+    result="$(jq -r '.result // ""' <<<"$out")"
+    log "key check $attempt of $CELL_NAME: ${result:-no result}"
+    [[ "$result" == rate_limited ]] || break
+    ((attempt < 3)) || break
+    sleep 61
+  done
+  record_kids="$(mgmt status | jq -r --arg cell "$CELL_NAME" '[.cells[] | select(.name == $cell)][0].kids // [] | sort | join(" ")')"
+  [[ "$record_kids" == "$(api_kids)" ]] || die "the record of $CELL_NAME lists the key IDs '$record_kids', and the API server publishes '$(api_kids)'. The key check answered '${result:-none}'"
+  log "the record of $CELL_NAME lists the key IDs of the API server: $record_kids"
+else
+  log "mgmtd does not answer, so the key check of $CELL_NAME is skipped"
+fi
 log "$cp and $CELL_NAME are repaired. Run: CELL=$cp mise run cell:verify and CELL=$CELL_NAME mise run cell:verify"

@@ -44,24 +44,31 @@ func Sign(c Cell, key ed25519.PrivateKey) ([]byte, error) {
 
 // Verify checks the envelope against the trusted keys and returns the cell record.
 // The keyid field is ignored, and one valid signature from any trusted key is enough.
+// The error wraps ErrPayloadType, ErrSignature or ErrDecode.
 func Verify(envelope []byte, keys []ed25519.PublicKey) (Cell, error) {
-	body, err := verifyPayload(envelope, keys)
+	c, _, err := VerifyWithPayload(envelope, keys)
+	return c, err
+}
+
+// VerifyWithPayload is Verify that also returns the raw signed payload, for a caller that digests it.
+func VerifyWithPayload(envelope []byte, keys []ed25519.PublicKey) (Cell, []byte, error) {
+	body, err := VerifyEnvelope(envelope, PayloadType, keys)
 	if err != nil {
-		return Cell{}, err
+		return Cell{}, nil, err
 	}
 	var c Cell
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
-		return Cell{}, fmt.Errorf("decode record: %w", err)
+		return Cell{}, nil, fmt.Errorf("%w record: %v", ErrDecode, err)
 	}
 	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return Cell{}, errors.New("decode record: trailing data after object")
+		return Cell{}, nil, fmt.Errorf("%w record: trailing data after object", ErrDecode)
 	}
 	if err := c.validate(); err != nil {
-		return Cell{}, err
+		return Cell{}, nil, fmt.Errorf("%w record: %v", ErrDecode, err)
 	}
-	return c, nil
+	return c, body, nil
 }
 
 func (c Cell) validate() error {

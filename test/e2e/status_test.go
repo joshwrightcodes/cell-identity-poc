@@ -188,3 +188,73 @@ func TestM3VerifyDetectsPeerRootDrift(t *testing.T) {
 		t.Fatalf("cell:verify exited %d, want the FAIL line, the detail line and the repair line of the peer root check:\n%s\nstdout:\n%s\nstderr:\n%s", code, check, stdout, stderr)
 	}
 }
+
+// TestM4StatusShowsSpec checks that harness:status reports the management plane: the signed and applied revisions
+// agree with mgmtd ctl status, the report of envd is younger than 60 seconds, each cell with cell-identity is bound, and
+// the host service runs. It reads the status again for up to the retry window, because a report or a bind can lag.
+func TestM4StatusShowsSpec(t *testing.T) {
+	type plane struct {
+		Signed       map[string]uint64 `json:"signed"`
+		Applied      map[string]uint64 `json:"applied"`
+		LastReportAt time.Time         `json:"lastReportAt"`
+		Restore      bool              `json:"restoreActive"`
+		Cells        []struct {
+			Name  string `json:"name"`
+			Bound bool   `json:"bound"`
+		} `json:"cells"`
+		Hostsvc struct {
+			Running bool   `json:"running"`
+			Check   string `json:"check"`
+		} `json:"hostsvc"`
+		Error string `json:"error"`
+	}
+	var (
+		p      plane
+		stdout string
+		code   int
+	)
+	deadline := time.Now().Add(statusRetryWindow)
+	for attempt := 1; ; attempt++ {
+		_, stdout, code = statusOnce(t)
+		for line := range strings.SplitSeq(strings.TrimSpace(stdout), "\n") {
+			var o struct {
+				Cluster    string `json:"cluster"`
+				Management plane  `json:"management"`
+			}
+			if json.Unmarshal([]byte(line), &o) == nil && o.Cluster == mgmtCluster {
+				p = o.Management
+			}
+		}
+		if code == 0 || time.Now().After(deadline) {
+			break
+		}
+		t.Logf("attempt %d: harness:status exited %d:\n%s", attempt, code, stdout)
+		time.Sleep(30 * time.Second)
+	}
+	if code != 0 {
+		t.Fatalf("harness:status exited %d, want 0:\n%s", code, stdout)
+	}
+	live := mgmtStatus(t)
+	if p.Error != "" || p.Signed["epoch"] != live.Signed.Epoch || p.Signed["counter"] != live.Signed.Counter ||
+		p.Applied["epoch"] != live.Applied.Epoch || p.Applied["counter"] != live.Applied.Counter {
+		t.Errorf("management %+v, want the signed %v and applied %v revisions of mgmtd ctl status", p, live.Signed, live.Applied)
+	}
+	if age := time.Since(p.LastReportAt); p.LastReportAt.IsZero() || age > time.Minute+statusSampleMax {
+		t.Errorf("lastReportAt is %v, want a report from envd in the last %v", p.LastReportAt, time.Minute+statusSampleMax)
+	}
+	if p.Restore {
+		t.Error("restoreActive is true, want false")
+	}
+	if !p.Hostsvc.Running || p.Hostsvc.Check != "" {
+		t.Errorf("hostsvc %+v, want a running service with an empty check", p.Hostsvc)
+	}
+	bound := map[string]bool{}
+	for _, c := range p.Cells {
+		bound[c.Name] = c.Bound
+	}
+	for _, cell := range clustersWith(t, agentCellSet) {
+		if !bound[cell] {
+			t.Errorf("cell %s is not bound in %+v", cell, p.Cells)
+		}
+	}
+}

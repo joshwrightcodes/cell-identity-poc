@@ -101,6 +101,16 @@ case "${pos[*]}" in
 esac
 `
 
+// fakeRotateHostsvc stands for hostsvc-serve.sh. restart logs the call and copies the bundle of the fake server
+// into the host service root, as a restart of the real service does. STUB_HOSTSVC_STALE leaves the root alone.
+const fakeRotateHostsvc = `#!/usr/bin/env bash
+[[ "$1" == restart ]] || exit 2
+echo "restart" >>"$STUB_STATE/hostsvc.log"
+[[ -z "${STUB_HOSTSVC_STALE:-}" ]] || exit 0
+mkdir -p "$POC_BUILD_ROOT/hostsvc"
+while read -r i t; do cat "$STUB_STATE/pem/$i"; done <"$STUB_STATE/x509.bundle" >"$POC_BUILD_ROOT/hostsvc/mgmt-root.crt"
+`
+
 // rotateServer is a fake server: X.509 authorities A (active), then B and C to prepare, and JWT
 // authorities j1 (active), then j2 and j3.
 type rotateServer struct {
@@ -124,6 +134,7 @@ func newRotateServer(t *testing.T) *rotateServer {
 		}
 	}
 	write("kubectl", caRotateKubectl, 0o755)
+	write("hostsvc-serve", fakeRotateHostsvc, 0o755)
 	write("spire-server", fakeSpireServer, 0o755)
 	for i := range 3 {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -173,7 +184,8 @@ func (s *rotateServer) run(t *testing.T, env ...string) (string, string, error) 
 	cmd := exec.Command(script)
 	cmd.Env = append([]string{"PATH=" + s.dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"CELL=management", "STUB_DIR=" + s.dir, "STUB_STATE=" + s.state, "STUB_LOG=" + logFile,
-		"MGMT_ROTATE_TAINT_WAIT=0", "MGMT_ROTATE_WAIT=5", "POC_BUILD_ROOT=" + filepath.Join(s.dir, "build")}, env...)
+		"MGMT_ROTATE_TAINT_WAIT=0", "MGMT_ROTATE_WAIT=5", "POC_BUILD_ROOT=" + filepath.Join(s.dir, "build"),
+		"HOSTSVC_SERVE=" + filepath.Join(s.dir, "hostsvc-serve")}, env...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
@@ -285,5 +297,29 @@ done`
 	}
 	if strings.Contains(after, "apply_bundle") {
 		t.Fatal("scripts/up.sh calls apply_bundle after the root sync, which skips the owner check of harness_apply")
+	}
+}
+
+// Both refresh steps restart the host service and wait until its root file equals the bundle. A service that
+// keeps an old root stops the run before the activate.
+func TestRotateCARestartsTheHostService(t *testing.T) {
+	s := newRotateServer(t)
+	out, _, err := s.run(t)
+	if err != nil {
+		t.Fatalf("rotation failed: %v\n%s", err, out)
+	}
+	if got := strings.Count(s.read(t, "hostsvc.log"), "restart"); got != 2 {
+		t.Fatalf("the host service restarted %d times, want 2 (prepare and revoke)", got)
+	}
+	root, err := os.ReadFile(filepath.Join(s.dir, "build", "hostsvc", "mgmt-root.crt"))
+	want, _ := os.ReadFile(filepath.Join(s.state, "pem", s.x509[1]))
+	if err != nil || string(root) != string(want) {
+		t.Fatalf("mgmt-root.crt holds %d bytes (%v), want only the new root", len(root), err)
+	}
+
+	s = newRotateServer(t)
+	out, calls, err := s.run(t, "STUB_HOSTSVC_STALE=1")
+	if err == nil || !strings.Contains(out, "still differs from the bundle of management") || count(calls, "activate") > 0 {
+		t.Fatalf("err %v, calls:\n%s\noutput:\n%s\nwant a stop before the activate", err, calls, out)
 	}
 }

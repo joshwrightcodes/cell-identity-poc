@@ -4,9 +4,33 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 )
+
+// The sentinels that VerifyEnvelope wraps. A caller tells the failure classes apart with errors.Is.
+var (
+	// ErrPayloadType means the payload type of the envelope differs from the expected type.
+	ErrPayloadType = errors.New("unexpected payload type")
+	// ErrSignature means no signature verifies under a trusted key, or the envelope has none.
+	ErrSignature = errors.New("no signature verifies under a trusted key")
+	// ErrDecode means the envelope, or the payload it carries, cannot be decoded.
+	ErrDecode = errors.New("cannot decode")
+)
+
+// MaxSignatures is the most signatures that an envelope may carry. Each one costs a verification.
+const MaxSignatures = 4
+
+// DecodeStrict decodes one JSON value into v and refuses what the default decoder lets through:
+// unknown members, duplicate members, members whose name differs only in case, invalid UTF-8 and
+// trailing data. Every failure wraps ErrDecode.
+func DecodeStrict(data []byte, v any) error {
+	if err := jsonv2.Unmarshal(data, v, jsonv2.RejectUnknownMembers(true)); err != nil {
+		return fmt.Errorf("%w: %v", ErrDecode, err)
+	}
+	return nil
+}
 
 type envelope struct {
 	PayloadType string      `json:"payloadType"`
@@ -24,33 +48,46 @@ func pae(payloadType string, body []byte) []byte {
 	return fmt.Appendf(nil, "DSSEv1 %d %s %d %s", len(payloadType), payloadType, len(body), body)
 }
 
+// signPayload signs body as a cell record.
 func signPayload(body []byte, key ed25519.PrivateKey) ([]byte, error) {
-	sig := ed25519.Sign(key, pae(PayloadType, body))
+	return SignEnvelope(PayloadType, body, key)
+}
+
+// SignEnvelope returns a DSSE envelope that carries body under payloadType, signed with key.
+func SignEnvelope(payloadType string, body []byte, key ed25519.PrivateKey) ([]byte, error) {
+	if len(key) != ed25519.PrivateKeySize {
+		return nil, errors.New("signing key is not an Ed25519 private key")
+	}
+	sig := ed25519.Sign(key, pae(payloadType, body))
 	return json.Marshal(envelope{
-		PayloadType: PayloadType,
+		PayloadType: payloadType,
 		Payload:     base64.StdEncoding.EncodeToString(body),
 		Signatures:  []signature{{Sig: base64.StdEncoding.EncodeToString(sig)}},
 	})
 }
 
-// verifyPayload checks the payload type, then accepts the envelope when any signature
-// verifies under any key. It returns the raw payload.
-func verifyPayload(data []byte, keys []ed25519.PublicKey) ([]byte, error) {
+// VerifyEnvelope checks the payload type field against payloadType, then accepts the envelope when
+// any signature verifies under any key. The pre-authentication encoding uses payloadType, never the
+// envelope field. It returns the raw payload. The error wraps ErrDecode, ErrPayloadType or ErrSignature.
+func VerifyEnvelope(data []byte, payloadType string, keys []ed25519.PublicKey) ([]byte, error) {
 	var env envelope
-	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, fmt.Errorf("decode envelope: %w", err)
+	if err := DecodeStrict(data, &env); err != nil {
+		return nil, fmt.Errorf("envelope: %w", err)
 	}
-	if env.PayloadType != PayloadType {
-		return nil, fmt.Errorf("unexpected payload type %q", env.PayloadType)
+	if len(env.Signatures) > MaxSignatures {
+		return nil, fmt.Errorf("%w envelope: more than %d signatures", ErrDecode, MaxSignatures)
+	}
+	if env.PayloadType != payloadType {
+		return nil, fmt.Errorf("%w %q", ErrPayloadType, env.PayloadType)
 	}
 	if len(env.Signatures) == 0 {
-		return nil, errors.New("envelope has no signatures")
+		return nil, fmt.Errorf("%w: envelope has no signatures", ErrSignature)
 	}
 	body, err := base64.StdEncoding.DecodeString(env.Payload)
 	if err != nil {
-		return nil, fmt.Errorf("decode payload: %w", err)
+		return nil, fmt.Errorf("%w payload: %v", ErrDecode, err)
 	}
-	msg := pae(env.PayloadType, body)
+	msg := pae(payloadType, body)
 	for _, s := range env.Signatures {
 		raw, err := base64.StdEncoding.DecodeString(s.Sig)
 		if err != nil {
@@ -62,5 +99,5 @@ func verifyPayload(data []byte, keys []ed25519.PublicKey) ([]byte, error) {
 			}
 		}
 	}
-	return nil, errors.New("no signature verifies under a trusted key")
+	return nil, ErrSignature
 }

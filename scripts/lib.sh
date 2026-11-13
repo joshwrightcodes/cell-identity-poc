@@ -15,7 +15,10 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 json_fail() {
   local name="$1" error="$2" pair args=()
   shift 2
-  for pair in "$@"; do args+=(--arg "${pair%%=*}" "${pair#*=}"); done
+  # key:=value passes value as JSON, for example a number. Any other pair passes a string.
+  for pair in "$@"; do
+    if [[ "${pair%%=*}" == *: ]]; then args+=(--argjson "${pair%%:=*}" "${pair#*:=}"); else args+=(--arg "${pair%%=*}" "${pair#*=}"); fi
+  done
   jq -nc --arg time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --arg msg "$name failed" --arg error "$error" "${args[@]}" \
     '{time: $time, level: "ERROR", msg: $msg, error: $error} + (reduce ($ARGS.named | to_entries[] | select(.key != "time" and .key != "msg" and .key != "error")) as $e ({}; .[$e.key] = $e.value))'
   exit 1
@@ -111,6 +114,14 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# envd pulls the signed spec and records from mgmtd and writes ConfigMap spire-system/cell-records, which
+# the SPIRE server of dev-cp reads. It owns the namespace envd-system, and its Role and RoleBinding live
+# in spire-system, next to the objects of the spire-server bundle. Its render reads the live SPIRE server
+# of its own cluster, so it renders after the waves.
+ENVD_HARNESS=(
+  "envd:envd-system"
+)
+
 # The mesh-view tunnel of a cell reads the roots of management and of SPIRE_SERVER_CLUSTER, which
 # exist before the cell, so it renders with the other harness components. It owns the namespace
 # mesh-view-system, which only this cluster uses for the tunnel.
@@ -122,7 +133,7 @@ MESH_VIEW_HARNESS=(
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
 # (CELL_UP_SKIP_LATE=1).
-LATE_HARNESS=(otel-uplink)
+LATE_HARNESS=(otel-uplink envd)
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
@@ -131,6 +142,13 @@ LATE_HARNESS=(otel-uplink)
 # Each entry is <component>:<namespace>.
 CENTRAL_VIEW_LINK=(
   "central-view:central-view-system"
+)
+# The management plane stand-in: mgmtd with its SPIRE agent sidecar, the intent, the host service pin
+# and the public signing key. It owns the namespace mgmt-system. Its render reads the host service
+# and the live roots of management and, when it exists, of VIEW_CONTROL_PLANE. It comes first, and it
+# must run before dev-cp exists, because dev-cp reads its signing key.
+MGMT_PLANE_LINK=(
+  "mgmt-api:mgmt-system"
 )
 # The telemetry gateway shares observability-system with the collector and the store. It carries the
 # harness label, so cell:verify tells its objects from those of the bundles.
@@ -160,6 +178,8 @@ for set_name in $set_names; do
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
+    envd) HARNESS_COMPONENTS+=("${ENVD_HARNESS[@]}") ;;
+    mgmt-plane) LINK_COMPONENTS+=("${MGMT_PLANE_LINK[@]}") ;;
     central-view) LINK_COMPONENTS+=("${CENTRAL_VIEW_LINK[@]}") ;;
     telemetry-gateway) LINK_COMPONENTS+=("${TELEMETRY_GATEWAY_LINK[@]}") ;;
     mesh-view-hub) LINK_COMPONENTS+=("${MESH_VIEW_HUB_LINK[@]}") ;;
@@ -206,7 +226,15 @@ load_local_settings() {
   local file="${POC_ENVRC_LOCAL:-$ROOT/.envrc.local}" name
   for name in "$@"; do
     if [[ -z "${!name:-}" ]]; then
-      [[ -f "$file" ]] || return 0
+      if [[ ! -f "$file" ]]; then
+        # A new worktree has no .envrc.local, because git ignores it. Name the cause and the fix. The file is never printed.
+        if [[ -n "${POC_ENVRC_LOCAL:-}" ]]; then
+          log "POC_ENVRC_LOCAL names $file, and that file is absent. Set it to the .envrc.local of the checkout that set up the clusters"
+        else
+          log "$file is absent, as in a new worktree. Copy .envrc.local from the checkout that set up the clusters, or set POC_ENVRC_LOCAL to its path"
+        fi
+        return 0
+      fi
       # shellcheck source=/dev/null
       source "$file"
       log "read the settings from $file"
@@ -453,11 +481,11 @@ check_relay_current() {
     cell_cidrs+=("$ip/32")
   done
   want_cells="$(printf '%s\n' "${cell_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
-  for name in relay-view relay-telemetry; do
-    json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; return 1; }
+  for name in relay-view relay-telemetry relay-bind; do
+    json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
-    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; return 1; }
+    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     cidrs="$(jq -r '[.spec.egress[0].to[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
     [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
     cidrs="$(jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
@@ -547,12 +575,30 @@ fix_command() {
   echo "CELL=$CELL_NAME mise run cell:up"
 }
 
+# link_entries prints the link components that the link phase handles, one <component>:<namespace>
+# entry on each line: every entry of LINK_COMPONENTS, or only the one that LINK_ONLY names. An unknown
+# name stops the caller with the known names. The output of die ends only a command substitution, so
+# call it as: entries="$(link_entries)" || exit 1
+link_entries() {
+  local entry
+  if [[ -z "${LINK_ONLY:-}" ]]; then
+    printf '%s\n' ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}
+    return
+  fi
+  for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+    [[ "${entry%%:*}" == "$LINK_ONLY" ]] && { echo "$entry"; return; }
+  done
+  die "LINK_ONLY '$LINK_ONLY' is not a link component of $CELL_NAME. Known: $(printf '%s ' ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"})"
+}
+
 # link_preflight prints one line for each cluster that the link phase of $CELL needs and that does
 # not answer: the environment control plane VIEW_CONTROL_PLANE with its SPIRE server, and each cell
 # of VIEW_CELLS. It prints nothing when the link phase can run, or when the cluster has none.
 link_preflight() {
   local c
   ((${#LINK_COMPONENTS[@]} > 0)) || return 0
+  # mgmt-api reads the other clusters only when they exist, so it runs before them.
+  [[ "${LINK_ONLY:-}" != mgmt-api ]] || return 0
   for c in ${VIEW_CONTROL_PLANE:-} ${VIEW_CELLS:-}; do
     if ! (cd "$ROOT" && mise run hostsvc -- facts --cluster "$c" >/dev/null 2>&1); then
       echo "cluster $c does not exist. Create it: CELL=$c mise run cell:up"
@@ -771,8 +817,8 @@ check_plane_pods() {
 # its own field manager. Each object of the bundle must have only the field manager kubectl,
 # kube-controller-manager for status, and validatingadmissionpolicy-status for the status of a
 # ValidatingAdmissionPolicy, which the API server writes for its type check.
-#   - When the bundle holds the Namespace, the component owns it: for each kind that the bundle
-#     holds in the namespace, the namespace must hold exactly the objects of the bundle, apart from
+#   - When the bundle holds the Namespace, the component owns it: for each namespaced kind that the bundle
+#     holds, the namespace must hold exactly the objects of the bundle in it, apart from
 #     objects that only system controllers write, for example kube-root-ca.crt. The Namespace must
 #     have only kubectl.
 #   - Otherwise the namespace is shared with a bundle, whose Application owns the Namespace and its
@@ -790,8 +836,16 @@ check_plane_pods() {
 # with the field manager foo and updates them as argocd-agent (v0.10.0
 # internal/backend/kubernetes/appproject/kubernetes.go lines 88 and 123). Each one keeps the labels
 # of the copy in the cell, so it carries the harness label argocd-agent.
+# The second case: mgmtd publishes ConfigMap mgmt-system/mgmt-signing-pub with the field manager
+# mgmtd, the harness label mgmt-api and the marker label poc.internal/made-by=mgmtd. A listed
+# object counts as a runtime object only when it carries the marker, so a person cannot add an
+# object of that name without it.
 runtime_objects() {
   local cell agents=()
+  if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
+    jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
+    return
+  fi
   if [[ "$1" == central-view && "$2" == central-view-system && "$3" == AppProject ]]; then
     for cell in ${VIEW_CELLS:-}; do agents+=("$POC_ENV-$cell"); done
     ((${#agents[@]} > 0)) || { echo null; return; }
@@ -807,15 +861,20 @@ check_harness_objects() {
   [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
   # managers_of <live list> <names> prints each field manager of the named objects other than
-  # kubectl Apply and the status writes named above.
+  # kubectl Apply and the status writes named above. The manager harness-replicas (scripts/harness-replicas.sh)
+  # is allowed on a StatefulSet or Deployment, as an Update of the scale subresource that owns exactly spec.replicas.
   managers_of() {
     jq -r --arg want " $2 " '.items[] | .metadata.name as $name | select($want | contains(" " + $name + " "))
       | . as $o | $o.metadata.managedFields[]? | select((.manager == "kubectl" and .operation == "Apply")
         or (.manager == "kube-controller-manager" and .subresource == "status")
-        or (.manager == "validatingadmissionpolicy-status" and .subresource == "status" and $o.kind == "ValidatingAdmissionPolicy") | not)
+        or (.manager == "validatingadmissionpolicy-status" and .subresource == "status" and $o.kind == "ValidatingAdmissionPolicy")
+        or (.manager == "harness-replicas" and .operation == "Update" and .subresource == "scale"
+          and (["StatefulSet", "Deployment"] | index($o.kind) != null) and .fieldsV1 == {"f:spec": {"f:replicas": {}}}) | not)
       | "\($o.kind)/\($name) has the field manager \(.manager) (\(.operation) \(.subresource // "object"))"' <<<"$1"
   }
-  for kind in $(NS="$ns" yq -N -r 'select(.kind != null and .metadata.namespace == strenv(NS)) | .kind' "$bundle" | sort -u); do
+  # The kinds are those that the bundle holds in any namespace, so a bundle that spans two namespaces (envd:
+  # its Deployment in envd-system, its Role in spire-system) also finds a stray object of such a kind here.
+  for kind in $(yq -N -r 'select(.kind != null and (.metadata.namespace // "") != "") | .kind' "$bundle" | sort -u); do
     want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
     runtime="$(runtime_objects "$comp" "$ns" "$kind")"
@@ -823,6 +882,7 @@ check_harness_objects() {
       got="$(jq -r --arg label "$HARNESS_LABEL" --argjson runtime "$runtime" '[.items[]
         | select(($runtime == null) or ((((.metadata.labels[$label] // "") as $l | $l == "" or ($runtime.labels | index($l)) != null)
             and (.metadata.name | test($runtime.names))
+            and (($runtime.marker // null) == null or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
             and ((.metadata.managedFields // []) | length) > 0
             and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not))
         | select((.metadata.labels[$label] // "") != ""
@@ -873,6 +933,53 @@ check_no_last_applied_secret() {
     echo "Run: CELL=$CELL_NAME mise run obs:rotate-password, which removes it from grafana-admin. Delete it from another Secret with: kubectl annotate secret <name> kubectl.kubernetes.io/last-applied-configuration-"
     return 1
   }
+}
+
+# pem_der_sha256 reads PEM certificates on standard input and prints the SHA-256 of their DER bytes, in
+# file order, one after the other. hostsvc prints the same value as root_sha256 for its client roots.
+pem_der_sha256() {
+  local decode=-d line
+  printf 'AA==' | base64 -d >/dev/null 2>&1 || decode=-D
+  awk '/-----BEGIN CERTIFICATE-----/ { b = ""; next } /-----END CERTIFICATE-----/ { print b; next } { b = b $0 }' \
+    | while read -r line; do printf '%s' "$line" | base64 "$decode"; done \
+    | if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
+# dependents_of <name> prints the commands that bring the copies of a change up to date, one command on each
+# line, in the order to run them. The name is a cluster that was rebuilt (management, dev-cp or a cell), or
+# hostsvc for a restart of the host service. The README section "Rebuild one cluster" holds the same table.
+# No step waits until every cell is bound: a cell binds on its own once its cell:up has run.
+dependents_of() {
+  local cell cells comp
+  # The cells are the clusters that dev-cp lists in SPIRE_AGENT_CELLS.
+  cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
+  case "$1" in
+    hostsvc) echo "mise run hostsvc:serve -- restart" ;;
+    management)
+      echo "mise run hostsvc -- up --only management"
+      echo "CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up"
+      echo "CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+      echo "CELL=dev-cp mise run cell:up"
+      for cell in $cells; do echo "CELL=$cell mise run cell:up"; done
+      echo "CELL=management mise run cell:link" ;;
+    dev-cp)
+      echo "CELL=dev-cp mise run cell:up"
+      # mgmtd admits envd by the dev-cp root and by the node address, so the link of mgmt-api follows the cell:up of dev-cp.
+      echo "CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+      for cell in $cells; do echo "CELL=$cell mise run cell:up"; done
+      for cell in $cells; do echo "CELL=$cell mise run cell:restart"; done
+      echo "CELL=management mise run cell:link" ;;
+    *)
+      for cell in $cells; do
+        [[ "$cell" == "$1" ]] || continue
+        echo "CELL=dev-cp mise run cell:up"
+        echo "CELL=$cell mise run cell:up"
+        # A new cell record changes the registries, and a registry follows the records only at a link.
+        for comp in central-view telemetry-gateway mesh-view-hub; do echo "CELL=management LINK_ONLY=$comp mise run cell:link"; done
+        return
+      done
+      die "dependents_of knows management, dev-cp, hostsvc and $cells, not '$1'" ;;
+  esac
 }
 
 # gate_test_timeout <budget minutes> prints the go test timeout of a gate in minutes: twice the budget,

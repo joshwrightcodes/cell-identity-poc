@@ -114,7 +114,8 @@ spec:
       labels:
         app.kubernetes.io/name: spire-server
       annotations:
-        # SPIRE reads its configuration and the cell records only at start. A change restarts the pod.
+        # SPIRE reads its configuration only at start, and a change restarts the pod. The cluster_jwt plugin
+        # reloads the cell records from the volume records while the server runs.
         cell.poc.internal/config-checksum: "a717a71c4368b9635caf282bd3aba951bbf2463279185427ee871d765c77a50a"
     spec:
       serviceAccountName: spire-server
@@ -251,20 +252,13 @@ spec:
                 path: intermediate.crt
               - key: root-cert
                 path: root.crt
-        # Every record ConfigMap uses the key record.dsse.json, so each item gets the file name <cell>.dsse.json.
+        # envd writes ConfigMap cell-records: the signed spec and the signed record of each cell. The
+        # ConfigMap does not exist until envd has pulled the first spec, and the plugin accepts no cell
+        # until then.
         - name: records
-          projected:
-            sources:
-              - configMap:
-                  name: cell-record-dev-cell-1
-                  items:
-                    - key: record.dsse.json
-                      path: dev-cell-1.dsse.json
-              - configMap:
-                  name: cell-record-dev-cell-2
-                  items:
-                    - key: record.dsse.json
-                      path: dev-cell-2.dsse.json
+          configMap:
+            name: cell-records
+            optional: true
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -381,7 +375,9 @@ data:
           env = "dev"
           trust_domain = "dev.env.poc.internal"
           records_dir = "/run/spire/records"
-          record_public_keys = ["stubkey1=", "stubkey2="]
+          record_public_keys = ["AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="]
+          reload_interval = "10s"
+          marks_file = "/run/spire/data/cluster_jwt-marks.json"
           # The slowest reply to a challenge in the gate:m2 runs of 2026-11-09 took 9 ms. The bound is
           # the larger of 10s and three times that time.
           challenge_timeout = "10s"
@@ -429,21 +425,3 @@ data:
       clusterSPIFFEIDs: false
       clusterFederatedTrustDomains: false
       clusterStaticEntries: true
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cell-record-dev-cell-1
-  namespace: spire-system
-data:
-  record.dsse.json: "{\"payload\":\"dev-cell-1\"}"
-  signer.pub: "stubkey1="
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: cell-record-dev-cell-2
-  namespace: spire-system
-data:
-  record.dsse.json: "{\"payload\":\"dev-cell-2\"}"
-  signer.pub: "stubkey2="

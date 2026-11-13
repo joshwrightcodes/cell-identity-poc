@@ -767,7 +767,7 @@ writes, `unsafe`, environment reads, `init` side effects and hidden Unicode in t
 | Module | Change | In the binaries | Result |
 | --- | --- | --- | --- |
 | `github.com/go-openapi/swag` and its 11 submodules | v0.27.1 to v0.28.0 | `cluster-jwt-agent`, `cluster-jwt-server` | Benign. See below. |
-| `go.yaml.in/yaml/v3` | v3.0.4 to v3.0.5 | `cluster-jwt-agent`, `cluster-jwt-server`, `hostsvc`, `recordgen` | Benign. Every changed Go line is a comment. `go.mod` retracts v3.0.0 and v3.0.1 and drops a test dependency. |
+| `go.yaml.in/yaml/v3` | v3.0.4 to v3.0.5 | `cluster-jwt-agent`, `cluster-jwt-server`, `hostsvc` | Benign. Every changed Go line is a comment. `go.mod` retracts v3.0.0 and v3.0.1 and drops a test dependency. |
 | `golang.org/x/term` | v0.45.0 to v0.46.0 | `cluster-jwt-agent`, `cluster-jwt-server` | Benign. `Terminal.ReadLine` now keeps a read error until it has processed the data of that read. `go.mod` raises `x/sys`. |
 
 The swag diff:

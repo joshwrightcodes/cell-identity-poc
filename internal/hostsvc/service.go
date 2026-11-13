@@ -62,11 +62,20 @@ type Service struct {
 	Prober   Prober
 	Reserved ReservedFunc
 	Docker   DockerFunc
+
+	// lookups holds one token for each Facts call whose runtime calls have not returned.
+	lookups chan struct{}
 }
+
+// MaxFactsInFlight is the number of Facts calls that may run their runtime calls at once.
+const MaxFactsInFlight = 2
+
+// ErrLookupBusy means that MaxFactsInFlight lookups are still running, so Facts did not start one.
+var ErrLookupBusy = errors.New("too many cluster lookups in flight")
 
 // New returns a Service that uses the real prober and the Docker reserved prefixes.
 func New(rt Runtime, t *topology.Topology) *Service {
-	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker}
+	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker, lookups: make(chan struct{}, MaxFactsInFlight)}
 }
 
 func (s *Service) lookup(name string) (topology.Cluster, error) {
@@ -75,6 +84,26 @@ func (s *Service) lookup(name string) (topology.Cluster, error) {
 		return topology.Cluster{}, fmt.Errorf("cluster %q is not in the topology", name)
 	}
 	return c, nil
+}
+
+// existsCtx is exists, but returns at once when ctx ends. The kind library takes no context, so an
+// abandoned call finishes in the background.
+func (s *Service) existsCtx(ctx context.Context, name string) (bool, error) {
+	type result struct {
+		found bool
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		found, err := s.exists(name)
+		ch <- result{found, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.found, r.err
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 
 func (s *Service) exists(name string) (bool, error) {
@@ -102,7 +131,7 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 	if err := s.EnsureRegistry(ctx); err != nil {
 		return Facts{}, err
 	}
-	found, err := s.exists(name)
+	found, err := s.existsCtx(ctx, name)
 	if err != nil {
 		return Facts{}, err
 	}
@@ -138,11 +167,11 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 }
 
 // Down deletes the cluster. An absent cluster is not an error.
-func (s *Service) Down(_ context.Context, name string) error {
+func (s *Service) Down(ctx context.Context, name string) error {
 	if _, err := s.lookup(name); err != nil {
 		return err
 	}
-	found, err := s.exists(name)
+	found, err := s.existsCtx(ctx, name)
 	if err != nil {
 		return err
 	}
@@ -157,17 +186,52 @@ func (s *Service) Down(_ context.Context, name string) error {
 	return nil
 }
 
-// Facts describes a running topology cluster.
+// Facts describes a running topology cluster. It returns when the lookup is done or ctx ends. The
+// runtime calls (the kind library runs docker without a context) cannot be cancelled, so the lookup
+// keeps its token until they really return. When MaxFactsInFlight lookups hold a token, Facts fails
+// at once with ErrLookupBusy, and a hung docker cannot pile up processes.
 func (s *Service) Facts(ctx context.Context, name string) (Facts, error) {
 	if _, err := s.lookup(name); err != nil {
 		return Facts{}, err
 	}
+	select {
+	case s.lookups <- struct{}{}:
+	default:
+		return Facts{}, ErrLookupBusy
+	}
+	type result struct {
+		f   Facts
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		defer func() { <-s.lookups }()
+		defer func() {
+			if r := recover(); r != nil {
+				done <- result{err: fmt.Errorf("lookup of %s panicked: %v", name, r)}
+			}
+		}()
+		f, err := s.facts(ctx, name)
+		done <- result{f, err}
+	}()
+	select {
+	case r := <-done:
+		return r.f, r.err
+	case <-ctx.Done():
+		return Facts{}, ctx.Err()
+	}
+}
+
+func (s *Service) facts(ctx context.Context, name string) (Facts, error) {
 	found, err := s.exists(name)
 	if err != nil {
 		return Facts{}, err
 	}
 	if !found {
 		return Facts{}, fmt.Errorf("cluster %q does not exist", name)
+	}
+	if err := ctx.Err(); err != nil {
+		return Facts{}, err
 	}
 	kc, err := s.rt.Kubeconfig(name)
 	if err != nil {

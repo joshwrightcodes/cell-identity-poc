@@ -1,15 +1,28 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]
+# m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
-budget_var="GATE_${pattern}_BUDGET_MINUTES"
+budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
+[[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 budget_minutes="${!budget_var:-}"
+
+# The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
+# the bundles, published.env and facts.env. A new worktree has none of it, so a test would fail late with another message.
+if [[ "$milestone" != m1 ]]; then
+  [[ -f "$BUILD_ROOT/images.env" ]] \
+    || die "$BUILD_ROOT/images.env is missing. Run: mise run images, or copy it from the checkout that set up the clusters: cp <that checkout>/build/images.env $BUILD_ROOT/"
+  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+    [[ -d "$BUILD_ROOT/$cluster" ]] \
+      || die "$BUILD_ROOT/$cluster is missing. Copy it from the checkout that set up the clusters: cp -R <that checkout>/build/$cluster $BUILD_ROOT/"
+  done
+fi
 
 # Build the test binary first, so that the budget covers only the test run.
 build_start=$SECONDS
@@ -17,7 +30,7 @@ go test -tags e2e -count=1 -run '^$' ./test/e2e/ >/dev/null || die "the end-to-e
 log "gate $milestone build took $((SECONDS - build_start))s"
 
 # The M2 tests run against the deployed SPIRE server, plugins and celld. First, an earlier run must
-# have left no trace, because the cell:up hint below would sign a record with a test key. Then the
+# have left no trace, because a bind would take the test key into the record of the cell. Then the
 # renewal tests need SVIDs of 1m, and each workload must run the image that `mise run images`
 # recorded, or the gate tests old code.
 if [[ "$milestone" == m2 ]]; then
@@ -58,6 +71,28 @@ if [[ "$milestone" == m3 ]]; then
       found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
       [[ -z "$found" ]] || stale+="$found"$'\n'"Run: CELL=$cluster mise run cell:up"$'\n'
     done <<<"$workloads"
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# The M4 tests run against mgmtd, envd, the SPIRE server of dev-cp, celld and the host service. An earlier
+# run can leave the host service with another pin or root, or mgmtd or envd with no replica. Each of these
+# workloads must run the images that `mise run images` recorded: mgmtd, envd, celld (with its agent plugin
+# cluster-jwt-agent) and the SPIRE server (with its plugin cluster-jwt-server). The other workloads keep the
+# digests that the M3 gate checks.
+if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
+  "$ROOT/scripts/gate-m4-repair.sh" --check || exit 1
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+    targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
+  done
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
   done
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi

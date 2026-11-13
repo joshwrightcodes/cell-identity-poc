@@ -29,24 +29,14 @@ const (
 
 // TestM2KeyRotationDenied adds a second service account key to the API server of dev-cell-1 and
 // signs new tokens with it. The cell record still holds only the first key. The running celld agent
-// must renew, and a new pod must fail with unknown_kid. The cleanup restores the manifest.
+// must renew, and a new pod must fail with unknown_kid. A key check of mgmtd runs first, so that the periodic check
+// cannot update the record during the test. The cleanup restores the manifest.
 func TestM2KeyRotationDenied(t *testing.T) {
 	const cell = rejectCell
-	node := cell + "-control-plane"
-	oldKIDs := apiKIDs(t, cell)
-	if len(oldKIDs) != 1 {
-		t.Fatalf("the API server of %s verifies keys %v, want one key before the test", cell, oldKIDs)
-	}
-	manifest, err := dockerExec(t, node, "", "cat", apiserverManifest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(manifest, testKeyPath) {
-		t.Fatalf("%s on %s still names %s from an earlier run. %s", apiserverManifest, node, testKeyPath, repairHint)
-	}
-	edited, err := addSigningKey(manifest)
-	if err != nil {
-		t.Fatal(err)
+	// A key check first: the record of the cell then holds the keys that the API server publishes, and the next
+	// periodic check of mgmtd is 15 minutes away, so it cannot update the record while the test runs.
+	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
+		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m2:repair", cell, res)
 	}
 	pods := celldPods(t, cell)
 	if len(pods) != 1 || pods[0].Status.Phase != "Running" {
@@ -55,30 +45,8 @@ func TestM2KeyRotationDenied(t *testing.T) {
 	pod := pods[0]
 	agentID := agentIDOf(t, cell, pod)
 
-	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && test ! -e "+savedManifest+" && cp "+apiserverManifest+" "+savedManifest); err != nil {
-		t.Fatalf("save %s on %s to %s, which must not exist yet: %v. %s", apiserverManifest, node, savedManifest, err, repairHint)
-	}
-	t.Cleanup(func() { repairAPIServer(t) })
-	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "+
-		testKeyPath+".key 2>/dev/null && openssl pkey -in "+testKeyPath+".key -pubout -out "+testKeyPath+".pub"); err != nil {
-		t.Fatalf("make the second key on %s: %v", node, err)
-	}
-	writeNodeFile(t, node, apiserverManifest, edited)
-	var newKID string
-	waitFor(t, "the API server of "+cell+" to verify two keys and sign with the new one", apiserverWait, func() (bool, string) {
-		kids, err := apiKIDsOnce(t, cell)
-		if err != nil {
-			return false, err.Error()
-		}
-		signing, err := signingKID(t, cell)
-		if err != nil {
-			return false, err.Error()
-		}
-		newKID = signing
-		return len(kids) == 2 && slices.Contains(kids, oldKIDs[0]) && slices.Contains(kids, signing) && signing != oldKIDs[0],
-			fmt.Sprintf("keys %v, signing key %s", kids, signing)
-	})
-	t.Logf("the API server signs with key %s and verifies %s too", newKID, oldKIDs[0])
+	oldKID, newKID := rotateAPIKey(t, cell)
+	t.Logf("the API server signs with key %s and verifies %s too", newKID, oldKID)
 	since := time.Now().Add(-logMargin)
 
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
@@ -101,6 +69,52 @@ func TestM2KeyRotationDenied(t *testing.T) {
 	}); len(again) > 0 {
 		t.Errorf("the server attested the running celld pod again after the key change: %v", again)
 	}
+}
+
+// rotateAPIKey adds a second service account key to the API server of a cell and signs new tokens with it, then waits until
+// the API server verifies both keys and signs with the new one. It returns the old and the new key ID. The cleanup runs
+// repairAPIServer.
+func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
+	t.Helper()
+	node := cell + "-control-plane"
+	oldKIDs := apiKIDs(t, cell)
+	if len(oldKIDs) != 1 {
+		t.Fatalf("the API server of %s verifies keys %v, want one key before the test", cell, oldKIDs)
+	}
+	manifest, err := dockerExec(t, node, "", "cat", apiserverManifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(manifest, testKeyPath) {
+		t.Fatalf("%s on %s still names %s from an earlier run. %s", apiserverManifest, node, testKeyPath, repairHint)
+	}
+	edited, err := addSigningKey(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && test ! -e "+savedManifest+" && cp "+apiserverManifest+" "+savedManifest); err != nil {
+		t.Fatalf("save %s on %s to %s, which must not exist yet: %v. %s", apiserverManifest, node, savedManifest, err, repairHint)
+	}
+	t.Cleanup(func() { repairAPIServer(t) })
+	if _, err := dockerExec(t, node, "", "sh", "-c", "umask 077 && openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "+
+		testKeyPath+".key 2>/dev/null && openssl pkey -in "+testKeyPath+".key -pubout -out "+testKeyPath+".pub"); err != nil {
+		t.Fatalf("make the second key on %s: %v", node, err)
+	}
+	writeNodeFile(t, node, apiserverManifest, edited)
+	waitFor(t, "the API server of "+cell+" to verify two keys and sign with the new one", apiserverWait, func() (bool, string) {
+		kids, err := apiKIDsOnce(t, cell)
+		if err != nil {
+			return false, err.Error()
+		}
+		signing, err := signingKID(t, cell)
+		if err != nil {
+			return false, err.Error()
+		}
+		newKID = signing
+		return len(kids) == 2 && slices.Contains(kids, oldKIDs[0]) && slices.Contains(kids, signing) && signing != oldKIDs[0],
+			fmt.Sprintf("keys %v, signing key %s", kids, signing)
+	})
+	return oldKIDs[0], newKID
 }
 
 // addSigningKey adds the test public key as a second verification key, and makes the test private
@@ -127,6 +141,22 @@ func repairAPIServer(t *testing.T) {
 	t.Logf("gate-m2-repair.sh:\n%s", strings.TrimSpace(string(out)))
 	if err != nil {
 		t.Errorf("the repair of dev-cell-1 failed: %v. %s", err, repairHint)
+		return
+	}
+	// The repair ran the key check, so the record lists the key that the API server publishes now.
+	kids, err := apiKIDsOnce(t, rejectCell)
+	if err != nil {
+		t.Errorf("read the JWKS of %s after the repair: %v", rejectCell, err)
+		return
+	}
+	var record []string
+	for _, c := range mgmtStatus(t).Cells {
+		if c.Name == rejectCell {
+			record = c.Kids
+		}
+	}
+	if len(record) != 1 || !slices.Equal(record, kids) {
+		t.Errorf("after the repair the record of %s lists the key IDs %v, and the API server publishes %v", rejectCell, record, kids)
 	}
 }
 

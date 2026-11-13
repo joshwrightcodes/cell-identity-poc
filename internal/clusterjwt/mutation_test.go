@@ -21,6 +21,8 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
+	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 // The server builds the agent ID from the pod UID, so a UID with a path separator must not reach it,
@@ -64,6 +66,8 @@ func TestRecordFileMustBeRegularAndSmall(t *testing.T) {
 		t.Fatal(err)
 	}
 	base := newKeys(t).record(t)
+	base.Epoch, base.Counter = 1, 1
+	var entries []envspec.Entry
 	sign := func(name string) []byte {
 		rec := base
 		rec.Name = name
@@ -71,6 +75,8 @@ func TestRecordFileMustBeRegularAndSmall(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		body, _ := json.Marshal(rec)
+		entries = append(entries, envspec.Entry{Name: name, Revision: envspec.RecordRevision(rec), RecordSHA256: envspec.RecordDigest(body)})
 		return env
 	}
 	dir := t.TempDir()
@@ -87,6 +93,9 @@ func TestRecordFileMustBeRegularAndSmall(t *testing.T) {
 	if err := os.Symlink("data", filepath.Join(dir, "dev-cell-3.dsse.json")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, specFile), signSpec(t, priv, testEnv, 1, 1, entries, nil), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	logs := &syncBuffer{}
 	p := New()
@@ -97,14 +106,17 @@ func TestRecordFileMustBeRegularAndSmall(t *testing.T) {
 	}
 	done := make(chan loaded, 1)
 	go func() {
-		recs, err := p.loadRecords(dir, testEnv, []ed25519.PublicKey{pub})
-		done <- loaded{recs, err}
+		snap, err := p.load(&state{dir: dir, env: testEnv, keys: []ed25519.PublicKey{pub}}, nil, false)
+		if snap == nil {
+			snap = emptySnapshot()
+		}
+		done <- loaded{snap.records, err}
 	}()
 	var got loaded
 	select {
 	case got = <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("loadRecords blocked on a record file that is not a regular file")
+		t.Fatal("load blocked on a record file that is not a regular file")
 	}
 	if got.err != nil {
 		t.Fatal(got.err)
@@ -186,8 +198,8 @@ func TestTokenRequestHasItsOwnTimeout(t *testing.T) {
 	if !c.ok {
 		t.Fatal("the TokenRequest call has no deadline")
 	}
-	if d := c.deadline.Sub(start); d > tokenRequestTimeout+time.Second || d < tokenRequestTimeout-time.Second {
-		t.Fatalf("the TokenRequest deadline is %s away, want %s", d, tokenRequestTimeout)
+	if d := c.deadline.Sub(start); d > satoken.RequestTimeout+time.Second || d < satoken.RequestTimeout-time.Second {
+		t.Fatalf("the TokenRequest deadline is %s away, want %s", d, satoken.RequestTimeout)
 	}
 }
 
@@ -255,7 +267,7 @@ func TestTokenRequestTimeoutIsBelowTheChallengeTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tokenRequestTimeout >= challenge {
-		t.Fatalf("tokenRequestTimeout %s is not below challenge_timeout %s of server.conf", tokenRequestTimeout, challenge)
+	if satoken.RequestTimeout >= challenge {
+		t.Fatalf("satoken.RequestTimeout %s is not below challenge_timeout %s of server.conf", satoken.RequestTimeout, challenge)
 	}
 }

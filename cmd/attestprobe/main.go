@@ -9,6 +9,16 @@
 // from the file instead. A denial is a result, not a failure: on success the probe prints one line,
 // issued:<agent SPIFFE ID> or denied:<message>, and exits 0. Any other failure prints one JSON error
 // line on stdout and exits 1.
+//
+// With --target mgmt-bind the probe sends a bind request to the management plane instead:
+//
+//	attestprobe --target mgmt-bind --upstream <host:port> --expect-id <id> --peer-bundle <file> \
+//	  --cell <cell> --variant good|other-nonce|attest-audience [--env <env>] [--reuse-nonce]
+//	attestprobe --target mgmt-bind ... --nonce-only
+//	attestprobe --target mgmt-bind ... --variant good --nonce <value> --token-file <path>
+//
+// It prints nonce:<value> <audience> for a nonce it requested, then bound:<status> or
+// denied:<request ID> for each bind request, and exits 0. See bind.go.
 package main
 
 import (
@@ -212,6 +222,8 @@ func throwawayCSR() ([]byte, error) {
 }
 
 type config struct {
+	target      string
+	bind        bindConfig
 	variant     string
 	server      string
 	trustDomain string
@@ -255,6 +267,9 @@ func run(ctx context.Context, args []string, d deps) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, cfg.timeout)
 	defer cancel()
+	if cfg.target == targetMgmtBind {
+		return runBind(ctx, cfg, d)
+	}
 
 	var mint func(context.Context, string) (string, error)
 	if cfg.tokenFile != "" {
@@ -287,7 +302,14 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 	fs := flag.NewFlagSet("attestprobe", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	cfg := config{}
-	fs.StringVar(&cfg.variant, "variant", "", "token variant: "+strings.Join(variantNames(), ", "))
+	fs.StringVar(&cfg.target, "target", targetSpire, "what to attest to: "+targetSpire+" or "+targetMgmtBind)
+	fs.StringVar(&cfg.bind.upstream, "upstream", "", "mgmt-bind: address of the bind listener as <host>:<port>")
+	fs.StringVar(&cfg.bind.expectID, "expect-id", "", "mgmt-bind: SPIFFE ID of the management plane API")
+	fs.StringVar(&cfg.bind.peerBundle, "peer-bundle", "", "mgmt-bind: PEM trust bundle of the management plane")
+	fs.BoolVar(&cfg.bind.reuseNonce, "reuse-nonce", false, "mgmt-bind: send the same bind request a second time")
+	fs.BoolVar(&cfg.bind.nonceOnly, "nonce-only", false, "mgmt-bind: request a nonce and stop")
+	fs.StringVar(&cfg.bind.nonce, "nonce", "", "mgmt-bind: bind with this nonce, with --token-file, and request no nonce")
+	fs.StringVar(&cfg.variant, "variant", "", "token variant: "+strings.Join(variantNames(), ", ")+"; for mgmt-bind: "+strings.Join(bindVariantNames(), ", "))
 	fs.StringVar(&cfg.server, "server", "", "SPIRE server address as <IP address>:<port>")
 	fs.StringVar(&cfg.cell, "cell", "", "cell name in the attestation payload")
 	fs.StringVar(&cfg.env, "env", "", "environment in the token audience, POC_ENV in cells/common.env")
@@ -300,6 +322,16 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 	}
 	if fs.NArg() > 0 {
 		return config{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	switch cfg.target {
+	case targetSpire:
+	case targetMgmtBind:
+		return parseBind(cfg, lookupEnv)
+	default:
+		return config{}, fmt.Errorf("--target must be %s or %s, got %q", targetSpire, targetMgmtBind, cfg.target)
+	}
+	if cfg.bind != (bindConfig{}) {
+		return config{}, errors.New("--upstream, --expect-id, --peer-bundle, --reuse-nonce, --nonce-only and --nonce need --target mgmt-bind")
 	}
 	if _, ok := variants[cfg.variant]; !ok {
 		return config{}, fmt.Errorf("--variant must be one of %s, got %q", strings.Join(variantNames(), ", "), cfg.variant)

@@ -23,7 +23,7 @@ func pluginEnv(t *testing.T, text string) string {
 
 // TestEnvironmentNameHasOneSource renders the server, the agent and the central view with POC_ENV
 // from cells/common.env and with another value. The server plugin, the agent plugin, the record
-// signers, the principal --auth pattern and the agent namespaces must follow the variable in both
+// signers of the registry, the principal --auth pattern and the agent namespaces must follow the variable in both
 // cases, so no render holds its own copy of the name.
 func TestEnvironmentNameHasOneSource(t *testing.T) {
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
@@ -35,13 +35,6 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 			conf := get[string](t, docs(t, server.stdout)["ConfigMap/spire-server"], "data", "server.conf")
 			if got := pluginEnv(t, conf); got != env {
 				t.Fatalf("server plugin env is %q, want %q", got, env)
-			}
-			for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
-				want := "run record:fixture -- --cluster " + cell + " --subject cell-identity-system/celld --subject argocd/argocd-agent" +
-					" --subject observability-system/otel-uplink --subject mesh-view-system/mesh-view --env " + env
-				if !strings.Contains(server.log, want) {
-					t.Fatalf("the render did not sign the record of %s for env %s; want %q in:\n%s", cell, env, want, server.log)
-				}
 			}
 
 			agent := renderCellIdentity(t, "POC_ENV="+env)
@@ -80,8 +73,9 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				if objs["Namespace "+env+"-"+cell] == nil {
 					t.Fatalf("the view renders no agent namespace %s-%s", env, cell)
 				}
-				if want := "run record:fixture -- --cluster " + cell + " --env " + env; !strings.Contains(view.log, want) {
-					t.Fatalf("the view did not sign the record of %s for env %s; want %q in:\n%s", cell, env, want, view.log)
+				reg := objs["ConfigMap "+viewNS+"/cell-registry"]
+				if reg == nil || get[string](t, reg, "data", cell+".dsse.json") == "" {
+					t.Fatalf("the registry of env %s has no record of %s", env, cell)
 				}
 			}
 		})

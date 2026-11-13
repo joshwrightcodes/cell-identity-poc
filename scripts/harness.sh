@@ -3,7 +3,10 @@
 # images and sets up the base cell on every cluster that has components in harness/topology.yaml,
 # in topology order. cell:up of dev-cp also connects its secret store, as scripts/up.sh says.
 # A cluster with link components (management) comes first with the link phase skipped, because its
-# links need the other clusters. Its link phase runs last, with cell:link.
+# links need the other clusters. Its first link step runs only mgmt-api, right after its cell:up and
+# before dev-cp. The same step runs again right after the cell:up of dev-cp, which adds the dev-cp
+# root that mgmtd needs to accept envd. The full link phase runs last, with cell:link. When a step fails, the script
+# prints that step and every later one. harness:down stops the host service last.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
@@ -17,40 +20,42 @@ case "${1:-}" in
     names="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology has components"
     read -r -a order <<<"$(echo $names)"
-    linked=()
+    linked=() early=() again=()
     for name in "${order[@]}"; do
-      n="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; echo "${#LINK_COMPONENTS[@]}"' _ "$ROOT")" \
+      comps="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; printf "%s\n" ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"}' _ "$ROOT")" \
         || die "could not read the component sets of $name"
-      ((n == 0)) || linked+=("$name")
-    done
-    # remaining <index> prints the commands that finish the harness from step <index>.
-    remaining() {
-      local name i="$1"
-      for name in "${order[@]:$i}"; do
-        if [[ " ${linked[*]-} " == *" $name "* ]]; then
-          printf '  CELL_UP_SKIP_LINK=1 CELL=%s mise run cell:up\n' "$name" >&2
-        else
-          printf '  CELL=%s mise run cell:up\n' "$name" >&2
-        fi
-      done
-      for name in ${linked[@]+"${linked[@]}"}; do
-        printf '  CELL=%s mise run cell:link\n' "$name" >&2
-      done
-    }
-    for i in "${!order[@]}"; do
-      log "setting up the base cell on ${order[$i]}"
-      skip=""
-      [[ " ${linked[*]-} " == *" ${order[$i]} "* ]] && skip=1
-      if ! CELL_UP_SKIP_LINK="$skip" CELL="${order[$i]}" mise run cell:up; then
-        log "cell:up of ${order[$i]} failed. Fix the cause, then run these commands in this order:"
-        remaining "$i"
-        exit 1
+      [[ -z "$comps" ]] || linked+=("$name")
+      # mgmt-api runs right after the cluster is up, before dev-cp exists, because dev-cp reads its key.
+      if grep -qx mgmt-api <<<"$comps"; then
+        early+=("$name")
+        # The cluster that holds the SPIRE server whose root mgmt-api needs, as <cluster>:<link cluster>.
+        vcp="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; printf "%s" "${VIEW_CONTROL_PLANE:-}"' _ "$ROOT")" \
+          || die "could not read VIEW_CONTROL_PLANE of $name"
+        [[ -z "$vcp" ]] || again+=("$vcp:$name")
       fi
     done
-    for name in ${linked[@]+"${linked[@]}"}; do
-      log "running the link phase of $name"
-      if ! CELL="$name" mise run cell:link; then
-        log "cell:link of $name failed. Fix the cause, then run: CELL=$name mise run cell:link"
+    # steps holds the commands of the order, as <environment>|<task>.
+    steps=()
+    for name in "${order[@]}"; do
+      if [[ " ${linked[*]-} " == *" $name "* ]]; then
+        steps+=("CELL_UP_SKIP_LINK=1 CELL=$name|cell:up")
+      else
+        steps+=("CELL=$name|cell:up")
+      fi
+      [[ " ${early[*]-} " != *" $name "* ]] || steps+=("CELL=$name LINK_ONLY=mgmt-api|cell:link")
+      for pair in ${again[@]+"${again[@]}"}; do
+        [[ "${pair%%:*}" != "$name" ]] || steps+=("CELL=${pair#*:} LINK_ONLY=mgmt-api|cell:link")
+      done
+    done
+    for name in ${linked[@]+"${linked[@]}"}; do steps+=("CELL=$name|cell:link"); done
+    for i in "${!steps[@]}"; do
+      log "step $((i + 1)) of ${#steps[@]}: ${steps[$i]%%|*} mise run ${steps[$i]#*|}"
+      # shellcheck disable=SC2086
+      if ! env ${steps[$i]%%|*} mise run "${steps[$i]#*|}"; then
+        log "${steps[$i]%%|*} mise run ${steps[$i]#*|} failed. Fix the cause, then run these commands in this order:"
+        for ((j = i; j < ${#steps[@]}; j++)); do
+          printf '  %s mise run %s\n' "${steps[$j]%%|*}" "${steps[$j]#*|}" >&2
+        done
         exit 1
       fi
     done
@@ -62,6 +67,8 @@ case "${1:-}" in
     for name in $names; do
       rm -rf "${BUILD_ROOT:?}/${name:?}"
     done
+    # The host service holds the root of the deleted management cluster, so stop it last.
+    "${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}" stop
     ;;
   *) die "usage: harness.sh up|down" ;;
 esac

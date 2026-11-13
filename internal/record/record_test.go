@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -212,5 +213,182 @@ func TestVerifyMultiSignatureRule(t *testing.T) {
 	onlyGarbage := func(m map[string]any) { m["signatures"] = []any{garbage, garbage} }
 	if _, err := Verify(mutate(t, env, onlyGarbage), []ed25519.PublicKey{pub}); err == nil {
 		t.Fatal("only invalid signatures must fail")
+	}
+}
+
+const otherType = "application/vnd.poc.other+json"
+
+func TestEnvelopeSentinels(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	body := []byte(`{"a":1}`)
+	env, err := SignEnvelope(otherType, body, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := VerifyEnvelope(env, otherType, keys)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("round trip: %q %v", got, err)
+	}
+
+	foreignPub, _ := testKey(t)
+	cases := []struct {
+		name string
+		env  []byte
+		typ  string
+		keys []ed25519.PublicKey
+		want error
+	}{
+		{"other_type", env, PayloadType, keys, ErrPayloadType},
+		{"no_signatures", mutate(t, env, func(m map[string]any) { m["signatures"] = []any{} }), otherType, keys, ErrSignature},
+		{"foreign_key", env, otherType, []ed25519.PublicKey{foreignPub}, ErrSignature},
+		{"no_keys", env, otherType, nil, ErrSignature},
+		{"bad_json", []byte("{"), otherType, keys, ErrDecode},
+		{"bad_payload_base64", mutate(t, env, func(m map[string]any) { m["payload"] = "!!" }), otherType, keys, ErrDecode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := VerifyEnvelope(tc.env, tc.typ, tc.keys)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			for _, other := range []error{ErrPayloadType, ErrSignature, ErrDecode} {
+				if other != tc.want && errors.Is(err, other) {
+					t.Fatalf("%v also matches %v", err, other)
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyWrapsDecodeErrors(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	for name, body := range map[string]string{
+		"unknown_field": `{"name":"a","bogus":1}`,
+		"trailing":      `{"name":"a"} {}`,
+		"not_json":      `nope`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, err := SignEnvelope(PayloadType, []byte(body), priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Verify(env, keys); !errors.Is(err, ErrDecode) {
+				t.Fatalf("got %v, want ErrDecode", err)
+			}
+		})
+	}
+	env, _ := Sign(testCell(), priv)
+	bad := mutate(t, env, func(m map[string]any) { m["payloadType"] = "text/plain" })
+	if _, err := Verify(bad, keys); !errors.Is(err, ErrPayloadType) {
+		t.Fatalf("got %v, want ErrPayloadType", err)
+	}
+}
+
+func TestVerifyWithPayload(t *testing.T) {
+	pub, priv := testKey(t)
+	env, _ := Sign(testCell(), priv)
+	c, raw, err := VerifyWithPayload(env, []ed25519.PublicKey{pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(testCell())
+	if c.Name != "dev-cell-1" || string(raw) != string(want) {
+		t.Fatalf("got %+v %s", c, raw)
+	}
+}
+
+func TestEnvelopeStrictDecode(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	env, err := Sign(testCell(), priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(env, &raw); err != nil {
+		t.Fatal(err)
+	}
+	typ, payload, sigs := string(raw["payloadType"]), string(raw["payload"]), string(raw["signatures"])
+	var list []struct{ Sig string }
+	if err := json.Unmarshal(raw["signatures"], &list); err != nil || len(list) != 1 {
+		t.Fatalf("setup: %v", err)
+	}
+	one := list[0]
+	many := make([]map[string]string, MaxSignatures+1)
+	for i := range many {
+		many[i] = map[string]string{"sig": one.Sig}
+	}
+	manyJSON, _ := json.Marshal(many)
+	atCap, _ := json.Marshal(many[:MaxSignatures])
+
+	cases := []struct {
+		name string
+		body string
+		want error
+	}{
+		{"canonical", `{"payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + sigs + `}`, nil},
+		{"at_signature_cap", `{"payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + string(atCap) + `}`, nil},
+		{"over_signature_cap", `{"payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + string(manyJSON) + `}`, ErrDecode},
+		{"unknown_member", `{"payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + sigs + `,"extra":1}`, ErrDecode},
+		{"duplicate_payload_type", `{"payloadType":"text/plain","payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + sigs + `}`, ErrDecode},
+		{"case_folded_member", `{"PAYLOADTYPE":` + typ + `,"payload":` + payload + `,"signatures":` + sigs + `}`, ErrDecode},
+		{"trailing_data", `{"payloadType":` + typ + `,"payload":` + payload + `,"signatures":` + sigs + `} {}`, ErrDecode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Verify([]byte(tc.body), keys)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("control failed: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestRewrittenPayloadTypeFailsSignature(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	env, err := Sign(testCell(), priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewritten := mutate(t, env, func(m map[string]any) { m["payloadType"] = otherType })
+	if _, err := VerifyEnvelope(rewritten, otherType, keys); !errors.Is(err, ErrSignature) {
+		t.Fatalf("got %v, want ErrSignature", err)
+	}
+}
+
+func TestVerifyErrorsMatchOneSentinel(t *testing.T) {
+	pub, priv := testKey(t)
+	keys := []ed25519.PublicKey{pub}
+	noIssuer := testCell()
+	noIssuer.Issuer = ""
+	badJWKS := testCell()
+	badJWKS.JWKS = json.RawMessage(`{"keys":[]}`)
+	for name, body := range map[string]Cell{"no_issuer": noIssuer, "empty_jwks": badJWKS} {
+		t.Run(name, func(t *testing.T) {
+			raw, _ := json.Marshal(body)
+			env, err := SignEnvelope(PayloadType, raw, priv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = Verify(env, keys)
+			n := 0
+			for _, s := range []error{ErrPayloadType, ErrSignature, ErrDecode} {
+				if errors.Is(err, s) {
+					n++
+				}
+			}
+			if n != 1 {
+				t.Fatalf("%v matches %d sentinels, want 1", err, n)
+			}
+		})
 	}
 }

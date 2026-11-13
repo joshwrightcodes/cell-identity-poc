@@ -20,11 +20,19 @@
 #                 down_cells are the cells without a tunnel at the hub. absent_cells are the ones among them
 #                 whose own API does not answer
 #   mesh          {ok, lines}: the result of mesh:status
+#   management    {env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError, restoreActive,
+#                 pendingDrops, cells, hostsvc}: the status of mgmtd, with the revisions as epoch and counter, and the
+#                 cells as {name, bound, lastCheck}. hostsvc is the status of hostsvc:serve and check, which holds
+#                 the text of the first failed pin or root check and is empty when both pass. When mgmtd does not
+#                 answer, the object holds only error
 # The checks of cell:verify, the hops of obs:uplink-status and the parts of mesh:status are read from those
 # tasks and not repeated here. STATUS_SAMPLE_MAX_AGE (default 300) is the age limit for a sample, and
 # STATUS_VERIFY_TIMEOUT (default 900) is the time in seconds that the task waits for cell:verify of one cluster.
 export CELL="${CELL:-management}"
 source "$(dirname "$0")/lib.sh"
+source "$ROOT/components/lib/peer-root.sh"
+source "$ROOT/components/lib/hostsvc-pin.sh"
+source "$ROOT/scripts/verify-lib.sh"
 
 cd "$ROOT"
 clusters="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml")"
@@ -85,9 +93,60 @@ run_telemetry() {
         | .wait = (.ok == false and (.verdict | startswith("collector export:")) and ($o.store.ok == true)) end' <<<"$out"
 }
 
+# management_plane prints the field management: the status of mgmtd and of the host service. The pin and the root
+# of the host service are checked with the functions of cell:verify, which print the reason and the command.
+management_plane() {
+  local st rc=0 serve hs check="" crc=0
+  st="$(mise run mgmt -- status 2>/dev/null)" || rc=$?
+  if ((rc != 0)) || ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
+    jq -Rsc --argjson rc "$rc" '(split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
+      | {error: ($o.error // "mise run mgmt -- status exited with status \($rc) and printed no status. Run: mise run mgmt -- status")}' <<<"$st"
+    return
+  fi
+  serve="$(hostsvc_serve_script)"
+  hs="$("$serve" status 2>/dev/null)" || hs=""
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$hs" || hs='{"running":false}'
+  if jq -e '.running == true and (.expires_soon | not)' >/dev/null <<<"$hs"; then
+    check="$(check_mgmt_hostsvc_pin 2>&1)" || crc=$?
+    if ((crc == 0)); then check="$(check_mgmt_hostsvc_root 2>&1)" || crc=$?; fi
+    # A check that fails with no output still counts as a failure.
+    if ((crc != 0)) && [[ -z "$check" ]]; then check="the host service check failed. Run: mise run hostsvc:serve -- status"; fi
+  fi
+  jq -c --argjson hs "$hs" --arg check "$check" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
+    restoreActive, pendingDrops, cells: [.cells[]? | {name, bound, lastCheck}], hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
+}
+
+# management_problems <cell-identity cells> reads the field management on standard input and prints one problem
+# for each bad value, as a JSON array of strings. Each problem ends with the command to run.
+management_problems() {
+  jq -c --arg bind "$1" 'def rev: "\(.epoch).\(.counter)";
+    def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    def cp: "CELL=dev-cp mise run cell:verify";
+    if .error != null then ["mgmtd status failed: " + .error]
+    else
+      . as $m | ([.signed.epoch, .signed.counter]) as $sig | ([.applied.epoch, .applied.counter]) as $app
+      | [
+        (if $sig > $app and .lagSince != null and (now - (.lagSince | ts)) > 120
+         then "signed revision \(.signed | rev) is above applied \(.applied | rev) for more than 2 minutes. Run: \(cp)" else empty end),
+        (if .lastRefusal != null and ((.lastRefusal.at | ts) == 0 or (.lastRefusal.at | ts) > ((.appliedAt // "") | ts))
+         then "envd refused a spec: \(.lastRefusal.reason) at revision \(.lastRefusal.revision | rev), after the last apply. Run: \(cp)" else empty end),
+        (if (.storeError // "") != "" then "envd reports a store error: \(.storeError). Run: \(cp)" else empty end),
+        (if .restoreActive then "a restore is active, so mgmtd serves an older revision. Run: mise run mgmt -- restore --revision latest" else empty end),
+        (if .lastReportAt == null or (now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
+        (.cells[] | select(.lastCheck == "keys_untrusted") | "the key check of \(.name) is keys_untrusted. Run: CELL=\(.name) mise run cell:restart"),
+        (.cells[] | select(.lastCheck == "issuer_untrusted") | "the key check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
+        (.cells[] | select(.lastCheck == "issuer_unavailable") | "the key check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
+        ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
+          | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
+        (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"
+         elif .hostsvc.expires_soon then "the host service certificate expires soon. Run: mise run hostsvc:serve -- restart"
+         elif .hostsvc.check != "" then "host service: " + .hostsvc.check else empty end)
+      ] end'
+}
+
 # management_extras prints the fields of the management object, as one JSON object.
 management_extras() {
-  local logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected
+  local logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
 
   # The principal lists an agent as connected until its last stream line closes the stream.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
@@ -141,19 +200,23 @@ management_extras() {
           else "Kiali is not Ready or does not reach every cell, but every tunnel is up. Wait up to 5 minutes, then run: mise run mesh:status" end)}' <<<"$conf")"
 
   mesh_out="$(mise run mesh:status 2>/dev/null)" || mesh_rc=$?
-  jq -nc --argjson agents "$agents" --argjson samples "$samples" --argjson kiali "$kiali_json" --argjson rc "$mesh_rc" --arg out "$mesh_out" \
-    '{agents: $agents, samples: $samples.samples, stale_samples: $samples.stale, kiali: $kiali,
+  plane="$(management_plane)"
+  jq -nc --argjson plane "$plane" --argjson agents "$agents" --argjson samples "$samples" --argjson kiali "$kiali_json" --argjson rc "$mesh_rc" --arg out "$mesh_out" \
+    '{management: $plane, agents: $agents, samples: $samples.samples, stale_samples: $samples.stale, kiali: $kiali,
       mesh: {ok: ($rc == 0), lines: ($out | split("\n") | map(select(length > 0)))}}'
 }
 
 # collect <cluster> writes the JSON object of one cluster to $tmp/<cluster>.json.
 collect() {
-  local cluster="$1" apps verify telemetry extras='{}'
+  local cluster="$1" apps verify telemetry extras='{}' mp='[]'
   apps="$(applications "$cluster")"
   verify="$(run_verify "$cluster")"
   telemetry="$(run_telemetry "$cluster")"
-  [[ "$cluster" != management ]] || extras="$(management_extras)"
-  jq -nc --arg cluster "$cluster" --arg env "$POC_ENV" --argjson apps "$apps" --argjson verify "$verify" --argjson telemetry "$telemetry" --argjson extras "$extras" '
+  if [[ "$cluster" == management ]]; then
+    extras="$(management_extras)"
+    mp="$(jq -c .management <<<"$extras" | management_problems "$(yq -r '.clusters[] | select(.components | contains(["cell-identity"])) | .name' "$ROOT/harness/topology.yaml" | paste -sd' ' -)")"
+  fi
+  jq -nc --argjson mp "$mp" --arg cluster "$cluster" --arg env "$POC_ENV" --argjson apps "$apps" --argjson verify "$verify" --argjson telemetry "$telemetry" --argjson extras "$extras" '
     ($apps.bad | map("Application " + .)) as $a
     | ([$verify.failed[] | "cell:verify failed: " + .] + (if $verify.ok then [] else ["Run: CELL=\($cluster) mise run cell:verify"] end)) as $v
     | ([if $telemetry.ok then empty
@@ -169,7 +232,7 @@ collect() {
         else empty end]
       + [if $extras.kiali != null and $extras.kiali.note != "" then "Kiali: " + $extras.kiali.note else empty end]
       + [if $extras.mesh != null and ($extras.mesh.ok | not) then "mesh:status reports a part that is not up. Run: mise run mesh:status" else empty end]) as $m
-    | ($a + $v + $t + $m) as $problems
+    | ($a + $v + $t + $m + $mp) as $problems
     | {cluster: $cluster, ok: ($problems | length == 0), applications: $apps, verify: $verify, telemetry: $telemetry}
       + $extras + {problems: $problems}' >"$tmp/$cluster.json"
 }

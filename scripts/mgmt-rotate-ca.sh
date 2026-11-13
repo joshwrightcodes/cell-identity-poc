@@ -20,6 +20,10 @@
 # again. An old authority that is not revoked yet is tainted or revoked first, and nothing is
 # prepared, because SPIRE prepares into the slot of the old authority.
 #
+# The host service on this Mac (scripts/hostsvc-serve.sh) holds a copy of the root too, in
+# build/hostsvc/mgmt-root.crt. Both refresh steps restart it, and wait until that file holds the roots
+# of the bundle.
+#
 # A copy is a ConfigMap in another cluster with the annotation poc.internal/peer-root-sha256 and a
 # key root.crt whose certificates are all CAs of SPIRE_TRUST_DOMAIN (components/lib/peer-root.sh).
 # The trust bundle of each SPIRE agent sidecar of a link component in this cluster is a copy too:
@@ -82,7 +86,26 @@ copies() {
   done
 }
 
-# refresh <copies> renders each copy again from the live bundle.
+# refresh_hostsvc restarts the host service on this Mac, which reads the live root of this cluster only
+# at start, and waits until build/hostsvc/mgmt-root.crt holds exactly the roots of the bundle. Only a
+# cluster with the link component mgmt-api has a host service to restart. HOSTSVC_SERVE names another
+# host service script, for the tests.
+refresh_hostsvc() {
+  local want got end=$((SECONDS + wait_seconds))
+  has_component_entry mgmt-api mgmt-system || return 0
+  log "restarting the host service, which holds a copy of the root"
+  "${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}" restart \
+    || die "the restart of the host service failed. Fix the cause, then run: mise run hostsvc:serve -- restart, and CELL=$CELL_NAME mise run mgmt:rotate-ca again"
+  want="$(bundle_blocks)" || die "could not read the bundle of $CELL_NAME"
+  while :; do
+    got="$(pem_blocks <"$BUILD_ROOT/hostsvc/mgmt-root.crt" 2>/dev/null || true)"
+    [[ "$got" == "$want" ]] && return 0
+    ((SECONDS < end)) || die "after ${wait_seconds}s the host service root $BUILD_ROOT/hostsvc/mgmt-root.crt still differs from the bundle of $CELL_NAME. Run: mise run hostsvc:serve -- restart"
+    sleep 1
+  done
+}
+
+# refresh <copies> renders each copy again from the live bundle, then restarts the host service.
 refresh() {
   local cluster ns name key done_clusters=" "
   while read -r cluster ns name key; do
@@ -99,6 +122,7 @@ refresh() {
       done_clusters+="$cluster "
     fi
   done <<<"$1"
+  refresh_hostsvc
 }
 
 # wait_for_copies <copies> waits until each copy holds exactly the roots of the live bundle.

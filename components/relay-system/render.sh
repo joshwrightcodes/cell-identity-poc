@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Render the relay of the environment control plane, a bundle at wave 8.
 #
-# Two Deployments run the relay binary: relay-view with the routes of RELAY_VIEW_ROUTES (the central
-# view and the mesh view) and relay-telemetry with the routes of RELAY_TELEMETRY_ROUTES, so a
-# telemetry backlog cannot slow the view. Each route is <node port>:<container port>=<node port of
-# RELAY_TARGET>. A NodePort Service with the local traffic policy admits the routes on the node.
+# Three Deployments run the relay binary: relay-view with the routes of RELAY_VIEW_ROUTES (the central
+# view and the mesh view), relay-telemetry with the routes of RELAY_TELEMETRY_ROUTES, so a telemetry
+# backlog cannot slow the view, and relay-bind with the routes of RELAY_BIND_ROUTES (the bind requests
+# of the cells to mgmtd). The render makes relay-bind only when RELAY_BIND_ROUTES is set. Each route is
+# <node port>:<container port>=<node port of RELAY_TARGET>. A NodePort Service with the local traffic
+# policy admits the routes on the node.
 #
 # The render reads these facts from the host service, as the M2 renders do:
 #   - the node address of RELAY_TARGET. The relay dials it, and the NetworkPolicy admits only it.
 #   - the node address of each cell of SPIRE_AGENT_CELLS. Only these addresses reach the routes.
 # The relay image is the one that `mise run images` built, by digest.
-# Inputs: RELAY_TARGET, RELAY_VIEW_ROUTES, RELAY_TELEMETRY_ROUTES and SPIRE_AGENT_CELLS from
-# cells/<cluster>.env, and NODE_IPS and DNS_SERVICE_IP from build/<cluster>/facts.env.
+# Inputs: RELAY_TARGET, RELAY_VIEW_ROUTES, RELAY_TELEMETRY_ROUTES, RELAY_BIND_ROUTES (optional) and
+# SPIRE_AGENT_CELLS from cells/<cluster>.env, and NODE_IPS and DNS_SERVICE_IP from build/<cluster>/facts.env.
 set -euo pipefail
 : "${RELAY_TARGET:?}" "${RELAY_VIEW_ROUTES:?}" "${RELAY_TELEMETRY_ROUTES:?}" "${SPIRE_AGENT_CELLS:?}" "${NODE_IPS:?}" "${DNS_SERVICE_IP:?}"
 
@@ -23,6 +25,8 @@ die() { printf 'error: relay-system render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
 source "$root/components/lib/addresses.sh"
+
+bind_routes="${RELAY_BIND_ROUTES:-}"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$DNS_SERVICE_IP" =~ $ipv4 ]] || die "DNS_SERVICE_IP '$DNS_SERVICE_IP' is not an IPv4 address"
@@ -75,6 +79,8 @@ check_routes() {
 }
 check_routes relay-view "$RELAY_VIEW_ROUTES"
 check_routes relay-telemetry "$RELAY_TELEMETRY_ROUTES"
+[[ -z "${RELAY_BIND_ROUTES+x}" || -n "${bind_routes// /}" ]] || die "relay-bind has no route"
+[[ -z "${bind_routes// /}" ]] || check_routes relay-bind "$bind_routes"
 
 # relay <name> <routes> prints the Deployment, the Service and the NetworkPolicy of one relay, for
 # routes that check_routes accepted.
@@ -109,11 +115,17 @@ relay() {
 
 view="$(relay relay-view "$RELAY_VIEW_ROUTES")" || die "could not render relay-view"
 telemetry="$(relay relay-telemetry "$RELAY_TELEMETRY_ROUTES")" || die "could not render relay-telemetry"
+bind=""
+[[ -z "${bind_routes// /}" ]] || bind="$(relay relay-bind "$bind_routes")" || die "could not render relay-bind"
 yq 'select(.kind == "Namespace" or .kind == "ServiceAccount")' "$here/manifests.yaml"
 echo "---"
 echo "$view"
 echo "---"
 echo "$telemetry"
+if [[ -n "$bind" ]]; then
+  echo "---"
+  echo "$bind"
+fi
 cat <<EOF
 ---
 apiVersion: networking.k8s.io/v1

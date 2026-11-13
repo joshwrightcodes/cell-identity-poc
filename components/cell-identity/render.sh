@@ -7,6 +7,10 @@
 #   - the trust bundle of the SPIRE server, from the server in SPIRE_SERVER_CLUSTER, through
 #     components/lib/peer-root.sh. It becomes ConfigMap spire-trust-bundle. The bundle holds only
 #     public certificates.
+#   - the root of the management trust domain, from the live SPIRE server of management, as
+#     ConfigMap mgmt-root. celld trusts the bind answer of mgmtd only through it. The pod template
+#     carries its SHA-256, so a new root restarts the pod. celld dials the bind route of the node
+#     of SPIRE_SERVER_CLUSTER on port 30447.
 #   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
 #     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
 #     checks the binary before it runs it.
@@ -38,6 +42,9 @@ server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 [[ "$server_ip" =~ $ipv4 ]] || die "node address of $SPIRE_SERVER_CLUSTER is '$server_ip', not an IPv4 address"
 
 bundle="$(peer_root_pem "$SPIRE_SERVER_CLUSTER" "$trust_domain")" || exit 1
+mgmt_root="$(peer_root_configmap mgmt-root cell-identity-system management mgmt.poc.internal)" || exit 1
+mgmt_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$mgmt_root")"
+[[ "$mgmt_sum" =~ ^[0-9a-f]{64}$ ]] || die "ConfigMap mgmt-root has no checksum"
 
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
@@ -47,7 +54,8 @@ manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
   (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
     .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
 ' "$here/manifests.yaml" \
-  | sed -e "s|@CELLD_IMAGE@|$celld_image|" \
+  | sed -e "s|@CELLD_IMAGE@|$celld_image|" -e "s|@PEER_ROOT_SHA256@|$mgmt_sum|" \
+    -e "s|@CELL_NAME@|$CELL_NAME|" -e "s|@BIND_UPSTREAM@|$server_ip:30447|" \
     -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
     -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
     -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|")"
@@ -63,4 +71,6 @@ celld="$(yq 'select(.kind == "Deployment" and .metadata.name == "celld")' <<<"$m
   yq 'select(.kind != "Deployment" or .metadata.name != "celld")' <<<"$manifests"
   echo "---"
   echo "$celld"
+  echo "---"
+  echo "$mgmt_root"
 } | yq '.metadata.labels["cell.poc.internal/harness"] = "cell-identity"'

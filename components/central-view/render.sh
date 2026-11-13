@@ -20,7 +20,7 @@
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for
 #     the trust bundle of the sidecar.
 #   - a signed record for each cell of VIEW_CELLS, as ConfigMap cell-registry
-#     (components/lib/registry.sh). The cells must exist.
+#     (components/lib/registry.sh). Each cell must have a bound celld.
 #   - the cell-proxy and viewkeys images that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root and of the registry content, so a new
 # root or a new set of cells restarts the pod.

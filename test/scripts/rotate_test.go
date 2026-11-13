@@ -82,6 +82,11 @@ case " $* " in
   *" delete pods "*) echo deleted ;;
   *" get pods -l app.kubernetes.io/name=spire-server -o json "*)
     echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=envd -o name "*) echo deployment.apps/envd ;;
+  *" get deployment.apps/envd -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"envd"}}}}' ;;
+  *" get pods -l app.kubernetes.io/name=envd -o jsonpath="*) echo old-uid ;;
+  *" get pods -l app.kubernetes.io/name=envd -o json "*)
+    echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=otel-uplink -o name "*) echo deployment.apps/otel-uplink ;;
   *" get deployment.apps/otel-uplink -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"otel-uplink"}}}}' ;;
   *" get pods -l app.kubernetes.io/name=otel-uplink -o jsonpath="*) echo old-uid ;;
@@ -121,13 +126,15 @@ func runRotate(t *testing.T, env ...string) rotateResult {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// dev-cp runs the harness component otel-uplink, and cell:restart restarts its Deployment too.
-	uplink := filepath.Join(dir, "build", "dev-cp", "bundles", "otel-uplink")
-	if err := os.MkdirAll(uplink, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(uplink, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: otel-uplink\n  namespace: observability-system\n"), 0o644); err != nil {
-		t.Fatal(err)
+	// dev-cp runs the harness components otel-uplink and envd, and cell:restart restarts their Deployments too.
+	for name, ns := range map[string]string{"otel-uplink": "observability-system", "envd": "envd-system"} {
+		bundle := filepath.Join(dir, "build", "dev-cp", "bundles", name)
+		if err := os.MkdirAll(bundle, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: "+name+"\n  namespace: "+ns+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 	cmd := exec.Command(script)
 	cmd.Env = append([]string{

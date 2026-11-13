@@ -11,7 +11,8 @@ metadata:
     pod-security.kubernetes.io/enforce: restricted
     cell.poc.internal/harness: cell-identity
 ---
-# The pod mounts no token for this account. Only the agent container gets a projected API token.
+# The pod mounts no token for this account. Only the agent container and the celld container get a
+# projected API token, each from its own volume.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -69,6 +70,7 @@ spec:
       labels:
         app.kubernetes.io/name: celld
       annotations:
+        poc.internal/peer-root-sha256: "c7270c7bf58069f36601f452004217519e176adcd66424a09a3e685fd8e66121"
         # SPIRE reads its configuration and the trust bundle only at start. A change restarts the pod.
         cell.poc.internal/config-checksum: "90422a3ae8aa56071729d70fd371e1d8a1e600fe2a7e8cd49e0a8c3ec9b6f770"
     spec:
@@ -174,7 +176,31 @@ spec:
         # The celld entry selects unix:uid:65532, the user of the ko base image.
         - name: celld
           image: "localhost:5001/celld@sha256:stub"
+          # celld binds the cell issuer to the management plane through relay-bind in the environment
+          # control plane. It asks for a token of its own account, bound to this pod, and sends it with
+          # the keys of the cell.
+          args:
+            - --cell=dev-cell-1
+            - --bind-upstream=10.9.0.9:30447
+            - --bind-expect-id=spiffe://mgmt.poc.internal/api
+            - --bind-peer-bundle=/run/celld/mgmt-root/root.crt
           env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
             - name: OTEL_SERVICE_NAME
@@ -198,7 +224,32 @@ spec:
             - name: agent-socket
               mountPath: /run/spire/agent
               readOnly: true
+            - name: mgmt-root
+              mountPath: /run/celld/mgmt-root
+              readOnly: true
+            - name: celld-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
       volumes:
+        - name: mgmt-root
+          configMap:
+            name: mgmt-root
+        - name: celld-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
         - name: agent-config
           configMap:
             name: spire-agent
@@ -276,8 +327,9 @@ spec:
         - protocol: TCP
           port: 53
 ---
-# The pod reaches only the SPIRE server node port in the environment control plane, the API
-# server for TokenRequest, and the collector. It accepts no connections: the probes run in the pod.
+# The pod reaches only the SPIRE server node port and the relay-bind node port in the environment
+# control plane, the API server for TokenRequest, and the collector. It accepts no connections: the
+# probes run in the pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -297,6 +349,8 @@ spec:
       ports:
         - protocol: TCP
           port: 30081
+        - protocol: TCP
+          port: 30447
     - to:
         - ipBlock:
             cidr: 172.18.0.5/32
@@ -387,4 +441,26 @@ data:
     aWZmZTovL2Rldi5lbnYucG9jLmludGVybmFsMAoGCCqGSM49BAMCA0gAMEUCIQCq
     Aw55ytr9T9f0ULc/XRlsSAw/tvzTZS5NMmH2l6ctiQIgVLADKoipDep60MEUqsLe
     44mE2ORReiDLpcDlDs2g5Vo=
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mgmt-root
+  namespace: cell-identity-system
+  annotations:
+    poc.internal/peer-root-sha256: c7270c7bf58069f36601f452004217519e176adcd66424a09a3e685fd8e66121
+  labels:
+    cell.poc.internal/harness: cell-identity
+data:
+  root.crt: |-
+    -----BEGIN CERTIFICATE-----
+    MIIBajCCARGgAwIBAgIBATAKBggqhkjOPQQDAjAZMRcwFQYDVQQDDA5yZW5kZXIg
+    dGVzdCBDQTAeFw0yNjAxMDEwMDAwMDBaFw00NjAxMDEwMDAwMDBaMBkxFzAVBgNV
+    BAMMDnJlbmRlciB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELTCG
+    NxXeNqtIuxDfUBraAOZF3Jd2CzIUoOeR17KnudfyhaRUuquPfyMrRwCVmqv5Yo3o
+    b6ju64CmYMUkHsuCjaNKMEgwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
+    AgQwJQYDVR0RBB4wHIYac3BpZmZlOi8vbWdtdC5wb2MuaW50ZXJuYWwwCgYIKoZI
+    zj0EAwIDRwAwRAIgA9lfrjEJ2rJm7dC1qHl0utlo20VDOK+3Cq9Rw/TSGXoCIFFT
+    B25W4tXcx2A0Zir/7VpQz6UHPEWCufUY3Tg0KDhR
     -----END CERTIFICATE-----

@@ -2,6 +2,10 @@
 # Check each base cell rule against the running cluster. Prints PASS or FAIL per check and
 # exits non-zero if any check fails.
 source "$(dirname "$0")/lib.sh"
+source "$ROOT/components/lib/peer-root.sh"
+source "$ROOT/components/lib/hostsvc-pin.sh"
+source "$ROOT/components/lib/mgmt-key.sh"
+source "$ROOT/scripts/verify-lib.sh"
 set +e
 
 failures=0
@@ -135,48 +139,6 @@ check_psa_rejects_privileged() {
   grep -q "violates PodSecurity" <<<"$out" || { echo "$out"; return 1; }
 }
 
-# missing_cell_hint <cell> prints the two ways out when an agent cell has no cluster.
-missing_cell_hint() {
-  echo "Create the cluster: mise run hostsvc -- up --only $1, then run CELL=$1 mise run cell:up and CELL=$CELL_NAME mise run cell:up."
-  echo "Or remove $1 from SPIRE_AGENT_CELLS in cells/$CELL_NAME.env, then run CELL=$CELL_NAME mise run cell:up."
-}
-
-# pem_lines prints each PEM certificate on standard input as one line, sorted.
-pem_lines() {
-  awk '/-----BEGIN CERTIFICATE-----/ { b = "" } { b = b $0 } /-----END CERTIFICATE-----/ { print b }' | sort
-}
-
-# peer_root_pods_current <namespace> <app> <ConfigMap> <fix command> succeeds when every running pod of the
-# workload carries the digest of the ConfigMap in its annotation poc.internal/peer-root-sha256. The process reads
-# the roots once at start, so a ConfigMap that is right does not show that the pod trusts the same roots.
-peer_root_pods_current() {
-  local ns="$1" app="$2" cm="$3" fix="$4" raw want pods bad
-  raw="$(k -n "$ns" get configmap "$cm" -o jsonpath='{.data.root\.crt}')" || { echo "could not read ConfigMap $ns/$cm"; return 1; }
-  want="$(printf '%s' "$raw" | shasum -a 256 | cut -d' ' -f1)"
-  pods="$(k -n "$ns" get pods -l "app.kubernetes.io/name=$app" -o json)" || { echo "could not read the pods of $app in $ns"; return 1; }
-  bad="$(jq -r --arg want "$want" '[.items[] | select(.metadata.deletionTimestamp == null) | .metadata.name as $n
-      | ((.metadata.annotations["poc.internal/peer-root-sha256"] // "") | if . == "" then "none" else . end) as $got | select($got != $want) | "\($n) carries the root digest \($got)"] | .[]' <<<"$pods")"
-  if [[ -z "$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | length | select(. > 0)' <<<"$pods")" ]]; then
-    echo "$app has no running pod in $ns."
-    echo "Run: $fix"
-    return 1
-  fi
-  if [[ -n "$bad" ]]; then
-    echo "$bad"
-    echo "ConfigMap $ns/$cm has the digest $want, and a pod reads the roots only at start."
-    echo "Run: $fix"
-    return 1
-  fi
-}
-
-node_ip() {
-  local facts ip
-  facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$1" 2>/dev/null)" || { echo "no host service facts for $1"; return 1; }
-  ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
-  [[ -n "$ip" ]] || { echo "the host service reports no node address for $1"; return 1; }
-  printf '%s\n' "$ip"
-}
-
 # The cell renders the address of the SPIRE server node into the agent config and the NetworkPolicy.
 # Docker can give a rebuilt node a new address, so both must match the host service now.
 check_spire_server_address() {
@@ -188,40 +150,6 @@ check_spire_server_address() {
     | jq -r '[.spec.egress[] | select(any(.ports[]; .port == 30081)) | .to[].ipBlock.cidr] | join(" ")')"
   if [[ "$addr" != "$want" || "$cidrs" != "$want/32" ]]; then
     echo "the $SPIRE_SERVER_CLUSTER node is $want, but the agent uses '$addr' and the NetworkPolicy allows '$cidrs'."
-    echo "Run: CELL=$CELL_NAME mise run cell:up"
-    return 1
-  fi
-}
-
-# The SPIRE server renders the node address and the signed record of each agent cell. A rebuilt
-# cell has a new service account key, and it can have a new node address.
-check_agent_cells_current() {
-  local cell ip facts want got cidrs traces want_cidrs=() stale=()
-  for cell in $SPIRE_AGENT_CELLS; do
-    ip="$(node_ip "$cell")" || { echo "$ip."; missing_cell_hint "$cell"; return 1; }
-    want_cidrs+=("$ip/32")
-    facts="$(cd "$ROOT" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"
-    want="$(jq -cS '.jwks.keys | sort_by(.kid)' <<<"$facts")"
-    got="$(k -n spire-system get configmap "cell-record-$cell" -o jsonpath='{.data.record\.dsse\.json}' \
-      | jq -r .payload | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)')"
-    [[ -n "$want" && "$got" == "$want" ]] || stale+=("the record of $cell holds other service account keys than $cell")
-  done
-  cidrs="$(k -n spire-system get networkpolicy spire-server-agents -o json | jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")')"
-  # jq sorts both sides, so the comparison does not depend on the locale of sort.
-  want="$(printf '%s\n' "${want_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
-  [[ "$cidrs" == "$want" ]] || stale+=("the NetworkPolicy admits '$cidrs', but the agent cell nodes are '$want'")
-  if ((${#stale[@]} > 0)); then
-    printf '%s\n' "${stale[@]}"
-    # A new record signs the live keys. While the key rotation test has changed a cell, those keys
-    # include the test key, so the node must be repaired first.
-    # A node that cannot be read counts as one that needs the repair.
-    for cell in $SPIRE_AGENT_CELLS; do
-      if ! traces="$(keytest_leftover "$cell")" || [[ -n "$traces" ]]; then
-        printf '%s\n' "$traces"
-        echo "Run: mise run gate:m2:repair, and then CELL=$CELL_NAME mise run cell:verify again"
-        return 1
-      fi
-    done
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
@@ -343,26 +271,6 @@ check_live_images() {
   if [[ -n "$bad" ]]; then
     printf '%s\n' "$bad"
     echo "Run: $3"
-    return 1
-  fi
-}
-
-# The M2 key rotation test changes the API server of a cell on its node. The node must hold no trace
-# of it, and the API server must publish exactly the keys that the record of the cell holds.
-check_keytest_clean() {
-  local traces live record
-  # The node traces come first, because the API server may not answer while the node holds them.
-  if ! traces="$(keytest_leftover "$CELL_NAME")" || [[ -n "$traces" ]]; then
-    printf '%s\n' "$traces"
-    echo "Run: mise run gate:m2:repair"
-    return 1
-  fi
-  live="$(k get --raw /openid/v1/jwks | jq -cS '.keys | sort_by(.kid)')" || { echo "could not read the JWKS of $CELL_NAME"; return 1; }
-  record="$(kubectl --context "kind-$SPIRE_SERVER_CLUSTER" -n spire-system get configmap "cell-record-$CELL_NAME" -o jsonpath='{.data.record\.dsse\.json}' \
-    | jq -r .payload | base64 -d | jq -cS '.jwks.keys | sort_by(.kid)')" || { echo "could not read the record of $CELL_NAME in $SPIRE_SERVER_CLUSTER"; return 1; }
-  if [[ -z "$live" || "$live" != "$record" ]]; then
-    echo "the API server of $CELL_NAME publishes other keys than its record in $SPIRE_SERVER_CLUSTER."
-    echo "Run: CELL=$SPIRE_SERVER_CLUSTER mise run cell:up"
     return 1
   fi
 }
@@ -867,6 +775,7 @@ if has_harness cell-identity; then
     check_harness_objects cell-identity cell-identity-system
   check "celld runs the images that build/images.env records" \
     check_live_images cell-identity-system deployment/celld "CELL=$CELL_NAME mise run cell:up"
+  check "ConfigMap mgmt-root of celld holds the live roots of management" check_celld_mgmt_root
   check "The node holds no trace of the M2 key rotation test, and the API server publishes the keys of the record" \
     check_keytest_clean
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the SPIRE node port (steady state)" \
@@ -983,6 +892,17 @@ if has_harness argocd-agent; then
   check "No object of a gate run is left, and no binding grants the agent more than the render" check_agent_grants
   check "The Argo CD Agent holds a stream to the principal" check_agent_connected
 fi
+if has_harness envd; then
+  check "The envd objects match the bundle" check_harness_drift envd
+  check "envd-system has exactly the envd objects of the bundle, with no other field manager" check_harness_objects envd envd-system
+  check "spire-system has exactly the envd objects of the bundle with the label envd, with no other field manager" check_harness_objects envd spire-system
+  check "envd runs the images that build/images.env records" \
+    check_live_images envd-system deployment/envd "CELL=$CELL_NAME mise run cell:up"
+  check "envd and its NetworkPolicy use the current node address of $RELAY_TARGET" check_envd_mgmt_address
+  check "The peer root ConfigMap of envd holds the live roots of $RELAY_TARGET" check_envd_peer_root
+  check "ConfigMap cell-records holds the spec revision that mgmtd signed last" check_envd_applied
+  check "The SPIRE server and envd pin the key that mgmtd signs with" check_spec_key_pinned
+fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
   check "The SPIRE server holds the node alias and the role entry of each subject of $SPIRE_AGENT_CELLS" check_agent_entries
@@ -1007,7 +927,7 @@ fi
 if [[ -n "${RELAY_TARGET:-}" ]]; then
   check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and $SPIRE_AGENT_CELLS" check_relay_current
   relay_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
-  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES; do
+  for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES ${RELAY_BIND_ROUTES:-}; do
     check "A probe pod in rogue cannot open TCP to the relay node port ${route%%:*} of $CELL_NAME (steady state)" \
       expect_dial_blocked rogue default "${relay_ip:-unknown}:${route%%:*}"
   done
@@ -1216,20 +1136,31 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   for ns in $(yq -N 'select(.metadata.namespace != null) | .metadata.namespace' "$bundle" 2>/dev/null | sort -u); do
     check "$ns has exactly the $comp objects of the bundle, with no other field manager" check_harness_objects "$comp" "$ns"
   done
+  if [[ "$comp" == mgmt-api ]]; then
+    check "ConfigMap hostsvc-pin equals the certificate that the host service presents" check_mgmt_hostsvc_pin
+    check "The host service trusts the live root of $CELL_NAME" check_mgmt_hostsvc_root
+    check "The host service address in the policy and in mgmtd is the one that the node resolves" check_mgmt_hostsvc_address
+    check "The API and bind ports admit the current $VIEW_CONTROL_PLANE node address" check_mgmt_env_address
+    check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_mgmt_peer_root
+    check "ConfigMap mgmt-signing-pub equals the key that mgmtd signs with" mgmt_signing_pub
+  fi
   if [[ "$comp" == central-view ]]; then
     check "The view listener admits the current $VIEW_CONTROL_PLANE node address" check_view_env_address
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_view_peer_root
     check "central-view-system holds only the Secrets of the view" check_view_secrets
     check "The view certificates are valid for 30 days or more" check_view_cert_expiry
     check "The principal and argocd-server started after the newest view key" check_view_pods_current
+    check "ConfigMap cell-registry of central-view-system holds the records that mgmtd serves" check_registry_current central-view-system central-view
   fi
   if [[ "$comp" == telemetry-gateway ]]; then
     check "The gateway listener admits the current $VIEW_CONTROL_PLANE node address" check_gateway_env_address
     check "ConfigMap peer-root of observability-system holds the live roots of $VIEW_CONTROL_PLANE" check_gateway_peer_root
+    check "ConfigMap cell-registry of observability-system holds the records that mgmtd serves" check_registry_current observability-system telemetry-gateway
   fi
   if [[ "$comp" == mesh-view-hub ]]; then
     check "The hub listener admits the current $VIEW_CONTROL_PLANE node address" check_hub_env_address
     check "ConfigMap peer-root of mesh-view-system holds the live roots of $VIEW_CONTROL_PLANE" check_hub_peer_root
+    check "ConfigMap cell-registry of mesh-view-system holds the records that mgmtd serves" check_registry_current mesh-view-system mesh-view-hub
     check "The hub holds a tunnel from each cell of MESH_VIEW_CELLS" check_hub_tunnels
   fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \

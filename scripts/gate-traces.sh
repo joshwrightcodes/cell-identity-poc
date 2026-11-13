@@ -97,3 +97,23 @@ bundle_traces() {
   jq -r --arg p "$BUNDLE_TEST_PATH" '.entries[] | select(.spiffe_id.path | startswith($p))
     | "the SPIRE server holds the test entry spiffe://\(.spiffe_id.trust_domain)\(.spiffe_id.path)"' <<<"$entries"
 }
+
+# record_kids_trace <cell> <key IDs of the API server, sorted and joined by spaces> prints one line when mgmtd answers and the record
+# of the cell lists other key IDs. A repair that stopped between its pod replacement and its key check leaves such a record. It
+# prints nothing when mgmtd does not answer.
+record_kids_trace() {
+  local status record
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || return 0
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$status" || return 0
+  record="$(jq -r --arg cell "$1" '[.cells[] | select(.name == $cell)][0].kids // [] | sort | join(" ")' <<<"$status")"
+  [[ "$record" == "$2" ]] || echo "the record of $1 lists the key IDs '$record', and the API server publishes '$2'. Run: mise run mgmt -- keycheck --cell $1"
+}
+
+# repair_order_pods <stale pod UIDs as a JSON array> reads the output of `kubectl get pods -A -o json` on standard input and prints
+# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. The pods of kindnet and kube-proxy come first:
+# kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start.
+repair_order_pods() {
+  jq -r --argjson uids "$1" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
+    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy")) then 0 else 1 end)
+    | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"'
+}

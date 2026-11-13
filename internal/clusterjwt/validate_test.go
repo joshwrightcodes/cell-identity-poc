@@ -479,3 +479,175 @@ func TestSmallRSAKeyNotUsable(t *testing.T) {
 	s.Key, s.KID = small, "small"
 	check(t, rec, s.token(t), UnknownKID)
 }
+
+const (
+	bindAud   = "mgmt-bind/dev-cell-1/n1"
+	attestAud = "spire-dev/n1"
+)
+
+func TestValidateForAudience(t *testing.T) {
+	k := newKeys(t)
+	rec := k.record(t)
+	bound := func(aud ...string) string {
+		s := k.good()
+		s.Audience = aud
+		return s.token(t)
+	}
+	forBind := func(token, audience string) Reason {
+		_, err := ValidateFor(rec, token, audience, testNow)
+		return ReasonOf(err)
+	}
+	validateAttest := func(token string) Reason {
+		_, err := Validate(rec, token, testEnv, "n1", testNow)
+		return ReasonOf(err)
+	}
+
+	bindTok := bound(bindAud)
+	if got := forBind(bindTok, bindAud); got != "" {
+		t.Fatalf("ValidateFor with its own audience = %q, want pass", got)
+	}
+	if got := validateAttest(bindTok); got != WrongAudience {
+		t.Fatalf("Validate of a bind token = %q, want wrong_audience", got)
+	}
+	if got := forBind(bound(attestAud), bindAud); got != WrongAudience {
+		t.Fatalf("ValidateFor of an attestation token = %q, want wrong_audience", got)
+	}
+	both := bound(bindAud, attestAud)
+	if got := forBind(both, bindAud); got != WrongAudience {
+		t.Fatalf("ValidateFor of a two-audience token = %q, want wrong_audience", got)
+	}
+	if got := validateAttest(both); got != WrongAudience {
+		t.Fatalf("Validate of a two-audience token = %q, want wrong_audience", got)
+	}
+	if got := forBind(bindTok, ""); got != WrongAudience {
+		t.Fatalf("ValidateFor with an empty audience = %q, want wrong_audience", got)
+	}
+	if got := forBind(bound(""), ""); got != WrongAudience {
+		t.Fatalf("ValidateFor of an empty-audience token = %q, want wrong_audience", got)
+	}
+}
+
+func TestValidateForSkipsEnvCheckOnly(t *testing.T) {
+	k := newKeys(t)
+	rec := k.record(t)
+	rec.Env = "prod"
+	s := k.good()
+	s.Audience = []string{bindAud}
+	if _, err := ValidateFor(rec, s.token(t), bindAud, testNow); err != nil {
+		t.Fatalf("env of the record must not matter: %v", err)
+	}
+	rec.Revoked = true
+	if _, err := ValidateFor(rec, s.token(t), bindAud, testNow); ReasonOf(err) != Revoked {
+		t.Fatalf("got %v, want revoked", err)
+	}
+	rec.Revoked = false
+	s.Key = newKeys(t).rsa
+	if _, err := ValidateFor(rec, s.token(t), bindAud, testNow); ReasonOf(err) != BadSignature {
+		t.Fatalf("got %v, want bad_signature", err)
+	}
+}
+
+func TestPrecheck(t *testing.T) {
+	k := newKeys(t)
+	other := newKeys(t)
+	subject := record.Subject{Namespace: "celld", ServiceAccount: "celld"}
+	cases := []struct {
+		name   string
+		want   Reason
+		mutate func(*spec)
+		token  string
+	}{
+		{name: "pass", want: ""},
+		{name: "foreign_key_passes", want: "", mutate: func(s *spec) { s.Key, s.KID = other.rsa, "foreign" }},
+		{name: "bad_signature_passes", want: "", mutate: func(s *spec) { s.Key = other.rsa }},
+		{name: "malformed", want: Malformed, token: "not-a-token"},
+		{name: "alg_not_allowed", want: AlgNotAllowed, mutate: func(s *spec) { s.Alg = jose.RS512 }},
+		{name: "issuer_mismatch", want: IssuerMismatch, mutate: func(s *spec) { s.Issuer = "https://evil.example" }},
+		{name: "subject_not_allowed", want: SubjectNotAllowed, mutate: func(s *spec) { s.K8s.Svcacct.Name = "other" }},
+		{name: "subject_not_allowed_namespace", want: SubjectNotAllowed, mutate: func(s *spec) { s.K8s.Namespace = "other" }},
+		{name: "not_pod_bound", want: NotPodBound, mutate: func(s *spec) { s.K8s.Pod = nil }},
+		{name: "lifetime_too_long", want: LifetimeTooLong, mutate: func(s *spec) { s.EXP = s.IAT + 3600 }},
+		{name: "stale_iat", want: StaleIAT, mutate: func(s *spec) {
+			s.IAT = testNow.Add(-16 * time.Minute).Unix()
+			s.EXP = s.IAT + 600
+		}},
+		{name: "iat_in_future", want: IATInFuture, mutate: func(s *spec) {
+			s.IAT = testNow.Add(10 * time.Minute).Unix()
+			s.EXP = s.IAT + 300
+		}},
+		{name: "expired", want: Expired, mutate: func(s *spec) {
+			s.IAT = testNow.Add(-5 * time.Minute).Unix()
+			s.EXP = testNow.Add(-2 * time.Minute).Unix()
+		}},
+		{name: "wrong_audience", want: WrongAudience, mutate: func(s *spec) { s.Audience = []string{"other"} }},
+		{name: "two_audiences", want: WrongAudience, mutate: func(s *spec) { s.Audience = []string{bindAud, attestAud} }},
+		{name: "missing_exp", want: Malformed, mutate: func(s *spec) { s.Omit = []string{"exp"} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			token := tc.token
+			if token == "" {
+				s := k.good()
+				s.Audience = []string{bindAud}
+				if tc.mutate != nil {
+					tc.mutate(&s)
+				}
+				token = s.token(t)
+			}
+			err := Precheck(token, testIssuer, bindAud, subject, testNow)
+			if got := ReasonOf(err); got != tc.want {
+				t.Fatalf("reason = %q (err %v), want %q", got, err, tc.want)
+			}
+		})
+	}
+	t.Run("empty_issuer_skips_issuer_check", func(t *testing.T) {
+		s := k.good()
+		s.Audience = []string{bindAud}
+		s.Issuer = "https://evil.example"
+		if err := Precheck(s.token(t), "", bindAud, subject, testNow); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("empty_audience", func(t *testing.T) {
+		s := k.good()
+		s.Audience = []string{bindAud}
+		if got := ReasonOf(Precheck(s.token(t), testIssuer, "", subject, testNow)); got != WrongAudience {
+			t.Fatalf("got %q", got)
+		}
+	})
+}
+
+func TestValidateEmptyRecordIssuerRefused(t *testing.T) {
+	k := newKeys(t)
+	rec := k.record(t)
+	rec.Issuer = ""
+	for name, iss := range map[string]string{"foreign_iss": "https://evil.example", "absent_iss": ""} {
+		t.Run(name, func(t *testing.T) {
+			s := k.good()
+			s.Issuer = iss
+			s.Audience = []string{bindAud}
+			if iss == "" {
+				s.Omit = []string{"iss"}
+			}
+			token := s.token(t)
+			if _, err := ValidateFor(rec, token, bindAud, testNow); ReasonOf(err) != IssuerMismatch {
+				t.Fatalf("ValidateFor = %v, want issuer_mismatch", err)
+			}
+			s.Audience = []string{Audience(testEnv, testNonce)}
+			if _, err := Validate(rec, s.token(t), testEnv, testNonce, testNow); ReasonOf(err) != IssuerMismatch {
+				t.Fatalf("Validate = %v, want issuer_mismatch", err)
+			}
+		})
+	}
+}
+
+func TestPrecheckRefusesTokenWithoutKid(t *testing.T) {
+	k := newKeys(t)
+	s := k.good()
+	s.Audience = []string{bindAud}
+	s.KID = ""
+	err := Precheck(s.token(t), testIssuer, bindAud, record.Subject{Namespace: "celld", ServiceAccount: "celld"}, testNow)
+	if ReasonOf(err) != UnknownKID {
+		t.Fatalf("got %v, want unknown_kid", err)
+	}
+}

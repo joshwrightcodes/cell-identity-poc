@@ -157,6 +157,16 @@ run = "scripts/pki-rotate-intermediate.sh"
 description = "Run the host service: up, down or facts, with the arguments after --"
 run = "go run ./cmd/hostsvc"
 
+[tasks."hostsvc:serve"]
+description = "Run the host service on this Mac, which answers the key requests of mgmtd on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status or pin"
+env = { CELL = "management" }
+run = "scripts/hostsvc-serve.sh"
+
+[tasks.mgmt]
+description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key, reset-state to start with a new state and a new signing key, or rotate-signing-key to rotate the signing key and render it"
+env = { CELL = "management" }
+run = "scripts/mgmt.sh"
+
 [tasks."harness:up"]
 description = "Check the tool versions, create all five clusters through the host service, build the images, then run cell:up on each cluster that has components. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
 depends = ["harness:preflight"]
@@ -209,6 +219,18 @@ run = "scripts/gate.sh m3"
 description = "Delete the objects and the firewall rules on the dev-cp node that a gate:m3 run left when it stopped before its cleanups. With --check, only list them. Safe to run again"
 run = "scripts/gate-m3-repair.sh"
 
+[tasks."gate:m4"]
+description = "Run the M4 end-to-end tests against the management plane stand-in, envd and the cells, plus the go test arguments after --. The task builds no image: run mise run images first, or mise run images -- <name> for one image"
+run = "scripts/gate.sh m4"
+
+[tasks."gate:m4:rotate"]
+description = "Run the test that rotates the signing key of mgmtd and renders the new key into envd and the SPIRE server of dev-cp, plus the go test arguments after --. It prints the attestation gap. Run it alone, after gate:m4"
+run = "scripts/gate.sh m4-rotate"
+
+[tasks."gate:m4:repair"]
+description = "Start the host service again and link mgmt-api when the pin or the root drifted, set the replicas of mgmtd and envd back to 1, link the registries of the central views again, serve the latest spec again, delete the test namespaces and Jobs of gate:m4, and run gate:m2:repair. With --check, only report, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m4-repair.sh"
+
 [tasks."mgmt:rotate-ca"]
 description = "Replace the CA of the SPIRE server in CELL (default management) with a new root: prepare, refresh every peer copy, activate, revoke the old root, refresh again"
 env = { CELL = "{{get_env(name='CELL', default='management')}}" }
@@ -230,10 +252,6 @@ run = "scripts/size.sh"
 [tasks."harness:restart-check"]
 description = "Stop and start the VM, wait for Ready nodes, then run the M1 gate. The clusters do not survive the restart, so this check leaves the harness broken. Rebuild it afterwards with harness:down and harness:up"
 run = "scripts/restart-check.sh"
-
-[tasks."record:fixture"]
-description = "Print a ConfigMap with a test-signed cell record and its public key: --cluster <name> --subject <ns>/<sa>"
-run = "go run ./cmd/recordgen"
 
 [tasks.pki]
 description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"

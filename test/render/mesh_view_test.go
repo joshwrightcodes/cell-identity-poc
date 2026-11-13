@@ -571,7 +571,7 @@ func TestRenderMeshViewHubFailsClosed(t *testing.T) {
 		{"MESH_VIEW_CELLS=dev-cell-1=18001 dev-cell-2=18001", "gives the port 18001 to two cells"},
 		{"MESH_VIEW_CELLS=dev-cell-1=8444", "out of range or in use"},
 		{"MESH_VIEW_CELLS=dev-cell-1", "is not <cell>=<port>"},
-		{"MESH_VIEW_CELLS=bad-facts=18001", "could not sign the record of bad-facts"},
+		{"MESH_VIEW_CELLS=bad-facts=18001", "Run CELL=bad-facts mise run cell:up, so its celld binds"},
 		{"MESH_VIEW_NAMESPACES=Bad_Name", "is not a namespace name"},
 		{"KIALI_IMAGE=quay.io/kiali/kiali:v2.34.1", "pinned by digest"},
 		{"KIALI_VERSION=v9.9.9", "pinned by digest"},

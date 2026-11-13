@@ -25,6 +25,10 @@ const kindNetwork = "kind"
 // limaHostPrefix is the Lima host network inside the Colima VM.
 const limaHostPrefix = "192.168.5.0/24"
 
+// apiCallTimeout bounds each call to the API server and each docker lookup of the reserved prefixes.
+// Tests shorten it.
+var apiCallTimeout = 10 * time.Second
+
 // KindRuntime runs clusters through the kind library and its Docker provider.
 // The Docker provider runs the docker command line, so docker must be on PATH.
 type KindRuntime struct {
@@ -79,6 +83,8 @@ func (k *KindRuntime) NodeIP(name string) (string, error) {
 // Before the first cluster exists the kind network is absent, and only the Lima prefix remains.
 func DockerReserved(ctx context.Context) ([]netip.Prefix, error) {
 	reserved := []netip.Prefix{netip.MustParsePrefix(limaHostPrefix)}
+	ctx, cancel := context.WithTimeout(ctx, apiCallTimeout)
+	defer cancel()
 	out, err := exec.CommandContext(ctx, "docker", "network", "inspect", kindNetwork,
 		"--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}").CombinedOutput()
 	if err != nil {
@@ -133,13 +139,14 @@ func (HTTPProber) Probe(ctx context.Context, kubeconfig string) (Observed, error
 		return Observed{}, fmt.Errorf("load client certificate: %w", err)
 	}
 	client := &http.Client{
-		Timeout: 30 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{
 			RootCAs: pool, Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12,
 		}},
 	}
 	server := strings.TrimSuffix(kc.Clusters[0].Cluster.Server, "/")
 	get := func(path string) ([]byte, error) {
+		ctx, cancel := context.WithTimeout(ctx, apiCallTimeout)
+		defer cancel()
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server+path, nil)
 		if err != nil {
 			return nil, err

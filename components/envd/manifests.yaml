@@ -1,0 +1,168 @@
+# The environment executor of dev-cp. render.sh fills in the @...@ values, adds the SPIRE agent sidecar
+# (components/lib/spire-sidecar.sh) and the harness label, and prints the ConfigMaps and the
+# NetworkPolicies.
+#
+# envd pulls the signed spec and the cell records from mgmtd, verifies them under the pinned
+# management key, and writes them to ConfigMap spire-system/cell-records. The cluster_jwt plugin of the
+# SPIRE server reads that ConfigMap. Its SVID is spiffe://dev.env.poc.internal/envd.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: envd-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: envd
+  namespace: envd-system
+automountServiceAccountToken: false
+---
+# envd writes the records as ConfigMap cell-records in spire-system. Create cannot name the object,
+# and get and update name only that one. envd calls Get, Create and Update on the ConfigMap.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-records
+  namespace: spire-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [cell-records]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-records
+  namespace: spire-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: envd-records
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envd
+  namespace: envd-system
+  labels:
+    app.kubernetes.io/name: envd
+spec:
+  replicas: 1
+  # One writer at a time: the new pod starts after the old one stops.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: envd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: envd
+      annotations:
+        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/spec-key-sha256: "@SPEC_KEY_SHA256@"
+    spec:
+      serviceAccountName: envd
+      # Only the envd container mounts the token, as the projected volume envd-api-token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: envd
+          image: "@ENVD_IMAGE@"
+          args:
+            - run
+            - --upstream=@UPSTREAM@
+            - --expect-id=spiffe://@MGMT_TRUST_DOMAIN@/api
+            - --peer-bundle=/run/envd/peer-root/root.crt
+            - --peer-trust-domain=@MGMT_TRUST_DOMAIN@
+            - --spec-key-file=/run/envd/spec-key/spec.pub
+            - --env=@POC_ENV@
+            - --output-configmap=spire-system/cell-records
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: envd
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: health
+              containerPort: 8080
+          # The kubelet reaches the health port from the node (flow N23). The endpoint does not depend on
+          # the management plane, so a pod that starts while mgmtd is down is Ready.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: peer-root
+              mountPath: /run/envd/peer-root
+              readOnly: true
+            - name: spec-key
+              mountPath: /run/envd/spec-key
+              readOnly: true
+            - name: envd-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: peer-root
+          configMap:
+            name: peer-root
+        - name: spec-key
+          configMap:
+            name: mgmt-spec-key
+        - name: envd-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
