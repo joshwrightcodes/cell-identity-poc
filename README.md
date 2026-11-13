@@ -310,8 +310,9 @@ Keep that file, and read the error before any other step.
 
 `envd` holds a higher revision than the new state, so it refuses each spec with `revision_old`.
 `mise run mgmt -- status` then shows `"stateBehindApplied": true`, and `mgmtd` logs `state_behind_applied`.
-To recover, run `mise run mgmt -- rotate-signing-key`. Each run raises the epoch by one.
-Run it again while `status` still shows `stateBehindApplied` as true.
+To recover, run `mise run mgmt -- rotate-signing-key` once.
+The new key changes the key fingerprint that `envd` pins, and `envd` then resets its stored high-water mark.
+It accepts the new epoch at once, so no second rotation is needed.
 Each cell binds again on its own, because `celld` repeats its bind until `mgmtd` holds a record.
 Then run `CELL=management mise run cell:verify` and `CELL=dev-cp mise run cell:verify`.
 

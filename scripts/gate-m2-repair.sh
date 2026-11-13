@@ -84,6 +84,8 @@ if [[ "${1:-}" == "--check" ]]; then
   else
     kids="$(api_kids 2>/dev/null)" || die "cannot read the JWKS of $CELL_NAME"
     [[ "$kids" != *" "* ]] || found+=("the API server of $CELL_NAME publishes the keys $kids")
+    record_trace="$(record_kids_trace "$CELL_NAME" "$kids")"
+    [[ -z "$record_trace" ]] || found+=("$record_trace")
   fi
   cp_traces="$(bundle_traces "$cp")" || die "$cp_traces"
   [[ -z "$cp_traces" ]] || found+=("$cp_traces")
@@ -256,9 +258,7 @@ if ((${#stale[@]} > 0)); then
   # kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start, so their pods come first.
   while read -r ns pod kind owner; do
     replace_pod "$ns" "$pod" "$kind" "$owner" </dev/null
-  done < <(k get pods -A -o json | jq -r --argjson uids "$uids" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy")) then 0 else 1 end)
-    | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"')
+  done < <(k get pods -A -o json | repair_order_pods "$uids")
 fi
 
 all_ready() {

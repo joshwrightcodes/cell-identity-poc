@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -62,14 +61,13 @@ func TestRotationSigningKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), rotateWait)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "mise", "run", "mgmt", "--", "rotate-signing-key")
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = io.Discard
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
 	took := time.Since(started)
 	t.Logf("rotate-signing-key took %s", took.Round(time.Second))
 	if err != nil {
-		t.Fatalf("mise run mgmt -- rotate-signing-key: %v\n%s", err, stdout.String())
+		t.Fatalf("mise run mgmt -- rotate-signing-key: %v\nstdout: %s\nstderr (the remaining commands, when the key rotated):\n%s", err, stdout.String(), stderr.String())
 	}
 	var res struct {
 		Rotated bool   `json:"rotated"`
@@ -78,7 +76,7 @@ func TestRotationSigningKey(t *testing.T) {
 		Epoch   uint64 `json:"epoch"`
 	}
 	if strings.Count(stdout.String(), "\n") != 1 || json.Unmarshal(stdout.Bytes(), &res) != nil {
-		t.Fatalf("standard output is %q, want one JSON line", stdout.String())
+		t.Fatalf("standard output is %q, want one JSON line. stderr:\n%s", stdout.String(), stderr.String())
 	}
 	if !res.Rotated || res.Epoch != before.Signed.Epoch+1 || res.Old == res.New {
 		t.Fatalf("the result %+v, want rotated at the epoch %d with a new key", res, before.Signed.Epoch+1)

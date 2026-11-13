@@ -316,6 +316,15 @@ func rogueToken(t *testing.T, audience string) string {
 	return strings.TrimSpace(token)
 }
 
+// lastLine returns the last line of a probe output, and fails the test when the output is empty.
+func lastLine(t *testing.T, lines []string) string {
+	t.Helper()
+	if len(lines) == 0 {
+		t.Fatal("the probe Job printed nothing, want a result line")
+	}
+	return lines[len(lines)-1]
+}
+
 // nonceFor requests a bind nonce for a cell through a Job in the namespace, and returns the nonce and its audience.
 func nonceFor(t *testing.T, cell, ns, account, forCell string) (nonce, audience string) {
 	t.Helper()
@@ -343,7 +352,8 @@ func TestM4BindRefusals(t *testing.T) {
 	}
 	copyMgmtRoot(t, cell, bindNS)
 
-	var last time.Time
+	// An earlier test can have logged a denial just before, so the first subtest waits too.
+	last := time.Now()
 	// denied runs a one-pod Job and checks that its last line is a refusal that the mgmtd log explains.
 	denied := func(t *testing.T, j probeJob, reason string, details ...string) []string {
 		t.Helper()
@@ -352,9 +362,9 @@ func TestM4BindRefusals(t *testing.T) {
 		start := time.Now().Add(-logMargin)
 		lines := j.run1(t)
 		last = time.Now()
-		m := denialLine.FindStringSubmatch(lines[len(lines)-1])
+		m := denialLine.FindStringSubmatch(lastLine(t, lines))
 		if m == nil {
-			t.Fatalf("the last line is %q, want denied:<request ID> with 16 hex digits", lines[len(lines)-1])
+			t.Fatalf("the last line is %q, want denied:<request ID> with 16 hex digits", lastLine(t, lines))
 		}
 		l := mgmtdDenial(t, m[1], start)
 		if l.str("reason") != reason || (len(details) > 0 && !slices.Contains(details, l.str("detail"))) {
@@ -399,6 +409,15 @@ func TestM4BindRefusals(t *testing.T) {
 		// The rogue cluster has another issuer, so the claim check can refuse the token before it looks up the key.
 		denied(t, j, mgmtapi.ReasonTokenInvalid, "issuer_mismatch", "unknown_kid", "bad_signature")
 	})
+	t.Run("unknown_kid", func(t *testing.T) {
+		// The token has the issuer and the claims of a good one, and a key ID that the cell does not publish, so only the key
+		// lookup can refuse it.
+		nonce, audience := nonceFor(t, cell, celldNamespace, celldAccount, cell)
+		secret := tokenSecret(t, cell, celldNamespace, forgedToken(t, cellStatusOf(t, cell).Issuer, audience))
+		j := bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
+		j.secret = secret
+		denied(t, j, mgmtapi.ReasonTokenInvalid, "unknown_kid")
+	})
 
 	for name, rev := range revisions {
 		if now := recordRevisions(t)[name]; now != rev {
@@ -441,15 +460,16 @@ func forgedToken(t *testing.T, issuer, audience string) string {
 }
 
 // TestM4NonceFloodLive sends 200 nonce requests for dev-cell-2 from Jobs in the namespace default of dev-cell-1, and one bind
-// request for dev-cell-2 with a forged token: the right claims, a random key ID and a junk signature. A new celld pod of
-// dev-cell-2 must still bind: its log holds already_bound within two minutes. mgmtd logs the forged request as token_invalid.
+// request for dev-cell-2 with a forged token: the right claims, a random key ID and a junk signature. mgmtd refuses the forged
+// request as token_invalid with the detail unknown_kid, and the log line with its request ID shows this. After the flood, a new celld
+// pod of dev-cell-2 binds: its log holds already_bound within two minutes. The test shows that the nonce requests do not stop a bind.
+// It does not show that the forged token started no update gap: the bind of the new pod answers already_bound, which never reads the gap.
 func TestM4NonceFloodLive(t *testing.T) {
 	const from, target, ns = rejectCell, "dev-cell-2", "default"
 	needAttestprobeImage(t)
 	copyMgmtRoot(t, from, ns)
 	issuer := cellStatusOf(t, target).Issuer
 	revisions := recordRevisions(t)
-	start := time.Now().Add(-logMargin)
 
 	flood := bindProbe(t, from, ns, "default", "--cell", target, "--variant", "good", "--nonce-only")
 	flood.completions, flood.parallelism, flood.backoffLimit = 200, 25, 400
@@ -459,9 +479,16 @@ func TestM4NonceFloodLive(t *testing.T) {
 	secret := tokenSecret(t, from, ns, forgedToken(t, issuer, audience))
 	forged := bindProbe(t, from, ns, "default", "--cell", target, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
 	forged.secret = secret
+	// The denial log of mgmtd allows one line for each reason in each window, so the forged bind waits for a quiet window.
+	time.Sleep(denialQuiet)
+	forgedStart := time.Now().Add(-logMargin)
 	lines := forged.run1(t)
-	if m := denialLine.FindStringSubmatch(lines[len(lines)-1]); m == nil {
-		t.Errorf("the forged bind printed %q, want denied:<request ID>", lines)
+	m := denialLine.FindStringSubmatch(lastLine(t, lines))
+	if m == nil {
+		t.Fatalf("the forged bind printed %q, want denied:<request ID>", lines)
+	}
+	if l := mgmtdDenial(t, m[1], forgedStart); l.str("reason") != mgmtapi.ReasonTokenInvalid || l.str("detail") != "unknown_kid" || l.str("cell") != target {
+		t.Errorf("the mgmtd line for the forged bind %s has reason %q, detail %q and cell %q, want token_invalid, unknown_kid and %s", m[1], l.str("reason"), l.str("detail"), l.str("cell"), target)
 	}
 
 	succeeded, failed, done := flood.wait(t, 5*time.Minute)
@@ -478,12 +505,6 @@ func TestM4NonceFloodLive(t *testing.T) {
 		}
 		return len(matching(logs, func(l logLine) bool { return l.str("msg") == "bound" && l.str("status") == mgmtapi.StatusAlreadyBound })) > 0, lastLines(logs, 2)
 	})
-	logs := mgmtdLog(t, start)
-	if n := len(matching(logs, func(l logLine) bool {
-		return l.str("msg") == "bind_denied" && l.str("reason") == mgmtapi.ReasonTokenInvalid && l.str("cell") == target
-	})); n == 0 {
-		t.Errorf("the mgmtd log holds no bind_denied with token_invalid for %s:\n%s", target, lastLines(logs, 6))
-	}
 	for name, rev := range revisions {
 		if now := recordRevisions(t)[name]; now != rev {
 			t.Errorf("the record of %s moved from %+v to %+v during the flood", name, rev, now)

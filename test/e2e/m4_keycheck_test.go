@@ -155,3 +155,20 @@ func mgmtdLog(t *testing.T, since time.Time) string {
 	}
 	return out
 }
+
+// makeRevision signs a new revision for a cell: a key check first, a rotation of the service account key with the M2 helpers, and
+// after the update gap a key check that gives keys_updated. The cleanup of rotateAPIKey repairs the API server when the test ends.
+func makeRevision(t *testing.T, cell string) {
+	t.Helper()
+	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
+		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
+	}
+	first := time.Now()
+	rotateAPIKey(t, cell)
+	if wait := keyUpdateGap - time.Since(first); wait > 0 {
+		time.Sleep(wait)
+	}
+	if got := keyCheck(t, cell); got != "keys_updated" {
+		t.Fatalf("the key check of %s after the rotation answered %q, want keys_updated", cell, got)
+	}
+}

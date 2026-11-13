@@ -10,7 +10,7 @@ milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
-[[ "$milestone" != m4-rotate ]] || pattern="TestRotationSigningKey"
+[[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 budget_minutes="${!budget_var:-}"
 
 # Build the test binary first, so that the budget covers only the test run.

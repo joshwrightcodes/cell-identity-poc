@@ -184,9 +184,18 @@ func envdLog(t *testing.T, since time.Time) string {
 // The cleanup serves the latest revision again and waits until envd reports C with no refusal.
 func TestM4EnvdRefusesOlderRevisionLive(t *testing.T) {
 	st := mgmtStatus(t)
+	if st.RestoreActive {
+		t.Fatalf("mgmtd serves an older revision already. Run: mise run gate:m4:repair")
+	}
+	if st.Signed.Counter < 2 {
+		// A rotation of the signing key sets the counter to 1, and a bind of a bound cell signs nothing. A key change that a key
+		// check takes into the record signs a revision, so the test makes one. Its cleanup repairs the API server, which signs another.
+		makeRevision(t, rejectCell)
+		st = mgmtStatus(t)
+	}
 	c := st.Signed.Counter
-	if st.RestoreActive || c < 2 {
-		t.Fatalf("mgmtd signed counter %d with restoreActive %t, want a counter of at least 2 and no restore. A rotation of the signing key sets the counter to 1: bind a key change (TestM4KeyCheckFollowsRotation) first", c, st.RestoreActive)
+	if c < 2 {
+		t.Fatalf("mgmtd signed counter %d after a key change, want at least 2", c)
 	}
 	waitApplied(t, c, envdApplyWait)
 	t.Cleanup(func() {
