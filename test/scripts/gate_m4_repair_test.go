@@ -21,12 +21,21 @@ case " $* " in
   *" get statefulset mgmtd -o jsonpath="*) [[ -z "${STUB_NO_STS:-}" ]] || exit 1; printf '%s' "${STUB_REPLICAS:-1}" ;;
   *" get deployment envd -o jsonpath="*) [[ -z "${STUB_NO_ENVD:-}" ]] || exit 1; printf '%s' "${STUB_ENVD_REPLICAS:-1}" ;;
   *" rollout status "*) echo "rollout $*" >>"$STUB_DIR/calls" ;;
+  *" get namespaces -o json"*) cat "$STUB_DIR/namespaces.json" 2>/dev/null || echo '{"items":[]}' ;;
+  *" get jobs,networkpolicies,secrets,configmaps -A "*) cat "$STUB_DIR/objects.json" 2>/dev/null || echo '{"items":[]}' ;;
+  *" delete "*) echo "kubectl $*" >>"$STUB_DIR/calls" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
 
 const repairMise = `#!/usr/bin/env bash
 [[ "$1 $2 $3 $4" == "run pki -- trust-bundle" ]] && exec cat
+if [[ "$1 $2 $3 $4" == "run mgmt -- status" ]]; then
+  [[ -z "${STUB_NO_MGMT:-}" ]] || exit 1
+  printf '{"restoreActive":%s}\n' "${STUB_RESTORE_ACTIVE:-false}"
+  exit 0
+fi
+if [[ "$1 $2 $3 $4 $5 $6" == "run mgmt -- restore --revision latest" ]]; then echo "mgmt restore $*" >>"$STUB_DIR/calls"; exit 0; fi
 echo "unexpected mise call: $*" >&2; exit 2
 `
 
@@ -35,6 +44,11 @@ case "$1" in
   status) printf '{"running":%s,"pid":1,"cert_sha256":"%s","root_sha256":"%s","expires_soon":false,"last_error":""}\n' "${STUB_RUNNING:-true}" "$STUB_CERT" "$STUB_ROOT" ;;
   restart) echo "hostsvc-serve restart" >>"$STUB_DIR/calls" ;;
 esac
+`
+
+const repairM2 = `#!/usr/bin/env bash
+echo "m2-repair $*" >>"$STUB_DIR/m2calls"
+[[ -z "${STUB_M2_FAIL:-}" ]] || { echo "the API server of dev-cell-1 publishes the keys a b" >&2; exit 1; }
 `
 
 const repairReplicas = `#!/usr/bin/env bash
@@ -58,7 +72,7 @@ func TestGateM4Repair(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "stub/serve": repairServe, "stub/replicas": repairReplicas} {
+	for name, body := range map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -75,9 +89,10 @@ func TestGateM4Repair(t *testing.T) {
 	good := []string{"STUB_CERT=" + hex.EncodeToString(pinSum[:]), "STUB_ROOT=" + goRootSHA(t, live)}
 	run := func(args []string, env ...string) (string, string, error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
+		_ = os.Remove(filepath.Join(stub, "m2calls"))
 		cmd := exec.Command(filepath.Join(root, "scripts", "gate-m4-repair.sh"), args...)
 		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
-			"STUB_DIR=" + stub, "HOSTSVC_SERVE=" + filepath.Join(stub, "serve"), "HARNESS_REPLICAS=" + filepath.Join(stub, "replicas")}, append(good, env...)...)
+			"STUB_DIR=" + stub, "HOSTSVC_SERVE=" + filepath.Join(stub, "serve"), "HARNESS_REPLICAS=" + filepath.Join(stub, "replicas"), "GATE_M2_REPAIR=" + filepath.Join(stub, "m2")}, append(good, env...)...)
 		var out, errOut bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &errOut
 		err := cmd.Run()
@@ -85,11 +100,12 @@ func TestGateM4Repair(t *testing.T) {
 		return out.String() + errOut.String(), string(calls), err
 	}
 
-	if out, calls, err := run([]string{"--check"}); err != nil || calls != "" {
-		t.Fatalf("a clean state: err %v, output %q, calls %q; want success and no change", err, out, calls)
+	m2calls := func() string { b, _ := os.ReadFile(filepath.Join(stub, "m2calls")); return string(b) }
+	if out, calls, err := run([]string{"--check"}); err != nil || calls != "" || m2calls() != "m2-repair --check\n" {
+		t.Fatalf("a clean state: err %v, output %q, calls %q, m2 %q; want success, no change, and the M2 check", err, out, calls, m2calls())
 	}
-	if out, calls, err := run(nil); err != nil || calls != "" {
-		t.Fatalf("a clean repair: err %v, output %q, calls %q", err, out, calls)
+	if out, calls, err := run(nil); err != nil || calls != "" || m2calls() != "m2-repair \n" {
+		t.Fatalf("a clean repair: err %v, output %q, calls %q, m2 %q; want the M2 repair", err, out, calls, m2calls())
 	}
 	repair := "Run: mise run gate:m4:repair"
 	for _, tc := range []struct {
@@ -120,5 +136,87 @@ func TestGateM4Repair(t *testing.T) {
 	out, _, err = run([]string{"--check"}, "STUB_NO_ENVD=1")
 	if err == nil || !strings.Contains(out, "Deployment envd is absent in dev-cp. Run: CELL=dev-cp mise run cell:up") {
 		t.Fatalf("an absent Deployment envd: err %v, output %q", err, out)
+	}
+}
+
+// TestGateM4RepairTestState: the repair serves the latest spec again after a refusal test left an older one, deletes the
+// labelled test namespaces m4-bind and m4-probe-* and the attestprobe objects, leaves other namespaces alone, and runs
+// the repair of gate:m2. With --check it only reports.
+func TestGateM4RepairTestState(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash", "base64")
+	root := t.TempDir()
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
+		copyFiles(t, root, d)
+	}
+	stub := filepath.Join(root, "stub")
+	bin := filepath.Join(root, "bin")
+	for _, d := range []string{stub, bin} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live := caPEM(t, 1)
+	block, _ := pem.Decode([]byte(live))
+	sum := sha256.Sum256(block.Bytes)
+	files := map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2,
+		"stub/live-root.pem": live, "stub/pin.pem": live,
+		"stub/namespaces.json": `{"items":[
+ {"metadata":{"name":"m4-bind","labels":{"cell.poc.internal/e2e":"true"}}},
+ {"metadata":{"name":"m4-probe-ab12","labels":{"cell.poc.internal/e2e":"true"}}},
+ {"metadata":{"name":"m4-probe-unlabelled"}},
+ {"metadata":{"name":"kube-system"}}]}`,
+		"stub/objects.json": `{"items":[{"kind":"Job","metadata":{"namespace":"default","name":"attestprobe-flood"}},{"kind":"NetworkPolicy","metadata":{"namespace":"default","name":"m4-flood"}}]}`}
+	for name, body := range files {
+		mode := os.FileMode(0o644)
+		if strings.HasPrefix(name, "bin/") || name == "stub/serve" || name == "stub/replicas" || name == "stub/m2" {
+			mode = 0o755
+		}
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(args []string, env ...string) (string, string, error) {
+		_ = os.Remove(filepath.Join(stub, "calls"))
+		cmd := exec.Command(filepath.Join(root, "scripts", "gate-m4-repair.sh"), args...)
+		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
+			"STUB_DIR=" + stub, "HOSTSVC_SERVE=" + filepath.Join(stub, "serve"), "HARNESS_REPLICAS=" + filepath.Join(stub, "replicas"), "GATE_M2_REPAIR=" + filepath.Join(stub, "m2"),
+			"STUB_CERT=" + hex.EncodeToString(sum[:]), "STUB_ROOT=" + goRootSHA(t, live)}, env...)
+		var out, errOut bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		err := cmd.Run()
+		calls, _ := os.ReadFile(filepath.Join(stub, "calls"))
+		return out.String() + errOut.String(), string(calls), err
+	}
+
+	out, calls, err := run([]string{"--check"}, "STUB_RESTORE_ACTIVE=true")
+	if err == nil || !strings.Contains(out, "mgmtd serves an older revision than its latest. Run: mise run gate:m4:repair") ||
+		!strings.Contains(out, "holds the test namespaces m4-bind m4-probe-ab12") || !strings.Contains(out, "2 attestprobe objects") || calls != "" {
+		t.Fatalf("--check: err %v, output %q, calls %q; want each drift reported and nothing changed", err, out, calls)
+	}
+	out, calls, err = run(nil, "STUB_RESTORE_ACTIVE=true")
+	if err != nil {
+		t.Fatalf("repair: %v\n%s", err, out)
+	}
+	for _, want := range []string{
+		"mgmt restore run mgmt -- restore --revision latest",
+		"kubectl --context kind-dev-cell-1 -n default delete job attestprobe-flood",
+		"kubectl --context kind-dev-cell-1 -n default delete networkpolicy m4-flood",
+		"kubectl --context kind-dev-cell-1 delete namespace m4-bind ",
+		"kubectl --context kind-dev-cell-1 delete namespace m4-probe-ab12 ",
+	} {
+		if !strings.Contains(calls, want) {
+			t.Errorf("repair calls lack %q:\n%s", want, calls)
+		}
+	}
+	if strings.Contains(calls, "m4-probe-unlabelled") || strings.Contains(calls, "kube-system") {
+		t.Errorf("the repair deleted a namespace that is not a labelled test namespace:\n%s", calls)
+	}
+	out, calls, err = run([]string{"--check"}, "STUB_M2_FAIL=1")
+	if err == nil || !strings.Contains(out, "publishes the keys a b") {
+		t.Fatalf("an M2 trace: err %v, output %q; want the M2 check to fail the check", err, out)
+	}
+	out, _, err = run([]string{"--check"}, "STUB_NO_MGMT=1")
+	if err == nil || !strings.Contains(out, "mise run mgmt -- status does not answer. Run: mise run gate:m4:repair") {
+		t.Fatalf("mgmtd that does not answer: err %v, output %q", err, out)
 	}
 }

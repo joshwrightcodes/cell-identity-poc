@@ -8,7 +8,11 @@
 #   --check prints each drift with the command that repairs it, and exits 1. It exits 0 when it finds none.
 # The repair starts the host service and runs the link of mgmt-api when the pin or the root drifted
 # (hostsvc-serve.sh restart), and sets the replicas of mgmtd and envd back to 1 (harness-replicas.sh).
-# HOSTSVC_SERVE names another host service script, for the tests.
+# It then makes mgmtd serve its latest spec (mgmt -- restore --revision latest) when a test left an older revision
+# active, deletes the test namespaces m4-bind and m4-probe-* with the Jobs, NetworkPolicies, Secrets and ConfigMaps of the attestprobe
+# label in every cluster, and runs the repair of gate:m2 (scripts/gate-m2-repair.sh), because the M4 tests change the
+# API server of dev-cell-1 through the M2 helpers.
+# HOSTSVC_SERVE names another host service script, and GATE_M2_REPAIR another M2 repair script, for the tests.
 export CELL=management
 source "$(dirname "$0")/lib.sh"
 
@@ -73,5 +77,63 @@ if [[ "$replicas" != 1 ]]; then
     kubectl --context kind-dev-cp -n envd-system rollout status deployment/envd --timeout=300s >/dev/null || die "deployment/envd did not finish its rollout in 300s"
     status=0
   fi
+fi
+
+# The latest spec. The refusal test serves an older revision for a short time.
+status_json="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || status_json=""
+if [[ -z "$status_json" ]] || ! jq -e 'type == "object"' <<<"$status_json" >/dev/null 2>&1; then
+  if ((check)); then
+    echo "mise run mgmt -- status does not answer. Run: $repair"
+    status=1
+  else
+    die "mise run mgmt -- status does not answer. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  fi
+elif [[ "$(jq -r '.restoreActive' <<<"$status_json")" == true ]]; then
+  status=1
+  if ((check)); then
+    echo "mgmtd serves an older revision than its latest. Run: $repair"
+  else
+    log "mgmtd serves an older revision, so it serves the latest again"
+    (cd "$ROOT" && mise run mgmt -- restore --revision latest >/dev/null) || die "could not restore the latest revision. Run: mise run mgmt -- restore --revision latest"
+    status=0
+  fi
+fi
+
+# The test namespaces and objects of the attestprobe label.
+probe_label="cell.poc.internal/attestprobe"
+test_label="cell.poc.internal/e2e"
+for cluster in $(yq -r '.clusters[].name' "$ROOT/harness/topology.yaml"); do
+  names="$(kubectl --context "kind-$cluster" get namespaces -o json | jq -r --arg l "$test_label" '.items[]
+    | select(.metadata.labels[$l] == "true" and (.metadata.name == "m4-bind" or (.metadata.name | startswith("m4-probe-")))) | .metadata.name')" \
+    || die "could not list the namespaces of $cluster"
+  objects="$(kubectl --context "kind-$cluster" get jobs,networkpolicies,secrets,configmaps -A -l "$probe_label" -o json | jq -r '.items[]
+    | "\(.kind | ascii_downcase) \(.metadata.namespace) \(.metadata.name)"')" || die "could not list the attestprobe objects of $cluster"
+  if [[ -n "$names" || -n "$objects" ]]; then
+    status=1
+    if ((check)); then
+      [[ -z "$names" ]] || echo "$cluster holds the test namespaces $(paste -sd' ' - <<<"$names"). Run: $repair"
+      [[ -z "$objects" ]] || echo "$cluster holds $(grep -c . <<<"$objects") attestprobe objects. Run: $repair"
+    else
+      while read -r kind ns name; do
+        [[ -n "$kind" ]] || continue
+        log "deleting $kind $ns/$name in $cluster"
+        kubectl --context "kind-$cluster" -n "$ns" delete "$kind" "$name" --ignore-not-found --wait=true --timeout=180s >/dev/null \
+          || die "could not delete $kind $ns/$name in $cluster"
+      done <<<"$objects"
+      for name in $names; do
+        log "deleting namespace $name in $cluster"
+        kubectl --context "kind-$cluster" delete namespace "$name" --ignore-not-found --wait=true --timeout=180s >/dev/null \
+          || die "could not delete namespace $name in $cluster"
+      done
+      status=0
+    fi
+  fi
+done
+
+# The M2 traces: a changed API server of dev-cell-1, and test bundles in dev-cp.
+if ((check)); then
+  "${GATE_M2_REPAIR:-$ROOT/scripts/gate-m2-repair.sh}" --check || status=1
+else
+  "${GATE_M2_REPAIR:-$ROOT/scripts/gate-m2-repair.sh}" || die "the repair of gate:m2 failed. Run: mise run gate:m2:repair"
 fi
 exit "$status"

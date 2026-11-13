@@ -212,6 +212,7 @@ A link run that stops prints one command for the failed component and for each l
 
 Use `mise run mgmt -- status` to read the state of `mgmtd`.
 The other arguments are `records`, `pubkey`, `keys --cell <cell>`, `keycheck --cell <cell>`, `restore` and `rotate-key`.
+`rotate-signing-key` is the argument that also renders the new key. See "Rotate the signing key of mgmtd".
 The command prints one JSON line.
 When `mgmtd-0` is absent or not Ready, it prints one JSON error line with the link command.
 
@@ -219,6 +220,7 @@ When `mgmtd-0` is absent or not Ready, it prints one JSON error line with the li
 The checks cover the pin, the root, the host address, the `dev-cp` node address, ConfigMap `peer-root` and ConfigMap `mgmt-signing-pub`.
 Each failed check prints the command that repairs it.
 `mise run gate:m4:repair` starts the host service again and sets the replicas of `mgmtd` and `envd` back to 1.
+It also serves the latest spec again, deletes the test namespaces and probe objects of `gate:m4`, and runs `gate:m2:repair`.
 With `--check`, it only reports.
 `mise run mgmt:rotate-ca` restarts the host service in both refresh steps.
 
@@ -258,6 +260,60 @@ At the start of `ready`, the script deletes a `celld` pod once when its `spire-a
 `cell:verify` of `dev-cp` checks the key pins, the revision in `cell-records`, the node address of `management` and the envd objects.
 `cell:verify` of a cell reads its record in `cell-records`.
 A record with other keys than the cell publishes prints `mise run mgmt -- keycheck --cell <cell>`.
+
+## Refused keys, signing key rotation and lost state
+
+### Fix unknown_kid
+
+A new `celld` pod can fail with `unknown_kid` after the API server of its cell gets a new service account key.
+The record of the cell then lists only the old keys. `mgmtd` finds the new key on one of three events:
+
+- A new `celld` pod binds with a token from the new key.
+- The periodic key check runs. It runs every 15 minutes for each cell.
+- An operator runs a key check.
+
+To check at once, run `mise run mgmt -- keycheck --cell <cell>`.
+The answer `keys_updated` means `mgmtd` signed a new record with both key IDs.
+`envd` then writes the record, and the SPIRE server reloads it within about two minutes.
+The answer `rate_limited` means the last check or key update is less than 60 seconds old. Run the command again after 61 seconds.
+Other answers are `unchanged`, `not_bound`, `issuer_unavailable`, `issuer_untrusted` and `keys_untrusted`.
+`mise run mgmt -- status` shows the key IDs and the last check of each cell.
+
+### Rotate the signing key of mgmtd
+
+Run `mise run mgmt -- rotate-signing-key` to replace the key that `mgmtd` signs with.
+The command runs these steps in order:
+
+1. It makes a new key, and signs the spec and every record again at the first counter of the next epoch.
+2. It waits until ConfigMap `mgmt-signing-pub` holds the new key.
+3. It runs `cell:up` for `dev-cp`, which renders the new key into `envd` and the SPIRE server.
+4. It runs `cell:link` for `management`.
+5. It runs `cell:verify` for `management` and for `dev-cp`.
+
+The command prints one JSON line with the SHA-256 fingerprint of the old key, of the new key, and the new epoch.
+The line holds public key data only.
+After step 1, a failure prints the commands that remain.
+Run them in the printed order.
+
+Between the restart of the SPIRE server and the first write of `envd` under the new key, the plugin holds no records.
+In that time a new pod cannot attest. Running agents keep renewing.
+`mise run gate:m4:rotate` measures this time and prints it as `ATTESTATION_GAP_SECONDS`.
+The rotation sets the counter back to 1, and it clears the stored history. `restore` then has no older revision to serve.
+
+### Recover lost management state
+
+`mgmtd` keeps its state in a file on its data volume.
+When the file is absent or does not parse, `mgmtd` starts with a new state at epoch 1 and counter 1.
+A file that does not parse moves to `state.json.corrupt-<unix time>` first.
+A file that parses but fails validation stays in place, and `mgmtd` does not start. The log names the file.
+Keep that file, and read the error before any other step.
+
+`envd` holds a higher revision than the new state, so it refuses each spec with `revision_old`.
+`mise run mgmt -- status` then shows `"stateBehindApplied": true`, and `mgmtd` logs `state_behind_applied`.
+To recover, run `mise run mgmt -- rotate-signing-key`. Each run raises the epoch by one.
+Run it again while `status` still shows `stateBehindApplied` as true.
+Each cell binds again on its own, because `celld` repeats its bind until `mgmtd` holds a record.
+Then run `CELL=management mise run cell:verify` and `CELL=dev-cp mise run cell:verify`.
 
 ## Central Argo CD view
 

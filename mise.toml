@@ -163,7 +163,7 @@ env = { CELL = "management" }
 run = "scripts/hostsvc-serve.sh"
 
 [tasks.mgmt]
-description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key"
+description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key, or rotate-signing-key to rotate the signing key and render it"
 env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
@@ -223,8 +223,12 @@ run = "scripts/gate-m3-repair.sh"
 description = "Run the M4 end-to-end tests against the management plane stand-in, envd and the cells, plus the go test arguments after --. The task builds no image: run mise run images first, or mise run images -- <name> for one image"
 run = "scripts/gate.sh m4"
 
+[tasks."gate:m4:rotate"]
+description = "Run the test that rotates the signing key of mgmtd and renders the new key into envd and the SPIRE server of dev-cp, plus the go test arguments after --. It prints the attestation gap. Run it alone, after gate:m4"
+run = "scripts/gate.sh m4-rotate"
+
 [tasks."gate:m4:repair"]
-description = "Start the host service again and link mgmt-api when the pin or the root drifted, and set the replicas of mgmtd and envd back to 1. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Start the host service again and link mgmt-api when the pin or the root drifted, set the replicas of mgmtd and envd back to 1, serve the latest spec again, delete the test namespaces and Jobs of gate:m4, and run gate:m2:repair. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m4-repair.sh"
 
 [tasks."mgmt:rotate-ca"]

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]
+# m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]}"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
-budget_var="GATE_${pattern}_BUDGET_MINUTES"
+budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
+[[ "$milestone" != m4-rotate ]] || pattern="TestRotationSigningKey"
 budget_minutes="${!budget_var:-}"
 
 # Build the test binary first, so that the budget covers only the test run.
@@ -17,7 +19,7 @@ go test -tags e2e -count=1 -run '^$' ./test/e2e/ >/dev/null || die "the end-to-e
 log "gate $milestone build took $((SECONDS - build_start))s"
 
 # The M2 tests run against the deployed SPIRE server, plugins and celld. First, an earlier run must
-# have left no trace, because the cell:up hint below would sign a record with a test key. Then the
+# have left no trace, because a bind would take the test key into the record of the cell. Then the
 # renewal tests need SVIDs of 1m, and each workload must run the image that `mise run images`
 # recorded, or the gate tests old code.
 if [[ "$milestone" == m2 ]]; then
@@ -67,7 +69,7 @@ fi
 # workloads must run the images that `mise run images` recorded: mgmtd, envd, celld (with its agent plugin
 # cluster-jwt-agent) and the SPIRE server (with its plugin cluster-jwt-server). The other workloads keep the
 # digests that the M3 gate checks.
-if [[ "$milestone" == m4 ]]; then
+if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   "$ROOT/scripts/gate-m4-repair.sh" --check || exit 1
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
