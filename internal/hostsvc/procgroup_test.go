@@ -149,10 +149,14 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 		cmd, pgid, start := spawn(t, "sleep 600")
 		j, logs := journalWith(t, pgid, start)
 		j.Reap(KillOrphanGroup)
-		_ = cmd.Wait() // reaps the leader, so that the group is gone
-		if groupAlive(pgid) {
-			t.Error("the orphan group is still alive")
+		waited := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(waited) }() // reaps the leader, so that the group is gone
+		select {
+		case <-waited:
+		case <-time.After(5 * time.Second):
+			t.Error("the orphan leader is still alive after Reap")
 		}
+		waitUntil(t, "the orphan group to be gone", 3*time.Second, func() bool { return !groupAlive(pgid) })
 		if !strings.Contains(logs.String(), "orphan_reaped") {
 			t.Errorf("log = %q, want orphan_reaped", logs.String())
 		}

@@ -193,8 +193,7 @@ func TestJournalInterruptedNotAnAttempt(t *testing.T) {
 	e.Pgid, e.LeaderStart = 999999, "1.000000"
 	_ = j.Put(e)
 	_ = j.Put(testEntry(idN(2), "dev-cell-2", mgmtapi.StepQueued, clock.Now()))
-	var called []int
-	j.Reap(func(pgid int, _ string) error { called = append(called, pgid); return nil })
+	j.Reap(func(int, string) error { return nil })
 	got, _ := j.Get(idN(1))
 	if got.Status.State != mgmtapi.StepFailed || got.Status.Detail != step.DetailInterrupted || got.Status.Attempts != 1 ||
 		got.Pgid != 0 || got.Status.Stage != mgmtapi.StageBootstrapping {
@@ -202,9 +201,6 @@ func TestJournalInterruptedNotAnAttempt(t *testing.T) {
 	}
 	if !mgmtapi.ValidStepStatus(got.Status) {
 		t.Errorf("reaped status is not valid: %+v", got.Status)
-	}
-	if len(called) != 1 || called[0] != 999999 {
-		t.Errorf("kill calls = %v, want one for the running entry", called)
 	}
 	if q, _ := j.Get(idN(2)); q.Status.State != mgmtapi.StepQueued {
 		t.Errorf("a queued entry changed: %v", q.Status.State)

@@ -203,7 +203,8 @@ func TestRouterPeerAuthorization(t *testing.T) {
 		_, err := r.client(src).call(context.Background(), method, path, nil)
 		return err
 	}
-	status := func(err error) int {
+	status := func(t *testing.T, err error) int {
+		t.Helper()
 		var he *mgmtapi.HostError
 		if !errors.As(err, &he) {
 			t.Fatalf("error %v is not a HostError", err)
@@ -240,7 +241,7 @@ func TestRouterPeerAuthorization(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			before := r.hitCount("keys") + r.hitCount("spec") + r.hitCount("steps")
-			if got := status(call(c.src, c.method, c.path)); got != http.StatusForbidden {
+			if got := status(t, call(c.src, c.method, c.path)); got != http.StatusForbidden {
 				t.Errorf("status = %d, want 403", got)
 			}
 			if after := r.hitCount("keys") + r.hitCount("spec") + r.hitCount("steps"); after != before {
@@ -271,7 +272,7 @@ func TestRouterPeerAuthorization(t *testing.T) {
 			if err == nil {
 				t.Fatal("the request succeeded, want a failed handshake")
 			}
-			if got := status(err); got != 0 {
+			if got := status(t, err); got != 0 {
 				t.Errorf("status = %d, want a failure before any HTTP answer", got)
 			}
 		})
