@@ -55,7 +55,7 @@ const (
 	sourceTimeout     = 30 * time.Second
 	serverStopTimeout = 8 * time.Second
 	flushTimeout      = 10 * time.Second
-	pruneEvery        = time.Hour
+	pruneEvery        = time.Minute
 	exitConfig        = 2
 	usage             = "usage: cellgw serve|ctl [flags]"
 )
@@ -391,7 +391,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	spawn("bind", func() error { return ignoreClosed(bindSrv.Serve(gateway.ListenBind(raws[1], bindTLS))) })
 	spawn("envd", func() error { return ignoreClosed(envdSrv.Serve(gateway.ListenEnvd(raws[2], envdTLS))) })
 	spawn("admin", func() error { return serveAdmin(ctx, adminLn, gateway.NewAdminHandler(st, status)) })
-	wg.Go(func() { pruneLoop(ctx, st, logger) })
+	wg.Go(func() { pruneLoop(ctx, st, logger, pruneEvery) })
 
 	logger.Info("listening", "env", cfg.env, "stream", raws[0].Addr().String(), "bind", raws[1].Addr().String(),
 		"envd", raws[2].Addr().String(), "health", healthLn.Addr().String(), "admin", cfg.adminSocket, "epoch", st.Epoch())
@@ -413,9 +413,10 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	return failure
 }
 
-// pruneLoop removes the done items and the old outcomes once an hour.
-func pruneLoop(ctx context.Context, st *gateway.Store, log *slog.Logger) {
-	t := time.NewTicker(pruneEvery)
+// pruneLoop removes the done items and the old outcomes every `every`. An outcome lives for the
+// retention of the store plus at most one period.
+func pruneLoop(ctx context.Context, st *gateway.Store, log *slog.Logger, every time.Duration) {
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
