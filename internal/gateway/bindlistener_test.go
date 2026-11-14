@@ -538,3 +538,33 @@ func TestBindServerTraces(t *testing.T) {
 		t.Fatalf("bind_denied line %v: trace_id %q, want a new 32 character ID unlike %s", line, id, callerTrace)
 	}
 }
+
+// The nonce route never serves a nonce that has expired. It answers 503, which a cell treats as a
+// transient failure, and it records no refusal.
+func TestBindListenerNonceRouteRefusesExpiredNonce(t *testing.T) {
+	e := newGwEnv(t)
+	now := time.Now()
+	if err := e.st.SetCells(context.Background(), []mgmtapi.CellInfo{{Name: cell1, Nonce: "n1", NonceExpiresAt: now.Add(time.Minute)}}); err != nil {
+		t.Fatal(err)
+	}
+	clock := now
+	h := NewBindHandler(e.st, BindConfig{CellNodes: map[string]netip.Addr{cell1: v4Node}, Subject: e.subject(), Now: func() time.Time { return clock }})
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, gwapi.NoncePath(cell1), nil)
+		req.RemoteAddr = "127.0.0.1:4444"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get(); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"nonce":"n1"`) {
+		t.Fatalf("live nonce: %d %s", rec.Code, rec.Body)
+	}
+	clock = now.Add(time.Minute)
+	rec := get()
+	if rec.Code != http.StatusServiceUnavailable || strings.Contains(rec.Body.String(), "n1") {
+		t.Fatalf("expired nonce: %d %s", rec.Code, rec.Body)
+	}
+	if r, ok := h.LastRefusals()[cell1]; ok {
+		t.Fatalf("an expired nonce is a refusal: %+v", r)
+	}
+}

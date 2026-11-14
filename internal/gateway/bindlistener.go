@@ -197,6 +197,15 @@ func (h *BindHandler) nonce(w http.ResponseWriter, r *http.Request, cell string,
 		h.deny(w, r, cell, gwapi.ReasonCellUnknown, "")
 		return
 	}
+	if !h.cfg.Now().Before(latest.NonceExpiresAt) {
+		// Only the management plane mints a nonce, and it hands a new one down with the next cell list.
+		// A 503 makes the cell try again soon, and a denial would make it wait for the long backoff.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "nonce_unavailable"})
+		if _, ok, suppressed, _ := h.limit.Allow("nonce_expired"); ok {
+			h.log.WarnContext(r.Context(), "bind_nonce_expired", "cell", clip(cell), "suppressed", suppressed)
+		}
+		return
+	}
 	writeJSON(w, http.StatusOK, mgmtapi.NonceResponse{
 		Nonce: latest.Nonce, Audience: mgmtapi.BindAudience(cell, latest.Nonce), ExpiresAt: latest.NonceExpiresAt, Bound: latest.Bound,
 	})
