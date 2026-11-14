@@ -50,7 +50,6 @@ spec:
         poc.internal/spec-key-sha256: "@SPEC_KEY_SHA256@"
     spec:
       serviceAccountName: cell-gateway
-      # The gateway needs no token of the API server.
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true

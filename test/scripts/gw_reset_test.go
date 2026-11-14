@@ -14,10 +14,15 @@ import (
 
 const gwResetKubectl = `#!/usr/bin/env bash
 case " $* " in
-  *" get pod cell-gateway-0 --ignore-not-found "*) ;;
+  *" get pod cell-gateway-0 --ignore-not-found "*)
+    echo podcheck >>"$STUB_DIR/calls"
+    n=$(cat "$STUB_DIR/n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$STUB_DIR/n"
+    if ((n <= ${STUB_POD_CHECKS:-0})); then echo pod/cell-gateway-0; fi ;;
   *" get pod cell-gateway-0 -o jsonpath="*) printf 'True' ;;
   *" get deployment envd -o jsonpath="*) printf '%s' "${STUB_ENVD_READY:-1}" ;;
-  *" delete pvc "*) echo "kubectl $*" >>"$STUB_DIR/calls" ;;
+  *" delete pvc "*)
+    [[ -z "${STUB_NO_PVC:-}" ]] || { echo 'Error from server (NotFound): persistentvolumeclaims "store-cell-gateway-0" not found' >&2; exit 1; }
+    echo "kubectl $*" >>"$STUB_DIR/calls" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -57,26 +62,29 @@ func TestGwReset(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	run := func(env ...string) (string, string, string) {
+	run := func(env ...string) (string, string, string, error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
 		_ = os.Remove(filepath.Join(stub, "seen"))
+		_ = os.Remove(filepath.Join(stub, "n"))
 		cmd := exec.Command(filepath.Join(root, "scripts", "gw-reset.sh"))
 		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
 			"STUB_DIR=" + stub, "HARNESS_REPLICAS=" + filepath.Join(stub, "replicas"), "GW_SCRIPT=" + filepath.Join(stub, "gw"), "GW_RESET_WAIT=10"}, env...)
 		var out, errOut bytes.Buffer
 		cmd.Stdout, cmd.Stderr = &out, &errOut
-		if err := cmd.Run(); err != nil {
-			t.Fatalf("gw-reset.sh: %v\n%s%s", err, out.String(), errOut.String())
-		}
+		err := cmd.Run()
 		calls, _ := os.ReadFile(filepath.Join(stub, "calls"))
-		return out.String(), errOut.String(), string(calls)
+		return out.String(), errOut.String(), string(calls), err
 	}
 
-	out, _, calls := run()
+	out, errOut, calls, err := run()
+	if err != nil {
+		t.Fatalf("gw-reset.sh: %v\n%s%s", err, out, errOut)
+	}
 	want := []string{
 		"gw status",
 		"harness-replicas dev-cp gateway-system statefulset/cell-gateway 0",
-		"kubectl --context kind-dev-cp -n gateway-system delete pvc store-cell-gateway-0 --ignore-not-found --wait=true --timeout=120s",
+		"podcheck",
+		"kubectl --context kind-dev-cp -n gateway-system delete pvc store-cell-gateway-0 --wait=true --timeout=120s",
 		"harness-replicas dev-cp gateway-system statefulset/cell-gateway 1",
 		"gw status",
 		"gw status",
@@ -97,8 +105,78 @@ func TestGwReset(t *testing.T) {
 	}
 
 	// Without a ready envd, the script does not wait for a sync.
-	_, _, calls = run("STUB_ENVD_READY=0")
+	_, _, calls, err = run("STUB_ENVD_READY=0")
+	if err != nil {
+		t.Fatalf("gw-reset.sh with no ready envd: %v", err)
+	}
 	if n := strings.Count(calls, "gw status"); n != 2 {
 		t.Errorf("with no ready envd the script read the status %d times, want 2 (before and after):\n%s", n, calls)
 	}
+}
+
+// TestGwResetWaitsForThePodAndNeedsTheClaim: the volume claim goes only after the pod is gone, and a missing claim ends the script with
+// one JSON error line and no delete that looks like a success.
+func TestGwResetWaitsForThePodAndNeedsTheClaim(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	root := t.TempDir()
+	for _, d := range []string{"scripts", "cells", "harness"} {
+		copyFiles(t, root, d)
+	}
+	stub := filepath.Join(root, "stub")
+	bin := filepath.Join(root, "bin")
+	for _, d := range []string{stub, bin} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range map[string]string{"bin/kubectl": gwResetKubectl, "stub/replicas": gwResetReplicas, "stub/gw": gwResetStatus} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run := func(env ...string) (string, string, error) {
+		for _, f := range []string{"calls", "seen", "n"} {
+			_ = os.Remove(filepath.Join(stub, f))
+		}
+		cmd := exec.Command(filepath.Join(root, "scripts", "gw-reset.sh"))
+		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
+			"STUB_DIR=" + stub, "HARNESS_REPLICAS=" + filepath.Join(stub, "replicas"), "GW_SCRIPT=" + filepath.Join(stub, "gw"), "GW_RESET_WAIT=20"}, env...)
+		var out bytes.Buffer
+		cmd.Stdout = &out
+		err := cmd.Run()
+		calls, _ := os.ReadFile(filepath.Join(stub, "calls"))
+		return out.String(), string(calls), err
+	}
+	_, calls, err := run("STUB_POD_CHECKS=2")
+	if err != nil {
+		t.Fatalf("gw-reset.sh: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(calls), "\n")
+	del := slicesIndexContains(lines, "delete pvc")
+	if del < 0 || strings.Count(strings.Join(lines[:del], "\n"), "podcheck") != 3 {
+		t.Errorf("the claim was deleted before the pod was gone (3 checks expected before the delete):\n%s", calls)
+	}
+	out, calls, err := run("STUB_NO_PVC=1")
+	if err == nil {
+		t.Fatalf("gw-reset.sh succeeded with no claim:\n%s", out)
+	}
+	var line struct{ Level, Error string }
+	if json.Unmarshal([]byte(strings.TrimSpace(out)), &line) != nil || line.Level != "ERROR" || !strings.Contains(line.Error, "store-cell-gateway-0") {
+		t.Errorf("the output %q is no JSON error line that names the claim", out)
+	}
+	if strings.Count(strings.TrimSpace(out), "\n") != 0 {
+		t.Errorf("the output is not one line: %q", out)
+	}
+	if !strings.Contains(calls, "statefulset/cell-gateway 1") {
+		t.Errorf("the replicas did not return to 1 after the failure:\n%s", calls)
+	}
+}
+
+func slicesIndexContains(lines []string, sub string) int {
+	for i, l := range lines {
+		if strings.Contains(l, sub) {
+			return i
+		}
+	}
+	return -1
 }

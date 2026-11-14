@@ -157,3 +157,26 @@ func statusItem(cell string) string {
 	item, _ := json.Marshal(map[string]any{"kind": "status", "cell": cell, "body": json.RawMessage(body), "token": ""})
 	return string(item)
 }
+
+// m5Namespace makes a namespace m5-probe-<hex> in cluster, so that gate:m5:repair finds it when a run stops early.
+func m5Namespace(t *testing.T, cluster string) string {
+	t.Helper()
+	ns := "m5-probe-" + randomHex(t, 4)
+	t.Logf("made the namespace %s in %s", ns, cluster)
+	createNamespace(t, cluster, ns)
+	return ns
+}
+
+// probeFromM5Namespace dials addr:port once from a netprobe pod in a new m5-probe namespace of cluster. It returns nil when the dial timed out,
+// and an error otherwise. A control dial to the API service must connect first, so a timeout cannot come from broken pod networking.
+func probeFromM5Namespace(t *testing.T, cluster, addr string, port int, timeout time.Duration) error {
+	t.Helper()
+	ns := m5Namespace(t, cluster)
+	if got := dialFrom(t, cluster, ns, apiServiceIP(t, cluster), 443, timeout); got != "connected" {
+		return fmt.Errorf("the control dial from %s/%s to the API service gave %q, want connected, so a timeout would prove nothing", cluster, ns, got)
+	}
+	if got := dialFrom(t, cluster, ns, addr, port, timeout); got != "timeout" {
+		return fmt.Errorf("the dial from %s/%s to %s:%d gave %q, want a timeout", cluster, ns, addr, port, got)
+	}
+	return nil
+}

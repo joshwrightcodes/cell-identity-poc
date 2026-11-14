@@ -3,7 +3,8 @@
 # NetworkPolicies.
 #
 # mgmtd signs the spec and the records of the environment. It serves the spec, the operations and the
-# reports to envd on the API NodePort, and reads the keys of each cell from the host service on this Mac. Its SVID is spiffe://mgmt.poc.internal/api. The signing key lives on the data
+# reports to envd on the API NodePort, and reads the keys of each cell from the host service on this
+# Mac. Its SVID is spiffe://mgmt.poc.internal/api. The signing key lives on the data
 # volume only, and no Secret exists in the namespace.
 apiVersion: v1
 kind: Namespace

@@ -86,7 +86,7 @@ func TestM5GatewayListenersAdmission(t *testing.T) {
 	for _, cell := range clustersWith(t, agentCellSet) {
 		for _, port := range []int{30450, 30451} {
 			t.Run(fmt.Sprintf("%s reaches %d", cell, port), func(t *testing.T) {
-				ns := freshNamespace(t, cell)
+				ns := m5Namespace(t, cell)
 				if got := dialFrom(t, cell, ns, cpIP, port, gatewayProbe); got != "connected" {
 					t.Errorf("a pod in %s dials %s:%d and gets %q, want connected, because the cell node is admitted", cell, cpIP, port, got)
 				}
@@ -96,7 +96,7 @@ func TestM5GatewayListenersAdmission(t *testing.T) {
 	for _, other := range []string{"rogue", mgmtCluster} {
 		for _, port := range []int{30450, 30451} {
 			t.Run(fmt.Sprintf("%s to %d", other, port), func(t *testing.T) {
-				if err := probeFromFreshNamespace(t, other, cpIP, port, gatewayProbe); err != nil {
+				if err := probeFromM5Namespace(t, other, cpIP, port, gatewayProbe); err != nil {
 					t.Errorf("%s reaches the gateway node port: %v", other, err)
 				}
 			})
@@ -116,7 +116,7 @@ func TestM5GatewayListenersAdmission(t *testing.T) {
 		{"service cell-gateway", strings.TrimSpace(svcIP), 8452},
 	} {
 		t.Run(fmt.Sprintf("dev-cp fresh namespace to %s %d", target.name, target.port), func(t *testing.T) {
-			if err := probeFromFreshNamespace(t, spireCluster, target.addr, target.port, gatewayProbe); err != nil {
+			if err := probeFromM5Namespace(t, spireCluster, target.addr, target.port, gatewayProbe); err != nil {
 				t.Errorf("a pod of a fresh namespace in dev-cp reaches the gateway: %v", err)
 			}
 		})
@@ -149,9 +149,18 @@ func TestM5EnvdSyncsGateway(t *testing.T) {
 // unchanged and the item is still there. envd returns to one replica at the end.
 func TestM5GatewayStatePersists(t *testing.T) {
 	setReplicas(t, spireCluster, envdNamespace, "deployment/"+envdDeployment, 0)
+	var injected string
 	t.Cleanup(func() {
 		setReplicas(t, spireCluster, envdNamespace, "deployment/"+envdDeployment, 1)
 		deploymentRolledOut(t, spireCluster, envdNamespace, envdDeployment)
+		if injected == "" {
+			return
+		}
+		// envd takes the item at its next round, and mgmtd refuses it, because its token is empty. The outbox is then empty again.
+		waitFor(t, "envd to take the injected item out of the outbox", m5Wait, func() (bool, string) {
+			out, err := gwCtlErr("", "outbox")
+			return err == nil && !strings.Contains(out, injected), out
+		})
 	})
 	waitFor(t, "envd to stop", m5Wait, func() (bool, string) {
 		out, err := kubectl(t, spireCluster, "", "-n", envdNamespace, "get", "pods", "-l", "app.kubernetes.io/name="+envdDeployment, "-o", "name")
@@ -164,6 +173,7 @@ func TestM5GatewayStatePersists(t *testing.T) {
 	if err := json.Unmarshal([]byte(gwCtl(t, statusItem(rejectCell), "inject")), &added); err != nil || added.ID == "" {
 		t.Fatalf("cellgw ctl inject gave no item ID: %v", err)
 	}
+	injected = added.ID
 	if !slices.Contains(outboxIDs(t), added.ID) {
 		t.Fatalf("the outbox lacks the injected item %s", added.ID)
 	}
@@ -211,7 +221,7 @@ func TestM5MgmtBindPathGone(t *testing.T) {
 		t.Errorf("the policy mgmtd still admits 8447: %s", policy)
 	}
 	mgmtIP := clusterFacts(t, mgmtCluster).NodeIP
-	ns := freshNamespace(t, spireCluster)
+	ns := m5Namespace(t, spireCluster)
 	if got := dialFrom(t, spireCluster, ns, mgmtIP, 31446, gatewayProbe); got != "connected" {
 		t.Fatalf("the control dial from dev-cp to %s:31446 gave %q, want connected, so a failure on 31447 would prove nothing", mgmtIP, got)
 	}
@@ -220,7 +230,7 @@ func TestM5MgmtBindPathGone(t *testing.T) {
 	}
 	cpIP := clusterFacts(t, spireCluster).NodeIP
 	cell := clustersWith(t, agentCellSet)[0]
-	cellNS := freshNamespace(t, cell)
+	cellNS := m5Namespace(t, cell)
 	if got := dialFrom(t, cell, cellNS, cpIP, 30450, gatewayProbe); got != "connected" {
 		t.Fatalf("the control dial from %s to %s:30450 gave %q, want connected, so a failure on 30447 would prove nothing", cell, cpIP, got)
 	}

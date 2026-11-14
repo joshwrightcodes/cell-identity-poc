@@ -301,7 +301,8 @@ check_registry_current() {
 gateway_status() {
   local out
   out="$("$ROOT/scripts/gw.sh" status 2>/dev/null)" || { echo "mise run gw -- status failed: $out"; echo "Run: $(dependents_of gateway-nodes)"; return 1; }
-  jq -e 'type == "object" and has("epoch")' <<<"$out" >/dev/null 2>&1 || { echo "mise run gw -- status is no gateway status: $out"; return 1; }
+  jq -e 'type == "object" and has("epoch")' <<<"$out" >/dev/null 2>&1 \
+    || { echo "mise run gw -- status is no gateway status: $out"; echo "Run: $(dependents_of gateway-nodes)"; return 1; }
   printf '%s\n' "$out"
 }
 
@@ -354,10 +355,15 @@ check_gateway_cells() {
 # check_gateway_records succeeds when the revision that the gateway holds for each cell equals the revision of the record in
 # ConfigMap cell-records, which envd verified under the key of mgmtd.
 check_gateway_records() {
-  local status cm cell have want problems=()
+  local status cm cell have want cells problems=()
   status="$(gateway_status)" || { echo "$status"; return 1; }
   cm="$(k -n spire-system get configmap cell-records -o json)" || { echo "could not read ConfigMap spire-system/cell-records"; return 1; }
-  for cell in $(jq -r '.data | keys[] | select(endswith(".dsse.json")) | sub("\\.dsse\\.json$"; "")' <<<"$cm"); do
+  cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")" || { echo "could not read the topology"; return 1; }
+  for cell in $cells; do
+    if ! jq -e --arg c "$cell" '.data[$c + ".dsse.json"] != null' <<<"$cm" >/dev/null; then
+      problems+=("cell-records holds no record of $cell")
+      continue
+    fi
     want="$(jq -r --arg c "$cell" '.data[$c + ".dsse.json"] | fromjson | .payload' <<<"$cm" | base64 -d | jq -c '[.epoch, .counter]')" \
       || { echo "could not read the record of $cell in cell-records"; return 1; }
     have="$(jq -c --arg c "$cell" '.records[$c] // null | if . == null then null else [.epoch, .counter] end' <<<"$status")"
@@ -381,7 +387,7 @@ check_gateway_spec_key() {
     || { echo "could not read statefulset/cell-gateway"; return 1; }
   if [[ "$stored" != "$live" || "$got" != "$sum" ]]; then
     echo "mgmt-signing-pub holds $live, mgmt-spec-key of the gateway holds '$stored', and the pod template carries '$got'."
-    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    echo "Run: $(dependents_of gateway-nodes)"
     return 1
   fi
 }

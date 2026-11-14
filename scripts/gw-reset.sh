@@ -6,6 +6,7 @@
 #      cell-gateway-0 is gone.
 #   3. Delete PersistentVolumeClaim store-cell-gateway-0, which holds the queue and the outbox.
 #   4. Set the replicas to 1, and wait until the pod is Ready.
+#      The step fails when the claim does not exist, so a wrong claim name never gives a silent no-op.
 #   5. When envd has a ready replica, wait until envd has synced with the new store, so the queue holds the open
 #      operations again. celld resends each result that it did not report.
 # The script prints one JSON line with the old and the new epoch. A failure prints one JSON error line on standard
@@ -54,8 +55,8 @@ old_epoch="$("$gw" status 2>/dev/null | jq -c '.epoch // null' 2>/dev/null || tr
 down=1
 scale 0 || json_fail gw-reset "could not set the replicas of cell-gateway to 0" step=scale-down
 poll "$wait_seconds" pod_gone || json_fail gw-reset "pod cell-gateway-0 did not stop in ${wait_seconds}s" step=wait-gone
-k -n "$ns" delete pvc store-cell-gateway-0 --ignore-not-found --wait=true --timeout=120s >/dev/null \
-  || json_fail gw-reset "could not delete PersistentVolumeClaim store-cell-gateway-0" step=delete-pvc
+k -n "$ns" delete pvc store-cell-gateway-0 --wait=true --timeout=120s >/dev/null \
+  || json_fail gw-reset "could not delete PersistentVolumeClaim store-cell-gateway-0, so the store is not wiped" step=delete-pvc
 scale 1 || json_fail gw-reset "could not set the replicas of cell-gateway to 1" step=scale-up
 down=0
 poll "$wait_seconds" pod_ready || json_fail gw-reset "pod cell-gateway-0 is not Ready after ${wait_seconds}s. Run: CELL=dev-cp mise run cell:up" step=wait-ready

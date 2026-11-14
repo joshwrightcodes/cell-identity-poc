@@ -3,8 +3,8 @@
 #
 # Two Deployments run the relay binary: relay-view with the routes of RELAY_VIEW_ROUTES (the central
 # view and the mesh view), and relay-telemetry with the routes of RELAY_TELEMETRY_ROUTES, so a telemetry
-# backlog cannot slow the view. Each route is <node port>:<container port>=<node port of RELAY_TARGET>. A NodePort Service with the local traffic
-# policy admits the routes on the node.
+# backlog cannot slow the view. Each route is <node port>:<container port>=<node port of RELAY_TARGET>.
+# A NodePort Service with the local traffic policy admits the routes on the node.
 #
 # The render reads these facts from the host service, as the M2 renders do:
 #   - the node address of RELAY_TARGET. The relay dials it, and the NetworkPolicy admits only it.

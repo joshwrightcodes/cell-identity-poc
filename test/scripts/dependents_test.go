@@ -83,9 +83,11 @@ const registryLinks = "CELL=management LINK_ONLY=central-view mise run cell:link
 // admits envd by the dev-cp root and the node address. A rebuilt cell links the three registries.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
-		"dependents_of hostsvc":    "mise run hostsvc:serve -- restart",
-		"dependents_of dev-cell-1": "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\n" + registryLinks,
-		"dependents_of dev-cp":     "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
+		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
+		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
+		"dependents_of gateway-store": "mise run gw:reset",
+		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\n" + registryLinks,
+		"dependents_of dev-cp":        "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)
 		if err != nil || strings.TrimSpace(out) != want {

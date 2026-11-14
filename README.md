@@ -248,8 +248,7 @@ The `cluster_jwt` plugin reloads the records every 10 seconds, and it keeps its 
 Until `envd` writes the ConfigMap, no new agent can attest.
 Agents that already run still renew their SVIDs.
 
-`celld` binds the cell issuer to `mgmtd`. The M4 path through the relay `relay-bind` is gone, and the bind goes through the cell gateway of `dev-cp` once the new `celld` runs.
-The flags are `--cell`, `--bind-upstream`, `--bind-expect-id` and `--bind-peer-bundle`.
+The bind listener of the cell gateway in `dev-cp` takes the bind requests of the cells on node port 30451.
 ConfigMap `mgmt-root` in `cell-identity-system` holds the root of `management`.
 
 `cell:up` of a cell runs `scripts/attest-wait.sh` for `cell-identity`.
@@ -275,7 +274,7 @@ A record with other keys than the cell publishes prints `mise run mgmt -- keyche
 ## Cell gateway
 
 The cell gateway runs in `dev-cp`, in namespace `gateway-system`, as the harness component `cell-gateway`.
-It is the StatefulSet `cell-gateway` with one replica and a `k8s_psat` SPIRE agent sidecar.
+It is the StatefulSet `cell-gateway` with one replica and a SPIRE agent sidecar that attests with `k8s_psat`.
 Its SVID is `spiffe://dev.env.poc.internal/cp/gateway`.
 The stream listener is on node port 30450, and the bind listener is on node port 30451.
 Both admit only the node addresses of the cells.
@@ -291,12 +290,15 @@ Other commands are `queue --cell <cell>`, `outbox`, `enqueue --cell <cell>` and 
 The last two read standard input.
 
 When the store of the gateway is lost, corrupt or full, run `mise run gw:reset`.
-It sets the replicas to 0, deletes the volume claim, sets the replicas to 1 and waits for the first sync of `envd`.
+It sets the replicas to 0, waits until the pod is gone, deletes the volume claim `store-cell-gateway-0` and sets the replicas to 1.
+When `envd` has a ready replica, it also waits for the first sync of `envd`.
+It fails with one JSON error line when the volume claim does not exist.
 It prints one JSON line with the old and the new epoch.
 Use it only for this case, because the queue starts empty.
 
 After each apply, the harness deletes the objects of a component that its render no longer holds.
-This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles and ClusterRoleBindings.
+This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles, ClusterRoleBindings, ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings.
+The prune stops, and deletes nothing, when it cannot read the render or the render holds no object.
 An object with the label `poc.internal/made-by` stays, because a process wrote it at run time.
 
 ## Refused keys, signing key rotation and lost state
