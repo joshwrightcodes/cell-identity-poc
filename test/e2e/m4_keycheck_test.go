@@ -138,7 +138,7 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 // celld pod binds with a token from the new key: the log of mgmtd then holds a bind with the result keys_updated for the cell,
 // and within five minutes the new pod and attestprobe both attest.
 func TestM4BindHealsRotation(t *testing.T) {
-	t.Skip("the M4 bind path is gone, and a new celld cannot bind until Task 12. Task 15 removes this skip when it adds TestM5BindHealsRotation")
+	t.Skip("Task 15 replaces this test with TestM5BindHealsRotation and removes the skip")
 	const cell = rejectCell
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)

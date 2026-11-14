@@ -786,6 +786,10 @@ if has_harness cell-identity; then
     expect_dial_blocked "$CELL_NAME" cell-identity-system "${collector_ip:-unknown}:4318"
   check "plaintext cannot reach the SPIRE node port, because of NetworkPolicy" \
     expect_no_tcp plaintext "http://${spire_ip:-unknown}:30081/"
+  for port in 30450 30451; do
+    check "A probe pod with no app label in cell-identity-system cannot open TCP to the gateway node port $port (steady state)" \
+      expect_dial_blocked "$CELL_NAME" cell-identity-system "${spire_ip:-unknown}:$port"
+  done
 fi
 # The agent copies the node address of SPIRE_SERVER_CLUSTER into the cell-proxy upstream and the
 # NetworkPolicy. A rebuilt control plane can get a new address.

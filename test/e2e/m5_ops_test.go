@@ -229,11 +229,17 @@ func TestM5ReplicaCap(t *testing.T) {
 		}
 		return false, "no pod logs replica_cap"
 	})
-	// The count stays at the cap while the third pod retries.
-	for range 3 {
-		if s := gwStatus(t); s.Streams[cell] != 2 {
-			t.Fatalf("the gateway holds %d streams of %s with three pods, want 2 (the replica cap): %v", s.Streams[cell], cell, s.Streams)
+	// Each pod restarts its stream for a new SVID about every 27 s, so a sample can fall in a reconnect window. No sample may show more than
+	// the cap, and at least one sample in 60 s must show exactly the cap.
+	atCap := false
+	for end := time.Now().Add(60 * time.Second); time.Now().Before(end); time.Sleep(3 * time.Second) {
+		n := gwStatus(t).Streams[cell]
+		if n > 2 {
+			t.Fatalf("the gateway holds %d streams of %s with three pods, want at most 2 (the replica cap)", n, cell)
 		}
-		time.Sleep(10 * time.Second)
+		atCap = atCap || n == 2
+	}
+	if !atCap {
+		t.Errorf("no sample in 60 s showed 2 streams of %s with three pods", cell)
 	}
 }

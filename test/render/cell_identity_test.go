@@ -279,7 +279,7 @@ func TestRenderCellIdentity(t *testing.T) {
 // TestCellIdentityGatewayFlags checks what celld needs to bind and to claim work through the cell gateway: the
 // flags, the four pod variables, the read-only projected API token that only celld and the agent mount, the mounts
 // of the trust bundle and of the operation key, the checksums of both on the pod template, and ConfigMap mgmt-op-key
-// with the live signing key of mgmtd. The old mgmt-root ConfigMap and its mount are gone.
+// with the live signing key of mgmtd. It also checks that the render names no mgmt-root, port 30447 or --bind- flag.
 func TestCellIdentityGatewayFlags(t *testing.T) {
 	r := renderCellIdentity(t)
 	if r.err != nil {

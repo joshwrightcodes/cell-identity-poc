@@ -279,7 +279,7 @@ check_op_key_pinned() {
     else
       problems+=("mgmt-op-key holds $name = $value, which is neither the live key of mgmtd nor its staged key")
     fi
-  done < <(jq -r '.data // {} | to_entries[] | select(.key | endswith(".pub")) | [.key, .value] | @tsv' <<<"$cm")
+  done < <(jq -r '((.data // {}) + ((.binaryData // {}) | map_values(@base64d))) | to_entries[] | select(.key | endswith(".pub")) | [.key, .value] | @tsv' <<<"$cm")
   ((found == 1)) || problems+=("mgmt-op-key holds no key that equals the live key $live")
   sum="$(jq -r '.metadata.annotations["poc.internal/op-key-sha256"] // ""' <<<"$cm")"
   pods="$(k -n cell-identity-system get pods -l app.kubernetes.io/name=celld -o json)" || { echo "could not read the pods of celld"; return 1; }

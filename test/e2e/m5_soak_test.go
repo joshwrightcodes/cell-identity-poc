@@ -66,9 +66,15 @@ func TestStreamSoakHalfHour(t *testing.T) {
 		}
 		time.Sleep(max(rest, 0))
 	}
+	// The stream restarted many times, so a late redelivery could apply an operation again after its own check. Count every ID once more.
+	for _, id := range ids {
+		if c := demoLogCount(t, cell, id); c != 1 {
+			t.Errorf("at the end of the soak demo-log holds %d lines of %s, want 1", c, id)
+		}
+	}
 	ended, restarted := celldReconnects(t, cell, started)
-	t.Logf("verify row 1: %d operations in %s, maximum claim gap %s, %d stream failures and %d restarts for a new SVID of the celld stream of %s",
-		len(ids), soakDuration, maxGap.Round(time.Millisecond), ended, restarted, cell)
+	t.Logf("verify row 1 (the claim gap is sampled once for each operation, %d samples, so an outage between samples is not measured): %d operations in %s, maximum claim gap %s, %d stream failures and %d restarts for a new SVID of the celld stream of %s",
+		len(ids), len(ids), soakDuration, maxGap.Round(time.Millisecond), ended, restarted, cell)
 	if c := cellStatusOf(t, cell); c.ForgedSeen != 0 {
 		t.Errorf("mgmtd counts %d forged results for %s, want 0", c.ForgedSeen, cell)
 	}

@@ -80,6 +80,7 @@ if ! status_json="$(mgmt_status)"; then
 fi
 
 stage_start=$SECONDS
+stage_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 if ! poll_until "${ATTEST_BOUND_WAIT:-120}" cell_bound; then
   celld_line="$(ctx "$cell" -n cell-identity-system logs deploy/celld -c celld --tail=200 2>&1 | grep -i bind | tail -n 1 || true)"
   # Two sources name the cause. The gateway keeps the last bind refusal for the cell, and mgmtd keeps the last refused
@@ -87,7 +88,9 @@ if ! poll_until "${ATTEST_BOUND_WAIT:-120}" cell_bound; then
   gw_refusal="$(cd "$ROOT" && mise run gw -- status 2>/dev/null | jq -c --arg c "$cell" '.lastBindRefusal[$c] // "none"' 2>/dev/null)" || gw_refusal=""
   mgmt_refusal="$(jq -c --arg c "$cell" '[.cells[]? | select(.name == $c)][0].lastRefusal // "none"' <<<"$(mgmt_status || echo '{}')" 2>/dev/null)" || mgmt_refusal=""
   next="mise x -- kubectl --context kind-$cell -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"
-  if jq -e '.reason == "source_mismatch" or .reason == "cell_unknown"' <<<"${gw_refusal:-null}" >/dev/null 2>&1; then
+  # Only a refusal from this stage counts, so an old one does not send the reader to cell:up.
+  if jq -e --arg since "$stage_iso" '(.reason == "source_mismatch" or .reason == "cell_unknown")
+      and ((.at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($since | fromdateiso8601)' <<<"${gw_refusal:-null}" >/dev/null 2>&1; then
     next="CELL=$server_cluster mise run cell:up, then $next"
   fi
   fail bound "mgmtd does not show $cell as bound after $((SECONDS - stage_start))s. Last celld bind log line: ${celld_line:-none}. Last gateway bind refusal for $cell: ${gw_refusal:-unknown}. Last mgmtd refusal for $cell: ${mgmt_refusal:-unknown}" "$next"

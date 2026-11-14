@@ -172,7 +172,7 @@ func TestHarnessObjectsByNamespace(t *testing.T) {
 // The bundle holds a Namespace, a Role, a NetworkPolicy and a ConfigMap in cell-identity-system, so the check lists the
 // ConfigMaps of cell-ops-system too. celld writes the objects op-<id> and demo-log there at run time.
 // STUB_RECORD describes the ConfigMap that celld wrote: "ok" (label made-by=celld, manager celld), "nolabel" (no
-// made-by label), "person" (label made-by=celld, manager kubectl-edit) or "name" (an unexpected name, label made-by=celld).
+// made-by label), "outside" (a celld record in cell-identity-system), "person" (label made-by=celld, manager kubectl-edit) or "name" (an unexpected name, label made-by=celld).
 const opsKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 args=" $* "
@@ -193,7 +193,10 @@ records() {
   esac
 }
 case "$args" in
-  *" -n cell-identity-system get ConfigMap -o json "*) list "$(item mgmt-op-key),$(item spire-agent)" ;;
+  *" -n cell-identity-system get ConfigMap -o json "*)
+    extra=""
+    [[ "${STUB_RECORD:-ok}" != outside ]] || extra=",$(celld op-0123456789abcdef0123456789abcdef "$made" celld)"
+    list "$(item mgmt-op-key),$(item spire-agent)$extra" ;;
   *" -n cell-identity-system get Role -o json "*) list "" ;;
   *" -n cell-identity-system get NetworkPolicy -o json "*) list "" ;;
   *" -n cell-ops-system get ConfigMap -o json "*)
@@ -201,6 +204,7 @@ case "$args" in
   *" -n cell-ops-system get Role -o json "*) list "$(item celld-ops)" ;;
   *" -n cell-ops-system get NetworkPolicy -o json "*) list "$(item default-deny)" ;;
   *" get Namespace -l cell.poc.internal/harness=cell-identity -o json "*) list "$(item cell-identity-system),$(item cell-ops-system)" ;;
+  *" get namespace cell-identity-system -o json "*) echo "{\"metadata\":{\"name\":\"cell-identity-system\",$mine}}" ;;
   *" get namespace cell-ops-system -o json "*) echo "{\"metadata\":{\"name\":\"cell-ops-system\",$mine}}" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
@@ -249,11 +253,13 @@ func TestHarnessObjectsIgnoresCelldRecords(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, record string
+		ns           string // the namespace to check, cell-ops-system when empty
 		want         string // text of the failure, empty when the check passes
 	}{
 		{name: "an op record and demo-log of celld", record: "ok"},
 		{name: "a record without the made-by label", record: "nolabel", want: "ConfigMap objects 'op-0123456789abcdef0123456789abcdef'"},
 		{name: "a record that another manager wrote", record: "person", want: "ConfigMap objects 'op-0123456789abcdef0123456789abcdef'"},
+		{name: "a celld record outside cell-ops-system is reported", record: "outside", ns: "cell-identity-system", want: "ConfigMap objects 'mgmt-op-key op-0123456789abcdef0123456789abcdef spire-agent'"},
 		{name: "a ConfigMap with another name", record: "name", want: "ConfigMap objects 'op-other'"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -272,7 +278,11 @@ func TestHarnessObjectsIgnoresCelldRecords(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects cell-identity cell-ops-system`, "_", lib)
+			ns := tc.ns
+			if ns == "" {
+				ns = "cell-ops-system"
+			}
+			cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects cell-identity "$2"`, "_", lib, ns)
 			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 				"CELL=dev-cell-1", "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_RECORD=" + tc.record}
 			var out bytes.Buffer

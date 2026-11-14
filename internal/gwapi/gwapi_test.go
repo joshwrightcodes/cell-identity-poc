@@ -377,6 +377,10 @@ func TestPathsAndPatterns(t *testing.T) {
 	}{
 		{StreamPattern, StreamPath("dev-cell-1"), "dev-cell-1", ""},
 		{BindResultPattern, BindResultPath("dev-cell-1", "0123"), "dev-cell-1", "0123"},
+		{NoncePattern, NoncePath("dev-cell-1"), "dev-cell-1", ""},
+		{BindPattern, BindPath("dev-cell-1"), "dev-cell-1", ""},
+		{NoncePattern, NoncePath("x?y=1#frag"), "x?y=1#frag", ""},
+		{BindPattern, BindPath("a b"), "a b", ""},
 	} {
 		var cell, id string
 		mux := http.NewServeMux()

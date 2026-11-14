@@ -265,8 +265,11 @@ The script waits for four stages in turn:
 
 The `reloaded` stage reads the server log since the last record change. A log that has rotated away makes it fail.
 A stage that fails prints its name, the reason and the next command.
-When the `bound` stage fails, the script prints two causes: the last bind refusal of the gateway for the cell, from `mise run gw -- status`, and the last refusal of `mgmtd` for the cell.
-After `source_mismatch` or `cell_unknown` from the gateway, it prints `CELL=dev-cp mise run cell:up` first, because the gateway admits a cell only by its node address.
+When the `bound` stage fails, the script prints two causes.
+The first is the last bind refusal of the gateway for the cell, from `mise run gw -- status`.
+The second is the last refusal of `mgmtd` for the cell.
+After a new `source_mismatch` or `cell_unknown` from the gateway, it prints `CELL=dev-cp mise run cell:up` first.
+The gateway admits a cell only by its node address.
 When `mise run mgmt -- status` does not answer, the script prints `CELL=management LINK_ONLY=mgmt-api mise run cell:link` and does not wait.
 When `mgmtd` has no `peer-root` for `dev-cp`, or `envd` logs a TLS refusal, the `applied` failure names the same command first.
 At the start of `ready`, the script deletes a `celld` pod once when its `spire-agent` container is in `CrashLoopBackOff`.
@@ -321,15 +324,20 @@ mise run gw -- status
 ```
 
 The record becomes `reported` only after `mgmtd` holds the final result `applied`.
-`mise run gw -- status` lists the open streams of each cell under `streams`.
+`mise run gw -- status` shows the number of open streams of each cell under `streams`.
 The gateway allows two streams for each cell, one for each `celld` pod, and refuses a third with `replica_cap`.
 
-When `cell:verify` of a cell reports that `mgmt-op-key` differs from the key of `mgmtd`, run `CELL=<cell> mise run cell:up`.
-When `cell:verify` of `dev-cp` reports that a cell has no stream, run `CELL=<cell> mise run cell:up`, and read the log of the `celld` pod.
-After a reset of the state of `mgmtd`, run `cell:up` for each cell before the full link, because each cell holds the old key until then.
+Suppose `cell:verify` of a cell reports that `mgmt-op-key` differs from the key of `mgmtd`.
+Then run `CELL=<cell> mise run cell:up`.
+Suppose `cell:verify` of `dev-cp` reports that a cell has no stream.
+Then run `CELL=<cell> mise run cell:up`, and read the log of the `celld` pod.
+After a reset of `mgmtd`, run `cell:up` for each cell before the full link.
+Each cell holds the old key until then.
 
 `mise run gate:m5:soak` sends one operation to `dev-cell-1` each minute for 30 minutes.
-It checks that each one is applied once and that the gap between the enqueue and the first record in the cell stays below 15 seconds.
+It checks that each operation is applied once, also after the last minute.
+It samples the gap between the enqueue and the first record in the cell once for each operation, 30 samples in all.
+Each sample must stay below 15 seconds.
 It prints the number of stream failures and of restarts for a new SVID.
 Run it alone, after `mise run gate:m5`.
 
@@ -380,7 +388,8 @@ The rotation sets the counter back to 1, and it clears the stored history. `rest
 
 ### Check a bind
 
-`celld` binds its cell to `mgmtd` through the bind listener of the cell gateway when it starts, and it repeats the bind until `mgmtd` holds a record.
+`celld` binds its cell to `mgmtd` through the bind listener of the cell gateway when it starts.
+It repeats the bind until `mgmtd` holds a record.
 Run `mise run mgmt -- status` to read the result. Each entry of `cells` shows `bound`, the issuer, the key IDs and `lastCheck`.
 A cell that is not bound has no record, so its new pods cannot attest.
 The refusal reasons of a bind are `cell_unknown`, `nonce_invalid`, `token_invalid`, `issuer_untrusted`, `issuer_unavailable`, `keys_untrusted`, `rate_limited` and `restore_active`.
@@ -540,7 +549,7 @@ Deployment `relay-telemetry` passes node port 30444 to node port 31444.
 The relay ends no TLS. It holds at most 256 connections, and 16 from one client address.
 The NetworkPolicy admits the node addresses of the cells. Every pod of a cell that no policy limits reaches the relay through its node address, so cell-proxy, and not the network, decides who is a peer.
 
-`cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-op-key` and the stream to the principal.
+`cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-root` and the stream to the principal.
 After a rebuild of `dev-cp` or a new root of `management`, it prints `CELL=<cell> mise run cell:up`.
 `cell:verify` of `dev-cp` checks that the relay routes and admit lists use the current node addresses of `management` and the cells. When it fails, run `CELL=dev-cp mise run cell:up`.
 
