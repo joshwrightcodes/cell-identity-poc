@@ -192,8 +192,7 @@ func (s *Store) claim(ctx context.Context, cell, holder string, requireLive bool
 const ForgedHold = 5 * time.Minute
 
 // MaxForgedHolds is the number of claims after which an empty-op-ID result ends the row.
-// With ForgedHold this is 30 min. The gateway does not read the expiry of the operation, because
-// op.Peek does not return it.
+// With ForgedHold this is 30 min.
 const MaxForgedHolds = 6
 
 // CompleteWithItem appends the result item and finds the queue row by leaseID, never by it.OpID.
