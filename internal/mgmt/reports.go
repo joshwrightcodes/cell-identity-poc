@@ -314,6 +314,8 @@ func decodeResult(it mgmtapi.ReportItem, claims clusterjwt.Claims) (op.Result, *
 		return bad("body")
 	case res.Cell != it.Cell:
 		return bad("cell")
+	case res.OpID != it.OpID:
+		return bad("op_id")
 	case res.OpID != "" && !opIDRE.MatchString(res.OpID):
 		return bad("op_id")
 	case !op.IsFinal(res.Outcome):

@@ -277,6 +277,15 @@ func TestReportResultBodyRules(t *testing.T) {
 		it := r.item(cell1, "result", x, r.signers[cell1], nil)
 		want(t, r.one(it), mgmtapi.OutcomeRefused, mgmtapi.ReasonPayloadInvalid, "cell")
 	})
+	t.Run("item_op_id_differs_from_body", func(t *testing.T) {
+		other, otherEnv := r.newOp(cell1)
+		it := r.resultItem(resultFor(other, otherEnv, op.OutcomeApplied), r.signers[cell1])
+		it.OpID = o.ID // the gateway keys the final outcome on this ID, and the body closes the other op
+		want(t, r.one(it), mgmtapi.OutcomeRefused, mgmtapi.ReasonPayloadInvalid, "op_id")
+		if r.opState(other.ID).Final != "" || r.opState(o.ID).Final != "" {
+			t.Fatal("a result with two different op IDs closed an operation")
+		}
+	})
 	// proof.Verify returns the claims and does not compare the pod, so the plane compares it.
 	t.Run("pod_differs_from_token", func(t *testing.T) {
 		x := good
