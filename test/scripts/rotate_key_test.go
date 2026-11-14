@@ -52,7 +52,8 @@ case "$*" in
     touch "$STUB_DIR/rotated"
     if [[ -n "${STUB_ROTATE_LOST:-}" ]]; then exit 1; fi
     if [[ -n "${STUB_ROTATE_PUBLISH_FAIL:-}" ]]; then echo '{"level":"ERROR","msg":"mgmtd failed","error":"the key rotated, but its public half did not publish: api down","rotated":true}'; exit 1; fi
-    printf '{"spec.pub":"%s","signed":{"epoch":2,"counter":1},"seq":9}\n' "$STUB_NEW_PUB" ;;
+    # STUB_COMMIT_OTHER makes the commit answer a key that the stage did not make.
+    printf '{"spec.pub":"%s","signed":{"epoch":2,"counter":1},"seq":9}\n' "${STUB_COMMIT_OTHER:-$STUB_NEW_PUB}" ;;
   "run cell:up"|"run cell:link"|"run cell:verify")
     echo "CELL=$CELL $*" >>"$STUB_DIR/calls"
     if [[ "CELL=$CELL $*" == "${STUB_FAIL:-}" ]]; then
@@ -327,6 +328,22 @@ func TestRotateKeyOrder(t *testing.T) {
 		res := oneLine(t, out)
 		if err == nil || !res.Rotated || res.Step != "cell:up-dev-cell-2" || strings.Join(res.Left, "|") != strings.Join([]string{cell2.cmd, verifyMgmt.cmd, verifyCP.cmd}, "|") {
 			t.Fatalf("err %v, line %+v; want rotated, the failed step and the commands from it on", err, res)
+		}
+	})
+
+	// A commit that answers another key than the staged one is a failure: the run did not rotate to the key that it staged, and no
+	// cell pass runs after it.
+	t.Run("commit answers another key than the staged one", func(t *testing.T) {
+		other := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32))
+		out, errOut, err := run("mgmt-rotate-key.sh", nil, "STUB_COMMIT_OTHER="+other)
+		res := oneLine(t, out)
+		if err == nil || res.Level != "ERROR" || res.Step != "commit" || !strings.Contains(res.Error, "not the key that this run staged") {
+			t.Fatalf("err %v, line %+v, stderr %q; want a failure at the commit that names the staged key", err, res, errOut)
+		}
+		for _, c := range callLog() {
+			if strings.Contains(c, "cell:link") || strings.Contains(c, "cell:verify") {
+				t.Errorf("%q ran after a commit of the wrong key", c)
+			}
 		}
 	})
 

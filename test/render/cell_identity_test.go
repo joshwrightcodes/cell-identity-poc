@@ -530,6 +530,7 @@ func TestCellIdentityNextKey(t *testing.T) {
 		{"next.pub with another hash than stagedKey", []string{"STUB_NEXT_PUB=" + next, "STUB_STAGED_KEY=" + strings.Repeat("0", 64)}, "has the SHA-256"},
 		{"stagedKey and no next.pub", []string{"STUB_STAGED_KEY=" + strings.Repeat("a", 64)}, "next.pub is not the base64 of 32 bytes"},
 		{"next.pub that is not a key", []string{"STUB_NEXT_PUB=bm90LWEta2V5", "STUB_STAGED_KEY=" + strings.Repeat("a", 64)}, "next.pub is not the base64 of 32 bytes"},
+		{"next.pub while mgmtd is not Ready", []string{"STUB_NEXT_PUB=" + next, "STUB_MGMTD_DOWN=1"}, "mgmtd-0 is not Ready"},
 		{"no override", []string{"STUB_NEXT_PUB=" + next, "STUB_STAGED_KEY=" + strings.Repeat("0", 64), "MGMT_KEY_ACCEPT_CHANGE=1"}, "has the SHA-256"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

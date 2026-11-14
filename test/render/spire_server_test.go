@@ -143,7 +143,8 @@ if [[ " $* " == *" get configmap mgmt-spec-key "* ]]; then
 fi
 if [[ " $* " == *" get pod mgmtd-0 "* ]]; then
   # mgmtd-0 is Ready only when the test stages a key, so the key helper checks the staged key against mgmtd.
-  [[ -z "${STUB_NEXT_PUB:-}${STUB_STAGED_KEY:-}" ]] || printf 'True'
+  # STUB_MGMTD_DOWN keeps it not Ready while a key is staged.
+  if [[ -n "${STUB_NEXT_PUB:-}${STUB_STAGED_KEY:-}" && -z "${STUB_MGMTD_DOWN:-}" ]]; then printf 'True'; fi
   exit 0
 fi
 if [[ " $* " == *" get node "* ]]; then
