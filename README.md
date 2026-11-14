@@ -428,7 +428,7 @@ The command runs these steps in order:
 
 The steps took 5 minutes 30 seconds in the measured run of 2026-11-15.
 The stage took 1 second and the first cell pass 98 seconds. The commit took 1 second, the planes 129 seconds and the second cell pass 96 seconds.
-The rollout wait and the two `cell:verify` runs add a few minutes.
+The whole default run took 9 minutes 13 seconds, with the rollout wait and the two `cell:verify` runs.
 The command prints one JSON line with the SHA-256 fingerprint of the old key and of the new key, the new epoch and the run time in seconds.
 The line holds public key data only.
 A failure prints the commands that remain, from the failed step on, as text on standard error and in the JSON error line.
