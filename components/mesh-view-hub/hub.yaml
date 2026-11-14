@@ -44,7 +44,7 @@ spec:
           type: RuntimeDefault
       containers:
         # The kiali entry selects unix:uid:65532, the user of the ko base image. mgmtd publishes the
-        # registry, and cell-proxy loads it again every 10 seconds, so a revoked cell needs no new pod.
+        # registry, and cell-proxy loads it again every 10 seconds, so a revoked cell reaches the hub without a new pod.
         # The proof of each tunnel connection comes from the account mesh-view in mesh-view-system.
         - name: cell-proxy
           image: "@CELL_PROXY_IMAGE@"

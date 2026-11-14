@@ -427,7 +427,12 @@ func streamProof(t *testing.T, cell, role string) func(binding string) string {
 	if !ok {
 		t.Fatalf("no client account for the role %q", role)
 	}
-	out, err := kubectl(t, cell, "", "-n", a.ns, "get", "pods", "-l", "app.kubernetes.io/name="+a.app, "-o", "jsonpath={.items[0].metadata.name} {.items[0].metadata.uid}")
+	// A Running pod with no deletion time: during a rollout, the first pod of the list can be the one that ends.
+	out, err := kubectl(t, cell, "", "-n", a.ns, "get", "pods", "-l", "app.kubernetes.io/name="+a.app, "--field-selector", "status.phase=Running",
+		"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp==null)]}{.metadata.name} {.metadata.uid}{"\n"}{end}`)
+	if lines := strings.Split(strings.TrimSpace(out), "\n"); err == nil && len(lines) > 0 {
+		out = lines[0]
+	}
 	if err != nil || len(strings.Fields(out)) != 2 {
 		t.Fatalf("the pod of %s in %s/%s: %q, %v", a.app, cell, a.ns, out, err)
 	}

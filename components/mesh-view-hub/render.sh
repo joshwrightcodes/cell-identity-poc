@@ -25,9 +25,9 @@
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the public key of mgmtd, as ConfigMap registry-signer (components/lib/registry.sh). cell-proxy
-#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry itself, and
-#     cell-proxy loads it again every 10 seconds. So the bundle holds a Role that lets
-#     mgmtd write it, and no registry.
+#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry, and
+#     cell-proxy loads it again every 10 seconds. The bundle holds the Role that lets
+#     mgmtd write it.
 #   - the cell-proxy image that `mise run images` built, by digest.
 # Kiali reads only the namespaces of MESH_VIEW_NAMESPACES, in each cluster. The chart with
 # cluster_wide_access false lists the namespace of Kiali alone, because it reads the other namespaces

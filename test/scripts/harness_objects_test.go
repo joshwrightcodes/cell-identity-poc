@@ -342,9 +342,14 @@ esac
 // that another manager wrote, and one with another name are reported.
 func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
-	for _, comp := range []struct{ name, ns, cluster string }{
-		{"central-view", "central-view-system", "management"},
-		{"mesh-view-hub", "mesh-view-system", "management"},
+	// telemetry-gateway shares observability-system with other bundles, so its bundle does not hold the Namespace.
+	for _, comp := range []struct {
+		name, ns, cluster string
+		shared            bool
+	}{
+		{"central-view", "central-view-system", "management", false},
+		{"mesh-view-hub", "mesh-view-system", "management", false},
+		{"telemetry-gateway", "observability-system", "management", true},
 	} {
 		for _, tc := range []struct {
 			name, registry, want string
@@ -355,6 +360,12 @@ func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
 			{name: "another manager wrote it", registry: "person", want: "ConfigMap objects 'cell-registry registry-signer'"},
 			{name: "another name", registry: "name", want: "ConfigMap objects 'cell-registry-other registry-signer'"},
 		} {
+			if comp.shared && tc.registry == "name" {
+				continue // a shared namespace lists only the objects that carry the harness label or a runtime name
+			}
+			if comp.shared && (tc.registry == "nolabel" || tc.registry == "person") {
+				tc.want = "runtime ConfigMap objects 'cell-registry'"
+			}
 			t.Run(comp.name+"/"+tc.name, func(t *testing.T) {
 				dir := t.TempDir()
 				if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(registryKubectl), 0o755); err != nil {
@@ -364,7 +375,11 @@ func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
 				if err := os.MkdirAll(bundle, 0o755); err != nil {
 					t.Fatal(err)
 				}
-				manifests := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + comp.ns + "\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: registry-signer\n  namespace: " + comp.ns + "\n"
+				manifests := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + comp.ns + "\n---\n"
+				if comp.shared {
+					manifests = ""
+				}
+				manifests += "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: registry-signer\n  namespace: " + comp.ns + "\n"
 				if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte(manifests), 0o644); err != nil {
 					t.Fatal(err)
 				}

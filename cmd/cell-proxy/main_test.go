@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/url"
@@ -294,6 +295,18 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 				t.Fatalf("output is %v, want one JSON error line", lines)
 			}
 		})
+	}
+}
+
+func TestServerNamesTheMissingRegistrySigner(t *testing.T) {
+	args := serverArgs(t, newCA(t, "dev.env.poc.internal"))
+	var out bytes.Buffer
+	if code := execute(t.Context(), without(args, "--registry-signer"), &out); code != 2 {
+		t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+	}
+	lines := jsonLines(t, out.String())
+	if len(lines) != 1 || !strings.Contains(fmt.Sprintf("%v", lines[0]["error"]), "--registry-signer required") {
+		t.Fatalf("output is %v, want the error --registry-signer required", lines)
 	}
 }
 

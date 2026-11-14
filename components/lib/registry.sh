@@ -2,8 +2,8 @@
 # renders of the view components.
 #
 # mgmtd publishes ConfigMap cell-registry into each view namespace, with the label
-# poc.internal/made-by=mgmtd. The renders of the view components do not hold it. They hold ConfigMap
-# registry-signer, which pins the key that signs the registry, and a Role that lets mgmtd write the registry.
+# poc.internal/made-by=mgmtd. The renders of the view components hold ConfigMap registry-signer, which pins
+# the key that signs the registry, and a Role that lets mgmtd write the registry.
 
 REGISTRY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$REGISTRY_ROOT/scripts/ko-image.sh"

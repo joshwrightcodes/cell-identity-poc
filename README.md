@@ -443,16 +443,28 @@ In two gaps, new agents cannot attest. Agents that already run still renew their
 The object carries only the label `poc.internal/made-by=mgmtd`.
 `mgmtd` writes it after each change of a record, and checks it again every minute.
 Each view server loads the registry every 10 seconds, and refuses a registry that another key signed.
-The link of a view component does not render the registry.
-It holds ConfigMap `registry-signer` with the key of `mgmtd`, and a Role that lets `mgmtd` write the registry.
+Each view bundle holds ConfigMap `registry-signer` with the key of `mgmtd`, and a Role that lets `mgmtd` write the registry.
 After the apply, the link waits up to 60 seconds until the registry lists each cell, and only then does it prune.
 If the wait fails, run `CELL=<cell> mise run cell:up` for the cell that the message names, so that its `celld` binds.
-Then read `mise run mgmt -- status` and the log of `mgmtd-0`.
+Then run `mise run mgmt -- status`, and read the log of `mgmtd-0`.
 `cell:verify` of `management` fails when a registry differs from the output of `mise run mgmt -- records`.
 A record change reaches the views without a link.
-A ConfigMap that an older render applied keeps the field manager `kubectl`, and `cell:verify` then reports it.
-Delete the three `cell-registry` objects once.
-`mgmtd` creates them again within a minute.
+
+#### One-time step after an upgrade
+
+A harness that ran a render of an older version holds `cell-registry` objects with the field manager `kubectl`.
+On that harness, `cell:verify` of `management`, `harness:status` and `gate:m3` (`TestM3StatusHealthy`) fail.
+Each failure says that `central-view-system` or `mesh-view-system` holds an object with another field manager.
+Delete the three objects once:
+
+```sh
+for ns in central-view-system observability-system mesh-view-system; do
+  mise x -- kubectl --context kind-management -n "$ns" delete configmap cell-registry
+done
+```
+
+`mgmtd` creates them again within a minute, and the view servers keep their last good registry meanwhile.
+A new harness never needs this step.
 
 ### Recover lost management state
 

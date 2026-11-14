@@ -126,34 +126,48 @@ func TestRegistryWait(t *testing.T) {
 	}
 }
 
-// TestHarnessApplyWaitsForRegistryBeforePrune: harness_apply of a view component applies, waits for the registry that
-// mgmtd publishes, and only then prunes. An old render left the registry with the harness label, so a prune before the
-// wait would delete it. When the registry never comes, the apply fails and the prune does not run. The other components
-// do not wait.
+// TestHarnessApplyWaitsForRegistryBeforePrune: harness_apply of each view component applies, waits for the registry that
+// mgmtd publishes in the namespace of the component, and only then prunes. An old render left the registry with the harness
+// label, so a prune before the wait would delete it. When the registry never comes, the apply fails and the prune does not
+// run. Another component does not wait.
 func TestHarnessApplyWaitsForRegistryBeforePrune(t *testing.T) {
 	stubs := `harness_conflicts() { :; }; apply_bundle() { echo "STEP apply $1" >>"$STUB_LOG"; }; release_from_argocd() { :; }; `
-	index := func(calls, sub string) int { return strings.Index(calls, sub) }
-	t.Run("published", func(t *testing.T) {
-		out, calls, err := runWait(t, stubs+"harness_apply central-view", map[string]string{"cm.json": registryJSON("mgmtd", "dev-cell-1", "dev-cell-2")})
-		if err != nil {
-			t.Fatalf("harness_apply fails: %v\n%s", err, out)
+	// bundle copies the fixture bundle of central-view to the bundle of another component.
+	bundle := func(comp string) string {
+		if comp == "central-view" {
+			return ""
 		}
-		apply, wait, prune := index(calls, "STEP apply central-view"), index(calls, "get configmap cell-registry"), index(calls, "-A -l cell.poc.internal/harness=central-view")
-		if apply < 0 || wait < apply || prune < wait {
-			t.Fatalf("the order is apply %d, wait %d, prune %d; want apply, then the wait, then the prune:\n%s", apply, wait, prune, calls)
-		}
-	})
-	t.Run("never published", func(t *testing.T) {
-		out, calls, err := runWait(t, stubs+"harness_apply central-view", nil, "REGISTRY_WAIT_SECONDS=0")
-		if err == nil || !strings.Contains(out, "CELL=dev-cell-1 mise run cell:up, so its celld binds") {
-			t.Fatalf("err %v, output %q; want a failure that names cell:up", err, out)
-		}
-		if strings.Contains(calls, "-A -l cell.poc.internal/harness=central-view") {
-			t.Errorf("the prune ran though the registry never came:\n%s", calls)
-		}
-	})
+		return `mkdir -p "$BUNDLES/` + comp + `"; cp "$BUNDLES/central-view/manifests.yaml" "$BUNDLES/` + comp + `/manifests.yaml"; `
+	}
+	for _, c := range []struct{ comp, ns string }{
+		{"central-view", "central-view-system"},
+		{"telemetry-gateway", "observability-system"},
+		{"mesh-view-hub", "mesh-view-system"},
+	} {
+		t.Run(c.comp+"/published", func(t *testing.T) {
+			out, calls, err := runWait(t, stubs+bundle(c.comp)+"harness_apply "+c.comp, map[string]string{"cm.json": registryJSON("mgmtd", "dev-cell-1", "dev-cell-2")})
+			if err != nil {
+				t.Fatalf("harness_apply fails: %v\n%s", err, out)
+			}
+			apply := strings.Index(calls, "STEP apply "+c.comp)
+			wait := strings.Index(calls, "-n "+c.ns+" get configmap cell-registry")
+			prune := strings.Index(calls, "-A -l cell.poc.internal/harness="+c.comp)
+			if apply < 0 || wait < apply || prune < wait {
+				t.Fatalf("the order is apply %d, wait %d, prune %d; want apply, then the wait in %s, then the prune:\n%s", apply, wait, prune, c.ns, calls)
+			}
+		})
+		t.Run(c.comp+"/never published", func(t *testing.T) {
+			out, calls, err := runWait(t, stubs+bundle(c.comp)+"harness_apply "+c.comp, nil, "REGISTRY_WAIT_SECONDS=0")
+			if err == nil || !strings.Contains(out, "CELL=dev-cell-1 mise run cell:up, so its celld binds") {
+				t.Fatalf("err %v, output %q; want a failure that names cell:up", err, out)
+			}
+			if strings.Contains(calls, "-A -l cell.poc.internal/harness="+c.comp) {
+				t.Errorf("the prune ran though the registry never came:\n%s", calls)
+			}
+		})
+	}
 	t.Run("another component does not wait", func(t *testing.T) {
-		out, calls, err := runWait(t, stubs+"mkdir -p \"$BUNDLES/envd\"; cp \"$BUNDLES/central-view/manifests.yaml\" \"$BUNDLES/envd/manifests.yaml\"; harness_apply envd", nil, "REGISTRY_WAIT_SECONDS=0")
+		out, calls, err := runWait(t, stubs+bundle("envd")+"harness_apply envd", nil, "REGISTRY_WAIT_SECONDS=0")
 		if err != nil || strings.Contains(calls, "cell-registry") {
 			t.Fatalf("err %v, output %q, calls:\n%s\nwant no wait for the registry", err, out, calls)
 		}

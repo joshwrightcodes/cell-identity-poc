@@ -810,7 +810,7 @@ harness_apply() {
   release_from_argocd "$BUNDLES/$1/manifests.yaml"
   # mgmtd publishes ConfigMap cell-registry of a view namespace, and the Role of the bundle lets it write.
   # An old render left the object with the harness label, and the prune would delete it before mgmtd
-  # takes the label off. So the prune waits for the published registry.
+  # removes the label. So the prune waits for the published registry.
   case "$1" in
     central-view) source "$ROOT/components/lib/registry.sh"; registry_wait central-view-system ;;
     telemetry-gateway) source "$ROOT/components/lib/registry.sh"; registry_wait observability-system ;;
@@ -922,7 +922,7 @@ runtime_objects() {
 }
 
 check_harness_objects() {
-  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned runtime problems=()
+  local comp="$1" ns="$2" bundle="$BUNDLES/$1/manifests.yaml" kind want got live bad owned runtime stray problems=()
   [[ -f "$bundle" ]] || { echo "no $bundle. Run: $(fix_command "$comp")"; return 1; }
   owned="$(NS="$ns" yq -N 'select(.kind == "Namespace" and .metadata.name == strenv(NS)) | .metadata.name' "$bundle")"
   # managers_of <live list> <names> prints each field manager of the named objects other than
@@ -959,6 +959,16 @@ check_harness_objects() {
         | select(.metadata.labels[$label] == $comp) | .metadata.name] | sort | join(" ")' <<<"$live")" \
         || { echo "could not read the $kind objects in $ns"; return 1; }
       [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
+      # A runtime object has no harness label, so the label list above never shows it. It must still carry the marker and
+      # only the field managers of its writer.
+      if [[ "$runtime" != null ]]; then
+        stray="$(jq -r --argjson runtime "$runtime" '[.items[] | select(.metadata.name | test($runtime.names))
+          | select((((($runtime.marker // null) == null) or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
+            and ((.metadata.managedFields // []) | length) > 0
+            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not)
+          | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
+        [[ -z "$stray" ]] || problems+=("$ns has the runtime $kind objects '$stray' that a person or another manager wrote")
+      fi
     fi
     bad="$(managers_of "$live" "$want")" || { echo "could not read the field managers of $kind in $ns"; return 1; }
     [[ -z "$bad" ]] || problems+=("$bad")

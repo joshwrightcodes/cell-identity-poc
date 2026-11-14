@@ -15,8 +15,8 @@
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the public key of mgmtd, as ConfigMap registry-signer (components/lib/registry.sh). cell-proxy
-#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry itself, so the
-#     bundle holds a Role that lets mgmtd write it, and no registry.
+#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry, and the
+#     bundle holds the Role that lets mgmtd write it.
 #   - the cell-proxy image that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root and of the registry signer, so a new root
 # or a new signing key restarts the pod.
