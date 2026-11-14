@@ -22,11 +22,13 @@ import (
 )
 
 const (
-	bindNodePort = 30447
-	bindNS       = "m4-bind"
-	// denialQuiet is longer than the window (10 s) of the denial log limiter of mgmtd, which allows one line for each reason.
+	// bindNodePort is the node port of the bind listener of the cell gateway in dev-cp.
+	bindNodePort = 30451
+	// denialQuiet is longer than the window (10 s) of the denial log limiter of the gateway, which allows one line for each reason.
 	denialQuiet = 11 * time.Second
 	bindJobWait = 4 * time.Minute
+	// trustBundlePath is where a probe Job mounts ConfigMap spire-trust-bundle.
+	trustBundlePath = "/run/spire/bundle/bundle.crt"
 )
 
 var (
@@ -34,7 +36,7 @@ var (
 	nonceLine  = regexp.MustCompile(`^nonce:(\S+) (\S+)$`)
 )
 
-// bindEnv is the pod environment that the mgmt-bind target of attestprobe reads.
+// bindEnv is the pod environment that the gw-bind target of attestprobe reads.
 func bindEnv() []map[string]any {
 	field := func(name, path string) map[string]any {
 		return map[string]any{"name": name, "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": path}}}
@@ -55,8 +57,8 @@ type probeJob struct {
 func (j probeJob) name() string { return "attestprobe-bind-" + j.run }
 
 func (j probeJob) manifest() []byte {
-	volumes := []map[string]any{{"name": "mgmt-root", "configMap": map[string]any{"name": "mgmt-root"}}}
-	mounts := []map[string]any{{"name": "mgmt-root", "mountPath": "/run/mgmt-root", "readOnly": true}}
+	volumes := []map[string]any{{"name": "bundle", "configMap": map[string]any{"name": trustBundleMap}}}
+	mounts := []map[string]any{{"name": "bundle", "mountPath": "/run/spire/bundle", "readOnly": true}}
 	if j.secret != "" {
 		volumes = append(volumes, map[string]any{"name": "token", "secret": map[string]any{"secretName": j.secret}})
 		mounts = append(mounts, map[string]any{"name": "token", "mountPath": "/run/attestprobe", "readOnly": true})
@@ -155,7 +157,7 @@ func (j probeJob) run1(t *testing.T) []string {
 }
 
 // allowBindEgress gives the probe pods of one run the egress rules of the live celld NetworkPolicy, which include the node port
-// 30447 of dev-cp, in any namespace of the cell.
+// 30451 of dev-cp, in any namespace of the cell.
 func allowBindEgress(t *testing.T, cell, ns, run string) {
 	t.Helper()
 	out, err := kubectl(t, cell, "", "-n", celldNamespace, "get", "networkpolicy", "celld", "-o", "json")
@@ -191,25 +193,6 @@ func allowBindEgress(t *testing.T, cell, ns, run string) {
 	})
 }
 
-// copyMgmtRoot copies ConfigMap mgmt-root of cell-identity-system into a namespace of the cell, with the probe label.
-func copyMgmtRoot(t *testing.T, cell, ns string) {
-	t.Helper()
-	root, err := kubectl(t, cell, "", "-n", celldNamespace, "get", "configmap", "mgmt-root", "-o", `jsonpath={.data.root\.crt}`)
-	if err != nil || strings.TrimSpace(root) == "" {
-		t.Fatalf("ConfigMap mgmt-root of %s holds no root: %v", cell, err)
-	}
-	cm, _ := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "ConfigMap",
-		"metadata": map[string]any{"name": "mgmt-root", "namespace": ns, "labels": map[string]string{probeLabel: "mgmt-root"}}, "data": map[string]string{"root.crt": root}})
-	if _, err := kubectl(t, cell, string(cm), "create", "-f", "-"); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if _, err := kubectl(t, cell, "", "-n", ns, "delete", "configmap", "mgmt-root", "--ignore-not-found"); err != nil {
-			t.Errorf("cleanup of ConfigMap mgmt-root in %s: %v", ns, err)
-		}
-	})
-}
-
 // tokenSecret stores a token in a Secret of the cell, with the probe label, and deletes it when the test ends.
 func tokenSecret(t *testing.T, cell, ns, token string) string {
 	t.Helper()
@@ -228,23 +211,27 @@ func tokenSecret(t *testing.T, cell, ns, token string) string {
 	return name
 }
 
-// bindProbe returns a Job that binds through the node port of dev-cp. The caller adds the arguments after the target.
+// bindProbe returns a Job that binds through the bind listener of the cell gateway. The namespace holds ConfigMap
+// spire-trust-bundle. The caller adds the arguments after the target.
 func bindProbe(t *testing.T, cell, ns, account string, extra ...string) probeJob {
 	t.Helper()
 	needAttestprobeImage(t)
 	run := randomHex(t, 4)
 	allowBindEgress(t, cell, ns, run)
-	args := append([]string{"--target", "mgmt-bind", "--upstream", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, bindNodePort),
-		"--expect-id", mgmtAPIID, "--peer-bundle", "/run/mgmt-root/root.crt", "--env", pocEnv}, extra...)
+	args := append([]string{"--target", "gw-bind", "--upstream", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, bindNodePort),
+		"--expect-id", gatewayID, "--trust-bundle", trustBundlePath, "--env", pocEnv}, extra...)
 	return probeJob{cluster: cell, namespace: ns, account: account, run: run, args: args, backoffLimit: 0}
 }
 
-// mgmtdDenial waits for the mgmtd log line bind_denied with the request ID.
-func mgmtdDenial(t *testing.T, id string, since time.Time) logLine {
+// gatewayDenial waits for the cellgw log line bind_denied with the request ID.
+func gatewayDenial(t *testing.T, id string, since time.Time) logLine {
 	t.Helper()
 	var found logLine
-	waitFor(t, "the mgmtd log line bind_denied with the request ID "+id, time.Minute, func() (bool, string) {
-		logs := mgmtdLog(t, since)
+	waitFor(t, "the cellgw log line bind_denied with the request ID "+id, time.Minute, func() (bool, string) {
+		logs, err := kubectl(t, spireCluster, "", "-n", gatewayNamespace, "logs", gatewayPod, "-c", "cellgw", "--since-time="+since.UTC().Format(time.RFC3339))
+		if err != nil {
+			return false, err.Error()
+		}
 		for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "bind_denied" && l.str("request_id") == id }) {
 			found = l
 			return true, ""
@@ -252,6 +239,18 @@ func mgmtdDenial(t *testing.T, id string, since time.Time) logLine {
 		return false, lastLines(logs, 2)
 	})
 	return found
+}
+
+// bindNamespace makes a test namespace m5-probe-<hex> in cell for probe Jobs, with the service account celld, its RBAC and the trust
+// bundle of the cell.
+func bindNamespace(t *testing.T, cell string) string {
+	t.Helper()
+	ns := m5Namespace(t, cell)
+	if _, err := kubectl(t, cell, celldRBAC(ns), "create", "-f", "-"); err != nil {
+		t.Fatal(err)
+	}
+	copyTrustBundle(t, cell, ns)
+	return ns
 }
 
 // celldRBAC lets service account celld of a test namespace request a token for itself.
