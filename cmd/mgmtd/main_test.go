@@ -705,8 +705,9 @@ func TestServePublishesRegistry(t *testing.T) {
 	r.stop(t)
 }
 
-// With no record, serve writes no registry, and an existing one stays.
-func TestServePublishesNoEmptyRegistry(t *testing.T) {
+// With no record, serve publishes a registry with signers.pub only, which replaces an object that
+// holds records.
+func TestServePublishesEmptyRegistry(t *testing.T) {
 	f := newFixture(t)
 	f.args["registry-namespaces"] = "central-view-system"
 	_, err := f.kube.CoreV1().ConfigMaps("central-view-system").Create(t.Context(), &corev1.ConfigMap{
@@ -715,13 +716,11 @@ func TestServePublishesNoEmptyRegistry(t *testing.T) {
 	}, metav1.CreateOptions{})
 	must(t, err)
 	r := f.start(t)
-	waitFor(t, "the registry_empty line", func() bool { return strings.Contains(r.out.String(), `"msg":"registry_empty"`) })
-	time.Sleep(200 * time.Millisecond)
-	cm, err := f.kube.CoreV1().ConfigMaps("central-view-system").Get(t.Context(), "cell-registry", metav1.GetOptions{})
-	must(t, err)
-	if cm.Data["dev-cell-1.dsse.json"] != "old" || cm.Labels["cell.poc.internal/harness"] != "x" {
-		t.Fatalf("the registry changed: %v %v", cm.Data, cm.Labels)
-	}
+	waitFor(t, "the registry without a record", func() bool {
+		cm, err := f.kube.CoreV1().ConfigMaps("central-view-system").Get(t.Context(), "cell-registry", metav1.GetOptions{})
+		_, old := cm.Data["dev-cell-1.dsse.json"]
+		return err == nil && !old && cm.Data["signers.pub"] != "old\n" && cm.Data["signers.pub"] != ""
+	})
 	r.stop(t)
 }
 

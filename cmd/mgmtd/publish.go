@@ -245,14 +245,11 @@ func publishRegistryNamespace(ctx context.Context, c kubernetes.Interface, names
 // PublishRegistry creates or repairs ConfigMap cell-registry in each namespace, with
 // <cell>.dsse.json for each record and signers.pub for pub. The only label is
 // poc.internal/made-by=mgmtd, so that a harness label or another annotation on an existing object
-// is removed. It refuses an empty record set, because cell-proxy cannot load a registry with no
-// record. It tries every namespace and returns the errors of those that failed.
+// is removed. An empty record set gives a registry with signers.pub only, which admits no cell.
+// It tries every namespace and returns the errors of those that failed.
 func PublishRegistry(ctx context.Context, c kubernetes.Interface, namespaces []string, records map[string]json.RawMessage, pub ed25519.PublicKey) error {
 	if len(pub) != ed25519.PublicKeySize {
 		return errors.New("public key has the wrong size")
-	}
-	if len(records) == 0 {
-		return errors.New("no record to publish: a registry with no record cannot load")
 	}
 	want := registryData(records, pub)
 	var errs []error
@@ -309,9 +306,9 @@ type registryState struct {
 	published bool
 }
 
-// run publishes the latest records to each namespace until ctx ends. It writes nothing while the
-// latest set holds no record. A namespace that fails waits
-// backoff, doubling up to 30 s, with jitter, and each namespace has its own wait. A namespace that
+// run publishes the latest records to each namespace until ctx ends. It writes nothing before the
+// plane has set a first set, and a set with no record gives a registry that admits no cell. A
+// namespace that fails waits backoff, doubling up to 30 s, with jitter, and each namespace has its own wait. A namespace that
 // succeeds is read again after resync, and a ConfigMap that differs or is gone is written again. A
 // new set wakes every namespace that is not backing off. The log gets one line for a namespace when
 // its error changes, and one when it recovers.
@@ -320,21 +317,9 @@ func (p *registryPublisher) run(ctx context.Context, c kubernetes.Interface, nam
 	for i, ns := range namespaces {
 		states[i] = &registryState{namespace: ns, wait: backoff}
 	}
-	emptyLogged := false
 	for {
 		now := time.Now()
 		records, pub, ok := p.latest()
-		if ok && len(records) == 0 {
-			// Before the first bind and after a reset there is nothing to publish, and an object
-			// that holds records must not give way to one that holds none.
-			if !emptyLogged {
-				log.Info("registry_empty", "detail", "no record to publish yet")
-				emptyLogged = true
-			}
-			ok = false
-		} else if ok {
-			emptyLogged = false
-		}
 		if ok {
 			want := registryData(records, pub)
 			for _, st := range states {

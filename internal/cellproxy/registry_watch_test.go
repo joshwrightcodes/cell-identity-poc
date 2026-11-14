@@ -145,13 +145,55 @@ func TestRegistryWatchKeepsLastGood(t *testing.T) {
 	}
 }
 
-func TestRegistryWatchFailsAtStart(t *testing.T) {
+func TestRegistryWatchStartsWithNoRecord(t *testing.T) {
 	pub, priv := signerKey(t)
 	dir := writeRegistry(t, []ed25519.PublicKey{pub}, priv)
 	signerFile := filepath.Join(t.TempDir(), "signers.pub")
 	copyFile(t, filepath.Join(dir, "signers.pub"), signerFile)
-	if _, err := WatchRegistry(t.Context(), dir, signerFile, time.Second, slog.New(slog.DiscardHandler)); err == nil {
-		t.Fatal("a registry with no record started")
+	w, err := WatchRegistry(t.Context(), dir, signerFile, time.Second, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("a registry with valid signers and no record: %v", err)
+	}
+	if w.Current().Allows(Source{Env: "dev", Plane: "cell", Cell: "dev-cell-1", Cluster: "dev-cell-1", Role: "otel"}) {
+		t.Fatal("an empty registry admits a cell")
+	}
+}
+
+// The management plane drops the last cell and publishes a registry with no record. The proxy adopts
+// it and admits nobody, and the revision mark of the dropped cell still refuses an older record.
+func TestRegistryWatchAdoptsRegistryWithNoRecord(t *testing.T) {
+	f := newWatchFixture(t, atRevision("dev-cell-1", 1, 3))
+	src := Source{Env: "dev", Plane: "cell", Cell: "dev-cell-1", Cluster: "dev-cell-1", Role: "otel"}
+	if !f.w.Current().Allows(src) {
+		t.Fatal("the cell is not admitted before the drop")
+	}
+	rewriteRegistry(t, f.dir, []ed25519.PublicKey{f.pub}, f.priv)
+	deadline := time.Now().Add(5 * time.Second)
+	for f.w.Current().Allows(src) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the dropped cell is still admitted:\n%s", f.out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := f.w.Current().Stats(); st.Records != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+	rewriteRegistry(t, f.dir, []ed25519.PublicKey{f.pub}, f.priv, atRevision("dev-cell-1", 1, 2))
+	f.waitLog(t, "registry_reload_failed", "lower revision refused")
+}
+
+// A registry that does not verify keeps the last good registry, also when the good one has records.
+func TestRegistryWatchBadSignatureKeepsLastGood(t *testing.T) {
+	f := newWatchFixture(t, atRevision("dev-cell-1", 1, 1))
+	_, otherPriv := signerKey(t)
+	src := writeRegistry(t, nil, otherPriv, atRevision("dev-cell-1", 1, 2))
+	copyFile(t, filepath.Join(src, "dev-cell-1.dsse.json"), filepath.Join(f.dir, "dev-cell-1.dsse.json"))
+	f.waitLog(t, "registry_reload_failed", "dev-cell-1.dsse.json")
+	if e, c := f.revision(t, "dev-cell-1"); e != 1 || c != 1 {
+		t.Fatalf("revision %d.%d after a record with a bad signature", e, c)
+	}
+	if !f.w.Current().Allows(Source{Env: "dev", Plane: "cell", Cell: "dev-cell-1", Cluster: "dev-cell-1", Role: "otel"}) {
+		t.Fatal("the last good registry was dropped")
 	}
 }
 

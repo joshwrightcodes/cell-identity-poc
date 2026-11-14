@@ -71,7 +71,8 @@ func revisionOf(c record.Cell) spec.Revision {
 
 // LoadRegistry reads signers.pub, one base64 Ed25519 key for each line, and every *.dsse.json
 // file in dir. It fails on any record that does not verify under those keys, on a record whose
-// name or environment ParseSource could never give, on no keys and on no records.
+// name or environment ParseSource could never give, and on no keys. A directory with keys and no
+// record gives a registry that admits no cell.
 func LoadRegistry(dir string) (*Registry, error) {
 	keys, err := readSigners(filepath.Join(dir, signersFile))
 	if err != nil {
@@ -95,9 +96,6 @@ func LoadRegistry(dir string) (*Registry, error) {
 			return nil, fmt.Errorf("record %s: %w", filepath.Base(path), err)
 		}
 		reg.cells = append(reg.cells, c)
-	}
-	if len(reg.cells) == 0 {
-		return nil, fmt.Errorf("no *%s record in %s", recordSuffix, dir)
 	}
 	return reg, nil
 }

@@ -656,3 +656,22 @@ func TestCachedCheckThatChangesNothingDoesNotSave(t *testing.T) {
 		t.Fatalf("cached checks saved the state %d times", got-seq)
 	}
 }
+
+// Dropping the last bound cell calls the hook with no record, so that the registry stops admitting
+// the cell.
+func TestOnRecordsCalledWhenTheLastCellDrops(t *testing.T) {
+	var rc recordCalls
+	r := newRig(t, cell1, cell2)
+	r.mod = func(c *Config) { c.OnRecords = rc.on }
+	r.restart(nil)
+	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	base := rc.n()
+	r.plane.Report(mgmtapi.StatusReport{Applied: r.verifySpec().Revision})
+	if rc.n() != base+1 {
+		t.Fatalf("%d hook calls after the drop, want 1", rc.n()-base)
+	}
+	if last := rc.calls[len(rc.calls)-1]; len(last) != 0 {
+		t.Fatalf("the hook got %d records after the last cell dropped", len(last))
+	}
+}

@@ -667,48 +667,36 @@ func TestPublishRegistryRepairsLabelsAndAnnotations(t *testing.T) {
 	}
 }
 
-// No record, no registry: PublishRegistry refuses an empty set, and the publisher writes nothing
-// and leaves an existing object alone until records arrive.
-func TestRegistryPublisherPublishesNothingWhileEmpty(t *testing.T) {
+// No record, no cell: an empty record set gives a registry with signers.pub only, and it replaces
+// the records that an object holds. The publisher does the same for an empty set.
+func TestRegistryPublisherPublishesEmptySet(t *testing.T) {
 	client := fake.NewClientset()
 	pub, priv := newKey(t)
-	if err := PublishRegistry(t.Context(), client, registryNamespaces, map[string]json.RawMessage{}, pub); err == nil {
-		t.Fatal("an empty record set was published")
+	records := registryRecords(t, priv, "dev-cell-1")
+	must(t, PublishRegistry(t.Context(), client, registryNamespaces, records, pub))
+	must(t, PublishRegistry(t.Context(), client, registryNamespaces, map[string]json.RawMessage{}, pub))
+	for _, ns := range registryNamespaces {
+		cm := getRegistry(t, client, ns)
+		if len(cellFiles(cm)) != 0 || cm.Data["signers.pub"] == "" {
+			t.Fatalf("%s: data %v, want signers.pub only", ns, keysOf(cm.Data))
+		}
 	}
-	_, err := client.CoreV1().ConfigMaps("central-view-system").Create(t.Context(), &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "cell-registry", Namespace: "central-view-system"},
-		Data:       map[string]string{"dev-cell-1.dsse.json": "old", "signers.pub": "old\n"},
-	}, metav1.CreateOptions{})
-	must(t, err)
-	var writes atomic.Int32
-	for _, verb := range []string{"create", "update"} {
-		client.PrependReactor(verb, "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
-			writes.Add(1)
-			return false, nil, nil
-		})
-	}
+
 	p := newRegistryPublisher()
-	p.set(map[string]json.RawMessage{}, pub)
-	var logs lockedBuffer
+	p.set(records, pub)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
-		p.run(ctx, client, registryNamespaces, jsonLogger(&logs), time.Millisecond, 20*time.Millisecond)
+		p.run(ctx, client, registryNamespaces, jsonLogger(&lockedBuffer{}), time.Millisecond, 20*time.Millisecond)
 		close(done)
 	}()
 	defer func() { cancel(); <-done }()
-	waitFor(t, "the registry_empty line", func() bool { return strings.Contains(logs.String(), `"msg":"registry_empty"`) })
-	time.Sleep(200 * time.Millisecond)
-	if writes.Load() != 0 || getRegistry(t, client, "central-view-system").Data["dev-cell-1.dsse.json"] != "old" {
-		t.Fatalf("%d writes while no record exists", writes.Load())
-	}
-	if n := strings.Count(logs.String(), `"msg":"registry_empty"`); n != 1 {
-		t.Fatalf("%d registry_empty lines, want 1", n)
-	}
-	records := registryRecords(t, priv, "dev-cell-1")
-	p.set(records, pub)
-	waitFor(t, "the first record", func() bool {
+	waitFor(t, "the record", func() bool {
 		return cellFiles(getRegistry(t, client, "central-view-system"))["dev-cell-1.dsse.json"] == string(records["dev-cell-1"])
+	})
+	p.set(map[string]json.RawMessage{}, pub)
+	waitFor(t, "the empty registry", func() bool {
+		return len(cellFiles(getRegistry(t, client, "central-view-system"))) == 0
 	})
 }
 
