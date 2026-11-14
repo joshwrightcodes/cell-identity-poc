@@ -969,3 +969,31 @@ func TestRoundLogsItemWithoutOutcome(t *testing.T) {
 		t.Errorf("no debug line for the item without an outcome: %v", r.logs.lines())
 	}
 }
+
+// The gateway hands a hint down once. When the status post of that round fails, envd keeps the hint
+// and sends it in the next round.
+func TestHintsFromGatewayKeptWhenTheStatusPostFails(t *testing.T) {
+	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC)
+	r := newRig(t, 3)
+	r.gw.set(func(g *fakeGateway) { g.status = mgmtapi.GatewayStatus{KeyHints: []mgmtapi.KeyHint{{Cell: "dev-cell-1", At: t0}}} })
+	r.mgmt.set(func(m *fakeMgmt) { m.statCode = 500 })
+	sleep := r.cfg.Sleep
+	r.cfg.Sleep = func(ctx context.Context, d time.Duration) error {
+		r.gw.set(func(g *fakeGateway) { g.status = mgmtapi.GatewayStatus{} })
+		r.mgmt.set(func(m *fakeMgmt) { m.statCode = 204 })
+		return sleep(ctx, d)
+	}
+	r.run()
+	reps := r.mgmt.reports()
+	if len(reps) < 3 {
+		t.Fatalf("%d status reports", len(reps))
+	}
+	for i := 0; i < 2; i++ {
+		if got := hintCells(reps[i].KeyHints); !slices.Equal(got, []string{"dev-cell-1"}) {
+			t.Errorf("report %d hints %v, want the gateway hint", i, got)
+		}
+	}
+	if len(reps[2].KeyHints) != 0 {
+		t.Errorf("report 2 repeats a hint that report 1 carried: %v", reps[2].KeyHints)
+	}
+}

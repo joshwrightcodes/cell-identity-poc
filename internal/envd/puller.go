@@ -96,6 +96,8 @@ type Puller struct {
 	outbox     metric.Int64Gauge
 	// hintMarks holds, for each cell, the newest hint that a status report has carried.
 	hintMarks map[string]time.Time
+	// gwHints holds, for each cell, the newest gateway hint that no status report has carried yet.
+	gwHints map[string]time.Time
 	// hintPending holds the unclamped time of each hint of the last status report.
 	hintPending map[string]time.Time
 	// relaySkipped is true while the relay legs wait for the first accepted spec.
@@ -131,7 +133,7 @@ func NewPuller(cfg PullerConfig) *Puller {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
 	}
-	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}}
+	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}}
 	// The instrument names are valid, so creation cannot fail. A failure leaves a no-op instrument.
 	p.counter, _ = cfg.Meter.Int64Gauge("envd.spec.counter",
 		metric.WithDescription("Counter of the last saved spec revision"))

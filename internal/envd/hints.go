@@ -142,8 +142,21 @@ func (p *Puller) pendingHints(ctx context.Context, gw *mgmtapi.GatewayStatus) []
 			return err
 		})
 	}
+	// The gateway hands each hint down once. envd keeps the ones that no report has carried yet, as the
+	// ConfigMap source does through its marks.
 	if gw != nil {
-		all = append(all, gw.KeyHints...)
+		for _, k := range gw.KeyHints {
+			if spec.ValidName(k.Cell) && k.At.After(p.gwHints[k.Cell]) && (len(p.gwHints) < maxHints || !p.gwHints[k.Cell].IsZero()) {
+				p.gwHints[k.Cell] = k.At
+			}
+		}
+	}
+	for cell, at := range p.gwHints {
+		if !at.After(p.hintMarks[cell]) {
+			delete(p.gwHints, cell)
+			continue
+		}
+		all = append(all, mgmtapi.KeyHint{Cell: cell, At: at})
 	}
 	newest := map[string]time.Time{}
 	for _, k := range all {
