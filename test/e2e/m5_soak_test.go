@@ -28,6 +28,7 @@ const (
 func TestStreamSoakHalfHour(t *testing.T) {
 	const cell = rejectCell
 	started := time.Now().Add(-logMargin)
+	forgedAtStart := cellStatusOf(t, cell).ForgedSeen
 	deadline := time.Now().Add(soakDuration)
 	var ids []string
 	var maxGap time.Duration
@@ -75,8 +76,9 @@ func TestStreamSoakHalfHour(t *testing.T) {
 	ended, restarted := celldReconnects(t, cell, started)
 	t.Logf("verify row 1 (the claim gap is sampled once for each operation, %d samples, so an outage between samples is not measured): %d operations in %s, maximum claim gap %s, %d stream failures and %d restarts for a new SVID of the celld stream of %s",
 		len(ids), len(ids), soakDuration, maxGap.Round(time.Millisecond), ended, restarted, cell)
-	if c := cellStatusOf(t, cell); c.ForgedSeen != 0 {
-		t.Errorf("mgmtd counts %d forged results for %s, want 0", c.ForgedSeen, cell)
+	// The counter of mgmtd only grows, and the refusal tests raise it on purpose, so the soak compares it with its value at the start.
+	if c := cellStatusOf(t, cell); c.ForgedSeen != forgedAtStart {
+		t.Errorf("mgmtd counted %d forged results for %s during the soak (%d at the start, %d at the end), want none", c.ForgedSeen-forgedAtStart, cell, forgedAtStart, c.ForgedSeen)
 	}
 }
 

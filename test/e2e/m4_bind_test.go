@@ -24,9 +24,7 @@ import (
 const (
 	// bindNodePort is the node port of the bind listener of the cell gateway in dev-cp.
 	bindNodePort = 30451
-	// denialQuiet is longer than the window (10 s) of the denial log limiter of the gateway, which allows one line for each reason.
-	denialQuiet = 11 * time.Second
-	bindJobWait = 4 * time.Minute
+	bindJobWait  = 4 * time.Minute
 	// trustBundlePath is where a probe Job mounts ConfigMap spire-trust-bundle.
 	trustBundlePath = "/run/spire/bundle/bundle.crt"
 )

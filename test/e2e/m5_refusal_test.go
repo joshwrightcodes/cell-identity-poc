@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gateway"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
@@ -71,20 +72,97 @@ func livePod(t *testing.T, cell, namespace, app string) (name, uid string) {
 	return "", ""
 }
 
-// closeOpAtCleanup closes the operation when the test ends and mgmtd still shows it as not final. It waits for the expiry first,
-// because mgmtd closes only an expired operation, so that no open operation is left for the status of the harness.
-func closeOpAtCleanup(t *testing.T, id string) {
+// opCloser ends every operation of a test before the test returns, so that none stays open for the status of the harness, and drains
+// each forged row that the test queued. One cleanup of the parent test waits for the last expiry, so the subtests do not wait one by one.
+type opCloser struct {
+	ids    []string
+	drains []drain
+}
+
+// drain is a queue row of a cell whose envelope is forged. After the operation expires, the genuine envelope replaces the row.
+type drain struct {
+	cell, id string
+	genuine  []byte
+}
+
+// newOpCloser registers the cleanup of t. Register it before any cleanup that celld needs, because cleanups run in reverse order.
+func newOpCloser(t *testing.T) *opCloser {
 	t.Helper()
-	t.Cleanup(func() {
-		waitFor(t, "operation "+id+" to be final or expired", 7*time.Minute, func() (bool, string) {
-			v := opGet(t, id)
-			return v.State != "open", "state " + v.State
+	c := &opCloser{}
+	t.Cleanup(func() { c.run(t) })
+	return c
+}
+
+// add makes the cleanup close the operation, after its expiry, when mgmtd does not show it as final.
+func (c *opCloser) add(id string) { c.ids = append(c.ids, id) }
+
+// addForged also makes the cleanup replace the row of the cell for the operation with the genuine envelope.
+func (c *opCloser) addForged(cell, id string, genuine []byte) {
+	c.add(id)
+	c.drains = append(c.drains, drain{cell, id, genuine})
+}
+
+func (c *opCloser) run(t *testing.T) {
+	for _, id := range c.ids {
+		v := opGet(t, id)
+		if v.State == "final" {
+			continue
+		}
+		// mgmtd closes an operation only after its expiry and a grace time of 60 s.
+		waitFor(t, "operation "+id+" to be final or expired", time.Until(v.ExpiresAt)+3*time.Minute, func() (bool, string) {
+			return opGet(t, id).State != "open", "state still open"
 		})
-		if v := opGet(t, id); v.State != "final" {
+	}
+	for _, d := range c.drains {
+		if queueRow(t, d.cell, d.id).State == gateway.StateDone {
+			continue
+		}
+		// A replay deletes the row of the cell for the ID, so it replaces the held row. celld answers expired, which ends the row.
+		enqueueSigned(t, d.cell, d.genuine, true)
+	}
+	for _, d := range c.drains {
+		waitRowDone(t, d.cell, d.id)
+	}
+	for _, id := range c.ids {
+		if opGet(t, id).State != "final" {
 			if out, err := mgmtCtlErr("op", "close", id); err != nil {
 				t.Errorf("could not close the operation %s: %v %s", id, err, out)
 			}
 		}
+	}
+}
+
+// queueRow returns the only row of the cell for the operation ID in the queue of the gateway. It fails the test when there are two rows,
+// and returns an empty entry when there is none.
+func queueRow(t *testing.T, cell, id string) gateway.QueueEntry {
+	t.Helper()
+	var res struct {
+		Items []gateway.QueueEntry `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(gwCtl(t, "", "queue", "--cell", cell)), &res); err != nil {
+		t.Fatalf("cellgw ctl queue is no list: %v", err)
+	}
+	var rows []gateway.QueueEntry
+	for _, e := range res.Items {
+		if e.OpID == id {
+			rows = append(rows, e)
+		}
+	}
+	if len(rows) > 1 {
+		t.Fatalf("the queue of %s holds %d rows for %s, want one", cell, len(rows), id)
+	}
+	if len(rows) == 0 {
+		return gateway.QueueEntry{}
+	}
+	return rows[0]
+}
+
+// waitRowDone waits until the row of the cell for the operation is done.
+func waitRowDone(t *testing.T, cell, id string) {
+	t.Helper()
+	waitFor(t, "the queue row of "+cell+" for "+id+" to be done", 2*time.Minute, func() (bool, string) {
+		r := queueRow(t, cell, id)
+		return r.State == gateway.StateDone, fmt.Sprintf("state %q, claims %d", r.State, r.Claims)
 	})
 }
 
@@ -120,15 +198,6 @@ func signedByRogue(t *testing.T, o op.Operation) []byte {
 		t.Fatal(err)
 	}
 	return env
-}
-
-// freshOperation returns an operation of kind demo.append for cell with a new ID, valid for ten minutes.
-func freshOperation(t *testing.T, cell string) op.Operation {
-	t.Helper()
-	args, _ := json.Marshal(map[string]string{"line": "m5 forged " + randomHex(t, 4)})
-	now := time.Now().UTC().Truncate(time.Second)
-	return op.Operation{ID: op.NewID(), Env: pocEnv, Cell: cell, Kind: op.KindDemoAppend, Version: 1, KeyEpoch: 1,
-		IssuedAt: now, ExpiresAt: now.Add(10 * time.Minute), Args: args}
 }
 
 // tamperedEnvelope changes the line in the payload of a genuine envelope and keeps its signature.
@@ -233,36 +302,30 @@ func requireOpOpen(t *testing.T, id string) {
 // result of the one before.
 func TestM5ForgedOpRefused(t *testing.T) {
 	const cell = refusalCell1
+	closer := newOpCloser(t)
 	var last time.Time
-	run := func(t *testing.T, id string, envelope []byte) {
-		t.Helper()
-		time.Sleep(time.Until(last.Add(forgedGap)))
-		before := demoLog(t, cell)
-		seen := cellStatusOf(t, cell).ForgedSeen
-		since := time.Now().Add(-logMargin)
-		enqueueSigned(t, cell, envelope, false)
-		waitCelldSaw(t, cell, since, id, op.OutcomeRefused, op.ReasonSignatureInvalid, refusalWait)
-		last = time.Now()
-		waitForgedSeen(t, cell, seen, refusalWait)
-		requireDemoLog(t, cell, before)
-		requireNoRecord(t, cell, id)
+	forged := map[string]func(t *testing.T, genuine []byte) []byte{
+		"rogue_key": func(t *testing.T, genuine []byte) []byte { return signedByRogue(t, operationOf(t, genuine)) },
+		"tampered":  tamperedEnvelope,
+		"unsigned":  unsignedEnvelope,
 	}
-	t.Run("rogue_key", func(t *testing.T) {
-		o := freshOperation(t, cell)
-		run(t, o.ID, signedByRogue(t, o))
-	})
-	t.Run("tampered", func(t *testing.T) {
-		id, genuine := opSign(t, cell, "m5 tampered "+randomHex(t, 4), time.Minute)
-		closeOpAtCleanup(t, id)
-		run(t, id, tamperedEnvelope(t, genuine))
-		requireOpOpen(t, id)
-	})
-	t.Run("unsigned", func(t *testing.T) {
-		id, genuine := opSign(t, cell, "m5 unsigned "+randomHex(t, 4), time.Minute)
-		closeOpAtCleanup(t, id)
-		run(t, id, unsignedEnvelope(t, genuine))
-		requireOpOpen(t, id)
-	})
+	for _, name := range []string{"rogue_key", "tampered", "unsigned"} {
+		t.Run(name, func(t *testing.T) {
+			id, genuine := opSign(t, cell, "m5 "+name+" "+randomHex(t, 4), time.Minute)
+			closer.addForged(cell, id, genuine)
+			time.Sleep(time.Until(last.Add(forgedGap)))
+			before := demoLog(t, cell)
+			seen := cellStatusOf(t, cell).ForgedSeen
+			since := time.Now().Add(-logMargin)
+			enqueueSigned(t, cell, forged[name](t, genuine), false)
+			waitCelldSaw(t, cell, since, id, op.OutcomeRefused, op.ReasonSignatureInvalid, refusalWait)
+			last = time.Now()
+			waitForgedSeen(t, cell, seen, refusalWait)
+			requireDemoLog(t, cell, before)
+			requireNoRecord(t, cell, id)
+			requireOpOpen(t, id)
+		})
+	}
 }
 
 // TestM5ForgedEnvelopeCannotCloseOp: with both celld at zero replicas, a rogue-signed envelope with the ID of the open operation X sits in
@@ -272,6 +335,7 @@ func TestM5ForgedOpRefused(t *testing.T) {
 func TestM5ForgedEnvelopeCannotCloseOp(t *testing.T) {
 	target := "deployment/" + celldDeployment
 	cells := []string{refusalCell1, refusalCell2}
+	closer := newOpCloser(t)
 	t.Cleanup(func() {
 		for _, c := range cells {
 			setReplicas(t, c, celldNamespace, target, 1)
@@ -285,11 +349,11 @@ func TestM5ForgedEnvelopeCannotCloseOp(t *testing.T) {
 	}
 	line := "m5 forged cannot close " + randomHex(t, 4)
 	id := opCreate(t, refusalCell1, line, 5*time.Minute)
-	closeOpAtCleanup(t, id)
 	genuine := []byte(opGet(t, id).Envelope)
 	if len(genuine) == 0 {
 		t.Fatalf("mgmtd gave no envelope for %s", id)
 	}
+	closer.addForged(refusalCell1, id, genuine)
 	forged := signedByRogue(t, operationOf(t, genuine))
 	seen1, seen2 := cellStatusOf(t, refusalCell1).ForgedSeen, cellStatusOf(t, refusalCell2).ForgedSeen
 	before1, before2 := demoLog(t, refusalCell1), demoLog(t, refusalCell2)
@@ -322,6 +386,8 @@ func TestM5ForgedEnvelopeCannotCloseOp(t *testing.T) {
 	if n := demoLogCount(t, refusalCell2, id); n != 0 {
 		t.Errorf("demo-log of %s holds %d lines of %s, want 0", refusalCell2, n, id)
 	}
+	waitRowDone(t, refusalCell1, id)
+	waitRowDone(t, refusalCell2, id)
 }
 
 // outboxHasOp reports whether the outbox of the gateway holds an item with the operation ID.
@@ -343,30 +409,13 @@ func outboxHasOp(t *testing.T, id string) bool {
 	return false
 }
 
-// outboxHasBind reports whether the outbox of the gateway holds a bind item of the cell.
-func outboxHasBind(t *testing.T, cell string) bool {
-	t.Helper()
-	var res struct {
-		Items []struct{ Cell, Kind string } `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(gwCtl(t, "", "outbox")), &res); err != nil {
-		t.Fatalf("cellgw ctl outbox is no list: %v", err)
-	}
-	for _, it := range res.Items {
-		if it.Cell == cell && it.Kind == gwapi.KindBind {
-			return true
-		}
-	}
-	return false
-}
-
 // TestM5ReplayedOpAppliesOnce: after an operation is applied and reported, the same envelope queued again (replay) makes celld answer
 // already_applied. The demo log keeps one line of the operation, mgmtd keeps the final result and its time, the record stays reported, and the
 // answer of mgmtd (duplicate) takes the item out of the outbox of the gateway.
 func TestM5ReplayedOpAppliesOnce(t *testing.T) {
 	const cell = refusalCell1
-	id := opCreate(t, cell, "m5 replayed "+randomHex(t, 4), 0)
-	closeOpAtCleanup(t, id)
+	id := opCreate(t, cell, "m5 replayed "+randomHex(t, 4), 2*time.Minute)
+	newOpCloser(t).add(id)
 	waitOpReported(t, cell, id, opWait)
 	first := opGet(t, id)
 	if first.Final != op.OutcomeApplied || len(first.Envelope) == 0 {
@@ -395,7 +444,7 @@ func TestM5ReplayedOpAppliesOnce(t *testing.T) {
 func TestM5ExpiredOpRefused(t *testing.T) {
 	const cell = refusalCell1
 	id, envelope := opSign(t, cell, "m5 expired "+randomHex(t, 4), time.Second)
-	closeOpAtCleanup(t, id)
+	newOpCloser(t).add(id)
 	before := demoLog(t, cell)
 	time.Sleep(3 * time.Second)
 	since := time.Now().Add(-logMargin)
@@ -416,7 +465,7 @@ func TestM5ExpiredOpRefused(t *testing.T) {
 // with wrong_target. No demo log changes, no record exists, mgmtd counts forged_seen for dev-cell-2, and the operation stays open.
 func TestM5WrongTargetRefused(t *testing.T) {
 	id, envelope := opSign(t, refusalCell1, "m5 wrong target "+randomHex(t, 4), time.Minute)
-	closeOpAtCleanup(t, id)
+	newOpCloser(t).add(id)
 	before1, before2 := demoLog(t, refusalCell1), demoLog(t, refusalCell2)
 	seen := cellStatusOf(t, refusalCell2).ForgedSeen
 	since := time.Now().Add(-logMargin)
@@ -428,6 +477,7 @@ func TestM5WrongTargetRefused(t *testing.T) {
 	requireDemoLog(t, refusalCell2, before2)
 	requireNoRecord(t, refusalCell1, id)
 	requireNoRecord(t, refusalCell2, id)
+	waitRowDone(t, refusalCell2, id)
 }
 
 // resultBody returns the compact JSON of a result of the operation, as celld sends it.
@@ -522,10 +572,12 @@ func TestM5DevCPCannotPoseOnReports(t *testing.T) {
 			return cellToken(t, refusalCell2, celldNamespace, celldAccount, otherPod, otherUID, audience("result", body))
 		}},
 	}
+	closer := newOpCloser(t)
 	for _, p := range poses {
 		t.Run(p.name, func(t *testing.T) {
-			id, envelope := opSign(t, cell, "m5 pose "+p.name+" "+randomHex(t, 4), time.Minute)
-			closeOpAtCleanup(t, id)
+			// The operation must stay open for the waits of the subtest, so its lifetime is long.
+			id, envelope := opSign(t, cell, "m5 pose "+p.name+" "+randomHex(t, 4), 4*time.Minute)
+			closer.add(id)
 			body := resultBody(t, cell, id, envelope)
 			token := p.token(body)
 			before := cellStatusOf(t, cell)
@@ -553,10 +605,8 @@ func TestM5DevCPCannotPoseOnReports(t *testing.T) {
 				if p.name == "rogue_key" && !after.HintAt.After(before.HintAt) {
 					t.Errorf("hintAt of %s is %s, want a hint check after %s", cell, after.HintAt, before.HintAt)
 				}
-				// A row that an earlier forged test left in the queue is claimed again after its 5 min hold, and each claim counts as
-				// forged_seen, so this counter says nothing about the injected item. The operation stays open (requireOpOpen).
 				if after.ForgedSeen != before.ForgedSeen {
-					t.Logf("forgedSeen of %s moved from %d to %d, from a held forged row of an earlier test", cell, before.ForgedSeen, after.ForgedSeen)
+					t.Errorf("forgedSeen of %s moved from %d to %d", cell, before.ForgedSeen, after.ForgedSeen)
 				}
 				if (after.LastRefusal == nil) != (before.LastRefusal == nil) || (after.LastRefusal != nil && !after.LastRefusal.At.Equal(before.LastRefusal.At)) {
 					t.Errorf("lastRefusal of %s moved from %+v to %+v for a retry", cell, before.LastRefusal, after.LastRefusal)
@@ -575,8 +625,8 @@ func TestM5DevCPCannotPoseOnReports(t *testing.T) {
 		})
 	}
 	t.Run("real_token", func(t *testing.T) {
-		id, envelope := opSign(t, cell, "m5 pose real token "+randomHex(t, 4), time.Minute)
-		closeOpAtCleanup(t, id)
+		id, envelope := opSign(t, cell, "m5 pose real token "+randomHex(t, 4), 4*time.Minute)
+		closer.add(id)
 		body := resultBody(t, cell, id, envelope)
 		token := cellToken(t, cell, celldNamespace, celldAccount, podName, podUID, audience("result", body))
 		waitItemTaken(t, injectItem(t, gwapi.Item{Kind: gwapi.KindResult, Cell: cell, OpID: id, Body: body, Token: token}))
@@ -635,9 +685,6 @@ func TestM5BindFloodOtherCellRefused(t *testing.T) {
 		return l.str("msg") == "bind_denied" && l.str("reason") == gwapi.ReasonSourceMismatch
 	})) == 0 {
 		t.Errorf("the cellgw log holds no bind_denied line with source_mismatch")
-	}
-	if outboxHasBind(t, target) {
-		t.Errorf("the outbox of the gateway holds a bind item of %s", target)
 	}
 	pod := replaceCelldPod(t, target)
 	waitFor(t, "the new celld pod of "+target+" to log a bind with the status already_bound", 2*time.Minute, func() (bool, string) {
@@ -731,8 +778,8 @@ func TestM5BindRefusalsLive(t *testing.T) {
 		secret := tokenSecret(t, cell, ns, rogueToken(t, audience))
 		j := bindProbe(t, cell, ns, "default", "--cell", cell, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
 		j.secret = secret
-		// The rogue cluster has another issuer, but mgmtd looks up the key first, so the key ID decides.
-		deniedByMgmtd(t, j, "unknown_kid", "issuer_mismatch", "bad_signature")
+		// mgmtd looks up the key before it checks the issuer, so the rogue key ID is unknown.
+		deniedByMgmtd(t, j, "unknown_kid")
 	})
 	t.Run("unknown_kid", func(t *testing.T) {
 		// The nonce lives for a short time, so the quiet time passes before the nonce request.

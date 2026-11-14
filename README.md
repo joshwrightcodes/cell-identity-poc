@@ -354,29 +354,33 @@ The reasons are `signature_invalid`, `payload_invalid`, `wrong_target`, `env_mis
 The outcome `expired` means that the operation was late.
 `celld` makes no `op-<id>` record and no `demo-log` line for a refused or expired operation.
 
-An operation that fails `signature_invalid` has no trusted ID.
-`celld` reports it with an empty operation ID, and `mgmtd` counts it as `forgedSeen` for the cell.
+When the envelope does not verify, `celld` cannot trust the ID in it.
+The log line then holds the ID in `peeked_id` and leaves `op_id` empty.
+`celld` reports such a refusal with an empty operation ID, and `mgmtd` counts it as `forgedSeen` for the cell.
 `mgmtd` also counts a result with a wrong cell or a wrong envelope digest.
 Such a result never closes the operation.
 Run `mise run mgmt -- status` to read `forgedSeen` and `lastRefusal` of each cell.
 `mgmtd` logs one `forged_seen` line for each cell in 5 minutes, so read the counter and not the log.
-The gateway holds a row that failed `signature_invalid` for 5 minutes, and ends it after 6 holds.
+After a result with an empty operation ID, the gateway holds the queue row for 5 minutes.
+The row ends at its 6th claim, about 25 minutes after the first.
+To end a held row at once, wait for the operation to expire, then queue its genuine envelope again.
+Run `mise run gw -- enqueue --cell <cell> --replay` with the envelope from `op get` on standard input.
 
 `mgmtd` refuses a result item when its proof does not match the exact body of the item.
 `lastRefusal` shows `proof_missing`, or `proof_invalid` with the detail `wrong_audience` or `subject_mismatch`.
 A token of a key that the record of the cell does not hold gets the answer `retry` with the detail `unknown_kid`.
 `mgmtd` then queues one key check for the cell in 60 seconds, and the counter `mgmtd.report.retry_unknown_kid` rises.
 A refused report item has no request ID.
-Join it with its log line by cell, reason and time.
+The log line `report_refused` holds the kind, the reason and the detail, and `mgmtd` writes one for each such set in 5 minutes.
+The field `lastRefusal` of the cell holds the same set with the time.
 
 An operation that no cell applies stays open until it expires.
-After the expiry, run `mise run mgmt -- op close <id>`.
-`mise run harness:status` fails while an expired operation has no final result.
+When `mise run mgmt -- op get <id>` shows the state `expired`, run `mise run mgmt -- op close <id>`.
+The command refuses during the 60 seconds of grace after the expiry.
 
 The bind listener of the gateway checks the source address first.
-A request for another cell than the node address of the source gets `source_mismatch` and the status 403.
+A request whose source is not the node of the named cell gets `source_mismatch` and the status 403.
 The gateway log shows `bind_denied` with the request ID that the probe prints.
-Run `mise run gate:m5:repair -- --check` after a test run to find test namespaces that remain.
 
 ## Refused keys, signing key rotation and lost state
 
