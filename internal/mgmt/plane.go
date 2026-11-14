@@ -266,9 +266,40 @@ const (
 	rotateFresh         // a new key, and any staged key moves aside
 )
 
+// clearStage drops the staged key from the state in one save and then moves its file aside. It
+// reports whether it changed the state.
+func (p *Plane) clearStage(expect *uint64) (cleared bool, err error) {
+	err = p.commit(func(t *txn) error {
+		if err := t.expectSeq(expect); err != nil {
+			return err
+		}
+		if t.st.StagedKeySHA256 == "" {
+			return nil
+		}
+		t.st.StagedKeySHA256, t.dirty, cleared = "", true, true
+		t.after = append(t.after, p.moveStagedAside)
+		return nil
+	})
+	return cleared && err == nil, err
+}
+
 func (p *Plane) rotate(ctx context.Context, expect *uint64, mode int) (ed25519.PublicKey, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if mode == rotateFresh {
+		// The stage is cleared in a save of its own, before the new key reaches the disk. A crash
+		// between the key write and the save of the rotation then cannot leave a stage that the
+		// emergency meant to discard.
+		cleared, err := p.clearStage(expect)
+		if err != nil {
+			return nil, err
+		}
+		if cleared && expect != nil {
+			// The clearing save raised the state version by one.
+			next := *expect + 1
+			expect = &next
+		}
 	}
 	err := p.commit(func(t *txn) error {
 		if err := t.expectSeq(expect); err != nil {
@@ -276,10 +307,7 @@ func (p *Plane) rotate(ctx context.Context, expect *uint64, mode int) (ed25519.P
 		}
 		next, staged := p.stagedKey(t.st)
 		if mode == rotateFresh {
-			if next, staged = nil, false; t.st.StagedKeySHA256 != "" {
-				t.st.StagedKeySHA256 = ""
-				t.after = append(t.after, p.moveStagedAside)
-			}
+			next, staged = nil, false
 		}
 		if mode == rotateCommit && !staged {
 			return ErrNotStaged

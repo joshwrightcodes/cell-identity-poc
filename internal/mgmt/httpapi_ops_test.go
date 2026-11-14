@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -820,5 +822,59 @@ func TestPlaneGuardedStageKey(t *testing.T) {
 	}
 	if _, err := r.plane.CommitStagedKey(t.Context()); !errors.Is(err, ErrNotStaged) {
 		t.Fatalf("a commit with no stage: %v", err)
+	}
+}
+
+// failAfterStore passes the first n saves and fails every later one.
+type failAfterStore struct {
+	Store
+	left atomic.Int64
+}
+
+func (f *failAfterStore) Save(st *State) error {
+	if f.left.Add(-1) < 0 {
+		return fmt.Errorf("disk full")
+	}
+	return f.Store.Save(st)
+}
+
+// An emergency rotation clears the stage in a save of its own before it writes the new key. When the
+// save of the rotation itself fails, the stage is gone and the old key stays.
+func TestRotateKeyEmergencyClearsTheStageBeforeTheKeyWrite(t *testing.T) {
+	r := newRig(t)
+	fs := &failAfterStore{Store: r.store}
+	fs.left.Store(1 << 30)
+	r.store = fs
+	r.restart(nil)
+	if _, err := r.plane.StageKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	staged1, _ := os.ReadFile(filepath.Join(r.dir, nextKeyFile))
+	before := r.plane.PublicKey()
+	fs.left.Store(1) // the save that clears the stage passes, the save of the rotation fails
+	if _, err := r.plane.RotateKeyEmergency(t.Context()); err == nil {
+		t.Fatal("the rotation did not fail with a failing save")
+	}
+	if !r.plane.PublicKey().Equal(before) {
+		t.Fatal("a failed rotation changed the signing key")
+	}
+	if _, ok := r.plane.StagedPublicKey(); ok || r.status().StagedKey != "" {
+		t.Fatal("the staged key survived a failed emergency rotation")
+	}
+	asides, _ := filepath.Glob(filepath.Join(r.dir, nextKeyFile+".stale-*"))
+	if len(asides) != 1 {
+		t.Fatalf("%d moved staged key files", len(asides))
+	}
+	if b, err := os.ReadFile(asides[0]); err != nil || !bytes.Equal(b, staged1) {
+		t.Fatalf("moved staged key differs: %v", err)
+	}
+	// A restart finds no stage to promote.
+	r.store = fs.Store
+	r.restart(nil)
+	if _, ok := r.plane.StagedPublicKey(); ok {
+		t.Fatal("the stage returned after a restart")
+	}
+	if _, err := r.plane.CommitStagedKey(t.Context()); !errors.Is(err, ErrNotStaged) {
+		t.Fatalf("commit after the failed emergency: %v", err)
 	}
 }
