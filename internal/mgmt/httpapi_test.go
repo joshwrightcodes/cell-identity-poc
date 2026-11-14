@@ -740,7 +740,7 @@ func TestAdminPortalBodyStrict(t *testing.T) {
 				}
 				var m map[string]any
 				_ = json.Unmarshal(rec.Body.Bytes(), &m)
-				if rec.Code != http.StatusBadRequest || m["error"] != bad.want {
+				if rec.Code != http.StatusBadRequest || m["error"] != bad.want || m["reason"] != bad.want {
 					t.Errorf("%s %s chunked=%v: status %d body %q, want 400 %s", route, name, chunked, rec.Code, rec.Body, bad.want)
 				}
 			}
@@ -773,10 +773,10 @@ func TestAdminPortalBodyStrict(t *testing.T) {
 		{"/portal/cancel", `{"cells":["` + cell2 + `"]}`, 422, mgmtapi.ReasonNoStep},
 		{"/portal/retry", `{"cells":["` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonNoStep},
 		{"/portal/recreate", `{"cells":["` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonNotRequested},
-		{"/portal/recreate", `{"cells":["` + cell1 + `","` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
-		{"/portal/retry", `{"cells":[],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
-		{"/portal/cancel", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
-		{"/portal/withdraw", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
+		{"/portal/recreate", `{"cells":["` + cell1 + `","` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, "body_invalid"},
+		{"/portal/retry", `{"cells":[],"bootstrapSHA256":"` + digest + `"}`, 400, "body_invalid"},
+		{"/portal/cancel", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, "body_invalid"},
+		{"/portal/withdraw", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, "body_invalid"},
 		{"/steps/sign", `{"id":"","env":"dev","cell":"` + cell1 + `","kind":"cell.create","version":1,"keyEpoch":0,"issuedAt":"2026-01-01T00:00:00Z","expiresAt":"2026-01-01T01:00:00Z","cluster":{"podSubnet":"10.20.0.0/16","serviceSubnet":"10.21.0.0/16","issuer":"https://x.test"},"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonTestDigestOnly},
 	} {
 		rec := do(h, "POST", tc.route, strings.NewReader(tc.body))
@@ -835,7 +835,7 @@ func TestAdminStepsSign(t *testing.T) {
 	}
 	// A body that the step rules refuse is a bad request, not a server error.
 	body.Cell = "Not A Cell"
-	if rec = do(h, "POST", "/steps/sign", strings.NewReader(marshal(t, body))); rec.Code != 400 || !strings.Contains(rec.Body.String(), "body_invalid") {
+	if rec = do(h, "POST", "/steps/sign", strings.NewReader(marshal(t, body))); rec.Code != 400 || reasonOf(t, rec) != "body_invalid" {
 		t.Fatalf("invalid step: %d %s", rec.Code, rec.Body)
 	}
 }

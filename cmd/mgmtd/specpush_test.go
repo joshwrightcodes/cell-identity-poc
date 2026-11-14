@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -185,6 +186,22 @@ func TestSpecPusherNewOfferDuringBackoffPushesAtOnce(t *testing.T) {
 	waitFor(t, "the push of the new spec", func() bool { return len(h.got()) >= 2 })
 	if string(h.got()[1].env) != "new" {
 		t.Fatalf("pushed %q", h.got()[1].env)
+	}
+}
+
+func TestSpecPusherLogsTheHostAnswer(t *testing.T) {
+	var logs lockedBuffer
+	h := &fakeHost{errs: []error{&mgmtapi.HostError{Reason: mgmtapi.ReasonHostsvcDenied, Status: 403, RequestID: "0123456789abcdef"}}}
+	p := NewSpecPusher(h, time.Hour, jsonLogger(&logs))
+	p.backoffMin, p.backoffMax = time.Hour, time.Hour
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go p.Run(ctx)
+	p.Offer([]byte("x"))
+	waitFor(t, "the failure line", func() bool { return strings.Contains(logs.String(), "spec_push_failed") })
+	lines := jsonLines(t, logs.String())
+	if len(lines) != 1 || lines[0]["reason"] != "hostsvc_denied" || lines[0]["status"] != float64(403) || lines[0]["request_id"] != "0123456789abcdef" {
+		t.Fatalf("log %q", logs.String())
 	}
 }
 

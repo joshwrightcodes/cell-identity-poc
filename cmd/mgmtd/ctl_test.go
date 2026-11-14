@@ -687,13 +687,13 @@ func TestCtlStepSignNotServed(t *testing.T) {
 		reason string
 	}{
 		"other_digest":  {enc(other), 1, mgmtapi.ReasonTestDigestOnly},
-		"empty_input":   {"", 1, ""},
-		"unknown_field": {strings.Replace(enc(body), `{`, `{"force":true,`, 1), 1, ""},
-		"bad_cell":      {strings.Replace(enc(body), `dev-cell-1`, `Not A Cell`, 1), 1, ""},
+		"empty_input":   {"", 1, "body_invalid"},
+		"unknown_field": {strings.Replace(enc(body), `{`, `{"force":true,`, 1), 1, "body_invalid"},
+		"bad_cell":      {strings.Replace(enc(body), `dev-cell-1`, `Not A Cell`, 1), 1, "body_invalid"},
 	} {
 		code, out := r.ctl(tc.stdin, "step", "sign")
 		lines := jsonLines(t, out)
-		if code != tc.code || len(lines) != 1 || lines[0]["level"] != "ERROR" || tc.reason != "" && lines[0]["reason"] != tc.reason {
+		if code != tc.code || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["reason"] != tc.reason {
 			t.Errorf("%s: exit %d output %q", name, code, out)
 		}
 	}

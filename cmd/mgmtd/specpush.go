@@ -116,15 +116,22 @@ func (p *SpecPusher) Run(ctx context.Context) {
 			}
 			if err != nil {
 				reason := mgmtapi.ReasonHostsvcUnavailable
+				attrs := []any{}
 				var he *mgmtapi.HostError
 				if errors.As(err, &he) {
 					reason = he.Reason
+					if he.Status != 0 {
+						attrs = append(attrs, "status", he.Status)
+					}
+					if he.RequestID != "" {
+						attrs = append(attrs, "request_id", he.RequestID)
+					}
 				}
 				p.mu.Lock()
 				p.lastErr = reason
 				p.mu.Unlock()
 				if _, ok, suppressed, _ := p.limit.Allow("spec_push_failed"); ok {
-					p.log.Warn("spec_push_failed", "reason", reason, "retry_in", wait.String(), "suppressed", suppressed)
+					p.log.Warn("spec_push_failed", append(attrs, "reason", reason, "retry_in", wait.String(), "suppressed", suppressed)...)
 				}
 				announce = true
 				timer = time.After(wait + time.Duration(rand.Int64N(int64(wait)/4+1)))

@@ -33,8 +33,8 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 )
 
-// maxRequestBody is the largest body of a status post or an admin request. A report post has its
-// own larger limits.
+// maxRequestBody is the largest body of an admin request. A status post and a report post have
+// their own larger limits.
 const maxRequestBody = 16 << 10
 
 // maxStatusBody is the largest body of a status post. It holds up to 32 step statuses and the
@@ -336,8 +336,15 @@ func refusalStatus(status int, out map[string]any, err error) (int, map[string]a
 	return status, out
 }
 
+// badRequest answers 400. A fixed word for a bad body is also the reason, so that a refusal of an
+// admin route always has the shape that ctl prints.
 func badRequest(w http.ResponseWriter, msg string) {
-	writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg})
+	out := map[string]any{"error": msg}
+	switch msg {
+	case "body_invalid", "body_too_large", "body_unreadable", "ttl_invalid":
+		out["reason"] = msg
+	}
+	writeJSON(w, http.StatusBadRequest, out)
 }
 
 // expectSeq reads the query expect-seq.

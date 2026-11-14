@@ -851,12 +851,21 @@ func TestAPILogLineCarriesATraceID(t *testing.T) {
 type specHost struct {
 	mu     sync.Mutex
 	bodies [][]byte
+	peers  []string
 }
 
 func (h *specHost) got() [][]byte {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return slices.Clone(h.bodies)
+}
+
+func authorityPool(ca *spiffetest.CA) *x509.CertPool {
+	pool := x509.NewCertPool()
+	for _, c := range ca.Bundle().X509Authorities() {
+		pool.AddCert(c)
+	}
+	return pool
 }
 
 func startSpecHost(t *testing.T, f *fixture) *specHost {
@@ -867,12 +876,23 @@ func startSpecHost(t *testing.T, f *fixture) *specHost {
 	h := &specHost{}
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
+		peer := ""
+		if len(r.TLS.PeerCertificates) > 0 {
+			if id, err := x509svid.IDFromCert(r.TLS.PeerCertificates[0]); err == nil {
+				peer = id.String()
+			}
+		}
+		if peer != mgmtID {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
 		if r.Method != http.MethodPut || r.URL.Path != mgmtapi.HostSpecPath {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		h.mu.Lock()
 		h.bodies = append(h.bodies, body)
+		h.peers = append(h.peers, peer)
 		n := len(h.bodies)
 		h.mu.Unlock()
 		if n == 1 {
@@ -882,7 +902,10 @@ func startSpecHost(t *testing.T, f *fixture) *specHost {
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})}
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13,
+		ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: authorityPool(f.mgmtCA),
+	})
 	must(t, err)
 	go srv.Serve(ln)
 	t.Cleanup(func() { _ = srv.Close() })
@@ -935,6 +958,16 @@ func TestStatusShowsValidAndSteps(t *testing.T) {
 		t.Error("the status never showed hostsvc_busy")
 	}
 	first := host.got()
+	host.mu.Lock()
+	for _, p := range host.peers {
+		if p != mgmtID {
+			t.Errorf("a push came from %q, want %q", p, mgmtID)
+		}
+	}
+	if len(host.peers) != len(first) {
+		t.Errorf("%d pushes and %d recorded peers", len(first), len(host.peers))
+	}
+	host.mu.Unlock()
 	if len(first) < 2 || !slices.Equal(first[0], first[1]) || !slices.Equal(first[len(first)-1], servedSpec()) {
 		t.Fatalf("the host service got %d pushes that differ from the served spec", len(first))
 	}
