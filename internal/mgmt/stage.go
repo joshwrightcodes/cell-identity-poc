@@ -1,6 +1,8 @@
 package mgmt
 
 import (
+	"bytes"
+	"encoding/json"
 	"slices"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
@@ -11,7 +13,7 @@ import (
 func (p *Plane) reconcile(t *txn) error {
 	var gone []string
 	for _, name := range sortedKeys(t.st.Cells) {
-		if _, ok := p.intent[name]; !ok {
+		if _, ok := p.cellIn(t.st, name); !ok {
 			gone = append(gone, name)
 		}
 	}
@@ -22,8 +24,13 @@ func (p *Plane) reconcile(t *txn) error {
 	if t.st.Served != 0 {
 		return nil
 	}
+	if p.stepIndexStale(t) {
+		if err := t.revise(); err != nil {
+			return err
+		}
+	}
 	for _, name := range sortedKeys(t.st.Cells) {
-		ic, ok := p.intent[name]
+		ic, ok := p.cellIn(t.st, name)
 		if !ok || slices.Equal(t.st.Cells[name].Subjects, sortedSubjects(ic.Subjects)) {
 			continue
 		}
@@ -48,7 +55,7 @@ func (p *Plane) dropNext(applied spec.Revision) error {
 		for len(t.st.PendingDrops) > 0 {
 			name := t.st.PendingDrops[0]
 			cs := t.st.Cells[name]
-			if _, in := p.intent[name]; in || cs == nil {
+			if _, in := p.cellIn(t.st, name); in || cs == nil {
 				t.st.PendingDrops = t.st.PendingDrops[1:]
 				t.dirty = true
 				continue
@@ -65,4 +72,24 @@ func (p *Plane) dropNext(applied spec.Revision) error {
 		}
 		return nil
 	})
+}
+
+// stepIndexStale reports whether the steps that the state holds differ from the steps that the
+// newest signed spec indexes, for example after a cell left the catalog.
+func (p *Plane) stepIndexStale(t *txn) bool {
+	var have map[string]json.RawMessage
+	if l := t.st.latest(); l != nil {
+		have = l.Bundle.Steps
+	}
+	want := 0
+	for name, r := range t.st.Requests {
+		if _, in := p.cellIn(t.st, name); !in || !r.Step.open() {
+			continue
+		}
+		want++
+		if !bytes.Equal(have[name], r.Step.Envelope) {
+			return true
+		}
+	}
+	return want != len(have)
 }

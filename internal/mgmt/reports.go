@@ -82,6 +82,7 @@ type cellRuntime struct {
 	forged             []ForgedSeen
 	hintAt             time.Time
 	lastHintCheck      string
+	invalidSince       time.Time
 }
 
 type liveState struct {
@@ -153,7 +154,8 @@ func (p *Plane) Wait() { p.bg.Wait() }
 // queueHint starts a hint key check for a bound cell, at most once per hintEvery for each cell. The
 // check runs in the background.
 func (p *Plane) queueHint(cell string) {
-	if _, ok := p.intent[cell]; !ok || p.snap.Load().st.Cells[cell] == nil {
+	st := p.snap.Load().st
+	if _, ok := p.cellIn(st, cell); !ok || st.Cells[cell] == nil {
 		return
 	}
 	now := p.cfg.Now()
@@ -270,10 +272,11 @@ func refused(it mgmtapi.ReportItem, reason, detail string) mgmtapi.ItemOutcome {
 // claims, or the outcome to answer with.
 func (p *Plane) verifyItem(it mgmtapi.ReportItem, now time.Time) (clusterjwt.Claims, *mgmtapi.ItemOutcome) {
 	fail := func(o mgmtapi.ItemOutcome) (clusterjwt.Claims, *mgmtapi.ItemOutcome) { return clusterjwt.Claims{}, &o }
-	if _, ok := p.intent[it.Cell]; !ok {
+	st := p.snap.Load().st
+	if _, ok := p.cellIn(st, it.Cell); !ok {
 		return fail(refused(it, mgmtapi.ReasonCellUnknown, ""))
 	}
-	cs := p.snap.Load().st.Cells[it.Cell]
+	cs := st.Cells[it.Cell]
 	if cs == nil {
 		return fail(refused(it, mgmtapi.ReasonNotBound, ""))
 	}
@@ -504,7 +507,7 @@ func (p *Plane) noteItem(ctx context.Context, it mgmtapi.ReportItem, o mgmtapi.I
 		attribute.String("kind", kind), attribute.String("outcome", o.Outcome),
 		attribute.String("reason", o.Reason), attribute.String("detail", o.Detail)))
 	if o.Outcome == mgmtapi.OutcomeRefused {
-		if _, ok := p.intent[it.Cell]; ok {
+		if _, ok := p.cellIn(p.snap.Load().st, it.Cell); ok {
 			p.rmu.Lock()
 			p.rt.cell(it.Cell).refusal = &ItemRefusal{Kind: kind, Reason: o.Reason, Detail: o.Detail, At: p.cfg.Now()}
 			p.rmu.Unlock()

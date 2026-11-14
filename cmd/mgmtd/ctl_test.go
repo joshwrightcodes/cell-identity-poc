@@ -38,6 +38,7 @@ func TestAdminCommandsPrintOneLine(t *testing.T) {
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	var published atomic.Int32
 	publish := func(context.Context, ed25519.PublicKey) error { published.Add(1); return nil }
 	sock := filepath.Join(f.sockDir, "c.sock")
@@ -139,6 +140,7 @@ func newAdminRig(t *testing.T, publish func(context.Context, ed25519.PublicKey) 
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	sock := filepath.Join(f.sockDir, "c.sock")
 	ln, err := listenAdmin(sock)
 	must(t, err)
@@ -296,6 +298,27 @@ func bindFixture(t *testing.T, f *fixture) (func(args ...string) (int, string), 
 	}, plane
 }
 
+// requestCell asks for dev-cell-1 through the portal, as the cell fixtures of the catalog need.
+func requestCell(t *testing.T, plane *mgmt.Plane) {
+	t.Helper()
+	_, err := plane.PortalRequest(t.Context(), []string{"dev-cell-1"}, strings.Repeat("a", 64))
+	must(t, err)
+}
+
+// seedRequestedState leaves a state with dev-cell-1 requested and not bound in the data directory
+// of f, where a serve then finds it.
+func seedRequestedState(t *testing.T, f *fixture) {
+	t.Helper()
+	in, err := mgmt.LoadIntent(f.args["intent"])
+	must(t, err)
+	plane, err := mgmt.NewPlane(mgmt.Config{
+		Intent: in, KeyPath: filepath.Join(f.dir, "data", "ed25519.key"), Keys: stubKeys{},
+		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
+	})
+	must(t, err)
+	requestCell(t, plane)
+}
+
 // seedBoundState binds dev-cell-1 with a token that a stub key source accepts, and leaves the state
 // and the signing key in the data directory of f, where a serve then finds a record.
 func seedBoundState(t *testing.T, f *fixture) *mgmt.Plane {
@@ -308,6 +331,7 @@ func seedBoundState(t *testing.T, f *fixture) *mgmt.Plane {
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	nonce, err := plane.Nonce("dev-cell-1")
 	must(t, err)
 	tok := signer.Token(t, kubetoken.Claims{

@@ -82,7 +82,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{dir: t.TempDir(), devCA: spiffetest.NewCA(t, "dev.env.poc.internal"), mgmtCA: spiffetest.NewCA(t, "mgmt.poc.internal"), kube: fake.NewClientset()}
 	intent := filepath.Join(f.dir, "intent.json")
-	must(t, os.WriteFile(intent, []byte(`{"env":"dev","bindSubject":{"namespace":"cell-identity-system","serviceAccount":"celld"},"cells":[{"name":"dev-cell-1","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"}]}]}`), 0o600))
+	must(t, os.WriteFile(intent, []byte(`{"env":"dev","bindSubject":{"namespace":"cell-identity-system","serviceAccount":"celld"},"cells":[{"name":"dev-cell-1","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"}],"cluster":{"podSubnet":"10.20.0.0/16","serviceSubnet":"10.21.0.0/16","issuer":"https://dev-cell-1.test"}}]}`), 0o600))
 	bundle := filepath.Join(f.dir, "peer-root.pem")
 	pemBytes, err := f.devCA.Bundle().Marshal()
 	must(t, err)
@@ -249,6 +249,8 @@ func TestServeRequiresFlags(t *testing.T) {
 
 func TestServeEndToEnd(t *testing.T) {
 	f := newFixture(t)
+	seedRequestedState(t, f)
+	must(t, os.Remove(filepath.Join(f.dir, "data", "ed25519.key")))
 	r := f.start(t)
 
 	// Health is 200 once the plane has loaded.

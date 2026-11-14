@@ -8,7 +8,7 @@ import (
 )
 
 const goodIntent = `{"env":"dev","bindSubject":{"namespace":"cell-identity-system","serviceAccount":"celld"},
-"cells":[{"name":"dev-cell-1","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"},{"namespace":"cell-identity-system","serviceAccount":"spire-agent"}]}]}`
+"cells":[{"name":"dev-cell-1","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"},{"namespace":"cell-identity-system","serviceAccount":"spire-agent"}],"cluster":{"podSubnet":"10.20.0.0/16","serviceSubnet":"10.21.0.0/16","issuer":"https://dev-cell-1.test"}}]}`
 
 func writeIntent(t *testing.T, body string) string {
 	t.Helper()

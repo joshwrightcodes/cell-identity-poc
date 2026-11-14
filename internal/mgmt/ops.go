@@ -56,7 +56,7 @@ func (p *Plane) CreateOp(ctx context.Context, cell, kind string, args json.RawMe
 	if ttl < op.MinTTL || ttl > op.MaxTTL {
 		return op.Operation{}, nil, refuse(mgmtapi.ReasonPayloadInvalid, "ttl")
 	}
-	if _, ok := p.intent[cell]; !ok {
+	if _, ok := p.cellIn(p.snap.Load().st, cell); !ok {
 		return op.Operation{}, nil, refuse(mgmtapi.ReasonCellUnknown, "")
 	}
 	if kind != op.KindDemoAppend {
@@ -70,6 +70,9 @@ func (p *Plane) CreateOp(ctx context.Context, cell, kind string, args json.RawMe
 		env []byte
 	)
 	err := p.commit(func(t *txn) error {
+		if _, ok := p.cellIn(t.st, cell); !ok {
+			return refuse(mgmtapi.ReasonCellUnknown, "")
+		}
 		if t.st.Cells[cell] == nil {
 			return refuse(mgmtapi.ReasonNotBound, "")
 		}
@@ -160,7 +163,7 @@ func (p *Plane) OpenOps() mgmtapi.OpsBundle {
 			b.Ops = append(b.Ops, slices.Clone(json.RawMessage(o.Envelope)))
 		}
 	}
-	for _, name := range sortedKeys(p.intent) {
+	for _, name := range p.intentNames(st) {
 		nonce, exp := p.nonces.Issue(name)
 		b.Cells = append(b.Cells, mgmtapi.CellInfo{Name: name, Nonce: nonce, NonceExpiresAt: exp, Bound: st.Cells[name] != nil})
 	}
@@ -288,10 +291,10 @@ func (p *Plane) OpView(id string) (OpView, error) {
 // OpViews returns the operations of cell, or every operation when cell is empty, oldest first and
 // without envelopes. An unknown cell is an error.
 func (p *Plane) OpViews(cell string) ([]OpView, error) {
-	if _, ok := p.intent[cell]; cell != "" && !ok {
+	st := p.snap.Load().st
+	if _, ok := p.cellIn(st, cell); cell != "" && !ok {
 		return nil, refuse(mgmtapi.ReasonCellUnknown, "")
 	}
-	st := p.snap.Load().st
 	out := []OpView{}
 	for _, id := range st.OpOrder {
 		if o := st.Ops[id]; cell == "" || o.Cell == cell {

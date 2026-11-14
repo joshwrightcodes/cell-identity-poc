@@ -22,6 +22,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/kubetoken"
 )
 
@@ -170,10 +171,14 @@ func mergeJWKS(signers ...*kubetoken.Signer) json.RawMessage {
 	return b
 }
 
+func testCluster(cell string) step.ClusterRef {
+	return step.ClusterRef{PodSubnet: "10.20.0.0/16", ServiceSubnet: "10.21.0.0/16", Issuer: "https://" + cell + ".test"}
+}
+
 func testIntent(cells ...string) Intent {
 	in := Intent{Env: "dev", BindSubject: celld}
 	for _, c := range cells {
-		in.Cells = append(in.Cells, IntentCell{Name: c, Subjects: []record.Subject{celld, agent}})
+		in.Cells = append(in.Cells, IntentCell{Name: c, Subjects: []record.Subject{celld, agent}, Cluster: testCluster(c)})
 	}
 	return in
 }
@@ -190,6 +195,7 @@ type rig struct {
 	ticks   chan time.Time
 	signers map[string]*kubetoken.Signer
 	mod     func(*Config)
+	started bool
 }
 
 func newSigner(t testing.TB, kid string) *kubetoken.Signer {
@@ -197,7 +203,12 @@ func newSigner(t testing.TB, kid string) *kubetoken.Signer {
 	return kubetoken.NewSigner(t, kid, jose.ES256)
 }
 
-func newRig(t *testing.T, cells ...string) *rig {
+func newRig(t *testing.T, cells ...string) *rig { return newRigWith(t, true, cells...) }
+
+// newBareRig is a rig whose catalog holds the cells but whose plane has no request.
+func newBareRig(t *testing.T, cells ...string) *rig { return newRigWith(t, false, cells...) }
+
+func newRigWith(t *testing.T, requested bool, cells ...string) *rig {
 	t.Helper()
 	if len(cells) == 0 {
 		cells = []string{cell1, cell2}
@@ -211,6 +222,7 @@ func newRig(t *testing.T, cells ...string) *rig {
 		logs:    &lockedBuf{},
 		ticks:   make(chan time.Time),
 		signers: map[string]*kubetoken.Signer{},
+		started: !requested,
 	}
 	log := slog.New(slog.NewJSONHandler(r.logs, nil))
 	r.store = &FileStore{Path: filepath.Join(r.dir, "state.json"), Log: log, Now: r.clk.Now}
@@ -242,7 +254,7 @@ func cloneIntent(in Intent) Intent {
 	out := in
 	out.Cells = make([]IntentCell, len(in.Cells))
 	for i, c := range in.Cells {
-		out.Cells[i] = IntentCell{Name: c.Name, Subjects: append([]record.Subject(nil), c.Subjects...)}
+		out.Cells[i] = IntentCell{Name: c.Name, Subjects: append([]record.Subject(nil), c.Subjects...), Cluster: c.Cluster}
 	}
 	return out
 }
@@ -254,6 +266,26 @@ func (r *rig) start() {
 		r.t.Fatalf("NewPlane: %v", err)
 	}
 	r.plane = p
+	if !r.started {
+		r.started = true
+		r.requestAll()
+	}
+}
+
+// requestAll puts a request, with no step and no new revision, on every catalog cell, as the first
+// start of a plane that the portal already served.
+func (r *rig) requestAll() {
+	r.t.Helper()
+	err := r.plane.commit(func(t *txn) error {
+		for _, c := range r.intent.Cells {
+			t.st.Requests[c.Name] = &Request{RequestID: "test", RequestedAt: t.now}
+		}
+		t.dirty = true
+		return nil
+	})
+	if err != nil {
+		r.t.Fatalf("request cells: %v", err)
+	}
 }
 
 func (r *rig) token(cell, nonce string, sig *kubetoken.Signer, mod func(*kubetoken.Claims)) string {
