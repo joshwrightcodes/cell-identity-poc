@@ -4,6 +4,7 @@
 //	envd run --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
 //	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
+//	  --steps-configmap <ns>/<name> --step-status-configmap <ns>/<name>
 //	  [--interval 10s] [--health-listen :8080]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
@@ -210,6 +211,10 @@ type runConfig struct {
 	gatewayID    spiffeid.ID
 	hintsNS      string
 	hintsName    string
+	stepsNS      string
+	stepsName    string
+	statusNS     string
+	statusName   string
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -226,6 +231,8 @@ func parseRun(args []string) (runConfig, error) {
 	gateway := fs.String("gateway", "", "base URL of the cell gateway, https://<host>:<port>")
 	gatewayID := fs.String("gateway-id", "", "the exact SPIFFE ID of the cell gateway")
 	hints := fs.String("hints-configmap", "", "ConfigMap that holds the key hints, as <namespace>/<name>")
+	steps := fs.String("steps-configmap", "", "ConfigMap that holds the signed steps for the cell controller, as <namespace>/<name>")
+	stepStatus := fs.String("step-status-configmap", "", "ConfigMap that holds the step status of the cell controller, as <namespace>/<name>")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
@@ -233,6 +240,7 @@ func parseRun(args []string) (runConfig, error) {
 		"upstream": *upstream, "expect-id": *expect, "peer-bundle": *bundle, "peer-trust-domain": *td,
 		"spec-key-file": *keyFile, "env": *env, "output-configmap": *out,
 		"gateway": *gateway, "gateway-id": *gatewayID, "hints-configmap": *hints,
+		"steps-configmap": *steps, "step-status-configmap": *stepStatus,
 	}); err != nil {
 		return runConfig{}, err
 	}
@@ -281,9 +289,18 @@ func parseRun(args []string) (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
+	sns, sname, err := configMapRef("steps-configmap", *steps)
+	if err != nil {
+		return runConfig{}, err
+	}
+	stns, stname, err := configMapRef("step-status-configmap", *stepStatus)
+	if err != nil {
+		return runConfig{}, err
+	}
 	return runConfig{upstream: *upstream, expect: id, peer: peer, key: key, env: *env, namespace: ns,
 		configMap: cm, interval: *interval, healthListen: *health,
-		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname}, nil
+		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
+		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname}, nil
 }
 
 func runCommand(ctx context.Context, cfg runConfig, stdout io.Writer, d deps) int {
@@ -325,17 +342,19 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	}
 	keys := []ed25519.PublicKey{cfg.key}
 	puller := envd.NewPuller(envd.PullerConfig{
-		Client:   mgmtClient,
-		BaseURL:  "https://" + cfg.upstream,
-		Env:      cfg.env,
-		Keys:     keys,
-		Store:    envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
-		Gateway:  gateway,
-		Hints:    envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
-		Interval: cfg.interval,
-		Log:      tel.Log,
-		Meter:    tel.Meter,
-		Tracer:   tel.Tracer,
+		Client:     mgmtClient,
+		BaseURL:    "https://" + cfg.upstream,
+		Env:        cfg.env,
+		Keys:       keys,
+		Store:      envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
+		Gateway:    gateway,
+		Hints:      envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
+		Steps:      envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
+		StepStatus: envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
+		Interval:   cfg.interval,
+		Log:        tel.Log,
+		Meter:      tel.Meter,
+		Tracer:     tel.Tracer,
 	})
 
 	ln, err := net.Listen("tcp", cfg.healthListen)

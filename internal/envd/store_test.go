@@ -88,8 +88,11 @@ func TestStoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflectEqual(got, cur) {
-		t.Fatalf("loaded %+v, want %+v", got, cur)
+	// A loaded state holds no verified steps, so only the flag differs from the accepted one.
+	want := cloneState(cur)
+	want.stepsVerified = false
+	if !reflectEqual(got, want) {
+		t.Fatalf("loaded %+v, want %+v", got, want)
 	}
 	cm, err := c.CoreV1().ConfigMaps(testNS).Get(t.Context(), testName, metav1.GetOptions{})
 	if err != nil {

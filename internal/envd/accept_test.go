@@ -130,7 +130,11 @@ func (f *fx) base() (*State, []item) {
 
 func cloneState(s *State) *State {
 	c := &State{Revision: s.Revision, SpecSHA256: s.SpecSHA256, SpecEnvelope: slices.Clone(s.SpecEnvelope),
-		Records: map[string][]byte{}, Cells: map[string]record.Cell{}, Marks: map[string]spec.Revision{}}
+		Records: map[string][]byte{}, Cells: map[string]record.Cell{}, Marks: map[string]spec.Revision{},
+		Steps: map[string][]byte{}, stepsVerified: s.stepsVerified}
+	for k, v := range s.Steps {
+		c.Steps[k] = slices.Clone(v)
+	}
 	for k, v := range s.Records {
 		c.Records[k] = slices.Clone(v)
 	}
