@@ -1,7 +1,11 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -10,6 +14,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
 const cell1, cell2 = "dev-cell-1", "dev-cell-2"
@@ -351,12 +356,17 @@ func TestCompleteEmptyOpIDByLease(t *testing.T) {
 	if _, err := f.s.CompleteWithItem(ctx, cell1, a.ID, it, a.Fence); err != nil {
 		t.Fatal(err)
 	}
-	f.clk.Advance(time.Hour)
-	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
-		t.Fatalf("a result with an empty OpID left the row claimable: %+v", l)
+	if d, _ := f.s.Depth(ctx, cell1); d != 1 {
+		t.Fatal("a result with an empty OpID marked the row done")
 	}
-	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
-		t.Fatal("row not done")
+	f.clk.Advance(ForgedHold - time.Second)
+	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
+		t.Fatalf("the row was claimable inside the hold: %+v", l)
+	}
+	f.clk.Advance(2 * time.Second)
+	l, _ := f.s.Claim(ctx, cell1, "pod")
+	if l == nil || l.OpID != a.OpID || l.Fence.Compare(a.Fence) <= 0 {
+		t.Fatalf("after the hold the row gave %+v, want the same op under a higher fence", l)
 	}
 }
 
@@ -546,5 +556,64 @@ func TestClaimReadsEpochInTransaction(t *testing.T) {
 	l, _ := f.s.Claim(ctx, cell1, "pod")
 	if l == nil || l.Fence.Epoch != old+6 {
 		t.Fatalf("claim fence %+v, want epoch %d", l, old+6)
+	}
+}
+
+// A key rotation re-signs an open op under a key that the cell does not pin yet. The cell refuses it
+// with an empty OpID. After the cell trusts the new key, the gateway delivers the re-signed op
+// again, and the cell verifies it and ends it.
+func TestRotationKeepsResignedOp(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	oldEnv := f.opEnv(opID(7), cell1, 1)
+	if _, added, err := f.s.Enqueue(ctx, cell1, oldEnv); err != nil || !added {
+		t.Fatal(added, err)
+	}
+	_, newPriv, _ := ed25519.GenerateKey(rand.Reader)
+	newPub := newPriv.Public().(ed25519.PublicKey)
+	o, _, err := op.Verify(oldEnv, []ed25519.PublicKey{f.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o.KeyEpoch = 2
+	newEnv, err := op.Sign(o, newPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := f.s.Enqueue(ctx, cell1, newEnv); err != nil {
+		t.Fatal(err)
+	}
+	l, err := f.s.Claim(ctx, cell1, "pod-a")
+	if err != nil || l == nil || !bytes.Equal(l.Envelope, newEnv) {
+		t.Fatalf("claim %+v, %v: want the re-signed envelope", l, err)
+	}
+	if _, _, err := op.Verify(l.Envelope, []ed25519.PublicKey{f.pub}); !errors.Is(err, record.ErrSignature) {
+		t.Fatalf("old pin: %v", err)
+	}
+	pid, _, _, _ := op.Peek(l.Envelope)
+	body, _ := json.Marshal(op.Result{PeekedID: pid, Cell: cell1, Outcome: op.OutcomeRefused,
+		Reason: op.ReasonSignatureInvalid, Fence: l.Fence, EnvelopeSHA256: op.EnvelopeSHA256(l.Envelope)})
+	it := gwapi.Item{Kind: gwapi.KindResult, Cell: cell1, Body: body, Token: "tok"}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l.ID, it, l.Fence); err != nil {
+		t.Fatal(err)
+	}
+
+	f.clk.Advance(ForgedHold + time.Second)
+	if _, added, err := f.s.Enqueue(ctx, cell1, newEnv); err != nil || added {
+		t.Fatalf("sync again: added %v, %v", added, err)
+	}
+	l2, err := f.s.Claim(ctx, cell1, "pod-b")
+	if err != nil || l2 == nil || !bytes.Equal(l2.Envelope, newEnv) {
+		t.Fatalf("after the hold: %+v, %v; want the re-signed op", l2, err)
+	}
+	if _, _, err := op.Verify(l2.Envelope, []ed25519.PublicKey{f.pub, newPub}); err != nil {
+		t.Fatalf("the cell does not accept the re-signed op: %v", err)
+	}
+	done := gwapi.Item{Kind: gwapi.KindResult, Cell: cell1, OpID: o.ID, Body: body, Token: "tok"}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l2.ID, done, l2.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatal("the applied op is still open")
 	}
 }

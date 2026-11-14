@@ -683,6 +683,7 @@ func TestStreamForgedItemNotLeasedAgain(t *testing.T) {
 	it := resultItem(cell1, "")
 	c.send(gwapi.Frame{Type: gwapi.TypeResult, LeaseID: lease.LeaseID, Fence: lease.Fence, Item: &it})
 	c.expect(gwapi.TypeAck)
+	// The row is on hold, not done, so the next claim gives nothing for now.
 	c.send(gwapi.Frame{Type: gwapi.TypeClaim})
 	c.expect(gwapi.TypeNone)
 }

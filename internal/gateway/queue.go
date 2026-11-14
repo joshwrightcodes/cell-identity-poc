@@ -181,8 +181,16 @@ func (s *Store) claim(ctx context.Context, cell, holder string, requireLive bool
 	return l, nil
 }
 
+// ForgedHold is how long the row of a lease stays out of reach after a result with an empty
+// operation ID. Such a result means that the cell could not verify the envelope, for example because
+// a key rotation signed it with a key that the cell does not pin yet. The row stays open, so the
+// envelope is delivered again when the cell trusts the key, and a planted envelope costs one claim in
+// each hold.
+const ForgedHold = 5 * time.Minute
+
 // CompleteWithItem appends the result item and finds the queue row by leaseID, never by it.OpID.
-// It marks the row done when f is at or above the lease fence of the row. It returns
+// It marks the row done when f is at or above the lease fence of the row. When it.OpID is empty it
+// holds the row for ForgedHold instead and leaves it open. It returns
 // gwapi.ErrLeaseLost, with the item still appended and its ID returned, only when a live lease
 // holds a higher fence. A call only appends, and never marks a row, when leaseID is empty, does not
 // parse, names another store file, names a row of another cell, or when it.OpID is not empty and
@@ -225,6 +233,10 @@ func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it g
 		if f.Compare(cur) < 0 && until > s.now().UnixNano() {
 			lost = true
 			return nil
+		}
+		if it.OpID == "" {
+			_, err = tx.Exec(`UPDATE queue SET lease_until = ? WHERE seq = ?`, s.now().Add(ForgedHold).UnixNano(), seq)
+			return err
 		}
 		_, err = tx.Exec(`UPDATE queue SET done = 1, done_at = ? WHERE seq = ?`, s.now().UnixNano(), seq)
 		return err
