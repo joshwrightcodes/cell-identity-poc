@@ -82,6 +82,11 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		ReasonCellUnknown, ReasonNonceInvalid, ReasonTokenInvalid, ReasonIssuerUntrusted, ReasonIssuerUnavailable,
 		ReasonKeysUntrusted, ReasonRateLimited, ReasonRestoreActive, ReasonNotBound, ReasonConflict,
 		ReasonProofMissing, ReasonProofInvalid, ReasonStale, ReasonStore, ReasonInternal,
+		ReasonStepInvalid, ReasonStepUnindexed,
+		ReasonAlreadyRequested, ReasonNotRequested, ReasonBootstrapInvalid, ReasonStepOpen, ReasonNoStep,
+		ReasonTooManyCells, ReasonTestDigestOnly,
+		ReasonHostsvcUntrusted, ReasonHostsvcUnavailable, ReasonHostsvcDenied, ReasonHostsvcBusy,
+		ReasonRecordNotApplied, ReasonNoStatus, ReasonStatusStale, ReasonKeysFailed,
 	}
 	want := []string{
 		"signature_invalid", "payload_invalid", "env_mismatch", "revision_old", "revision_conflict",
@@ -90,6 +95,11 @@ func TestReasonStringsAreDistinct(t *testing.T) {
 		"cell_unknown", "nonce_invalid", "token_invalid", "issuer_untrusted", "issuer_unavailable",
 		"keys_untrusted", "rate_limited", "restore_active", "not_bound", "conflict",
 		"proof_missing", "proof_invalid", "stale", "store", "internal",
+		"step_invalid", "step_unindexed",
+		"already_requested", "not_requested", "bootstrap_invalid", "step_open", "no_step",
+		"too_many_cells", "test_digest_only",
+		"hostsvc_untrusted", "hostsvc_unavailable", "hostsvc_denied", "hostsvc_busy",
+		"record_not_applied", "no_status", "status_stale", "keys_failed",
 	}
 	seen := map[string]bool{}
 	for i, r := range all {
@@ -128,13 +138,13 @@ func TestPatternsMatchPathHelpers(t *testing.T) {
 		path    func(string) string
 	}{
 		{SpecPattern, SpecPath}, {StatusPattern, StatusPath},
-		{KeysPattern, KeysPath}, {OpsPattern, OpsPath}, {ReportsPattern, ReportsPath},
+		{KeysPattern, KeysPath}, {OpsPattern, OpsPath}, {ReportsPattern, ReportsPath}, {StepPattern, StepPath},
 	} {
 		for _, value := range []string{"dev-cell-1", "a b", "x/y", "q?z"} {
 			var got string
 			mux := http.NewServeMux()
 			mux.HandleFunc(tc.pattern, func(w http.ResponseWriter, r *http.Request) {
-				for _, name := range []string{"env", "cell", "cluster"} {
+				for _, name := range []string{"env", "cell", "cluster", "id"} {
 					if v := r.PathValue(name); v != "" {
 						got = v
 					}

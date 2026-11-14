@@ -15,6 +15,8 @@ import (
 type SpecBundle struct {
 	Spec    json.RawMessage            `json:"spec"`
 	Records map[string]json.RawMessage `json:"records"`
+	// Steps holds one signed step envelope for each cell that the spec indexes a step for.
+	Steps map[string]json.RawMessage `json:"steps,omitempty"`
 }
 
 // NonceResponse is the answer to a nonce request. Bound tells whether the cell has a record.
@@ -51,6 +53,9 @@ type StatusReport struct {
 	StoreError  string         `json:"storeError,omitempty"`
 	KeyHints    []KeyHint      `json:"keyHints,omitempty"`
 	Gateway     *GatewayStatus `json:"gateway,omitempty"`
+	// Steps is the status of the provisioning steps, as the cell controller wrote it at StepsAt.
+	Steps   []StepStatus `json:"steps,omitempty"`
+	StepsAt time.Time    `json:"stepsAt,omitzero"`
 }
 
 // Refusal records the last spec that envd refused.
@@ -89,6 +94,7 @@ const (
 	KeysPattern    = "/v1/clusters/{cluster}/keys"
 	OpsPattern     = "/v1/envs/{env}/ops"
 	ReportsPattern = "/v1/envs/{env}/reports"
+	StepPattern    = "/v1/steps/{id}"
 )
 
 // SpecPath is the path of the signed spec bundle of an environment.
@@ -105,3 +111,6 @@ func OpsPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/o
 
 // ReportsPath is the path where envd sends the report items of an environment.
 func ReportsPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/reports" }
+
+// StepPath is the path of one step on the host service.
+func StepPath(id string) string { return "/v1/steps/" + url.PathEscape(id) }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -386,5 +387,102 @@ func TestCheckRecord(t *testing.T) {
 				t.Fatalf("got %v, want %v", err, tc.want)
 			}
 		})
+	}
+}
+
+func specWithSteps() Spec {
+	s := goodSpec()
+	s.Steps = []StepEntry{
+		{Name: "dev-cell-1", StepID: strings.Repeat("ab", 16), StepSHA256: digest},
+		{Name: "dev-cell-3", StepID: strings.Repeat("cd", 16), StepSHA256: digest},
+	}
+	return s
+}
+
+func TestSpecWithStepsRoundTrip(t *testing.T) {
+	pub, priv := keyPair(t)
+	want := specWithSteps()
+	env, err := Sign(want, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, payload, err := Verify(env, []ed25519.PublicKey{pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Steps) != 2 || got.Steps[0] != want.Steps[0] || got.Steps[1] != want.Steps[1] {
+		t.Fatalf("got %+v", got.Steps)
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &m); err != nil {
+		t.Fatal(err)
+	}
+	if string(m["steps"]) != `[{"name":"dev-cell-1","stepID":"`+strings.Repeat("ab", 16)+`","stepSHA256":"`+digest+`"},{"name":"dev-cell-3","stepID":"`+strings.Repeat("cd", 16)+`","stepSHA256":"`+digest+`"}]` {
+		t.Fatalf("steps %s", m["steps"])
+	}
+}
+
+func TestSpecStepsRules(t *testing.T) {
+	pub, priv := keyPair(t)
+	keys := []ed25519.PublicKey{pub}
+	id := strings.Repeat("ab", 16)
+	mod := func(steps ...StepEntry) []byte {
+		s := goodSpec()
+		s.Steps = steps
+		return signRaw(t, s, priv)
+	}
+	for _, tc := range []struct {
+		name string
+		env  []byte
+		bad  bool
+	}{
+		{"names_out_of_order", mod(StepEntry{"dev-cell-2", id, digest}, StepEntry{"dev-cell-1", id, digest}), true},
+		{"duplicate_name", mod(StepEntry{"dev-cell-1", id, digest}, StepEntry{"dev-cell-1", id, digest}), true},
+		{"step_id_upper", mod(StepEntry{"dev-cell-1", strings.Repeat("AB", 16), digest}), true},
+		{"step_id_31_hex", mod(StepEntry{"dev-cell-1", strings.Repeat("a", 31), digest}), true},
+		{"digest_63", mod(StepEntry{"dev-cell-1", id, strings.Repeat("a", 63)}), true},
+		{"digest_upper", mod(StepEntry{"dev-cell-1", id, strings.Repeat("AB", 32)}), true},
+		{"name_invalid", mod(StepEntry{"Dev-Cell", id, digest}), true},
+		{"name_also_in_cells", mod(StepEntry{"dev-cell-2", id, digest}), false},
+		{"name_also_in_retired", mod(StepEntry{"dev-cell-9", id, digest}), false},
+		{"empty_steps", mod(), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := Verify(tc.env, keys)
+			if tc.bad && !errors.Is(err, record.ErrDecode) {
+				t.Fatalf("got %v, want ErrDecode", err)
+			}
+			if !tc.bad && err != nil {
+				t.Fatalf("got %v, want success", err)
+			}
+		})
+	}
+	bad := goodSpec()
+	bad.Steps = []StepEntry{{"dev-cell-2", id, digest}, {"dev-cell-1", id, digest}}
+	if _, err := Sign(bad, priv); err == nil {
+		t.Fatal("Sign accepted steps out of order")
+	}
+}
+
+func TestSpecWithoutStepsUnchanged(t *testing.T) {
+	pub, priv := keyPair(t)
+	env, err := Sign(goodSpec(), priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err := Verify(env, []ed25519.PublicKey{pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile("testdata/m4-spec.sha256")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(payload)
+	if got := hex.EncodeToString(sum[:]); got != strings.TrimSpace(string(want)) {
+		t.Fatalf("payload digest %s, M4 digest %s; payload %s", got, want, payload)
+	}
+	if strings.Contains(string(payload), "steps") {
+		t.Fatalf("payload %s", payload)
 	}
 }

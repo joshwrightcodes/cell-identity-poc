@@ -64,3 +64,35 @@ func (e *KeyError) Error() string {
 }
 
 func (e *KeyError) Unwrap() error { return e.Err }
+
+// Reasons about steps. ReasonStepInvalid and ReasonStepUnindexed are detail reasons of envd. The
+// portal reasons also reuse ReasonCellUnknown. ReasonNotRequested is a portal reason and a valid
+// reason.
+const (
+	ReasonStepInvalid   = "step_invalid"
+	ReasonStepUnindexed = "step_unindexed"
+
+	ReasonAlreadyRequested = "already_requested"
+	ReasonNotRequested     = "not_requested"
+	ReasonBootstrapInvalid = "bootstrap_invalid"
+	ReasonStepOpen         = "step_open"
+	ReasonNoStep           = "no_step"
+	ReasonTooManyCells     = "too_many_cells"
+	ReasonTestDigestOnly   = "test_digest_only"
+)
+
+// Reasons that a cell controller gives for a failed host service call.
+const (
+	ReasonHostsvcUntrusted   = "hostsvc_untrusted"
+	ReasonHostsvcUnavailable = "hostsvc_unavailable"
+	ReasonHostsvcDenied      = "hostsvc_denied"
+	ReasonHostsvcBusy        = "hostsvc_busy"
+)
+
+// The reasons that a cell is not valid, besides ReasonNotRequested and ReasonNotBound.
+const (
+	ReasonRecordNotApplied = "record_not_applied"
+	ReasonNoStatus         = "no_status"
+	ReasonStatusStale      = "status_stale"
+	ReasonKeysFailed       = "keys_failed"
+)

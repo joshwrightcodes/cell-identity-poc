@@ -22,6 +22,7 @@ const MaxNameLength = 59
 
 var (
 	labelRE  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+	stepIDRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 	digestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
@@ -65,12 +66,22 @@ type Retired struct {
 	Revision Revision `json:"revision"`
 }
 
-// Spec is the signed payload. Cells and Retired hold names in strictly ascending order.
+// StepEntry indexes one signed provisioning step: the cell, the step ID and the digest of the step
+// payload.
+type StepEntry struct {
+	Name       string `json:"name"`
+	StepID     string `json:"stepID"`
+	StepSHA256 string `json:"stepSHA256"`
+}
+
+// Spec is the signed payload. Cells, Retired and Steps hold names in strictly ascending order. Steps
+// holds at most one entry for each cell, and a name in Steps may also be in Cells or Retired.
 type Spec struct {
-	Env      string    `json:"env"`
-	Revision Revision  `json:"revision"`
-	Cells    []Entry   `json:"cells"`
-	Retired  []Retired `json:"retired"`
+	Env      string      `json:"env"`
+	Revision Revision    `json:"revision"`
+	Cells    []Entry     `json:"cells"`
+	Retired  []Retired   `json:"retired"`
+	Steps    []StepEntry `json:"steps,omitempty"`
 }
 
 // Sign returns a DSSE envelope that holds the spec signed with key. It runs Validate first, so it
@@ -166,8 +177,9 @@ func (r Revision) valid() bool { return r.Epoch >= 1 && r.Counter >= 1 }
 func ValidName(n string) bool { return len(n) <= MaxNameLength && labelRE.MatchString(n) }
 
 // Validate checks the rules that Verify applies to the index: a DNS label env, revisions of at
-// least 1, valid names in strictly ascending order in each list, no name in both lists, digests of
-// 64 lowercase hex characters, and no revision above the spec revision.
+// least 1, valid names in strictly ascending order in each list, no name in both cells and retired,
+// digests of 64 lowercase hex characters, no revision above the spec revision, and in steps a step
+// ID of 32 lowercase hex characters.
 func (s Spec) Validate() error {
 	if len(s.Env) > 63 || !labelRE.MatchString(s.Env) {
 		return errors.New("env is not a DNS label")
@@ -207,6 +219,22 @@ func (s Spec) Validate() error {
 		}
 		if !r.Revision.valid() || r.Revision.Compare(s.Revision) > 0 {
 			return fmt.Errorf("retired cell %q has a revision outside 1 to the spec revision", r.Name)
+		}
+	}
+	prev = ""
+	for i, st := range s.Steps {
+		if !ValidName(st.Name) {
+			return fmt.Errorf("step %d has an invalid name", i)
+		}
+		if i > 0 && st.Name <= prev {
+			return fmt.Errorf("step %q is not in strictly ascending order", st.Name)
+		}
+		prev = st.Name
+		if !stepIDRE.MatchString(st.StepID) {
+			return fmt.Errorf("step %q has an invalid step ID", st.Name)
+		}
+		if !digestRE.MatchString(st.StepSHA256) {
+			return fmt.Errorf("step %q has an invalid step digest", st.Name)
 		}
 	}
 	return nil
