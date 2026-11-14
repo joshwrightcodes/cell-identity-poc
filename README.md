@@ -450,6 +450,9 @@ If the wait fails, run `CELL=<cell> mise run cell:up` for the cell that the mess
 Then read `mise run mgmt -- status` and the log of `mgmtd-0`.
 `cell:verify` of `management` fails when a registry differs from the output of `mise run mgmt -- records`.
 A record change reaches the views without a link.
+A ConfigMap that an older render applied keeps the field manager `kubectl`, and `cell:verify` then reports it.
+Delete the three `cell-registry` objects once.
+`mgmtd` creates them again within a minute.
 
 ### Recover lost management state
 
