@@ -25,7 +25,9 @@ const (
 
 	leaseTerm  = 60 * time.Second
 	renewEvery = 20 * time.Second
-	maxRecords = 1000
+	// effectMargin is how long before the lease end the context of an effect ends.
+	effectMargin = 5 * time.Second
+	maxRecords   = 1000
 
 	// ReasonStoreError is the reason of a local lease_lost that follows a failed API call. A cell
 	// never sends it up.
@@ -57,6 +59,8 @@ type Executor struct {
 	applied, refused, forged atomic.Uint64
 
 	renewEvery time.Duration
+	// margin is how long before the lease end the context of an effect ends.
+	margin     time.Duration
 	afterClaim func()
 	// beforeTakeover runs between the read and the update of a takeover.
 	beforeTakeover func()
@@ -79,7 +83,7 @@ func New(cfg Config) *Executor {
 	if cfg.Meter == nil {
 		cfg.Meter = metricnoop.NewMeterProvider().Meter("celld")
 	}
-	e := &Executor{cfg: cfg, renewEvery: renewEvery}
+	e := &Executor{cfg: cfg, renewEvery: renewEvery, margin: effectMargin}
 	e.results, _ = cfg.Meter.Int64Counter("celld.ops.results")
 	return e
 }
@@ -123,15 +127,16 @@ func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.
 	if e.afterClaim != nil {
 		e.afterClaim()
 	}
-	if err := e.renew(ctx, o.ID, f); err != nil {
+	until, err := e.renew(ctx, o.ID, f)
+	if err != nil {
 		reason := ReasonStoreError
 		if errors.Is(err, errNotHeld) {
 			reason = op.ReasonLeaseLost
 		}
 		return e.result(o.ID, op.OutcomeLeaseLost, reason, f, sha)
 	}
-	effectCtx, stop := e.renewLease(ctx, o.ID, f)
-	err := e.cfg.Kinds[o.Kind](effectCtx, e, o)
+	effectCtx, stop := e.renewLease(ctx, o.ID, f, until)
+	err = e.cfg.Kinds[o.Kind](effectCtx, e, o)
 	stop()
 	if err != nil {
 		e.cfg.Log.LogAttrs(ctx, slog.LevelWarn, "effect failed",

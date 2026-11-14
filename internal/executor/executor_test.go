@@ -6,8 +6,12 @@ import (
 	"crypto/rand"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
@@ -445,5 +449,58 @@ func TestLastFenceSkipsFenceFarAhead(t *testing.T) {
 	r.clock.Advance(-48 * time.Hour)
 	if last, err := e.lastFence(ctx); err != nil || last != fence(5, 2) {
 		t.Fatalf("lastFence %+v, %v after the clock moved back; want the lower fence", last, err)
+	}
+}
+
+// A run of failed renewals ends the effect context before the lease end, so that another pod cannot
+// take over while the effect still runs.
+func TestEffectContextEndsBeforeTheLeaseWhenRenewalsFail(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	e.renewEvery = 5 * time.Millisecond
+	e.margin = leaseTerm - 300*time.Millisecond
+	var failing atomic.Bool
+	r.client.PrependReactor("update", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if failing.Load() {
+			return true, nil, errors.New("apiserver timeout")
+		}
+		return false, nil, nil
+	})
+	start := time.Now()
+	var endedAfter time.Duration
+	e.cfg.Kinds[testKind] = func(c context.Context, _ *Executor, _ op.Operation) error {
+		failing.Store(true)
+		select {
+		case <-c.Done():
+			endedAfter = time.Since(start)
+		case <-time.After(5 * time.Second):
+		}
+		return c.Err()
+	}
+	res := e.Execute(ctx, r.sign(r.operation(testKind, `{}`)), fence(1, 1))
+	if res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonEffectFailed {
+		t.Fatalf("result %+v", res)
+	}
+	if endedAfter == 0 || endedAfter > 2*time.Second {
+		t.Fatalf("the effect context ended after %v, want about 300 ms", endedAfter)
+	}
+}
+
+// Renewals that succeed move the end of the effect context along with the lease.
+func TestEffectContextFollowsRenewals(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	e.renewEvery = 5 * time.Millisecond
+	e.margin = leaseTerm - 100*time.Millisecond
+	e.cfg.Kinds[testKind] = func(c context.Context, _ *Executor, _ op.Operation) error {
+		select {
+		case <-c.Done():
+			return c.Err()
+		case <-time.After(400 * time.Millisecond):
+			return nil
+		}
+	}
+	if res := e.Execute(ctx, r.sign(r.operation(testKind, `{}`)), fence(1, 1)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("result %+v", res)
 	}
 }

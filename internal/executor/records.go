@@ -151,37 +151,40 @@ var errNotHeld = errors.New("this pod does not hold a live lease on the record")
 
 // renew extends the lease by compare-and-swap on the resourceVersion that it read. It succeeds only
 // while this pod holds the record at fence f and leaseUntil is still in the future on the executor
-// clock. It returns errNotHeld when the lease is gone, and the API error otherwise.
-func (e *Executor) renew(ctx context.Context, id string, f op.Fence) error {
+// clock. It returns the new lease end, errNotHeld when the lease is gone, and the API error otherwise.
+func (e *Executor) renew(ctx context.Context, id string, f op.Fence) (time.Time, error) {
 	cms := e.cfg.Client.CoreV1().ConfigMaps(e.cfg.Namespace)
 	cm, err := cms.Get(ctx, recordPrefix+id, metav1.GetOptions{})
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	rec, err := decodeRecord(cm)
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	now := e.cfg.Now()
 	if rec.State != stateClaimed || rec.Holder != e.cfg.PodUID || rec.Fence != f || !now.Before(rec.LeaseUntil) {
-		return errNotHeld
+		return time.Time{}, errNotHeld
 	}
 	rec.LeaseUntil, rec.UpdatedAt = now.Add(leaseTerm), now
 	cm.Data[recordKey] = encodeRecord(rec)
 	if _, err := cms.Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
 		if apierrors.IsConflict(err) {
-			return errNotHeld
+			return time.Time{}, errNotHeld
 		}
-		return err
+		return time.Time{}, err
 	}
-	return nil
+	return rec.LeaseUntil, nil
 }
 
 // renewLease extends the lease every renewEvery until the returned function is called. It returns
-// the context for the effect, which ends when a renewal finds that the lease is gone. The returned
-// function returns after the last renewal ends.
-func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (context.Context, func()) {
+// the context for the effect. That context ends when a renewal finds that the lease is gone, and
+// also e.margin before the last lease end that a renewal set, so that a run of failed renewals does
+// not leave the effect running after another pod may take over. The returned function returns after
+// the last renewal ends. until is the lease end that the claim renewal set.
+func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence, until time.Time) (context.Context, func()) {
 	rctx, cancel := context.WithCancel(ctx)
+	expire := time.AfterFunc(max(0, until.Sub(e.cfg.Now())-e.margin), cancel)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -192,8 +195,12 @@ func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (conte
 			case <-rctx.Done():
 				return
 			case <-t.C:
-				err := e.renew(rctx, id, f)
-				if err == nil || rctx.Err() != nil {
+				next, err := e.renew(rctx, id, f)
+				if err == nil {
+					expire.Reset(max(0, next.Sub(e.cfg.Now())-e.margin))
+					continue
+				}
+				if rctx.Err() != nil {
 					continue
 				}
 				e.cfg.Log.LogAttrs(rctx, slog.LevelWarn, "lease renewal failed",
@@ -205,7 +212,7 @@ func (e *Executor) renewLease(ctx context.Context, id string, f op.Fence) (conte
 			}
 		}
 	}()
-	return rctx, func() { cancel(); <-done }
+	return rctx, func() { expire.Stop(); cancel(); <-done }
 }
 
 // finish stores the applied result when this pod still holds the claim.
