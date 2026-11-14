@@ -9,6 +9,11 @@ import (
 	"net/netip"
 	"slices"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
@@ -62,6 +67,7 @@ type Service struct {
 	Prober   Prober
 	Reserved ReservedFunc
 	Docker   DockerFunc
+	Marker   Marker
 
 	// lookups holds one token for each Facts call whose runtime calls have not returned.
 	lookups chan struct{}
@@ -75,7 +81,7 @@ var ErrLookupBusy = errors.New("too many cluster lookups in flight")
 
 // New returns a Service that uses the real prober and the Docker reserved prefixes.
 func New(rt Runtime, t *topology.Topology) *Service {
-	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker, lookups: make(chan struct{}, MaxFactsInFlight)}
+	return &Service{rt: rt, topo: t, Prober: HTTPProber{}, Reserved: DockerReserved, Docker: RunDocker, Marker: KubeMarker{}, lookups: make(chan struct{}, MaxFactsInFlight)}
 }
 
 func (s *Service) lookup(name string) (topology.Cluster, error) {
@@ -114,13 +120,97 @@ func (s *Service) exists(name string) (bool, error) {
 	return slices.Contains(names, name), nil
 }
 
-// Up creates the cluster if it is absent and returns its facts.
-// It refuses to touch an existing cluster whose spec differs from the topology.
+// ErrCellNeedsStep means a cell cluster is absent. Only a signed step creates a cell, through
+// the Create method that the step actor runs.
+var ErrCellNeedsStep = errors.New("cell does not exist and only a signed step creates it")
+
+// Marker is the ConfigMap kube-system/poc-provisioned that Create writes into a cluster that it
+// made, so that a retry can tell a finished cluster from a half-built one.
+type Marker interface {
+	// Has reports whether the marker exists. A cluster that does not answer is an error.
+	Has(ctx context.Context, kubeconfig string) (bool, error)
+	// Write creates the marker with the label poc.internal/made-by=hostsvc.
+	Write(ctx context.Context, kubeconfig string) error
+}
+
+// Up creates the cluster if it is absent and returns its facts. A cell that is absent is not
+// created: the error wraps ErrCellNeedsStep. It refuses to touch an existing cluster whose spec
+// differs from the topology.
 func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 	c, err := s.lookup(name)
 	if err != nil {
 		return Facts{}, err
 	}
+	found, err := s.existsCtx(ctx, name)
+	if err != nil {
+		return Facts{}, err
+	}
+	if !found && IsCell(c) {
+		return Facts{}, fmt.Errorf("%w: %s", ErrCellNeedsStep, name)
+	}
+	return s.bringUp(ctx, c, found)
+}
+
+// UpAll runs Up for every cluster of the topology. An absent cell is skipped with a cell_needs_step
+// log line, and it is not an error.
+func (s *Service) UpAll(ctx context.Context) error {
+	for _, c := range s.topo.Clusters {
+		if _, err := s.Up(ctx, c.Name); err != nil {
+			if errors.Is(err, ErrCellNeedsStep) {
+				slog.Warn("cell_needs_step", "cluster", c.Name)
+				continue
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// Create makes the cluster of a cell and writes the marker ConfigMap after its facts are read. With
+// retryOfCreate, an existing cluster without the marker is a half-built cluster of an earlier
+// run, and Create deletes it first. Without it, an existing cluster is kept and checked as Up does.
+func (s *Service) Create(ctx context.Context, name string, retryOfCreate bool) (Facts, error) {
+	c, err := s.lookup(name)
+	if err != nil {
+		return Facts{}, err
+	}
+	found, err := s.existsCtx(ctx, name)
+	if err != nil {
+		return Facts{}, err
+	}
+	if found && retryOfCreate {
+		kc, err := s.rt.Kubeconfig(name)
+		if err != nil {
+			return Facts{}, fmt.Errorf("read kubeconfig of %s: %w", name, err)
+		}
+		has, err := s.Marker.Has(ctx, kc)
+		if err != nil {
+			slog.Warn("marker unreadable, treating the cluster as half built", "cluster", name, "error", err.Error())
+		}
+		if !has {
+			slog.Warn("deleting half-built cluster", "cluster", name)
+			if err := s.rt.Delete(name); err != nil {
+				return Facts{}, fmt.Errorf("delete half-built cluster %s: %w", name, err)
+			}
+			found = false
+		}
+	}
+	f, err := s.bringUp(ctx, c, found)
+	if err != nil || found {
+		return f, err
+	}
+	kc, err := s.rt.Kubeconfig(name)
+	if err != nil {
+		return Facts{}, fmt.Errorf("read kubeconfig of %s: %w", name, err)
+	}
+	if err := s.Marker.Write(ctx, kc); err != nil {
+		return Facts{}, fmt.Errorf("write marker in %s: %w", name, err)
+	}
+	return f, nil
+}
+
+func (s *Service) bringUp(ctx context.Context, c topology.Cluster, found bool) (Facts, error) {
+	name := c.Name
 	reserved, err := s.Reserved(ctx)
 	if err != nil {
 		return Facts{}, fmt.Errorf("read reserved prefixes: %w", err)
@@ -129,10 +219,6 @@ func (s *Service) Up(ctx context.Context, name string) (Facts, error) {
 		return Facts{}, fmt.Errorf("validate topology: %w", err)
 	}
 	if err := s.EnsureRegistry(ctx); err != nil {
-		return Facts{}, err
-	}
-	found, err := s.existsCtx(ctx, name)
-	if err != nil {
 		return Facts{}, err
 	}
 	if found {
@@ -255,4 +341,59 @@ func (s *Service) facts(ctx context.Context, name string) (Facts, error) {
 		APIServer:     obs.APIServer,
 		JWKS:          obs.JWKS,
 	}, nil
+}
+
+// Marker object that Create writes into a cluster that it made.
+const (
+	MarkerNamespace = "kube-system"
+	MarkerName      = "poc-provisioned"
+)
+
+// KubeMarker is the Marker that talks to the cluster through its kubeconfig. A test sets Client to
+// a fake clientset.
+type KubeMarker struct {
+	Client func(kubeconfig string) (kubernetes.Interface, error)
+}
+
+func (m KubeMarker) client(kubeconfig string) (kubernetes.Interface, error) {
+	if m.Client != nil {
+		return m.Client(kubeconfig)
+	}
+	cfg, err := clientcmd.RESTConfigFromKubeConfig([]byte(kubeconfig))
+	if err != nil {
+		return nil, fmt.Errorf("parse kubeconfig: %w", err)
+	}
+	return kubernetes.NewForConfig(cfg)
+}
+
+// Has reports whether the marker ConfigMap exists.
+func (m KubeMarker) Has(ctx context.Context, kubeconfig string) (bool, error) {
+	c, err := m.client(kubeconfig)
+	if err != nil {
+		return false, err
+	}
+	_, err = c.CoreV1().ConfigMaps(MarkerNamespace).Get(ctx, MarkerName, metav1.GetOptions{})
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err):
+		return false, nil
+	}
+	return false, err
+}
+
+// Write creates the marker ConfigMap with the label poc.internal/made-by=hostsvc.
+func (m KubeMarker) Write(ctx context.Context, kubeconfig string) error {
+	c, err := m.client(kubeconfig)
+	if err != nil {
+		return err
+	}
+	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+		Name: MarkerName, Namespace: MarkerNamespace, Labels: map[string]string{"poc.internal/made-by": "hostsvc"},
+	}}
+	_, err = c.CoreV1().ConfigMaps(MarkerNamespace).Create(ctx, cm, metav1.CreateOptions{})
+	if apierrors.IsAlreadyExists(err) {
+		return nil
+	}
+	return err
 }

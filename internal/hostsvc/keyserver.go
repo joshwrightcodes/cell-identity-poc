@@ -32,6 +32,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/connlimit"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
@@ -107,15 +108,40 @@ func SelfSignedCert(host string, now time.Time) (tls.Certificate, error) {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}, nil
 }
 
-// ServerTLS returns the TLS settings of the key server: TLS 1.3 only, and a client certificate
-// that chains to clientRoots and carries exactly clientID. Session tickets are off, so each
-// connection runs the client check again.
-func ServerTLS(cert tls.Certificate, clientRoots x509bundle.Source, clientID spiffeid.ID) *tls.Config {
+// StepClientTrustDomain is the trust domain of the cell controller, the only peer of the step route.
+const StepClientTrustDomain = "dev.env.poc.internal"
+
+// MaxStepClientLeaf is the longest lifetime that a leaf certificate of the step client trust
+// domain may have: its NotAfter minus its NotBefore.
+const MaxStepClientLeaf = 65 * time.Minute
+
+// ServerTLS returns the TLS settings of the host service: TLS 1.3 only, and a client certificate
+// that chains to the roots of its own trust domain and carries one of ids. A leaf of the step
+// client trust domain whose lifetime is above MaxStepClientLeaf fails the handshake. Session
+// tickets are off, so each connection runs the client checks again.
+func ServerTLS(cert tls.Certificate, clientRoots x509bundle.Source, ids ...spiffeid.ID) *tls.Config {
+	verify := tlsconfig.VerifyPeerCertificate(clientRoots, tlsconfig.AuthorizeOneOf(ids...))
 	return &tls.Config{
-		MinVersion:             tls.VersionTLS13,
-		Certificates:           []tls.Certificate{cert},
-		ClientAuth:             tls.RequireAnyClientCert,
-		VerifyPeerCertificate:  tlsconfig.VerifyPeerCertificate(clientRoots, tlsconfig.AuthorizeID(clientID)),
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequireAnyClientCert,
+		VerifyPeerCertificate: func(raw [][]byte, chains [][]*x509.Certificate) error {
+			if err := verify(raw, chains); err != nil {
+				return err
+			}
+			leaf, err := x509.ParseCertificate(raw[0])
+			if err != nil {
+				return err
+			}
+			id, err := x509svid.IDFromCert(leaf)
+			if err != nil {
+				return err
+			}
+			if id.TrustDomain().Name() == StepClientTrustDomain && leaf.NotAfter.Sub(leaf.NotBefore) > MaxStepClientLeaf {
+				return fmt.Errorf("client certificate lives %s, above the limit of %s", leaf.NotAfter.Sub(leaf.NotBefore), MaxStepClientLeaf)
+			}
+			return nil
+		},
 		SessionTicketsDisabled: true,
 	}
 }
