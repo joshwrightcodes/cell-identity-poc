@@ -778,8 +778,9 @@ func TestM5BindRefusalsLive(t *testing.T) {
 		secret := tokenSecret(t, cell, ns, rogueToken(t, audience))
 		j := bindProbe(t, cell, ns, "default", "--cell", cell, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
 		j.secret = secret
-		// mgmtd looks up the key before it checks the issuer, so the rogue key ID is unknown.
-		deniedByMgmtd(t, j, "unknown_kid")
+		// Which check refuses the token depends on the key of the rogue cluster and the keys that mgmtd holds for the cell: the key ID can
+		// be unknown, the signature can fail, or (as live run 16:14 UTC showed) the signature can verify and the issuer differ.
+		deniedByMgmtd(t, j, "unknown_kid", "bad_signature", "issuer_mismatch")
 	})
 	t.Run("unknown_kid", func(t *testing.T) {
 		// The nonce lives for a short time, so the quiet time passes before the nonce request.
