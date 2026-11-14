@@ -4,10 +4,14 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
@@ -160,5 +164,34 @@ func TestExecuteTwoKeys(t *testing.T) {
 	}
 	if n := r.cnt.count(); n != 2 {
 		t.Fatalf("count = %d", n)
+	}
+}
+
+// A failed read of the record of an applied op, after its expiry, is not the final outcome expired.
+// The cell answers with a local lease_lost, so the lease tries again.
+func TestExpiredOpWithFailedRecordReadIsRetryable(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	o := r.operation(testKind, `{}`)
+	env := r.sign(o)
+	if res := e.Execute(ctx, env, fence(1, 1)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("first = %+v", res)
+	}
+	r.clock.Advance(time.Hour)
+	fail := &atomic.Bool{}
+	fail.Store(true)
+	r.client.PrependReactor("get", "configmaps", func(clienttesting.Action) (bool, runtime.Object, error) {
+		if fail.Load() {
+			return true, nil, errors.New("apiserver: request timed out")
+		}
+		return false, nil, nil
+	})
+	res := e.Execute(ctx, env, fence(1, 2))
+	if res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonStoreError || op.IsFinal(res.Outcome) {
+		t.Fatalf("after a failed read: %+v", res)
+	}
+	fail.Store(false)
+	if res := e.Execute(ctx, env, fence(1, 3)); res.Outcome != op.OutcomeAlreadyApplied {
+		t.Fatalf("after the read works again: %+v", res)
 	}
 }
