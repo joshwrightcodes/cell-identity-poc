@@ -30,6 +30,9 @@ const (
 	// ReasonStoreError is the reason of a local lease_lost that follows a failed API call. A cell
 	// never sends it up.
 	ReasonStoreError = "store_error"
+	// ReasonFenceRange is the reason of a local lease_lost for a lease whose fence epoch is too far
+	// above the clock of the cell. A cell never sends it up.
+	ReasonFenceRange = "fence_range"
 	// ReasonEffectFailed is the reason of a local lease_lost that follows a failed effect. A cell
 	// never sends it up.
 	ReasonEffectFailed = "effect_failed"
@@ -103,6 +106,13 @@ func (e *Executor) Execute(ctx context.Context, envelope []byte, f op.Fence) op.
 
 func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.Result {
 	sha := op.EnvelopeSHA256(envelope)
+	if f.Epoch > uint64(e.cfg.Now().Unix())+op.MaxFenceAhead {
+		// The gateway refuses a hello with an epoch above this bound, so a record with such a fence
+		// would lock the cell out of the stream.
+		e.cfg.Log.LogAttrs(ctx, slog.LevelWarn, "lease refused: fence epoch is too high",
+			slog.Uint64("epoch", f.Epoch), slog.Uint64("counter", f.Counter))
+		return e.result("", op.OutcomeLeaseLost, ReasonFenceRange, f, sha)
+	}
 	o, refusal := e.check(ctx, envelope, f, sha)
 	if refusal != nil {
 		return *refusal

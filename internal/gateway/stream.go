@@ -64,9 +64,6 @@ const (
 	streamHeaderLimit = 5 * time.Second
 	pollEvery         = time.Second
 	hintGap           = 60 * time.Second
-	// maxFenceAhead is how far above the current time in seconds a hello may report an epoch. The
-	// epoch starts at the Unix time of the file and rises by one for each raise.
-	maxFenceAhead = 24 * 60 * 60
 )
 
 // StreamConfig holds the settings of the stream handler. A zero value gets the default of its
@@ -366,7 +363,7 @@ func (h *StreamHandler) serve(w http.ResponseWriter, r *http.Request) {
 		refuse(reason, "detail", detail)
 		return
 	}
-	if hello.LastFence.Epoch > uint64(h.cfg.Now().Unix())+maxFenceAhead {
+	if hello.LastFence.Epoch > uint64(h.cfg.Now().Unix())+op.MaxFenceAhead {
 		refuse(mgmtapi.ReasonPayloadInvalid, "what", "fence_epoch", "pod", claims.PodUID, "epoch", hello.LastFence.Epoch)
 		return
 	}

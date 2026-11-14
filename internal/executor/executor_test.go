@@ -402,3 +402,48 @@ func TestCounts(t *testing.T) {
 		t.Fatalf("counts = %+v", got)
 	}
 }
+
+// A lease whose fence epoch is far above the clock would lock the cell out of the stream, because the
+// gateway refuses a hello that reports it. The cell refuses the lease and writes no record.
+func TestExecuteRefusesFenceFarAhead(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	o := r.operation(testKind, `{}`)
+	env := r.sign(o)
+	for _, epoch := range []uint64{1 << 62, uint64(r.clock.Now().Unix()) + op.MaxFenceAhead + 1} {
+		res := e.Execute(ctx, env, op.Fence{Epoch: epoch, Counter: 1})
+		if res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonFenceRange {
+			t.Fatalf("epoch %d: %+v", epoch, res)
+		}
+		if n := len(r.records()); n != 0 || r.cnt.count() != 0 {
+			t.Fatalf("epoch %d: %d records and %d effects, want none", epoch, n, r.cnt.count())
+		}
+	}
+	// The bound itself is allowed.
+	at := op.Fence{Epoch: uint64(r.clock.Now().Unix()) + op.MaxFenceAhead, Counter: 1}
+	if res := e.Execute(ctx, env, at); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("at the bound: %+v", res)
+	}
+}
+
+// A record that already holds a fence above the bound does not reach the hello, so the cell can
+// open a stream again.
+func TestLastFenceSkipsFenceFarAhead(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	good := r.operation(testKind, `{}`)
+	if res := e.Execute(ctx, r.sign(good), fence(5, 2)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("%+v", res)
+	}
+	high := op.Fence{Epoch: uint64(r.clock.Now().Unix()) + op.MaxFenceAhead, Counter: 9}
+	if res := e.Execute(ctx, r.sign(r.operation(testKind, `{}`)), high); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("%+v", res)
+	}
+	if last, err := e.lastFence(ctx); err != nil || last != high {
+		t.Fatalf("lastFence %+v, %v; want %+v", last, err, high)
+	}
+	r.clock.Advance(-48 * time.Hour)
+	if last, err := e.lastFence(ctx); err != nil || last != fence(5, 2) {
+		t.Fatalf("lastFence %+v, %v after the clock moved back; want the lower fence", last, err)
+	}
+}

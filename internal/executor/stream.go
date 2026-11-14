@@ -268,16 +268,18 @@ func (c StreamConfig) runGC(ctx context.Context) {
 	}
 }
 
-// lastFence returns the highest fence in the operation records.
+// lastFence returns the highest fence in the operation records. It skips a fence whose epoch is above
+// the bound of the gateway, because the gateway refuses a hello that reports one.
 func (e *Executor) lastFence(ctx context.Context) (op.Fence, error) {
 	items, err := e.list(ctx)
 	if err != nil {
 		return op.Fence{}, err
 	}
+	limit := uint64(e.cfg.Now().Unix()) + op.MaxFenceAhead
 	var last op.Fence
 	for i := range items {
 		rec, err := decodeRecord(&items[i])
-		if err == nil && rec.Fence.Compare(last) > 0 {
+		if err == nil && rec.Fence.Epoch <= limit && rec.Fence.Compare(last) > 0 {
 			last = rec.Fence
 		}
 	}

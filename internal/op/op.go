@@ -180,6 +180,11 @@ func ParseDemoAppend(args json.RawMessage) (DemoAppend, error) {
 	return d, nil
 }
 
+// MaxFenceAhead is how far above the current Unix time, in seconds, a fence epoch may lie. A gateway
+// epoch starts at the Unix time of its store file and rises by one for each raise. The gateway refuses
+// a hello above this bound and celld refuses a lease above it.
+const MaxFenceAhead uint64 = 24 * 60 * 60
+
 // Fence orders the work that a gateway hands out: the epoch first, then the counter.
 type Fence struct {
 	Epoch   uint64 `json:"epoch"`
