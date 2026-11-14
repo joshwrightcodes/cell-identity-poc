@@ -257,17 +257,40 @@ check_envd_peer_root() {
   peer_root_pods_current envd-system envd peer-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
-# celld trusts the bind answer of mgmtd only through ConfigMap cell-identity-system/mgmt-root.
-check_celld_mgmt_root() {
-  local live got
-  live="$(peer_root_pem management mgmt.poc.internal 2>&1)" || { echo "$live"; return 1; }
-  got="$(k -n cell-identity-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}' 2>/dev/null | pem_lines)"
-  if [[ -z "$got" || "$got" != "$(pem_lines <<<"$live")" ]]; then
-    echo "ConfigMap cell-identity-system/mgmt-root is absent or holds other roots than the live bundle of management."
-    echo "Run: CELL=$CELL_NAME mise run cell:up"
+# check_op_key_pinned succeeds when each key in ConfigMap cell-identity-system/mgmt-op-key is the live signing key of
+# mgmtd (`mgmt -- pubkey`) or the key that mgmtd has staged for the next rotation (the SHA-256 of its bytes equals
+# `stagedKey` in `mgmt -- status`), when the live key is among them, and when each running celld pod carries the
+# checksum of the ConfigMap. celld trusts an operation signed by any key in the mount, and loads the mount only at start.
+check_op_key_pinned() {
+  local fix="CELL=$CELL_NAME mise run cell:up" live status staged cm name value fp sum got pods bad problems=() found=0
+  live="$(cd "$ROOT" && mise run mgmt -- pubkey 2>/dev/null | jq -r '."spec.pub" // ""')" || live=""
+  [[ -n "$live" ]] || { echo "mise run mgmt -- pubkey gave no key."; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || status='{}'
+  staged="$(jq -r '.stagedKey // ""' <<<"$status" 2>/dev/null)" || staged=""
+  cm="$(k -n cell-identity-system get configmap mgmt-op-key -o json 2>/dev/null)" \
+    || { echo "ConfigMap cell-identity-system/mgmt-op-key is absent."; echo "Run: $fix"; return 1; }
+  while IFS=$'\t' read -r name value; do
+    [[ -n "$name" ]] || continue
+    fp="$(printf '%s' "$value" | base64 -d 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+    if [[ "$value" == "$live" ]]; then
+      found=1
+    elif [[ -n "$staged" && "$fp" == "$staged" ]]; then
+      :
+    else
+      problems+=("mgmt-op-key holds $name = $value, which is neither the live key of mgmtd nor its staged key")
+    fi
+  done < <(jq -r '.data // {} | to_entries[] | select(.key | endswith(".pub")) | [.key, .value] | @tsv' <<<"$cm")
+  ((found == 1)) || problems+=("mgmt-op-key holds no key that equals the live key $live")
+  sum="$(jq -r '.metadata.annotations["poc.internal/op-key-sha256"] // ""' <<<"$cm")"
+  pods="$(k -n cell-identity-system get pods -l app.kubernetes.io/name=celld -o json)" || { echo "could not read the pods of celld"; return 1; }
+  bad="$(jq -r --arg want "$sum" '.items[] | select(.metadata.deletionTimestamp == null)
+    | (.metadata.annotations["poc.internal/op-key-sha256"] // "none") as $got | select($got != $want) | "\(.metadata.name) carries the key checksum \($got)"' <<<"$pods")"
+  [[ -z "$bad" ]] || problems+=("$bad, and mgmt-op-key has $sum, which celld reads only at start")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: $fix"
     return 1
   fi
-  peer_root_pods_current cell-identity-system celld mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
 # check_registry_current <namespace> <component> compares each record in ConfigMap cell-registry of the
@@ -372,6 +395,22 @@ check_gateway_records() {
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
     echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd. If the store of the gateway is lost or corrupt, run: $(dependents_of gateway-store)"
+    return 1
+  fi
+}
+
+# check_celld_streams succeeds when the gateway holds at least one open stream for each cell that has the cell-identity
+# set. celld opens one stream when it starts, and again at each new SVID.
+check_celld_streams() {
+  local status cells cell n problems=()
+  status="$(gateway_status)" || { echo "$status"; return 1; }
+  cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")" || { echo "could not read the topology"; return 1; }
+  for cell in $cells; do
+    n="$(jq -r --arg c "$cell" '.streams[$c] // 0' <<<"$status")"
+    ((n >= 1)) || problems+=("the gateway holds no stream of $cell. Run: CELL=$cell mise run cell:up")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
     return 1
   fi
 }

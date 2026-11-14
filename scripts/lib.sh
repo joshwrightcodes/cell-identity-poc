@@ -883,10 +883,17 @@ check_plane_pods() {
 # mgmtd, the harness label mgmt-api and the marker label poc.internal/made-by=mgmtd. A listed
 # object counts as a runtime object only when it carries the marker, so a person cannot add an
 # object of that name without it.
+# The third case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
+# with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
+# the check skips them, and prints no delete hint for them.
 runtime_objects() {
   local cell agents=()
   if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
     jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
+    return
+  fi
+  if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
+    jq -cn '{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}}'
     return
   fi
   if [[ "$1" == central-view && "$2" == central-view-system && "$3" == AppProject ]]; then

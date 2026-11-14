@@ -16,8 +16,9 @@ import (
 )
 
 // goldenCelld holds the cell-identity render of M2 at commit 2d8cb64, before the sidecar helper
-// existed, and the changes that M4 Task 9 made on purpose to celld (the bind flags, the pod fields, the
-// token and root mounts, ConfigMap mgmt-root and the bind port in the policy). Review the diff of the
+// existed, and the changes that M4 and M5 made on purpose to celld (the gateway flags, the pod fields, the
+// token, trust bundle and operation key mounts, ConfigMap mgmt-op-key, the gateway ports in the policy and the
+// namespace cell-ops-system). Review the diff of the
 // file by hand before each commit. The image
 // digest of the stub registry is replaced by stubDigest, so the file does not depend on the gzip
 // output of one Go version. UPDATE_GOLDEN=1 writes the file again from the current render.
@@ -31,16 +32,6 @@ const (
 func devEnvCA(t *testing.T) string {
 	t.Helper()
 	p, err := filepath.Abs("testdata/dev-env-ca.pem")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return p
-}
-
-// mgmtCA is a fixed CA certificate of mgmt.poc.internal, for the ConfigMap mgmt-root of the golden render.
-func mgmtCA(t *testing.T) string {
-	t.Helper()
-	p, err := filepath.Abs("testdata/mgmt-ca.pem")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +64,7 @@ func sameObjects(t *testing.T, got, want map[string]object) {
 // TestSpireSidecarClusterJWTMatchesCelld renders celld through the sidecar helper and compares
 // every object with the M2 render, so the helper keeps the deployed celld pod as it is.
 func TestSpireSidecarClusterJWTMatchesCelld(t *testing.T) {
-	r := renderCellIdentity(t, "STUB_BUNDLE_FILE="+devEnvCA(t), "STUB_MGMT_BUNDLE_FILE="+mgmtCA(t))
+	r := renderCellIdentity(t, "STUB_BUNDLE_FILE="+devEnvCA(t))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
@@ -87,7 +78,7 @@ func TestSpireSidecarClusterJWTMatchesCelld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sameObjects(t, docsIn(t, out, "cell-identity-system"), docsIn(t, string(want), "cell-identity-system"))
+	sameObjects(t, objectsIn(t, out), objectsIn(t, string(want)))
 }
 
 // planeWorkload is a Deployment of a plane workload before the sidecar helper adds the agent. Its

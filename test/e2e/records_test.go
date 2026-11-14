@@ -164,7 +164,6 @@ func TestM4CellsBound(t *testing.T) {
 			if !ok || !c.Bound || c.Record.Counter < 1 || c.Issuer == "" {
 				t.Fatalf("mgmtd shows %+v for %s, want a bound cell with an issuer and a record", c, cell)
 			}
-			t.Skip("the celld log check needs the bind path, which is gone until Task 12. Task 12 removes this skip when celld binds through the cell gateway")
 			logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", "deploy/"+celldDeployment, "-c", celldContainer)
 			if err != nil {
 				t.Fatal(err)

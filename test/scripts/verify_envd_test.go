@@ -29,7 +29,7 @@ case " $* " in
   *" -n envd-system get networkpolicy envd "*) cat "$d/envd-policy.json" ;;
   *" -n envd-system get configmap peer-root "*) printf '%s' "$(cat "$d/envd-peer-root.pem")" ;;
   *" -n envd-system get pods -l app.kubernetes.io/name=envd "*) cat "$d/envd-pods.json" ;;
-  *" -n cell-identity-system get configmap mgmt-root "*) printf '%s' "$(cat "$d/celld-mgmt-root.pem")" ;;
+  *" -n cell-identity-system get configmap mgmt-op-key "*) cat "$d/op-key.json" ;;
   *" -n cell-identity-system get pods -l app.kubernetes.io/name=celld "*) cat "$d/celld-pods.json" ;;
   *" get --raw /openid/v1/jwks "*) cat "$d/live-jwks.json" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
@@ -103,12 +103,28 @@ func TestVerifyEnvdChecks(t *testing.T) {
 	pods := func(app, sum string) string {
 		return `{"items":[{"metadata":{"name":"` + app + `-0","annotations":{"poc.internal/peer-root-sha256":"` + sum + `"}}}]}`
 	}
+	// opSum is the checksum annotation of the render: the SHA-256 of the op.pub text.
+	opSum := func(key string) string { return fmt.Sprintf("%x", sha256sum(key)) }
+	opKey := func(keys map[string]string) string {
+		var data []string
+		for name, key := range keys {
+			data = append(data, fmt.Sprintf("%q:%q", name, key))
+		}
+		return `{"metadata":{"annotations":{"poc.internal/op-key-sha256":"` + opSum(pub) + `"}},"data":{` + strings.Join(data, ",") + `}}`
+	}
+	opPods := func(sum string) string {
+		return `{"items":[{"metadata":{"name":"celld-0","annotations":{"poc.internal/op-key-sha256":"` + sum + `"}}}]}`
+	}
+	stagedStatus := func(key string) string {
+		raw, _ := base64.StdEncoding.DecodeString(key)
+		return fmt.Sprintf(`{"signed":{"epoch":1,"counter":7},"stagedKey":"%x"}`, sha256sum(string(raw)))
+	}
 	healthy := map[string]string{
 		"mgmt-root.pem": mgmtRoot, "signing-pub": pub, "status.json": `{"signed":{"epoch":1,"counter":7}}`,
 		"cell-records.json":  records("7", map[string]string{"dev-cell-1": jwks("a", "b"), "dev-cell-2": jwks("c")}),
 		"agents-policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"10.9.0.1/32"}},{"ipBlock":{"cidr":"10.9.0.2/32"}}]}]}}`,
 		"server.conf":        conf(pub), "spec-key": pub, "envd-deployment.json": envd("10.9.0.10"), "envd-policy.json": envdPolicy("10.9.0.10"),
-		"envd-peer-root.pem": mgmtRoot, "envd-pods.json": pods("envd", rootSum(mgmtRoot)), "celld-mgmt-root.pem": mgmtRoot, "celld-pods.json": pods("celld", rootSum(mgmtRoot)),
+		"envd-peer-root.pem": mgmtRoot, "envd-pods.json": pods("envd", rootSum(mgmtRoot)), "op-key.json": opKey(map[string]string{"op.pub": pub}), "celld-pods.json": opPods(opSum(pub)), "gw-status.json": `{"epoch":1,"streams":{"dev-cell-1":1,"dev-cell-2":2}}`,
 		"live-jwks.json": jwks("a", "b"), "traces": "",
 		"facts-management.json": `{"name":"management","nodeIP":"10.9.0.10"}`,
 		"facts-dev-cell-1.json": `{"name":"dev-cell-1","nodeIP":"10.9.0.1","jwks":` + jwks("a", "b") + `}`,
@@ -141,9 +157,26 @@ func TestVerifyEnvdChecks(t *testing.T) {
 		{name: "envd peer root: management has a new root", check: "check_envd_peer_root", cell: "dev-cp", change: map[string]string{"mgmt-root.pem": otherRoot}, want: []string{"absent or holds other roots", up}},
 		{name: "envd peer root: the pod holds an old digest", check: "check_envd_peer_root", cell: "dev-cp", change: map[string]string{"envd-pods.json": pods("envd", strings.Repeat("0", 64))},
 			want: []string{"envd-0 carries the root digest", up}},
-		{name: "celld root ok", check: "check_celld_mgmt_root", cell: "dev-cell-1"},
-		{name: "celld root: management has a new root", check: "check_celld_mgmt_root", cell: "dev-cell-1", change: map[string]string{"mgmt-root.pem": otherRoot},
-			want: []string{"absent or holds other roots", "Run: CELL=dev-cell-1 mise run cell:up"}},
+		{name: "op key ok", check: "check_op_key_pinned", cell: "dev-cell-1"},
+		{name: "op key ok during a rotation: the staged key is mounted too", check: "check_op_key_pinned", cell: "dev-cell-1",
+			change: map[string]string{"op-key.json": opKey(map[string]string{"op.pub": pub, "op.next.pub": otherPub}), "status.json": stagedStatus(otherPub)}},
+		{name: "op key: mgmtd signs with a new key", check: "check_op_key_pinned", cell: "dev-cell-1", change: map[string]string{"signing-pub": otherPub},
+			want: []string{"mgmt-op-key holds op.pub = " + pub, "holds no key that equals the live key " + otherPub, "Run: CELL=dev-cell-1 mise run cell:up"}},
+		{name: "op key: a key that nobody staged", check: "check_op_key_pinned", cell: "dev-cell-1",
+			change: map[string]string{"op-key.json": opKey(map[string]string{"op.pub": pub, "op.next.pub": otherPub})},
+			want:   []string{"mgmt-op-key holds op.next.pub = " + otherPub + ", which is neither the live key of mgmtd nor its staged key", "Run: CELL=dev-cell-1 mise run cell:up"}},
+		{name: "op key: the staged key differs from the mounted one", check: "check_op_key_pinned", cell: "dev-cell-1",
+			change: map[string]string{"op-key.json": opKey(map[string]string{"op.pub": pub, "op.next.pub": otherPub}), "status.json": stagedStatus(base64.StdEncoding.EncodeToString([]byte(strings.Repeat("z", 32))))},
+			want:   []string{"op.next.pub", "neither the live key"}},
+		{name: "op key: the pod started with another key", check: "check_op_key_pinned", cell: "dev-cell-1", change: map[string]string{"celld-pods.json": opPods(strings.Repeat("0", 64))},
+			want: []string{"celld-0 carries the key checksum " + strings.Repeat("0", 64), "Run: CELL=dev-cell-1 mise run cell:up"}},
+		{name: "op key: no ConfigMap", check: "check_op_key_pinned", cell: "dev-cell-1", change: map[string]string{"op-key.json": ""},
+			want: []string{"Run: CELL=dev-cell-1 mise run cell:up"}},
+		{name: "celld streams ok", check: "check_celld_streams", cell: "dev-cp"},
+		{name: "celld streams: a cell has none", check: "check_celld_streams", cell: "dev-cp", change: map[string]string{"gw-status.json": `{"epoch":1,"streams":{"dev-cell-1":1}}`},
+			want: []string{"the gateway holds no stream of dev-cell-2", "CELL=dev-cell-2 mise run cell:up"}},
+		{name: "celld streams: a stream count of zero", check: "check_celld_streams", cell: "dev-cp", change: map[string]string{"gw-status.json": `{"epoch":1,"streams":{"dev-cell-1":0,"dev-cell-2":1}}`},
+			want: []string{"the gateway holds no stream of dev-cell-1", "CELL=dev-cell-1 mise run cell:up"}},
 		{name: "agent cells ok", check: "check_agent_cells_current", cell: "dev-cp"},
 		{name: "agent cells: a record holds old keys", check: "check_agent_cells_current", cell: "dev-cp",
 			change: map[string]string{"cell-records.json": records("7", map[string]string{"dev-cell-1": jwks("a"), "dev-cell-2": jwks("c")})},
@@ -183,6 +216,7 @@ func TestVerifyEnvdChecks(t *testing.T) {
 			cmd := exec.Command("bash", "-c", `source "$1/scripts/lib.sh"; source "$1/components/lib/peer-root.sh"; source "$1/components/lib/hostsvc-pin.sh"
 source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"
 keytest_leftover() { cat "$STUB_DIR/traces"; }
+gateway_status() { cat "$STUB_DIR/gw-status.json"; }
 set +e; `+tc.check, "_", root)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + tc.cell,
 				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub}

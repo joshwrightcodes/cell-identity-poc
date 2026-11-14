@@ -67,10 +67,28 @@ func waitIssued(t *testing.T, cell string, timeout time.Duration) {
 // afterRevision reports whether a is after b.
 func afterRevision(a, b spec.Revision) bool { return a.Compare(b) > 0 }
 
+// keyCheckAfterRotation runs a key check for a cell after rotateAPIKey and the update gap. The celld streams make the gateway hint
+// mgmtd, which updates the record within about a minute of the rotation, so the check answers keys_updated, or unchanged when
+// the hint was first. Either way the record must then list both key IDs, so that a token of the old key and one of the new key verify.
+func keyCheckAfterRotation(t *testing.T, cell, oldKID, newKID string) {
+	t.Helper()
+	switch got := keyCheck(t, cell); got {
+	case "keys_updated":
+	case "unchanged":
+		if kids := cellStatusOf(t, cell).Kids; !slices.Contains(kids, oldKID) || !slices.Contains(kids, newKID) {
+			t.Fatalf("the key check of %s after the rotation answered unchanged, and the record lists %v, want %s and %s", cell, kids, oldKID, newKID)
+		}
+	default:
+		t.Fatalf("the key check of %s after the rotation answered %q, want keys_updated or unchanged with both key IDs in the record", cell, got)
+	}
+}
+
 // TestM4KeyCheckFollowsRotation rotates the service account key of dev-cell-1 with the M2 helpers, and restarts no celld pod. A
 // key check first makes the record current and holds the periodic check back. With a record at one key, attestprobe fails with
-// unknown_kid. After the update gap, a key check gives keys_updated with both key IDs at a new revision. Then attestprobe is
-// issued within five minutes, with a token from the new key, and the SPIRE server pod keeps its UID and logs 'records reloaded'.
+// unknown_kid, unless a hint from a celld status report updated the record first (the hint comes about a minute after a rotation).
+// After the update gap, a key check gives keys_updated, or unchanged with both key IDs already in the record, at a new revision.
+// Then attestprobe is issued within five minutes, with a token from the new key, and the SPIRE server pod keeps its UID and
+// logs 'records reloaded' since the rotation.
 func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	const cell = rejectCell
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
@@ -84,18 +102,20 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	}
 	uid := serverPodUID(t)
 
+	rotatedAt := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
-	expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
+	if strings.HasPrefix(res.out, "issued:") {
+		t.Logf("a hint from a celld report updated the record of %s before the probe ran: %s", cell, res.out)
+	} else {
+		expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
+	}
 
 	if wait := keyUpdateGap - time.Since(first); wait > 0 {
 		t.Logf("waiting %s, so that the key check falls outside the update gap", wait.Round(time.Second))
 		time.Sleep(wait)
 	}
-	checkedAt := time.Now().Add(-logMargin)
-	if got := keyCheck(t, cell); got != "keys_updated" {
-		t.Fatalf("the key check of %s after the rotation answered %q, want keys_updated", cell, got)
-	}
+	keyCheckAfterRotation(t, cell, oldKID, newKID)
 	after := cellStatusOf(t, cell)
 	if !slices.Contains(after.Kids, oldKID) || !slices.Contains(after.Kids, newKID) || len(after.Kids) != 2 || !afterRevision(after.Record, before.Record) {
 		t.Errorf("after the key check the record of %s lists %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
@@ -104,12 +124,12 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	if got := serverPodUID(t); got != uid {
 		t.Errorf("the pod %s has the UID %s after the update, and had %s before: the server restarted", spireServerPod, got, uid)
 	}
-	logs, err := serverLog(t, checkedAt)
+	logs, err := serverLog(t, rotatedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "records reloaded" })); n == 0 {
-		t.Errorf("the SPIRE server log holds no 'records reloaded' line since the key check")
+		t.Errorf("the SPIRE server log holds no 'records reloaded' line since the rotation")
 	}
 }
 
@@ -160,7 +180,7 @@ func mgmtdLog(t *testing.T, since time.Time) string {
 }
 
 // makeRevision signs a new revision for a cell: a key check first, a rotation of the service account key with the M2 helpers, and
-// after the update gap a key check that gives keys_updated. The cleanup of rotateAPIKey repairs the API server when the test ends, and then the registries follow the record.
+// after the update gap a key check that gives keys_updated, or unchanged when a hint updated the record first. The cleanup of rotateAPIKey repairs the API server when the test ends, and then the registries follow the record.
 func makeRevision(t *testing.T, cell string) {
 	t.Helper()
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
@@ -168,11 +188,9 @@ func makeRevision(t *testing.T, cell string) {
 	}
 	renderRegistryAtCleanup(t)
 	first := time.Now()
-	rotateAPIKey(t, cell)
+	oldKID, newKID := rotateAPIKey(t, cell)
 	if wait := keyUpdateGap - time.Since(first); wait > 0 {
 		time.Sleep(wait)
 	}
-	if got := keyCheck(t, cell); got != "keys_updated" {
-		t.Fatalf("the key check of %s after the rotation answered %q, want keys_updated", cell, got)
-	}
+	keyCheckAfterRotation(t, cell, oldKID, newKID)
 }

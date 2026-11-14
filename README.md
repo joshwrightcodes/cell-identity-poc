@@ -249,20 +249,24 @@ Until `envd` writes the ConfigMap, no new agent can attest.
 Agents that already run still renew their SVIDs.
 
 The bind listener of the cell gateway in `dev-cp` takes the bind requests of the cells on node port 30451.
-ConfigMap `mgmt-root` in `cell-identity-system` holds the root of `management`.
+`celld` reaches the gateway on node ports 30450 (stream) and 30451 (bind) of `dev-cp`, and trusts it through ConfigMap `spire-trust-bundle`.
+ConfigMap `mgmt-op-key` in `cell-identity-system` holds the signing key of `mgmtd`, and `celld` applies only operations that this key signed.
+`celld` reads both ConfigMaps only at start, so each one has a checksum annotation on the pod template, and a new key restarts the pod.
 
 `cell:up` of a cell runs `scripts/attest-wait.sh` for `cell-identity`.
 The script waits for four stages in turn:
 
 | Stage | Meaning | Limit |
 | --- | --- | --- |
-| `bound` | `mise run mgmt -- status` shows the cell as bound | 120 s |
+| `bound` | `mise run mgmt -- status` shows the cell as bound, with the key IDs that the cell publishes now | 120 s |
 | `applied` | `cell-records` holds the revision of the record of the cell | 60 s |
 | `reloaded` | The server log shows the record of the cell at that revision or a later one | 150 s |
 | `ready` | The rollout of `celld` finishes | 300 s |
 
 The `reloaded` stage reads the server log since the last record change. A log that has rotated away makes it fail.
 A stage that fails prints its name, the reason and the next command.
+When the `bound` stage fails, the script prints two causes: the last bind refusal of the gateway for the cell, from `mise run gw -- status`, and the last refusal of `mgmtd` for the cell.
+After `source_mismatch` or `cell_unknown` from the gateway, it prints `CELL=dev-cp mise run cell:up` first, because the gateway admits a cell only by its node address.
 When `mise run mgmt -- status` does not answer, the script prints `CELL=management LINK_ONLY=mgmt-api mise run cell:link` and does not wait.
 When `mgmtd` has no `peer-root` for `dev-cp`, or `envd` logs a TLS refusal, the `applied` failure names the same command first.
 At the start of `ready`, the script deletes a `celld` pod once when its `spire-agent` container is in `CrashLoopBackOff`.
@@ -295,6 +299,39 @@ When `envd` has a ready replica, it also waits for the first sync of `envd`.
 It fails with one JSON error line when the volume claim does not exist.
 It prints one JSON line with the old and the new epoch.
 Use it only for this case, because the queue starts empty.
+
+### Signed operations in a cell
+
+`celld` keeps one open stream to the gateway, claims each signed operation on it, applies the operation and reports the result.
+The only kind in production is `demo.append`.
+It adds the line `<operation id> <text>` to ConfigMap `cell-ops-system/demo-log`.
+`celld` keeps one ConfigMap `op-<id>` for each operation in the same namespace, with the state `claimed`, `applied` or `reported`.
+Namespace `cell-ops-system` holds no pod.
+Role `celld-ops` allows `celld` to create, get, list, update and delete ConfigMaps there, and nothing else.
+`celld` and `celld` alone write `op-<id>` and `demo-log`, and both carry the label `poc.internal/made-by=celld`.
+`cell:verify` and the harness prune leave them alone.
+
+To follow one operation, run these commands:
+
+```sh
+mise run mgmt -- op create --cell dev-cell-1 --line "hello"
+mise run mgmt -- op get <id>
+mise x -- kubectl --context kind-dev-cell-1 -n cell-ops-system get configmap op-<id> -o jsonpath='{.data.record\.json}'
+mise run gw -- status
+```
+
+The record becomes `reported` only after `mgmtd` holds the final result `applied`.
+`mise run gw -- status` lists the open streams of each cell under `streams`.
+The gateway allows two streams for each cell, one for each `celld` pod, and refuses a third with `replica_cap`.
+
+When `cell:verify` of a cell reports that `mgmt-op-key` differs from the key of `mgmtd`, run `CELL=<cell> mise run cell:up`.
+When `cell:verify` of `dev-cp` reports that a cell has no stream, run `CELL=<cell> mise run cell:up`, and read the log of the `celld` pod.
+After a reset of the state of `mgmtd`, run `cell:up` for each cell before the full link, because each cell holds the old key until then.
+
+`mise run gate:m5:soak` sends one operation to `dev-cell-1` each minute for 30 minutes.
+It checks that each one is applied once and that the gap between the enqueue and the first record in the cell stays below 15 seconds.
+It prints the number of stream failures and of restarts for a new SVID.
+Run it alone, after `mise run gate:m5`.
 
 After each apply, the harness deletes the objects of a component that its render no longer holds.
 This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles, ClusterRoleBindings, ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings.
@@ -343,7 +380,7 @@ The rotation sets the counter back to 1, and it clears the stored history. `rest
 
 ### Check a bind
 
-`celld` binds its cell to `mgmtd` when it starts, and it repeats the bind until `mgmtd` holds a record.
+`celld` binds its cell to `mgmtd` through the bind listener of the cell gateway when it starts, and it repeats the bind until `mgmtd` holds a record.
 Run `mise run mgmt -- status` to read the result. Each entry of `cells` shows `bound`, the issuer, the key IDs and `lastCheck`.
 A cell that is not bound has no record, so its new pods cannot attest.
 The refusal reasons of a bind are `cell_unknown`, `nonce_invalid`, `token_invalid`, `issuer_untrusted`, `issuer_unavailable`, `keys_untrusted`, `rate_limited` and `restore_active`.
@@ -431,8 +468,13 @@ Run the printed commands in this order:
 
 ```sh
 CELL=dev-cp mise run cell:up
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
 CELL=management mise run cell:link
 ```
+
+The command prints one `cell:up` for each cell that `dev-cp` lists in `SPIRE_AGENT_CELLS`.
+Each cell holds the old signing key in ConfigMap `mgmt-op-key` until its `cell:up`, and until then `celld` refuses every new operation as `signature_invalid`.
 
 The fresh state starts with a new signing key.
 The `dev-cp` render pins that key, so `envd` and the plugin of the SPIRE server both start their marks again.
@@ -498,7 +540,7 @@ Deployment `relay-telemetry` passes node port 30444 to node port 31444.
 The relay ends no TLS. It holds at most 256 connections, and 16 from one client address.
 The NetworkPolicy admits the node addresses of the cells. Every pod of a cell that no policy limits reaches the relay through its node address, so cell-proxy, and not the network, decides who is a peer.
 
-`cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-root` and the stream to the principal.
+`cell:verify` of a cell checks the agent objects, its images, the `dev-cp` node address, ConfigMap `mgmt-op-key` and the stream to the principal.
 After a rebuild of `dev-cp` or a new root of `management`, it prints `CELL=<cell> mise run cell:up`.
 `cell:verify` of `dev-cp` checks that the relay routes and admit lists use the current node addresses of `management` and the cells. When it fails, run `CELL=dev-cp mise run cell:up`.
 

@@ -775,7 +775,9 @@ if has_harness cell-identity; then
     check_harness_objects cell-identity cell-identity-system
   check "celld runs the images that build/images.env records" \
     check_live_images cell-identity-system deployment/celld "CELL=$CELL_NAME mise run cell:up"
-  check "ConfigMap mgmt-root of celld holds the live roots of management" check_celld_mgmt_root
+  check "cell-ops-system has exactly the objects of the bundle, besides the records that celld wrote" \
+    check_harness_objects cell-identity cell-ops-system
+  check "celld pins the live signing key of mgmtd, or the staged key during a rotation" check_op_key_pinned
   check "The node holds no trace of the M2 key rotation test, and the API server publishes the keys of the record" \
     check_keytest_clean
   check "A probe pod with no app label in cell-identity-system cannot open TCP to the SPIRE node port (steady state)" \
@@ -912,6 +914,7 @@ if has_harness cell-gateway; then
   check "The cell gateway holds no store error, and envd synced with it in the last 2 minutes" check_gateway_synced
   check "The cell gateway and its NetworkPolicy use the current node address of each cell" check_gateway_cells
   check "The cell gateway holds the record revision of each cell in ConfigMap cell-records" check_gateway_records
+  check "The cell gateway holds an open stream for each cell of the topology" check_celld_streams
   check "The cell gateway pins the key that mgmtd signs with" check_gateway_spec_key
   for port in 30450 30451; do
     check "A probe pod in rogue cannot open TCP to the gateway node port $port of $CELL_NAME (steady state)" \

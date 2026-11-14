@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Repair what a gate:m5 run can leave behind. It runs gate-m4-repair.sh first, which repairs the host service, the
 # replicas of mgmtd and envd, the registries and the M2 traces. Then it sets the replicas of StatefulSet cell-gateway
-# in dev-cp back to 1 through scripts/harness-replicas.sh, and deletes the test namespaces m5-* of every cluster.
+# in dev-cp, and of Deployment celld in each cell with the cell-identity set, back to 1 through
+# scripts/harness-replicas.sh, and deletes the test namespaces m5-* of every cluster.
 # It is safe to run again.
 #
 # Usage: gate-m5-repair.sh [--check]
@@ -36,6 +37,23 @@ if [[ "$replicas" != 1 ]]; then
     status=0
   fi
 fi
+
+# TestM5ReplicaCap runs two celld pods in a cell, and a run that stops early leaves them.
+for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+  replicas="$(kubectl --context "kind-$cluster" -n cell-identity-system get deployment celld -o jsonpath='{.spec.replicas}' 2>/dev/null)" \
+    || { echo "Deployment celld is absent in $cluster. Run: CELL=$cluster mise run cell:up"; status=1; continue; }
+  [[ "$replicas" != 1 ]] || continue
+  if ((check)); then
+    status=1
+    echo "Deployment celld in $cluster has $replicas replicas. Run: $repair"
+  else
+    log "setting the replicas of celld in $cluster from $replicas to 1"
+    "${HARNESS_REPLICAS:-$ROOT/scripts/harness-replicas.sh}" "$cluster" cell-identity-system deployment/celld 1 \
+      || die "could not set the replicas of celld in $cluster. Run: scripts/harness-replicas.sh $cluster cell-identity-system deployment/celld 1"
+    kubectl --context "kind-$cluster" -n cell-identity-system rollout status deployment/celld --timeout=300s >/dev/null \
+      || die "deployment/celld in $cluster did not finish its rollout in 300s"
+  fi
+done
 
 # The test namespaces of the M5 tests carry the label cell.poc.internal/e2e=true.
 test_label="cell.poc.internal/e2e"

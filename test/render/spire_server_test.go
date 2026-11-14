@@ -478,7 +478,8 @@ var clusterScoped = []string{"Namespace", "CustomResourceDefinition", "ClusterRo
 	"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
 
 // docsIn parses the render output by kind and name. Every namespaced object must be in ns, and no
-// Namespace other than ns may appear.
+// Namespace other than ns may appear. The cell-identity render also holds the objects of namespace
+// cell-ops-system (TestCellOpsNamespace), and docsIn skips them for ns cell-identity-system.
 func docsIn(t *testing.T, out, ns string) map[string]object {
 	t.Helper()
 	byKey := map[string]object{}
@@ -494,6 +495,11 @@ func docsIn(t *testing.T, out, ns string) map[string]object {
 			continue
 		}
 		key := get[string](t, o, "kind") + "/" + get[string](t, o, "metadata", "name")
+		if ns == "cell-identity-system" {
+			if opsNS, _ := lookup(o, "metadata", "namespace"); opsNS == "cell-ops-system" || key == "Namespace/cell-ops-system" {
+				continue
+			}
+		}
 		if _, dup := byKey[key]; dup {
 			t.Fatalf("%s appears twice", key)
 		}

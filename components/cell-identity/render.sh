@@ -7,10 +7,11 @@
 #   - the trust bundle of the SPIRE server, from the server in SPIRE_SERVER_CLUSTER, through
 #     components/lib/peer-root.sh. It becomes ConfigMap spire-trust-bundle. The bundle holds only
 #     public certificates.
-#   - the root of the management trust domain, from the live SPIRE server of management, as
-#     ConfigMap mgmt-root. celld trusts the bind answer of mgmtd only through it. The pod template
-#     carries its SHA-256, so a new root restarts the pod. celld dials the bind route of the node
-#     of SPIRE_SERVER_CLUSTER on port 30447.
+#   - the public signing key of mgmtd, from ConfigMap mgmt-signing-pub in management, as ConfigMap
+#     mgmt-op-key (key op.pub). celld trusts an operation only when this key signed it. celld dials the
+#     stream port 30450 and the bind port 30451 of the cell gateway on the node of SPIRE_SERVER_CLUSTER.
+#     The pod template carries the SHA-256 of the trust bundle and of the key, because celld loads both
+#     only at start, so a change restarts the pod.
 #   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
 #     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
 #     checks the binary before it runs it.
@@ -31,6 +32,7 @@ source "$root/scripts/ko-image.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/addresses.sh"
+source "$root/components/lib/mgmt-key.sh"
 
 celld_image="$(ko_image celld)" || die "no celld image"
 
@@ -42,9 +44,14 @@ server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 [[ "$server_ip" =~ $ipv4 ]] || die "node address of $SPIRE_SERVER_CLUSTER is '$server_ip', not an IPv4 address"
 
 bundle="$(peer_root_pem "$SPIRE_SERVER_CLUSTER" "$trust_domain")" || exit 1
-mgmt_root="$(peer_root_configmap mgmt-root cell-identity-system management mgmt.poc.internal)" || exit 1
-mgmt_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$mgmt_root")"
-[[ "$mgmt_sum" =~ ^[0-9a-f]{64}$ ]] || die "ConfigMap mgmt-root has no checksum"
+bundle_sum="$(printf '%s' "$bundle" | sha256)"
+op_pub="$(mgmt_signing_pub)" || exit 1
+op_sum="$(printf '%s' "$op_pub" | sha256)"
+op_key="$(PUB="$op_pub" SUM="$op_sum" yq -n '
+  .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "mgmt-op-key" | .metadata.namespace = "cell-identity-system"
+  | .metadata.annotations["poc.internal/op-key-sha256"] = strenv(SUM)
+  | .data["op.pub"] = strenv(PUB)')"
+[[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
@@ -54,8 +61,9 @@ manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
   (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
     .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
 ' "$here/manifests.yaml" \
-  | sed -e "s|@CELLD_IMAGE@|$celld_image|" -e "s|@PEER_ROOT_SHA256@|$mgmt_sum|" \
-    -e "s|@CELL_NAME@|$CELL_NAME|" -e "s|@BIND_UPSTREAM@|$server_ip:30447|" \
+  | sed -e "s|@CELLD_IMAGE@|$celld_image|" -e "s|@TRUST_BUNDLE_SHA256@|$bundle_sum|" -e "s|@OP_KEY_SHA256@|$op_sum|" \
+    -e "s|@CELL_NAME@|$CELL_NAME|" -e "s|@POC_ENV@|$POC_ENV|" \
+    -e "s|@GATEWAY_STREAM@|$server_ip:30450|" -e "s|@GATEWAY_BIND@|$server_ip:30451|" -e "s|@GATEWAY_ADDRESS@|$server_ip|" \
     -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
     -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
     -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|")"
@@ -72,5 +80,5 @@ celld="$(yq 'select(.kind == "Deployment" and .metadata.name == "celld")' <<<"$m
   echo "---"
   echo "$celld"
   echo "---"
-  echo "$mgmt_root"
+  echo "$op_key"
 } | yq '.metadata.labels["cell.poc.internal/harness"] = "cell-identity"'
