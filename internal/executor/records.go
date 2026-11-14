@@ -265,7 +265,10 @@ func (e *Executor) MarkReported(ctx context.Context, id string) error {
 	return last
 }
 
-// Pending returns the results of applied records that are not reported, oldest first.
+// Pending returns the results of applied records that are not reported, oldest first. Each result
+// names this pod, because the management plane compares the pod of a result with the pod of its
+// token and a resend may come from another pod than the one that applied the operation. The record
+// keeps the pod that applied it.
 func (e *Executor) Pending(ctx context.Context) ([]op.Result, error) {
 	items, err := e.list(ctx)
 	if err != nil {
@@ -277,7 +280,9 @@ func (e *Executor) Pending(ctx context.Context) ([]op.Result, error) {
 		if err != nil || rec.State != stateApplied || rec.Result == nil {
 			continue
 		}
-		out = append(out, *rec.Result)
+		res := *rec.Result
+		res.Pod = e.cfg.Pod
+		out = append(out, res)
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].At.Before(out[j].At) })
 	return out, nil

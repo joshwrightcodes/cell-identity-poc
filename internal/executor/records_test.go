@@ -124,3 +124,25 @@ func TestRecordLabels(t *testing.T) {
 		t.Errorf("record lacks %s", labelRecord)
 	}
 }
+
+// A resend from another pod names that pod, and the record keeps the pod that applied the operation.
+func TestPendingNamesThisPod(t *testing.T) {
+	r := newRig(t)
+	a := r.executor("uid-a")
+	o := r.operation(testKind, `{}`)
+	if res := a.Execute(ctx, r.sign(o), fence(1, 1)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("%+v", res)
+	}
+	b := r.executor("uid-b")
+	p, err := b.Pending(ctx)
+	if err != nil || len(p) != 1 {
+		t.Fatalf("pending = %+v, %v", p, err)
+	}
+	if p[0].Pod != b.cfg.Pod || p[0].Pod == a.cfg.Pod {
+		t.Fatalf("pod %q, want %q (applier %q)", p[0].Pod, b.cfg.Pod, a.cfg.Pod)
+	}
+	rec, err := decodeRecord(mustGet(t, r, recordPrefix+o.ID))
+	if err != nil || rec.Result == nil || rec.Result.Pod != a.cfg.Pod {
+		t.Fatalf("record keeps %+v, %v; want pod %q", rec.Result, err, a.cfg.Pod)
+	}
+}

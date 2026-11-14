@@ -24,6 +24,7 @@ import (
 	clienttesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
@@ -437,7 +438,7 @@ func TestStreamResendsUntilFinal(t *testing.T) {
 			}
 		}
 
-		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: id, Outcome: op.OutcomeApplied})
+		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: id, Outcome: mgmtapi.OutcomeAccepted})
 		waitFor(t, 5*time.Second, "the record to be marked reported", func() bool {
 			p, _ := f.exec.Pending(t.Context())
 			return len(p) == 0
@@ -642,7 +643,7 @@ func TestStreamFinalMarksOnlyItsOp(t *testing.T) {
 		f.g.offer(a, b)
 		f.start()
 		waitFor(t, 10*time.Second, "two results", func() bool { return len(f.g.frames(gwapi.TypeResult)) >= 2 })
-		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: idA, Outcome: op.OutcomeApplied})
+		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: idA, Outcome: mgmtapi.OutcomeAccepted})
 		waitFor(t, 5*time.Second, "A to be reported", func() bool {
 			p, _ := f.exec.Pending(t.Context())
 			return len(p) == 1
@@ -801,4 +802,61 @@ func TestStreamRetryWithoutRecordIsLogged(t *testing.T) {
 			return false
 		})
 	})
+}
+
+// A final that is not accepted, duplicate or unknown_op leaves the record applied. The periodic
+// resend skips the operation for the rest of the stream, and the next stream sends it again.
+func TestStreamFinalRefusedKeepsRecordApplied(t *testing.T) {
+	for _, outcome := range []string{mgmtapi.OutcomeRefused, mgmtapi.OutcomeForgedSeen, ""} {
+		t.Run("outcome="+outcome, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t, func(c *StreamConfig) { c.ResendEvery = 40 * time.Second })
+				defer f.stop()
+				l, id := f.lease("s1.1", fence(1, 5))
+				f.g.offer(l)
+				f.start()
+				waitFor(t, 5*time.Second, "the result", func() bool { return len(f.g.frames(gwapi.TypeResult)) > 0 })
+
+				_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: id, Outcome: outcome})
+				_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: id, Outcome: outcome})
+				time.Sleep(time.Second)
+				if p, _ := f.exec.Pending(t.Context()); len(p) != 1 {
+					t.Fatalf("%d pending after a %q final, want the result kept", len(p), outcome)
+				}
+				n := len(f.g.frames(gwapi.TypeResult))
+				time.Sleep(125 * time.Second)
+				if got := len(f.g.frames(gwapi.TypeResult)); got != n {
+					t.Fatalf("%d result frames in the same stream after the final, want %d", got, n)
+				}
+
+				f.updates <- struct{}{}
+				waitFor(t, 20*time.Second, "the resend on the next stream", func() bool {
+					return len(f.g.frames(gwapi.TypeResult)) > n
+				})
+				if last := f.g.frames(gwapi.TypeResult)[n]; last.stream < 2 || resultOf(t, last.f).OpID != id {
+					t.Fatalf("resend %+v", last)
+				}
+			})
+		})
+	}
+}
+
+func TestStreamFinalEndsRecord(t *testing.T) {
+	for _, outcome := range []string{mgmtapi.OutcomeAccepted, mgmtapi.OutcomeDuplicate, mgmtapi.OutcomeUnknownOp} {
+		t.Run(outcome, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := newFixture(t)
+				defer f.stop()
+				l, id := f.lease("s1.1", fence(1, 5))
+				f.g.offer(l)
+				f.start()
+				waitFor(t, 5*time.Second, "the result", func() bool { return len(f.g.frames(gwapi.TypeResult)) > 0 })
+				_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeFinal, OpID: id, Outcome: outcome})
+				waitFor(t, 5*time.Second, "the record to be marked reported", func() bool {
+					p, _ := f.exec.Pending(t.Context())
+					return len(p) == 0
+				})
+			})
+		})
+	}
 }

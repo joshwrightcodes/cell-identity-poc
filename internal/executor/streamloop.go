@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 )
@@ -41,11 +42,14 @@ type loop struct {
 	ackDue                              []time.Time
 	claimDue                            time.Time
 	lastForged                          time.Time
+	// held holds the operations whose result the management plane refused in this stream. The
+	// periodic resend skips them, and the next stream sends them again.
+	held map[string]struct{}
 }
 
 func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Decoder) *loop {
 	l := &loop{cfg: cfg, ctx: ctx, w: w, exec: make(chan execOutcome, 1),
-		frames: make(chan gwapi.Frame), readErr: make(chan error, 1)}
+		frames: make(chan gwapi.Frame), readErr: make(chan error, 1), held: map[string]struct{}{}}
 	now := cfg.Now()
 	l.wantClaim = true
 	l.claimAt = now.Add(cfg.ClaimEvery)
@@ -216,13 +220,7 @@ func (l *loop) handle(f gwapi.Frame) error {
 	case gwapi.TypePing:
 		return l.send(gwapi.Frame{Type: gwapi.TypePong})
 	case gwapi.TypeFinal:
-		kctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
-		err := c.Exec.MarkReported(kctx, f.OpID)
-		cancel()
-		if err != nil && !apierrors.IsNotFound(err) {
-			c.Log.WarnContext(l.ctx, "mark reported failed", "op_id", f.OpID, "error", err.Error())
-		}
-		c.resent.forget(f.OpID)
+		l.handleFinal(f)
 	case gwapi.TypeRetry:
 		return l.resendPending(f.OpID)
 	case gwapi.TypeRefused:
@@ -237,6 +235,30 @@ func (l *loop) handle(f gwapi.Frame) error {
 		return fmt.Errorf("the gateway refused the stream: %s", f.Reason)
 	}
 	return nil
+}
+
+// handleFinal ends the record of an operation when the management plane has a final verdict for it:
+// it took the result, already had it, or does not know the operation. Any other verdict leaves the
+// record applied, so the next stream sends the result again.
+func (l *loop) handleFinal(f gwapi.Frame) {
+	c := l.cfg
+	switch f.Outcome {
+	case mgmtapi.OutcomeAccepted, mgmtapi.OutcomeDuplicate, mgmtapi.OutcomeUnknownOp:
+	default:
+		if _, again := l.held[f.OpID]; !again {
+			l.held[f.OpID] = struct{}{}
+			c.Log.WarnContext(l.ctx, "the management plane did not take a result; it stays applied",
+				"op_id", f.OpID, "outcome", f.Outcome)
+		}
+		return
+	}
+	kctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
+	err := c.Exec.MarkReported(kctx, f.OpID)
+	cancel()
+	if err != nil && !apierrors.IsNotFound(err) {
+		c.Log.WarnContext(l.ctx, "mark reported failed", "op_id", f.OpID, "error", err.Error())
+	}
+	c.resent.forget(f.OpID)
 }
 
 // reportLease sends the result of a lease when it is final. A local outcome stays in the log. At most
@@ -304,6 +326,9 @@ func (l *loop) resendPending(opID string) error {
 	found := false
 	for _, res := range pending {
 		if opID != "" && res.OpID != opID {
+			continue
+		}
+		if _, held := l.held[res.OpID]; held && opID == "" {
 			continue
 		}
 		found = true
