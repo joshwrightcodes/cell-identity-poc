@@ -102,8 +102,13 @@ func TestRelayPassesBytes(t *testing.T) {
 	down, up := randomBytes(t, size), randomBytes(t, size)
 	got := make(chan []byte, 1)
 	addr := upstreamServer(t, func(c net.Conn) {
-		go func() { _, _ = c.Write(up) }()
+		written := make(chan struct{})
+		go func() {
+			defer close(written)
+			_, _ = c.Write(up)
+		}()
 		b, _ := io.ReadAll(io.LimitReader(c, size))
+		<-written
 		got <- b
 	})
 	relayAddr, _ := startRelay(t, addr, nil)
