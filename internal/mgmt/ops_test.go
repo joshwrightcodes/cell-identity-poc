@@ -3,6 +3,7 @@ package mgmt
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
 var demoArgs = json.RawMessage(`{"line":"hello"}`)
@@ -673,5 +675,41 @@ func TestOnRecordsCalledWhenTheLastCellDrops(t *testing.T) {
 	}
 	if last := rc.calls[len(rc.calls)-1]; len(last) != 0 {
 		t.Fatalf("the hook got %d records after the last cell dropped", len(last))
+	}
+}
+
+// A rotation that commits while the hook is being prepared must not pair records of the new key
+// with the old public key.
+func TestOnRecordsTakesRecordsAndKeyFromOneSnapshot(t *testing.T) {
+	var rc recordCalls
+	r := newRig(t, cell1, cell2)
+	r.mod = func(c *Config) { c.OnRecords = rc.on }
+	r.restart(nil)
+	r.plane.betweenLoads = func() {
+		r.plane.betweenLoads = nil
+		_, next, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_, err = r.plane.commitTxn(func(tx *txn) error {
+			tx.key = next
+			return r.plane.resignAll(fingerprint(next.Public().(ed25519.PublicKey)))(tx)
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	recs, pub := rc.calls[len(rc.calls)-1], rc.pubs[len(rc.pubs)-1]
+	if len(recs) == 0 {
+		t.Fatal("the hook got no record")
+	}
+	for name, raw := range recs {
+		if _, err := record.Verify(raw, []ed25519.PublicKey{pub}); err != nil {
+			t.Fatalf("record of %s does not verify under the key of the same call: %v", name, err)
+		}
 	}
 }

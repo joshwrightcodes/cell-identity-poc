@@ -111,9 +111,11 @@ type Plane struct {
 	rep reports
 	rt  liveState
 
-	cbmu  sync.Mutex // serializes OnRecords calls
-	ready atomic.Bool
-	bg    sync.WaitGroup // background hint checks
+	cbmu sync.Mutex // serializes OnRecords calls
+	// betweenLoads runs in notifyRecords after the snapshot load. Tests use it.
+	betweenLoads func()
+	ready        atomic.Bool
+	bg           sync.WaitGroup // background hint checks
 
 	bindResults, checkResults, reportItems, retryUnknownKID metric.Int64Counter
 }

@@ -47,7 +47,16 @@ func (p *Plane) notifyRecords() {
 	p.cbmu.Lock()
 	defer p.cbmu.Unlock()
 	cur := p.snap.Load()
-	p.cfg.OnRecords(p.Records(), slices.Clone(cur.pub))
+	if p.betweenLoads != nil {
+		p.betweenLoads()
+	}
+	// The records and the key come from one snapshot, so that a rotation that commits now cannot
+	// pair records of the new key with the old public key.
+	var records map[string]json.RawMessage
+	if s := cur.st.served(); s != nil {
+		records = maps.Clone(s.Bundle.Records)
+	}
+	p.cfg.OnRecords(records, slices.Clone(cur.pub))
 }
 
 // sameRecords reports whether two bundles hold the same record envelopes.
