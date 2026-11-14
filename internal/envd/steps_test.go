@@ -299,6 +299,21 @@ func TestStepStoreRoundTrip(t *testing.T) {
 	}
 }
 
+// An update of a ConfigMap that exists without the label adds it.
+func TestStepStoreLabelsExistingConfigMap(t *testing.T) {
+	f := newFx(t)
+	c := fake.NewClientset(&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "cell-steps", Namespace: "cell-controller-system"},
+		Data: map[string]string{"stale.step.json": "x"}})
+	s := NewStepStore(c, "cell-controller-system", "cell-steps", KeyFingerprint(f.keys()), nil)
+	if err := s.Save(t.Context(), stepsState(t, f, 6, f.stepFor("d", nil))); err != nil {
+		t.Fatal(err)
+	}
+	cm, _ := c.CoreV1().ConfigMaps("cell-controller-system").Get(t.Context(), "cell-steps", metav1.GetOptions{})
+	if cm.Labels["poc.internal/made-by"] != "envd" || cm.Data["stale.step.json"] != "" {
+		t.Fatalf("labels %v data keys %d", cm.Labels, len(cm.Data))
+	}
+}
+
 // The steps ConfigMap is a separate object from the records ConfigMap, and a spec with steps
 // does not make the records store refuse its own content.
 func TestStepStoreAfterRecords(t *testing.T) {
@@ -528,6 +543,9 @@ func TestPullerAdoptDoesNotBlankSteps(t *testing.T) {
 	if p.state.Revision != rev(1, 6) || p.state.stepsVerified || ms.count() != 0 {
 		t.Fatalf("adopted revision %v verified %v step saves %d", p.state.Revision, p.state.stepsVerified, ms.count())
 	}
+	if err := p.saveSteps(t.Context(), p.state); err != nil || ms.count() != 0 {
+		t.Fatalf("a save from the adopted state: %v, step saves %d", err, ms.count())
+	}
 	p.accept(t.Context(), t.Context(), b)
 	if ms.count() != 1 || !bytes.Equal(ms.saved[0].Steps["d"], d.env) {
 		t.Fatalf("step saves %d after the pull of the adopted revision", ms.count())
@@ -554,6 +572,32 @@ func TestPullerRewritesStepsOnChange(t *testing.T) {
 	}
 	if len(ms.saved[2].Steps) != 0 || len(ms.saved[1].Steps) != 2 {
 		t.Fatalf("steps of the saves: %d, %d", len(ms.saved[1].Steps), len(ms.saved[2].Steps))
+	}
+}
+
+// The same step payload in another envelope is other content for the cell controller.
+func TestPullerRewritesStepsOnEnvelopeChange(t *testing.T) {
+	f := newFx(t)
+	ms := &memSteps{}
+	p := NewPuller(PullerConfig{Env: testEnv, Keys: f.keys(), Store: &memStore{}, Steps: ms, Log: newLog(io.Discard)})
+	p.state = Empty()
+	d := f.stepFor("d", nil)
+	b := stepBundle(f, rev(1, 4), d)
+	p.accept(t.Context(), t.Context(), b)
+	var m map[string]any
+	if err := json.Unmarshal(d.env, &m); err != nil {
+		t.Fatal(err)
+	}
+	sig := m["signatures"].([]any)[0]
+	m["signatures"] = []any{sig, sig}
+	b.Steps["d"], _ = json.Marshal(m)
+	p.accept(t.Context(), t.Context(), b)
+	if ms.count() != 2 || !bytes.Equal(ms.saved[1].Steps["d"], b.Steps["d"]) {
+		t.Fatalf("step saves %d", ms.count())
+	}
+	p.accept(t.Context(), t.Context(), b)
+	if ms.count() != 2 {
+		t.Fatalf("step saves %d for the same envelope", ms.count())
 	}
 }
 
