@@ -104,7 +104,7 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 // spec too. The state that it returns when the spec is unchanged is cur itself.
 func acceptRecords(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicKey) (*State, bool, spec.Spec, error) {
 	next, changed, s, err := acceptRecordsCore(cur, b, env, keys)
-	if next != nil && next.Steps == nil {
+	if next != nil && changed && next.Steps == nil {
 		next.Steps = map[string][]byte{}
 	}
 	return next, changed, s, err

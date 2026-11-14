@@ -347,6 +347,7 @@ func TestCellgwServesWithZeroCells(t *testing.T) {
 	client := &http.Client{Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}}, ForceAttemptHTTP2: true}}
 	defer client.CloseIdleConnections()
+	var firstID string
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 		resp, err := client.Post("https://"+r.fields["bind"].(string)+gwapi.BindPath(cell), "application/json", strings.NewReader("{}"))
 		if err != nil {
@@ -357,10 +358,36 @@ func TestCellgwServesWithZeroCells(t *testing.T) {
 		if resp.StatusCode != http.StatusForbidden {
 			t.Fatalf("bind of %s: status %d, body %q", cell, resp.StatusCode, body)
 		}
+		if firstID == "" {
+			var d struct {
+				RequestID string `json:"request_id"`
+			}
+			if err := json.Unmarshal(body, &d); err != nil || d.RequestID == "" {
+				t.Fatalf("denial body %q: %v", body, err)
+			}
+			firstID = d.RequestID
+		}
 	}
-	// The body of a denial is the same for every reason, so the reason is read from the log.
-	logs := r.out.String()
-	if !strings.Contains(logs, `"reason":"`+gwapi.ReasonSourceMismatch+`"`) || strings.Contains(logs, `"reason":"`+gwapi.ReasonCellUnknown+`"`) {
-		t.Fatalf("bind_denied reasons: %s", logs)
+	// The body of a denial is the same for every reason, so the reason is read from the log. The
+	// limiter keeps only the first line of each reason, and it belongs to the first bind.
+	var reasons []string
+	matched := false
+	for _, l := range strings.Split(r.out.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) != nil || m["msg"] != "bind_denied" {
+			continue
+		}
+		reasons = append(reasons, m["reason"].(string))
+		if m["reason"] == gwapi.ReasonSourceMismatch && m["request_id"] == firstID {
+			matched = true
+		}
+	}
+	for _, reason := range reasons {
+		if reason != gwapi.ReasonSourceMismatch {
+			t.Fatalf("bind_denied reasons %v", reasons)
+		}
+	}
+	if !matched {
+		t.Fatalf("no bind_denied line with request_id %s and reason source_mismatch: %s", firstID, r.out.String())
 	}
 }

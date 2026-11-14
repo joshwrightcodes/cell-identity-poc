@@ -30,6 +30,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -636,5 +638,51 @@ func TestNewClientsBuildsGatewayClient(t *testing.T) {
 	cfg.gatewayID = spiffeid.RequireFromString(gwID)
 	if _, _, err := newClients(envCA.Source(t, "spiffe://dev.env.poc.internal/envd"), cfg); err == nil {
 		t.Error("a source with no bundles was accepted")
+	}
+}
+
+// pullerConfig wires the step store and the step status to the ConfigMaps of the flags.
+func TestPullerConfigWiresStepConfigMaps(t *testing.T) {
+	s := newSigner(t)
+	cfg := runConfig{upstream: "x:1", env: "dev", key: s.pub, namespace: "spire-system", configMap: "cell-records",
+		hintsNS: "spire-system", hintsName: "hints", stepsNS: "steps-ns", stepsName: "steps-name",
+		statusNS: "status-ns", statusName: "status-name", interval: time.Second}
+	kube := fake.NewClientset()
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	pc := pullerConfig(cfg, kube, &http.Client{}, nil, tel)
+	if pc.Steps == nil || pc.StepStatus == nil || pc.Env != "dev" || pc.BaseURL != "https://x:1" {
+		t.Fatalf("config %+v", pc)
+	}
+
+	// The step store writes the ConfigMap of --steps-configmap.
+	b := s.bundle(1)
+	var sp spec.Spec
+	sp.Env, sp.Revision = "dev", spec.Revision{Epoch: 1, Counter: 2}
+	_, payload, _ := record.VerifyWithPayload(b.Records["a"], []ed25519.PublicKey{s.pub})
+	sp.Cells = []spec.Entry{{Name: "a", Revision: spec.Revision{Epoch: 1, Counter: 1}, RecordSHA256: spec.RecordDigest(payload)}}
+	raw, err := spec.Sign(sp, s.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _, err := envd.Accept(envd.Empty(), mgmtapi.SpecBundle{Spec: raw, Records: b.Records}, "dev", []ed25519.PublicKey{s.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.Steps.Save(t.Context(), st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kube.CoreV1().ConfigMaps("steps-ns").Get(t.Context(), "steps-name", metav1.GetOptions{}); err != nil {
+		t.Fatalf("steps ConfigMap: %v", err)
+	}
+
+	// The step status is read from the ConfigMap of --step-status-configmap.
+	body := `{"at":"2026-11-12T09:00:00Z","steps":[{"id":"` + strings.Repeat("ab", 16) + `","cell":"d","state":"done"}]}`
+	if _, err := kube.CoreV1().ConfigMaps("status-ns").Create(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-name", Namespace: "status-ns"}, Data: map[string]string{"status.json": body}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := pc.StepStatus.Read(t.Context())
+	if err != nil || len(got) != 1 || got[0].Cell != "d" {
+		t.Fatalf("step status %v %v", got, err)
 	}
 }

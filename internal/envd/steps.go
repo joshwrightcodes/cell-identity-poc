@@ -196,7 +196,7 @@ type configMapStepStatus struct {
 }
 
 // NewConfigMapStepStatus returns a StepStatusSource on the ConfigMap namespace/name. A missing
-// ConfigMap, one above 64 KiB and a body that does not decode strictly give no entries. Read keeps
+// ConfigMap, one above 64 KiB, and a body that does not decode strictly or has no "at" give no entries. Read keeps
 // only the entries that pass mgmtapi.ValidStepStatus, at most 32. It logs one line for each ignored
 // ConfigMap, at most once in each window, to the first logger or to the default logger.
 func NewConfigMapStepStatus(c kubernetes.Interface, namespace, name string, log ...*slog.Logger) StepStatusSource {
@@ -222,8 +222,11 @@ func (s *configMapStepStatus) Read(ctx context.Context) ([]mgmtapi.StepStatus, t
 	if err != nil {
 		return nil, time.Time{}, fmt.Errorf("step status configmap %s/%s: %w", s.namespace, s.name, err)
 	}
-	size := len(cm.BinaryData)
+	size := 0
 	for k, v := range cm.Data {
+		size += len(k) + len(v)
+	}
+	for k, v := range cm.BinaryData {
 		size += len(k) + len(v)
 	}
 	if size > MaxStatusBytes {
@@ -240,7 +243,7 @@ func (s *configMapStepStatus) Read(ctx context.Context) ([]mgmtapi.StepStatus, t
 	}
 	dec := json.NewDecoder(bytes.NewReader([]byte(raw)))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil || dec.More() {
+	if err := dec.Decode(&body); err != nil || dec.More() || body.At.IsZero() {
 		s.skip(ctx, "body does not decode")
 		return nil, time.Time{}, nil
 	}

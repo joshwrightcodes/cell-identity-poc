@@ -147,6 +147,8 @@ func TestAcceptRefusesSteps(t *testing.T) {
 	bundle := func(steps ...stepItem) mgmtapi.SpecBundle {
 		return f.bundleSteps(next, slices.Clone(items), retired, steps...)
 	}
+	// The detail reaches the log, and it tells the check that refused apart from the later compares.
+	details := map[string]string{"step_missing_envelope": "no step envelope", "step_unsigned": "signature"}
 	for _, tc := range []struct {
 		name, reason string
 		bundle       func() mgmtapi.SpecBundle
@@ -195,6 +197,9 @@ func TestAcceptRefusesSteps(t *testing.T) {
 			if !errors.As(err, &r) || r.Reason != tc.reason {
 				t.Fatalf("err = %v, want reason %q", err, tc.reason)
 			}
+			if want := details[tc.name]; !strings.Contains(r.Detail, want) {
+				t.Errorf("detail %q lacks %q", r.Detail, want)
+			}
 			if got != nil || changed || !reflectEqual(cur, before) {
 				t.Error("a refusal returned a state or changed cur")
 			}
@@ -205,7 +210,7 @@ func TestAcceptRefusesSteps(t *testing.T) {
 			t.Fatalf("changed=%v err=%v", changed, err)
 		}
 	})
-	t.Run("step_over_limit_but_size_ok", func(t *testing.T) {
+	t.Run("step_padded_below_limit", func(t *testing.T) {
 		st := f.stepFor("d", nil)
 		st.env = append(slices.Clone(st.env), bytes.Repeat([]byte(" "), 1024)...)
 		if _, _, err := Accept(cur, bundle(st), testEnv, f.keys()); err != nil {
@@ -397,10 +402,16 @@ func TestStepStatusMalformedIgnored(t *testing.T) {
 			{"trailing_data", statusCM(statusBody(t, stepT0, good) + "{}"), 0, false, false},
 			{"unknown_field", statusCM(`{"at":"2026-11-12T09:00:00Z","steps":[],"extra":1}`), 0, false, false},
 			{"unknown_entry_field", statusCM(`{"at":"2026-11-12T09:00:00Z","steps":[{"id":"` + id1 + `","cell":"d","state":"done","bogus":1}]}`), 0, false, false},
+			{"no_at", statusCM(`{"steps":[{"id":"` + id1 + `","cell":"d","state":"done"}]}`), 0, false, false},
 			{"bad_at", statusCM(`{"at":"yesterday","steps":[]}`), 0, false, false},
 			{"bad_entry_dropped", statusCM(statusBody(t, stepT0, good, mgmtapi.StepStatus{ID: "short", Cell: "d", State: mgmtapi.StepDone},
 				mgmtapi.StepStatus{ID: id2, Cell: "e", State: "nonsense"})), 1, true, false},
-			{"huge_detail_dropped", statusCM(statusBody(t, stepT0, good, mgmtapi.StepStatus{ID: id2, Cell: "e", State: mgmtapi.StepFailed, Detail: strings.Repeat("x", 70<<10)})), 0, false, false},
+			{"configmap_over_64k", statusCM(statusBody(t, stepT0, good, mgmtapi.StepStatus{ID: id2, Cell: "e", State: mgmtapi.StepFailed, Detail: strings.Repeat("x", 70<<10)})), 0, false, false},
+			{"binary_data_over_64k", func() *corev1.ConfigMap {
+				cm := statusCM(statusBody(t, stepT0, good))
+				cm.BinaryData = map[string][]byte{"x": make([]byte, 70<<10)}
+				return cm
+			}(), 0, false, false},
 			{"over_32", statusCM(statusBody(t, stepT0, many...)), 32, true, false},
 			{"valid", statusCM(statusBody(t, stepT0, good)), 1, true, false},
 		} {
@@ -508,7 +519,7 @@ func TestPullerWritesStepsAfterRestart(t *testing.T) {
 		t.Fatalf("step saves %d, want one with the step", ms.count())
 	}
 
-	// The same content again, and then a new step set at the same revision of the records.
+	// The same content again.
 	h.up.set(stepBundle(h.f, rev(1, 4), d))
 	h.clk.mu.Lock()
 	h.clk.sleeps, h.clk.stop = nil, 1
@@ -669,5 +680,23 @@ func TestStepStatusMalformedLogsOnce(t *testing.T) {
 	}
 	if n := logs.count("step status ignored"); n != 1 {
 		t.Fatalf("log lines %d, want 1", n)
+	}
+}
+
+// An unchanged-spec accept leaves cur as it was, also when cur holds no steps map.
+func TestAcceptUnchangedLeavesCur(t *testing.T) {
+	f := newFx(t)
+	b := stepBundle(f, rev(1, 4), f.stepFor("d", nil))
+	cur, _, err := Accept(Empty(), b, testEnv, f.keys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur.Steps, cur.stepsVerified = nil, false
+	got, changed, err := Accept(cur, b, testEnv, f.keys())
+	if err != nil || changed || len(got.Steps) != 1 {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if cur.Steps != nil || cur.stepsVerified {
+		t.Fatal("Accept changed cur")
 	}
 }

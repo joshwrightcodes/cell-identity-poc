@@ -340,22 +340,7 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	if err != nil {
 		return err
 	}
-	keys := []ed25519.PublicKey{cfg.key}
-	puller := envd.NewPuller(envd.PullerConfig{
-		Client:     mgmtClient,
-		BaseURL:    "https://" + cfg.upstream,
-		Env:        cfg.env,
-		Keys:       keys,
-		Store:      envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
-		Gateway:    gateway,
-		Hints:      envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
-		Steps:      envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
-		StepStatus: envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
-		Interval:   cfg.interval,
-		Log:        tel.Log,
-		Meter:      tel.Meter,
-		Tracer:     tel.Tracer,
-	})
+	puller := envd.NewPuller(pullerConfig(cfg, kube, mgmtClient, gateway, tel))
 
 	ln, err := net.Listen("tcp", cfg.healthListen)
 	if err != nil {
@@ -373,6 +358,26 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	return nil
+}
+
+// pullerConfig wires the puller to the ConfigMaps that cfg names.
+func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, gateway envd.GatewayClient, tel *telemetry.T) envd.PullerConfig {
+	keys := []ed25519.PublicKey{cfg.key}
+	return envd.PullerConfig{
+		Client:     mgmt,
+		BaseURL:    "https://" + cfg.upstream,
+		Env:        cfg.env,
+		Keys:       keys,
+		Store:      envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
+		Gateway:    gateway,
+		Hints:      envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
+		Steps:      envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
+		StepStatus: envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
+		Interval:   cfg.interval,
+		Log:        tel.Log,
+		Meter:      tel.Meter,
+		Tracer:     tel.Tracer,
+	}
 }
 
 // newClients builds the client of the management plane and the client of the gateway. The gateway
