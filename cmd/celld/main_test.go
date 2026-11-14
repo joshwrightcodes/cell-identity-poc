@@ -444,13 +444,13 @@ func newBindServer(t *testing.T, ca *spiffetest.CA, serverID string) *bindServer
 	cfg := tlsconfig.TLSServerConfig(ca.Source(t, serverID))
 	cfg.MinVersion, cfg.NextProtos = tls.VersionTLS13, []string{"h2"}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+gwapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.requests++
 		s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(mgmtapi.NonceResponse{Nonce: "nonce1", Audience: mgmtapi.BindAudience(r.PathValue("cell"), "nonce1"), Bound: s.bound.Load()})
 	})
-	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+gwapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		s.mu.Lock()

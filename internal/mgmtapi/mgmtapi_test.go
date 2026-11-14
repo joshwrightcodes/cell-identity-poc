@@ -21,13 +21,10 @@ func TestBindAudience(t *testing.T) {
 
 func TestPaths(t *testing.T) {
 	for got, want := range map[string]string{
-		SpecPath("dev"):         "/v1/envs/dev/spec",
-		StatusPath("dev"):       "/v1/envs/dev/status",
-		NoncePath("dev-cell-1"): "/v1/cells/dev-cell-1/nonce",
-		BindPath("dev-cell-1"):  "/v1/cells/dev-cell-1/bind",
-		KeysPath("dev-cell-1"):  "/v1/clusters/dev-cell-1/keys",
-		KeysPath("a/../b c"):    "/v1/clusters/a%2F..%2Fb%20c/keys",
-		NoncePath("x?y=1#frag"): "/v1/cells/x%3Fy=1%23frag/nonce",
+		SpecPath("dev"):        "/v1/envs/dev/spec",
+		StatusPath("dev"):      "/v1/envs/dev/status",
+		KeysPath("dev-cell-1"): "/v1/clusters/dev-cell-1/keys",
+		KeysPath("a/../b c"):   "/v1/clusters/a%2F..%2Fb%20c/keys",
 	} {
 		if got != want {
 			t.Errorf("got %q, want %q", got, want)
@@ -130,8 +127,8 @@ func TestPatternsMatchPathHelpers(t *testing.T) {
 		pattern string
 		path    func(string) string
 	}{
-		{SpecPattern, SpecPath}, {StatusPattern, StatusPath}, {NoncePattern, NoncePath},
-		{BindPattern, BindPath}, {KeysPattern, KeysPath}, {OpsPattern, OpsPath}, {ReportsPattern, ReportsPath},
+		{SpecPattern, SpecPath}, {StatusPattern, StatusPath},
+		{KeysPattern, KeysPath}, {OpsPattern, OpsPath}, {ReportsPattern, ReportsPath},
 	} {
 		for _, value := range []string{"dev-cell-1", "a b", "x/y", "q?z"} {
 			var got string

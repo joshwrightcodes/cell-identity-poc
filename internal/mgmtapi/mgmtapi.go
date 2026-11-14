@@ -86,8 +86,6 @@ func BindAudience(cell, nonce string) string {
 const (
 	SpecPattern    = "/v1/envs/{env}/spec"
 	StatusPattern  = "/v1/envs/{env}/status"
-	NoncePattern   = "/v1/cells/{cell}/nonce"
-	BindPattern    = "/v1/cells/{cell}/bind"
 	KeysPattern    = "/v1/clusters/{cluster}/keys"
 	OpsPattern     = "/v1/envs/{env}/ops"
 	ReportsPattern = "/v1/envs/{env}/reports"
@@ -98,12 +96,6 @@ func SpecPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/
 
 // StatusPath is the path where envd reports the status of an environment.
 func StatusPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/status" }
-
-// NoncePath is the path where a cell asks for a bind nonce.
-func NoncePath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/nonce" }
-
-// BindPath is the path where a cell sends its bind request.
-func BindPath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/bind" }
 
 // KeysPath is the path of the host service route that returns the keys of a cluster.
 func KeysPath(cluster string) string { return "/v1/clusters/" + url.PathEscape(cluster) + "/keys" }

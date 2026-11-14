@@ -361,8 +361,8 @@ func TestSyncAndAckWireNames(t *testing.T) {
 }
 
 func TestPathsAndPatterns(t *testing.T) {
-	if StreamPath("dev-cell-1") != "/v1/cells/dev-cell-1/stream" || NoncePath("c") != mgmtapi.NoncePath("c") ||
-		BindPath("c") != mgmtapi.BindPath("c") || BindResultPath("c", "abc") != "/v1/cells/c/bind/abc" ||
+	if StreamPath("dev-cell-1") != "/v1/cells/dev-cell-1/stream" || NoncePath("c") != "/v1/cells/c/nonce" ||
+		BindPath("c") != "/v1/cells/c/bind" || BindResultPath("c", "abc") != "/v1/cells/c/bind/abc" ||
 		SyncPath != "/v1/sync" || AckPath != "/v1/ack" {
 		t.Fatal("path values")
 	}

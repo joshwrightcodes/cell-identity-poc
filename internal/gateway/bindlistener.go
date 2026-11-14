@@ -92,8 +92,8 @@ func NewBindHandler(st *Store, cfg BindConfig) *BindHandler {
 	h := &BindHandler{st: st, cfg: cfg, log: cfg.Log, ins: newInstruments(cfg.Meter), nodes: nodes,
 		limit: lograte.New(10*time.Second, 32, time.Now), mux: http.NewServeMux(),
 		rate: map[netip.Addr][]time.Time{}, refusals: map[string]mgmtapi.BindRefusal{}}
-	h.mux.HandleFunc("GET "+mgmtapi.NoncePattern, h.guard(h.nonce))
-	h.mux.HandleFunc("POST "+mgmtapi.BindPattern, h.guard(h.bind))
+	h.mux.HandleFunc("GET "+gwapi.NoncePattern, h.guard(h.nonce))
+	h.mux.HandleFunc("POST "+gwapi.BindPattern, h.guard(h.bind))
 	h.mux.HandleFunc("GET "+gwapi.BindResultPattern, h.guard(h.result))
 	h.mux.HandleFunc("/", http.NotFound)
 	return h

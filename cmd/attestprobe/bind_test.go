@@ -58,7 +58,7 @@ func newBindServer(t *testing.T) *bindServer {
 		_ = json.NewEncoder(w).Encode(v)
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+gwapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		s.methods = append(s.methods, r.Method+" "+r.URL.Path)
 		s.nonces++
@@ -69,7 +69,7 @@ func newBindServer(t *testing.T) *bindServer {
 		}
 		reply(w, 200, mgmtapi.NonceResponse{Nonce: "n1", Audience: mgmtapi.BindAudience(r.PathValue("cell"), "n1")})
 	})
-	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+gwapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		s.mu.Lock()

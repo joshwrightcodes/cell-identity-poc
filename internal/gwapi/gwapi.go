@@ -302,6 +302,9 @@ type AckRequest struct {
 const (
 	StreamPattern     = "/v1/cells/{cell}/stream"
 	BindResultPattern = "/v1/cells/{cell}/bind/{id}"
+	// NoncePattern and BindPattern are the routes where a cell asks for a bind nonce and posts a bind request.
+	NoncePattern = "/v1/cells/{cell}/nonce"
+	BindPattern  = "/v1/cells/{cell}/bind"
 
 	// SyncPath is where envd posts a SyncRequest.
 	SyncPath = "/v1/sync"
@@ -312,12 +315,11 @@ const (
 // StreamPath is the path of the stream of a cell.
 func StreamPath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/stream" }
 
-// NoncePath is the path where a cell asks the gateway for a bind nonce. It equals the management
-// plane path, so a cell uses one path on either server.
-func NoncePath(cell string) string { return mgmtapi.NoncePath(cell) }
+// NoncePath is the path where a cell asks the gateway for a bind nonce.
+func NoncePath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/nonce" }
 
 // BindPath is the path where a cell posts a bind request to the gateway.
-func BindPath(cell string) string { return mgmtapi.BindPath(cell) }
+func BindPath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/bind" }
 
 // BindResultPath is the path where a cell polls the result of a bind.
 func BindResultPath(cell string, id string) string {

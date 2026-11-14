@@ -99,7 +99,7 @@ func newServer(t *testing.T, serverID string) *fakeServer {
 		return nil
 	}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET "+gwapi.NoncePattern, func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		f.mu.Lock()
 		f.methods = append(f.methods, r.Method+" "+r.URL.Path)
@@ -123,7 +123,7 @@ func newServer(t *testing.T, serverID string) *fakeServer {
 		}
 		h(w, r, n)
 	})
-	mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+gwapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 		var req mgmtapi.BindRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
@@ -431,13 +431,13 @@ func TestOnceAttemptTimeout(t *testing.T) {
 				pl := &pipeListener{ch: make(chan net.Conn), done: make(chan struct{})}
 				release := make(chan struct{})
 				mux := http.NewServeMux()
-				mux.HandleFunc("GET "+mgmtapi.NoncePattern, func(w http.ResponseWriter, _ *http.Request) {
+				mux.HandleFunc("GET "+gwapi.NoncePattern, func(w http.ResponseWriter, _ *http.Request) {
 					if stage == "nonce" {
 						<-release
 					}
 					okNonce(false)(w, nil, 0)
 				})
-				mux.HandleFunc("POST "+mgmtapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
+				mux.HandleFunc("POST "+gwapi.BindPattern, func(w http.ResponseWriter, r *http.Request) {
 					if stage == "bind" {
 						<-release
 					}
