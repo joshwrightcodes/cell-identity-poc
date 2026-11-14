@@ -226,6 +226,22 @@ check_spec_key_pinned() {
   fi
 }
 
+# check_attest_hints_exists succeeds when ConfigMap spire-system/attest-hints exists and the server config of the SPIRE server sets
+# hint_configmap to it. envd creates the ConfigMap, and the cluster_jwt plugin only patches it, so a missing ConfigMap means that
+# every hint of an unknown key ID is lost.
+check_attest_hints_exists() {
+  local conf set
+  k -n spire-system get configmap attest-hints -o name >/dev/null 2>&1 \
+    || { echo "ConfigMap spire-system/attest-hints is absent, so the SPIRE server cannot hint mgmtd on an unknown key ID."; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  set="$(sed -n 's/^ *hint_configmap = "\(.*\)"$/\1/p' <<<"$conf")"
+  if [[ "$set" != spire-system/attest-hints ]]; then
+    echo "the server config sets hint_configmap '$set', want spire-system/attest-hints."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
 # envd copies the node address of RELAY_TARGET into its upstream argument, and the NetworkPolicy of
 # flow N30 admits it. Docker can give a rebuilt node a new address.
 check_envd_mgmt_address() {

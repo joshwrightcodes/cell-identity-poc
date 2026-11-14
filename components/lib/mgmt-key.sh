@@ -41,3 +41,45 @@ mgmt_signing_pub() {
   fi
   printf '%s\n' "$pub"
 }
+
+# mgmt_signing_next_pub prints the key that mgmtd has staged for the next rotation: key next.pub of ConfigMap
+# mgmt-system/mgmt-signing-pub, the standard base64 of 32 bytes. It prints nothing when the ConfigMap holds no next.pub and
+# `mise run mgmt -- status` shows no stagedKey, or when the ConfigMap holds no next.pub and mgmtd-0 is not Ready. Otherwise
+# it requires mgmtd-0 to be Ready and the SHA-256 of the bytes of next.pub to equal stagedKey. It fails with the reason on
+# standard error and has no override, so a writer of the ConfigMap cannot add a signing key to a cell. MGMT_KEY_ACCEPT_CHANGE
+# applies to spec.pub only.
+mgmt_signing_next_pub() {
+  local cm next ready status staged fp
+  if ! cm="$(kubectl --context kind-management -n mgmt-system get configmap mgmt-signing-pub -o json 2>/dev/null)"; then
+    printf 'error: ConfigMap mgmt-system/mgmt-signing-pub is absent. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' >&2
+    return 1
+  fi
+  next="$(jq -r '.data["next.pub"] // ""' <<<"$cm")"
+  ready="$(kubectl --context kind-management -n mgmt-system get pod mgmtd-0 \
+    -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+  if [[ -z "$next" && "$ready" != True ]]; then
+    return 0
+  fi
+  if [[ "$ready" != True ]]; then
+    printf 'error: ConfigMap mgmt-signing-pub holds a next.pub, and mgmtd-0 is not Ready, so the staged key is unchecked. Start mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' >&2
+    return 1
+  fi
+  status="$(cd "$MGMT_KEY_ROOT" && mise run mgmt -- status 2>/dev/null)" || status=""
+  if ! staged="$(jq -er '.stagedKey // ""' <<<"$status" 2>/dev/null)"; then
+    printf 'error: mise run mgmt -- status printed no status object\n' >&2
+    return 1
+  fi
+  if [[ -z "$next" && -z "$staged" ]]; then
+    return 0
+  fi
+  if [[ ! "$next" =~ ^[A-Za-z0-9+/]{43}=$ ]] || [[ "$(printf '%s' "$next" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" != 32 ]]; then
+    printf 'error: key next.pub of mgmt-signing-pub is %s, and mgmtd shows the staged key %s. next.pub is not the base64 of 32 bytes\n' "${next:-absent}" "${staged:-none}" >&2
+    return 1
+  fi
+  fp="$(printf '%s' "$next" | base64 -d | shasum -a 256 | cut -d' ' -f1)"
+  if [[ "$fp" != "$staged" ]]; then
+    printf 'error: key next.pub of mgmt-signing-pub has the SHA-256 %s, and mgmtd shows the staged key %s. Run: mise run mgmt -- status, and CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' "$fp" "${staged:-none}" >&2
+    return 1
+  fi
+  printf '%s\n' "$next"
+}

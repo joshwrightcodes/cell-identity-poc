@@ -11,7 +11,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
-// TestGateM5ImageCheck: gate.sh m5 compares the images of mgmtd, envd, the gateway, celld in each cell and the three
+// TestGateM5ImageCheck: gate.sh m5 compares the images of mgmtd, envd, the gateway, the SPIRE server plugin, celld in each cell and the three
 // cell-proxy servers of management with build/images.env. It stops before the tests on a stale image and names the
 // command that brings the workload up to date. The cell-proxy clients are not in this check: a new image of the server
 // changes the digest of every user of cell-proxy, and the M3 check covers the clients.
@@ -27,6 +27,8 @@ func TestGateM5ImageCheck(t *testing.T) {
 			want: "Run: mise run images -- cell-proxy, then CELL=management LINK_ONLY=telemetry-gateway mise run cell:link"},
 		{name: "a stale cell-proxy in the mesh hub", stale: "cell-proxy@mesh-view-system",
 			want: "Run: mise run images -- cell-proxy, then CELL=management LINK_ONLY=mesh-view-hub mise run cell:link"},
+		{name: "a stale SPIRE server plugin", stale: "cluster-jwt-server@dev-cp",
+			want: "Run: mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up"},
 		{name: "a stale celld", stale: "celld@dev-cell-1", want: "Run: mise run images -- celld cluster-jwt-agent, then CELL=dev-cell-1 mise run cell:up"},
 		{name: "a stale cell-proxy client in a cell is left to the M3 check", stale: "cell-proxy@argocd"},
 	} {
@@ -45,7 +47,7 @@ func TestGateM5ImageCheck(t *testing.T) {
 				}
 			}
 			var env strings.Builder
-			for _, n := range []string{"mgmtd", "envd", "cellgw", "celld", "cluster-jwt-agent", "cell-proxy"} {
+			for _, n := range []string{"mgmtd", "envd", "cellgw", "celld", "cluster-jwt-agent", "cluster-jwt-server", "cell-proxy"} {
 				fmt.Fprintf(&env, "IMAGE_%s=localhost:5001/%s@sha256:%s\n", strings.ToUpper(strings.ReplaceAll(n, "-", "_")), n, strings.Repeat("a", 64))
 			}
 			write("build/images.env", env.String())
@@ -70,6 +72,7 @@ case " $* " in
   *" get statefulset/mgmtd "*) one mgmtd mgmtd ;;
   *" get deployment/envd "*) one envd envd ;;
   *" get statefulset/cell-gateway "*) one cell-gateway cellgw ;;
+  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
   *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
   *" get deployment/argocd-agent-principal "*|*" get deployment/telemetry-gateway "*|*" get deployment/mesh-view-hub "*) one cell-proxy cell-proxy ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;

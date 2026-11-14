@@ -99,7 +99,7 @@ if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
-# The M5 tests run against mgmtd, envd, the cell gateway and the cells. An earlier run can leave a workload with no
+# The M5 tests run against mgmtd, envd, the cell gateway, the SPIRE server of dev-cp (its plugin writes the key hints) and the cells. An earlier run can leave a workload with no
 # replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded, and so
 # must celld in each cell and the three cell-proxy servers of management. The cell-proxy clients stay with the M3 check:
 # a new image of the server changes the digest of every user of cell-proxy.
@@ -109,6 +109,7 @@ if [[ "$milestone" == m5 || "$milestone" == m5-soak ]]; then
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
     "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
     "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up"
     "management:central-view-system:deployment/argocd-agent-principal:mise run images -- cell-proxy, then CELL=management LINK_ONLY=central-view mise run cell:link"
     "management:observability-system:deployment/telemetry-gateway:mise run images -- cell-proxy, then CELL=management LINK_ONLY=telemetry-gateway mise run cell:link"
     "management:mesh-view-system:deployment/mesh-view-hub:mise run images -- cell-proxy, then CELL=management LINK_ONLY=mesh-view-hub mise run cell:link")

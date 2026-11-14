@@ -908,6 +908,7 @@ if has_harness envd; then
   check "The peer root ConfigMap of envd holds the live roots of $RELAY_TARGET" check_envd_peer_root
   check "ConfigMap cell-records holds the spec revision that mgmtd signed last" check_envd_applied
   check "The SPIRE server and envd pin the key that mgmtd signs with" check_spec_key_pinned
+  check "ConfigMap spire-system/attest-hints exists, and the SPIRE server config sets hint_configmap to it" check_attest_hints_exists
 fi
 if has_harness cell-gateway; then
   gateway_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"

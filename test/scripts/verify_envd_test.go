@@ -23,6 +23,7 @@ case " $* " in
   *" --context kind-management "*" get pod mgmtd-0 "*) printf 'True' ;;
   *" -n spire-system get configmap cell-records -o json "*) cat "$d/cell-records.json" ;;
   *" -n spire-system get networkpolicy spire-server-agents "*) cat "$d/agents-policy.json" ;;
+  *" -n spire-system get configmap attest-hints "*) [[ -s "$d/attest-hints" ]] || { echo 'not found' >&2; exit 1; }; echo configmap/attest-hints ;;
   *" -n spire-system get configmap spire-server "*) cat "$d/server.conf" ;;
   *" -n envd-system get configmap mgmt-spec-key "*) printf '%s' "$(cat "$d/spec-key")" ;;
   *" -n envd-system get deployment envd "*) cat "$d/envd-deployment.json" ;;
@@ -123,7 +124,7 @@ func TestVerifyEnvdChecks(t *testing.T) {
 		"mgmt-root.pem": mgmtRoot, "signing-pub": pub, "status.json": `{"signed":{"epoch":1,"counter":7}}`,
 		"cell-records.json":  records("7", map[string]string{"dev-cell-1": jwks("a", "b"), "dev-cell-2": jwks("c")}),
 		"agents-policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"10.9.0.1/32"}},{"ipBlock":{"cidr":"10.9.0.2/32"}}]}]}}`,
-		"server.conf":        conf(pub), "spec-key": pub, "envd-deployment.json": envd("10.9.0.10"), "envd-policy.json": envdPolicy("10.9.0.10"),
+		"server.conf":        conf(pub) + "      hint_configmap = \"spire-system/attest-hints\"\n", "attest-hints": "{}", "spec-key": pub, "envd-deployment.json": envd("10.9.0.10"), "envd-policy.json": envdPolicy("10.9.0.10"),
 		"envd-peer-root.pem": mgmtRoot, "envd-pods.json": pods("envd", rootSum(mgmtRoot)), "op-key.json": opKey(map[string]string{"op.pub": pub}), "celld-pods.json": opPods(opSum(pub)), "gw-status.json": `{"epoch":1,"streams":{"dev-cell-1":1,"dev-cell-2":2}}`,
 		"live-jwks.json": jwks("a", "b"), "traces": "",
 		"facts-management.json": `{"name":"management","nodeIP":"10.9.0.10"}`,
@@ -148,6 +149,13 @@ func TestVerifyEnvdChecks(t *testing.T) {
 		{name: "spec key: the server pins two keys", check: "check_spec_key_pinned", cell: "dev-cp", change: map[string]string{"server.conf": conf(pub + `", "` + otherPub)}, want: []string{"the server config pins", up}},
 		{name: "spec key: envd holds an old key", check: "check_spec_key_pinned", cell: "dev-cp", change: map[string]string{"spec-key": otherPub}, want: []string{"mgmt-spec-key holds '" + otherPub + "'", up}},
 		{name: "spec key: mgmtd signs with a new key", check: "check_spec_key_pinned", cell: "dev-cp", change: map[string]string{"signing-pub": otherPub}, want: []string{"mgmt-signing-pub holds " + otherPub, up}},
+		{name: "attest hints ok", check: "check_attest_hints_exists", cell: "dev-cp"},
+		{name: "attest hints: the ConfigMap is absent", check: "check_attest_hints_exists", cell: "dev-cp", change: map[string]string{"attest-hints": ""},
+			want: []string{"ConfigMap spire-system/attest-hints is absent", up}},
+		{name: "attest hints: the server config names another ConfigMap", check: "check_attest_hints_exists", cell: "dev-cp",
+			change: map[string]string{"server.conf": conf(pub) + "      hint_configmap = \"spire-system/other\"\n"}, want: []string{"sets hint_configmap 'spire-system/other'", up}},
+		{name: "attest hints: the server config sets none", check: "check_attest_hints_exists", cell: "dev-cp", want: []string{"sets hint_configmap ''", up},
+			change: map[string]string{"server.conf": conf(pub)}},
 		{name: "management address ok", check: "check_envd_mgmt_address", cell: "dev-cp"},
 		{name: "management address: the node moved", check: "check_envd_mgmt_address", cell: "dev-cp", change: map[string]string{"facts-management.json": `{"name":"management","nodeIP":"10.9.0.77"}`},
 			want: []string{"the management node is 10.9.0.77", "runs '--upstream=10.9.0.10:31446'", up}},

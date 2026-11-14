@@ -8,7 +8,8 @@
 #     components/lib/peer-root.sh. It becomes ConfigMap spire-trust-bundle. The bundle holds only
 #     public certificates.
 #   - the public signing key of mgmtd, from ConfigMap mgmt-signing-pub in management, as ConfigMap
-#     mgmt-op-key (key op.pub). celld trusts an operation only when this key signed it. celld dials the
+#     mgmt-op-key (key op.pub), and, while mgmtd has a staged key, the staged key next.pub as key op.next.pub
+#     (components/lib/mgmt-key.sh checks it against `mgmt -- status`). celld trusts an operation only when one of these keys signed it. celld dials the
 #     stream port 30450 and the bind port 30451 of the cell gateway on the node of SPIRE_SERVER_CLUSTER.
 #     The pod template carries the SHA-256 of the trust bundle and of the key, because celld loads both
 #     only at start, so a change restarts the pod.
@@ -46,11 +47,14 @@ server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 bundle="$(peer_root_pem "$SPIRE_SERVER_CLUSTER" "$trust_domain")" || exit 1
 bundle_sum="$(printf '%s' "$bundle" | sha256)"
 op_pub="$(mgmt_signing_pub)" || exit 1
-op_sum="$(printf '%s' "$op_pub" | sha256)"
-op_key="$(PUB="$op_pub" SUM="$op_sum" yq -n '
+next_pub="$(mgmt_signing_next_pub)" || exit 1
+# The checksum covers the staged key too, so the stage pass and the later passes of a rotation each restart celld.
+op_sum="$(printf '%s' "$op_pub${next_pub:+$'\n'$next_pub}" | sha256)"
+op_key="$(PUB="$op_pub" NEXT="$next_pub" SUM="$op_sum" yq -n '
   .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "mgmt-op-key" | .metadata.namespace = "cell-identity-system"
   | .metadata.annotations["poc.internal/op-key-sha256"] = strenv(SUM)
-  | .data["op.pub"] = strenv(PUB)')"
+  | .data["op.pub"] = strenv(PUB)
+  | (select(strenv(NEXT) != "") | .data["op.next.pub"]) = strenv(NEXT)')"
 [[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1

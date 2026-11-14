@@ -473,3 +473,76 @@ func TestRenderCellIdentityFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestCellIdentityNextKey: while mgmtd has staged a key, ConfigMap mgmt-op-key holds both files, op.pub with the live key and
+// op.next.pub with the staged key, and the checksum of the ConfigMap and of the pod template covers both, so the stage pass
+// restarts celld. The staged key must match `mgmt -- status`: a next.pub that mgmtd did not stage, a stagedKey with no next.pub,
+// and a next.pub with another hash each fail the render, and MGMT_KEY_ACCEPT_CHANGE does not override it. With nothing staged,
+// the ConfigMap holds op.pub only.
+func TestCellIdentityNextKey(t *testing.T) {
+	sum := func(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
+	next := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+
+	t.Run("staged key", func(t *testing.T) {
+		r := renderCellIdentity(t, "STUB_NEXT_PUB="+next)
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		objs := docsIn(t, r.stdout, "cell-identity-system")
+		key := objs["ConfigMap/mgmt-op-key"]
+		if key == nil || get[string](t, key, "data", "op.pub") != stubMgmtKey || get[string](t, key, "data", "op.next.pub") != next {
+			t.Fatalf("ConfigMap mgmt-op-key is %v, want op.pub = %s and op.next.pub = %s", key, stubMgmtKey, next)
+		}
+		want := sum(stubMgmtKey + "\n" + next)
+		ann := get[map[string]any](t, objs["Deployment/celld"], "spec", "template", "metadata", "annotations")
+		if got := get[string](t, key, "metadata", "annotations", "poc.internal/op-key-sha256"); got != want || ann["poc.internal/op-key-sha256"] != want {
+			t.Errorf("op key checksums are %s (ConfigMap) and %v (pod template), want %s over both keys", got, ann["poc.internal/op-key-sha256"], want)
+		}
+		plain := renderCellIdentity(t)
+		if plain.err != nil {
+			t.Fatal(plain.err)
+		}
+		plainAnn := get[map[string]any](t, docsIn(t, plain.stdout, "cell-identity-system")["Deployment/celld"], "spec", "template", "metadata", "annotations")
+		if plainAnn["poc.internal/op-key-sha256"] == ann["poc.internal/op-key-sha256"] {
+			t.Error("the pod template checksum is the same with and without a staged key, so the stage pass would not restart celld")
+		}
+	})
+
+	t.Run("nothing staged", func(t *testing.T) {
+		r := renderCellIdentity(t)
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		key := docsIn(t, r.stdout, "cell-identity-system")["ConfigMap/mgmt-op-key"]
+		if data := get[map[string]any](t, key, "data"); len(data) != 1 || data["op.pub"] != stubMgmtKey {
+			t.Errorf("ConfigMap mgmt-op-key data is %v, want op.pub only", data)
+		}
+		if get[string](t, key, "metadata", "annotations", "poc.internal/op-key-sha256") != sum(stubMgmtKey) {
+			t.Errorf("the checksum with no staged key is not the SHA-256 of op.pub")
+		}
+	})
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"next.pub with another hash than stagedKey", []string{"STUB_NEXT_PUB=" + next, "STUB_STAGED_KEY=" + strings.Repeat("0", 64)}, "has the SHA-256"},
+		{"stagedKey and no next.pub", []string{"STUB_STAGED_KEY=" + strings.Repeat("a", 64)}, "next.pub is not the base64 of 32 bytes"},
+		{"next.pub that is not a key", []string{"STUB_NEXT_PUB=bm90LWEta2V5", "STUB_STAGED_KEY=" + strings.Repeat("a", 64)}, "next.pub is not the base64 of 32 bytes"},
+		{"no override", []string{"STUB_NEXT_PUB=" + next, "STUB_STAGED_KEY=" + strings.Repeat("0", 64), "MGMT_KEY_ACCEPT_CHANGE=1"}, "has the SHA-256"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renderCellIdentity(t, tc.env...)
+			if r.err == nil {
+				t.Fatalf("the render succeeded, want a failure with %q:\n%s", tc.want, r.stdout)
+			}
+			if !strings.Contains(r.stderr, tc.want) {
+				t.Errorf("stderr %q does not contain %q", r.stderr, tc.want)
+			}
+			if strings.Contains(r.stdout, "op.next.pub") {
+				t.Error("the failed render still printed a staged key")
+			}
+		})
+	}
+}

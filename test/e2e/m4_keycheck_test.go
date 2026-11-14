@@ -4,7 +4,6 @@ package e2e
 
 import (
 	"encoding/json"
-	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -131,42 +130,6 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	if n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "records reloaded" })); n == 0 {
 		t.Errorf("the SPIRE server log holds no 'records reloaded' line since the rotation")
 	}
-}
-
-// TestM4BindHealsRotation rotates the service account key of dev-cell-1 again, after a key check and the update gap, with no further
-// key check, so that neither the periodic check nor the gap falls inside the test. attestprobe fails with unknown_kid. A new
-// celld pod binds with a token from the new key: the log of mgmtd then holds a bind with the result keys_updated for the cell,
-// and within five minutes the new pod and attestprobe both attest.
-func TestM4BindHealsRotation(t *testing.T) {
-	t.Skip("Task 15 replaces this test with TestM5BindHealsRotation and removes the skip")
-	const cell = rejectCell
-	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
-		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
-	}
-	waitRegistryAtCleanup(t)
-	t.Logf("waiting %s, so that the update gap has passed before the rotation", keyUpdateGap)
-	time.Sleep(keyUpdateGap)
-	start := time.Now().Add(-logMargin)
-	_, newKID := rotateAPIKey(t, cell)
-	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
-	expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
-
-	pod := replaceCelldPod(t, cell)
-	want := fmt.Sprintf("spiffe://%s/cell/%s/celld", spireTD, cell)
-	waitFor(t, "the new celld pod to log "+want, healWait, func() (bool, string) {
-		logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
-		if err != nil {
-			return false, err.Error()
-		}
-		return slices.Contains(celldSPIFFEIDs(logs), want), lastLines(logs, 3)
-	})
-	logs := mgmtdLog(t, start)
-	if n := len(matching(logs, func(l logLine) bool {
-		return l.str("msg") == "bind" && l.str("cell") == cell && l.str("result") == "keys_updated"
-	})); n == 0 {
-		t.Errorf("the mgmtd log holds no bind with the result keys_updated for %s since the rotation:\n%s", cell, lastLines(logs, 8))
-	}
-	waitIssued(t, cell, healWait)
 }
 
 // mgmtdLog returns the log of mgmtd since a time.
