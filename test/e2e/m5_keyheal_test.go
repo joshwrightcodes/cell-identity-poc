@@ -135,12 +135,10 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
-	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
-	waitControllerManager(t, cell)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 	expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
 	refusedAt := firstRefusalAt(t, res.start, cell, newKID)
@@ -188,14 +186,12 @@ func TestM5HintFloodNoLockout(t *testing.T) {
 	requireCurrentRecord(t, flooded)
 	waitRegistryAtCleanup(t)
 	floodedBefore := cellStatusOf(t, flooded)
-	freshCNIToken(t, victim)
 	waitUpdateGap(t, checked)
 
 	token := rogueToken(t, clusterjwt.Audience(pocEnv, flooded))
 	secret := tokenSecret(t, flooded, celldNamespace, token)
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, victim)
-	waitControllerManager(t, victim)
 
 	const attempts = 6
 	floodStart := time.Now()
@@ -291,7 +287,6 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
-	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
@@ -299,7 +294,6 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	oldKID, newKID := rotateAPIKey(t, cell)
 	rotatedAt := time.Now()
 	t.Logf("rotated the key of %s in %s", cell, rotatedAt.Sub(rotateStart).Round(time.Second))
-	waitControllerManager(t, cell)
 
 	var updatedAt time.Time
 	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the rotation", rotationHealWait, func() (bool, string) {
@@ -320,7 +314,7 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	if !slices.Contains(after.Kids, oldKID) || !slices.Contains(after.Kids, newKID) || !afterRevision(after.Record, before.Record) {
 		t.Errorf("the record of %s lists %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
 	}
-	t.Logf("KEYS_UPDATED_SECONDS=%.0f after the rotation", updatedAt.Sub(rotatedAt).Seconds())
+	t.Logf("KEYS_UPDATED_SECONDS=%.0f after the start of the rotation (%.0f after rotateAPIKey returned)", updatedAt.Sub(rotateStart).Seconds(), updatedAt.Sub(rotatedAt).Seconds())
 
 	// The registry servers.
 	var slowest time.Duration
@@ -400,12 +394,10 @@ func TestM5BindHealsRotation(t *testing.T) {
 	const cell = rejectCell
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
-	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
-	waitControllerManager(t, cell)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 	if strings.HasPrefix(res.out, "issued:") {
 		t.Logf("a hint updated the record of %s before the probe ran: %s", cell, res.out)
