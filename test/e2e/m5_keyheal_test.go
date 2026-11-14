@@ -86,6 +86,43 @@ func firstRefusalAt(t *testing.T, since time.Time, cell, kid string) time.Time {
 	return first
 }
 
+// freshCNIToken restarts istio-cni-node in the cell and waits for its rollout. The pod reads a projected token that the kubelet
+// replaces after 48 minutes. When that replacement falls into a rotation of the service account key, the new token is signed by the
+// test key. The repair then removes that key, the plugin gets Unauthorized, and no pod of the cell gets a sandbox until the pod
+// of istio-cni-node restarts. A fresh pod keeps its first token for longer than any test here lasts.
+func freshCNIToken(t *testing.T, cell string) {
+	t.Helper()
+	if _, err := kubectl(t, cell, "", "-n", "istio-system", "delete", "pod", "-l", "k8s-app=istio-cni-node", "--wait=true", "--timeout=120s"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kubectl(t, cell, "", "-n", "istio-system", "rollout", "status", "daemonset/istio-cni-node", "--timeout=180s"); err != nil {
+		t.Fatalf("istio-cni-node in %s did not finish its rollout: %v", cell, err)
+	}
+}
+
+// waitControllerManager waits until kube-controller-manager of the cell is Ready and renews its leader lease. Each switch of the
+// service account key restarts the API server, and the controller manager can lose its lease and restart. Its restart backoff grows
+// to five minutes after many restarts, and in that time no Job creates a pod, so a probe Job would hang.
+func waitControllerManager(t *testing.T, cell string) {
+	t.Helper()
+	pod := "kube-controller-manager-" + cell + "-control-plane"
+	waitFor(t, "kube-controller-manager of "+cell+" to be Ready and to renew its lease", 8*time.Minute, func() (bool, string) {
+		ready, err := kubectl(t, cell, "", "-n", "kube-system", "get", "pod", pod, "-o", "jsonpath={.status.containerStatuses[0].ready}")
+		if err != nil || strings.TrimSpace(ready) != "true" {
+			return false, fmt.Sprintf("ready %q, %v", ready, err)
+		}
+		renewed, err := kubectl(t, cell, "", "-n", "kube-system", "get", "lease", "kube-controller-manager", "-o", "jsonpath={.spec.renewTime}")
+		if err != nil {
+			return false, err.Error()
+		}
+		at, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(renewed))
+		if err != nil {
+			return false, fmt.Sprintf("renewTime %q: %v", renewed, err)
+		}
+		return time.Since(at) < 20*time.Second, "lease renewed " + time.Since(at).Round(time.Second).String() + " ago"
+	})
+}
+
 // TestM5UnknownKidTriggersKeyCheck: the plugin of the SPIRE server hints mgmtd when it refuses a token with an unknown key ID, so
 // the record of the cell follows a rotation of its service account key without the periodic check. celld of the cell is down for
 // the test, because the gateway turns a refused hello into a hint too, and a report with unknown_kid queues one. A manual key
@@ -98,10 +135,12 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
+	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
+	waitControllerManager(t, cell)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 	expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
 	refusedAt := firstRefusalAt(t, res.start, cell, newKID)
@@ -141,20 +180,22 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 // TestM5HintFloodNoLockout: a flood of forged unknown_kid attempts for dev-cell-2, from a token that the cluster rogue signed, must
 // not stop the key update of dev-cell-1. dev-cell-1 rotates its service account key. While six forged attempts for dev-cell-2 run,
 // attestprobe of dev-cell-1 must be issued within five minutes. The hints of the flood stay bounded: the mgmtd log holds at
-// most one hint check of dev-cell-2 for each minute of the flood and one more, each with the result unchanged, and the record
-// of dev-cell-2 keeps its revision.
+// most one hint check of dev-cell-2 for each minute since the first forged attempt and one more, no two less than 55 s apart,
+// each with the result unchanged, and the record of dev-cell-2 keeps its revision.
 func TestM5HintFloodNoLockout(t *testing.T) {
 	const victim, flooded = rejectCell, "dev-cell-2"
 	checked := requireCurrentRecord(t, victim)
 	requireCurrentRecord(t, flooded)
 	waitRegistryAtCleanup(t)
 	floodedBefore := cellStatusOf(t, flooded)
+	freshCNIToken(t, victim)
 	waitUpdateGap(t, checked)
 
 	token := rogueToken(t, clusterjwt.Audience(pocEnv, flooded))
 	secret := tokenSecret(t, flooded, celldNamespace, token)
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, victim)
+	waitControllerManager(t, victim)
 
 	const attempts = 6
 	floodStart := time.Now()
@@ -164,27 +205,35 @@ func TestM5HintFloodNoLockout(t *testing.T) {
 			t.Fatalf("forged attempt %d for %s: attestprobe printed %q, want %q", i+1, flooded, res.out, want)
 		}
 	}
-	floodTook := time.Since(floodStart)
+	t.Logf("%d forged attempts for %s took %s", attempts, flooded, time.Since(floodStart).Round(time.Second))
 	waitIssued(t, victim, healWait)
-	t.Logf("%d forged attempts for %s took %s, and %s attested within %s of the rotation", attempts, flooded, floodTook.Round(time.Second), victim, time.Since(start).Round(time.Second))
+	t.Logf("%s attested %s after the rotation", victim, time.Since(start).Round(time.Second))
 
 	victimStatus := cellStatusOf(t, victim)
 	if !slices.Contains(victimStatus.Kids, oldKID) || !slices.Contains(victimStatus.Kids, newKID) {
 		t.Errorf("the record of %s lists %v, want %s and %s", victim, victimStatus.Kids, oldKID, newKID)
 	}
-	hints := 0
-	for _, l := range keyCheckLines(t, start, flooded) {
+	// The hint checks that the flood caused: at most one for each minute since the first forged attempt, and no two closer than the
+	// gap of the plugin and of mgmtd (60 s, with a margin for the clock of the log line).
+	var hintTimes []time.Time
+	for _, l := range keyCheckLines(t, floodStart.Add(-logMargin), flooded) {
 		if l.str("via") != "hint" {
 			continue
 		}
-		hints++
+		hintTimes = append(hintTimes, lineTime(l))
 		if l.str("result") != "unchanged" {
 			t.Errorf("a hint check of %s during the flood gave %q, want unchanged: %v", flooded, l.str("result"), l)
 		}
 	}
-	if limit := int(floodTook/time.Minute) + 1; hints > limit {
-		t.Errorf("the flood of %s caused %d hint checks in %s, want at most %d", flooded, hints, floodTook.Round(time.Second), limit)
+	if limit := int(time.Since(floodStart)/time.Minute) + 1; len(hintTimes) > limit {
+		t.Errorf("the flood of %s caused %d hint checks in %s, want at most %d", flooded, len(hintTimes), time.Since(floodStart).Round(time.Second), limit)
 	}
+	for i := 1; i < len(hintTimes); i++ {
+		if gap := hintTimes[i].Sub(hintTimes[i-1]); gap < 55*time.Second {
+			t.Errorf("two hint checks of %s ran %s apart, want at least 55 s", flooded, gap.Round(time.Second))
+		}
+	}
+	t.Logf("the flood of %s caused %d hint checks at %v", flooded, len(hintTimes), hintTimes)
 	after := cellStatusOf(t, flooded)
 	if afterRevision(after.Record, floodedBefore.Record) || !slices.Equal(after.Kids, floodedBefore.Kids) {
 		t.Errorf("the record of %s changed during the flood: %v at %+v, was %v at %+v", flooded, after.Kids, after.Record, floodedBefore.Kids, floodedBefore.Record)
@@ -242,13 +291,15 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
+	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
-	rotatedAt := time.Now()
+	rotateStart := time.Now()
 	oldKID, newKID := rotateAPIKey(t, cell)
-	t.Logf("rotated the key of %s in %s", cell, time.Since(rotatedAt).Round(time.Second))
-	rotatedAt = time.Now()
+	rotatedAt := time.Now()
+	t.Logf("rotated the key of %s in %s", cell, rotatedAt.Sub(rotateStart).Round(time.Second))
+	waitControllerManager(t, cell)
 
 	var updatedAt time.Time
 	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the rotation", rotationHealWait, func() (bool, string) {
@@ -343,16 +394,18 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 // TestM5BindHealsRotation: a new celld pod binds with a token from a rotated key. attestprobe of dev-cell-1 right after the rotation
 // is refused with unknown_kid, or issued when a hint already updated the record, because the hint check of the plugin or of the
 // gateway can come before the bind. A new celld pod then gets its SVID within five minutes, and the mgmtd log holds a bind of the
-// cell with the result keys_updated, or already_bound when the status of the cell shows a hint check with keys_updated since the
-// rotation. In both cases the record lists both key IDs, and attestprobe is issued.
+// cell with the result keys_updated, or, when a hint came first, a hint check with keys_updated since the rotation (the bind then
+// answers already_bound, which mgmtd does not log). In both cases the record lists both key IDs, and attestprobe is issued.
 func TestM5BindHealsRotation(t *testing.T) {
 	const cell = rejectCell
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
+	freshCNIToken(t, cell)
 	waitUpdateGap(t, checked)
 
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
+	waitControllerManager(t, cell)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 	if strings.HasPrefix(res.out, "issued:") {
 		t.Logf("a hint updated the record of %s before the probe ran: %s", cell, res.out)
@@ -369,25 +422,29 @@ func TestM5BindHealsRotation(t *testing.T) {
 		}
 		return slices.Contains(celldSPIFFEIDs(logs), want), lastLines(logs, 3)
 	})
+	// mgmtd logs a bind only when it changes something: a bind that finds the keys already in the record answers already_bound and
+	// leaves no line. So the heal is either a bind line with the result keys_updated, or a hint check with keys_updated since
+	// the rotation, which came before the bind.
 	logs := mgmtdLog(t, start)
-	binds := matching(logs, func(l logLine) bool { return l.str("msg") == "bind" && l.str("cell") == cell })
 	var results []string
 	healed := false
-	for _, l := range binds {
+	for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "bind" && l.str("cell") == cell }) {
 		results = append(results, l.str("result"))
-		switch l.str("result") {
-		case "keys_updated":
+		if l.str("result") == "keys_updated" {
 			healed = true
-		case "already_bound":
-			if st := cellStatusOf(t, cell); st.LastHintCheck == "keys_updated" && !st.HintAt.Before(start) {
-				healed = true
-			}
+		}
+	}
+	for _, l := range keyCheckLines(t, start, cell) {
+		if l.str("via") == "hint" && l.str("result") == "keys_updated" {
+			healed = true
+			results = append(results, "hint:keys_updated")
 		}
 	}
 	if !healed {
-		t.Errorf("the mgmtd log holds no bind of %s with the result keys_updated, or already_bound after a hint check with keys_updated, since the rotation. Bind results: %v\n%s",
+		t.Errorf("the mgmtd log holds no bind of %s with the result keys_updated, and no hint check with keys_updated, since the rotation. Results: %v\n%s",
 			cell, results, lastLines(logs, 8))
 	}
+	t.Logf("the key update of %s came through %v", cell, results)
 	st := cellStatusOf(t, cell)
 	if !slices.Contains(st.Kids, oldKID) || !slices.Contains(st.Kids, newKID) {
 		t.Errorf("the record of %s lists %v, want %s and %s", cell, st.Kids, oldKID, newKID)
