@@ -667,13 +667,56 @@ func TestCatalogDropWithdraws(t *testing.T) {
 	if _, err := r.plane.PortalRequest(t.Context(), []string{cell2}, testDigest); ReasonOf(err) != mgmtapi.ReasonCellUnknown {
 		t.Fatalf("request: %v", err)
 	}
-	// The cell is withdrawn by the catalog, and it can still be withdrawn by name.
-	before := r.plane.snapshotSeq()
-	if _, err := r.plane.PortalWithdraw(t.Context(), []string{cell2}); err != nil {
+	if st := r.plane.snap.Load().st; st.Requests[cell2] != nil || st.Requests[cell1] == nil {
+		t.Fatalf("requests after the drop: %v", st.Requests)
+	}
+	if _, err := r.plane.PortalWithdraw(t.Context(), []string{cell2}); ReasonOf(err) != mgmtapi.ReasonCellUnknown {
+		t.Fatalf("withdraw of a cell outside the catalog: %v", err)
+	}
+}
+
+func TestCatalogReAddSignsNoStep(t *testing.T) {
+	r := newBareRig(t)
+	r.request(cell1, cell2)
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	r.restart(func(in *Intent) { *in = testIntent(cell1, cell2) })
+	if r.plane.snap.Load().st.Requests[cell2] != nil || len(r.specSteps()) != 1 {
+		t.Fatalf("the re-added cell is requested again: %v, index %v", r.plane.snap.Load().st.Requests, r.specSteps())
+	}
+	if _, err := r.plane.Nonce(cell2); ReasonOf(err) != mgmtapi.ReasonCellUnknown {
+		t.Fatalf("nonce: %v", err)
+	}
+	if c := cellStatus(r.status(), cell2); c.Requested || c.Step != nil || c.ValidReason != mgmtapi.ReasonNotRequested {
+		t.Fatalf("status %+v", c)
+	}
+	if res := r.request(cell2); len(res.Steps) != 1 {
+		t.Fatalf("a new request: %+v", res)
+	}
+}
+
+func TestKeyCheckRechecksTheIntent(t *testing.T) {
+	r := newBareRig(t)
+	r.request(cell1)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	r.rekey(cell1, "kid-2")
+	r.keys.gate = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.plane.KeyCheck(t.Context(), cell1)
+		done <- err
+	}()
+	for r.keys.count(cell1) < 2 {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := r.plane.PortalWithdraw(t.Context(), []string{cell1}); err != nil {
 		t.Fatal(err)
 	}
-	if r.plane.snapshotSeq() == before {
-		t.Fatal("no commit for the request that outlived the catalog")
+	close(r.keys.gate)
+	if err := <-done; ReasonOf(err) != mgmtapi.ReasonCellUnknown {
+		t.Fatalf("a key check that read the old intent: %v", err)
+	}
+	if c := r.plane.snap.Load().st.Cells[cell1]; strings.Contains(string(c.JWKS), "kid-2") {
+		t.Fatal("the key check changed the record of a withdrawn cell")
 	}
 }
 
@@ -918,5 +961,90 @@ func testPortalBindRace(t *testing.T) {
 			t.Fatal("the withdrawn cell kept a step")
 		}
 		r.restart(nil)
+	}
+}
+
+// A bind whose proven keys equal the keys at issue keeps the step, through the key check path.
+func TestBindSameKeysKeepsStepViaKeyCheck(t *testing.T) {
+	r := newBareRig(t)
+	r.request(cell1)
+	k1 := r.signers[cell1]
+	r.mustBind(cell1, k1, mgmtapi.StatusBound)
+	if _, err := r.plane.PortalRecreate(t.Context(), cell1, testDigest); err != nil {
+		t.Fatal(err)
+	}
+	issuer := r.keys.issuer(cell1)
+	k2 := newSigner(t, "kid-2")
+	r.keys.set(cell1, issuer, k1, k2)
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUpdated {
+		t.Fatalf("key check to both keys: %v %v", res, err)
+	}
+	r.keys.set(cell1, issuer, k2)
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUpdated {
+		t.Fatalf("key check to kid-2: %v %v", res, err)
+	}
+	if jw := string(r.plane.snap.Load().st.Cells[cell1].JWKS); !strings.Contains(jw, "kid-2") || strings.Contains(jw, "kid-1") {
+		t.Fatalf("the record does not hold only kid-2: %s", jw)
+	}
+	if !r.stepOf(cell1).open() {
+		t.Fatal("a key check closed the step")
+	}
+	r.keys.set(cell1, issuer, k1)
+	r.clk.Advance(61 * time.Second)
+	r.mustBind(cell1, k1, mgmtapi.StatusKeysUpdated)
+	if !r.stepOf(cell1).open() {
+		t.Fatal("a bind that proved the keys at issue closed the step")
+	}
+	if len(r.specSteps()) != 1 {
+		t.Fatal("the step left the spec")
+	}
+}
+
+// Two binds with new keys read the old record. The second meets already_bound inside its commit,
+// and that answer closes nothing.
+func TestAlreadyBoundInCommitDoesNotCloseStep(t *testing.T) {
+	r := newBareRig(t)
+	r.request(cell1)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	if _, err := r.plane.PortalRecreate(t.Context(), cell1, testDigest); err != nil {
+		t.Fatal(err)
+	}
+	k2 := r.rekey(cell1, "kid-2")
+	before := r.stepOf(cell1).IssuedAt.Add(-10 * time.Second) // a token minted before the step
+	r.keys.gate = make(chan struct{})
+	type result struct {
+		status string
+		err    error
+	}
+	done := make(chan result, 2)
+	bind := func() {
+		n := r.nonce(cell1)
+		tok := r.token(cell1, n, k2, func(c *kubetoken.Claims) { c.IssuedAt = before })
+		resp, err := r.plane.Bind(t.Context(), cell1, mgmtapi.BindRequest{Nonce: n, Token: tok})
+		done <- result{resp.Status, err}
+	}
+	base := r.keys.count(cell1)
+	go bind()
+	for r.keys.count(cell1) == base {
+		time.Sleep(time.Millisecond)
+	}
+	go bind()
+	time.Sleep(100 * time.Millisecond)
+	close(r.keys.gate)
+	got := map[string]int{}
+	for range 2 {
+		res := <-done
+		if res.err != nil {
+			t.Fatal(res.err)
+		}
+		got[res.status]++
+	}
+	if got[mgmtapi.StatusKeysUpdated] != 1 || got[mgmtapi.StatusAlreadyBound] != 1 {
+		t.Fatalf("outcomes %v", got)
+	}
+	if !r.stepOf(cell1).open() {
+		t.Fatal("the step closed")
 	}
 }

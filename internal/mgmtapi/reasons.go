@@ -94,5 +94,8 @@ const (
 	ReasonRecordNotApplied = "record_not_applied"
 	ReasonNoStatus         = "no_status"
 	ReasonStatusStale      = "status_stale"
-	ReasonKeysFailed       = "keys_failed"
+	// ReasonStatusInFuture is the reason of a cell whose last proven status lies more than 60 s
+	// ahead of the clock.
+	ReasonStatusInFuture = "status_in_future"
+	ReasonKeysFailed     = "keys_failed"
 )

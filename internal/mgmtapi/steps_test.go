@@ -129,7 +129,7 @@ func TestStepReasonStrings(t *testing.T) {
 		ReasonStepOpen: "step_open", ReasonNoStep: "no_step", ReasonTooManyCells: "too_many_cells", ReasonTestDigestOnly: "test_digest_only",
 		ReasonHostsvcUntrusted: "hostsvc_untrusted", ReasonHostsvcUnavailable: "hostsvc_unavailable",
 		ReasonHostsvcDenied: "hostsvc_denied", ReasonHostsvcBusy: "hostsvc_busy",
-		ReasonRecordNotApplied: "record_not_applied", ReasonNoStatus: "no_status", ReasonStatusStale: "status_stale", ReasonKeysFailed: "keys_failed",
+		ReasonRecordNotApplied: "record_not_applied", ReasonNoStatus: "no_status", ReasonStatusStale: "status_stale", ReasonStatusInFuture: "status_in_future", ReasonKeysFailed: "keys_failed",
 		StepQueued: "queued", StepCreating: "creating", StepAdmitting: "admitting", StepBootstrapping: "bootstrapping",
 		StepDone: "done", StepFailed: "failed", StepFailedFinal: "failed_final", StepCancelled: "cancelled", StepRefused: "refused",
 	} {

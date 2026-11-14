@@ -8,9 +8,16 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
-// reconcile applies the intent to the state. A bound cell that left the intent becomes a pending
+// reconcile applies the intent to the state. A request for a cell that left the catalog is
+// withdrawn. A bound cell that left the intent becomes a pending
 // drop, and a cell whose subjects changed gets a new record in one revision.
 func (p *Plane) reconcile(t *txn) error {
+	for _, name := range sortedKeys(t.st.Requests) {
+		if _, listed := p.catalog[name]; !listed {
+			delete(t.st.Requests, name)
+			t.dirty = true
+		}
+	}
 	var gone []string
 	for _, name := range sortedKeys(t.st.Cells) {
 		if _, ok := p.cellIn(t.st, name); !ok {

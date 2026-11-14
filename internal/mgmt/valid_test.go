@@ -41,7 +41,7 @@ func TestValidRule(t *testing.T) {
 		{"no_status", func(in *ValidInput) { in.LastStatusAt = time.Time{} }, false, mgmtapi.ReasonNoStatus},
 		{"status_before_rebind", func(in *ValidInput) { in.KeysUpdatedAt = in.LastStatusAt.Add(time.Nanosecond) }, false, mgmtapi.ReasonNoStatus},
 		{"status_stale", func(in *ValidInput) { in.LastStatusAt = now.Add(-2*time.Minute - time.Nanosecond) }, false, mgmtapi.ReasonStatusStale},
-		{"status_in_future", func(in *ValidInput) { in.LastStatusAt = now.Add(60*time.Second + time.Nanosecond) }, false, ReasonStatusInFuture},
+		{"status_in_future", func(in *ValidInput) { in.LastStatusAt = now.Add(60*time.Second + time.Nanosecond) }, false, mgmtapi.ReasonStatusInFuture},
 		{"keys_untrusted", func(in *ValidInput) { in.LastCheck = string(CheckKeysUntrusted) }, false, mgmtapi.ReasonKeysFailed},
 		{"issuer_untrusted", func(in *ValidInput) { in.LastCheck = string(CheckIssuerUntrusted) }, false, mgmtapi.ReasonKeysFailed},
 		{"issuer_unavailable", func(in *ValidInput) { in.LastCheck = string(CheckIssuerUnavailable) }, false, mgmtapi.ReasonKeysFailed},
@@ -159,7 +159,8 @@ func TestValidIgnoresStepStatus(t *testing.T) {
 	}
 }
 
-func TestInvalidSince(t *testing.T) {
+// InvalidSince is the time that a Status call or a gauge tick first observed the cell invalid.
+func TestInvalidSinceIsFirstObserved(t *testing.T) {
 	r := validRig(t)
 	t0 := r.clk.Now()
 	if c := cellStatus(r.status(), cell1); !c.InvalidSince.Equal(t0) {
@@ -177,6 +178,20 @@ func TestInvalidSince(t *testing.T) {
 	t1 := r.clk.Now()
 	if c := cellStatus(r.status(), cell1); c.Valid || !c.InvalidSince.Equal(t1) {
 		t.Fatalf("invalid again: %+v, want since %v", c, t1)
+	}
+}
+
+func TestInvalidSinceFromGaugeTick(t *testing.T) {
+	reader, meter := testMeter()
+	r := newRig(t)
+	r.mod = func(c *Config) { c.Meter = meter }
+	r.restart(nil)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	t0 := r.clk.Now()
+	collect(t, reader) // a tick sees the cell invalid
+	r.clk.Advance(time.Minute)
+	if c := cellStatus(r.status(), cell1); !c.InvalidSince.Equal(t0) {
+		t.Fatalf("invalidSince %v, want the gauge tick %v", c.InvalidSince, t0)
 	}
 }
 

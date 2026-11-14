@@ -356,6 +356,37 @@ func TestServeEndToEnd(t *testing.T) {
 	}
 }
 
+// A first start has no state and no key: the plane signs the first spec with a new key, and no cell
+// is requested yet, so the ops bundle lists none.
+func TestServeEndToEndFirstStart(t *testing.T) {
+	f := newFixture(t)
+	r := f.start(t)
+	auth := tlsconfig.AuthorizeID(mustSPIFFE(t, mgmtID))
+	cfg := tlsconfig.MTLSClientConfig(f.devCA.Source(t, envdID), f.mgmtCA.Bundle(), auth)
+	tr := &http.Transport{TLSClientConfig: cfg, ForceAttemptHTTP2: true}
+	defer tr.CloseIdleConnections()
+	c := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	resp, err := c.Get("https://" + r.addrs["api"] + mgmtapi.SpecPath("dev"))
+	must(t, err)
+	var bundle mgmtapi.SpecBundle
+	must(t, json.NewDecoder(resp.Body).Decode(&bundle))
+	resp.Body.Close()
+	if resp.StatusCode != 200 || len(bundle.Spec) == 0 || len(bundle.Steps) != 0 {
+		t.Fatalf("spec: %d %+v", resp.StatusCode, bundle)
+	}
+	resp, err = c.Get("https://" + r.addrs["api"] + mgmtapi.OpsPath("dev"))
+	must(t, err)
+	var ops mgmtapi.OpsBundle
+	must(t, json.NewDecoder(resp.Body).Decode(&ops))
+	resp.Body.Close()
+	if resp.StatusCode != 200 || len(ops.Cells) != 0 {
+		t.Fatalf("ops: %d %+v", resp.StatusCode, ops)
+	}
+	if !strings.Contains(r.out.String(), "signing_key_created") || strings.Contains(r.out.String(), "signing_key_changed") {
+		t.Fatalf("first start log: %s", r.out.String())
+	}
+}
+
 func mustSPIFFE(t testing.TB, s string) spiffeid.ID {
 	t.Helper()
 	id, err := spiffeid.FromString(s)

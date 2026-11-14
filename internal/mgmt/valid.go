@@ -10,10 +10,6 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
-// ReasonStatusInFuture is the valid reason of a cell whose last proven status lies more than
-// MaxValidSkew ahead of the clock.
-const ReasonStatusInFuture = "status_in_future"
-
 const (
 	// MaxValidAge is the oldest proven status that a valid cell may have.
 	MaxValidAge = 2 * time.Minute
@@ -46,7 +42,7 @@ func ValidOf(in ValidInput, now time.Time) (bool, string) {
 	case now.Sub(in.LastStatusAt) > MaxValidAge:
 		return false, mgmtapi.ReasonStatusStale
 	case in.LastStatusAt.Sub(now) > MaxValidSkew:
-		return false, ReasonStatusInFuture
+		return false, mgmtapi.ReasonStatusInFuture
 	}
 	switch CheckResult(in.LastCheck) {
 	case CheckKeysUntrusted, CheckIssuerUntrusted, CheckIssuerUnavailable:
@@ -55,8 +51,8 @@ func ValidOf(in ValidInput, now time.Time) (bool, string) {
 	return true, ""
 }
 
-// validOf evaluates one catalog or state cell against the snapshot st and the live data. The caller
-// holds rmu.
+// validOf evaluates one catalog or state cell against the snapshot st and the live data. It reads
+// no field that rmu guards, so the caller needs no lock.
 func (p *Plane) validOf(st *State, name string, live cellRuntime, applied spec.Revision, now time.Time) (bool, string) {
 	in := ValidInput{Applied: applied, LastStatusAt: live.lastStatusAt}
 	_, in.Requested = p.cellIn(st, name)
@@ -78,7 +74,9 @@ func (p *Plane) observeValid(_ context.Context, o metric.Int64Observer) error {
 		if c := p.rt.cells[name]; c != nil {
 			live = *c
 		}
-		if ok, _ := p.validOf(st, name, live, p.rep.applied, now); ok {
+		ok, _ := p.validOf(st, name, live, p.rep.applied, now)
+		p.noteValidLocked(name, ok, now)
+		if ok {
 			n++
 		}
 	}
@@ -86,10 +84,17 @@ func (p *Plane) observeValid(_ context.Context, o metric.Int64Observer) error {
 	return nil
 }
 
-// noteValid keeps the time that a cell was first seen invalid, and returns it. A valid cell has none.
+// noteValid keeps the time that a cell was first observed invalid, and returns it. A valid cell
+// has none. An observation is a Status call or a tick of the gauge, so the time can lag the real
+// change by one gauge interval.
 func (p *Plane) noteValid(name string, valid bool, now time.Time) time.Time {
 	p.rmu.Lock()
 	defer p.rmu.Unlock()
+	return p.noteValidLocked(name, valid, now)
+}
+
+// noteValidLocked is noteValid for a caller that holds rmu.
+func (p *Plane) noteValidLocked(name string, valid bool, now time.Time) time.Time {
 	c := p.rt.cell(name)
 	switch {
 	case valid:

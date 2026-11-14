@@ -1567,6 +1567,7 @@ func TestIntentReAddAfterDrop(t *testing.T) {
 	if s := r.verifySpec(); len(s.Retired) != 1 {
 		t.Fatalf("re-adding the cell to the intent changed the retired list: %+v", s)
 	}
+	r.request(cell2)
 	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
 	check := func() {
 		s := r.verifySpec()

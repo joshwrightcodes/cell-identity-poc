@@ -78,6 +78,9 @@ func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) 
 		if err := t.expectSeq(expect); err != nil {
 			return err
 		}
+		if _, ok := p.cellIn(t.st, cell); !ok {
+			return refuse(mgmtapi.ReasonCellUnknown, "")
+		}
 		cs := t.st.Cells[cell]
 		if cs == nil {
 			res = CheckNotBound

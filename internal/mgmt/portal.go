@@ -23,7 +23,7 @@ var bootstrapDigestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // one signed step, in one commit. A cell that is already requested is listed in AlreadyRequested
 // and gets no new step, and a request where every cell is already requested makes no commit.
 func (p *Plane) PortalRequest(ctx context.Context, cells []string, digest string) (mgmtapi.PortalResult, error) {
-	cells, err := p.portalCells(ctx, cells, false)
+	cells, err := p.portalCells(ctx, cells)
 	if err != nil {
 		return mgmtapi.PortalResult{}, err
 	}
@@ -73,7 +73,7 @@ func (p *Plane) PortalRequest(ctx context.Context, cells []string, digest string
 // skipped, and a call where no named cell is requested makes no commit. A bound cell stays in the
 // state until its staged drop, but its step leaves the spec in this commit.
 func (p *Plane) PortalWithdraw(ctx context.Context, cells []string) (mgmtapi.PortalResult, error) {
-	cells, err := p.portalCells(ctx, cells, true)
+	cells, err := p.portalCells(ctx, cells)
 	if err != nil {
 		return mgmtapi.PortalResult{}, err
 	}
@@ -196,9 +196,8 @@ func (p *Plane) portalStep(ctx context.Context, cell, digest string, check func(
 	return res, nil
 }
 
-// portalCells checks the cell list of a request or a withdraw and returns it without duplicates. A
-// withdraw also accepts a name that left the catalog while a request still holds it.
-func (p *Plane) portalCells(ctx context.Context, cells []string, withdraw bool) ([]string, error) {
+// portalCells checks the cell list of a request or a withdraw and returns it without duplicates.
+func (p *Plane) portalCells(ctx context.Context, cells []string) ([]string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -208,11 +207,9 @@ func (p *Plane) portalCells(ctx context.Context, cells []string, withdraw bool) 
 	if len(cells) > MaxPortalCells {
 		return nil, refuse(mgmtapi.ReasonTooManyCells, "")
 	}
-	st := p.snap.Load().st
 	out := make([]string, 0, len(cells))
 	for _, c := range cells {
-		_, listed := p.catalog[c]
-		if !listed && !(withdraw && st.Requests[c] != nil) {
+		if _, listed := p.catalog[c]; !listed {
 			return nil, refuse(mgmtapi.ReasonCellUnknown, "")
 		}
 		if !slices.Contains(out, c) {
