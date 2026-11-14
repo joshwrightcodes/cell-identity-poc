@@ -586,9 +586,29 @@ func (a *harnessAPI) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *harnessAPI) replicas() any { return a.sts["spec"].(map[string]any)["replicas"] }
+func (a *harnessAPI) replicas() any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sts["spec"].(map[string]any)["replicas"]
+}
+
+// specField returns the JSON of one field under spec, read while the server is not writing.
+func (a *harnessAPI) specField(name string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b, _ := json.Marshal(a.sts["spec"].(map[string]any)[name])
+	return string(b)
+}
+
+func (a *harnessAPI) requestLog() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.Join(a.requests, "\n")
+}
 
 func (a *harnessAPI) managers() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	var out []string
 	for _, e := range a.sts["metadata"].(map[string]any)["managedFields"].([]any) {
 		m := e.(map[string]any)
@@ -656,8 +676,7 @@ current-context: kind-management
 		cmd := exec.Command(script, "management", "mgmt-system", "statefulset/mgmtd", n)
 		cmd.Env = env
 		if out, err := cmd.CombinedOutput(); err != nil {
-			a := strings.Join(api.requests, "\n")
-			t.Fatalf("harness-replicas.sh %s failed: %v\n%s\nrequests:\n%s", n, err, out, a)
+			t.Fatalf("harness-replicas.sh %s failed: %v\n%s\nrequests:\n%s", n, err, out, api.requestLog())
 		}
 	}
 	check := func() (string, error) {
@@ -666,8 +685,7 @@ current-context: kind-management
 		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
-	wantSpec, _ := json.Marshal(api.sts["spec"].(map[string]any)["template"])
-	wantSelector, _ := json.Marshal(api.sts["spec"].(map[string]any)["selector"])
+	wantSpec, wantSelector := api.specField("template"), api.specField("selector")
 	if out, err := check(); err != nil {
 		t.Fatalf("the check fails before any change: %v\n%s", err, out)
 	}
@@ -676,9 +694,8 @@ current-context: kind-management
 		if fmt.Sprint(api.replicas()) != n {
 			t.Fatalf("replicas %v, want %s", api.replicas(), n)
 		}
-		tmpl, _ := json.Marshal(api.sts["spec"].(map[string]any)["template"])
-		sel, _ := json.Marshal(api.sts["spec"].(map[string]any)["selector"])
-		if string(tmpl) != string(wantSpec) || string(sel) != string(wantSelector) {
+		tmpl, sel := api.specField("template"), api.specField("selector")
+		if tmpl != wantSpec || sel != wantSelector {
 			t.Fatalf("the object lost its template or selector:\n%s\n%s", tmpl, sel)
 		}
 		if got := api.managers(); !slices.Equal(got, []string{"kubectl/Apply/<nil>", "harness-replicas/Update/scale"}) {
