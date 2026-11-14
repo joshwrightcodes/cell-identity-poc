@@ -314,7 +314,8 @@ func TestStepPeek(t *testing.T) {
 	} {
 		bad := valid()
 		mut(&bad)
-		badEnv, _ := Sign(bad, priv)
+		raw, _ := json.Marshal(bad)
+		badEnv := signRaw(t, priv, string(raw))
 		if _, _, _, err := Peek(badEnv); !errors.Is(err, record.ErrDecode) {
 			t.Errorf("%s: %v", name, err)
 		}
@@ -406,6 +407,28 @@ func TestSameExceptEpoch(t *testing.T) {
 		mut(&c)
 		if SameExceptEpoch(base, c) {
 			t.Errorf("%s differs but SameExceptEpoch is true", name)
+		}
+	}
+}
+
+func TestStepSignRefusesWhatVerifyRefuses(t *testing.T) {
+	_, priv := keypair(t)
+	for name, mut := range map[string]func(*Step){
+		"id":      func(s *Step) { s.ID = "x" },
+		"version": func(s *Step) { s.Version = 2 },
+		"epoch":   func(s *Step) { s.KeyEpoch = 0 },
+		"kind":    func(s *Step) { s.Kind = "cell.delete" },
+		"env":     func(s *Step) { s.Env = "DEV" },
+		"cell":    func(s *Step) { s.Cell = strings.Repeat("a", 60) },
+		"subnet":  func(s *Step) { s.Cluster.PodSubnet = "10.20.0.1/16" },
+		"issuer":  func(s *Step) { s.Cluster.Issuer = "http://x.example" },
+		"digest":  func(s *Step) { s.BootstrapSHA256 = "abc" },
+		"ttl":     func(s *Step) { s.ExpiresAt = s.IssuedAt.Add(time.Minute) },
+	} {
+		s := valid()
+		mut(&s)
+		if _, err := Sign(s, priv); !errors.Is(err, record.ErrDecode) {
+			t.Errorf("%s: got %v, want ErrDecode", name, err)
 		}
 	}
 }

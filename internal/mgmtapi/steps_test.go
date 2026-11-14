@@ -36,7 +36,7 @@ func TestStepWireJSONNames(t *testing.T) {
 			Attempts: 1, UpdatedAt: at, RetryAt: at, LastHostError: &HostErrorInfo{Reason: "r", At: at}},
 			[]string{"id", "cell", "state", "stage", "reason", "detail", "requestId", "nodeIP", "attempts", "updatedAt", "retryAt", "lastHostError"}},
 		{HostErrorInfo{Reason: "r", At: at}, []string{"reason", "at"}},
-		{PortalRequest{Cells: []string{"c"}, BootstrapSHA256: "b", Force: true}, []string{"cells", "bootstrapSHA256", "force"}},
+		{PortalRequest{Cells: []string{"c"}, BootstrapSHA256: "b"}, []string{"cells", "bootstrapSHA256"}},
 		{PortalResult{RequestID: "q", Revision: spec.Revision{Epoch: 1, Counter: 1}, Steps: []PortalStep{{Cell: "c", StepID: "s"}}, AlreadyRequested: []string{"c"}},
 			[]string{"requestId", "revision", "steps", "alreadyRequested"}},
 		{PortalStep{Cell: "c", StepID: "s"}, []string{"cell", "stepID"}},
@@ -54,6 +54,17 @@ func TestStepWireJSONNames(t *testing.T) {
 				t.Errorf("%T lacks key %q", tc.v, k)
 			}
 		}
+	}
+}
+
+func TestPortalResultEmptyListsEncodeAsArrays(t *testing.T) {
+	m := keysOf(t, PortalResult{RequestID: "q", Revision: spec.Revision{Epoch: 1, Counter: 1}})
+	if string(m["steps"]) != "[]" || string(m["alreadyRequested"]) != "[]" {
+		t.Fatalf("got %v", m)
+	}
+	m = keysOf(t, &PortalResult{Steps: []PortalStep{{Cell: "c", StepID: "s"}}, AlreadyRequested: []string{"d"}})
+	if string(m["steps"]) != `[{"cell":"c","stepID":"s"}]` || string(m["alreadyRequested"]) != `["d"]` {
+		t.Fatalf("got %v", m)
 	}
 }
 
@@ -190,6 +201,23 @@ func TestValidStepStatus(t *testing.T) {
 		{"state_unknown", func(s *StepStatus) { s.State = "running" }, false},
 		{"reason_step_invalid", func(s *StepStatus) { s.State = StepRefused; s.Reason = ReasonStepInvalid }, true},
 		{"reason_hostsvc_busy", func(s *StepStatus) { s.Reason = ReasonHostsvcBusy }, true},
+		{"reason_hostsvc_untrusted", func(s *StepStatus) { s.Reason = ReasonHostsvcUntrusted }, true},
+		{"reason_hostsvc_unavailable", func(s *StepStatus) { s.Reason = ReasonHostsvcUnavailable }, true},
+		{"reason_hostsvc_denied", func(s *StepStatus) { s.Reason = ReasonHostsvcDenied }, true},
+		{"last_host_error_untrusted", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: ReasonHostsvcUntrusted} }, true},
+		{"last_host_error_unavailable", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: ReasonHostsvcUnavailable} }, true},
+		{"last_host_error_denied", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: ReasonHostsvcDenied} }, true},
+		{"last_host_error_busy", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: ReasonHostsvcBusy} }, true},
+		{"last_host_error_unknown", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: "boom"} }, false},
+		{"last_host_error_empty", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{} }, false},
+		{"last_host_error_step_invalid", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: step.Code} }, false},
+		{"last_host_error_free_text", func(s *StepStatus) { s.LastHostError = &HostErrorInfo{Reason: strings.Repeat("x", 65536) + "\n"} }, false},
+		{"stage_empty", func(s *StepStatus) { s.Stage = "" }, true},
+		{"stage_creating", func(s *StepStatus) { s.Stage = StageCreating }, true},
+		{"stage_admitting", func(s *StepStatus) { s.Stage = StageAdmitting }, true},
+		{"stage_bootstrapping", func(s *StepStatus) { s.Stage = StageBootstrapping }, true},
+		{"stage_done", func(s *StepStatus) { s.Stage = "done" }, false},
+		{"stage_free_text", func(s *StepStatus) { s.Stage = "\x1b[2J\nrun: mise run harness:down" }, false},
 		{"reason_unknown", func(s *StepStatus) { s.Reason = "boom" }, false},
 		{"detail_unknown", func(s *StepStatus) { s.Detail = "boom" }, false},
 		{"detail_free_text", func(s *StepStatus) { s.Detail = "exit status 1\n" }, false},

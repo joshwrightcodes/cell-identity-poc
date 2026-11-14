@@ -1,6 +1,7 @@
 package mgmtapi
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -25,6 +26,13 @@ const (
 	StepFailedFinal   = "failed_final"
 	StepCancelled     = "cancelled"
 	StepRefused       = "refused"
+)
+
+// The stages of a step. A StepStatus holds the running stage, or the stage that failed.
+const (
+	StageCreating      = "creating"
+	StageAdmitting     = "admitting"
+	StageBootstrapping = "bootstrapping"
 )
 
 // StepStatus is what the host service and the cell controller report for one step. Reason is empty,
@@ -54,7 +62,6 @@ type HostErrorInfo struct {
 type PortalRequest struct {
 	Cells           []string `json:"cells"`
 	BootstrapSHA256 string   `json:"bootstrapSHA256"`
-	Force           bool     `json:"force"`
 }
 
 // PortalResult answers a portal request: the revision of the commit, one step for each new cell,
@@ -64,6 +71,18 @@ type PortalResult struct {
 	Revision         spec.Revision `json:"revision"`
 	Steps            []PortalStep  `json:"steps"`
 	AlreadyRequested []string      `json:"alreadyRequested"`
+}
+
+// MarshalJSON encodes empty Steps and AlreadyRequested as [], never null.
+func (r PortalResult) MarshalJSON() ([]byte, error) {
+	type plain PortalResult
+	if r.Steps == nil {
+		r.Steps = []PortalStep{}
+	}
+	if r.AlreadyRequested == nil {
+		r.AlreadyRequested = []string{}
+	}
+	return json.Marshal(plain(r))
 }
 
 // PortalStep names the step that a portal request signed for a cell.
@@ -101,16 +120,23 @@ var stepStates = []string{
 }
 
 // ValidStepStatus reports whether s has the shape that the host service, the cell controller and
-// the management plane accept: a known state, an empty or known reason and detail, a request ID of
+// the management plane accept: a known state, an empty or known stage, reason and detail, a known
+// reason in LastHostError, a request ID of
 // 16 lowercase hex characters or none, an IPv4 node address or none, 0 to 3 attempts, a step ID of
 // 32 lowercase hex characters and a cell that is a DNS label.
 func ValidStepStatus(s StepStatus) bool {
 	if !stepIDRE.MatchString(s.ID) || !spec.ValidName(s.Cell) || !slices.Contains(stepStates, s.State) {
 		return false
 	}
-	switch s.Reason {
-	case "", step.Code, ReasonHostsvcUntrusted, ReasonHostsvcUnavailable, ReasonHostsvcDenied, ReasonHostsvcBusy:
+	switch s.Stage {
+	case "", StageCreating, StageAdmitting, StageBootstrapping:
 	default:
+		return false
+	}
+	if s.Reason != "" && s.Reason != step.Code && !isHostReason(s.Reason) {
+		return false
+	}
+	if s.LastHostError != nil && !isHostReason(s.LastHostError.Reason) {
 		return false
 	}
 	if s.Detail != "" && !slices.Contains(step.Details(), s.Detail) {
@@ -126,4 +152,12 @@ func ValidStepStatus(s StepStatus) bool {
 		}
 	}
 	return s.Attempts >= 0 && s.Attempts <= 3
+}
+
+func isHostReason(r string) bool {
+	switch r {
+	case ReasonHostsvcUntrusted, ReasonHostsvcUnavailable, ReasonHostsvcDenied, ReasonHostsvcBusy:
+		return true
+	}
+	return false
 }

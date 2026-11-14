@@ -81,8 +81,12 @@ func NewID() string {
 	return hex.EncodeToString(b[:])
 }
 
-// Sign returns a DSSE envelope that holds the step signed with key.
+// Sign returns a DSSE envelope that holds the step signed with key. It runs the field rules of
+// Verify first, so it never signs a step that Verify refuses. The error wraps record.ErrDecode.
 func Sign(s Step, key ed25519.PrivateKey) ([]byte, error) {
+	if err := s.validate(); err != nil {
+		return nil, fmt.Errorf("refusing to sign: %w step: %v", record.ErrDecode, err)
+	}
 	body, err := json.Marshal(s)
 	if err != nil {
 		return nil, fmt.Errorf("encode step: %w", err)
