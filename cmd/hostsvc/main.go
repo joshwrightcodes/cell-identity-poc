@@ -92,6 +92,7 @@ func (e *exitError) Unwrap() error { return e.err }
 var (
 	startTelemetry  = telemetry.Start
 	selfExecutable  = os.Executable
+	newService      = func(topo *topology.Topology) *hostsvc.Service { return hostsvc.New(hostsvc.NewKindRuntime(), topo) }
 	nofileSoftLimit = func() (uint64, error) {
 		var r syscall.Rlimit
 		if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &r); err != nil {
@@ -134,7 +135,7 @@ func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 	fs.StringVar(&sf.repoRoot, "repo-root", ".", "repository root of the bootstrap digest (serve)")
 	fs.StringVar(&sf.adminSocket, "admin-socket", "", "path of the admin socket (serve, ctl); default <journal-dir>/../admin.sock for serve, build/hostsvc/admin.sock for ctl")
 	fs.StringVar(&sf.bootstrapCmd, "bootstrap-cmd", "mise run cell:up", "command of the admitting and bootstrapping stages (serve)")
-	retry := fs.Bool("retry-of-create", false, "delete a half-built cluster that has no marker first (create)")
+	retry := fs.Bool("retry-of-create", false, "this is a later run of creating: delete the cluster of this step first if its marker is missing (create)")
 	root := fs.String("root", ".", "repository root (bootstrap-digest)")
 	stepID := fs.String("step", "", "step ID (ctl log, cancel)")
 	follow := fs.Bool("follow", false, "follow the log (ctl log)")
@@ -166,7 +167,7 @@ func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 	if err != nil {
 		return err
 	}
-	svc := hostsvc.New(hostsvc.NewKindRuntime(), topo)
+	svc := newService(topo)
 
 	names := func() []string {
 		if *only != "" {

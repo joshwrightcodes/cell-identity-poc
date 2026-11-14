@@ -133,7 +133,12 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 		// orphan of a dead host service has no parent that waits.
 		waited := make(chan struct{})
 		go func() { _ = cmd.Wait(); close(waited) }()
-		t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); <-waited })
+		t.Cleanup(func() {
+			if groupAlive(cmd.Process.Pid) {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			}
+			<-waited
+		})
 		return waited, cmd.Process.Pid, start
 	}
 	journalWith := func(t *testing.T, pgid int, start string) (*Journal, *syncBuf) {

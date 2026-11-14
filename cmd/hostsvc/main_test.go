@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"math/big"
 	"net/url"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -547,7 +549,11 @@ func TestServeStopEndsChild(t *testing.T) {
 		pid, err = strconv.Atoi(strings.TrimSpace(string(b)))
 		return err == nil && pid > 1
 	})
-	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) }) // by group id, never by name
+	t.Cleanup(func() { // by group id, never by name, and only while the group lives
+		if syscall.Kill(-pid, 0) == nil {
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+		}
+	})
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("the child is not running: %v", err)
 	}
@@ -584,5 +590,74 @@ func waitFor(t *testing.T, what string, d time.Duration, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// wiringRuntime is a runtime with one existing cluster that records deletes.
+type wiringRuntime struct {
+	clusters map[string]bool
+	deleted  []string
+}
+
+func (w *wiringRuntime) List() ([]string, error) {
+	var out []string
+	for n := range w.clusters {
+		out = append(out, n)
+	}
+	return out, nil
+}
+func (w *wiringRuntime) Create(*v1alpha4.Cluster) error { return errors.New("create is not expected") }
+func (w *wiringRuntime) Delete(n string) error {
+	w.deleted = append(w.deleted, n)
+	delete(w.clusters, n)
+	return nil
+}
+func (w *wiringRuntime) Kubeconfig(string) (string, error) { return "kubeconfig", nil }
+func (w *wiringRuntime) NodeIP(string) (string, error)     { return "172.18.0.5", nil }
+
+type wiringMarker struct{}
+
+func (wiringMarker) Has(context.Context, string) (bool, error) { return false, nil }
+func (wiringMarker) Write(context.Context, string) error       { return nil }
+
+// TestCreateCommandWiresCreateRecords runs `create --retry-of-create` with the production record
+// store: the step recorded the cluster, so the command must delete it. Without the records and the
+// step ID in the service, the command deletes nothing.
+func TestCreateCommandWiresCreateRecords(t *testing.T) {
+	dir := t.TempDir()
+	j, err := hostsvc.OpenJournal(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("ab", 16)
+	if err := j.Put(hostsvc.JournalEntry{Status: mgmtapi.StepStatus{ID: id, Cell: "dev-cell-1", State: mgmtapi.StepCreating}, Envelope: "{}", EnvelopeSHA256: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	for name, recorded := range map[string]bool{"recorded_by_this_step": true, "not_recorded": false} {
+		t.Run(name, func(t *testing.T) {
+			if recorded {
+				if err := (hostsvc.FileCreateRecords{Dir: dir}).Record(id, "dev-cell-1"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				_ = os.Remove(filepath.Join(dir, id+".create"))
+			}
+			rt := &wiringRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+			old := newService
+			newService = func(topo *topology.Topology) *hostsvc.Service {
+				s := hostsvc.New(rt, topo)
+				s.Marker = wiringMarker{}
+				s.Docker = func(context.Context, ...string) ([]byte, error) { return nil, errors.New("docker is not expected") }
+				s.APIWait, s.APIPoll = 10*time.Millisecond, 5*time.Millisecond
+				return s
+			}
+			t.Cleanup(func() { newService = old })
+			t.Setenv("POC_STEP_ID", id)
+			var out strings.Builder
+			execute(context.Background(), []string{"create", "--cluster", "dev-cell-1", "--retry-of-create", "--journal-dir", dir, "--topology", topologyFile}, &out)
+			if got := len(rt.deleted) == 1; got != recorded {
+				t.Errorf("deleted %v with recorded=%v, want a delete only for a recorded cluster (output %s)", rt.deleted, recorded, out.String())
+			}
+		})
 	}
 }

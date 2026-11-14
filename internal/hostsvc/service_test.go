@@ -8,11 +8,15 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -642,5 +646,56 @@ func TestKubeMarker(t *testing.T) {
 	bad := KubeMarker{}
 	if _, err := bad.Has(context.Background(), "not a kubeconfig"); err == nil {
 		t.Error("Has accepted a bad kubeconfig")
+	}
+}
+
+func TestFileCreateRecords(t *testing.T) {
+	dir := t.TempDir()
+	j, err := OpenJournal(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Put(testEntry(idN(1), "dev-cell-1", mgmtapi.StepDone, time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(dir, "journal.json"))
+	r := FileCreateRecords{Dir: dir}
+	if made, err := r.Made(idN(1), "dev-cell-1"); err != nil || made {
+		t.Fatalf("absent file: Made = %v %v, want false", made, err)
+	}
+	if err := r.Record(idN(1), "dev-cell-1"); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, idN(1)+".create")); err != nil || strings.TrimSpace(string(b)) != "dev-cell-1" {
+		t.Errorf("record file = %q %v", b, err)
+	}
+	if tmps, _ := filepath.Glob(filepath.Join(dir, "*.tmp")); len(tmps) != 0 {
+		t.Errorf("temporary files left: %v", tmps)
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, "journal.json")); string(after) != string(before) {
+		t.Error("Record changed journal.json")
+	}
+	if made, _ := r.Made(idN(1), "dev-cell-1"); !made {
+		t.Error("an own record is not made")
+	}
+	if made, _ := r.Made(idN(1), "dev-cell-2"); made {
+		t.Error("a record of another cluster counts as made")
+	}
+	if made, _ := r.Made(idN(2), "dev-cell-1"); made {
+		t.Error("a record of another step counts as made")
+	}
+	// A journal reset leaves the record.
+	if _, err := os.Stat(filepath.Join(dir, idN(1)+".create")); err != nil {
+		t.Errorf("record file gone: %v", err)
+	}
+	if err := j.Reset(); err != nil {
+		t.Fatal(err)
+	}
+	if made, _ := r.Made(idN(1), "dev-cell-1"); !made {
+		t.Error("a journal reset removed the record")
+	}
+	// A missing directory is an absent record.
+	if _, err := (FileCreateRecords{Dir: filepath.Join(dir, "none")}).Made(idN(1), "dev-cell-1"); err != nil {
+		t.Errorf("a missing directory is an absent record: %v", err)
 	}
 }

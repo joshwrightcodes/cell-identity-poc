@@ -55,7 +55,9 @@ type actorEnv struct {
 func killGroupAtCleanup(t *testing.T, g *Group) {
 	t.Helper()
 	t.Cleanup(func() {
-		_ = syscall.Kill(-g.Pgid, syscall.SIGKILL)
+		if groupAlive(g.Pgid) { // a group id cannot be reused while a member lives
+			_ = syscall.Kill(-g.Pgid, syscall.SIGKILL)
+		}
 		select {
 		case <-g.Done():
 		case <-time.After(5 * time.Second):

@@ -152,6 +152,9 @@ func TestJournalEviction(t *testing.T) {
 		if err := os.WriteFile(j.LogPath(idN(n)), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
+		if err := (FileCreateRecords{Dir: dir}).Record(idN(n), "dev-cell-1"); err != nil {
+			t.Fatal(err)
+		}
 	}
 	j.Evict(func(id string) bool { return id == idN(2) })
 	list := j.List()
@@ -173,6 +176,14 @@ func TestJournalEviction(t *testing.T) {
 	}
 	if _, err := os.Stat(j.LogPath(idN(1))); err != nil {
 		t.Errorf("log of a kept entry was deleted: %v", err)
+	}
+	for _, gone := range []int{3, 4, 5} {
+		if _, err := os.Stat(filepath.Join(dir, idN(gone)+".create")); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("create record of evicted entry %d: %v, want deleted", gone, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, idN(1)+".create")); err != nil {
+		t.Errorf("create record of a kept entry was deleted: %v", err)
 	}
 	// Only non-final entries: nothing may go.
 	j2, _ := OpenJournal(t.TempDir(), clock.Now)

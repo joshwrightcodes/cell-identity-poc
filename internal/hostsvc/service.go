@@ -135,8 +135,9 @@ func (s *Service) exists(name string) (bool, error) {
 // the Create method that the step actor runs.
 var ErrCellNeedsStep = errors.New("cell does not exist and only a signed step creates it")
 
-// Marker is the ConfigMap kube-system/poc-provisioned that Create writes into a cluster that it
-// made, so that a retry can tell a finished cluster from a half-built one.
+// Marker is the ConfigMap kube-system/poc-provisioned that Create writes into a cluster after its
+// facts are read, whether Create made the cluster or kept an existing one. A retry then tells a
+// finished cluster from a half-built one.
 type Marker interface {
 	// Has reports whether the marker exists. A cluster that does not answer is an error.
 	Has(ctx context.Context, kubeconfig string) (bool, error)
@@ -447,7 +448,7 @@ func (s *Service) facts(ctx context.Context, name string) (Facts, error) {
 	}, nil
 }
 
-// Marker object that Create writes into a cluster that it made.
+// Marker object that Create writes into each cluster that it finishes.
 const (
 	MarkerNamespace = "kube-system"
 	MarkerName      = "poc-provisioned"
