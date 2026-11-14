@@ -428,15 +428,32 @@ func streamProof(t *testing.T, cell, role string) func(binding string) string {
 		t.Fatalf("no client account for the role %q", role)
 	}
 	// A Running pod with no deletion time: during a rollout, the first pod of the list can be the one that ends.
-	out, err := kubectl(t, cell, "", "-n", a.ns, "get", "pods", "-l", "app.kubernetes.io/name="+a.app, "--field-selector", "status.phase=Running",
-		"-o", `jsonpath={range .items[?(@.metadata.deletionTimestamp==null)]}{.metadata.name} {.metadata.uid}{"\n"}{end}`)
-	if lines := strings.Split(strings.TrimSpace(out), "\n"); err == nil && len(lines) > 0 {
-		out = lines[0]
+	out, err := kubectl(t, cell, "", "-n", a.ns, "get", "pods", "-l", "app.kubernetes.io/name="+a.app, "-o", "json")
+	if err != nil {
+		t.Fatalf("the pods of %s in %s/%s: %v", a.app, cell, a.ns, err)
 	}
-	if err != nil || len(strings.Fields(out)) != 2 {
-		t.Fatalf("the pod of %s in %s/%s: %q, %v", a.app, cell, a.ns, out, err)
+	var pods struct {
+		Items []struct {
+			Metadata struct {
+				Name, UID         string
+				DeletionTimestamp *string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+			Status struct{ Phase string } `json:"status"`
+		} `json:"items"`
 	}
-	name, uid := strings.Fields(out)[0], strings.Fields(out)[1]
+	if err := json.Unmarshal([]byte(out), &pods); err != nil {
+		t.Fatal(err)
+	}
+	var name, uid string
+	for _, p := range pods.Items {
+		if p.Status.Phase == "Running" && p.Metadata.DeletionTimestamp == nil {
+			name, uid = p.Metadata.Name, p.Metadata.UID
+			break
+		}
+	}
+	if name == "" {
+		t.Fatalf("no running pod of %s in %s/%s", a.app, cell, a.ns)
+	}
 	return func(binding string) string {
 		tok, err := kubectl(t, cell, "", "-n", a.ns, "create", "token", a.account, "--audience", proof.StreamAudience(cell, role, binding),
 			"--duration", "10m", "--bound-object-kind", "Pod", "--bound-object-name", name, "--bound-object-uid", uid)
