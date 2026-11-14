@@ -60,9 +60,11 @@ func TestStreamSoakHalfHour(t *testing.T) {
 			t.Errorf("operation %d (%s): mgmtd shows the final result %q, want applied", n, id, v.Final)
 		}
 		t.Logf("operation %d applied %s after the enqueue, claim gap %s", n, time.Since(enqueuedAt).Round(time.Millisecond), gap.Round(time.Millisecond))
-		if rest := soakInterval - time.Since(tick); rest > 0 && time.Now().Add(rest).Before(deadline) {
-			time.Sleep(rest)
+		rest := soakInterval - time.Since(tick)
+		if time.Now().Add(rest).After(deadline) {
+			break
 		}
+		time.Sleep(max(rest, 0))
 	}
 	ended, restarted := celldReconnects(t, cell, started)
 	t.Logf("verify row 1: %d operations in %s, maximum claim gap %s, %d stream failures and %d restarts for a new SVID of the celld stream of %s",
