@@ -465,14 +465,24 @@ func waitItemTaken(t *testing.T, itemID string) {
 	})
 }
 
-// retryUnknownKID returns the sum of the series mgmtd.report.retry_unknown_kid for the cell in the metric store.
-func retryUnknownKID(t *testing.T, cell string) float64 {
+// retryCounts returns the value of each series of mgmtd.report.retry_unknown_kid for the cell in the metric store, by its labels. A
+// restart of mgmtd resets the counter under the same labels, so the window is short: it holds only the points of the running process.
+func retryCounts(t *testing.T, cell string) map[string]float64 {
 	t.Helper()
-	var sum float64
-	for _, s := range promSamplesFrom(t, fmt.Sprintf(`mgmtd_report_retry_unknown_kid_total{cell=%q}`, cell), "now-30m") {
-		sum += s.last
+	out := map[string]float64{}
+	for _, s := range promSamplesFrom(t, fmt.Sprintf(`mgmtd_report_retry_unknown_kid_total{cell=%q}`, cell), "now-2m") {
+		out[fmt.Sprint(s.labels)] = s.last
 	}
-	return sum
+	return out
+}
+
+// retryRise returns how much the series of retryCounts rose since before. A series that is new counts from zero.
+func retryRise(before, now map[string]float64) float64 {
+	var rise float64
+	for k, v := range now {
+		rise += max(0, v-before[k])
+	}
+	return rise
 }
 
 // TestM5DevCPCannotPoseOnReports: dev-cp can inject any item into the outbox of the gateway, and the item still needs the proof of the pod
@@ -519,7 +529,7 @@ func TestM5DevCPCannotPoseOnReports(t *testing.T) {
 			body := resultBody(t, cell, id, envelope)
 			token := p.token(body)
 			before := cellStatusOf(t, cell)
-			beforeMetric := retryUnknownKID(t, cell)
+			beforeMetric := retryCounts(t, cell)
 			if p.name == "rogue_key" {
 				// mgmtd queues at most one hint check for each cell in 60 s.
 				waitFor(t, "the last hint check of "+cell+" to be older than 70 s", 3*time.Minute, func() (bool, string) {
@@ -527,17 +537,17 @@ func TestM5DevCPCannotPoseOnReports(t *testing.T) {
 					return time.Since(at) > 70*time.Second, "hintAt " + at.String()
 				})
 				before = cellStatusOf(t, cell)
-				beforeMetric = retryUnknownKID(t, cell)
+				beforeMetric = retryCounts(t, cell)
 			}
 			injected := time.Now().Add(-logMargin)
 			waitItemTaken(t, injectItem(t, gwapi.Item{Kind: gwapi.KindResult, Cell: cell, OpID: id, Body: body, Token: token}))
 			if p.retry {
 				waitFor(t, "the retry_unknown_kid counter of "+cell+" to rise by one", 3*time.Minute, func() (bool, string) {
-					n := retryUnknownKID(t, cell)
-					return n >= beforeMetric+1, fmt.Sprintf("counter %v, before %v", n, beforeMetric)
+					n := retryRise(beforeMetric, retryCounts(t, cell))
+					return n >= 1, fmt.Sprintf("counter rose by %v", n)
 				})
-				if n := retryUnknownKID(t, cell); n != beforeMetric+1 {
-					t.Errorf("the retry_unknown_kid counter of %s is %v, want %v", cell, n, beforeMetric+1)
+				if n := retryRise(beforeMetric, retryCounts(t, cell)); n != 1 {
+					t.Errorf("the retry_unknown_kid counter of %s rose by %v, want 1", cell, n)
 				}
 				after := cellStatusOf(t, cell)
 				if p.name == "rogue_key" && !after.HintAt.After(before.HintAt) {
