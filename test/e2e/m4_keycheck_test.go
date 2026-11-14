@@ -94,7 +94,7 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the first key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
-	renderRegistryAtCleanup(t)
+	waitRegistryAtCleanup(t)
 	first := time.Now()
 	before := cellStatusOf(t, cell)
 	if len(before.Kids) != 1 {
@@ -143,7 +143,7 @@ func TestM4BindHealsRotation(t *testing.T) {
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
-	renderRegistryAtCleanup(t)
+	waitRegistryAtCleanup(t)
 	t.Logf("waiting %s, so that the update gap has passed before the rotation", keyUpdateGap)
 	time.Sleep(keyUpdateGap)
 	start := time.Now().Add(-logMargin)
@@ -186,7 +186,7 @@ func makeRevision(t *testing.T, cell string) {
 	if res := keyCheck(t, cell); res != "unchanged" && res != "rate_limited" {
 		t.Fatalf("the key check of %s answered %q, want unchanged or rate_limited. Run: mise run gate:m4:repair", cell, res)
 	}
-	renderRegistryAtCleanup(t)
+	waitRegistryAtCleanup(t)
 	first := time.Now()
 	oldKID, newKID := rotateAPIKey(t, cell)
 	if wait := keyUpdateGap - time.Since(first); wait > 0 {

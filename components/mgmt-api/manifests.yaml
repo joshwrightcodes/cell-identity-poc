@@ -105,6 +105,9 @@ spec:
             - --hostsvc-server-name=host.docker.internal
             - --hostsvc-pin=/etc/mgmtd/hostsvc-pin/hostsvc.crt
             - --public-configmap=mgmt-system/mgmt-signing-pub
+            # mgmtd publishes ConfigMap cell-registry into the namespaces of the view servers. The Role
+            # cell-registry-publish of each view component lets it write there.
+            - --registry-namespaces=central-view-system,observability-system,mesh-view-system
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock

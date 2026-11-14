@@ -303,3 +303,91 @@ func TestHarnessObjectsIgnoresCelldRecords(t *testing.T) {
 		})
 	}
 }
+
+// registryKubectl answers the reads of check_harness_objects for a view component that owns its namespace. The bundle
+// holds the Namespace and ConfigMap registry-signer. mgmtd publishes ConfigMap cell-registry at run time.
+// STUB_REGISTRY describes it: "ok" (label made-by=mgmtd only, manager mgmtd), "harness" (the harness label of the
+// component too, as an old render left it), "nolabel" (no made-by label), "person" (manager kubectl-edit) or "name"
+// (another name, label made-by=mgmtd). STUB_NS and STUB_COMP name the namespace and the component.
+const registryKubectl = `#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+mine="\"labels\":{\"cell.poc.internal/harness\":\"$STUB_COMP\"},\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]"
+item() { printf '{"metadata":{"name":"%s",%s}}' "$1" "$mine"; }
+reg() { # reg <name> <labels> <manager>
+  printf '{"metadata":{"name":"%s","labels":{%s},"managedFields":[{"manager":"%s","operation":"Update"}]}}' "$1" "$2" "$3"
+}
+made='"poc.internal/made-by":"mgmtd"'
+list() { printf '{"items":[%s]}\n' "$1"; }
+registry() {
+  case "${STUB_REGISTRY:-ok}" in
+    ok) reg cell-registry "$made" mgmtd ;;
+    harness) reg cell-registry "$made,\"cell.poc.internal/harness\":\"$STUB_COMP\"" mgmtd ;;
+    nolabel) reg cell-registry "" mgmtd ;;
+    person) reg cell-registry "$made" kubectl-edit ;;
+    name) reg cell-registry-other "$made" mgmtd ;;
+  esac
+}
+case "$args" in
+  *" -n $STUB_NS get ConfigMap -o json "*) list "$(item registry-signer),$(registry)" ;;
+  *" get Namespace -l cell.poc.internal/harness=$STUB_COMP -o json "*) list "$(item "$STUB_NS")" ;;
+  *" get namespace $STUB_NS -o json "*) echo "{\"metadata\":{\"name\":\"$STUB_NS\",$mine}}" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`
+
+// TestHarnessObjectsAcceptsPublishedRegistry: ConfigMap cell-registry, which mgmtd publishes into a view namespace,
+// carries only the label poc.internal/made-by=mgmtd and the field manager mgmtd. check_harness_objects accepts it by
+// name and prints no delete hint. An object that keeps the harness label of an old render, one without the marker, one
+// that another manager wrote, and one with another name are reported.
+func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	for _, comp := range []struct{ name, ns, cluster string }{
+		{"central-view", "central-view-system", "management"},
+		{"mesh-view-hub", "mesh-view-system", "management"},
+	} {
+		for _, tc := range []struct {
+			name, registry, want string
+		}{
+			{name: "the registry that mgmtd published", registry: "ok"},
+			{name: "an old render left the harness label", registry: "harness", want: "ConfigMap objects 'cell-registry registry-signer'"},
+			{name: "no made-by label", registry: "nolabel", want: "ConfigMap objects 'cell-registry registry-signer'"},
+			{name: "another manager wrote it", registry: "person", want: "ConfigMap objects 'cell-registry registry-signer'"},
+			{name: "another name", registry: "name", want: "ConfigMap objects 'cell-registry-other registry-signer'"},
+		} {
+			t.Run(comp.name+"/"+tc.name, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(registryKubectl), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				bundle := filepath.Join(dir, "build", comp.cluster, "bundles", comp.name)
+				if err := os.MkdirAll(bundle, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				manifests := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + comp.ns + "\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: registry-signer\n  namespace: " + comp.ns + "\n"
+				if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte(manifests), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				lib, err := filepath.Abs("../../scripts/lib.sh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects "$2" "$3"`, "_", lib, comp.name, comp.ns)
+				cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+					"CELL=" + comp.cluster, "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_REGISTRY=" + tc.registry, "STUB_NS=" + comp.ns, "STUB_COMP=" + comp.name}
+				var out bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &out, &out
+				err = cmd.Run()
+				if tc.want == "" {
+					if err != nil || out.Len() != 0 {
+						t.Fatalf("the check fails with the registry of mgmtd: %v\n%s", err, out.String())
+					}
+					return
+				}
+				if err == nil || !strings.Contains(out.String(), tc.want) {
+					t.Fatalf("err %v, output %q; want a failure that holds %s", err, out.String(), tc.want)
+				}
+			})
+		}
+	}
+}

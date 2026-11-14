@@ -22,9 +22,8 @@ func pluginEnv(t *testing.T, text string) string {
 }
 
 // TestEnvironmentNameHasOneSource renders the server, the agent and the central view with POC_ENV
-// from cells/common.env and with another value. The server plugin, the agent plugin, the record
-// signers of the registry, the principal --auth pattern and the agent namespaces must follow the variable in both
-// cases, so no render holds its own copy of the name.
+// from cells/common.env and with another value. The server plugin, the agent plugin, the principal --auth
+// pattern and the agent namespaces must follow the variable in both cases, so no render holds its own copy of the name.
 func TestEnvironmentNameHasOneSource(t *testing.T) {
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
 		t.Run(env, func(t *testing.T) {
@@ -56,7 +55,7 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				t.Fatalf("the view guard does not hold the audience pattern %s", guardAudiencePattern(env))
 			}
 
-			// The central view: the --auth pattern, the agent namespaces and the registry --env.
+			// The central view: the --auth pattern and the agent namespaces.
 			view := renderCentralView(t, "POC_ENV="+env)
 			if view.err != nil {
 				t.Fatalf("central-view render failed: %v\n%s", view.err, view.stderr)
@@ -73,9 +72,8 @@ func TestEnvironmentNameHasOneSource(t *testing.T) {
 				if objs["Namespace "+env+"-"+cell] == nil {
 					t.Fatalf("the view renders no agent namespace %s-%s", env, cell)
 				}
-				reg := objs["ConfigMap "+viewNS+"/cell-registry"]
-				if reg == nil || get[string](t, reg, "data", cell+".dsse.json") == "" {
-					t.Fatalf("the registry of env %s has no record of %s", env, cell)
+				if objs["ConfigMap "+viewNS+"/cell-registry"] != nil {
+					t.Fatalf("the view of env %s renders ConfigMap cell-registry, which mgmtd publishes", env)
 				}
 			}
 		})

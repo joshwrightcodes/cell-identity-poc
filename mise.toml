@@ -228,7 +228,7 @@ description = "Run the test that rotates the signing key of mgmtd and renders th
 run = "scripts/gate.sh m4-rotate"
 
 [tasks."gate:m4:repair"]
-description = "Start the host service again and link mgmt-api when the pin or the root drifted, set the replicas of mgmtd and envd back to 1, link the registries of the central views again, serve the latest spec again, delete the test namespaces and Jobs of gate:m4, and run gate:m2:repair. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Start the host service again and link mgmt-api when the pin or the root drifted, set the replicas of mgmtd and envd back to 1, serve the latest spec again, delete the test namespaces and Jobs of gate:m4, and run gate:m2:repair. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m4-repair.sh"
 
 [tasks."gate:m5"]

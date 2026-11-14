@@ -191,6 +191,20 @@ func serveWorkloadAPI(t *testing.T, ca testCA, ids ...string) {
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", "unix://"+path)
 }
 
+// signerFile copies signers.pub of a registry directory to a file of its own, as the pinned signer file of a server.
+func signerFile(t *testing.T, dir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "signer.pub")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // registryDir writes a signers.pub and one record for dev-cell-1.
 func registryDir(t *testing.T) string {
 	t.Helper()
@@ -226,10 +240,11 @@ func registryDir(t *testing.T) string {
 
 func serverArgs(t *testing.T, envCA testCA) []string {
 	t.Helper()
+	dir := registryDir(t)
 	return []string{
 		"spiffe-server", "--listen", "127.0.0.1:0",
 		"--peer-bundle", envCA.bundleFile(t), "--peer-trust-domain", "dev.env.poc.internal",
-		"--allow-id", viewPattern, "--registry-dir", registryDir(t),
+		"--allow-id", viewPattern, "--registry-dir", dir, "--registry-signer", signerFile(t, dir),
 		"--backend", "grpc-header", "--upstream", "127.0.0.1:1", "--identity-header", "x-cell-agent",
 		"--proof-subject", "argocd-agent=cell-identity-system/celld",
 	}
@@ -260,6 +275,7 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 		"no --peer-trust-domain": without(args, "--peer-trust-domain"),
 		"no --allow-id":          without(args, "--allow-id"),
 		"no --registry-dir":      without(args, "--registry-dir"),
+		"no --registry-signer":   without(args, "--registry-signer"),
 		"unparsable bundle":      with(args, "--peer-bundle", garbage),
 		"missing bundle file":    with(args, "--peer-bundle", filepath.Join(t.TempDir(), "absent.crt")),
 		"unanchored --allow-id":  with(args, "--allow-id", "dev"),
@@ -657,12 +673,12 @@ func TestServerRequiresProofSubjectFlag(t *testing.T) {
 	}
 
 	bad := map[string][]string{
-		"no namespace":            with(args, "--proof-subject", "argocd-agent=celld"),
-		"no role":                 with(args, "--proof-subject", "=ns/sa"),
-		"capitals":                with(args, "--proof-subject", "argocd-agent=NS/sa"),
-		"same role twice":         append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
-		"reload no signer":        append(slices.Clone(args), "--registry-reload", "5s"),
-		"reload zero with signer": append(slices.Clone(args), "--registry-signer", filepath.Join(args[slices.Index(args, "--registry-dir")+1], "signers.pub"), "--registry-reload", "0"),
+		"no namespace":    with(args, "--proof-subject", "argocd-agent=celld"),
+		"no role":         with(args, "--proof-subject", "=ns/sa"),
+		"capitals":        with(args, "--proof-subject", "argocd-agent=NS/sa"),
+		"same role twice": append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
+		"reload zero":     append(slices.Clone(args), "--registry-reload", "0"),
+		"reload negative": append(slices.Clone(args), "--registry-reload", "-1s"),
 	}
 	for name, a := range bad {
 		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
@@ -672,16 +688,8 @@ func TestServerRequiresProofSubjectFlag(t *testing.T) {
 func TestServerRegistrySignerFlag(t *testing.T) {
 	envCA := newCA(t, "dev.env.poc.internal")
 	args := serverArgs(t, envCA)
-	dir := args[slices.Index(args, "--registry-dir")+1]
-	signer := filepath.Join(t.TempDir(), "signers.pub")
-	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(signer, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := parseServer(append(slices.Clone(args), "--registry-signer", signer)[1:])
+	signer := args[slices.Index(args, "--registry-signer")+1]
+	cfg, err := parseServer(args[1:])
 	if err != nil || cfg.signer != signer || cfg.reload != 10*time.Second {
 		t.Fatalf("got %+v %v, want the signer and the 10 s default", cfg, err)
 	}
@@ -720,16 +728,8 @@ func TestServerRunsWithRegistryWatcher(t *testing.T) {
 	serveWorkloadAPI(t, mgmt, principalID)
 	args := serverArgs(t, envCA)
 	dir := args[slices.Index(args, "--registry-dir")+1]
-	signer := filepath.Join(t.TempDir(), "signers.pub")
-	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(signer, data, 0o600); err != nil {
-		t.Fatal(err)
-	}
 	out := &syncBuffer{}
-	stop := runUntilCanceled(t, append(args, "--registry-signer", signer, "--registry-reload", "50ms"), out)
+	stop := runUntilCanceled(t, append(args, "--registry-reload", "50ms"), out)
 	waitLine(t, out, "listening")
 	// A record that does not verify keeps the last good registry, and the server logs it.
 	if err := os.WriteFile(filepath.Join(dir, "dev-cell-1.dsse.json"), []byte("{broken"), 0o600); err != nil {

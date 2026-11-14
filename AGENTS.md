@@ -52,7 +52,7 @@
 | Run `mgmtd ctl` in `mgmtd-0`: `status`, `records`, `pubkey`, `keys`, `keycheck`, `restore`, `rotate-key`, `rotate-signing-key` to rotate the signing key and render it (see README "Rotate the signing key of mgmtd"), or `reset-state` to start `mgmtd` with a fresh state (see README "Recover lost management state") | `mise run mgmt -- status` |
 | Run the M4 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m4` |
 | Rotate the signing key of `mgmtd` and print the attestation gap. Run it alone, after `gate:m4` | `mise run gate:m4:rotate` |
-| Start the host service again, set the replicas of `mgmtd` and `envd` back to 1 and link the registries again (`--check` only reports) | `mise run gate:m4:repair` |
+| Start the host service again, set the replicas of `mgmtd` and `envd` back to 1 (`--check` only reports) | `mise run gate:m4:repair` |
 | Run `cellgw ctl` in `cell-gateway-0` of `dev-cp`: `status`, `queue --cell <cell>`, `outbox`, `enqueue` or `inject` (see README "Cell gateway") | `mise run gw -- status` |
 | Start the cell gateway with an empty store when its store is lost, corrupt or full (break-glass) | `mise run gw:reset` |
 | Run the M5 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m5` |

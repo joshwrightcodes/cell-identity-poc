@@ -4,10 +4,12 @@
 # second control: a role that someone adds later does not open a write path, and the account cannot mint
 # a token that outlives its pod. render.sh replaces @POC_ENV@ with the environment name.
 #
-# The first create is the SelfSubjectAccessReview that the tunnel allow-list forwards. The second is the
-# TokenRequest of the SPIRE agent sidecar. It names the ServiceAccount mesh-view in mesh-view-system and
-# one audience spire-<env>/<nonce>, and it binds the token to the Pod that sends it, by the name and UID
-# that the API server puts in the user extras. A token for another audience, account or Pod is denied.
+# The first create is the SelfSubjectAccessReview that the tunnel allow-list forwards. The second is a
+# TokenRequest of the pod. It names the ServiceAccount mesh-view in mesh-view-system and one audience:
+# spire-<env>/<nonce> for the SPIRE agent sidecar, or mgmt-stream/<cell>/mesh-view/<binding> for the proof that
+# cell-proxy sends to the hub. It binds the token to the Pod that sends it, by the name and UID that the API
+# server puts in the user extras. A token for another audience, account or Pod is denied. hydrate replaces
+# @CELL_NAME@.
 # Code that runs inside the tunnel pod can still use the SVID of that pod: a residual of the PoC.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
@@ -37,7 +39,8 @@ spec:
           request.resource.group == '' && request.resource.resource == 'serviceaccounts' &&
           has(request.subResource) && request.subResource == 'token' && request.namespace == 'mesh-view-system' && request.name == 'mesh-view' &&
           has(object.spec.audiences) && object.spec.audiences.size() == 1 &&
-          object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') &&
+          (object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') ||
+           object.spec.audiences[0].matches('^mgmt-stream/@CELL_NAME@/mesh-view/[A-Za-z0-9_-]{22}$')) &&
           has(object.spec.boundObjectRef) && has(object.spec.boundObjectRef.kind) &&
           object.spec.boundObjectRef.kind == 'Pod' &&
           has(object.spec.boundObjectRef.name) && has(object.spec.boundObjectRef.uid) &&

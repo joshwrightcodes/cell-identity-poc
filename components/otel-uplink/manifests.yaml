@@ -7,7 +7,8 @@
 # It dials the upstream with SPIFFE mTLS, and accepts only the exact server ID
 # spiffe://mgmt.poc.internal/telemetry, chained to the roots in the peer root ConfigMap. In a cell the
 # upstream is the relay of dev-cp, and in dev-cp it is the gateway in management.
-# The pod mounts no API token. The cluster_jwt plugin of the sidecar uses its own projected token.
+# The pod mounts no API token by default. The cluster_jwt plugin of the sidecar uses its own projected token. In a
+# cell, render.sh also gives the cell-proxy container a projected token for the proof of its pod.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

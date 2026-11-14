@@ -200,7 +200,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 		t.Errorf("the readiness probe %s reads /healthz, which needs the remote stream", probe)
 	}
 	proxyArgs := fmt.Sprint(get[[]any](t, named(t, containers, "cell-proxy"), "args"))
-	if want := "[spiffe-client --listen=127.0.0.1:8443 --upstream=10.9.0.9:30443 --expect-id=spiffe://mgmt.poc.internal/argocd/principal --peer-bundle=/run/cell-proxy/mgmt-root/root.crt --peer-trust-domain=mgmt.poc.internal]"; proxyArgs != want {
+	if want := "[spiffe-client --listen=127.0.0.1:8443 --upstream=10.9.0.9:30443 --expect-id=spiffe://mgmt.poc.internal/argocd/principal --peer-bundle=/run/cell-proxy/mgmt-root/root.crt --peer-trust-domain=mgmt.poc.internal --proof]"; proxyArgs != want {
 		t.Errorf("cell-proxy args %s, want %s", proxyArgs, want)
 	}
 	root := objs["ConfigMap argocd/mgmt-root"]

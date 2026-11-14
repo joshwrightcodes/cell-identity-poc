@@ -293,28 +293,46 @@ check_op_key_pinned() {
   fi
 }
 
-# check_registry_current <namespace> <component> compares each record in ConfigMap cell-registry of the
-# namespace with the record that mgmtd serves, as compact JSON. The render of the component copies the
-# records, so a record that mgmtd signed after the last link leaves the registry behind. A mismatch prints
-# the link command of the component. LINK_ONLY=<component> renders only that component.
-check_registry_current() {
-  local ns="$1" comp="$2" fix served cm key cell held bad=""
-  fix="CELL=management LINK_ONLY=$comp mise run cell:link"
-  served="$(cd "$ROOT" && mise run mgmt -- records 2>/dev/null)" && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$served" \
-    || { echo "mise run mgmt -- records failed: ${served:-no output}"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
-  cm="$(k -n "$ns" get configmap cell-registry -o json 2>&1)" || { echo "could not read ConfigMap $ns/cell-registry: $cm"; echo "Run: $fix"; return 1; }
-  while IFS= read -r key; do
-    cell="${key%.dsse.json}"
-    held="$(jq -c --arg k "$key" '.data[$k] | fromjson' <<<"$cm" 2>/dev/null)" || held=""
-    if [[ -z "$held" || "$held" != "$(jq -c --arg c "$cell" '.[$c] // "absent"' <<<"$served")" ]]; then
-      bad+="$cell "
+# check_registry_published <namespace> checks ConfigMap cell-registry of the namespace, which mgmtd publishes. It must carry
+# only the label poc.internal/made-by=mgmtd, hold the record of each cell that mgmtd serves as compact JSON and no other
+# record, and hold the live signing key of mgmtd in signers.pub. mgmtd checks the object again every minute, and writes it
+# at once after a bind, so the check reads it again for up to REGISTRY_PUBLISHED_WAIT seconds (default 20) before it fails.
+# A mismatch names the status of mgmtd and its log.
+check_registry_published() {
+  local ns="$1" wait="${REGISTRY_PUBLISHED_WAIT:-20}" end problem="" served cm key cell held pub signers
+  local next="Run: mise run mgmt -- status, and read the log of mgmtd-0: kubectl --context kind-management -n mgmt-system logs mgmtd-0 -c mgmtd"
+  end=$((SECONDS + wait))
+  while :; do
+    problem=""
+    if ! served="$(cd "$ROOT" && mise run mgmt -- records 2>/dev/null)" || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$served"; then
+      echo "mise run mgmt -- records failed: ${served:-no output}"; echo "$next"; return 1
     fi
-  done < <(jq -r '.data // {} | keys[] | select(endswith(".dsse.json"))' <<<"$cm")
-  if [[ -n "$bad" ]]; then
-    echo "ConfigMap $ns/cell-registry holds another record than mgmtd serves for: ${bad% }."
-    echo "Run: $fix"
-    return 1
-  fi
+    if ! pub="$(mgmt_signing_pub)"; then
+      echo "could not read the signing key of mgmtd"; echo "$next"; return 1
+    fi
+    if ! cm="$(k -n "$ns" get configmap cell-registry -o json 2>&1)"; then
+      problem="could not read ConfigMap $ns/cell-registry: $cm"
+    elif [[ "$(jq -c '.metadata.labels // {}' <<<"$cm")" != '{"poc.internal/made-by":"mgmtd"}' ]]; then
+      problem="ConfigMap $ns/cell-registry has the labels $(jq -c '.metadata.labels // {}' <<<"$cm"), and mgmtd publishes only poc.internal/made-by=mgmtd"
+    else
+      # The trailing newline belongs to the value, and a command substitution would drop it.
+      signers="$(jq -j '.data["signers.pub"] // ""' <<<"$cm"; echo x)"; signers="${signers%x}"
+      [[ "$signers" == "$pub"$'\n' ]] || problem="signers.pub of $ns/cell-registry is '${signers%$'\n'}', and mgmtd signs with $pub"
+      for cell in $(jq -r 'keys[]' <<<"$served"); do
+        key="$cell.dsse.json"
+        held="$(jq -c --arg k "$key" '.data[$k] | fromjson' <<<"$cm" 2>/dev/null)" || held=""
+        [[ -n "$held" && "$held" == "$(jq -c --arg c "$cell" '.[$c]' <<<"$served")" ]] || problem+="${problem:+; }$cell has another record than mgmtd serves, or none"
+      done
+      for key in $(jq -r '.data // {} | keys[] | select(endswith(".dsse.json"))' <<<"$cm"); do
+        jq -e --arg c "${key%.dsse.json}" 'has($c)' >/dev/null <<<"$served" || problem+="${problem:+; }$ns/cell-registry holds the record ${key%.dsse.json}, which mgmtd does not serve"
+      done
+    fi
+    [[ -n "$problem" ]] || return 0
+    if ((SECONDS >= end)); then
+      echo "$problem"; echo "$next"; return 1
+    fi
+    sleep 2
+  done
 }
 
 # The gateway checks. check_gateway_* need scripts/gw.sh and the functions of scripts/lib.sh and of this file. A

@@ -6,7 +6,9 @@
 # there to the principal in management. It speaks plaintext gRPC to cell-proxy on 127.0.0.1:8443.
 # cell-proxy dials the relay of the environment control plane with SPIFFE mTLS, and accepts only the
 # exact server ID spiffe://mgmt.poc.internal/argocd/principal, chained to ConfigMap mgmt-root.
-# The pod mounts no token for this account. Only the agent container gets a projected API token.
+# The pod mounts no token for this account. The agent container and the cell-proxy container each get a
+# projected API token, and no other container of the pod does. cell-proxy asks the API server for one token
+# of its own pod for each stream, which proves the pod to the principal (--proof).
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -148,11 +150,28 @@ spec:
             - --expect-id=spiffe://mgmt.poc.internal/argocd/principal
             - --peer-bundle=/run/cell-proxy/mgmt-root/root.crt
             - --peer-trust-domain=mgmt.poc.internal
+            - --proof
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
             - name: OTEL_SERVICE_NAME
               value: cell-proxy-agent
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
           securityContext:
@@ -175,6 +194,9 @@ spec:
             - name: mgmt-root
               mountPath: /run/cell-proxy/mgmt-root
               readOnly: true
+            - name: proof-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
       volumes:
         - name: mgmt-root
           configMap:
@@ -185,6 +207,22 @@ spec:
             items:
               - key: auth
                 path: auth
+        - name: proof-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
         - name: agent-api-token
           projected:
             sources:

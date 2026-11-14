@@ -1,10 +1,10 @@
 // Command cell-proxy carries streams between the planes over SPIFFE mTLS.
 //
 //	cell-proxy spiffe-client --listen <addr> --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> [--proof]
-//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
-//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --backend otlp --upstream <host:port> [--upstream-wait <duration>]
+//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --registry-signer <file> --backend grpc-header --upstream <host:port> --identity-header x-cell-agent
+//	cell-proxy spiffe-server --listen <addr> --peer-bundle <file> --peer-trust-domain <td> --allow-id <regex> --registry-dir <dir> --registry-signer <file> --backend otlp --upstream <host:port> [--upstream-wait <duration>]
 //	cell-proxy spiffe-server ... --backend tunnel --tunnel-cell <cell>=<listen addr> [--tunnel-cell ...] [--tunnel-wait 10s]
-//	cell-proxy spiffe-server ... --proof-subject <role>=<namespace>/<service account> [--proof-subject ...] [--registry-signer <file> [--registry-reload 10s]]
+//	cell-proxy spiffe-server ... --proof-subject <role>=<namespace>/<service account> [--proof-subject ...] [--registry-reload 10s]
 //	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> [--proof]
 //	cell-proxy promql-proxy --listen <addr> --upstream <url>
 //	cell-proxy probe --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
@@ -26,7 +26,7 @@
 // in-cluster configuration and the pod environment. spiffe-server checks the proof of each cell
 // source against the live registry and the service account that --proof-subject names for the role
 // of the source. An --allow-id that can admit a cell source needs at least one --proof-subject.
-// With --registry-signer, spiffe-server reloads the registry every --registry-reload, refuses a
+// spiffe-server needs --registry-signer. It reloads the registry every --registry-reload, refuses a
 // registry whose signers.pub differs from that file, and keeps the last good registry on an error.
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
@@ -263,7 +263,7 @@ type serverConfig struct {
 	peer     *x509bundle.Bundle
 	allow    *regexp.Regexp
 	registry *cellproxy.Registry
-	// registryDir, signer and reload set the watcher. An empty signer loads the registry once.
+	// registryDir, signer and reload set the watcher.
 	registryDir, signer string
 	reload              time.Duration
 	// signerSHA256 is the fingerprint of the pinned keys that LoadPinnedRegistry returned.
@@ -295,7 +295,7 @@ func parseServer(args []string) (serverConfig, error) {
 	if err := parseFlags(fs, args); err != nil {
 		return serverConfig{}, err
 	}
-	if err := required(map[string]string{"peer-bundle": *bundle, "peer-trust-domain": *td, "allow-id": *allow, "registry-dir": *registryDir, "backend": *backend}); err != nil {
+	if err := required(map[string]string{"peer-bundle": *bundle, "peer-trust-domain": *td, "allow-id": *allow, "registry-dir": *registryDir, "registry-signer": *signer, "backend": *backend}); err != nil {
 		return serverConfig{}, err
 	}
 	peer, _, err := loadPeer(*bundle, *td)
@@ -312,23 +312,12 @@ func parseServer(args []string) (serverConfig, error) {
 	if len(subjects) == 0 && mayAdmitCell(*allow) {
 		return serverConfig{}, errors.New("--allow-id can admit a cell source, so at least one --proof-subject <role>=<namespace>/<service account> is required")
 	}
-	reloadSet := false
-	fs.Visit(func(f *flag.Flag) { reloadSet = reloadSet || f.Name == "registry-reload" })
-	switch {
-	case *signer == "" && reloadSet:
-		return serverConfig{}, errors.New("--registry-reload needs --registry-signer")
-	case *reload < 0 || (*signer != "" && *reload == 0):
+	if *reload <= 0 {
 		return serverConfig{}, errors.New("--registry-reload must be positive")
 	}
-	var reg *cellproxy.Registry
-	var fingerprint string
-	if *signer != "" {
-		reg, fingerprint, err = cellproxy.LoadPinnedRegistry(*registryDir, *signer)
-		if err != nil {
-			return serverConfig{}, fmt.Errorf("--registry-dir with --registry-signer: %w", err)
-		}
-	} else if reg, err = cellproxy.LoadRegistry(*registryDir); err != nil {
-		return serverConfig{}, fmt.Errorf("--registry-dir: %w", err)
+	reg, fingerprint, err := cellproxy.LoadPinnedRegistry(*registryDir, *signer)
+	if err != nil {
+		return serverConfig{}, fmt.Errorf("--registry-dir with --registry-signer: %w", err)
 	}
 	cfg := serverConfig{listen: *listen, peer: peer, allow: pattern, registry: reg, registryDir: *registryDir, signer: *signer, reload: *reload, signerSHA256: fingerprint}
 	if len(subjects) > 0 {
@@ -453,10 +442,7 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 		if err != nil {
 			return err
 		}
-		var reg cellproxy.RegistrySource = cfg.registry
-		if cfg.signer != "" {
-			reg = cellproxy.WatchLoaded(ctx, cfg.registry, cfg.signerSHA256, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
-		}
+		reg := cellproxy.WatchLoaded(ctx, cfg.registry, cfg.signerSHA256, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
 		scfg := serverProofConfig(cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log)}, cfg, reg)
 		return serveBackend(ctx, cellproxy.NewServer(scfg, backend, tel.Log), ln, backend)
 	})

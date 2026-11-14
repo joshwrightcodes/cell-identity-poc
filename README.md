@@ -437,15 +437,19 @@ In two gaps, new agents cannot attest. Agents that already run still renew their
 
 `attest-wait.sh` shows which stage of the first gap is slow. A `celld` pod that starts in a gap can restart its agent container until the record lands.
 
-### Refresh the registry of a view
+### Check the registry of a view
 
-The central view, the telemetry gateway and the mesh view each hold a copy of the records of `mgmtd` in ConfigMap `cell-registry`.
-Only a link of `management` renders that copy.
-After a record change, the copy stays old until the next link.
-Then `cell:verify` and `harness:status` of `management` fail and print the link command, for example `CELL=management LINK_ONLY=central-view mise run cell:link`.
-Run the printed command.
-A view uses only the name, the environment and the revoked flag of a record, so an old key list changes nothing.
-A revocation or a new cell reaches the views only after the link.
+`mgmtd` publishes ConfigMap `cell-registry` into `central-view-system`, `observability-system` and `mesh-view-system`.
+The object carries only the label `poc.internal/made-by=mgmtd`.
+`mgmtd` writes it after each change of a record, and checks it again every minute.
+Each view server loads the registry every 10 seconds, and refuses a registry that another key signed.
+The link of a view component does not render the registry.
+It holds ConfigMap `registry-signer` with the key of `mgmtd`, and a Role that lets `mgmtd` write the registry.
+After the apply, the link waits up to 60 seconds until the registry lists each cell, and only then does it prune.
+If the wait fails, run `CELL=<cell> mise run cell:up` for the cell that the message names, so that its `celld` binds.
+Then read `mise run mgmt -- status` and the log of `mgmtd-0`.
+`cell:verify` of `management` fails when a registry differs from the output of `mise run mgmt -- records`.
+A record change reaches the views without a link.
 
 ### Recover lost management state
 

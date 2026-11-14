@@ -76,17 +76,14 @@ func TestDependentsManagementOrder(t *testing.T) {
 	}
 }
 
-// registryLinks are the links that render the registries from the records of mgmtd.
-const registryLinks = "CELL=management LINK_ONLY=central-view mise run cell:link\nCELL=management LINK_ONLY=telemetry-gateway mise run cell:link\nCELL=management LINK_ONLY=mesh-view-hub mise run cell:link"
-
 // dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
-// admits envd by the dev-cp root and the node address. A rebuilt cell links the three registries.
+// admits envd by the dev-cp root and the node address. A rebuilt cell links no registry: mgmtd publishes them.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
 		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
 		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
 		"dependents_of gateway-store": "mise run gw:reset",
-		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\n" + registryLinks,
+		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up",
 		"dependents_of dev-cp":        "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)

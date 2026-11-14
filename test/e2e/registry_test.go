@@ -12,23 +12,71 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
-// registryLinks are the link components of management that render ConfigMap cell-registry. The registry follows the
-// records of mgmtd only at a link, so a test that changes a cell record renders these again.
-var registryLinks = []string{"central-view", "telemetry-gateway", "mesh-view-hub"}
+// registryNamespaces are the view namespaces of management where mgmtd publishes ConfigMap cell-registry.
+var registryNamespaces = []string{"central-view-system", "observability-system", "mesh-view-system"}
 
-// registryRenderMax bounds one link component. The hub waits for its tunnels for up to 5 minutes.
-const registryRenderMax = 10 * time.Minute
+// registryWait bounds the wait for mgmtd to publish a changed record: it writes at once after a change, and checks the
+// object again every minute.
+const registryWait = 3 * time.Minute
 
-// renderRegistryAtCleanup makes the cleanup of the test render the registries again, with the command that cell:verify
-// prints for each of them: CELL=management LINK_ONLY=<component> mise run cell:link. A test that changes a cell record
-// calls it before the step that changes it, so that it runs after the cleanups of that step, which settle the record.
-func renderRegistryAtCleanup(t *testing.T) {
+// registryDiff returns why ConfigMap cell-registry of a namespace differs from the records and the key of mgmtd, or the
+// empty string when it holds exactly them.
+func registryDiff(t *testing.T, namespace string) string {
+	t.Helper()
+	res, err := cmdrun.Run(2*time.Minute, "", nil, "mise", "run", "mgmt", "--", "records")
+	if err != nil || res.Code != 0 {
+		return "mise run mgmt -- records failed"
+	}
+	var served map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(strings.TrimSpace(res.Stdout)), &served); err != nil {
+		return "mgmtd ctl records is no object of records: " + err.Error()
+	}
+	out, err := kubectl(t, mgmtCluster, "", "-n", namespace, "get", "configmap", "cell-registry", "-o", "json")
+	if err != nil {
+		return err.Error()
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(out), &cm); err != nil {
+		return err.Error()
+	}
+	var diffs []string
+	if got := strings.Fields(cm.Data["signers.pub"]); !slices.Equal(got, []string{mgmtSigningPub(t)}) {
+		diffs = append(diffs, "signers.pub holds "+strings.Join(got, " "))
+	}
+	for cell, raw := range served {
+		if got, ok := cm.Data[cell+".dsse.json"]; !ok || compactJSON(t, got) != compactJSON(t, string(raw)) {
+			diffs = append(diffs, "the record of "+cell+" differs from the one that mgmtd serves")
+		}
+	}
+	for key := range cm.Data {
+		if cell, ok := strings.CutSuffix(key, ".dsse.json"); ok && served[cell] == nil {
+			diffs = append(diffs, "the registry holds the record of "+cell+", which mgmtd does not serve")
+		}
+	}
+	slices.Sort(diffs)
+	return strings.Join(diffs, "; ")
+}
+
+// waitRegistryAtCleanup makes the cleanup of the test wait until each ConfigMap cell-registry holds the records that
+// mgmtd serves. mgmtd publishes them itself, so no render runs. A test that changes a cell record calls it before the
+// step that changes it, so that it runs after the cleanups of that step, which settle the record.
+func waitRegistryAtCleanup(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		for _, comp := range registryLinks {
-			res, err := cmdrun.Run(registryRenderMax, "../..", []string{"CELL=management", "LINK_ONLY=" + comp}, "mise", "run", "cell:link")
-			if err != nil || res.Code != 0 {
-				t.Errorf("CELL=management LINK_ONLY=%s mise run cell:link: %v (exit %d)\n%s", comp, err, res.Code, res.Stderr)
+		for _, ns := range registryNamespaces {
+			deadline := time.Now().Add(registryWait)
+			for {
+				diff := registryDiff(t, ns)
+				if diff == "" {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Errorf("cell-registry of %s did not follow the records of mgmtd within %s: %s. Run: mise run mgmt -- status", ns, registryWait, diff)
+					break
+				}
+				time.Sleep(5 * time.Second)
 			}
 		}
 	})

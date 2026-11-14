@@ -604,6 +604,14 @@ func dialTLS(t *testing.T, addr string, cfg *tls.Config) *grpc.ClientConn {
 	return conn
 }
 
+// gatewayConnAsCell is gatewayConn for a sender in the role otel of a cell: the SVID that dev-cp mints, and the proof of the
+// real uplink pod of the cell, which the gateway checks after the handshake.
+func gatewayConnAsCell(t *testing.T, cell string) *grpc.ClientConn {
+	t.Helper()
+	return dialGatewayAsCell(t, portForward(t, mgmtCluster, obsNamespace, gatewayService, 8444),
+		senderCert(t, "spiffe://"+envTrustDomain+"/cell/"+cell+"/otel"), streamProof(t, cell, "otel"))
+}
+
 // senderCert mints an SVID for the SPIFFE ID id in dev-cp, as a sender of the environment.
 func senderCert(t *testing.T, id string) tls.Certificate {
 	t.Helper()
@@ -753,7 +761,7 @@ func overwriteRise(base, now map[string]float64) float64 {
 func TestM3GatewayResetsSpoofedAttributes(t *testing.T) {
 	marker := "m3spoof" + randomHex(t, 4)
 	metric := "m3_spoof_" + marker
-	conn := gatewayConn(t, senderCert(t, "spiffe://"+envTrustDomain+"/cell/dev-cell-1/otel"))
+	conn := gatewayConnAsCell(t, "dev-cell-1")
 	base := overwriteSeries(t, "dev-cell-1")
 
 	sendSignals(t, conn, spoofResource("m3-spoof"), marker, strAttr("platform_cell", "dev-cell-2"), strAttr("m3.marker", marker))
@@ -884,7 +892,7 @@ func TestM3GatewayRefusesUnknownSenders(t *testing.T) {
 // The store accepts it, because Prometheus holds an out-of-order window of 25 hours.
 func TestM3OldSamplesAccepted(t *testing.T) {
 	name := "m3_old_" + randomHex(t, 4)
-	conn := gatewayConn(t, senderCert(t, "spiffe://"+envTrustDomain+"/cell/dev-cell-1/otel"))
+	conn := gatewayConnAsCell(t, "dev-cell-1")
 	// A newer sample first, so the old one is out of order for the series, as a drained queue makes it.
 	sendMetric(t, conn, &resourcepb.Resource{Attributes: []*commonpb.KeyValue{strAttr("service.name", "m3-old")}}, name, time.Now())
 	sendMetric(t, conn, &resourcepb.Resource{Attributes: []*commonpb.KeyValue{strAttr("service.name", "m3-old")}}, name, time.Now().Add(-30*time.Minute))

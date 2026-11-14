@@ -808,6 +808,14 @@ harness_apply() {
   [[ -z "$conflicts" ]] || die "the harness component $1 renders objects that another owner holds:"$'\n'"$conflicts"$'\n'"Rename the object in the harness render or remove it from the other owner, so that one owner holds it. Then run: $(fix_command "$1")"
   apply_bundle "$1"
   release_from_argocd "$BUNDLES/$1/manifests.yaml"
+  # mgmtd publishes ConfigMap cell-registry of a view namespace, and the Role of the bundle lets it write.
+  # An old render left the object with the harness label, and the prune would delete it before mgmtd
+  # takes the label off. So the prune waits for the published registry.
+  case "$1" in
+    central-view) source "$ROOT/components/lib/registry.sh"; registry_wait central-view-system ;;
+    telemetry-gateway) source "$ROOT/components/lib/registry.sh"; registry_wait observability-system ;;
+    mesh-view-hub) source "$ROOT/components/lib/registry.sh"; registry_wait mesh-view-system ;;
+  esac
   harness_prune "$1" "$BUNDLES/$1/manifests.yaml"
 }
 
@@ -883,7 +891,10 @@ check_plane_pods() {
 # mgmtd, the harness label mgmt-api and the marker label poc.internal/made-by=mgmtd. A listed
 # object counts as a runtime object only when it carries the marker, so a person cannot add an
 # object of that name without it.
-# The third case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
+# The third case: mgmtd publishes ConfigMap cell-registry into central-view-system (central-view),
+# observability-system (telemetry-gateway) and mesh-view-system (mesh-view-hub), with the field manager mgmtd, no
+# harness label and the marker label poc.internal/made-by=mgmtd.
+# The fourth case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
 # the check skips them, and prints no delete hint for them.
 runtime_objects() {
@@ -894,6 +905,10 @@ runtime_objects() {
   fi
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
     jq -cn '{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}}'
+    return
+  fi
+  if [[ "$1:$2" =~ ^(central-view:central-view-system|telemetry-gateway:observability-system|mesh-view-hub:mesh-view-system)$ && "$3" == ConfigMap ]]; then
+    jq -cn '{names: "^cell-registry$", managers: ["mgmtd"], labels: [], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
     return
   fi
   if [[ "$1" == central-view && "$2" == central-view-system && "$3" == AppProject ]]; then
@@ -1031,8 +1046,6 @@ dependents_of() {
         [[ "$cell" == "$1" ]] || continue
         echo "CELL=dev-cp mise run cell:up"
         echo "CELL=$cell mise run cell:up"
-        # A new cell record changes the registries, and a registry follows the records only at a link.
-        for comp in central-view telemetry-gateway mesh-view-hub; do echo "CELL=management LINK_ONLY=$comp mise run cell:link"; done
         return
       done
       die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $cells, not '$1'" ;;

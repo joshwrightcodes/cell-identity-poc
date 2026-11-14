@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 )
 
 const (
@@ -219,38 +221,13 @@ func TestM3CentralPortsFromFreshNamespace(t *testing.T) {
 	}
 }
 
-// viewDial makes one mTLS handshake to the view listener with cert, and checks the server ID. It
-// then sends the HTTP/2 preface and reads once. It returns nil when the server answered, so it
-// accepted the peer, and the error otherwise. TLS 1.3 finishes the client side of the handshake
-// before the server checks the client, so only the read shows a refusal.
-func viewDial(t *testing.T, addr string, cert tls.Certificate, roots *x509.CertPool) error {
+// viewDial makes one mTLS handshake to the view listener with cert, and checks the server ID. A non-nil proofToken
+// sends the proof frame of a cell pod. It then sends the HTTP/2 preface and reads once. It returns nil when the server
+// answered, so it accepted the peer, and the error otherwise. TLS 1.3 finishes the client side of the handshake before the
+// server checks the client, so only the read shows a refusal.
+func viewDial(t *testing.T, addr, cell string, cert tls.Certificate, proofToken func(binding string) string) error {
 	t.Helper()
-	cfg := &tls.Config{
-		MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert},
-		// SPIFFE certificates carry no DNS name, so the callback checks the chain and the URI.
-		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			var chain []*x509.Certificate
-			for _, r := range raw {
-				c, err := x509.ParseCertificate(r)
-				if err != nil {
-					return err
-				}
-				chain = append(chain, c)
-			}
-			inter := x509.NewCertPool()
-			for _, c := range chain[1:] {
-				inter.AddCert(c)
-			}
-			if _, err := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
-				return err
-			}
-			if len(chain[0].URIs) != 1 || chain[0].URIs[0].String() != principalID {
-				return fmt.Errorf("server ID %v, want %s", chain[0].URIs, principalID)
-			}
-			return nil
-		},
-	}
+	cfg := streamClientConfig(t, "argocd-agent", cert)
 	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", addr, cfg)
 	if err != nil {
 		return err
@@ -258,6 +235,15 @@ func viewDial(t *testing.T, addr string, cert tls.Certificate, roots *x509.CertP
 	defer conn.Close()
 	if p := conn.ConnectionState().NegotiatedProtocol; p != "h2" {
 		return fmt.Errorf("ALPN %q, want h2", p)
+	}
+	if proofToken != nil {
+		binding, err := proof.Binding(conn.ConnectionState())
+		if err != nil {
+			return err
+		}
+		if err := proof.WriteFrame(conn, proofToken(binding)); err != nil {
+			return err
+		}
 	}
 	// The client preface and an empty SETTINGS frame.
 	if _, err := conn.Write(append([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), 0, 0, 0, 4, 0, 0, 0, 0, 0)); err != nil {
@@ -308,7 +294,7 @@ func TestM3ViewListenerIdentity(t *testing.T) {
 		return c
 	}
 	good := "spiffe://" + envTrustDomain + "/cell/dev-cell-1/argocd-agent"
-	if err := viewDial(t, addr, svid(good), roots); err != nil {
+	if err := viewDial(t, addr, "dev-cell-1", svid(good), streamProof(t, "dev-cell-1", "argocd-agent")); err != nil {
 		t.Fatalf("%s: %v, want an answer", good, err)
 	}
 	refused := map[string]tls.Certificate{
@@ -317,7 +303,7 @@ func TestM3ViewListenerIdentity(t *testing.T) {
 		"self-signed " + good: selfSigned(t, good),
 	}
 	for name, cert := range refused {
-		if err := viewDial(t, addr, cert, roots); err == nil {
+		if err := viewDial(t, addr, "dev-cell-1", cert, nil); err == nil {
 			t.Errorf("%s got an answer, want a refusal", name)
 		} else {
 			t.Logf("%s: refused: %v", name, err)

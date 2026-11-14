@@ -281,6 +281,7 @@ func TestTelemetryGatewayRender(t *testing.T) {
 	}
 	want := []string{"spiffe-server", "--listen=:8444", "--backend=otlp", "--upstream=lgtm.observability-system.svc.cluster.local:4317", "--upstream-wait=2m",
 		`--allow-id=^spiffe://dev\.env\.poc\.internal/(cell/[a-z0-9-]+|cp)/otel$`, "--registry-dir=/run/cell-proxy/registry",
+		"--registry-signer=/run/cell-proxy/registry-signer/signer.pub", "--registry-reload=10s", "--proof-subject=otel=observability-system/otel-uplink",
 		"--peer-bundle=/run/cell-proxy/peer-root/root.crt", "--peer-trust-domain=dev.env.poc.internal"}
 	if !slices.Equal(args, want) {
 		t.Errorf("args %q, want %q", args, want)
@@ -289,10 +290,13 @@ func TestTelemetryGatewayRender(t *testing.T) {
 		t.Errorf("peer-root volume reads ConfigMap %s", got)
 	}
 	ann := get[map[string]any](t, dep, "spec", "template", "metadata", "annotations")
-	for _, k := range []string{"poc.internal/peer-root-sha256", "poc.internal/registry-content-sha256", "cell.poc.internal/config-checksum"} {
+	for _, k := range []string{"poc.internal/peer-root-sha256", "poc.internal/registry-signer-sha256", "cell.poc.internal/config-checksum"} {
 		if s, _ := ann[k].(string); len(s) != 64 {
 			t.Errorf("annotation %s is %q, want a SHA-256", k, ann[k])
 		}
+	}
+	if _, ok := ann["poc.internal/registry-content-sha256"]; ok {
+		t.Error("the pod template carries the registry content checksum, and the render holds no registry")
 	}
 	// The heap peaks near 860 MiB, so the limit holds it with room, and GOMEMLIMIT sits below the limit.
 	if env := envOf(t, ctr); env["GOMEMLIMIT"] != "1000MiB" || get[string](t, ctr, "resources", "limits", "memory") != "1280Mi" {

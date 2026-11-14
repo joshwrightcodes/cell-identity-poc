@@ -106,7 +106,8 @@ func TestMgmtAPIRender(t *testing.T) {
 	mgmtd := named(t, get[[]any](t, spec, "containers"), "mgmtd")
 	wantArgs := []string{"serve", "--intent=/etc/mgmtd/intent/intent.json", "--data-dir=/var/lib/mgmtd", "--peer-bundle=/etc/mgmtd/peer-root/root.crt",
 		"--peer-trust-domain=dev.env.poc.internal", "--allow-id=spiffe://dev.env.poc.internal/envd", "--hostsvc-addr=192.168.5.2:17443",
-		"--hostsvc-server-name=host.docker.internal", "--hostsvc-pin=/etc/mgmtd/hostsvc-pin/hostsvc.crt", "--public-configmap=mgmt-system/mgmt-signing-pub"}
+		"--hostsvc-server-name=host.docker.internal", "--hostsvc-pin=/etc/mgmtd/hostsvc-pin/hostsvc.crt", "--public-configmap=mgmt-system/mgmt-signing-pub",
+		"--registry-namespaces=central-view-system,observability-system,mesh-view-system"}
 	if got := containerArgs(t, mgmtd); !slices.Equal(got, wantArgs) {
 		t.Errorf("mgmtd args\n%v\nwant\n%v", got, wantArgs)
 	}

@@ -5,7 +5,8 @@
 # the k8s_psat SPIRE agent sidecar, Service mgmt-api (node port 31446), the
 # ConfigMaps mgmt-intent, hostsvc-pin and peer-root, the objects of the sidecar, and the
 # NetworkPolicies default-deny, allow-dns and mgmtd (flows N26, N28, N29, N8, N11 and N23). Every
-# object carries the harness label of the component. mgmtd makes ConfigMap mgmt-signing-pub itself.
+# object carries the harness label of the component. mgmtd makes ConfigMap mgmt-signing-pub itself, and
+# ConfigMap cell-registry in the namespaces of the view servers (--registry-namespaces in manifests.yaml).
 #
 # The render reads these facts from outside the cluster, so it runs in the link phase:
 #   - the host service (components/lib/hostsvc-pin.sh): it starts when it does not serve, and the
@@ -114,7 +115,7 @@ statefulset="$(yq 'select(.kind == "StatefulSet")' <<<"$manifests" \
     spire_sidecar mgmtd k8s_psat)" || die "the SPIRE sidecar of mgmtd failed"
 
 # The mgmtd policy: flow N8 (SPIRE sidecar to the SPIRE server), N28 (key requests to the host
-# service), N29 (ConfigMap mgmt-signing-pub through the API server) and N11 (OTLP to the collector)
+# service), N29 (ConfigMaps mgmt-signing-pub and cell-registry through the API server) and N11 (OTLP to the collector)
 # leave the pod. Flow N26 admits only the node of VIEW_CONTROL_PLANE, which the local traffic policy keeps as the source
 # address. While that cluster does not exist, the pod admits no peer on the API port.
 ingress="$(peers $node_ips | jq -c '[{from: ., ports: [{protocol: "TCP", port: 8080}]}]')"

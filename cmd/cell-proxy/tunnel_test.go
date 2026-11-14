@@ -72,10 +72,11 @@ func assertConfigError(t *testing.T, args []string) {
 
 func tunnelServerArgs(t *testing.T, envCA testCA) []string {
 	t.Helper()
+	dir := registryDir(t)
 	return []string{
 		"spiffe-server", "--listen", "127.0.0.1:0",
 		"--peer-bundle", envCA.bundleFile(t), "--peer-trust-domain", "dev.env.poc.internal",
-		"--allow-id", meshPattern, "--registry-dir", registryDir(t),
+		"--allow-id", meshPattern, "--registry-dir", dir, "--registry-signer", signerFile(t, dir),
 		"--backend", "tunnel", "--tunnel-cell", "dev-cell-1=127.0.0.1:0", "--tunnel-wait", "200ms",
 		"--proof-subject", "mesh-view=cell-identity-system/celld",
 	}

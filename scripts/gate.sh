@@ -101,13 +101,17 @@ fi
 
 # The M5 tests run against mgmtd, envd, the cell gateway and the cells. An earlier run can leave a workload with no
 # replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded, and so
-# must celld in each cell.
+# must celld in each cell and the three cell-proxy servers of management. The cell-proxy clients stay with the M3 check:
+# a new image of the server changes the digest of every user of cell-proxy.
 if [[ "$milestone" == m5 || "$milestone" == m5-soak ]]; then
   "$ROOT/scripts/gate-m5-repair.sh" --check || exit 1
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
     "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
-    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up")
+    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
+    "management:central-view-system:deployment/argocd-agent-principal:mise run images -- cell-proxy, then CELL=management LINK_ONLY=central-view mise run cell:link"
+    "management:observability-system:deployment/telemetry-gateway:mise run images -- cell-proxy, then CELL=management LINK_ONLY=telemetry-gateway mise run cell:link"
+    "management:mesh-view-system:deployment/mesh-view-hub:mise run images -- cell-proxy, then CELL=management LINK_ONLY=mesh-view-hub mise run cell:link")
   for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
     targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
   done

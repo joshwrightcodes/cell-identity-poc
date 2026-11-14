@@ -19,11 +19,12 @@
 #     peer-root (components/lib/peer-root.sh). cell-proxy trusts agents only through it.
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for
 #     the trust bundle of the sidecar.
-#   - a signed record for each cell of VIEW_CELLS, as ConfigMap cell-registry
-#     (components/lib/registry.sh). Each cell must have a bound celld.
+#   - the public key of mgmtd, as ConfigMap registry-signer (components/lib/registry.sh). cell-proxy
+#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry itself, so the
+#     bundle holds a Role that lets mgmtd write it, and no registry.
 #   - the cell-proxy and viewkeys images that `mise run images` built, by digest.
-# The pod template carries the SHA-256 of the peer root and of the registry content, so a new
-# root or a new set of cells restarts the pod.
+# The pod template carries the SHA-256 of the peer root and of the registry signer, so a new
+# root or a new signing key restarts the pod.
 # Inputs: VIEW_CELLS, VIEW_CONTROL_PLANE and SPIRE_TRUST_DOMAIN from cells/management.env, POC_ENV and
 # ARGOCD_AGENT_IMAGE from cells/common.env, and the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
@@ -88,10 +89,10 @@ cell_proxy_image="$(ko_image cell-proxy)" || die "no cell-proxy image"
 viewkeys_image="$(ko_image viewkeys)" || die "no viewkeys image"
 peer_root="$(peer_root_configmap peer-root "$namespace" "$env_cluster" "$env_td")" || exit 1
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
-registry="$(registry_configmap "$namespace" "$POC_ENV" "${cells[@]}")" || exit 1
+registry_signer="$(registry_signer_configmap "$namespace")" || exit 1
 peer_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$peer_root")"
-registry_sum="$(yq -r '.metadata.annotations["poc.internal/registry-content-sha256"]' <<<"$registry")"
-[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$registry_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry has no checksum"
+signer_sum="$(yq -r '.metadata.annotations["poc.internal/registry-signer-sha256"]' <<<"$registry_signer")"
+[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$signer_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry signer has no checksum"
 
 # The agent name is the first capture group of the header value, and the header comes only from
 # cell-proxy, which sets <env>-<cell> from the verified SVID.
@@ -139,7 +140,7 @@ for ns in "${agents[@]}"; do
 done)"
 
 principal="$(sed -e "s|@ARGOCD_AGENT_IMAGE@|$ARGOCD_AGENT_IMAGE|" -e "s|@CELL_PROXY_IMAGE@|$cell_proxy_image|" \
-    -e "s|@PEER_ROOT_SHA256@|$peer_sum|" -e "s|@REGISTRY_SHA256@|$registry_sum|" \
+    -e "s|@PEER_ROOT_SHA256@|$peer_sum|" -e "s|@REGISTRY_SIGNER_SHA256@|$signer_sum|" \
     -e "s|@AGENT_NAMESPACES@|$agent_list|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|" -e "s|@PRINCIPAL_UID@|$principal_uid|" \
     "$here/principal.yaml" \
   | AUTH="$auth" ALLOW="$allow_id" yq '(.. | select(. == "--auth=@PRINCIPAL_AUTH@")) = "--auth=" + strenv(AUTH)
@@ -177,7 +178,9 @@ policies="$(NODE="$node_peers" API="$api_peers" ENVP="$env_peers" PORT="$API_SER
   echo "---"
   echo "$peer_root"
   echo "---"
-  echo "$registry"
+  echo "$registry_signer"
+  echo "---"
+  registry_publisher_rbac "$namespace"
 } | COMP="$component" yq 'select(.kind != null)
     | .metadata.labels["cell.poc.internal/harness"] = strenv(COMP)
     | with(select(.spec.template.metadata != null); .spec.template.metadata.labels["cell.poc.internal/harness"] = strenv(COMP))'
