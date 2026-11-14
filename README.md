@@ -395,8 +395,9 @@ The record of the cell then lists only the old keys. `mgmtd` finds the new key o
 - The periodic key check runs. It runs every 15 minutes for each cell.
 - An operator runs a key check.
 
-The path through the plugin hint is the one to use for a new pod. A pod that is refused is issued again within about 5 minutes after the key rotates.
-If it is not, check these in order:
+In the measured runs of 2026-11-15, `mgmtd` checked the keys 3 to 8 seconds after the first refusal, and a new pod was issued 40 to 87 seconds after it.
+Most of that time is the kubelet update of the ConfigMap that the SPIRE server mounts.
+If a pod is still refused after 5 minutes, check these in order:
 
 1. `mise run mgmt -- status` shows a `hintAt` and a `lastHintCheck` for the cell. A cell with no `hintAt` got no hint.
 2. ConfigMap `spire-system/attest-hints` exists in `dev-cp`. `CELL=dev-cp mise run cell:verify` checks it. `CELL=dev-cp mise run cell:up` makes `envd` create it again.
@@ -424,7 +425,8 @@ The command runs these steps in order:
 7. It runs `cell:up` for each cluster with the `cell-identity` set again. `mgmt-op-key` then holds the new key alone.
 8. It runs `cell:verify` for `management` and for `dev-cp`.
 
-The command takes about 15 minutes.
+The steps took 5 minutes 30 seconds in the measured run of 2026-11-15: 1 second for the stage, 98 seconds for the first cell pass, 1 second for the commit, 129 seconds for the planes and 96 seconds for the second cell pass.
+The two `cell:verify` runs add a few minutes.
 It prints one JSON line with the SHA-256 fingerprint of the old key, of the new key, the new epoch and the run time in seconds.
 The line holds public key data only.
 A failure prints the commands that remain, from the failed step on, as text on standard error and in the JSON error line.
