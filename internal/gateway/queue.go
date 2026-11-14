@@ -37,7 +37,7 @@ type Lease struct {
 // has not yet reached the management plane. That gives ErrEnvelopeConflict for that operation. It
 // is an expected event of one operation and not a failed sync.
 func (s *Store) Enqueue(ctx context.Context, cell string, envelope []byte) (id string, added bool, err error) {
-	id, keyEpoch, err := peekFor(cell, envelope)
+	id, keyEpoch, err := peekFor(cell, envelope, true)
 	if err != nil {
 		return "", false, err
 	}
@@ -54,9 +54,11 @@ func (s *Store) Enqueue(ctx context.Context, cell string, envelope []byte) (id s
 }
 
 // EnqueueReplay deletes the row of that cell for the envelope ID, then enqueues the envelope. A
-// row of another cell stays.
+// row of another cell stays. It does not compare the cell of the envelope with cell, because the
+// admin socket stands for an operator who may queue any envelope, for example to test that a cell
+// refuses an envelope for another target. Enqueue keeps that comparison.
 func (s *Store) EnqueueReplay(ctx context.Context, cell string, envelope []byte) (id string, err error) {
-	id, keyEpoch, err := peekFor(cell, envelope)
+	id, keyEpoch, err := peekFor(cell, envelope, false)
 	if err != nil {
 		return "", err
 	}
@@ -73,12 +75,12 @@ func (s *Store) EnqueueReplay(ctx context.Context, cell string, envelope []byte)
 	return id, err
 }
 
-func peekFor(cell string, envelope []byte) (id string, keyEpoch uint64, err error) {
+func peekFor(cell string, envelope []byte, sameCell bool) (id string, keyEpoch uint64, err error) {
 	id, peeked, keyEpoch, err := op.Peek(envelope)
 	if err != nil {
 		return "", 0, fmt.Errorf("enqueue: %w", err)
 	}
-	if peeked != cell {
+	if sameCell && peeked != cell {
 		return "", 0, fmt.Errorf("enqueue: envelope is for cell %q, not %q", peeked, cell)
 	}
 	return id, keyEpoch, nil

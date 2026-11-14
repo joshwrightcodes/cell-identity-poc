@@ -617,3 +617,28 @@ func TestRotationKeepsResignedOp(t *testing.T) {
 		t.Fatal("the applied op is still open")
 	}
 }
+
+// The admin replay path queues an envelope for another cell, so that a test can show that the cell
+// refuses it. The sync path of envd keeps the check and refuses the same envelope.
+func TestEnqueueReplayAcceptsEnvelopeOfAnotherCell(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	wrong := f.opEnv(opID(9), cell2, 1)
+	if _, _, err := f.s.Enqueue(ctx, cell1, wrong); err == nil {
+		t.Fatal("the sync path queued an envelope for another cell")
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatalf("depth %d after a refused enqueue", d)
+	}
+	id, err := f.s.EnqueueReplay(ctx, cell1, wrong)
+	if err != nil || id != opID(9) {
+		t.Fatalf("replay: %q, %v", id, err)
+	}
+	l, err := f.s.Claim(ctx, cell1, "pod")
+	if err != nil || l == nil || !bytes.Equal(l.Envelope, wrong) {
+		t.Fatalf("claim %+v, %v; want the envelope for the other cell", l, err)
+	}
+	if d, _ := f.s.Depth(ctx, cell2); d != 0 {
+		t.Fatalf("the other cell has depth %d", d)
+	}
+}
