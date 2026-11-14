@@ -322,7 +322,7 @@ func TestRealHostClientIsBuiltFromTheFlags(t *testing.T) {
 	if err != nil || c == nil {
 		t.Fatalf("%v, %v", c, err)
 	}
-	// Nothing listens on 192.0.2.1, so a call fails as hostsvc_unavailable, and a Put refuses a bad envelope.
+	// A Put refuses an envelope that has no step ID before it makes a call. TestHostClientAgainstTheStepRoute makes real calls.
 	if _, err := c.Put(t.Context(), "x", []byte("not an envelope")); err == nil {
 		t.Error("a bad envelope was sent")
 	}

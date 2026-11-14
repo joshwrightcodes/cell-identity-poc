@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -80,6 +81,8 @@ type Controller struct {
 	steps  metric.Int64Counter
 	refuse metric.Int64Counter
 
+	// The revision mark and the last index live in memory only. After a restart the host service,
+	// with its own spec mark and index checks, is the backstop.
 	entries   map[string]*entry
 	mark      spec.Revision
 	lastIndex map[string]string // step ID to cell, from the last spec that verified
@@ -87,11 +90,13 @@ type Controller struct {
 	logged    map[string]bool
 
 	nextRead     time.Time
-	blockedUntil time.Time
-	failures     int
-	lastWrite    time.Time
-	lastWritten  []byte
-	writeRetry   time.Time
+	blockedUntil time.Time // no host call at all: the host service is unavailable or untrusted
+	// putBlockedUntil holds back Puts only, after a busy answer. Polls go on.
+	putBlockedUntil time.Time
+	failures        int
+	lastWrite       time.Time
+	lastWritten     []byte
+	writeRetry      time.Time
 }
 
 // entry is what the controller knows about one step ID.
@@ -390,13 +395,48 @@ func (c *Controller) hostWork(ctx context.Context) {
 		if now.Before(c.blockedUntil) {
 			return
 		}
-		if e.needsPut(now) {
+		if e.needsPut(now) && !now.Before(c.putBlockedUntil) && c.mayPut(e) {
 			c.put(ctx, e)
 			continue
 		}
 		if due, ok := e.pollDue(c.cfg.PollEvery); ok && !now.Before(due) {
 			c.poll(ctx, e)
 		}
+	}
+}
+
+// mayPut holds a step that the host service has not seen while another step is open at the host
+// service, so that the oldest step goes first and one step runs. A step that the host service
+// knows, and a step that waits for its RetryAt, never hold anything back.
+func (c *Controller) mayPut(e *entry) bool {
+	if e.status != nil || e.putEnv != nil {
+		return true
+	}
+	for _, x := range c.entries {
+		if x != e && x.open() {
+			return false
+		}
+	}
+	return true
+}
+
+// open reports whether the host service holds the step in a state that queues or runs it.
+func (e *entry) open() bool {
+	if e.status == nil || e.ended || e.denied != nil {
+		return false
+	}
+	switch e.status.State {
+	case mgmtapi.StepQueued, mgmtapi.StepCreating, mgmtapi.StepAdmitting, mgmtapi.StepBootstrapping:
+		return true
+	}
+	return false
+}
+
+// hostOK ends an outage: the failure count and every lastHostError go.
+func (c *Controller) hostOK() {
+	c.failures = 0
+	for _, x := range c.entries {
+		x.lastErr = nil
 	}
 }
 
@@ -410,7 +450,7 @@ func (c *Controller) put(ctx context.Context, e *entry) {
 		c.failed(e, "put", env, err)
 		return
 	}
-	c.failures = 0
+	c.hostOK()
 	e.denied, e.ended = nil, false
 	e.putEnv = append([]byte(nil), env...)
 	c.setStatus(e, st)
@@ -425,7 +465,7 @@ func (c *Controller) poll(ctx context.Context, e *entry) {
 		c.failed(e, "get", nil, err)
 		return
 	}
-	c.failures = 0
+	c.hostOK()
 	c.setStatus(e, st)
 }
 
@@ -447,12 +487,19 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 	if !errors.As(err, &he) {
 		he = &mgmtapi.HostError{Reason: mgmtapi.ReasonHostsvcUnavailable}
 	}
-	info := &mgmtapi.HostErrorInfo{Reason: he.Reason, At: now}
+	mark := func(x *entry) {
+		if x.lastErr == nil {
+			x.lastErr = &mgmtapi.HostErrorInfo{Reason: he.Reason, At: now}
+		} else {
+			x.lastErr.Reason = he.Reason
+		}
+	}
 	c.cfg.Log.Warn("host call failed", "op", op, "step", e.id, "reason", he.Reason, "status", he.Status, "request_id", he.RequestID)
 
 	switch {
 	case he.Reason == mgmtapi.ReasonHostsvcDenied && op == "get" && he.Status == 404:
 		// The host service does not know the step.
+		c.hostOK()
 		if e.cur == nil {
 			e.ended = true
 			return
@@ -460,7 +507,8 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 		e.status, e.putEnv = nil, nil
 		return
 	case he.Reason == mgmtapi.ReasonHostsvcDenied:
-		e.lastErr = info
+		c.hostOK()
+		mark(e)
 		if env == nil && e.cur != nil {
 			env = e.cur.Envelope
 		}
@@ -471,8 +519,8 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 		return
 	}
 	for _, x := range c.entries {
-		if !x.final() && x.denied == nil {
-			x.lastErr = info
+		if !x.final() && x.denied == nil && (x.cur != nil || x.status != nil) {
+			mark(x)
 		}
 	}
 	if he.Reason == mgmtapi.ReasonHostsvcBusy {
@@ -480,7 +528,8 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 		if wait <= 0 {
 			wait = c.cfg.MinBackoff
 		}
-		c.blockedUntil = now.Add(wait)
+		c.putBlockedUntil = now.Add(wait)
+		e.polled = now
 		return
 	}
 	c.blockedUntil = now.Add(c.backoff())
@@ -502,45 +551,53 @@ func (c *Controller) backoff() time.Duration {
 	return min(max(d, c.cfg.MinBackoff), c.cfg.MaxBackoff)
 }
 
-// statuses returns the report: one entry for each known step, at most MaxStatuses, with the oldest
-// final entries left out first.
+// statuses returns the report: one entry for each known step, at most MaxStatuses. When there are
+// more, final entries go first, then entries that only a refusal holds, then the oldest.
 func (c *Controller) statuses() []mgmtapi.StepStatus {
-	var out []mgmtapi.StepStatus
+	type item struct {
+		e  *entry
+		st mgmtapi.StepStatus
+	}
+	var items []item
 	for _, e := range c.ordered() {
 		if st, ok := e.report(); ok {
-			out = append(out, st)
+			items = append(items, item{e, st})
 		}
 	}
-	for len(out) > MaxStatuses {
-		drop := -1
-		for i, st := range out {
-			if st.State == mgmtapi.StepDone || st.State == mgmtapi.StepFailedFinal || st.State == mgmtapi.StepCancelled {
-				drop = i
-				break
-			}
+	final := func(it item) bool {
+		return it.st.State == mgmtapi.StepDone || it.st.State == mgmtapi.StepFailedFinal || it.st.State == mgmtapi.StepCancelled
+	}
+	for len(items) > MaxStatuses {
+		drop := slices.IndexFunc(items, final)
+		if drop < 0 {
+			drop = slices.IndexFunc(items, func(it item) bool { return it.e.cur == nil && it.e.status == nil })
 		}
 		if drop < 0 {
-			out = out[:MaxStatuses]
-			break
+			drop = 0
 		}
-		out = append(out[:drop], out[drop+1:]...)
+		items = slices.Delete(items, drop, drop+1)
+	}
+	out := make([]mgmtapi.StepStatus, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.st)
 	}
 	return out
 }
 
-// report gives the status of one entry: a denial, the status of the host service, a refusal, or
-// queued for a step that the host service has not accepted yet.
+// report gives the status of one entry: a denial, a refusal (which wins over the host status, while
+// the controller still polls the step), the status of the host service, or queued for a step that
+// the host service has not accepted yet.
 func (e *entry) report() (mgmtapi.StepStatus, bool) {
 	var st mgmtapi.StepStatus
 	switch {
 	case e.denied != nil:
 		st = mgmtapi.StepStatus{ID: e.id, Cell: e.cell, State: mgmtapi.StepRefused, Reason: mgmtapi.ReasonHostsvcDenied,
 			RequestID: e.denied.requestID, UpdatedAt: e.firstAt}
-	case e.status != nil:
-		st = *e.status
 	case e.refusal != nil:
 		st = *e.refusal
 		st.ID, st.Cell, st.UpdatedAt = e.id, e.cell, e.firstAt
+	case e.status != nil:
+		st = *e.status
 	case e.cur != nil:
 		st = mgmtapi.StepStatus{ID: e.id, Cell: e.cell, State: mgmtapi.StepQueued, UpdatedAt: e.firstAt}
 	default:
@@ -598,9 +655,8 @@ func (c *Controller) wait() time.Duration {
 		consider(t)
 	}
 	for _, e := range c.entries {
-		if e.needsPut(now) {
-			hostDue(now)
-			continue
+		if e.needsPut(now) && c.mayPut(e) {
+			hostDue(maxTime(now, c.putBlockedUntil))
 		}
 		if due, ok := e.pollDue(c.cfg.PollEvery); ok {
 			if e.cur != nil && e.status != nil && e.status.State == mgmtapi.StepFailed && e.status.RetryAt.Before(due) {
@@ -610,4 +666,11 @@ func (c *Controller) wait() time.Duration {
 		}
 	}
 	return max(next.Sub(now), minWake)
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }

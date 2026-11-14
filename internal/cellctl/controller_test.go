@@ -63,6 +63,8 @@ type fakeHost struct {
 	advance bool
 	// onCreate changes the status of a step when the host service first accepts it.
 	onCreate map[string]func(*mgmtapi.StepStatus)
+	// doneOnCreate makes every new step done at once, so that it holds nothing back.
+	doneOnCreate bool
 }
 
 func newHost(t *testing.T, clk *clock) *fakeHost {
@@ -107,6 +109,9 @@ func (h *fakeHost) Put(_ context.Context, id string, env []byte) (mgmtapi.StepSt
 		s = &hostStep{st: mgmtapi.StepStatus{ID: id, Cell: cell, State: mgmtapi.StepQueued, UpdatedAt: h.clk.now}}
 		h.steps[id] = s
 		h.created[id]++
+		if h.doneOnCreate {
+			s.st.State = mgmtapi.StepDone
+		}
 		if f := h.onCreate[id]; f != nil {
 			f(&s.st)
 		}
@@ -344,8 +349,9 @@ func TestControllerOneInFlight(t *testing.T) {
 	w := newWorld(t)
 	a, b, c := w.item("dev-cell-3", 0), w.item("dev-cell-1", time.Second), w.item("dev-cell-2", time.Second)
 	h := newHarness(t, w)
+	h.host.advance = true
 	h.setSteps(w.data(2, a, b, c))
-	h.runFor(time.Minute)
+	h.runFor(5 * time.Minute)
 	var order []string
 	for _, cl := range h.host.callsOf("put", "") {
 		order = append(order, cl.id)
@@ -369,6 +375,10 @@ func TestControllerSendsNextWhileHeadWaits(t *testing.T) {
 	}
 	if puts := h.host.callsOf("put", a.s.ID); len(puts) != 1 {
 		t.Errorf("the head step was sent again before its RetryAt: %+v", puts)
+	} // At its RetryAt the head goes out again, although the next step is open at the host service.
+	h.runFor(2 * time.Minute)
+	if puts := h.host.callsOf("put", a.s.ID); len(puts) != 2 {
+		t.Errorf("the head step was not sent again at its RetryAt: %+v", puts)
 	}
 }
 
@@ -408,11 +418,12 @@ func TestControllerHostDown(t *testing.T) {
 			})
 			h.host.err = &mgmtapi.HostError{Reason: reason}
 			h.setSteps(w.data(2, a))
-			h.runFor(10 * time.Minute)
+			h.runFor(30 * time.Minute)
 
 			calls := h.host.callsOf("", "")
-			if len(calls) < 6 {
-				t.Fatalf("%d calls in 10 minutes", len(calls))
+			// More than 34 failures in a row would overflow a back-off that is not capped in its loop.
+			if len(calls) < 40 {
+				t.Fatalf("%d calls in 30 minutes", len(calls))
 			}
 			base := time.Second
 			for i := 1; i < len(calls); i++ {
@@ -423,8 +434,12 @@ func TestControllerHostDown(t *testing.T) {
 				base = min(base*2, 30*time.Second)
 			}
 			st, ok := h.statusOf(a.s.ID)
-			if !ok || st.LastHostError == nil || st.LastHostError.Reason != reason || st.LastHostError.At.IsZero() {
-				t.Errorf("status %+v", st)
+			if !ok || st.LastHostError == nil || st.LastHostError.Reason != reason {
+				t.Fatalf("status %+v", st)
+			}
+			// At is the start of the outage, so the rule "older than 2 minutes" fires while the outage lasts.
+			if !st.LastHostError.At.Equal(t0) || h.clk.now.Sub(st.LastHostError.At) < 2*time.Minute {
+				t.Errorf("lastHostError.At %s, want the first failure at %s", st.LastHostError.At, t0)
 			}
 			if !mgmtapi.ValidStepStatus(st) {
 				t.Errorf("status %+v is not valid", st)
@@ -432,8 +447,9 @@ func TestControllerHostDown(t *testing.T) {
 
 			h.host.err = nil
 			h.runFor(time.Minute)
-			if st, _ := h.statusOf(a.s.ID); st.State != mgmtapi.StepQueued {
-				t.Errorf("after recovery %+v", st)
+			st, _ = h.statusOf(a.s.ID)
+			if st.State != mgmtapi.StepQueued || st.LastHostError != nil {
+				t.Errorf("after recovery %+v, want queued with no lastHostError", st)
 			}
 			if h.host.created[a.s.ID] != 1 {
 				t.Errorf("created %d times", h.host.created[a.s.ID])
@@ -664,6 +680,7 @@ func TestControllerTwoKeys(t *testing.T) {
 		}
 	}
 	h := newHarness(t, w1, func(c *Config) { c.Keys = hostsvc.KeysFromDir(dir) })
+	h.host.doneOnCreate = true
 
 	a := w1.item("dev-cell-1", 0)
 	h.setSteps(w1.data(2, a))
@@ -867,36 +884,169 @@ func TestControllerReadyIgnoresHost(t *testing.T) {
 }
 
 func TestControllerSpecRefusalShowsOnLastIndex(t *testing.T) {
+	for _, hostUp := range []bool{false, true} {
+		name := "step_unsent_host_down"
+		if hostUp {
+			name = "step_known_to_host"
+		}
+		t.Run(name, func(t *testing.T) {
+			w := newWorld(t)
+			a := w.item("dev-cell-1", 0)
+			h := newHarness(t, w)
+			if !hostUp {
+				h.host.err = unavailable()
+			}
+			h.setSteps(w.data(2, a))
+			h.runFor(15 * time.Second)
+
+			bad := w.data(3, a)
+			bad[SpecKey] = w.specEnv(3, w.rogue, w.entry(a))
+			h.setSteps(bad)
+			h.runFor(15 * time.Second)
+			before := len(h.host.callsOf("", ""))
+			h.host.err = nil
+			h.runFor(time.Minute)
+			if puts := h.host.callsOf("put", ""); hostUp && len(puts) != 1 {
+				t.Errorf("%d puts, want only the first", len(puts))
+			}
+			if hostUp && len(h.host.callsOf("get", a.s.ID)) < 5 {
+				t.Errorf("the step is not polled while its spec is refused")
+			}
+			if !hostUp && len(h.host.callsOf("", "")) != before {
+				t.Errorf("%d host calls after the spec was refused", len(h.host.callsOf("", ""))-before)
+			}
+			st, ok := h.statusOf(a.s.ID)
+			if !ok || st.State != mgmtapi.StepRefused || st.Reason != step.Code || st.Detail != step.DetailSignatureInvalid || !mgmtapi.ValidStepStatus(st) {
+				t.Fatalf("status %+v", st)
+			}
+			if n := strings.Count(h.logs.String(), `"msg":"spec refused"`); n != 1 {
+				t.Errorf("%d spec refusal logs in a minute, want 1", n)
+			}
+
+			// A later spec that verifies clears the refusal.
+			h.setSteps(w.data(4, a))
+			h.runFor(15 * time.Second)
+			if st, _ := h.statusOf(a.s.ID); st.State != mgmtapi.StepQueued {
+				t.Errorf("status after the good spec %+v", st)
+			}
+		})
+	}
+}
+
+func TestControllerStepRefusalShowsOverHostStatus(t *testing.T) {
 	w := newWorld(t)
 	a := w.item("dev-cell-1", 0)
 	h := newHarness(t, w)
-	h.host.err = unavailable()
 	h.setSteps(w.data(2, a))
-	h.runFor(5 * time.Second)
-
-	bad := w.data(3, a)
-	bad[SpecKey] = w.specEnv(3, w.rogue, w.entry(a))
-	h.setSteps(bad)
 	h.runFor(15 * time.Second)
-	before := len(h.host.callsOf("", ""))
-	h.host.err = nil
+	// A compromised dev-cp swaps the envelope for one under another key.
+	rogue, err := step.Sign(a.s, w.rogue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := w.data(3, a)
+	d[a.s.Cell+StepSuffix] = string(rogue)
+	h.setSteps(d)
 	h.runFor(time.Minute)
-	if n := len(h.host.callsOf("", "")); n != before {
-		t.Errorf("%d host calls after the spec was refused: %+v", n-before, h.host.callsOf("", "")[before:])
+	if n := len(h.host.callsOf("put", a.s.ID)); n != 1 {
+		t.Errorf("%d puts", n)
 	}
-	st, ok := h.statusOf(a.s.ID)
-	if !ok || st.State != mgmtapi.StepRefused || st.Detail != step.DetailSignatureInvalid || !mgmtapi.ValidStepStatus(st) {
-		t.Fatalf("status %+v", st)
+	if n := len(h.host.callsOf("get", a.s.ID)); n < 5 {
+		t.Errorf("%d polls while the step is refused", n)
 	}
-	if n := strings.Count(h.logs.String(), `"msg":"spec refused"`); n != 1 {
-		t.Errorf("%d spec refusal logs in a minute, want 1", n)
+	st, _ := h.statusOf(a.s.ID)
+	if st.State != mgmtapi.StepRefused || st.Detail != step.DetailSignatureInvalid {
+		t.Errorf("status %+v", st)
 	}
+}
 
-	// A later spec that verifies clears the refusal and the step goes out.
-	h.setSteps(w.data(4, a))
+func TestControllerHoldsNextStepWhileHeadRuns(t *testing.T) {
+	w := newWorld(t)
+	a, b := w.item("dev-cell-1", 0), w.item("dev-cell-2", time.Second)
+	h := newHarness(t, w)
+	h.setSteps(w.data(2, a, b))
+	h.runFor(2 * time.Minute)
+	if n := len(h.host.callsOf("put", b.s.ID)); n != 0 {
+		t.Fatalf("the next step was sent while the head runs: %d puts", n)
+	}
+	if st, _ := h.statusOf(b.s.ID); st.State != mgmtapi.StepQueued {
+		t.Errorf("held step %+v", st)
+	}
+	h.host.set(a.s.ID, func(s *mgmtapi.StepStatus) { s.State, s.Stage = mgmtapi.StepDone, "" })
+	h.runFor(30 * time.Second)
+	puts := h.host.callsOf("put", b.s.ID)
+	if len(puts) != 1 {
+		t.Fatalf("%d puts of the next step after the head ended", len(puts))
+	}
+}
+
+func TestControllerBusyDelaysPutsNotPolls(t *testing.T) {
+	w := newWorld(t)
+	a := w.item("dev-cell-1", 0)
+	h := newHarness(t, w)
+	h.setSteps(w.data(2, a))
 	h.runFor(15 * time.Second)
-	if st, _ := h.statusOf(a.s.ID); st.State != mgmtapi.StepQueued {
-		t.Errorf("status after the good spec %+v", st)
+
+	// A rotation signs the step again. The host service is busy for the new Put.
+	again := a.s
+	again.KeyEpoch = 2
+	re := w.sign(again)
+	h.host.putErr[a.s.ID] = busy(60 * time.Second)
+	h.setSteps(w.data(3, re))
+	gets := len(h.host.callsOf("get", a.s.ID))
+	h.runFor(55 * time.Second)
+	if n := len(h.host.callsOf("put", a.s.ID)); n != 2 {
+		t.Errorf("%d puts inside the Retry-After window, want the first and one busy", n)
+	}
+	if n := len(h.host.callsOf("get", a.s.ID)) - gets; n < 4 {
+		t.Errorf("%d polls in 55 s while Puts wait, want one every 10 s", n)
+	}
+	delete(h.host.putErr, a.s.ID)
+	h.runFor(15 * time.Second)
+	if n := len(h.host.callsOf("put", a.s.ID)); n != 3 {
+		t.Errorf("%d puts after the window", n)
+	}
+}
+
+func TestControllerReportKeepsRealStepsFirst(t *testing.T) {
+	w := newWorld(t)
+	good := w.item("dev-cell-1", 0)
+	d := w.data(2, good)
+	for i := range 40 {
+		stray := w.item(fmt.Sprintf("dev-cell-%02d", i+10), 0)
+		d[stray.s.Cell+StepSuffix] = string(stray.env)
+	}
+	h := newHarness(t, w)
+	h.setSteps(d)
+	h.runFor(time.Second)
+	steps := h.report().Steps
+	if len(steps) != 32 {
+		t.Fatalf("%d entries", len(steps))
+	}
+	var found bool
+	for _, st := range steps {
+		found = found || st.ID == good.s.ID
+	}
+	if !found {
+		t.Error("the step in the spec is not in the report")
+	}
+}
+
+func TestControllerNoHostErrorOnRefusalOnlyEntries(t *testing.T) {
+	w := newWorld(t)
+	good, stray := w.item("dev-cell-1", 0), w.item("dev-cell-2", 0)
+	d := w.data(2, good)
+	d[stray.s.Cell+StepSuffix] = string(stray.env)
+	h := newHarness(t, w)
+	h.host.err = unavailable()
+	h.setSteps(d)
+	h.runFor(30 * time.Second)
+	st, ok := h.statusOf(stray.s.ID)
+	if !ok || st.State != mgmtapi.StepRefused || st.LastHostError != nil {
+		t.Errorf("refusal-only entry %+v", st)
+	}
+	if st, _ := h.statusOf(good.s.ID); st.LastHostError == nil {
+		t.Errorf("step in the spec has no lastHostError: %+v", st)
 	}
 }
 
