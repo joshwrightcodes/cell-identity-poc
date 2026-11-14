@@ -45,6 +45,9 @@ type loop struct {
 	// held holds the operations whose result the management plane refused in this stream. The
 	// periodic resend skips them, and the next stream sends them again.
 	held map[string]struct{}
+	// resendMore is true while a burst of resends left results unsent. The next burst starts when
+	// the acks of the sent items are in.
+	resendMore bool
 }
 
 func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Decoder) *loop {
@@ -215,6 +218,9 @@ func (l *loop) handle(f gwapi.Frame) error {
 		if len(l.ackDue) > 0 {
 			l.ackDue = l.ackDue[1:]
 		}
+		if l.resendMore && len(l.ackDue) == 0 {
+			l.resendMore, l.resendAt = false, l.cfg.Now()
+		}
 	case gwapi.TypePong:
 		l.pongDue = time.Time{}
 	case gwapi.TypePing:
@@ -314,7 +320,8 @@ func (l *loop) sendStatus() error {
 }
 
 // resendPending sends again each unreported result, or only the one for opID when it is not empty.
-// An op goes up again at most once in minResendGap.
+// An op goes up again at most once in minResendGap. One call sends at most maxResendBurst results,
+// so that the loop reads its frames in time. The rest follow when the acks of the burst are in.
 func (l *loop) resendPending(opID string) error {
 	ctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
 	pending, err := l.cfg.Exec.Pending(ctx)
@@ -323,7 +330,7 @@ func (l *loop) resendPending(opID string) error {
 		l.cfg.Log.WarnContext(l.ctx, "read the pending results failed", "error", err.Error())
 		return nil
 	}
-	found := false
+	found, sent := false, 0
 	for _, res := range pending {
 		if opID != "" && res.OpID != opID {
 			continue
@@ -332,12 +339,17 @@ func (l *loop) resendPending(opID string) error {
 			continue
 		}
 		found = true
+		if sent >= maxResendBurst {
+			l.resendMore = true
+			break
+		}
 		if !l.cfg.resent.allow(res.OpID, l.cfg.Now()) {
 			continue
 		}
 		if err := l.sendResult(res, ""); err != nil {
 			return err
 		}
+		sent++
 	}
 	if opID != "" && !found {
 		l.cfg.Log.InfoContext(l.ctx, "retry without a pending result", "op_id", opID)

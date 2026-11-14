@@ -860,3 +860,50 @@ func TestStreamFinalEndsRecord(t *testing.T) {
 		})
 	}
 }
+
+// A new stream sends at most maxResendBurst results at once and sends the rest after their acks.
+func TestStreamResendBurstIsCapped(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		ids := map[string]bool{}
+		for i := 0; i < maxResendBurst+5; i++ {
+			o := f.rig.operation(testKind, "{}")
+			ids[o.ID] = true
+			if res := f.exec.Execute(t.Context(), f.rig.sign(o), fence(1, uint64(i+1))); res.Outcome != op.OutcomeApplied {
+				t.Fatalf("%+v", res)
+			}
+		}
+		hold := true
+		var mu sync.Mutex
+		f.g.handler = func(s *gwStream) {
+			s.loop(func(fr gwapi.Frame) bool {
+				mu.Lock()
+				defer mu.Unlock()
+				return hold && fr.Type == gwapi.TypeResult
+			})
+		}
+		f.start()
+		waitFor(t, 5*time.Second, "the first burst", func() bool { return len(f.g.frames(gwapi.TypeResult)) >= maxResendBurst })
+		time.Sleep(5 * time.Second)
+		if n := len(f.g.frames(gwapi.TypeResult)); n != maxResendBurst {
+			t.Fatalf("%d result frames before any ack, want %d", n, maxResendBurst)
+		}
+		mu.Lock()
+		hold = false
+		mu.Unlock()
+		for i := 0; i < maxResendBurst; i++ {
+			_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeAck})
+		}
+		waitFor(t, 5*time.Second, "the rest", func() bool { return len(f.g.frames(gwapi.TypeResult)) >= maxResendBurst+5 })
+		seen := map[string]int{}
+		for _, fr := range f.g.frames(gwapi.TypeResult) {
+			seen[resultOf(t, fr.f).OpID]++
+		}
+		for id := range ids {
+			if seen[id] != 1 {
+				t.Fatalf("op %s was sent %d times, want 1", id, seen[id])
+			}
+		}
+	})
+}

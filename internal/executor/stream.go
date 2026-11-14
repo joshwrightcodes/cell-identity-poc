@@ -52,6 +52,7 @@ const (
 	backoffSpread   = 0.5
 	kubeTimeout     = 5 * time.Second
 	minResendGap    = 30 * time.Second
+	maxResendBurst  = 20
 )
 
 // StreamConfig holds the settings of RunStream. A zero duration, ClaimsPerSecond, Log, Tracer, Now,
