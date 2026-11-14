@@ -686,6 +686,9 @@ func TestStreamForgedItemNotLeasedAgain(t *testing.T) {
 	// The row is on hold, not done, so the next claim gives nothing for now.
 	c.send(gwapi.Frame{Type: gwapi.TypeClaim})
 	c.expect(gwapi.TypeNone)
+	if d, _ := e.st.Depth(context.Background(), cell1); d != 1 {
+		t.Fatalf("depth %d after a forged result, want the row open", d)
+	}
 }
 
 func TestStreamResendAfterDoneIsAcked(t *testing.T) {
