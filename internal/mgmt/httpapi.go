@@ -30,11 +30,16 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 )
 
 // maxRequestBody is the largest body of a status post or an admin request. A report post has its
 // own larger limits.
 const maxRequestBody = 16 << 10
+
+// maxStatusBody is the largest body of a status post. It holds up to 32 step statuses and the
+// gateway status, which together pass maxRequestBody.
+const maxStatusBody = 64 << 10
 
 // A report post holds at most maxReportBody bytes and maxReportItems items.
 const (
@@ -194,7 +199,7 @@ func (h *apiHandler) status(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	body, bad := readBody(w, r)
+	body, bad := readBodyLimit(w, r, maxStatusBody)
 	var rep mgmtapi.StatusReport
 	if bad == "" {
 		if err := record.DecodeStrict(body, &rep); err != nil {
@@ -278,6 +283,12 @@ func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) 
 	mux.HandleFunc("GET /ops", h.listOps)
 	mux.HandleFunc("GET /ops/{id}", h.getOp)
 	mux.HandleFunc("POST /ops/{id}/close", h.closeOp)
+	mux.HandleFunc("POST /portal/request", h.portalRequest)
+	mux.HandleFunc("POST /portal/withdraw", h.portalWithdraw)
+	mux.HandleFunc("POST /portal/recreate", h.portalRecreate)
+	mux.HandleFunc("POST /portal/retry", h.portalRetry)
+	mux.HandleFunc("POST /portal/cancel", h.portalCancel)
+	mux.HandleFunc("POST /steps/sign", h.stepsSign)
 	return cleanPathOnly(mux)
 }
 
@@ -594,6 +605,95 @@ func (h *adminHandler) closeOp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"id": id, "final": OpAbandoned})
+}
+
+// portalBody reads the body of a portal route: strict JSON of at most maxRequestBody bytes. A
+// route that takes a digest needs one; the other routes refuse it. A route that names one cell
+// refuses any other count. On a refusal it has written the answer.
+func portalBody(w http.ResponseWriter, r *http.Request, wantDigest, oneCell bool) (mgmtapi.PortalRequest, bool) {
+	body, bad := readBody(w, r)
+	var req mgmtapi.PortalRequest
+	if bad == "" {
+		if err := record.DecodeStrict(body, &req); err != nil {
+			bad = "body_invalid"
+		}
+	}
+	if bad == "" && (wantDigest != (req.BootstrapSHA256 != "") || oneCell && len(req.Cells) != 1) {
+		bad = "body_invalid"
+	}
+	if bad != "" {
+		badRequest(w, bad)
+		return req, false
+	}
+	return req, true
+}
+
+func (h *adminHandler) portalAnswer(w http.ResponseWriter, res mgmtapi.PortalResult, err error) {
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (h *adminHandler) portalRequest(w http.ResponseWriter, r *http.Request) {
+	if req, ok := portalBody(w, r, true, false); ok {
+		res, err := h.p.PortalRequest(r.Context(), req.Cells, req.BootstrapSHA256)
+		h.portalAnswer(w, res, err)
+	}
+}
+
+func (h *adminHandler) portalWithdraw(w http.ResponseWriter, r *http.Request) {
+	if req, ok := portalBody(w, r, false, false); ok {
+		res, err := h.p.PortalWithdraw(r.Context(), req.Cells)
+		h.portalAnswer(w, res, err)
+	}
+}
+
+func (h *adminHandler) portalRecreate(w http.ResponseWriter, r *http.Request) {
+	if req, ok := portalBody(w, r, true, true); ok {
+		res, err := h.p.PortalRecreate(r.Context(), req.Cells[0], req.BootstrapSHA256)
+		h.portalAnswer(w, res, err)
+	}
+}
+
+func (h *adminHandler) portalRetry(w http.ResponseWriter, r *http.Request) {
+	if req, ok := portalBody(w, r, true, true); ok {
+		res, err := h.p.PortalRetry(r.Context(), req.Cells[0], req.BootstrapSHA256)
+		h.portalAnswer(w, res, err)
+	}
+}
+
+func (h *adminHandler) portalCancel(w http.ResponseWriter, r *http.Request) {
+	if req, ok := portalBody(w, r, false, true); ok {
+		res, err := h.p.PortalCancel(r.Context(), req.Cells[0])
+		h.portalAnswer(w, res, err)
+	}
+}
+
+// stepsSign signs the step in the body and answers with its envelope. The plane records nothing.
+func (h *adminHandler) stepsSign(w http.ResponseWriter, r *http.Request) {
+	body, bad := readBody(w, r)
+	var s step.Step
+	if bad == "" {
+		if err := record.DecodeStrict(body, &s); err != nil {
+			bad = "body_invalid"
+		}
+	}
+	if bad != "" {
+		badRequest(w, bad)
+		return
+	}
+	env, err := h.p.SignStep(r.Context(), s)
+	if errors.Is(err, record.ErrDecode) {
+		badRequest(w, "body_invalid")
+		return
+	}
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, json.RawMessage(env))
 }
 
 // ---- TLS

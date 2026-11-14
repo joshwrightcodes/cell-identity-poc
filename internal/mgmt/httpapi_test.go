@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -28,6 +29,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
@@ -265,7 +267,7 @@ func TestAPIStatusReport(t *testing.T) {
 		"unknown_field": `{"applied":{"epoch":1,"counter":1},"extra":1}`,
 		"not_json":      `nope`,
 		"trailing":      good + `{}`,
-		"too_large":     `{"storeError":"` + strings.Repeat("a", 17<<10) + `"}`,
+		"too_large":     `{"storeError":"` + strings.Repeat("a", 65<<10) + `"}`,
 	} {
 		if code := post(body); code == 204 || code < 400 {
 			t.Errorf("%s: status %d", name, code)
@@ -602,5 +604,238 @@ func TestFileBundleSourceReloadsOnChange(t *testing.T) {
 	_ = os.Chtimes(path, later.Add(time.Minute), later.Add(time.Minute))
 	if _, err := src.GetX509BundleForTrustDomain(td); err == nil {
 		t.Fatal("an unreadable file was accepted")
+	}
+}
+
+// peerRequest returns a POST request to target that carries the verified envd certificate.
+func peerRequest(t *testing.T, ca *spiffetest.CA, target string, body io.Reader) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest("POST", target, body)
+	req.TLS = &tls.ConnectionState{PeerCertificates: ca.SVID(t, envdSPIFFE).Certificates}
+	return req
+}
+
+func TestReportSizeWithStepsAndGateway(t *testing.T) {
+	ca := spiffetest.NewCA(t, devTD)
+	fs := &fakeAPI{bundle: testBundle()}
+	h := NewAPIHandler(fs, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard))
+	at := time.Unix(1700000000, 0).UTC()
+	cell := strings.Repeat("c", 63)
+	var steps []mgmtapi.StepStatus
+	for i := range 32 {
+		steps = append(steps, mgmtapi.StepStatus{
+			ID: fmt.Sprintf("%032x", i), Cell: cell, State: mgmtapi.StepFailedFinal, Stage: mgmtapi.StageBootstrapping,
+			Reason: mgmtapi.ReasonHostsvcUnavailable, Detail: step.DetailBootstrapMismatch, RequestID: strings.Repeat("a", 16),
+			NodeIP: "255.255.255.255", Attempts: 3, UpdatedAt: at, RetryAt: at,
+			LastHostError: &mgmtapi.HostErrorInfo{Reason: mgmtapi.ReasonHostsvcUnavailable, At: at},
+		})
+	}
+	gw := &mgmtapi.GatewayStatus{
+		Epoch: 1, SyncedAt: at, OutboxItems: 9, Queued: map[string]int{}, Streams: map[string]int{},
+		MostClaimed: map[string]mgmtapi.ClaimInfo{}, Records: map[string]spec.Revision{}, LastBindRefusal: map[string]mgmtapi.BindRefusal{},
+	}
+	for i := range 8 {
+		c := fmt.Sprintf("%s%d", strings.Repeat("g", 62), i)
+		gw.Queued[c], gw.Streams[c] = 9, 9
+		gw.MostClaimed[c] = mgmtapi.ClaimInfo{OpID: strings.Repeat("b", 32), Count: 99}
+		gw.Records[c] = spec.Revision{Epoch: 9, Counter: 99}
+		gw.LastBindRefusal[c] = mgmtapi.BindRefusal{Reason: mgmtapi.ReasonTokenInvalid, RequestID: strings.Repeat("a", 16), At: at}
+		gw.KeyHints = append(gw.KeyHints, mgmtapi.KeyHint{Cell: c, At: at})
+	}
+	rep := mgmtapi.StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 3}, Gateway: gw, Steps: steps, StepsAt: at}
+	post := func(rep mgmtapi.StatusReport, unknownLength bool) *httptest.ResponseRecorder {
+		body := marshal(t, rep)
+		var rd io.Reader = strings.NewReader(body)
+		if unknownLength {
+			rd = io.MultiReader(rd)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, peerRequest(t, ca, mgmtapi.StatusPath("dev"), rd))
+		return rec
+	}
+	for _, unknown := range []bool{false, true} {
+		body := marshal(t, rep)
+		if len(body) <= maxRequestBody || len(body) >= maxStatusBody {
+			t.Fatalf("the report has %d bytes, which must pass 16 KiB and stay under 64 KiB", len(body))
+		}
+		if rec := post(rep, unknown); rec.Code != http.StatusNoContent {
+			t.Fatalf("unknownLength=%v: status %d %s", unknown, rec.Code, rec.Body)
+		}
+	}
+	if got := fs.got(); len(got) != 2 || len(got[1].Steps) != 32 {
+		t.Fatalf("the plane got %d reports", len(got))
+	}
+	// A body of 64 KiB passes and one byte more does not.
+	pad := func(n int) mgmtapi.StatusReport {
+		r := rep
+		r.StoreError = "x"
+		r.StoreError = strings.Repeat("x", n-len(marshal(t, r))+1)
+		return r
+	}
+	at64 := pad(maxStatusBody)
+	if n := len(marshal(t, at64)); n != maxStatusBody {
+		t.Fatalf("padded body has %d bytes", n)
+	}
+	if rec := post(at64, true); rec.Code != http.StatusNoContent {
+		t.Fatalf("64 KiB: status %d %s", rec.Code, rec.Body)
+	}
+	over := pad(maxStatusBody + 1)
+	for _, unknown := range []bool{false, true} {
+		rec := post(over, unknown)
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "body_too_large") {
+			t.Fatalf("64 KiB plus one, unknownLength=%v: status %d %s", unknown, rec.Code, rec.Body)
+		}
+	}
+	if len(fs.got()) != 3 {
+		t.Fatalf("a refused report reached the plane: %d", len(fs.got()))
+	}
+}
+
+// adminPost sends body to path of the admin handler with no Content-Length, as a chunked client does.
+func adminPost(h http.Handler, path, body string) *httptest.ResponseRecorder {
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", path, io.MultiReader(strings.NewReader(body)))
+	req.ContentLength = -1
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func reasonOf(t *testing.T, rec *httptest.ResponseRecorder) string {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &m); err != nil {
+		t.Fatalf("body %q: %v", rec.Body, err)
+	}
+	s, _ := m["reason"].(string)
+	return s
+}
+
+func TestAdminPortalBodyStrict(t *testing.T) {
+	r := newBareRig(t)
+	h := NewAdminHandler(r.plane, nil)
+	digest := strings.Repeat("a", 64)
+	good := `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`
+	routes := []string{"/portal/request", "/portal/withdraw", "/portal/recreate", "/portal/retry", "/portal/cancel", "/steps/sign"}
+	before := r.status().Seq
+	for _, route := range routes {
+		body := good
+		if route == "/steps/sign" {
+			body = `{"env":"dev"}`
+		}
+		for name, bad := range map[string]struct{ body, want string }{
+			"unknown_field": {strings.TrimSuffix(body, "}") + `,"extra":1}`, "body_invalid"},
+			"force_field":   {strings.TrimSuffix(body, "}") + `,"force":true}`, "body_invalid"},
+			"trailing_data": {body + `{}`, "body_invalid"},
+			"not_json":      {`nope`, "body_invalid"},
+			"empty":         {``, "body_invalid"},
+			"too_large":     {body + strings.Repeat(" ", maxRequestBody+1-len(body)), "body_too_large"},
+			"wrong_type":    {`{"cells":"` + cell1 + `"}`, "body_invalid"},
+		} {
+			for _, chunked := range []bool{false, true} {
+				var rec *httptest.ResponseRecorder
+				if chunked {
+					rec = adminPost(h, route, bad.body)
+				} else {
+					rec = do(h, "POST", route, strings.NewReader(bad.body))
+				}
+				var m map[string]any
+				_ = json.Unmarshal(rec.Body.Bytes(), &m)
+				if rec.Code != http.StatusBadRequest || m["error"] != bad.want {
+					t.Errorf("%s %s chunked=%v: status %d body %q, want 400 %s", route, name, chunked, rec.Code, rec.Body, bad.want)
+				}
+			}
+		}
+		if rec := do(h, "GET", route); rec.Code != http.StatusMethodNotAllowed {
+			t.Errorf("GET %s: status %d, want 405", route, rec.Code)
+		}
+	}
+	if r.status().Seq != before || len(r.plane.snap.Load().st.Requests) != 0 {
+		t.Fatal("a body that was refused changed the state")
+	}
+
+	// A body of exactly 16 KiB reaches the plane.
+	padded := good + strings.Repeat(" ", maxRequestBody-len(good))
+	if rec := adminPost(h, "/portal/request", padded); rec.Code != http.StatusOK {
+		t.Fatalf("a body of 16 KiB: status %d %s", rec.Code, rec.Body)
+	}
+
+	// Refusals map to statuses by reason.
+	for _, tc := range []struct {
+		route, body string
+		status      int
+		reason      string
+	}{
+		{"/portal/request", `{"cells":["nope"],"bootstrapSHA256":"` + digest + `"}`, 404, mgmtapi.ReasonCellUnknown},
+		{"/portal/request", `{"cells":["` + cell2 + `"],"bootstrapSHA256":"short"}`, 422, mgmtapi.ReasonBootstrapInvalid},
+		{"/portal/request", `{"cells":[],"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonPayloadInvalid},
+		{"/portal/withdraw", `{"cells":["nope"]}`, 404, mgmtapi.ReasonCellUnknown},
+		{"/portal/cancel", `{"cells":["nope"]}`, 404, mgmtapi.ReasonCellUnknown},
+		{"/portal/cancel", `{"cells":["` + cell2 + `"]}`, 422, mgmtapi.ReasonNoStep},
+		{"/portal/retry", `{"cells":["` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonNoStep},
+		{"/portal/recreate", `{"cells":["` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonNotRequested},
+		{"/portal/recreate", `{"cells":["` + cell1 + `","` + cell2 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
+		{"/portal/retry", `{"cells":[],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
+		{"/portal/cancel", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
+		{"/portal/withdraw", `{"cells":["` + cell1 + `"],"bootstrapSHA256":"` + digest + `"}`, 400, ""},
+		{"/steps/sign", `{"id":"","env":"dev","cell":"` + cell1 + `","kind":"cell.create","version":1,"keyEpoch":0,"issuedAt":"2026-01-01T00:00:00Z","expiresAt":"2026-01-01T01:00:00Z","cluster":{"podSubnet":"10.20.0.0/16","serviceSubnet":"10.21.0.0/16","issuer":"https://x.test"},"bootstrapSHA256":"` + digest + `"}`, 422, mgmtapi.ReasonTestDigestOnly},
+	} {
+		rec := do(h, "POST", tc.route, strings.NewReader(tc.body))
+		if rec.Code != tc.status || reasonOf(t, rec) != tc.reason {
+			t.Errorf("%s %s: status %d reason %q body %s, want %d %q", tc.route, tc.body, rec.Code, reasonOf(t, rec), rec.Body, tc.status, tc.reason)
+		}
+	}
+	if rec := do(h, "POST", "/portal/withdraw", strings.NewReader(`{"cells":["`+cell1+`"]}`)); rec.Code != 200 {
+		t.Fatalf("withdraw: %d %s", rec.Code, rec.Body)
+	}
+	if len(r.plane.snap.Load().st.Requests) != 0 {
+		t.Fatal("withdraw left a request")
+	}
+}
+
+func TestAdminPortalRoutesCallThePlane(t *testing.T) {
+	r := newBareRig(t)
+	h := NewAdminHandler(r.plane, nil)
+	digest := strings.Repeat("a", 64)
+	rec := do(h, "POST", "/portal/request", strings.NewReader(`{"cells":["`+cell1+`","`+cell2+`"],"bootstrapSHA256":"`+digest+`"}`))
+	var res mgmtapi.PortalResult
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil || rec.Code != 200 || len(res.Steps) != 2 || bytes.Count(rec.Body.Bytes(), []byte("\n")) != 1 {
+		t.Fatalf("request: %d %s: %v", rec.Code, rec.Body, err)
+	}
+	first := r.stepOf(cell1).ID
+	rec = do(h, "POST", "/portal/retry", strings.NewReader(`{"cells":["`+cell1+`"],"bootstrapSHA256":"`+digest+`"}`))
+	if rec.Code != 200 || r.stepOf(cell1) == nil || r.stepOf(cell1).ID == first {
+		t.Fatalf("retry: %d %s", rec.Code, rec.Body)
+	}
+	if rec = do(h, "POST", "/portal/cancel", strings.NewReader(`{"cells":["`+cell2+`"]}`)); rec.Code != 200 || r.stepOf(cell2) != nil {
+		t.Fatalf("cancel: %d %s", rec.Code, rec.Body)
+	}
+	if rec = do(h, "POST", "/portal/withdraw", strings.NewReader(`{"cells":["`+cell1+`","`+cell2+`"]}`)); rec.Code != 200 || len(r.plane.snap.Load().st.Requests) != 0 {
+		t.Fatalf("withdraw: %d %s", rec.Code, rec.Body)
+	}
+	if rec = do(h, "POST", "/portal/recreate", strings.NewReader(`{"cells":["`+cell1+`"],"bootstrapSHA256":"`+digest+`"}`)); rec.Code != 422 || reasonOf(t, rec) != mgmtapi.ReasonNotRequested {
+		t.Fatalf("recreate of an unrequested cell: %d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminStepsSign(t *testing.T) {
+	r := newBareRig(t)
+	h := NewAdminHandler(r.plane, nil)
+	body := step.Step{
+		Env: "dev", Cell: cell1, Kind: step.KindCellCreate, Version: 1, IssuedAt: r.clk.Now(),
+		ExpiresAt: r.clk.Now().Add(time.Hour), Cluster: testCluster(cell1), BootstrapSHA256: step.TestDigest,
+	}
+	before := r.status().Seq
+	rec := do(h, "POST", "/steps/sign", strings.NewReader(marshal(t, body)))
+	if rec.Code != 200 {
+		t.Fatalf("status %d %s", rec.Code, rec.Body)
+	}
+	got, _, err := step.Verify(bytes.TrimSpace(rec.Body.Bytes()), []ed25519.PublicKey{r.plane.PublicKey()})
+	if err != nil || got.Cell != cell1 || got.ID == "" || r.status().Seq != before {
+		t.Fatalf("step %+v err %v seq %d to %d", got, err, before, r.status().Seq)
+	}
+	// A body that the step rules refuse is a bad request, not a server error.
+	body.Cell = "Not A Cell"
+	if rec = do(h, "POST", "/steps/sign", strings.NewReader(marshal(t, body))); rec.Code != 400 || !strings.Contains(rec.Body.String(), "body_invalid") {
+		t.Fatalf("invalid step: %d %s", rec.Code, rec.Body)
 	}
 }

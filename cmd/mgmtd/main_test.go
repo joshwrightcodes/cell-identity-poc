@@ -845,3 +845,113 @@ func TestAPILogLineCarriesATraceID(t *testing.T) {
 		}
 	}
 }
+
+// specHost is a host service that takes spec pushes. It answers the first push with 503 and a
+// Retry-After header, and every later one with 204.
+type specHost struct {
+	mu     sync.Mutex
+	bodies [][]byte
+}
+
+func (h *specHost) got() [][]byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.bodies)
+}
+
+func startSpecHost(t *testing.T, f *fixture) *specHost {
+	t.Helper()
+	cert, err := hostsvc.SelfSignedCert("host.docker.internal", time.Now())
+	must(t, err)
+	must(t, os.WriteFile(f.args["hostsvc-pin"], pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Certificate[0]}), 0o600))
+	h := &specHost{}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPut || r.URL.Path != mgmtapi.HostSpecPath {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		h.mu.Lock()
+		h.bodies = append(h.bodies, body)
+		n := len(h.bodies)
+		h.mu.Unlock()
+		if n == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13})
+	must(t, err)
+	go srv.Serve(ln)
+	t.Cleanup(func() { _ = srv.Close() })
+	f.args["hostsvc-addr"] = ln.Addr().String()
+	return h
+}
+
+// The status shows the spec push to the host service, the request of a cell, its step, and why the
+// cell is not valid yet. The host service gets the spec that the API serves, and gets the next spec
+// after a portal request.
+func TestStatusShowsValidAndSteps(t *testing.T) {
+	f := newFixture(t)
+	host := startSpecHost(t, f)
+	r := f.start(t)
+	currentT = t
+	ctl := func(args ...string) map[string]any {
+		t.Helper()
+		var out bytes.Buffer
+		if code := execute(t.Context(), append([]string{"ctl", "--socket", f.args["admin-socket"]}, args...), &out, f.deps()); code != 0 {
+			t.Fatalf("ctl %v: exit %d output %q", args, code, out.String())
+		}
+		lines := jsonLines(t, out.String())
+		if len(lines) != 1 {
+			t.Fatalf("ctl %v: %q", args, out.String())
+		}
+		return lines[0]
+	}
+	servedSpec := func() []byte {
+		t.Helper()
+		cfg := tlsconfig.MTLSClientConfig(f.devCA.Source(t, envdID), f.mgmtCA.Bundle(), tlsconfig.AuthorizeID(mustSPIFFE(t, mgmtID)))
+		tr := &http.Transport{TLSClientConfig: cfg, ForceAttemptHTTP2: true}
+		defer tr.CloseIdleConnections()
+		resp, err := (&http.Client{Transport: tr, Timeout: 5 * time.Second}).Get("https://" + r.addrs["api"] + mgmtapi.SpecPath("dev"))
+		must(t, err)
+		defer resp.Body.Close()
+		var bundle mgmtapi.SpecBundle
+		must(t, json.NewDecoder(resp.Body).Decode(&bundle))
+		return bundle.Spec
+	}
+
+	// The first push gets 503, which the status shows until the second push succeeds.
+	sawBusy := false
+	waitFor(t, "a successful spec push", func() bool {
+		st := ctl("status")
+		sawBusy = sawBusy || st["hostSpecPushError"] == mgmtapi.ReasonHostsvcBusy
+		_, pushed := st["hostSpecPushedAt"]
+		return pushed && st["hostSpecPushError"] == nil
+	})
+	if !sawBusy {
+		t.Error("the status never showed hostsvc_busy")
+	}
+	first := host.got()
+	if len(first) < 2 || !slices.Equal(first[0], first[1]) || !slices.Equal(first[len(first)-1], servedSpec()) {
+		t.Fatalf("the host service got %d pushes that differ from the served spec", len(first))
+	}
+
+	res := ctl("portal", "request", "--cell", "dev-cell-1", "--bootstrap-sha256", strings.Repeat("a", 64))
+	stepID := res["steps"].([]any)[0].(map[string]any)["stepID"]
+	st := ctl("status")
+	cell := st["cells"].([]any)[0].(map[string]any)
+	view, _ := cell["step"].(map[string]any)
+	if cell["requested"] != true || view == nil || view["id"] != stepID || cell["valid"] != false || cell["validReason"] == nil || cell["validReason"] == "" {
+		t.Fatalf("cell status %v, want requested, step %v and an invalid reason", cell, stepID)
+	}
+	waitFor(t, "the push of the spec with the step", func() bool {
+		got := host.got()
+		return len(got) > len(first) && slices.Equal(got[len(got)-1], servedSpec())
+	})
+	if bytes.Equal(host.got()[len(first)], first[0]) {
+		t.Fatal("the push after the request is the old spec")
+	}
+}

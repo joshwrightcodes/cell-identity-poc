@@ -20,13 +20,15 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 )
 
 const (
 	defaultSocket  = "/run/mgmtd/ctl/admin.sock"
 	ctlTimeout     = 60 * time.Second
 	maxCtlResponse = 16 << 20
-	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]"
+	maxStepInput   = 16 << 10
+	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign (the step as JSON on standard input)"
 )
 
 // Hooks that tests replace.
@@ -124,7 +126,7 @@ func serveAdmin(ctx context.Context, ln net.Listener, h http.Handler) error {
 }
 
 // ctlCommand runs one command against the admin socket and prints its answer as one JSON line.
-func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
+func ctlCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) int {
 	fs := newFlags("ctl")
 	socket := fs.String("socket", defaultSocket, "admin socket")
 	expect := fs.String("expect-seq", "", "run a change only at this state version")
@@ -138,7 +140,11 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		return exitConfig
 	}
 	sub := newFlags("ctl " + rest[0])
-	cell := sub.String("cell", "", "cell name")
+	var cells []string
+	sub.Func("cell", "cell name; portal request and portal withdraw take it more than once", func(v string) error {
+		cells = append(cells, v)
+		return nil
+	})
 	revision := sub.String("revision", "", "revision counter or latest")
 	stage := sub.Bool("stage", false, "rotate-key: make the next signing key")
 	commit := sub.Bool("commit", false, "rotate-key: make the staged key the signing key")
@@ -147,11 +153,12 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 	ttl := sub.String("ttl", "", "op create, op sign: the lifetime of the operation, for example 10m")
 	kind := sub.String("kind", "demo.append", "op create, op sign: the kind of the operation")
 	id := sub.String("id", "", "op get, op close: the operation ID")
+	digest := sub.String("bootstrap-sha256", "", "portal request, recreate, retry: the SHA-256 of the bootstrap bundle, as 64 lowercase hex characters")
 	subArgs := rest[1:]
 	opSub := ""
-	if rest[0] == "op" {
+	if verbs, ok := map[string]string{"op": "create, sign, get, list or close", "portal": "request, withdraw, recreate, retry or cancel", "step": "sign"}[rest[0]]; ok {
 		if len(subArgs) == 0 {
-			cli.Fail(stdout, name, fmt.Errorf("op needs create, sign, get, list or close; %s", ctlUsage))
+			cli.Fail(stdout, name, fmt.Errorf("%s needs %s; %s", rest[0], verbs, ctlUsage))
 			return exitConfig
 		}
 		opSub, subArgs = subArgs[0], subArgs[1:]
@@ -179,6 +186,14 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 			return exitConfig
 		}
 	}
+	cell := ""
+	if len(cells) > 0 {
+		cell = cells[0]
+	}
+	if len(cells) > 1 && !(rest[0] == "portal" && (opSub == "request" || opSub == "withdraw")) {
+		cli.Fail(stdout, name, fmt.Errorf("--cell may appear once here, and more than once only for portal request and portal withdraw; %s", ctlUsage))
+		return exitConfig
+	}
 	query := ""
 	if *expect != "" {
 		if _, err := strconv.ParseUint(*expect, 10, 64); err != nil {
@@ -201,17 +216,17 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 	case "pubkey":
 		method, path = http.MethodGet, "/pubkey"
 	case "keys":
-		if *cell == "" {
+		if cell == "" {
 			cli.Fail(stdout, name, errors.New("keys needs --cell"))
 			return exitConfig
 		}
-		method, path = http.MethodGet, "/keys/"+url.PathEscape(*cell)
+		method, path = http.MethodGet, "/keys/"+url.PathEscape(cell)
 	case "keycheck":
-		if *cell == "" {
+		if cell == "" {
 			cli.Fail(stdout, name, errors.New("keycheck needs --cell"))
 			return exitConfig
 		}
-		method, path = http.MethodPost, "/keycheck/"+url.PathEscape(*cell)+query
+		method, path = http.MethodPost, "/keycheck/"+url.PathEscape(cell)+query
 	case "restore":
 		if *revision == "" {
 			cli.Fail(stdout, name, errors.New("restore needs --revision"))
@@ -240,10 +255,27 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		method, path = http.MethodPost, "/rotate-key"+joinQuery(query, mode)
 	case "op":
 		var err error
-		if method, path, body, err = opRequest(opSub, *cell, *kind, *line, *ttl, *id); err != nil {
+		if method, path, body, err = opRequest(opSub, cell, *kind, *line, *ttl, *id); err != nil {
 			cli.Fail(stdout, name, err)
 			return exitConfig
 		}
+	case "portal":
+		var err error
+		if method, path, body, err = portalRequest(opSub, cells, *digest); err != nil {
+			cli.Fail(stdout, name, err)
+			return exitConfig
+		}
+	case "step":
+		if opSub != "sign" {
+			cli.Fail(stdout, name, fmt.Errorf("unknown step command %q; %s", opSub, ctlUsage))
+			return exitConfig
+		}
+		in, err := readStepInput(stdin)
+		if err != nil {
+			cli.Fail(stdout, name, err)
+			return exitConfig
+		}
+		method, path, body = http.MethodPost, "/steps/sign", bytes.NewReader(in)
 	default:
 		cli.Fail(stdout, name, fmt.Errorf("unknown ctl command %q; %s", rest[0], ctlUsage))
 		return exitConfig
@@ -310,6 +342,13 @@ func flagApplies(command, opSub, flagName string) bool {
 		return flagName == "revision"
 	case "rotate-key":
 		return flagName == "stage" || flagName == "commit" || flagName == "emergency"
+	case "portal":
+		switch opSub {
+		case "request", "recreate", "retry":
+			return flagName == "cell" || flagName == "bootstrap-sha256"
+		case "withdraw", "cancel":
+			return flagName == "cell"
+		}
 	case "op":
 		switch opSub {
 		case "create", "sign":
@@ -321,6 +360,50 @@ func flagApplies(command, opSub, flagName string) bool {
 		}
 	}
 	return false
+}
+
+// portalRequest returns the admin request of `ctl portal <sub>`. request and withdraw take one cell
+// or more, and the other commands take exactly one. A digest goes with request, recreate and retry,
+// and the plane checks its shape.
+func portalRequest(sub string, cells []string, digest string) (method, path string, body io.Reader, err error) {
+	var wantDigest, oneCell bool
+	switch sub {
+	case "request":
+		wantDigest = true
+	case "withdraw":
+	case "recreate", "retry":
+		wantDigest, oneCell = true, true
+	case "cancel":
+		oneCell = true
+	default:
+		return "", "", nil, fmt.Errorf("unknown portal command %q; %s", sub, ctlUsage)
+	}
+	switch {
+	case len(cells) == 0 || oneCell && len(cells) != 1:
+		return "", "", nil, fmt.Errorf("portal %s needs --cell%s", sub, map[bool]string{true: " once", false: ""}[oneCell])
+	case wantDigest && digest == "":
+		return "", "", nil, fmt.Errorf("portal %s needs --bootstrap-sha256", sub)
+	}
+	req, err := json.Marshal(mgmtapi.PortalRequest{Cells: cells, BootstrapSHA256: digest})
+	if err != nil {
+		return "", "", nil, err
+	}
+	return http.MethodPost, "/portal/" + sub, bytes.NewReader(req), nil
+}
+
+// readStepInput reads the step body of `ctl step sign` from in, at most maxStepInput bytes.
+func readStepInput(in io.Reader) ([]byte, error) {
+	if in == nil {
+		return nil, nil
+	}
+	b, err := io.ReadAll(io.LimitReader(in, maxStepInput+1))
+	if err != nil {
+		return nil, fmt.Errorf("read the step from standard input: %w", err)
+	}
+	if len(b) > maxStepInput {
+		return nil, fmt.Errorf("the step on standard input is larger than %d bytes", maxStepInput)
+	}
+	return b, nil
 }
 
 // joinQuery adds the query part extra to query, which is empty or starts with ?.

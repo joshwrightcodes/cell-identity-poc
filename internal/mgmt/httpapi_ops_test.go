@@ -224,15 +224,15 @@ func TestAPIReportsLimits(t *testing.T) {
 			t.Fatalf("%d Reports calls for an oversized body", nr)
 		}
 	})
-	t.Run("status_keeps_16_kib", func(t *testing.T) {
+	t.Run("status_keeps_64_kib", func(t *testing.T) {
 		f := newAPIFixture(t)
-		big := `{"storeError":"` + strings.Repeat("a", 17<<10) + `"}`
+		big := `{"storeError":"` + strings.Repeat("a", 65<<10) + `"}`
 		if rec := f.do("POST", mgmtapi.StatusPath("dev"), strings.NewReader(big)); rec.Code < 400 {
-			t.Fatalf("a 17 KiB status: %d", rec.Code)
+			t.Fatalf("a 65 KiB status: %d", rec.Code)
 		}
-		ok := `{"storeError":"` + strings.Repeat("a", 15<<10) + `"}`
+		ok := `{"storeError":"` + strings.Repeat("a", 63<<10) + `"}`
 		if rec := f.do("POST", mgmtapi.StatusPath("dev"), strings.NewReader(ok)); rec.Code != 204 {
-			t.Fatalf("a 15 KiB status: %d", rec.Code)
+			t.Fatalf("a 63 KiB status: %d", rec.Code)
 		}
 	})
 }
