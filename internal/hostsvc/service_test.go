@@ -4,15 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/kind/pkg/apis/config/v1alpha4"
 	"sigs.k8s.io/yaml"
 
@@ -229,13 +237,41 @@ func cellObs() Observed {
 }
 
 type fakeMarker struct {
-	has     bool
-	hasErr  error
-	written int
-	order   *[]string
+	has      bool
+	hasErr   error
+	hasSeq   []error // errors for the first calls of Has, then hasErr
+	hasCalls int
+	written  int
+	order    *[]string
 }
 
-func (m *fakeMarker) Has(context.Context, string) (bool, error) { return m.has, m.hasErr }
+func (m *fakeMarker) Has(context.Context, string) (bool, error) {
+	m.hasCalls++
+	if len(m.hasSeq) > 0 {
+		err := m.hasSeq[0]
+		m.hasSeq = m.hasSeq[1:]
+		return false, err
+	}
+	return m.has, m.hasErr
+}
+
+// fakeRecords is the create records of steps, in memory.
+type fakeRecords struct {
+	made  map[string]bool
+	order *[]string
+}
+
+func (r *fakeRecords) Made(step, cluster string) (bool, error) { return r.made[step+"/"+cluster], nil }
+func (r *fakeRecords) Record(step, cluster string) error {
+	if r.made == nil {
+		r.made = map[string]bool{}
+	}
+	r.made[step+"/"+cluster] = true
+	if r.order != nil {
+		*r.order = append(*r.order, "record")
+	}
+	return nil
+}
 func (m *fakeMarker) Write(context.Context, string) error {
 	m.written++
 	m.has = true
@@ -260,6 +296,8 @@ func newCellService(rt *fakeRuntime) (*Service, *fakeMarker, *fakeDocker) {
 	}
 	m := &fakeMarker{}
 	s.Marker = m
+	s.Records, s.StepID = &fakeRecords{}, "step1"
+	s.APIWait, s.APIPoll, s.APITry = 60*time.Millisecond, 10*time.Millisecond, time.Second
 	return s, m, d
 }
 
@@ -382,6 +420,7 @@ func (errProber) Probe(context.Context, string) (Observed, error) {
 func TestRetryDeletesHalfBuiltCluster(t *testing.T) {
 	rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
 	s, m, d := newCellService(rt)
+	_ = s.Records.Record("step1", "dev-cell-1") // an earlier run of this step started to make it
 	if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
 		t.Fatal(err)
 	}
@@ -393,15 +432,41 @@ func TestRetryDeletesHalfBuiltCluster(t *testing.T) {
 	}
 }
 
+func TestCreateRecordsBeforeRuntimeCreate(t *testing.T) {
+	rt := &orderRuntime{fakeRuntime: fakeRuntime{clusters: map[string]bool{}}}
+	s, _, _ := newCellService(&rt.fakeRuntime)
+	s.rt = rt
+	var order []string
+	rt.order = &order
+	s.Records.(*fakeRecords).order = &order
+	if _, err := s.Create(context.Background(), "dev-cell-1", false); err != nil {
+		t.Fatal(err)
+	}
+	if len(order) < 2 || order[0] != "record" || order[1] != "create" {
+		t.Errorf("order = %v, want the record before the runtime create", order)
+	}
+}
+
+type orderRuntime struct {
+	fakeRuntime
+	order *[]string
+}
+
+func (o *orderRuntime) Create(cfg *v1alpha4.Cluster) error {
+	*o.order = append(*o.order, "create")
+	return o.fakeRuntime.Create(cfg)
+}
+
 func TestRetryKeepsClusterWithMarker(t *testing.T) {
 	rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
 	s, m, _ := newCellService(rt)
+	_ = s.Records.Record("step1", "dev-cell-1")
 	m.has = true
 	if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
 		t.Fatal(err)
 	}
-	if len(rt.deleted) != 0 || len(rt.created) != 0 || m.written != 0 {
-		t.Errorf("a finished cluster was touched: deleted %v, created %d, marker %d", rt.deleted, len(rt.created), m.written)
+	if len(rt.deleted) != 0 || len(rt.created) != 0 {
+		t.Errorf("a finished cluster was touched: deleted %v, created %d", rt.deleted, len(rt.created))
 	}
 }
 
@@ -411,11 +476,14 @@ func TestFirstAttemptKeepsExistingCluster(t *testing.T) {
 	if _, err := s.Create(context.Background(), "dev-cell-1", false); err != nil {
 		t.Fatal(err)
 	}
-	if len(rt.deleted) != 0 || len(rt.created) != 0 || m.written != 0 {
-		t.Errorf("deleted %v, created %d, marker %d: the first attempt keeps an existing cluster", rt.deleted, len(rt.created), m.written)
+	if len(rt.deleted) != 0 || len(rt.created) != 0 || m.written != 1 {
+		t.Errorf("deleted %v, created %d, marker %d: the first attempt keeps an existing cluster and marks it", rt.deleted, len(rt.created), m.written)
 	}
 	if !slices.ContainsFunc(d.calls, func(c string) bool { return strings.Contains(c, "config dump") }) {
 		t.Errorf("the existing path did not reapply the registry settings: %v", d.calls)
+	}
+	if made, _ := s.Records.Made("step1", "dev-cell-1"); made {
+		t.Error("a step that kept a cluster recorded that it made it")
 	}
 	// The existing path checks the spec.
 	obs := cellObs()
@@ -423,6 +491,125 @@ func TestFirstAttemptKeepsExistingCluster(t *testing.T) {
 	s.Prober = fakeProber{obs: obs}
 	if _, err := s.Create(context.Background(), "dev-cell-1", false); !errors.Is(err, ErrSpecMismatch) {
 		t.Errorf("Create on a cluster with another spec = %v, want ErrSpecMismatch", err)
+	}
+}
+
+func TestCreateKeptClusterSurvivesSecondRun(t *testing.T) {
+	rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+	s, m, _ := newCellService(rt)
+	m.has = false
+	if _, err := s.Create(context.Background(), "dev-cell-1", false); err != nil {
+		t.Fatal(err)
+	}
+	// The second run of creating (after an interrupted end, say) carries --retry-of-create.
+	if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.deleted) != 0 || len(rt.created) != 0 {
+		t.Errorf("deleted %v, created %d: a cluster that this step kept must survive a second creating", rt.deleted, len(rt.created))
+	}
+}
+
+func TestCreateRetryOfOtherStepsClusterKeeps(t *testing.T) {
+	rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+	s, _, _ := newCellService(rt)
+	_ = s.Records.Record("other", "dev-cell-1")
+	if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
+		t.Fatal(err)
+	}
+	if len(rt.deleted) != 0 {
+		t.Errorf("deleted %v: only the cluster that this step made may go", rt.deleted)
+	}
+}
+
+func TestCreateMarkerReadErrorDeletesNothing(t *testing.T) {
+	for name, err := range map[string]error{
+		"forbidden":      apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, "poc-provisioned", errors.New("no")),
+		"unauthorized":   apierrors.NewUnauthorized("bad token"),
+		"server_error":   apierrors.NewInternalError(errors.New("etcd down")),
+		"bad_kubeconfig": errors.New("parse kubeconfig: bad"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+			s, m, _ := newCellService(rt)
+			_ = s.Records.Record("step1", "dev-cell-1")
+			m.hasErr = err
+			if _, got := s.Create(context.Background(), "dev-cell-1", true); got == nil {
+				t.Fatal("Create succeeded although the marker could not be read")
+			}
+			if len(rt.deleted) != 0 || len(rt.created) != 0 || m.written != 0 {
+				t.Errorf("deleted %v, created %d, marker %d: nothing may change", rt.deleted, len(rt.created), m.written)
+			}
+			if m.hasCalls != 1 {
+				t.Errorf("Has called %d times: an error that is not unreachable is not retried", m.hasCalls)
+			}
+		})
+	}
+}
+
+func TestCreateUnreachableAPI(t *testing.T) {
+	down := fmt.Errorf("%w: connection refused", ErrAPIUnreachable)
+	t.Run("with_record_deletes_after_wait", func(t *testing.T) {
+		rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+		s, m, _ := newCellService(rt)
+		_ = s.Records.Record("step1", "dev-cell-1")
+		m.hasErr = down
+		start := time.Now()
+		if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
+			t.Fatal(err)
+		}
+		if time.Since(start) < 40*time.Millisecond || m.hasCalls < 3 {
+			t.Errorf("waited %s with %d polls: the delete must follow the bounded wait", time.Since(start), m.hasCalls)
+		}
+		if !slices.Equal(rt.deleted, []string{"dev-cell-1"}) || len(rt.created) != 1 {
+			t.Errorf("deleted %v, created %d", rt.deleted, len(rt.created))
+		}
+	})
+	t.Run("without_record_keeps", func(t *testing.T) {
+		rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+		s, m, _ := newCellService(rt)
+		m.hasErr = down
+		if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
+			t.Fatal(err)
+		}
+		if len(rt.deleted) != 0 || m.hasCalls != 0 {
+			t.Errorf("deleted %v after %d marker reads: a cluster with no record of this step is never deleted", rt.deleted, m.hasCalls)
+		}
+	})
+	t.Run("recovers_within_wait_keeps", func(t *testing.T) {
+		rt := &fakeRuntime{clusters: map[string]bool{"dev-cell-1": true}}
+		s, m, _ := newCellService(rt)
+		_ = s.Records.Record("step1", "dev-cell-1")
+		m.hasSeq = []error{down, down}
+		m.has = true
+		if _, err := s.Create(context.Background(), "dev-cell-1", true); err != nil {
+			t.Fatal(err)
+		}
+		if len(rt.deleted) != 0 || m.hasCalls != 3 {
+			t.Errorf("deleted %v after %d reads: a cluster that answers again is finished", rt.deleted, m.hasCalls)
+		}
+	})
+}
+
+func TestKubeMarkerClassifiesErrors(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err         error
+		unreachable bool
+	}{
+		"refused":   {&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, true},
+		"deadline":  {context.DeadlineExceeded, true},
+		"forbidden": {apierrors.NewForbidden(schema.GroupResource{}, "x", errors.New("no")), false},
+		"plain":     {errors.New("boom"), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cs := fake.NewClientset()
+			cs.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) { return true, nil, tc.err })
+			m := KubeMarker{Client: func(string) (kubernetes.Interface, error) { return cs, nil }}
+			_, err := m.Has(context.Background(), "kc")
+			if err == nil || errors.Is(err, ErrAPIUnreachable) != tc.unreachable {
+				t.Errorf("Has = %v, want unreachable %v", err, tc.unreachable)
+			}
+		})
 	}
 }
 

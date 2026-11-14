@@ -121,7 +121,8 @@ func groupAlive(pgid int) bool {
 }
 
 // KillOrphanGroup kills the group that a stopped host service left. leaderStart is the start time
-// that StartGroup recorded. It does nothing when the group is gone. It returns ErrLeaderChanged,
+// that StartGroup recorded. It returns ErrGroupGone when the group is already gone, and nil only
+// after it killed a live group and the group has ended. It returns ErrLeaderChanged,
 // and kills nothing, when a live leader has another start time. When the leader has gone but
 // members live, the group is still ours, because no new process can take the id of a live group.
 func KillOrphanGroup(pgid int, leaderStart string) error {
@@ -129,7 +130,7 @@ func KillOrphanGroup(pgid int, leaderStart string) error {
 		return fmt.Errorf("refusing group %d", pgid)
 	}
 	if !groupAlive(pgid) {
-		return nil
+		return ErrGroupGone
 	}
 	start, err := processStart(pgid)
 	switch {
@@ -141,7 +142,13 @@ func KillOrphanGroup(pgid int, leaderStart string) error {
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return err
 	}
-	return nil
+	for range 60 {
+		if !groupAlive(pgid) {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("group %d is still alive after SIGKILL", pgid)
 }
 
 var errNoProcess = errors.New("no such process")

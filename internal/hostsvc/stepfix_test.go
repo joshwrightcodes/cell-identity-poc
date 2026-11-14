@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -42,10 +43,11 @@ type stepEnv struct {
 	priv  ed25519.PrivateKey
 	pub   ed25519.PublicKey
 
-	mu      sync.Mutex
-	keys    []ed25519.PublicKey
-	digest  atomic.Value
-	digests atomic.Int32
+	mu        sync.Mutex
+	keys      []ed25519.PublicKey
+	digest    atomic.Value
+	digests   atomic.Int32
+	digestErr atomic.Bool
 
 	spec *SpecStore
 	ver  *StepVerifier
@@ -74,6 +76,9 @@ func newStepEnv(t *testing.T) *stepEnv {
 	e.spec.SetLogger(discardLog())
 	e.ver = &StepVerifier{Keys: e.getKeys, Env: "dev", Topo: fixTopo, Spec: e.spec, Now: e.clock.Now, Digest: func() (string, error) {
 		e.digests.Add(1)
+		if e.digestErr.Load() {
+			return "", errors.New("git: index.lock exists")
+		}
 		return e.digest.Load().(string), nil
 	}}
 	return e

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
@@ -86,6 +87,7 @@ func TestGroupStopKillsTrapper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	killGroupAtCleanup(t, g)
 	sleeper := readPid(t, pidFile)
 	g.Stop(300 * time.Millisecond)
 	select {
@@ -106,6 +108,7 @@ func TestWaitKillsChildThatOutlivesLeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	killGroupAtCleanup(t, g)
 	sleeper := readPid(t, pidFile)
 	if err := g.Wait(); err != nil {
 		t.Fatal(err)
@@ -115,7 +118,7 @@ func TestWaitKillsChildThatOutlivesLeader(t *testing.T) {
 
 func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 	testtool.Need(t, "sh", "sleep")
-	spawn := func(t *testing.T, script string) (*exec.Cmd, int, string) {
+	spawn := func(t *testing.T, script string) (<-chan struct{}, int, string) {
 		t.Helper()
 		cmd := exec.Command("sh", "-c", script)
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -126,8 +129,12 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); _ = cmd.Wait() })
-		return cmd, cmd.Process.Pid, start
+		// The test is the parent of the leader, so it reaps the leader as soon as it ends: an
+		// orphan of a dead host service has no parent that waits.
+		waited := make(chan struct{})
+		go func() { _ = cmd.Wait(); close(waited) }()
+		t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); <-waited })
+		return waited, cmd.Process.Pid, start
 	}
 	journalWith := func(t *testing.T, pgid int, start string) (*Journal, *syncBuf) {
 		t.Helper()
@@ -146,11 +153,9 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 		return j, &logBuf
 	}
 	t.Run("leader_alive", func(t *testing.T) {
-		cmd, pgid, start := spawn(t, "sleep 600")
+		waited, pgid, start := spawn(t, "sleep 600")
 		j, logs := journalWith(t, pgid, start)
 		j.Reap(KillOrphanGroup)
-		waited := make(chan struct{})
-		go func() { _ = cmd.Wait(); close(waited) }() // reaps the leader, so that the group is gone
 		select {
 		case <-waited:
 		case <-time.After(5 * time.Second):
@@ -181,11 +186,9 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 	})
 	t.Run("leader_gone_members_live", func(t *testing.T) {
 		pidFile := filepath.Join(t.TempDir(), "member.pid")
-		cmd, pgid, start := spawn(t, "sleep 600 & echo $! > "+pidFile)
+		waited, pgid, start := spawn(t, "sleep 600 & echo $! > "+pidFile)
 		member := readPid(t, pidFile)
-		if err := cmd.Wait(); err != nil {
-			t.Fatal(err)
-		}
+		<-waited
 		if !groupAlive(pgid) {
 			t.Fatal("test setup: the member is gone")
 		}
@@ -197,12 +200,38 @@ func TestOpenJournalReapsOrphanGroup(t *testing.T) {
 		}
 	})
 	t.Run("group_gone", func(t *testing.T) {
-		cmd, pgid, start := spawn(t, "exit 0")
-		_ = cmd.Wait()
-		j, _ := journalWith(t, pgid, start)
+		waited, pgid, start := spawn(t, "exit 0")
+		<-waited
+		j, logs := journalWith(t, pgid, start)
 		j.Reap(KillOrphanGroup)
 		if e, _ := j.Get(idN(1)); e.Status.State != mgmtapi.StepFailed {
 			t.Errorf("entry = %+v", e.Status)
+		}
+		if strings.Contains(logs.String(), "orphan_reaped") {
+			t.Errorf("log = %q: a group that was already gone was not reaped", logs.String())
+		}
+	})
+	t.Run("closed_entry_ends_final", func(t *testing.T) {
+		_, pgid, start := spawn(t, "sleep 600")
+		j, _ := journalWith(t, pgid, start)
+		if _, _, err := j.Update(idN(1), func(e *JournalEntry) { e.ClosedIn = spec.Revision{Epoch: 1, Counter: 9} }); err != nil {
+			t.Fatal(err)
+		}
+		j.Reap(KillOrphanGroup)
+		e, _ := j.Get(idN(1))
+		if e.Status.State != mgmtapi.StepFailedFinal || e.Status.Detail != "interrupted" || !e.Final() || !e.Status.RetryAt.IsZero() {
+			t.Errorf("entry = %+v, want failed_final with interrupted", e.Status)
+		}
+	})
+	t.Run("kill_error_holds_entry", func(t *testing.T) {
+		j, logs := journalWith(t, 4242, "1.000000")
+		j.Reap(func(int, string) error { return errors.New("operation not permitted") })
+		e, _ := j.Get(idN(1))
+		if e.Status.State != mgmtapi.StepAdmitting || e.Pgid != 4242 {
+			t.Errorf("entry = %+v pgid %d: a group that may still run must not become retryable", e.Status, e.Pgid)
+		}
+		if !strings.Contains(logs.String(), "orphan_kill_failed") || strings.Contains(logs.String(), "orphan_reaped") {
+			t.Errorf("log = %q", logs.String())
 		}
 	})
 	t.Run("refuses_group_1", func(t *testing.T) {

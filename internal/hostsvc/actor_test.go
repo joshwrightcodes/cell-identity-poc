@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,8 +43,38 @@ type actorEnv struct {
 	envs     [][]string
 	startErr error
 
+	checkMu     sync.Mutex
+	startChecks []error // CheckCreateStep for the step of each start, as the create child runs it
+
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// killGroupAtCleanup kills the group by its pgid at the end of the test, whether or not the code
+// under test did, and waits for the leader. It never kills by name.
+func killGroupAtCleanup(t *testing.T, g *Group) {
+	t.Helper()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-g.Pgid, syscall.SIGKILL)
+		select {
+		case <-g.Done():
+		case <-time.After(5 * time.Second):
+		}
+	})
+}
+
+// checkStart runs the check of `hostsvc create` for the step that a start belongs to.
+func checkStart(j *Journal, env []string) error {
+	var id, cell string
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "POC_STEP_ID="); ok {
+			id = v
+		}
+		if v, ok := strings.CutPrefix(kv, "CELL="); ok {
+			cell = v
+		}
+	}
+	return CheckCreateStep(j.Dir(), id, cell)
 }
 
 func newActorEnv(t *testing.T, tweak func(*ActorConfig)) *actorEnv {
@@ -93,7 +124,14 @@ func (ae *actorEnv) newActor(j *Journal, tweak func(*ActorConfig)) *Actor {
 			if err != nil {
 				return nil, err
 			}
-			return StartGroup(argv, env, log)
+			g, err := StartGroup(argv, env, log)
+			if g != nil {
+				killGroupAtCleanup(ae.t, g)
+			}
+			ae.checkMu.Lock()
+			ae.startChecks = append(ae.startChecks, checkStart(j, env))
+			ae.checkMu.Unlock()
+			return g, err
 		},
 		KillAfter: 300 * time.Millisecond, Heartbeat: 40 * time.Millisecond, Now: ae.clock.Now, Log: jsonLogger(ae.logs),
 	}
@@ -1174,5 +1212,100 @@ func TestActorCountsStates(t *testing.T) {
 	}
 	if _, err := NewActor(ActorConfig{}); err == nil {
 		t.Error("NewActor accepted an empty config")
+	}
+}
+
+func TestActorSavesCreatingBeforeStart(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.start()
+	ae.submit(s, env)
+	ae.waitState(s.ID, mgmtapi.StepDone)
+	ae.checkMu.Lock()
+	defer ae.checkMu.Unlock()
+	if len(ae.startChecks) == 0 || ae.startChecks[0] != nil {
+		t.Errorf("the create check at the first start = %v, want nil: creating must be saved before the child starts", ae.startChecks)
+	}
+}
+
+func TestActorTransientDigestErrorIsRetryable(t *testing.T) {
+	t.Run("open_step_fails_retryable", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		s, env := ae.indexed("dev-cell-1", nil)
+		ae.submit(s, env)
+		ae.digestErr.Store(true)
+		ae.start()
+		st := ae.waitState(s.ID, mgmtapi.StepFailed, mgmtapi.StepFailedFinal)
+		if st.State != mgmtapi.StepFailed || st.Detail != step.DetailStageFailed || st.Attempts != 0 || !st.RetryAt.Equal(ae.clock.Now().Add(5*time.Minute)) {
+			t.Fatalf("status = %+v, want failed (not final) with no attempt used", st)
+		}
+		ae.digestErr.Store(false)
+		ae.clock.Advance(6 * time.Minute)
+		ae.submit(s, env)
+		ae.waitState(s.ID, mgmtapi.StepDone)
+	})
+	t.Run("mismatch_stays_final", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		s, env := ae.indexed("dev-cell-1", nil)
+		ae.submit(s, env)
+		ae.digest.Store(strings.Repeat("d", 64))
+		ae.start()
+		if st := ae.waitState(s.ID, mgmtapi.StepFailedFinal); st.Detail != step.DetailBootstrapMismatch {
+			t.Errorf("status = %+v", st)
+		}
+	})
+}
+
+func TestActorJournalWriteFailureBacksOff(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to a read-only directory")
+	}
+	old := writeBackoffMin
+	writeBackoffMin = 100 * time.Millisecond
+	t.Cleanup(func() { writeBackoffMin = old })
+	ae := newActorEnv(t, nil)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.submit(s, env)
+	dir := ae.j.Dir()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	ae.start()
+	time.Sleep(900 * time.Millisecond)
+	ae.mu.Lock()
+	runs := len(ae.cmds)
+	ae.mu.Unlock()
+	logged := strings.Count(ae.logs.String(), `"journal_write_failed"`)
+	if runs != 0 || logged != 1 {
+		t.Errorf("with a read-only journal: %d stage starts and %d journal_write_failed lines in 0.9 s, want 0 and 1 (back-off, one line)", runs, logged)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ae.waitState(s.ID, mgmtapi.StepDone)
+	if !strings.Contains(ae.logs.String(), "journal_write_recovered") {
+		t.Error("no journal_write_recovered line")
+	}
+}
+
+func TestActorResetJournalTakesTheLock(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.submit(s, env)
+	ae.a.mu.Lock()
+	done := make(chan error, 1)
+	go func() { done <- ae.a.ResetJournal() }()
+	select {
+	case <-done:
+		t.Fatal("ResetJournal ran while the actor lock was held")
+	case <-time.After(150 * time.Millisecond):
+	}
+	ae.a.mu.Unlock()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(ae.j.List()) != 0 {
+		t.Error("entries survived the reset")
 	}
 }

@@ -98,8 +98,35 @@ type Actor struct {
 	wake   chan struct{}
 	steps  metric.Int64Counter
 
-	mu  sync.Mutex
-	cur *runState
+	mu       sync.Mutex
+	cur      *runState
+	writeErr string // the last journal write error that was logged, empty after a success
+}
+
+// Back-off of Run after a step that made no progress because the journal could not be written.
+// Tests shorten the minimum.
+var (
+	writeBackoffMin = time.Second
+	writeBackoffMax = 30 * time.Second
+)
+
+// rootCause is the text of the innermost error, so that two failures of the same kind in different
+// temporary files count as one outcome.
+func rootCause(err error) string {
+	for {
+		next := errors.Unwrap(err)
+		if next == nil {
+			return err.Error()
+		}
+		err = next
+	}
+}
+
+// ResetJournal clears the journal under the lock that every actor write takes.
+func (a *Actor) ResetJournal() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.Journal.Reset()
 }
 
 // NewActor checks cfg, subscribes to the spec store and returns an Actor. Entries that the journal
@@ -208,8 +235,13 @@ func (a *Actor) updateLocked(id string, f func(*JournalEntry)) (JournalEntry, bo
 		f(e)
 		e.Status.UpdatedAt = a.now()
 	})
-	if err != nil {
+	switch {
+	case err != nil && rootCause(err) != a.writeErr:
+		a.writeErr = rootCause(err)
 		a.cfg.Log.Error("journal_write_failed", "step", id, "error", err.Error())
+	case err == nil && a.writeErr != "":
+		a.writeErr = ""
+		a.cfg.Log.Info("journal_write_recovered", "step", id)
 	}
 	if ok && err == nil && e.Status.State != before {
 		a.steps.Add(context.Background(), 1, metric.WithAttributes(attribute.String("state", e.Status.State)))
@@ -453,12 +485,24 @@ func (a *Actor) drainSpec() {
 // ends during a stage, it stops the group, marks the step failed with detail interrupted and
 // returns after the group has exited.
 func (a *Actor) Run(ctx context.Context) error {
+	var backoff time.Duration
 	for {
 		a.drainSpec()
 		if id := a.nextQueued(); id != "" {
 			a.runStep(ctx, id)
 			if ctx.Err() != nil {
 				return nil
+			}
+			if e, ok := a.cfg.Journal.Get(id); ok && e.Status.State == mgmtapi.StepQueued {
+				// The step made no progress, because the journal cannot be written.
+				backoff = min(max(2*backoff, writeBackoffMin), writeBackoffMax)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(backoff):
+				}
+			} else {
+				backoff = 0
 			}
 			continue
 		}
@@ -553,6 +597,10 @@ func (a *Actor) preCheck(ctx context.Context, rs *runState, stg Stage) bool {
 		}
 		if e.Closed() {
 			if err := a.checkClosed(e); err != nil {
+				if !isRefusal(err) {
+					a.transient(rs.id, stg.Name, err)
+					return false
+				}
 				a.update(rs.id, func(e *JournalEntry) { a.setFinal(e, stg.Name, detailOrFailed(err)) })
 				a.cfg.Log.Warn("step_run_refused", "step", rs.id, "cell", e.Status.Cell, "stage", stg.Name, "detail", detailOrFailed(err))
 				return false
@@ -567,6 +615,10 @@ func (a *Actor) preCheck(ctx context.Context, rs *runState, stg Stage) bool {
 			continue
 		}
 		if _, err := v.Check([]byte(e.Envelope), false); err != nil {
+			if !isRefusal(err) {
+				a.transient(rs.id, stg.Name, err)
+				return false
+			}
 			d := detailOrFailed(err)
 			a.update(rs.id, func(e *JournalEntry) { a.setFinal(e, stg.Name, d) })
 			a.cfg.Log.Warn("step_run_refused", "step", rs.id, "cell", e.Status.Cell, "stage", stg.Name, "detail", d, "error", err.Error())
@@ -574,6 +626,24 @@ func (a *Actor) preCheck(ctx context.Context, rs *runState, stg Stage) bool {
 		}
 		return true
 	}
+}
+
+func isRefusal(err error) bool {
+	var se *step.Error
+	return errors.As(err, &se)
+}
+
+// transient ends the stage of a step whose check failed for a reason that is not a refusal, such as
+// a bootstrap digest that could not be computed. The step is failed, not final, and the cell
+// controller may retry it after RetryAfter. A closed step is final, because no PUT can retry it.
+func (a *Actor) transient(id, stage string, err error) {
+	a.cfg.Log.Warn("step_check_failed", "step", id, "stage", stage, "error", err.Error())
+	a.update(id, func(e *JournalEntry) {
+		a.setFailed(e, stage, step.DetailStageFailed, false)
+		if e.Status.State == mgmtapi.StepFailed {
+			e.Status.RetryAt = a.now().Add(a.cfg.RetryAfter)
+		}
+	})
 }
 
 // detailOrFailed returns the step detail of a refusal, and stage_failed for any other error.

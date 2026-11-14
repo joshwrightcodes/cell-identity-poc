@@ -103,7 +103,7 @@ func (h *adminHandler) cancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *adminHandler) reset(w http.ResponseWriter, _ *http.Request) {
-	if err := h.j.Reset(); err != nil {
+	if err := h.a.ResetJournal(); err != nil {
 		adminError(w, http.StatusConflict, err.Error())
 		return
 	}

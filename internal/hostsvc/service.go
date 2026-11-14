@@ -6,8 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
+	"syscall"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -68,6 +74,11 @@ type Service struct {
 	Reserved ReservedFunc
 	Docker   DockerFunc
 	Marker   Marker
+	// Records and StepID tell which cluster this step made. Both are needed to delete one.
+	Records CreateRecords
+	StepID  string
+	// APIWait, APIPoll and APITry bound the wait for an API server that does not answer.
+	APIWait, APIPoll, APITry time.Duration
 
 	// lookups holds one token for each Facts call whose runtime calls have not returned.
 	lookups chan struct{}
@@ -166,9 +177,55 @@ func (s *Service) UpAll(ctx context.Context) error {
 	return nil
 }
 
-// Create makes the cluster of a cell and writes the marker ConfigMap after its facts are read. With
-// retryOfCreate, an existing cluster without the marker is a half-built cluster of an earlier
-// run, and Create deletes it first. Without it, an existing cluster is kept and checked as Up does.
+// ErrAPIUnreachable wraps a marker read that failed because the API server of the cluster does not
+// answer: a refused or timed out connection.
+var ErrAPIUnreachable = errors.New("cluster API server is unreachable")
+
+// CreateRecords tells which clusters a step made. The create child writes a record before it calls
+// the runtime, so a later run of the same step knows that the cluster is its own.
+type CreateRecords interface {
+	// Made reports whether the step recorded that it creates the cluster.
+	Made(stepID, cluster string) (bool, error)
+	// Record notes that the step creates the cluster.
+	Record(stepID, cluster string) error
+}
+
+// FileCreateRecords keeps the records as files <dir>/<step id>.create. It never touches
+// journal.json.
+type FileCreateRecords struct{ Dir string }
+
+func (f FileCreateRecords) path(stepID string) string { return filepath.Join(f.Dir, stepID+".create") }
+
+// Made reports whether the file of the step names the cluster.
+func (f FileCreateRecords) Made(stepID, cluster string) (bool, error) {
+	b, err := os.ReadFile(f.path(stepID))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(b)) == cluster, nil
+}
+
+// Record writes the file of the step.
+func (f FileCreateRecords) Record(stepID, cluster string) error {
+	return writeFileAtomic(f.path(stepID), []byte(cluster+"\n"), 0o644)
+}
+
+// Defaults of the wait for an API server that does not answer.
+const (
+	defaultAPIWait = 2 * time.Minute
+	defaultAPIPoll = 5 * time.Second
+	defaultAPITry  = 20 * time.Second
+)
+
+// Create makes the cluster of a cell. When it makes the cluster, it records that first, and it
+// writes the marker ConfigMap after the facts are read. When the cluster exists, Create keeps it,
+// checks it as Up does, and writes the marker, so that a later run sees a finished cluster.
+// With retryOfCreate, Create deletes an existing cluster only when this step recorded that it made
+// it, and the marker is a definite NotFound, or the API server stays unreachable through the wait.
+// Any other read error fails the run and deletes nothing.
 func (s *Service) Create(ctx context.Context, name string, retryOfCreate bool) (Facts, error) {
 	c, err := s.lookup(name)
 	if err != nil {
@@ -178,26 +235,33 @@ func (s *Service) Create(ctx context.Context, name string, retryOfCreate bool) (
 	if err != nil {
 		return Facts{}, err
 	}
-	if found && retryOfCreate {
-		kc, err := s.rt.Kubeconfig(name)
+	if found && retryOfCreate && s.Records != nil && s.StepID != "" {
+		own, err := s.Records.Made(s.StepID, name)
 		if err != nil {
-			return Facts{}, fmt.Errorf("read kubeconfig of %s: %w", name, err)
+			return Facts{}, fmt.Errorf("read create record: %w", err)
 		}
-		has, err := s.Marker.Has(ctx, kc)
-		if err != nil {
-			slog.Warn("marker unreadable, treating the cluster as half built", "cluster", name, "error", err.Error())
-		}
-		if !has {
-			slog.Warn("deleting half-built cluster", "cluster", name)
-			if err := s.rt.Delete(name); err != nil {
-				return Facts{}, fmt.Errorf("delete half-built cluster %s: %w", name, err)
+		if own {
+			remove, err := s.halfBuilt(ctx, name)
+			if err != nil {
+				return Facts{}, err
 			}
-			found = false
+			if remove {
+				slog.Warn("deleting half-built cluster of this step", "cluster", name, "step", s.StepID)
+				if err := s.rt.Delete(name); err != nil {
+					return Facts{}, fmt.Errorf("delete half-built cluster %s: %w", name, err)
+				}
+				found = false
+			}
+		}
+	}
+	if !found && s.Records != nil && s.StepID != "" {
+		if err := s.Records.Record(s.StepID, name); err != nil {
+			return Facts{}, fmt.Errorf("write create record: %w", err)
 		}
 	}
 	f, err := s.bringUp(ctx, c, found)
-	if err != nil || found {
-		return f, err
+	if err != nil {
+		return Facts{}, err
 	}
 	kc, err := s.rt.Kubeconfig(name)
 	if err != nil {
@@ -207,6 +271,46 @@ func (s *Service) Create(ctx context.Context, name string, retryOfCreate bool) (
 		return Facts{}, fmt.Errorf("write marker in %s: %w", name, err)
 	}
 	return f, nil
+}
+
+// halfBuilt reports whether the existing cluster of this step is unfinished: its marker is a
+// definite NotFound, or its API server stays unreachable through the wait. Another read error is
+// returned and the caller deletes nothing.
+func (s *Service) halfBuilt(ctx context.Context, name string) (bool, error) {
+	kc, err := s.rt.Kubeconfig(name)
+	if err != nil {
+		return false, fmt.Errorf("read kubeconfig of %s: %w", name, err)
+	}
+	wait, poll, try := s.APIWait, s.APIPoll, s.APITry
+	if wait <= 0 {
+		wait = defaultAPIWait
+	}
+	if poll <= 0 {
+		poll = defaultAPIPoll
+	}
+	if try <= 0 {
+		try = defaultAPITry
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		tctx, cancel := context.WithTimeout(ctx, try)
+		has, err := s.Marker.Has(tctx, kc)
+		cancel()
+		switch {
+		case err == nil:
+			return !has, nil
+		case !errors.Is(err, ErrAPIUnreachable):
+			return false, fmt.Errorf("read marker in %s: %w", name, err)
+		case !time.Now().Add(poll).Before(deadline):
+			slog.Warn("API server stayed unreachable", "cluster", name, "wait", wait.String())
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(poll):
+		}
+	}
 }
 
 func (s *Service) bringUp(ctx context.Context, c topology.Cluster, found bool) (Facts, error) {
@@ -378,8 +482,18 @@ func (m KubeMarker) Has(ctx context.Context, kubeconfig string) (bool, error) {
 		return true, nil
 	case apierrors.IsNotFound(err):
 		return false, nil
+	case unreachable(err):
+		return false, fmt.Errorf("%w: %v", ErrAPIUnreachable, err)
 	}
 	return false, err
+}
+
+// unreachable reports whether err means that no API server answered: a refused or timed out
+// connection or a request that ran out of time.
+func unreachable(err error) bool {
+	var ne net.Error
+	return errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, context.DeadlineExceeded) ||
+		(errors.As(err, &ne) && ne.Timeout())
 }
 
 // Write creates the marker ConfigMap with the label poc.internal/made-by=hostsvc.

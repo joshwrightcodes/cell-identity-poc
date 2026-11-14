@@ -271,6 +271,7 @@ func (j *Journal) Evict(indexed func(id string) bool) {
 		}
 		delete(j.entries, e.Status.ID)
 		_ = os.Remove(j.LogPath(e.Status.ID))
+		_ = os.Remove(filepath.Join(j.dir, e.Status.ID+".create"))
 		changed = true
 		j.log.Info("journal_evicted", "step", e.Status.ID, "cell", e.Status.Cell, "state", e.Status.State)
 	}
@@ -285,9 +286,14 @@ func (j *Journal) Evict(indexed func(id string) bool) {
 // belongs to another process.
 var ErrLeaderChanged = errors.New("process group has another leader")
 
+// ErrGroupGone is what a kill function of Reap returns when no process of the group is left.
+var ErrGroupGone = errors.New("process group is gone")
+
 // Reap ends the stages that a stopped host service left running. For each entry in a running state,
-// it calls kill with the recorded group and leader start time, logs orphan_reaped when kill
-// succeeds, and marks the entry failed with detail interrupted, which is not an attempt.
+// it calls kill with the recorded group and leader start time. It logs orphan_reaped only when kill
+// ended a live group. When kill fails in another way, the group may still run, so Reap leaves the
+// entry as it is and logs the error. Otherwise it marks the entry failed with detail interrupted,
+// which is not an attempt, or failed_final for a closed step, because no PUT can run that again.
 func (j *Journal) Reap(kill func(pgid int, leaderStart string) error) {
 	for _, e := range j.List() {
 		if !e.Running() {
@@ -297,10 +303,13 @@ func (j *Journal) Reap(kill func(pgid int, leaderStart string) error) {
 			switch err := kill(e.Pgid, e.LeaderStart); {
 			case err == nil:
 				j.log.Warn("orphan_reaped", "step", e.Status.ID, "cell", e.Status.Cell, "stage", e.Status.Stage, "pgid", e.Pgid)
+			case errors.Is(err, ErrGroupGone):
+				j.log.Info("orphan_gone", "step", e.Status.ID, "cell", e.Status.Cell, "pgid", e.Pgid)
 			case errors.Is(err, ErrLeaderChanged):
 				j.log.Warn("orphan_not_ours", "step", e.Status.ID, "cell", e.Status.Cell, "pgid", e.Pgid)
 			default:
 				j.log.Error("orphan_kill_failed", "step", e.Status.ID, "cell", e.Status.Cell, "pgid", e.Pgid, "error", err.Error())
+				continue
 			}
 		}
 		now := j.now()
@@ -311,6 +320,10 @@ func (j *Journal) Reap(kill func(pgid int, leaderStart string) error) {
 			e.Status.Detail = step.DetailInterrupted
 			e.Status.UpdatedAt = now
 			e.Status.RetryAt = now
+			if e.Closed() {
+				e.Status.State = mgmtapi.StepFailedFinal
+				e.Status.RetryAt = time.Time{}
+			}
 		})
 		if err != nil {
 			j.log.Error("journal_write_failed", "error", err.Error())

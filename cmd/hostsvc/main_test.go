@@ -362,13 +362,14 @@ func TestServeStepFlags(t *testing.T) {
 	good := writeBundle(t, ca)
 	keysDir := t.TempDir()
 	for name, args := range map[string][]string{
-		"step_id_in_mgmt_td":  {"--step-client-id", "spiffe://mgmt.poc.internal/cp/cell-controller"},
-		"step_id_no_path":     {"--step-client-id", "spiffe://dev.env.poc.internal"},
-		"step_id_other_td":    {"--step-client-id", "spiffe://other.poc.internal/cp/cell-controller"},
-		"step_id_bad":         {"--step-client-id", "nope"},
-		"journal_needs_keys":  {"--journal-dir", t.TempDir()},
-		"empty_bootstrap_cmd": {"--journal-dir", t.TempDir(), "--step-keys-dir", keysDir, "--bootstrap-cmd", " "},
-		"bad_env":             {"--journal-dir", t.TempDir(), "--step-keys-dir", keysDir, "--env", "Dev"},
+		"step_id_in_mgmt_td":   {"--step-client-id", "spiffe://mgmt.poc.internal/cp/cell-controller"},
+		"step_id_no_path":      {"--step-client-id", "spiffe://dev.env.poc.internal"},
+		"step_id_other_td":     {"--step-client-id", "spiffe://other.poc.internal/cp/cell-controller"},
+		"step_id_bad":          {"--step-client-id", "nope"},
+		"keys_without_journal": {"--step-keys-dir", keysDir},
+		"journal_needs_keys":   {"--journal-dir", t.TempDir()},
+		"empty_bootstrap_cmd":  {"--journal-dir", t.TempDir(), "--step-keys-dir", keysDir, "--bootstrap-cmd", " "},
+		"bad_env":              {"--journal-dir", t.TempDir(), "--step-keys-dir", keysDir, "--env", "Dev"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var out strings.Builder
@@ -543,6 +544,7 @@ func TestServeStopEndsChild(t *testing.T) {
 		pid, err = strconv.Atoi(strings.TrimSpace(string(b)))
 		return err == nil && pid > 1
 	})
+	t.Cleanup(func() { _ = syscall.Kill(-pid, syscall.SIGKILL) }) // by group id, never by name
 	if err := syscall.Kill(pid, 0); err != nil {
 		t.Fatalf("the child is not running: %v", err)
 	}

@@ -193,6 +193,7 @@ func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 		if err := hostsvc.CheckCreateStep(sf.journalDir, os.Getenv("POC_STEP_ID"), *name); err != nil {
 			return err
 		}
+		svc.Records, svc.StepID = hostsvc.FileCreateRecords{Dir: sf.journalDir}, os.Getenv("POC_STEP_ID")
 		_, err := svc.Create(ctx, *name, *retry)
 		return err
 	case "down":
@@ -368,6 +369,9 @@ func serve(ctx context.Context, svc *hostsvc.Service, topo *topology.Topology, s
 		if keys, err = hostsvc.NewInstrumentedKeyHandler(cache, isKnown, log, tel.Tracer, tel.Meter); err != nil {
 			return fmt.Errorf("instrument key handler: %w", err)
 		}
+	}
+	if (sf.journalDir == "") != (sf.keysDir == "") {
+		return errors.New("serve needs both --journal-dir and --step-keys-dir, or neither")
 	}
 	var stack *stepStack
 	var stepsH, specH http.Handler
