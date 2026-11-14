@@ -60,7 +60,7 @@ func TestRecordKidsTrace(t *testing.T) {
 	}
 }
 
-// TestRepairOrderPods: the pods of kindnet and kube-proxy come before coredns and every other pod, and only the pods with a stale UID
+// TestRepairOrderPods: the pods of kindnet, kube-proxy and istio-cni-node come before coredns and every other pod, and only the pods with a stale UID
 // are listed.
 func TestRepairOrderPods(t *testing.T) {
 	testtool.Need(t, "jq", "bash")
@@ -74,21 +74,22 @@ func TestRepairOrderPods(t *testing.T) {
 		pod("kube-system", "fresh", "u9", "ReplicaSet", "fresh-1"),
 		pod("kube-system", "kindnet-y", "u4", "DaemonSet", "kindnet"),
 		pod("local-path-storage", "provisioner", "u5", "ReplicaSet", "provisioner-1"),
+		pod("istio-system", "istio-cni-node-z", "u6", "DaemonSet", "istio-cni-node"),
 	}, ",") + `]}`
 	dir := t.TempDir()
-	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5"]`, pods)
+	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5","u6"]`, pods)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 5 {
-		t.Fatalf("got %d pods %q, want the 5 with a stale UID", len(lines), lines)
+	if len(lines) != 6 {
+		t.Fatalf("got %d pods %q, want the 6 with a stale UID", len(lines), lines)
 	}
-	first := map[string]bool{lines[0]: true, lines[1]: true}
-	if !first["kube-system kube-proxy-x DaemonSet kube-proxy"] || !first["kube-system kindnet-y DaemonSet kindnet"] {
-		t.Fatalf("the first two pods are %q, want kindnet and kube-proxy before coredns and the others", lines[:2])
+	first := map[string]bool{lines[0]: true, lines[1]: true, lines[2]: true}
+	if !first["kube-system kube-proxy-x DaemonSet kube-proxy"] || !first["kube-system kindnet-y DaemonSet kindnet"] || !first["istio-system istio-cni-node-z DaemonSet istio-cni-node"] {
+		t.Fatalf("the first three pods are %q, want kindnet, kube-proxy and istio-cni-node before coredns and the others", lines[:3])
 	}
-	for _, l := range lines[2:] {
+	for _, l := range lines[3:] {
 		if strings.Contains(l, "fresh") {
 			t.Errorf("the pod with a current UID is listed: %s", l)
 		}

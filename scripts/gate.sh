@@ -99,7 +99,8 @@ if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
-# The M5 tests run against mgmtd, envd, the cell gateway, the SPIRE server of dev-cp (its plugin writes the key hints) and the cells. An earlier run can leave a workload with no
+# The M5 tests run against mgmtd, envd, the cell gateway, the SPIRE server of dev-cp (its plugin writes the key hints) and
+# the cells. An earlier run can leave a workload with no
 # replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded, and so
 # must celld in each cell and the three cell-proxy servers of management. The cell-proxy clients stay with the M3 check:
 # a new image of the server changes the digest of every user of cell-proxy.

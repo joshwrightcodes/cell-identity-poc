@@ -110,10 +110,11 @@ record_kids_trace() {
 }
 
 # repair_order_pods <stale pod UIDs as a JSON array> reads the output of `kubectl get pods -A -o json` on standard input and prints
-# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. The pods of kindnet and kube-proxy come first:
-# kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start.
+# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. The pods of kindnet, kube-proxy and istio-cni-node
+# come first: kindnet enforces NetworkPolicy, kube-proxy routes the service addresses that other pods need to start, and no pod
+# gets a sandbox while the token of istio-cni-node is signed by a key that the API server no longer verifies.
 repair_order_pods() {
   jq -r --argjson uids "$1" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy")) then 0 else 1 end)
+    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy", "istio-cni-node")) then 0 else 1 end)
     | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"'
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,8 @@ case " $* " in
       *'next\.pub'*) if [[ -n "${STUB_NEXT_STALE:-}" ]]; then printf ''; else printf '%s' "$STUB_NEW_PUB"; fi ;;
       *) if [[ -n "${STUB_PUB_STALE:-}" ]]; then printf '%s' "$STUB_OLD_PUB"; else printf '%s' "$STUB_NEW_PUB"; fi ;;
     esac ;;
+  *" rollout status deployment/celld "*)
+    echo "kubectl $*" >>"$STUB_DIR/calls" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -41,7 +44,11 @@ case "$*" in
       pub="$STUB_NEW_PUB"
     else pub="$STUB_OLD_PUB"; fi
     printf '{"spec.pub":"%s"}\n' "$pub" ;;
-  "run mgmt -- status") echo '{"signed":{"epoch":2,"counter":1}}' ;;
+  "run mgmt -- status")
+    [[ -z "${STUB_STATUS_FAIL:-}" ]] || { echo "exec failed" >&2; exit 1; }
+    # stagedKey is the SHA-256 of the staged key, which is the new key. STUB_STAGED_OTHER replaces it.
+    staged="${STUB_STAGED_OTHER:-$(printf '%s' "$STUB_NEW_PUB" | base64 -d | shasum -a 256 | cut -d' ' -f1)}"
+    printf '{"signed":{"epoch":2,"counter":1},"stagedKey":"%s"}\n' "$staged" ;;
   "run mgmt -- rotate-key --stage")
     echo "mgmt rotate-key --stage" >>"$STUB_DIR/calls"
     if [[ -n "${STUB_STAGE_FAIL:-}" ]]; then echo '{"level":"ERROR","msg":"mgmtd failed","error":"conflict","reason":"conflict"}'; exit 1; fi
@@ -126,11 +133,16 @@ func TestRotateKeyOrder(t *testing.T) {
 	specWait := step{"publish", waitCmd(`spec\.pub`), kubectlCall(`spec\.pub`)}
 	devCP := up("dev-cp")
 	link := step{"cell:link-management", "CELL=management mise run cell:link", "CELL=management run cell:link"}
+	rollout := func(cell string) step {
+		c := "mise x -- kubectl --context kind-" + cell + " -n cell-identity-system rollout status deployment/celld --timeout=300s"
+		return step{"rollout-" + cell, c, "kubectl --context kind-" + cell + " -n cell-identity-system rollout status deployment/celld --timeout=300s"}
+	}
 	verifyMgmt := step{"cell:verify-management", "CELL=management mise run cell:verify", "CELL=management run cell:verify"}
 	verifyCP := step{"cell:verify-dev-cp", "CELL=dev-cp mise run cell:verify", "CELL=dev-cp run cell:verify"}
 	cell1, cell2 := up("dev-cell-1"), up("dev-cell-2")
-	overlap := []step{stage, nextWait, cell1, cell2, commit, specWait, devCP, link, cell1, cell2, verifyMgmt, verifyCP}
-	emergencyOrder := []step{emergency, specWait, devCP, link, cell1, cell2, verifyMgmt, verifyCP}
+	roll1, roll2 := rollout("dev-cell-1"), rollout("dev-cell-2")
+	overlap := []step{stage, nextWait, cell1, cell2, commit, specWait, devCP, link, cell1, cell2, roll1, roll2, verifyMgmt, verifyCP}
+	emergencyOrder := []step{emergency, specWait, devCP, link, cell1, cell2, roll1, roll2, verifyMgmt, verifyCP}
 	calls := func(steps []step) []string {
 		got := []string{"mgmt pubkey"}
 		for _, s := range steps {
@@ -230,6 +242,29 @@ func TestRotateKeyOrder(t *testing.T) {
 		})
 	}
 
+	// The commit step alone refuses a next.pub that does not hash to stagedKey, before the key changes.
+	t.Run("step commit with a next.pub that mgmtd did not stage", func(t *testing.T) {
+		out, _, err := run("mgmt-rotate-key.sh", []string{"--step", "commit"}, "STUB_STAGED_OTHER="+strings.Repeat("0", 64))
+		var line map[string]any
+		if err == nil || json.Unmarshal([]byte(out), &line) != nil || !strings.Contains(fmt.Sprint(line["error"]), "has the SHA-256") {
+			t.Fatalf("err %v, stdout %q; want one error line that names the hashes", err, out)
+		}
+		for _, c := range callLog() {
+			if strings.Contains(c, "rotate-key") {
+				t.Errorf("%q ran after the check failed", c)
+			}
+		}
+	})
+
+	// A failed status read after the stage prints one JSON error line.
+	t.Run("step stage with a failed status read", func(t *testing.T) {
+		out, _, err := run("mgmt-rotate-key.sh", []string{"--step", "stage"}, "STUB_STATUS_FAIL=1")
+		var line map[string]any
+		if err == nil || strings.Count(out, "\n") != 1 || json.Unmarshal([]byte(out), &line) != nil || line["level"] != "ERROR" {
+			t.Fatalf("err %v, stdout %q; want one JSON error line", err, out)
+		}
+	})
+
 	t.Run("bad arguments", func(t *testing.T) {
 		for _, args := range [][]string{{"--step"}, {"--step", "verify"}, {"--step", "stage", "x"}, {"--emergency", "x"}, {"--now"}} {
 			if out, _, err := run("mgmt-rotate-key.sh", args); err == nil || strings.Contains(strings.Join(callLog(), "\n"), "rotate-key") {
@@ -257,8 +292,8 @@ func TestRotateKeyOrder(t *testing.T) {
 		{"link step fails", overlap, 7, []string{"STUB_FAIL=CELL=management run cell:link"}},
 		{"second pass, dev-cell-1 fails", overlap, 8, []string{"STUB_FAIL=CELL=dev-cell-1 run cell:up", "STUB_FAIL_AT=2"}},
 		{"second pass, dev-cell-2 fails", overlap, 9, []string{"STUB_FAIL=CELL=dev-cell-2 run cell:up", "STUB_FAIL_AT=2"}},
-		{"management verify fails", overlap, 10, []string{"STUB_FAIL=CELL=management run cell:verify"}},
-		{"last verify fails", overlap, 11, []string{"STUB_FAIL=CELL=dev-cp run cell:verify"}},
+		{"management verify fails", overlap, 12, []string{"STUB_FAIL=CELL=management run cell:verify"}},
+		{"last verify fails", overlap, 13, []string{"STUB_FAIL=CELL=dev-cp run cell:verify"}},
 	}
 	for _, tc := range failures {
 		t.Run(tc.name, func(t *testing.T) {
@@ -326,7 +361,7 @@ func TestRotateKeyOrder(t *testing.T) {
 	t.Run("emergency: the cell pass fails", func(t *testing.T) {
 		out, _, err := run("mgmt-rotate-key.sh", []string{"--emergency"}, "STUB_FAIL=CELL=dev-cell-2 run cell:up")
 		res := oneLine(t, out)
-		if err == nil || !res.Rotated || res.Step != "cell:up-dev-cell-2" || strings.Join(res.Left, "|") != strings.Join([]string{cell2.cmd, verifyMgmt.cmd, verifyCP.cmd}, "|") {
+		if err == nil || !res.Rotated || res.Step != "cell:up-dev-cell-2" || strings.Join(res.Left, "|") != strings.Join([]string{cell2.cmd, roll1.cmd, roll2.cmd, verifyMgmt.cmd, verifyCP.cmd}, "|") {
 			t.Fatalf("err %v, line %+v; want rotated, the failed step and the commands from it on", err, res)
 		}
 	})
@@ -335,7 +370,7 @@ func TestRotateKeyOrder(t *testing.T) {
 	// cell pass runs after it.
 	t.Run("commit answers another key than the staged one", func(t *testing.T) {
 		other := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32))
-		out, errOut, err := run("mgmt-rotate-key.sh", nil, "STUB_COMMIT_OTHER="+other)
+		out, errOut, err := run("mgmt-rotate-key.sh", nil, "STUB_COMMIT_OTHER="+other, "MGMT_ROTATE_KEY_WAIT=1")
 		res := oneLine(t, out)
 		if err == nil || res.Level != "ERROR" || res.Step != "commit" || !strings.Contains(res.Error, "not the key that this run staged") {
 			t.Fatalf("err %v, line %+v, stderr %q; want a failure at the commit that names the staged key", err, res, errOut)

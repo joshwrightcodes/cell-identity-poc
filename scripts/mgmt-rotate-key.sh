@@ -14,7 +14,7 @@
 #   6. planes:  CELL=dev-cp mise run cell:up renders the new key into envd, the cell gateway and the SPIRE server of dev-cp.
 #               CELL=management mise run cell:link renders it into the link components of management.
 #   7. cells:   the cell passes run again. mgmt-op-key then holds the new key alone, and each celld pod restarts with it.
-#   8. cell:verify runs for management and for dev-cp.
+#   8. The script waits until celld of each cluster has finished its rollout. Then cell:verify runs for management and for dev-cp.
 # Between the commit and the second cell pass, cell:verify of each cell fails, because mgmt-op-key holds an old key that is neither
 # the live key nor a staged key. CELL=<cell> mise run cell:up repairs that.
 # --emergency makes a new key at once and skips the stage and the first cell pass: rotate-key --emergency, the wait, the planes,
@@ -74,6 +74,7 @@ add() { names+=("$1"); cmds+=("$2"); funcs+=("$3"); }
 cell_up() { CELL="$1" mise run cell:up >&2; }
 cell_link() { CELL=management mise run cell:link >&2; }
 cell_verify() { CELL="$1" mise run cell:verify >&2; }
+rollout() { kubectl --context "kind-$1" -n cell-identity-system rollout status deployment/celld --timeout=300s >&2; }
 
 add_cells() {
   local c
@@ -82,6 +83,13 @@ add_cells() {
 add_planes() {
   add cell:up-dev-cp "CELL=dev-cp mise run cell:up" "cell_up dev-cp"
   add cell:link-management "CELL=management mise run cell:link" cell_link
+}
+# add_rollout waits until celld of each cluster has finished its rollout, so that cell:verify does not race the new pods.
+add_rollout() {
+  local c
+  for c in "${cells[@]}"; do
+    add "rollout-$c" "mise x -- kubectl --context kind-$c -n cell-identity-system rollout status deployment/celld --timeout=300s" "rollout $c"
+  done
 }
 add_verify() {
   add cell:verify-management "CELL=management mise run cell:verify" "cell_verify management"
@@ -100,6 +108,7 @@ case "$mode" in
     add publish "$(wait_cmd 'spec\.pub')" wait_new
     add_planes
     add_cells
+    add_rollout
     add_verify
     ;;
   emergency)
@@ -107,6 +116,7 @@ case "$mode" in
     add publish "$(wait_cmd 'spec\.pub')" wait_new
     add_planes
     add_cells
+    add_rollout
     add_verify
     ;;
   step)
@@ -209,10 +219,15 @@ do_rotate() {
   log "mgmtd signs with a new key at epoch $epoch"
 }
 
-# A run of the commit step alone has no stage step before it: read the staged key, so that the commit can check it.
+# A run of the commit step alone has no stage step before it: read the staged key, so that the commit can check it. The key must hash
+# to stagedKey of mgmtd, as the cell render requires, or the commit stops before it changes anything.
 if [[ "$mode" == step && "$one_step" == commit ]]; then
   next_pub="$(kubectl --context kind-management -n mgmt-system get configmap mgmt-signing-pub -o 'jsonpath={.data.next\.pub}' 2>/dev/null)" || next_pub=""
-  [[ -z "$next_pub" ]] || new_fp="$(fingerprint "$next_pub")"
+  [[ -n "$next_pub" ]] || json_fail mgmt-rotate-key "ConfigMap mgmt-signing-pub holds no next.pub, so no key is staged. Run: mise run mgmt -- rotate-signing-key --step stage"
+  staged_hash="$(mise run mgmt -- status | jq -er '.stagedKey // ""')" || json_fail mgmt-rotate-key "could not read stagedKey from mise run mgmt -- status"
+  [[ "$(fingerprint "$next_pub")" == "$staged_hash" ]] \
+    || json_fail mgmt-rotate-key "next.pub of mgmt-signing-pub has the SHA-256 $(fingerprint "$next_pub"), and mgmtd shows the staged key '${staged_hash:-none}'. Run: mise run mgmt -- status"
+  new_fp="$(fingerprint "$next_pub")"
 fi
 # A run of the cells or the planes step alone changes no key.
 if [[ "$mode" == step && ( "$one_step" == cells || "$one_step" == planes ) ]]; then
@@ -229,7 +244,8 @@ done
 
 secs=$((SECONDS - started))
 if [[ "$mode" == step && "$one_step" == stage ]]; then
-  jq -nc --arg old "$old_fp" --arg new "$new_fp" --argjson epoch "$(mise run mgmt -- status | jq -er '.signed.epoch')" --argjson seconds "$secs" \
+  stage_epoch="$(mise run mgmt -- status | jq -er '.signed.epoch')" || json_fail mgmt-rotate-key "the key is staged, but the epoch could not be read from mise run mgmt -- status" staged:=true
+  jq -nc --arg old "$old_fp" --arg new "$new_fp" --argjson epoch "$stage_epoch" --argjson seconds "$secs" \
     '{rotated: false, staged: true, old_key_sha256: $old, new_key_sha256: $new, epoch: $epoch, seconds: $seconds}'
 elif [[ "$mode" == step && ( "$one_step" == cells || "$one_step" == planes ) ]]; then
   jq -nc --arg key "$old_fp" --arg step "$one_step" --argjson seconds "$secs" '{rotated: false, step: $step, key_sha256: $key, seconds: $seconds}'
