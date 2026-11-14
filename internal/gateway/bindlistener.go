@@ -185,6 +185,7 @@ func (h *BindHandler) failed(w http.ResponseWriter, r *http.Request, what string
 	id := newRequestID()
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "request_id": id})
 	h.log.ErrorContext(r.Context(), "bind_failed", "what", what, "request_id", id, "error", err.Error())
+	h.st.NoteFailure("bind_"+what, err)
 }
 
 func (h *BindHandler) nonce(w http.ResponseWriter, r *http.Request, cell string, _ netip.Addr) {

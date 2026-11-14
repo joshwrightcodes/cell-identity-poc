@@ -53,6 +53,10 @@ type Store struct {
 	raiseMu sync.Mutex
 	storeID string
 
+	// failure is the last store failure that a handler noted. Stats reports it once and clears it.
+	failMu  sync.Mutex
+	failure string
+
 	maxItems, maxBytes, perCell, perCellBytes, maxBinds int
 }
 
@@ -248,6 +252,29 @@ func (s *Store) notify(cell string) {
 	}
 }
 
+// maxFailureText is the longest text of a store failure that the status carries.
+const maxFailureText = 200
+
+// NoteFailure keeps the last store failure, for the status of the next sync. A handler calls it
+// where it answers a request with a server error, because envd gets no status from a failed sync.
+func (s *Store) NoteFailure(what string, err error) {
+	msg := what + ": " + err.Error()
+	if len(msg) > maxFailureText {
+		msg = msg[:maxFailureText]
+	}
+	s.failMu.Lock()
+	s.failure = msg
+	s.failMu.Unlock()
+}
+
+func (s *Store) takeFailure() string {
+	s.failMu.Lock()
+	defer s.failMu.Unlock()
+	msg := s.failure
+	s.failure = ""
+	return msg
+}
+
 // Stats returns the gateway status that the store knows. The stream and bind handlers fill in
 // Streams and LastBindRefusal.
 func (s *Store) Stats(ctx context.Context) (mgmtapi.GatewayStatus, error) {
@@ -312,6 +339,9 @@ func (s *Store) Stats(ctx context.Context) (mgmtapi.GatewayStatus, error) {
 			return nil
 		})
 	})
+	if err == nil {
+		st.StoreError = s.takeFailure()
+	}
 	return st, err
 }
 

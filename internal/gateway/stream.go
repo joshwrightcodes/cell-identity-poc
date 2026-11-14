@@ -298,6 +298,7 @@ func (h *StreamHandler) serve(w http.ResponseWriter, r *http.Request) {
 	rec, found, err := h.st.Cell(ctx, cell)
 	if err != nil {
 		h.log.ErrorContext(ctx, "stream_store_failed", "cell", cell, "error", err.Error())
+		h.st.NoteFailure("stream_cell", err)
 		http.Error(w, "internal", http.StatusInternalServerError)
 		return
 	}
@@ -373,6 +374,7 @@ func (h *StreamHandler) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.log.ErrorContext(ctx, "stream_store_failed", "cell", cell, "error", err.Error())
+		h.st.NoteFailure("stream_raise_epoch", err)
 		return
 	}
 	me, reason := h.admit(cell, claims.PodUID)

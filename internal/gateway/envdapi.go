@@ -284,6 +284,7 @@ func (h *envdHandler) enqueue(ctx context.Context, env json.RawMessage) error {
 func (h *envdHandler) storeFailed(ctx context.Context, w http.ResponseWriter, what string, err error) {
 	id := newRequestID()
 	h.log.ErrorContext(ctx, "sync_store_failed", "what", what, "error", err.Error(), "request_id", id)
+	h.st.NoteFailure(what, err)
 	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "request_id": id})
 }
 

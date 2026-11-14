@@ -343,3 +343,28 @@ func TestHelloHintRidesTheSyncStatus(t *testing.T) {
 		t.Fatalf("the hint came twice: %+v", st.KeyHints)
 	}
 }
+
+// A sync that fails in the store answers 500, so envd gets no status from it. The gateway keeps the
+// failure and reports it once in the status of the next sync that works.
+func TestStoreFailureRidesTheNextSyncStatus(t *testing.T) {
+	e := newGwEnv(t)
+	f := newEnvdFixture(t, e, envdSetup{})
+	cells := []mgmtapi.CellInfo{{Name: cell1, Nonce: "n1", NonceExpiresAt: time.Now().Add(time.Hour)}}
+	if _, err := e.st.db.Exec(`DROP TABLE cell_info`); err != nil {
+		t.Fatal(err)
+	}
+	if code, body := f.post(t, gwapi.SyncPath, e.syncRequest(nil, cells)); code != http.StatusInternalServerError {
+		t.Fatalf("sync with a broken store: %d %s", code, body)
+	}
+	if _, err := e.st.db.Exec(`CREATE TABLE cell_info (name TEXT PRIMARY KEY, latest BLOB NOT NULL, previous BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	code, body := f.post(t, gwapi.SyncPath, e.syncRequest(nil, cells))
+	if st := decodeSync(t, code, body).Status; !strings.HasPrefix(st.StoreError, "set_cells: ") {
+		t.Fatalf("storeError %q, want the failure of set_cells", st.StoreError)
+	}
+	code, body = f.post(t, gwapi.SyncPath, e.syncRequest(nil, cells))
+	if st := decodeSync(t, code, body).Status; st.StoreError != "" {
+		t.Fatalf("storeError %q repeated", st.StoreError)
+	}
+}
