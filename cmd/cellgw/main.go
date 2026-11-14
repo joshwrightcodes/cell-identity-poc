@@ -1,7 +1,7 @@
 // Command cellgw is the cell gateway. It takes celld streams and bind requests from the cells,
 // syncs with envd, and keeps the operation queue and the outbox in SQLite.
 //
-//	cellgw serve --env <env> --envd-id <spiffe id> --spec-key-file <file> --cell-node <cell>=<ip> [--cell-node ...] [--data-dir /var/lib/cellgw] [--stream-listen :8450] [--bind-listen :8451] [--envd-listen :8452] [--health-listen :8080] [--admin-socket /run/cellgw/admin.sock] [--replica-cap 2]
+//	cellgw serve --env <env> --envd-id <spiffe id> --spec-key-file <file> [--cell-node <cell>=<ip> ...] [--data-dir /var/lib/cellgw] [--stream-listen :8450] [--bind-listen :8451] [--envd-listen :8452] [--health-listen :8080] [--admin-socket /run/cellgw/admin.sock] [--replica-cap 2]
 //	cellgw ctl [--socket <path>] status | queue --cell <c> | enqueue --cell <c> [--replay] | inject | outbox
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
@@ -222,9 +222,6 @@ func parseServe(args []string) (serveConfig, error) {
 		if v == "" {
 			missing = append(missing, "--"+k)
 		}
-	}
-	if len(nodes) == 0 {
-		missing = append(missing, "--cell-node")
 	}
 	if len(missing) > 0 {
 		slices.Sort(missing)

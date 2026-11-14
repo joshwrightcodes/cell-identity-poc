@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +21,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
@@ -101,7 +104,7 @@ func TestServeRequiresFlags(t *testing.T) {
 		var out bytes.Buffer
 		return execute(context.Background(), args, strings.NewReader(""), &out, testDeps(t)), out.String()
 	}
-	for _, flag := range []string{"--env", "--envd-id", "--spec-key-file", "--cell-node"} {
+	for _, flag := range []string{"--env", "--envd-id", "--spec-key-file"} {
 		t.Run("missing"+flag, func(t *testing.T) {
 			var args []string
 			for i := 0; i < len(full); i++ {
@@ -164,12 +167,17 @@ type running struct {
 
 func startServe(t *testing.T) *running {
 	t.Helper()
+	return startServeWith(t, func(dir, key string) []string { return serveArgs(dir, key) })
+}
+
+func startServeWith(t *testing.T, args func(dir, key string) []string) *running {
+	t.Helper()
 	dir := shortDir(t)
 	key, _ := keyFile(t, dir)
 	out := &lockedBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{out: out, cancel: cancel, done: make(chan int, 1), dir: dir}
-	go func() { r.done <- execute(ctx, serveArgs(dir, key), strings.NewReader(""), out, testDeps(t)) }()
+	go func() { r.done <- execute(ctx, args(dir, key), strings.NewReader(""), out, testDeps(t)) }()
 	t.Cleanup(func() {
 		cancel()
 		select {
@@ -314,5 +322,45 @@ func TestListenAdminModes(t *testing.T) {
 	}
 	if got := syscall.Umask(0o022); got != 0o022 {
 		t.Fatalf("the process umask is %o after listenAdmin", got)
+	}
+}
+
+// Without any --cell-node, serve still runs. Every bind then gets source_mismatch.
+func TestCellgwServesWithZeroCells(t *testing.T) {
+	r := startServeWith(t, func(dir, key string) []string {
+		full := serveArgs(dir, key)
+		var args []string
+		for i := 0; i < len(full); i++ {
+			if full[i] == "--cell-node" {
+				i++
+				continue
+			}
+			args = append(args, full[i])
+		}
+		return args
+	})
+	resp, err := http.Get("http://" + r.fields["health"].(string) + "/healthz")
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("healthz: %v %v", resp, err)
+	}
+	resp.Body.Close()
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}}, ForceAttemptHTTP2: true}}
+	defer client.CloseIdleConnections()
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		resp, err := client.Post("https://"+r.fields["bind"].(string)+gwapi.BindPath(cell), "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("bind of %s: status %d, body %q", cell, resp.StatusCode, body)
+		}
+	}
+	// The body of a denial is the same for every reason, so the reason is read from the log.
+	logs := r.out.String()
+	if !strings.Contains(logs, `"reason":"`+gwapi.ReasonSourceMismatch+`"`) || strings.Contains(logs, `"reason":"`+gwapi.ReasonCellUnknown+`"`) {
+		t.Fatalf("bind_denied reasons: %s", logs)
 	}
 }
