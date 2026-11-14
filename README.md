@@ -395,7 +395,8 @@ The record of the cell then lists only the old keys. `mgmtd` finds the new key o
 - The periodic key check runs. It runs every 15 minutes for each cell.
 - An operator runs a key check.
 
-In the measured runs of 2026-11-15, `mgmtd` checked the keys 3 to 8 seconds after the first refusal, and a new pod was issued 40 to 87 seconds after it.
+In the measured runs of 2026-11-15, `mgmtd` checked the keys 3 to 8 seconds after the first refusal.
+The SPIRE server issued a new pod 40 to 112 seconds after it.
 Most of that time is the kubelet update of the ConfigMap that the SPIRE server mounts.
 If a pod is still refused after 5 minutes, check these in order:
 
@@ -419,20 +420,21 @@ The command runs these steps in order:
 1. It stages a next key with `rotate-key --stage`. `mgmtd` publishes the public half as key `next.pub` in ConfigMap `mgmt-signing-pub`. The signing key does not change.
 2. It waits until ConfigMap `mgmt-signing-pub` holds `next.pub`.
 3. It runs `cell:up` for each cluster with the `cell-identity` set. ConfigMap `mgmt-op-key` then holds the live key and the staged key, and each `celld` pod restarts with both.
-4. It commits with `rotate-key --commit`. `mgmtd` signs the spec, every record and every open operation again at the first counter of the next epoch, and publishes the new key as `spec.pub`.
+4. It commits with `rotate-key --commit`. `mgmtd` signs the spec, every record and every open operation again at the first counter of the next epoch. Then it publishes the new key as `spec.pub`.
 5. It waits until ConfigMap `mgmt-signing-pub` holds the new key.
 6. It runs `cell:up` for `dev-cp`, which renders the new key into `envd`, the cell gateway and the SPIRE server. Then it runs `cell:link` for `management`.
 7. It runs `cell:up` for each cluster with the `cell-identity` set again. `mgmt-op-key` then holds the new key alone.
-8. It runs `cell:verify` for `management` and for `dev-cp`.
+8. It waits until the rollout of `celld` has finished in each of those clusters. Then it runs `cell:verify` for `management` and for `dev-cp`.
 
-The steps took 5 minutes 30 seconds in the measured run of 2026-11-15: 1 second for the stage, 98 seconds for the first cell pass, 1 second for the commit, 129 seconds for the planes and 96 seconds for the second cell pass.
-The two `cell:verify` runs add a few minutes.
-It prints one JSON line with the SHA-256 fingerprint of the old key, of the new key, the new epoch and the run time in seconds.
+The steps took 5 minutes 30 seconds in the measured run of 2026-11-15.
+The stage took 1 second and the first cell pass 98 seconds. The commit took 1 second, the planes 129 seconds and the second cell pass 96 seconds.
+The rollout wait and the two `cell:verify` runs add a few minutes.
+The command prints one JSON line with the SHA-256 fingerprint of the old key and of the new key, the new epoch and the run time in seconds.
 The line holds public key data only.
 A failure prints the commands that remain, from the failed step on, as text on standard error and in the JSON error line.
 Run them in the printed order.
 
-Between the commit (step 4) and the second cell pass (step 7), `cell:verify` of each cell fails.
+Between the commit (step 4) and the second cell pass (step 7), `cell:verify` of each cell fails in the check `check_op_key_pinned`.
 `mgmt-op-key` then holds the old `op.pub`, which is neither the live key nor a staged key.
 This is a planned state. If a person repairs a cell in that window, run `CELL=<cell> mise run cell:up`, which is also the fix.
 Do not rotate the signing key while a test runs that rotates a cell key. The servers of `cell-proxy` keep the last good registry from the commit until the link of step 6.
@@ -443,8 +445,9 @@ Each `cell:up` pass takes the replica field of `celld` back, so a pass restores 
 
 For an emergency, run `mise run mgmt -- rotate-signing-key --emergency`.
 It makes a new key at once, and it skips the stage and the first cell pass.
+`cell:verify` of each cell also fails in `check_op_key_pinned` between the `--emergency` rotation and its cell pass. The same `cell:up` fixes it.
 A bare `mise run mgmt -- rotate-key` and `rotate-key --emergency` discard a staged key. The file moves to `ed25519.next.key.stale-<unix>`, and `next.pub` leaves `mgmt-signing-pub`. Only `rotate-key --commit` promotes a staged key.
-A cell that has not rolled yet refuses an operation of the new key as `signature_invalid`. The gateway holds that operation for 5 minutes and offers it again, so it applies after the cell rolls.
+A cell that has not rolled yet refuses an operation of the new key as `signature_invalid`. The gateway holds that operation for 5 minutes and offers it again. The operation applies after the cell rolls.
 
 Between the restart of the SPIRE server and the first write of `envd` under the new key, the plugin holds no records.
 In that time a new pod cannot attest. Agents that already run still renew.
