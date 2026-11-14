@@ -86,20 +86,6 @@ func firstRefusalAt(t *testing.T, since time.Time, cell, kid string) time.Time {
 	return first
 }
 
-// freshCNIToken restarts istio-cni-node in the cell and waits for its rollout. The pod reads a projected token that the kubelet
-// replaces after 48 minutes. When that replacement falls into a rotation of the service account key, the new token is signed by the
-// test key. The repair then removes that key, the plugin gets Unauthorized, and no pod of the cell gets a sandbox until the pod
-// of istio-cni-node restarts. A fresh pod keeps its first token for longer than any test here lasts.
-func freshCNIToken(t *testing.T, cell string) {
-	t.Helper()
-	if _, err := kubectl(t, cell, "", "-n", "istio-system", "delete", "pod", "-l", "k8s-app=istio-cni-node", "--wait=true", "--timeout=120s"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := kubectl(t, cell, "", "-n", "istio-system", "rollout", "status", "daemonset/istio-cni-node", "--timeout=180s"); err != nil {
-		t.Fatalf("istio-cni-node in %s did not finish its rollout: %v", cell, err)
-	}
-}
-
 // waitControllerManager waits until kube-controller-manager of the cell is Ready and renews its leader lease. Each switch of the
 // service account key restarts the API server, and the controller manager can lose its lease and restart. Its restart backoff grows
 // to five minutes after many restarts, and in that time no Job creates a pod, so a probe Job would hang.

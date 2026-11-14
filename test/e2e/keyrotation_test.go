@@ -72,8 +72,8 @@ func TestM2KeyRotationDenied(t *testing.T) {
 }
 
 // rotateAPIKey adds a second service account key to the API server of a cell and signs new tokens with it, then waits until
-// the API server verifies both keys and signs with the new one, and until kube-controller-manager renews its lease again. A pod of
-// istio-cni-node restarts first (freshCNIToken). It returns the old and the new key ID. The cleanup runs repairAPIServer.
+// the API server verifies both keys and signs with the new one, and until kube-controller-manager renews its lease again. It returns
+// the old and the new key ID. The cleanup runs repairAPIServer.
 func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 	t.Helper()
 	oldKID, newKID, _ = rotateAPIKeyAt(t, cell, time.Time{})
@@ -90,7 +90,6 @@ func rotateAPIKeyAt(t *testing.T, cell string, gapFrom time.Time) (oldKID, newKI
 	if len(oldKIDs) != 1 {
 		t.Fatalf("the API server of %s verifies keys %v, want one key before the test", cell, oldKIDs)
 	}
-	freshCNIToken(t, cell)
 	manifest, err := dockerExec(t, node, "", "cat", apiserverManifest)
 	if err != nil {
 		t.Fatal(err)
