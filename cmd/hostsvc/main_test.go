@@ -374,7 +374,10 @@ func TestServeStepFlags(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			var out strings.Builder
 			full := append([]string{"serve", "--listen", "127.0.0.1:0", "--client-bundle", good, "--topology", topologyFile}, args...)
-			if code := execute(context.Background(), full, &out); code == 0 {
+			// A serve that wrongly starts stops at the timeout with exit 0, so the row fails.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			if code := execute(ctx, full, &out); code == 0 {
 				t.Fatal("serve started")
 			}
 			if l := jsonLines(t, out.String()); len(l) != 1 || l[0]["error"] == nil {

@@ -1278,7 +1278,12 @@ func TestActorJournalWriteFailureBacksOff(t *testing.T) {
 	ae.mu.Unlock()
 	logged := strings.Count(ae.logs.String(), `"journal_write_failed"`)
 	if runs != 0 || logged != 1 {
-		t.Errorf("with a read-only journal: %d stage starts and %d journal_write_failed lines in 0.9 s, want 0 and 1 (back-off, one line)", runs, logged)
+		t.Errorf("with a read-only journal: %d stage starts and %d journal_write_failed lines in 0.9 s, want 0 and 1 (one line)", runs, logged)
+	}
+	// Each try of the step runs the digest once: with a back-off of 100 ms, doubling, a try comes
+	// at about 0, 100, 300 and 700 ms.
+	if n := ae.digests.Load(); n > 6 {
+		t.Errorf("the actor tried the step %d times in 0.9 s, want a back-off (at most 6)", n)
 	}
 	if err := os.Chmod(dir, 0o755); err != nil {
 		t.Fatal(err)
