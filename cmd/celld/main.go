@@ -52,6 +52,9 @@ import (
 
 const (
 	serviceName = "celld"
+	// effectGrace is how long an effect may keep running after SIGTERM. It lies inside the 30 s
+	// termination grace period of the pod, and leaves time for the telemetry flush.
+	effectGrace = 5 * time.Second
 	// shutdownTimeout bounds the whole flush. Each provider has its own shorter timeout inside it.
 	shutdownTimeout = 15 * time.Second
 )
@@ -77,6 +80,8 @@ type deps struct {
 	kubeClient func() (kubernetes.Interface, error)
 	bindRun    func(ctx context.Context, cfg bind.Config) error
 	streamRun  func(ctx context.Context, cfg executor.StreamConfig) error
+	// effectGrace is how long an effect may run after the first signal. Zero takes effectGrace.
+	effectGrace time.Duration
 }
 
 // options are the settings that the flags and the environment give.
@@ -227,10 +232,19 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 	bundle := bind.FileBundle(opts.trustBundle, opts.gatewayID.TrustDomain())
 
 	bgCtx, stopBackground := context.WithCancel(ctx)
+	grace := d.effectGrace
+	if grace <= 0 {
+		grace = effectGrace
+	}
+	// An effect that runs at SIGTERM gets a few more seconds to finish and write its record.
+	effectCtx, stopEffect := context.WithCancel(context.WithoutCancel(ctx))
+	stopGrace := context.AfterFunc(bgCtx, func() { time.AfterFunc(grace, stopEffect) })
 	var background sync.WaitGroup
 	defer func() {
 		stopBackground()
 		background.Wait()
+		stopGrace()
+		stopEffect()
 	}()
 	background.Add(2)
 	go func() {
@@ -253,7 +267,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		cfg := executor.StreamConfig{
 			Cell: opts.cell, Upstream: opts.gateway, Log: tel.Log, Tracer: tel.Tracer,
 			TLS:         executor.StreamTLS(w, bundle, opts.gatewayID),
-			SVIDUpdates: w.signal, Tokens: tokens, Exec: exec,
+			SVIDUpdates: w.signal, Tokens: tokens, Exec: exec, EffectCtx: effectCtx,
 			Status: executor.NewStatus(opts.cell, opts.pod.name, opts.pod.uid, buildVersion(), w.expiry, exec),
 		}
 		if err := d.streamRun(bgCtx, cfg); err != nil && bgCtx.Err() == nil {

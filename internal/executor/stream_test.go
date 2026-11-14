@@ -907,3 +907,36 @@ func TestStreamResendBurstIsCapped(t *testing.T) {
 		}
 	})
 }
+
+// An effect runs on EffectCtx, so the end of the stream context does not cancel it, and its record is
+// written.
+func TestStreamEffectRunsOnItsOwnContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		effectCtx, endEffect := context.WithCancel(context.Background())
+		defer endEffect()
+		f := newFixture(t, func(c *StreamConfig) { c.EffectCtx = effectCtx })
+		started, release := make(chan struct{}), make(chan struct{})
+		var ctxErr error
+		f.exec.cfg.Kinds[testKind] = func(c context.Context, _ *Executor, _ op.Operation) error {
+			close(started)
+			<-release
+			ctxErr = c.Err()
+			return nil
+		}
+		l, id := f.lease("s1.1", fence(1, 5))
+		f.g.offer(l)
+		f.start()
+		<-started
+		f.cancel()
+		time.Sleep(time.Second)
+		close(release)
+		<-f.done
+		f.g.close()
+		if ctxErr != nil {
+			t.Fatalf("the effect context ended with the stream: %v", ctxErr)
+		}
+		if rec := f.rig.record(id); rec.State != stateApplied {
+			t.Fatalf("record state %q, want applied", rec.State)
+		}
+	})
+}

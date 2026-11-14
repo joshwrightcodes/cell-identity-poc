@@ -66,7 +66,11 @@ type StreamConfig struct {
 	SVIDUpdates <-chan struct{}
 	Tokens      satoken.TokenFunc
 	Exec        *Executor
-	Status      func() op.Status
+	// EffectCtx is the context of each Execute call. A nil value takes the context of RunStream. A
+	// caller can pass a context that ends a few seconds after the one of RunStream, so that an
+	// effect that runs at shutdown has time to finish.
+	EffectCtx context.Context
+	Status    func() op.Status
 
 	MinBackoff, MaxBackoff, ClaimEvery, StatusEvery, ResendEvery, AckTimeout, PongTimeout time.Duration
 	ClaimsPerSecond                                                                       float64

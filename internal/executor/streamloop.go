@@ -208,7 +208,11 @@ func (l *loop) handle(f gwapi.Frame) error {
 			return nil
 		}
 		l.executing = true
-		go func() { l.exec <- execOutcome{res: c.Exec.Execute(l.parent, f.Envelope, f.Fence), leaseID: f.LeaseID} }()
+		ectx := c.EffectCtx
+		if ectx == nil {
+			ectx = l.parent
+		}
+		go func() { l.exec <- execOutcome{res: c.Exec.Execute(ectx, f.Envelope, f.Fence), leaseID: f.LeaseID} }()
 	case gwapi.TypeNone:
 		l.claimInFlight = false
 		l.claimDue = time.Time{}

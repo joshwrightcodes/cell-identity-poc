@@ -904,3 +904,35 @@ func TestSVIDAgainAfterAGap(t *testing.T) {
 		})
 	}
 }
+
+// An effect that runs at SIGTERM keeps its context for the grace period, and then loses it.
+func TestEffectContextOutlivesTheSignalBriefly(t *testing.T) {
+	d := testDeps(testTelemetry(discard()))
+	d.effectGrace = 300 * time.Millisecond
+	var openAtSignal, closedAfterGrace atomic.Bool
+	d.streamRun = func(ctx context.Context, cfg executor.StreamConfig) error {
+		<-ctx.Done()
+		openAtSignal.Store(cfg.EffectCtx != nil && cfg.EffectCtx.Err() == nil)
+		select {
+		case <-cfg.EffectCtx.Done():
+			closedAfterGrace.Store(true)
+		case <-time.After(5 * time.Second):
+		}
+		return ctx.Err()
+	}
+	_, addr := serveWorkloadAPI(t)
+	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
+	ctx, cancel := context.WithCancel(t.Context())
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, validArgs(t), out, d) }()
+	waitForLines(t, out, "watching the workload api", 1)
+	cancel()
+	<-done
+	if !openAtSignal.Load() {
+		t.Fatal("the effect context ended with the signal")
+	}
+	if !closedAfterGrace.Load() {
+		t.Fatal("the effect context did not end after the grace period")
+	}
+}
