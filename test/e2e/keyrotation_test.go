@@ -76,6 +76,15 @@ func TestM2KeyRotationDenied(t *testing.T) {
 // istio-cni-node restarts first (freshCNIToken). It returns the old and the new key ID. The cleanup runs repairAPIServer.
 func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 	t.Helper()
+	oldKID, newKID, _ = rotateAPIKeyAt(t, cell, time.Time{})
+	return oldKID, newKID
+}
+
+// rotateAPIKeyAt is rotateAPIKey with two additions. It waits before the switch until the update gap of mgmtd has passed since
+// gapFrom (the time of a key check), so the wait overlaps the restart of istio-cni-node and the other set-up. A zero gapFrom does not
+// wait. It also returns the time of the switch, which is the moment that the bounds of the healing tests count from.
+func rotateAPIKeyAt(t *testing.T, cell string, gapFrom time.Time) (oldKID, newKID string, switchedAt time.Time) {
+	t.Helper()
 	node := cell + "-control-plane"
 	oldKIDs := apiKIDs(t, cell)
 	if len(oldKIDs) != 1 {
@@ -101,7 +110,11 @@ func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 		testKeyPath+".key 2>/dev/null && openssl pkey -in "+testKeyPath+".key -pubout -out "+testKeyPath+".pub"); err != nil {
 		t.Fatalf("make the second key on %s: %v", node, err)
 	}
+	if !gapFrom.IsZero() {
+		waitUpdateGap(t, gapFrom)
+	}
 	writeNodeFile(t, node, apiserverManifest, edited)
+	switchedAt = time.Now()
 	waitFor(t, "the API server of "+cell+" to verify two keys and sign with the new one", apiserverWait, func() (bool, string) {
 		kids, err := apiKIDsOnce(t, cell)
 		if err != nil {
@@ -116,7 +129,7 @@ func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 			fmt.Sprintf("keys %v, signing key %s", kids, signing)
 	})
 	waitControllerManager(t, cell)
-	return oldKIDs[0], newKID
+	return oldKIDs[0], newKID, switchedAt
 }
 
 // addSigningKey adds the test public key as a second verification key, and makes the test private

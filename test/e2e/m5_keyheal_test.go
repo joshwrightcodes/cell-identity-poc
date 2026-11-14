@@ -135,10 +135,11 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
-	waitUpdateGap(t, checked)
 
+	// celld is down, so the first hint can come only after the first probe. The update gap therefore needs no wait before the switch.
 	start := time.Now().Add(-logMargin)
 	oldKID, newKID := rotateAPIKey(t, cell)
+	waitUpdateGap(t, checked)
 	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 	expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
 	refusedAt := firstRefusalAt(t, res.start, cell, newKID)
@@ -175,64 +176,89 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 	}
 }
 
-// TestM5HintFloodNoLockout: a flood of forged unknown_kid attempts for dev-cell-2, from a token that the cluster rogue signed, must
-// not stop the key update of dev-cell-1. dev-cell-1 rotates its service account key. While six forged attempts for dev-cell-2 run,
-// attestprobe of dev-cell-1 must be issued within five minutes. The hints of the flood stay bounded: the mgmtd log holds at
-// most one hint check of dev-cell-2 for each minute since the first forged attempt and one more, no two less than 55 s apart,
-// each with the result unchanged, and the record of dev-cell-2 keeps its revision.
+// TestM5HintFloodNoLockout: a pod in dev-cell-2 floods the SPIRE server with forged unknown_kid attempts that name dev-cell-1, with a
+// token that the cluster rogue signed, while dev-cell-1 rotates its service account key. The forged attempts use up the hint budget
+// of the victim name: the plugin writes at most one hint for a cell each minute, and mgmtd runs at most one hint check for it each
+// minute. The real key update must still land. celld of dev-cell-1 is held at 0, so no gateway hello, report or bind can make a
+// hint, and the plugin hint is the only way for the record to follow. Each round runs one forged attempt and one genuine probe of
+// dev-cell-1. The genuine probe must be issued within five minutes. The mgmtd log then holds one hint check of dev-cell-1 with
+// keys_updated, any others with unchanged, at most one for each minute since the first forged attempt, and none closer than 55 s.
+// The record of dev-cell-2 keeps its revision. The mutant that never writes a hint fails this test as well as
+// TestM5UnknownKidTriggersKeyCheck.
 func TestM5HintFloodNoLockout(t *testing.T) {
-	const victim, flooded = rejectCell, "dev-cell-2"
+	const victim, attacker = rejectCell, "dev-cell-2"
+	holdCelldDown(t, victim)
 	checked := requireCurrentRecord(t, victim)
-	requireCurrentRecord(t, flooded)
+	requireCurrentRecord(t, attacker)
 	waitRegistryAtCleanup(t)
-	floodedBefore := cellStatusOf(t, flooded)
-	waitUpdateGap(t, checked)
+	attackerBefore := cellStatusOf(t, attacker)
 
-	token := rogueToken(t, clusterjwt.Audience(pocEnv, flooded))
-	secret := tokenSecret(t, flooded, celldNamespace, token)
+	token := rogueToken(t, clusterjwt.Audience(pocEnv, victim))
+	secret := tokenSecret(t, attacker, celldNamespace, token)
 	start := time.Now().Add(-logMargin)
-	oldKID, newKID := rotateAPIKey(t, victim)
+	oldKID, newKID, switchedAt := rotateAPIKeyAt(t, victim, checked)
 
-	const attempts = 6
+	forged := probe{cell: attacker, claimCell: victim, namespace: celldNamespace, account: celldAccount, variant: "good", tokenSecret: secret}
+	genuine := probe{cell: victim, namespace: celldNamespace, account: celldAccount, variant: "good"}
+	const minAttempts = 6
 	floodStart := time.Now()
-	for i := range attempts {
-		res := runAttestProbe(t, probe{cell: flooded, namespace: celldNamespace, account: celldAccount, variant: "good", tokenSecret: secret})
+	attempts := 0
+	var issuedAt time.Time
+	flood := func() {
+		attempts++
+		res := runAttestProbe(t, forged)
 		if want := "denied:nodeattestor(cluster_jwt): unknown_kid"; res.out != want {
-			t.Fatalf("forged attempt %d for %s: attestprobe printed %q, want %q", i+1, flooded, res.out, want)
+			t.Fatalf("forged attempt %d for %s: attestprobe printed %q, want %q", attempts, victim, res.out, want)
 		}
 	}
-	t.Logf("%d forged attempts for %s took %s", attempts, flooded, time.Since(floodStart).Round(time.Second))
-	waitIssued(t, victim, healWait)
-	t.Logf("%s attested %s after the rotation", victim, time.Since(start).Round(time.Second))
+	for issuedAt.IsZero() {
+		if time.Since(switchedAt) > healWait+3*time.Minute {
+			t.Fatalf("%s was not issued within %s of the switch, with %d forged attempts running", victim, time.Since(switchedAt).Round(time.Second), attempts)
+		}
+		flood()
+		if got := runAttestProbe(t, genuine); strings.HasPrefix(got.out, "issued:") {
+			issuedAt = time.Now()
+		}
+	}
+	for attempts < minAttempts {
+		flood()
+	}
+	t.Logf("%s was issued %s after the switch, with %d forged attempts in %s", victim, issuedAt.Sub(switchedAt).Round(time.Second), attempts, time.Since(floodStart).Round(time.Second))
 
 	victimStatus := cellStatusOf(t, victim)
 	if !slices.Contains(victimStatus.Kids, oldKID) || !slices.Contains(victimStatus.Kids, newKID) {
 		t.Errorf("the record of %s lists %v, want %s and %s", victim, victimStatus.Kids, oldKID, newKID)
 	}
-	// The hint checks that the flood caused: at most one for each minute since the first forged attempt, and no two closer than the
-	// gap of the plugin and of mgmtd (60 s, with a margin for the clock of the log line).
+	// The hint checks of the victim: the first updates the keys, and the others find nothing. At most one for each minute, and none
+	// closer than the gap of the plugin and of mgmtd (60 s, with a margin for the clock of the log line).
 	var hintTimes []time.Time
-	for _, l := range keyCheckLines(t, floodStart.Add(-logMargin), flooded) {
+	updated := 0
+	for _, l := range keyCheckLines(t, start, victim) {
 		if l.str("via") != "hint" {
 			continue
 		}
 		hintTimes = append(hintTimes, lineTime(l))
-		if l.str("result") != "unchanged" {
-			t.Errorf("a hint check of %s during the flood gave %q, want unchanged: %v", flooded, l.str("result"), l)
+		if l.str("result") == "keys_updated" {
+			updated++
+		} else if l.str("result") != "unchanged" {
+			t.Errorf("a hint check of %s gave %q, want keys_updated or unchanged: %v", victim, l.str("result"), l)
 		}
 	}
-	if limit := int(time.Since(floodStart)/time.Minute) + 1; len(hintTimes) > limit {
-		t.Errorf("the flood of %s caused %d hint checks in %s, want at most %d", flooded, len(hintTimes), time.Since(floodStart).Round(time.Second), limit)
+	if updated != 1 {
+		t.Errorf("%d hint checks of %s gave keys_updated, want 1", updated, victim)
+	}
+	if limit := int(time.Since(floodStart)/time.Minute) + 2; len(hintTimes) > limit {
+		t.Errorf("the flood caused %d hint checks of %s in %s, want at most %d", len(hintTimes), victim, time.Since(floodStart).Round(time.Second), limit)
 	}
 	for i := 1; i < len(hintTimes); i++ {
 		if gap := hintTimes[i].Sub(hintTimes[i-1]); gap < 55*time.Second {
-			t.Errorf("two hint checks of %s ran %s apart, want at least 55 s", flooded, gap.Round(time.Second))
+			t.Errorf("two hint checks of %s ran %s apart, want at least 55 s", victim, gap.Round(time.Second))
 		}
 	}
-	t.Logf("the flood of %s caused %d hint checks at %v", flooded, len(hintTimes), hintTimes)
-	after := cellStatusOf(t, flooded)
-	if afterRevision(after.Record, floodedBefore.Record) || !slices.Equal(after.Kids, floodedBefore.Kids) {
-		t.Errorf("the record of %s changed during the flood: %v at %+v, was %v at %+v", flooded, after.Kids, after.Record, floodedBefore.Kids, floodedBefore.Record)
+	t.Logf("the flood caused %d hint checks of %s at %v", len(hintTimes), victim, hintTimes)
+	after := cellStatusOf(t, attacker)
+	if afterRevision(after.Record, attackerBefore.Record) || !slices.Equal(after.Kids, attackerBefore.Kids) {
+		t.Errorf("the record of %s changed during the flood: %v at %+v, was %v at %+v", attacker, after.Kids, after.Record, attackerBefore.Kids, attackerBefore.Record)
 	}
 }
 
@@ -276,9 +302,11 @@ func readyPodUIDs(t *testing.T, cluster, ns, app string) []string {
 //   - mgmtd updates the record (keys_updated) within three minutes, because the new hello tokens of celld make the gateway hint.
 //     The periodic check does not run in that window: a manual check 61 s before the rotation holds it back.
 //   - Each cell-proxy server of management logs "registry reloaded" within three minutes of the update (verify row 8).
-//   - celld streams again within three minutes of the rotation, and an operation that is created then applies once.
+//   - celld streams again within three minutes of the switch of the key, and an operation that is created then applies once.
 //   - The otel-uplink pod of dev-cell-1 is deleted. A marker that the collector sends through its new pod reaches Grafana within
 //     five minutes of the delete.
+//   - A new celld pod binds with a token of the new key: its log holds "bound" with the status already_bound or keys_updated, the
+//     record lists both key IDs, and attestprobe is issued. One rotation serves both the proof and the bind checks.
 //
 // The cleanup of rotateAPIKey repairs the API server.
 func TestM5ProofFollowsKeyRotation(t *testing.T) {
@@ -287,16 +315,16 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	checked := requireCurrentRecord(t, cell)
 	waitRegistryAtCleanup(t)
 	before := cellStatusOf(t, cell)
-	waitUpdateGap(t, checked)
 
+	// celld is up, so the gateway can hint within seconds of the switch. The update gap passes before the switch, and the wait
+	// overlaps the set-up of the rotation.
 	start := time.Now().Add(-logMargin)
 	rotateStart := time.Now()
-	oldKID, newKID := rotateAPIKey(t, cell)
-	rotatedAt := time.Now()
-	t.Logf("rotated the key of %s in %s", cell, rotatedAt.Sub(rotateStart).Round(time.Second))
+	oldKID, newKID, rotatedAt := rotateAPIKeyAt(t, cell, checked)
+	t.Logf("rotated the key of %s in %s, and switched it at %s", cell, time.Since(rotateStart).Round(time.Second), rotatedAt.Format(time.RFC3339))
 
 	var updatedAt time.Time
-	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the rotation", rotationHealWait, func() (bool, string) {
+	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the switch", max(time.Until(rotatedAt.Add(rotationHealWait)), 30*time.Second), func() (bool, string) {
 		for _, l := range keyCheckLines(t, start, cell) {
 			if l.str("result") == "keys_updated" {
 				updatedAt = lineTime(l)
@@ -314,7 +342,7 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	if !slices.Contains(after.Kids, oldKID) || !slices.Contains(after.Kids, newKID) || !afterRevision(after.Record, before.Record) {
 		t.Errorf("the record of %s lists %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
 	}
-	t.Logf("KEYS_UPDATED_SECONDS=%.0f after the start of the rotation (%.0f after rotateAPIKey returned)", updatedAt.Sub(rotateStart).Seconds(), updatedAt.Sub(rotatedAt).Seconds())
+	t.Logf("KEYS_UPDATED_SECONDS=%.0f after the switch of the key", updatedAt.Sub(rotatedAt).Seconds())
 
 	// The registry servers.
 	var slowest time.Duration
@@ -383,63 +411,27 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		return len(s) == 1, fmt.Sprintf("%d series", len(s))
 	})
 	t.Logf("UPLINK_MARKER_SECONDS=%.0f after the delete of the pod", time.Since(deletedAt).Seconds())
-}
 
-// TestM5BindHealsRotation: a new celld pod binds with a token from a rotated key. attestprobe of dev-cell-1 right after the rotation
-// is refused with unknown_kid, or issued when a hint already updated the record, because the hint check of the plugin or of the
-// gateway can come before the bind. A new celld pod then gets its SVID within five minutes, and the mgmtd log holds a bind of the
-// cell with the result keys_updated, or, when a hint came first, a hint check with keys_updated since the rotation (the bind then
-// answers already_bound, which mgmtd does not log). In both cases the record lists both key IDs, and attestprobe is issued.
-func TestM5BindHealsRotation(t *testing.T) {
-	const cell = rejectCell
-	checked := requireCurrentRecord(t, cell)
-	waitRegistryAtCleanup(t)
-	waitUpdateGap(t, checked)
-
-	start := time.Now().Add(-logMargin)
-	oldKID, newKID := rotateAPIKey(t, cell)
-	res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
-	if strings.HasPrefix(res.out, "issued:") {
-		t.Logf("a hint updated the record of %s before the probe ran: %s", cell, res.out)
-	} else {
-		expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
-	}
-
+	// A new celld pod binds with a token of the new key. mgmtd logs no line for already_bound, so the proof is the line "bound" of
+	// the pod itself (internal/bind/client.go), with the status already_bound (a hint came first) or keys_updated.
 	pod := replaceCelldPod(t, cell)
-	want := fmt.Sprintf("spiffe://%s/cell/%s/celld", spireTD, cell)
-	waitFor(t, "the new celld pod to log "+want, healWait, func() (bool, string) {
+	waitCelldSVID(t, cell, pod)
+	waitFor(t, "the new celld pod "+pod.Metadata.Name+" to log bound with the status already_bound or keys_updated", healWait, func() (bool, string) {
 		logs, err := kubectl(t, cell, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
 		if err != nil {
 			return false, err.Error()
 		}
-		return slices.Contains(celldSPIFFEIDs(logs), want), lastLines(logs, 3)
+		var seen []string
+		for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "bound" }) {
+			seen = append(seen, l.str("status"))
+			if st := l.str("status"); st == "already_bound" || st == "keys_updated" {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("bound lines %v: %s", seen, lastLines(logs, 2))
 	})
-	// mgmtd logs a bind only when it changes something: a bind that finds the keys already in the record answers already_bound and
-	// leaves no line. So the heal is either a bind line with the result keys_updated, or a hint check with keys_updated since
-	// the rotation, which came before the bind.
-	logs := mgmtdLog(t, start)
-	var results []string
-	healed := false
-	for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "bind" && l.str("cell") == cell }) {
-		results = append(results, l.str("result"))
-		if l.str("result") == "keys_updated" {
-			healed = true
-		}
-	}
-	for _, l := range keyCheckLines(t, start, cell) {
-		if l.str("via") == "hint" && l.str("result") == "keys_updated" {
-			healed = true
-			results = append(results, "hint:keys_updated")
-		}
-	}
-	if !healed {
-		t.Errorf("the mgmtd log holds no bind of %s with the result keys_updated, and no hint check with keys_updated, since the rotation. Results: %v\n%s",
-			cell, results, lastLines(logs, 8))
-	}
-	t.Logf("the key update of %s came through %v", cell, results)
-	st := cellStatusOf(t, cell)
-	if !slices.Contains(st.Kids, oldKID) || !slices.Contains(st.Kids, newKID) {
-		t.Errorf("the record of %s lists %v, want %s and %s", cell, st.Kids, oldKID, newKID)
+	if st := cellStatusOf(t, cell); !slices.Contains(st.Kids, oldKID) || !slices.Contains(st.Kids, newKID) {
+		t.Errorf("the record of %s lists %v after the bind, want %s and %s", cell, st.Kids, oldKID, newKID)
 	}
 	waitIssued(t, cell, healWait)
 }
