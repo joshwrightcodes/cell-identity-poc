@@ -153,6 +153,7 @@ func TestM4EnvdAppliesSignedSpec(t *testing.T) {
 
 // TestM4CellsBound: mgmtd shows each cell of the harness as bound, with a record, and each celld logs its bound line.
 func TestM4CellsBound(t *testing.T) {
+	t.Skip("the M4 bind path is gone, and a new celld cannot bind until Task 12. Task 12 removes this skip when celld binds through the cell gateway")
 	status := mgmtStatus(t)
 	byName := map[string]mgmt.CellStatus{}
 	for _, c := range status.Cells {

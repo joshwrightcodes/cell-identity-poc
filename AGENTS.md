@@ -53,6 +53,10 @@
 | Run the M4 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m4` |
 | Rotate the signing key of `mgmtd` and print the attestation gap. Run it alone, after `gate:m4` | `mise run gate:m4:rotate` |
 | Start the host service again, set the replicas of `mgmtd` and `envd` back to 1 and link the registries again (`--check` only reports) | `mise run gate:m4:repair` |
+| Run `cellgw ctl` in `cell-gateway-0` of `dev-cp`: `status`, `queue --cell <cell>`, `outbox`, `enqueue` or `inject` (see README "Cell gateway") | `mise run gw -- status` |
+| Start the cell gateway with an empty store when its store is lost, corrupt or full (break-glass) | `mise run gw:reset` |
+| Run the M5 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m5` |
+| Set the replicas of the cell gateway back to 1, delete the test namespaces `m5-*` and run `gate:m4:repair` (`--check` only reports) | `mise run gate:m5:repair` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References
