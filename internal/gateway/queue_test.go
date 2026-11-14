@@ -642,3 +642,49 @@ func TestEnqueueReplayAcceptsEnvelopeOfAnotherCell(t *testing.T) {
 		t.Fatalf("the other cell has depth %d", d)
 	}
 }
+
+// A row that the cell never verifies is held MaxForgedHolds times, and then it is done.
+func TestForgedHoldEndsAfterTheLimit(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	for i := 1; i <= MaxForgedHolds; i++ {
+		l, _ := f.s.Claim(ctx, cell1, "pod")
+		if l == nil {
+			t.Fatalf("claim %d gave nothing", i)
+		}
+		if _, err := f.s.CompleteWithItem(ctx, cell1, l.ID, resultItem(cell1, ""), l.Fence); err != nil {
+			t.Fatal(err)
+		}
+		wantOpen := i < MaxForgedHolds
+		if d, _ := f.s.Depth(ctx, cell1); (d == 1) != wantOpen {
+			t.Fatalf("after result %d depth is %d, want open %v", i, d, wantOpen)
+		}
+		f.clk.Advance(ForgedHold + time.Second)
+	}
+	if l, _ := f.s.Claim(ctx, cell1, "pod"); l != nil {
+		t.Fatalf("a row that ended is claimable: %+v", l)
+	}
+}
+
+// A row that verifies on its second claim applies and ends.
+func TestForgedHoldRowThatVerifiesOnHoldTwoApplies(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	f.enqueue(1, cell1)
+	l, _ := f.s.Claim(ctx, cell1, "pod")
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l.ID, resultItem(cell1, ""), l.Fence); err != nil {
+		t.Fatal(err)
+	}
+	f.clk.Advance(ForgedHold + time.Second)
+	l2, _ := f.s.Claim(ctx, cell1, "pod")
+	if l2 == nil || l2.OpID != l.OpID {
+		t.Fatalf("second claim %+v", l2)
+	}
+	if _, err := f.s.CompleteWithItem(ctx, cell1, l2.ID, resultItem(cell1, l2.OpID), l2.Fence); err != nil {
+		t.Fatal(err)
+	}
+	if d, _ := f.s.Depth(ctx, cell1); d != 0 {
+		t.Fatal("the applied row is still open")
+	}
+}

@@ -186,9 +186,15 @@ func (s *Store) claim(ctx context.Context, cell, holder string, requireLive bool
 // ForgedHold is how long the row of a lease stays out of reach after a result with an empty
 // operation ID. Such a result means that the cell could not verify the envelope, for example because
 // a key rotation signed it with a key that the cell does not pin yet. The row stays open, so the
-// envelope is delivered again when the cell trusts the key, and a planted envelope costs one claim in
-// each hold.
+// envelope is delivered again when the cell trusts the key. After MaxForgedHolds claims the row is
+// marked done, so a row that the cell can never verify does not stay for ever. A planted envelope
+// costs one claim in each hold until then.
 const ForgedHold = 5 * time.Minute
+
+// MaxForgedHolds is the number of claims after which an empty-op-ID result ends the row.
+// With ForgedHold this is 30 min. The gateway does not read the expiry of the operation, because
+// op.Peek does not return it.
+const MaxForgedHolds = 6
 
 // CompleteWithItem appends the result item and finds the queue row by leaseID, never by it.OpID.
 // It marks the row done when f is at or above the lease fence of the row. When it.OpID is empty it
@@ -220,8 +226,9 @@ func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it g
 		var until int64
 		var done bool
 		var rowOp string
-		err = tx.QueryRow(`SELECT fence_epoch, fence_counter, lease_until, done, op_id FROM queue WHERE seq = ? AND cell = ?`, seq, cell).
-			Scan(&cur.Epoch, &cur.Counter, &until, &done, &rowOp)
+		var claims int
+		err = tx.QueryRow(`SELECT fence_epoch, fence_counter, lease_until, done, op_id, claims FROM queue WHERE seq = ? AND cell = ?`, seq, cell).
+			Scan(&cur.Epoch, &cur.Counter, &until, &done, &rowOp, &claims)
 		if errors.Is(err, sql.ErrNoRows) || (err == nil && done) {
 			return nil
 		}
@@ -236,7 +243,7 @@ func (s *Store) CompleteWithItem(ctx context.Context, cell, leaseID string, it g
 			lost = true
 			return nil
 		}
-		if it.OpID == "" {
+		if it.OpID == "" && claims < MaxForgedHolds {
 			_, err = tx.Exec(`UPDATE queue SET lease_until = ? WHERE seq = ?`, s.now().Add(ForgedHold).UnixNano(), seq)
 			return err
 		}
