@@ -975,7 +975,9 @@ func TestRoundLogsItemWithoutOutcome(t *testing.T) {
 func TestHintsFromGatewayKeptWhenTheStatusPostFails(t *testing.T) {
 	t0 := time.Date(2026, 11, 12, 8, 0, 0, 0, time.UTC)
 	r := newRig(t, 3)
-	r.gw.set(func(g *fakeGateway) { g.status = mgmtapi.GatewayStatus{KeyHints: []mgmtapi.KeyHint{{Cell: "dev-cell-1", At: t0}}} })
+	r.gw.set(func(g *fakeGateway) {
+		g.status = mgmtapi.GatewayStatus{KeyHints: []mgmtapi.KeyHint{{Cell: "dev-cell-1", At: t0}}}
+	})
 	r.mgmt.set(func(m *fakeMgmt) { m.statCode = 500 })
 	sleep := r.cfg.Sleep
 	r.cfg.Sleep = func(ctx context.Context, d time.Duration) error {
