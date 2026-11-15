@@ -560,6 +560,33 @@ func TestStreamStatusEvery30s(t *testing.T) {
 	})
 }
 
+// With a 1 m SVID the stream ends after about 27 s. A status deadline that starts again with each stream never fires, so the
+// deadline must outlive the stream: the status gap stays within StatusEvery plus the spread across streams of 20 s.
+func TestStreamStatusDeadlineSurvivesNewStreams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		f.start()
+		for range 9 {
+			time.Sleep(20 * time.Second)
+			f.updates <- struct{}{}
+		}
+		time.Sleep(5 * time.Second)
+		if n := streamsStarted(f); n < 8 {
+			t.Fatalf("%d streams started, want one for each SVID update", n)
+		}
+		st := f.g.frames(gwapi.TypeStatus)
+		if len(st) < 5 {
+			t.Fatalf("%d status frames in 3 minutes over streams of 20 s, want at least 5", len(st))
+		}
+		for i := 1; i < len(st); i++ {
+			if gap := st[i].at.Sub(st[i-1].at); gap > 37*time.Second {
+				t.Fatalf("status gap %v between status %d and %d, want at most 30 s plus 20%% spread plus a reconnect", gap, i-1, i)
+			}
+		}
+	})
+}
+
 func TestStreamLogCarriesTraceID(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		var out syncBuf

@@ -82,6 +82,9 @@ type StreamConfig struct {
 	Rand   func() float64
 
 	resent *resendLog
+	// status holds the next status deadline across streams. A stream ends about every half life of the SVID, which can be shorter than
+	// StatusEvery, so a deadline that restarted with each stream would never fire.
+	status *statusClock
 	dial   func(ctx context.Context, network, addr string) (net.Conn, error)
 	// pingEvery is the application ping interval of a test. Zero takes the 10 s default.
 	pingEvery time.Duration
@@ -149,6 +152,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	}
 	if c.Rand == nil {
 		c.Rand = rand.Float64
+	}
+	if c.status == nil {
+		c.status = &statusClock{}
 	}
 	if c.resent == nil {
 		c.resent = &resendLog{last: map[string]time.Time{}}
@@ -411,4 +417,23 @@ func (r *resendLog) forget(opID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.last, opID)
+}
+
+// statusClock keeps the time of the next status for all streams of one StreamConfig.
+type statusClock struct {
+	mu   sync.Mutex
+	next time.Time
+}
+
+// get returns the next deadline, or the zero time before the first status.
+func (s *statusClock) get() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.next
+}
+
+func (s *statusClock) set(t time.Time) {
+	s.mu.Lock()
+	s.next = t
+	s.mu.Unlock()
 }

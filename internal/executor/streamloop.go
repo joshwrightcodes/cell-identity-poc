@@ -56,7 +56,11 @@ func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Deco
 	now := cfg.Now()
 	l.wantClaim = true
 	l.claimAt = now.Add(cfg.ClaimEvery)
-	l.statusAt = now.Add(cfg.statusWait())
+	// The deadline of the last stream carries over. A new stream sends a status at once when that deadline has passed.
+	if l.statusAt = cfg.status.get(); l.statusAt.IsZero() {
+		l.statusAt = now.Add(cfg.statusWait())
+		cfg.status.set(l.statusAt)
+	}
 	l.resendAt = now // a new stream sends every result that is still unreported
 	l.pingAt = now.Add(cfg.pingEvery)
 	l.wg.Add(1)
@@ -164,6 +168,7 @@ func (l *loop) fire(now time.Time) error {
 	}
 	if !now.Before(l.statusAt) {
 		l.statusAt = now.Add(c.statusWait())
+		c.status.set(l.statusAt)
 		if err := l.sendStatus(); err != nil {
 			return err
 		}
