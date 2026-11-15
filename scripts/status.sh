@@ -211,14 +211,20 @@ gateway_problems() {
 management_extras() {
   local logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
 
-  # The principal lists an agent as connected until its last stream line closes the stream.
+  # The principal lists an agent as connected until its last stream line closes the stream. The kubelet rotates the log after
+  # about 10 hours, and the connect line goes with it. An agent with no stream line in the log counts as connected when the
+  # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
   expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  agents="$(jq -Rsc --argjson expected "$expected" '[split("\n")[] | fromjson? | select(type == "object" and .client != null
-      and (.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream"))]
-    | group_by(.client) | map({client: .[0].client, up: (.[-1].msg != "Closing EventStream")}) as $last
-    | ([$last[] | select(.up) | .client] | sort) as $up
-    | {expected: $expected, connected: ($expected - ($expected - $up)), missing: ($expected - $up)}' <<<"$logs")"
+  agents="$(jq -Rsc --argjson expected "$expected" '
+      def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+      [split("\n")[] | fromjson? | select(type == "object" and .client != null)] as $lines
+      | [$lines[] | select(.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream")]
+      | group_by(.client) | map({client: .[0].client, up: (.[-1].msg != "Closing EventStream")}) as $last
+      | ([$last[].client]) as $seen
+      | ([$lines[] | select((.msg // "" | startswith("Event received")) and ((.time // "") | ts) > (now - 300)) | .client] | unique) as $active
+      | ([$last[] | select(.up) | .client] + ($active - $seen) | unique | sort) as $up
+      | {expected: $expected, connected: ($expected - ($expected - $up)), missing: ($expected - $up)}' <<<"$logs")"
 
   # The age of the newest sample of each cluster in the Prometheus of lgtm.
   samples="$(kubectl --context kind-management -n observability-system exec lgtm-0 -c lgtm -- curl -s --max-time 20 \

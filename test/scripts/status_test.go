@@ -380,6 +380,41 @@ func TestStatusHealthyShape(t *testing.T) {
 	}
 }
 
+// TestStatusAgentsSurviveLogRotation checks the count of agent streams once the connect lines have left the log of the
+// principal (the kubelet rotates the log after about 10 hours). An agent with no stream line counts as connected when the
+// principal received an event from it in the last 5 minutes. A closing line that is newer than the connect line still wins.
+func TestStatusAgentsSurviveLogRotation(t *testing.T) {
+	event := func(client string, ago time.Duration) string {
+		return fmt.Sprintf(`{"client":%q,"msg":"Event received: application spec-update","time":%q}`, client, time.Now().Add(-ago).UTC().Format("2006-01-02T15:04:05Z"))
+	}
+	for _, tc := range []struct {
+		name        string
+		principal   string
+		wantMissing []string
+	}{
+		{"events from both agents and no stream line", event("dev-dev-cell-1", time.Minute) + "\n" + event("dev-dev-cell-2", 2*time.Minute), nil},
+		{"an event 20 minutes ago is no sign of a stream", event("dev-dev-cell-1", time.Minute) + "\n" + event("dev-dev-cell-2", 20*time.Minute), []string{"dev-dev-cell-2"}},
+		{"a closing line after a recent event wins", event("dev-dev-cell-1", time.Minute) + "\n" + event("dev-dev-cell-2", time.Minute) + "\n" +
+			`{"client":"dev-dev-cell-2","msg":"Closing EventStream"}`, []string{"dev-dev-cell-2"}},
+		{"no line at all", "", []string{"dev-dev-cell-1", "dev-dev-cell-2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			byName, _, _, code := runStatus(t, "STUB_PRINCIPAL="+tc.principal)
+			agents := byName["management"]["agents"].(map[string]any)
+			got := []string{}
+			if m, ok := agents["missing"].([]any); ok {
+				got = strs(m)
+			}
+			if !slices.Equal(got, append([]string{}, tc.wantMissing...)) && !(len(got) == 0 && len(tc.wantMissing) == 0) {
+				t.Errorf("missing %v, want %v", got, tc.wantMissing)
+			}
+			if (code == 0) != (len(tc.wantMissing) == 0) {
+				t.Errorf("exit %d with missing %v", code, tc.wantMissing)
+			}
+		})
+	}
+}
+
 func TestStatusReportsEachBadValue(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
