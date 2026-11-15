@@ -16,6 +16,17 @@ import (
 
 var residualPorts = []int{2379, 2380, 6443, 10250, 10256}
 
+// designPorts are the node ports that the design opens on dev-cp on purpose, with their owners. Each one is a residual in
+// docs/design/poc-scope.md. No other cluster opens one.
+var designPorts = map[string][]int{
+	"dev-cp": {
+		30081, // the SPIRE server API, which the agents of the cells dial (spire-server Service, cells/dev-cp.env)
+		30443, // relay-view, for the Argo CD agent to the principal (RELAY_VIEW_ROUTES)
+		30444, // relay-telemetry, for the OTLP uplink of the cells (RELAY_TELEMETRY_ROUTES)
+		30445, // relay-view, for the mesh view tunnel to Kiali (RELAY_VIEW_ROUTES)
+	},
+}
+
 var alwaysOpenPorts = []int{6443, 10250}
 
 const nodePortServer = 30090
@@ -40,13 +51,13 @@ func TestM1RogueReachesOnlyResidualPorts(t *testing.T) {
 			}
 			var extra []string
 			for _, p := range open {
-				if !slices.Contains(residualPorts, p) {
+				if !slices.Contains(residualPorts, p) && !slices.Contains(designPorts[target], p) {
 					extra = append(extra, fmt.Sprint(p))
 				}
 			}
 			if len(extra) > 0 {
-				t.Errorf("cluster %s: rogue reaches extra ports %s beyond the residual set %v",
-					target, strings.Join(extra, ", "), residualPorts)
+				t.Errorf("cluster %s: rogue reaches extra ports %s beyond the residual set %v and the design ports %v",
+					target, strings.Join(extra, ", "), residualPorts, designPorts[target])
 			}
 		})
 	}
