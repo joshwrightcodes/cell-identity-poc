@@ -258,3 +258,88 @@ func TestM4StatusShowsSpec(t *testing.T) {
 		}
 	}
 }
+
+// TestM5StatusShowsWork checks that harness:status reports signed work: the dev-cp object holds the gateway with an epoch that
+// equals cellgw ctl status, an open stream and a recent sync, and each bound cell of the management object holds a status that is
+// younger than two minutes. It reads the status again for up to the retry window, because a report can lag.
+func TestM5StatusShowsWork(t *testing.T) {
+	type object struct {
+		Cluster string `json:"cluster"`
+		Gateway struct {
+			Epoch          uint64         `json:"epoch"`
+			SyncedAt       time.Time      `json:"syncedAt"`
+			OutboxItems    int            `json:"outboxItems"`
+			Streams        map[string]int `json:"streams"`
+			StoreError     string         `json:"storeError"`
+			Error          string         `json:"error"`
+			EpochChangedAt time.Time      `json:"epochChangedAt"`
+		} `json:"gateway"`
+		Management struct {
+			Cells []struct {
+				Name         string    `json:"name"`
+				Bound        bool      `json:"bound"`
+				LastStatusAt time.Time `json:"lastStatusAt"`
+				Records      *int      `json:"records"`
+				OpenOps      *int      `json:"openOps"`
+				ExpiredOps   *int      `json:"expiredOps"`
+				ForgedSeen   *int      `json:"forgedSeen"`
+			} `json:"cells"`
+		} `json:"management"`
+	}
+	var (
+		objs   = map[string]object{}
+		stdout string
+		code   int
+	)
+	deadline := time.Now().Add(statusRetryWindow)
+	for attempt := 1; ; attempt++ {
+		_, stdout, code = statusOnce(t)
+		objs = map[string]object{}
+		for line := range strings.SplitSeq(strings.TrimSpace(stdout), "\n") {
+			var o object
+			if json.Unmarshal([]byte(line), &o) == nil {
+				objs[o.Cluster] = o
+			}
+		}
+		if code == 0 || time.Now().After(deadline) {
+			break
+		}
+		t.Logf("attempt %d: harness:status exited %d:\n%s", attempt, code, stdout)
+		time.Sleep(30 * time.Second)
+	}
+	if code != 0 {
+		t.Fatalf("harness:status exited %d, want 0:\n%s", code, stdout)
+	}
+	g := objs[spireCluster].Gateway
+	live := gwStatus(t)
+	if g.Error != "" || g.Epoch == 0 || g.Epoch != live.Epoch || g.StoreError != "" {
+		t.Errorf("gateway %+v, want the epoch %d of cellgw ctl status, no store error and no error", g, live.Epoch)
+	}
+	if g.SyncedAt.IsZero() || time.Since(g.SyncedAt) > 2*time.Minute+statusSampleMax {
+		t.Errorf("gateway syncedAt is %v, want a sync in the last 2 minutes", g.SyncedAt)
+	}
+	cells := clustersWith(t, agentCellSet)
+	for _, cell := range cells {
+		if g.Streams[cell] < 1 {
+			t.Errorf("gateway streams %v hold no stream of %s", g.Streams, cell)
+		}
+	}
+	seen := map[string]bool{}
+	for _, c := range objs[mgmtCluster].Management.Cells {
+		seen[c.Name] = true
+		if !c.Bound {
+			continue
+		}
+		if c.LastStatusAt.IsZero() || time.Since(c.LastStatusAt) > 2*time.Minute+statusSampleMax {
+			t.Errorf("cell %s has lastStatusAt %v, want a status in the last 2 minutes", c.Name, c.LastStatusAt)
+		}
+		if c.Records == nil || c.OpenOps == nil || c.ExpiredOps == nil || c.ForgedSeen == nil {
+			t.Errorf("cell %s lacks a work field: %+v", c.Name, c)
+		}
+	}
+	for _, cell := range cells {
+		if !seen[cell] {
+			t.Errorf("the management object lists no cell %s", cell)
+		}
+	}
+}

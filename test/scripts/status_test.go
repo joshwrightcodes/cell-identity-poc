@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,6 +205,12 @@ case "$*" in
   "run mgmt -- status")
     printf '%s\n' "${STUB_MGMT_STATUS:-}"
     exit "${STUB_MGMT_RC:-0}" ;;
+  "run mgmt -- op list")
+    if [[ -n "${STUB_MGMT_OPS:-}" ]]; then printf '%s\n' "$STUB_MGMT_OPS"; else echo '{"ops":[]}'; fi
+    exit "${STUB_MGMT_OPS_RC:-0}" ;;
+  "run gw -- status")
+    printf '%s\n' "${STUB_GW_STATUS:-}"
+    exit "${STUB_GW_RC:-0}" ;;
   "run pki -- trust-bundle "*) cat ;;
   "run mesh:status")
     printf 'hub    dev-cell-1: tunnel up\n'
@@ -248,14 +255,39 @@ func derSHA(t *testing.T, pemText string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// timeAgo formats the time that is d before now, as mgmtd prints it.
+func timeAgo(d time.Duration) string { return time.Now().Add(-d).UTC().Format(time.RFC3339Nano) }
+
+const zeroTime = "0001-01-01T00:00:00Z"
+
+// planeCell is one cell of mise run mgmt -- status, with a status from 20 seconds ago and nothing unreported. over replaces fields.
+func planeCell(name string, over map[string]any) map[string]any {
+	c := map[string]any{"name": name, "bound": true, "lastCheck": "unchanged", "lastStatusAt": timeAgo(20 * time.Second), "unreported": 0,
+		"oldestUnreportedAt": zeroTime, "records": 3, "openOps": 0, "expiredOps": 0, "forgedSeen": 0, "lastHintCheck": "unchanged"}
+	maps.Copy(c, over)
+	return c
+}
+
+// healthyGateway is what mise run gw -- status prints for a gateway that envd synced 10 seconds ago, with a stream
+// for each cell and nothing queued. mutate changes the object.
+func healthyGateway(mutate func(m map[string]any)) string {
+	m := map[string]any{"epoch": 3, "syncedAt": timeAgo(10 * time.Second), "oldestOutboxAt": zeroTime, "epochChangedAt": timeAgo(time.Hour),
+		"droppedAt": zeroTime, "recordOldAt": zeroTime, "outboxItems": 0, "dropped": 0, "recordOld": 0, "queued": map[string]any{},
+		"streams": map[string]any{"dev-cell-1": 1, "dev-cell-2": 1}, "mostClaimed": map[string]any{}, "records": map[string]any{},
+		"lastBindRefusal": map[string]any{}, "keyHints": []any{}, "storeError": ""}
+	if mutate != nil {
+		mutate(m)
+	}
+	out, _ := json.Marshal(m)
+	return string(out)
+}
+
 // healthyPlane is what mise run mgmt -- status prints on a healthy plane: signed and applied at the same
 // revision, a report from 10 seconds ago, and both cells bound and checked. mutate changes the object.
 func healthyPlane(mutate func(m map[string]any)) string {
 	at := func(ago time.Duration) string { return time.Now().Add(-ago).UTC().Format(time.RFC3339Nano) }
 	rev := map[string]any{"epoch": 1, "counter": 4}
-	cell := func(name string) map[string]any {
-		return map[string]any{"name": name, "bound": true, "lastCheck": "unchanged"}
-	}
+	cell := func(name string) map[string]any { return planeCell(name, nil) }
 	m := map[string]any{"env": "dev", "signed": rev, "served": rev, "applied": rev, "restoreActive": false, "appliedAt": at(time.Hour),
 		"lastReportAt": at(10 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")}}
 	if mutate != nil {
@@ -285,7 +317,7 @@ func runStatus(t *testing.T, extra ...string) (map[string]map[string]any, []map[
 		t.Fatal(err)
 	}
 	env := append([]string{"STUB_PRINCIPAL=" + stubConnected, "STUB_SAMPLES=" + stubSamples, "STUB_KIALI_CONF=" + stubKialiConf, "STUB_HUB=" + stubHubUp,
-		"STUB_MGMT_STATUS=" + healthyPlane(nil), "HOSTSVC_SERVE=" + serve, "STUB_PIN_PEM=" + pin, "STUB_ROOT_PEM=" + root, "STUB_POD_PIN=" + derSHA(t, pin),
+		"STUB_MGMT_STATUS=" + healthyPlane(nil), "STUB_GW_STATUS=" + healthyGateway(nil), "HOSTSVC_SERVE=" + serve, "STUB_PIN_PEM=" + pin, "STUB_ROOT_PEM=" + root, "STUB_POD_PIN=" + derSHA(t, pin),
 		"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), nil)}, extra...)
 	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub}, env)
 	lines := jsonLines(t, out)
@@ -696,8 +728,7 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 	}
 	cellCheck := func(name, result string) func(m map[string]any) {
 		return func(m map[string]any) {
-			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
-				map[string]any{"name": name, "bound": true, "lastCheck": result}}
+			m["cells"] = []any{planeCell("dev-cell-1", nil), planeCell(name, map[string]any{"lastCheck": result})}
 		}
 	}
 	pin, root := caPEM(t, 10), caPEM(t, 1)
@@ -731,11 +762,10 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 		{"a cell has an unavailable issuer", plane(cellCheck("dev-cell-2", "issuer_unavailable")),
 			[]string{"dev-cell-2", "issuer_unavailable", "mise run hostsvc:serve -- status"}},
 		{"a cell with cell-identity is unbound", plane(func(m map[string]any) {
-			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"},
-				map[string]any{"name": "dev-cell-2", "bound": false, "lastCheck": ""}}
+			m["cells"] = []any{planeCell("dev-cell-1", nil), planeCell("dev-cell-2", map[string]any{"bound": false, "lastCheck": ""})}
 		}), []string{"dev-cell-2 is not bound", "CELL=dev-cell-2 mise run cell:up"}},
 		{"a cell with cell-identity is not in the status", plane(func(m map[string]any) {
-			m["cells"] = []any{map[string]any{"name": "dev-cell-1", "bound": true, "lastCheck": "unchanged"}}
+			m["cells"] = []any{planeCell("dev-cell-1", nil)}
 		}), []string{"dev-cell-2 is not bound", "CELL=dev-cell-2 mise run cell:up"}},
 		{"mgmtd does not answer", []string{"STUB_MGMT_RC=1", `STUB_MGMT_STATUS={"level":"ERROR","msg":"mgmt failed","error":"pod mgmtd-0 is absent or not Ready. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"}`},
 			[]string{"mgmtd status failed", "pod mgmtd-0 is absent", "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"}},
@@ -793,6 +823,147 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 		})...)
 		if code != 0 {
 			t.Errorf("exit %d, want 0 for a refusal before the last apply", code)
+		}
+	})
+}
+
+// TestStatusReportsTheGatewayAndSignedWork checks each condition of the signed work: the gateway object of dev-cp, and the
+// work fields of each cell of the management object. A healthy run has none of them. Each case changes one value and
+// expects exit 1 with the problem on the object of the cluster that holds the value, and the command to run.
+func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
+	healthy, _, _, code := runStatus(t)
+	if code != 0 {
+		t.Fatalf("exit %d on a healthy run: %v", code, healthy["dev-cp"]["problems"])
+	}
+	g, _ := healthy["dev-cp"]["gateway"].(map[string]any)
+	for _, f := range []string{"epoch", "epochChangedAt", "syncedAt", "outboxItems", "oldestOutboxAt", "dropped", "droppedAt", "recordOld", "recordOldAt", "queued", "streams", "mostClaimed", "lastBindRefusal", "storeError"} {
+		if _, ok := g[f]; !ok {
+			t.Errorf("the gateway object %v has no field %s", keys(g), f)
+		}
+	}
+	mc, _ := healthy["management"]["management"].(map[string]any)["cells"].([]any)
+	for _, f := range []string{"lastStatusAt", "unreported", "oldestUnreportedAt", "records", "openOps", "expiredOps", "forgedSeen", "lastRefusal", "lastHintCheck"} {
+		if c := mc[0].(map[string]any); f != "lastRefusal" {
+			if _, ok := c[f]; !ok {
+				t.Errorf("a cell of management %v has no field %s", keys(c), f)
+			}
+		}
+	}
+	gw := func(mutate func(m map[string]any)) []string {
+		return []string{"STUB_GW_STATUS=" + healthyGateway(mutate)}
+	}
+	plane := func(mutate func(m map[string]any)) []string {
+		return []string{"STUB_MGMT_STATUS=" + healthyPlane(mutate)}
+	}
+	cellOf := func(over map[string]any) func(m map[string]any) {
+		return func(m map[string]any) {
+			m["cells"] = []any{planeCell("dev-cell-1", nil), planeCell("dev-cell-2", over)}
+		}
+	}
+	op := func(state, final string, expiredAgo time.Duration) []string {
+		o := map[string]any{"id": "0123456789abcdef0123456789abcdef", "cell": "dev-cell-1", "state": state, "final": final}
+		if expiredAgo > 0 {
+			o["expiredAt"] = timeAgo(expiredAgo)
+		}
+		out, _ := json.Marshal(map[string]any{"ops": []any{o}})
+		return []string{"STUB_MGMT_OPS=" + string(out)}
+	}
+	for _, tc := range []struct {
+		name    string
+		env     []string
+		cluster string
+		want    []string
+	}{
+		{"the gateway has a store error", gw(func(m map[string]any) { m["storeError"] = "database is locked" }), "dev-cp",
+			[]string{"store error", "database is locked", "mise run gw:reset"}},
+		{"envd synced the gateway 3 minutes ago", gw(func(m map[string]any) { m["syncedAt"] = timeAgo(3 * time.Minute) }), "dev-cp",
+			[]string{"more than 2 minutes", "CELL=dev-cp mise run cell:up"}},
+		{"envd never synced the gateway", gw(func(m map[string]any) { m["syncedAt"] = zeroTime }), "dev-cp",
+			[]string{"synced with the gateway at", "CELL=dev-cp mise run cell:up"}},
+		{"the oldest outbox item is 3 minutes old and mgmtd answers", gw(func(m map[string]any) { m["outboxItems"] = 2; m["oldestOutboxAt"] = timeAgo(3 * time.Minute) }), "dev-cp",
+			[]string{"oldest outbox item", "mise run gw -- outbox"}},
+		{"an item was dropped 5 minutes ago", gw(func(m map[string]any) { m["dropped"] = 1; m["droppedAt"] = timeAgo(5 * time.Minute) }), "dev-cp",
+			[]string{"dropped", "mise run gw -- outbox"}},
+		{"an old record was refused 5 minutes ago", gw(func(m map[string]any) { m["recordOld"] = 1; m["recordOldAt"] = timeAgo(5 * time.Minute) }), "dev-cp",
+			[]string{"older record", "CELL=dev-cp mise run cell:up"}},
+		{"a bound cell has no stream", gw(func(m map[string]any) { m["streams"] = map[string]any{"dev-cell-1": 1} }), "dev-cp",
+			[]string{"no stream of dev-cell-2", "CELL=dev-cell-2 mise run cell:up"}},
+		{"a cell claimed one operation 4 times", gw(func(m map[string]any) {
+			m["mostClaimed"] = map[string]any{"dev-cell-1": map[string]any{"opId": "feedfacefeedfacefeedfacefeedface", "count": 4}}
+		}), "dev-cp", []string{"dev-cell-1 claimed operation feedfacefeedfacefeedfacefeedface 4 times", "mise run ops -- trace feedfacefeedfacefeedfacefeedface"}},
+		{"the gateway status fails", []string{"STUB_GW_RC=1", `STUB_GW_STATUS={"level":"ERROR","msg":"gw failed","error":"pod cell-gateway-0 is absent or not Ready. Run: CELL=dev-cp mise run cell:up"}`}, "dev-cp",
+			[]string{"gateway status failed", "pod cell-gateway-0 is absent", "Run: CELL=dev-cp mise run cell:up"}},
+		{"a cell sent no status for 3 minutes", plane(cellOf(map[string]any{"lastStatusAt": timeAgo(3 * time.Minute)})), "management",
+			[]string{"dev-cell-2", "no status", "CELL=dev-cell-2 mise run cell:verify"}},
+		{"a bound cell never sent a status", plane(cellOf(map[string]any{"lastStatusAt": zeroTime})), "management",
+			[]string{"dev-cell-2", "no status", "CELL=dev-cell-2 mise run cell:verify"}},
+		{"an unreported item is 6 minutes old", plane(cellOf(map[string]any{"unreported": 2, "oldestUnreportedAt": timeAgo(6 * time.Minute)})), "management",
+			[]string{"dev-cell-2", "unreported", "CELL=dev-cell-2 mise run cell:verify"}},
+		{"a cell holds 801 records", plane(cellOf(map[string]any{"records": 801})), "management",
+			[]string{"dev-cell-2", "801 operation records", "CELL=dev-cell-2 mise run cell:verify"}},
+		{"an operation expired 5 minutes ago with no result", append(plane(nil), op("expired", "", 5*time.Minute)...), "management",
+			[]string{"0123456789abcdef0123456789abcdef", "expired", "mise run ops -- close 0123456789abcdef0123456789abcdef"}},
+		{"a hint check says keys_untrusted", plane(cellOf(map[string]any{"lastHintCheck": "keys_untrusted"})), "management",
+			[]string{"dev-cell-2", "hint check", "keys_untrusted", "CELL=dev-cell-2 mise run cell:restart"}},
+		{"a hint check says issuer_untrusted", plane(cellOf(map[string]any{"lastHintCheck": "issuer_untrusted"})), "management",
+			[]string{"dev-cell-2", "issuer_untrusted", "mise run hostsvc:serve -- restart"}},
+		{"a hint check says issuer_unavailable", plane(cellOf(map[string]any{"lastHintCheck": "issuer_unavailable"})), "management",
+			[]string{"dev-cell-2", "issuer_unavailable", "mise run hostsvc:serve -- status"}},
+		{"a hint check says error", plane(cellOf(map[string]any{"lastHintCheck": "error"})), "management",
+			[]string{"dev-cell-2", "hint check", "error", "mise run mgmt -- keycheck --cell dev-cell-2"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			byName, lines, _, code := runStatus(t, tc.env...)
+			bad := byName[tc.cluster]
+			problems := strings.Join(strs(bad["problems"]), "\n")
+			if code != 1 || bad["ok"] != false {
+				t.Fatalf("exit %d, ok %v, problems %q; want exit 1 and ok false", code, bad["ok"], problems)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(problems, w) {
+					t.Errorf("problems %q lack %q", problems, w)
+				}
+			}
+			if strings.ContainsAny(problems, "<>") {
+				t.Errorf("problems %q hold a placeholder, and each command must work as printed", problems)
+			}
+			for _, m := range lines {
+				if m["cluster"] != tc.cluster && m["ok"] != true {
+					t.Errorf("the object of %s is not ok, and only %s has a bad value: %v", m["cluster"], tc.cluster, m)
+				}
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		env  []string
+	}{
+		{"envd synced 90 seconds ago is within 2 minutes", gw(func(m map[string]any) { m["syncedAt"] = timeAgo(90 * time.Second) })},
+		{"an outbox item of 1 minute is a wait", gw(func(m map[string]any) { m["outboxItems"] = 1; m["oldestOutboxAt"] = timeAgo(time.Minute) })},
+		{"a drop 20 minutes ago is history", gw(func(m map[string]any) { m["dropped"] = 1; m["droppedAt"] = timeAgo(20 * time.Minute) })},
+		{"a refused old record 20 minutes ago is history", gw(func(m map[string]any) { m["recordOld"] = 1; m["recordOldAt"] = timeAgo(20 * time.Minute) })},
+		{"three claims are no concern", gw(func(m map[string]any) {
+			m["mostClaimed"] = map[string]any{"dev-cell-1": map[string]any{"opId": "feedfacefeedfacefeedfacefeedface", "count": 3}}
+		})},
+		{"800 records are within the limit", plane(cellOf(map[string]any{"records": 800}))},
+		{"an unreported item of 4 minutes is a wait", plane(cellOf(map[string]any{"unreported": 1, "oldestUnreportedAt": timeAgo(4 * time.Minute)}))},
+		{"an operation that expired 20 minutes ago is history", append(plane(nil), op("expired", "", 20*time.Minute)...)},
+		{"an expired operation with a final result is closed", append(plane(nil), op("final", "refused", 5*time.Minute)...)},
+		{"an open operation is fine", append(plane(nil), op("open", "", 0)...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			byName, _, _, code := runStatus(t, tc.env...)
+			if code != 0 {
+				t.Errorf("exit %d, want 0: %v %v", code, byName["dev-cp"]["problems"], byName["management"]["problems"])
+			}
+		})
+	}
+	t.Run("an outbox item of 3 minutes is no concern when mgmtd does not answer", func(t *testing.T) {
+		byName, _, _, _ := runStatus(t, append(gw(func(m map[string]any) { m["outboxItems"] = 2; m["oldestOutboxAt"] = timeAgo(3 * time.Minute) }),
+			"STUB_MGMT_RC=1", `STUB_MGMT_STATUS={"error":"down"}`)...)
+		if p := strings.Join(strs(byName["dev-cp"]["problems"]), "\n"); strings.Contains(p, "outbox") {
+			t.Errorf("problems %q name the outbox while mgmtd is down", p)
 		}
 	})
 }
