@@ -239,14 +239,23 @@ run = "scripts/gate.sh m5"
 description = "Run the test that sends an operation to dev-cell-1 each minute for 30 minutes, applies each once, keeps the gap between enqueue and claim below 15 s, and records the reconnect count, plus the go test arguments after --. It runs the checks of gate:m5 first. Run it alone, after gate:m5. The task builds no image: run mise run images first"
 run = "scripts/gate.sh m5-soak"
 
+[tasks."gate:m5:drill"]
+description = "Run the test that loses the volume of the cell gateway with an operation in flight, runs gw:reset, and checks that the operation is applied once and reported, plus the go test arguments after --. It runs the checks of gate:m5 first. It runs gw:reset on purpose. Run it alone, after gate:m5. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m5-drill"
+
 [tasks."gate:m5:repair"]
-description = "Run gate:m4:repair, set the replicas of the cell gateway back to 1, and delete the test namespaces m5-* of every cluster. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Run gate:m4:repair, set the replicas of the cell gateway and of celld back to 1, delete the test namespaces m5-* of every cluster, and check that each celld holds a stream at the gateway. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m5-repair.sh"
 
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"
 env = { CELL = "dev-cp" }
 run = "scripts/gw.sh"
+
+[tasks.ops]
+description = "Look at signed work, with the arguments after --: trace <id> prints the operation at mgmtd and its rows in the gateway queue, and close <id> closes an open or expired operation with a refusal that mgmtd signs"
+env = { CELL = "dev-cp" }
+run = "scripts/ops.sh"
 
 [tasks."gw:reset"]
 description = "Break-glass: start the cell gateway with an empty store. Set its replicas to 0, delete the volume claim store-cell-gateway-0, set the replicas to 1, wait for Ready and for the first sync of envd, and print one JSON line with the old and the new epoch"

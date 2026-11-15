@@ -323,6 +323,12 @@ mise x -- kubectl --context kind-dev-cell-1 -n cell-ops-system get configmap op-
 mise run gw -- status
 ```
 
+To see where an operation stands, run `mise run ops -- trace <id>`.
+It prints the operation at `mgmtd`, without its envelopes, and each row of the gateway queue that has the ID.
+For an ID that `mgmtd` does not hold, it reads the queue of each cell.
+To end an open or expired operation, run `mise run ops -- close <id>`.
+`mgmtd` then signs a refusal and the operation is final.
+
 The record becomes `reported` only after `mgmtd` holds the final result `applied`.
 `mise run gw -- status` shows the number of open streams of each cell under `streams`.
 The gateway allows two streams for each cell, one for each `celld` pod, and refuses a third with `replica_cap`.
@@ -340,6 +346,18 @@ It samples the gap between the enqueue and the first record in the cell once for
 Each sample must stay below 15 seconds.
 It prints the number of stream failures and of restarts for a new SVID.
 Run it alone, after `mise run gate:m5`.
+
+`mise run gate:m5:drill` loses the gateway volume while an operation is in flight.
+It stops `celld`, signs an operation, stops `mgmtd`, lets `celld` apply the operation, runs `mise run gw:reset` and starts `mgmtd` again.
+Afterwards the epoch is higher, the operation is final with `applied` or `already_applied`, and the demo log holds one line for it.
+`mise run harness:status` must exit 0.
+It runs `gw:reset` on purpose.
+Run it alone, after `mise run gate:m5`.
+
+After `gate:m5`, `gate:m5:soak` and `gate:m5:drill`, a scan reads the logs of `cellgw`, `envd`, `mgmtd`, `celld` and each `cell-proxy` since the start of the run.
+A line with the shape of a signed token (two base64 parts that start with `eyJ`, each followed by a dot) fails the gate.
+The scan prints the cluster, pod, container and line number, and never the line.
+It cannot read the logs of a pod that a test deleted.
 
 After each apply, the harness deletes the objects of a component that its render no longer holds.
 This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles, ClusterRoleBindings, ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings.

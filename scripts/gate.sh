@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
+# m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
+# After the tests, m5, m5-soak and m5-drill scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]}"
+gate_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 [[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
+[[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -104,7 +108,7 @@ fi
 # replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded, and so
 # must celld in each cell and the three cell-proxy servers of management. The cell-proxy clients stay with the M3 check:
 # a new image of the server changes the digest of every user of cell-proxy.
-if [[ "$milestone" == m5 || "$milestone" == m5-soak ]]; then
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill ]]; then
   "$ROOT/scripts/gate-m5-repair.sh" --check || exit 1
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
@@ -139,6 +143,10 @@ go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$
   | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
+# No token may reach a log of the M5 components. A hit fails the gate, like a failed test.
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill ]]; then
+  "$ROOT/scripts/gate-token-scan.sh" "$gate_started" || { printf 'FAIL: gate %s found a token in a log\n' "$milestone" >&2; status=1; }
+fi
 # The duration of each top-level test, slowest first.
 jq -Rrn '[inputs | fromjson? | select(.Test != null and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
     | {test: .Test, action: .Action, elapsed: .Elapsed}] | sort_by(-.elapsed)[] | "\(.elapsed)s \(.action) \(.test)"' "$events" >"$durations" || true

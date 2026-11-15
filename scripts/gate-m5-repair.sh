@@ -3,11 +3,14 @@
 # replicas of mgmtd and envd, the registries and the M2 traces. Then it sets the replicas of StatefulSet cell-gateway
 # in dev-cp, and of Deployment celld in each cell with the cell-identity set, back to 1 through
 # scripts/harness-replicas.sh, and deletes the test namespaces m5-* of every cluster.
+# It also checks that the gateway holds a stream for each cell with the cell-identity set. The repair cannot open a stream, so the
+# script reports a cell with no stream in both modes, with the cell:up of that cell, and exits 1. After a repair it waits up to
+# GATE_M5_STREAM_WAIT seconds (default 120) for the streams of the celld pods that it restarted.
 # It is safe to run again.
 #
 # Usage: gate-m5-repair.sh [--check]
 #   --check prints each drift with the command that repairs it, and exits 1. It exits 0 when it finds none.
-# GATE_M4_REPAIR names another M4 repair script, and HARNESS_REPLICAS another replicas script, for the tests.
+# GATE_M4_REPAIR names another M4 repair script, HARNESS_REPLICAS another replicas script and GW_SCRIPT another gw.sh, for the tests.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
 
@@ -74,4 +77,28 @@ for cluster in $(yq -r '.clusters[].name' "$ROOT/harness/topology.yaml"); do
     status=0
   fi
 done
+
+# Each celld opens one stream to the gateway when it starts, so a cell with no stream means that celld does not run or does not reach the gateway.
+streams_missing() {
+  local gw cluster n out=""
+  gw="$("${GW_SCRIPT:-$ROOT/scripts/gw.sh}" status)" || true
+  if ! jq -e 'type == "object" and has("streams")' >/dev/null 2>&1 <<<"$gw"; then
+    echo "the gateway status failed: $(jq -Rsr '(split("\n") | map(fromjson? | select(type == "object")) | .[0].error) // "no status"' <<<"$gw"). Run: CELL=dev-cp mise run cell:up"
+    return 1
+  fi
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+    n="$(jq -r --arg c "$cluster" '.streams[$c] // 0' <<<"$gw")"
+    ((n >= 1)) || out+="the gateway holds no stream of $cluster. Run: CELL=$cluster mise run cell:up"$'\n'
+  done
+  [[ -z "$out" ]] || { printf '%s' "$out"; return 1; }
+}
+if ((check)); then
+  streams_missing || status=1
+else
+  end=$((SECONDS + ${GATE_M5_STREAM_WAIT:-120}))
+  until problems="$(streams_missing)"; do
+    ((SECONDS < end)) || { printf '%s\n' "$problems"; status=1; break; }
+    sleep 2
+  done
+fi
 exit "$status"
