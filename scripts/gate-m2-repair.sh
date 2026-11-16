@@ -192,31 +192,9 @@ if ((changed)); then
   api_restarted() { local s; s="$(container_started kube-apiserver)" && { ((!touched)) || ((s >= changed_at)); }; }
   wait_until 240 "the runtime shows a kube-apiserver container that started after the manifest changed" api_restarted
   api_started="$(container_started kube-apiserver)" || die "cannot read the start of the kube-apiserver container from the runtime"
-  # A container that started before the API server keeps the tokens of the old key in memory, so it is stopped. The holder of its
-  # Lease is read first, because the old process renews the Lease against the new API server before the stop.
-  manager_old_holder="" manager_stopped_at="" scheduler_old_holder="" scheduler_stopped_at=""
-  for component in kube-controller-manager kube-scheduler; do
-    rc=0
-    component_started="$(container_started "$component")" || rc=$?
-    ((rc != 2)) || die "the container runtime call failed on $node while it read the $component container"
-    if ((rc == 0)) && ((component_started < api_started)); then
-      holder="$(lease_holder "$component")" || die "cannot read Lease $component"
-      ids="$(on_node crictl ps --name "^$component\$" -q)" || die "the container runtime call failed on $node while it listed $component"
-      for id in $ids; do
-        on_node crictl stop "$id" >/dev/null
-      done
-      stopped_at="$(on_node date +%s)" || die "cannot read the time of the node $node"
-      case "$component" in
-        kube-controller-manager) manager_old_holder="$holder" manager_stopped_at="$stopped_at" ;;
-        kube-scheduler) scheduler_old_holder="$holder" scheduler_stopped_at="$stopped_at" ;;
-      esac
-      log "stopped the $component container, which started before the API server"
-    fi
-  done
   # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait while kube-scheduler is in back-off,
   # so step 4 starts only when both components are current.
-  control_plane_ready() { control_plane_current "$node" "$api_started"; }
-  wait_until 330 "kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease" control_plane_ready
+  settle_control_plane "$node" "$api_started" 330 || die "kube-controller-manager and kube-scheduler did not become current (see the lines above)"
   log "kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease"
 fi
 

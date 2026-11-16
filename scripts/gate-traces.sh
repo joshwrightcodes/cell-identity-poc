@@ -165,12 +165,56 @@ component_current() {
   started="$(container_started "$1")" && ((started >= $3)) && lease_current "$1" "$2" "$4" "${5:-}" "${6:-}"
 }
 
-# control_plane_current <node> <API server start> succeeds when kube-controller-manager and kube-scheduler are both current. The
-# variables manager_old_holder, manager_stopped_at, scheduler_old_holder and scheduler_stopped_at hold what the repair read before it
-# stopped a container. They are empty for a component that the repair did not stop.
+# control_plane_current <node> <API server start> [<manager holder before the stop> <manager stop time> <scheduler holder before the stop>
+# <scheduler stop time>] succeeds when kube-controller-manager and kube-scheduler are both current. The holder and stop time of a component
+# that the repair did not stop are empty.
 control_plane_current() {
   local now
   now="$(on_node date +%s)" || return 1
-  component_current kube-controller-manager "$1" "$2" "$now" "${manager_old_holder:-}" "${manager_stopped_at:-}" \
-    && component_current kube-scheduler "$1" "$2" "$now" "${scheduler_old_holder:-}" "${scheduler_stopped_at:-}"
+  component_current kube-controller-manager "$1" "$2" "$now" "${3:-}" "${4:-}" \
+    && component_current kube-scheduler "$1" "$2" "$now" "${5:-}" "${6:-}"
+}
+
+# lease_summary <lease> prints the holder and the acquire time of Lease kube-system/<lease>.
+lease_summary() {
+  k -n kube-system get lease "$1" -o json | jq -r '"holder " + (.spec.holderIdentity // "none") + ", acquireTime " + (.spec.acquireTime // "none")'
+}
+
+# settle_control_plane <node> <API server start> <bound in seconds> is step 3 of gate-m2-repair.sh. It stops each container of
+# kube-controller-manager and kube-scheduler that started before the API server, because such a container keeps the tokens of the old key
+# in memory. It reads the Lease holder before each stop, and takes the stop time from the node clock. Then it waits, up to the bound, until
+# control_plane_current holds with those values. The pause between two checks is $CONTROL_PLANE_POLL seconds (default 3). It logs the holder
+# before the stop, the stop time, and the holder and acquire time of the Lease that let the wait pass. It returns 1 after a failed call or a timeout.
+settle_control_plane() {
+  local node="$1" api_started="$2" bound="$3" component rc started holder ids id stopped_at end
+  local manager_holder="" manager_stop="" scheduler_holder="" scheduler_stop=""
+  for component in kube-controller-manager kube-scheduler; do
+    rc=0
+    started="$(container_started "$component")" || rc=$?
+    if ((rc == 2)); then
+      log "the container runtime call failed on $node while it read the $component container"
+      return 1
+    fi
+    ((rc == 0)) && ((started < api_started)) || continue
+    holder="$(lease_holder "$component")" || { log "cannot read Lease $component"; return 1; }
+    ids="$(on_node crictl ps --name "^$component\$" -q)" || { log "the container runtime call failed on $node while it listed $component"; return 1; }
+    for id in $ids; do
+      on_node crictl stop "$id" >/dev/null || { log "cannot stop the container $id of $component on $node"; return 1; }
+    done
+    stopped_at="$(on_node date +%s)" || { log "cannot read the time of the node $node"; return 1; }
+    case "$component" in
+      kube-controller-manager) manager_holder="$holder" manager_stop="$stopped_at" ;;
+      kube-scheduler) scheduler_holder="$holder" scheduler_stop="$stopped_at" ;;
+    esac
+    log "stopped the $component container, which started before the API server. Lease holder before the stop '${holder:-none}', stop time $stopped_at (node clock)"
+  done
+  end=$((SECONDS + bound))
+  log "waiting up to ${bound}s until kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease"
+  until control_plane_current "$node" "$api_started" "$manager_holder" "$manager_stop" "$scheduler_holder" "$scheduler_stop" >/dev/null 2>&1; do
+    ((SECONDS < end)) || { log "kube-controller-manager and kube-scheduler are not current after ${bound}s"; return 1; }
+    sleep "${CONTROL_PLANE_POLL:-3}"
+  done
+  for component in kube-controller-manager kube-scheduler; do
+    log "the Lease of $component let the wait pass: $(lease_summary "$component" 2>/dev/null || echo 'unreadable')"
+  done
 }
