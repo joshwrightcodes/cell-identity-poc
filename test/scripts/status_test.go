@@ -877,11 +877,10 @@ func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
 		}
 	}
 	mc, _ := healthy["management"]["management"].(map[string]any)["cells"].([]any)
-	for _, f := range []string{"lastStatusAt", "unreported", "oldestUnreportedAt", "records", "openOps", "expiredOps", "forgedSeen", "lastRefusal", "lastHintCheck"} {
-		if c := mc[0].(map[string]any); f != "lastRefusal" {
-			if _, ok := c[f]; !ok {
-				t.Errorf("a cell of management %v has no field %s", keys(c), f)
-			}
+	// lastRefusal is empty until a refusal happened, so a healthy cell has none.
+	for _, f := range []string{"lastStatusAt", "unreported", "oldestUnreportedAt", "records", "openOps", "expiredOps", "forgedSeen", "lastHintCheck"} {
+		if c := mc[0].(map[string]any); c[f] == nil && f != "oldestUnreportedAt" {
+			t.Errorf("a cell of management %v has no field %s", keys(c), f)
 		}
 	}
 	gw := func(mutate func(m map[string]any)) []string {
@@ -944,6 +943,8 @@ func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
 			[]string{"dev-cell-2", "issuer_untrusted", "mise run hostsvc:serve -- restart"}},
 		{"a hint check says issuer_unavailable", plane(cellOf(map[string]any{"lastHintCheck": "issuer_unavailable"})), "management",
 			[]string{"dev-cell-2", "issuer_unavailable", "mise run hostsvc:serve -- status"}},
+		{"the list of operations fails", []string{"STUB_MGMT_OPS_RC=1", `STUB_MGMT_OPS={"level":"ERROR","msg":"mgmt failed","error":"boom"}`}, "management",
+			[]string{"list of operations failed", "expired operations are not checked", "mise run mgmt -- op list"}},
 		{"a hint check says error", plane(cellOf(map[string]any{"lastHintCheck": "error"})), "management",
 			[]string{"dev-cell-2", "hint check", "error", "mise run mgmt -- keycheck --cell dev-cell-2"}},
 	} {

@@ -58,7 +58,7 @@
 | Run the M5 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m5` |
 | Send one operation a minute for 30 minutes and check that each applies once. Run it alone, after `gate:m5` | `mise run gate:m5:soak` |
 | Lose the gateway volume with an operation in flight, run `gw:reset` and check the operation. Run it alone, after `gate:m5` | `mise run gate:m5:drill` |
-| Set the replicas of the cell gateway and `celld` back to 1, delete the test namespaces `m5-*`, run `gate:m4:repair` and check that each `celld` has a stream (`--check` only reports) | `mise run gate:m5:repair` |
+| Repair what `gate:m5` leaves: replicas of the gateway and `celld`, test namespaces `m5-*`, and each `celld` stream (`--check` only reports) | `mise run gate:m5:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 

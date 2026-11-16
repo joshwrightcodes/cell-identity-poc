@@ -298,8 +298,10 @@ func readyPodUIDs(t *testing.T, cluster, ns, app string) []string {
 
 // TestM5ProofFollowsKeyRotation: after the service account key of dev-cell-1 rotates, every consumer of its record follows within
 // minutes, with no re-link and no restart.
-//   - mgmtd updates the record (keys_updated) within three minutes, because the new hello tokens of celld make the gateway hint.
-//     The periodic check does not run in that window: a manual check 61 s before the rotation holds it back.
+//   - mgmtd updates the record (keys_updated) within three minutes. Two paths heal it: the hint check that the gateway starts from the
+//     hello of celld, and the bind of the new celld pod. The first keys_updated line of either path counts, and the test logs which one
+//     (KEYS_UPDATED_BY). TestM5UnknownKidTriggersKeyCheck covers the hint path alone. The periodic check does not run in that window:
+//     a manual check 61 s before the rotation holds it back.
 //   - Each cell-proxy server of management logs "registry reloaded" within three minutes of the update (verify row 8).
 //   - celld streams again within three minutes of the switch of the key, and an operation that is created then applies once.
 //   - The otel-uplink pod of dev-cell-1 is deleted. A marker that the collector sends through its new pod reaches Grafana within
@@ -339,16 +341,6 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		return false, fmt.Sprintf("key checks: %d", len(keyCheckLines(t, start, cell)))
 	})
 	t.Logf("KEYS_UPDATED_BY=%s", updatedBy)
-	// The hint check can follow a bind by seconds, so it gets the rest of the heal window.
-	waitFor(t, "a key check of "+cell+" with via hint after the switch", max(time.Until(rotatedAt.Add(rotationHealWait)), 30*time.Second), func() (bool, string) {
-		lines := keyCheckLines(t, start, cell)
-		for _, l := range lines {
-			if l.str("via") == "hint" {
-				return true, ""
-			}
-		}
-		return false, fmt.Sprintf("key checks: %d, none via hint", len(lines))
-	})
 	for _, l := range keyCheckLines(t, start, cell) {
 		if l.str("via") == "periodic" {
 			t.Errorf("a periodic key check of %s ran in the window: %v", cell, l)

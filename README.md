@@ -359,7 +359,7 @@ Run it alone, after `mise run gate:m5`.
 After `gate:m5`, `gate:m5:soak` and `gate:m5:drill`, a scan reads the logs of `cellgw`, `envd`, `mgmtd`, `celld` and each `cell-proxy` since the start of the run.
 A line with the shape of a signed token (two base64 parts that start with `eyJ`, each followed by a dot) fails the gate.
 The scan prints the cluster, pod, container and line number, and never the line.
-It cannot read the logs of a pod that a test deleted.
+It cannot read the logs of a pod that a test deleted, or the log of a middle instance of a container that restarted twice.
 
 After each apply, the harness deletes the objects of a component that its render no longer holds.
 This covers Deployments, StatefulSets, DaemonSets, Services, ConfigMaps, ServiceAccounts, Roles, RoleBindings, NetworkPolicies, ClusterRoles, ClusterRoleBindings, ValidatingAdmissionPolicies and ValidatingAdmissionPolicyBindings.
@@ -912,7 +912,7 @@ The object of `management` has these fields too:
 
 | Field | Description |
 | --- | --- |
-| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal. The kubelet rotates that log after about 10 hours, and the connect line goes with it. An agent with no stream line then counts as connected when the principal logged an event from it in the last 5 minutes. A later closing line wins. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
+| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal. The kubelet rotates that log after about 10 hours, and the connect line goes with it. An agent with no stream line then counts as connected when the principal logged an event from it in the last 5 minutes. A closing line that comes later wins. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
 | `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
 | `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
 | `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `absent_cells` holds the cells among them whose own API does not answer. `note` is empty, or says what to do. |
@@ -939,7 +939,7 @@ It also lists `expiredOps`, the operations that expired with no final result, ea
 | An operation expired in the last 15 minutes with no final result | `mise run ops -- close <id>` |
 | A hint check of a cell is `keys_untrusted`, `issuer_untrusted`, `issuer_unavailable` or `error` | The command in the problem text |
 
-`cell:verify` owns three more checks. `harness:status` includes them in the `verify` field of `dev-cp`. They cover the sync and the store error of the gateway, the record revisions that the gateway holds, and the file `attest-hints`.
+`cell:verify` owns three more checks. `harness:status` includes them in the `verify` field of `dev-cp`. They cover the sync and the store error of the gateway, the record revisions that the gateway holds, and the ConfigMap `attest-hints`.
 A failure of one of them shows in `verify.failed`, and its repair command is in `problems`.
 The sync case then shows twice, once from `cell:verify` and once from the gateway field.
 
@@ -1113,13 +1113,14 @@ It prints the twelve slowest tests at the end.
 The slowest tests are the management CA rotation (574 seconds) and the rogue telemetry test (246 seconds).
 The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take 97 seconds.
 `gate:m5` fails when the run takes longer than `GATE_M5_BUDGET_MINUTES`.
-The budget is 80 minutes. This is 1.5 times the slower of two full runs, 3,006 and 2,696 seconds of tests, rounded up to 5 minutes.
+The budget is 80 minutes. This is 1.5 times the slowest M5 run before the fixes, 3,096 seconds of tests on 2026-11-15 (UTC), rounded up to 5 minutes.
 The test timeout is 160 minutes, twice the budget.
 `gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has the floor of 30 minutes for its test timeout.
-Measured on 2026-11-16: `gate:m1` 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
-The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 252 seconds for `gate:m5:drill` and 2,937 seconds for the last full `gate:m5`.
-A run from clean with the M5 components took 1,730 seconds for `harness:up` on 2026-11-16.
-The rebuild of `management` took 21 minutes 36 seconds from `cell:down` to a passing `harness:status`. The first `harness:status` failed only on collector export retries, which clear by themselves within 5 minutes.
+All times of the next paragraph are wall time in seconds, measured on 2026-11-15 and 2026-11-16 (UTC).
+`gate:m1` took 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
+The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 252 seconds for `gate:m5:drill` and 2,945 seconds for the last full `gate:m5`.
+A run from clean with the M5 components took 1,730 seconds for `harness:up`.
+The rebuild of `management` took 21 minutes 36 seconds from `cell:down` to the first `harness:status` that exited 0. The first `harness:status` failed only on collector export retries, which clear by themselves within 5 minutes.
 The slowest M5 tests are the key rotation tests, about 6 to 11 minutes each, and `TestM5DevCPCannotPoseOnReports`, about 6 minutes.
 The budgets do not cover `harness:up`.
 

@@ -10,7 +10,8 @@ source "$(dirname "$0")/lib.sh"
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
 milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]}"
-gate_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
+gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"

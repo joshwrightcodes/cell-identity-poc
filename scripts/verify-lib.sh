@@ -365,6 +365,8 @@ gateway_status() {
 
 # check_gateway_synced succeeds when the store of the gateway reports no error, and envd synced with it within 2 minutes.
 # envd syncs at each round, every 10 seconds.
+# GATEWAY_SYNC_MAX_AGE is the age in seconds above which the sync of envd counts as late (2 minutes). harness:status uses the same value.
+GATEWAY_SYNC_MAX_AGE=120
 check_gateway_synced() {
   local status err synced age
   status="$(gateway_status)" || { echo "$status"; return 1; }
@@ -376,7 +378,7 @@ check_gateway_synced() {
   fi
   synced="$(jq -r '.syncedAt // ""' <<<"$status")"
   age="$(jq -n --arg t "$synced" '(now - ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0))')"
-  if [[ -z "$synced" ]] || ((${age%.*} > 120)); then
+  if [[ -z "$synced" ]] || ((${age%.*} > GATEWAY_SYNC_MAX_AGE)); then
     echo "envd synced with the gateway at '${synced:-never}', which is more than 2 minutes ago."
     echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd. Then run: $(dependents_of gateway-nodes)"
     return 1

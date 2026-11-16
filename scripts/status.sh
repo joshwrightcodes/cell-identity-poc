@@ -102,7 +102,7 @@ run_telemetry() {
 # management_plane prints the field management: the status of mgmtd and of the host service. The pin and the root
 # of the host service are checked with the functions of cell:verify, which print the reason and the command.
 management_plane() {
-  local st rc=0 serve hs check="" crc=0 ops
+  local st rc=0 serve hs check="" crc=0 ops opsFailed
   st="$(mise run mgmt -- status 2>/dev/null)" || rc=$?
   if ((rc != 0)) || ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
     jq -Rsc --argjson rc "$rc" '(split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
@@ -118,12 +118,14 @@ management_plane() {
     # A check that fails with no output still counts as a failure.
     if ((crc != 0)) && [[ -z "$check" ]]; then check="the host service check failed. Run: mise run hostsvc:serve -- status"; fi
   fi
-  # The state of an operation is expired only while it has no final result. A list that fails gives no expired operations.
+  # The state of an operation is expired only while it has no final result. A list that fails gives opsFailed, and a problem.
   ops="$(mise run mgmt -- op list 2>/dev/null)" || ops=""
-  jq -e 'type == "object" and has("ops")' >/dev/null 2>&1 <<<"$ops" || ops='{"ops":[]}'
-  jq -c --argjson hs "$hs" --arg check "$check" --argjson ops "$ops" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
+  opsFailed=false
+  jq -e 'type == "object" and has("ops")' >/dev/null 2>&1 <<<"$ops" || { ops='{"ops":[]}'; opsFailed=true; }
+  jq -c --argjson hs "$hs" --arg check "$check" --argjson ops "$ops" --argjson opsFailed "$opsFailed" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
     restoreActive, pendingDrops,
     cells: [.cells[]? | {name, bound, lastCheck, lastStatusAt, unreported, oldestUnreportedAt, records, openOps, expiredOps, forgedSeen, lastRefusal, lastHintCheck}],
+    opsFailed: $opsFailed,
     expiredOps: [$ops.ops[]? | select(.state == "expired") | {id, cell, expiredAt}],
     hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
 }
@@ -157,6 +159,7 @@ management_problems() {
         (.cells[] | select((.unreported // 0) > 0 and ((.oldestUnreportedAt // "") | ts) > 1000000000 and (now - (.oldestUnreportedAt | ts)) > 300)
           | "\(.name) has \(.unreported) unreported items, the oldest from \(.oldestUnreportedAt), more than 5 minutes ago. Run: CELL=\(.name) mise run cell:verify"),
         (.cells[] | select((.records // 0) > 800) | "\(.name) holds \(.records) operation records, above 800. Run: CELL=\(.name) mise run cell:verify"),
+        (if .opsFailed then "the list of operations failed, so expired operations are not checked. Run: mise run mgmt -- op list" else empty end),
         (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and (now - (.expiredAt | ts)) < 900)
           | "operation \(.id) for \(.cell) expired at \(.expiredAt) with no final result. Run: mise run ops -- close \(.id)"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
@@ -189,13 +192,13 @@ gateway_plane() {
 # gateway_problems reads the output of gateway_plane on standard input and prints one problem for each bad value, as a
 # JSON array of strings. The sync and the store error follow check_gateway_synced of cell:verify, with the same 2 minutes.
 gateway_problems() {
-  jq -c 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+  jq -c --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def recent($t; $secs): ($t | ts) > 1000000000 and (now - ($t | ts)) < $secs;
     .gateway as $g | .bound as $bound | .mgmt_up as $up
     | if $g.error != null then ["gateway status failed: " + $g.error]
       else [
         (if ($g.storeError // "") != "" then "the cell gateway reports a store error: \($g.storeError). Run: mise run gw:reset" else empty end),
-        (if ($g.syncedAt | ts) < 1000000000 or (now - ($g.syncedAt | ts)) > 120
+        (if ($g.syncedAt | ts) < 1000000000 or (now - ($g.syncedAt | ts)) > $syncmax
          then "envd synced with the gateway at \($g.syncedAt // "never"), which is more than 2 minutes ago. Read the log of envd with: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd. Then run: CELL=dev-cp mise run cell:up" else empty end),
         (if $up and ($g.outboxItems // 0) > 0 and (($g.oldestOutboxAt | ts) > 1000000000) and (now - ($g.oldestOutboxAt | ts)) > 120
          then "the oldest outbox item of the gateway is from \($g.oldestOutboxAt), more than 2 minutes ago, and mgmtd answers. Run: mise run gw -- outbox" else empty end),

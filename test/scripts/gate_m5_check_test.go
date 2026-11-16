@@ -81,6 +81,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	}
 	write("scripts/gate-m5-repair.sh", "#!/usr/bin/env bash\nexit 0\n")
 	write("scripts/gate-token-scan.sh", "#!/usr/bin/env bash\nexit 0\n")
+	write("bin/docker", "#!/usr/bin/env bash\n[[ \"$*\" == \"exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ\" ]] || exit 2\necho 2026-11-16T01:02:03Z\n")
 	write("bin/go", "#!/usr/bin/env bash\necho \"go $*\" >>\"$STUB_LOG\"\n")
 	// The fake answers "get <workload> -o json". Each workload runs the images that build/images.env records, except
 	// the one that STUB_STALE names, as <image>@<namespace> or <image>@<cluster>.
@@ -150,7 +151,7 @@ echo "scan $*" >>"$STUB_LOG"
 			if !strings.Contains(string(calls), tc.pattern) {
 				t.Fatalf("the tests did not run with %q: calls %s\noutput %s", tc.pattern, calls, out)
 			}
-			scanned := strings.Contains(string(calls), "scan 20")
+			scanned := strings.Contains(string(calls), "scan 2026-11-16T01:02:03Z")
 			if scanned != tc.scan {
 				t.Errorf("scan ran %v, want %v; calls %s", scanned, tc.scan, calls)
 			}

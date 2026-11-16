@@ -3,8 +3,8 @@
 # In each cluster with components, it reads the log of every container that runs the image cellgw, envd, mgmtd, celld or cell-proxy
 # since the start time, and the previous log of a container that restarted. A line that holds a compact JWS (eyJ..., a dot, eyJ..., a dot)
 # is a token: the script prints the cluster, the pod, the container and the line number, never the line, and exits 1. The standard
-# base64 of any JSON object starts with eyJ, so a bare eyJ is no token. The logs of a pod that a test deleted are gone, and the scan
-# cannot read them.
+# base64 of any JSON object starts with eyJ, so a bare eyJ is no token. The logs of a pod that a test deleted are gone, and so is the log of a middle
+# instance of a container that restarted twice. The scan cannot read either.
 source "$(dirname "$0")/lib.sh"
 
 since="${1:?usage: gate-token-scan.sh <start time, RFC 3339 UTC>}"
