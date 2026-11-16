@@ -127,7 +127,7 @@ The table also covers a new root that no one planned. For a planned change of th
 | --- | --- | --- |
 | `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. |
 | `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
-| a cell | `CELL=dev-cp mise run cell:up`, `CELL=<cell> mise run cell:up`, then `CELL=management LINK_ONLY=<component> mise run cell:link` for `central-view`, `telemetry-gateway` and `mesh-view-hub` | The relay and the SPIRE node port admit the node addresses of the cells. A rebuilt cell binds with a new key, and each registry copies its record only at a link. |
+| a cell | `CELL=dev-cp mise run cell:up`, `CELL=<cell> mise run cell:up` | The relay, the gateway and the SPIRE node port admit the node addresses of the cells. A rebuilt cell binds with a new key, and `mgmtd` publishes its record to the registries of the views. |
 | the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
@@ -289,7 +289,8 @@ Both admit only the node addresses of the cells.
 The gateway keeps its queue and its outbox in SQLite on a volume of 256 MiB.
 
 The `cell:up` of `dev-cp` renders the gateway again.
-Run it after a rebuilt cell, and after `vm:up` when `cell:verify` reports a new node address.
+Run it after a rebuilt cell.
+After a restart of the VM, rebuild the harness, as the section on restarts says.
 
 Use `mise run gw -- status` to read the state of the gateway.
 The command prints one JSON line.
@@ -343,13 +344,14 @@ Each cell holds the old key until then.
 `mise run gate:m5:soak` sends one operation to `dev-cell-1` each minute for 30 minutes.
 It checks that each operation is applied once, also after the last minute.
 It samples the gap between the enqueue and the first record in the cell once for each operation, 30 samples in all.
-Each sample must stay below 15 seconds.
+The gate fails when a sample reaches 15 seconds.
 It prints the number of stream failures and of restarts for a new SVID.
 Run it alone, after `mise run gate:m5`.
 
 `mise run gate:m5:drill` loses the gateway volume while an operation is in flight.
 It stops `celld`, signs an operation, stops `mgmtd` and lets `celld` apply the operation.
-It waits until the outbox holds an item of kind `result` with the ID of that operation, because the status items of both cells fill the outbox too.
+It waits until the outbox holds an item of kind `result` with the ID of that operation.
+The status items of both cells also fill the outbox, so only that item shows the lost result.
 Then it runs `mise run gw:reset` and starts `mgmtd` again.
 Afterwards the epoch is higher, the operation is final with `applied` or `already_applied`, and the demo log holds one line for it.
 At the end, `mise run harness:status` exits 0.
@@ -435,8 +437,9 @@ The record of the cell then lists only the old keys. `mgmtd` finds the new key o
 - The periodic key check runs. It runs every 15 minutes for each cell.
 - An operator runs a key check.
 
-In the measured runs of 2026-11-15, `mgmtd` checked the keys 3 to 8 seconds after the first refusal.
+In the measured runs of 2026-11-14 UTC, `mgmtd` checked the keys 3 to 8 seconds after the first refusal.
 The SPIRE server issued a new pod 40 to 112 seconds after it.
+Four test runs gave 74, 40, 87 and 79 seconds, and the full `gate:m5` run gave 112 seconds.
 Most of that time is the kubelet update of the ConfigMap that the SPIRE server mounts.
 If a pod is still refused after 5 minutes, check these in order:
 
@@ -469,7 +472,8 @@ The command runs these steps in order:
 The steps took 5 minutes 30 seconds in the measured run of 2026-11-15.
 The stage took 1 second and the first cell pass 98 seconds. The commit took 1 second, the planes 129 seconds and the second cell pass 96 seconds.
 The whole default run took 9 minutes 13 seconds, with the rollout wait and the two `cell:verify` runs.
-The command prints one JSON line with the SHA-256 fingerprint of the old key and of the new key, the new epoch and the run time in seconds.
+The command prints one JSON line.
+The line holds the SHA-256 fingerprints of the old and the new key, the new epoch and the run time in seconds.
 The line holds public key data only.
 A failure prints the commands that remain, from the failed step on, as text on standard error and in the JSON error line.
 Run them in the printed order.
@@ -837,8 +841,9 @@ Kiali also tries to read the version of each `istiod` through a port forward. Th
 The Kiali log then holds the lines `Failing starting the port forwarding` and `Unable to get version info`, and the page shows no Istio version. This is expected.
 Kiali v2.34.1 has no setting that stops this call, so an alert on Kiali errors sees one error line for each cell and minute.
 The hub and each tunnel run one replica with the strategy `Recreate`.
-The hub reads the registry of cells at start, so a revoked cell stays connected until the hub pod starts again.
-`CELL=management mise run cell:link` renders the registry again, and it starts the hub pod when the content changed.
+The hub reads the registry of cells every 10 seconds, so it refuses a revoked cell at its next connection.
+An open tunnel ends at the expiry of the cell leaf.
+`mgmtd` publishes the registry, and the hub pod starts again only when the registry signer changes.
 The hub passes only the headers `Accept`, `Accept-Encoding`, `Content-Type` and `User-Agent`.
 The allow-list of the cell tunnel is the control that limits the requests, and the hub does not repeat it.
 
@@ -912,7 +917,7 @@ The object of `management` has these fields too:
 
 | Field | Description |
 | --- | --- |
-| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal. The kubelet rotates that log after about 10 hours, and the connect line goes with it. An agent with no stream line then counts as connected when the principal logged an event from it in the last 5 minutes. A closing line that comes later wins. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
+| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal. The kubelet rotates that log after about 10 hours, and the connect line goes with it. An agent with no stream line then counts as connected when the principal logged an event from it in the last 5 minutes. A later line that closes the stream wins. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
 | `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
 | `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
 | `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `absent_cells` holds the cells among them whose own API does not answer. `note` is empty, or says what to do. |
@@ -999,6 +1004,8 @@ The `cell-proxy` logs carry a `reason` field when they refuse a peer or a reques
 | `handshake_failed` | The handshake failed for another reason, for example a timeout. |
 | `request_too_large` | The gateway refused an export that is over a size limit of the gateway or of its upstream. |
 | `resource_refused` | One resource of an export is over a size limit. The gateway drops it and forwards the other resources. |
+| `proof_missing` | A cell source sent no proof, or the proof frame did not arrive in time. The log message is `proof refused`. |
+| `proof_invalid` | The proof of a cell source failed a check. The log message is `proof refused`, and the line carries the detail. |
 
 The hub and each tunnel pod also log the end of a tunnel as `tunnel_down` with a `cause`: `expiry`, `replaced`, `peer_closed` or `local_close`.
 A tunnel that the hub replaced with a newer one never counts as down.
@@ -1118,7 +1125,9 @@ The test timeout is 160 minutes, twice the budget.
 `gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has the floor of 30 minutes for its test timeout.
 All times of the next paragraph are wall time in seconds, measured on 2026-11-15 and 2026-11-16 (UTC).
 `gate:m1` took 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
-The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 440 seconds for `gate:m5:drill` with the wait for the result of X and 2,945 seconds for the last full `gate:m5`.
+The other gates took 592 seconds for `gate:m4:rotate` and 1,764 seconds for `gate:m5:soak`.
+The gate `gate:m5:drill` took 440 seconds with the wait for the result of X.
+The last full `gate:m5` took 2,945 seconds.
 Two runs from clean with the M5 components took 1,730 and 1,507 seconds for `harness:up`.
 After the second run, the five node containers used about 11 GiB of memory in total:
 
@@ -1257,9 +1266,18 @@ The restart check ran again on 2026-11-15 and 2026-11-16, and the result was the
 After the second restart, the gateway pod `cell-gateway-0` stayed in `CrashLoopBackOff` for at least 6 minutes, with the error `x509 source from the workload api: context deadline exceeded`.
 The gateway epoch could not be read, so the check does not show that the gateway state survives a restart.
 Every node had a new address, and the policies of `dev-cp` still held the old addresses.
-The last step, `gate:m1`, then found ports 30081 and 30443 to 30445 open on `dev-cp` from `rogue`, because `rogue` held an address that a cell had held before.
+The last step, `gate:m1`, then found ports 30081 and 30443 to 30445 open on `dev-cp` from `rogue`.
+`rogue` held an address that a cell had held before.
+The SPIRE server policy admits the cell addresses on port 30081, and the relay policy admits them on ports 30443 to 30445.
+The same old addresses also reach two more groups of ports, which the scan did not show because the gateway pod did not run.
+The gateway ports 30450 and 30451 admit the old cell addresses in their ingress rules and in the `--cell-node` check.
+The policies of `management` admit the old `dev-cp` address on port 8446 and on the view ports 31443 to 31445.
+The identity checks still hold.
+A pod of `rogue` at an old address reaches only the unauthenticated surface that a pod on a cell node already has.
+The real cell, at its new address, is shut out.
 The `gate:m1` step is expected to fail after a restart, and a pass does not show that the harness works.
 Rebuild with `harness:down` and `harness:up`.
+A run of `CELL=dev-cp mise run cell:up` alone does not repair the policies of `management`.
 
 ## How a change reaches the cell
 
