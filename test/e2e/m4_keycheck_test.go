@@ -85,7 +85,10 @@ func keyCheckAfterRotation(t *testing.T, cell, oldKID, newKID string, since time
 		t.Fatalf("the key check of %s after the rotation answered %q, want keys_updated or unchanged with both key IDs in the record", cell, got)
 	}
 	waitFor(t, "the mgmtd log to hold the key_check line of the manual check of "+cell, 30*time.Second, func() (bool, string) {
-		lines := keyCheckLines(t, called, cell)
+		lines, err := keyCheckLinesErr(t, called, cell)
+		if err != nil {
+			return false, err.Error()
+		}
 		for _, l := range lines {
 			if l.str("via") == "manual" {
 				return true, ""
@@ -161,10 +164,16 @@ func TestM4KeyCheckFollowsRotation(t *testing.T) {
 	}
 }
 
-// mgmtdLog returns the log of mgmtd since a time.
+// mgmtdLogErr returns the log of mgmtd since a time, and the error of the read. A poll uses it and tries again on an error.
+func mgmtdLogErr(t *testing.T, since time.Time) (string, error) {
+	t.Helper()
+	return kubectl(t, mgmtCluster, "", "-n", mgmtNamespace, "logs", mgmtdPod, "-c", "mgmtd", "--since-time="+since.UTC().Format(time.RFC3339))
+}
+
+// mgmtdLog returns the log of mgmtd since a time, and fails the test on a read error, so that an assertion on an empty log is never vacuous.
 func mgmtdLog(t *testing.T, since time.Time) string {
 	t.Helper()
-	out, err := kubectl(t, mgmtCluster, "", "-n", mgmtNamespace, "logs", mgmtdPod, "-c", "mgmtd", "--since-time="+since.UTC().Format(time.RFC3339))
+	out, err := mgmtdLogErr(t, since)
 	if err != nil {
 		t.Fatalf("read the mgmtd log: %v", err)
 	}

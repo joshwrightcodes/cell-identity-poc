@@ -1039,7 +1039,7 @@ dependents_of() {
   cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
   case "$1" in
     hostsvc) echo "mise run hostsvc:serve -- restart" ;;
-    # The gateway admits a cell by its node address, and Docker can give a node a new address after vm:up.
+    # The gateway admits a cell by its node address, and a rebuilt cell gets a new address. After a restart of the VM the harness is rebuilt instead.
     gateway-nodes) echo "CELL=dev-cp mise run cell:up" ;;
     # A lost, corrupt or full store of the gateway: gw:reset wipes it, and envd fills it again.
     gateway-store) echo "mise run gw:reset" ;;
@@ -1068,10 +1068,10 @@ dependents_of() {
   esac
 }
 
-# gate_test_timeout <budget minutes> prints the go test timeout of a gate in minutes: twice the budget,
-# and never below 30. An empty budget gives 30.
+# gate_test_timeout <budget minutes> [<floor minutes>] prints the go test timeout of a gate in minutes: twice the budget,
+# and never below the floor (default 30). An empty budget gives the floor.
 gate_test_timeout() {
-  local budget="${1:-}" timeout=30
+  local budget="${1:-}" timeout="${2:-30}"
   [[ -z "$budget" ]] || ((budget * 2 <= timeout)) || timeout=$((budget * 2))
   printf '%s\n' "$timeout"
 }

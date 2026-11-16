@@ -91,20 +91,23 @@ func TestRunSendsTermBeforeKill(t *testing.T) {
 		t.Errorf("the trap of the command did not run after the limit: %q, %v", raw, rerr)
 	}
 
+	// A child that ignores SIGTERM stays alive until the SIGKILL of the group. The leader dies at WaitDelay in any case, so only the child shows
+	// that the group got the SIGKILL.
 	pidFile := t.TempDir() + "/pid"
-	start := time.Now()
-	_, err = Run(300*time.Millisecond, "", nil, "bash", "-c", `trap '' TERM; echo $$ >"$0"; while :; do sleep 1; done`, pidFile)
+	_, err = Run(300*time.Millisecond, "", nil, "bash", "-c", `trap '' TERM; sleep 60 & echo $! >"$0"; wait`, pidFile)
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
-	if took := time.Since(start); took > 10*time.Second {
-		t.Errorf("a command that ignores SIGTERM ran %s, want the SIGKILL after the grace time", took)
+	raw, rerr := os.ReadFile(pidFile)
+	if rerr != nil {
+		t.Fatal(rerr)
 	}
-	raw, _ := os.ReadFile(pidFile)
-	deadline := time.Now().Add(3 * time.Second)
-	for exec.Command("kill", "-0", strings.TrimSpace(string(raw))).Run() == nil {
+	pid := strings.TrimSpace(string(raw))
+	t.Cleanup(func() { _ = exec.Command("kill", "-9", pid).Run() })
+	deadline := time.Now().Add(2 * time.Second)
+	for exec.Command("kill", "-0", pid).Run() == nil {
 		if time.Now().After(deadline) {
-			t.Fatalf("the process %s is still alive after the grace time", raw)
+			t.Fatalf("the child %s that ignores SIGTERM is still alive after Run returned, so the group got no SIGKILL", pid)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

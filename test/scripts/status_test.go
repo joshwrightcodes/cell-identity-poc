@@ -191,6 +191,7 @@ esac
 const statusMiseStub = `#!/usr/bin/env bash
 case "$*" in
   "run cell:verify")
+    [[ -z "${STUB_VERIFY_SLEEP:-}" ]] || sleep "$STUB_VERIFY_SLEEP"
     [[ "${CELL}" == "${STUB_VERIFY_HANG:-none}" ]] && exec sleep 30
     [[ "${CELL}" == "${STUB_VERIFY_DIES:-none}" ]] && { echo "==> checking cell $CELL" >&2; echo "error: cannot reach the API server of $CELL" >&2; exit 1; }
     var="STUB_VERIFY_${CELL//-/_}"
@@ -259,6 +260,7 @@ func derSHA(t *testing.T, pemText string) string {
 // seconds behind the clock of the Mac (default 0), in epoch seconds or in the form of date -u.
 const nodeClockDocker = `#!/usr/bin/env bash
 [[ "$1 $2" == "exec dev-cp-control-plane" && "$3" == date ]] || { echo "unexpected docker call: $*" >&2; exit 2; }
+[[ -z "${STUB_CLOCK_FAIL:-}" ]] || { echo "Error: No such container: dev-cp-control-plane" >&2; exit 1; }
 t=$(( $(date +%s) - ${STUB_CLOCK_SKEW:-0} ))
 if [[ "$4" == +%s ]]; then echo "$t"; else date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ; fi
 `
@@ -1059,5 +1061,32 @@ func TestCheckGatewaySyncedUsesTheNodeClock(t *testing.T) {
 	}
 	if out, err := run(3 * time.Minute); err == nil || !strings.Contains(out, "more than 2 minutes ago") {
 		t.Errorf("a sync from 3 minutes ago on the node clock gave %v and %q, want the late sync", err, out)
+	}
+}
+
+// TestStatusReadsTheClockAfterTheVerifySteps: cell:verify can run for minutes before the age checks. A sync that is 110 seconds old when
+// the script starts, with a verify step of 15 seconds, is 125 seconds old at the check, and the script reports it.
+func TestStatusReadsTheClockAfterTheVerifySteps(t *testing.T) {
+	byName, _, stderr, code := runStatus(t, "STUB_VERIFY_SLEEP=15",
+		"STUB_GW_STATUS="+healthyGateway(func(m map[string]any) { m["syncedAt"] = timeAgo(110 * time.Second) }))
+	if code == 0 || !strings.Contains(strings.Join(strs(byName["dev-cp"]["problems"]), "\n"), "more than 2 minutes") {
+		t.Errorf("a sync that is 125 seconds old at the check gave exit %d and problems %v, want the late sync\n%s", code, byName["dev-cp"]["problems"], stderr)
+	}
+}
+
+// TestStatusPrintsEveryClusterWhenTheNodeClockIsUnreadable: with no answer from the node dev-cp-control-plane, the script still prints one object for
+// each cluster. The clusters with time-based checks report a problem that names the cause.
+func TestStatusPrintsEveryClusterWhenTheNodeClockIsUnreadable(t *testing.T) {
+	byName, lines, stderr, code := runStatus(t, "STUB_CLOCK_FAIL=1")
+	if len(lines) != 4 {
+		t.Fatalf("got %d cluster objects, want 4\n%s", len(lines), stderr)
+	}
+	if code == 0 {
+		t.Errorf("exit 0 with an unreadable node clock, want 1")
+	}
+	for _, c := range []string{"dev-cp", "management"} {
+		if !strings.Contains(strings.Join(strs(byName[c]["problems"]), "\n"), "cannot read the time of the node dev-cp-control-plane") {
+			t.Errorf("%s problems %v lack the clock cause", c, byName[c]["problems"])
+		}
 	}
 }

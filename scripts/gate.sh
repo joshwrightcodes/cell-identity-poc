@@ -15,6 +15,7 @@ gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" |
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
+timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 [[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
 [[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
@@ -137,9 +138,9 @@ events="$BUILD_ROOT/gate-$milestone.json"
 durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS
 status=0
-# The test timeout is twice the budget, with a floor of 30 minutes, so the budget check reports a
-# slow run and the Go timeout never ends the run first.
-test_timeout="$(gate_test_timeout "$budget_minutes")"
+# The test timeout is twice the budget, with a floor of 30 minutes or GATE_<MILESTONE>_TEST_TIMEOUT_MINUTES, so the budget check
+# reports a slow run and the Go timeout never ends the run first.
+test_timeout="$(gate_test_timeout "$budget_minutes" "${!timeout_var:-}")"
 go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$pattern" "$@" \
   | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))

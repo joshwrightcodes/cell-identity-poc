@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stop and start the Colima VM, wait until every node is Ready, then run the M1 gate. A restart gives each node a new address, and the
-# policies of dev-cp hold the old addresses. The last step fails when rogue takes an address that a policy still admits, and a pass does
+# policies of dev-cp and management hold the old addresses. The last step fails when rogue takes an address that a policy still admits, and a pass does
 # not show that the harness works. Rebuild with harness:down and harness:up afterwards. An API server that does not answer yet counts as
 # not ready, and the loop keeps waiting for it.
 source "$(dirname "$0")/lib.sh"

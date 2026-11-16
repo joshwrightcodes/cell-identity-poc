@@ -3,15 +3,14 @@
 package e2e
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"slices"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 const (
@@ -154,14 +153,13 @@ func repairAPIServer(t *testing.T) {
 	// pods that started while the test key signed carry its token, so the bound allows five. 1532 s + 5 x 183 s = 2447 s, 41 minutes.
 	// On a timeout the whole process group ends, so no kubectl or docker child of the script stays behind.
 	const repairBound = (1532 + 5*183) * time.Second
-	ctx, cancel := context.WithTimeout(context.Background(), repairBound)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m2-repair.sh")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-	cmd.WaitDelay = 10 * time.Second
-	out, err := cmd.CombinedOutput()
-	t.Logf("gate-m2-repair.sh:\n%s", strings.TrimSpace(string(out)))
+	// cmdrun.Run starts the repair in its own process group, forwards INT and TERM of the test process to it (so a Ctrl-C reaches the
+	// script and its EXIT trap frees the repair lock), and ends the group with TERM and then KILL at the bound.
+	res, err := cmdrun.Run(repairBound, "", nil, "bash", "../../scripts/gate-m2-repair.sh")
+	t.Logf("gate-m2-repair.sh:\n%s\n%s", strings.TrimSpace(res.Stdout), strings.TrimSpace(res.Stderr))
+	if err == nil && res.Code != 0 {
+		err = fmt.Errorf("exit status %d", res.Code)
+	}
 	if err != nil {
 		t.Errorf("the repair of dev-cell-1 failed: %v. %s", err, repairHint)
 		return

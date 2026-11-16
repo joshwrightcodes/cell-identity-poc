@@ -45,14 +45,21 @@ clusters="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROO
 [[ -n "$clusters" ]] || json_fail harness:status "no cluster in harness/topology.yaml has components"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-# NODE_NOW is the time of a node in epoch seconds. Every age in this script is a difference between it and a timestamp that a cluster wrote.
-NODE_NOW="$(node_now)" || json_fail harness:status "cannot read the time of the node dev-cp-control-plane. Check that Docker runs and that the node container exists with: docker ps"
-[[ "$NODE_NOW" =~ ^[0-9]+$ ]] || json_fail harness:status "the node dev-cp-control-plane gave '$NODE_NOW' as its time, want epoch seconds"
 max_age="${STATUS_SAMPLE_MAX_AGE:-300}"
 verify_limit="${STATUS_VERIFY_TIMEOUT:-900}"
 
 # kubectl with a bound on each request, so that a hung API server gives a problem and no hang.
 kubectl() { command kubectl --request-timeout=20s "$@"; }
+
+# read_clock sets now to the time of the node dev-cp-control-plane in epoch seconds, and clock_problem to "". Every age in this script is a
+# difference between now and a timestamp that a cluster wrote, so each check reads the clock again just before it compares, and the time
+# of the verify steps never counts as age. When the node does not answer, now is the time of the Mac, and clock_problem names the cause.
+read_clock() {
+  clock_problem=""
+  if now="$(node_now 2>/dev/null)" && [[ "$now" =~ ^[0-9]+$ ]]; then return 0; fi
+  now="$(date +%s)"
+  clock_problem="cannot read the time of the node dev-cp-control-plane, so the age checks use the clock of the Mac, which can differ from the clock of the VM. Run: docker ps"
+}
 
 # with_timeout <seconds> <command...> runs the command, and stops it with TERM after the time.
 with_timeout() {
@@ -136,7 +143,9 @@ management_plane() {
 # management_problems <cell-identity cells> reads the field management on standard input and prints one problem
 # for each bad value, as a JSON array of strings. Each problem ends with the command to run.
 management_problems() {
-  jq -c --arg bind "$1" --argjson now "$NODE_NOW" 'def rev: "\(.epoch).\(.counter)";
+  local now clock_problem
+  read_clock
+  jq -c --arg bind "$1" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def cp: "CELL=dev-cp mise run cell:verify";
     if .error != null then ["mgmtd status failed: " + .error]
@@ -170,7 +179,7 @@ management_problems() {
         (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"
          elif .hostsvc.expires_soon then "the host service certificate expires soon. Run: mise run hostsvc:serve -- restart"
          elif .hostsvc.check != "" then "host service: " + .hostsvc.check else empty end)
-      ] end'
+      ] end | . + (if $clockp != "" then [$clockp] else [] end)'
 }
 
 # gateway_plane prints the field gateway, the cells that mgmtd reports as bound, and whether mgmtd answers, as one JSON
@@ -195,7 +204,9 @@ gateway_plane() {
 # gateway_problems reads the output of gateway_plane on standard input and prints one problem for each bad value, as a
 # JSON array of strings. The sync and the store error follow check_gateway_synced of cell:verify, with the same 2 minutes.
 gateway_problems() {
-  jq -c --argjson now "$NODE_NOW" --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+  local now clock_problem
+  read_clock
+  jq -c --argjson now "$now" --arg clockp "$clock_problem" --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def recent($t; $secs): ($t | ts) > 1000000000 and ($now - ($t | ts)) < $secs;
     .gateway as $g | .bound as $bound | .mgmt_up as $up
     | if $g.error != null then ["gateway status failed: " + $g.error]
@@ -210,19 +221,20 @@ gateway_problems() {
         ($bound[] as $c | select(($g.streams[$c] // 0) < 1) | "the gateway holds no stream of \($c). Run: CELL=\($c) mise run cell:up"),
         (($g.mostClaimed // {}) | to_entries[] | select(.value.count > 3)
           | "the cell \(.key) claimed operation \(.value.opId) \(.value.count) times. Run: mise run ops -- trace \(.value.opId)")
-      ] end'
+      ] end | . + (if $clockp != "" then [$clockp] else [] end)'
 }
 
 # management_extras prints the fields of the management object, as one JSON object.
 management_extras() {
-  local logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
+  local now clock_problem logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
 
   # The principal lists an agent as connected until its last stream line closes the stream. The kubelet rotates the log after
   # about 10 hours, and the connect line goes with it. An agent with no stream line in the log counts as connected when the
   # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
   expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  agents="$(jq -Rsc --argjson now "$NODE_NOW" --argjson expected "$expected" '
+  read_clock
+  agents="$(jq -Rsc --argjson now "$now" --argjson expected "$expected" '
       def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
       [split("\n")[] | fromjson? | select(type == "object" and .client != null)] as $lines
       | [$lines[] | select(.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream")]

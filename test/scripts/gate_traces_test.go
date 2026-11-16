@@ -272,6 +272,17 @@ func TestSettleControlPlane(t *testing.T) {
 		}
 		return m
 	}
+	// staleScheduler makes the manager current and the scheduler a container that started before the API server (s0), with s1 after the stop.
+	staleScheduler := func(over map[string]string) map[string]string {
+		m := map[string]string{
+			"id-kube-controller-manager": "m1\n", "lease-kube-controller-manager.json": lease(node+"_new", "2026-11-16T03:25:35.000000Z", "2026-11-16T03:25:48.000000Z"),
+			"id-kube-scheduler": "s0\n", "id-kube-scheduler-after": "s1\n", "inspect-s0.json": inspect("2026-11-16T03:00:05Z"),
+			"lease-kube-scheduler-before.json": lease(node+"_s_old", "2026-11-16T03:10:00.000000Z", "2026-11-16T03:25:40.000000Z")}
+		for k, v := range over {
+			m[k] = v
+		}
+		return m
+	}
 	for _, tc := range []struct {
 		name    string
 		files   map[string]string
@@ -290,6 +301,13 @@ func TestSettleControlPlane(t *testing.T) {
 		{"the same holder with an acquire time after the stop", base(map[string]string{
 			"lease-kube-controller-manager.json": lease(node+"_old", "2026-11-16T03:25:50.000000Z", "2026-11-16T03:25:51.000000Z")}), true,
 			[]string{"acquireTime 2026-11-16T03:25:50.000000Z"}, nil},
+		{"a stale scheduler whose old process renews its Lease after the stop", base(staleScheduler(map[string]string{
+			"lease-kube-scheduler.json": lease(node+"_s_old", "2026-11-16T03:10:00.000000Z", "2026-11-16T03:25:48.000000Z")})), false,
+			[]string{"stopped the kube-scheduler container", "Lease holder before the stop '" + node + "_s_old', stop time 1794799550", "not current after 2s"},
+			[]string{"stopped the kube-controller-manager", "let the wait pass"}},
+		{"a stale scheduler with a new holder", base(staleScheduler(map[string]string{
+			"lease-kube-scheduler.json": lease(node+"_s_new", "2026-11-16T03:25:45.000000Z", "2026-11-16T03:25:48.000000Z")})), true,
+			[]string{"Lease of kube-scheduler let the wait pass: holder " + node + "_s_new"}, nil},
 		{"no container started before the API server", base(map[string]string{
 			"id-kube-controller-manager": "m1\n", "lease-kube-controller-manager.json": lease(node+"_new", "2026-11-16T03:25:45.000000Z", "2026-11-16T03:25:48.000000Z")}), true,
 			nil, []string{"stopped the"}},

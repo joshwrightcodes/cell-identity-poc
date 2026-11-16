@@ -55,23 +55,38 @@ func waitUpdateGap(t *testing.T, since time.Time) {
 	}
 }
 
-// keyCheckLines returns the key_check lines of mgmtd for a cell since a time.
+// keyCheckLines returns the key_check lines of mgmtd for a cell since a time, and fails the test on a read error.
 func keyCheckLines(t *testing.T, since time.Time, cell string) []logLine {
 	t.Helper()
 	return matching(mgmtdLog(t, since), func(l logLine) bool { return l.str("msg") == "key_check" && l.str("cell") == cell })
 }
 
+// keyCheckLinesErr is keyCheckLines for a poll: it returns the read error.
+func keyCheckLinesErr(t *testing.T, since time.Time, cell string) ([]logLine, error) {
+	t.Helper()
+	out, err := mgmtdLogErr(t, since)
+	if err != nil {
+		return nil, err
+	}
+	return matching(out, func(l logLine) bool { return l.str("msg") == "key_check" && l.str("cell") == cell }), nil
+}
+
 // keysUpdatedLines returns the lines of mgmtd for a cell since a time that show a record update: a key_check line with the result
 // keys_updated, and a bind line with the result keys_updated. Each is tagged with the path that wrote the key.
-func keysUpdatedLines(t *testing.T, since time.Time, cell string) (lines []logLine, paths []string) {
+// It is for a poll, so it returns the read error.
+func keysUpdatedLines(t *testing.T, since time.Time, cell string) (lines []logLine, paths []string, err error) {
 	t.Helper()
-	for _, l := range matching(mgmtdLog(t, since), func(l logLine) bool {
+	out, err := mgmtdLogErr(t, since)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, l := range matching(out, func(l logLine) bool {
 		return (l.str("msg") == "key_check" || l.str("msg") == "bind") && l.str("cell") == cell && l.str("result") == "keys_updated"
 	}) {
 		lines = append(lines, l)
 		paths = append(paths, l.str("msg"))
 	}
-	return lines, paths
+	return lines, paths, nil
 }
 
 func lineTime(l logLine) time.Time {
@@ -340,7 +355,10 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	var updatedAt time.Time
 	var updatedBy string
 	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the switch", max(time.Until(rotatedAt.Add(rotationHealWait)), 30*time.Second), func() (bool, string) {
-		lines, paths := keysUpdatedLines(t, start, cell)
+		lines, paths, err := keysUpdatedLines(t, start, cell)
+		if err != nil {
+			return false, err.Error()
+		}
 		for i, l := range lines {
 			if at := lineTime(l); updatedAt.IsZero() || at.Before(updatedAt) {
 				updatedAt, updatedBy = at, paths[i]
@@ -349,7 +367,7 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		if !updatedAt.IsZero() {
 			return true, ""
 		}
-		return false, fmt.Sprintf("key checks: %d", len(keyCheckLines(t, start, cell)))
+		return false, fmt.Sprintf("keys_updated lines: %d", len(lines))
 	})
 	t.Logf("KEYS_UPDATED_BY=%s", updatedBy)
 	for _, l := range keyCheckLines(t, start, cell) {
