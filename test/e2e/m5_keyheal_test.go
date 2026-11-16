@@ -339,13 +339,16 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		return false, fmt.Sprintf("key checks: %d", len(keyCheckLines(t, start, cell)))
 	})
 	t.Logf("KEYS_UPDATED_BY=%s", updatedBy)
-	hinted := false
-	for _, l := range keyCheckLines(t, start, cell) {
-		hinted = hinted || l.str("via") == "hint"
-	}
-	if !hinted {
-		t.Errorf("no key check of %s with via hint ran in the window, so the gateway did not hint", cell)
-	}
+	// The hint check can follow a bind by seconds, so it gets the rest of the heal window.
+	waitFor(t, "a key check of "+cell+" with via hint after the switch", max(time.Until(rotatedAt.Add(rotationHealWait)), 30*time.Second), func() (bool, string) {
+		lines := keyCheckLines(t, start, cell)
+		for _, l := range lines {
+			if l.str("via") == "hint" {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("key checks: %d, none via hint", len(lines))
+	})
 	for _, l := range keyCheckLines(t, start, cell) {
 		if l.str("via") == "periodic" {
 			t.Errorf("a periodic key check of %s ran in the window: %v", cell, l)
