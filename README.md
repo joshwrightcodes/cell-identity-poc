@@ -400,6 +400,26 @@ The bind listener of the gateway checks the source address first.
 A request whose source is not the node of the named cell gets `source_mismatch` and the status 403.
 The gateway log shows `bind_denied` with the request ID that the probe prints.
 
+### An operation does not finish
+
+Run `mise run ops -- trace <id>` first.
+It prints the operation at `mgmtd` and each row of the gateway queue that has the ID.
+Read the cases in this order:
+
+| What you see | What it means | What to do |
+| --- | --- | --- |
+| State `open`, no queue row | `envd` has not synced the operation to the gateway | Read `syncedAt` in `mise run gw -- status`, then the log of `envd` |
+| Row `queued` with no holder and no claims | The cell has no stream | Run `CELL=<cell> mise run cell:up` and read the log of `celld` |
+| Row `leased`, `claims` above 3 | The cell claims the operation again and again | Read the log of `celld` for the reason, then `mise run ops -- close <id>` after the expiry |
+| Row `done`, state still `open` | The result is in the outbox or refused by `mgmtd` | Run `mise run gw -- outbox`, then read `lastRefusal` in `mise run mgmt -- status` |
+| State `expired` with no final result | No cell applied it in time | Run `mise run ops -- close <id>` |
+| An ID with no operation but a queue row | A forged or a replayed envelope | Read `forgedSeen` and `lastRefusal`, and see the section on refused operations |
+
+The outbox of the gateway holds at most 10,000 items and 64 MiB, and each cell at most 2,000 items and 16 MiB.
+The gateway counts an item that it cannot keep in `dropped`, and `harness:status` fails for 15 minutes after the last drop.
+`celld` keeps each result until `mgmtd` reports it, and sends it again after a new stream, so a dropped result reaches `mgmtd` later.
+A lost or full store of the gateway needs `mise run gw:reset`, as the section on the cell gateway says.
+
 ## Refused keys, signing key rotation and lost state
 
 ### Fix unknown_kid
@@ -890,11 +910,36 @@ The object of `management` has these fields too:
 
 | Field | Description |
 | --- | --- |
-| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal, because no other source is verified. After the kubelet rotates that log, an agent that connected before and did not reconnect reads as missing. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
+| `agents` | `expected` holds the agent names `<env>-<cell>` of `VIEW_CELLS`. `connected` holds the agents with an open stream to the principal. `missing` holds the others. The task reads the current log of the principal. The kubelet rotates that log after about 10 hours, and the connect line goes with it. An agent with no stream line then counts as connected when the principal logged an event from it in the last 5 minutes. A later closing line wins. Run `CELL=<cell> mise run cell:verify` for that cell to check its agent. |
 | `samples` | The age in seconds of the last Prometheus sample for each `k8s_cluster_name`. |
 | `stale_samples` | Each cluster with no sample, or with a sample of 300 seconds or more. |
 | `kiali` | `ready` is the state of the Kiali Deployment. `accessible` holds the clusters that Kiali reaches. `missing` holds the cells of `MESH_VIEW_CELLS` that it does not reach. `down_cells` holds the cells without a tunnel at the hub. `absent_cells` holds the cells among them whose own API does not answer. `note` is empty, or says what to do. |
 | `mesh` | `ok` is the exit status of `mesh:status`. `lines` holds its output. |
+
+The object of `dev-cp` has the field `gateway`. It holds `epoch`, `epochChangedAt`, `syncedAt`, `outboxItems`, `oldestOutboxAt`, `dropped`, `droppedAt`, `recordOld`, `recordOldAt`, `queued`, `streams`, `mostClaimed`, `lastBindRefusal` and `storeError`.
+It holds only `error` when the gateway does not answer.
+The `management` object holds `cells`, and each cell has `lastStatusAt`, `unreported`, `oldestUnreportedAt`, `records`, `openOps`, `expiredOps`, `forgedSeen`, `lastRefusal` and `lastHintCheck`.
+It also lists `expiredOps`, the operations that expired with no final result, each as `id`, `cell` and `expiredAt`.
+
+`mise run harness:status` exits 1, and prints the next command, in these cases for signed work:
+
+| Case | Command |
+| --- | --- |
+| The gateway reports a store error | `mise run gw:reset` |
+| `envd` synced with the gateway more than 2 minutes ago | Read the log of `envd`, then `CELL=dev-cp mise run cell:up` |
+| The oldest outbox item is older than 2 minutes while `mgmtd` answers | `mise run gw -- outbox` |
+| The gateway dropped an item in the last 15 minutes | `mise run gw -- outbox` |
+| The gateway refused an older record in the last 15 minutes | `CELL=dev-cp mise run cell:up` |
+| A bound cell has no stream at the gateway | `CELL=<cell> mise run cell:up` |
+| One operation was claimed more than 3 times by one cell | `mise run ops -- trace <id>` |
+| A bound cell sent no status in the last 2 minutes | `CELL=<cell> mise run cell:verify` |
+| A cell has unreported items older than 5 minutes, or more than 800 records | `CELL=<cell> mise run cell:verify` |
+| An operation expired in the last 15 minutes with no final result | `mise run ops -- close <id>` |
+| A hint check of a cell is `keys_untrusted`, `issuer_untrusted`, `issuer_unavailable` or `error` | The command in the problem text |
+
+`cell:verify` owns three more checks. `harness:status` includes them in the `verify` field of `dev-cp`. They cover the sync and the store error of the gateway, the record revisions that the gateway holds, and the file `attest-hints`.
+A failure of one of them shows in `verify.failed`, and its repair command is in `problems`.
+The sync case then shows twice, once from `cell:verify` and once from the gateway field.
 
 While a cell is down, Kiali cannot start. It stops during discovery and restarts with longer waits.
 It recovers about five minutes after the cell returns.
@@ -1065,6 +1110,15 @@ Each test that changes a cell record links the three registry components again i
 It prints the twelve slowest tests at the end.
 The slowest tests are the management CA rotation (574 seconds) and the rogue telemetry test (246 seconds).
 The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take 97 seconds.
+`gate:m5` fails when the run takes longer than `GATE_M5_BUDGET_MINUTES`.
+The budget is 80 minutes. This is 1.5 times the slower of two full runs, 3,006 and 2,696 seconds of tests, rounded up to 5 minutes.
+The test timeout is 160 minutes, twice the budget.
+`gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has the floor of 30 minutes for its test timeout.
+Measured on 2026-11-16: `gate:m1` 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
+The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 252 seconds for `gate:m5:drill` and 2,937 seconds for the last full `gate:m5`.
+A run from clean with the M5 components took 1,730 seconds for `harness:up` on 2026-11-16.
+The rebuild of `management` took 21 minutes 36 seconds from `cell:down` to a passing `harness:status`. The first `harness:status` failed only on collector export retries, which clear by themselves within 5 minutes.
+The slowest M5 tests are the key rotation tests, about 6 to 11 minutes each, and `TestM5DevCPCannotPoseOnReports`, about 6 minutes.
 The budgets do not cover `harness:up`.
 
 ## Side effects of gate:m2
@@ -1078,8 +1132,13 @@ The budgets do not cover `harness:up`.
 - After the edit, it makes sure that `kube-controller-manager` of `dev-cell-1` runs a new container, because it keeps a token for each controller in memory.
   kubelet can delay that container by its restart back-off, up to 5 minutes.
   Until it runs, no controller of `dev-cell-1` replaces a pod.
+  The repair reads the start of the API server from the container runtime on the node.
+  It does not read the mirror pods, because their status can still show the old containers.
+  It waits until `kube-controller-manager` and `kube-scheduler` each hold their Lease since that start. A held Lease shows that the component runs its controllers.
 - It replaces each pod of `dev-cell-1` that received a token from the test key.
-  The `kindnet` pod comes first, and the others follow one at a time.
+  The repair replaces the pods one at a time, in three ranks.
+  The ranks are the node pods (`kindnet`, `kube-proxy` and `istio-cni-node`), the issuers (`istiod` and the SPIRE server), and all other pods.
+  An app pod waits for a certificate from an issuer, so an issuer with a token of the old key must go before it.
   A Deployment outside the harness and outside Argo CD gets a rollout restart, so `coredns` keeps one ready pod.
   The other pods are deleted, and their controllers create them again.
   While the `kindnet` pod restarts, NetworkPolicy fails open, as the residual limits in `docs/design/poc-scope.md` say.
@@ -1102,7 +1161,9 @@ It usually takes a few minutes.
 Each wait has a bound, and the log names it.
 The fixed waits add up to about 20 minutes, and each replaced pod adds up to 3 minutes.
 kubelet back-off alone can take 5 minutes of that time.
-New pods of `dev-cell-1` wait while `kube-scheduler` is in kubelet back-off, so the repair waits for it before it replaces pods.
+New pods of `dev-cell-1` wait while `kube-scheduler` is in kubelet back-off, so the repair waits for its Lease before it replaces pods.
+A rollout restart that does not finish in 120 seconds is logged, and the final wait for every workload decides.
+After many key switches in a row, the back-off of the controller manager grows. This is a residual limit in `docs/design/poc-scope.md`.
 A repair in the cleanup of a test can outlast the `go test` timeout in the worst case.
 The next run then stops in its precheck and prints the repair command.
 Only one repair runs at a time. A repair holds the lock `build/gate-m2-repair.lock`, and a second repair or a gate precheck refuses to start beside it.
