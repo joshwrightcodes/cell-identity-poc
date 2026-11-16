@@ -1118,7 +1118,7 @@ The test timeout is 160 minutes, twice the budget.
 `gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has the floor of 30 minutes for its test timeout.
 All times of the next paragraph are wall time in seconds, measured on 2026-11-15 and 2026-11-16 (UTC).
 `gate:m1` took 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
-The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 252 seconds for `gate:m5:drill` and 2,945 seconds for the last full `gate:m5`.
+The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 440 seconds for `gate:m5:drill` with the wait for the result of X and 2,945 seconds for the last full `gate:m5`.
 Two runs from clean with the M5 components took 1,730 and 1,507 seconds for `harness:up`.
 After the second run, the five node containers used about 11 GiB of memory in total:
 
