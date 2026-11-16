@@ -282,7 +282,9 @@ func TestM3ViewListenerIdentity(t *testing.T) {
 	for _, c := range bundleRoots(t, mgmtCluster) {
 		roots.AddCert(c)
 	}
-	addr := portForward(t, mgmtCluster, viewNamespace, "svc/"+viewListener, 8444)
+	// Each dial gets its own port-forward: kubectl ends a port-forward when a write to the pod hits a connection that the pod
+	// side already closed, and a refusal closes the connection.
+	addr := func() string { return portForward(t, mgmtCluster, viewNamespace, "svc/"+viewListener, 8444) }
 	pod, _, _ := principalPod(t)
 	since := time.Now().Add(-2 * time.Second)
 	svid := func(id string) tls.Certificate {
@@ -294,7 +296,7 @@ func TestM3ViewListenerIdentity(t *testing.T) {
 		return c
 	}
 	good := "spiffe://" + envTrustDomain + "/cell/dev-cell-1/argocd-agent"
-	if err := viewDial(t, addr, "dev-cell-1", svid(good), streamProof(t, "dev-cell-1", "argocd-agent")); err != nil {
+	if err := viewDial(t, addr(), "dev-cell-1", svid(good), streamProof(t, "dev-cell-1", "argocd-agent")); err != nil {
 		t.Fatalf("%s: %v, want an answer", good, err)
 	}
 	refused := map[string]tls.Certificate{
@@ -303,7 +305,7 @@ func TestM3ViewListenerIdentity(t *testing.T) {
 		"self-signed " + good: selfSigned(t, good),
 	}
 	for name, cert := range refused {
-		if err := viewDial(t, addr, "dev-cell-1", cert, nil); err == nil {
+		if err := viewDial(t, addr(), "dev-cell-1", cert, nil); err == nil {
 			t.Errorf("%s got an answer, want a refusal", name)
 		} else {
 			t.Logf("%s: refused: %v", name, err)

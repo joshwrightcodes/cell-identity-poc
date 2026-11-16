@@ -157,21 +157,25 @@ func requireRefused(t *testing.T, s poseStream, conn *tls.Conn) {
 func TestM5DevCPCannotPoseOnStreams(t *testing.T) {
 	for _, s := range poseStreams {
 		t.Run(s.name, func(t *testing.T) {
-			addr := s.addr(t)
+			// Each subtest opens its own port-forward: kubectl ends a port-forward when a write to the pod hits a connection that
+			// the pod side already closed, and a refusal closes the connection, which is the behaviour under test.
 			id := func(cell string) string { return "spiffe://" + envTrustDomain + "/cell/" + cell + "/" + s.role }
 			t.Run("no_proof", func(t *testing.T) {
+				addr := s.addr(t)
 				since := time.Now().Add(-2 * time.Second)
 				conn := dialAsCell(t, addr, "dev-cell-1", s.role, cellSVID(t, "dev-cell-1", s.role), func(string) string { return "" })
 				requireRefused(t, s, conn)
 				refusalSeen(t, s, "proof_missing", id("dev-cell-1"), since)
 			})
 			t.Run("rogue_proof", func(t *testing.T) {
+				addr := s.addr(t)
 				since := time.Now().Add(-2 * time.Second)
 				conn := dialAsCell(t, addr, "dev-cell-1", s.role, cellSVID(t, "dev-cell-1", s.role), rogueStreamProof(t, "dev-cell-1", s.role))
 				requireRefused(t, s, conn)
 				refusalSeen(t, s, "proof_invalid", id("dev-cell-1"), since)
 			})
 			t.Run("replayed_proof", func(t *testing.T) {
+				addr := s.addr(t)
 				// The real pod of dev-cell-2 makes a token for the session of a first connection. A second connection sends
 				// it. The audience names the first session, so the server refuses it.
 				cell := "dev-cell-2"
@@ -191,6 +195,7 @@ func TestM5DevCPCannotPoseOnStreams(t *testing.T) {
 				refusalSeen(t, s, "proof_invalid", id(cell), since)
 			})
 			t.Run("control", func(t *testing.T) {
+				addr := s.addr(t)
 				cell := "dev-cell-1"
 				if s.name == "mesh_view" {
 					// The hub keeps the newest connection of a cell as its tunnel, so the control replaces the real
