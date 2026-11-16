@@ -60,6 +60,19 @@ func keyCheckLines(t *testing.T, since time.Time, cell string) []logLine {
 	return matching(mgmtdLog(t, since), func(l logLine) bool { return l.str("msg") == "key_check" && l.str("cell") == cell })
 }
 
+// keysUpdatedLines returns the lines of mgmtd for a cell since a time that show a record update: a key_check line with the result
+// keys_updated, and a bind line with the result keys_updated. Each is tagged with the path that wrote the key.
+func keysUpdatedLines(t *testing.T, since time.Time, cell string) (lines []logLine, paths []string) {
+	t.Helper()
+	for _, l := range matching(mgmtdLog(t, since), func(l logLine) bool {
+		return (l.str("msg") == "key_check" || l.str("msg") == "bind") && l.str("cell") == cell && l.str("result") == "keys_updated"
+	}) {
+		lines = append(lines, l)
+		paths = append(paths, l.str("msg"))
+	}
+	return lines, paths
+}
+
 func lineTime(l logLine) time.Time {
 	at, _ := time.Parse(time.RFC3339Nano, l.str("time"))
 	return at
@@ -309,16 +322,30 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 	oldKID, newKID, rotatedAt := rotateAPIKeyAt(t, cell, checked)
 	t.Logf("rotated the key of %s in %s, and switched it at %s", cell, time.Since(rotateStart).Round(time.Second), rotatedAt.Format(time.RFC3339))
 
+	// Two paths heal the record after one switch: the hint check that the gateway starts, and the bind of the new celld pod. The
+	// first to write the new key counts, and the other then finds "unchanged" or "already_bound".
 	var updatedAt time.Time
+	var updatedBy string
 	waitFor(t, "mgmtd to update the record of "+cell+" with the new key after the switch", max(time.Until(rotatedAt.Add(rotationHealWait)), 30*time.Second), func() (bool, string) {
-		for _, l := range keyCheckLines(t, start, cell) {
-			if l.str("result") == "keys_updated" {
-				updatedAt = lineTime(l)
-				return true, ""
+		lines, paths := keysUpdatedLines(t, start, cell)
+		for i, l := range lines {
+			if at := lineTime(l); updatedAt.IsZero() || at.Before(updatedAt) {
+				updatedAt, updatedBy = at, paths[i]
 			}
+		}
+		if !updatedAt.IsZero() {
+			return true, ""
 		}
 		return false, fmt.Sprintf("key checks: %d", len(keyCheckLines(t, start, cell)))
 	})
+	t.Logf("KEYS_UPDATED_BY=%s", updatedBy)
+	hinted := false
+	for _, l := range keyCheckLines(t, start, cell) {
+		hinted = hinted || l.str("via") == "hint"
+	}
+	if !hinted {
+		t.Errorf("no key check of %s with via hint ran in the window, so the gateway did not hint", cell)
+	}
 	for _, l := range keyCheckLines(t, start, cell) {
 		if l.str("via") == "periodic" {
 			t.Errorf("a periodic key check of %s ran in the window: %v", cell, l)
