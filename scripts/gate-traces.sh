@@ -110,11 +110,16 @@ record_kids_trace() {
 }
 
 # repair_order_pods <stale pod UIDs as a JSON array> reads the output of `kubectl get pods -A -o json` on standard input and prints
-# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. The pods of kindnet, kube-proxy and istio-cni-node
-# come first: kindnet enforces NetworkPolicy, kube-proxy routes the service addresses that other pods need to start, and no pod
-# gets a sandbox while the token of istio-cni-node is signed by a key that the API server no longer verifies.
+# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. Three ranks, in this order:
+#   0. kindnet, kube-proxy and istio-cni-node: kindnet enforces NetworkPolicy, kube-proxy routes the service addresses that other pods
+#      need to start, and no pod gets a sandbox while the token of istio-cni-node is signed by a key that the API server no longer verifies.
+#   1. istiod and the SPIRE server (label app.kubernetes.io/name): they review tokens through the API server or issue the certificates
+#      of other pods. An app pod that waits for a certificate from an issuer that still holds a token of the old key never gets
+#      one, so the issuers come before every app pod, whatever the namespace sorts like.
+#   2. every other pod, in list order.
 repair_order_pods() {
   jq -r --argjson uids "$1" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy", "istio-cni-node")) then 0 else 1 end)
+    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy", "istio-cni-node")) then 0
+        elif ((.metadata.labels["app.kubernetes.io/name"] // "") | IN("istiod", "spire-server")) then 1 else 2 end)
     | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"'
 }

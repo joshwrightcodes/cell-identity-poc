@@ -95,3 +95,39 @@ func TestRepairOrderPods(t *testing.T) {
 		}
 	}
 }
+
+// TestRepairOrderPodsIssuersBeforeApps: a pod that issues certificates or reviews tokens (istiod, the SPIRE server) comes after the
+// node pods and before every app pod, also when the app pod sits in a namespace that sorts first. An app pod that waits for a certificate
+// from an issuer that still holds a token of the old key would otherwise stall the repair. The match uses the label app.kubernetes.io/name.
+func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
+	testtool.Need(t, "jq", "bash")
+	pod := func(ns, name, uid, kind, owner, app string) string {
+		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","labels":{"app.kubernetes.io/name":"` + app + `"},"ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
+	}
+	pods := `{"items":[` + strings.Join([]string{
+		pod("apps-demo", "client-1", "u1", "ReplicaSet", "client-667d", "client"),
+		pod("istio-system", "istiod-7f", "u2", "ReplicaSet", "istiod-7f", "istiod"),
+		pod("spire-system", "spire-server-0", "u3", "StatefulSet", "spire-server", "spire-server"),
+		pod("istio-system", "istio-cni-node-z", "u4", "DaemonSet", "istio-cni-node", "istio-cni"),
+		pod("cell-identity-system", "celld-1", "u5", "ReplicaSet", "celld-6b", "celld"),
+	}, ",") + `]}`
+	out, err := sourceLib(t, t.TempDir(), `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5"]`, pods)
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	pos := map[string]int{}
+	for i, l := range lines {
+		pos[strings.Fields(l)[1]] = i
+	}
+	if len(lines) != 5 || pos["istio-cni-node-z"] != 0 {
+		t.Fatalf("order %q, want istio-cni-node first", lines)
+	}
+	for _, app := range []string{"client-1", "celld-1"} {
+		for _, issuer := range []string{"istiod-7f", "spire-server-0"} {
+			if pos[issuer] >= pos[app] {
+				t.Errorf("order %q puts %s before %s, want the issuer first", lines, app, issuer)
+			}
+		}
+	}
+}
