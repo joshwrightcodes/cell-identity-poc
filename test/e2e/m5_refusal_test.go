@@ -263,7 +263,9 @@ func waitCelldSaw(t *testing.T, cell string, since time.Time, id, outcome, reaso
 	})
 }
 
-// waitForgedSeen waits until mgmtd counts more forged_seen results of the cell than before.
+// waitForgedSeen waits until mgmtd counts more forged_seen results of the cell than before. The count is a total with no operation ID, and
+// its log line is rate limited, so a false forged_seen (the stream residual of poc-scope.md) can satisfy it. The celld log line, requireOpOpen
+// and the unchanged demo log carry the claim of each subtest, and this wait shows only that mgmtd counted a forged result.
 func waitForgedSeen(t *testing.T, cell string, before int, timeout time.Duration) {
 	t.Helper()
 	waitFor(t, "mgmtd to count a forged_seen result of "+cell+" above "+fmt.Sprint(before), timeout, func() (bool, string) {
@@ -390,6 +392,18 @@ func TestM5ForgedEnvelopeCannotCloseOp(t *testing.T) {
 	waitRowDone(t, refusalCell2, id)
 }
 
+// waitEnvdSyncs waits until envd has synced with the gateway n more times, seen as n distinct values of the sync time.
+func waitEnvdSyncs(t *testing.T, n int, timeout time.Duration) {
+	t.Helper()
+	last, seen := gwStatus(t).SyncedAt, 0
+	waitFor(t, fmt.Sprintf("envd to sync with the gateway %d more times", n), timeout, func() (bool, string) {
+		if at := gwStatus(t).SyncedAt; !at.Equal(last) {
+			last, seen = at, seen+1
+		}
+		return seen >= n, fmt.Sprintf("%d syncs seen, last at %s", seen, last)
+	})
+}
+
 // outboxHasOp reports whether the outbox of the gateway holds an item with the operation ID.
 func outboxHasOp(t *testing.T, id string) bool {
 	t.Helper()
@@ -411,7 +425,8 @@ func outboxHasOp(t *testing.T, id string) bool {
 
 // TestM5ReplayedOpAppliesOnce: after an operation is applied and reported, the same envelope queued again (replay) makes celld answer
 // already_applied. The demo log keeps one line of the operation, mgmtd keeps the final result and its time, the record stays reported, and the
-// answer of mgmtd (duplicate) takes the item out of the outbox of the gateway.
+// answer of mgmtd (duplicate) takes the item out of the outbox of the gateway. The outbox check starts after three envd syncs that follow
+// the celld log line, so that the absence does not come from an item that has not arrived yet.
 func TestM5ReplayedOpAppliesOnce(t *testing.T) {
 	const cell = refusalCell1
 	id := opCreate(t, cell, "m5 replayed "+randomHex(t, 4), 2*time.Minute)
@@ -424,6 +439,10 @@ func TestM5ReplayedOpAppliesOnce(t *testing.T) {
 	since := time.Now().Add(-logMargin)
 	enqueueSigned(t, cell, []byte(first.Envelope), true)
 	waitCelldSaw(t, cell, since, id, op.OutcomeAlreadyApplied, "", refusalWait)
+	// The item of the replay can leave the outbox before the first poll, so an absence alone proves nothing. The result of celld
+	// reaches the outbox seconds after the log line, and envd takes it in its next round. Three rounds after the log line cover
+	// the arrival, the peek and the ack of mgmtd. Only then does the absence count.
+	waitEnvdSyncs(t, 3, m5Wait)
 	waitFor(t, "the outbox of the gateway to hold no item of "+id, refusalWait, func() (bool, string) {
 		return !outboxHasOp(t, id), "an item of the operation is still in the outbox"
 	})
@@ -653,7 +672,7 @@ func denialRun(t *testing.T, j probeJob) ([]string, string) {
 
 // TestM5BindFloodOtherCellRefused: a Job in dev-cell-1 posts 50 binds for dev-cell-2 through the bind listener of the gateway. The source
 // address is the node of dev-cell-1, so each post is refused with HTTP 403 (the probe prints denied) and the gateway log names
-// source_mismatch. The outbox holds no bind item of dev-cell-2. A new celld pod of dev-cell-2 then binds with already_bound.
+// source_mismatch. A new celld pod of dev-cell-2 then binds with already_bound.
 func TestM5BindFloodOtherCellRefused(t *testing.T) {
 	const from, target = refusalCell1, refusalCell2
 	needAttestprobeImage(t)

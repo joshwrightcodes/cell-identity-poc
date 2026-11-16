@@ -99,9 +99,22 @@ func TestM5CelldStreams(t *testing.T) {
 		})
 	}
 	cell := clustersWith(t, agentCellSet)[len(clustersWith(t, agentCellSet))-1]
+	started := time.Now().Add(-logMargin)
 	pod := replaceCelldPod(t, cell)
 	waitCelldSVID(t, cell, pod)
-	waitFor(t, "one open stream of "+cell+" at the gateway after the new pod started", m5Wait, func() (bool, string) {
+	// The gateway logs stream_open with the UID of the pod. The count is read only after that line, so a stream of the deleted pod,
+	// or an earlier count of one, cannot stand in for the stream of the new pod.
+	waitFor(t, "the gateway to log stream_open of the new celld pod "+pod.Metadata.Name+" of "+cell, m5Wait, func() (bool, string) {
+		logs, err := kubectl(t, spireCluster, "", "-n", gatewayNamespace, "logs", gatewayPod, "-c", "cellgw", "--since-time="+started.UTC().Format(time.RFC3339))
+		if err != nil {
+			return false, err.Error()
+		}
+		n := len(matching(logs, func(l logLine) bool {
+			return l.str("msg") == "stream_open" && l.str("cell") == cell && l.str("pod") == pod.Metadata.UID
+		}))
+		return n > 0, lastLines(logs, 2)
+	})
+	waitFor(t, "one open stream of "+cell+" at the gateway after the new pod opened its stream", m5Wait, func() (bool, string) {
 		s := gwStatus(t)
 		return s.Streams[cell] == 1, fmt.Sprintf("streams %v", s.Streams)
 	})
@@ -135,8 +148,9 @@ func TestM5OpAppliesOnce(t *testing.T) {
 		t.Errorf("mgmtd shows %+v for %s, want a final result applied from %s", v, id, cell)
 	}
 
+	replayedAt := time.Now().Add(-logMargin)
 	enqueueSigned(t, cell, envelope, true)
-	time.Sleep(30 * time.Second)
+	waitCelldSaw(t, cell, replayedAt, id, op.OutcomeAlreadyApplied, "", opWait)
 	if n := demoLogCount(t, cell, id); n != 1 {
 		t.Errorf("after a replay demo-log in %s holds %d lines of %s, want 1", cell, n, id)
 	}

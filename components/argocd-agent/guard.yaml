@@ -47,7 +47,7 @@ spec:
           'authentication.kubernetes.io/pod-uid' in request.userInfo.extra &&
           request.userInfo.extra['authentication.kubernetes.io/pod-name'] == [object.spec.boundObjectRef.name] &&
           request.userInfo.extra['authentication.kubernetes.io/pod-uid'] == [object.spec.boundObjectRef.uid])
-      message: The agent ServiceAccount of the central view creates only the bound token of its own SPIRE agent
+      message: The agent ServiceAccount of the central view creates only a bound token of its own pod, for the SPIRE agent or the stream proof
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

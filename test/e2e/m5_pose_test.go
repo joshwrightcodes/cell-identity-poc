@@ -317,7 +317,25 @@ func TestM5GuardStillBlocksViewTokens(t *testing.T) {
 		{"the stream audience of another cell bound to the agent Pod", authenticationv1.TokenRequestSpec{Audiences: []string{proof.StreamAudience("dev-cell-2", "argocd-agent", binding)}, ExpirationSeconds: &secs, BoundObjectRef: pod}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			since := time.Now().Add(-2 * time.Second)
+			// The count of refusal lines before the request makes the window start with this subtest, with no clock involved: a
+			// line of an earlier subtest is in the count already.
+			refusals := func() (int, error) {
+				logs, lerr := kubectl(t, cell, "", "-n", agentNamespace, "logs", "deploy/"+agentDeployment, "-c", agentDeployment)
+				if lerr != nil {
+					return 0, lerr
+				}
+				n := 0
+				for l := range strings.SplitSeq(logs, "\n") {
+					if strings.Contains(l, "resource not managed by app") && strings.Contains(l, "argocd-agent") {
+						n++
+					}
+				}
+				return n, nil
+			}
+			startCount, cerr := refusals()
+			if cerr != nil {
+				t.Fatalf("read the agent log: %v", cerr)
+			}
 			ctx, cancel := ctxTimeout()
 			defer cancel()
 			res := cs.CoreV1().RESTClient().Post().Namespace("argocd").Resource("serviceaccounts").Name("argocd-agent").SubResource("token").
@@ -332,17 +350,12 @@ func TestM5GuardStillBlocksViewTokens(t *testing.T) {
 			if code != 403 {
 				t.Errorf("the token request answered HTTP %d with the error %q, want 403", code, err)
 			}
-			waitFor(t, "the agent log to name the managed-object refusal", time.Minute, func() (bool, string) {
-				logs, lerr := kubectl(t, cell, "", "-n", agentNamespace, "logs", "deploy/"+agentDeployment, "-c", agentDeployment, "--since-time="+since.UTC().Format(time.RFC3339))
+			waitFor(t, "the agent log to name the managed-object refusal of this request", time.Minute, func() (bool, string) {
+				n, lerr := refusals()
 				if lerr != nil {
 					return false, lerr.Error()
 				}
-				for l := range strings.SplitSeq(logs, "\n") {
-					if strings.Contains(l, "resource not managed by app") && strings.Contains(l, "argocd-agent") {
-						return true, ""
-					}
-				}
-				return false, "no line with 'resource not managed by app' for argocd-agent"
+				return n > startCount, fmt.Sprintf("%d lines with 'resource not managed by app' for argocd-agent, %d before the request", n, startCount)
 			})
 		})
 	}

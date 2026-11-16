@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -118,7 +119,17 @@ func waitControllerManager(t *testing.T, cell string) {
 		if err != nil {
 			return false, fmt.Sprintf("renewTime %q: %v", renewed, err)
 		}
-		return time.Since(at) < 20*time.Second, "lease renewed " + time.Since(at).Round(time.Second).String() + " ago"
+		// renewTime comes from the clock of the VM, so the present comes from the node too. After a sleep of the Mac the clocks differ.
+		nowOut, err := dockerExec(t, cell+"-control-plane", "", "date", "+%s")
+		if err != nil {
+			return false, "read the time of the node: " + err.Error()
+		}
+		nowSec, err := strconv.ParseInt(strings.TrimSpace(nowOut), 10, 64)
+		if err != nil {
+			return false, fmt.Sprintf("the node time %q: %v", nowOut, err)
+		}
+		age := time.Unix(nowSec, 0).Sub(at)
+		return age < 20*time.Second, "lease renewed " + age.Round(time.Second).String() + " ago on the node clock"
 	})
 }
 
@@ -176,14 +187,14 @@ func TestM5UnknownKidTriggersKeyCheck(t *testing.T) {
 }
 
 // TestM5HintFloodNoLockout: a pod in dev-cell-2 floods the SPIRE server with forged unknown_kid attempts that name dev-cell-1, with a
-// token that the cluster rogue signed, while dev-cell-1 rotates its service account key. The forged attempts use up the hint budget
-// of the victim name: the plugin writes at most one hint for a cell each minute, and mgmtd runs at most one hint check for it each
-// minute. The real key update must still land. celld of dev-cell-1 is held at 0, so no gateway hello, report or bind can make a
-// hint, and the plugin hint is the only way for the record to follow. Each round runs one forged attempt and one genuine probe of
-// dev-cell-1. The genuine probe must be issued within five minutes. The mgmtd log then holds one hint check of dev-cell-1 with
-// keys_updated, any others with unchanged, at most one for each minute since the first forged attempt, and none closer than 55 s.
-// The record of dev-cell-2 keeps its revision. The mutant that never writes a hint fails this test as well as
-// TestM5UnknownKidTriggersKeyCheck.
+// token that the cluster rogue signed. The flood starts after dev-cell-1 switches its service account key, so a forged hint can itself
+// make the check that updates the record of the victim: the check reads the live keys. The test does not show that a hint before the
+// switch spends the budget. It checks that the flood does not keep the record from following: the plugin writes at most one hint for a
+// cell each minute, and mgmtd runs at most one hint check for it each minute. celld of dev-cell-1 is held at 0, so no gateway hello,
+// report or bind can make a hint. Each round runs one forged attempt and one genuine probe of dev-cell-1. The genuine probe must be
+// issued within eight minutes of the switch. The mgmtd log then holds one hint check of dev-cell-1 with keys_updated, any others with
+// unchanged, at most one for each minute since the first forged attempt, and none closer than 55 s. The record of dev-cell-2 keeps its
+// revision.
 func TestM5HintFloodNoLockout(t *testing.T) {
 	const victim, attacker = rejectCell, "dev-cell-2"
 	holdCelldDown(t, victim)
@@ -351,6 +362,9 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		t.Errorf("the record of %s lists %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
 	}
 	t.Logf("KEYS_UPDATED_SECONDS=%.0f after the switch of the key", updatedAt.Sub(rotatedAt).Seconds())
+	if d := updatedAt.Sub(rotatedAt); d > rotationHealWait {
+		t.Errorf("mgmtd updated the record of %s %s after the switch, want at most %s (verify row 8)", cell, d.Round(time.Second), rotationHealWait)
+	}
 
 	// The registry servers.
 	var slowest time.Duration
@@ -372,6 +386,9 @@ func TestM5ProofFollowsKeyRotation(t *testing.T) {
 		})
 		took := at.Sub(updatedAt)
 		t.Logf("REGISTRY_RELOAD_SECONDS %s=%.0f", s.name, took.Seconds())
+		if took > registryReloadWait {
+			t.Errorf("the cell-proxy server %s reloaded the registry %s after the record update, want at most %s (verify row 8)", s.name, took.Round(time.Second), registryReloadWait)
+		}
 		slowest = max(slowest, took)
 	}
 	t.Logf("REGISTRY_RELOAD_SLOWEST_SECONDS=%.0f", slowest.Seconds())

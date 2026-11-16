@@ -67,6 +67,11 @@ func gwQueueHas(t *testing.T, cell, id string) (bool, string) {
 // Expected: the epoch is higher. celld resends the result, or claims X again and gets already_applied, whichever comes first, so the
 // final result of X at mgmtd is applied or already_applied (the test logs which). The record of X reaches reported, the demo log holds one
 // line for X, and harness:status exits 0.
+// gwResetBound bounds gw:reset. The waits of scripts/gw-reset.sh add up to 660 s in the worst case (180 s for the pod to stop, 120 s for
+// the claim delete, 180 s for the pod to be Ready and 180 s for the sync), so the bound is 12 minutes, which leaves 60 s for the calls
+// between the waits. At the bound the process group gets SIGTERM, so the EXIT trap of the script sets the replicas back to 1.
+const gwResetBound = 12 * time.Minute
+
 func TestGatewayVolumeLostDrill(t *testing.T) {
 	const mgmtd = "statefulset/mgmtd"
 	cell := clustersWith(t, agentCellSet)[0]
@@ -113,7 +118,7 @@ func TestGatewayVolumeLostDrill(t *testing.T) {
 	})
 	before := gwStatus(t).Epoch
 
-	stdout, stderr, code := runMiseBounded(t, 10*time.Minute, "", "gw:reset")
+	stdout, stderr, code := runMiseBounded(t, gwResetBound, "", "gw:reset")
 	if code != 0 {
 		t.Fatalf("mise run gw:reset exited %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}

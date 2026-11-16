@@ -239,7 +239,7 @@ func TestM5MgmtBindPathGone(t *testing.T) {
 	}
 }
 
-// TestM5EnvdIslandStillSyncs: with mgmtd at zero replicas, envd still syncs with the gateway within two minutes, because a failed pull never
+// TestM5EnvdIslandStillSyncs: with mgmtd at zero replicas, and its pod gone, envd still syncs with the gateway within two minutes, because a failed pull never
 // stops a later leg. mgmtd returns at the end, and envd reports to it again.
 func TestM5EnvdIslandStillSyncs(t *testing.T) {
 	const mgmtd = "statefulset/mgmtd"
@@ -254,6 +254,10 @@ func TestM5EnvdIslandStillSyncs(t *testing.T) {
 	t.Cleanup(func() {
 		restore()
 		statefulSetReady(t, mgmtCluster, mgmtNamespace, "mgmtd")
+	})
+	waitFor(t, "the pod "+mgmtdPod+" to be gone", m5Wait, func() (bool, string) {
+		out, err := kubectl(t, mgmtCluster, "", "-n", mgmtNamespace, "get", "pod", mgmtdPod, "--ignore-not-found", "-o", "name")
+		return err == nil && strings.TrimSpace(out) == "", out
 	})
 	gone := time.Now()
 	waitFor(t, "envd to sync with the gateway while mgmtd is away", m5Wait, func() (bool, string) {

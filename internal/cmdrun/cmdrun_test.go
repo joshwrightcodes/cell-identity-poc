@@ -71,8 +71,42 @@ func TestRunReturnsWhenAChildLeftTheGroup(t *testing.T) {
 	if !errors.Is(err, ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
-	if took > 15*time.Second {
-		t.Fatalf("Run took %s, want a return within the wait delay of %s", took, waitDelay)
+	if limit := termGrace + waitDelay + 5*time.Second; took > limit {
+		t.Fatalf("Run took %s, want a return within %s", took, limit)
+	}
+}
+
+// TestRunSendsTermBeforeKill: a command that passes its limit gets SIGTERM first, so the EXIT trap of a script runs. A command that
+// ignores SIGTERM gets SIGKILL after the grace time.
+func TestRunSendsTermBeforeKill(t *testing.T) {
+	old := termGrace
+	termGrace = time.Second
+	t.Cleanup(func() { termGrace = old })
+	marker := t.TempDir() + "/trap"
+	_, err := Run(500*time.Millisecond, "", nil, "bash", "-c", `trap 'echo cleaned >"$0"; exit 7' TERM; sleep 25 & wait`, marker)
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if raw, rerr := os.ReadFile(marker); rerr != nil || strings.TrimSpace(string(raw)) != "cleaned" {
+		t.Errorf("the trap of the command did not run after the limit: %q, %v", raw, rerr)
+	}
+
+	pidFile := t.TempDir() + "/pid"
+	start := time.Now()
+	_, err = Run(300*time.Millisecond, "", nil, "bash", "-c", `trap '' TERM; echo $$ >"$0"; while :; do sleep 1; done`, pidFile)
+	if !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("a command that ignores SIGTERM ran %s, want the SIGKILL after the grace time", took)
+	}
+	raw, _ := os.ReadFile(pidFile)
+	deadline := time.Now().Add(3 * time.Second)
+	for exec.Command("kill", "-0", strings.TrimSpace(string(raw))).Run() == nil {
+		if time.Now().After(deadline) {
+			t.Fatalf("the process %s is still alive after the grace time", raw)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

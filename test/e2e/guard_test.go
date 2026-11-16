@@ -727,7 +727,7 @@ func podFacts(t *testing.T, cell, app string) (name, uid string) {
 const (
 	denyDeleteConnect = "cannot delete an object or connect to a Pod"
 	denyUpdate        = "cannot update an object"
-	denyCreate        = "creates only the bound token of its own SPIRE agent"
+	denyCreate        = "creates only a bound token of its own pod, for the SPIRE agent or the stream proof"
 )
 
 // requireDeniedBy fails unless err is a denial that names the policy and the message of one of its

@@ -108,11 +108,24 @@ func TestCellProxyClientsProve(t *testing.T) {
 // is the key of mgmt-signing-pub. It mounts the registry as a whole volume of the ConfigMap that mgmtd publishes:
 // a mount with subPath never sees the update of a ConfigMap.
 func TestCellProxyServersRequireProof(t *testing.T) {
-	for _, tc := range []struct{ component, ns, deployment, subject string }{
-		{"central-view", "central-view-system", "argocd-agent-principal", "argocd-agent=argocd/argocd-agent"},
-		{"telemetry-gateway", "observability-system", "telemetry-gateway", "otel=observability-system/otel-uplink"},
-		{"mesh-view-hub", "mesh-view-system", "mesh-view-hub", "mesh-view=mesh-view-system/mesh-view"},
+	// SPIRE_CELL_SUBJECTS of cells/dev-cp.env lists "<namespace>/<account>=<role>" for each attested role. A server expects "<role>=<namespace>/<account>".
+	subjectOf := map[string]string{}
+	for _, e := range strings.Fields(cellEnv(t, "dev-cp", "SPIRE_CELL_SUBJECTS")) {
+		account, role, ok := strings.Cut(e, "=")
+		if !ok {
+			t.Fatalf("SPIRE_CELL_SUBJECTS entry %q has no role", e)
+		}
+		subjectOf[role] = role + "=" + account
+	}
+	for _, tc := range []struct{ component, ns, deployment, role string }{
+		{"central-view", "central-view-system", "argocd-agent-principal", "argocd-agent"},
+		{"telemetry-gateway", "observability-system", "telemetry-gateway", "otel"},
+		{"mesh-view-hub", "mesh-view-system", "mesh-view-hub", "mesh-view"},
 	} {
+		wantSubject, found := subjectOf[tc.role]
+		if !found {
+			t.Fatalf("SPIRE_CELL_SUBJECTS lists no role %q: %v", tc.role, subjectOf)
+		}
 		t.Run(tc.component, func(t *testing.T) {
 			objs := clusterComponent(t, "management", tc.component)
 			spec := get[map[string]any](t, objs["Deployment "+tc.ns+"/"+tc.deployment], "spec", "template", "spec")
@@ -124,8 +137,8 @@ func TestCellProxyServersRequireProof(t *testing.T) {
 					subjects = append(subjects, v)
 				}
 			}
-			if !slices.Equal(subjects, []string{tc.subject}) {
-				t.Errorf("--proof-subject values %q, want only %q", subjects, tc.subject)
+			if !slices.Equal(subjects, []string{wantSubject}) {
+				t.Errorf("--proof-subject values %q, want only %q from SPIRE_CELL_SUBJECTS", subjects, wantSubject)
 			}
 			for _, want := range []string{"--registry-reload=10s", "--registry-signer=/run/cell-proxy/registry-signer/signer.pub", "--registry-dir=/run/cell-proxy/registry"} {
 				if !slices.Contains(args, want) {

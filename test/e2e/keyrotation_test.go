@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -147,10 +148,18 @@ func addSigningKey(manifest string) (string, error) {
 // a projected token from the test key, and the controllers create those pods again.
 func repairAPIServer(t *testing.T) {
 	t.Helper()
-	// The fixed waits of the script add up to about 20 minutes, and each replaced pod adds up to 3.
-	ctx, cancel := context.WithTimeout(context.Background(), 26*time.Minute)
+	// The bound is the fixed waits of the script plus the replaced pods. Fixed waits of gate-m2-repair.sh: 300 s (Applications), 120 s
+	// (SPIRE entries), 240 s (one key), 240 s (API server restart), 330 s (control plane), 180 s (every workload) and 2 x 61 s (key
+	// check retries) are 1532 s. A pod replacement takes up to 183 s: 60 s for the delete, 3 s of sleep and 120 s until ready. Only the
+	// pods that started while the test key signed carry its token, so the bound allows five. 1532 s + 5 x 183 s = 2447 s, 41 minutes.
+	// On a timeout the whole process group ends, so no kubectl or docker child of the script stays behind.
+	const repairBound = (1532 + 5*183) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), repairBound)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m2-repair.sh")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = 10 * time.Second
 	out, err := cmd.CombinedOutput()
 	t.Logf("gate-m2-repair.sh:\n%s", strings.TrimSpace(string(out)))
 	if err != nil {
