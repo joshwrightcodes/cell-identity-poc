@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Stop and start the Colima VM, wait until every node is Ready, then run the M1 gate.
+# Stop and start the Colima VM, wait until every node is Ready, then run the M1 gate. A restart gives each node a new address, so the
+# last step is expected to fail: the policies of dev-cp hold old addresses. Rebuild with harness:down and harness:up afterwards.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"

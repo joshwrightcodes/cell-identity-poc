@@ -1238,6 +1238,14 @@ Eight of the 15 `cell:verify` checks failed, and the first `gate:m1` run failed 
 Treat a restart of the Mac or the VM as a disaster recovery event.
 Run `mise run harness:down` and `mise run harness:up` after it.
 
+The restart check ran again on 2026-11-15 and 2026-11-16, and the result was the same.
+After the second restart, the gateway pod `cell-gateway-0` stayed in `CrashLoopBackOff` for at least 6 minutes, with the error `x509 source from the workload api: context deadline exceeded`.
+The gateway epoch could not be read, so the check does not show that the gateway state survives a restart.
+Every node had a new address, and the policies of `dev-cp` still held the old addresses.
+The last step, `gate:m1`, then found ports 30081 and 30443 to 30445 open on `dev-cp` from `rogue`, because `rogue` held an address that a cell had held before.
+The `gate:m1` step is expected to fail after a restart, and a pass does not show that the harness works.
+Rebuild with `harness:down` and `harness:up`.
+
 ## How a change reaches the cell
 
 1. Change a component under `components/`. After a change under `cmd/` or `internal/`, run `mise run images` first.
