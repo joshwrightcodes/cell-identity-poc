@@ -14,7 +14,8 @@
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes
 #      and signs with one key;
 #   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory, and kube-scheduler
-#      hold their Leases since the API server container started (read from the container runtime, not from the mirror pods);
+#      run a container that started after the API server container (read from the container runtime, not from the mirror pods)
+#      and hold a live Lease;
 #   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
 #      a time, and waits for every workload;
 #   5. runs the key check of mgmtd for dev-cell-1, and repeats it after 61 s while the answer is rate_limited, up to
@@ -185,25 +186,38 @@ log "the API server of $CELL_NAME publishes and signs with the key $kid"
 
 # Step 3: kube-controller-manager and kube-scheduler. The reference is the start of the API server container, read from the container
 # runtime on the node. The mirror pods are not read: just after a restart of the API server their status can still show the old
-# containers, and the old manager started after the old API server. Each component counts as current only when it holds its Lease
-# since the API server start, which shows that it runs its controllers (a ready container does not show that).
+# containers. A component counts as current when the runtime shows a container that started after the API server, its Lease names the
+# node and is alive, and, for a container that this step stopped, the Lease has a new holder (see control_plane_current in gate-traces.sh).
 if ((changed)); then
   api_restarted() { local s; s="$(container_started kube-apiserver)" && { ((!touched)) || ((s >= changed_at)); }; }
   wait_until 240 "the runtime shows a kube-apiserver container that started after the manifest changed" api_restarted
   api_started="$(container_started kube-apiserver)" || die "cannot read the start of the kube-apiserver container from the runtime"
-  # A manager container that started before the API server keeps the tokens of the old key in memory, so it is stopped.
-  manager_started="$(container_started kube-controller-manager || true)"
-  if [[ -n "$manager_started" ]] && ((manager_started < api_started)); then
-    for id in $(on_node crictl ps --name '^kube-controller-manager$' -q); do
-      on_node crictl stop "$id" >/dev/null
-    done
-    log "stopped the kube-controller-manager container, which started before the API server"
-  fi
+  # A container that started before the API server keeps the tokens of the old key in memory, so it is stopped. The holder of its
+  # Lease is read first, because the old process renews the Lease against the new API server before the stop.
+  manager_old_holder="" manager_stopped_at="" scheduler_old_holder="" scheduler_stopped_at=""
+  for component in kube-controller-manager kube-scheduler; do
+    rc=0
+    component_started="$(container_started "$component")" || rc=$?
+    ((rc != 2)) || die "the container runtime call failed on $node while it read the $component container"
+    if ((rc == 0)) && ((component_started < api_started)); then
+      holder="$(lease_holder "$component")" || die "cannot read Lease $component"
+      ids="$(on_node crictl ps --name "^$component\$" -q)" || die "the container runtime call failed on $node while it listed $component"
+      for id in $ids; do
+        on_node crictl stop "$id" >/dev/null
+      done
+      stopped_at="$(on_node date +%s)" || die "cannot read the time of the node $node"
+      case "$component" in
+        kube-controller-manager) manager_old_holder="$holder" manager_stopped_at="$stopped_at" ;;
+        kube-scheduler) scheduler_old_holder="$holder" scheduler_stopped_at="$stopped_at" ;;
+      esac
+      log "stopped the $component container, which started before the API server"
+    fi
+  done
   # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait while kube-scheduler is in back-off,
-  # so step 4 starts only when both Leases are held.
+  # so step 4 starts only when both components are current.
   control_plane_ready() { control_plane_current "$node" "$api_started"; }
-  wait_until 330 "kube-controller-manager and kube-scheduler hold their Leases since the start of the API server" control_plane_ready
-  log "kube-controller-manager and kube-scheduler hold their Leases since the start of the API server"
+  wait_until 330 "kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease" control_plane_ready
+  log "kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease"
 fi
 
 # Step 4: pods with a projected token from another key. Only the token header leaves the node.

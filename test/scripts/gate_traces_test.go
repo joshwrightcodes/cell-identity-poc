@@ -96,9 +96,9 @@ func TestRepairOrderPods(t *testing.T) {
 	}
 }
 
-// TestRepairOrderPodsIssuersBeforeApps: a pod that issues certificates or reviews tokens (istiod, the SPIRE server) comes after the
-// node pods and before every app pod, also when the app pod sits in a namespace that sorts first. An app pod that waits for a certificate
-// from an issuer that still holds a token of the old key would otherwise stall the repair. The match uses the label app.kubernetes.io/name.
+// TestRepairOrderPodsIssuersBeforeApps: istiod comes after the node pods and before every app pod, also when the app pod sits in a namespace that
+// sorts first. An app pod that waits for a certificate from an istiod with a token of the old key would otherwise stall the repair. The match uses
+// the label app.kubernetes.io/name. A SPIRE server pod gets no rank of its own.
 func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
 	testtool.Need(t, "jq", "bash")
 	pod := func(ns, name, uid, kind, owner, app string) string {
@@ -124,7 +124,7 @@ func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
 		t.Fatalf("order %q, want istio-cni-node first", lines)
 	}
 	for _, app := range []string{"client-1", "celld-1"} {
-		for _, issuer := range []string{"istiod-7f", "spire-server-0"} {
+		for _, issuer := range []string{"istiod-7f"} {
 			if pos[issuer] >= pos[app] {
 				t.Errorf("order %q puts %s before %s, want the issuer first", lines, app, issuer)
 			}
@@ -132,20 +132,20 @@ func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
 	}
 }
 
-// controlPlaneStubs defines k and on_node for the step 3 checks of gate-m2-repair.sh. k prints a Lease from $D/lease-<name>.json and a mirror pod from
-// $D/pod-<name>.json. on_node answers crictl ps with $D/id-<name> and crictl inspect with $D/inspect-<id>.json.
+// controlPlaneStubs defines k and on_node for the step 3 checks of gate-m2-repair.sh. k prints a Lease from $D/lease-<name>.json. on_node answers
+// date +%s with $D/now, crictl ps with $D/id-<name>, and crictl inspect with $D/inspect-<id>.json. The file $D/crictl-fails makes every crictl call fail.
 const controlPlaneStubs = `
 k() {
   case "$*" in
     "-n kube-system get lease "*) cat "$D/lease-${5}.json" ;;
-    "-n kube-system get pod "*) n="${5%-dev-cell-1-control-plane}"; cat "$D/pod-$n.json" ;;
     *) echo "unexpected k call: $*" >&2; return 2 ;;
   esac
 }
 on_node() {
   case "$1 $2" in
-    "crictl ps") name="${4#^}"; name="${name%\$}"; cat "$D/id-$name" 2>/dev/null ;;
-    "crictl inspect") cat "$D/inspect-$3.json" ;;
+    "date +%s") cat "$D/now" ;;
+    "crictl ps") [ -e "$D/crictl-fails" ] && return 1; name="${4#^}"; name="${name%\$}"; cat "$D/id-$name" 2>/dev/null; return 0 ;;
+    "crictl inspect") [ -e "$D/crictl-fails" ] && return 1; cat "$D/inspect-$3.json" ;;
     *) echo "unexpected on_node call: $*" >&2; return 2 ;;
   esac
 }
@@ -160,7 +160,8 @@ func writeStubs(t *testing.T, dir string, files map[string]string) {
 	}
 }
 
-// TestContainerStarted: the start of a container comes from the container runtime, in epoch seconds, and a missing container fails.
+// TestContainerStarted: the start of a container comes from the container runtime, in epoch seconds. A container that does not run gives status 1, and a failed runtime
+// call gives status 2, so that the repair can stop with an error and not treat the failure as "no container".
 func TestContainerStarted(t *testing.T) {
 	testtool.Need(t, "jq", "bash")
 	dir := t.TempDir()
@@ -169,50 +170,71 @@ func TestContainerStarted(t *testing.T) {
 	if err != nil || strings.TrimSpace(out) != "1794799258" {
 		t.Fatalf("started %q (%v), want 1794799258", out, err)
 	}
-	if out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`container_started kube-scheduler`); err == nil {
-		t.Fatalf("a container that does not run gave %q, want a failure", out)
+	out, err = sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`container_started kube-scheduler || echo "status $?"`)
+	if !strings.Contains(out, "status 1") {
+		t.Fatalf("a container that does not run gave %q (%v), want status 1", out, err)
+	}
+	writeStubs(t, dir, map[string]string{"crictl-fails": ""})
+	out, _ = sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`container_started kube-apiserver || echo "status $?"`)
+	if !strings.Contains(out, "status 2") {
+		t.Fatalf("a failed runtime call gave %q, want status 2", out)
 	}
 }
 
-// TestControlPlaneCurrent: step 3 passes only when both Leases name the node as holder and show an acquire or a renew time at or after the
-// start of the API server. A stale mirror pod, which shows the old manager as started after the old API server, must not pass it, and neither
-// must a Lease that was renewed before the API server start.
+// TestControlPlaneCurrent: step 3 passes only when each of kube-controller-manager and kube-scheduler runs a container that started at or after the API
+// server, and holds a live Lease with the node as holder. For a container that the repair stopped, the Lease needs a new holder or an acquire
+// time at or after the stop: the old process renewed its Lease against the new API server before the stop, so a late renew time alone is no proof.
 func TestControlPlaneCurrent(t *testing.T) {
 	testtool.Need(t, "jq", "bash")
 	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
-	lease := func(holder, acquire, renew string) string {
-		return `{"spec":{"holderIdentity":"` + holder + `","acquireTime":"` + acquire + `","renewTime":"` + renew + `"}}`
-	}
 	node := "dev-cell-1-control-plane"
-	// The mirror pods show a manager that started 5 s after the old API server, which is stale: the status was not updated yet.
-	stalePod := `{"status":{"containerStatuses":[{"ready":true,"state":{"running":{"startedAt":"2026-11-16T03:00:05Z"}}}]}}`
+	lease := func(holder, acquire, renew string) string {
+		return `{"spec":{"holderIdentity":"` + holder + `","acquireTime":"` + acquire + `","renewTime":"` + renew + `","leaseDurationSeconds":15}}`
+	}
+	inspect := func(started string) string { return `{"status":{"startedAt":"` + started + `"}}` }
+	// base is a control plane that is current: both containers started 03:25:30, after the API server, and both Leases were renewed at 03:25:38.
+	base := func(over map[string]string) map[string]string {
+		m := map[string]string{
+			"now":                        "1794799550", // 03:25:50
+			"id-kube-controller-manager": "m1\n", "inspect-m1.json": inspect("2026-11-16T03:25:30.1Z"),
+			"id-kube-scheduler": "s1\n", "inspect-s1.json": inspect("2026-11-16T03:25:31.1Z"),
+			"lease-kube-controller-manager.json": lease(node+"_new", "2026-11-16T03:25:35.000000Z", "2026-11-16T03:25:48.569171Z"),
+			"lease-kube-scheduler.json":          lease(node+"_s", "2026-11-16T03:25:36.000000Z", "2026-11-16T03:25:48.000000Z")}
+		for k, v := range over {
+			m[k] = v
+		}
+		return m
+	}
 	for _, tc := range []struct {
 		name  string
 		files map[string]string
+		vars  string // shell assignments of the values that the repair read before a stop
 		want  bool
 	}{
-		{"both leases renewed after the API start", map[string]string{
-			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:38.569171Z"),
-			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:40.000000Z")}, true},
-		{"a stale mirror status and a lease renewed before the API start", map[string]string{
-			"pod-kube-apiserver.json":            stalePod,
-			"pod-kube-controller-manager.json":   stalePod,
-			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:00:06.000000Z", "2026-11-16T03:20:33.000000Z"),
-			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:40.000000Z")}, false},
-		{"the scheduler lease is old", map[string]string{
-			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z"),
-			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:00:00.000000Z", "2026-11-16T03:20:00.000000Z")}, false},
-		{"another node holds the lease", map[string]string{
-			"lease-kube-controller-manager.json": lease("other-node_u1", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z"),
-			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z")}, false},
-		{"a lease with no holder", map[string]string{
-			"lease-kube-controller-manager.json": `{"spec":{"renewTime":"2026-11-16T03:25:50.000000Z"}}`,
-			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z")}, false},
+		{"both started after the API server and hold live Leases", base(nil), "", true},
+		{"a manager that started before the API server, with a stale mirror status", base(map[string]string{
+			"inspect-m1.json": inspect("2026-11-16T03:00:05Z")}), "", false},
+		{"a Lease renewed before the API start and older than its duration", base(map[string]string{
+			"lease-kube-controller-manager.json": lease(node+"_new", "2026-11-16T03:00:06.000000Z", "2026-11-16T03:20:33.000000Z")}), "", false},
+		{"the scheduler Lease is old", base(map[string]string{
+			"lease-kube-scheduler.json": lease(node+"_s", "2026-11-16T03:00:00.000000Z", "2026-11-16T03:20:00.000000Z")}), "", false},
+		{"another node holds the Lease", base(map[string]string{
+			"lease-kube-controller-manager.json": lease("other-node_new", "2026-11-16T03:25:35.000000Z", "2026-11-16T03:25:48.000000Z")}), "", false},
+		{"a Lease with no holder", base(map[string]string{
+			"lease-kube-controller-manager.json": `{"spec":{"renewTime":"2026-11-16T03:25:48.000000Z"}}`}), "", false},
+		{"a stopped manager whose old process renewed the Lease after the API start", base(map[string]string{
+			"lease-kube-controller-manager.json": lease(node+"_old", "2026-11-16T03:10:00.000000Z", "2026-11-16T03:25:48.000000Z")}),
+			`manager_old_holder=` + node + `_old; manager_stopped_at=1794799540`, false},
+		{"a stopped manager with a new holder", base(nil), `manager_old_holder=` + node + `_old; manager_stopped_at=1794799540`, true},
+		{"a stopped manager with the same holder and an acquire time after the stop", base(map[string]string{
+			"lease-kube-controller-manager.json": lease(node+"_old", "2026-11-16T03:25:45.000000Z", "2026-11-16T03:25:48.000000Z")}),
+			`manager_old_holder=` + node + `_old; manager_stopped_at=1794799540`, true},
+		{"the runtime call fails", base(map[string]string{"crictl-fails": ""}), "", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeStubs(t, dir, tc.files)
-			out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`control_plane_current "$1" "$2"`, node, apiStart)
+			out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+tc.vars+"\n"+`control_plane_current "$1" "$2"`, node, apiStart)
 			if (err == nil) != tc.want {
 				t.Fatalf("control_plane_current passed %v (%v: %s), want %v", err == nil, err, out, tc.want)
 			}

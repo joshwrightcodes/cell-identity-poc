@@ -1134,11 +1134,13 @@ The budgets do not cover `harness:up`.
   Until it runs, no controller of `dev-cell-1` replaces a pod.
   The repair reads the start of the API server from the container runtime on the node.
   It does not read the mirror pods, because their status can still show the old containers.
-  It waits until `kube-controller-manager` and `kube-scheduler` each hold their Lease since that start. A held Lease shows that the component runs its controllers.
+  It stops a manager or scheduler container that started before the API server, and it reads the Lease holder first.
+  Then it waits until each component runs a container that started after the API server and holds a live Lease.
+  After a stop, the Lease needs a new holder, because the old process renews its Lease against the new API server before the stop.
 - It replaces each pod of `dev-cell-1` that received a token from the test key.
   The repair replaces the pods one at a time, in three ranks.
-  The ranks are the node pods (`kindnet`, `kube-proxy` and `istio-cni-node`), the issuers (`istiod` and the SPIRE server), and all other pods.
-  An app pod waits for a certificate from an issuer, so an issuer with a token of the old key must go before it.
+  The ranks are the node pods (`kindnet`, `kube-proxy` and `istio-cni-node`), `istiod`, and all other pods.
+  An app pod waits for a certificate from `istiod`, so an `istiod` with a token of the old key goes before it.
   A Deployment outside the harness and outside Argo CD gets a rollout restart, so `coredns` keeps one ready pod.
   The other pods are deleted, and their controllers create them again.
   While the `kindnet` pod restarts, NetworkPolicy fails open, as the residual limits in `docs/design/poc-scope.md` say.
