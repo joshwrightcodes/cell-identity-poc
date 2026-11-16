@@ -131,3 +131,91 @@ func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
 		}
 	}
 }
+
+// controlPlaneStubs defines k and on_node for the step 3 checks of gate-m2-repair.sh. k prints a Lease from $D/lease-<name>.json and a mirror pod from
+// $D/pod-<name>.json. on_node answers crictl ps with $D/id-<name> and crictl inspect with $D/inspect-<id>.json.
+const controlPlaneStubs = `
+k() {
+  case "$*" in
+    "-n kube-system get lease "*) cat "$D/lease-${5}.json" ;;
+    "-n kube-system get pod "*) n="${5%-dev-cell-1-control-plane}"; cat "$D/pod-$n.json" ;;
+    *) echo "unexpected k call: $*" >&2; return 2 ;;
+  esac
+}
+on_node() {
+  case "$1 $2" in
+    "crictl ps") name="${4#^}"; name="${name%\$}"; cat "$D/id-$name" 2>/dev/null ;;
+    "crictl inspect") cat "$D/inspect-$3.json" ;;
+    *) echo "unexpected on_node call: $*" >&2; return 2 ;;
+  esac
+}
+`
+
+func writeStubs(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestContainerStarted: the start of a container comes from the container runtime, in epoch seconds, and a missing container fails.
+func TestContainerStarted(t *testing.T) {
+	testtool.Need(t, "jq", "bash")
+	dir := t.TempDir()
+	writeStubs(t, dir, map[string]string{"id-kube-apiserver": "abc\n", "inspect-abc.json": `{"status":{"state":"CONTAINER_RUNNING","startedAt":"2026-11-16T03:20:58.438809979Z"}}`})
+	out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`container_started kube-apiserver`)
+	if err != nil || strings.TrimSpace(out) != "1794799258" {
+		t.Fatalf("started %q (%v), want 1794799258", out, err)
+	}
+	if out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`container_started kube-scheduler`); err == nil {
+		t.Fatalf("a container that does not run gave %q, want a failure", out)
+	}
+}
+
+// TestControlPlaneCurrent: step 3 passes only when both Leases name the node as holder and show an acquire or a renew time at or after the
+// start of the API server. A stale mirror pod, which shows the old manager as started after the old API server, must not pass it, and neither
+// must a Lease that was renewed before the API server start.
+func TestControlPlaneCurrent(t *testing.T) {
+	testtool.Need(t, "jq", "bash")
+	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
+	lease := func(holder, acquire, renew string) string {
+		return `{"spec":{"holderIdentity":"` + holder + `","acquireTime":"` + acquire + `","renewTime":"` + renew + `"}}`
+	}
+	node := "dev-cell-1-control-plane"
+	// The mirror pods show a manager that started 5 s after the old API server, which is stale: the status was not updated yet.
+	stalePod := `{"status":{"containerStatuses":[{"ready":true,"state":{"running":{"startedAt":"2026-11-16T03:00:05Z"}}}]}}`
+	for _, tc := range []struct {
+		name  string
+		files map[string]string
+		want  bool
+	}{
+		{"both leases renewed after the API start", map[string]string{
+			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:38.569171Z"),
+			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:40.000000Z")}, true},
+		{"a stale mirror status and a lease renewed before the API start", map[string]string{
+			"pod-kube-apiserver.json":            stalePod,
+			"pod-kube-controller-manager.json":   stalePod,
+			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:00:06.000000Z", "2026-11-16T03:20:33.000000Z"),
+			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:10:00.100000Z", "2026-11-16T03:25:40.000000Z")}, false},
+		{"the scheduler lease is old", map[string]string{
+			"lease-kube-controller-manager.json": lease(node+"_u1", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z"),
+			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:00:00.000000Z", "2026-11-16T03:20:00.000000Z")}, false},
+		{"another node holds the lease", map[string]string{
+			"lease-kube-controller-manager.json": lease("other-node_u1", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z"),
+			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z")}, false},
+		{"a lease with no holder", map[string]string{
+			"lease-kube-controller-manager.json": `{"spec":{"renewTime":"2026-11-16T03:25:50.000000Z"}}`,
+			"lease-kube-scheduler.json":          lease(node+"_u2", "2026-11-16T03:25:49.000000Z", "2026-11-16T03:25:50.000000Z")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeStubs(t, dir, tc.files)
+			out, err := sourceLib(t, dir, "D="+dir+"\n"+controlPlaneStubs+`control_plane_current "$1" "$2"`, node, apiStart)
+			if (err == nil) != tc.want {
+				t.Fatalf("control_plane_current passed %v (%v: %s), want %v", err == nil, err, out, tc.want)
+			}
+		})
+	}
+}

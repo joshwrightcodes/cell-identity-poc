@@ -123,3 +123,29 @@ repair_order_pods() {
         elif ((.metadata.labels["app.kubernetes.io/name"] // "") | IN("istiod", "spire-server")) then 1 else 2 end)
     | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"'
 }
+
+# The checks of step 3 of gate-m2-repair.sh. They need the functions k (kubectl of the cell) and on_node (a command on the node), and
+# they never read the status of the mirror pods: just after a restart of the API server, the mirror pod of a static pod can still show
+# the old container, whose start counts as "after the API server".
+
+# container_started <name> prints the start time, in epoch seconds, of the running container of that name on the node, from
+# the container runtime. It fails when no such container runs.
+container_started() {
+  local id
+  id="$(on_node crictl ps --name "^$1\$" --state running -q | head -n 1)" && [[ -n "$id" ]] || return 1
+  on_node crictl inspect "$id" | jq -er '.status.startedAt | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601'
+}
+
+# lease_current <lease> <node> <epoch> succeeds when Lease kube-system/<lease> has the node as holder and shows an acquire or a renew
+# time at or after the epoch. A held lease shows that the component runs its controllers, which a ready container does not show.
+lease_current() {
+  k -n kube-system get lease "$1" -o json | jq -e --arg n "$2" --argjson t "$3" 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;
+    ((.spec.holderIdentity // "") | startswith($n + "_"))
+    and (([.spec.acquireTime, .spec.renewTime] | map(select(. != null) | ts) | max) >= $t)' >/dev/null
+}
+
+# control_plane_current <node> <epoch of the API server start> succeeds when kube-controller-manager and kube-scheduler each hold their lease
+# since the start of the API server.
+control_plane_current() {
+  lease_current kube-controller-manager "$1" "$2" && lease_current kube-scheduler "$1" "$2"
+}
