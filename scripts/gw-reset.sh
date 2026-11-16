@@ -5,12 +5,14 @@
 #   2. Set the replicas of StatefulSet cell-gateway to 0 through scripts/harness-replicas.sh, and wait until pod
 #      cell-gateway-0 is gone.
 #   3. Delete PersistentVolumeClaim store-cell-gateway-0, which holds the queue and the outbox.
-#   4. Set the replicas to 1, and wait until the pod is Ready.
 #      The step fails when the claim does not exist, so a wrong claim name never gives a silent no-op.
+#   4. Set the replicas to 1, and wait until the pod is Ready.
 #   5. When envd has a ready replica, wait until envd has synced with the new store, so the queue holds the open
 #      operations again. celld resends each result that it did not report.
 # The script prints one JSON line with the old and the new epoch. A failure prints one JSON error line on standard
-# output, and the EXIT trap sets the replicas back to 1. GW_RESET_WAIT bounds each wait in seconds (default 180).
+# output, and the EXIT trap sets the replicas back to 1. GW_RESET_WAIT bounds each wait in seconds (default 180). The worst case is
+# 660 seconds: 180 for the pod to stop, 120 for the claim delete, 180 for the pod to be Ready and 180 for the sync. The drill test bounds
+# the whole run at 12 minutes, and its TERM reaches this script before its KILL, so the EXIT trap runs.
 # HARNESS_REPLICAS and GW_SCRIPT name other scripts, for the tests.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"

@@ -255,6 +255,14 @@ func derSHA(t *testing.T, pemText string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// nodeClockDocker stands in for docker. It answers `exec dev-cp-control-plane date` with the time of a node, which is STUB_CLOCK_SKEW
+// seconds behind the clock of the Mac (default 0), in epoch seconds or in the form of date -u.
+const nodeClockDocker = `#!/usr/bin/env bash
+[[ "$1 $2" == "exec dev-cp-control-plane" && "$3" == date ]] || { echo "unexpected docker call: $*" >&2; exit 2; }
+t=$(( $(date +%s) - ${STUB_CLOCK_SKEW:-0} ))
+if [[ "$4" == +%s ]]; then echo "$t"; else date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ; fi
+`
+
 // timeAgo formats the time that is d before now, as mgmtd prints it.
 func timeAgo(d time.Duration) string { return time.Now().Add(-d).UTC().Format(time.RFC3339Nano) }
 
@@ -319,7 +327,7 @@ func runStatus(t *testing.T, extra ...string) (map[string]map[string]any, []map[
 	env := append([]string{"STUB_PRINCIPAL=" + stubConnected, "STUB_SAMPLES=" + stubSamples, "STUB_KIALI_CONF=" + stubKialiConf, "STUB_HUB=" + stubHubUp,
 		"STUB_MGMT_STATUS=" + healthyPlane(nil), "STUB_GW_STATUS=" + healthyGateway(nil), "HOSTSVC_SERVE=" + serve, "STUB_PIN_PEM=" + pin, "STUB_ROOT_PEM=" + root, "STUB_POD_PIN=" + derSHA(t, pin),
 		"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), nil)}, extra...)
-	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub}, env)
+	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker}, env)
 	lines := jsonLines(t, out)
 	byName := map[string]map[string]any{}
 	for _, m := range lines {
@@ -1002,4 +1010,54 @@ func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
 			t.Errorf("problems %q name the outbox while mgmtd is down", p)
 		}
 	})
+}
+
+// TestStatusAgesFollowTheNodeClock: the timestamps of mgmtd and the gateway come from the clock of the VM. With a VM clock 5 minutes behind the Mac, a
+// sync from 10 seconds ago on the VM clock is no problem, and a sync from 3 minutes ago on that clock still is.
+func TestStatusAgesFollowTheNodeClock(t *testing.T) {
+	const skew = 5 * time.Minute
+	vm := func(d time.Duration) string { return timeAgo(skew + d) }
+	env := func(syncedAgo time.Duration) []string {
+		return []string{"STUB_CLOCK_SKEW=300",
+			"STUB_GW_STATUS=" + healthyGateway(func(m map[string]any) { m["syncedAt"] = vm(syncedAgo) }),
+			"STUB_MGMT_STATUS=" + healthyPlane(func(m map[string]any) {
+				m["lastReportAt"] = vm(10 * time.Second)
+				m["cells"] = []any{planeCell("dev-cell-1", map[string]any{"lastStatusAt": vm(20 * time.Second)}), planeCell("dev-cell-2", map[string]any{"lastStatusAt": vm(20 * time.Second)})}
+			})}
+	}
+	healthy, _, stderr, code := runStatus(t, env(10*time.Second)...)
+	if code != 0 {
+		t.Fatalf("exit %d with a VM clock that lags 5 minutes, want 0: dev-cp %v, management %v\n%s", code, healthy["dev-cp"]["problems"], healthy["management"]["problems"], stderr)
+	}
+	late, _, _, code := runStatus(t, env(3*time.Minute)...)
+	if code == 0 || !strings.Contains(strings.Join(strs(late["dev-cp"]["problems"]), "\n"), "more than 2 minutes") {
+		t.Errorf("a sync from 3 minutes ago on the VM clock gave exit %d and problems %v, want the late sync", code, late["dev-cp"]["problems"])
+	}
+}
+
+// TestCheckGatewaySyncedUsesTheNodeClock: check_gateway_synced reads the present from a node. With a node clock 5 minutes behind the Mac, a sync from
+// 10 seconds ago on the node clock passes, and one from 3 minutes ago fails.
+func TestCheckGatewaySyncedUsesTheNodeClock(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	lib, _ := filepath.Abs("../../scripts/lib.sh")
+	verifyLib, _ := filepath.Abs("../../scripts/verify-lib.sh")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(nodeClockDocker), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(syncedAgo time.Duration) (string, error) {
+		cmd := exec.Command("bash", "-c", `source "$1"; source "$2"; gateway_status() { echo "$STUB_GW"; }; check_gateway_synced`, "_", lib, verifyLib)
+		cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=dev-cp", "STUB_CLOCK_SKEW=300",
+			"STUB_GW=" + healthyGateway(func(m map[string]any) { m["syncedAt"] = timeAgo(5*time.Minute + syncedAgo) })}
+		var out bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &out
+		err := cmd.Run()
+		return out.String(), err
+	}
+	if out, err := run(10 * time.Second); err != nil {
+		t.Errorf("a sync from 10 seconds ago on the node clock failed: %v\n%s", err, out)
+	}
+	if out, err := run(3 * time.Minute); err == nil || !strings.Contains(out, "more than 2 minutes ago") {
+		t.Errorf("a sync from 3 minutes ago on the node clock gave %v and %q, want the late sync", err, out)
+	}
 }

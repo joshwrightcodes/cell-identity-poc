@@ -45,6 +45,9 @@ clusters="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROO
 [[ -n "$clusters" ]] || json_fail harness:status "no cluster in harness/topology.yaml has components"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
+# NODE_NOW is the time of a node in epoch seconds. Every age in this script is a difference between it and a timestamp that a cluster wrote.
+NODE_NOW="$(node_now)" || json_fail harness:status "cannot read the time of the node dev-cp-control-plane. Check that Docker runs and that the node container exists with: docker ps"
+[[ "$NODE_NOW" =~ ^[0-9]+$ ]] || json_fail harness:status "the node dev-cp-control-plane gave '$NODE_NOW' as its time, want epoch seconds"
 max_age="${STATUS_SAMPLE_MAX_AGE:-300}"
 verify_limit="${STATUS_VERIFY_TIMEOUT:-900}"
 
@@ -133,20 +136,20 @@ management_plane() {
 # management_problems <cell-identity cells> reads the field management on standard input and prints one problem
 # for each bad value, as a JSON array of strings. Each problem ends with the command to run.
 management_problems() {
-  jq -c --arg bind "$1" 'def rev: "\(.epoch).\(.counter)";
+  jq -c --arg bind "$1" --argjson now "$NODE_NOW" 'def rev: "\(.epoch).\(.counter)";
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def cp: "CELL=dev-cp mise run cell:verify";
     if .error != null then ["mgmtd status failed: " + .error]
     else
       . as $m | ([.signed.epoch, .signed.counter]) as $sig | ([.applied.epoch, .applied.counter]) as $app
       | [
-        (if $sig > $app and .lagSince != null and (now - (.lagSince | ts)) > 120
+        (if $sig > $app and .lagSince != null and ($now - (.lagSince | ts)) > 120
          then "signed revision \(.signed | rev) is above applied \(.applied | rev) for more than 2 minutes. Run: \(cp)" else empty end),
         (if .lastRefusal != null and ((.lastRefusal.at | ts) == 0 or (.lastRefusal.at | ts) > ((.appliedAt // "") | ts))
          then "envd refused a spec: \(.lastRefusal.reason) at revision \(.lastRefusal.revision | rev), after the last apply. Run: \(cp)" else empty end),
         (if (.storeError // "") != "" then "envd reports a store error: \(.storeError). Run: \(cp)" else empty end),
         (if .restoreActive then "a restore is active, so mgmtd serves an older revision. Run: mise run mgmt -- restore --revision latest" else empty end),
-        (if .lastReportAt == null or (now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
+        (if .lastReportAt == null or ($now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
         (.cells[] | select(.lastCheck == "keys_untrusted") | "the key check of \(.name) is keys_untrusted. Run: CELL=\(.name) mise run cell:restart"),
         (.cells[] | select(.lastCheck == "issuer_untrusted") | "the key check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
         (.cells[] | select(.lastCheck == "issuer_unavailable") | "the key check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
@@ -154,13 +157,13 @@ management_problems() {
         (.cells[] | select(.lastHintCheck == "issuer_untrusted") | "the hint check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
         (.cells[] | select(.lastHintCheck == "issuer_unavailable") | "the hint check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
         (.cells[] | select(.lastHintCheck == "error") | "the hint check of \(.name) is error. Run: mise run mgmt -- keycheck --cell \(.name)"),
-        (.cells[] | select(.bound and (now - ((.lastStatusAt // "") | ts)) > 120)
+        (.cells[] | select(.bound and ($now - ((.lastStatusAt // "") | ts)) > 120)
           | "no status from the celld of \(.name) in the last 2 minutes. Run: CELL=\(.name) mise run cell:verify"),
-        (.cells[] | select((.unreported // 0) > 0 and ((.oldestUnreportedAt // "") | ts) > 1000000000 and (now - (.oldestUnreportedAt | ts)) > 300)
+        (.cells[] | select((.unreported // 0) > 0 and ((.oldestUnreportedAt // "") | ts) > 1000000000 and ($now - (.oldestUnreportedAt | ts)) > 300)
           | "\(.name) has \(.unreported) unreported items, the oldest from \(.oldestUnreportedAt), more than 5 minutes ago. Run: CELL=\(.name) mise run cell:verify"),
         (.cells[] | select((.records // 0) > 800) | "\(.name) holds \(.records) operation records, above 800. Run: CELL=\(.name) mise run cell:verify"),
         (if .opsFailed then "the list of operations failed, so expired operations are not checked. Run: mise run mgmt -- op list" else empty end),
-        (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and (now - (.expiredAt | ts)) < 900)
+        (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and ($now - (.expiredAt | ts)) < 900)
           | "operation \(.id) for \(.cell) expired at \(.expiredAt) with no final result. Run: mise run ops -- close \(.id)"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
           | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
@@ -192,15 +195,15 @@ gateway_plane() {
 # gateway_problems reads the output of gateway_plane on standard input and prints one problem for each bad value, as a
 # JSON array of strings. The sync and the store error follow check_gateway_synced of cell:verify, with the same 2 minutes.
 gateway_problems() {
-  jq -c --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
-    def recent($t; $secs): ($t | ts) > 1000000000 and (now - ($t | ts)) < $secs;
+  jq -c --argjson now "$NODE_NOW" --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    def recent($t; $secs): ($t | ts) > 1000000000 and ($now - ($t | ts)) < $secs;
     .gateway as $g | .bound as $bound | .mgmt_up as $up
     | if $g.error != null then ["gateway status failed: " + $g.error]
       else [
         (if ($g.storeError // "") != "" then "the cell gateway reports a store error: \($g.storeError). Run: mise run gw:reset" else empty end),
-        (if ($g.syncedAt | ts) < 1000000000 or (now - ($g.syncedAt | ts)) > $syncmax
+        (if ($g.syncedAt | ts) < 1000000000 or ($now - ($g.syncedAt | ts)) > $syncmax
          then "envd synced with the gateway at \($g.syncedAt // "never"), which is more than 2 minutes ago. Read the log of envd with: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd. Then run: CELL=dev-cp mise run cell:up" else empty end),
-        (if $up and ($g.outboxItems // 0) > 0 and (($g.oldestOutboxAt | ts) > 1000000000) and (now - ($g.oldestOutboxAt | ts)) > 120
+        (if $up and ($g.outboxItems // 0) > 0 and (($g.oldestOutboxAt | ts) > 1000000000) and ($now - ($g.oldestOutboxAt | ts)) > 120
          then "the oldest outbox item of the gateway is from \($g.oldestOutboxAt), more than 2 minutes ago, and mgmtd answers. Run: mise run gw -- outbox" else empty end),
         (if recent($g.droppedAt; 900) then "the gateway dropped an outbox item at \($g.droppedAt), within the last 15 minutes. Run: mise run gw -- outbox" else empty end),
         (if recent($g.recordOldAt; 900) then "the gateway refused an older record at \($g.recordOldAt), within the last 15 minutes. Run: CELL=dev-cp mise run cell:up" else empty end),
@@ -219,13 +222,13 @@ management_extras() {
   # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
   expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  agents="$(jq -Rsc --argjson expected "$expected" '
+  agents="$(jq -Rsc --argjson now "$NODE_NOW" --argjson expected "$expected" '
       def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
       [split("\n")[] | fromjson? | select(type == "object" and .client != null)] as $lines
       | [$lines[] | select(.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream")]
       | group_by(.client) | map({client: .[0].client, up: (.[-1].msg != "Closing EventStream")}) as $last
       | ([$last[].client]) as $seen
-      | ([$lines[] | select((.msg // "" | startswith("Event received")) and ((.time // "") | ts) > (now - 300)) | .client] | unique) as $active
+      | ([$lines[] | select((.msg // "" | startswith("Event received")) and ((.time // "") | ts) > ($now - 300)) | .client] | unique) as $active
       | ([$last[] | select(.up) | .client] + ($active - $seen) | unique | sort) as $up
       | {expected: $expected, connected: ($expected - ($expected - $up)), missing: ($expected - $up)}' <<<"$logs")"
 

@@ -9,6 +9,12 @@ log() { printf '==> %s\n' "$*" >&2; }
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
+# node_now prints the time of a node in epoch seconds, and node_now_iso in the form 2026-11-16T03:20:58Z. The clusters write their
+# timestamps from the clock of the VM, which differs from the clock of the Mac after a sleep. A check that compares a timestamp of
+# a cluster with the present reads the present from a node.
+node_now() { docker exec dev-cp-control-plane date +%s; }
+node_now_iso() { docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ; }
+
 # json_fail <name> <error> [key=value...] prints one JSON error line on standard output, in the
 # shape of the Go commands (log/slog JSONHandler), and exits with status 1. A script whose standard
 # output carries data uses it, so a caller never reads a partial result as data.

@@ -80,7 +80,9 @@ if ! status_json="$(mgmt_status)"; then
 fi
 
 stage_start=$SECONDS
-stage_iso="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+# The gateway writes the time of a refusal from the clock of the VM, so the start of the stage comes from a node, as in gate.sh. With no
+# time, no refusal counts as new, and the hint to run cell:up is left out.
+stage_iso="$(node_now_iso 2>/dev/null || true)"
 if ! poll_until "${ATTEST_BOUND_WAIT:-120}" cell_bound; then
   celld_line="$(ctx "$cell" -n cell-identity-system logs deploy/celld -c celld --tail=200 2>&1 | grep -i bind | tail -n 1 || true)"
   # Two sources name the cause. The gateway keeps the last bind refusal for the cell, and mgmtd keeps the last refused

@@ -31,12 +31,15 @@ const gwResetReplicas = `#!/usr/bin/env bash
 echo "harness-replicas $*" >>"$STUB_DIR/calls"
 `
 
-// gwResetStatus answers the first call with the old store and each later call with the new one.
+// gwResetStatus answers the first call with the old store and each later call with the new one. The first STUB_ZERO_SYNCS calls after
+// the first show a zero syncedAt, as a gateway with a new store that envd has not synced with.
 const gwResetStatus = `#!/usr/bin/env bash
 echo "gw $*" >>"$STUB_DIR/calls"
-if [[ ! -f "$STUB_DIR/seen" ]]; then
-  touch "$STUB_DIR/seen"
+n=$(cat "$STUB_DIR/gn" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" >"$STUB_DIR/gn"
+if ((n == 1)); then
   echo '{"epoch":100,"syncedAt":"2026-11-14T00:00:00Z"}'
+elif ((n - 1 <= ${STUB_ZERO_SYNCS:-0})); then
+  echo '{"epoch":200,"syncedAt":"0001-01-01T00:00:00Z"}'
 else
   echo '{"epoch":200,"syncedAt":"2026-11-14T00:05:00Z"}'
 fi
@@ -65,6 +68,7 @@ func TestGwReset(t *testing.T) {
 	run := func(env ...string) (string, string, string, error) {
 		_ = os.Remove(filepath.Join(stub, "calls"))
 		_ = os.Remove(filepath.Join(stub, "seen"))
+		_ = os.Remove(filepath.Join(stub, "gn"))
 		_ = os.Remove(filepath.Join(stub, "n"))
 		cmd := exec.Command(filepath.Join(root, "scripts", "gw-reset.sh"))
 		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_BUILD_ROOT=" + filepath.Join(root, "build"),
@@ -102,6 +106,15 @@ func TestGwReset(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(out), &line); err != nil || line.Level != "INFO" || line.OldEpoch != 100 || line.NewEpoch != 200 {
 		t.Errorf("the output %q is %+v (%v), want one JSON line with oldEpoch 100 and newEpoch 200", out, line, err)
+	}
+
+	// A zero syncedAt is no sync: the script polls until the time is set. Two zero answers make two more reads of the status.
+	_, _, calls, err = run("STUB_ZERO_SYNCS=2")
+	if err != nil {
+		t.Fatalf("gw-reset.sh with a zero syncedAt: %v", err)
+	}
+	if n := strings.Count(calls, "gw status"); n != 5 {
+		t.Errorf("with two zero syncedAt answers the script read the status %d times, want 5 (before, three polls, after):\n%s", n, calls)
 	}
 
 	// Without a ready envd, the script does not wait for a sync.

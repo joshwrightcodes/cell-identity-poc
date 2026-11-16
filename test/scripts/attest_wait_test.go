@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -56,7 +57,7 @@ func TestAttestWaitStages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for name, body := range map[string]string{"kubectl": attestKubectl, "mise": attestMise} {
+	for name, body := range map[string]string{"kubectl": attestKubectl, "mise": attestMise, "docker": nodeClockDocker} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -106,6 +107,9 @@ func TestAttestWaitStages(t *testing.T) {
 			deny: []string{"CELL=dev-cp mise run cell:up"}},
 		{name: "the gateway refused the bind source", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","requestId":"00000000000000bb","at":"2099-01-01T00:00:00Z"}}}`}, code: 1,
 			want: []string{"stage bound failed", `Last gateway bind refusal for dev-cell-1: {"reason":"source_mismatch"`, "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
+		{name: "a fresh refusal on a node clock that lags the Mac counts as new", env: []string{"STUB_CLOCK_SKEW=300"},
+			change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","at":"` + time.Now().Add(-290*time.Second).UTC().Format(time.RFC3339) + `"}}}`}, code: 1,
+			want: []string{"stage bound failed", "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
 		{name: "the gateway does not know the cell", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"cell_unknown","at":"2099-01-01T00:00:00.5Z"}}}`}, code: 1,
 			want: []string{"stage bound failed", `"reason":"cell_unknown"`, "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
 		{name: "an old gateway refusal prints no cell:up hint", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","at":"2020-01-01T00:00:00Z"}}}`}, code: 1,

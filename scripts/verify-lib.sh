@@ -368,8 +368,9 @@ gateway_status() {
 # GATEWAY_SYNC_MAX_AGE is the age in seconds above which the sync of envd counts as late (2 minutes). harness:status uses the same value.
 GATEWAY_SYNC_MAX_AGE=120
 check_gateway_synced() {
-  local status err synced age
+  local status err synced age now
   status="$(gateway_status)" || { echo "$status"; return 1; }
+  now="$(node_now)" || { echo "cannot read the time of the node dev-cp-control-plane, so the age of the sync is unknown. Run: docker ps"; return 1; }
   err="$(jq -r '.storeError // ""' <<<"$status")"
   if [[ -n "$err" ]]; then
     echo "the store of the gateway reports '$err'."
@@ -377,7 +378,7 @@ check_gateway_synced() {
     return 1
   fi
   synced="$(jq -r '.syncedAt // ""' <<<"$status")"
-  age="$(jq -n --arg t "$synced" '(now - ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0))')"
+  age="$(jq -n --argjson now "$now" --arg t "$synced" '($now - ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0))')"
   if [[ -z "$synced" ]] || ((${age%.*} > GATEWAY_SYNC_MAX_AGE)); then
     echo "envd synced with the gateway at '${synced:-never}', which is more than 2 minutes ago."
     echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd. Then run: $(dependents_of gateway-nodes)"
@@ -406,7 +407,8 @@ check_gateway_cells() {
   done
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
-    echo "Run: $(dependents_of gateway-nodes)"
+    echo "After a rebuilt cell, run: $(dependents_of gateway-nodes)"
+    echo "After a restart of the VM, rebuild the harness: mise run harness:down, then mise run harness:up"
     return 1
   fi
 }

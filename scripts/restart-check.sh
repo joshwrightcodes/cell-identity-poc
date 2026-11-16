@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Stop and start the Colima VM, wait until every node is Ready, then run the M1 gate. A restart gives each node a new address, so the
-# last step is expected to fail: the policies of dev-cp hold old addresses. Rebuild with harness:down and harness:up afterwards.
+# Stop and start the Colima VM, wait until every node is Ready, then run the M1 gate. A restart gives each node a new address, and the
+# policies of dev-cp hold the old addresses. The last step fails when rogue takes an address that a policy still admits, and a pass does
+# not show that the harness works. Rebuild with harness:down and harness:up afterwards. An API server that does not answer yet counts as
+# not ready, and the loop keeps waiting for it.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
@@ -17,7 +19,7 @@ deadline=$((SECONDS + wait_seconds))
 for name in $clusters; do
   while true; do
     not_ready="$(kubectl --context "kind-$name" get nodes --no-headers 2>/dev/null | awk '$2 != "Ready"' || true)"
-    count="$(kubectl --context "kind-$name" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+    count="$(kubectl --context "kind-$name" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')" || count=0
     if [[ "$count" -gt 0 && -z "$not_ready" ]]; then
       log "$name: every node is Ready"
       break
