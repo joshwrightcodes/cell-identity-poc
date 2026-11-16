@@ -1119,7 +1119,19 @@ The test timeout is 160 minutes, twice the budget.
 All times of the next paragraph are wall time in seconds, measured on 2026-11-15 and 2026-11-16 (UTC).
 `gate:m1` took 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
 The other gates took 592 seconds for `gate:m4:rotate`, 1,764 seconds for `gate:m5:soak`, 252 seconds for `gate:m5:drill` and 2,945 seconds for the last full `gate:m5`.
-A run from clean with the M5 components took 1,730 seconds for `harness:up`.
+Two runs from clean with the M5 components took 1,730 and 1,507 seconds for `harness:up`.
+After the second run, the five node containers used about 11 GiB of memory in total:
+
+| Container | Memory | CPU |
+| --- | --- | --- |
+| `management` | 3.6 GiB | 12 percent |
+| `dev-cp` | 2.4 GiB | 15 percent |
+| `dev-cell-1`, `dev-cell-2` (each) | 2.0 to 2.2 GiB | 11 to 12 percent |
+| `rogue` | 0.6 GiB | 4 percent |
+| `registry-mirror` | 51 MiB | 0 percent |
+
+The VM reported 11.3 GB in use and 22 GB in the file cache.
+The numbers come from `harness:size` after `gate:m5:drill`.
 The rebuild of `management` took 21 minutes 36 seconds from `cell:down` to the first `harness:status` that exited 0. The first `harness:status` failed only on collector export retries, which clear by themselves within 5 minutes.
 The slowest M5 tests are the key rotation tests, about 6 to 11 minutes each, and `TestM5DevCPCannotPoseOnReports`, about 6 minutes.
 The budgets do not cover `harness:up`.
