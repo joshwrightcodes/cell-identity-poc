@@ -10,8 +10,30 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
+
+// outboxKindsOf returns the kind of each item in the outbox of the gateway that has the operation ID id.
+func outboxKindsOf(t *testing.T, id string) []string {
+	t.Helper()
+	var res struct {
+		Items []struct {
+			Kind string `json:"kind"`
+			OpID string `json:"opId"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(gwCtl(t, "", "outbox")), &res); err != nil {
+		t.Fatalf("cellgw ctl outbox is no list: %v", err)
+	}
+	var kinds []string
+	for _, it := range res.Items {
+		if it.OpID == id {
+			kinds = append(kinds, it.Kind)
+		}
+	}
+	return kinds
+}
 
 // gwQueueHas reports whether the queue of the gateway for cell holds a row of operation id, and the state of that row.
 func gwQueueHas(t *testing.T, cell, id string) (bool, string) {
@@ -38,7 +60,7 @@ func gwQueueHas(t *testing.T, cell, id string) (bool, string) {
 //  1. celld of the first cell goes to 0 replicas.
 //  2. An operation X is signed, and the queue of the gateway shows it.
 //  3. mgmtd goes to 0 replicas, so results stay in the outbox while envd keeps syncing.
-//  4. celld returns, applies X, and the outbox of the gateway holds its result.
+//  4. celld returns, applies X, and the outbox of the gateway holds the result of X (an item of kind result with the ID of X).
 //  5. mise run gw:reset replaces the volume, and the epoch rises.
 //  6. mgmtd returns.
 //
@@ -83,9 +105,11 @@ func TestGatewayVolumeLostDrill(t *testing.T) {
 		state := opRecordState(t, cell, id)
 		return state == "applied", fmt.Sprintf("record %q", state)
 	})
-	waitFor(t, "the outbox of the gateway to hold the result", m5Wait, func() (bool, string) {
-		ids := outboxIDs(t)
-		return len(ids) > 0, fmt.Sprintf("outbox %v", ids)
+	// With mgmtd away, the status items of both cells fill the outbox too, so only an item of kind result with the ID of X shows that the
+	// reset loses the result of X.
+	waitFor(t, "the outbox of the gateway to hold the result of "+id, m5Wait, func() (bool, string) {
+		kinds := outboxKindsOf(t, id)
+		return slices.Contains(kinds, gwapi.KindResult), fmt.Sprintf("outbox items of %s: %v", id, kinds)
 	})
 	before := gwStatus(t).Epoch
 

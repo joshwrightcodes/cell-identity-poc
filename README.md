@@ -348,10 +348,12 @@ It prints the number of stream failures and of restarts for a new SVID.
 Run it alone, after `mise run gate:m5`.
 
 `mise run gate:m5:drill` loses the gateway volume while an operation is in flight.
-It stops `celld`, signs an operation, stops `mgmtd`, lets `celld` apply the operation, runs `mise run gw:reset` and starts `mgmtd` again.
+It stops `celld`, signs an operation, stops `mgmtd` and lets `celld` apply the operation.
+It waits until the outbox holds an item of kind `result` with the ID of that operation, because the status items of both cells fill the outbox too.
+Then it runs `mise run gw:reset` and starts `mgmtd` again.
 Afterwards the epoch is higher, the operation is final with `applied` or `already_applied`, and the demo log holds one line for it.
-`mise run harness:status` must exit 0.
-It runs `gw:reset` on purpose.
+At the end, `mise run harness:status` exits 0.
+The drill runs `gw:reset` on purpose.
 Run it alone, after `mise run gate:m5`.
 
 After `gate:m5`, `gate:m5:soak` and `gate:m5:drill`, a scan reads the logs of `cellgw`, `envd`, `mgmtd`, `celld` and each `cell-proxy` since the start of the run.
