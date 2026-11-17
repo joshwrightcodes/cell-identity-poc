@@ -712,6 +712,43 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		}
 	}
 
+	// stages is what rotate-signing-key reads: one line for each step that runs a stage, from the service or from journal.json.
+	t.Run("stages lists the steps that run a stage", func(t *testing.T) {
+		line := func(state string) string { return strings.Repeat("a", 32) + " dev-cell-1 " + state + "\n" }
+		for _, state := range []string{"creating", "admitting", "bootstrapping"} {
+			e := newServeEnv(t)
+			stageJournal(t, e, state)
+			if out, errOut, err := e.serve(t, "stages"); err != nil || out != line(state) {
+				t.Fatalf("journal file, %s: err %v, stdout %q, stderr %q; want %q", state, err, out, errOut, line(state))
+			}
+			e = newServeEnv(t)
+			e.mustServe(t, "start")
+			stageSteps(t, e, state)
+			if out, errOut, err := e.serve(t, "stages"); err != nil || out != line(state) {
+				t.Fatalf("running service, %s: err %v, stdout %q, stderr %q; want %q", state, err, out, errOut, line(state))
+			}
+		}
+		for _, state := range []string{"queued", "done", "failed_final"} {
+			e := newServeEnv(t)
+			stageJournal(t, e, state)
+			if out, _, err := e.serve(t, "stages"); err != nil || out != "" {
+				t.Fatalf("%s: err %v, stdout %q; want no line", state, err, out)
+			}
+		}
+		e := newServeEnv(t)
+		if out, _, err := e.serve(t, "stages"); err != nil || out != "" {
+			t.Fatalf("no journal: err %v, stdout %q; want no line", err, out)
+		}
+		e = newServeEnv(t)
+		e.mustServe(t, "start")
+		if err := os.WriteFile(filepath.Join(e.state, "ctl-fail"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, errOut, err := e.serve(t, "stages"); err == nil || !strings.Contains(errOut, "could not read the steps") {
+			t.Fatalf("a failed read: err %v, stderr %q; want a failure", err, errOut)
+		}
+	})
+
 	t.Run("start_refuses_during_stage", func(t *testing.T) {
 		for _, state := range []string{"creating", "admitting", "bootstrapping"} {
 			e := newServeEnv(t)

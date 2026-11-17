@@ -513,6 +513,8 @@ Do not rotate the signing key while a test runs that rotates a cell key. The ser
 To run one step, use `mise run mgmt -- rotate-signing-key --step stage|cells|commit|planes`.
 The step `stage` and the step `commit` include their wait and their sync. The step `stage` also renders the cell controller. The step `planes` renders `envd` and the cell controller, runs `CELL=dev-cp mise run cell:up` and `CELL=management mise run cell:link`, and runs no verify.
 Every mode refuses to start while a step runs a stage, because a stage holds the lock of `dev-cp`, and the command cannot take it. The command also refuses when it cannot read the steps. Read them with `mise run hostsvc:serve -- steps`. Wait until the stage ends, or add `--force` to go on. With `--force`, each `cell:up` and `cell:link` of the run waits up to 900 seconds for the lock.
+A stage runs for 10 to 45 minutes, so a wait of 900 seconds can end before the stage does, and then `envd-render` or a later command fails. The host service holds a step that `mgmtd` signed again for 10 minutes from its next stage boundary. Run the remaining commands within 10 minutes after the stage ends.
+After `--emergency --force` across a stage boundary, for up to about 40 seconds the host service trusts the new key, and `mgmtd` has not yet pushed the new spec. A stage boundary in that time can end the step as `failed_final` with `signature_invalid`. Open the step again with `portal -- retry`.
 Each `cell:up` pass takes the replica field of `celld` back, so a pass restores a `celld` that a test set to 0.
 
 For an emergency, run `mise run mgmt -- rotate-signing-key --emergency`.

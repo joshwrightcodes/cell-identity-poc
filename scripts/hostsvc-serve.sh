@@ -2,7 +2,7 @@
 # The host service on this Mac: hostsvc serve answers the key requests of mgmtd, the spec pushes of mgmtd and
 # the step requests of the cell controller on 127.0.0.1 at HOSTSVC_PORT. Pods reach it at the address that
 # host.docker.internal has in the node container.
-# Usage: hostsvc-serve.sh start [--force]|stop|restart [--force]|status|pin|sync|steps [--reset]|log --step <id> [--follow]|cancel --cell <c>|--step <id>
+# Usage: hostsvc-serve.sh start [--force]|stop|restart [--force]|status|pin|sync|stages|steps [--reset]|log --step <id> [--follow]|cancel --cell <c>|--step <id>
 #   start    Fetch the live root of management, check it, and write it to build/hostsvc/mgmt-root.crt.
 #            Run sync. Build build/bin/hostsvc, rotate the log, and run serve with nohup under env -i,
 #            with only HOME, PATH, USER, TMPDIR, DOCKER_HOST and the OTEL_* variables. Write the pid file.
@@ -27,6 +27,8 @@
 #            the cross-check: spec.pub must equal mise run mgmt -- pubkey, and next.pub must equal the staged key
 #            of mise run mgmt -- status. While mgmtd-0 is not Ready, the files stay and the command fails.
 #            No restart: the server reloads the files within 10 seconds.
+#   stages   Print one line "<id> <cell> <state>" for each step that runs a stage, and nothing when none runs. It reads
+#            the running service, or journal.json when the service does not run. It fails when it cannot read the steps.
 #   steps    Print the journal as one JSON line (hostsvc ctl steps). --reset resets a corrupt journal.
 #   log      Print the log of a step, or follow it (hostsvc ctl log).
 #   cancel   Cancel the open step of a cell or the step with an ID at the host service. An answer that no
@@ -398,6 +400,7 @@ case "${1:-}" in
   status) do_status ;;
   pin) do_pin ;;
   sync) do_sync ;;
+  stages) stage_entries ;;
   steps)
     case "${2:-}" in
       "") ctl steps ;;
@@ -406,5 +409,5 @@ case "${1:-}" in
     esac ;;
   log) shift; ctl log "$@" ;;
   cancel) shift; do_cancel "$@" ;;
-  *) die "usage: hostsvc-serve.sh start [--force]|stop|restart [--force]|status|pin|sync|steps [--reset]|log --step <id> [--follow]|cancel --cell <c>|--step <id>" ;;
+  *) die "usage: hostsvc-serve.sh start [--force]|stop|restart [--force]|status|pin|sync|stages|steps [--reset]|log --step <id> [--follow]|cancel --cell <c>|--step <id>" ;;
 esac

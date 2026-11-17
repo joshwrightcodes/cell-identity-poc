@@ -48,7 +48,7 @@ echo 172.18.0.5
 // makes the commit or the emergency rotation fail with nothing changed. STUB_ROTATE_PUBLISH_FAIL makes it fail after the rotation, with
 // rotated:true in its error line, as mgmtd does when the publish of the public key fails. STUB_FAIL names one cell command that fails,
 // and STUB_FAIL_AT its occurrence (default 1). hostsvc:serve -- sync is logged, and STUB_SYNC_FAIL makes its STUB_SYNC_FAIL_AT occurrence
-// fail (default 1). hostsvc:serve -- steps answers STUB_STEPS, an empty journal by default, and fails with STUB_STEPS_FAIL. Each cell command
+// fail (default 1). hostsvc:serve -- stages prints STUB_STAGES (the lines of the running stages, none by default), and fails with STUB_STEPS_FAIL. It prints a task header and a warning on standard error. Each cell command
 // records CLUSTER_LOCK_WAIT in the file lockwait.
 const rotateKeyMise = `#!/usr/bin/env bash
 case "$*" in
@@ -79,12 +79,13 @@ case "$*" in
   "run hostsvc:serve -- sync")
     echo "hostsvc sync" >>"$STUB_DIR/calls"
     if [[ -n "${STUB_SYNC_FAIL:-}" && "$(grep -cxF "hostsvc sync" "$STUB_DIR/calls")" == "${STUB_SYNC_FAIL_AT:-1}" ]]; then echo "sync failed" >&2; exit 1; fi ;;
-  "run hostsvc:serve -- steps")
-    echo "hostsvc steps" >>"$STUB_DIR/calls"
+  "run hostsvc:serve -- stages")
+    echo "hostsvc stages" >>"$STUB_DIR/calls"
+    # The real mise prints the task header on standard error, and a run of mise can print warnings there too.
+    echo "[hostsvc:serve] \$ scripts/hostsvc-serve.sh stages" >&2
+    echo "mise WARN a warning on standard error" >&2
     [[ -z "${STUB_STEPS_FAIL:-}" ]] || { echo "no admin socket" >&2; exit 1; }
-    steps="${STUB_STEPS:-}"
-    [[ -n "$steps" ]] || steps='{"steps":[]}'
-    printf '%s\n' "$steps" ;;
+    [[ -z "${STUB_STAGES:-}" ]] || printf '%s\n' "$STUB_STAGES" ;;
   "run cell:up"|"run cell:link"|"run cell:verify")
     label="CELL=$CELL ${HARNESS_ONLY:+HARNESS_ONLY=$HARNESS_ONLY }$*"
     echo "$label" >>"$STUB_DIR/calls"
@@ -179,7 +180,7 @@ func TestRotateKeyOrder(t *testing.T) {
 	emergencyOrder := []step{emergency, specWait, syncNew, envdRender, ctlRender, devCP, link, cell1, cell2, roll1, roll2, verifyMgmt, verifyCP}
 	// A run reads the steps of the host service first, then the public key of mgmtd.
 	calls := func(steps []step) []string {
-		got := []string{"hostsvc steps", "mgmt pubkey"}
+		got := []string{"hostsvc stages", "mgmt pubkey"}
 		for _, s := range steps {
 			got = append(got, s.call)
 		}
@@ -496,27 +497,24 @@ func TestRotateKeyOrder(t *testing.T) {
 
 	// The cell passes and the planes take the lock of their clusters, and an admit stage holds the lock of dev-cp for up to 45 minutes. So
 	// the script refuses to start while the journal shows a stage, before it changes anything, unless --force.
-	const running = `{"steps":[{"id":"0123456789abcdef0123456789abcdef","cell":"dev-cell-2","state":"admitting"}]}`
+	const running = "0123456789abcdef0123456789abcdef dev-cell-2 admitting"
 	t.Run("a stage that runs refuses every mode", func(t *testing.T) {
 		for _, args := range [][]string{nil, {"--emergency"}, {"--step", "stage"}, {"--step", "cells"}, {"--step", "commit"}, {"--step", "planes"}} {
-			out, errOut, err := run("mgmt-rotate-key.sh", args, "STUB_STEPS="+running)
+			out, errOut, err := run("mgmt-rotate-key.sh", args, "STUB_STAGES="+running)
 			var line map[string]any
 			if err == nil || json.Unmarshal([]byte(out), &line) != nil || line["level"] != "ERROR" ||
 				!strings.Contains(fmt.Sprint(line["error"]), "a step runs a stage: 0123456789abcdef0123456789abcdef dev-cell-2 admitting") ||
 				!strings.Contains(fmt.Sprint(line["error"]), "--force") {
 				t.Fatalf("args %v: err %v, stdout %q, stderr %q; want one error line that names the stage and --force", args, err, out, errOut)
 			}
-			sameCalls(t, callLog(), []string{"hostsvc steps"})
+			sameCalls(t, callLog(), []string{"hostsvc stages"})
 		}
 	})
 
-	// A step that waits, or that ended, runs no stage.
-	t.Run("a step that does not run a stage does not refuse", func(t *testing.T) {
-		for _, state := range []string{"queued", "failed_final", "ready"} {
-			steps := `{"steps":[{"id":"0123456789abcdef0123456789abcdef","cell":"dev-cell-2","state":"` + state + `"}]}`
-			if out, errOut, err := run("mgmt-rotate-key.sh", nil, "STUB_STEPS="+steps); err != nil {
-				t.Fatalf("state %s: %v\n%s\n%s", state, err, out, errOut)
-			}
+	// A run with no stage works although the task prints a header and a warning on standard error.
+	t.Run("the task header on standard error does not break the read", func(t *testing.T) {
+		if out, errOut, err := run("mgmt-rotate-key.sh", nil); err != nil {
+			t.Fatalf("%v\n%s\n%s", err, out, errOut)
 		}
 	})
 
@@ -526,18 +524,18 @@ func TestRotateKeyOrder(t *testing.T) {
 		if err == nil || json.Unmarshal([]byte(out), &line) != nil || !strings.Contains(fmt.Sprint(line["error"]), "cannot tell whether a step runs a stage") || !strings.Contains(fmt.Sprint(line["error"]), "--force") {
 			t.Fatalf("err %v, stdout %q; want one error line that says the read failed and names --force", err, out)
 		}
-		sameCalls(t, callLog(), []string{"hostsvc steps"})
+		sameCalls(t, callLog(), []string{"hostsvc stages"})
 	})
 
 	// --force skips the read and makes each cell command wait up to 900 s for the lock of a stage. Without it no command waits.
 	t.Run("force goes on and waits for the lock", func(t *testing.T) {
 		for _, args := range [][]string{{"--force"}, {"--force", "--emergency"}, {"--emergency", "--force"}, {"--step", "planes", "--force"}} {
-			out, errOut, err := run("mgmt-rotate-key.sh", args, "STUB_STEPS="+running)
+			out, errOut, err := run("mgmt-rotate-key.sh", args, "STUB_STAGES="+running)
 			if err != nil {
 				t.Fatalf("args %v: %v\n%s\n%s", args, err, out, errOut)
 			}
 			for _, c := range callLog() {
-				if c == "hostsvc steps" {
+				if c == "hostsvc stages" {
 					t.Errorf("args %v: the script read the steps although --force was given", args)
 				}
 			}

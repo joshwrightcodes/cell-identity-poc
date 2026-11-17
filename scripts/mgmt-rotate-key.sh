@@ -28,7 +28,7 @@
 # --step stage|cells|commit|planes runs one step. cells and planes run no verify, so a test can hold a cell down between them.
 # stage and commit include their wait and their sync.
 # The cell passes and the planes take the lock of their clusters, and an admit stage holds the lock of dev-cp. So the script refuses to
-# start while hostsvc:serve -- steps shows a step that runs a stage, or when it cannot read the steps. --force skips that check and
+# start while hostsvc:serve -- stages shows a step that runs a stage, or when it cannot read the steps. --force skips that check and
 # sets CLUSTER_LOCK_WAIT=900 for each cell command, so that it waits for the lock of the stage.
 #
 # The script prints one JSON line on standard output: the SHA-256 fingerprints of the old and the new key (of the public key, in
@@ -73,12 +73,15 @@ started=$SECONDS
 if ((force)); then
   export CLUSTER_LOCK_WAIT="${CLUSTER_LOCK_WAIT:-900}"
 else
-  # stage_entries prints one line "<id> <cell> <state>" for each journal entry that runs a stage: creating, admitting or bootstrapping.
-  steps_json="$(mise run hostsvc:serve -- steps 2>&1)" \
-    || json_fail mgmt-rotate-key "cannot tell whether a step runs a stage, because the read failed: ${steps_json:-no output}. Read it with: mise run hostsvc:serve -- steps. To go on anyway, add --force"
-  running="$(jq -r '[(.steps // [] | .[] | {id, cell, state}), (.entries // [] | .[].status | {id, cell, state})]
-    | .[] | select(.state == "creating" or .state == "admitting" or .state == "bootstrapping") | "\(.id) \(.cell) \(.state)"' <<<"$steps_json")" \
-    || json_fail mgmt-rotate-key "cannot tell whether a step runs a stage, because the steps are no journal: $steps_json. To go on anyway, add --force"
+  # hostsvc:serve -- stages prints one line "<id> <cell> <state>" for each step that runs a stage. The mise task header goes to
+  # standard error, so only standard output counts.
+  stages_err="$(mktemp)"
+  if ! running="$(mise run hostsvc:serve -- stages 2>"$stages_err")"; then
+    reason="$(tr '\n' ' ' <"$stages_err")"
+    rm -f "$stages_err"
+    json_fail mgmt-rotate-key "cannot tell whether a step runs a stage, because the read failed: ${reason:-no output}. Read it with: mise run hostsvc:serve -- steps. To go on anyway, add --force"
+  fi
+  rm -f "$stages_err"
   [[ -z "$running" ]] \
     || json_fail mgmt-rotate-key "a step runs a stage: ${running//$'\n'/; }. Wait until it ends, or cancel it with: mise run hostsvc:serve -- cancel --step <id>. To go on anyway, add --force"
 fi
