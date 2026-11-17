@@ -92,6 +92,10 @@ type Config struct {
 	// the requests carry the traceparent header.
 	Tracer trace.Tracer
 
+	// LocalIP, when set, is the source address of each connection. The kernel refuses a dial when
+	// the host does not hold the address.
+	LocalIP net.IP
+
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
@@ -170,6 +174,11 @@ type Client struct {
 func NewClient(cfg Config) *Client {
 	protos := new(http.Protocols)
 	protos.SetHTTP2(true)
+	dial := cfg.dial
+	if dial == nil && cfg.LocalIP != nil {
+		d := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: &net.TCPAddr{IP: cfg.LocalIP}}
+		dial = d.DialContext
+	}
 	tr := &http.Transport{
 		TLSClientConfig:   cfg.TLS,
 		Protocols:         protos,
@@ -177,7 +186,7 @@ func NewClient(cfg Config) *Client {
 		// The limit is far below the default of 10 MiB, for a pod with a small memory limit.
 		MaxResponseHeaderBytes: maxHeaderBytes,
 		HTTP2:                  &http.HTTP2Config{SendPingTimeout: pingIdle, PingTimeout: pingTimeout},
-		DialContext:            cfg.dial,
+		DialContext:            dial,
 	}
 	return &Client{cell: cfg.Cell, base: "https://" + cfg.Upstream, tr: tr, http: &http.Client{
 		Transport: telemetry.Transport(tr),

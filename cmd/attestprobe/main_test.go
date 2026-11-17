@@ -10,6 +10,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -490,5 +492,19 @@ func TestParseNeedsEnv(t *testing.T) {
 	_, err := parse([]string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1"}, podEnv(nil))
 	if err == nil || !strings.Contains(err.Error(), "--env") {
 		t.Fatalf("err = %v, want an error that names --env", err)
+	}
+}
+
+func TestAttestprobeSourceParse(t *testing.T) {
+	base := []string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1", "--env", "dev"}
+	cfg, err := parse(append(slices.Clone(base), "--source", "172.18.0.9"), podEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.source.Equal(net.ParseIP("172.18.0.9")) {
+		t.Fatalf("source = %v", cfg.source)
+	}
+	if _, err := parse(append(slices.Clone(base), "--source", "not-an-ip"), podEnv(nil)); err == nil || !strings.Contains(err.Error(), "--source") {
+		t.Fatalf("err = %v, want an error that names --source", err)
 	}
 }
