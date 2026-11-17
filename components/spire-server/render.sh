@@ -2,17 +2,18 @@
 # Render the SPIRE server of one trust domain.
 #
 # Two attestation paths feed the server. Each loads only when its inputs are set.
-#   - cluster_jwt, for the SPIRE agent sidecars in cells: SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS.
-#     For each cell, the render reads the node address from the host service. The NetworkPolicy
-#     admits only those node addresses on the node port. The plugin trusts only records that the
+#   - cluster_jwt, for the SPIRE agent sidecars in cells: SPIRE_AGENT_CELLS (the catalog of cells) and
+#     SPIRE_CELL_SUBJECTS. For each live cell (live_cells in components/lib/live-cells.sh), the render reads the
+#     node address from the host service. The NetworkPolicy admits only those node addresses on the node
+#     port. With no live cell, the render drops the cluster_jwt section and the policy, and keeps the entries. The plugin trusts only records that the
 #     management plane signs: record_public_keys holds the public key of mgmtd, from ConfigMap
 #     mgmt-signing-pub in management (components/lib/mgmt-key.sh). envd writes the signed records into
 #     ConfigMap spire-system/cell-records, which the pod mounts as an optional volume, and the plugin
 #     reloads them while the server runs. ConfigMap spire-entries gets two
 #     ClusterStaticEntry manifests for each subject of each cell: a node alias
 #     spiffe://<td>/cell/<cell>/agents/<role> that matches only the attested agents of that cell and
-#     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias. So the agent of
-#     one subject gets no entry of another subject. The plugin image is the one that
+#     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias, for each cell of the
+#     catalog, live or not. So the agent of one subject gets no entry of another subject. The plugin image is the one that
 #     `mise run images` built on this Mac, pinned by the digest in build/images.env. The server
 #     config carries the SHA-256 of the plugin binary from that image, so the server checks the
 #     binary before it runs it.
@@ -50,6 +51,7 @@ source "$root/scripts/ko-image.sh"
 source "$root/scripts/gate-traces.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/live-cells.sh"
 
 # seconds <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
 seconds() {
@@ -95,8 +97,8 @@ entries='{}'
 mgmt_pub=""
 plugin_image=""
 checksum=""
+live=()
 if ((${#cells[@]} > 0)); then
-  sections+=(cluster_jwt)
   # Each subject is <namespace>/<service account>=<role>. A role and a ServiceAccount may appear once.
   seen_roles=" " seen_accounts=" "
   for subject in "${subjects[@]}"; do
@@ -106,27 +108,9 @@ if ((${#cells[@]} > 0)); then
     [[ "$seen_accounts" != *" ${subject%%=*} "* ]] || die "SPIRE_CELL_SUBJECTS names the ServiceAccount ${subject%%=*} twice"
     seen_roles+="${subject#*=} " seen_accounts+="${subject%%=*} "
   done
-  mgmt_pub="$(mgmt_signing_pub)" || exit 1
 
-  # The plugin image and the checksum of the binary in it.
-  plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
-  checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no plugin checksum"
-
-  ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  # The entries of every cell of the catalog stay, whether its cluster exists or not.
   for cell in "${cells[@]}"; do
-    # A cell without a cluster has no facts. The node check below would then send the operator to a
-    # repair that cannot reach the node either.
-    if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
-      die "no host service facts for $cell: ${facts:-no output}. Create the cluster: mise run hostsvc -- up --only $cell, then run CELL=$cell mise run cell:up. Or remove $cell from SPIRE_AGENT_CELLS in cells/dev-cp.env"
-    fi
-    # While the M2 key rotation test has changed the cell, its API server publishes the test key, so
-    # the render stops until the node is repaired.
-    traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
-    [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
-    ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
-    [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
-    peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
-
     # The cluster_jwt plugin gives an attested agent the selectors cluster_jwt:cell:<cell> and
     # cluster_jwt:sa:<namespace>:<service account>. Each alias matches both, for one subject. The
     # role entry selects the uid of the ko images.
@@ -145,6 +129,36 @@ if ((${#cells[@]} > 0)); then
               selectors: ["unix:uid:" + $uid]}}
         }' <<<"$entries")"
     done
+  done
+
+  # Only a live cell has a node address to admit. A catalog cell with no cluster is not admitted.
+  live_all="$(live_cells)" || die "could not list the live cells"
+  for cell in $live_all; do
+    [[ " ${cells[*]} " != *" $cell "* ]] || live+=("$cell")
+  done
+fi
+if ((${#live[@]} > 0)); then
+  sections+=(cluster_jwt)
+  mgmt_pub="$(mgmt_signing_pub)" || exit 1
+
+  # The plugin image and the checksum of the binary in it.
+  plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
+  checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no plugin checksum"
+
+  ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  for cell in "${live[@]}"; do
+    # A live cell has a cluster, so its facts must read. A read error stops the render: a cell that the render left out
+    # because of a transient error would lose its place in the admit list.
+    if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
+      die "no host service facts for the live cell $cell: ${facts:-no output}. Read them: mise run hostsvc -- facts --cluster $cell"
+    fi
+    # While the M2 key rotation test has changed the cell, its API server publishes the test key, so
+    # the render stops until the node is repaired.
+    traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
+    [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
+    ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
+    [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
+    peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
   done
 fi
 
@@ -203,7 +217,7 @@ server_conf="$(awk -v keep=" ${sections[*]} " '
   | sed -e "s|@SPIRE_TRUST_DOMAIN@|$td|g" -e "s|@SPIRE_CA_TTL@|$ca_ttl|" -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" \
     -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" -e "s|@SPIRE_PSAT_ACCOUNTS@|$account_list|" \
     -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" -e "s|@POC_ENV@|$POC_ENV|g")"
-if ((${#cells[@]} == 0 || ${#local_workloads[@]} == 0)); then
+if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
   server_conf="$(sed -e '/^ *hint_configmap = /d' <<<"$server_conf")"
 fi
 controller_conf="$(sed -e "s|@SPIRE_TRUST_DOMAIN@|$td|" "$here/controller-manager.yaml")"
@@ -223,7 +237,7 @@ drop_volumes=()
 pod='select(.kind == "StatefulSet" and .metadata.name == "spire-server") | .spec.template.spec'
 service='select(.kind == "Service" and .metadata.name == "spire-server") | .spec'
 edits=""
-if ((${#cells[@]} == 0)); then
+if ((${#live[@]} == 0)); then
   drop_objects+=("NetworkPolicy/spire-server-agents")
   drop_volumes+=(plugins records)
   edits+=" | del($pod.initContainers) | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
@@ -236,7 +250,7 @@ if ((${#local_workloads[@]} == 0)); then
   drop_objects+=("ClusterRole/spire-server-psat" "ClusterRoleBinding/spire-server-psat" "NetworkPolicy/spire-server-workloads" "NetworkPolicy/spire-server-api")
   drop_volumes+=(api-token)
 fi
-if ((${#cells[@]} == 0 || ${#local_workloads[@]} == 0)); then
+if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
   drop_objects+=("Role/spire-server-hints" "RoleBinding/spire-server-hints")
 fi
 eso_namespace="${EXTERNAL_SECRETS_NAMESPACE:-${SECRET_STORE_NAMESPACES:-}}"

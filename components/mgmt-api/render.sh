@@ -13,8 +13,11 @@
 #     render copies its certificate into ConfigMap hostsvc-pin. The address of host.docker.internal
 #     in the node container of this cluster goes into the argument --hostsvc-addr and into the
 #     egress rule of flow N28.
-#   - the intent: the cells are the clusters that harness/topology.yaml gives the cell-identity set,
-#     and the subjects of each cell come from SPIRE_CELL_SUBJECTS in cells/dev-cp.env.
+#   - the intent, the catalog of cells that the portal may request: the cells are the clusters that
+#     harness/topology.yaml gives the cell-identity set, with the cluster object of each (podSubnet,
+#     serviceSubnet and issuer, from the same file), and the subjects of each cell come from
+#     SPIRE_CELL_SUBJECTS in cells/dev-cp.env. The catalog lists every cell, whether its cluster exists
+#     or not. mgmtd sends the signed spec to the host service with the client that it uses for key reads.
 #   - the root of the environment trust domain, from the live SPIRE server of VIEW_CONTROL_PLANE, as
 #     ConfigMap peer-root. The render leaves it out only when VIEW_CONTROL_PLANE does not exist or its
 #     SPIRE server StatefulSet does not exist. When the StatefulSet exists, a failed read stops the
@@ -57,9 +60,14 @@ ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 node_ips="$(ipv4_list NODE_IPS)" || exit 1
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 
-# The intent: the cells with the cell-identity set, and the subjects that each of them may present.
-cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$root/harness/topology.yaml")" || die "could not read the topology"
-[[ -n "$cells" ]] || die "no cluster in harness/topology.yaml has the cell-identity set, so the intent has no cell"
+# The intent: the catalog of cells with the cell-identity set, the cluster object of each, and the subjects that each may present.
+catalog="$(yq -o=json -I=0 '[.clusters[] | select(.components[] == "cell-identity")
+  | {"name": .name, "cluster": {"podSubnet": .podSubnet, "serviceSubnet": .serviceSubnet, "issuer": .issuer}}]' "$root/harness/topology.yaml")" || die "could not read the topology"
+jq -e 'length > 0' <<<"$catalog" >/dev/null || die "no cluster in harness/topology.yaml has the cell-identity set, so the intent has no cell"
+# Each cluster object must hold the two subnets as CIDR blocks and an https issuer, because a step signs them.
+jq -e --arg cidr '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$' --arg issuer '^https://[a-z0-9.-]+$' 'all(.[].cluster;
+  (.podSubnet // "" | test($cidr)) and (.serviceSubnet // "" | test($cidr)) and (.issuer // "" | test($issuer)))' <<<"$catalog" >/dev/null \
+  || die "a cell of harness/topology.yaml has no podSubnet, serviceSubnet or issuer in the form that a step needs"
 subjects_raw="$(source "$root/cells/dev-cp.env"; printf '%s\n' "${SPIRE_CELL_SUBJECTS:-}")"
 [[ -n "$subjects_raw" ]] || die "cells/dev-cp.env sets no SPIRE_CELL_SUBJECTS"
 subjects='[]'
@@ -69,8 +77,8 @@ for entry in $subjects_raw; do
 done
 jq -e --arg ns "$bind_namespace" --arg sa "$bind_account" 'any(.[]; .namespace == $ns and .serviceAccount == $sa)' <<<"$subjects" >/dev/null \
   || die "SPIRE_CELL_SUBJECTS in cells/dev-cp.env lacks the bind subject $bind_namespace/$bind_account"
-intent="$(printf '%s\n' $cells | jq -Rcn --arg env "$POC_ENV" --arg ns "$bind_namespace" --arg sa "$bind_account" --argjson subjects "$subjects" \
-  '{env: $env, bindSubject: {namespace: $ns, serviceAccount: $sa}, cells: [inputs | select(length > 0) | {name: ., subjects: $subjects}]}')" \
+intent="$(jq -cn --arg env "$POC_ENV" --arg ns "$bind_namespace" --arg sa "$bind_account" --argjson subjects "$subjects" --argjson catalog "$catalog" \
+  '{env: $env, bindSubject: {namespace: $ns, serviceAccount: $sa}, cells: [$catalog[] | {name: .name, subjects: $subjects, cluster: .cluster}]}')" \
   || die "could not build the intent"
 intent_sum="$(printf '%s' "$intent" | sha256)"
 intent_cm="$(NS="$namespace" INTENT="$intent" yq -n '

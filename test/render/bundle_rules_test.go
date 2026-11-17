@@ -542,8 +542,39 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 	}
 }
 
+// emptyPeerRules returns one line for each NetworkPolicy rule in objs that has ports, or any other field, and
+// names no peer. A rule with an empty or missing from or to list admits every peer.
+func emptyPeerRules(label string, objs []object) []string {
+	var out []string
+	for _, o := range objs {
+		if o["kind"] != "NetworkPolicy" {
+			continue
+		}
+		for _, dir := range [][2]string{{"ingress", "from"}, {"egress", "to"}} {
+			rules, _ := lookup(o, "spec", dir[0])
+			list, _ := rules.([]any)
+			for i, rule := range list {
+				peers, _ := lookup(rule, dir[1])
+				if l, ok := peers.([]any); !ok || len(l) == 0 {
+					out = append(out, fmt.Sprintf("%s: %s rule %d of %s has no %s peers", label, dir[0], i, objName(o), dir[1]))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// liveCellVariants are the clusters that kind lists in the renders of dev-cp that admit cells by node address: none of
+// the cells, and one of them.
+var liveCellVariants = map[string]string{
+	"no live cell":  "STUB_KIND_CLUSTERS=management dev-cp rogue",
+	"one live cell": "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-2",
+}
+
 // TestNoEmptyPeerList checks that every NetworkPolicy rule in every render names its peers. A rule
-// with an empty or missing from or to list admits every peer.
+// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay and cell-gateway in
+// dev-cp run again with no live cell and with one, because their cell rules lose the peers when a cell is absent, and
+// the rule must then go, not stay with an empty list.
 func TestNoEmptyPeerList(t *testing.T) {
 	// The collector policies and both forms of the uplink must be among the policies that the loop sees.
 	seen := map[string]bool{}
@@ -566,21 +597,45 @@ func TestNoEmptyPeerList(t *testing.T) {
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
 			for _, o := range c.objs {
-				if o["kind"] != "NetworkPolicy" {
-					continue
-				}
-				seen[cr.name+" "+fmt.Sprint(lookupOr(o, "metadata", "name"))] = true
-				for _, dir := range [][2]string{{"ingress", "from"}, {"egress", "to"}} {
-					rules, _ := lookup(o, "spec", dir[0])
-					list, _ := rules.([]any)
-					for i, rule := range list {
-						peers, _ := lookup(rule, dir[1])
-						if l, ok := peers.([]any); !ok || len(l) == 0 {
-							t.Errorf("%s: %s %s rule %d of %s has no %s peers", cr.name, c.name, dir[0], i, objName(o), dir[1])
-						}
-					}
+				if o["kind"] == "NetworkPolicy" {
+					seen[cr.name+" "+fmt.Sprint(lookupOr(o, "metadata", "name"))] = true
 				}
 			}
+			for _, p := range emptyPeerRules(cr.name+" "+c.name, c.objs) {
+				t.Error(p)
+			}
+		}
+	}
+	for label, kindEnv := range liveCellVariants {
+		for _, tc := range []struct{ component, binary string }{
+			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"},
+		} {
+			t.Run(label+" "+tc.component, func(t *testing.T) {
+				script, err := filepath.Abs("../../components/" + tc.component + "/render.sh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := runStubbed(t, tc.binary, "", []string{script}, append([]string{"STUB_CELL=dev-cp", kindEnv}, bundleFacts...)...)
+				if r.err != nil {
+					t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+				}
+				objs, err := parseDocs(r.stdout)
+				if err != nil {
+					t.Fatal(err)
+				}
+				policies := 0
+				for _, o := range objs {
+					if o["kind"] == "NetworkPolicy" {
+						policies++
+					}
+				}
+				if policies == 0 {
+					t.Fatalf("the %s render of %s holds no NetworkPolicy, so the check proves nothing", label, tc.component)
+				}
+				for _, p := range emptyPeerRules(label+" "+tc.component, objs) {
+					t.Error(p)
+				}
+			})
 		}
 	}
 }

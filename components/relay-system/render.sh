@@ -8,7 +8,9 @@
 #
 # The render reads these facts from the host service, as the M2 renders do:
 #   - the node address of RELAY_TARGET. The relay dials it, and the NetworkPolicy admits only it.
-#   - the node address of each cell of SPIRE_AGENT_CELLS. Only these addresses reach the routes.
+#   - the node address of each live cell (live_cells in components/lib/live-cells.sh), among the cells of
+#     SPIRE_AGENT_CELLS. Only these addresses reach the routes. With no live cell, the render deletes the rule
+#     of the cells from each NetworkPolicy.
 # The relay image is the one that `mise run images` built, by digest.
 # Inputs: RELAY_TARGET, RELAY_VIEW_ROUTES, RELAY_TELEMETRY_ROUTES and
 # SPIRE_AGENT_CELLS from cells/<cluster>.env, and NODE_IPS and DNS_SERVICE_IP from build/<cluster>/facts.env.
@@ -23,6 +25,7 @@ die() { printf 'error: relay-system render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
 source "$root/components/lib/addresses.sh"
+source "$root/components/lib/live-cells.sh"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$DNS_SERVICE_IP" =~ $ipv4 ]] || die "DNS_SERVICE_IP '$DNS_SERVICE_IP' is not an IPv4 address"
@@ -32,7 +35,7 @@ node_ips="$(ipv4_list NODE_IPS)" || exit 1
 node_ip() {
   local facts ip
   if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$1" 2>/dev/null)"; then
-    die "no host service facts for $1: ${facts:-no output}. Create the cluster: mise run hostsvc -- up --only $1"
+    die "no host service facts for $1: ${facts:-no output}. Read them: mise run hostsvc -- facts --cluster $1"
   fi
   ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
   [[ "$ip" =~ $ipv4 ]] || die "node address of $1 is '$ip', not an IPv4 address"
@@ -40,17 +43,20 @@ node_ip() {
 }
 
 target_ip="$(node_ip "$RELAY_TARGET")"
-read -r -a cells <<<"$SPIRE_AGENT_CELLS"
-((${#cells[@]} > 0)) || die "SPIRE_AGENT_CELLS names no cell, so no cell could reach the relay"
-cell_ips=()
-for cell in "${cells[@]}"; do
+read -r -a catalog <<<"$SPIRE_AGENT_CELLS"
+((${#catalog[@]} > 0)) || die "SPIRE_AGENT_CELLS names no cell, so no cell could reach the relay"
+for cell in "${catalog[@]}"; do
   [[ "$cell" != "$RELAY_TARGET" ]] || die "SPIRE_AGENT_CELLS names the relay target $RELAY_TARGET"
-  cell_ips+=("$(node_ip "$cell")")
+done
+live_all="$(live_cells)" || die "could not list the live cells"
+cell_ips=()
+for cell in $live_all; do
+  [[ " ${catalog[*]} " != *" $cell "* ]] || cell_ips+=("$(node_ip "$cell")")
 done
 relay_image="$(ko_image relay)" || die "no relay image"
 
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }
-cell_peers="$(peers "${cell_ips[@]}")"
+cell_peers="$(peers ${cell_ips[@]+"${cell_ips[@]}"})"
 node_peers="$(peers $node_ips)"
 target_peers="$(peers "$target_ip")"
 
@@ -95,6 +101,7 @@ relay() {
   ARGS="$(printf '%s\n' "${args[@]}" | jq -Rcn '[inputs]')" PORTS="$ports" SERVICE="$service" ROUTE_PORTS="$route_ports" \
     TARGET_PORTS="$target_ports" CELLS="$cell_peers" NODES="$node_peers" TARGET="$target_peers" NAME="$name" IMAGE="$relay_image" yq '
     select(.kind == "Deployment" or .kind == "Service" or .kind == "NetworkPolicy")
+    | with(select(.kind == "NetworkPolicy" and strenv(CELLS) == "[]"); del(.spec.ingress[] | select(.from == "@CELL_PEERS@")))
     | (.. | select(. == "@RELAY@")) = strenv(NAME)
     | (.. | select(. == "@RELAY_IMAGE@")) = strenv(IMAGE)
     | (.. | select(. == "@RELAY_ARGS@")) |= (env(ARGS) | ... style="")

@@ -305,10 +305,11 @@ func TestMgmtAPIStopsWithoutHostService(t *testing.T) {
 	}
 }
 
-// TestMgmtIntentFromTopology checks that intent.json holds POC_ENV, exactly the clusters with the
-// cell-identity set, and the subjects of SPIRE_CELL_SUBJECTS in cells/dev-cp.env, without the roles. The
-// bind subject comes from the shared table. mgmt.LoadIntent must accept the file, which pins the shape
-// that mgmtd reads.
+// TestMgmtIntentFromTopology checks that intent.json, the catalog, holds POC_ENV, exactly the clusters with the
+// cell-identity set (each with the cluster object of harness/topology.yaml: podSubnet, serviceSubnet and issuer), and
+// the subjects of SPIRE_CELL_SUBJECTS in cells/dev-cp.env, without the roles. The catalog lists each cell whether its
+// cluster exists or not, so it holds both cells with no live cell. The bind subject comes from the shared table.
+// mgmt.LoadIntent must accept the file, which pins the shape that mgmtd reads.
 func TestMgmtIntentFromTopology(t *testing.T) {
 	objs, _ := mgmtObjects(t)
 	raw := get[string](t, objs["ConfigMap/mgmt-intent"], "data", "intent.json")
@@ -318,6 +319,7 @@ func TestMgmtIntentFromTopology(t *testing.T) {
 		Cells       []struct {
 			Name     string
 			Subjects []struct{ Namespace, ServiceAccount string }
+			Cluster  struct{ PodSubnet, ServiceSubnet, Issuer string }
 		}
 	}
 	if err := json.Unmarshal([]byte(raw), &intent); err != nil {
@@ -336,6 +338,16 @@ func TestMgmtIntentFromTopology(t *testing.T) {
 	}
 	if want := topo.WithComponent("cell-identity"); !slices.Equal(cells, want) {
 		t.Errorf("cells %v, want the clusters with cell-identity %v", cells, want)
+	}
+	for _, c := range intent.Cells {
+		want, ok := topo.Cluster(c.Name)
+		if !ok {
+			t.Fatalf("cell %s is no cluster of the topology", c.Name)
+		}
+		if c.Cluster.PodSubnet != want.PodSubnet || c.Cluster.ServiceSubnet != want.ServiceSubnet || c.Cluster.Issuer != want.Issuer ||
+			c.Cluster.PodSubnet == "" || c.Cluster.ServiceSubnet == "" || c.Cluster.Issuer == "" {
+			t.Errorf("cell %s cluster %+v, want the subnets and issuer of the topology %+v", c.Name, c.Cluster, want)
+		}
 	}
 	file, err := os.ReadFile("../../cells/dev-cp.env")
 	if err != nil {
@@ -367,6 +379,12 @@ func TestMgmtIntentFromTopology(t *testing.T) {
 	}
 	if _, err := mgmt.LoadIntent(path); err != nil {
 		t.Errorf("mgmt.LoadIntent refuses the rendered intent: %v", err)
+	}
+
+	// The catalog does not depend on the clusters that exist: it lists both cells when no cell cluster exists.
+	noCells, _ := mgmtObjects(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
+	if got := get[string](t, noCells["ConfigMap/mgmt-intent"], "data", "intent.json"); got != raw {
+		t.Errorf("the intent with no live cell is\n%s\nwant the same catalog\n%s", got, raw)
 	}
 
 	mgmtEnv, err := os.ReadFile("../../cells/management.env")

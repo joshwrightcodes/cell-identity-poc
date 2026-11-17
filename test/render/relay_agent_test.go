@@ -138,6 +138,7 @@ func TestRenderRelaySystemFailsClosed(t *testing.T) {
 		{"RELAY_TELEMETRY_ROUTES=30446:8443=31444", "the container port 8443 appears in two routes"},
 		{"RELAY_VIEW_ROUTES= ", "relay-view has no route"},
 		{"RELAY_TARGET=missing", "no host service facts for missing"},
+		{"STUB_FACTS_FAIL=dev-cell-2", "no host service facts for dev-cell-2"},
 		{"SPIRE_AGENT_CELLS=dev-cell-1 management", "names the relay target management"},
 		{"NODE_IPS= ", "NODE_IPS holds no address"},
 	} {
@@ -358,4 +359,44 @@ func keysOfObjects(m map[string]object) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// relayIngress lists the ingress rules of NetworkPolicy relay-system/<name> as "<peers> <ports>".
+func relayIngress(t *testing.T, objs map[string]object, name string) []string {
+	t.Helper()
+	var out []string
+	for _, rule := range get[[]any](t, objs["NetworkPolicy relay-system/"+name], "spec", "ingress") {
+		out = append(out, fmt.Sprintf("%s %v", peerList(t, rule, "from"), portList(t, rule)))
+	}
+	return out
+}
+
+// TestRenderRelaySystemNoLiveCells: with no cell cluster the render succeeds, reads no cell facts, and holds only the
+// node rule in each ingress policy.
+func TestRenderRelaySystemNoLiveCells(t *testing.T) {
+	r := renderRelay(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	if strings.Contains(r.log, "facts --cluster dev-cell") {
+		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
+	}
+	objs := objectsIn(t, r.stdout)
+	for _, name := range []string{"relay-view", "relay-telemetry"} {
+		if got := relayIngress(t, objs, name); !slices.Equal(got, []string{"172.18.0.4/32 [8080]"}) {
+			t.Errorf("ingress rules of %s are %v, want the node rule only", name, got)
+		}
+	}
+}
+
+// TestRenderRelaySystemOneLiveCell: one live cell gives one address in the route rule.
+func TestRenderRelaySystemOneLiveCell(t *testing.T) {
+	r := renderRelay(t, "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-1")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	if got := relayIngress(t, objs, "relay-view"); !slices.Equal(got, []string{"10.9.0.1/32 [8443 8445]", "172.18.0.4/32 [8080]"}) {
+		t.Errorf("ingress rules of relay-view are %v", got)
+	}
 }

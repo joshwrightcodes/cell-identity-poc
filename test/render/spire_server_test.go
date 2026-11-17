@@ -39,13 +39,20 @@ const stubMgmtKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 // stubMise answers "mise run hostsvc -- facts" for the cells below, "mise run mgmt -- records" with
 // the records of dev-cell-1 and dev-cell-2, and runs the real pkigen for "mise run pki". The cell
 // bad-facts fails the way hostsvc fails, and no-ip has no node address. STUB_RANDOM_SIG gives each
-// record a new signature, STUB_REVOKED=<cell> revokes one record, STUB_RECORD_NAME=<cell>=<name> signs the record of a cell with another name, and STUB_NO_MGMT makes mgmt fail.
+// record a new signature, STUB_FACTS_FAIL=<cells> makes the facts of those cells fail, STUB_FACTS_NOIP=<cells> gives them no node address, STUB_REVOKED=<cell> revokes one record, STUB_RECORD_NAME=<cell>=<name> signs the record of a cell with another name, and STUB_NO_MGMT makes mgmt fail.
 const stubMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "$*" >>"$STUB_LOG"
 case "$2" in
   hostsvc)
     cell="$6"
+    # STUB_FACTS_FAIL and STUB_FACTS_NOIP name cells (space separated) whose facts fail, or have no node address.
+    if [[ " ${STUB_FACTS_FAIL:-} " == *" $cell "* ]]; then
+      echo '{"level":"ERROR","msg":"hostsvc failed","error":"cluster does not exist"}'; exit 1
+    fi
+    if [[ " ${STUB_FACTS_NOIP:-} " == *" $cell "* ]]; then
+      printf '{"name":"%s","nodeIP":""}\n' "$cell"; exit 0
+    fi
     case "$cell" in
       dev-cell-1) echo '{"name":"dev-cell-1","nodeIP":"10.9.0.1"}' ;;
       dev-cell-2) echo '{"name":"dev-cell-2","nodeIP":"10.9.0.2"}' ;;
@@ -193,12 +200,15 @@ cat "$STUB_BUNDLE_FILE"
 
 // stubDocker answers the node checks of scripts/gate-traces.sh. Every node has the address 10.9.0.7
 // unless STUB_DOCKER_IP sets another one. STUB_KEYTEST_TRACE names a cell whose node holds a trace of
-// the key rotation test. It also answers getent for host.docker.internal in a node container.
+// the key rotation test, and STUB_NO_NODE_IP names cells with no node address. It also answers getent for host.docker.internal in a node container.
 const stubDocker = `#!/usr/bin/env bash
 set -euo pipefail
 echo "docker $*" >>"$STUB_LOG"
 case "$1" in
-  inspect) echo "${STUB_DOCKER_IP:-10.9.0.7} " ;;
+  inspect)
+    # STUB_NO_NODE_IP names the cells (space separated) whose node container has no address on the network kind.
+    name="${*: -1}"
+    if [[ " ${STUB_NO_NODE_IP:-} " == *" ${name%-control-plane} "* ]]; then echo " "; else echo "${STUB_DOCKER_IP:-10.9.0.7} "; fi ;;
   exec)
     if [[ " $* " == *" getent ahostsv4 host.docker.internal "* ]]; then
       # STUB_GETENT replaces the answer. The default is one address in three socket types.
@@ -944,8 +954,9 @@ func TestRenderFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{"cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 bad-facts"}, "Create the cluster: mise run hostsvc -- up --only bad-facts, then run CELL=bad-facts mise run cell:up. Or remove bad-facts from SPIRE_AGENT_CELLS"},
-		{"cell without node address", []string{"SPIRE_AGENT_CELLS=no-ip"}, "node address of no-ip"},
+		{"live cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "no host service facts for the live cell dev-cell-2"},
+		{"live cell without facts names the read command", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "Read them: mise run hostsvc -- facts --cluster dev-cell-2"},
+		{"live cell without node address", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_FACTS_NOIP=dev-cell-1"}, "node address of dev-cell-1"},
 		{"blank cells with subjects", []string{"SPIRE_AGENT_CELLS= "}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"cells without subjects", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS="}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"no cell and no local workload", []string{"SPIRE_AGENT_CELLS=", "SPIRE_CELL_SUBJECTS="}, "names no agent cell and no local workload"},
@@ -1453,4 +1464,113 @@ func TestSpireServerHintConfig(t *testing.T) {
 			t.Errorf("a server with no API token has a hint line or a hint Role:\n%s", r.stdout)
 		}
 	})
+}
+
+// liveEnv sets the clusters that kind lists. STUB_NO_NODE_IP and the rest of the stubs then decide which of the
+// topology cells are live.
+func liveEnv(clusters string) string { return "STUB_KIND_CLUSTERS=" + clusters }
+
+// agentPolicyRules returns the ingress rules of NetworkPolicy spire-server-agents, or nil when the render has none.
+func agentPolicyRules(t *testing.T, objs map[string]object) []any {
+	t.Helper()
+	np, ok := objs["NetworkPolicy/spire-server-agents"]
+	if !ok {
+		return nil
+	}
+	return get[[]any](t, np, "spec", "ingress")
+}
+
+// TestSpireServerRenderNoLiveCells: dev-cp with a catalog of two cells and no cluster for either of them. The render
+// succeeds with no cell fact, drops the cluster_jwt section and the policy of the agent node port, and keeps the
+// ClusterStaticEntry pairs of both cells.
+func TestSpireServerRenderNoLiveCells(t *testing.T) {
+	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := docs(t, hydrated(r.stdout, "dev-cp"))
+	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
+	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) || strings.Contains(conf, "record_public_keys") {
+		t.Errorf("server.conf holds the cluster_jwt section with no live cell:\n%s", conf)
+	}
+	for _, rule := range agentPolicyRules(t, objs) {
+		t.Errorf("NetworkPolicy spire-server-agents has a rule with no live cell: %v", rule)
+	}
+	// No rule that names port 8081 may admit an ipBlock: only the local workloads reach the server.
+	for key, o := range objs {
+		if o["kind"] != "NetworkPolicy" {
+			continue
+		}
+		ingress, _ := lookupOr(o, "spec", "ingress").([]any)
+		for _, rule := range ingress {
+			ports, _ := lookup(rule, "ports")
+			from, _ := lookup(rule, "from")
+			if !strings.Contains(fmt.Sprint(ports), "port:8081") {
+				continue
+			}
+			for _, p := range from.([]any) {
+				if _, isBlock := lookup(p, "ipBlock"); isBlock {
+					t.Errorf("%s: a rule for port 8081 admits an ipBlock: %v", key, rule)
+				}
+			}
+		}
+	}
+	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		for _, role := range []string{"celld", "argocd-agent", "otel", "mesh-view"} {
+			for _, name := range []string{cell + "-agents-" + role + ".yaml", cell + "-" + role + ".yaml"} {
+				if _, ok := entries[name]; !ok {
+					t.Errorf("spire-entries has no %s", name)
+				}
+			}
+		}
+	}
+	for _, bad := range []string{"hostsvc -- facts --cluster dev-cell", "spire-server bundle show", "get configmap mgmt-signing-pub"} {
+		if strings.Contains(r.log, bad) {
+			t.Errorf("the render ran %q with no live cell:\n%s", bad, r.log)
+		}
+	}
+	if _, ok := objs["ConfigMap/spire-entries"]; !ok {
+		t.Error("no ConfigMap spire-entries")
+	}
+}
+
+// TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The policy admits only the node of
+// dev-cell-1, the facts of dev-cell-2 are never read, and the entries of both cells stay.
+func TestSpireServerRenderOneLiveCell(t *testing.T) {
+	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue dev-cell-1"))
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := docs(t, hydrated(r.stdout, "dev-cp"))
+	rules := agentPolicyRules(t, objs)
+	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
+		t.Fatalf("agent policy rules %v, want one rule that admits 10.9.0.1/32", rules)
+	}
+	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
+	if !strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
+		t.Error("server.conf lacks the cluster_jwt section with one live cell")
+	}
+	if strings.Contains(r.log, "facts --cluster dev-cell-2") {
+		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
+	}
+	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
+	for _, name := range []string{"dev-cell-1-celld.yaml", "dev-cell-2-celld.yaml", "dev-cell-1-agents-celld.yaml", "dev-cell-2-agents-celld.yaml"} {
+		if _, ok := entries[name]; !ok {
+			t.Errorf("spire-entries has no %s", name)
+		}
+	}
+}
+
+// TestSpireServerRenderNoNodeAddressIsNotLive: a cluster whose node container has no address on the network kind is
+// not live, so the render leaves it out and does not read its facts.
+func TestSpireServerRenderNoNodeAddressIsNotLive(t *testing.T) {
+	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-2")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	rules := agentPolicyRules(t, docs(t, hydrated(r.stdout, "dev-cp")))
+	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
+		t.Fatalf("agent policy rules %v, want one rule that admits only dev-cell-1", rules)
+	}
 }
