@@ -23,9 +23,15 @@ case "${STUB_KIND:-management dev-cp dev-cell-1 dev-cell-2 rogue}" in
 esac
 `
 
-// stubDocker answers docker inspect for a node container: the address on the network kind, or nothing for the cells in
+// stubDocker answers the time of the node dev-cp-control-plane, and docker inspect for a node container: the address on the network kind, or nothing for the cells in
 // STUB_NO_NODE_IP.
 const stubDocker = `#!/usr/bin/env bash
+if [[ "$1 $2 $4" == "exec dev-cp-control-plane +%s" || "$1 $2 $4 $5" == "exec dev-cp-control-plane -u +%Y-%m-%dT%H:%M:%SZ" ]]; then
+  [[ "$3" == date ]] || exit 2
+  if [[ "$4" == +%s ]]; then date +%s; else date -u +%Y-%m-%dT%H:%M:%SZ; fi
+  exit 0
+fi
+if [[ "$1 $2 $3 $4" == "exec dev-cp-control-plane iptables -S" ]]; then echo "-P FORWARD ACCEPT"; exit 0; fi
 [[ "$1" == inspect ]] || exit 2
 name="${*: -1}"
 cell="${name%-control-plane}"

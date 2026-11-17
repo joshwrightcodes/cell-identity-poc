@@ -127,7 +127,8 @@ run = "scripts/down.sh"
 [tasks.test]
 description = "Run the Go unit tests, or the packages given after --"
 usage = 'arg "[packages]..." var=#true default="./..."'
-run = 'eval go test ${usage_packages?}'
+# The go test timeout is 20 minutes for each package. test/scripts took 541 s (559 s on a loaded run) on 2026-11-17, and the default of 10 minutes was too close. The CI job runs this task, so it has the same timeout.
+run = 'eval go test -timeout 20m ${usage_packages?}'
 
 [tasks.lint]
 description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag"

@@ -719,7 +719,10 @@ current-context: kind-management
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "KUBECONFIG=" + kubeconfig, "KUBECACHEDIR=" + filepath.Join(dir, "cache"),
+	// The real kubectl talks to the fake API server above, through the KUBECONFIG below and a HOME of its own.
+	realBin := t.TempDir()
+	useRealTool(t, realBin, "kubectl")
+	env := []string{"PATH=" + realBin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + dir, "KUBECONFIG=" + kubeconfig, "KUBECACHEDIR=" + filepath.Join(dir, "cache"),
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(dir, "build")}
 	scale := func(n string) {
 		t.Helper()

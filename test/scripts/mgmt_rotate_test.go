@@ -136,6 +136,7 @@ func newRotateServer(t *testing.T) *rotateServer {
 	}
 	write("kubectl", caRotateKubectl, 0o755)
 	write("kind", stubKind, 0o755)
+	write("mise", pkiMise, 0o755)
 	write("hostsvc-serve", fakeRotateHostsvc, 0o755)
 	write("spire-server", fakeSpireServer, 0o755)
 	for i := range 3 {

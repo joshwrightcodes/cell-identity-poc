@@ -244,6 +244,7 @@ func TestGateM4PreCheck(t *testing.T) {
 			}
 			write("scripts/gate-m4-repair.sh", "#!/usr/bin/env bash\n"+repair+"\n")
 			write("bin/go", "#!/usr/bin/env bash\necho \"go $*\" >>\"$STUB_LOG\"\n")
+			writeLiveStubs(t, filepath.Join(root, "bin"))
 			// The fake answers "get <workload> -o json" for the cluster in --context. Each workload runs the images that
 			// build/images.env records, except the one that STUB_STALE names, as <image> or <image>@<cluster>.
 			write("bin/kubectl", `#!/usr/bin/env bash

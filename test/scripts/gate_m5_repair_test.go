@@ -63,7 +63,7 @@ func TestGateM5RepairCelldReplicas(t *testing.T) {
 			write("gw", m5RepairGw)
 			write("replicas", "#!/usr/bin/env bash\necho \"harness-replicas $*\" >>\"$STUB_DIR/calls\"\n")
 			args := tc.args
-			out, errOut, code := runScript(t, "gate-m5-repair.sh", map[string]string{"kubectl": m5RepairKubectl},
+			out, errOut, code := runScript(t, "gate-m5-repair.sh", withLive(map[string]string{"kubectl": m5RepairKubectl}),
 				append([]string{"STUB_DIR=" + dir, "GATE_M4_REPAIR=" + filepath.Join(dir, "repair-m4"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"), "GW_SCRIPT=" + filepath.Join(dir, "gw"), "GATE_M5_STREAM_WAIT=2"}, tc.env...), args...)
 			if code != tc.code {
 				t.Fatalf("exit %d, want %d\nstdout %s\nstderr %s", code, tc.code, out, errOut)
@@ -121,7 +121,7 @@ func TestGateM5RepairStreams(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			out, errOut, code := runScript(t, "gate-m5-repair.sh", map[string]string{"kubectl": m5RepairKubectl},
+			out, errOut, code := runScript(t, "gate-m5-repair.sh", withLive(map[string]string{"kubectl": m5RepairKubectl}),
 				append([]string{"STUB_DIR=" + dir, "GATE_M4_REPAIR=" + filepath.Join(dir, "repair-m4"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
 					"GW_SCRIPT=" + filepath.Join(dir, "gw"), "GATE_M5_STREAM_WAIT=2"}, tc.env...), tc.args...)
 			if code != tc.code {
@@ -177,7 +177,7 @@ func TestGateM5RepairGatewayAndNamespaces(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			out, errOut, code := runScript(t, "gate-m5-repair.sh", map[string]string{"kubectl": m5RepairKubectl},
+			out, errOut, code := runScript(t, "gate-m5-repair.sh", withLive(map[string]string{"kubectl": m5RepairKubectl}),
 				append([]string{"STUB_DIR=" + dir, "GATE_M4_REPAIR=" + filepath.Join(dir, "repair-m4"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
 					"GW_SCRIPT=" + filepath.Join(dir, "gw"), "GATE_M5_STREAM_WAIT=2"}, tc.env...), tc.args...)
 			if code != tc.code {

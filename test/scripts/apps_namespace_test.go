@@ -352,6 +352,7 @@ func TestCheckRelayCurrent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := relayFixture(t, "172.18.0.3", "172.18.0.5", "172.18.0.6")
+			writeLiveStubs(t, dir)
 			if strings.Contains(tc.name, "telemetry relay") {
 				_ = os.Remove(filepath.Join(dir, "d-relay-telemetry.json"))
 			}

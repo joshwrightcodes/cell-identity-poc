@@ -177,6 +177,7 @@ func TestResetStateInterruptScalesMgmtdBack(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(resetKubectl), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			writeLiveStubs(t, bin)
 			path, err := filepath.Abs("../../scripts/mgmt.sh")
 			if err != nil {
 				t.Fatal(err)

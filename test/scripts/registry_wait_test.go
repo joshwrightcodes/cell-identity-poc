@@ -47,6 +47,7 @@ func runWait(t *testing.T, snippet string, files map[string]string, env ...strin
 	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(waitKubectl), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	writeLiveStubs(t, dir)
 	build := filepath.Join(dir, "build")
 	bundle := filepath.Join(build, "management", "bundles", "central-view")
 	if err := os.MkdirAll(bundle, 0o755); err != nil {

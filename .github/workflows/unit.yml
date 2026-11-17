@@ -11,6 +11,8 @@ permissions:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    # The tests take about 12 minutes in all (test/scripts 541 s and test/render 80 s, one after the other, on 2026-11-17), and each package has a go test timeout of 20 minutes in mise.toml.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
