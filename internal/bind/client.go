@@ -23,10 +23,10 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"go.opentelemetry.io/otel/trace"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -64,10 +64,7 @@ func PodTokenFunc(c corev1client.ServiceAccountsGetter, namespace, serviceAccoun
 // expect and a certificate that chains to peer. The client sends no certificate. Only TLS 1.3 and
 // HTTP/2 are allowed.
 func ClientTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
-	cfg := tlsconfig.TLSClientConfig(peer, tlsconfig.AuthorizeID(expect))
-	cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
-	cfg.NextProtos = []string{"h2"}
-	return cfg
+	return cellproxy.ProbeTLS(peer, expect)
 }
 
 // Config holds the settings of Once and Run. A zero duration takes the default.
@@ -426,7 +423,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 			wait = backoff(cfg, failures)
 		}
 		cfg.observe(ctx, result)
-		cfg.Log.WarnContext(actx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "retry_in", wait.String())
+		cfg.Log.WarnContext(actx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
 		if err := cfg.Sleep(ctx, wait); err != nil {
 			return err
 		}
@@ -450,7 +447,7 @@ func recheck(ctx context.Context, cfg Config) error {
 		case err != nil:
 			wait = backoff(cfg, failures)
 			failures++
-			cfg.Log.WarnContext(ctx, "bind recheck failed", "cell", cfg.Cell, "error", err.Error(), "retry_in", wait.String())
+			cfg.Log.WarnContext(ctx, "bind recheck failed", "cell", cfg.Cell, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
 		case !bound:
 			cfg.Log.WarnContext(ctx, "the management plane holds no record", "cell", cfg.Cell)
 			return nil

@@ -799,3 +799,47 @@ func TestRunRecheckWaits(t *testing.T) {
 		}
 	}
 }
+
+// bindFailedReason runs Run until it logs one "bind failed" line and returns the reason field.
+func bindFailedReason(t *testing.T, ctx context.Context, cfg Config, rec *sleepRecorder, out *bytes.Buffer) (string, map[string]any) {
+	t.Helper()
+	cfg.Log = slog.New(slog.NewJSONHandler(out, nil))
+	_ = Run(ctx, cfg)
+	for _, l := range strings.Split(out.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == "bind failed" {
+			reason, _ := m["reason"].(string)
+			return reason, m
+		}
+	}
+	t.Fatalf("no bind failed line in %s", out.String())
+	return "", nil
+}
+
+func TestBindRefusalReasonWrongID(t *testing.T) {
+	f := newServer(t, "spiffe://dev.env.poc.internal/cp/other")
+	var out bytes.Buffer
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	cfg, ctx := runCfg(t, f, rec)
+	reason, line := bindFailedReason(t, ctx, cfg, rec, &out)
+	if reason != "peer_not_allowed" {
+		t.Fatalf("reason = %q in %v", reason, line)
+	}
+	for _, k := range []string{"cell", "result", "error", "retry_in"} {
+		if _, ok := line[k]; !ok {
+			t.Errorf("line lost the field %s: %v", k, line)
+		}
+	}
+}
+
+func TestBindRefusalReasonUntrusted(t *testing.T) {
+	f := newServer(t, apiID)
+	var out bytes.Buffer
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	cfg, ctx := runCfg(t, f, rec)
+	// The client trusts another CA than the one that signed the gateway certificate.
+	cfg.TLS = ClientTLS(spiffetest.NewCA(t, mgmtTD).Bundle(), spiffeid.RequireFromString(apiID))
+	if reason, line := bindFailedReason(t, ctx, cfg, rec, &out); reason != "peer_untrusted" {
+		t.Fatalf("reason = %q in %v", reason, line)
+	}
+}

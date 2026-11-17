@@ -1,6 +1,7 @@
 package cellproxy
 
 import (
+	"crypto/tls"
 	"errors"
 	"net/http"
 
@@ -79,6 +80,22 @@ func ReasonOf(err error) Reason {
 	var pe *PeerError
 	if errors.As(err, &pe) {
 		return pe.Reason
+	}
+	return ""
+}
+
+// TLSReason names why a client TLS dial failed. It returns the reason of a refused peer, which the
+// config of ClientTLS and ProbeTLS raises, handshake_failed for any other TLS failure, and "" for
+// an error that is not a TLS failure, such as a refused connection.
+func TLSReason(err error) Reason {
+	if r := ReasonOf(err); r != "" {
+		return r
+	}
+	var alert tls.AlertError
+	var hdr tls.RecordHeaderError
+	var verify *tls.CertificateVerificationError
+	if errors.As(err, &alert) || errors.As(err, &hdr) || errors.As(err, &verify) {
+		return HandshakeFailed
 	}
 	return ""
 }

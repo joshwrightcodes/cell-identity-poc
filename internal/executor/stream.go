@@ -16,13 +16,13 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 	"golang.org/x/net/http2"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
@@ -98,10 +98,7 @@ func StreamTLS(svid x509svid.Source, bundle x509bundle.Source, gateway spiffeid.
 		if _, err := svid.GetX509SVID(); err != nil {
 			return nil, fmt.Errorf("no SVID: %w", err)
 		}
-		cfg := tlsconfig.MTLSClientConfig(svid, bundle, tlsconfig.AuthorizeID(gateway))
-		cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
-		cfg.NextProtos = []string{"h2"}
-		return cfg, nil
+		return cellproxy.ClientTLS(svid, bundle, gateway), nil
 	}
 }
 
@@ -209,7 +206,7 @@ func RunStream(ctx context.Context, cfg StreamConfig) error {
 		}
 		wait := cfg.backoff(failures)
 		failures++
-		cfg.Log.WarnContext(ctx, "stream ended", "cell", cfg.Cell, "error", err.Error(), "retry_in", wait.String())
+		cfg.Log.WarnContext(ctx, "stream ended", "cell", cfg.Cell, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
 		if err := cfg.wait(ctx, wait); err != nil {
 			return err
 		}

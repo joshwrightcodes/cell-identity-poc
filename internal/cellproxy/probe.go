@@ -20,7 +20,7 @@ func Probe(ctx context.Context, addr string, peer x509bundle.Source, expect spif
 	if err != nil {
 		return spiffeid.ID{}, err
 	}
-	conn := tls.Client(raw, probeTLS(peer, expect))
+	conn := tls.Client(raw, ProbeTLS(peer, expect))
 	defer func() { _ = conn.Close() }()
 	hctx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
