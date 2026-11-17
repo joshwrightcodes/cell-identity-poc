@@ -6,11 +6,15 @@
 #   2. cancels, through portal -- cancel, each open step whose ID a test recorded in build/gate/m6-steps. It never
 #      cancels a step that the provision test signed, because no test records those;
 #   3. deletes the test namespaces m6-* (label cell.poc.internal/e2e=true) in management, dev-cp, rogue and each live cell;
-#   4. restores the cells while the marker build/gate/m6-provision exists. TestProvisionFromPortal writes the marker before it
-#      deletes the cells and removes it after both cells are valid again, so an interrupted run leaves it. The restore runs one
-#      portal -- request for every catalog cell that is not requested, portal -- wait for every catalog cell, CELL=management mise run
-#      cell:link, then the M5 repair again, which waits for the stream of each new cell, and it removes the marker last. The M2, M4 and
-#      M5 repairs at the start skip a cell that is not live, so they run while a cell is absent.
+#   4. restores the cells while the marker build/gate/m6-provision exists. TestProvisionFromPortal writes the cells that it deletes into the
+#      marker before it deletes them, and removes the marker after both cells are valid again, so an interrupted run leaves it. With the
+#      marker, the M5 repair does not run first, because a half-built cell counts as live and has no celld. The repair instead
+#      a. cancels each open step of a cell that the marker names (portal -- cancel, then cell:down, which waits until no stage runs and
+#         deletes the half-built cluster), and runs hostsvc:serve -- sync;
+#      b. waits until mgmtd holds no pending drop of a catalog cell, runs one portal -- request for every catalog cell that is not
+#         requested, portal -- recreate for each cell of a, portal -- wait for every catalog cell, CELL=management mise run cell:link,
+#         then the M5 repair, which waits for the stream of each new cell;
+#      c. removes the marker last, after each cell is bound with no open step.
 # It is safe to run again.
 #
 # Usage: gate-m6-repair.sh [--check]
@@ -31,8 +35,49 @@ marker="$BUILD_ROOT/gate/m6-provision"
 
 portal() { if [[ -n "${PORTAL:-}" ]]; then "$PORTAL" "$@"; else mise run portal -- "$@"; fi; }
 
+# marker_cells prints the cells that the marker names, one on each line: the lines of the marker that are catalog cells, or every
+# catalog cell when the marker names none.
+marker_cells() {
+  local catalog cell named=""
+  catalog="$(catalog_cells)" || die "could not read the cells of the topology"
+  for cell in $catalog; do
+    ! grep -qx -- "$cell" "$marker" 2>/dev/null || named+="$cell"$'\n'
+  done
+  if [[ -n "$named" ]]; then printf '%s' "$named"; else printf '%s\n' "$catalog"; fi
+}
+
+# reopen holds the cells of the marker whose step was open at the host service. restore_cells asks for them again with recreate.
+reopen=()
+
+# clear_interrupted_steps handles each cell of the marker that has an open step: the step belongs to the interrupted run, which the
+# marker proves. It cancels the step at mgmtd, then cell:down cancels it at the host, waits until no stage runs, and deletes a
+# half-built cluster. A step of a cell that the marker does not name is never touched. A half-built cell counts as live, so the M5
+# repair (which restore_cells runs last) would fail on it.
+clear_interrupted_steps() {
+  local json cell open existing
+  json="$("$serve" steps)" || die "could not read the steps of the host service. Run: mise run hostsvc:serve -- steps"
+  existing="$(existing_clusters)" || die "could not list the clusters"
+  for cell in $(marker_cells); do
+    open="$(jq -r --arg c "$cell" '.steps[]? | select(.cell == $c)
+      | select(.state != "done" and .state != "failed_final" and .state != "refused" and .state != "cancelled") | .id' <<<"$json")" \
+      || die "the steps of the host service are no journal. Run: mise run hostsvc:serve -- steps"
+    [[ -n "$open" ]] || continue
+    log "cancelling the open step of $cell, which the interrupted provision run left"
+    (cd "$ROOT" && portal cancel --cell "$cell") || die "could not cancel the step of $cell. Run: mise run portal -- cancel --cell $cell"
+    if grep -qx -- "$cell" <<<"$existing"; then
+      (cd "$ROOT" && CELL="$cell" CELL_DOWN_SKIP_RERENDER=1 CELL_DOWN_WAIT="${GATE_M6_STAGE_WAIT:-120}" mise run cell:down) \
+        || die "could not delete the half-built $cell. Run: CELL=$cell mise run cell:down"
+    fi
+    reopen+=("$cell")
+  done
+}
+
 if ((check)); then
   "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" --check || status=1
+elif [[ -e "$marker" ]]; then
+  # The M5 repair runs at the end of restore_cells, when each cell has its celld.
+  clear_interrupted_steps
+  "$serve" sync || die "could not sync the host service. Run: mise run hostsvc:serve -- sync"
 else
   "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" || die "the repair of gate:m5 failed. Run: mise run gate:m5:repair"
   "$serve" sync || die "could not sync the host service. Run: mise run hostsvc:serve -- sync"
@@ -138,11 +183,23 @@ for cluster in $clusters; do
 done
 
 # restore_cells brings the cells back after an interrupted provision run. Each command is safe to run again, and the marker
-# stays until the last one has succeeded.
+# stays until the last one has succeeded. It first waits until mgmtd holds no pending drop of a catalog cell, because a request
+# before the drop leaves the old record in place and the step would never close (hint: wait, then run the repair again).
 restore_cells() {
-  local catalog status_json requested missing=() margs=() cell args=()
+  local catalog status_json requested pending blocked missing=() margs=() cell args=() end poll="${GATE_M6_POLL:-5}"
   catalog="$(catalog_cells)" || die "could not read the cells of the topology"
-  status_json="$(cd "$ROOT" && mise run mgmt -- status)" || die "could not read mgmt -- status. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  end=$((SECONDS + ${GATE_M6_DROP_WAIT:-300}))
+  while :; do
+    status_json="$(cd "$ROOT" && mise run mgmt -- status)" || die "could not read mgmt -- status. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    pending="$(jq -r '.pendingDrops[]?' <<<"$status_json")" || die "mgmt -- status printed no status object"
+    blocked=""
+    for cell in $catalog; do
+      ! grep -qx -- "$cell" <<<"$pending" || blocked+=" $cell"
+    done
+    [[ -n "$blocked" ]] || break
+    ((SECONDS < end)) || die "after ${GATE_M6_DROP_WAIT:-300}s mgmtd still holds the pending drop of$blocked. Wait for envd to apply it, then run: $repair"
+    sleep "$poll"
+  done
   requested="$(jq -r '.cells[]? | select(.requested == true) | .name' <<<"$status_json")" || die "mgmt -- status printed no status object"
   for cell in $catalog; do
     grep -qx -- "$cell" <<<"$requested" || missing+=("$cell")
@@ -153,11 +210,25 @@ restore_cells() {
     for cell in "${missing[@]}"; do margs+=(--cell "$cell"); done
     (cd "$ROOT" && portal request "${margs[@]}") || die "could not request ${missing[*]}. Run: mise run portal -- request ${margs[*]}"
   fi
+  for cell in ${reopen[@]+"${reopen[@]}"}; do
+    log "requesting $cell again, because its step was cancelled"
+    (cd "$ROOT" && portal recreate --cell "$cell") || die "could not request $cell again. Run: mise run portal -- recreate --cell $cell"
+  done
   log "waiting until ${catalog//$'\n'/ } are valid"
   (cd "$ROOT" && portal wait "${args[@]}") || die "a cell is not valid. Read the step: mise run hostsvc:serve -- steps. Then run: $repair"
   log "linking management"
   (cd "$ROOT" && CELL=management mise run cell:link) || die "could not link management. Run: CELL=management mise run cell:link, then $repair"
-  "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" || die "a cell holds no stream at the gateway. Run: $repair"
+  "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" || die "the repair of gate:m5 failed, or a cell holds no stream at the gateway. Run: $repair"
+  # Each cell must be bound with no open step, or the next gate fails its check for an open step.
+  end=$((SECONDS + ${GATE_M6_BOUND_WAIT:-120}))
+  while :; do
+    status_json="$(cd "$ROOT" && mise run mgmt -- status)" || die "could not read mgmt -- status. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    blocked="$(jq -r '.cells[]? | select(.bound != true or ((.step // null) != null and ((.step.doneAt // "") == ""))) | .name' <<<"$status_json")" \
+      || die "mgmt -- status printed no status object"
+    [[ -z "$blocked" ]] && break
+    ((SECONDS < end)) || die "after ${GATE_M6_BOUND_WAIT:-120}s these cells are not bound, or have an open step: $(paste -sd' ' - <<<"$blocked"). Read: mise run mgmt -- status. Then run: mise run portal -- cancel --cell <cell> if its step is stale, and $repair"
+    sleep "$poll"
+  done
   rm -f "$marker" || die "could not remove $marker"
 }
 if [[ -e "$marker" ]]; then
