@@ -45,7 +45,17 @@ func precheck(run string) error {
 		return fmt.Errorf("load topology: %w", err)
 	}
 	for _, c := range topo.Clusters {
-		if err := checkClock(c.Name + "-control-plane"); err != nil {
+		node := c.Name + "-control-plane"
+		absent, err := nodeAbsent(node)
+		if err != nil {
+			return err
+		}
+		if absent {
+			// A cell exists only after its step ran, and a provision run or a repair starts while a cell is absent.
+			fmt.Fprintf(os.Stderr, "e2e precheck: %s has no node container, so its clock is not checked\n", c.Name)
+			continue
+		}
+		if err := checkClock(node); err != nil {
 			return err
 		}
 	}
@@ -114,6 +124,19 @@ func agentTTL(conf string) string {
 		}
 	}
 	return ""
+}
+
+// nodeAbsent reports whether Docker has no container with the name. Any other failure of docker inspect is an error, so a stopped
+// runtime never looks like an absent cell.
+func nodeAbsent(node string) (bool, error) {
+	out, err := command("", "docker", "container", "inspect", "--format", "{{.Id}}", node)
+	if err == nil {
+		return false, nil
+	}
+	if strings.Contains(out, "No such container") {
+		return true, nil
+	}
+	return false, fmt.Errorf("inspect the node container %s: %w\n%s", node, err, out)
 }
 
 // checkClock compares the clock of a node with the clock of this Mac, at the midpoint of the call.
