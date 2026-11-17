@@ -602,9 +602,10 @@ func TestActorRechecksBeforeRun(t *testing.T) {
 		ae.submit(s, env)
 		ae.clock.Advance(3 * time.Minute)
 		ae.start()
-		st := ae.waitState(s.ID, mgmtapi.StepFailedFinal)
-		if st.Detail != step.DetailStepUnindexed || len(ae.stagesRun()) != 0 {
-			t.Errorf("status %+v, stages run %v, want step_unindexed and none", st, ae.stagesRun())
+		ae.putSpec(nil, nil)
+		st := ae.waitState(s.ID, mgmtapi.StepCancelled)
+		if len(ae.stagesRun()) != 0 {
+			t.Errorf("status %+v, stages run %v, want cancelled and none", st, ae.stagesRun())
 		}
 	})
 	t.Run("signature_in_queue", func(t *testing.T) {
@@ -773,6 +774,7 @@ func TestJournalQueuedSurvivesRestart(t *testing.T) {
 	ae.j = j2
 	ae.a = ae.newActor(j2, nil)
 	ae.start()
+	ae.putSpec([]spec.StepEntry{ae.indexOf(s1, e1), ae.indexOf(s2, e2)}, nil)
 	ae.waitState(s1.ID, mgmtapi.StepDone)
 	ae.waitState(s2.ID, mgmtapi.StepDone)
 	if got := countStage(ae.stagesRun(), "creating"); got != 2 {
@@ -1288,6 +1290,8 @@ func TestInterruptedCreateDeletesHalfBuiltCluster(t *testing.T) {
 	ae.j = j2
 	ae.a = ae.newActor(j2, func(c *ActorConfig) { c.Stages = DefaultStages(script, []string{"true"}, "dev-cp") })
 	ae.start()
+	ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
+	waitUntil(t, "the actor to take the push", 5*time.Second, func() bool { return !ae.a.held.Load() })
 	ae.submit(s, env)
 	ae.waitState(s.ID, mgmtapi.StepDone)
 	b, _ := os.ReadFile(calls)
@@ -1488,5 +1492,80 @@ func TestActorNodeIPUnsetKeepsEmpty(t *testing.T) {
 	ae.submit(s, env)
 	if st := ae.waitState(s.ID, mgmtapi.StepDone); st.NodeIP != "" {
 		t.Errorf("nodeIP = %q, want empty with no NodeIP function", st.NodeIP)
+	}
+}
+
+// restartedWithQueued returns an env whose stored spec indexes a step that the journal holds queued,
+// and whose actor started anew on that journal. No spec push arrived after the start.
+func restartedWithQueued(t *testing.T) (*actorEnv, step.Step, []byte) {
+	t.Helper()
+	ae := newActorEnv(t, nil)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.submit(s, env)
+	j2, err := OpenJournal(ae.j.Dir(), ae.clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ae.j = j2
+	ae.a = ae.newActor(j2, nil)
+	ae.start()
+	return ae, s, env
+}
+
+func TestStartHoldsQueueUntilSpecPush(t *testing.T) {
+	t.Run("push_drops_step_cancels", func(t *testing.T) {
+		ae, s, _ := restartedWithQueued(t)
+		time.Sleep(300 * time.Millisecond)
+		if st := ae.status(s.ID); st.State != mgmtapi.StepQueued || len(ae.stagesRun()) != 0 {
+			t.Fatalf("before a push: %+v, stages %v, want queued and none", st, ae.stagesRun())
+		}
+		ae.putSpec(nil, nil)
+		ae.waitState(s.ID, mgmtapi.StepCancelled)
+		if got := ae.stagesRun(); len(got) != 0 {
+			t.Errorf("stages run = %v, want none", got)
+		}
+	})
+	t.Run("push_keeps_step_runs", func(t *testing.T) {
+		ae, s, env := restartedWithQueued(t)
+		time.Sleep(300 * time.Millisecond)
+		if st := ae.status(s.ID); st.State != mgmtapi.StepQueued {
+			t.Fatalf("before a push: %s, want queued", st.State)
+		}
+		ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
+		ae.waitState(s.ID, mgmtapi.StepDone)
+	})
+	t.Run("repeated_push_runs", func(t *testing.T) {
+		ae, s, env := restartedWithQueued(t)
+		if _, ok := ae.spec.Current(); !ok {
+			t.Fatal("no stored spec")
+		}
+		ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
+		ae.waitState(s.ID, mgmtapi.StepDone)
+	})
+}
+
+func TestStartHoldsFailedStepUntilSpecPush(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	ae.setScript("creating", "exit 1")
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.start()
+	ae.submit(s, env)
+	ae.waitState(s.ID, mgmtapi.StepFailed)
+	ae.stop()
+	j2, err := OpenJournal(ae.j.Dir(), ae.clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ae.j = j2
+	ae.a = ae.newActor(j2, nil)
+	ae.start()
+	ae.clock.Advance(time.Hour)
+	if st := ae.submit(s, env); st.State != mgmtapi.StepFailed {
+		t.Fatalf("a PUT before a push gives %s, want failed", st.State)
+	}
+	ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
+	waitUntil(t, "the actor to take the push", 5*time.Second, func() bool { return !ae.a.held.Load() })
+	if st := ae.submit(s, env); st.State == mgmtapi.StepFailed {
+		t.Fatalf("a PUT after a push gives %s, want a retry", st.State)
 	}
 }

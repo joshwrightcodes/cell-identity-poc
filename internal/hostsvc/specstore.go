@@ -127,6 +127,7 @@ func (s *SpecStore) Put(envelope []byte) (spec.Spec, error) {
 	if s.cur != nil {
 		switch c := sp.Revision.Compare(s.cur.Revision); {
 		case c == 0 && sha == s.sha:
+			s.notify(*s.cur)
 			return *s.cur, nil
 		case c <= 0:
 			if s.signerTrusted(keys) || signer == s.signer {
@@ -147,6 +148,14 @@ func (s *SpecStore) Put(envelope []byte) (spec.Spec, error) {
 	}
 	s.cur, s.sha, s.signer = &sp, sha, signer
 	s.noteSeen(sp)
+	s.notify(sp)
+	return sp, nil
+}
+
+// notify hands sp to every subscriber, in place of a spec that it has not read yet. The caller
+// holds s.mu. A push that repeats the stored spec also notifies, because it shows that the
+// management plane holds nothing newer.
+func (s *SpecStore) notify(sp spec.Spec) {
 	for _, ch := range s.subs {
 		select {
 		case <-ch:
@@ -154,7 +163,6 @@ func (s *SpecStore) Put(envelope []byte) (spec.Spec, error) {
 		}
 		ch <- sp
 	}
-	return sp, nil
 }
 
 // signerTrusted reports whether the key that signed the stored spec is still trusted.

@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -102,6 +103,11 @@ type Actor struct {
 	wake   chan struct{}
 	steps  metric.Int64Counter
 
+	// held is true from the start until the spec store accepts a push. While it is set, no queued
+	// step runs and no failed step queues again, because the stored spec can be older than the
+	// intent of the management plane.
+	held atomic.Bool
+
 	mu       sync.Mutex
 	cur      *runState
 	writeErr string // the last journal write error that was logged, empty after a success
@@ -135,7 +141,8 @@ func (a *Actor) ResetJournal() error {
 
 // NewActor checks cfg, subscribes to the spec store and returns an Actor. Entries that the journal
 // holds in queued run first, in order. An entry in a running state with no recorded group is marked
-// failed with detail interrupted, because no stage can still run for it.
+// failed with detail interrupted, because no stage can still run for it. No step runs until the spec
+// store accepts a push after the start.
 func NewActor(cfg ActorConfig) (*Actor, error) {
 	switch {
 	case cfg.Journal == nil || cfg.Verifier == nil || cfg.Spec == nil:
@@ -174,6 +181,7 @@ func NewActor(cfg ActorConfig) (*Actor, error) {
 		return nil, err
 	}
 	a := &Actor{cfg: cfg, specCh: cfg.Spec.Subscribe(), wake: make(chan struct{}, 1), steps: steps}
+	a.held.Store(true)
 	for _, e := range cfg.Journal.List() {
 		if e.Running() && e.Pgid == 0 {
 			a.update(e.Status.ID, func(e *JournalEntry) { a.setFailed(e, e.Status.Stage, step.DetailInterrupted, false) })
@@ -318,7 +326,7 @@ func (a *Actor) indexedByNewest(id string) bool {
 
 func (a *Actor) resubmitLocked(e JournalEntry, envelope []byte, sha string, s step.Step) (mgmtapi.StepStatus, error) {
 	if e.EnvelopeSHA256 == sha {
-		if e.Status.State == mgmtapi.StepFailed && !a.now().Before(e.Status.RetryAt) && e.Status.Attempts < a.cfg.MaxAttempts {
+		if e.Status.State == mgmtapi.StepFailed && !a.held.Load() && !a.now().Before(e.Status.RetryAt) && e.Status.Attempts < a.cfg.MaxAttempts {
 			e2, _ := a.updateLocked(s.ID, func(e *JournalEntry) { e.Status.State = mgmtapi.StepQueued })
 			a.signal()
 			return e2.Status, nil
@@ -439,6 +447,7 @@ func (a *Actor) setFinal(e *JournalEntry, stage, detail string) {
 func (a *Actor) handleSpec(sp spec.Spec) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.held.Store(false)
 	for _, e := range a.cfg.Journal.List() {
 		if e.Final() {
 			continue
@@ -513,6 +522,9 @@ func (a *Actor) Run(ctx context.Context) error {
 }
 
 func (a *Actor) nextQueued() string {
+	if a.held.Load() {
+		return ""
+	}
 	for _, e := range a.cfg.Journal.List() {
 		if e.Status.State == mgmtapi.StepQueued {
 			return e.Status.ID

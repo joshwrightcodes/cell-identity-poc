@@ -306,6 +306,8 @@ mise run hostsvc:serve -- stop
 It builds `build/bin/hostsvc` and runs it in the background.
 The pid file is `build/hostsvc/serve.pid`, and the log is `build/hostsvc/serve.log`.
 `start` fails when another process holds the port.
+After a start, the service runs no step until it accepts a spec push from `mgmtd`.
+A step waits while `mgmtd` cannot reach the service.
 `restart` stops the service, starts it, and links `mgmt-api` again, so `mgmtd` gets the new pin.
 `stop` ends only a process with the command line `build/bin/hostsvc serve`.
 A logout or a reboot of the Mac stops the service.

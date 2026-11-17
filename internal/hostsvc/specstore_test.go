@@ -166,8 +166,8 @@ func TestSpecStore(t *testing.T) {
 		}
 		select {
 		case <-ch:
-			t.Error("the same spec sent a Subscribe event")
 		default:
+			t.Error("the same spec sent no Subscribe event: a repeated push must show that nothing is newer")
 		}
 	})
 	t.Run("same_revision_other_bytes", func(t *testing.T) {
