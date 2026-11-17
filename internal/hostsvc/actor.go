@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -72,6 +73,9 @@ type ActorConfig struct {
 	Start func(argv []string, env []string, log io.Writer) (*Group, error)
 	// Env is the base environment of a child. Nil means the environment of this process.
 	Env []string
+	// NodeIP returns the IPv4 address of the control-plane node of a cell. When it is set, the
+	// actor reads it after creating ends with success and records it in the step status.
+	NodeIP func(cell string) (string, error)
 
 	MaxAttempts, QueueCap            int
 	RetryAfter, KillAfter, Heartbeat time.Duration
@@ -801,7 +805,26 @@ func (a *Actor) runStage(ctx context.Context, rs *runState, stg Stage) bool {
 	case waitErr != nil:
 		detail = step.DetailStageFailed
 	default:
-		a.update(id, func(e *JournalEntry) { e.Pgid, e.LeaderStart = 0, "" })
+		var nodeIP string
+		if stg.Name == mgmtapi.StageCreating && a.cfg.NodeIP != nil {
+			ip, err := a.cfg.NodeIP(st.Cell)
+			if addr, perr := netip.ParseAddr(ip); err == nil && (perr != nil || !addr.Is4() || addr.String() != ip) {
+				err = fmt.Errorf("node address %q is not a canonical IPv4 address", ip)
+			}
+			if err != nil {
+				fmt.Fprintf(logf, "node address: %v\n", err)
+				a.cfg.Log.Warn("node_ip_failed", "step", id, "cell", st.Cell, "error", err.Error())
+				a.update(id, func(e *JournalEntry) { a.setFailed(e, stg.Name, step.DetailStageFailed, true) })
+				return false
+			}
+			nodeIP = ip
+		}
+		a.update(id, func(e *JournalEntry) {
+			e.Pgid, e.LeaderStart = 0, ""
+			if nodeIP != "" {
+				e.Status.NodeIP = nodeIP
+			}
+		})
 		a.cfg.Log.Info("stage_done", "step", id, "stage", stg.Name)
 		return true
 	}

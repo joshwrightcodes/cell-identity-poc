@@ -1316,3 +1316,71 @@ func TestActorResetJournalTakesTheLock(t *testing.T) {
 		t.Error("entries survived the reset")
 	}
 }
+
+func TestActorRecordsNodeIP(t *testing.T) {
+	var mu sync.Mutex
+	var asked []string
+	ae := newActorEnv(t, func(c *ActorConfig) {
+		c.NodeIP = func(cell string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			asked = append(asked, cell)
+			return "172.18.0.7", nil
+		}
+	})
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.start()
+	ae.submit(s, env)
+	st := ae.waitState(s.ID, mgmtapi.StepDone)
+	if st.NodeIP != "172.18.0.7" || !mgmtapi.ValidStepStatus(st) {
+		t.Errorf("final status = %+v, want nodeIP 172.18.0.7", st)
+	}
+	mu.Lock()
+	if len(asked) != 1 || asked[0] != "dev-cell-1" {
+		t.Errorf("NodeIP asked for %q, want one call for dev-cell-1", asked)
+	}
+	mu.Unlock()
+	ae.stop()
+	j2, err := OpenJournal(ae.j.Dir(), ae.clock.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, ok := j2.Get(s.ID)
+	if !ok || e.Status.NodeIP != "172.18.0.7" {
+		t.Errorf("reloaded journal entry = %+v, %v, want nodeIP 172.18.0.7", e.Status, ok)
+	}
+}
+
+func TestActorNodeIPReadFails(t *testing.T) {
+	for name, read := range map[string]func(string) (string, error){
+		"error":         func(string) (string, error) { return "", errors.New("node not found") },
+		"not_canonical": func(string) (string, error) { return "172.018.0.7", nil },
+		"not_ipv4":      func(string) (string, error) { return "fd00::7", nil },
+	} {
+		t.Run(name, func(t *testing.T) {
+			ae := newActorEnv(t, func(c *ActorConfig) { c.NodeIP = read })
+			s, env := ae.indexed("dev-cell-1", nil)
+			ae.start()
+			ae.submit(s, env)
+			st := ae.waitState(s.ID, mgmtapi.StepFailed)
+			if st.Stage != "creating" || st.Detail != step.DetailStageFailed || st.Attempts != 1 || st.NodeIP != "" || !mgmtapi.ValidStepStatus(st) {
+				t.Errorf("failed status = %+v, want creating, stage_failed, 1 attempt, no nodeIP", st)
+			}
+			for _, r := range ae.stagesRun() {
+				if r != "creating" {
+					t.Errorf("stage %s ran after the failed read", r)
+				}
+			}
+		})
+	}
+}
+
+func TestActorNodeIPUnsetKeepsEmpty(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.start()
+	ae.submit(s, env)
+	if st := ae.waitState(s.ID, mgmtapi.StepDone); st.NodeIP != "" {
+		t.Errorf("nodeIP = %q, want empty with no NodeIP function", st.NodeIP)
+	}
+}

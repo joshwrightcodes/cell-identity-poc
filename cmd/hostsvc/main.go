@@ -269,7 +269,7 @@ func newStepStack(topo *topology.Topology, sf serveFlags, log *slog.Logger, mete
 	}
 	actor, err := hostsvc.NewActor(hostsvc.ActorConfig{
 		Journal: j, Verifier: v, Spec: store, Stages: hostsvc.DefaultStages(exe, cmdline, sf.cpCluster),
-		Start: hostsvc.StartGroup, Log: log, Meter: meter,
+		Start: hostsvc.StartGroup, NodeIP: hostsvc.NewKindRuntime().NodeIP, Log: log, Meter: meter,
 	})
 	if err != nil {
 		return nil, err
