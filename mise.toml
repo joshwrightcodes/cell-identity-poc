@@ -168,7 +168,7 @@ env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create all five clusters through the host service, build the images, then run cell:up on each cluster that has components. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
+description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 
@@ -256,8 +256,12 @@ run = "scripts/portal.sh"
 description = "Run the M6 end-to-end tests against the management plane stand-in, the host service and the cells, plus the go test arguments after --. It runs gate:m6:repair --check first, and checks the deployed image of mgmtd. The task builds no image: run mise run images first, or mise run images -- <name> for one image"
 run = "scripts/gate.sh m6"
 
+[tasks."gate:m6:provision"]
+description = "Run the test that deletes both cells and creates them again through the portal, checks 1 to 3 of the PoC from one request, plus the go test arguments after --. It runs gate:m6:repair --check first, and checks the deployed images of mgmtd, envd, the cell controller, cellgw and the SPIRE server. It deletes the cells on purpose, and writes build/gate/m6-provision, which gate:m6:repair uses to restore them after an interrupted run. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m6-provision"
+
 [tasks."gate:m6:repair"]
-description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. With --check, only report, also fail on an open step that no test recorded, and fail with the repair command. Safe to run again"
+description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m6-repair.sh"
 
 [tasks.gw]

@@ -5,12 +5,17 @@
 #      It also removes each key <cell>.step.json of ConfigMap cell-steps that is not the step that the spec indexes;
 #   2. cancels, through portal -- cancel, each open step whose ID a test recorded in build/gate/m6-steps. It never
 #      cancels a step that the provision test signed, because no test records those;
-#   3. deletes the test namespaces m6-* (label cell.poc.internal/e2e=true) in management, dev-cp, rogue and each live cell.
+#   3. deletes the test namespaces m6-* (label cell.poc.internal/e2e=true) in management, dev-cp, rogue and each live cell;
+#   4. restores the cells while the marker build/gate/m6-provision exists. TestProvisionFromPortal writes the marker before it
+#      deletes the cells and removes it after both cells are valid again, so an interrupted run leaves it. The restore runs one
+#      portal -- request for every catalog cell that is not requested, portal -- wait for every catalog cell, CELL=management mise run
+#      cell:link, then the M5 repair again, which waits for the stream of each new cell, and it removes the marker last. The M2, M4 and
+#      M5 repairs at the start skip a cell that is not live, so they run while a cell is absent.
 # It is safe to run again.
 #
 # Usage: gate-m6-repair.sh [--check]
 #   --check prints each drift with the command that repairs it, and exits 1. It exits 0 when it finds none. It also fails when a step
-#   that no test recorded is open: a gate starts with no open step.
+#   that no test recorded is open: a gate starts with no open step. It fails too while the marker build/gate/m6-provision exists.
 # GATE_M5_REPAIR names another M5 repair script, HOSTSVC_SERVE another host service script, HARNESS_REPLICAS another replicas script
 # and PORTAL another portal script, for the tests.
 export CELL=dev-cp
@@ -22,6 +27,7 @@ repair="mise run gate:m6:repair"
 status=0
 serve="${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}"
 recorded="$BUILD_ROOT/gate/m6-steps"
+marker="$BUILD_ROOT/gate/m6-provision"
 
 portal() { if [[ -n "${PORTAL:-}" ]]; then "$PORTAL" "$@"; else mise run portal -- "$@"; fi; }
 
@@ -130,4 +136,37 @@ for cluster in $clusters; do
     done
   fi
 done
+
+# restore_cells brings the cells back after an interrupted provision run. Each command is safe to run again, and the marker
+# stays until the last one has succeeded.
+restore_cells() {
+  local catalog status_json requested missing=() margs=() cell args=()
+  catalog="$(catalog_cells)" || die "could not read the cells of the topology"
+  status_json="$(cd "$ROOT" && mise run mgmt -- status)" || die "could not read mgmt -- status. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  requested="$(jq -r '.cells[]? | select(.requested == true) | .name' <<<"$status_json")" || die "mgmt -- status printed no status object"
+  for cell in $catalog; do
+    grep -qx -- "$cell" <<<"$requested" || missing+=("$cell")
+    args+=(--cell "$cell")
+  done
+  if ((${#missing[@]} > 0)); then
+    log "requesting ${missing[*]}"
+    for cell in "${missing[@]}"; do margs+=(--cell "$cell"); done
+    (cd "$ROOT" && portal request "${margs[@]}") || die "could not request ${missing[*]}. Run: mise run portal -- request ${margs[*]}"
+  fi
+  log "waiting until ${catalog//$'\n'/ } are valid"
+  (cd "$ROOT" && portal wait "${args[@]}") || die "a cell is not valid. Read the step: mise run hostsvc:serve -- steps. Then run: $repair"
+  log "linking management"
+  (cd "$ROOT" && CELL=management mise run cell:link) || die "could not link management. Run: CELL=management mise run cell:link, then $repair"
+  "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" || die "a cell holds no stream at the gateway. Run: $repair"
+  rm -f "$marker" || die "could not remove $marker"
+}
+if [[ -e "$marker" ]]; then
+  if ((check)); then
+    status=1
+    echo "the marker $marker exists, so a provision run stopped early and a cell can be missing. Run: $repair"
+  else
+    log "restoring the cells, because $marker exists"
+    restore_cells
+  fi
+fi
 exit "$status"

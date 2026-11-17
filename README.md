@@ -75,8 +75,9 @@ CELL=dev-cp mise run secrets:connect
 ```
 
 `harness:up` first runs `harness:preflight`, which starts the Colima VM and checks the tool versions.
-It then creates all five clusters through the host service, and builds the images with `mise run images`.
-After that it runs `cell:up` for each cluster that has the `base-cell` component set in `harness/topology.yaml`. The `rogue` cluster has no components.
+It then creates `management`, `dev-cp` and `rogue` through the host service, and builds the images with `mise run images`.
+After that it runs `cell:up` for `management` and `dev-cp`, the clusters that have components and no `cell-identity` set in `harness/topology.yaml`. The `rogue` cluster has no components.
+The two cells have no `cell:up` step. `harness:up` asks the portal for them, as [Provisioning](#provisioning) describes.
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
 In `dev-cp`, that wait also runs `secrets:connect` once, or prints the command above, while the secret store is not connected.
@@ -85,22 +86,22 @@ Last, `cell:up` runs the link phase of a cluster with link components, as [Centr
 `harness:up` sets up `management` first with `CELL_UP_SKIP_LINK=1`.
 It runs `CELL=management LINK_ONLY=mgmt-api mise run cell:link` after `management`, and again after `dev-cp`.
 The second run adds the `dev-cp` root, so `mgmtd` admits `envd`.
-The full `CELL=management mise run cell:link` runs after the cells.
+The full `CELL=management mise run cell:link` runs after both cells are valid.
 Harness components stay outside every Argo CD Application. A bundle can still write to their namespace, as the residual limits in `docs/design/poc-scope.md` say.
 `cell:verify` runs the checks of one cluster and prints PASS or FAIL for each.
 `harness:verify` runs `cell:verify` on each cluster with components, and prints one line for each cluster at the end.
 `harness:status` answers the wider question "is the PoC healthy". [Operator status and logs](#operator-status-and-logs) describes it.
 
-`harness:up` stops at the first cluster that fails, so a failure in `dev-cp` also stops the cells.
-It then prints the commands for the remaining clusters. Fix the cause, and run them in topology order:
+`harness:up` stops at the first step that fails, so a failure in `dev-cp` also stops the cells.
+It then prints the commands for the remaining steps. Fix the cause, and run them in this order:
 
 ```sh
 CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up
 CELL=management LINK_ONLY=mgmt-api mise run cell:link
 CELL=dev-cp mise run cell:up
 CELL=management LINK_ONLY=mgmt-api mise run cell:link
-CELL=dev-cell-1 mise run cell:up
-CELL=dev-cell-2 mise run cell:up
+mise run portal -- request --cell dev-cell-1 --cell dev-cell-2
+mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2
 CELL=management mise run cell:link
 ```
 
@@ -112,6 +113,32 @@ An unknown name fails with a list of the known cells. For example, `CELL=dev-cel
 `cell:up` of `management` also runs its link phase, which needs `dev-cp` and each cell of `VIEW_CELLS`.
 When one of them is missing, `cell:up` stops before its first apply and prints the command.
 To set up the base cell of `management` alone, run `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`.
+
+## Provisioning
+
+The harness creates a cell only through the portal. The portal stand-in is `mise run portal`. A request is one signed step for each cell, and
+the host service runs the step. It creates the cluster, admits it in `dev-cp` and bootstraps it. A cell exists only after its step ran.
+
+```sh
+mise run portal -- request --cell dev-cell-1 --cell dev-cell-2
+mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2
+```
+
+The request asks only for cells that are not requested yet. A cell that is requested already counts as a success, so you can run the request again.
+The wait polls until each cell is valid. It prints the state of each step and the path of the step log.
+The two cells run one after the other, because the host service runs one step at a time. Allow up to 75 minutes for both.
+During that time, make no change to the checkout. The host service refuses a step when the files of `cell:up` differ from the ones that the request signed.
+`mise run hostsvc:serve -- steps` lists the steps, and `mise run hostsvc:serve -- log --step <id>` prints the log of one step.
+
+`CELL=<cell> mise run cell:up` of a cell that is absent fails with the portal command. It never creates a cell.
+A step that ends `failed`, `failed_final`, `refused` or expired needs `mise run portal -- retry --cell <cell>`.
+This is no security boundary, because the Mac user can still run `kind create cluster`.
+
+A `gate:m6:provision` run deletes both cells and creates them again through one portal request. It writes the marker `build/gate/m6-provision`
+first. A run that stops early leaves the marker, and `gate:m6` then fails its check.
+Run `mise run gate:m6:repair` to restore the cells. It requests each cell that is not requested, waits until both are valid, links `management`
+and removes the marker. The repair takes about as long as the first creation. `gate:m6:repair` and `gate:m6:provision` change the cells,
+so run them alone.
 
 ## Rebuild one cluster
 
@@ -125,23 +152,23 @@ The table also covers a new root that no one planned. For a planned change of th
 
 | Rebuilt cluster | Then run | Reason |
 | --- | --- | --- |
-| `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `cell:up` for each cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. |
-| `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
-| a cell | `CELL=dev-cp mise run cell:up`, `CELL=<cell> mise run cell:up` | The relay, the gateway and the SPIRE node port admit the node addresses of the cells. A rebuilt cell binds with a new key, and `mgmtd` publishes its record to the registries of the views. |
+| `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `mise run portal -- request` and `mise run portal -- wait` for each live cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. A new `mgmtd` has no request, so the portal asks again. A request for a cell that exists skips its creation. |
+| `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each live cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
+| a cell | `CELL=<cell> mise run cell:down` while the cluster exists, `mise run portal -- recreate --cell <cell> --wait`, `CELL=management mise run cell:link` | A new cluster has a new node address and new keys. The step admits the address in `dev-cp`. The bind proves the new keys, and `mgmtd` publishes the record of the cell to the registries of the views. |
 | the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
 `mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the command for it.
 
-To rebuild a cell, for example `dev-cell-1`, create the cluster first.
-Then `mgmtd` binds the new cell and signs its record, and `envd` delivers the record before the agent attests:
+To rebuild a cell, for example `dev-cell-1`, delete the cluster, then ask the portal to create it again.
+The step creates the cluster and admits its node address in `dev-cp`. Then `mgmtd` binds the new cell and signs its record,
+and `envd` delivers the record before the agent attests:
 
 ```sh
 CELL=dev-cell-1 mise run cell:down
-mise run hostsvc -- up --only dev-cell-1
-CELL=dev-cp mise run cell:up
-CELL=dev-cell-1 mise run cell:up
+mise run portal -- recreate --cell dev-cell-1 --wait
+CELL=management mise run cell:link
 CELL=dev-cp mise run cell:verify
 CELL=dev-cell-1 mise run cell:verify
 ```
@@ -1022,24 +1049,26 @@ To add a cell, for example `dev-cell-3`, follow these steps:
    The SPIRE server renders a node alias `cell/<cell>/agents/<role>` and a role entry for each subject of `SPIRE_CELL_SUBJECTS`. `mgmtd` signs the record of the cell when its `celld` binds.
    The relay admits the node address of the cell.
 4. Change the cluster count in `TestValidateAcceptsHarnessTopology` of `internal/topology`, which checks the real file.
-5. Create the cluster, bind it in `mgmtd`, and set it up:
+5. Give the catalog to `mgmtd`, ask the portal for the cell, and link `management`. The step creates the cluster, admits it in `dev-cp` and bootstraps it:
 
    ```sh
-   mise run hostsvc -- up --only dev-cell-3
-   CELL=dev-cp mise run cell:up
-   CELL=dev-cell-3 mise run cell:up
+   CELL=management LINK_ONLY=mgmt-api mise run cell:link
+   mise run portal -- request --cell dev-cell-3 --wait
    CELL=management mise run cell:link
    mise run harness:status
    ```
 
+   `CELL=dev-cell-3 mise run cell:up` fails while the cluster is absent, and it prints the portal command.
+
 `harness:up`, `harness:verify`, `harness:status`, the image check of `gate:m2` and the cell loops of the end-to-end tests read the cells from `harness/topology.yaml`.
 The M2 rejection and renewal tests use `dev-cell-1` and `dev-cell-2` by name, because each test gives one of them its own role.
 
-To remove a cell, remove it from `SPIRE_AGENT_CELLS`, `VIEW_CELLS` and `MESH_VIEW_CELLS`.
-Then run `CELL=dev-cp mise run cell:up`, which also takes the cell out of the relay admit lists, and `CELL=management mise run cell:link`, which removes the view record of the cell.
+To remove a cell, run `mise run portal -- withdraw --cell <cell>`. It retires the record of the cell and cancels its step.
+Then run `CELL=<cell> mise run cell:down`. It deletes the cluster, renders `dev-cp` again with no rule for the cell, and runs the link of `management`.
+Then remove the cell from `SPIRE_AGENT_CELLS`, `VIEW_CELLS` and `MESH_VIEW_CELLS`, and remove its entry in `harness/topology.yaml` and its `cells/<cell>.env`.
+Then run `CELL=dev-cp mise run cell:up` and `CELL=management mise run cell:link`, which remove the view record of the cell.
 The link keeps the agent namespace `<env>-<cell>` in `management`. Delete it with `mise x -- kubectl --context kind-management delete namespace <env>-<cell>`.
 Then run `CELL=management mise run cell:verify`, which passes when no object of the cell is left.
-Then delete the cluster with `CELL=<cell> mise run cell:down`, and remove its entry and its `cells/<cell>.env`.
 The server keeps the entries of the old agents of that cell until they expire and it prunes them.
 To end them at once, evict each agent of the cell:
 

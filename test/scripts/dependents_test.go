@@ -137,8 +137,8 @@ func TestDependentsOfOtherChanges(t *testing.T) {
 }
 
 // harnessRoot copies the scripts, cell settings and topology, and puts a fake mise in front. The fake logs
-// each call with the settings of the step, and fails the step that STUB_FAIL_AT names as
-// <CELL>/<task>/<LINK_ONLY>.
+// each call with the settings of the step, fails the step that STUB_FAIL_AT names as
+// <CELL>/<task>/<LINK_ONLY>, and fails each call whose arguments start with STUB_FAIL_ARGS.
 func harnessRoot(t *testing.T) (root, calls string) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
@@ -160,6 +160,7 @@ func harnessRoot(t *testing.T) (root, calls string) {
 	write("bin/mise", `#!/usr/bin/env bash
 echo "mise $* | CELL=${CELL:-} LINK_ONLY=${LINK_ONLY:-} SKIP=${CELL_UP_SKIP_LINK:-}" >>"$STUB_LOG"
 [[ "${CELL:-}/$2/${LINK_ONLY:-}" != "${STUB_FAIL_AT:-none}" ]] || exit 1
+[[ -z "${STUB_FAIL_ARGS:-}" || "$*" != "$STUB_FAIL_ARGS"* ]] || exit 1
 `)
 	write("bin/hostsvc-serve", "#!/usr/bin/env bash\necho \"hostsvc-serve $*\" >>\"$STUB_LOG\"\n")
 	return root, calls
@@ -177,32 +178,11 @@ func runHarness(t *testing.T, root, calls, verb string, env ...string) (string, 
 	return string(log), errOut.String(), err
 }
 
-// harness:up follows the rebuild order: the first link of mgmt-api comes right after the cell:up of
-// management, before dev-cp. The second comes right after the cell:up of dev-cp, with the dev-cp root.
-// harness:down stops the host service last.
-func TestHarnessUpOrderAndDown(t *testing.T) {
+// harness:down stops the host service first, then deletes the clusters. The order of harness:up is in
+// TestHarnessUpOrderM6.
+func TestHarnessDown(t *testing.T) {
 	root, calls := harnessRoot(t)
-	log, errOut, err := runHarness(t, root, calls, "up")
-	if err != nil {
-		t.Fatalf("harness up failed: %v\n%s", err, errOut)
-	}
-	want := []string{
-		"mise run hostsvc -- up | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run images | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run cell:up | CELL=management LINK_ONLY= SKIP=1",
-		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
-		"mise run cell:up | CELL=dev-cp LINK_ONLY= SKIP=",
-		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
-		"mise run cell:up | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run cell:up | CELL=dev-cell-2 LINK_ONLY= SKIP=",
-		"mise run cell:link | CELL=management LINK_ONLY= SKIP=",
-	}
-	if got := strings.Split(strings.TrimSpace(log), "\n"); !slices.Equal(got, want) {
-		t.Fatalf("calls\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-
-	root, calls = harnessRoot(t)
-	log, errOut, err = runHarness(t, root, calls, "down")
+	log, errOut, err := runHarness(t, root, calls, "down")
 	if err != nil {
 		t.Fatalf("harness down failed: %v\n%s", err, errOut)
 	}
@@ -225,34 +205,18 @@ func TestHarnessUpOrderAndDown(t *testing.T) {
 	})
 }
 
-// TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps
-// included.
+// TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps and the portal
+// steps included. The commands are those of TestHarnessUpOrderM6.
 func TestHarnessUpHintListsAllSteps(t *testing.T) {
-	all := []string{
-		"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cp mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cell-1 mise run cell:up",
-		"CELL=dev-cell-2 mise run cell:up",
-		"CELL=management mise run cell:link",
-	}
-	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2, "dev-cell-2/cell:up/": 5} {
+	all := harnessUpHint
+	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2} {
 		t.Run(failAt, func(t *testing.T) {
 			root, calls := harnessRoot(t)
 			_, errOut, err := runHarness(t, root, calls, "up", "STUB_FAIL_AT="+failAt)
 			if err == nil {
 				t.Fatal("harness up passed with a failing step")
 			}
-			_, hint, ok := strings.Cut(errOut, "Fix the cause, then run these commands in this order:\n")
-			if !ok {
-				t.Fatalf("no hint in\n%s", errOut)
-			}
-			var got []string
-			for _, l := range strings.Split(strings.TrimSpace(hint), "\n") {
-				got = append(got, strings.TrimSpace(l))
-			}
-			if !slices.Equal(got, all[from:]) {
+			if got := hintLines(t, errOut); !slices.Equal(got, all[from:]) {
 				t.Fatalf("hint\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(all[from:], "\n"))
 			}
 		})

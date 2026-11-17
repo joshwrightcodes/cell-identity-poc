@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -201,5 +202,78 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 				t.Errorf("patch ran %v, want %v; calls %q", got, tc.patched, calls)
 			}
 		})
+	}
+}
+
+// TestGateM6ProvisionGate: gate.sh m6-provision runs only TestProvisionFromPortal, with the go test timeout that gate_test_timeout derives from
+// the provisional budget of 90 minutes and the floor of 150 minutes in harness/versions.env: twice the budget, 180 minutes. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
+// pattern of gate m6 does not match the provision test, because that test deletes both cells.
+func TestGateM6ProvisionGate(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	for _, tc := range []struct {
+		name, milestone, stale, want string
+	}{
+		{name: "healthy", milestone: "m6-provision"},
+		{name: "a stale cell controller", milestone: "m6-provision", stale: "cell-controller@cell-controller-system",
+			want: "Run: mise run images -- cell-controller, then CELL=dev-cp mise run cell:up"},
+		{name: "a stale mgmtd", milestone: "m6-provision", stale: "mgmtd@mgmt-system",
+			want: "Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := newM5GateRoot(t, tc.stale)
+			if err := os.WriteFile(filepath.Join(root, "scripts", "gate-m6-repair.sh"), []byte("#!/usr/bin/env bash\necho \"repair $*\" >>\"$STUB_LOG\"\nexit 0\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "scripts", "gate-token-scan.sh"), []byte("#!/usr/bin/env bash\necho \"scan $*\" >>\"$STUB_LOG\"\n"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), tc.milestone)
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
+			out, err := cmd.CombinedOutput()
+			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
+			if !strings.Contains(string(calls), "repair --check") {
+				t.Errorf("gate-m6-repair.sh --check did not run first: calls %s", calls)
+			}
+			ran := strings.Contains(string(calls), "-run ^TestProvisionFromPortal$")
+			if scanned := strings.Contains(string(calls), "scan 2026-11-16T01:02:03Z"); tc.want == "" && !scanned {
+				t.Errorf("the token scan did not run after the tests: calls %s", calls)
+			}
+			if tc.want == "" {
+				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 180m") || strings.Contains(string(calls), "-run M6") {
+					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 180m", err, ran, out, calls)
+				}
+				return
+			}
+			if err == nil || ran || !strings.Contains(string(out), tc.want) {
+				t.Fatalf("err %v, tests ran %v, output %s; want a stop before the tests that says %q", err, ran, out, tc.want)
+			}
+		})
+	}
+	if regexp.MustCompile("M6").MatchString("TestProvisionFromPortal") {
+		t.Error("the pattern M6 of gate m6 matches TestProvisionFromPortal")
+	}
+}
+
+// TestGateM6ProvisionTimeoutFloor: the go test timeout of gate:m6:provision is never below 150 minutes, whatever budget Task 11 sets,
+// because the waits of TestProvisionFromPortal sum to 89 minutes and the two cell:down calls come on top.
+func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
+	testtool.Need(t, "bash")
+	versions, _ := filepath.Abs("../../harness/versions.env")
+	lib, _ := filepath.Abs("../../scripts/lib.sh")
+	for budget, want := range map[string]string{"": "150", "50": "150", "75": "150", "90": "180"} {
+		cmd := exec.Command("bash", "-c", `source "$1"; source "$2"; gate_test_timeout "$3" "${GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES:-}"`, "bash", lib, versions, budget)
+		cmd.Env = append(os.Environ(), "CELL=dev-cell-1")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := strings.TrimSpace(string(out)); got != want {
+			t.Errorf("the go test timeout of gate:m6:provision with the budget %q is %s minutes, want %s", budget, got, want)
+		}
+	}
+	out, err := exec.Command("bash", "-c", `source "$1"; printf '%s %s' "$GATE_M6_PROVISION_BUDGET_MINUTES" "$GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES"`, "bash", versions).Output()
+	if err != nil || string(out) != "90 150" {
+		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"90 150\"", out, err)
 	}
 }

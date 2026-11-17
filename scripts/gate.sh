@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
 # m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
 # m6 runs gate-m6-repair.sh --check and the image check of mgmtd, envd, the cell controller, the cell gateway and the SPIRE server first.
-# After the tests, m5, m5-soak, m5-drill and m6 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
+# m6-provision runs the one test that deletes both cells and creates them again through the portal, after the same checks. It is not
+# part of m6, because it deletes the cells. An interrupted run leaves build/gate/m6-provision, and mise run gate:m6:repair restores the cells.
+# After the tests, m5, m5-soak, m5-drill, m6 and m6-provision scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision [go test arguments]}"
 # The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
 gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift
@@ -20,6 +22,7 @@ timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 [[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
 [[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
+[[ "$milestone" != m6-provision ]] || pattern="^TestProvisionFromPortal$"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -136,8 +139,9 @@ fi
 # The M6 tests run against mgmtd, the host service, envd, the cell controller, the cell gateway and the SPIRE server of dev-cp
 # (its plugin checks the cells). Each of these workloads must run the image that `mise run images` recorded, so a test does not
 # run old code, and a step does not end with bootstrap_mismatch because the images changed. gate-m6-repair.sh --check runs
-# gate-m5-repair.sh, which runs the M4 and M2 repairs once.
-if [[ "$milestone" == m6 ]]; then
+# gate-m5-repair.sh, which runs the M4 and M2 repairs once. The provision gate checks the same, and the check fails while the marker
+# of an earlier provision run exists.
+if [[ "$milestone" == m6 || "$milestone" == m6-provision ]]; then
   "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
@@ -168,7 +172,7 @@ go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
 # No token may reach a log of the M5 components. A hit fails the gate, like a failed test.
-if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill || "$milestone" == m6 ]]; then
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill || "$milestone" == m6 || "$milestone" == m6-provision ]]; then
   "$ROOT/scripts/gate-token-scan.sh" "$gate_started" || { printf 'FAIL: gate %s found a token in a log\n' "$milestone" >&2; status=1; }
 fi
 # The duration of each top-level test, slowest first.
