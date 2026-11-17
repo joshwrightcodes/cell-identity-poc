@@ -302,7 +302,7 @@ cluster_lock_trap() {
 }
 
 cluster_lock() {
-  local cluster="$1" dir holder end stale who
+  local cluster="$1" dir holder end stale who seen
   [[ " ${POC_HELD_LOCKS:-} " != *" $cluster "* ]] || return 0
   dir="$(cluster_lock_dir "$cluster")"
   mkdir -p "$(dirname "$dir")"
@@ -310,9 +310,14 @@ cluster_lock() {
   until mkdir "$dir" 2>/dev/null; do
     holder="$(cluster_lock_holder "$cluster")"
     if [[ -z "$holder" ]]; then
-      # A rename moves the stale lock aside in one step, so two runs cannot both remove it.
+      # A rename to a name of this run moves the stale lock aside in one step. The pid that this run judged stale must be the pid in the
+      # moved directory. When another run took the lock in between, the moved directory is a live lock: put it back. A window of a few
+      # instructions stays between the check and the put back (residual).
+      seen="$(cat "$dir/pid" 2>/dev/null || true)"
       stale="$dir.stale.$$"
-      mv "$dir" "$stale" 2>/dev/null && rm -rf "$stale"
+      if mv "$dir" "$stale" 2>/dev/null; then
+        if [[ "$(cat "$stale/pid" 2>/dev/null || true)" == "$seen" ]]; then rm -rf "$stale"; else mv -n "$stale" "$dir" 2>/dev/null || rm -rf "$stale"; fi
+      fi
       continue
     fi
     if ((SECONDS >= end)); then

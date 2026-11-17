@@ -204,22 +204,24 @@ stage_entries() {
   local json jq_filter='[(.steps // [] | .[] | {id, cell, state}), (.entries // [] | .[].status | {id, cell, state})]
     | .[] | select(.state == "creating" or .state == "admitting" or .state == "bootstrapping")
     | select($cell == "" or .cell == $cell) | "\(.id) \(.cell) \(.state)"'
-  if [[ -n "$(running_pid)" && -x "$bin" ]]; then
-    json="$(cd "$ROOT" && "$bin" ctl steps --admin-socket "$(rel "$sockfile")" 2>/dev/null)" || json=""
-    [[ -n "$json" ]] || return 0
+  if [[ -n "$(running_pid)" ]]; then
+    [[ -x "$bin" ]] || { echo "error: the host service runs, but $bin is missing, so its steps cannot be read" >&2; return 1; }
+    json="$(cd "$ROOT" && "$bin" ctl steps --admin-socket "$(rel "$sockfile")" 2>&1)" \
+      || { echo "error: could not read the steps from the running host service: ${json:-no output}" >&2; return 1; }
   elif [[ -f "$stepsdir/journal.json" ]]; then
-    json="$(cat "$stepsdir/journal.json")"
+    json="$(cat "$stepsdir/journal.json")" || { echo "error: could not read $stepsdir/journal.json" >&2; return 1; }
   else
     return 0
   fi
-  jq -r --arg cell "${1:-}" "$jq_filter" <<<"$json" 2>/dev/null || true
+  jq -r --arg cell "${1:-}" "$jq_filter" <<<"$json" \
+    || { echo "error: the steps of the host service are no journal: $json" >&2; return 1; }
 }
 
 # refuse_during_stage <force> fails while a step runs a stage, unless force is --force.
 refuse_during_stage() {
   local running
   [[ "$1" != --force ]] || return 0
-  running="$(stage_entries)"
+  running="$(stage_entries)" || die "cannot tell whether a step runs a stage, because the read failed. Read it with: mise run hostsvc:serve -- steps. To go on anyway, add --force"
   [[ -z "$running" ]] || die "a step runs a stage: ${running//$'\n'/; }. Wait until it ends, or cancel it with: mise run hostsvc:serve -- cancel --step <id>. To go on anyway, add --force"
 }
 

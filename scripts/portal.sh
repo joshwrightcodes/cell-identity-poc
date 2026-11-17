@@ -46,21 +46,25 @@ for c in "${cells[@]}"; do cell_args+=(--cell "$c"); done
 # mgmt_call <args...> runs mise run mgmt -- <args> from the repository root. The output goes to standard output as it is.
 mgmt_call() { (cd "$ROOT" && mise run mgmt -- "$@"); }
 
-# running_stage <cell> prints "<id> <state>" when the host service shows a step of the cell in a stage.
+# running_stage <cell> sets STAGE to "<id> <state>" when the host service shows a step of the cell in a stage, and to nothing
+# otherwise. A failed read of the service stops the command: a retry without --force would cancel a running stage.
 running_stage() {
   local running json
-  running="$("$serve" status | jq -r '.running')" || return 0
+  STAGE=""
+  running="$("$serve" status)" || json_fail portal "could not read the host service status, so a running stage is unknown. Run: mise run hostsvc:serve -- status. To retry anyway, add --force" reason=stage_read_failed
+  running="$(jq -r '.running' <<<"$running")" || json_fail portal "the host service status is no JSON object. Run: mise run hostsvc:serve -- status. To retry anyway, add --force" reason=stage_read_failed
   [[ "$running" == true ]] || return 0
-  json="$("$serve" steps)" || return 0
-  jq -r --arg cell "$1" '.steps[]? | select(.cell == $cell)
-    | select(.state == "creating" or .state == "admitting" or .state == "bootstrapping") | "\(.id) \(.state)"' <<<"$json" | head -n 1
+  json="$("$serve" steps)" || json_fail portal "could not read the steps of the host service, so a running stage is unknown. Run: mise run hostsvc:serve -- steps. To retry anyway, add --force" reason=stage_read_failed
+  STAGE="$(jq -r --arg cell "$1" '.steps[]? | select(.cell == $cell)
+    | select(.state == "creating" or .state == "admitting" or .state == "bootstrapping") | "\(.id) \(.state)"' <<<"$json" | head -n 1)" \
+    || json_fail portal "the steps of the host service are no journal. Run: mise run hostsvc:serve -- steps. To retry anyway, add --force" reason=stage_read_failed
 }
 
 digest=""
 if [[ "$command" == request || "$command" == recreate || "$command" == retry ]]; then
   if [[ "$command" == retry && "$force" == 0 ]]; then
-    stage="$(running_stage "${cells[0]}")"
-    [[ -z "$stage" ]] || json_fail portal "the step ${stage% *} of ${cells[0]} runs a stage (${stage#* }), and a retry would cancel it. Wait for it with: mise run portal -- wait --cell ${cells[0]}. To cancel it anyway, add --force" reason=step_running
+    running_stage "${cells[0]}"
+    [[ -z "$STAGE" ]] || json_fail portal "the step ${STAGE% *} of ${cells[0]} runs a stage (${STAGE#* }), and a retry would cancel it. Wait for it with: mise run portal -- wait --cell ${cells[0]}. To cancel it anyway, add --force" reason=step_running
   fi
   digest_out="$(cd "$ROOT" && mise run hostsvc -- bootstrap-digest)" || json_fail portal "mise run hostsvc -- bootstrap-digest failed: ${digest_out:-no output}"
   digest="$(jq -r '.bootstrapSHA256 // ""' <<<"$digest_out")"

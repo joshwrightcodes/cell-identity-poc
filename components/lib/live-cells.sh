@@ -23,7 +23,9 @@ live_cells() {
   existing="$(kind get clusters 2>/dev/null)" || { echo "error: kind get clusters failed, so the live cells are unknown" >&2; return 1; }
   for cell in $catalog; do
     grep -qx -- "$cell" <<<"$existing" || continue
-    ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "$cell-control-plane" 2>/dev/null)" || continue
+    # A cluster that kind lists but docker cannot inspect is an error, never an absent cell: a dropped cell would leave every admit list.
+    ip="$(docker inspect -f '{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' "$cell-control-plane" 2>&1)" \
+      || { echo "error: docker inspect of $cell-control-plane failed, so the live cells are unknown: $ip" >&2; return 1; }
     ip="${ip//[[:space:]]/}"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
     printf '%s\n' "$cell"

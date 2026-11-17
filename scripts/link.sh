@@ -36,7 +36,8 @@ link_hint() {
     printf '  CELL=%s LINK_ONLY=%s mise run cell:link\n' "$CELL_NAME" "${entries[$i]%%:*}" >&2
   done
 }
-trap link_hint EXIT
+# One handler: the hint first, and then the release of the lock, which a second trap would replace.
+trap 'link_hint; cluster_lock_release' EXIT
 
 # job_state <namespace> <job> prints Complete, Failed or nothing.
 job_state() {

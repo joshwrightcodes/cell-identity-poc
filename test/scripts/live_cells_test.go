@@ -29,6 +29,7 @@ const stubDocker = `#!/usr/bin/env bash
 [[ "$1" == inspect ]] || exit 2
 name="${*: -1}"
 cell="${name%-control-plane}"
+if [[ " ${STUB_DOCKER_FAIL:-} " == *" $cell "* ]]; then echo "Error: No such container: $name" >&2; exit 1; fi
 if [[ " ${STUB_NO_NODE_IP:-} " == *" $cell "* ]]; then echo; exit 0; fi
 case "$cell" in
   dev-cell-1) echo 172.18.0.5 ;;
@@ -101,6 +102,17 @@ func TestLiveCells(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a cluster that kind lists and docker cannot inspect stops the render", func(t *testing.T) {
+		out, errOut, err := liveCellsRun(t, "STUB_DOCKER_FAIL=dev-cell-1")
+		if err == nil || out != "" || !strings.Contains(errOut, "docker inspect of dev-cell-1-control-plane failed") {
+			t.Fatalf("err %v, stdout %q, stderr %q; want an error, never a list without the cell", err, out, errOut)
+		}
+		// A cluster that kind does not list is absent, and docker is not asked about it.
+		out, _, err = liveCellsRun(t, "STUB_DOCKER_FAIL=dev-cell-1", "STUB_KIND=management dev-cp rogue dev-cell-2")
+		if err != nil || strings.Fields(out)[0] != "dev-cell-2" {
+			t.Fatalf("err %v, output %q; want dev-cell-2 for a cell that kind does not list", err, out)
+		}
+	})
 	t.Run("kind does not answer", func(t *testing.T) {
 		out, errOut, err := liveCellsRun(t, "STUB_KIND_FAIL=1")
 		if err == nil || out != "" || !strings.Contains(errOut, "kind get clusters failed, so the live cells are unknown") {

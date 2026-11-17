@@ -84,8 +84,9 @@ exit 2
 const portalServe = `#!/usr/bin/env bash
 echo "hostsvc-serve $*" >>"$STUB_STATE/calls"
 case "$1" in
-  status) echo '{"running":true}' ;;
-  steps) if [[ -s "$STUB_STATE/steps.json" ]]; then cat "$STUB_STATE/steps.json"; else echo '{"steps":[],"corrupt":false}'; fi ;;
+  status) [[ -z "${STUB_SERVE_FAIL:-}" ]] || exit 1; echo '{"running":true}' ;;
+  steps) [[ -z "${STUB_STEPS_FAIL:-}" ]] || exit 1
+    if [[ -s "$STUB_STATE/steps.json" ]]; then cat "$STUB_STATE/steps.json"; else echo '{"steps":[],"corrupt":false}'; fi ;;
 esac
 `
 
@@ -246,6 +247,23 @@ func TestPortalScript(t *testing.T) {
 		for _, c := range e.calls() {
 			if strings.Contains(c, "--force") {
 				t.Errorf("--force reached mgmtd, which refuses it: %s", c)
+			}
+		}
+	})
+
+	t.Run("a failed read of the host service refuses the retry", func(t *testing.T) {
+		for _, env := range []string{"STUB_SERVE_FAIL=1", "STUB_STEPS_FAIL=1"} {
+			e := newPortalEnv(t)
+			e.set(t, "state-dev-cell-1", "failed")
+			out, _, err := e.run(t, []string{"retry", "--cell", "dev-cell-1"}, env)
+			m := portalJSON(t, out)
+			if err == nil || m["reason"] != "stage_read_failed" || !strings.Contains(m["error"].(string), "mise run hostsvc:serve -- ") {
+				t.Fatalf("%s: err %v, answer %v; want a refusal that names the read", env, err, m)
+			}
+			for _, c := range e.calls() {
+				if strings.Contains(c, "portal retry") {
+					t.Fatalf("%s: the retry reached the plane: %s", env, c)
+				}
 			}
 		}
 	})

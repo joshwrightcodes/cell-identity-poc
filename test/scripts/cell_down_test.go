@@ -32,8 +32,10 @@ echo "mise $* | CELL=${CELL:-} lock=$lock" >>"$STUB_LOG"
 	write("bin/hostsvc-serve", `#!/usr/bin/env bash
 echo "hostsvc-serve $*" >>"$STUB_LOG"
 case "$1" in
-  status) if [[ -n "${STUB_HOST_DOWN:-}" ]]; then echo '{"running":false}'; else echo '{"running":true}'; fi ;;
-  steps) if [[ -s "${STUB_STEPS:-/nonexistent}" ]]; then cat "$STUB_STEPS"; else echo '{"steps":[],"corrupt":false}'; fi ;;
+  status) [[ -z "${STUB_STATUS_FAIL:-}" ]] || exit 1
+    if [[ -n "${STUB_HOST_DOWN:-}" ]]; then echo '{"running":false}'; else echo '{"running":true}'; fi ;;
+  steps) [[ -z "${STUB_STEPS_FAIL:-}" ]] || exit 1
+    if [[ -s "${STUB_STEPS:-/nonexistent}" ]]; then cat "$STUB_STEPS"; else echo '{"steps":[],"corrupt":false}'; fi ;;
 esac
 `)
 	return root, calls
@@ -128,6 +130,28 @@ func TestCellDownRerenders(t *testing.T) {
 		}
 	})
 
+	t.Run("a failed read of the host service stops the delete", func(t *testing.T) {
+		for _, env := range []string{"STUB_STATUS_FAIL=1", "STUB_STEPS_FAIL=1"} {
+			root, calls := downRoot(t)
+			log, errOut, err := runDown(t, root, calls, env)
+			if err == nil || !strings.Contains(errOut, "mise run hostsvc:serve -- ") || strings.Contains(log, "hostsvc -- down") || strings.Contains(log, "cell:up") {
+				t.Fatalf("%s: err %v, output %q, calls\n%s; want a stop that names the read, before the delete", env, err, errOut, log)
+			}
+		}
+	})
+
+	t.Run("an unreadable catalog after the delete prints the re-render commands and fails", func(t *testing.T) {
+		root, calls := downRoot(t)
+		// A topology that does not parse makes yq fail, but only after the cell name check of lib.sh, so break it after the delete started.
+		if err := os.WriteFile(filepath.Join(root, "bin", "yq"), []byte("#!/usr/bin/env bash\nif [[ \"$*\" == *cell-identity* ]]; then exit 1; fi\nexec \""+yqPath(t)+"\" \"$@\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log, errOut, err := runDown(t, root, calls)
+		if err == nil || !strings.Contains(errOut, "CELL=dev-cp mise run cell:up") || !strings.Contains(errOut, "CELL=management mise run cell:link") || !strings.Contains(log, "hostsvc -- down --only dev-cell-1") {
+			t.Fatalf("err %v, output %q, calls\n%s; want the delete, the two commands and exit 1", err, errOut, log)
+		}
+	})
+
 	t.Run("CELL_DOWN_SKIP_RERENDER skips the two renders", func(t *testing.T) {
 		root, calls := downRoot(t)
 		log, errOut, err := runDown(t, root, calls, "CELL_DOWN_SKIP_RERENDER=1")
@@ -152,4 +176,14 @@ func TestCellDownRerenders(t *testing.T) {
 			t.Fatalf("err %v, output %q, calls\n%s; want a refusal before the delete", err, errOut, log)
 		}
 	})
+}
+
+// yqPath returns the real yq, for a stub that fails for one query only.
+func yqPath(t *testing.T) string {
+	t.Helper()
+	p, err := exec.LookPath("yq")
+	if err != nil {
+		t.Skip("yq is not installed")
+	}
+	return p
 }

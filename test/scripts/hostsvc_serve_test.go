@@ -78,6 +78,10 @@ func main() {
 		appendLine(filepath.Join(st, "ctl.log"), strings.Join(os.Args[2:], " "))
 		switch os.Args[2] {
 		case "steps":
+			if _, err := os.Stat(filepath.Join(st, "ctl-fail")); err == nil {
+				fmt.Println("{\"level\":\"ERROR\",\"msg\":\"hostsvc failed\",\"error\":\"admin socket: connection refused\"}")
+				os.Exit(1)
+			}
 			data, err := os.ReadFile(filepath.Join(st, "steps.json"))
 			if err != nil {
 				data = []byte("{\"steps\":[],\"corrupt\":false}\n")
@@ -712,6 +716,34 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		e.mustRun(t, "restart", "--force")
 		if second := e.status(t); *second.PID == *first.PID || second.RootSHA256 != e.shaB {
 			t.Fatalf("restart --force: %+v, want a new process with the new root", second)
+		}
+	})
+
+	t.Run("a failed read of the steps refuses start and restart", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		first := e.status(t)
+		e.setRoot(t, e.rootB)
+		if err := os.WriteFile(filepath.Join(e.state, "ctl-fail"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, verb := range []string{"start", "restart"} {
+			_, errOut, err := e.serve(t, verb)
+			if err == nil || !strings.Contains(errOut, "cannot tell whether a step runs a stage") || !strings.Contains(errOut, "--force") || *e.status(t).PID != *first.PID {
+				t.Fatalf("%s: err %v, stderr %q; want a refusal that leaves process %d", verb, err, errOut, *first.PID)
+			}
+		}
+		// A journal file that does not parse refuses too, while the service does not run.
+		e = newServeEnv(t)
+		dir := filepath.Join(e.build, "hostsvc", "steps")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "journal.json"), []byte("{not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, errOut, err := e.serve(t, "start"); err == nil || !strings.Contains(errOut, "cannot tell whether a step runs a stage") || e.read("starts") != "" {
+			t.Fatalf("a corrupt journal: err %v, stderr %q", err, errOut)
 		}
 	})
 
