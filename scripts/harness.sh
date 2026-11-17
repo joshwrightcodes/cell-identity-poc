@@ -83,6 +83,8 @@ case "${1:-}" in
     mise run hostsvc -- down
     # The journal, the step logs and the stored spec name clusters that go now. The log of the service and its key files stay.
     rm -rf "${BUILD_ROOT:?}/hostsvc/steps"
+    # The marker of gate:m6:provision names cells that go now, and gate:m6:repair would take a healthy new harness for an interrupted run.
+    rm -f "${BUILD_ROOT:?}/gate/m6-provision"
     names="$(yq -r '.clusters[].name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology"
     for name in $names; do

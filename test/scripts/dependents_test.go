@@ -207,12 +207,22 @@ func TestHarnessDown(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
+		marker := filepath.Join(root, "build", "gate", "m6-provision")
+		if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, []byte("dev-cell-1\ndev-cell-2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 		failing := filepath.Join(root, "bin", "hostsvc-serve-fails")
 		if err := os.WriteFile(failing, []byte("#!/usr/bin/env bash\nexit 1\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 		if _, _, err := runHarness(t, root, calls, "down", "HOSTSVC_SERVE="+failing); err == nil {
 			t.Fatal("down succeeded with a failing stop")
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Errorf("a failed stop deleted the provision marker: %v", err)
 		}
 		if _, err := os.Stat(filepath.Join(hostsvc, "steps", "journal.json")); err != nil {
 			t.Errorf("a failed stop deleted the journal: %v", err)
@@ -222,6 +232,9 @@ func TestHarnessDown(t *testing.T) {
 		}
 		if _, err := os.Stat(filepath.Join(hostsvc, "steps")); !os.IsNotExist(err) {
 			t.Errorf("the steps directory is still there after down: %v", err)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Errorf("the provision marker is still there after down: %v", err)
 		}
 		for _, f := range []string{"serve.log", "mgmt-keys/spec.pub"} {
 			if _, err := os.Stat(filepath.Join(hostsvc, f)); err != nil {
