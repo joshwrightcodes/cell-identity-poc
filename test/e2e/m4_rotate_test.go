@@ -6,13 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 )
+
+// sortedStrings returns the values in order, as the keys field of hostsvc:serve -- status lists them.
+func sortedStrings(v ...string) []string {
+	out := slices.Clone(v)
+	slices.Sort(out)
+	return out
+}
 
 // rotateWait bounds each call of rotate-signing-key: the cell passes, the render of dev-cp, the link of management and two verify runs.
 const rotateWait = 45 * time.Minute
@@ -111,6 +120,15 @@ func celldReplicas(t *testing.T, cell string) string {
 // dev-cp. The test logs the time of each step and the attestation gap: the time from the start of the SPIRE server container to the
 // first log line with the records of the new epoch. In that time the plugin holds no records, so a new pod cannot attest. The name is
 // outside the pattern of gate:m4.
+//
+// M6 adds an open step. Before the stage, the cell controller goes to no replica, and a step of dev-cell-2 with step.TestDigest opens
+// through mgmtCtl portal recreate, never through scripts/portal.sh. The stage syncs the staged key to the host service: its keys hold
+// the old and the new fingerprint. The commit syncs again: the keys hold the new fingerprint alone, which fails when the sync after the
+// commit is missing, because the host service then still holds the old key too. After the planes, ConfigMap cell-steps holds the step
+// with the same ID at the new keyEpoch, and the host service holds the new spec revision. Each stage and each render of the rotation
+// scales the cell controller back to 1 (the harness apply sets the replicas), so the test scales it down after the stage, and the
+// renders of the planes bring it back. Within 120 s the log of the host service for the step ID then holds bootstrap_mismatch, and
+// neither signature_invalid nor step_unindexed. The cleanup cancels the step.
 func TestRotationSigningKey(t *testing.T) {
 	const cell = rejectCell
 	closer := newOpCloser(t)
@@ -118,11 +136,24 @@ func TestRotationSigningKey(t *testing.T) {
 	oldPub := mgmtSigningPub(t)
 	started := time.Now()
 
+	// The cell controller stays down while the step is re-signed, so that the host service sees the re-signed step only after the planes.
+	setReplicas(t, spireCluster, cellCtlNamespace, "deployment/"+cellCtlDeployment, 0)
+	t.Cleanup(func() { setReplicas(t, spireCluster, cellCtlNamespace, "deployment/"+cellCtlDeployment, 1) })
+	openStep := m6Recreate(t, m6TestCell)
+	_, _, openEpoch, err := step.Peek(stepEnvelopeOf(t, m6TestCell, openStep, 2*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// (1) The stage, and the first cell pass.
 	staged := rotateStep(t, "stage")
 	if staged.Rotated || !staged.Staged || staged.New == "" || staged.Old == staged.New {
 		t.Fatalf("the stage printed %+v, want a staged key that differs from the live key", staged)
 	}
+	if keys := hostsvcStatus(t).Keys; !slices.Equal(keys, sortedStrings(staged.Old, staged.New)) {
+		t.Errorf("after the stage the host service holds the keys %v, want the old and the staged key %v", keys, sortedStrings(staged.Old, staged.New))
+	}
+	setReplicas(t, spireCluster, cellCtlNamespace, "deployment/"+cellCtlDeployment, 0)
 	rotateStep(t, "cells")
 	for _, c := range clustersWith(t, agentCellSet) {
 		keys := opKeys(t, c)
@@ -150,7 +181,31 @@ func TestRotationSigningKey(t *testing.T) {
 	if !commit.Rotated || commit.Epoch != before.Signed.Epoch+1 || commit.New != staged.New {
 		t.Fatalf("the commit printed %+v, want the staged key at the epoch %d", commit, before.Signed.Epoch+1)
 	}
+	if keys := hostsvcStatus(t).Keys; !slices.Equal(keys, []string{commit.New}) {
+		t.Errorf("after the commit the host service holds the keys %v, want the new key %s alone", keys, commit.New)
+	}
+	waitHostSpecAtLeast(t, mgmtStatus(t).Signed, 2*time.Minute)
 	rotateStep(t, "planes")
+	waitHostSpecAtLeast(t, mgmtStatus(t).Signed, 2*time.Minute)
+	if openEpoch >= commit.Epoch {
+		t.Fatalf("the step %s had the key epoch %d before the commit, want less than %d", openStep, openEpoch, commit.Epoch)
+	}
+	waitFor(t, "ConfigMap cell-steps to hold step "+openStep+" at the key epoch "+fmt.Sprint(commit.Epoch), 5*time.Minute, func() (bool, string) {
+		data, _, _, err := cellStepsConfigMap(t)
+		if err != nil {
+			return false, err.Error()
+		}
+		id, _, epoch, err := step.Peek([]byte(data[m6TestCell+".step.json"]))
+		return err == nil && id == openStep && epoch == commit.Epoch, fmt.Sprintf("the key holds step %q at the epoch %d (%v)", id, epoch, err)
+	})
+	// The renders of the planes set the replicas of the cell controller back to 1, and the cleanup does it again.
+	startCellController(t)
+	reasons := waitStepRefusedAtHost(t, openStep)
+	for _, r := range reasons {
+		if r == step.DetailSignatureInvalid || r == step.DetailStepUnindexed {
+			t.Errorf("the log of the host service for step %s holds the reason %s, want bootstrap_mismatch alone: %v", openStep, r, reasons)
+		}
+	}
 	waitFor(t, "the queue of the gateway to hold "+id+" with the new key epoch", 5*time.Minute, func() (bool, string) {
 		row := queueRow(t, cell, id)
 		return row.OpID == id && row.KeyEpoch == commit.Epoch, fmt.Sprintf("row %+v", row)
