@@ -8,6 +8,16 @@ source "$ROOT/components/lib/mgmt-key.sh"
 source "$ROOT/scripts/verify-lib.sh"
 set +e
 
+# A cell exists only through a signed step. cell:verify of a cell with no cluster prints one line and passes, so harness:verify,
+# which runs every cluster of the topology, does not fail while a cell is absent.
+if grep -qx -- "$CELL_NAME" <<<"$(catalog_cells)"; then
+  existing_clusters="$(kind get clusters 2>/dev/null)" || existing_clusters="unknown"
+  if [[ "$existing_clusters" != unknown ]] && ! grep -qx -- "$CELL_NAME" <<<"$existing_clusters"; then
+    log "skipped: cell $CELL_NAME has no cluster yet. A signed step creates it: mise run portal -- request --cell $CELL_NAME --wait"
+    exit 0
+  fi
+fi
+
 failures=0
 check() {
   local name="$1"; shift
@@ -381,7 +391,7 @@ expect_rogue_blocked() {
   expect_dial_blocked rogue default "$1"
 }
 
-# The SPIRE server must hold, for each agent cell and each subject of SPIRE_CELL_SUBJECTS, the node
+# The SPIRE server must hold, for each agent cell of the catalog (SPIRE_AGENT_CELLS, live or not) and each subject of SPIRE_CELL_SUBJECTS, the node
 # alias cell/<cell>/agents/<role> and the role entry under it, with the parents and selectors that
 # the render declares.
 check_agent_entries() {
@@ -927,7 +937,7 @@ if has_harness cell-gateway; then
   done
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
-  check "The SPIRE server holds the current node address and keys of $SPIRE_AGENT_CELLS" check_agent_cells_current
+  check "The SPIRE server holds the current node address and keys of each live cell of $SPIRE_AGENT_CELLS" check_agent_cells_current
   check "The SPIRE server holds the node alias and the role entry of each subject of $SPIRE_AGENT_CELLS" check_agent_entries
   check "The bundle store and the SPIRE server hold no test bundle or test entry of gate:m2" check_no_gate_bundles
   check "The SPIRE server runs the plugin image that build/images.env records" \
@@ -947,8 +957,11 @@ fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" && -z "${SPIRE_UPSTREAM:-}" ]]; then
   check "The SPIRE server keeps its CA key on its data volume, and the next root is more than 7 days away" check_ca_key_persists
 fi
+if [[ -n "${SPIRE_AGENT_CELLS:-}" && -n "${RELAY_TARGET:-}" ]] && has_harness cell-gateway; then
+  check "The SPIRE server, relay and gateway admit lists, and the --cell-node arguments, equal the node addresses of the live cells" check_admit_lists
+fi
 if [[ -n "${RELAY_TARGET:-}" ]]; then
-  check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and $SPIRE_AGENT_CELLS" check_relay_current
+  check "The relay routes and admit lists use the current node addresses of $RELAY_TARGET and each live cell of $SPIRE_AGENT_CELLS" check_relay_current
   relay_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
   for route in $RELAY_VIEW_ROUTES $RELAY_TELEMETRY_ROUTES; do
     check "A probe pod in rogue cannot open TCP to the relay node port ${route%%:*} of $CELL_NAME (steady state)" \
@@ -1125,11 +1138,14 @@ check_hub_peer_root() {
   peer_root_pods_current mesh-view-system mesh-view-hub peer-root "CELL=$CELL_NAME mise run cell:link" || return 1
 }
 
-# hub_tunnel_gaps prints each cell of MESH_VIEW_CELLS whose tunnel is not up, by the state that the hub serves.
+# hub_tunnel_gaps prints each live cell of MESH_VIEW_CELLS whose tunnel is not up, by the state that the hub serves. A cell with
+# no cluster has no tunnel.
 hub_tunnel_gaps() {
-  local entry cell
+  local entry cell live
+  live="$(live_cells)" || return 1
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
+    grep -qx -- "$cell" <<<"$live" || continue
     hub_cell_state "$cell" || echo "$cell"
   done
 }
@@ -1162,6 +1178,7 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
   if [[ "$comp" == mgmt-api ]]; then
     check "ConfigMap hostsvc-pin equals the certificate that the host service presents" check_mgmt_hostsvc_pin
     check "The host service trusts the live root of $CELL_NAME" check_mgmt_hostsvc_root
+    check "The host service serves the live dev root and the keys of mgmtd, and knows the signed spec revision" check_hostsvc_roots
     check "The host service address in the policy and in mgmtd is the one that the node resolves" check_mgmt_hostsvc_address
     check "The API port admits the current $VIEW_CONTROL_PLANE node address" check_mgmt_env_address
     check "ConfigMap peer-root holds the live roots of $VIEW_CONTROL_PLANE" check_mgmt_peer_root
@@ -1184,7 +1201,7 @@ for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
     check "The hub listener admits the current $VIEW_CONTROL_PLANE node address" check_hub_env_address
     check "ConfigMap peer-root of mesh-view-system holds the live roots of $VIEW_CONTROL_PLANE" check_hub_peer_root
     check "ConfigMap cell-registry of mesh-view-system is the registry that mgmtd published" check_registry_published mesh-view-system
-    check "The hub holds a tunnel from each cell of MESH_VIEW_CELLS" check_hub_tunnels
+    check "The hub holds a tunnel from each live cell of MESH_VIEW_CELLS" check_hub_tunnels
   fi
   for workload in $(yq -o=json -I=0 'select(.kind == "Deployment" or .kind == "StatefulSet" or .kind == "Job")' "$bundle" 2>/dev/null \
       | jq -r 'select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))

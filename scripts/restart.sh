@@ -10,13 +10,20 @@
 # and every peer copy of it stays valid.
 # The script deletes the pods and lets the controller replace them. It does not change the
 # Deployment or the StatefulSet, so their field managers stay the same.
+# HARNESS_ONLY=<component> restarts only the workloads of that harness component, and leaves the SPIRE server and the other
+# components alone. An unknown name fails.
 source "$(dirname "$0")/lib.sh"
 
 runs_spire_server=0
 for entry in "${COMPONENTS[@]}"; do
   [[ "${entry%%:*}" == spire-server ]] && runs_spire_server=1
 done
-((${#HARNESS_COMPONENTS[@]} + ${#LINK_COMPONENTS[@]} > 0 || runs_spire_server)) \
+restart_entries=(${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"})
+if [[ -n "${HARNESS_ONLY:-}" ]]; then
+  restart_entries=("$(harness_only_entry)") || exit 1
+  runs_spire_server=0
+fi
+((${#restart_entries[@]} > 0 || runs_spire_server)) \
   || die "cluster $CELL_NAME has no harness or link component and no SPIRE server in harness/topology.yaml, so cell:restart has nothing to restart"
 
 # rollout_hint <namespace> <deployment> prints the commands that show why a rollout failed.
@@ -41,7 +48,7 @@ if ((runs_spire_server)); then
   log "restarted the SPIRE server in spire-system. It answered no agent for $((SECONDS - stopped))s"
 fi
 
-for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"} ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do
+for entry in ${restart_entries[@]+"${restart_entries[@]}"}; do
   ns="${entry#*:}"
   workloads="$(harness_workloads "${entry%%:*}" "$ns")" || exit 1
   for workload in $workloads; do

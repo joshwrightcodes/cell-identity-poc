@@ -6,6 +6,8 @@
 # LATE_HARNESS read the SPIRE server of their own cluster: CELL_UP_SKIP_LATE=1 skips them, and
 # HYDRATE_ONLY=late renders only them. LINK_ONLY=<component> narrows HYDRATE_ONLY=link to that one
 # link component, and an unknown name fails.
+# HARNESS_ONLY=<component> renders only that harness component, for cell:up with HARNESS_ONLY, and an unknown
+# name fails. It cannot go with HYDRATE_ONLY.
 source "$(dirname "$0")/lib.sh"
 
 [[ -f "$FACTS" ]] || "$ROOT/scripts/facts.sh"
@@ -13,17 +15,22 @@ set -a; source "$FACTS"; set +a
 export CELL_NAME CELL_MESH_TRUST_DOMAIN
 
 entries=()
+[[ -z "${HARNESS_ONLY:-}" || -z "${HYDRATE_ONLY:-}" ]] || die "HARNESS_ONLY and HYDRATE_ONLY cannot go together"
 case "${HYDRATE_ONLY:-}" in
-  "") entries=("${COMPONENTS[@]}" ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"})
-    if [[ "${CELL_UP_SKIP_LINK:-}" == 1 ]]; then
-      ((${#LINK_COMPONENTS[@]} == 0)) || log "skipping the link components, because CELL_UP_SKIP_LINK=1"
+  "") if [[ -n "${HARNESS_ONLY:-}" ]]; then
+      entries=("$(harness_only_entry)") || exit 1
     else
-      entries+=(${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"})
-    fi
-    if [[ "${CELL_UP_SKIP_LATE:-}" == 1 ]]; then
-      kept=()
-      for e in "${entries[@]}"; do [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]] || kept+=("$e"); done
-      entries=("${kept[@]}")
+      entries=("${COMPONENTS[@]}" ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"})
+      if [[ "${CELL_UP_SKIP_LINK:-}" == 1 ]]; then
+        ((${#LINK_COMPONENTS[@]} == 0)) || log "skipping the link components, because CELL_UP_SKIP_LINK=1"
+      else
+        entries+=(${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"})
+      fi
+      if [[ "${CELL_UP_SKIP_LATE:-}" == 1 ]]; then
+        kept=()
+        for e in "${entries[@]}"; do [[ " ${LATE_HARNESS[*]} " == *" ${e%%:*} "* ]] || kept+=("$e"); done
+        entries=("${kept[@]}")
+      fi
     fi ;;
   link) linked="$(link_entries)" || exit 1
     while read -r e; do [[ -z "$e" ]] || entries+=("$e"); done <<<"$linked" ;;

@@ -19,77 +19,117 @@ import (
 )
 
 // libFunc runs a function of scripts/lib.sh in the cluster CELL and returns its standard output.
-func libFunc(t *testing.T, cell, call string) (string, string, error) {
+func libFunc(t *testing.T, cell, call string, env ...string) (string, string, error) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
+	bin := t.TempDir()
+	writeLiveStubs(t, bin)
 	cmd := exec.Command("bash", "-c", `source "$1"; `+call, "_", lib)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + cell, "POC_BUILD_ROOT=" + t.TempDir()}
+	cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + cell, "POC_BUILD_ROOT=" + t.TempDir()}, env...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
 	return out.String(), errOut.String(), err
 }
 
-// TestDependentsManagementOrder: the rebuild order of management runs the first link of mgmt-api before
-// dev-cp and before each cell, and no step waits until every cell is bound.
-func TestDependentsManagementOrder(t *testing.T) {
-	out, errOut, err := libFunc(t, "management", "dependents_of management")
-	if err != nil {
-		t.Fatalf("dependents_of management: %v\n%s", err, errOut)
-	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	index := func(prefix string) int {
-		for i, l := range lines {
-			if l == prefix {
-				return i
+// TestDependentsManagementRebuild: the rebuild order of management runs the first link of mgmt-api before dev-cp and before
+// each cell. A new mgmtd has no request, so the portal asks again for each live cell and waits for it, and the full link comes
+// last. A cell that has no cluster is neither requested nor waited for.
+func TestDependentsManagementRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{"both cells are live", nil, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2",
+			"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2",
+			"CELL=management mise run cell:link",
+		}},
+		{"one cell is live", []string{"STUB_KIND=management dev-cp rogue dev-cell-2"}, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"mise run portal -- request --cell dev-cell-2",
+			"mise run portal -- wait --cell dev-cell-2",
+			"CELL=management mise run cell:link",
+		}},
+		{"no cell is live", []string{"STUB_KIND=management dev-cp rogue"}, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"CELL=management mise run cell:link",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, err := libFunc(t, "management", "dependents_of management", tc.env...)
+			if err != nil {
+				t.Fatalf("dependents_of management: %v\n%s", err, errOut)
 			}
-		}
-		t.Fatalf("the order has no line %q:\n%s", prefix, out)
-		return -1
+			if got := strings.Split(strings.TrimSpace(out), "\n"); !slices.Equal(got, tc.want) {
+				t.Fatalf("order\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.want, "\n"))
+			}
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			link := slices.Index(lines, "CELL=management LINK_ONLY=mgmt-api mise run cell:link")
+			if devcp := slices.Index(lines, "CELL=dev-cp mise run cell:up"); link < 0 || devcp < link {
+				t.Errorf("the link of mgmt-api (%d) must come before the cell:up of dev-cp (%d)", link, devcp)
+			}
+			for _, l := range lines {
+				if strings.Contains(l, "bound") || strings.Contains(l, "attest") || strings.Contains(l, "CELL=dev-cell-") {
+					t.Errorf("step %q waits for a bind or runs cell:up of a cell: a cell exists only through its step", l)
+				}
+			}
+		})
 	}
-	want := []string{
-		"mise run hostsvc -- up --only management",
-		"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cp mise run cell:up",
-		"CELL=dev-cell-1 mise run cell:up",
-		"CELL=dev-cell-2 mise run cell:up",
-		"CELL=management mise run cell:link",
-	}
-	if !slices.Equal(lines, want) {
-		t.Fatalf("order\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
-	}
-	link := index("CELL=management LINK_ONLY=mgmt-api mise run cell:link")
-	for _, later := range []string{"CELL=dev-cp mise run cell:up", "CELL=dev-cell-1 mise run cell:up", "CELL=dev-cell-2 mise run cell:up"} {
-		if index(later) < link {
-			t.Errorf("%q comes before the link of mgmt-api", later)
-		}
-	}
-	for _, l := range lines {
-		if strings.Contains(l, "wait") || strings.Contains(l, "bound") || strings.Contains(l, "attest") {
-			t.Errorf("step %q waits for a bind", l)
-		}
+}
+
+// TestDependentsCellRebuild: a lost or rebuilt cell goes through cell:down (while its cluster exists), a portal recreate
+// that waits, and the management link. A cell that must be created first goes through the portal too.
+func TestDependentsCellRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"the cluster exists", nil, "CELL=dev-cell-1 mise run cell:down\nmise run portal -- recreate --cell dev-cell-1 --wait\nCELL=management mise run cell:link"},
+		{"the cluster is gone", []string{"STUB_KIND=management dev-cp rogue dev-cell-2"}, "mise run portal -- recreate --cell dev-cell-1 --wait\nCELL=management mise run cell:link"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, err := libFunc(t, "management", "dependents_of dev-cell-1", tc.env...)
+			if err != nil || strings.TrimSpace(out) != tc.want {
+				t.Fatalf("err %v, output %q, stderr %q; want %q", err, out, errOut, tc.want)
+			}
+		})
 	}
 }
 
 // dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
-// admits envd by the dev-cp root and the node address. A rebuilt cell links no registry: mgmtd publishes them.
+// admits envd by the dev-cp root and the node address. It names the live cells only.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
 		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
 		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
 		"dependents_of gateway-store": "mise run gw:reset",
-		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up",
 		"dependents_of dev-cp":        "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)
 		if err != nil || strings.TrimSpace(out) != want {
 			t.Errorf("%s: err %v, output %q, stderr %q; want %q", call, err, out, errOut, want)
 		}
+	}
+	out, errOut, err := libFunc(t, "management", "dependents_of dev-cp", "STUB_KIND=management dev-cp rogue dev-cell-1")
+	if want := "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=management mise run cell:link"; err != nil || strings.TrimSpace(out) != want {
+		t.Errorf("dependents_of dev-cp with one live cell: err %v, output %q, stderr %q; want %q", err, out, errOut, want)
 	}
 	if _, errOut, err := libFunc(t, "management", "dependents_of rogue"); err == nil || !strings.Contains(errOut, "dependents_of knows") {
 		t.Errorf("an unknown cluster: err %v, stderr %q", err, errOut)
@@ -104,9 +144,10 @@ func harnessRoot(t *testing.T) (root, calls string) {
 	testtool.Need(t, "yq", "jq", "bash")
 	root = t.TempDir()
 	calls = filepath.Join(root, "calls.log")
-	for _, d := range []string{"scripts", "cells", "harness"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 		copyFiles(t, root, d)
 	}
+	writeLiveStubs(t, filepath.Join(root, "bin"))
 	write := func(path, content string) {
 		p := filepath.Join(root, path)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -166,9 +207,22 @@ func TestHarnessUpOrderAndDown(t *testing.T) {
 		t.Fatalf("harness down failed: %v\n%s", err, errOut)
 	}
 	lines := strings.Split(strings.TrimSpace(log), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "mise run hostsvc -- down") || lines[1] != "hostsvc-serve stop" {
-		t.Fatalf("down calls\n%s\nwant hostsvc down, then hostsvc-serve stop last", log)
+	if len(lines) != 2 || lines[0] != "hostsvc-serve stop" || !strings.HasPrefix(lines[1], "mise run hostsvc -- down") {
+		t.Fatalf("down calls\n%s\nwant hostsvc-serve stop first, then hostsvc down", log)
 	}
+	// TestHarnessDownStopsHostFirst: the host service runs the steps that create and admit cells, so it stops before any
+	// cluster goes, and a failed stop leaves the clusters alone.
+	t.Run("TestHarnessDownStopsHostFirst", func(t *testing.T) {
+		root, calls := harnessRoot(t)
+		failing := filepath.Join(root, "bin", "hostsvc-serve-fails")
+		if err := os.WriteFile(failing, []byte("#!/usr/bin/env bash\necho \"hostsvc-serve $*\" >>\"$STUB_LOG\"\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log, _, err := runHarness(t, root, calls, "down", "HOSTSVC_SERVE="+failing)
+		if err == nil || strings.Contains(log, "hostsvc -- down") || !strings.HasPrefix(log, "hostsvc-serve stop") {
+			t.Fatalf("err %v, calls\n%s\nwant a stop that fails first, and no cluster deleted after it", err, log)
+		}
+	})
 }
 
 // TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps

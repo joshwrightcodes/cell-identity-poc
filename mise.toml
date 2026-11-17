@@ -158,7 +158,7 @@ description = "Run the host service: up, down or facts, with the arguments after
 run = "go run ./cmd/hostsvc"
 
 [tasks."hostsvc:serve"]
-description = "Run the host service on this Mac, which answers the key requests of mgmtd on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status or pin"
+description = "Run the host service on this Mac, which answers the key requests and the spec pushes of mgmtd and the step requests of the cell controller on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status, pin, sync (write the dev root and the keys after the cross-check with mgmtd), steps [--reset], log --step <id> [--follow] or cancel --cell <c> | --step <id>. start and restart refuse while a step runs a stage, unless --force"
 env = { CELL = "management" }
 run = "scripts/hostsvc-serve.sh"
 
@@ -246,6 +246,19 @@ run = "scripts/gate.sh m5-drill"
 [tasks."gate:m5:repair"]
 description = "Run gate:m4:repair, set the replicas of the cell gateway and of celld back to 1, delete the test namespaces m5-* of every cluster, and check that each celld holds a stream at the gateway. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m5-repair.sh"
+
+[tasks.portal]
+description = "The portal stand-in, with the arguments after --: request --cell <c>... [--wait], wait --cell <c>..., withdraw --cell <c>..., recreate --cell <c> [--wait], retry --cell <c> [--force] [--wait] or cancel --cell <c>. One command is one mgmtd ctl portal call and one commit. Prints one JSON line"
+env = { CELL = "management" }
+run = "scripts/portal.sh"
+
+[tasks."gate:m6"]
+description = "Run the M6 end-to-end tests against the management plane stand-in, the host service and the cells, plus the go test arguments after --. It runs gate:m6:repair --check first, and checks the deployed image of mgmtd. The task builds no image: run mise run images first, or mise run images -- <name> for one image"
+run = "scripts/gate.sh m6"
+
+[tasks."gate:m6:repair"]
+description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. With --check, only report, also fail on an open step that no test recorded, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m6-repair.sh"
 
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"

@@ -6,7 +6,7 @@
 # links need the other clusters. Its first link step runs only mgmt-api, right after its cell:up and
 # before dev-cp. The same step runs again right after the cell:up of dev-cp, which adds the dev-cp
 # root that mgmtd needs to accept envd. The full link phase runs last, with cell:link. When a step fails, the script
-# prints that step and every later one. harness:down stops the host service last.
+# prints that step and every later one. harness:down stops the host service first.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
@@ -61,14 +61,15 @@ case "${1:-}" in
     done
     ;;
   down)
+    # The host service runs the steps that create and admit cells. Stop it first, so that no stage runs while the
+    # clusters go, and no step re-creates a cell that this command deletes.
+    "${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}" stop
     mise run hostsvc -- down
     names="$(yq -r '.clusters[].name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology"
     for name in $names; do
       rm -rf "${BUILD_ROOT:?}/${name:?}"
     done
-    # The host service holds the root of the deleted management cluster, so stop it last.
-    "${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}" stop
     ;;
   *) die "usage: harness.sh up|down" ;;
 esac

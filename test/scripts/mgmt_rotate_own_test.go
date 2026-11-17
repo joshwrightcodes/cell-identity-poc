@@ -45,7 +45,7 @@ func TestRotateCARefreshesTheSidecarBundle(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newRotateServer(t)
 			root := t.TempDir()
-			for _, d := range []string{"scripts", "cells", "harness"} {
+			for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 				copyFiles(t, root, d)
 			}
 			refreshLog := filepath.Join(s.dir, "refresh.log")

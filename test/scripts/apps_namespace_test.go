@@ -321,7 +321,14 @@ func relayFixture(t *testing.T, target string, cells ...string) string {
 			args = append(args, `"--route"`, `"`+p+`"`)
 		}
 		deploy := `{"spec":{"template":{"spec":{"containers":[{"args":[` + strings.Join(args, ",") + `,"--health",":8080"]}]}}}}`
-		np := `{"spec":{"ingress":[{"from":[` + strings.Join(from, ",") + `]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}]}],"egress":[{"to":[{"ipBlock":{"cidr":"` + target + `/32"}}]},{"to":[]}]}}`
+		var routePorts, targetPorts []string
+		for _, p := range ports {
+			container, rest, _ := strings.Cut(p, "=")
+			routePorts = append(routePorts, `{"port":`+container+`}`)
+			targetPorts = append(targetPorts, `{"port":`+rest[strings.LastIndex(rest, ":")+1:]+`}`)
+		}
+		np := `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]},{"from":[` + strings.Join(from, ",") + `],"ports":[` + strings.Join(routePorts, ",") + `]}],` +
+			`"egress":[{"to":[],"ports":[{"port":4317}]},{"to":[{"ipBlock":{"cidr":"` + target + `/32"}}],"ports":[` + strings.Join(targetPorts, ",") + `]}]}}`
 		for f, data := range map[string]string{"d-" + name + ".json": deploy, "n-" + name + ".json": np} {
 			if err := os.WriteFile(filepath.Join(dir, f), []byte(data), 0o644); err != nil {
 				t.Fatal(err)

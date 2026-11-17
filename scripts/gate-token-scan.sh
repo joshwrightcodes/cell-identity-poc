@@ -11,7 +11,10 @@ since="${1:?usage: gate-token-scan.sh <start time, RFC 3339 UTC>}"
 shape='eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]*\.'
 status=0
 
+# A cell has no cluster until its step creates it, so the scan reads the clusters that exist.
+existing="$(existing_clusters)" || die "could not list the clusters"
 for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+  grep -qx -- "$cluster" <<<"$existing" || continue
   targets="$(kubectl --context "kind-$cluster" get pods -A -o json | jq -r '.items[] | . as $p
     | $p.spec.containers[] | select(.image | test("/(cellgw|envd|mgmtd|celld|cell-proxy)(@|:|$)")) | .name as $c
     | "\($p.metadata.namespace) \($p.metadata.name) \($c) \(([$p.status.containerStatuses[]? | select(.name == $c) | .restartCount] | first) // 0)"')" \

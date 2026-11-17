@@ -8,8 +8,9 @@
 #   3. Delete the Job and scale mgmtd to 1.
 #   4. Wait until mgmtd-0 is Ready.
 # A fresh state starts with a new key, so the plugin of the SPIRE server of dev-cp starts its marks again.
-# The script prints one JSON line with the moved files and the next commands: the cell:up of dev-cp, the cell:up of each cell
-# of SPIRE_AGENT_CELLS, and the full link of management. A failure prints one JSON error line on standard output.
+# The script prints one JSON line with the moved files and the next commands: the cell:up of dev-cp, the cell:up of each live
+# cell, the portal request and the portal wait for the live cells, and the full link of management. A failure prints one JSON
+# error line on standard output. A new state holds no request, so each bind gets cell_unknown until the portal requests the cell again.
 # After a failure in step 2, and after an interrupt, the script scales mgmtd back to 1. The Job can have moved one file before it failed,
 # so the files can be partly moved. Read the moved list in the Job output, or run: mise run mgmt -- status.
 # MGMT_RESET_WAIT bounds each wait in seconds (default 180).
@@ -23,9 +24,16 @@ job="mgmtd-reset-state-$(date +%s)"
 # After a reset the signing key is new, and the ConfigMap mgmt-op-key of each cell holds the old one. Each cell:up pins the
 # new key. They come after the cell:up of dev-cp, which pins the key in the gateway, and before the full link.
 next=("CELL=dev-cp mise run cell:up")
-# The cells are the ones that dev-cp lists in SPIRE_AGENT_CELLS, as dependents_of reads them.
-agent_cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
-for cell in $agent_cells; do next+=("CELL=$cell mise run cell:up"); done
+# The cells are the live cells, as dependents_of reads them. A request for a cell whose cluster exists skips the creation.
+live="$(live_cells)" || json_fail mgmt-reset-state "kind does not answer, so the live cells are unknown" step=read-live-cells next=""
+portal_cells=""
+for cell in $live; do
+  next+=("CELL=$cell mise run cell:up")
+  portal_cells+=" --cell $cell"
+done
+if [[ -n "$portal_cells" ]]; then
+  next+=("mise run portal -- request$portal_cells" "mise run portal -- wait$portal_cells")
+fi
 next+=("CELL=management mise run cell:link")
 
 scale() { "$ROOT/scripts/harness-replicas.sh" "$CELL_NAME" "$ns" statefulset/mgmtd "$1" >/dev/null; }

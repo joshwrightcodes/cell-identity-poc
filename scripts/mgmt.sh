@@ -5,6 +5,8 @@
 # The admin socket of mgmtd is a unix socket in the pod, so the command runs there. The binary prints
 # one JSON line. When mgmtd-0 is absent or not Ready, the script prints one JSON error line that
 # names the link command, and exits with status 1. A failed kubectl exec with no output also prints one JSON error line.
+# The command step sign reads the step as JSON on standard input, so only that command runs kubectl exec with -i. Another
+# command would take the standard input of a shell loop that calls this script.
 export CELL="${CELL:-management}"
 source "$(dirname "$0")/lib.sh"
 
@@ -25,7 +27,9 @@ timeout=()
 case "${1:-}" in status | records | pubkey | keys) timeout=(--request-timeout=60s) ;; esac
 # The output is captured, so a kubectl failure that prints nothing on standard output still ends with one JSON error line.
 rc=0
-out="$(kubectl --context "kind-$CELL_NAME" ${timeout[@]+"${timeout[@]}"} -n mgmt-system exec mgmtd-0 -c mgmtd -- /ko-app/mgmtd ctl "$@")" || rc=$?
+stdin=()
+[[ "${1:-}" != step || "${2:-}" != sign ]] || stdin=(-i)
+out="$(kubectl --context "kind-$CELL_NAME" ${timeout[@]+"${timeout[@]}"} -n mgmt-system exec ${stdin[@]+"${stdin[@]}"} mgmtd-0 -c mgmtd -- /ko-app/mgmtd ctl "$@")" || rc=$?
 if ((rc != 0)) && [[ -z "$out" ]]; then
   json_fail mgmt "kubectl exec into mgmtd-0 failed with exit code $rc and printed no output. Run: mise run harness:status" "kubectl_exit:=$rc"
 fi

@@ -217,7 +217,7 @@ func TestGateM4PreCheck(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
-			for _, d := range []string{"scripts", "cells", "harness"} {
+			for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 				copyFiles(t, root, d)
 			}
 			write := func(path, body string) {

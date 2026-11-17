@@ -46,6 +46,8 @@ func linkRoot(t *testing.T) (root, logFile string) {
 	copyDir("scripts", "scripts")
 	copyDir("cells", "cells")
 	copyDir("harness", "harness")
+	copyDir("components/lib", "components/lib")
+	writeLiveStubs(t, filepath.Join(root, "bin"))
 	write := func(path, content string) {
 		p := filepath.Join(root, path)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
