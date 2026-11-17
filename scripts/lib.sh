@@ -1194,6 +1194,8 @@ dependents_of() {
         echo "mise run portal -- request$args"
         echo "mise run portal -- wait$args"
       fi
+      # Each cell holds the root and the node address of management in its uplinks and its mesh tunnel.
+      for cell in $live; do echo "CELL=$cell mise run cell:up"; done
       echo "CELL=management mise run cell:link" ;;
     dev-cp)
       live="$(live_cells)" || return 1

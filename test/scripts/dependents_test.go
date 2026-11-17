@@ -37,8 +37,9 @@ func libFunc(t *testing.T, cell, call string, env ...string) (string, string, er
 }
 
 // TestDependentsManagementRebuild: the rebuild order of management runs the first link of mgmt-api before dev-cp and before
-// each cell. A new mgmtd has no request, so the portal asks again for each live cell and waits for it, and the full link comes
-// last. A cell that has no cluster is neither requested nor waited for.
+// each cell. A new mgmtd has no request, so the portal asks again for each live cell and waits for it. Each live cell then
+// runs cell:up, because its uplinks and mesh tunnel hold the root and node address of management. The full link comes last.
+// A cell that has no cluster is neither requested nor waited for.
 func TestDependentsManagementRebuild(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -52,6 +53,8 @@ func TestDependentsManagementRebuild(t *testing.T) {
 			"CELL=dev-cp mise run cell:up",
 			"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2",
 			"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2",
+			"CELL=dev-cell-1 mise run cell:up",
+			"CELL=dev-cell-2 mise run cell:up",
 			"CELL=management mise run cell:link",
 		}},
 		{"one cell is live", []string{"STUB_KIND=management dev-cp rogue dev-cell-2"}, []string{
@@ -61,6 +64,7 @@ func TestDependentsManagementRebuild(t *testing.T) {
 			"CELL=dev-cp mise run cell:up",
 			"mise run portal -- request --cell dev-cell-2",
 			"mise run portal -- wait --cell dev-cell-2",
+			"CELL=dev-cell-2 mise run cell:up",
 			"CELL=management mise run cell:link",
 		}},
 		{"no cell is live", []string{"STUB_KIND=management dev-cp rogue"}, []string{
@@ -85,8 +89,8 @@ func TestDependentsManagementRebuild(t *testing.T) {
 				t.Errorf("the link of mgmt-api (%d) must come before the cell:up of dev-cp (%d)", link, devcp)
 			}
 			for _, l := range lines {
-				if strings.Contains(l, "bound") || strings.Contains(l, "attest") || strings.Contains(l, "CELL=dev-cell-") {
-					t.Errorf("step %q waits for a bind or runs cell:up of a cell: a cell exists only through its step", l)
+				if strings.Contains(l, "bound") || strings.Contains(l, "attest") {
+					t.Errorf("step %q waits for a bind: a cell exists only through its step", l)
 				}
 			}
 		})
