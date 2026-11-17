@@ -2,6 +2,7 @@ package hostsvc
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1535,11 +1536,21 @@ func TestStartHoldsQueueUntilSpecPush(t *testing.T) {
 		ae.waitState(s.ID, mgmtapi.StepDone)
 	})
 	t.Run("repeated_push_runs", func(t *testing.T) {
-		ae, s, env := restartedWithQueued(t)
+		ae, s, _ := restartedWithQueued(t)
 		if _, ok := ae.spec.Current(); !ok {
 			t.Fatal("no stored spec")
 		}
-		ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
+		raw, err := os.ReadFile(filepath.Join(ae.dir, "spec.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var stored storedSpec
+		if err := json.Unmarshal(raw, &stored); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ae.spec.Put([]byte(stored.Envelope)); err != nil {
+			t.Fatalf("repeated push: %v", err)
+		}
 		ae.waitState(s.ID, mgmtapi.StepDone)
 	})
 }
@@ -1560,12 +1571,15 @@ func TestStartHoldsFailedStepUntilSpecPush(t *testing.T) {
 	ae.a = ae.newActor(j2, nil)
 	ae.start()
 	ae.clock.Advance(time.Hour)
-	if st := ae.submit(s, env); st.State != mgmtapi.StepFailed {
-		t.Fatalf("a PUT before a push gives %s, want failed", st.State)
+	// A PUT during the hold must not return failed with a past RetryAt, because the cell controller
+	// would send it again at once. The step waits queued, and no stage runs before the push.
+	if st := ae.submit(s, env); st.State != mgmtapi.StepQueued {
+		t.Fatalf("a PUT during the hold gives %s, want queued", st.State)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if got := ae.stagesRun(); len(got) != 1 {
+		t.Fatalf("stages run = %v, want only the first run before the restart", got)
 	}
 	ae.putSpec([]spec.StepEntry{ae.indexOf(s, env)}, nil)
-	waitUntil(t, "the actor to take the push", 5*time.Second, func() bool { return !ae.a.held.Load() })
-	if st := ae.submit(s, env); st.State == mgmtapi.StepFailed {
-		t.Fatalf("a PUT after a push gives %s, want a retry", st.State)
-	}
+	waitUntil(t, "a run after the push", 5*time.Second, func() bool { return len(ae.stagesRun()) >= 2 })
 }

@@ -99,7 +99,9 @@ func keySHA(k ed25519.PublicKey) string {
 }
 
 // Put verifies the envelope under the trusted keys and keeps it when its revision is higher than
-// the stored one. The same revision with the same payload succeeds and changes nothing. A lower
+// the stored one. The same revision with the same payload succeeds and writes nothing, but it
+// notifies every subscriber like a new spec, because it shows that the management plane holds
+// nothing newer, and the actor ends its start hold on it. A lower
 // revision, or the same revision with another payload, gets revision_old, unless the signing key
 // replaced the key of the stored spec in the trusted set: then the mark resets, as envd does. The
 // errors carry a step detail: signature_invalid, payload_invalid, env_mismatch or revision_old.

@@ -104,8 +104,8 @@ type Actor struct {
 	steps  metric.Int64Counter
 
 	// held is true from the start until the spec store accepts a push. While it is set, no queued
-	// step runs and no failed step queues again, because the stored spec can be older than the
-	// intent of the management plane.
+	// step runs, because the stored spec can be older than the intent of the management plane. A
+	// PUT may still queue a failed step, so that the cell controller does not send it again at once.
 	held atomic.Bool
 
 	mu       sync.Mutex
@@ -326,7 +326,7 @@ func (a *Actor) indexedByNewest(id string) bool {
 
 func (a *Actor) resubmitLocked(e JournalEntry, envelope []byte, sha string, s step.Step) (mgmtapi.StepStatus, error) {
 	if e.EnvelopeSHA256 == sha {
-		if e.Status.State == mgmtapi.StepFailed && !a.held.Load() && !a.now().Before(e.Status.RetryAt) && e.Status.Attempts < a.cfg.MaxAttempts {
+		if e.Status.State == mgmtapi.StepFailed && !a.now().Before(e.Status.RetryAt) && e.Status.Attempts < a.cfg.MaxAttempts {
 			e2, _ := a.updateLocked(s.ID, func(e *JournalEntry) { e.Status.State = mgmtapi.StepQueued })
 			a.signal()
 			return e2.Status, nil
