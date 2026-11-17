@@ -206,9 +206,10 @@ max_first_block=10
 # TCP connection to the address. Only a dial timeout counts as blocked, because a refused dial
 # means that the packets reached the host. The first blocked dial must come within
 # max_first_block seconds of Ready, and three more dials over about six seconds must also time
-# out. The time to the first block goes to build/<cluster>/verify-probes.log.
+# out. The time to the first block goes to build/<cluster>/verify-probes.log. A fourth argument "refused" makes a refused dial count
+# as blocked too, for an address where nothing listens.
 expect_dial_blocked() {
-  local cluster="$1" ns="$2" addr="$3" image name overrides out="" dialed="" result=1 ready_at dial_start first="" i
+  local cluster="$1" ns="$2" addr="$3" also="${4:-}" image name overrides out="" dialed="" result=1 ready_at dial_start first="" i
   local kc=(kubectl --context "kind-$cluster" -n "$ns")
   image="$(sed -n 's/^IMAGE_NETPROBE=//p' "$BUILD_ROOT/images.env" 2>/dev/null)"
   [[ -n "$image" ]] || { echo "build/images.env has no IMAGE_NETPROBE. Run mise run images."; return 1; }
@@ -232,7 +233,7 @@ expect_dial_blocked() {
     while ((SECONDS - ready_at <= max_first_block)); do
       dial_start=$SECONDS
       dial
-      if [[ "$dialed" == timeout ]]; then first=$((dial_start - ready_at)); break; fi
+      if [[ "$dialed" == timeout || ( -n "$also" && "$dialed" == "$also" ) ]]; then first=$((dial_start - ready_at)); break; fi
       sleep 1
     done
     if [[ -n "$first" ]] && ((first > max_first_block)); then
@@ -244,7 +245,7 @@ expect_dial_blocked() {
       for i in 1 2 3; do
         sleep 2
         dial
-        if [[ "$dialed" != timeout ]]; then
+        if [[ "$dialed" != timeout && ( -z "$also" || "$dialed" != "$also" ) ]]; then
           echo "a probe pod in $cluster/$ns was blocked at ${first}s, then dial $i to $addr gave: $out"
           result=1
           break
@@ -389,6 +390,12 @@ check_server_endpoint() {
 expect_rogue_blocked() {
   check_server_endpoint || return 1
   expect_dial_blocked rogue default "$1"
+}
+
+# expect_rogue_closed <ip:port> is the case of no live cell: Service spire-server has no node port, and a dial from rogue gets no connection.
+expect_rogue_closed() {
+  check_spire_node_port_closed || return 1
+  expect_dial_blocked rogue default "$1" refused
 }
 
 # The SPIRE server must hold, for each agent cell of the catalog (SPIRE_AGENT_CELLS, live or not) and each subject of SPIRE_CELL_SUBJECTS, the node
@@ -956,8 +963,15 @@ if [[ -n "${SPIRE_AGENT_CELLS:-}" ]]; then
   # rogue is outside the admitted node addresses, so the server NetworkPolicy must drop it.
   probe_targets+=("rogue/default")
   own_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
-  check "The SPIRE node port of $CELL_NAME has a ready local endpoint, and a probe pod in rogue cannot open TCP to it (steady state)" \
-    expect_rogue_blocked "${own_ip:-unknown}:30081"
+  live_now="$(live_cells)" || live_now="?"
+  if [[ -z "$live_now" ]]; then
+    # With no live cell the render has no node port, so nothing listens and a dial is refused.
+    check "The SPIRE server of $CELL_NAME has no node port 30081 with no live cell, and a probe pod in rogue cannot open TCP to it (steady state)" \
+      expect_rogue_closed "${own_ip:-unknown}:30081"
+  else
+    check "The SPIRE node port of $CELL_NAME has a ready local endpoint, and a probe pod in rogue cannot open TCP to it (steady state)" \
+      expect_rogue_blocked "${own_ip:-unknown}:30081"
+  fi
 fi
 if [[ -n "${SPIRE_AGENT_CELLS:-}${SPIRE_LOCAL_WORKLOADS:-}" ]]; then
   check "The SPIRE server is Ready and healthy" check_server_healthy

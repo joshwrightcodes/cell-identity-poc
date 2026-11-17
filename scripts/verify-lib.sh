@@ -304,13 +304,25 @@ configmap_applied_spec() {
 check_envd_applied() { configmap_applied_spec spire-system cell-records; }
 
 # The SPIRE server and envd pin the public key of mgmtd: record_public_keys in the server config, and
-# ConfigMap mgmt-spec-key. Both must equal ConfigMap mgmt-signing-pub in management.
+# ConfigMap mgmt-spec-key. Both must equal ConfigMap mgmt-signing-pub in management. With no live cell the render drops the
+# cluster_jwt plugin, so the server config must hold no record_public_keys line and no cluster_jwt plugin, and only mgmt-spec-key
+# must equal the live key.
 check_spec_key_pinned() {
-  local live conf pinned stored
+  local live conf pinned stored cells
   live="$(mgmt_signing_pub 2>&1)" || { echo "$live"; return 1; }
   conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
   pinned="$(sed -n 's/^ *record_public_keys = \[\(.*\)\]$/\1/p' <<<"$conf" | tr -d ' "')"
   stored="$(k -n envd-system get configmap mgmt-spec-key -o jsonpath='{.data.spec\.pub}')" || { echo "could not read ConfigMap envd-system/mgmt-spec-key"; return 1; }
+  cells="$(live_cells)" || { echo "$cells"; return 1; }
+  if [[ -z "$cells" ]]; then
+    if [[ -n "$pinned" ]] || grep -q cluster_jwt <<<"$conf" || [[ "$stored" != "$live" ]]; then
+      echo "no cell is live, so the server config must hold no cluster_jwt plugin and no record_public_keys, and mgmt-spec-key must hold $live."
+      echo "The server config pins '$pinned' (cluster_jwt plugin present: $(grep -q cluster_jwt <<<"$conf" && echo yes || echo no)), and mgmt-spec-key holds '$stored'."
+      echo "Run: CELL=$CELL_NAME mise run cell:up"
+      return 1
+    fi
+    return 0
+  fi
   if [[ "$pinned" != "$live" || "$stored" != "$live" ]]; then
     echo "mgmt-signing-pub holds $live, the server config pins '$pinned', and mgmt-spec-key holds '$stored'."
     echo "Run: CELL=$CELL_NAME mise run cell:up"
@@ -320,15 +332,38 @@ check_spec_key_pinned() {
 
 # check_attest_hints_exists succeeds when ConfigMap spire-system/attest-hints exists and the server config of the SPIRE server sets
 # hint_configmap to it. envd creates the ConfigMap, and the cluster_jwt plugin only patches it, so a missing ConfigMap means that
-# every hint of an unknown key ID is lost.
+# every hint of an unknown key ID is lost. With no live cell the render drops the plugin, and the server config must set no
+# hint_configmap.
 check_attest_hints_exists() {
-  local conf set
-  k -n spire-system get configmap attest-hints -o name >/dev/null 2>&1 \
-    || { echo "ConfigMap spire-system/attest-hints is absent, so the SPIRE server cannot hint mgmtd on an unknown key ID."; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  local conf set cells
+  cells="$(live_cells)" || { echo "$cells"; return 1; }
   conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
   set="$(sed -n 's/^ *hint_configmap = "\(.*\)"$/\1/p' <<<"$conf")"
+  if [[ -z "$cells" ]]; then
+    if [[ -n "$set" ]]; then
+      echo "no cell is live, so the render drops the cluster_jwt plugin, and the server config sets hint_configmap '$set', want none."
+      echo "Run: CELL=$CELL_NAME mise run cell:up"
+      return 1
+    fi
+    return 0
+  fi
+  k -n spire-system get configmap attest-hints -o name >/dev/null 2>&1 \
+    || { echo "ConfigMap spire-system/attest-hints is absent, so the SPIRE server cannot hint mgmtd on an unknown key ID."; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
   if [[ "$set" != spire-system/attest-hints ]]; then
     echo "the server config sets hint_configmap '$set', want spire-system/attest-hints."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# check_spire_node_port_closed succeeds when the Service of the SPIRE server has no node port 30081. With no live cell the render
+# keeps only the ClusterIP Service of the workloads, so nothing listens on the node port, and the node answers a dial with a refusal.
+check_spire_node_port_closed() {
+  local ports
+  ports="$(k -n spire-system get service spire-server -o json | jq -r '[.spec.ports[]? | .nodePort // empty] | join(" ")')" \
+    || { echo "could not read Service spire-server"; return 1; }
+  if [[ " $ports " == *" 30081 "* ]]; then
+    echo "no cell is live, and Service spire-server still has the node port 30081."
     echo "Run: CELL=$CELL_NAME mise run cell:up"
     return 1
   fi
