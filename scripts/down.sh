@@ -2,16 +2,19 @@
 # Delete the cell cluster and its kubeconfig context. In order:
 #   1. Cancel the open step of the cell at the host service (hostsvc:serve -- cancel --cell <cell>), and wait up to
 #      CELL_DOWN_WAIT seconds (default 30) until no step of the cell runs a stage. A stage still running after that
-#      stops the command, and the message names hostsvc:serve -- cancel. When the host service does not run, the cancel
-#      is skipped, because a stopped service runs no stage.
+#      stops the command, and the message names hostsvc:serve -- cancel. When the host service does not run, the step
+#      stays in its journal and runs again at the next start. For a cell of the catalog the script then runs
+#      portal -- cancel --cell <cell>, which mgmtd signs, and the host cancels the dropped step at its next start. A cell
+#      that has no open step needs no cancel. When mgmtd answers with another error, the script stops with a hint.
 #   2. Take the lock of the cluster (cluster_lock in scripts/lib.sh) and delete the cluster.
 #   3. Release the lock, and for a cell of the catalog run CELL=dev-cp mise run cell:up and CELL=management mise run
 #      cell:link, so that the admit lists of dev-cp and the lists of management drop the deleted node. Set
 #      CELL_DOWN_SKIP_RERENDER=1 to skip them, for example when harness:down deletes every cluster next.
-# HOSTSVC_SERVE names another host service script, for the tests.
+# HOSTSVC_SERVE and PORTAL_SH name other scripts, for the tests.
 source "$(dirname "$0")/lib.sh"
 
 serve="${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}"
+portal="${PORTAL_SH:-$ROOT/scripts/portal.sh}"
 is_cell=0
 catalog="$(catalog_cells)" || catalog_failed=1
 [[ -z "${catalog_failed:-}" ]] && grep -qx -- "$CELL_NAME" <<<"$catalog" && is_cell=1
@@ -39,8 +42,17 @@ if [[ "$running" == true ]]; then
     fi
     sleep "${CELL_DOWN_POLL:-1}"
   done
+elif ((is_cell)); then
+  log "the host service does not run, so mgmtd cancels the step of $CELL_NAME: portal -- cancel"
+  cancel_rc=0
+  cancel_out="$("$portal" cancel --cell "$CELL_NAME" 2>&1)" || cancel_rc=$?
+  if ((cancel_rc != 0)); then
+    cancel_reason="$(grep '^{' <<<"$cancel_out" | jq -r '.reason // empty' 2>/dev/null | tail -n 1)" || cancel_reason=""
+    [[ "$cancel_reason" == no_step ]] || die "the host service does not run, and mgmtd did not cancel the step of $CELL_NAME: ${cancel_out:-no output}. A queued step would run again at the next start. Reach mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link. Then run CELL=$CELL_NAME mise run cell:down again"
+    log "$CELL_NAME has no open step, so nothing needs a cancel"
+  fi
 else
-  log "the host service does not run, so it runs no stage, and the cancel is skipped"
+  log "the host service does not run, and $CELL_NAME is not a cell of the catalog, so it has no step to cancel"
 fi
 
 cluster_lock "$CELL_NAME"

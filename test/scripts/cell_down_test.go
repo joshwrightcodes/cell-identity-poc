@@ -38,6 +38,14 @@ case "$1" in
     if [[ -s "${STUB_STEPS:-/nonexistent}" ]]; then cat "$STUB_STEPS"; else echo '{"steps":[],"corrupt":false}'; fi ;;
 esac
 `)
+	write("bin/portal", `#!/usr/bin/env bash
+echo "portal $*" >>"$STUB_LOG"
+case "${STUB_PORTAL:-ok}" in
+  ok) echo '{"requestId":"r","revision":{"epoch":1,"counter":2}}' ;;
+  no_step) echo '{"level":"ERROR","msg":"portal failed","error":"no_step","reason":"no_step"}'; exit 1 ;;
+  unreachable) echo "mise run mgmt -- portal failed: connection refused" >&2; exit 1 ;;
+esac
+`)
 	return root, calls
 }
 
@@ -46,7 +54,7 @@ func runDown(t *testing.T, root, calls string, env ...string) (log, errOut strin
 	cmd := exec.Command(filepath.Join(root, "scripts", "down.sh"))
 	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"CELL=dev-cell-1", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + calls,
-		"HOSTSVC_SERVE=" + filepath.Join(root, "bin", "hostsvc-serve"), "CELL_DOWN_POLL=0.2", "CELL_DOWN_WAIT=2"}, env...)
+		"HOSTSVC_SERVE=" + filepath.Join(root, "bin", "hostsvc-serve"), "PORTAL_SH=" + filepath.Join(root, "bin", "portal"), "CELL_DOWN_POLL=0.2", "CELL_DOWN_WAIT=2"}, env...)
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	err = cmd.Run()
@@ -122,11 +130,47 @@ func TestCellDownRerenders(t *testing.T) {
 		}
 	})
 
-	t.Run("a host service that does not run is skipped", func(t *testing.T) {
+	t.Run("a running host service cancels at the host and not through mgmtd", func(t *testing.T) {
+		root, calls := downRoot(t)
+		log, errOut, err := runDown(t, root, calls)
+		if err != nil || !strings.Contains(log, "hostsvc-serve cancel --cell dev-cell-1") || strings.Contains(log, "portal ") {
+			t.Fatalf("err %v, output %q, calls\n%s; want the host cancel and no portal call", err, errOut, log)
+		}
+	})
+
+	t.Run("a host service that does not run cancels through mgmtd", func(t *testing.T) {
 		root, calls := downRoot(t)
 		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1")
-		if err != nil || strings.Contains(log, "cancel") || !strings.Contains(errOut, "does not run") || !strings.Contains(log, "hostsvc -- down --only dev-cell-1") {
-			t.Fatalf("err %v, output %q, calls\n%s; want the cancel skipped with a log line, and the delete", err, errOut, log)
+		if err != nil || !strings.Contains(log, "portal cancel --cell dev-cell-1") || strings.Contains(log, "hostsvc-serve cancel") || !strings.Contains(log, "hostsvc -- down --only dev-cell-1") {
+			t.Fatalf("err %v, output %q, calls\n%s; want portal -- cancel, no host cancel, and the delete", err, errOut, log)
+		}
+		if i, j := strings.Index(log, "portal cancel"), strings.Index(log, "hostsvc -- down"); i < 0 || j < i {
+			t.Errorf("the delete comes before the cancel:\n%s", log)
+		}
+	})
+
+	t.Run("a cell without an open step needs no cancel", func(t *testing.T) {
+		root, calls := downRoot(t)
+		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1", "STUB_PORTAL=no_step")
+		if err != nil || !strings.Contains(errOut, "no open step") || !strings.Contains(log, "hostsvc -- down --only dev-cell-1") {
+			t.Fatalf("err %v, output %q, calls\n%s; want the delete after a no_step answer", err, errOut, log)
+		}
+	})
+
+	t.Run("a host service that does not run and an unreachable mgmtd stop the delete", func(t *testing.T) {
+		root, calls := downRoot(t)
+		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1", "STUB_PORTAL=unreachable")
+		if err == nil || !strings.Contains(errOut, "LINK_ONLY=mgmt-api mise run cell:link") || !strings.Contains(errOut, "cell:down again") ||
+			strings.Contains(log, "hostsvc -- down") || strings.Contains(log, "cell:up") {
+			t.Fatalf("err %v, output %q, calls\n%s; want a refusal with a hint, before the delete", err, errOut, log)
+		}
+	})
+
+	t.Run("a host service that does not run and a cluster that is no cell skip the cancel", func(t *testing.T) {
+		root, calls := downRoot(t)
+		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1", "CELL=dev-cp")
+		if err != nil || strings.Contains(log, "portal ") || !strings.Contains(errOut, "not a cell") || !strings.Contains(log, "hostsvc -- down --only dev-cp") {
+			t.Fatalf("err %v, output %q, calls\n%s", err, errOut, log)
 		}
 	})
 
