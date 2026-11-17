@@ -275,6 +275,9 @@ func TestCellControllerRenderFollowsTheKeys(t *testing.T) {
 	if annotation(a) == annotation(b) || annotation(b) != sha256Hex(other) {
 		t.Errorf("the key annotations are %v and %v, want two digests that follow the key", annotation(a), annotation(b))
 	}
+	if alone := get[map[string]any](t, objectsIn(t, a.stdout)["ConfigMap cell-controller-system/mgmt-spec-key"], "data"); len(alone) != 1 || alone["spec.pub"] != stubMgmtKey {
+		t.Errorf("mgmt-spec-key holds %v with no staged key, want spec.pub alone", alone)
+	}
 	keys := get[map[string]any](t, objectsIn(t, c.stdout)["ConfigMap cell-controller-system/mgmt-spec-key"], "data")
 	if keys["spec.pub"] != stubMgmtKey || keys["next.pub"] != next || len(keys) != 2 {
 		t.Errorf("mgmt-spec-key holds %v, want spec.pub and next.pub with the staged key", keys)
