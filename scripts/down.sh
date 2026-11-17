@@ -42,14 +42,20 @@ if [[ "$running" == true ]]; then
     fi
     sleep "${CELL_DOWN_POLL:-1}"
   done
+elif [[ -n "${catalog_failed:-}" ]]; then
+  die "the host service does not run, and the catalog of harness/topology.yaml is unreadable, so a step of $CELL_NAME could not be cancelled. Check yq and harness/topology.yaml, or start the service with: mise run hostsvc:serve -- start. Then run CELL=$CELL_NAME mise run cell:down again"
 elif ((is_cell)); then
   log "the host service does not run, so mgmtd cancels the step of $CELL_NAME: portal -- cancel"
   cancel_rc=0
   cancel_out="$("$portal" cancel --cell "$CELL_NAME" 2>&1)" || cancel_rc=$?
   if ((cancel_rc != 0)); then
     cancel_reason="$(grep '^{' <<<"$cancel_out" | jq -r '.reason // empty' 2>/dev/null | tail -n 1)" || cancel_reason=""
-    [[ "$cancel_reason" == no_step ]] || die "the host service does not run, and mgmtd did not cancel the step of $CELL_NAME: ${cancel_out:-no output}. A queued step would run again at the next start. Reach mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link. Then run CELL=$CELL_NAME mise run cell:down again"
-    log "$CELL_NAME has no open step, so nothing needs a cancel"
+    case "$cancel_reason" in
+      no_step) log "$CELL_NAME has no open step, so nothing needs a cancel" ;;
+      restore_active) die "the host service does not run, and mgmtd serves an older revision, so it did not cancel the step of $CELL_NAME: $cancel_out. End the restore with: mise run mgmt -- restore --revision latest. Then run CELL=$CELL_NAME mise run cell:down again" ;;
+      "") die "the host service does not run, and mgmtd did not answer, so the step of $CELL_NAME is not cancelled: ${cancel_out:-no output}. A queued step would run again at the next start. Reach mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link. Then run CELL=$CELL_NAME mise run cell:down again" ;;
+      *) die "the host service does not run, and mgmtd refused to cancel the step of $CELL_NAME with the reason $cancel_reason: $cancel_out. Fix the reason, or start the service with: mise run hostsvc:serve -- start. Then run CELL=$CELL_NAME mise run cell:down again" ;;
+    esac
   fi
 else
   log "the host service does not run, and $CELL_NAME is not a cell of the catalog, so it has no step to cancel"

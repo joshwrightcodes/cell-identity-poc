@@ -43,6 +43,7 @@ echo "portal $*" >>"$STUB_LOG"
 case "${STUB_PORTAL:-ok}" in
   ok) echo '{"requestId":"r","revision":{"epoch":1,"counter":2}}' ;;
   no_step) echo '{"level":"ERROR","msg":"portal failed","error":"no_step","reason":"no_step"}'; exit 1 ;;
+  restore_active) echo '{"level":"ERROR","msg":"portal failed","error":"restore_active","reason":"restore_active"}'; exit 1 ;;
   unreachable) echo "mise run mgmt -- portal failed: connection refused" >&2; exit 1 ;;
 esac
 `)
@@ -163,6 +164,25 @@ func TestCellDownRerenders(t *testing.T) {
 		if err == nil || !strings.Contains(errOut, "LINK_ONLY=mgmt-api mise run cell:link") || !strings.Contains(errOut, "cell:down again") ||
 			strings.Contains(log, "hostsvc -- down") || strings.Contains(log, "cell:up") {
 			t.Fatalf("err %v, output %q, calls\n%s; want a refusal with a hint, before the delete", err, errOut, log)
+		}
+	})
+
+	t.Run("a restore in force names the restore command", func(t *testing.T) {
+		root, calls := downRoot(t)
+		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1", "STUB_PORTAL=restore_active")
+		if err == nil || !strings.Contains(errOut, "mise run mgmt -- restore --revision latest") || strings.Contains(errOut, "cell:link") || strings.Contains(log, "hostsvc -- down") {
+			t.Fatalf("err %v, output %q, calls\n%s; want the restore hint and no delete", err, errOut, log)
+		}
+	})
+
+	t.Run("an unreadable catalog and a stopped service refuse the delete", func(t *testing.T) {
+		root, calls := downRoot(t)
+		if err := os.WriteFile(filepath.Join(root, "bin", "yq"), []byte("#!/usr/bin/env bash\nif [[ \"$*\" == *cell-identity* ]]; then exit 1; fi\nexec \""+yqPath(t)+"\" \"$@\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log, errOut, err := runDown(t, root, calls, "STUB_HOST_DOWN=1")
+		if err == nil || !strings.Contains(errOut, "catalog") || !strings.Contains(errOut, "hostsvc:serve -- start") || strings.Contains(log, "hostsvc -- down") || strings.Contains(log, "portal ") {
+			t.Fatalf("err %v, output %q, calls\n%s; want a refusal before the delete", err, errOut, log)
 		}
 	})
 
