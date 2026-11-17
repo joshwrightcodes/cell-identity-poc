@@ -1,8 +1,11 @@
 package hostsvc
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -13,6 +16,18 @@ type fakeDocker struct {
 	noNet    bool
 	stale    bool
 	rootUser bool
+	// env replaces the JSON environment that inspect reports. Empty means the expected environment.
+	env string
+}
+
+const goodEnv = `["PATH=/bin","REGISTRY_HTTP_DEBUG_ADDR=","REGISTRY_STORAGE_DELETE_ENABLED=false"]`
+
+func (f *fakeDocker) inspect(user string) []byte {
+	env := f.env
+	if env == "" {
+		env = goodEnv
+	}
+	return []byte("true|" + user + "|" + env)
 }
 
 func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
@@ -22,9 +37,9 @@ func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 	case strings.HasPrefix(line, "container inspect") && f.missing:
 		return []byte("Error: No such container"), errors.New("exit 1")
 	case strings.HasPrefix(line, "container inspect") && f.rootUser:
-		return []byte("true "), nil
+		return f.inspect(""), nil
 	case strings.HasPrefix(line, "container inspect"):
-		return []byte("true 65534:65534"), nil
+		return f.inspect("65534:65534"), nil
 	case strings.HasPrefix(line, "network inspect") && f.noNet:
 		return []byte("Error: No such network"), errors.New("exit 1")
 	case strings.HasPrefix(line, "network inspect"):
@@ -74,7 +89,7 @@ func TestEnsureRegistryStartsAbsentContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "run -d --restart=always --name registry-mirror --user 65534:65534 " +
-		"-v registry-mirror-data:/var/lib/registry -e REGISTRY_HTTP_DEBUG_ADDR= -p 127.0.0.1:5001:5000 " + RegistryImage
+		"-v registry-mirror-data:/var/lib/registry -e REGISTRY_HTTP_DEBUG_ADDR= -e REGISTRY_STORAGE_DELETE_ENABLED=false -p 127.0.0.1:5001:5000 " + RegistryImage
 	if !d.has(want) {
 		t.Errorf("calls = %q", d.calls)
 	}
@@ -178,4 +193,57 @@ func TestEnsureRegistryReplacesRootContainer(t *testing.T) {
 	if !d.has("rm -f registry-mirror") || !d.has("run -d ") {
 		t.Errorf("calls = %q", d.calls)
 	}
+}
+
+func TestEnsureRegistryReplacesOnEnv(t *testing.T) {
+	for name, env := range map[string]string{
+		"delete setting absent":   `["PATH=/bin","REGISTRY_HTTP_DEBUG_ADDR="]`,
+		"deletes enabled":         `["REGISTRY_HTTP_DEBUG_ADDR=","REGISTRY_STORAGE_DELETE_ENABLED=true"]`,
+		"debug address not empty": `["REGISTRY_HTTP_DEBUG_ADDR=:5001","REGISTRY_STORAGE_DELETE_ENABLED=false"]`,
+		"no environment":          `null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := &fakeDocker{env: env}
+			s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
+			s.Docker = d.run
+			if err := s.EnsureRegistry(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !d.has("rm -f registry-mirror") || !d.has("run -d ") {
+				t.Errorf("calls = %q", d.calls)
+			}
+			if !d.has("run -d --restart=always --name registry-mirror --user 65534:65534 -v registry-mirror-data:/var/lib/registry ") {
+				t.Errorf("the replacement must keep the volume: %q", d.calls)
+			}
+			if d.has("volume rm") {
+				t.Errorf("the volume must stay: %q", d.calls)
+			}
+		})
+	}
+}
+
+func TestEnsureRegistryLogsReplacedField(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+	d := &fakeDocker{env: `["REGISTRY_HTTP_DEBUG_ADDR="]`}
+	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
+	s.Docker = d.run
+	if err := s.EnsureRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var line struct {
+		Msg   string `json:"msg"`
+		Field string `json:"field"`
+	}
+	for _, l := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
+		if json.Unmarshal([]byte(l), &line) == nil && line.Msg == "registry_replaced" {
+			if line.Field != "env:REGISTRY_STORAGE_DELETE_ENABLED=false" {
+				t.Errorf("field = %q", line.Field)
+			}
+			return
+		}
+	}
+	t.Errorf("no registry_replaced line in %s", buf.String())
 }
