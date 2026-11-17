@@ -331,17 +331,17 @@ func (j *Journal) Reap(kill func(pgid int, leaderStart string) error) {
 	}
 }
 
-// Reset deletes every entry and clears the corrupt mark. It refuses while a stage runs, unless the
-// journal is corrupt. The step logs stay.
+// ErrJournalHealthy means Reset refused a journal that parses. A reset forgets the cancelled and
+// final end of each step, so a step that the spec still indexes could run again.
+var ErrJournalHealthy = errors.New("the step journal is healthy: cancel or retry each open cell, and reset only a corrupt journal")
+
+// Reset deletes every entry and clears the corrupt mark. It refuses a journal that is not corrupt.
+// The step logs stay.
 func (j *Journal) Reset() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	if !j.corrupt {
-		for _, e := range j.entries {
-			if e.Running() {
-				return fmt.Errorf("step %s runs: cancel it first", e.Status.ID)
-			}
-		}
+		return ErrJournalHealthy
 	}
 	if err := os.Remove(filepath.Join(j.dir, journalFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove journal: %w", err)

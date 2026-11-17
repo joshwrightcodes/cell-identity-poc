@@ -3,6 +3,7 @@ package hostsvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -98,15 +99,44 @@ func TestAdminResetJournal(t *testing.T) {
 	h := ae.adminHandler()
 	s, env := ae.indexed("dev-cell-1", nil)
 	ae.submit(s, env)
+	if rec := adminDo(h, "POST", "/reset-journal"); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "healthy") {
+		t.Fatalf("reset of a healthy journal: %d %s, want 409", rec.Code, rec.Body.String())
+	}
+	if len(ae.j.List()) != 1 {
+		t.Error("a refused reset removed the entry")
+	}
+	ae.j.mu.Lock()
+	ae.j.corrupt = true
+	ae.j.mu.Unlock()
 	if rec := adminDo(h, "POST", "/reset-journal"); rec.Code != 200 {
-		t.Fatalf("reset: %d %s", rec.Code, rec.Body.String())
+		t.Fatalf("reset of a corrupt journal: %d %s", rec.Code, rec.Body.String())
 	}
 	if len(ae.j.List()) != 0 {
 		t.Error("entries survived the reset")
 	}
-	ae.putEntry(s, env, func(e *JournalEntry) { e.Status.State = mgmtapi.StepAdmitting })
-	if rec := adminDo(h, "POST", "/reset-journal"); rec.Code != http.StatusConflict {
-		t.Errorf("reset while a stage runs: %d, want 409", rec.Code)
+}
+
+// A reset of a healthy journal would forget a cancel, and the step that the spec still indexes would run again.
+func TestReviewResetHealthyJournalRerunsCancelled(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	block, _ := ae.blocker("rel")
+	ae.setScript("creating", block)
+	s, env := ae.indexed("dev-cell-1", nil)
+	ae.start()
+	ae.submit(s, env)
+	ae.waitState(s.ID, mgmtapi.StepCreating)
+	if rec := adminDo(ae.adminHandler(), "POST", "/cancel?step="+s.ID); rec.Code != 200 {
+		t.Fatalf("cancel: %d %s", rec.Code, rec.Body.String())
+	}
+	ae.waitState(s.ID, mgmtapi.StepCancelled)
+	if err := ae.a.ResetJournal(); !errors.Is(err, ErrJournalHealthy) {
+		t.Fatalf("ResetJournal of a healthy journal = %v, want a refusal", err)
+	}
+	if st := ae.status(s.ID); st.State != mgmtapi.StepCancelled {
+		t.Fatalf("after the refused reset: %s, want cancelled", st.State)
+	}
+	if st, err := ae.a.Submit(env, s); err == nil && st.State != mgmtapi.StepCancelled {
+		t.Errorf("the same envelope gives %s after the refused reset, want cancelled", st.State)
 	}
 }
 

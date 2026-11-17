@@ -29,7 +29,7 @@
 #            No restart: the server reloads the files within 10 seconds.
 #   stages   Print one line "<id> <cell> <state>" for each step that runs a stage, and nothing when none runs. It reads
 #            the running service, or journal.json when the service does not run. It fails when it cannot read the steps.
-#   steps    Print the journal as one JSON line (hostsvc ctl steps). --reset resets a corrupt journal.
+#   steps    Print the journal as one JSON line (hostsvc ctl steps). --reset resets a corrupt journal and refuses a healthy one.
 #   log      Print the log of a step, or follow it (hostsvc ctl log).
 #   cancel   Cancel the open step of a cell or the step with an ID at the host service. An answer that no
 #            step is open is no failure.

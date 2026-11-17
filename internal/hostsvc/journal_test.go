@@ -119,14 +119,20 @@ func TestJournalCorruptFailsClosed(t *testing.T) {
 	}
 }
 
-func TestJournalResetRefusesWhileRunning(t *testing.T) {
-	j, _ := OpenJournal(t.TempDir(), nil)
-	_ = j.Put(testEntry(idN(1), "dev-cell-1", mgmtapi.StepAdmitting, time.Now()))
-	if err := j.Reset(); err == nil {
-		t.Fatal("Reset succeeded while a stage runs")
-	}
-	if _, ok := j.Get(idN(1)); !ok {
-		t.Fatal("the running entry is gone")
+func TestJournalResetRefusesHealthy(t *testing.T) {
+	for name, state := range map[string]string{"empty": "", "queued": mgmtapi.StepQueued, "running": mgmtapi.StepAdmitting, "cancelled": mgmtapi.StepCancelled} {
+		t.Run(name, func(t *testing.T) {
+			j, _ := OpenJournal(t.TempDir(), nil)
+			if state != "" {
+				_ = j.Put(testEntry(idN(1), "dev-cell-1", state, time.Now()))
+			}
+			if err := j.Reset(); !errors.Is(err, ErrJournalHealthy) {
+				t.Fatalf("Reset of a healthy journal = %v, want ErrJournalHealthy", err)
+			}
+			if _, ok := j.Get(idN(1)); ok != (state != "") {
+				t.Fatalf("entry present = %v after the refused reset", ok)
+			}
+		})
 	}
 }
 

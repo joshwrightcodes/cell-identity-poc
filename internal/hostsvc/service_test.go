@@ -688,6 +688,9 @@ func TestFileCreateRecords(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, idN(1)+".create")); err != nil {
 		t.Errorf("record file gone: %v", err)
 	}
+	j.mu.Lock()
+	j.corrupt = true
+	j.mu.Unlock()
 	if err := j.Reset(); err != nil {
 		t.Fatal(err)
 	}

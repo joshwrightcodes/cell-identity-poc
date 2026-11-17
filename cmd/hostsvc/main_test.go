@@ -512,12 +512,12 @@ func TestCtlCommandsPrintOneLine(t *testing.T) {
 		})
 	}
 	out, code = ctl("reset-journal")
-	if l := jsonLines(t, out); code != 0 || len(l) != 1 || l[0]["reset"] != true {
-		t.Errorf("reset-journal = %d %q", code, out)
+	if l := jsonLines(t, out); code == 0 || len(l) != 1 || l[0]["error"] == nil || !strings.Contains(out, "healthy") {
+		t.Errorf("reset-journal of a healthy journal = %d %q, want one JSON error line", code, out)
 	}
 	out, _ = ctl("steps")
-	if l := jsonLines(t, out); len(l[0]["steps"].([]any)) != 0 {
-		t.Errorf("steps after the reset = %q", out)
+	if l := jsonLines(t, out); len(l[0]["steps"].([]any)) != 1 {
+		t.Errorf("steps after the refused reset = %q", out)
 	}
 	var out2 strings.Builder
 	if code := execute(ctx, []string{"ctl"}, &out2); code == 0 {

@@ -1403,6 +1403,9 @@ func TestActorResetJournalTakesTheLock(t *testing.T) {
 	ae := newActorEnv(t, nil)
 	s, env := ae.indexed("dev-cell-1", nil)
 	ae.submit(s, env)
+	ae.j.mu.Lock()
+	ae.j.corrupt = true
+	ae.j.mu.Unlock()
 	ae.a.mu.Lock()
 	done := make(chan error, 1)
 	go func() { done <- ae.a.ResetJournal() }()
