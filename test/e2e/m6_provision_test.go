@@ -126,13 +126,6 @@ func waitValid(t *testing.T, cells []string, timeout time.Duration) {
 	})
 }
 
-// stageSection is one stage of a step log: its header fields and its lines.
-type stageSection struct {
-	stage, cluster string
-	at             time.Time
-	lines          []string
-}
-
 // stepLogSections reads the log of a step through `hostsvc:serve -- log` and splits it at the stage headers.
 func stepLogSections(t *testing.T, id string) []stageSection {
 	t.Helper()
@@ -185,7 +178,7 @@ func TestProvisionFromPortal(t *testing.T) {
 	}
 	m6RequireNoSteps(t)
 	if have := kindClusters(t); !slices.Contains(have, cells[0]) || !slices.Contains(have, cells[1]) {
-		t.Fatalf("kind lists %v, and the test starts from both cells %v. Run: mise run gate:m6:repair", have, cells)
+		t.Fatalf("kind lists %v, and the test starts from both cells %v. Run: mise run portal -- request --cell %s --cell %s --wait", have, cells, cells[0], cells[1])
 	}
 	waitValid(t, cells, 2*time.Minute)
 
@@ -193,7 +186,8 @@ func TestProvisionFromPortal(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(m6ProvisionMarker), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(m6ProvisionMarker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
+	// The marker names the cells that the test deletes, one on each line, so that the repair touches only their steps.
+	if err := os.WriteFile(m6ProvisionMarker, []byte(strings.Join(cells, "\n")+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	deleteStart := time.Now()
@@ -219,6 +213,11 @@ func TestProvisionFromPortal(t *testing.T) {
 	retired := map[string]spec.Revision{}
 	for _, r := range sp.Retired {
 		retired[r.Name] = r.Revision
+	}
+	for _, c := range cells {
+		if _, ok := retired[c]; !ok {
+			t.Fatalf("step 2: the spec lists the retired cells %v, and %s is not one of them (the drop writes the mark that step 10 compares)", sp.Retired, c)
+		}
 	}
 	if out, err := miseRun(t, 10*time.Minute, []string{"CELL=dev-cp"}, "cell:verify"); err != nil || !regexp.MustCompile(`(?m)^PASS  The SPIRE server, relay and gateway admit lists`).MatchString(out) {
 		t.Fatalf("step 2: cell:verify of dev-cp with no cell: %v, want a pass with the admit lists check\n%s", err, out)
@@ -269,6 +268,7 @@ func TestProvisionFromPortal(t *testing.T) {
 
 	// 6. While the first cell is unbound, a status item for it does not make it valid. dev-cp can inject any item, so mgmtd must refuse
 	// each one with not_bound, whatever token it carries.
+	var prevRefusal time.Time
 	for _, tc := range []struct {
 		name  string
 		token func(string) string
@@ -290,7 +290,12 @@ func TestProvisionFromPortal(t *testing.T) {
 			if r == nil {
 				return false, "no last refusal"
 			}
-			return r.Kind == gwapi.KindStatus && r.Reason == mgmtapi.ReasonNotBound && r.At.After(injected), fmt.Sprintf("last refusal %+v", *r)
+			// The refusal has no item ID, so it must be newer than the one that ended the previous case.
+			if freshRefusal(r, gwapi.KindStatus, mgmtapi.ReasonNotBound, injected, prevRefusal) {
+				prevRefusal = r.At
+				return true, ""
+			}
+			return false, fmt.Sprintf("last refusal %+v, injected after %s, previous refusal %s", *r, injected, prevRefusal)
 		})
 	}
 
@@ -325,7 +330,7 @@ func TestProvisionFromPortal(t *testing.T) {
 		if want := clusterFacts(t, c).NodeIP; steps[id].NodeIP != want || want == "" {
 			t.Errorf("step 7: the step %s of %s has the nodeIP %q, and the node of the cluster has %q", id, c, steps[id].NodeIP, want)
 		}
-		secs := stepLogSections(t, id)
+		secs := lastAttempts(stepLogSections(t, id))
 		var order []string
 		for _, s := range secs {
 			order = append(order, s.stage+"@"+s.cluster)

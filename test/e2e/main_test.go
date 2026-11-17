@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,11 +45,15 @@ func precheck(run string) error {
 	if err != nil {
 		return fmt.Errorf("load topology: %w", err)
 	}
+	cellNames := topo.WithComponent(agentCellSet)
 	for _, c := range topo.Clusters {
 		node := c.Name + "-control-plane"
 		absent, err := nodeAbsent(node)
 		if err != nil {
 			return err
+		}
+		if absent && !slices.Contains(cellNames, c.Name) {
+			return fmt.Errorf("%s has no node container, and only a cell may be absent. Run: mise run harness:status", c.Name)
 		}
 		if absent {
 			// A cell exists only after its step ran, and a provision run or a repair starts while a cell is absent.
