@@ -140,6 +140,90 @@ Run `mise run gate:m6:repair` to restore the cells. It requests each cell that i
 and removes the marker. The repair takes about as long as the first creation. `gate:m6:repair` and `gate:m6:provision` change the cells,
 so run them alone.
 
+### Portal commands
+
+| Command | What it does |
+| --- | --- |
+| `mise run portal -- request --cell <cell>... [--wait]` | Asks for cells. A cell that is requested already counts as a success. |
+| `mise run portal -- wait --cell <cell>...` | Polls until each cell is valid. It prints each change of the step state. |
+| `mise run portal -- withdraw --cell <cell>...` | Retires the cells and cancels their steps. Run `CELL=<cell> mise run cell:down` after it. |
+| `mise run portal -- recreate --cell <cell> [--wait]` | Asks for a cell again after its cluster was deleted. |
+| `mise run portal -- retry --cell <cell> [--force] [--wait]` | Signs a new step for a cell whose step failed, was refused or expired. It refuses while a stage runs, unless you add `--force`. |
+| `mise run portal -- cancel --cell <cell>` | Ends the open step of a cell. |
+
+### Stages of a step
+
+The host service runs three stages for each step, one after the other. The stage names are the step states `creating`, `admitting` and `bootstrapping`.
+
+| Stage | What it does | Timeout |
+| --- | --- | --- |
+| `creating` | Creates the cluster, or keeps a cluster that exists, and reads its node address. | 10 minutes |
+| `admitting` | Runs `cell:up` for `dev-cp`, so that the SPIRE server, the relay and the gateway admit the new node address. | 30 minutes |
+| `bootstrapping` | Runs `cell:up` for the new cell. | 45 minutes |
+
+A stage that fails gives the state `failed`. The cell controller sends the step again after 5 minutes. After 3 attempts the state is `failed_final`, and you run `mise run portal -- retry --cell <cell>`.
+The host service writes a heartbeat every 30 seconds while a stage runs.
+`mise run hostsvc:serve -- steps` prints the journal as one JSON line.
+`mise run hostsvc:serve -- log --step <id>` prints the log of one step, and `--follow` keeps reading while the stage runs.
+The log has one header line for each stage run, with the stage, the attempt and the start time.
+
+Each admit stage restarts the SPIRE server and the gateway of `dev-cp`.
+For a few minutes after it, `harness:status` can show `status_stale` for a cell that was valid before.
+This clears by itself. Wait up to 5 minutes before you act on it.
+Two new cells provision one after the other, because the host service runs one stage at a time.
+
+### Runbook: provisioning
+
+Read the state of a step with `mise run hostsvc:serve -- steps` and `mise run mgmt -- status`.
+A refusal shows as the reason `step_invalid` in `step-status`, with a `detail`. The log of the cell controller names the same detail in the message `step refused`.
+The host service writes at most one refusal line for each reason in 10 seconds.
+
+| Detail | Meaning | What to do |
+| --- | --- | --- |
+| `signature_invalid` | The verifier does not trust the signature. Its pinned key differs from the key that signed the step. | Run `mise run hostsvc:serve -- sync`. After a key rotation, wait for the re-signed step. Then run `mise run portal -- retry --cell <cell>`. |
+| `payload_invalid`, `env_mismatch`, `cell_unknown`, `cluster_mismatch` | The step does not match the environment, the catalog or the topology of this checkout. | Read the step with `mise run hostsvc:serve -- steps`. Run `mise run portal -- retry --cell <cell>` after you fix the checkout. |
+| `expired`, `not_yet_valid` | The clock of the verifier is outside the life of the step. | Compare the clocks of the Mac and the VM. Then run `mise run portal -- retry --cell <cell>`. |
+| `bootstrap_mismatch` | The files of `cell:up` or the image digests changed after the request. | Change no file and no image during a step. Run `mise run portal -- retry --cell <cell>`, which signs the new digest. |
+| `step_conflict` | The host service holds another step with this ID or for this cell. | Run `mise run hostsvc:serve -- steps`, then `mise run portal -- cancel --cell <cell>` for the step that you do not want. |
+| `step_unindexed`, `step_missing` | The newest spec does not list the step, or the envelope is not in `cell-steps`. | The request was withdrawn, cancelled or replaced. Run `mise run portal -- recreate --cell <cell>`. |
+| `revision_old` | The spec is older than the one that the verifier already holds. | Run `mise run hostsvc:serve -- sync`. |
+| `spec_behind` | The host service knows an older spec than the step needs. `mgmtd` pushes the spec, so this clears by itself. | Wait 2 minutes. If it stays, run `mise run hostsvc:serve -- sync`, or `CELL=management LINK_ONLY=mgmt-api mise run cell:link`. |
+| `cell_needs_step` | A command tried to create a cell directly. Only a signed step creates a cell. | Run `mise run portal -- request --cell <cell> --wait`. |
+| `journal_corrupt` | `journal.json` of the host service does not parse. The host service refuses every step. | Run `mise run hostsvc:serve -- steps --reset`, then `mise run portal -- retry --cell <cell>` for each open cell. |
+| `interrupted` | The host service stopped, or the Mac slept or logged out, while a stage ran. | Wait 5 minutes. The cell controller sends the step again. Run `mise run portal -- retry --cell <cell>` if it does not. |
+| `timeout` | A stage ran past its limit. | Read the step log, fix the cause, then run `mise run portal -- retry --cell <cell>`. |
+| `stage_failed` | A stage exited with an error. | Read the step log, fix the cause, then run `mise run portal -- retry --cell <cell>`. |
+
+A stuck stage shows in `harness:status` as a heartbeat older than 2 minutes, or a stage past its timeout plus 5 minutes.
+Run `mise run hostsvc:serve -- restart --force`. It ends the stage, and the cell controller sends the step again.
+Without `--force` the restart refuses while a stage runs.
+
+In the admit stage, the `dev-cp` store can have a gap: the records of the gateway lag behind `mgmtd`.
+`cell:verify` of `dev-cp` then names the record or the store. Run `mise run gw:reset` only when it reports a store error. Otherwise wait for `envd` to sync.
+
+A command that needs a cluster can print that another process holds the lock of that cluster.
+The message names the process and the step. Wait until it ends, or stop it with the `kill` command in the message, and run your command again.
+
+`mise run portal -- cancel --cell <cell>` ends the open step. `mise run portal -- retry --cell <cell>` signs a new one.
+A retry never runs a step twice at the same time. A cancelled, retried or withdrawn step does not run again.
+
+Carry-over cases:
+
+- A cell that was withdrawn while bound, and requested again before its staged drop, keeps an open step. Run `mise run portal -- recreate --cell <cell>`.
+- A crash between the start of a child process and the write of its process group, or a corrupt journal, can leave an orphan process group. Find it with `ps`, and stop it by its process group ID.
+- An ended step can leave a half-built cell. Check the cell, then run `CELL=<cell> mise run cell:down`.
+- A request for a cell that is still bound keeps its step open until it expires, because each bind gives `already_bound`. `mise run portal -- cancel --cell <cell>` ends it.
+- Two new cells provision one after the other. The second cell waits in `queued` until the first step ends.
+
+Mac sleep and logout: a sleep stops the clock of the VM, and the VM clock differs from the Mac clock after it. `harness:status` compares each time with the right clock.
+A logout stops the host service and its stage, and the step shows `failed` with `interrupted`. Start the service with `mise run hostsvc:serve -- start`.
+
+An `mgmtd` image rollback after M6 needs `mise run mgmt -- reset-state`, then the commands that `reset-state` prints, which request each live cell.
+An older `mgmtd` refuses a stored spec that holds steps, so the state must go.
+
+Rebuild a cell with the commands in [Rebuild one cluster](#rebuild-one-cluster). Rebuild `management` with `dependents_of management`, as the same section lists.
+The rebuild drill of `management` ran in the live part: <measured in the live part>.
+
 ## Rebuild one cluster
 
 A rebuilt cluster can get a new node address from Docker, and a rebuilt cell gets a new service account key.
@@ -958,6 +1042,31 @@ It holds only `error` when the gateway does not answer.
 The `management` object holds `cells`, and each cell has `lastStatusAt`, `unreported`, `oldestUnreportedAt`, `records`, `openOps`, `expiredOps`, `forgedSeen`, `lastRefusal` and `lastHintCheck`.
 It also lists `expiredOps`, the operations that expired with no final result, each as `id`, `cell` and `expiredAt`.
 
+A cell that has no cluster gets an object with only `cluster`, `ok`, `absent` and `problems`. `absent` is `true`, and the object has no `applications`, `verify` or `telemetry`.
+A cell that is absent and has no problem is `ok`, for example while its first step creates it.
+`harness:logs all` skips such a cell and prints one line on standard error. `harness:logs <cell>` for it gives one error line with the portal command.
+The journal of the host service and its step logs hold times from the clock of the Mac. `mgmtd` and the cell controller write times from the clock of the VM.
+`harness:status` compares each time with the clock that wrote it.
+
+`mise run harness:status` exits 1, and prints the next command, in these cases for provisioning:
+
+| Case | Command |
+| --- | --- |
+| A requested cell is invalid for more than 5 minutes, no step is open and no step runs the `admitting` stage | `CELL=<cell> mise run cell:verify` |
+| An open step is expired, `failed`, `failed_final` or `refused` | `mise run portal -- retry --cell <cell>` |
+| A running journal entry has a heartbeat older than 2 minutes, or has run one stage longer than its timeout plus 5 minutes | `mise run hostsvc:serve -- restart --force` |
+| `step-status` is older than 90 seconds while a step is open | `CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:restart` |
+| A step has a host error that started more than 2 minutes ago | `mise run hostsvc:serve -- restart` for `hostsvc_untrusted`, `mise run hostsvc:serve -- status` for `hostsvc_unavailable` |
+| A requested cell has no cluster and no open step | `mise run portal -- recreate --cell <cell>` |
+| A cluster of a cell exists, and the cell is not requested | `mise run portal -- request --cell <cell>`, or `CELL=<cell> mise run cell:down` |
+| A cell is neither requested nor live | `mise run gate:m6:repair` while the marker `build/gate/m6-provision` exists, else `mise run portal -- request --cell <cell> --wait` |
+| The admit lists of `dev-cp` differ from the live cells | `CELL=dev-cp mise run cell:up` |
+| The host service has no `dev-root.crt`, trusts other keys than `mgmtd` holds, or knows an older spec revision for more than 2 minutes | `mise run hostsvc:serve -- sync`, or the `mgmt-api` link |
+| The journal of the host service does not parse | `mise run hostsvc:serve -- steps --reset` |
+
+A live cell that is not bound keeps the problem `is not bound` with `CELL=<cell> mise run cell:up`. An absent cell never gets it, because `cell:up` refuses an absent cell.
+`gate:m6:repair --check` finds a journal entry past its stage timeout plus 5 minutes, and a live cell that `mgmtd` does not hold as requested.
+
 `mise run harness:status` exits 1, and prints the next command, in these cases for signed work:
 
 | Case | Command |
@@ -1176,6 +1285,18 @@ The numbers come from `harness:size` after `gate:m5:drill`.
 The rebuild of `management` took 21 minutes 36 seconds from `cell:down` to the first `harness:status` that exited 0. The first `harness:status` failed only on collector export retries, which clear by themselves within 5 minutes.
 The slowest M5 tests are the key rotation tests, about 6 to 11 minutes each, and `TestM5DevCPCannotPoseOnReports`, about 6 minutes.
 The budgets do not cover `harness:up`.
+
+M6 measured values come from the live part of Task 11. Each value below is a marker until that run writes it:
+
+| Value | Result |
+| --- | --- |
+| `harness:up` from clean with the portal | <measured in the live part> |
+| `harness:up` run again, with both cells valid | <measured in the live part> |
+| Rebuild drill of `management` | <measured in the live part> |
+| `gate:m6`, two runs | <measured in the live part> |
+| `gate:m6:provision`, two runs | <measured in the live part> |
+| `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | <measured in the live part>, 1.5 times the slower run, rounded up to 5 minutes |
+| `harness:size` after the runs | <measured in the live part> |
 
 ## Side effects of gate:m2
 
