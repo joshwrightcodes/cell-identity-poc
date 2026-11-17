@@ -23,7 +23,12 @@ if [[ "$target" == all ]]; then
     if grep -Fxq -- "$name" <<<"$existing"; then targets+=("$name"); else log "$name has no cluster, so its logs are skipped"; fi
   done <<<"$clusters"
 elif grep -Fxq -- "$target" <<<"$clusters"; then
-  grep -Fxq -- "$target" <<<"$existing" || json_fail harness:logs "the cluster $target does not exist. Run: mise run portal -- recreate --cell $target"
+  if ! grep -Fxq -- "$target" <<<"$existing"; then
+    if catalog_cells | grep -Fxq -- "$target"; then
+      json_fail harness:logs "the cluster $target does not exist. Run: mise run portal -- recreate --cell $target"
+    fi
+    json_fail harness:logs "the cluster $target does not exist. Rebuild it with the commands in the README section Rebuild one cluster, or run: mise run harness:up"
+  fi
   targets=("$target")
 else
   json_fail harness:logs "the argument '$target' is not all or a cluster with components: $(paste -sd' ' - <<<"$clusters"). Usage: mise run harness:logs <cluster or all> <label selector>"

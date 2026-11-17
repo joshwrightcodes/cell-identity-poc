@@ -15,6 +15,9 @@ type journalRow struct {
 	id, cell, state string
 	heartbeat       time.Duration
 	stage           time.Duration
+	// ranAdmit marks that the admitting stage ran (stageRuns), and header names the stage of the log header when it differs from state.
+	ranAdmit bool
+	header   string
 }
 
 // writeJournal writes journal.json and the step logs of the rows into a new directory, and returns it. The heartbeat gets an offset
@@ -26,12 +29,19 @@ func writeJournal(t *testing.T, rows ...journalRow) string {
 	var entries []map[string]any
 	for _, r := range rows {
 		e := map[string]any{"status": map[string]any{"id": r.id, "cell": r.cell, "state": r.state}}
+		if r.ranAdmit {
+			e["stageRuns"] = map[string]int{"admitting": 1}
+		}
+		hdr := r.state
+		if r.header != "" {
+			hdr = r.header
+		}
 		if r.heartbeat > 0 {
 			e["heartbeatAt"] = time.Now().Add(-r.heartbeat).In(zone).Format(time.RFC3339Nano)
 		}
 		entries = append(entries, e)
 		if r.stage > 0 {
-			header := "== " + r.state + " attempt 1 CELL=" + r.cell + " at " + time.Now().Add(-r.stage).UTC().Format(time.RFC3339) + "\nsecret-looking line eyJ.eyJ.\n"
+			header := "== " + hdr + " attempt 1 CELL=" + r.cell + " at " + time.Now().Add(-r.stage).UTC().Format(time.RFC3339) + "\nsecret-looking line eyJ.eyJ.\n"
 			if err := os.WriteFile(filepath.Join(dir, r.id+".log"), []byte(header), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -91,6 +101,7 @@ func TestStatusProvisioning(t *testing.T) {
 		env     []string
 		cluster string   // the object that carries the problem; empty when the run must pass
 		want    []string // substrings of the problems
+		deny    []string // substrings that no problem holds
 	}
 	// The table is built again for each case, because its times are ages from the moment of the build, and a slow run must not age them.
 	build := func() []provCase {
@@ -104,6 +115,22 @@ func TestStatusProvisioning(t *testing.T) {
 				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "admitting", heartbeat: 10 * time.Second, stage: 7 * time.Minute}},
 				env: []string{"STUB_MGMT_STATUS=" + cells(planeCell("dev-cell-1", map[string]any{"valid": false, "invalidSince": timeAgo(20 * time.Minute)}), openAdmitting()),
 					stepStatusAt(20 * time.Second)}},
+			{name: "invalid for a long time while the journal alone shows an admit stage is a wait",
+				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "admitting", heartbeat: 10 * time.Second, stage: 7 * time.Minute}},
+				env:  []string{"STUB_MGMT_STATUS=" + cells(planeCell("dev-cell-1", map[string]any{"valid": false, "invalidSince": timeAgo(20 * time.Minute)}), healthyCell("dev-cell-2"))}},
+			{name: "invalid for a long time, and an admit stage ended 2 minutes ago, is a wait",
+				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "done", ranAdmit: true, header: "bootstrapping", stage: 2 * time.Minute}},
+				env:  []string{"STUB_MGMT_STATUS=" + cells(planeCell("dev-cell-1", map[string]any{"valid": false, "invalidSince": timeAgo(20 * time.Minute)}), healthyCell("dev-cell-2"))}},
+			{name: "invalid for a long time, and an admit stage ended 8 minutes ago", cluster: "dev-cell-1",
+				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "done", ranAdmit: true, header: "bootstrapping", stage: 8 * time.Minute}},
+				env:  []string{"STUB_MGMT_STATUS=" + cells(planeCell("dev-cell-1", map[string]any{"valid": false, "invalidSince": timeAgo(20 * time.Minute)}), healthyCell("dev-cell-2"))},
+				want: []string{"dev-cell-1 has been invalid since"}},
+			{name: "a failed step that the controller sends again soon is a wait", cluster: "dev-cell-2",
+				env:  []string{"STUB_MGMT_STATUS=" + withHost(map[string]any{"state": "failed", "reason": "stage_failed", "retryAt": timeAgo(-4 * time.Minute)}), stepStatusAt(20 * time.Second)},
+				want: []string{"is failed (stage_failed)", "sends it again at", "Wait until then"}, deny: []string{"portal -- retry"}},
+			{name: "a failed step that stays failed past its retry time", cluster: "dev-cell-2",
+				env:  []string{"STUB_MGMT_STATUS=" + withHost(map[string]any{"state": "failed", "reason": "stage_failed", "retryAt": timeAgo(2 * time.Minute)}), stepStatusAt(20 * time.Second)},
+				want: []string{"is failed (stage_failed)", "Run: mise run portal -- retry --cell dev-cell-2"}},
 			{name: "an open step that has expired", cluster: "dev-cell-2",
 				env: []string{"STUB_MGMT_STATUS=" + cells(healthyCell("dev-cell-1"), stepCell("dev-cell-2", id, true, -time.Minute, hostStatus(id, "dev-cell-2", "queued", nil))),
 					stepStatusAt(20 * time.Second)},
@@ -200,6 +227,11 @@ func TestStatusProvisioning(t *testing.T) {
 					t.Errorf("problems of %s %q lack %q", tc.cluster, got, w)
 				}
 			}
+			for _, d := range tc.deny {
+				if strings.Contains(got, d) {
+					t.Errorf("problems of %s %q hold %q", tc.cluster, got, d)
+				}
+			}
 			if strings.ContainsAny(got, "<>") {
 				t.Errorf("problems %q hold a placeholder, and each command must work as printed", got)
 			}
@@ -226,10 +258,18 @@ func openStepPlane(id string) string {
 // problems of provisioning, and the M5 problem "is not bound" never names a cell that has no cluster.
 func TestStatusAbsentCell(t *testing.T) {
 	dir := writeJournal(t)
-	byName, lines, stderr, code := runStatus(t, "HOSTSVC_STEPS_DIR="+dir, "STUB_KIND=management dev-cp dev-cell-1 rogue",
-		"STUB_MGMT_STATUS="+healthyPlane(func(m map[string]any) {
-			m["cells"] = []any{planeCell("dev-cell-1", nil), planeCell("dev-cell-2", map[string]any{"bound": false, "valid": false})}
-		}))
+	// The sources report what is true for a cell with no cluster: no agent, no sample, no Kiali cluster and no tunnel.
+	absentSources := []string{"HOSTSVC_STEPS_DIR=" + dir, "STUB_KIND=management dev-cp dev-cell-1 rogue",
+		"STUB_PRINCIPAL=" + `{"client":"dev-dev-cell-1","msg":"An agent connected to the subscription stream"}`,
+		"STUB_SAMPLES=" + `{"data":{"result":[{"metric":{"k8s_cluster_name":"management"},"value":[0,"5"]},{"metric":{"k8s_cluster_name":"dev-cp"},"value":[0,"4"]},{"metric":{"k8s_cluster_name":"dev-cell-1"},"value":[0,"6"]}]}}`,
+		"STUB_KIALI_CONF=" + `{"clusters":{"dev-cell-1":{"accessible":true},"management":{"accessible":true}}}`,
+		"STUB_HUB=" + `{"cells":{"dev-cell-1":{"up":true}}}`}
+	withPlane := func(plane string, more ...string) []string {
+		return append(append([]string{"STUB_MGMT_STATUS=" + plane}, absentSources...), more...)
+	}
+	byName, lines, stderr, code := runStatus(t, withPlane(healthyPlane(func(m map[string]any) {
+		m["cells"] = []any{planeCell("dev-cell-1", nil), planeCell("dev-cell-2", map[string]any{"bound": false, "valid": false})}
+	}))...)
 	if len(lines) != 4 || code != 1 {
 		t.Fatalf("exit %d with %d objects, want exit 1 and 4 objects\n%s", code, len(lines), stderr)
 	}
@@ -240,16 +280,15 @@ func TestStatusAbsentCell(t *testing.T) {
 	if got := problemsOf(absent); got != "the cell dev-cell-2 is requested and has no cluster, and no step is open. Run: mise run portal -- recreate --cell dev-cell-2" {
 		t.Errorf("problems of the absent cell %q", got)
 	}
-	if got := problemsOf(byName["management"]); strings.Contains(got, "is not bound") {
-		t.Errorf("management problems %q name an absent cell as not bound, and cell:up refuses it", got)
+	if got := problemsOf(byName["management"]); byName["management"]["ok"] != true {
+		t.Errorf("management problems %q for an absent cell, want none: no agent, sample or tunnel exists for it, and cell:up refuses it", got)
 	}
-	// A cell that is absent and has no problem keeps its object, with ok true.
-	byName, _, _, code = runStatus(t, "HOSTSVC_STEPS_DIR="+dir, "STUB_KIND=management dev-cp dev-cell-1 rogue",
-		"STUB_MGMT_STATUS="+healthyPlane(func(m map[string]any) {
-			m["cells"] = []any{planeCell("dev-cell-1", nil), stepCell("dev-cell-2", "0123456789abcdef0123456789abcdef", false, time.Hour, nil)}
-		}), stepStatusAt(20*time.Second))
+	// A cell that is absent and has no problem keeps its object, and the whole status exits 0.
+	byName, _, _, code = runStatus(t, withPlane(healthyPlane(func(m map[string]any) {
+		m["cells"] = []any{planeCell("dev-cell-1", nil), stepCell("dev-cell-2", "0123456789abcdef0123456789abcdef", false, time.Hour, nil)}
+	}), stepStatusAt(20*time.Second))...)
 	if code != 0 || byName["dev-cell-2"]["absent"] != true || byName["dev-cell-2"]["ok"] != true {
-		t.Errorf("exit %d and object %v, want an absent cell with ok true while its step creates it", code, byName["dev-cell-2"])
+		t.Errorf("exit %d and object %v, want an absent cell with ok true while its step creates it, and exit 0", code, byName["dev-cell-2"])
 	}
 	// A live cell that is not bound keeps the M5 hint.
 	byName, _, _, _ = runStatus(t, "HOSTSVC_STEPS_DIR="+dir, "STUB_MGMT_STATUS="+healthyPlane(func(m map[string]any) {
@@ -257,6 +296,16 @@ func TestStatusAbsentCell(t *testing.T) {
 	}))
 	if got := problemsOf(byName["management"]); !strings.Contains(got, "dev-cell-2 is not bound. Run: CELL=dev-cell-2 mise run cell:up") {
 		t.Errorf("management problems %q lack the M5 hint for a live cell", got)
+	}
+	// While a stage of that cell runs, the hint names the stage and does not compete for the cluster lock.
+	id := "0123456789abcdef0123456789abcdef"
+	byName, _, _, _ = runStatus(t, "HOSTSVC_STEPS_DIR="+writeJournal(t, journalRow{id: id, cell: "dev-cell-2", state: "bootstrapping", heartbeat: 10 * time.Second, stage: time.Minute}),
+		stepStatusAt(20*time.Second), "STUB_MGMT_STATUS="+healthyPlane(func(m map[string]any) {
+			m["cells"] = []any{planeCell("dev-cell-1", nil), stepCell("dev-cell-2", id, false, time.Hour, hostStatus(id, "dev-cell-2", "bootstrapping", nil))}
+		}))
+	got := problemsOf(byName["management"])
+	if !strings.Contains(got, "dev-cell-2 is not bound while its stage bootstrapping runs. Wait for the stage") || strings.Contains(got, "cell:up") {
+		t.Errorf("management problems %q, want the stage name and no cell:up", got)
 	}
 }
 

@@ -157,9 +157,10 @@ management_plane() {
 # management_problems <cell-identity cells> reads the field management on standard input and prints one problem
 # for each bad value, as a JSON array of strings. Each problem ends with the command to run.
 management_problems() {
-  local now clock_problem
+  local now clock_problem staged=""
+  staged="$(stage_cells 2>/dev/null)" || staged=""
   read_clock
-  jq -c --arg bind "$1" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
+  jq -c --arg bind "$1" --arg staged "$staged" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def cp: "CELL=dev-cp mise run cell:verify";
     if .error != null then ["mgmtd status failed: " + .error]
@@ -189,7 +190,8 @@ management_problems() {
         (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and ($now - (.expiredAt | ts)) < 900)
           | "operation \(.id) for \(.cell) expired at \(.expiredAt) with no final result. Run: mise run ops -- close \(.id)"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
-          | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
+          | ($staged | split(" ") | map(select(startswith($c + ":"))) | first // "") as $run
+          | if $run != "" then "\($c) is not bound while its stage \($run | sub("^[^:]*:"; "")) runs. Wait for the stage" else "\($c) is not bound. Run: CELL=\($c) mise run cell:up" end),
         (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"
          elif .hostsvc.expires_soon then "the host service certificate expires soon. Run: mise run hostsvc:serve -- restart"
          elif .hostsvc.check != "" then "host service: " + .hostsvc.check else empty end)
@@ -246,7 +248,12 @@ management_extras() {
   # about 10 hours, and the connect line goes with it. An agent with no stream line in the log counts as connected when the
   # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
-  expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  # A cell with no cluster has no agent, sample or tunnel, so the lists hold only the cells that are live.
+  view_live="" mesh_live="" clusters_live=""
+  for cell in $VIEW_CELLS; do [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || view_live+="$cell "; done
+  for entry in $MESH_VIEW_CELLS; do cell="${entry%%=*}"; [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || mesh_live+="$entry "; done
+  for cell in $clusters; do [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || clusters_live+="$cell"$'\n'; done
+  expected="$(for cell in $view_live; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
   read_clock
   agents="$(jq -Rsc --argjson now "$now" --argjson expected "$expected" '
       def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
@@ -263,11 +270,11 @@ management_extras() {
     --data-urlencode 'query=time() - max by (k8s_cluster_name) (timestamp(up))' http://127.0.0.1:9090/api/v1/query 2>/dev/null \
     | jq -c '[.data.result[]? | select(.metric.k8s_cluster_name != null) | {key: .metric.k8s_cluster_name, value: (.value[1] | tonumber | floor)}] | from_entries' 2>/dev/null)" || samples=""
   [[ -n "$samples" ]] || samples='{}'
-  samples="$(jq -c --arg clusters "$clusters" --argjson max "$max_age" '. as $s | {samples: ., stale: [$clusters | split("\n")[] | select(length > 0) | select(($s[.] == null) or $s[.] >= $max)]}' <<<"$samples")"
+  samples="$(jq -c --arg clusters "$clusters_live" --argjson max "$max_age" '. as $s | {samples: ., stale: [$clusters | split("\n")[] | select(length > 0) | select(($s[.] == null) or $s[.] >= $max)]}' <<<"$samples")"
 
   # Kiali reads every cell once at start. While a cell is down, it stops in discovery and restarts until all answer.
   # A cell is absent only when its own API does not answer. A tunnel that is down while the API answers has another cause.
-  for entry in $MESH_VIEW_CELLS; do
+  for entry in $mesh_live; do
     cell="${entry%%=*}"
     if ! hub_cell_state "$cell"; then
       down+="$cell "
@@ -278,7 +285,7 @@ management_extras() {
   conf=""
   [[ "${ready:-0}" == 1 ]] && conf="$(kubectl --context kind-management get --raw \
     /api/v1/namespaces/mesh-view-system/services/kiali:20001/proxy/kiali/api/config 2>/dev/null || true)"
-  kiali_json="$(jq -Rsc --arg ready "${ready:-0}" --arg cells "$MESH_VIEW_CELLS" --arg down "$down" --arg absent "$absent" '
+  kiali_json="$(jq -Rsc --arg ready "${ready:-0}" --arg cells "$mesh_live" --arg down "$down" --arg absent "$absent" '
       def names: map(select(length > 0));
       (fromjson? // {}) as $c
       | ([$c.clusters // {} | to_entries[] | select(.value.accessible == true) | .key] | sort) as $acc
@@ -312,7 +319,7 @@ management_extras() {
 # ConfigMap step-status of dev-cp and the status of the host service. When mgmtd does not answer it prints [], because the object of
 # management already reports that. The times of the journal come from the clock of the Mac and every other time from a node.
 provisioning_problems() {
-  local st now clock_problem mac_now states stuck id cell state kind secs limit hs serve pub staged wantkeys='null' sat="" jadmit=false
+  local st now clock_problem mac_now states stuck id cell state kind secs limit hs serve pub staged wantkeys='null' sat="" jadmit=false admit_at=0
   local extra='[]' marker=false open_steps=false flag=-d
   st="$(mise run mgmt -- status 2>/dev/null)" || st=""
   if ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
@@ -326,6 +333,8 @@ provisioning_problems() {
   mac_now="$(date +%s)"
   if states="$(journal_states 2>/dev/null)" && stuck="$(stuck_steps "$mac_now" 2>/dev/null)"; then
     ! grep -qx admitting <<<"$states" || jadmit=true
+    admit_at="$(admit_end 2>/dev/null)" || admit_at=0
+    [[ "$admit_at" =~ ^[0-9]+$ ]] || admit_at=0
     while read -r id cell state kind secs limit; do
       [[ -n "$id" ]] || continue
       if [[ "$kind" == heartbeat ]]; then
@@ -357,9 +366,10 @@ provisioning_problems() {
     wantkeys="$({ printf '%s' "$pub" | base64 "$flag" | shasum -a 256 | cut -d' ' -f1; [[ -z "$staged" ]] || echo "$staged"; } | jq -Rcn '[inputs] | sort')"
   fi
 
+  # retryAt and the journal times come from the clock of the Mac (macnow). Every other time comes from a node (now).
   read_clock
   jq -c --arg live "$live" --arg catalog "$(catalog_cells | paste -sd' ' -)" --argjson now "$now" --arg clockp "$clock_problem" \
-    --argjson marker "$marker" --argjson jadmit "$jadmit" --arg sat "$sat" --argjson hs "$hs" --argjson wantkeys "$wantkeys" --argjson extra "$extra" '
+    --argjson marker "$marker" --argjson jadmit "$jadmit" --argjson admitat "$admit_at" --argjson macnow "$mac_now" --arg sat "$sat" --argjson hs "$hs" --argjson wantkeys "$wantkeys" --argjson extra "$extra" '
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def isopen: . != null and .step != null and ((.step.doneAt // "") | (. == "" or startswith("0001-")));
     def words: split(" ") | map(select(length > 0));
@@ -373,11 +383,13 @@ provisioning_problems() {
         | ($cs.step.host // null) as $host
         | (if $host != null and $host.id == $cs.step.id then $host else null end) as $h
         | (
-          (if $islive and $req and ($cs.invalidSince | ts) > 1000000000 and ($now - ($cs.invalidSince | ts)) > 300 and ($open | not) and ($admitting | not)
+          (if $islive and $req and ($cs.invalidSince | ts) > 1000000000 and ($now - ([($cs.invalidSince | ts), $admitat] | max)) > 300 and ($open | not) and ($admitting | not)
            then {cluster: $c, problem: "the cell \($c) has been invalid since \($cs.invalidSince) (\($cs.validReason // "no reason")), which is more than 5 minutes, and no step is open. Run: CELL=\($c) mise run cell:verify"} else empty end),
           (if $open and ($cs.step.expiresAt | ts) > 1000000000 and ($cs.step.expiresAt | ts) < $now
            then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) expired at \($cs.step.expiresAt). Run: mise run portal -- retry --cell \($c)"} else empty end),
-          (if $open and $h != null and ($h.state == "failed" or $h.state == "failed_final" or $h.state == "refused")
+          (if $open and $h != null and $h.state == "failed" and ($h.retryAt | ts) > 1000000000 and ($h.retryAt | ts) + 30 > $macnow
+           then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) is failed\(if ($h.reason // "") != "" then " (" + $h.reason + ")" else "" end), and the cell controller sends it again at \($h.retryAt). Wait until then"} else empty end),
+          (if $open and $h != null and (($h.state == "failed" and (($h.retryAt | ts) + 30 <= $macnow)) or $h.state == "failed_final" or $h.state == "refused")
            then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) is \($h.state)\(if ($h.reason // "") != "" then " (" + $h.reason + ")" else "" end). Run: mise run portal -- retry --cell \($c)"} else empty end),
           (if $open and $h != null and $h.lastHostError != null and ($h.lastHostError.at | ts) > 1000000000 and ($now - ($h.lastHostError.at | ts)) > 120
            then {cluster: $c, problem: (if $h.lastHostError.reason == "hostsvc_untrusted"

@@ -59,3 +59,43 @@ stuck_steps() {
     fi
   done <<<"$rows"
 }
+
+# stage_cells prints "<cell>:<stage>" for each journal entry that runs a stage, on one line, separated by spaces. It prints nothing when the
+# journal is absent, and it returns 1 when the journal does not parse.
+stage_cells() {
+  local file
+  file="$(steps_dir)/journal.json"
+  [[ -f "$file" ]] || return 0
+  jq -r '[.entries[]? | select(.status.state == "creating" or .status.state == "admitting" or .status.state == "bootstrapping")
+    | "\(.status.cell):\(.status.state)"] | join(" ")' "$file"
+}
+
+# header_epoch <log> <stage> prints the time of the first header line of the stage in the step log, in epoch seconds, or nothing.
+header_epoch() {
+  local line
+  line="$(grep "^== $2 attempt " "$1" 2>/dev/null | head -n 1)" || line=""
+  [[ "$line" == *" at "* ]] || return 0
+  jq -nr --arg t "${line##* at }" '$t | fromdateiso8601' 2>/dev/null || true
+}
+
+# admit_end prints the time in epoch seconds when the newest admit stage of the journal ended, or 0. A running admit stage is left to the
+# caller, which sees it in the journal. The end of a stage that no later stage followed is the time that its log was last written, and
+# the end of a stage that a bootstrapping stage followed is the start of that stage. The times come from the clock of the Mac.
+admit_end() {
+  local dir file ids id log end best=0 mtime
+  dir="$(steps_dir)"
+  file="$dir/journal.json"
+  [[ -f "$file" ]] || { echo 0; return 0; }
+  ids="$(jq -r '.entries[]? | select((.stageRuns.admitting // 0) > 0 and .status.state != "admitting") | .status.id' "$file")" || return 1
+  for id in $ids; do
+    log="$dir/$id.log"
+    [[ -r "$log" ]] || continue
+    end="$(header_epoch "$log" bootstrapping)"
+    if [[ -z "$end" ]]; then
+      mtime="$(stat -f %m "$log" 2>/dev/null || stat -c %Y "$log" 2>/dev/null)" || continue
+      end="$mtime"
+    fi
+    ((end > best)) && best="$end"
+  done
+  echo "$best"
+}
