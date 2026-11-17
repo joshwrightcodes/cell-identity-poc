@@ -252,7 +252,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
 		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system", "link mgmt-api 0 mgmt-system"},
-		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness envd 0 envd-system", "harness cell-gateway 0 gateway-system"},
+		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness cell-controller 0 cell-controller-system", "harness envd 0 envd-system", "harness cell-gateway 0 gateway-system"},
 		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 	}
@@ -344,6 +344,58 @@ func TestRootBundleWaveOrder(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHarnessWritesOnlyIntoExistingNamespaces checks the order of the harness and link components of each cluster: no
+// component renders an object into a namespace that a later component creates. The apply of the earlier component
+// would stop with "namespace not found". The envd render once needed a Role in the namespace of the cell controller, so
+// the Role belongs to the component that creates the namespace, and that component comes first.
+func TestHarnessWritesOnlyIntoExistingNamespaces(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			creator := map[string]int{}
+			for i, c := range cr.components {
+				for _, o := range c.objs {
+					if o["kind"] == "Namespace" {
+						creator[fmt.Sprint(lookupOr(o, "metadata", "name"))] = i
+					}
+				}
+			}
+			for i, c := range cr.components {
+				if c.kind == "bundle" {
+					continue
+				}
+				for _, o := range c.objs {
+					ns, ok := lookup(o, "metadata", "namespace")
+					if !ok {
+						continue
+					}
+					if at, made := creator[fmt.Sprint(ns)]; made && at > i {
+						t.Errorf("%s: the %s component %s renders %s, and the later component %s creates namespace %v", cr.name, c.kind, c.name, objName(o), cr.components[at].name, ns)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestCellControllerComesBeforeEnvd: the new envd needs the namespace cell-controller-system and the Role envd-steps at its first
+// round, and both come with the cell controller component. Without them each round ends with store_failed.
+func TestCellControllerComesBeforeEnvd(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		if cr.name != "dev-cp" {
+			continue
+		}
+		index := map[string]int{}
+		for i, c := range cr.components {
+			index[c.name] = i
+		}
+		cc, okCC := index["cell-controller"]
+		envd, okEnvd := index["envd"]
+		if !okCC || !okEnvd || cc >= envd {
+			t.Errorf("the components of dev-cp are %v, want cell-controller before envd", index)
+		}
 	}
 }
 
@@ -517,6 +569,7 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 	}
 	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
 		"envd Deployment envd-system/envd envd", "envd Deployment envd-system/envd spire-agent",
+		"cell-controller Deployment cell-controller-system/cell-controller cell-controller", "cell-controller Deployment cell-controller-system/cell-controller spire-agent",
 		"cell-gateway StatefulSet gateway-system/cell-gateway cellgw", "cell-gateway StatefulSet gateway-system/cell-gateway spire-agent",
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
 		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
@@ -590,8 +643,8 @@ func TestNoEmptyPeerList(t *testing.T) {
 		if !seen["management mgmtd"] {
 			t.Error("the loop saw no mgmtd policy in management")
 		}
-		if !seen["dev-cp envd"] || !seen["dev-cp cell-gateway"] || !seen["dev-cp relay-view"] {
-			t.Error("the loop saw no envd, cell-gateway or relay-view policy in dev-cp")
+		if !seen["dev-cp envd"] || !seen["dev-cp cell-gateway"] || !seen["dev-cp relay-view"] || !seen["dev-cp cell-controller"] {
+			t.Error("the loop saw no envd, cell-gateway, cell-controller or relay-view policy in dev-cp")
 		}
 	}()
 	for _, cr := range renderAll(t) {
@@ -696,6 +749,7 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
 		{"mgmt-api", script("mgmt-api", "management"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"envd", script("envd", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"cell-controller", script("cell-controller", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"cell-gateway", script("cell-gateway", "dev-cp"), []string{"NODE_IPS"}},
 	}
 	for _, tc := range cases {

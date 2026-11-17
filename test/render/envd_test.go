@@ -84,7 +84,8 @@ func TestEnvdRender(t *testing.T) {
 		ctr := named(t, containers, "envd")
 		wantArgs := []string{"run", "--upstream=10.9.0.10:31446", "--expect-id=spiffe://mgmt.poc.internal/api", "--peer-bundle=/run/envd/peer-root/root.crt",
 			"--peer-trust-domain=mgmt.poc.internal", "--spec-key-file=/run/envd/spec-key/spec.pub", "--env=dev", "--output-configmap=spire-system/cell-records",
-			"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints"}
+			"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints",
+			"--steps-configmap=cell-controller-system/cell-steps", "--step-status-configmap=cell-controller-system/step-status"}
 		if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != fmt.Sprint(wantArgs) {
 			t.Errorf("envd args are %s, want %v", got, wantArgs)
 		}
@@ -290,5 +291,36 @@ func TestEnvdRenderGatewayFlags(t *testing.T) {
 	}
 	if !found {
 		t.Error("the Role has no rule with get on configmaps attest-hints")
+	}
+}
+
+// TestEnvdRenderStepFlags checks the two step flags of envd, which an envd of Task 4 needs to start. The new envd needs
+// both, and each round ends with store_failed until the Role envd-steps exists in cell-controller-system. That Role comes with the
+// render of the cell controller, so envd renders no object in that namespace, and its policy gets no rule for it: the
+// ConfigMaps go through flow N31, the API server.
+func TestEnvdRenderStepFlags(t *testing.T) {
+	r := renderEnvd(t)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	ctr := named(t, get[[]any](t, objs["Deployment envd-system/envd"], "spec", "template", "spec", "containers"), "envd")
+	args := fmt.Sprint(get[[]any](t, ctr, "args"))
+	for _, want := range []string{"--steps-configmap=cell-controller-system/cell-steps", "--step-status-configmap=cell-controller-system/step-status"} {
+		if strings.Count(args, want) != 1 {
+			t.Errorf("envd args %s do not hold %s once", args, want)
+		}
+	}
+	for key := range objs {
+		if strings.Contains(key, "cell-controller-system") {
+			t.Errorf("the envd render prints %s, which belongs to the cell controller component", key)
+		}
+	}
+	var egress []string
+	for _, rule := range get[[]any](t, objs["NetworkPolicy envd-system/envd"], "spec", "egress") {
+		egress = append(egress, peerList(t, rule, "to"))
+	}
+	if len(egress) != 6 {
+		t.Errorf("the envd policy has the egress rules %v, want the six of M5 and none for the steps", egress)
 	}
 }

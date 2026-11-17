@@ -1,0 +1,209 @@
+# The cell controller of dev-cp. render.sh fills in the @...@ values, adds the SPIRE agent sidecar
+# (components/lib/spire-sidecar.sh) and the harness label, and prints the ConfigMaps and the
+# NetworkPolicies.
+#
+# The cell controller reads the signed steps that envd keeps in ConfigMap cell-steps, verifies each one
+# under its own pinned copy of the management key, sends it to the host service over mutual TLS and
+# writes the progress to ConfigMap step-status. Its SVID is
+# spiffe://dev.env.poc.internal/cp/cell-controller.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cell-controller-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cell-controller
+  namespace: cell-controller-system
+automountServiceAccountToken: false
+---
+# The cell controller reads cell-steps and writes step-status. Create cannot name the object, and get and
+# update name only the one that the rule lists.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cell-controller
+  namespace: cell-controller-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [cell-steps]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [step-status]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cell-controller
+  namespace: cell-controller-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cell-controller
+subjects:
+  - kind: ServiceAccount
+    name: cell-controller
+    namespace: cell-controller-system
+---
+# envd writes ConfigMap cell-steps here and reads ConfigMap step-status. The bundle of this component holds the
+# Role, so the namespace exists before envd uses it. envd calls Get, Create and Update on cell-steps, and Get on
+# step-status.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-steps
+  namespace: cell-controller-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [cell-steps]
+    verbs: [get, update]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [step-status]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-steps
+  namespace: cell-controller-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: envd-steps
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cell-controller
+  namespace: cell-controller-system
+  labels:
+    app.kubernetes.io/name: cell-controller
+spec:
+  replicas: 1
+  # One host client at a time: the new pod starts after the old one stops.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cell-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cell-controller
+      annotations:
+        poc.internal/hostsvc-pin-sha256: "@HOSTSVC_PIN_SHA256@"
+        poc.internal/spec-key-sha256: "@SPEC_KEY_SHA256@"
+    spec:
+      serviceAccountName: cell-controller
+      # Only the cell-controller container mounts the token, as the projected volume cell-controller-api-token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cell-controller
+          image: "@CELL_CONTROLLER_IMAGE@"
+          args:
+            - run
+            - --env=@POC_ENV@
+            - --steps-configmap=cell-controller-system/cell-steps
+            - --status-configmap=cell-controller-system/step-status
+            - --spec-key-dir=/run/cell-controller/spec-key
+            - --hostsvc-addr=@HOSTSVC_ADDR@
+            - --hostsvc-server-name=host.docker.internal
+            - --hostsvc-pin=/run/cell-controller/hostsvc-pin/hostsvc.crt
+            - --health-listen=:8080
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cell-controller
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: health
+              containerPort: 8080
+          # The kubelet reaches the health port from the node (flow N23). The pod is Ready after its first
+          # read of cell-steps, also while the host service is down.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: spec-key
+              mountPath: /run/cell-controller/spec-key
+              readOnly: true
+            - name: hostsvc-pin
+              mountPath: /run/cell-controller/hostsvc-pin
+              readOnly: true
+            - name: cell-controller-api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: spec-key
+          configMap:
+            name: mgmt-spec-key
+        - name: hostsvc-pin
+          configMap:
+            name: hostsvc-pin
+        - name: cell-controller-api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace

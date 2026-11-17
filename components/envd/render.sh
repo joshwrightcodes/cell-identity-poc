@@ -6,7 +6,9 @@
 # NetworkPolicies default-deny, allow-dns and envd (flows N30, N31, N35, N39, N8, N11 and N23), and Role
 # and RoleBinding envd-records in spire-system. The Role lets envd write ConfigMap
 # spire-system/cell-records and read ConfigMap spire-system/attest-hints, and nothing else. Every object
-# carries the harness label of the component.
+# carries the harness label of the component. The step flags name ConfigMaps cell-steps and step-status in
+# cell-controller-system. The cell controller render holds the Role envd-steps for them, and its component comes
+# first in the topology.
 #
 # The render reads these facts from outside the cluster, so the harness runs it after the waves:
 #   - the node address of the management cluster, from the host service. The envd arguments and the

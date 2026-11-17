@@ -409,7 +409,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd", "envd", "cellgw"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd", "envd", "cell-controller", "cellgw"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -607,8 +607,8 @@ func TestRenderSpireServer(t *testing.T) {
 	}
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
-	t.Run("k8s_psat admits the plane workloads cp/otel, envd and cp/gateway", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway"})
+	t.Run("k8s_psat admits the plane workloads cp/otel, envd, cp/gateway and cp/cell-controller", func(t *testing.T) {
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"})
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
@@ -860,7 +860,8 @@ func TestRenderSpireServer(t *testing.T) {
 		subjects := map[string]string{"celld": "cell-identity-system:celld", "argocd-agent": "argocd:argocd-agent",
 			"otel": "observability-system:otel-uplink", "mesh-view": "mesh-view-system:mesh-view"}
 		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml", "agents-envd-system-envd.yaml", "workload-envd.yaml",
-			"agents-gateway-system-cell-gateway.yaml", "workload-cp-gateway.yaml"}
+			"agents-gateway-system-cell-gateway.yaml", "workload-cp-gateway.yaml",
+			"agents-cell-controller-system-cell-controller.yaml", "workload-cp-cell-controller.yaml"}
 		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 			for role := range subjects {
 				wantKeys = append(wantKeys, cell+"-agents-"+role+".yaml", cell+"-"+role+".yaml")

@@ -120,6 +120,14 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# The cell controller sends the signed steps that envd keeps in ConfigMap cell-controller-system/cell-steps to the host
+# service. It owns the namespace cell-controller-system, which also holds the Role and RoleBinding envd-steps of envd,
+# so it comes before envd: the new envd needs the namespace and the Role at its first round. Its render reads the live
+# SPIRE server of its own cluster and the host service, so it renders after the waves.
+CELL_CONTROLLER_HARNESS=(
+  "cell-controller:cell-controller-system"
+)
+
 # envd pulls the signed spec and records from mgmtd and writes ConfigMap spire-system/cell-records, which
 # the SPIRE server of dev-cp reads. It owns the namespace envd-system, and its Role and RoleBinding live
 # in spire-system, next to the objects of the spire-server bundle. Its render reads the live SPIRE server
@@ -146,7 +154,7 @@ MESH_VIEW_HARNESS=(
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
 # (CELL_UP_SKIP_LATE=1).
-LATE_HARNESS=(otel-uplink envd cell-gateway)
+LATE_HARNESS=(otel-uplink cell-controller envd cell-gateway)
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
@@ -191,6 +199,7 @@ for set_name in $set_names; do
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
+    cell-controller) HARNESS_COMPONENTS+=("${CELL_CONTROLLER_HARNESS[@]}") ;;
     envd) HARNESS_COMPONENTS+=("${ENVD_HARNESS[@]}") ;;
     cell-gateway) HARNESS_COMPONENTS+=("${CELL_GATEWAY_HARNESS[@]}") ;;
     mgmt-plane) LINK_COMPONENTS+=("${MGMT_PLANE_LINK[@]}") ;;
@@ -1017,8 +1026,18 @@ check_plane_pods() {
 # The fourth case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
 # the check skips them, and prints no delete hint for them.
+# The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
+# manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
+# cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
+# runtime_objects prints one case object, or a JSON list of cases when a namespace holds writers that differ. An object is a
+# runtime object when it fits one case.
 runtime_objects() {
   local cell agents=()
+  if [[ "$1" == cell-controller && "$2" == cell-controller-system && "$3" == ConfigMap ]]; then
+    jq -cn '[{names: "^cell-steps$", managers: ["envd"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
+      {names: "^step-status$", managers: ["cell-controller"], labels: [], marker: {key: "poc.internal/made-by", value: "cell-controller"}}]'
+    return
+  fi
   if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
     jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
     return
@@ -1062,14 +1081,17 @@ check_harness_objects() {
   for kind in $(yq -N -r 'select(.kind != null and (.metadata.namespace // "") != "") | .kind' "$bundle" | sort -u); do
     want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
-    runtime="$(runtime_objects "$comp" "$ns" "$kind")"
+    # runtime is the list of cases that fit a runtime object of this kind, empty when there is none.
+    runtime="$(runtime_objects "$comp" "$ns" "$kind" | jq -c 'if . == null then [] elif type == "array" then . else [.] end')" \
+      || { echo "could not read the runtime objects of $kind in $ns"; return 1; }
     if [[ -n "$owned" ]]; then
       got="$(jq -r --arg label "$HARNESS_LABEL" --argjson runtime "$runtime" '[.items[]
-        | select(($runtime == null) or ((((.metadata.labels[$label] // "") as $l | $l == "" or ($runtime.labels | index($l)) != null)
-            and (.metadata.name | test($runtime.names))
-            and (($runtime.marker // null) == null or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
-            and ((.metadata.managedFields // []) | length) > 0
-            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not))
+        | select(. as $o | any($runtime[]; . as $c
+            | (($o.metadata.labels[$label] // "") as $l | $l == "" or ($c.labels | index($l)) != null)
+            and ($o.metadata.name | test($c.names))
+            and (($c.marker // null) == null or $o.metadata.labels[$c.marker.key] == $c.marker.value)
+            and (($o.metadata.managedFields // []) | length) > 0
+            and all($o.metadata.managedFields[]; .manager as $m | $c.managers | index($m) != null)) | not)
         | select((.metadata.labels[$label] // "") != ""
           or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
         | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
@@ -1081,11 +1103,12 @@ check_harness_objects() {
       [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
       # A runtime object has no harness label, so the label list above never shows it. It must still carry the marker and
       # only the field managers of its writer.
-      if [[ "$runtime" != null ]]; then
-        stray="$(jq -r --argjson runtime "$runtime" '[.items[] | select(.metadata.name | test($runtime.names))
-          | select((((($runtime.marker // null) == null) or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
-            and ((.metadata.managedFields // []) | length) > 0
-            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not)
+      if [[ "$runtime" != "[]" ]]; then
+        stray="$(jq -r --argjson runtime "$runtime" '[.items[] | . as $o | select(any($runtime[]; . as $c | $o.metadata.name | test($c.names)))
+          | select(any($runtime[]; . as $c | ($o.metadata.name | test($c.names))
+            and ((($c.marker // null) == null) or $o.metadata.labels[$c.marker.key] == $c.marker.value)
+            and (($o.metadata.managedFields // []) | length) > 0
+            and all($o.metadata.managedFields[]; .manager as $m | $c.managers | index($m) != null)) | not)
           | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
         [[ -z "$stray" ]] || problems+=("$ns has the runtime $kind objects '$stray' that a person or another manager wrote")
       fi
