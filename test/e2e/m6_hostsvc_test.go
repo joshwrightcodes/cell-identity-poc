@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os/exec"
@@ -208,7 +209,7 @@ func TestM6UnsignedStepRefused(t *testing.T) {
 			t.Fatalf("got %d %s, want 403 with the Denied body", a.Code, a.Body)
 		}
 		var body map[string]any
-		if err := json.Unmarshal(a.Body, &body); err != nil || len(body) != 2 || body["error"] != "denied" || !sixteenHex.MatchString(body["requestId"].(string)) {
+		if err := json.Unmarshal(a.Body, &body); err != nil || len(body) != 2 || body["error"] != "denied" || !sixteenHex.MatchString(fmt.Sprint(body["request_id"])) {
 			t.Fatalf("the body is %s, want only error denied and a request ID of 16 hexadecimal characters", a.Body)
 		}
 		if line := hostLog(t, rid); !strings.Contains(line, `"reason":"`+detail+`"`) {
