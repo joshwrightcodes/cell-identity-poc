@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,7 +70,9 @@ func refusalText(r *mgmtapi.Refusal) string {
 	return r.Reason
 }
 
-// liveBundle returns the spec bundle that envd holds in cell-records.
+// liveBundle returns the spec bundle that envd holds in cell-records, with the step envelopes that it holds in ConfigMap
+// cell-controller-system/cell-steps, one for each key <cell>.step.json. While a step is open, the spec indexes it, and a bundle
+// with no envelope for it is not the live bundle: envd check refuses it.
 func liveBundle(t *testing.T) mgmtapi.SpecBundle {
 	t.Helper()
 	data, _, _, err := recordsConfigMap(t)
@@ -80,6 +83,18 @@ func liveBundle(t *testing.T) mgmtapi.SpecBundle {
 	b := mgmtapi.SpecBundle{Spec: json.RawMessage(data["spec-envelope.json"]), Records: map[string]json.RawMessage{}}
 	for _, e := range sp.Cells {
 		b.Records[e.Name] = json.RawMessage(data[e.Name+".dsse.json"])
+	}
+	stepData, _, _, err := cellStepsConfigMap(t)
+	if err != nil {
+		t.Fatalf("read ConfigMap cell-steps: %v", err)
+	}
+	for key, envelope := range stepData {
+		if cell, ok := strings.CutSuffix(key, ".step.json"); ok {
+			if b.Steps == nil {
+				b.Steps = map[string]json.RawMessage{}
+			}
+			b.Steps[cell] = json.RawMessage(envelope)
+		}
 	}
 	return b
 }
