@@ -30,40 +30,6 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
-// The listener limits of the shared table.
-func TestListenerLimitsOfTheSharedTable(t *testing.T) {
-	if maxConns != 64 || apiMaxAge != 5*time.Minute || bindMaxAge != 15*time.Second || apiGrace != 5*time.Second || bindGrace != 10*time.Second {
-		t.Fatalf("connections %d, API age %s grace %s, bind age %s grace %s", maxConns, apiMaxAge, apiGrace, bindMaxAge, bindGrace)
-	}
-	if maxEstablished != 1024 || maxPendingHandshakes != 1024 || handshakeDeadline != 5*time.Second || firstByteDeadline != time.Second || bindHandlerTimeout != 25*time.Second {
-		t.Fatalf("established %d, pending %d, hard %s, first byte %s, handler %s", maxEstablished, maxPendingHandshakes, handshakeDeadline, firstByteDeadline, bindHandlerTimeout)
-	}
-	if bindMaxAge+bindGrace >= 30*time.Second {
-		t.Fatal("the bind hard deadline must stay below the 30 s attempt timeout of celld")
-	}
-	dummy := spiffetest.NewCA(t, devTD)
-	svids := dummy.Source(t, mgmtSPIFFE)
-	api, bind := NewServers(http.NotFoundHandler(), http.NotFoundHandler(), APIServerTLS(svids, dummy.Bundle(), mustID(t, envdSPIFFE)), BindServerTLS(svids))
-	for _, tc := range []struct {
-		name              string
-		srv               *http.Server
-		streams           int32
-		read, write, idle time.Duration
-	}{
-		{"api", api, 4, 15 * time.Second, 15 * time.Second, 60 * time.Second},
-		{"bind", bind, 2, 10 * time.Second, bindHandlerTimeout + 2*time.Second, 30 * time.Second},
-	} {
-		s := tc.srv
-		if s.HTTP2 == nil || int32(s.HTTP2.MaxConcurrentStreams) != tc.streams || s.ReadTimeout != tc.read || s.WriteTimeout != tc.write ||
-			s.IdleTimeout != tc.idle || s.ReadHeaderTimeout != 10*time.Second || s.ConnContext == nil || s.Handler == nil {
-			t.Errorf("%s server limits %+v", tc.name, s)
-		}
-		if s.Protocols == nil || s.Protocols.HTTP1() || !s.Protocols.HTTP2() {
-			t.Errorf("%s server protocols %v", tc.name, s.Protocols)
-		}
-	}
-}
-
 func envdRaw(t *testing.T, r *apiRig, timeout time.Duration) (*tls.Conn, error) {
 	t.Helper()
 	cfg := tlsconfig.MTLSClientConfig(r.devCA.Source(t, envdSPIFFE), r.mgmtCA.Bundle(), tlsconfig.AuthorizeID(mustID(t, mgmtSPIFFE)))
@@ -73,7 +39,7 @@ func envdRaw(t *testing.T, r *apiRig, timeout time.Duration) (*tls.Conn, error) 
 
 func newAPI(t *testing.T) *apiRig {
 	t.Helper()
-	return startAPI(t, NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
+	return startAPI(t, NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)), nil, nil)
 }
 
 // 64 verified connections fill the verified slots. The 65th request waits until one closes.
@@ -239,7 +205,7 @@ func must0(t testing.TB, err error) {
 // and a request on an expired certificate gets 403.
 func TestAPIConnClosesAtCertificateExpiry(t *testing.T) {
 	ca := newShortCA(t, devTD)
-	rig := startAPI(t, NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)),
+	rig := startAPI(t, NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard)),
 		func(*spiffetest.CA) x509bundle.Source { return ca.bundle() }, nil)
 	svid := ca.svid(t, envdSPIFFE, time.Now().Add(1500*time.Millisecond))
 	cfg := tlsconfig.MTLSClientConfig(staticSVID{svid}, rig.mgmtCA.Bundle(), tlsconfig.AuthorizeID(mustID(t, mgmtSPIFFE)))
@@ -259,7 +225,7 @@ func TestAPIConnClosesAtCertificateExpiry(t *testing.T) {
 
 func TestAPIHandlerRefusesExpiredCertificate(t *testing.T) {
 	ca := newShortCA(t, devTD)
-	h := NewAPIHandler(&fakeSpec{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard))
+	h := NewAPIHandler(&fakeAPI{bundle: testBundle()}, "dev", mustID(t, envdSPIFFE), jsonLog(io.Discard))
 	for name, notAfter := range map[string]time.Time{"valid": time.Now().Add(time.Hour), "expired": time.Now().Add(-time.Second)} {
 		r := httptest.NewRequest("GET", mgmtapi.SpecPath("dev"), nil)
 		r.TLS = &tls.ConnectionState{PeerCertificates: ca.svid(t, envdSPIFFE, notAfter.Add(2*time.Second)).Certificates}
@@ -333,3 +299,26 @@ func TestSigningKeyCreatedIsLoggedInEveryPath(t *testing.T) {
 type failingStore struct{ Store }
 
 func (failingStore) Save(*State) error { return io.ErrClosedPipe }
+
+// The limits of the API listener and server.
+func TestAPIServerLimits(t *testing.T) {
+	if maxConns != 64 || apiMaxAge != 5*time.Minute || apiGrace != 5*time.Second {
+		t.Fatalf("connections %d, API age %s grace %s", maxConns, apiMaxAge, apiGrace)
+	}
+	if maxPendingHandshakes != 1024 || handshakeDeadline != 5*time.Second || firstByteDeadline != time.Second {
+		t.Fatalf("pending %d, hard %s, first byte %s", maxPendingHandshakes, handshakeDeadline, firstByteDeadline)
+	}
+	dummy := spiffetest.NewCA(t, devTD)
+	svids := dummy.Source(t, mgmtSPIFFE)
+	s := NewServers(http.NotFoundHandler(), APIServerTLS(svids, dummy.Bundle(), mustID(t, envdSPIFFE)))
+	if s.HTTP2 == nil || s.HTTP2.MaxConcurrentStreams != 4 || s.ReadTimeout != 15*time.Second || s.WriteTimeout != 15*time.Second ||
+		s.IdleTimeout != 60*time.Second || s.ReadHeaderTimeout != 10*time.Second || s.ConnContext == nil || s.Handler == nil {
+		t.Errorf("server limits %+v", s)
+	}
+	if s.Protocols == nil || s.Protocols.HTTP1() || !s.Protocols.HTTP2() {
+		t.Errorf("server protocols %v", s.Protocols)
+	}
+	if reportsHandlerTimeout >= s.WriteTimeout {
+		t.Errorf("the reports deadline %s must stay below the write timeout %s", reportsHandlerTimeout, s.WriteTimeout)
+	}
+}

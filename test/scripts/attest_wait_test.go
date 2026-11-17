@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -22,7 +23,6 @@ case " $* " in
   *" logs deploy/celld "*) cat "$d/celld.log" ;;
   *" logs deploy/envd "*) cat "$d/envd.log" 2>/dev/null || true ;;
   *" get configmap peer-root "*) [[ -f "$d/no-peer-root" ]] || echo configmap/peer-root ;;
-  *" logs mgmtd-0 "*) cat "$d/mgmtd.log" ;;
   *" get pods -l app.kubernetes.io/name=celld "*) cat "$d/pods.json" ;;
   *" delete pod "*) echo "delete $*" >>"$d/deleted" ;;
   *" wait --for=delete "*) echo "wait $*" >>"$d/deleted" ;;
@@ -34,6 +34,7 @@ esac
 const attestMise = `#!/usr/bin/env bash
 echo "mise $*" >>"$STUB_DIR/calls"
 if [[ "$1 $2 $3 $4" == "run hostsvc -- facts" ]]; then cat "$STUB_DIR/facts.json"; exit 0; fi
+if [[ "$1 $2 $3 $4" == "run gw -- status" ]]; then cat "$STUB_DIR/gw-status.json"; exit 0; fi
 [[ "$1 $2 $3 $4" == "run mgmt -- status" ]] || { echo "unexpected mise call: $*" >&2; exit 2; }
 [[ -f "$STUB_DIR/status.json" ]] || exit 1
 cat "$STUB_DIR/status.json"
@@ -56,7 +57,7 @@ func TestAttestWaitStages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for name, body := range map[string]string{"kubectl": attestKubectl, "mise": attestMise} {
+	for name, body := range map[string]string{"kubectl": attestKubectl, "mise": attestMise, "docker": nodeClockDocker} {
 		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -67,7 +68,7 @@ func TestAttestWaitStages(t *testing.T) {
 			b = "true"
 		}
 		return `{"signed":{"epoch":1,"counter":7},"lastRefusal":{"reason":"spec_invalid","revision":{"epoch":1,"counter":7}},"storeError":"update refused",` +
-			`"cells":[{"name":"dev-cell-1","bound":` + b + `,"kids":["a","b"],"record":{"epoch":1,"counter":7}},{"name":"dev-cell-2","bound":true,"record":{"epoch":1,"counter":7}}]}`
+			`"cells":[{"name":"dev-cell-1","bound":` + b + `,"kids":["a","b"],"record":{"epoch":1,"counter":7},"lastRefusal":{"kind":"bind","reason":"not_bound","at":"2026-11-14T01:00:00Z"}},{"name":"dev-cell-2","bound":true,"record":{"epoch":1,"counter":7}}]}`
 	}
 	records := func(counter string) string {
 		return `{"metadata":{"annotations":{"poc.internal/spec-epoch":"1","poc.internal/spec-counter":"` + counter + `"}},"data":{"spec-envelope.json":"{}","dev-cell-1.dsse.json":"{}","dev-cell-2.dsse.json":"{}"}}`
@@ -78,7 +79,7 @@ func TestAttestWaitStages(t *testing.T) {
 		"cell-records.json": records("7"),
 		"server.log":        `{"msg":"records reloaded","spec_epoch":1,"spec_counter":7,"cells":["dev-cell-1","dev-cell-2"]}` + "\n",
 		"celld.log":         `{"msg":"bind refused","cell":"dev-cell-1"}` + "\n",
-		"mgmtd.log":         `{"msg":"bind_denied","reason":"cell_unknown","cell":"dev-cell-1"}` + "\n",
+		"gw-status.json":    `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"nonce_invalid","requestId":"00000000000000aa","at":"2026-11-14T01:00:00Z"}}}`,
 		"pods.json":         `{"items":[{"metadata":{"name":"celld-abc"},"status":{"containerStatuses":[{"name":"spire-agent","state":{"running":{}}}]}}]}`,
 	}
 	for _, tc := range []struct {
@@ -99,7 +100,24 @@ func TestAttestWaitStages(t *testing.T) {
 			}},
 		{name: "management prints no JSON", change: map[string]string{"status.json": "not json"}, want: []string{"warning: attest-wait dev-cell-1", "CELL=management LINK_ONLY=mgmt-api mise run cell:link"}, deny: []string{"stage bound"}},
 		{name: "not bound", change: map[string]string{"status.json": status(false)}, code: 1,
-			want: []string{"stage bound failed", "Last celld bind log line: {\"msg\":\"bind refused\"", "Last mgmtd denial for dev-cell-1: {\"msg\":\"bind_denied\",\"reason\":\"cell_unknown\"", "Next: mise x -- kubectl --context kind-dev-cell-1 -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"}},
+			want: []string{"stage bound failed", "Last celld bind log line: {\"msg\":\"bind refused\"",
+				`Last gateway bind refusal for dev-cell-1: {"reason":"nonce_invalid","requestId":"00000000000000aa"`,
+				`Last mgmtd refusal for dev-cell-1: {"kind":"bind","reason":"not_bound"`,
+				"Next: mise x -- kubectl --context kind-dev-cell-1 -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"},
+			deny: []string{"CELL=dev-cp mise run cell:up"}},
+		{name: "the gateway refused the bind source", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","requestId":"00000000000000bb","at":"2099-01-01T00:00:00Z"}}}`}, code: 1,
+			want: []string{"stage bound failed", `Last gateway bind refusal for dev-cell-1: {"reason":"source_mismatch"`, "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
+		{name: "a fresh refusal on a node clock that lags the Mac counts as new", env: []string{"STUB_CLOCK_SKEW=300"},
+			change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","at":"` + time.Now().Add(-290*time.Second).UTC().Format(time.RFC3339) + `"}}}`}, code: 1,
+			want: []string{"stage bound failed", "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
+		{name: "the gateway does not know the cell", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"cell_unknown","at":"2099-01-01T00:00:00.5Z"}}}`}, code: 1,
+			want: []string{"stage bound failed", `"reason":"cell_unknown"`, "Next: CELL=dev-cp mise run cell:up, then mise x -- kubectl"}},
+		{name: "an old gateway refusal prints no cell:up hint", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-1":{"reason":"source_mismatch","at":"2020-01-01T00:00:00Z"}}}`}, code: 1,
+			want: []string{"stage bound failed", `"reason":"source_mismatch"`}, deny: []string{"CELL=dev-cp mise run cell:up"}},
+		{name: "the gateway refusal of another cell does not count", change: map[string]string{"status.json": status(false), "gw-status.json": `{"epoch":1,"lastBindRefusal":{"dev-cell-2":{"reason":"source_mismatch"}}}`}, code: 1,
+			want: []string{"stage bound failed", "Last gateway bind refusal for dev-cell-1: \"none\""}, deny: []string{"CELL=dev-cp mise run cell:up"}},
+		{name: "the gateway status does not answer", change: map[string]string{"status.json": status(false), "gw-status.json": "not json"}, code: 1,
+			want: []string{"stage bound failed", "Last mgmtd refusal for dev-cell-1:"}, deny: []string{"CELL=dev-cp mise run cell:up"}},
 		{name: "not applied", change: map[string]string{"cell-records.json": records("6")}, code: 1,
 			want: []string{"stage applied failed", "does not reach the revision 1/7", `lastRefusal: {"reason":"spec_invalid"`, "storeError: update refused", "Next: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd"}},
 		{name: "mgmtd has no root of dev-cp", change: map[string]string{"cell-records.json": records("6"), "no-peer-root": "1"}, code: 1,

@@ -76,16 +76,15 @@ func TestDependentsManagementOrder(t *testing.T) {
 	}
 }
 
-// registryLinks are the links that render the registries from the records of mgmtd.
-const registryLinks = "CELL=management LINK_ONLY=central-view mise run cell:link\nCELL=management LINK_ONLY=telemetry-gateway mise run cell:link\nCELL=management LINK_ONLY=mesh-view-hub mise run cell:link"
-
 // dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
-// admits envd by the dev-cp root and the node address. A rebuilt cell links the three registries.
+// admits envd by the dev-cp root and the node address. A rebuilt cell links no registry: mgmtd publishes them.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
-		"dependents_of hostsvc":    "mise run hostsvc:serve -- restart",
-		"dependents_of dev-cell-1": "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up\n" + registryLinks,
-		"dependents_of dev-cp":     "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
+		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
+		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
+		"dependents_of gateway-store": "mise run gw:reset",
+		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up",
+		"dependents_of dev-cp":        "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)
 		if err != nil || strings.TrimSpace(out) != want {
@@ -449,7 +448,7 @@ func TestImagesNamed(t *testing.T) {
 	if got, _ := os.ReadFile(envFile); !strings.HasPrefix(string(got), "# commit abc123\n") {
 		t.Fatalf("a partial build rewrote the commit line:\n%s", got)
 	}
-	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd")
+	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cellgw")
 	if out, err := run("6", allNames...); err != nil {
 		t.Fatalf("images.sh with every name failed: %v\n%s", err, out)
 	}
@@ -584,9 +583,29 @@ func (a *harnessAPI) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (a *harnessAPI) replicas() any { return a.sts["spec"].(map[string]any)["replicas"] }
+func (a *harnessAPI) replicas() any {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.sts["spec"].(map[string]any)["replicas"]
+}
+
+// specField returns the JSON of one field under spec, read while the server is not writing.
+func (a *harnessAPI) specField(name string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	b, _ := json.Marshal(a.sts["spec"].(map[string]any)[name])
+	return string(b)
+}
+
+func (a *harnessAPI) requestLog() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return strings.Join(a.requests, "\n")
+}
 
 func (a *harnessAPI) managers() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	var out []string
 	for _, e := range a.sts["metadata"].(map[string]any)["managedFields"].([]any) {
 		m := e.(map[string]any)
@@ -654,8 +673,7 @@ current-context: kind-management
 		cmd := exec.Command(script, "management", "mgmt-system", "statefulset/mgmtd", n)
 		cmd.Env = env
 		if out, err := cmd.CombinedOutput(); err != nil {
-			a := strings.Join(api.requests, "\n")
-			t.Fatalf("harness-replicas.sh %s failed: %v\n%s\nrequests:\n%s", n, err, out, a)
+			t.Fatalf("harness-replicas.sh %s failed: %v\n%s\nrequests:\n%s", n, err, out, api.requestLog())
 		}
 	}
 	check := func() (string, error) {
@@ -664,8 +682,7 @@ current-context: kind-management
 		out, err := cmd.CombinedOutput()
 		return string(out), err
 	}
-	wantSpec, _ := json.Marshal(api.sts["spec"].(map[string]any)["template"])
-	wantSelector, _ := json.Marshal(api.sts["spec"].(map[string]any)["selector"])
+	wantSpec, wantSelector := api.specField("template"), api.specField("selector")
 	if out, err := check(); err != nil {
 		t.Fatalf("the check fails before any change: %v\n%s", err, out)
 	}
@@ -674,9 +691,8 @@ current-context: kind-management
 		if fmt.Sprint(api.replicas()) != n {
 			t.Fatalf("replicas %v, want %s", api.replicas(), n)
 		}
-		tmpl, _ := json.Marshal(api.sts["spec"].(map[string]any)["template"])
-		sel, _ := json.Marshal(api.sts["spec"].(map[string]any)["selector"])
-		if string(tmpl) != string(wantSpec) || string(sel) != string(wantSelector) {
+		tmpl, sel := api.specField("template"), api.specField("selector")
+		if tmpl != wantSpec || sel != wantSelector {
 			t.Fatalf("the object lost its template or selector:\n%s\n%s", tmpl, sel)
 		}
 		if got := api.managers(); !slices.Equal(got, []string{"kubectl/Apply/<nil>", "harness-replicas/Update/scale"}) {

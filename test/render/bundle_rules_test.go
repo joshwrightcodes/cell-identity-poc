@@ -252,7 +252,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
 		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system", "link mgmt-api 0 mgmt-system"},
-		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness envd 0 envd-system"},
+		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness envd 0 envd-system", "harness cell-gateway 0 gateway-system"},
 		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 	}
@@ -515,8 +515,9 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 			}
 		}
 	}
-	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay", "relay-system Deployment relay-system/relay-bind relay",
+	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
 		"envd Deployment envd-system/envd envd", "envd Deployment envd-system/envd spire-agent",
+		"cell-gateway StatefulSet gateway-system/cell-gateway cellgw", "cell-gateway StatefulSet gateway-system/cell-gateway spire-agent",
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
 		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
 		"observability-store StatefulSet observability-system/lgtm lgtm", "telemetry-gateway Deployment observability-system/telemetry-gateway cell-proxy",
@@ -558,8 +559,8 @@ func TestNoEmptyPeerList(t *testing.T) {
 		if !seen["management mgmtd"] {
 			t.Error("the loop saw no mgmtd policy in management")
 		}
-		if !seen["dev-cp envd"] || !seen["dev-cp relay-bind"] {
-			t.Error("the loop saw no envd or relay-bind policy in dev-cp")
+		if !seen["dev-cp envd"] || !seen["dev-cp cell-gateway"] || !seen["dev-cp relay-view"] {
+			t.Error("the loop saw no envd, cell-gateway or relay-view policy in dev-cp")
 		}
 	}()
 	for _, cr := range renderAll(t) {
@@ -640,7 +641,7 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
 		{"mgmt-api", script("mgmt-api", "management"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"envd", script("envd", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
-		{"relay-system with relay-bind", script("relay-system", "dev-cp"), []string{"NODE_IPS"}},
+		{"cell-gateway", script("cell-gateway", "dev-cp"), []string{"NODE_IPS"}},
 	}
 	for _, tc := range cases {
 		for _, v := range tc.vars {

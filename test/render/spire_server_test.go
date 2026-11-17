@@ -55,6 +55,17 @@ case "$2" in
       *) echo '{"level":"ERROR","msg":"hostsvc failed","error":"cluster does not exist"}'; exit 1 ;;
     esac ;;
   mgmt)
+    # With STUB_NEXT_PUB set, mgmtd has staged a key: pubkey answers the live key, and status answers stagedKey, the SHA-256 of the
+    # bytes of STUB_NEXT_PUB, or STUB_STAGED_KEY when that is set. STUB_STAGED_KEY alone makes status show a stagedKey while the
+    # ConfigMap holds no next.pub.
+    case "$4" in
+      pubkey) printf '{"spec.pub":"%s"}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"; exit 0 ;;
+      status)
+        staged="${STUB_STAGED_KEY:-}"
+        if [[ -z "$staged" && -n "${STUB_NEXT_PUB:-}" ]]; then staged="$(printf '%s' "$STUB_NEXT_PUB" | base64 -d | shasum -a 256 | cut -d' ' -f1)"; fi
+        printf '{"signed":{"epoch":1,"counter":1},"stagedKey":"%s"}\n' "$staged"
+        exit 0 ;;
+    esac
     [[ "$4" == records ]] || exit 2
     if [[ -n "${STUB_NO_MGMT:-}" ]]; then
       echo '{"level":"ERROR","msg":"mgmt failed","error":"pod mgmtd-0 is absent or not Ready"}'
@@ -119,7 +130,11 @@ if [[ " $* " == *" get configmap mgmt-signing-pub "* ]]; then
     echo 'Error from server (NotFound): configmaps "mgmt-signing-pub" not found' >&2
     exit 1
   fi
-  printf '{"data":{"spec.pub":"%s"}}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"
+  if [[ -n "${STUB_NEXT_PUB:-}" ]]; then
+    printf '{"data":{"spec.pub":"%s","next.pub":"%s"}}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}" "$STUB_NEXT_PUB"
+  else
+    printf '{"data":{"spec.pub":"%s"}}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"
+  fi
   exit 0
 fi
 if [[ " $* " == *" get configmap mgmt-spec-key "* ]]; then
@@ -127,6 +142,9 @@ if [[ " $* " == *" get configmap mgmt-spec-key "* ]]; then
   exit 0
 fi
 if [[ " $* " == *" get pod mgmtd-0 "* ]]; then
+  # mgmtd-0 is Ready only when the test stages a key, so the key helper checks the staged key against mgmtd.
+  # STUB_MGMTD_DOWN keeps it not Ready while a key is staged.
+  if [[ -n "${STUB_NEXT_PUB:-}${STUB_STAGED_KEY:-}" && -z "${STUB_MGMTD_DOWN:-}" ]]; then printf 'True'; fi
   exit 0
 fi
 if [[ " $* " == *" get node "* ]]; then
@@ -381,7 +399,7 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("manifest.json.bad", string(manifestBytes)+" ", 0o644)
 	digest := digestOf(manifestBytes)
 	var images strings.Builder
-	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd", "envd"} {
+	for _, repo := range []string{"netprobe", "cluster-jwt-server", "cluster-jwt-agent", "celld", "cell-proxy", "viewkeys", "relay", "mgmtd", "envd", "cellgw"} {
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
@@ -478,7 +496,8 @@ var clusterScoped = []string{"Namespace", "CustomResourceDefinition", "ClusterRo
 	"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
 
 // docsIn parses the render output by kind and name. Every namespaced object must be in ns, and no
-// Namespace other than ns may appear.
+// Namespace other than ns may appear. The cell-identity render also holds the objects of namespace
+// cell-ops-system (TestCellOpsNamespace), and docsIn skips them for ns cell-identity-system.
 func docsIn(t *testing.T, out, ns string) map[string]object {
 	t.Helper()
 	byKey := map[string]object{}
@@ -494,6 +513,11 @@ func docsIn(t *testing.T, out, ns string) map[string]object {
 			continue
 		}
 		key := get[string](t, o, "kind") + "/" + get[string](t, o, "metadata", "name")
+		if ns == "cell-identity-system" {
+			if opsNS, _ := lookup(o, "metadata", "namespace"); opsNS == "cell-ops-system" || key == "Namespace/cell-ops-system" {
+				continue
+			}
+		}
 		if _, dup := byKey[key]; dup {
 			t.Fatalf("%s appears twice", key)
 		}
@@ -573,8 +597,8 @@ func TestRenderSpireServer(t *testing.T) {
 	}
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
-	t.Run("k8s_psat admits the plane workloads cp/otel and envd", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd"})
+	t.Run("k8s_psat admits the plane workloads cp/otel, envd and cp/gateway", func(t *testing.T) {
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway"})
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
@@ -825,7 +849,8 @@ func TestRenderSpireServer(t *testing.T) {
 		data := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 		subjects := map[string]string{"celld": "cell-identity-system:celld", "argocd-agent": "argocd:argocd-agent",
 			"otel": "observability-system:otel-uplink", "mesh-view": "mesh-view-system:mesh-view"}
-		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml", "agents-envd-system-envd.yaml", "workload-envd.yaml"}
+		wantKeys := []string{"agents-observability-system-otel-uplink.yaml", "workload-cp-otel.yaml", "agents-envd-system-envd.yaml", "workload-envd.yaml",
+			"agents-gateway-system-cell-gateway.yaml", "workload-cp-gateway.yaml"}
 		for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 			for role := range subjects {
 				wantKeys = append(wantKeys, cell+"-agents-"+role+".yaml", cell+"-"+role+".yaml")
@@ -1004,7 +1029,8 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
 	m2 := docs(t, string(want))
-	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics"} {
+	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
+		"Role/spire-server-hints", "RoleBinding/spire-server-hints"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("render has no %s", key)
 		}
@@ -1374,6 +1400,57 @@ func TestSpireServerRenderManagement(t *testing.T) {
 		}
 		if _, ok := spec["externalTrafficPolicy"]; ok {
 			t.Fatal("a ClusterIP service sets externalTrafficPolicy")
+		}
+	})
+}
+
+// TestSpireServerHintConfig: the server of dev-cp, which has agent cells and local workloads, sets hint_configmap to
+// spire-system/attest-hints in the cluster_jwt plugin, and a Role that reads and patches that one ConfigMap and nothing
+// else, with its RoleBinding for the server account. A server that has agent cells but no local workload has no API token,
+// so it gets no hint line and no Role. A server with no agent cell has no cluster_jwt plugin.
+func TestSpireServerHintConfig(t *testing.T) {
+	r := renderCell(t, "dev-cp")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := docs(t, hydrated(r.stdout, "dev-cp"))
+	var top map[string]any
+	if err := hcl.Decode(&top, get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")); err != nil {
+		t.Fatalf("server.conf does not parse: %v", err)
+	}
+	if got := hclAt(t, top, "plugins", "NodeAttestor", "cluster_jwt", "plugin_data", "hint_configmap"); got != "spire-system/attest-hints" {
+		t.Errorf("hint_configmap is %v, want spire-system/attest-hints", got)
+	}
+	role := objs["Role/spire-server-hints"]
+	if role == nil {
+		t.Fatal("the render has no Role spire-server-hints")
+	}
+	if get[string](t, role, "metadata", "namespace") != "spire-system" {
+		t.Errorf("Role namespace is %v, want spire-system", get[string](t, role, "metadata", "namespace"))
+	}
+	rules := get[[]any](t, role, "rules")
+	if len(rules) != 1 {
+		t.Fatalf("Role spire-server-hints has %d rules, want 1: %v", len(rules), rules)
+	}
+	rule := rules[0]
+	if !slices.Equal(get[[]any](t, rule, "apiGroups"), []any{""}) || !slices.Equal(get[[]any](t, rule, "resources"), []any{"configmaps"}) ||
+		!slices.Equal(get[[]any](t, rule, "resourceNames"), []any{"attest-hints"}) || !slices.Equal(get[[]any](t, rule, "verbs"), []any{"get", "patch"}) {
+		t.Errorf("the rule is %v, want configmaps named attest-hints with only get and patch", rule)
+	}
+	binding := objs["RoleBinding/spire-server-hints"]
+	if binding == nil || get[string](t, binding, "roleRef", "kind") != "Role" || get[string](t, binding, "roleRef", "name") != "spire-server-hints" ||
+		get[string](t, binding, "subjects", 0, "kind") != "ServiceAccount" || get[string](t, binding, "subjects", 0, "name") != "spire-server" ||
+		get[string](t, binding, "subjects", 0, "namespace") != "spire-system" {
+		t.Errorf("RoleBinding is %v, want Role spire-server-hints for ServiceAccount spire-system/spire-server", binding)
+	}
+
+	t.Run("agent cells without a local workload", func(t *testing.T) {
+		r := render(t, "SPIRE_AGENT_CELLS=dev-cell-1")
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		if strings.Contains(r.stdout, "hint_configmap") || strings.Contains(r.stdout, "spire-server-hints") {
+			t.Errorf("a server with no API token has a hint line or a hint Role:\n%s", r.stdout)
 		}
 	})
 }

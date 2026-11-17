@@ -91,21 +91,19 @@ check_mgmt_hostsvc_address() {
 check_mgmt_env_address() {
   local want got port
   if ! kind get clusters 2>/dev/null | grep -qx "$VIEW_CONTROL_PLANE"; then
-    got="$(k -n mgmt-system get networkpolicy mgmtd -o json | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8446 or .port == 8447)) | .from[].ipBlock.cidr] | join(" ")')"
-    [[ -z "$got" ]] || { echo "$VIEW_CONTROL_PLANE does not exist, but the API and bind ports admit '$got'."; echo "Run: $(fix_command mgmt-api)"; return 1; }
+    got="$(k -n mgmt-system get networkpolicy mgmtd -o json | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8446)) | .from[].ipBlock.cidr] | join(" ")')"
+    [[ -z "$got" ]] || { echo "$VIEW_CONTROL_PLANE does not exist, but the API port admits '$got'."; echo "Run: $(fix_command mgmt-api)"; return 1; }
     return 0
   fi
   want="$(node_ip "$VIEW_CONTROL_PLANE")" || { echo "$want"; return 1; }
-  for port in 8446 8447; do
-    got="$(k -n mgmt-system get networkpolicy mgmtd -o json \
-      | jq -r --argjson p "$port" '[.spec.ingress[] | select(any(.ports[]; .port == $p)) | .from[].ipBlock.cidr] | join(" ")')" \
-      || { echo "could not read NetworkPolicy mgmt-system/mgmtd"; return 1; }
-    if [[ "$got" != "$want/32" ]]; then
-      echo "the $VIEW_CONTROL_PLANE node is $want, but port $port admits '$got'."
-      echo "Run: $(fix_command mgmt-api)"
-      return 1
-    fi
-  done
+  got="$(k -n mgmt-system get networkpolicy mgmtd -o json \
+    | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8446)) | .from[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy mgmt-system/mgmtd"; return 1; }
+  if [[ "$got" != "$want/32" ]]; then
+    echo "the $VIEW_CONTROL_PLANE node is $want, but port 8446 admits '$got'."
+    echo "Run: $(fix_command mgmt-api)"
+    return 1
+  fi
 }
 
 check_mgmt_peer_root() {
@@ -228,6 +226,22 @@ check_spec_key_pinned() {
   fi
 }
 
+# check_attest_hints_exists succeeds when ConfigMap spire-system/attest-hints exists and the server config of the SPIRE server sets
+# hint_configmap to it. envd creates the ConfigMap, and the cluster_jwt plugin only patches it, so a missing ConfigMap means that
+# every hint of an unknown key ID is lost.
+check_attest_hints_exists() {
+  local conf set
+  k -n spire-system get configmap attest-hints -o name >/dev/null 2>&1 \
+    || { echo "ConfigMap spire-system/attest-hints is absent, so the SPIRE server cannot hint mgmtd on an unknown key ID."; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  conf="$(k -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || { echo "could not read ConfigMap spire-server"; return 1; }
+  set="$(sed -n 's/^ *hint_configmap = "\(.*\)"$/\1/p' <<<"$conf")"
+  if [[ "$set" != spire-system/attest-hints ]]; then
+    echo "the server config sets hint_configmap '$set', want spire-system/attest-hints."
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
 # envd copies the node address of RELAY_TARGET into its upstream argument, and the NetworkPolicy of
 # flow N30 admits it. Docker can give a rebuilt node a new address.
 check_envd_mgmt_address() {
@@ -259,39 +273,198 @@ check_envd_peer_root() {
   peer_root_pods_current envd-system envd peer-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
-# celld trusts the bind answer of mgmtd only through ConfigMap cell-identity-system/mgmt-root.
-check_celld_mgmt_root() {
-  local live got
-  live="$(peer_root_pem management mgmt.poc.internal 2>&1)" || { echo "$live"; return 1; }
-  got="$(k -n cell-identity-system get configmap mgmt-root -o jsonpath='{.data.root\.crt}' 2>/dev/null | pem_lines)"
-  if [[ -z "$got" || "$got" != "$(pem_lines <<<"$live")" ]]; then
-    echo "ConfigMap cell-identity-system/mgmt-root is absent or holds other roots than the live bundle of management."
-    echo "Run: CELL=$CELL_NAME mise run cell:up"
+# check_op_key_pinned succeeds when each key in ConfigMap cell-identity-system/mgmt-op-key is the live signing key of
+# mgmtd (`mgmt -- pubkey`) or the key that mgmtd has staged for the next rotation (the SHA-256 of its bytes equals
+# `stagedKey` in `mgmt -- status`), when the live key is among them, and when each running celld pod carries the
+# checksum of the ConfigMap. celld trusts an operation signed by any key in the mount, and loads the mount only at start.
+check_op_key_pinned() {
+  local fix="CELL=$CELL_NAME mise run cell:up" live status staged cm name value fp sum got pods bad problems=() found=0
+  live="$(cd "$ROOT" && mise run mgmt -- pubkey 2>/dev/null | jq -r '."spec.pub" // ""')" || live=""
+  [[ -n "$live" ]] || { echo "mise run mgmt -- pubkey gave no key."; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || status='{}'
+  staged="$(jq -r '.stagedKey // ""' <<<"$status" 2>/dev/null)" || staged=""
+  cm="$(k -n cell-identity-system get configmap mgmt-op-key -o json 2>/dev/null)" \
+    || { echo "ConfigMap cell-identity-system/mgmt-op-key is absent."; echo "Run: $fix"; return 1; }
+  while IFS=$'\t' read -r name value; do
+    [[ -n "$name" ]] || continue
+    fp="$(printf '%s' "$value" | base64 -d 2>/dev/null | shasum -a 256 | cut -d' ' -f1)"
+    if [[ "$value" == "$live" ]]; then
+      found=1
+    elif [[ -n "$staged" && "$fp" == "$staged" ]]; then
+      :
+    else
+      problems+=("mgmt-op-key holds $name = $value, which is neither the live key of mgmtd nor its staged key")
+    fi
+  done < <(jq -r '((.data // {}) + ((.binaryData // {}) | map_values(@base64d))) | to_entries[] | select(.key | endswith(".pub")) | [.key, .value] | @tsv' <<<"$cm")
+  ((found == 1)) || problems+=("mgmt-op-key holds no key that equals the live key $live")
+  sum="$(jq -r '.metadata.annotations["poc.internal/op-key-sha256"] // ""' <<<"$cm")"
+  pods="$(k -n cell-identity-system get pods -l app.kubernetes.io/name=celld -o json)" || { echo "could not read the pods of celld"; return 1; }
+  bad="$(jq -r --arg want "$sum" '.items[] | select(.metadata.deletionTimestamp == null)
+    | (.metadata.annotations["poc.internal/op-key-sha256"] // "none") as $got | select($got != $want) | "\(.metadata.name) carries the key checksum \($got)"' <<<"$pods")"
+  [[ -z "$bad" ]] || problems+=("$bad, and mgmt-op-key has $sum, which celld reads only at start")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: $fix"
     return 1
   fi
-  peer_root_pods_current cell-identity-system celld mgmt-root "CELL=$CELL_NAME mise run cell:up" || return 1
 }
 
-# check_registry_current <namespace> <component> compares each record in ConfigMap cell-registry of the
-# namespace with the record that mgmtd serves, as compact JSON. The render of the component copies the
-# records, so a record that mgmtd signed after the last link leaves the registry behind. A mismatch prints
-# the link command of the component. LINK_ONLY=<component> renders only that component.
-check_registry_current() {
-  local ns="$1" comp="$2" fix served cm key cell held bad=""
-  fix="CELL=management LINK_ONLY=$comp mise run cell:link"
-  served="$(cd "$ROOT" && mise run mgmt -- records 2>/dev/null)" && jq -e 'type == "object"' >/dev/null 2>&1 <<<"$served" \
-    || { echo "mise run mgmt -- records failed: ${served:-no output}"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
-  cm="$(k -n "$ns" get configmap cell-registry -o json 2>&1)" || { echo "could not read ConfigMap $ns/cell-registry: $cm"; echo "Run: $fix"; return 1; }
-  while IFS= read -r key; do
-    cell="${key%.dsse.json}"
-    held="$(jq -c --arg k "$key" '.data[$k] | fromjson' <<<"$cm" 2>/dev/null)" || held=""
-    if [[ -z "$held" || "$held" != "$(jq -c --arg c "$cell" '.[$c] // "absent"' <<<"$served")" ]]; then
-      bad+="$cell "
+# check_registry_published <namespace> checks ConfigMap cell-registry of the namespace, which mgmtd publishes. It must carry
+# only the label poc.internal/made-by=mgmtd, hold the record of each cell that mgmtd serves as compact JSON and no other
+# record, and hold the live signing key of mgmtd in signers.pub. mgmtd checks the object again every minute, and writes it
+# at once after a bind, so the check reads it again for up to REGISTRY_PUBLISHED_WAIT seconds (default 20) before it fails.
+# A mismatch names the status of mgmtd and its log.
+check_registry_published() {
+  local ns="$1" wait="${REGISTRY_PUBLISHED_WAIT:-20}" end problem="" served cm key cell held pub signers
+  local next="Run: mise run mgmt -- status, and read the log of mgmtd-0: kubectl --context kind-management -n mgmt-system logs mgmtd-0 -c mgmtd"
+  end=$((SECONDS + wait))
+  while :; do
+    problem=""
+    if ! served="$(cd "$ROOT" && mise run mgmt -- records 2>/dev/null)" || ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$served"; then
+      echo "mise run mgmt -- records failed: ${served:-no output}"; echo "$next"; return 1
     fi
-  done < <(jq -r '.data // {} | keys[] | select(endswith(".dsse.json"))' <<<"$cm")
-  if [[ -n "$bad" ]]; then
-    echo "ConfigMap $ns/cell-registry holds another record than mgmtd serves for: ${bad% }."
-    echo "Run: $fix"
+    if ! pub="$(mgmt_signing_pub)"; then
+      echo "could not read the signing key of mgmtd"; echo "$next"; return 1
+    fi
+    if ! cm="$(k -n "$ns" get configmap cell-registry -o json 2>&1)"; then
+      problem="could not read ConfigMap $ns/cell-registry: $cm"
+    elif [[ "$(jq -c '.metadata.labels // {}' <<<"$cm")" != '{"poc.internal/made-by":"mgmtd"}' ]]; then
+      problem="ConfigMap $ns/cell-registry has the labels $(jq -c '.metadata.labels // {}' <<<"$cm"), and mgmtd publishes only poc.internal/made-by=mgmtd"
+    else
+      # The trailing newline belongs to the value, and a command substitution would drop it.
+      signers="$(jq -j '.data["signers.pub"] // ""' <<<"$cm"; echo x)"; signers="${signers%x}"
+      [[ "$signers" == "$pub"$'\n' ]] || problem="signers.pub of $ns/cell-registry is '${signers%$'\n'}', and mgmtd signs with $pub"
+      for cell in $(jq -r 'keys[]' <<<"$served"); do
+        key="$cell.dsse.json"
+        held="$(jq -c --arg k "$key" '.data[$k] | fromjson' <<<"$cm" 2>/dev/null)" || held=""
+        [[ -n "$held" && "$held" == "$(jq -c --arg c "$cell" '.[$c]' <<<"$served")" ]] || problem+="${problem:+; }$cell has another record than mgmtd serves, or none"
+      done
+      for key in $(jq -r '.data // {} | keys[] | select(endswith(".dsse.json"))' <<<"$cm"); do
+        jq -e --arg c "${key%.dsse.json}" 'has($c)' >/dev/null <<<"$served" || problem+="${problem:+; }$ns/cell-registry holds the record ${key%.dsse.json}, which mgmtd does not serve"
+      done
+    fi
+    [[ -n "$problem" ]] || return 0
+    if ((SECONDS >= end)); then
+      echo "$problem"; echo "$next"; return 1
+    fi
+    sleep 2
+  done
+}
+
+# The gateway checks. check_gateway_* need scripts/gw.sh and the functions of scripts/lib.sh and of this file. A
+# mismatch prints the command of dependents_of that brings the gateway up to date.
+
+# gateway_status prints the status that cellgw ctl status answers, or the reason on standard output and fails.
+gateway_status() {
+  local out
+  out="$("$ROOT/scripts/gw.sh" status 2>/dev/null)" || { echo "mise run gw -- status failed: $out"; echo "Run: $(dependents_of gateway-nodes)"; return 1; }
+  jq -e 'type == "object" and has("epoch")' <<<"$out" >/dev/null 2>&1 \
+    || { echo "mise run gw -- status is no gateway status: $out"; echo "Run: $(dependents_of gateway-nodes)"; return 1; }
+  printf '%s\n' "$out"
+}
+
+# check_gateway_synced succeeds when the store of the gateway reports no error, and envd synced with it within 2 minutes.
+# envd syncs at each round, every 10 seconds.
+# GATEWAY_SYNC_MAX_AGE is the age in seconds above which the sync of envd counts as late (2 minutes). harness:status uses the same value.
+GATEWAY_SYNC_MAX_AGE=120
+check_gateway_synced() {
+  local status err synced age now
+  status="$(gateway_status)" || { echo "$status"; return 1; }
+  now="$(node_now)" || { echo "cannot read the time of the node dev-cp-control-plane, so the age of the sync is unknown. Run: docker ps"; return 1; }
+  err="$(jq -r '.storeError // ""' <<<"$status")"
+  if [[ -n "$err" ]]; then
+    echo "the store of the gateway reports '$err'."
+    echo "Run: $(dependents_of gateway-store)"
+    return 1
+  fi
+  synced="$(jq -r '.syncedAt // ""' <<<"$status")"
+  age="$(jq -n --argjson now "$now" --arg t "$synced" '($now - ($t | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601? // 0))')"
+  if [[ -z "$synced" ]] || ((${age%.*} > GATEWAY_SYNC_MAX_AGE)); then
+    echo "envd synced with the gateway at '${synced:-never}', which is more than 2 minutes ago."
+    echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd. Then run: $(dependents_of gateway-nodes)"
+    return 1
+  fi
+}
+
+# check_gateway_cells succeeds when the gateway admits the current node address of each cell that has the cell-identity
+# set: its --cell-node argument and the ingress rules of flows N37 and N38. Docker can give a node a new address.
+check_gateway_cells() {
+  local cells cell want arg policy cidrs port want_cidrs=() problems=()
+  cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")" || { echo "could not read the topology"; return 1; }
+  policy="$(k -n gateway-system get networkpolicy cell-gateway -o json)" || { echo "could not read NetworkPolicy gateway-system/cell-gateway"; return 1; }
+  for cell in $cells; do
+    want="$(node_ip "$cell")" || { echo "$want"; return 1; }
+    want_cidrs+=("$want/32")
+    arg="$(k -n gateway-system get statefulset cell-gateway -o json \
+      | jq -r --arg c "$cell" '[.spec.template.spec.containers[] | select(.name == "cellgw") | .args[] | select(startswith("--cell-node=" + $c + "="))] | join(" ")')" \
+      || { echo "could not read statefulset/cell-gateway"; return 1; }
+    [[ "$arg" == "--cell-node=$cell=$want" ]] || problems+=("the node of $cell is $want, but the gateway runs '${arg:-no --cell-node}'")
+  done
+  want="$(printf '%s\n' "${want_cidrs[@]}" | sort | paste -sd' ' -)"
+  for port in 8450 8451; do
+    cidrs="$(jq -r --argjson p "$port" '[.spec.ingress[] | select(any(.ports[]; .port == $p)) | .from[].ipBlock.cidr] | sort | join(" ")' <<<"$policy")"
+    [[ "$cidrs" == "$want" ]] || problems+=("the policy admits '$cidrs' on $port, but the cell nodes are '$want'")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "After a rebuilt cell, run: $(dependents_of gateway-nodes)"
+    echo "After a restart of the VM, rebuild the harness: mise run harness:down, then mise run harness:up"
+    return 1
+  fi
+}
+
+# check_gateway_records succeeds when the revision that the gateway holds for each cell equals the revision of the record in
+# ConfigMap cell-records, which envd verified under the key of mgmtd.
+check_gateway_records() {
+  local status cm cell have want cells problems=()
+  status="$(gateway_status)" || { echo "$status"; return 1; }
+  cm="$(k -n spire-system get configmap cell-records -o json)" || { echo "could not read ConfigMap spire-system/cell-records"; return 1; }
+  cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")" || { echo "could not read the topology"; return 1; }
+  for cell in $cells; do
+    if ! jq -e --arg c "$cell" '.data[$c + ".dsse.json"] != null' <<<"$cm" >/dev/null; then
+      problems+=("cell-records holds no record of $cell")
+      continue
+    fi
+    want="$(jq -r --arg c "$cell" '.data[$c + ".dsse.json"] | fromjson | .payload' <<<"$cm" | base64 -d | jq -c '[.epoch, .counter]')" \
+      || { echo "could not read the record of $cell in cell-records"; return 1; }
+    have="$(jq -c --arg c "$cell" '.records[$c] // null | if . == null then null else [.epoch, .counter] end' <<<"$status")"
+    [[ "$have" == "$want" ]] || problems+=("the gateway holds the record revision $have of $cell, and cell-records holds $want")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd. If the store of the gateway is lost or corrupt, run: $(dependents_of gateway-store)"
+    return 1
+  fi
+}
+
+# check_celld_streams succeeds when the gateway holds at least one open stream for each cell that has the cell-identity
+# set. celld opens one stream when it starts, and again at each new SVID.
+check_celld_streams() {
+  local status cells cell n problems=()
+  status="$(gateway_status)" || { echo "$status"; return 1; }
+  cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")" || { echo "could not read the topology"; return 1; }
+  for cell in $cells; do
+    n="$(jq -r --arg c "$cell" '.streams[$c] // 0' <<<"$status")"
+    ((n >= 1)) || problems+=("the gateway holds no stream of $cell. Run: CELL=$cell mise run cell:up")
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    return 1
+  fi
+}
+
+# check_gateway_spec_key succeeds when the gateway pins the key that mgmtd signs with: ConfigMap mgmt-spec-key of
+# gateway-system, and the pod template checksum that follows it.
+check_gateway_spec_key() {
+  local live stored sum got
+  live="$(mgmt_signing_pub 2>&1)" || { echo "$live"; return 1; }
+  stored="$(k -n gateway-system get configmap mgmt-spec-key -o jsonpath='{.data.spec\.pub}')" || { echo "could not read ConfigMap gateway-system/mgmt-spec-key"; return 1; }
+  sum="$(printf '%s' "$live" | shasum -a 256 | cut -d' ' -f1)"
+  got="$(k -n gateway-system get statefulset cell-gateway -o jsonpath='{.spec.template.metadata.annotations.poc\.internal/spec-key-sha256}')" \
+    || { echo "could not read statefulset/cell-gateway"; return 1; }
+  if [[ "$stored" != "$live" || "$got" != "$sum" ]]; then
+    echo "mgmt-signing-pub holds $live, mgmt-spec-key of the gateway holds '$stored', and the pod template carries '$got'."
+    echo "Run: $(dependents_of gateway-nodes)"
     return 1
   fi
 }

@@ -1231,7 +1231,7 @@ func TestM3MeshGuardDeniesWithoutRBAC(t *testing.T) {
 				requireMeshDenied(t, "patch a ConfigMap", "cannot update an object", as("patch", "configmap", "mgmt-root", "--type", "merge", "-p", `{"data":{"guard-test":"1"}}`, "--dry-run=server"))
 			})
 			t.Run("create", func(t *testing.T) {
-				requireMeshDenied(t, "create a ConfigMap", "creates only the bound token", as("create", "configmap", "guard-test", "--dry-run=server"))
+				requireMeshDenied(t, "create a ConfigMap", "creates only a bound token of its own pod", as("create", "configmap", "guard-test", "--dry-run=server"))
 			})
 			t.Run("delete", func(t *testing.T) {
 				requireMeshDenied(t, "delete a ConfigMap", "cannot delete an object or connect", as("delete", "configmap", "mgmt-root", "--dry-run=server"))
@@ -1252,7 +1252,7 @@ func TestM3MeshGuardDeniesWithoutRBAC(t *testing.T) {
 				if err := token(true, audience("spire-"+pocEnv+"/abc_DEF-123")...); err != nil {
 					t.Errorf("the bound token that the SPIRE agent asks for was refused: %v", err)
 				}
-				const msg = "creates only the bound token"
+				const msg = "creates only a bound token of its own pod"
 				requireMeshDenied(t, "a token for the API server audience", msg, token(true, audience("https://kubernetes.default.svc")...))
 				requireMeshDenied(t, "a token with no bound object", msg, token(true, "--audience=spire-"+pocEnv+"/abc", "--duration=10m"))
 				requireMeshDenied(t, "a token with no pod extras", msg, token(false, audience("spire-"+pocEnv+"/abc")...))

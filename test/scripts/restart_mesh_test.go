@@ -127,3 +127,28 @@ func toJSON(v any) string {
 	}
 	return string(b)
 }
+
+// TestRestartCheckWaitsForAnApiServerThatDoesNotAnswer: right after vm:up the API server of a cluster can refuse the first requests. The wait loop
+// of restart-check.sh treats that as "not ready" and tries again, and does not end the script with status 1 and no message.
+func TestRestartCheckWaitsForAnApiServerThatDoesNotAnswer(t *testing.T) {
+	dir := t.TempDir()
+	stubs := map[string]string{
+		"mise":   "#!/usr/bin/env bash\necho \"mise $*\" >>\"$STUB_DIR/calls\"\n",
+		"docker": "#!/usr/bin/env bash\necho dev-cp-control-plane\\tUp\n",
+		"kubectl": `#!/usr/bin/env bash
+ctx="${2#kind-}"
+if [[ "$ctx" == management ]]; then
+  n=$(( $(cat "$STUB_DIR/n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$STUB_DIR/n"
+  ((n > 2)) || exit 1
+fi
+echo "$ctx-control-plane   Ready   control-plane   1m   v1"
+`}
+	out, errOut, code := runScript(t, "restart-check.sh", stubs, []string{"STUB_DIR=" + dir, "RESTART_WAIT_SECONDS=60"})
+	if code != 0 {
+		t.Fatalf("exit %d, want 0\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	if !strings.Contains(string(calls), "mise run gate:m1") {
+		t.Errorf("the script did not reach gate:m1: %q", calls)
+	}
+}

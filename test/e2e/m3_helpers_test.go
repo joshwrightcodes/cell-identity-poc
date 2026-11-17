@@ -5,6 +5,7 @@ package e2e
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -16,6 +17,11 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 )
 
 const (
@@ -338,4 +344,163 @@ func requireViewConnected(t *testing.T, agent string) {
 	if ok, detail := viewConnectedSince(t, agent, time.Time{}); !ok {
 		t.Fatalf("the principal does not list %s as connected: %s", agent, detail)
 	}
+}
+
+// streamServerID is the SPIFFE ID of the cell-proxy server in management for each stream role.
+var streamServerID = map[string]string{"argocd-agent": principalID, "otel": telemetryID, "mesh-view": hubID}
+
+// streamClientConfig is the TLS config of a client of a cell-proxy server of management in the role of a cell workload:
+// TLS 1.3, h2, the SVID cert, and a check that the server chains to the management roots and has the ID of the role.
+// SPIFFE certificates carry no DNS name, so the callback checks the chain and the URI.
+func streamClientConfig(t *testing.T, role string, cert tls.Certificate) *tls.Config {
+	t.Helper()
+	serverID, ok := streamServerID[role]
+	if !ok {
+		t.Fatalf("no stream server for the role %q", role)
+	}
+	roots := x509.NewCertPool()
+	for _, c := range bundleRoots(t, mgmtCluster) {
+		roots.AddCert(c)
+	}
+	return &tls.Config{
+		MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert},
+		InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+			var chain []*x509.Certificate
+			for _, r := range raw {
+				c, err := x509.ParseCertificate(r)
+				if err != nil {
+					return err
+				}
+				chain = append(chain, c)
+			}
+			inter := x509.NewCertPool()
+			for _, c := range chain[1:] {
+				inter.AddCert(c)
+			}
+			if _, err := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
+				return err
+			}
+			if len(chain[0].URIs) != 1 || chain[0].URIs[0].String() != serverID {
+				return fmt.Errorf("server ID %v, want %s", chain[0].URIs, serverID)
+			}
+			return nil
+		},
+	}
+}
+
+// dialAsCell makes one mTLS connection to a cell-proxy server of management with a cell SVID, checks the server ID of
+// the role, and then writes the proof frame that proofToken gives for the binding of this connection. A nil proofToken
+// writes no frame. A proofToken that returns the empty string writes the frame that means no proof. TLS 1.3 finishes the
+// client side of the handshake before the server checks the client, so a refusal shows at the first read.
+func dialAsCell(t *testing.T, addr, cell, role string, cert tls.Certificate, proofToken func(binding string) string) *tls.Conn {
+	t.Helper()
+	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", addr, streamClientConfig(t, role, cert))
+	if err != nil {
+		t.Fatalf("mTLS as %s/%s to %s: %v", cell, role, addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	if proofToken != nil {
+		binding, err := proof.Binding(conn.ConnectionState())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := proof.WriteFrame(conn, proofToken(binding)); err != nil {
+			t.Fatalf("write the proof frame as %s/%s: %v", cell, role, err)
+		}
+	}
+	return conn
+}
+
+// streamAccount holds the service account, the namespace and the pod label of the cell-proxy client of each stream role.
+var streamAccount = map[string]struct{ ns, account, app string }{
+	"argocd-agent": {"argocd", "argocd-agent", "argocd-agent"},
+	"otel":         {"observability-system", "otel-uplink", "otel-uplink"},
+	"mesh-view":    {"mesh-view-system", "mesh-view", "mesh-view"},
+}
+
+// streamProof returns a proofToken for dialAsCell: for each binding, a token of the real client pod of the role in the cell,
+// made by the API server of the cell with the audience mgmt-stream/<cell>/<role>/<binding>. The token stays in memory.
+func streamProof(t *testing.T, cell, role string) func(binding string) string {
+	t.Helper()
+	a, ok := streamAccount[role]
+	if !ok {
+		t.Fatalf("no client account for the role %q", role)
+	}
+	// A Running pod with no deletion time: during a rollout, the first pod of the list can be the one that ends.
+	out, err := kubectl(t, cell, "", "-n", a.ns, "get", "pods", "-l", "app.kubernetes.io/name="+a.app, "-o", "json")
+	if err != nil {
+		t.Fatalf("the pods of %s in %s/%s: %v", a.app, cell, a.ns, err)
+	}
+	var pods struct {
+		Items []struct {
+			Metadata struct {
+				Name, UID         string
+				DeletionTimestamp *string `json:"deletionTimestamp"`
+			} `json:"metadata"`
+			Status struct{ Phase string } `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal([]byte(out), &pods); err != nil {
+		t.Fatal(err)
+	}
+	var name, uid string
+	for _, p := range pods.Items {
+		if p.Status.Phase == "Running" && p.Metadata.DeletionTimestamp == nil {
+			name, uid = p.Metadata.Name, p.Metadata.UID
+			break
+		}
+	}
+	if name == "" {
+		t.Fatalf("no running pod of %s in %s/%s", a.app, cell, a.ns)
+	}
+	return func(binding string) string {
+		tok, err := kubectl(t, cell, "", "-n", a.ns, "create", "token", a.account, "--audience", proof.StreamAudience(cell, role, binding),
+			"--duration", "10m", "--bound-object-kind", "Pod", "--bound-object-name", name, "--bound-object-uid", uid)
+		if err != nil {
+			t.Fatalf("the proof token of %s/%s: %v", cell, role, err)
+		}
+		return strings.TrimSpace(tok)
+	}
+}
+
+// proofCreds wraps the TLS credentials of a gRPC client. After the handshake and before the first byte of HTTP/2, it
+// writes the proof frame of the stream.
+type proofCreds struct {
+	credentials.TransportCredentials
+	proofToken func(binding string) string
+}
+
+func (c proofCreds) ClientHandshake(ctx context.Context, authority string, raw net.Conn) (net.Conn, credentials.AuthInfo, error) {
+	conn, info, err := c.TransportCredentials.ClientHandshake(ctx, authority, raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	tlsInfo, ok := info.(credentials.TLSInfo)
+	if !ok {
+		_ = conn.Close()
+		return nil, nil, fmt.Errorf("auth info is %T, want credentials.TLSInfo", info)
+	}
+	binding, err := proof.Binding(tlsInfo.State)
+	if err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	if err := proof.WriteFrame(conn, c.proofToken(binding)); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	return conn, info, nil
+}
+
+// dialGatewayAsCell is dialTLS with the proof frame of a cell: it writes the frame after each handshake of the connection.
+func dialGatewayAsCell(t *testing.T, addr string, cert tls.Certificate, proofToken func(binding string) string) *grpc.ClientConn {
+	t.Helper()
+	creds := proofCreds{TransportCredentials: credentials.NewTLS(gatewayTLS(t, cert)), proofToken: proofToken}
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		t.Fatalf("dial the gateway at %s: %v", addr, err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
 }

@@ -381,6 +381,7 @@ data:
           # The slowest reply to a challenge in the gate:m2 runs of 2026-11-09 took 9 ms. The bound is
           # the larger of 10s and three times that time.
           challenge_timeout = "10s"
+          hint_configmap = "spire-system/attest-hints"
         }
       }
 

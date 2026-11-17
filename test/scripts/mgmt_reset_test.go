@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -79,8 +80,9 @@ func TestResetStateOrderAndNextCommands(t *testing.T) {
 		t.Fatalf("stdout %q, want one JSON line with reset true", out)
 	}
 	next, _ := lines[0]["next"].([]any)
-	if len(next) != 2 || next[0] != "CELL=dev-cp mise run cell:up" || next[1] != "CELL=management mise run cell:link" {
-		t.Fatalf("next %v, want the cell:up of dev-cp and then the cell:link of management", next)
+	want := []any{"CELL=dev-cp mise run cell:up", "CELL=dev-cell-1 mise run cell:up", "CELL=dev-cell-2 mise run cell:up", "CELL=management mise run cell:link"}
+	if !reflect.DeepEqual(next, want) {
+		t.Fatalf("next %v, want the cell:up of dev-cp, the cell:up of each cell, and then the cell:link of management: %v", next, want)
 	}
 	if moved, _ := lines[0]["moved"].([]any); len(moved) != 2 {
 		t.Fatalf("moved %v, want two files", lines[0]["moved"])

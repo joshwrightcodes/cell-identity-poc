@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"math/big"
 	"net"
 	"net/url"
@@ -27,6 +28,7 @@ import (
 	workloadpb "github.com/spiffe/go-spiffe/v2/proto/spiffe/workload"
 	"google.golang.org/grpc"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/proof"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
@@ -190,6 +192,20 @@ func serveWorkloadAPI(t *testing.T, ca testCA, ids ...string) {
 	t.Setenv("SPIFFE_ENDPOINT_SOCKET", "unix://"+path)
 }
 
+// signerFile copies signers.pub of a registry directory to a file of its own, as the pinned signer file of a server.
+func signerFile(t *testing.T, dir string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "signers.pub"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "signer.pub")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 // registryDir writes a signers.pub and one record for dev-cell-1.
 func registryDir(t *testing.T) string {
 	t.Helper()
@@ -225,11 +241,13 @@ func registryDir(t *testing.T) string {
 
 func serverArgs(t *testing.T, envCA testCA) []string {
 	t.Helper()
+	dir := registryDir(t)
 	return []string{
 		"spiffe-server", "--listen", "127.0.0.1:0",
 		"--peer-bundle", envCA.bundleFile(t), "--peer-trust-domain", "dev.env.poc.internal",
-		"--allow-id", viewPattern, "--registry-dir", registryDir(t),
+		"--allow-id", viewPattern, "--registry-dir", dir, "--registry-signer", signerFile(t, dir),
 		"--backend", "grpc-header", "--upstream", "127.0.0.1:1", "--identity-header", "x-cell-agent",
+		"--proof-subject", "argocd-agent=cell-identity-system/celld",
 	}
 }
 
@@ -258,6 +276,7 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 		"no --peer-trust-domain": without(args, "--peer-trust-domain"),
 		"no --allow-id":          without(args, "--allow-id"),
 		"no --registry-dir":      without(args, "--registry-dir"),
+		"no --registry-signer":   without(args, "--registry-signer"),
 		"unparsable bundle":      with(args, "--peer-bundle", garbage),
 		"missing bundle file":    with(args, "--peer-bundle", filepath.Join(t.TempDir(), "absent.crt")),
 		"unanchored --allow-id":  with(args, "--allow-id", "dev"),
@@ -276,6 +295,18 @@ func TestServerRequiresTrustFlags(t *testing.T) {
 				t.Fatalf("output is %v, want one JSON error line", lines)
 			}
 		})
+	}
+}
+
+func TestServerNamesTheMissingRegistrySigner(t *testing.T) {
+	args := serverArgs(t, newCA(t, "dev.env.poc.internal"))
+	var out bytes.Buffer
+	if code := execute(t.Context(), without(args, "--registry-signer"), &out); code != 2 {
+		t.Fatalf("exit code %d, want 2\n%s", code, out.String())
+	}
+	lines := jsonLines(t, out.String())
+	if len(lines) != 1 || !strings.Contains(fmt.Sprintf("%v", lines[0]["error"]), "--registry-signer required") {
+		t.Fatalf("output is %v, want the error --registry-signer required", lines)
 	}
 }
 
@@ -634,4 +665,155 @@ func TestServerOTLPWaitsForUpstream(t *testing.T) {
 			t.Fatal("the server did not stop")
 		}
 	})
+}
+
+func TestServerRequiresProofSubjectFlag(t *testing.T) {
+	envCA := newCA(t, "dev.env.poc.internal")
+	args := serverArgs(t, envCA)
+	noSubject := without(args, "--proof-subject")
+	assertConfigError(t, noSubject)
+
+	cases := map[string][]string{
+		"environment only": with(noSubject, "--allow-id", `^spiffe://dev\.env\.poc\.internal/cp/otel$`),
+		"one subject":      args,
+	}
+	for name, a := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseServer(a[1:]); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	bad := map[string][]string{
+		"no namespace":    with(args, "--proof-subject", "argocd-agent=celld"),
+		"no role":         with(args, "--proof-subject", "=ns/sa"),
+		"capitals":        with(args, "--proof-subject", "argocd-agent=NS/sa"),
+		"same role twice": append(slices.Clone(args), "--proof-subject", "argocd-agent=other/sa"),
+		"reload zero":     append(slices.Clone(args), "--registry-reload", "0"),
+		"reload negative": append(slices.Clone(args), "--registry-reload", "-1s"),
+	}
+	for name, a := range bad {
+		t.Run(name, func(t *testing.T) { assertConfigError(t, a) })
+	}
+}
+
+func TestServerRegistrySignerFlag(t *testing.T) {
+	envCA := newCA(t, "dev.env.poc.internal")
+	args := serverArgs(t, envCA)
+	signer := args[slices.Index(args, "--registry-signer")+1]
+	cfg, err := parseServer(args[1:])
+	if err != nil || cfg.signer != signer || cfg.reload != 10*time.Second {
+		t.Fatalf("got %+v %v, want the signer and the 10 s default", cfg, err)
+	}
+	other := filepath.Join(t.TempDir(), "other.pub")
+	pub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte(base64.StdEncoding.EncodeToString(pub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assertConfigError(t, append(slices.Clone(args), "--registry-signer", other))
+}
+
+func TestMayAdmitCell(t *testing.T) {
+	for p, want := range map[string]bool{
+		viewPattern: true,
+		`^spiffe://dev\.env\.poc\.internal/(?:cp/otel|cell/[a-z0-9-]+/otel)$`:       true,
+		`^spiffe://dev\.env\.poc\.internal/.*$`:                                     true,
+		`^spiffe://dev\.env\.poc\.internal/[^x]+$`:                                  true,
+		`^spiffe://dev\.env\.poc\.internal(?:/cp/otel|(?i:/cell)/[a-z0-9-]+/otel)$`: true,
+		`^spiffe://dev\.env\.poc\.internal/cel{2}/[a-z0-9-]+/otel(?:/cp/)?$`:        true,
+		`^spiffe://dev\.env\.poc\.internal/cp/otel$`:                                false,
+		`^spiffe://dev\.env\.poc\.internal/cp/(?:otel|argocd-agent)$`:               false,
+	} {
+		if got := mayAdmitCell(p); got != want {
+			t.Errorf("%s: got %v, want %v", p, got, want)
+		}
+	}
+}
+
+func TestServerRunsWithRegistryWatcher(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+	serveWorkloadAPI(t, mgmt, principalID)
+	args := serverArgs(t, envCA)
+	dir := args[slices.Index(args, "--registry-dir")+1]
+	out := &syncBuffer{}
+	stop := runUntilCanceled(t, append(args, "--registry-reload", "50ms"), out)
+	waitLine(t, out, "listening")
+	// A record that does not verify keeps the last good registry, and the server logs it.
+	if err := os.WriteFile(filepath.Join(dir, "dev-cell-1.dsse.json"), []byte("{broken"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitLine(t, out, "registry_reload_failed")
+	stop()
+}
+
+// TestServerRefusesCellStreamsWithoutProof runs the server as the binary builds it and dials it
+// with a cell SVID. The proof check must run whatever --allow-id can admit.
+func TestServerRefusesCellStreamsWithoutProof(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	// This pattern admits the cell path, but mayAdmitCell does not see it: a class splits the literal.
+	// The start check is advisory, so the server must refuse the stream itself.
+	hidden := `^spiffe://dev\.env\.poc\.internal(?:/cp/otel|/c[ex]ll/[a-z0-9-]+/otel(?:/cp/)?)$`
+	cases := []struct {
+		name, role string
+		args       func([]string) []string
+		frame      string
+		reason     string
+	}{
+		{"no frame", "argocd-agent", func(a []string) []string { return a }, "", "proof_missing"},
+		{"no subject flag", "otel", func(a []string) []string {
+			return without(with(a, "--allow-id", hidden), "--proof-subject")
+		}, "x", "proof_invalid"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mgmt, envCA := newCA(t, mgmtTD), newCA(t, "dev.env.poc.internal")
+			serveWorkloadAPI(t, mgmt, principalID)
+			out := &syncBuffer{}
+			args := tc.args(serverArgs(t, envCA))
+			if tc.name == "no subject flag" {
+				if _, err := parseServer(args[1:]); err != nil {
+					t.Fatalf("the test needs a pattern that the start check misses: %v", err)
+				}
+			}
+			stop := runUntilCanceled(t, args, out)
+			defer stop()
+			addr := waitLine(t, out, "listening")["addr"].(string)
+			der, _, key := envCA.leaf(t, "spiffe://dev.env.poc.internal/cell/dev-cell-1/"+tc.role)
+			conn, err := tls.Dial("tcp", addr, &tls.Config{
+				InsecureSkipVerify: true, MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"},
+				Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = conn.Close() }()
+			if tc.frame != "" {
+				if err := proof.WriteFrame(conn, tc.frame); err != nil {
+					t.Fatal(err)
+				}
+			}
+			deadline := time.Now().Add(10 * time.Second)
+			for {
+				for _, l := range jsonLines(t, out.String()) {
+					if l["msg"] == "proof refused" && l["reason"] == tc.reason {
+						return
+					}
+					if l["msg"] == "peer accepted" {
+						t.Fatalf("a cell stream reached the backend with no valid proof:\n%s", out.String())
+					}
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("no proof refused line with reason %s:\n%s", tc.reason, out.String())
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
 }

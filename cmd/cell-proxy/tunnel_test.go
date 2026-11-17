@@ -72,11 +72,13 @@ func assertConfigError(t *testing.T, args []string) {
 
 func tunnelServerArgs(t *testing.T, envCA testCA) []string {
 	t.Helper()
+	dir := registryDir(t)
 	return []string{
 		"spiffe-server", "--listen", "127.0.0.1:0",
 		"--peer-bundle", envCA.bundleFile(t), "--peer-trust-domain", "dev.env.poc.internal",
-		"--allow-id", meshPattern, "--registry-dir", registryDir(t),
+		"--allow-id", meshPattern, "--registry-dir", dir, "--registry-signer", signerFile(t, dir),
 		"--backend", "tunnel", "--tunnel-cell", "dev-cell-1=127.0.0.1:0", "--tunnel-wait", "200ms",
+		"--proof-subject", "mesh-view=cell-identity-system/celld",
 	}
 }
 
@@ -267,5 +269,15 @@ func TestServeTelemetryBridgesTheStandardLogger(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("standard output has no JSON line for the bridged message:\n%s", out.String())
+	}
+}
+
+func TestTunnelModeProofFlag(t *testing.T) {
+	cfg, err := parseTunnel(append(tunnelArgs(t), "--proof")[1:])
+	if err != nil || !cfg.proof {
+		t.Fatalf("got %+v %v", cfg, err)
+	}
+	if cfg, err = parseTunnel(tunnelArgs(t)[1:]); err != nil || cfg.proof {
+		t.Fatalf("got %+v %v, want no proof by default", cfg, err)
 	}
 }

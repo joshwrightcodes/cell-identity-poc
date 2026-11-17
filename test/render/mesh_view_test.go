@@ -64,7 +64,7 @@ func TestMeshViewCellRender(t *testing.T) {
 			}
 			ctr := named(t, get[[]any](t, spec, "containers"), "cell-proxy")
 			want := []string{"tunnel", "--upstream=10.9.0.9:30445", "--expect-id=spiffe://mgmt.poc.internal/kiali",
-				"--peer-bundle=/run/cell-proxy/mgmt-root/root.crt", "--peer-trust-domain=mgmt.poc.internal", "--read-idle=10s", "--ping-timeout=5s"}
+				"--peer-bundle=/run/cell-proxy/mgmt-root/root.crt", "--peer-trust-domain=mgmt.poc.internal", "--read-idle=10s", "--ping-timeout=5s", "--proof"}
 			if got := argsOf(t, ctr); !slices.Equal(got, want) {
 				t.Errorf("args %q, want %q", got, want)
 			}
@@ -220,6 +220,7 @@ func TestMeshViewHubRender(t *testing.T) {
 	ctr := named(t, get[[]any](t, spec, "containers"), "cell-proxy")
 	want := []string{"spiffe-server", "--listen=:8444", "--backend=tunnel",
 		`--allow-id=^spiffe://dev\.env\.poc\.internal/cell/([a-z0-9-]+)/mesh-view$`, "--registry-dir=/run/cell-proxy/registry",
+		"--registry-signer=/run/cell-proxy/registry-signer/signer.pub", "--registry-reload=10s", "--proof-subject=mesh-view=mesh-view-system/mesh-view",
 		"--peer-bundle=/run/cell-proxy/peer-root/root.crt", "--peer-trust-domain=dev.env.poc.internal",
 		"--tunnel-read-idle=10s", "--tunnel-ping-timeout=5s", "--tunnel-cell=dev-cell-1=:18001", "--tunnel-cell=dev-cell-2=:18002"}
 	if got := argsOf(t, ctr); !slices.Equal(got, want) {
@@ -238,10 +239,13 @@ func TestMeshViewHubRender(t *testing.T) {
 		t.Error("the pod has no spire-agent sidecar")
 	}
 	ann := get[map[string]any](t, dep, "spec", "template", "metadata", "annotations")
-	for _, k := range []string{"poc.internal/peer-root-sha256", "poc.internal/registry-content-sha256", "cell.poc.internal/config-checksum"} {
+	for _, k := range []string{"poc.internal/peer-root-sha256", "poc.internal/registry-signer-sha256", "cell.poc.internal/config-checksum"} {
 		if s, _ := ann[k].(string); len(s) != 64 {
 			t.Errorf("annotation %s is %q, want a SHA-256", k, ann[k])
 		}
+	}
+	if _, ok := ann["poc.internal/registry-content-sha256"]; ok {
+		t.Error("the pod template carries the registry content checksum, and the render holds no registry")
 	}
 
 	svc := objs["Service mesh-view-system/mesh-view-listener"]
@@ -571,7 +575,6 @@ func TestRenderMeshViewHubFailsClosed(t *testing.T) {
 		{"MESH_VIEW_CELLS=dev-cell-1=18001 dev-cell-2=18001", "gives the port 18001 to two cells"},
 		{"MESH_VIEW_CELLS=dev-cell-1=8444", "out of range or in use"},
 		{"MESH_VIEW_CELLS=dev-cell-1", "is not <cell>=<port>"},
-		{"MESH_VIEW_CELLS=bad-facts=18001", "Run CELL=bad-facts mise run cell:up, so its celld binds"},
 		{"MESH_VIEW_NAMESPACES=Bad_Name", "is not a namespace name"},
 		{"KIALI_IMAGE=quay.io/kiali/kiali:v2.34.1", "pinned by digest"},
 		{"KIALI_VERSION=v9.9.9", "pinned by digest"},

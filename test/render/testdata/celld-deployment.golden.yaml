@@ -1,6 +1,7 @@
-# The cell identity stub: celld with a SPIRE agent sidecar. render.sh fills in the images, the
-# config checksum and the network peers. The agent attests to the SPIRE server of the environment
-# with the cluster_jwt plugin, and celld gets its X.509 SVID from the agent.
+# The cell identity stub: celld with a SPIRE agent sidecar. render.sh fills in the celld image and
+# the network peers, and components/lib/spire-sidecar.sh adds the agent, its token Role and its
+# ConfigMaps. The agent attests to the SPIRE server of the environment with the cluster_jwt
+# plugin, and celld gets its X.509 SVID from the agent.
 # The namespace stays out of the mesh, so identity does not depend on Istio.
 apiVersion: v1
 kind: Namespace
@@ -22,31 +23,142 @@ metadata:
     cell.poc.internal/harness: cell-identity
 automountServiceAccountToken: false
 ---
-# The agent plugin requests pod-bound tokens for its own ServiceAccount, and for no other account.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: cell-identity-system
+  labels:
+    cell.poc.internal/harness: cell-identity
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# celld resolves the collector name, so the namespace needs DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: cell-identity-system
+  labels:
+    cell.poc.internal/harness: cell-identity
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - ipBlock:
+            cidr: "10.120.0.10/32"
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The pod reaches only the SPIRE server node port, the stream and bind node ports of the cell gateway
+# (flow N41), all in the environment control plane, the API server, and the collector. It accepts no
+# connections: the probes run in the pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: celld
+  namespace: cell-identity-system
+  labels:
+    cell.poc.internal/harness: cell-identity
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: celld
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: "10.9.0.9/32"
+      ports:
+        - protocol: TCP
+          port: 30081
+    - to:
+        - ipBlock:
+            cidr: "10.9.0.9/32"
+      ports:
+        - protocol: TCP
+          port: 30450
+        - protocol: TCP
+          port: 30451
+    - to:
+        - ipBlock:
+            cidr: 172.18.0.5/32
+      ports:
+        - protocol: TCP
+          port: 6443
+    - to:
+        - ipBlock:
+            cidr: "10.120.0.1/32"
+      ports:
+        - protocol: TCP
+          port: 443
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+---
+# The operation records and the demo target of celld. The namespace holds no pod and stays out of the mesh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cell-ops-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+    cell.poc.internal/harness: cell-identity
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: cell-ops-system
+  labels:
+    cell.poc.internal/harness: cell-identity
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# celld keeps one record for each operation, and the demo log, as ConfigMaps in this namespace only.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: celld-token
-  namespace: cell-identity-system
+  name: celld-ops
+  namespace: cell-ops-system
   labels:
     cell.poc.internal/harness: cell-identity
 rules:
   - apiGroups: [""]
-    resources: ["serviceaccounts/token"]
-    resourceNames: ["celld"]
-    verbs: ["create"]
+    resources: [configmaps]
+    verbs: [create, get, list, update, delete]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: celld-token
-  namespace: cell-identity-system
+  name: celld-ops
+  namespace: cell-ops-system
   labels:
     cell.poc.internal/harness: cell-identity
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: celld-token
+  name: celld-ops
 subjects:
   - kind: ServiceAccount
     name: celld
@@ -70,65 +182,20 @@ spec:
       labels:
         app.kubernetes.io/name: celld
       annotations:
-        poc.internal/peer-root-sha256: "c7270c7bf58069f36601f452004217519e176adcd66424a09a3e685fd8e66121"
-        # SPIRE reads its configuration and the trust bundle only at start. A change restarts the pod.
-        cell.poc.internal/config-checksum: "90422a3ae8aa56071729d70fd371e1d8a1e600fe2a7e8cd49e0a8c3ec9b6f770"
+        poc.internal/trust-bundle-sha256: "a9b0e85b184525a44655bdca8f337af2ba419eb5b9dccf1dd99b8c2eecf9ae38"
+        poc.internal/op-key-sha256: "b01198f80d7523505107539aebd55b08d1923bfd91f72483a644cfdf40c51142"
+        cell.poc.internal/config-checksum: 90422a3ae8aa56071729d70fd371e1d8a1e600fe2a7e8cd49e0a8c3ec9b6f770
     spec:
       serviceAccountName: celld
       automountServiceAccountToken: false
-      # The unix workload attestor reads the caller process from /proc of the agent container.
-      shareProcessNamespace: true
       securityContext:
         runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        # The plugin image copies its static binary into the shared plugin volume, read-only for
-        # every user. User 1001 matches neither the agent nor the celld entry.
-        - name: install-agent-plugin
-          image: "localhost:5001/cluster-jwt-agent@sha256:stub"
-          args: ["install", "/run/spire/plugins"]
-          securityContext:
-            runAsUser: 1001
-            runAsGroup: 1001
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          resources:
-            requests:
-              cpu: 10m
-              memory: 16Mi
-            limits:
-              memory: 64Mi
-          volumeMounts:
-            - name: plugins
-              mountPath: /run/spire/plugins
       containers:
-        # The agent image runs as root by default. The sidecar runs as user 1000, which differs
-        # from the celld user, so the celld entry never matches the agent process.
         - name: spire-agent
           image: ghcr.io/spiffe/spire-agent:1.15.5@sha256:3652c732b0f0d36f4dd78394230a1b1cd0ddcc29548a46c67a996b1a78c14481
           args: ["-config", "/run/spire/config/agent.conf"]
-          env:
-            # The cluster_jwt plugin binds its token to this pod and names it in the TokenRequest.
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_UID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.uid
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: SERVICE_ACCOUNT
-              valueFrom:
-                fieldRef:
-                  fieldPath: spec.serviceAccountName
-          # The image has no shell. The probes run the agent binary against the Workload API socket.
           readinessProbe:
             exec:
               command: ["/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/agent/agent.sock"]
@@ -167,23 +234,43 @@ spec:
             - name: plugins
               mountPath: /run/spire/plugins
               readOnly: true
-            # go-plugin creates the plugin socket in the temporary directory.
             - name: tmp
               mountPath: /tmp
             - name: api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
         # The celld entry selects unix:uid:65532, the user of the ko base image.
         - name: celld
           image: "localhost:5001/celld@sha256:stub"
-          # celld binds the cell issuer to the management plane through relay-bind in the environment
-          # control plane. It asks for a token of its own account, bound to this pod, and sends it with
-          # the keys of the cell.
+          # celld binds the cell issuer to the management plane and claims signed operations through the
+          # cell gateway in the environment control plane. It loads the trust bundle and the operation
+          # keys only at start, so each mount has a checksum annotation on the pod template.
           args:
             - --cell=dev-cell-1
-            - --bind-upstream=10.9.0.9:30447
-            - --bind-expect-id=spiffe://mgmt.poc.internal/api
-            - --bind-peer-bundle=/run/celld/mgmt-root/root.crt
+            - --env=dev
+            - --gateway=10.9.0.9:30450
+            - --gateway-bind=10.9.0.9:30451
+            - --gateway-id=spiffe://dev.env.poc.internal/cp/gateway
+            - --trust-bundle=/run/celld/trust-bundle/bundle.crt
+            - --op-key-dir=/run/celld/op-key
+            - --ops-namespace=cell-ops-system
           env:
             - name: POD_NAME
               valueFrom:
@@ -224,16 +311,22 @@ spec:
             - name: agent-socket
               mountPath: /run/spire/agent
               readOnly: true
-            - name: mgmt-root
-              mountPath: /run/celld/mgmt-root
+            - name: spire-trust-bundle
+              mountPath: /run/celld/trust-bundle
+              readOnly: true
+            - name: mgmt-op-key
+              mountPath: /run/celld/op-key
               readOnly: true
             - name: celld-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
       volumes:
-        - name: mgmt-root
+        - name: spire-trust-bundle
           configMap:
-            name: mgmt-root
+            name: spire-trust-bundle
+        - name: mgmt-op-key
+          configMap:
+            name: mgmt-op-key
         - name: celld-api-token
           projected:
             sources:
@@ -271,7 +364,6 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: 16Mi
-        # The same files as the automatic token mount, for the agent container only.
         - name: api-token
           projected:
             sources:
@@ -288,91 +380,63 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
+      shareProcessNamespace: true
+      initContainers:
+        - name: install-agent-plugin
+          image: localhost:5001/cluster-jwt-agent@sha256:stub
+          args:
+            - install
+            - /run/spire/plugins
+          securityContext:
+            runAsUser: 1001
+            runAsGroup: 1001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: plugins
+              mountPath: /run/spire/plugins
 ---
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
 metadata:
-  name: default-deny
+  name: celld-token
   namespace: cell-identity-system
   labels:
     cell.poc.internal/harness: cell-identity
-spec:
-  podSelector: {}
-  policyTypes: [Ingress, Egress]
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - serviceaccounts/token
+    resourceNames:
+      - celld
+    verbs:
+      - create
 ---
-# celld resolves the collector name, so the namespace needs DNS.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
 metadata:
-  name: allow-dns
+  name: celld-token
   namespace: cell-identity-system
   labels:
     cell.poc.internal/harness: cell-identity
-spec:
-  podSelector: {}
-  policyTypes: [Egress]
-  egress:
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: kube-system
-          podSelector:
-            matchLabels:
-              k8s-app: kube-dns
-        - ipBlock:
-            cidr: "10.120.0.10/32"
-      ports:
-        - protocol: UDP
-          port: 53
-        - protocol: TCP
-          port: 53
----
-# The pod reaches only the SPIRE server node port and the relay-bind node port in the environment
-# control plane, the API server for TokenRequest, and the collector. It accepts no connections: the
-# probes run in the pod.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: celld
-  namespace: cell-identity-system
-  labels:
-    cell.poc.internal/harness: cell-identity
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: celld
-  policyTypes: [Ingress, Egress]
-  egress:
-    - to:
-        - ipBlock:
-            cidr: "10.9.0.9/32"
-      ports:
-        - protocol: TCP
-          port: 30081
-        - protocol: TCP
-          port: 30447
-    - to:
-        - ipBlock:
-            cidr: 172.18.0.5/32
-      ports:
-        - protocol: TCP
-          port: 6443
-    - to:
-        - ipBlock:
-            cidr: "10.120.0.1/32"
-      ports:
-        - protocol: TCP
-          port: 443
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: observability-system
-          podSelector:
-            matchLabels:
-              app.kubernetes.io/name: otel-collector
-      ports:
-        - protocol: TCP
-          port: 4317
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: celld-token
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -446,21 +510,11 @@ data:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: mgmt-root
+  name: mgmt-op-key
   namespace: cell-identity-system
   annotations:
-    poc.internal/peer-root-sha256: c7270c7bf58069f36601f452004217519e176adcd66424a09a3e685fd8e66121
+    poc.internal/op-key-sha256: b01198f80d7523505107539aebd55b08d1923bfd91f72483a644cfdf40c51142
   labels:
     cell.poc.internal/harness: cell-identity
 data:
-  root.crt: |-
-    -----BEGIN CERTIFICATE-----
-    MIIBajCCARGgAwIBAgIBATAKBggqhkjOPQQDAjAZMRcwFQYDVQQDDA5yZW5kZXIg
-    dGVzdCBDQTAeFw0yNjAxMDEwMDAwMDBaFw00NjAxMDEwMDAwMDBaMBkxFzAVBgNV
-    BAMMDnJlbmRlciB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAELTCG
-    NxXeNqtIuxDfUBraAOZF3Jd2CzIUoOeR17KnudfyhaRUuquPfyMrRwCVmqv5Yo3o
-    b6ju64CmYMUkHsuCjaNKMEgwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMC
-    AgQwJQYDVR0RBB4wHIYac3BpZmZlOi8vbWdtdC5wb2MuaW50ZXJuYWwwCgYIKoZI
-    zj0EAwIDRwAwRAIgA9lfrjEJ2rJm7dC1qHl0utlo20VDOK+3Cq9Rw/TSGXoCIFFT
-    B25W4tXcx2A0Zir/7VpQz6UHPEWCufUY3Tg0KDhR
-    -----END CERTIFICATE-----
+  op.pub: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=

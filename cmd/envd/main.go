@@ -1,11 +1,15 @@
 // Command envd pulls the signed spec and cell records of one environment from the management plane,
 // verifies them, keeps them in a ConfigMap and reports its status.
 //
-//	envd run --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> --spec-key-file <file> --env <env> --output-configmap <ns>/<name> [--interval 10s] [--health-listen :8080]
+//	envd run --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
+//	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
+//	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
+//	  [--interval 10s] [--health-listen :8080]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
 // run takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET and trusts the management plane
-// only through --peer-bundle. Every log line is compact JSON on stdout, and logs, traces and metrics
+// only through --peer-bundle. It reaches the cell gateway with the same SVID, trusts the bundle of
+// its own trust domain from the Workload API, and accepts only the exact --gateway-id. Every log line is compact JSON on stdout, and logs, traces and metrics
 // also go out as OTLP through package internal/telemetry.
 //
 // check reads one SpecBundle from standard input, loads the current state without writing it, and
@@ -16,6 +20,7 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -25,6 +30,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"slices"
@@ -55,6 +61,8 @@ const (
 	shutdownTimeout = 15 * time.Second
 	// loadTimeout bounds the read of the stored state by check.
 	loadTimeout = 15 * time.Second
+	// kubeTimeout bounds each request to the Kubernetes API.
+	kubeTimeout = 15 * time.Second
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
 )
@@ -76,6 +84,7 @@ func realDeps() deps {
 			if err != nil {
 				return nil, fmt.Errorf("in-cluster config: %w", err)
 			}
+			cfg.Timeout = kubeTimeout
 			return kubernetes.NewForConfig(cfg)
 		},
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
@@ -197,6 +206,10 @@ type runConfig struct {
 	configMap    string
 	interval     time.Duration
 	healthListen string
+	gateway      string
+	gatewayID    spiffeid.ID
+	hintsNS      string
+	hintsName    string
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -210,12 +223,16 @@ func parseRun(args []string) (runConfig, error) {
 	out := fs.String("output-configmap", "", "ConfigMap that holds the records, as <namespace>/<name>")
 	interval := fs.Duration("interval", 10*time.Second, "time between pulls")
 	health := fs.String("health-listen", ":8080", "address of the health endpoint")
+	gateway := fs.String("gateway", "", "base URL of the cell gateway, https://<host>:<port>")
+	gatewayID := fs.String("gateway-id", "", "the exact SPIFFE ID of the cell gateway")
+	hints := fs.String("hints-configmap", "", "ConfigMap that holds the key hints, as <namespace>/<name>")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
 	if err := required(map[string]string{
 		"upstream": *upstream, "expect-id": *expect, "peer-bundle": *bundle, "peer-trust-domain": *td,
 		"spec-key-file": *keyFile, "env": *env, "output-configmap": *out,
+		"gateway": *gateway, "gateway-id": *gatewayID, "hints-configmap": *hints,
 	}); err != nil {
 		return runConfig{}, err
 	}
@@ -251,8 +268,22 @@ func parseRun(args []string) (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
+	gwURL, err := url.Parse(*gateway)
+	if err != nil || gwURL.Scheme != "https" || gwURL.Host == "" || gwURL.Path != "" && gwURL.Path != "/" ||
+		gwURL.RawQuery != "" || gwURL.ForceQuery || gwURL.Fragment != "" || gwURL.User != nil {
+		return runConfig{}, errors.New("--gateway must be an https URL with a host and no path, query, fragment or user")
+	}
+	gwID, err := spiffeid.FromString(*gatewayID)
+	if err != nil {
+		return runConfig{}, fmt.Errorf("--gateway-id: %w", err)
+	}
+	hns, hname, err := configMapRef("hints-configmap", *hints)
+	if err != nil {
+		return runConfig{}, err
+	}
 	return runConfig{upstream: *upstream, expect: id, peer: peer, key: key, env: *env, namespace: ns,
-		configMap: cm, interval: *interval, healthListen: *health}, nil
+		configMap: cm, interval: *interval, healthListen: *health,
+		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname}, nil
 }
 
 func runCommand(ctx context.Context, cfg runConfig, stdout io.Writer, d deps) int {
@@ -288,16 +319,19 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	}
 	defer closeSVIDs()
 
+	mgmtClient, gateway, err := newClients(svids, cfg)
+	if err != nil {
+		return err
+	}
 	keys := []ed25519.PublicKey{cfg.key}
-	// The transport adds the traceparent header, so a trace of a round continues in the logs of mgmtd.
-	client := envd.NewClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect))
-	client.Transport = telemetry.Transport(client.Transport)
 	puller := envd.NewPuller(envd.PullerConfig{
-		Client:   client,
+		Client:   mgmtClient,
 		BaseURL:  "https://" + cfg.upstream,
 		Env:      cfg.env,
 		Keys:     keys,
 		Store:    envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
+		Gateway:  gateway,
+		Hints:    envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
 		Interval: cfg.interval,
 		Log:      tel.Log,
 		Meter:    tel.Meter,
@@ -320,6 +354,34 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	return nil
+}
+
+// newClients builds the client of the management plane and the client of the gateway. The gateway
+// runs in the trust domain of envd, so its roots come from the Workload API, and it must carry
+// --gateway-id exactly. A --gateway-id outside the trust domain of the SVID is a configuration error.
+func newClients(svids x509svid.Source, cfg runConfig) (*http.Client, envd.GatewayClient, error) {
+	bundles, ok := svids.(x509bundle.Source)
+	if !ok {
+		return nil, nil, errors.New("the workload api source holds no trust bundles")
+	}
+	own, err := svids.GetX509SVID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("envd svid: %w", err)
+	}
+	if own.ID.TrustDomain() != cfg.gatewayID.TrustDomain() {
+		return nil, nil, fmt.Errorf("--gateway-id %s is outside the trust domain %s of the envd svid", cfg.gatewayID, own.ID.TrustDomain())
+	}
+	mgmt := tracedClient(cellproxy.ClientTLS(svids, cfg.peer, cfg.expect))
+	gateway := envd.NewGatewayClient(tracedClient(cellproxy.ClientTLS(svids, bundles, cfg.gatewayID)), cfg.gateway)
+	return mgmt, gateway, nil
+}
+
+// tracedClient returns the envd HTTP client for tlsCfg. Its transport adds the traceparent header, so
+// a trace of a round continues in the logs of the server.
+func tracedClient(tlsCfg *tls.Config) *http.Client {
+	c := envd.NewClient(tlsCfg)
+	c.Transport = telemetry.Transport(c.Transport)
+	return c
 }
 
 // newHealthServer returns the server of the health endpoint, with limits on every phase of a request.

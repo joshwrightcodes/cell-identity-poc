@@ -49,10 +49,17 @@
 | Repair the objects and firewall rules that a `gate:m3` run left when it stopped before its cleanups (`--check` only lists them) | `mise run gate:m3:repair` |
 | Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
 | Run the host service on this Mac (see README "Host service and mgmtd"): `start`, `stop`, `restart`, `status` or `pin` | `mise run hostsvc:serve -- status` |
-| Run `mgmtd ctl` in `mgmtd-0`: `status`, `records`, `pubkey`, `keys`, `keycheck`, `restore`, `rotate-key`, `rotate-signing-key` to rotate the signing key and render it (see README "Rotate the signing key of mgmtd"), or `reset-state` to start `mgmtd` with a fresh state (see README "Recover lost management state") | `mise run mgmt -- status` |
+| Run `mgmtd ctl` in `mgmtd-0`: `status`, `records`, `pubkey`, `keys`, `keycheck`, `restore`, `rotate-key [--stage|--commit|--emergency]`, `rotate-signing-key [--emergency|--step <name>]` for the overlap rotation of the signing key, with the cell passes and the render of the new key (see README "Rotate the signing key of mgmtd"), or `reset-state` to start `mgmtd` with a fresh state (see README "Recover lost management state") | `mise run mgmt -- status` |
 | Run the M4 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m4` |
 | Rotate the signing key of `mgmtd` and print the attestation gap. Run it alone, after `gate:m4` | `mise run gate:m4:rotate` |
-| Start the host service again, set the replicas of `mgmtd` and `envd` back to 1 and link the registries again (`--check` only reports) | `mise run gate:m4:repair` |
+| Start the host service again, set the replicas of `mgmtd` and `envd` back to 1 (`--check` only reports) | `mise run gate:m4:repair` |
+| Run `cellgw ctl` in `cell-gateway-0` of `dev-cp`: `status`, `queue --cell <cell>`, `outbox`, `enqueue` or `inject` (see README "Cell gateway") | `mise run gw -- status` |
+| Start the cell gateway with an empty store when its store is lost, corrupt or full (break-glass) | `mise run gw:reset` |
+| Run the M5 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m5` |
+| Send one operation a minute for 30 minutes and check that each applies once. Run it alone, after `gate:m5` | `mise run gate:m5:soak` |
+| Lose the gateway volume with an operation in flight, run `gw:reset` and check the operation. Run it alone, after `gate:m5` | `mise run gate:m5:drill` |
+| Repair what `gate:m5` leaves: replicas of the gateway and `celld`, test namespaces `m5-*`, and each `celld` stream (`--check` only reports) | `mise run gate:m5:repair` |
+| Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References

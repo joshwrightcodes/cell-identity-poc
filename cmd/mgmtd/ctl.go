@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -25,7 +26,7 @@ const (
 	defaultSocket  = "/run/mgmtd/ctl/admin.sock"
 	ctlTimeout     = 60 * time.Second
 	maxCtlResponse = 16 << 20
-	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key"
+	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]"
 )
 
 // Hooks that tests replace.
@@ -139,9 +140,44 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 	sub := newFlags("ctl " + rest[0])
 	cell := sub.String("cell", "", "cell name")
 	revision := sub.String("revision", "", "revision counter or latest")
-	if err := parseFlags(sub, rest[1:]); err != nil {
+	stage := sub.Bool("stage", false, "rotate-key: make the next signing key")
+	commit := sub.Bool("commit", false, "rotate-key: make the staged key the signing key")
+	emergency := sub.Bool("emergency", false, "rotate-key: rotate to a new key at once")
+	line := sub.String("line", "", "op create, op sign: the line of a demo.append operation")
+	ttl := sub.String("ttl", "", "op create, op sign: the lifetime of the operation, for example 10m")
+	kind := sub.String("kind", "demo.append", "op create, op sign: the kind of the operation")
+	id := sub.String("id", "", "op get, op close: the operation ID")
+	subArgs := rest[1:]
+	opSub := ""
+	if rest[0] == "op" {
+		if len(subArgs) == 0 {
+			cli.Fail(stdout, name, fmt.Errorf("op needs create, sign, get, list or close; %s", ctlUsage))
+			return exitConfig
+		}
+		opSub, subArgs = subArgs[0], subArgs[1:]
+	}
+	if err := sub.Parse(subArgs); err != nil {
 		cli.Fail(stdout, name, fmt.Errorf("%w; %s", err, ctlUsage))
 		return exitConfig
+	}
+	if sub.NArg() > 0 {
+		if opSub != "get" && opSub != "close" || sub.NArg() > 1 || *id != "" {
+			cli.Fail(stdout, name, fmt.Errorf("unexpected argument %q; %s", sub.Arg(0), ctlUsage))
+			return exitConfig
+		}
+		*id = sub.Arg(0)
+	}
+	given := map[string]bool{}
+	sub.Visit(func(f *flag.Flag) { given[f.Name] = true })
+	for flagName := range given {
+		if !flagApplies(rest[0], opSub, flagName) {
+			what := rest[0]
+			if opSub != "" {
+				what += " " + opSub
+			}
+			cli.Fail(stdout, name, fmt.Errorf("--%s does not apply to %s; %s", flagName, what, ctlUsage))
+			return exitConfig
+		}
 	}
 	query := ""
 	if *expect != "" {
@@ -156,6 +192,7 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		return exitConfig
 	}
 	var method, path string
+	var body io.Reader
 	switch rest[0] {
 	case "status":
 		method, path = http.MethodGet, "/status"
@@ -182,17 +219,41 @@ func ctlCommand(ctx context.Context, args []string, stdout io.Writer) int {
 		}
 		method, path = http.MethodPost, "/restore/"+url.PathEscape(*revision)+query
 	case "rotate-key":
-		method, path = http.MethodPost, "/rotate-key"+query
+		modes := 0
+		for _, set := range []bool{*stage, *commit, *emergency} {
+			if set {
+				modes++
+			}
+		}
+		if modes > 1 {
+			cli.Fail(stdout, name, errors.New("rotate-key takes at most one of --stage, --commit and --emergency"))
+			return exitConfig
+		}
+		// With no flag the command is the emergency rotation, as it was before the stage.
+		mode := ""
+		switch {
+		case *stage:
+			mode = "stage=1"
+		case *commit:
+			mode = "commit=1"
+		}
+		method, path = http.MethodPost, "/rotate-key"+joinQuery(query, mode)
+	case "op":
+		var err error
+		if method, path, body, err = opRequest(opSub, *cell, *kind, *line, *ttl, *id); err != nil {
+			cli.Fail(stdout, name, err)
+			return exitConfig
+		}
 	default:
 		cli.Fail(stdout, name, fmt.Errorf("unknown ctl command %q; %s", rest[0], ctlUsage))
 		return exitConfig
 	}
 	return cli.Run(stdout, name, func(out io.Writer) error {
-		return ctlRequest(ctx, *socket, method, path, out)
+		return ctlRequest(ctx, *socket, method, path, body, out)
 	})
 }
 
-func ctlRequest(ctx context.Context, socket, method, path string, out io.Writer) error {
+func ctlRequest(ctx context.Context, socket, method, path string, body io.Reader, out io.Writer) error {
 	if fi, err := os.Lstat(socket); err == nil {
 		if fi.Mode()&os.ModeSocket == 0 {
 			return fmt.Errorf("%s is not a socket", socket)
@@ -208,33 +269,113 @@ func ctlRequest(ctx context.Context, socket, method, path string, out io.Writer)
 		}},
 	}
 	defer client.CloseIdleConnections()
-	req, err := http.NewRequestWithContext(ctx, method, "http://mgmtd"+path, nil)
+	req, err := http.NewRequestWithContext(ctx, method, "http://mgmtd"+path, body)
 	if err != nil {
 		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("admin socket %s: %w", socket, err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCtlResponse))
+	answer, err := io.ReadAll(io.LimitReader(resp.Body, maxCtlResponse))
 	if err != nil {
 		return fmt.Errorf("read the answer: %w", err)
 	}
 	if resp.StatusCode/100 != 2 {
 		var e adminFailure
-		if json.Unmarshal(body, &e) == nil && e.Message != "" {
+		if json.Unmarshal(answer, &e) == nil && e.Message != "" {
 			return &e
 		}
 		return fmt.Errorf("admin socket answered %s", resp.Status)
 	}
-	var line bytes.Buffer
-	if err := json.Compact(&line, body); err != nil {
+	var one bytes.Buffer
+	if err := json.Compact(&one, answer); err != nil {
 		return fmt.Errorf("the answer is not JSON: %w", err)
 	}
-	line.WriteByte('\n')
-	_, err = out.Write(line.Bytes())
+	one.WriteByte('\n')
+	_, err = out.Write(one.Bytes())
 	return err
+}
+
+// flagApplies reports whether the subcommand flag applies to the command (and the op subcommand).
+func flagApplies(command, opSub, flagName string) bool {
+	switch command {
+	case "keys", "keycheck":
+		return flagName == "cell"
+	case "restore":
+		return flagName == "revision"
+	case "rotate-key":
+		return flagName == "stage" || flagName == "commit" || flagName == "emergency"
+	case "op":
+		switch opSub {
+		case "create", "sign":
+			return flagName == "cell" || flagName == "line" || flagName == "ttl" || flagName == "kind"
+		case "get", "close":
+			return flagName == "id"
+		case "list":
+			return flagName == "cell"
+		}
+	}
+	return false
+}
+
+// joinQuery adds the query part extra to query, which is empty or starts with ?.
+func joinQuery(query, extra string) string {
+	switch {
+	case extra == "":
+		return query
+	case query == "":
+		return "?" + extra
+	}
+	return query + "&" + extra
+}
+
+// opRequest returns the admin request of `ctl op <sub>`. create and sign take --cell and --line, and
+// sign records the operation and signs it without serving it.
+func opRequest(sub, cell, kind, line, ttl, id string) (method, path string, body io.Reader, err error) {
+	switch sub {
+	case "create", "sign":
+		if cell == "" || line == "" {
+			return "", "", nil, fmt.Errorf("op %s needs --cell and --line", sub)
+		}
+		args, err := json.Marshal(map[string]string{"line": line})
+		if err != nil {
+			return "", "", nil, err
+		}
+		req, err := json.Marshal(struct {
+			Cell string          `json:"cell"`
+			Kind string          `json:"kind"`
+			Args json.RawMessage `json:"args"`
+			TTL  string          `json:"ttl,omitempty"`
+		}{cell, kind, args, ttl})
+		if err != nil {
+			return "", "", nil, err
+		}
+		path = "/ops"
+		if sub == "sign" {
+			path += "?serve=0"
+		}
+		return http.MethodPost, path, bytes.NewReader(req), nil
+	case "get", "close":
+		if id == "" {
+			return "", "", nil, fmt.Errorf("op %s needs an operation ID", sub)
+		}
+		if sub == "get" {
+			return http.MethodGet, "/ops/" + url.PathEscape(id), nil, nil
+		}
+		return http.MethodPost, "/ops/" + url.PathEscape(id) + "/close", nil, nil
+	case "list":
+		path = "/ops"
+		if cell != "" {
+			path += "?cell=" + url.QueryEscape(cell)
+		}
+		return http.MethodGet, path, nil, nil
+	}
+	return "", "", nil, fmt.Errorf("unknown op command %q; %s", sub, ctlUsage)
 }
 
 // adminFailure is an error answer of the admin socket. LogAttrs puts the reason and the rotated
@@ -243,6 +384,7 @@ type adminFailure struct {
 	Message string `json:"error"`
 	Reason  string `json:"reason"`
 	Rotated bool   `json:"rotated"`
+	Staged  bool   `json:"staged"`
 }
 
 func (e *adminFailure) Error() string { return e.Message }
@@ -254,6 +396,9 @@ func (e *adminFailure) LogAttrs() []any {
 	}
 	if e.Rotated {
 		a = append(a, "rotated", true)
+	}
+	if e.Staged {
+		a = append(a, "staged", true)
 	}
 	return a
 }

@@ -23,13 +23,14 @@ d="$STUB_DIR"
 case " $* " in
   *" --context kind-management "*" exec spire-server-0 "*) cat "$d/mgmt-root.pem" ;;
   *" --context kind-dev-cp "*" exec spire-server-0 "*) cat "$d/cp-root.pem" ;;
+  *" get configmap mgmt-signing-pub "*) cat "$d/signing-pub.json" ;;
   *" get configmap hostsvc-pin "*) printf '%s' "$(cat "$d/cm-pin.pem")" ;;
   *" get pod mgmtd-0 "*) printf '%s' "$(cat "$d/pod-pin-annotation")" ;;
   *" get networkpolicy mgmtd "*) cat "$d/policy.json" ;;
   *" get statefulset mgmtd "*) cat "$d/sts.json" ;;
   *" get configmap peer-root "*) printf '%s' "$(cat "$d/cm-peer-root.pem")" ;;
   *" get pods -l app.kubernetes.io/name=mgmtd "*) cat "$d/pods.json" ;;
-  *" get configmap cell-registry "*) cat "$d/registry.json" ;;
+  *" get configmap cell-registry "*) [ "$(cat "$d/registry.json")" = ABSENT ] && { echo "Error from server (NotFound): configmaps cell-registry not found" >&2; exit 1; }; cat "$d/registry.json" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -85,7 +86,7 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 	pinSHA := hex.EncodeToString(pinSum[:])
 	cpSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.TrimRight(cpRoot, "\n"))))
 	policy := func(host, cp string) string {
-		return fmt.Sprintf(`{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":8446},{"port":8447}]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],
+		return fmt.Sprintf(`{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":8446}]},{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],
 "egress":[{"to":[{"ipBlock":{"cidr":"%s/32"}}],"ports":[{"port":17443}]}]}}`, cp, host)
 	}
 	sts := func(host string) string {
@@ -96,20 +97,23 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 	}
 	// registry is ConfigMap cell-registry with the record of dev-cell-1 as given and one of dev-cell-2. The stored JSON has
 	// other spacing than the served one, so only a compact comparison finds them equal.
-	registry := func(cell1 string) string {
-		b, _ := json.Marshal(map[string]any{"data": map[string]string{"dev-cell-1.dsse.json": cell1,
-			"dev-cell-2.dsse.json": `{ "payload": "counter2", "signatures": [1] }`, "signers.pub": "key\n"}})
+	const signingKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+	registry := func(cell1 string, labels map[string]string, signers string) string {
+		b, _ := json.Marshal(map[string]any{"metadata": map[string]any{"labels": labels}, "data": map[string]string{"dev-cell-1.dsse.json": cell1,
+			"dev-cell-2.dsse.json": `{ "payload": "counter2", "signatures": [1] }`, "signers.pub": signers}})
 		return string(b)
 	}
+	madeBy := map[string]string{"poc.internal/made-by": "mgmtd"}
 	healthy := map[string]string{
 		"mgmt-root.pem": mgmtRoot, "cp-root.pem": cpRoot, "cm-pin.pem": pinPEM, "live-pin.pem": pinPEM, "pod-pin-annotation": pinSHA,
 		"serve-cert-sha": pinSHA, "serve-root-sha": goRootSHA(t, mgmtRoot), "policy.json": policy("192.168.5.2", "10.9.0.9"),
 		"sts.json": sts("192.168.5.2"), "getent": `192.168.5.2 STREAM host.docker.internal\n`, "cp-node-ip": "10.9.0.9",
 		"kind-clusters": "management\ndev-cp\ndev-cell-1\ndev-cell-2\nrogue\n", "cm-peer-root.pem": cpRoot, "pods.json": pods(cpSHA),
-		"records.json":  `{"dev-cell-1":{"payload":"counter7","signatures":[1]},"dev-cell-2":{"payload":"counter2","signatures":[1]}}`,
-		"registry.json": registry(`{"payload":"counter7", "signatures":[1]}`),
+		"records.json":     `{"dev-cell-1":{"payload":"counter7","signatures":[1]},"dev-cell-2":{"payload":"counter2","signatures":[1]}}`,
+		"registry.json":    registry(`{"payload":"counter7", "signatures":[1]}`, madeBy, signingKey+"\n"),
+		"signing-pub.json": `{"data":{"spec.pub":"` + signingKey + `"}}`,
 	}
-	registryFix := "CELL=management LINK_ONLY=central-view mise run cell:link"
+	registryNext := "mise run mgmt -- status"
 	restart := "mise run hostsvc:serve -- restart"
 	link := "CELL=management mise run cell:link"
 	for _, tc := range []struct {
@@ -131,16 +135,29 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 		{"env address: dev-cp has a new node address", "check_mgmt_env_address", map[string]string{"cp-node-ip": "10.9.0.77"}, []string{"the dev-cp node is 10.9.0.77", link}},
 		{"env address: no dev-cp and no rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n",
 			"policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],"egress":[]}}`}, nil},
-		{"env address: no dev-cp but a rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n"}, []string{"does not exist, but the API and bind ports admit", link}},
+		{"env address: no dev-cp but a rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n"}, []string{"does not exist, but the API port admits", link}},
 		{"peer root ok", "check_mgmt_peer_root", nil, nil},
 		{"peer root: dev-cp has a new root", "check_mgmt_peer_root", map[string]string{"cp-root.pem": otherRoot}, []string{"absent or holds other roots", link}},
 		{"peer root: a pod holds an old root", "check_mgmt_peer_root", map[string]string{"pods.json": pods(strings.Repeat("0", 64))}, []string{"carries the root digest", link}},
 		{"peer root: the ConfigMap is absent", "check_mgmt_peer_root", map[string]string{"cm-peer-root.pem": ""}, []string{"absent or holds other roots", link}},
-		{"registry ok", "check_registry_current central-view-system central-view", nil, nil},
-		{"registry: a record is older than the one mgmtd serves", "check_registry_current central-view-system central-view",
-			map[string]string{"registry.json": registry(`{"payload":"counter1","signatures":[1]}`)}, []string{"another record than mgmtd serves for: dev-cell-1", registryFix}},
-		{"registry: a record of a cell that mgmtd does not serve", "check_registry_current central-view-system central-view",
-			map[string]string{"records.json": `{"dev-cell-1":{"payload":"counter7","signatures":[1]}}`}, []string{"for: dev-cell-2", registryFix}},
+		{"registry ok", "check_registry_published central-view-system", nil, nil},
+		{"registry: a signed registry with no record, as mgmtd publishes after the last cell drops", "check_registry_published central-view-system",
+			map[string]string{"records.json": `{}`, "registry.json": `{"metadata":{"labels":{"poc.internal/made-by":"mgmtd"}},"data":{"signers.pub":"` + signingKey + `\n"}}`}, nil},
+		{"registry: no record held, and mgmtd serves one", "check_registry_published central-view-system",
+			map[string]string{"registry.json": `{"metadata":{"labels":{"poc.internal/made-by":"mgmtd"}},"data":{"signers.pub":"` + signingKey + `\n"}}`}, []string{"has another record than mgmtd serves, or none", registryNext}},
+		{"registry: a record is older than the one mgmtd serves", "check_registry_published central-view-system",
+			map[string]string{"registry.json": registry(`{"payload":"counter1","signatures":[1]}`, madeBy, signingKey+"\n")}, []string{"dev-cell-1 has another record than mgmtd serves", registryNext, "logs mgmtd-0"}},
+		{"registry: a record of a cell that mgmtd does not serve", "check_registry_published central-view-system",
+			map[string]string{"records.json": `{"dev-cell-1":{"payload":"counter7","signatures":[1]}}`}, []string{"holds the record dev-cell-2, which mgmtd does not serve", registryNext}},
+		{"registry: a harness label is still on the object", "check_registry_published central-view-system",
+			map[string]string{"registry.json": registry(`{"payload":"counter7", "signatures":[1]}`, map[string]string{"poc.internal/made-by": "mgmtd", "cell.poc.internal/harness": "central-view"}, signingKey+"\n")},
+			[]string{"has the labels", "cell.poc.internal/harness", registryNext}},
+		{"registry: no made-by label", "check_registry_published central-view-system",
+			map[string]string{"registry.json": registry(`{"payload":"counter7", "signatures":[1]}`, nil, signingKey+"\n")}, []string{"has the labels", registryNext}},
+		{"registry: another signing key", "check_registry_published central-view-system",
+			map[string]string{"registry.json": registry(`{"payload":"counter7", "signatures":[1]}`, madeBy, "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\n")}, []string{"signers.pub of central-view-system/cell-registry", registryNext}},
+		{"registry: the ConfigMap is absent", "check_registry_published central-view-system",
+			map[string]string{"registry.json": "ABSENT"}, []string{"could not read ConfigMap central-view-system/cell-registry", registryNext}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			files := map[string]string{}
@@ -158,7 +175,7 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 			cmd := exec.Command("bash", "-c", `source "$1/scripts/lib.sh"; source "$1/components/lib/peer-root.sh"; source "$1/components/lib/hostsvc-pin.sh"
 source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"; set +e; `+tc.check, "_", root)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=management",
-				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub, "HOSTSVC_SERVE=" + filepath.Join(stub, "serve")}
+				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub, "MGMT_KEY_ACCEPT_CHANGE=1", "REGISTRY_PUBLISHED_WAIT=0", "HOSTSVC_SERVE=" + filepath.Join(stub, "serve")}
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err := cmd.Run()

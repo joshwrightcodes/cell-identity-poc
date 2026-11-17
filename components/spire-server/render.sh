@@ -22,6 +22,9 @@
 #     and its ID under that alias. The server gets an API token and a ClusterRole for TokenReview
 #     and the pod and node reads. Each workload pod reaches the server API through the ClusterIP of
 #     Service spire-server, and carries the label app.kubernetes.io/name=<service account>.
+#   - Key hints: the cluster_jwt plugin patches ConfigMap spire-system/attest-hints on unknown_kid (hint_configmap in
+#     server.conf). It reaches the API through the same token as k8s_psat, so the hint line and Role spire-server-hints
+#     stay only when the cluster has both agent cells and local workloads.
 # SPIRE_UPSTREAM=disk signs the server CA with the intermediate CA from Secret spire-upstream, and
 # the CA keys stay in memory. Without it, the CA is a self-signed root, and its key lives on the
 # data volume, so a restart keeps the root.
@@ -200,6 +203,9 @@ server_conf="$(awk -v keep=" ${sections[*]} " '
   | sed -e "s|@SPIRE_TRUST_DOMAIN@|$td|g" -e "s|@SPIRE_CA_TTL@|$ca_ttl|" -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" \
     -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" -e "s|@SPIRE_PSAT_ACCOUNTS@|$account_list|" \
     -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" -e "s|@POC_ENV@|$POC_ENV|g")"
+if ((${#cells[@]} == 0 || ${#local_workloads[@]} == 0)); then
+  server_conf="$(sed -e '/^ *hint_configmap = /d' <<<"$server_conf")"
+fi
 controller_conf="$(sed -e "s|@SPIRE_TRUST_DOMAIN@|$td|" "$here/controller-manager.yaml")"
 
 # config_map <name> <key> <content> prints a ConfigMap with one literal block value.
@@ -229,6 +235,9 @@ fi
 if ((${#local_workloads[@]} == 0)); then
   drop_objects+=("ClusterRole/spire-server-psat" "ClusterRoleBinding/spire-server-psat" "NetworkPolicy/spire-server-workloads" "NetworkPolicy/spire-server-api")
   drop_volumes+=(api-token)
+fi
+if ((${#cells[@]} == 0 || ${#local_workloads[@]} == 0)); then
+  drop_objects+=("Role/spire-server-hints" "RoleBinding/spire-server-hints")
 fi
 eso_namespace="${EXTERNAL_SECRETS_NAMESPACE:-${SECRET_STORE_NAMESPACES:-}}"
 [[ "$eso_namespace" != "$namespace" ]] || drop_objects+=("Namespace/$namespace")

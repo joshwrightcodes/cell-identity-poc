@@ -13,8 +13,9 @@
 #   2. dev-cell-1: puts back the manifest that the key rotation test saved, or removes the two test
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes
 #      and signs with one key;
-#   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory,
-#      runs a container that started after the API server, and waits for a ready kube-scheduler;
+#   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory, and kube-scheduler
+#      run a container that started after the API server container (read from the container runtime, not from the mirror pods)
+#      and hold a live Lease;
 #   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
 #      a time, and waits for every workload;
 #   5. runs the key check of mgmtd for dev-cell-1, and repeats it after 61 s while the answer is rate_limited, up to
@@ -150,14 +151,19 @@ log "the bundles of $cp match build/$cp/published.env"
 # Step 2: the API server of dev-cell-1.
 identity="$(node_matches "$CELL_NAME")" || die "$identity"
 changed=0
+# touched is 1 when this run changes the manifest, and then the API server must restart after the time that the node shows now.
+touched=0
+changed_at="$(on_node date +%s)" || die "cannot read the time of the node $node"
 if on_node test -e "$KEYTEST_SAVED"; then
   changed=1
   if ! on_node cmp -s "$KEYTEST_SAVED" "$KEYTEST_MANIFEST"; then
+    touched=1
     on_node sh -c "umask 077 && cp '$KEYTEST_SAVED' /root/m2-test.tmp && mv /root/m2-test.tmp '$KEYTEST_MANIFEST'"
     log "restored $KEYTEST_MANIFEST from $KEYTEST_SAVED"
   fi
 elif on_node grep -q 'm2-test-sa' "$KEYTEST_MANIFEST"; then
   changed=1
+  touched=1
   on_node sh -c "umask 077 && sed -e '\\|--service-account-key-file=$KEYTEST_KEY.pub|d' \
     -e 's|--service-account-signing-key-file=$KEYTEST_KEY.key|--service-account-signing-key-file=/etc/kubernetes/pki/sa.key|' \
     '$KEYTEST_MANIFEST' > /root/m2-test.tmp && mv /root/m2-test.tmp '$KEYTEST_MANIFEST'"
@@ -178,27 +184,18 @@ wait_until 240 "the API server of $CELL_NAME publishes one key, signs with it an
 kid="$(api_kids)"
 log "the API server of $CELL_NAME publishes and signs with the key $kid"
 
-# Step 3: kube-controller-manager. The reference is the start of the API server container, so a
-# rerun accepts the container that an earlier run started.
-started_at() {
-  k -n kube-system get pod "$1-$node" -o json \
-    | jq -er '.status.containerStatuses[0] | select(.ready) | .state.running.startedAt | fromdateiso8601'
-}
+# Step 3: kube-controller-manager and kube-scheduler. The reference is the start of the API server container, read from the container
+# runtime on the node. The mirror pods are not read: just after a restart of the API server their status can still show the old
+# containers. A component counts as current when the runtime shows a container that started after the API server, its Lease names the
+# node and is alive, and, for a container that this step stopped, the Lease has a new holder (see control_plane_current in gate-traces.sh).
 if ((changed)); then
-  api_started="$(started_at kube-apiserver)" || die "cannot read the start of the kube-apiserver container"
-  manager_current() { local s; s="$(started_at kube-controller-manager)" && ((s >= api_started)); }
-  if ! manager_current; then
-    for id in $(on_node crictl ps --name '^kube-controller-manager$' -q); do
-      on_node crictl stop "$id" >/dev/null
-    done
-    log "stopped the kube-controller-manager container, which started before the API server"
-  fi
-  # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait
-  # while kube-scheduler is in back-off, so step 4 starts only when it runs.
-  scheduler_ready() { started_at kube-scheduler >/dev/null; }
-  control_plane_ready() { manager_current && scheduler_ready; }
-  wait_until 330 "kube-controller-manager runs a ready container that started after the API server, and kube-scheduler is ready" control_plane_ready
-  log "kube-controller-manager runs a container that started after the API server, and kube-scheduler is ready"
+  api_restarted() { local s; s="$(container_started kube-apiserver)" && { ((!touched)) || ((s >= changed_at)); }; }
+  wait_until 240 "the runtime shows a kube-apiserver container that started after the manifest changed" api_restarted
+  api_started="$(container_started kube-apiserver)" || die "cannot read the start of the kube-apiserver container from the runtime"
+  # kubelet can delay a new container by its restart back-off, up to 5 minutes. New pods wait while kube-scheduler is in back-off,
+  # so step 4 starts only when both components are current.
+  settle_control_plane "$node" "$api_started" 330 || die "kube-controller-manager and kube-scheduler did not become current (see the lines above)"
+  log "kube-controller-manager and kube-scheduler run a container that started after the API server and hold a live Lease"
 fi
 
 # Step 4: pods with a projected token from another key. Only the token header leaves the node.
@@ -237,7 +234,8 @@ replace_pod() {
         log "restarting deployment $ns/$deployment, whose pod $pod holds a token from another key"
         k -n "$ns" rollout restart deployment "$deployment" >/dev/null
         log "waiting up to 120s for the rollout of $ns/$deployment"
-        k -n "$ns" rollout status deployment "$deployment" --timeout=120s >/dev/null || die "the rollout of $ns/$deployment did not finish in 120s"
+        k -n "$ns" rollout status deployment "$deployment" --timeout=120s >/dev/null \
+          || log "the rollout of $ns/$deployment did not finish in 120s, and the wait for every workload decides"
         return 0
       fi
       kind=deployment owner="$deployment" ;;

@@ -1,16 +1,17 @@
-// Command mgmtd is the management plane process. It signs the spec and the records of one
-// environment, serves the spec to envd over mTLS, binds cells through a server-only TLS listener,
-// and answers local commands on an admin socket.
+// Command mgmtd is the management plane process. It signs the spec, the records and the operations
+// of one environment, serves them to envd over mTLS, verifies the reports of the cells that envd
+// sends up, publishes the signed records to the cell registries, and answers local commands on an
+// admin socket.
 //
-//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--bind-listen :8447] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m]
+//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m] [--registry-namespaces <ns>,<ns>]
 //	mgmtd reset-state [--data-dir /var/lib/mgmtd]
-//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key
+//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
 // JSON on stdout. Logs, traces and metrics also go out as OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is
-// set. reset-state renames the state file and the key file in the data directory, so the next serve starts fresh
-// under a new key. The signing key stays in the data directory and never reaches logs, arguments or the
-// environment.
+// set. reset-state renames the state file, the key file and the staged key file in the data
+// directory, so the next serve starts fresh under a new key. The signing key stays in the data
+// directory and never reaches logs, arguments or the environment.
 package main
 
 import (
@@ -53,9 +54,9 @@ const (
 	name = "mgmtd"
 	// sourceTimeout bounds the wait for the first SVID from the Workload API.
 	sourceTimeout = 30 * time.Second
-	// serverStopTimeout is the one budget for the stop of the three servers, and flushTimeout bounds
+	// serverStopTimeout is the one budget for the stop of the two servers, and flushTimeout bounds
 	// the telemetry flush. Together they stay below the 30 s termination grace of a pod.
-	serverStopTimeout = 8 * time.Second
+	serverStopTimeout = 13 * time.Second
 	flushTimeout      = 10 * time.Second
 	exitConfig        = 2
 )
@@ -167,7 +168,7 @@ func parseFlags(fs *flag.FlagSet, args []string) error {
 
 type serveConfig struct {
 	intent, dataDir                      string
-	apiListen, bindListen, healthListen  string
+	apiListen, healthListen              string
 	adminSocket, peerBundle              string
 	peerTD                               spiffeid.TrustDomain
 	allow                                spiffeid.ID
@@ -175,6 +176,7 @@ type serveConfig struct {
 	hostsvcTimeout                       time.Duration
 	cmNamespace, cmName                  string
 	checkEvery                           time.Duration
+	registryNamespaces                   []string
 }
 
 func parseServe(args []string) (serveConfig, error) {
@@ -182,7 +184,6 @@ func parseServe(args []string) (serveConfig, error) {
 	intent := fs.String("intent", "", "intent file")
 	dataDir := fs.String("data-dir", "/var/lib/mgmtd", "directory of the signing key and the state")
 	apiListen := fs.String("api-listen", ":8446", "address of the mTLS API listener")
-	bindListen := fs.String("bind-listen", ":8447", "address of the bind listener")
 	health := fs.String("health-listen", ":8080", "address of the health endpoint")
 	sock := fs.String("admin-socket", defaultSocket, "path of the admin socket")
 	bundle := fs.String("peer-bundle", "", "PEM file with the roots of the peer trust domain")
@@ -194,6 +195,7 @@ func parseServe(args []string) (serveConfig, error) {
 	hTimeout := fs.Duration("hostsvc-timeout", 10*time.Second, "timeout of a host service call")
 	cm := fs.String("public-configmap", "", "ConfigMap for the public key, as <namespace>/<name>")
 	every := fs.Duration("check-every", 15*time.Minute, "time between key checks of a bound cell")
+	regNS := fs.String("registry-namespaces", "", "namespaces that get ConfigMap cell-registry, separated by commas; empty publishes nothing")
 	if err := parseFlags(fs, args); err != nil {
 		return serveConfig{}, err
 	}
@@ -226,9 +228,31 @@ func parseServe(args []string) (serveConfig, error) {
 	if !ok || ns == "" || cmName == "" || strings.Contains(cmName, "/") {
 		return serveConfig{}, errors.New("--public-configmap must be <namespace>/<name>")
 	}
-	return serveConfig{intent: *intent, dataDir: *dataDir, apiListen: *apiListen, bindListen: *bindListen, healthListen: *health,
+	namespaces, err := parseNamespaces(*regNS)
+	if err != nil {
+		return serveConfig{}, fmt.Errorf("--registry-namespaces: %w", err)
+	}
+	return serveConfig{intent: *intent, dataDir: *dataDir, apiListen: *apiListen, healthListen: *health, registryNamespaces: namespaces,
 		adminSocket: *sock, peerBundle: *bundle, peerTD: trust, allow: id, hostsvcAddr: *hAddr, hostsvcName: *hName,
 		hostsvcPin: *hPin, hostsvcTimeout: *hTimeout, cmNamespace: ns, cmName: cmName, checkEvery: *every}, nil
+}
+
+// parseNamespaces splits a comma list of namespace names. An empty list gives no namespace.
+func parseNamespaces(list string) ([]string, error) {
+	var out []string
+	if strings.TrimSpace(list) == "" {
+		return out, nil
+	}
+	for _, ns := range strings.Split(list, ",") {
+		ns = strings.TrimSpace(ns)
+		if ns == "" || len(ns) > 63 || strings.Trim(ns, "abcdefghijklmnopqrstuvwxyz0123456789-") != "" || ns[0] == '-' || ns[len(ns)-1] == '-' {
+			return nil, fmt.Errorf("%q is not a namespace name", ns)
+		}
+		if !slices.Contains(out, ns) {
+			out = append(out, ns)
+		}
+	}
+	return out, nil
 }
 
 // limitedErrorLog sends the errors of an HTTP server to log, at most one line in each window.
@@ -339,7 +363,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	if d.beforePlane != nil {
 		d.beforePlane()
 	}
-	plane, err := mgmt.NewPlane(mgmt.Config{
+	pcfg := mgmt.Config{
 		Intent:     intent,
 		KeyPath:    filepath.Join(cfg.dataDir, keyFileName),
 		Store:      &mgmt.FileStore{Path: filepath.Join(cfg.dataDir, stateFileName), Log: logger},
@@ -347,46 +371,47 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		Log:        logger,
 		Meter:      meter,
 		CheckEvery: cfg.checkEvery,
-	})
+	}
+	var registry *registryPublisher
+	if len(cfg.registryNamespaces) > 0 {
+		registry = newRegistryPublisher()
+		pcfg.OnRecords = registry.set
+	}
+	plane, err := mgmt.NewPlane(pcfg)
 	if err != nil {
 		return fmt.Errorf("start the plane: %w", err)
 	}
 	ready.Store(true)
 
 	apiTLS := mgmt.APIServerTLS(svids, mgmt.FileBundleSource(cfg.peerBundle, cfg.peerTD), cfg.allow)
-	apiSrv, bindSrv := mgmt.NewServers(
-		telemetry.Handler(tracer, "mgmtd.api", mgmt.NewAPIHandler(plane, intent.Env, cfg.allow, logger)),
-		telemetry.Handler(tracer, "mgmtd.bind", mgmt.NewBindHandler(plane, logger), telemetry.WithPublicEndpoint()),
-		apiTLS, mgmt.BindServerTLS(svids))
-	apiSrv.ErrorLog, bindSrv.ErrorLog = limitedErrorLog(logger), limitedErrorLog(logger)
+	apiSrv := mgmt.NewServers(
+		telemetry.Handler(tracer, "mgmtd.api", mgmt.NewAPIHandler(plane, intent.Env, cfg.allow, logger)), apiTLS)
+	apiSrv.ErrorLog = limitedErrorLog(logger)
 
 	apiRaw, err := net.Listen("tcp", cfg.apiListen)
 	if err != nil {
 		return fmt.Errorf("api listener: %w", err)
 	}
-	bindRaw, err := net.Listen("tcp", cfg.bindListen)
-	if err != nil {
-		_ = apiRaw.Close()
-		return fmt.Errorf("bind listener: %w", err)
-	}
 
 	publisher := newKeyPublisher(plane.PublicKey, func(ctx context.Context, pub ed25519.PublicKey) error {
-		return PublishPublicKey(ctx, kube, cfg.cmNamespace, cfg.cmName, pub)
+		next, _ := plane.StagedPublicKey()
+		return PublishPublicKey(ctx, kube, cfg.cmNamespace, cfg.cmName, pub, next)
 	})
 	adminLn, err := listenAdmin(cfg.adminSocket)
 	if err != nil {
 		_ = apiRaw.Close()
-		_ = bindRaw.Close()
 		return err
 	}
 
 	spawn("api", func() error { return ignoreClosed(apiSrv.Serve(mgmt.ListenAPI(apiRaw, apiSrv.TLSConfig, logger))) })
-	spawn("bind", func() error { return ignoreClosed(bindSrv.Serve(mgmt.ListenBind(bindRaw, bindSrv.TLSConfig, logger))) })
 	spawn("admin", func() error { return serveAdmin(ctx, adminLn, mgmt.NewAdminHandler(plane, publisher.adminPublish)) })
 	wg.Go(func() { _ = plane.RunChecks(ctx) })
 	wg.Go(func() { publisher.run(ctx, logger, time.Second, 5*time.Minute) })
+	if registry != nil {
+		wg.Go(func() { registry.run(ctx, kube, cfg.registryNamespaces, logger, registryBackoff, registryResync) })
+	}
 
-	logger.Info("listening", "env", intent.Env, "api", apiRaw.Addr().String(), "bind", bindRaw.Addr().String(),
+	logger.Info("listening", "env", intent.Env, "api", apiRaw.Addr().String(),
 		"health", healthLn.Addr().String(), "admin", cfg.adminSocket, "cells", cellNames(intent))
 
 	var failure error
@@ -397,10 +422,18 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	cancel()
 	sctx, stop := context.WithTimeout(context.Background(), serverStopTimeout)
 	defer stop()
-	for _, s := range []*http.Server{apiSrv, bindSrv, health} {
+	for _, s := range []*http.Server{apiSrv, health} {
 		if s.Shutdown(sctx) != nil {
 			_ = s.Close()
 		}
+	}
+	// No report call is running now, so no hint check can start while Wait runs.
+	waited := make(chan struct{})
+	go func() { plane.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-sctx.Done():
+		logger.Warn("hint_checks_unfinished")
 	}
 	logger.Info("stopped")
 	return failure

@@ -29,10 +29,16 @@ func (b *holdBackend) Serve(_ context.Context, conn *tls.Conn, src Source) error
 // address, its log and the CA of the environment.
 func testServer(t *testing.T, cfg ServerConfig, b Backend, pattern string, level slog.Level) (string, *syncBuffer, *testCA) {
 	t.Helper()
+	return testServerWith(t, cfg, b, pattern, level, testRegistry(t))
+}
+
+// testServerWith is testServer with the registry source reg.
+func testServerWith(t *testing.T, cfg ServerConfig, b Backend, pattern string, level slog.Level, reg RegistrySource) (string, *syncBuffer, *testCA) {
+	t.Helper()
 	mgmt, env := newCA(t, mgmtTD), newCA(t, envTD)
 	out := &syncBuffer{}
 	log := slog.New(slog.NewJSONHandler(out, &slog.HandlerOptions{Level: level}))
-	cfg.TLS = ServerTLS(source(mgmt.svid(t, principalID)), env.bundle(), regexp.MustCompile(pattern), testRegistry(t), log)
+	cfg.TLS = ServerTLS(source(mgmt.svid(t, principalID)), env.bundle(), regexp.MustCompile(pattern), reg, log)
 	return serveOn(t, NewServer(cfg, b, log), out, env)
 }
 

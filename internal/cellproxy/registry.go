@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
@@ -28,11 +29,50 @@ const (
 type Registry struct {
 	cells   []record.Cell
 	signers int
+	keys    []ed25519.PublicKey
+}
+
+// RegistrySource gives the registry that is current now. A *Registry is its own source, and a
+// *RegistryWatcher gives the last good reload.
+type RegistrySource interface{ Current() *Registry }
+
+// Current returns r.
+func (r *Registry) Current() *Registry { return r }
+
+// Record returns the record of the cell with the highest revision. It reports false when the
+// registry holds no record of that name, or when any record of that name is revoked.
+func (r *Registry) Record(cell string) (record.Cell, bool) { return r.recordFor(cell, "") }
+
+// recordFor is Record limited to the records of environment env. An empty env takes any record
+// of the name, and a revoked record of the name hides the cell in every environment.
+func (r *Registry) recordFor(cell, env string) (record.Cell, bool) {
+	var best record.Cell
+	found := false
+	for _, c := range r.cells {
+		if c.Name != cell {
+			continue
+		}
+		if c.Revoked {
+			return record.Cell{}, false
+		}
+		if env != "" && c.Env != env {
+			continue
+		}
+		if !found || revisionOf(c).Compare(revisionOf(best)) > 0 {
+			best, found = c, true
+		}
+	}
+	return best, found
+}
+
+func revisionOf(c record.Cell) spec.Revision {
+	return spec.Revision{Epoch: c.Epoch, Counter: c.Counter}
 }
 
 // LoadRegistry reads signers.pub, one base64 Ed25519 key for each line, and every *.dsse.json
 // file in dir. It fails on any record that does not verify under those keys, on a record whose
-// name or environment ParseSource could never give, on no keys and on no records.
+// name or environment ParseSource could never give, and on no keys. A directory with keys and no
+// record gives a registry that admits no cell.
 func LoadRegistry(dir string) (*Registry, error) {
 	keys, err := readSigners(filepath.Join(dir, signersFile))
 	if err != nil {
@@ -42,7 +82,7 @@ func LoadRegistry(dir string) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	reg := &Registry{signers: len(keys)}
+	reg := &Registry{signers: len(keys), keys: keys}
 	for _, path := range paths {
 		data, err := readBounded(path)
 		if err != nil {
@@ -56,9 +96,6 @@ func LoadRegistry(dir string) (*Registry, error) {
 			return nil, fmt.Errorf("record %s: %w", filepath.Base(path), err)
 		}
 		reg.cells = append(reg.cells, c)
-	}
-	if len(reg.cells) == 0 {
-		return nil, fmt.Errorf("no *%s record in %s", recordSuffix, dir)
 	}
 	return reg, nil
 }

@@ -3,9 +3,10 @@
 #
 # The bundle holds Namespace envd-system, ServiceAccount envd, Deployment envd with the k8s_psat SPIRE
 # agent sidecar, ConfigMaps peer-root and mgmt-spec-key, the objects of the sidecar, the
-# NetworkPolicies default-deny, allow-dns and envd (flows N30, N31, N35, N8, N11 and N23), and Role
+# NetworkPolicies default-deny, allow-dns and envd (flows N30, N31, N35, N39, N8, N11 and N23), and Role
 # and RoleBinding envd-records in spire-system. The Role lets envd write ConfigMap
-# spire-system/cell-records, and nothing else. Every object carries the harness label of the component.
+# spire-system/cell-records and read ConfigMap spire-system/attest-hints, and nothing else. Every object
+# carries the harness label of the component.
 #
 # The render reads these facts from outside the cluster, so the harness runs it after the waves:
 #   - the node address of the management cluster, from the host service. The envd arguments and the
@@ -66,7 +67,7 @@ own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
 envd_image="$(ko_image envd)" || die "no envd image"
 
 manifests="$(sed -e "s|@ENVD_IMAGE@|$envd_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" -e "s|@SPEC_KEY_SHA256@|$spec_sum|" \
-  -e "s|@UPSTREAM@|$mgmt_ip:$api_port|" -e "s|@MGMT_TRUST_DOMAIN@|$mgmt_td|g" -e "s|@POC_ENV@|$POC_ENV|" "$here/manifests.yaml")"
+  -e "s|@UPSTREAM@|$mgmt_ip:$api_port|" -e "s|@MGMT_TRUST_DOMAIN@|$mgmt_td|g" -e "s|@POC_ENV@|$POC_ENV|" -e "s|@POC_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" "$here/manifests.yaml")"
 grep -q '@[A-Z_]*@' <<<"$manifests" && die "the manifests keep a token that the render does not replace"
 
 deployment="$(yq 'select(.kind == "Deployment")' <<<"$manifests" \
@@ -75,8 +76,8 @@ deployment="$(yq 'select(.kind == "Deployment")' <<<"$manifests" \
     spire_sidecar envd k8s_psat)" || die "the SPIRE sidecar of envd failed"
 
 # The envd policy. Flow N30 reaches the API node port of mgmtd. Flow N31 reaches the API server for
-# ConfigMap cell-records: its node address, and the ClusterIP of its Service on 443. Flow N35 is allow-dns,
-# which the namespace has apart from this policy. Flow N8 reaches the
+# ConfigMap cell-records: its node address, and the ClusterIP of its Service on 443. Flow N39 reaches the cell
+# gateway on 8452. Flow N35 is allow-dns, which the namespace has apart from this policy. Flow N8 reaches the
 # SPIRE server for the sidecar, and N11 the collector. Flow N23 admits the node addresses on the health
 # port for the kubelet probes.
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }
@@ -93,6 +94,9 @@ policy="$(jq -n --arg ns "$namespace" --argjson mgmt "$(peers "$mgmt_ip")" --arg
        {to: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "spire-system"}},
               podSelector: {matchLabels: {"app.kubernetes.io/name": "spire-server"}}}],
         ports: [{protocol: "TCP", port: 8081}]},
+       {to: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "gateway-system"}},
+              podSelector: {matchLabels: {"app.kubernetes.io/name": "cell-gateway"}}}],
+        ports: [{protocol: "TCP", port: 8452}]},
        {to: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "observability-system"}},
               podSelector: {matchLabels: {"app.kubernetes.io/name": "otel-collector"}}}],
         ports: [{protocol: "TCP", port: 4317}]}]}}' | yq -P '.')"

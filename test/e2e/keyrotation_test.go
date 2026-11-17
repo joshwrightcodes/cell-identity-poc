@@ -3,14 +3,14 @@
 package e2e
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
 )
 
 const (
@@ -72,9 +72,18 @@ func TestM2KeyRotationDenied(t *testing.T) {
 }
 
 // rotateAPIKey adds a second service account key to the API server of a cell and signs new tokens with it, then waits until
-// the API server verifies both keys and signs with the new one. It returns the old and the new key ID. The cleanup runs
-// repairAPIServer.
+// the API server verifies both keys and signs with the new one, and until kube-controller-manager renews its lease again. It returns
+// the old and the new key ID. The cleanup runs repairAPIServer.
 func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
+	t.Helper()
+	oldKID, newKID, _ = rotateAPIKeyAt(t, cell, time.Time{})
+	return oldKID, newKID
+}
+
+// rotateAPIKeyAt is rotateAPIKey with two additions. It waits before the switch until the update gap of mgmtd has passed since
+// gapFrom (the time of a key check), so the wait overlaps the restart of istio-cni-node and the other set-up. A zero gapFrom does not
+// wait. It also returns the time of the switch, which is the moment that the bounds of the healing tests count from.
+func rotateAPIKeyAt(t *testing.T, cell string, gapFrom time.Time) (oldKID, newKID string, switchedAt time.Time) {
 	t.Helper()
 	node := cell + "-control-plane"
 	oldKIDs := apiKIDs(t, cell)
@@ -100,7 +109,11 @@ func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 		testKeyPath+".key 2>/dev/null && openssl pkey -in "+testKeyPath+".key -pubout -out "+testKeyPath+".pub"); err != nil {
 		t.Fatalf("make the second key on %s: %v", node, err)
 	}
+	if !gapFrom.IsZero() {
+		waitUpdateGap(t, gapFrom)
+	}
 	writeNodeFile(t, node, apiserverManifest, edited)
+	switchedAt = time.Now()
 	waitFor(t, "the API server of "+cell+" to verify two keys and sign with the new one", apiserverWait, func() (bool, string) {
 		kids, err := apiKIDsOnce(t, cell)
 		if err != nil {
@@ -114,7 +127,8 @@ func rotateAPIKey(t *testing.T, cell string) (oldKID, newKID string) {
 		return len(kids) == 2 && slices.Contains(kids, oldKIDs[0]) && slices.Contains(kids, signing) && signing != oldKIDs[0],
 			fmt.Sprintf("keys %v, signing key %s", kids, signing)
 	})
-	return oldKIDs[0], newKID
+	waitControllerManager(t, cell)
+	return oldKIDs[0], newKID, switchedAt
 }
 
 // addSigningKey adds the test public key as a second verification key, and makes the test private
@@ -133,12 +147,19 @@ func addSigningKey(manifest string) (string, error) {
 // a projected token from the test key, and the controllers create those pods again.
 func repairAPIServer(t *testing.T) {
 	t.Helper()
-	// The fixed waits of the script add up to about 20 minutes, and each replaced pod adds up to 3.
-	ctx, cancel := context.WithTimeout(context.Background(), 26*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "../../scripts/gate-m2-repair.sh")
-	out, err := cmd.CombinedOutput()
-	t.Logf("gate-m2-repair.sh:\n%s", strings.TrimSpace(string(out)))
+	// The bound is the fixed waits of the script plus the replaced pods. Fixed waits of gate-m2-repair.sh: 300 s (Applications), 120 s
+	// (SPIRE entries), 240 s (one key), 240 s (API server restart), 330 s (control plane), 180 s (every workload) and 2 x 61 s (key
+	// check retries) are 1532 s. A pod replacement takes up to 183 s: 60 s for the delete, 3 s of sleep and 120 s until ready. Only the
+	// pods that started while the test key signed carry its token, so the bound allows five. 1532 s + 5 x 183 s = 2447 s, 41 minutes.
+	// On a timeout the whole process group ends, so no kubectl or docker child of the script stays behind.
+	const repairBound = (1532 + 5*183) * time.Second
+	// cmdrun.Run starts the repair in its own process group, forwards INT and TERM of the test process to it (so a Ctrl-C reaches the
+	// script and its EXIT trap frees the repair lock), and ends the group with TERM and then KILL at the bound.
+	res, err := cmdrun.Run(repairBound, "", nil, "bash", "../../scripts/gate-m2-repair.sh")
+	t.Logf("gate-m2-repair.sh:\n%s\n%s", strings.TrimSpace(res.Stdout), strings.TrimSpace(res.Stderr))
+	if err == nil && res.Code != 0 {
+		err = fmt.Errorf("exit status %d", res.Code)
+	}
 	if err != nil {
 		t.Errorf("the repair of dev-cell-1 failed: %v. %s", err, repairHint)
 		return

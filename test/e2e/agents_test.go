@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -277,37 +276,11 @@ type grpcConn struct {
 	cc *http2.ClientConn
 }
 
-// dialView makes one mTLS connection to addr with cert, checks that the server is the principal ID
-// chained to the management roots, and opens HTTP/2 on it.
-func dialView(t *testing.T, addr string, cert tls.Certificate, roots *x509.CertPool) *grpcConn {
+// dialView makes one mTLS connection to addr with the SVID of a cell, checks that the server is the principal ID chained to
+// the management roots, sends the proof of the cell pod, and opens HTTP/2 on the connection.
+func dialView(t *testing.T, addr, cell string, cert tls.Certificate, proofToken func(binding string) string) *grpcConn {
 	t.Helper()
-	cfg := &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert},
-		InsecureSkipVerify: true,
-		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
-			leaf, err := x509.ParseCertificate(raw[0])
-			if err != nil {
-				return err
-			}
-			inter := x509.NewCertPool()
-			for _, r := range raw[1:] {
-				c, err := x509.ParseCertificate(r)
-				if err != nil {
-					return err
-				}
-				inter.AddCert(c)
-			}
-			if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}}); err != nil {
-				return err
-			}
-			if len(leaf.URIs) != 1 || leaf.URIs[0].String() != principalID {
-				return fmt.Errorf("server ID %v, want %s", leaf.URIs, principalID)
-			}
-			return nil
-		}}
-	conn, err := tls.DialWithDialer(&net.Dialer{Timeout: 10 * time.Second}, "tcp", addr, cfg)
-	if err != nil {
-		t.Fatalf("mTLS to the view through %s: %v", addr, err)
-	}
+	conn := dialAsCell(t, addr, cell, "argocd-agent", cert, proofToken)
 	cc, err := (&http2.Transport{}).NewClientConn(conn)
 	if err != nil {
 		_ = conn.Close()
@@ -413,12 +386,9 @@ func principalAgentVersion(t *testing.T) string {
 }
 
 // TestM3TokenReplayAcrossCells gets the tokens of dev-cell-1 with its SVID, and then uses them with
-// the SVID of dev-cell-2. cell-proxy refuses both calls with subject_mismatch.
+// the SVID of dev-cell-2. Each connection sends the proof of the real agent pod of its cell. cell-proxy refuses both
+// calls with subject_mismatch.
 func TestM3TokenReplayAcrossCells(t *testing.T) {
-	roots := x509.NewCertPool()
-	for _, c := range bundleRoots(t, mgmtCluster) {
-		roots.AddCert(c)
-	}
 	svid := func(cell string) tls.Certificate {
 		certPEM, keyPEM := mintSVID(t, envCluster, "spiffe://"+envTrustDomain+"/cell/"+cell+"/argocd-agent", 10*time.Minute)
 		c, err := tls.X509KeyPair(certPEM, keyPEM)
@@ -444,7 +414,7 @@ func TestM3TokenReplayAcrossCells(t *testing.T) {
 	req = protoString(req, 3, "autonomous")
 	req = protoString(req, 4, version)
 	req = protoString(req, 5, agentNamespace)
-	one := dialView(t, addr, svid("dev-cell-1"), roots)
+	one := dialView(t, addr, "dev-cell-1", svid("dev-cell-1"), streamProof(t, "dev-cell-1", "argocd-agent"))
 	resp, status := one.call(t, "/authapi.Authentication/Authenticate", "", req)
 	if status != "0" {
 		t.Fatalf("Authenticate as dev-cell-1: grpc-status %q, want 0", status)
@@ -455,7 +425,7 @@ func TestM3TokenReplayAcrossCells(t *testing.T) {
 	}
 	t.Log("Authenticate as dev-cell-1 returned an access token and a refresh token; they stay in memory")
 
-	two := dialView(t, addr, svid("dev-cell-2"), roots)
+	two := dialView(t, addr, "dev-cell-2", svid("dev-cell-2"), streamProof(t, "dev-cell-2", "argocd-agent"))
 	if _, status := two.call(t, "/versionapi.Version/Version", access, nil); status == "0" {
 		t.Error("Version with the access token of dev-cell-1 over the SVID of dev-cell-2 succeeded")
 	} else {

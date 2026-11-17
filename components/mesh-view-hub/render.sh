@@ -24,9 +24,10 @@
 #     ConfigMap peer-root (components/lib/peer-root.sh).
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
-#   - a signed record for each cell of MESH_VIEW_CELLS, as ConfigMap cell-registry
-#     (components/lib/registry.sh). Each cell must have a bound celld. The registry is read at start, so a
-#     revoked cell needs a new hub pod: cell:link renders a new registry and starts the pod again.
+#   - the public key of mgmtd, as ConfigMap registry-signer (components/lib/registry.sh). cell-proxy
+#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry, and
+#     cell-proxy loads it again every 10 seconds. The bundle holds the Role that lets
+#     mgmtd write it.
 #   - the cell-proxy image that `mise run images` built, by digest.
 # Kiali reads only the namespaces of MESH_VIEW_NAMESPACES, in each cluster. The chart with
 # cluster_wide_access false lists the namespace of Kiali alone, because it reads the other namespaces
@@ -104,16 +105,16 @@ tunnel_args="$(for i in "${!cells[@]}"; do printf -- '--tunnel-cell=%s=:%s\n' "$
 cell_proxy_image="$(ko_image cell-proxy)" || die "no cell-proxy image"
 peer_root="$(peer_root_configmap peer-root "$namespace" "$env_cluster" "$env_td")" || exit 1
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
-registry="$(registry_configmap "$namespace" "$POC_ENV" "${cells[@]}")" || exit 1
+registry_signer="$(registry_signer_configmap "$namespace")" || exit 1
 peer_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$peer_root")"
-registry_sum="$(yq -r '.metadata.annotations["poc.internal/registry-content-sha256"]' <<<"$registry")"
-[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$registry_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry has no checksum"
+signer_sum="$(yq -r '.metadata.annotations["poc.internal/registry-signer-sha256"]' <<<"$registry_signer")"
+[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$signer_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry signer has no checksum"
 
 # The tunnel ID is the role mesh-view of one cell. The first capture group is the cell name.
 allow_id="^spiffe://${env_td//./\\.}/cell/([a-z0-9-]+)/mesh-view\$"
 
 hub="$(sed -e "s|@CELL_PROXY_IMAGE@|$cell_proxy_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" \
-    -e "s|@REGISTRY_SHA256@|$registry_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|" \
+    -e "s|@REGISTRY_SIGNER_SHA256@|$signer_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|" \
     -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|" \
     "$here/hub.yaml" \
   | ALLOW="$allow_id" NODE="$node_peers" ENVP="$env_peers" API="$api_peers" APIPORT="$API_SERVER_PORT" PORTS="$cell_ports" TARGS="$tunnel_args" \
@@ -207,7 +208,9 @@ done)"
   echo "---"
   echo "$peer_root"
   echo "---"
-  echo "$registry"
+  echo "$registry_signer"
+  echo "---"
+  registry_publisher_rbac "$namespace"
   echo "---"
   echo "$clusters_secret"
   echo "---"

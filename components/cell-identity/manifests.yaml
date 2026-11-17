@@ -37,7 +37,8 @@ spec:
       labels:
         app.kubernetes.io/name: celld
       annotations:
-        poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
+        poc.internal/trust-bundle-sha256: "@TRUST_BUNDLE_SHA256@"
+        poc.internal/op-key-sha256: "@OP_KEY_SHA256@"
     spec:
       serviceAccountName: celld
       automountServiceAccountToken: false
@@ -49,14 +50,18 @@ spec:
         # The celld entry selects unix:uid:65532, the user of the ko base image.
         - name: celld
           image: "@CELLD_IMAGE@"
-          # celld binds the cell issuer to the management plane through relay-bind in the environment
-          # control plane. It asks for a token of its own account, bound to this pod, and sends it with
-          # the keys of the cell.
+          # celld binds the cell issuer to the management plane and claims signed operations through the
+          # cell gateway in the environment control plane. It loads the trust bundle and the operation
+          # keys only at start, so each mount has a checksum annotation on the pod template.
           args:
             - --cell=@CELL_NAME@
-            - --bind-upstream=@BIND_UPSTREAM@
-            - --bind-expect-id=spiffe://mgmt.poc.internal/api
-            - --bind-peer-bundle=/run/celld/mgmt-root/root.crt
+            - --env=@POC_ENV@
+            - --gateway=@GATEWAY_STREAM@
+            - --gateway-bind=@GATEWAY_BIND@
+            - --gateway-id=spiffe://dev.env.poc.internal/cp/gateway
+            - --trust-bundle=/run/celld/trust-bundle/bundle.crt
+            - --op-key-dir=/run/celld/op-key
+            - --ops-namespace=cell-ops-system
           env:
             - name: POD_NAME
               valueFrom:
@@ -97,16 +102,22 @@ spec:
             - name: agent-socket
               mountPath: /run/spire/agent
               readOnly: true
-            - name: mgmt-root
-              mountPath: /run/celld/mgmt-root
+            - name: spire-trust-bundle
+              mountPath: /run/celld/trust-bundle
+              readOnly: true
+            - name: mgmt-op-key
+              mountPath: /run/celld/op-key
               readOnly: true
             - name: celld-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
       volumes:
-        - name: mgmt-root
+        - name: spire-trust-bundle
           configMap:
-            name: mgmt-root
+            name: spire-trust-bundle
+        - name: mgmt-op-key
+          configMap:
+            name: mgmt-op-key
         - name: celld-api-token
           projected:
             sources:
@@ -158,9 +169,9 @@ spec:
         - protocol: TCP
           port: 53
 ---
-# The pod reaches only the SPIRE server node port and the relay-bind node port in the environment
-# control plane, the API server for TokenRequest, and the collector. It accepts no connections: the
-# probes run in the pod.
+# The pod reaches only the SPIRE server node port, the stream and bind node ports of the cell gateway
+# (flow N41), all in the environment control plane, the API server, and the collector. It accepts no
+# connections: the probes run in the pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -178,8 +189,14 @@ spec:
       ports:
         - protocol: TCP
           port: 30081
+    - to:
+        - ipBlock:
+            cidr: "@GATEWAY_ADDRESS@/32"
+      ports:
         - protocol: TCP
-          port: 30447
+          port: 30450
+        - protocol: TCP
+          port: 30451
     - to: "@API_SERVER_PEERS@"
       ports:
         - protocol: TCP
@@ -200,3 +217,46 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
+---
+# The operation records and the demo target of celld. The namespace holds no pod and stays out of the mesh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cell-ops-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: cell-ops-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# celld keeps one record for each operation, and the demo log, as ConfigMaps in this namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: celld-ops
+  namespace: cell-ops-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create, get, list, update, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: celld-ops
+  namespace: cell-ops-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: celld-ops
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system

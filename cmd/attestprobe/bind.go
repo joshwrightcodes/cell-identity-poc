@@ -7,7 +7,6 @@ import (
 	"maps"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 
@@ -18,19 +17,19 @@ import (
 )
 
 const (
-	targetSpire    = "spire"
-	targetMgmtBind = "mgmt-bind"
+	targetSpire  = "spire"
+	targetGWBind = "gw-bind"
 
-	bindTokenTTL = 600 * time.Second
+	bindTokenTTL = satoken.PodTokenTTL
 )
 
-// bindConfig holds the flags that only the mgmt-bind target reads.
+// bindConfig holds the flags that only the gw-bind target reads.
 type bindConfig struct {
-	upstream, expectID, peerBundle, nonce string
-	reuseNonce, nonceOnly                 bool
+	upstream, expectID, trustBundle, nonce string
+	reuseNonce, nonceOnly                  bool
 }
 
-// bindVariants maps each variant of the mgmt-bind target to the audience of its token. The token
+// bindVariants maps each variant of the gw-bind target to the audience of its token. The token
 // is the same as for a good bind in every other respect.
 var bindVariants = map[string]func(cell, env, nonce string) (string, error){
 	"good": func(cell, _, nonce string) (string, error) { return mgmtapi.BindAudience(cell, nonce), nil },
@@ -55,8 +54,8 @@ func parseBind(cfg config, lookupEnv func(string) (string, bool)) (config, error
 		return config{}, errors.New("--upstream is required")
 	case b.expectID == "":
 		return config{}, errors.New("--expect-id is required")
-	case b.peerBundle == "":
-		return config{}, errors.New("--peer-bundle is required")
+	case b.trustBundle == "":
+		return config{}, errors.New("--trust-bundle is required")
 	case cfg.cell == "":
 		return config{}, errors.New("--cell is required")
 	case cfg.timeout <= 0:
@@ -93,14 +92,14 @@ func parseBind(cfg config, lookupEnv func(string) (string, bool)) (config, error
 	return cfg, nil
 }
 
-// runBind sends the requests of the mgmt-bind target and returns the lines to print. A refusal of
-// the management plane is the result denied:<request ID>. Every other failure fails the probe.
+// runBind sends the requests of the gw-bind target and returns the lines to print. A refusal of
+// the gateway is the result denied:<request ID>. Every other failure fails the probe.
 func runBind(ctx context.Context, cfg config, d deps) (string, error) {
 	id, err := spiffeid.FromString(cfg.bind.expectID)
 	if err != nil {
 		return "", fmt.Errorf("--expect-id: %w", err)
 	}
-	tlsCfg := bind.ClientTLS(bind.FileBundle(cfg.bind.peerBundle, id.TrustDomain()), id)
+	tlsCfg := bind.ClientTLS(bind.FileBundle(cfg.bind.trustBundle, id.TrustDomain()), id)
 	client := bind.NewClient(bind.Config{Cell: cfg.cell, Upstream: cfg.bind.upstream, TLS: tlsCfg})
 	defer client.Close()
 
@@ -130,13 +129,13 @@ func runBind(ctx context.Context, cfg config, d deps) (string, error) {
 		sends = 2
 	}
 	for range sends {
-		resp, err := client.Bind(ctx, mgmtapi.BindRequest{Nonce: nonce, Token: token})
+		resp, err := client.BindWait(ctx, mgmtapi.BindRequest{Nonce: nonce, Token: token}, bind.DefaultPollEvery, nil)
 		var refused *bind.Refused
 		switch {
 		case errors.As(err, &refused):
 			lines = append(lines, "denied:"+refused.RequestID)
 		case err != nil:
-			return "", fmt.Errorf("send the bind request: %w", err)
+			return "", err
 		default:
 			lines = append(lines, "bound:"+resp.Status)
 		}

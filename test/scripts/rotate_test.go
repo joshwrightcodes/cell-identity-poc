@@ -87,6 +87,11 @@ case " $* " in
   *" get pods -l app.kubernetes.io/name=envd -o jsonpath="*) echo old-uid ;;
   *" get pods -l app.kubernetes.io/name=envd -o json "*)
     echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=cell-gateway -o name "*) echo statefulset.apps/cell-gateway ;;
+  *" get statefulset.apps/cell-gateway -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"cell-gateway"}}}}' ;;
+  *" get pods -l app.kubernetes.io/name=cell-gateway -o jsonpath="*) echo old-uid ;;
+  *" get pods -l app.kubernetes.io/name=cell-gateway -o json "*)
+    echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=otel-uplink -o name "*) echo deployment.apps/otel-uplink ;;
   *" get deployment.apps/otel-uplink -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"otel-uplink"}}}}' ;;
   *" get pods -l app.kubernetes.io/name=otel-uplink -o jsonpath="*) echo old-uid ;;
@@ -126,13 +131,17 @@ func runRotate(t *testing.T, env ...string) rotateResult {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// dev-cp runs the harness components otel-uplink and envd, and cell:restart restarts their Deployments too.
-	for name, ns := range map[string]string{"otel-uplink": "observability-system", "envd": "envd-system"} {
+	// dev-cp runs the harness components otel-uplink, envd and cell-gateway, and cell:restart restarts their workloads too.
+	for name, ns := range map[string]string{"otel-uplink": "observability-system", "envd": "envd-system", "cell-gateway": "gateway-system"} {
+		kind := "Deployment"
+		if name == "cell-gateway" {
+			kind = "StatefulSet"
+		}
 		bundle := filepath.Join(dir, "build", "dev-cp", "bundles", name)
 		if err := os.MkdirAll(bundle, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: "+name+"\n  namespace: "+ns+"\n"), 0o644); err != nil {
+		if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: "+kind+"\nmetadata:\n  name: "+name+"\n  namespace: "+ns+"\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}

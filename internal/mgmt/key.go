@@ -42,6 +42,16 @@ func LoadOrCreateKey(path string) (ed25519.PrivateKey, bool, error) {
 	}
 }
 
+// loadKey reads the Ed25519 signing key at path. A missing file is an error.
+func loadKey(path string) (ed25519.PrivateKey, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readKey(f)
+}
+
 func readKey(f *os.File) (ed25519.PrivateKey, error) {
 	info, err := f.Stat()
 	if err != nil {

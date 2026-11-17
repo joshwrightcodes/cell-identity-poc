@@ -68,6 +68,12 @@ func serial(t testing.TB) *big.Int {
 // SVID issues an SVID for the SPIFFE ID id, valid for one hour.
 func (ca *CA) SVID(t testing.TB, id string) *x509svid.SVID {
 	t.Helper()
+	return ca.SVIDWithTTL(t, id, time.Hour)
+}
+
+// SVIDWithTTL issues an SVID for the SPIFFE ID id whose leaf expires after ttl.
+func (ca *CA) SVIDWithTTL(t testing.TB, id string, ttl time.Duration) *x509svid.SVID {
+	t.Helper()
 	sid, err := spiffeid.FromString(id)
 	if err != nil {
 		t.Fatal(err)
@@ -83,7 +89,7 @@ func (ca *CA) SVID(t testing.TB, id string) *x509svid.SVID {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial(t),
 		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
+		NotAfter:     time.Now().Add(ttl),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
 		URIs:         []*url.URL{u},

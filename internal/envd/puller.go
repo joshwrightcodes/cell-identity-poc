@@ -67,8 +67,12 @@ type PullerConfig struct {
 	Log          *slog.Logger
 	Meter        metric.Meter
 	Tracer       trace.Tracer
-	Now          func() time.Time
-	Sleep        func(context.Context, time.Duration) error
+	// Gateway and Hints switch on the relay legs. A nil Gateway leaves the ops, sync, report and ack
+	// legs out, and a nil Hints leaves out the hints of the key plugin.
+	Gateway GatewayClient
+	Hints   HintSource
+	Now     func() time.Time
+	Sleep   func(context.Context, time.Duration) error
 }
 
 // Puller pulls the bundle of one environment in rounds, accepts it, saves it and reports.
@@ -88,6 +92,16 @@ type Puller struct {
 	logs       *lograte.Limiter
 	counter    metric.Int64Gauge
 	refusals   metric.Int64Counter
+	relayCount metric.Int64Counter
+	outbox     metric.Int64Gauge
+	// hintMarks holds, for each cell, the newest hint that a status report has carried.
+	hintMarks map[string]time.Time
+	// gwHints holds, for each cell, the newest gateway hint that no status report has carried yet.
+	gwHints map[string]time.Time
+	// hintPending holds the unclamped time of each hint of the last status report.
+	hintPending map[string]time.Time
+	// relaySkipped is true while the relay legs wait for the first accepted spec.
+	relaySkipped bool
 }
 
 // NewPuller returns a Puller for cfg.
@@ -119,12 +133,16 @@ func NewPuller(cfg PullerConfig) *Puller {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
 	}
-	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now)}
+	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}}
 	// The instrument names are valid, so creation cannot fail. A failure leaves a no-op instrument.
 	p.counter, _ = cfg.Meter.Int64Gauge("envd.spec.counter",
 		metric.WithDescription("Counter of the last saved spec revision"))
 	p.refusals, _ = cfg.Meter.Int64Counter("envd.spec.refusals",
 		metric.WithDescription("Rounds in which envd refused the bundle"))
+	p.relayCount, _ = cfg.Meter.Int64Counter("envd.relay.items",
+		metric.WithDescription("Report items that the management plane decided, by outcome"))
+	p.outbox, _ = cfg.Meter.Int64Gauge("envd.gateway.outbox",
+		metric.WithDescription("Items in the outbox of the gateway at the last sync"))
 	return p
 }
 
@@ -156,6 +174,11 @@ func HealthHandler(p *Puller) http.Handler {
 // Run loads the state, then pulls until ctx ends. It returns ctx.Err(). While the stored state does
 // not verify, Run still pulls, stays not Ready, and reports state_unverifiable until the first spec is accepted.
 func (p *Puller) Run(ctx context.Context) error {
+	if p.cfg.Gateway != nil {
+		if _, ok := p.cfg.Gateway.(interface{ CloseIdleConnections() }); !ok {
+			return errors.New("the gateway client has no CloseIdleConnections, so a round cannot dial the gateway again")
+		}
+	}
 	failures := 0
 	for p.state == nil {
 		lctx, cancel := context.WithTimeout(ctx, p.cfg.RoundTimeout)
@@ -192,6 +215,9 @@ func (p *Puller) Run(ctx context.Context) error {
 			failures = 0
 		}
 		p.cfg.Client.CloseIdleConnections()
+		if c, ok := p.cfg.Gateway.(interface{ CloseIdleConnections() }); ok {
+			c.CloseIdleConnections()
+		}
 		if err := p.cfg.Sleep(ctx, wait); err != nil {
 			return err
 		}
@@ -235,8 +261,32 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	if err != nil {
 		fail(span, err)
 		p.logLimited(ctx, "pull failed", "pull", "error", clip(err.Error()))
-		return true
+		failed = true
+	} else if p.accept(ctx, rctx, bundle) {
+		failed = true
 	}
+	if p.storeErr != "" {
+		failed = true
+	}
+	storeErr := p.storeErr
+	if storeErr == "" && p.unverifiable {
+		storeErr = mgmtapi.ReasonStateUnverifiable
+	}
+	var gw *mgmtapi.GatewayStatus
+	if p.cfg.Gateway != nil {
+		gw = p.relay(ctx)
+	}
+	hints := p.pendingHints(ctx, gw)
+	if p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
+		KeyHints: hints, Gateway: gw}) {
+		p.forwarded(hints)
+	}
+	return failed
+}
+
+// accept runs the spec bundle through Accept and saves a changed result. It reports whether the
+// round failed in a way that calls for a backoff.
+func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (failed bool) {
 	_, acceptSpan := p.cfg.Tracer.Start(rctx, "envd.accept")
 	next, changed, err := Accept(p.state, bundle, p.cfg.Env, p.cfg.Keys)
 	var refused *Refused
@@ -279,14 +329,6 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 		}
 	}
 	acceptSpan.End()
-	if p.storeErr != "" {
-		failed = true
-	}
-	storeErr := p.storeErr
-	if storeErr == "" && p.unverifiable {
-		storeErr = mgmtapi.ReasonStateUnverifiable
-	}
-	p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr})
 	return failed
 }
 
@@ -441,18 +483,18 @@ func (p *Puller) get(ctx context.Context) (mgmtapi.SpecBundle, error) {
 
 // report tells the management plane what envd has applied. It runs under its own deadline, and a
 // failure only reaches the log.
-func (p *Puller) report(ctx context.Context, rep mgmtapi.StatusReport) {
+func (p *Puller) report(ctx context.Context, rep mgmtapi.StatusReport) (ok bool) {
 	ctx, span := p.cfg.Tracer.Start(ctx, "envd.report")
 	defer span.End()
 	rctx, cancel := context.WithTimeout(ctx, p.cfg.RoundTimeout)
 	defer cancel()
 	body, err := json.Marshal(rep)
 	if err != nil {
-		return
+		return false
 	}
 	req, err := http.NewRequestWithContext(rctx, http.MethodPost, p.cfg.BaseURL+mgmtapi.StatusPath(p.cfg.Env), bytes.NewReader(body))
 	if err != nil {
-		return
+		return false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	// The report ends the round. Close marks the connection for single use, so the next round dials
@@ -462,11 +504,13 @@ func (p *Puller) report(ctx context.Context, rep mgmtapi.StatusReport) {
 	if err != nil {
 		fail(span, err)
 		p.logLimited(ctx, "status report failed", "report", "error", clip(err.Error()))
-		return
+		return false
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode/100 != 2 {
 		p.logLimited(ctx, "status report refused", "report", "status", resp.StatusCode)
+		return false
 	}
+	return true
 }

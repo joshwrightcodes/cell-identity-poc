@@ -57,6 +57,9 @@ func TestUplinkRender(t *testing.T) {
 			}
 			want := []string{"spiffe-client", "--listen=:4319", "--upstream=" + upstream, "--expect-id=spiffe://mgmt.poc.internal/telemetry",
 				"--peer-bundle=/run/cell-proxy/peer-root/root.crt", "--peer-trust-domain=mgmt.poc.internal"}
+			if tc.cluster != "dev-cp" {
+				want = append(want, "--proof")
+			}
 			if !slices.Equal(args, want) {
 				t.Errorf("args %q, want %q", args, want)
 			}
@@ -83,9 +86,9 @@ func TestUplinkRender(t *testing.T) {
 			if env := envOf(t, ctr); env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME)" {
 				t.Errorf("OTEL_RESOURCE_ATTRIBUTES %q, want the pod name as service.instance.id", env["OTEL_RESOURCE_ATTRIBUTES"])
 			}
-			// The only token is the one that the sidecar mounts for the cluster_jwt plugin.
+			// In dev-cp the container mounts no token. In a cell it mounts the one token of its proof.
 			for _, m := range get[[]any](t, ctr, "volumeMounts") {
-				if strings.Contains(get[string](t, m, "mountPath"), "serviceaccount") {
+				if strings.Contains(get[string](t, m, "mountPath"), "serviceaccount") && (tc.cluster == "dev-cp" || get[string](t, m, "name") != "proof-api-token") {
 					t.Errorf("cell-proxy mounts %v", m)
 				}
 			}

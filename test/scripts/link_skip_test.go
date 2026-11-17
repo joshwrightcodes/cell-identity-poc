@@ -236,14 +236,14 @@ func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
 			t.Fatalf("%s: hydrate calls:\n%s\nwant otel-uplink", cell, calls)
 		}
 		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "CELL_UP_SKIP_LATE=1")
-		if strings.Contains(calls, "render otel-uplink") || strings.Contains(calls, "render envd") || !strings.Contains(calls, "render spire-server") && cell == "dev-cp" {
+		if strings.Contains(calls, "render otel-uplink") || strings.Contains(calls, "render envd") || strings.Contains(calls, "render cell-gateway") || !strings.Contains(calls, "render spire-server") && cell == "dev-cp" {
 			t.Fatalf("%s: hydrate with CELL_UP_SKIP_LATE=1 calls:\n%s\nwant no otel-uplink", cell, calls)
 		}
 		_, calls = runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell, "HYDRATE_ONLY=late")
-		// dev-cp has two late components: the uplink and envd, which reads the live server of dev-cp.
+		// dev-cp has three late components: the uplink, envd and the cell gateway, which read the live server of dev-cp.
 		want := "render otel-uplink"
 		if cell == "dev-cp" {
-			want = "render otel-uplink\nrender envd"
+			want = "render otel-uplink\nrender envd\nrender cell-gateway"
 		}
 		if strings.TrimSpace(calls) != want {
 			t.Fatalf("%s: hydrate with HYDRATE_ONLY=late calls:\n%s\nwant %q only", cell, calls, want)

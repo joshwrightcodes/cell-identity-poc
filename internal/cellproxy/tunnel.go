@@ -187,6 +187,7 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 		case <-renew:
 			old, oldStart, oldStable, oldExpiry := ended, start, stable, expiry
 			oldConn := cur
+			beginRenewal(oldConn)
 			if connect(true) {
 				markRenewedAfterAccept(oldConn, cur, ended)
 				if expiry.After(oldExpiry) {
@@ -195,6 +196,7 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 					renewAt = start.Add(max(renewAt.Sub(start), jitter(backoff)))
 				}
 			} else {
+				endRenewal(oldConn)
 				ended, start, stable, expiry = old, oldStart, oldStable, oldExpiry
 				renewAt = c.now().Add(jitter(backoff))
 				backoff = min(2*backoff, tunnelMaxBackoff)
@@ -205,6 +207,23 @@ func runTunnelWith(ctx context.Context, dial func(context.Context) (net.Conn, er
 			}
 			return nil
 		}
+	}
+}
+
+// beginRenewal tells the old tunnel that a renewal is under way, before the cell dials the new one. The
+// hub closes the old tunnel as soon as it accepts the new one, and the cell can read that close before it
+// reads the first bytes of the new tunnel. A tunnel that the hub closes while a renewal is undecided waits
+// for the decision before it logs who closed it.
+func beginRenewal(old net.Conn) {
+	if r, ok := old.(interface{ BeginRenewal() }); ok {
+		r.BeginRenewal()
+	}
+}
+
+// endRenewal ends the undecided state that beginRenewal started, with the old tunnel not renewed.
+func endRenewal(old net.Conn) {
+	if r, ok := old.(interface{ EndRenewal() }); ok {
+		r.EndRenewal()
 	}
 }
 
@@ -232,6 +251,7 @@ func markRenewedAfterAccept(old, next net.Conn, nextEnded <-chan struct{}) {
 		case <-a.Accepted():
 			r.MarkRenewed()
 		case <-nextEnded:
+			endRenewal(old)
 		}
 	}()
 }
@@ -309,6 +329,17 @@ func TunnelDialer(addr string, cfg *tls.Config, log *slog.Logger, opts ...Tunnel
 			}
 			return nil, err
 		}
+		if o.proof != nil {
+			pctx, pcancel := context.WithTimeout(ctx, handshakeTimeout)
+			err := o.proof(pctx, conn)
+			pcancel()
+			if err != nil {
+				_ = conn.Close()
+				result(ctx, dialFailed)
+				log.Warn("tunnel_dial_failed", "reason", string(ProofFailed), "upstream", addr, "error", err.Error())
+				return nil, err
+			}
+		}
 		cn := &cellConn{Conn: conn, log: log, upstream: addr, up: up, result: result, state: state, limiter: limiter, accepted: make(chan struct{})}
 		// The cell ends the tunnel at the earlier expiry of its own leaf and the leaf of the hub, so a
 		// hub that never closes cannot keep the access past a credential.
@@ -354,9 +385,11 @@ type cellConn struct {
 
 	mu         sync.Mutex
 	acceptedAt time.Time
-	closing    bool
-	peerErr    error
-	once       sync.Once
+	// renewal is open while the cell has not yet learned whether the hub accepted the newer tunnel.
+	renewal chan struct{}
+	closing bool
+	peerErr error
+	once    sync.Once
 }
 
 func (c *cellConn) Read(p []byte) (int, error) {
@@ -399,12 +432,40 @@ func refusalDetail(err error) string {
 func (c *cellConn) Accepted() <-chan struct{} { return c.accepted }
 
 // MarkRenewed says that the cell opened a newer tunnel, so the end of this one is planned.
-func (c *cellConn) MarkRenewed() { c.renewed.Store(true) }
+func (c *cellConn) MarkRenewed() {
+	c.renewed.Store(true)
+	c.EndRenewal()
+}
+
+// BeginRenewal says that the cell dials a newer tunnel and does not know yet if the hub accepts it.
+func (c *cellConn) BeginRenewal() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.renewal == nil {
+		c.renewal = make(chan struct{})
+	}
+}
+
+// EndRenewal says that the cell knows if the hub accepted the newer tunnel.
+func (c *cellConn) EndRenewal() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.renewal != nil {
+		close(c.renewal)
+		c.renewal = nil
+	}
+}
 
 // Expiry is the earlier expiry of the leaf of the cell and the leaf of the hub.
 func (c *cellConn) Expiry() time.Time { return c.expiry }
 
 func (c *cellConn) Close() error {
+	c.mu.Lock()
+	undecided, hubEnded := c.renewal, c.peerErr != nil
+	c.mu.Unlock()
+	if undecided != nil && hubEnded {
+		<-undecided
+	}
 	c.mu.Lock()
 	c.closing = true
 	acceptedAt, peerErr, stateID, timer := c.acceptedAt, c.peerErr, c.stateID, c.timer

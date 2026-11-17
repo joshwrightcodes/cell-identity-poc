@@ -36,7 +36,15 @@ func stageRoot(t *testing.T) (root, calls string) {
 			}
 		}
 	}
-	write("harness/topology.yaml", "clusters:\n  - name: management\n    components: [mesh-view-hub]\n", 0o644)
+	write("harness/topology.yaml", "clusters:\n  - name: management\n    components: [mesh-view-hub]\n  - name: dev-cell-1\n    components: [cell-identity]\n", 0o644)
+	// harness_apply waits for the registry that mgmtd publishes, before it prunes.
+	for _, f := range []string{"registry.sh", "mgmt-key.sh"} {
+		b, err := os.ReadFile(filepath.Join("../../components/lib", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		write(filepath.Join("components/lib", f), string(b), 0o644)
+	}
 	write("components/mesh-view-hub/render.sh", `#!/usr/bin/env bash
 cat <<'EOF2'
 apiVersion: apps/v1
@@ -61,6 +69,7 @@ case "$args" in
   *" rollout status "*) echo "rollout ${*: -2:1}" >>"$STUB_LOG" ;;
   *" logs "*) echo "logs" >>"$STUB_LOG"; printf '%s\n' "${STUB_HUB_LOG:-}" ;;
   *" exec "*) [[ -n "${STUB_STATUS:-}" ]] || exit 1; printf '%s\n' "$STUB_STATUS" ;;
+  *" get configmap cell-registry "*) echo '{"metadata":{"labels":{"poc.internal/made-by":"mgmtd"}},"data":{"signers.pub":"k\n","dev-cell-1.dsse.json":"{}"}}' ;;
   *" get pod spire-server-0 "*) echo Running ;;
   *" get -f "*) echo '{"kind":"List","items":[]}' ;;
   *" get deployments,statefulsets "*) printf 'deployment.apps/kiali\ndeployment.apps/mesh-view-hub\n' ;;

@@ -2,6 +2,7 @@ package mgmt
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -15,21 +16,42 @@ import (
 // CheckResult is the outcome of a key check.
 type CheckResult string
 
-// KeyCheck compares the keys that the issuer publishes with the keys of the record. An error means
-// the check could not run; a refusal is a result.
+// The sources of a key check. A manual check always asks the key source. A periodic, hint or bind
+// check reads the key cache while its last fetch is under KeyCacheTTL old.
+const (
+	ViaManual   = "manual"
+	ViaPeriodic = "periodic"
+	ViaHint     = "hint"
+)
+
+// KeyCheck is KeyCheckVia with the source manual.
 func (p *Plane) KeyCheck(ctx context.Context, cell string) (CheckResult, error) {
-	return p.keyCheck(ctx, cell, nil)
+	return p.KeyCheckVia(ctx, cell, ViaManual)
+}
+
+// KeyCheckVia compares the keys that the issuer publishes with the keys of the record. via is
+// ViaManual, ViaPeriodic or ViaHint. An error means the check could not run; a refusal is a result.
+func (p *Plane) KeyCheckVia(ctx context.Context, cell, via string) (CheckResult, error) {
+	return p.keyCheck(ctx, cell, via, nil)
 }
 
 // KeyCheck is Plane.KeyCheck, guarded by the state version.
 func (g SeqGuard) KeyCheck(ctx context.Context, cell string) (CheckResult, error) {
-	return g.p.keyCheck(ctx, cell, &g.seq)
+	return g.p.keyCheck(ctx, cell, ViaManual, &g.seq)
 }
 
-func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res CheckResult, err error) {
+func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) (res CheckResult, err error) {
+	mode := fetchCached
+	switch via {
+	case ViaManual:
+		mode = fetchFresh
+	case ViaPeriodic, ViaHint:
+	default:
+		return "", fmt.Errorf("unknown key check source %q", via)
+	}
 	defer func() {
 		if err == nil {
-			p.checkResults.Add(ctx, 1, metric.WithAttributes(attribute.String("result", string(res))))
+			p.checkResults.Add(ctx, 1, metric.WithAttributes(attribute.String("result", string(res)), attribute.String("via", via)))
 		}
 	}()
 	if _, ok := p.intent[cell]; !ok {
@@ -38,14 +60,10 @@ func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res 
 	if expect != nil && p.snapshotSeq() != *expect {
 		return "", refuse(mgmtapi.ReasonConflict, "state version changed")
 	}
-	pre := p.snap.Load().st.Cells[cell]
-	switch {
-	case pre == nil:
+	if p.snap.Load().st.Cells[cell] == nil {
 		return CheckNotBound, nil
-	case p.gapActive(pre, p.cfg.Now()):
-		return CheckRateLimited, nil
 	}
-	keys, at, _, ferr := p.cachedKeys(ctx, cell, fetchFresh)
+	keys, at, _, ferr := p.cachedKeys(ctx, cell, mode)
 	if ferr != nil {
 		res = CheckIssuerUnavailable
 		if ReasonOf(ferr) == mgmtapi.ReasonIssuerUntrusted {
@@ -61,12 +79,8 @@ func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res 
 			return err
 		}
 		cs := t.st.Cells[cell]
-		switch {
-		case cs == nil:
+		if cs == nil {
 			res = CheckNotBound
-			return nil
-		case p.gapActive(cs, t.now):
-			res = CheckRateLimited
 			return nil
 		}
 		var err error
@@ -77,15 +91,17 @@ func (p *Plane) keyCheck(ctx context.Context, cell string, expect *uint64) (res 
 		return "", err
 	}
 	if res != CheckRateLimited && res != CheckNotBound {
-		p.cfg.Log.InfoContext(ctx, "key_check", "cell", cell, "result", string(res))
+		p.cfg.Log.InfoContext(ctx, "key_check", "cell", cell, "result", string(res), "via", via)
 	}
 	return res, nil
 }
 
 func (p *Plane) judge(t *txn, cell string, cs *CellState, keys mgmtapi.ClusterKeys, fetchedAt time.Time) (CheckResult, error) {
 	settle := func(res CheckResult) (CheckResult, error) {
-		cs.CheckedAt, cs.LastCheck = fetchedAt, string(res)
-		t.dirty = true
+		if !cs.CheckedAt.Equal(fetchedAt) || cs.LastCheck != string(res) {
+			cs.CheckedAt, cs.LastCheck = fetchedAt, string(res)
+			t.dirty = true
+		}
 		return res, nil
 	}
 	if keys.Issuer != cs.Issuer {
@@ -102,6 +118,9 @@ func (p *Plane) judge(t *txn, cell string, cs *CellState, keys mgmtapi.ClusterKe
 	jwks, err := encodeKeys(fresh)
 	if err != nil {
 		return settle(CheckKeysUntrusted)
+	}
+	if p.gapActive(cs, t.now) {
+		return CheckRateLimited, nil
 	}
 	if err := t.revise(); err != nil {
 		return "", err
@@ -164,7 +183,7 @@ func (p *Plane) RunChecks(ctx context.Context) error {
 			if _, ok := p.intent[name]; !ok || p.cfg.Now().Sub(st.Cells[name].CheckedAt) < p.cfg.CheckEvery {
 				continue
 			}
-			if _, err := p.KeyCheck(ctx, name); err != nil {
+			if _, err := p.KeyCheckVia(ctx, name, ViaPeriodic); err != nil {
 				p.logLimited(ctx, slog.LevelWarn, "key_check_failed/"+name, "key_check_failed", "cell", name, "error", err.Error())
 			}
 		}

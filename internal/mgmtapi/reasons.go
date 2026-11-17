@@ -32,6 +32,21 @@ const (
 	ReasonRestoreActive     = "restore_active"
 	ReasonNotBound          = "not_bound"
 	ReasonConflict          = "conflict"
+	ReasonProofMissing      = "proof_missing"
+	ReasonProofInvalid      = "proof_invalid"
+	ReasonStale             = "stale"
+	ReasonStore             = "store"
+	ReasonInternal          = "internal"
+)
+
+// The values of ItemOutcome.Outcome. The reason of an item outcome reuses the detail reasons above.
+const (
+	OutcomeAccepted   = "accepted"
+	OutcomeDuplicate  = "duplicate"
+	OutcomeUnknownOp  = "unknown_op"
+	OutcomeForgedSeen = "forged_seen"
+	OutcomeRefused    = "refused"
+	OutcomeRetry      = "retry"
 )
 
 // KeyError is the error of a cluster key read. Reason is ReasonIssuerUntrusted or

@@ -57,6 +57,14 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// Flush flushes the wrapped writer when it can. FlushError does the same and returns the error of
+// the wrapped writer, which http.ResponseController prefers.
+func (w *statusWriter) Flush() { _ = w.FlushError() }
+
+func (w *statusWriter) FlushError() error {
+	return http.NewResponseController(w.ResponseWriter).Flush()
+}
+
 // Unwrap lets http.ResponseController reach the writer below.
 func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 

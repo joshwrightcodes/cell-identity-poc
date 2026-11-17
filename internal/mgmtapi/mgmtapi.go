@@ -46,9 +46,11 @@ type BindResponse struct {
 
 // StatusReport is what envd tells the management plane after each round.
 type StatusReport struct {
-	Applied     spec.Revision `json:"applied"`
-	LastRefusal *Refusal      `json:"lastRefusal,omitempty"`
-	StoreError  string        `json:"storeError,omitempty"`
+	Applied     spec.Revision  `json:"applied"`
+	LastRefusal *Refusal       `json:"lastRefusal,omitempty"`
+	StoreError  string         `json:"storeError,omitempty"`
+	KeyHints    []KeyHint      `json:"keyHints,omitempty"`
+	Gateway     *GatewayStatus `json:"gateway,omitempty"`
 }
 
 // Refusal records the last spec that envd refused.
@@ -82,11 +84,11 @@ func BindAudience(cell, nonce string) string {
 // Route patterns for http.ServeMux, one for each path helper. A server registers a pattern and
 // reads the wildcard with Request.PathValue.
 const (
-	SpecPattern   = "/v1/envs/{env}/spec"
-	StatusPattern = "/v1/envs/{env}/status"
-	NoncePattern  = "/v1/cells/{cell}/nonce"
-	BindPattern   = "/v1/cells/{cell}/bind"
-	KeysPattern   = "/v1/clusters/{cluster}/keys"
+	SpecPattern    = "/v1/envs/{env}/spec"
+	StatusPattern  = "/v1/envs/{env}/status"
+	KeysPattern    = "/v1/clusters/{cluster}/keys"
+	OpsPattern     = "/v1/envs/{env}/ops"
+	ReportsPattern = "/v1/envs/{env}/reports"
 )
 
 // SpecPath is the path of the signed spec bundle of an environment.
@@ -95,11 +97,11 @@ func SpecPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/
 // StatusPath is the path where envd reports the status of an environment.
 func StatusPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/status" }
 
-// NoncePath is the path where a cell asks for a bind nonce.
-func NoncePath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/nonce" }
-
-// BindPath is the path where a cell sends its bind request.
-func BindPath(cell string) string { return "/v1/cells/" + url.PathEscape(cell) + "/bind" }
-
 // KeysPath is the path of the host service route that returns the keys of a cluster.
 func KeysPath(cluster string) string { return "/v1/clusters/" + url.PathEscape(cluster) + "/keys" }
+
+// OpsPath is the path where envd pulls the open operations and the cell nonces of an environment.
+func OpsPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/ops" }
+
+// ReportsPath is the path where envd sends the report items of an environment.
+func ReportsPath(env string) string { return "/v1/envs/" + url.PathEscape(env) + "/reports" }

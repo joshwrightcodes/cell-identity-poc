@@ -57,6 +57,7 @@ spec:
             # A dead path ends the tunnel after 15 seconds, well inside one SVID life of 1 minute.
             - --read-idle=10s
             - --ping-timeout=5s
+            - --proof
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
@@ -70,6 +71,18 @@ spec:
                   fieldPath: metadata.name
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.instance.id=$(POD_NAME)
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: SERVICE_ACCOUNT
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.serviceAccountName
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
           # The tunnel serves its own state on 127.0.0.1:18099, and mise run mesh:status reads it with

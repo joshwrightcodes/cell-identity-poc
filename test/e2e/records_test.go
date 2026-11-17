@@ -220,42 +220,6 @@ func TestM4NewPodAttestsAfterBind(t *testing.T) {
 	}
 }
 
-// TestM4RelayBindRoute: Deployment relay-bind routes 8447 to the management node on 31447, its Service is the NodePort 30447,
-// relay-view keeps its two routes, and a pod in a cell reaches the node port from the cell node, while rogue does not.
-func TestM4RelayBindRoute(t *testing.T) {
-	mgmtIP := clusterFacts(t, mgmtCluster).NodeIP
-	args, err := kubectl(t, spireCluster, "", "-n", "relay-system", "get", "deployment", "relay-bind", "-o", `jsonpath={.spec.template.spec.containers[0].args}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := fmt.Sprintf(`["--route","8447=%s:31447","--health",":8080"]`, mgmtIP); strings.TrimSpace(args) != want {
-		t.Errorf("relay-bind args are %s, want %s", args, want)
-	}
-	view, err := kubectl(t, spireCluster, "", "-n", "relay-system", "get", "deployment", "relay-view", "-o", `jsonpath={.spec.template.spec.containers[0].args}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := fmt.Sprintf(`["--route","8443=%s:31443","--route","8445=%s:31445","--health",":8080"]`, mgmtIP, mgmtIP); strings.TrimSpace(view) != want {
-		t.Errorf("relay-view args are %s, want %s", view, want)
-	}
-	svc, err := kubectl(t, spireCluster, "", "-n", "relay-system", "get", "service", "relay-bind", "-o", `jsonpath={.spec.type} {.spec.externalTrafficPolicy} {.spec.ports[*].nodePort}`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.TrimSpace(svc) != "NodePort Local 30447" {
-		t.Errorf("Service relay-bind is %q, want NodePort Local 30447", svc)
-	}
-	cpIP := clusterFacts(t, spireCluster).NodeIP
-	cell := clustersWith(t, agentCellSet)[0]
-	ns := freshNamespace(t, cell)
-	if got := dialFrom(t, cell, ns, cpIP, 30447, 10*time.Second); got != "connected" {
-		t.Errorf("a pod in %s dials %s:30447 and gets %q, want connected, because the cell node is admitted", cell, cpIP, got)
-	}
-	if err := probeFromFreshNamespace(t, "rogue", cpIP, 30447, 10*time.Second); err != nil {
-		t.Errorf("rogue reaches the bind node port: %v", err)
-	}
-}
-
 // envdPod returns the name of the live envd pod: the one that has no deletion timestamp.
 func envdPod(t *testing.T) string {
 	t.Helper()
@@ -340,7 +304,7 @@ func TestM4EnvdEntry(t *testing.T) {
 }
 
 // TestM4EnvdEgressClosed: from the envd pod, the API port of mgmtd (31446) connects, because flow N30 admits it, and the
-// bind port (31447) times out.
+// bind port (31447) times out, because no policy and no Service names it.
 func TestM4EnvdEgressClosed(t *testing.T) {
 	mgmtIP := clusterFacts(t, mgmtCluster).NodeIP
 	pod := envdPod(t)

@@ -81,9 +81,6 @@ func TestLoadRegistry(t *testing.T) {
 		"no signers.pub": func(t *testing.T) string {
 			return writeRegistry(t, nil, priv, cell("dev-cell-1", false))
 		},
-		"zero records": func(t *testing.T) string {
-			return writeRegistry(t, keys, priv)
-		},
 		"name with capitals": func(t *testing.T) string {
 			c := cell("dev-cell-1", false)
 			c.Name, c.Env = "Dev-Cell-2", "dev"
@@ -122,6 +119,24 @@ func TestLoadRegistry(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("zero records admit no cell", func(t *testing.T) {
+		reg, err := LoadRegistry(writeRegistry(t, keys, priv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st := reg.Stats(); st.Records != 0 || st.Signers != 1 {
+			t.Fatalf("stats %+v", st)
+		}
+		for _, s := range []Source{
+			{Env: "dev", Plane: "cell", Cell: "dev-cell-1", Cluster: "dev-cell-1", Role: "otel"},
+			{Env: "dev", Plane: "environment", Cluster: "dev-cp", Role: "otel"},
+		} {
+			if reg.Allows(s) {
+				t.Fatalf("an empty registry allows %+v", s)
+			}
+		}
+	})
 
 	t.Run("revoked record wins", func(t *testing.T) {
 		reg, err := LoadRegistry(writeRegistry(t, keys, priv, cell("dev-cell-1", false), cell("dev-cell-1", true)))

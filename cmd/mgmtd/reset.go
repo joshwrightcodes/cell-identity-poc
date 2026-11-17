@@ -16,10 +16,12 @@ import (
 
 const resetUsage = "usage: mgmtd reset-state [--data-dir /var/lib/mgmtd]"
 
-// The names of the files that reset-state moves. serve reads the same two files.
+// The names of the files that reset-state moves. serve reads the same files. The staged key is the
+// next signing key of a rotation, which only the state that staged it may trust.
 const (
-	stateFileName = "state.json"
-	keyFileName   = "ed25519.key"
+	stateFileName   = "state.json"
+	keyFileName     = "ed25519.key"
+	nextKeyFileName = "ed25519.next.key"
 )
 
 type movedFile struct {
@@ -27,9 +29,10 @@ type movedFile struct {
 	To   string `json:"to"`
 }
 
-// resetState renames the state file and the signing key file in dir to <name>.reset-<unix time>.
-// It deletes nothing. The state file moves first, so a failure between the two moves leaves a key
-// without a state, and serve then makes a new key for the fresh state. A file that is absent is skipped.
+// resetState renames the state file, the signing key file and the staged key file in dir to
+// <name>.reset-<unix time>. It deletes nothing. The state file moves first, so a failure between the
+// moves leaves a key without a state, and serve then makes a new key for the fresh state. A file
+// that is absent is skipped.
 func resetState(dir string, now time.Time) ([]movedFile, error) {
 	info, err := os.Stat(dir)
 	switch {
@@ -40,7 +43,7 @@ func resetState(dir string, now time.Time) ([]movedFile, error) {
 	}
 	stamp := strconv.FormatInt(now.Unix(), 10)
 	moved := []movedFile{}
-	for _, n := range []string{stateFileName, keyFileName} {
+	for _, n := range []string{stateFileName, keyFileName, nextKeyFileName} {
 		from, to := filepath.Join(dir, n), filepath.Join(dir, n+".reset-"+stamp)
 		if _, err := os.Lstat(from); errors.Is(err, fs.ErrNotExist) {
 			continue

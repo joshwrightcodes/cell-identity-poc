@@ -48,7 +48,6 @@ func TestRenderRelaySystem(t *testing.T) {
 	}{
 		"relay-view":      {[]string{"--route", "8443=10.9.0.10:31443", "--route", "8445=10.9.0.10:31445", "--health", ":8080"}, []int{8443, 8445}, map[int]int{8443: 30443, 8445: 30445}, []int{31443, 31445}},
 		"relay-telemetry": {[]string{"--route", "8444=10.9.0.10:31444", "--health", ":8080"}, []int{8444}, map[int]int{8444: 30444}, []int{31444}},
-		"relay-bind":      {[]string{"--route", "8447=10.9.0.10:31447", "--health", ":8080"}, []int{8447}, map[int]int{8447: 30447}, []int{31447}},
 	}
 	for name, w := range want {
 		t.Run(name, func(t *testing.T) {
@@ -102,38 +101,30 @@ func TestRenderRelaySystem(t *testing.T) {
 	}
 }
 
-// TestRelayBindRoute checks Deployment relay-bind on its own: route 8447 to the management node on 31447, the
-// NodePort 30447, and the cell nodes as the only peers of the route. relay-view keeps its two routes.
-func TestRelayBindRoute(t *testing.T) {
-	r := renderRelay(t)
-	if r.err != nil {
-		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
-	}
-	objs := objectsIn(t, r.stdout)
-	d := objs["Deployment relay-system/relay-bind"]
-	if d == nil {
-		t.Fatalf("no Deployment relay-bind in %v", keysOfObjects(objs))
-	}
-	ctr := named(t, get[[]any](t, d, "spec", "template", "spec", "containers"), "relay")
-	if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != "[--route 8447=10.9.0.10:31447 --health :8080]" {
-		t.Errorf("relay-bind args are %s", got)
-	}
-	svc := objs["Service relay-system/relay-bind"]
-	if get[float64](t, svc, "spec", "ports", 0, "nodePort") != 30447 || get[string](t, svc, "spec", "externalTrafficPolicy") != "Local" {
-		t.Errorf("Service relay-bind is %v, want NodePort 30447 with the local traffic policy", svc["spec"])
-	}
-	np := objs["NetworkPolicy relay-system/relay-bind"]
-	if peers := fmt.Sprint(get[[]any](t, np, "spec", "ingress", 0, "from")); peers != "[map[ipBlock:map[cidr:10.9.0.1/32]] map[ipBlock:map[cidr:10.9.0.2/32]]]" {
-		t.Errorf("the route rule of relay-bind admits %s, want the two cell nodes only", peers)
-	}
-	// The collector egress (flow N11) and the probe ingress (flow N23) come from the shared template.
-	egress := get[[]any](t, np, "spec", "egress")
-	if len(egress) != 2 || fmt.Sprint(get[[]any](t, egress[1], "to")) != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]" {
-		t.Errorf("the egress of relay-bind is %v, want the management node and the collector", egress)
-	}
-	view := named(t, get[[]any](t, objs["Deployment relay-system/relay-view"], "spec", "template", "spec", "containers"), "relay")
-	if got := fmt.Sprint(get[[]any](t, view, "args")); got != "[--route 8443=10.9.0.10:31443 --route 8445=10.9.0.10:31445 --health :8080]" {
-		t.Errorf("relay-view args are %s, want the two routes of M3", got)
+// TestRelayHasNoBindRoute checks that the render of dev-cp holds the view and telemetry relays only. It holds no
+// relay-bind Deployment, Service or NetworkPolicy, no route to 8447, and no node port 30447, even when the settings
+// still carry the old RELAY_BIND_ROUTES value.
+func TestRelayHasNoBindRoute(t *testing.T) {
+	for _, env := range [][]string{nil, {"RELAY_BIND_ROUTES=30447:8447=31447"}} {
+		r := renderRelay(t, env...)
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		objs := objectsIn(t, r.stdout)
+		for key := range objs {
+			if strings.Contains(key, "relay-bind") {
+				t.Errorf("the render holds %s", key)
+			}
+		}
+		for _, bad := range []string{"8447", "30447", "31447"} {
+			if strings.Contains(r.stdout, bad) {
+				t.Errorf("the render mentions %s", bad)
+			}
+		}
+		view := named(t, get[[]any](t, objs["Deployment relay-system/relay-view"], "spec", "template", "spec", "containers"), "relay")
+		if got := fmt.Sprint(get[[]any](t, view, "args")); got != "[--route 8443=10.9.0.10:31443 --route 8445=10.9.0.10:31445 --health :8080]" {
+			t.Errorf("relay-view args are %s, want the two routes of M3", got)
+		}
 	}
 }
 
@@ -144,10 +135,6 @@ func TestRenderRelaySystemFailsClosed(t *testing.T) {
 		{"RELAY_VIEW_ROUTES=29999:8443=31443", "outside 30000 to 32767"},
 		{"RELAY_VIEW_ROUTES=30443:8080=31443", "not the health port 8080"},
 		{"RELAY_TELEMETRY_ROUTES=30443:8446=31444", "the node port 30443 appears in two routes"},
-		{"RELAY_BIND_ROUTES=30443:8447=31447", "the node port 30443 appears in two routes"},
-		{"RELAY_BIND_ROUTES=30447:8443=31447", "the container port 8443 appears in two routes"},
-		{"RELAY_BIND_ROUTES=8447=31447", "is not <node port>:<container port>=<target node port>"},
-		{"RELAY_BIND_ROUTES= ", "relay-bind has no route"},
 		{"RELAY_TELEMETRY_ROUTES=30446:8443=31444", "the container port 8443 appears in two routes"},
 		{"RELAY_VIEW_ROUTES= ", "relay-view has no route"},
 		{"RELAY_TARGET=missing", "no host service facts for missing"},
@@ -213,7 +200,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 		t.Errorf("the readiness probe %s reads /healthz, which needs the remote stream", probe)
 	}
 	proxyArgs := fmt.Sprint(get[[]any](t, named(t, containers, "cell-proxy"), "args"))
-	if want := "[spiffe-client --listen=127.0.0.1:8443 --upstream=10.9.0.9:30443 --expect-id=spiffe://mgmt.poc.internal/argocd/principal --peer-bundle=/run/cell-proxy/mgmt-root/root.crt --peer-trust-domain=mgmt.poc.internal]"; proxyArgs != want {
+	if want := "[spiffe-client --listen=127.0.0.1:8443 --upstream=10.9.0.9:30443 --expect-id=spiffe://mgmt.poc.internal/argocd/principal --peer-bundle=/run/cell-proxy/mgmt-root/root.crt --peer-trust-domain=mgmt.poc.internal --proof]"; proxyArgs != want {
 		t.Errorf("cell-proxy args %s, want %s", proxyArgs, want)
 	}
 	root := objs["ConfigMap argocd/mgmt-root"]

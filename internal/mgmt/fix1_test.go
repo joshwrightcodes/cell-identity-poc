@@ -64,17 +64,16 @@ func TestRateLimitedWithDefaultConfig(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	r.clk.Advance(61 * time.Second)
-	n := newSigner(t, "kid-new")
-	r.keys.set(cell1, "https://dev-cell-1.test", n)
-	if res, err := r.plane.KeyCheck(t.Context(), cell1); err != nil || res != CheckKeysUntrusted {
-		t.Fatalf("check %v, %v", res, err)
-	}
+	n1, n2 := newSigner(t, "kid-n1"), newSigner(t, "kid-n2")
+	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], n1)
+	r.mustBind(cell1, n1, mgmtapi.StatusKeysUpdated)
+	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], n1, n2)
 	r.clk.Advance(30 * time.Second)
-	if _, err := r.bind(cell1, n); ReasonOf(err) != mgmtapi.ReasonRateLimited {
-		t.Fatalf("bind 30 s after a check: %v", err)
+	if _, err := r.bind(cell1, n2); ReasonOf(err) != mgmtapi.ReasonRateLimited {
+		t.Fatalf("bind 30 s after a key update: %v", err)
 	}
 	r.clk.Advance(31 * time.Second)
-	r.mustBind(cell1, n, mgmtapi.StatusKeysUpdated)
+	r.mustBind(cell1, n2, mgmtapi.StatusKeysUpdated)
 }
 
 func TestPendingDropsGetNoKeyCheck(t *testing.T) {
@@ -293,10 +292,12 @@ func TestSameCellBindRaceBindsOnce(t *testing.T) {
 	}
 }
 
-func TestConcurrentChecksStartOneGap(t *testing.T) {
+func TestConcurrentChecksMakeOneUpdate(t *testing.T) {
 	r := newRig(t)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	r.clk.Advance(61 * time.Second)
+	r.keys.set(cell1, "https://dev-cell-1.test", r.signers[cell1], newSigner(t, "kid-b"))
+	base := r.keys.count(cell1)
 	r.keys.mu.Lock()
 	r.keys.gate, r.keys.gateCell = make(chan struct{}), cell1
 	gate := r.keys.gate
@@ -308,14 +309,17 @@ func TestConcurrentChecksStartOneGap(t *testing.T) {
 			res <- c
 		}()
 	}
-	for r.keys.count(cell1) < 2 {
+	// One fetch per cell is in flight at a time, so the second check waits for the key slot while the
+	// first holds the gate. Both checks are in the plane before the gate opens.
+	for r.keys.count(cell1) < base+1 {
 		time.Sleep(time.Millisecond)
 	}
+	time.Sleep(50 * time.Millisecond)
 	close(gate)
 	got := []string{string(<-res), string(<-res)}
 	slices.Sort(got)
-	if !slices.Equal(got, []string{string(CheckRateLimited), string(CheckUnchanged)}) {
-		t.Fatalf("results %v", got)
+	if !slices.Equal(got, []string{string(CheckKeysUpdated), string(CheckUnchanged)}) || r.status().Signed != rev(1, 3) {
+		t.Fatalf("results %v, signed %v", got, r.status().Signed)
 	}
 }
 

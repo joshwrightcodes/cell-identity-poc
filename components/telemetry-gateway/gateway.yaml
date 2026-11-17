@@ -2,8 +2,8 @@
 # components/lib/spire-sidecar.sh adds the k8s_psat SPIRE agent, which gives cell-proxy the SVID
 # spiffe://mgmt.poc.internal/telemetry.
 #
-# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the sender ID and the cell
-# registry, sets the source attributes of every resource again from the verified ID, and forwards
+# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the sender ID, the cell registry
+# and the proof of each cell pod, sets the source attributes of every resource again from the verified ID, and forwards
 # OTLP in plaintext gRPC to the store lgtm.
 apiVersion: v1
 kind: ServiceAccount
@@ -32,7 +32,7 @@ spec:
         app.kubernetes.io/name: telemetry-gateway
       annotations:
         poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
-        poc.internal/registry-content-sha256: "@REGISTRY_SHA256@"
+        poc.internal/registry-signer-sha256: "@REGISTRY_SIGNER_SHA256@"
     spec:
       serviceAccountName: telemetry-gateway
       automountServiceAccountToken: false
@@ -52,6 +52,9 @@ spec:
             - --upstream-wait=2m
             - "--allow-id=@ALLOW_ID@"
             - --registry-dir=/run/cell-proxy/registry
+            - --registry-signer=/run/cell-proxy/registry-signer/signer.pub
+            - --registry-reload=10s
+            - --proof-subject=otel=observability-system/otel-uplink
             - --peer-bundle=/run/cell-proxy/peer-root/root.crt
             - --peer-trust-domain=@PEER_TRUST_DOMAIN@
           env:
@@ -143,6 +146,9 @@ spec:
             - name: registry
               mountPath: /run/cell-proxy/registry
               readOnly: true
+            - name: registry-signer
+              mountPath: /run/cell-proxy/registry-signer
+              readOnly: true
             - name: peer-root
               mountPath: /run/cell-proxy/peer-root
               readOnly: true
@@ -153,6 +159,9 @@ spec:
         - name: registry
           configMap:
             name: cell-registry
+        - name: registry-signer
+          configMap:
+            name: registry-signer
         - name: peer-root
           configMap:
             name: peer-root

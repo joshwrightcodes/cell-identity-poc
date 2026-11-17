@@ -1,0 +1,186 @@
+# The cell gateway of dev-cp. render.sh fills in the @...@ values, adds the SPIRE agent sidecar
+# (components/lib/spire-sidecar.sh) and the harness label, and prints the ConfigMap and the
+# NetworkPolicies.
+#
+# The data volume has the name store, because the SPIRE sidecar adds a volume named data.
+# The gateway takes the celld streams and the bind requests of the cells, keeps the operation queue and
+# the outbox in SQLite on its data volume, and syncs with envd over mTLS. Its SVID is
+# spiffe://dev.env.poc.internal/cp/gateway.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway-system
+  labels:
+    istio-injection: disabled
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cell-gateway
+  namespace: gateway-system
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cell-gateway
+  namespace: gateway-system
+  labels:
+    app.kubernetes.io/name: cell-gateway
+spec:
+  replicas: 1
+  serviceName: cell-gateway
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cell-gateway
+  volumeClaimTemplates:
+    - metadata:
+        name: store
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 256Mi
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cell-gateway
+      annotations:
+        poc.internal/spec-key-sha256: "@SPEC_KEY_SHA256@"
+    spec:
+      serviceAccountName: cell-gateway
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cellgw
+          image: "@CELLGW_IMAGE@"
+          args:
+            - serve
+            - --env=@POC_ENV@
+            - --envd-id=spiffe://@SPIRE_TRUST_DOMAIN@/envd
+            - --spec-key-file=/etc/cellgw/spec-key/spec.pub
+            - --data-dir=/var/lib/cellgw
+            - --stream-listen=:8450
+            - --bind-listen=:8451
+            - --envd-listen=:8452
+            - --health-listen=:8080
+            - --admin-socket=/run/cellgw/admin.sock
+@CELL_NODE_ARGS@
+          env:
+            - name: SPIFFE_ENDPOINT_SOCKET
+              value: unix:///run/spire/agent/agent.sock
+            - name: OTEL_SERVICE_NAME
+              value: cellgw
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          ports:
+            - name: stream
+              containerPort: 8450
+            - name: bind
+              containerPort: 8451
+            - name: envd
+              containerPort: 8452
+            - name: health
+              containerPort: 8080
+          # The kubelet reaches the health port from the node (flow N23). /livez answers once the store is open.
+          # /healthz answers 200 only when the store takes a write and the SVID has loaded.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: spire-agent-socket
+              mountPath: /run/spire/agent
+              readOnly: true
+            - name: store
+              mountPath: /var/lib/cellgw
+            - name: spec-key
+              mountPath: /etc/cellgw/spec-key
+              readOnly: true
+            # The admin socket lives at /run/cellgw/admin.sock. Only this container mounts the volume.
+            - name: admin
+              mountPath: /run/cellgw
+      volumes:
+        - name: spec-key
+          configMap:
+            name: mgmt-spec-key
+        - name: admin
+          emptyDir:
+            sizeLimit: 1Mi
+---
+# Flow N37: the cells reach the stream listener through this node port. The local traffic policy keeps the
+# source address, so the NetworkPolicy can admit only the cell nodes.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cell-gateway-stream
+  namespace: gateway-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: cell-gateway
+  ports:
+    - name: stream
+      port: 8450
+      targetPort: 8450
+      nodePort: 30450
+---
+# Flow N38: the cells reach the bind listener through this node port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cell-gateway-bind
+  namespace: gateway-system
+spec:
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: cell-gateway
+  ports:
+    - name: bind
+      port: 8451
+      targetPort: 8451
+      nodePort: 30451
+---
+# Flow N39: envd reaches the API of the gateway through this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: cell-gateway
+  namespace: gateway-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: cell-gateway
+  ports:
+    - name: envd
+      port: 8452
+      targetPort: 8452

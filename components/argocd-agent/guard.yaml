@@ -5,10 +5,11 @@
 # or of a write to the admission objects, is a grant that this policy cannot see, so the tests ask
 # RBAC that the agent holds none. render.sh replaces @POC_ENV@ with the environment name.
 #
-# The one request that the agent may create is the TokenRequest of its own SPIRE agent sidecar. The
-# request names the ServiceAccount argocd-agent in argocd and one audience spire-<env>/<nonce>. It
-# binds the token to the Pod that sends it, by the name and UID that the API server puts in the
-# user extras of the request. A token for another audience, another account or another Pod is denied.
+# The one kind of request that the agent may create is a TokenRequest of its own pod. The request names the
+# ServiceAccount argocd-agent in argocd and one audience. The audience is spire-<env>/<nonce> for the SPIRE agent
+# sidecar, or mgmt-stream/<cell>/argocd-agent/<binding> for the proof that cell-proxy sends to the principal. It
+# binds the token to the Pod that sends it, by the name and UID that the API server puts in the user extras of the
+# request. A token for another audience, another account or another Pod is denied. hydrate replaces @CELL_NAME@.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -36,7 +37,8 @@ spec:
           request.resource.group == '' && request.resource.resource == 'serviceaccounts' &&
           has(request.subResource) && request.subResource == 'token' && request.namespace == 'argocd' && request.name == 'argocd-agent' &&
           has(object.spec.audiences) && object.spec.audiences.size() == 1 &&
-          object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') &&
+          (object.spec.audiences[0].matches('^spire-@POC_ENV@/[A-Za-z0-9_-]{1,128}$') ||
+           object.spec.audiences[0].matches('^mgmt-stream/@CELL_NAME@/argocd-agent/[A-Za-z0-9_-]{22}$')) &&
           has(object.spec.boundObjectRef) && has(object.spec.boundObjectRef.kind) &&
           object.spec.boundObjectRef.kind == 'Pod' &&
           has(object.spec.boundObjectRef.name) && has(object.spec.boundObjectRef.uid) &&
@@ -45,7 +47,7 @@ spec:
           'authentication.kubernetes.io/pod-uid' in request.userInfo.extra &&
           request.userInfo.extra['authentication.kubernetes.io/pod-name'] == [object.spec.boundObjectRef.name] &&
           request.userInfo.extra['authentication.kubernetes.io/pod-uid'] == [object.spec.boundObjectRef.uid])
-      message: The agent ServiceAccount of the central view creates only the bound token of its own SPIRE agent
+      message: The agent ServiceAccount of the central view creates only a bound token of its own pod, for the SPIRE agent or the stream proof
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

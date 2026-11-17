@@ -342,6 +342,8 @@ type probe struct {
 	cell, namespace, account, variant string
 	// tokenSecret names a Secret with the key token. The probe then sends that token.
 	tokenSecret string
+	// claimCell is the cell that the attestation payload names, when it differs from cell, the cluster that runs the Job.
+	claimCell string
 }
 
 type probeResult struct {
@@ -361,7 +363,11 @@ func runAttestProbe(t *testing.T, p probe) probeResult {
 	if p.namespace == celldNamespace {
 		allowProbeEgress(t, p.cell, run)
 	}
-	args := []string{"--variant", p.variant, "--cell", p.cell, "--env", pocEnv,
+	claim := p.cell
+	if p.claimCell != "" {
+		claim = p.claimCell
+	}
+	args := []string{"--variant", p.variant, "--cell", claim, "--env", pocEnv,
 		"--server", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, spireNodePort)}
 	volumes := []map[string]any{{"name": "bundle", "configMap": map[string]any{"name": trustBundleMap}}}
 	mounts := []map[string]any{{"name": "bundle", "mountPath": "/run/spire/bundle", "readOnly": true}}

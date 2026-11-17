@@ -23,6 +23,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
@@ -415,8 +416,11 @@ func TestPullerBodyLimit(t *testing.T) {
 	p := NewPuller(PullerConfig{Client: u.client, BaseURL: u.url, Env: testEnv, Keys: f.keys(), Store: store,
 		Log: newLog(logs), Now: clk.Now, Sleep: clk.Sleep})
 	runRounds(t, p, clk)
-	if len(store.saves()) != 0 || len(u.got()) != 0 {
-		t.Fatalf("saves %v, reports %d", store.saves(), len(u.got()))
+	if len(store.saves()) != 0 {
+		t.Fatalf("saves %v", store.saves())
+	}
+	if reps := u.got(); len(reps) != 1 || reps[0].Applied != (spec.Revision{}) {
+		t.Fatalf("a failed pull must still post the status: %+v", reps)
 	}
 	var found bool
 	for _, l := range logs.lines() {
@@ -501,17 +505,54 @@ func TestPullerNewHandshakeEachRound(t *testing.T) {
 	}
 }
 
-// A round whose pull fails sends no report, so only CloseIdleConnections ends its connection.
+// memGateway counts the syncs of a gateway that holds no items.
+type memGateway struct {
+	mu    sync.Mutex
+	syncs []gwapi.SyncRequest
+}
+
+func (g *memGateway) Sync(_ context.Context, r gwapi.SyncRequest) (gwapi.SyncResponse, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.syncs = append(g.syncs, r)
+	return gwapi.SyncResponse{}, nil
+}
+
+func (g *memGateway) Ack(context.Context, gwapi.AckRequest) error { return nil }
+
+func (g *memGateway) CloseIdleConnections() {}
+
+func (g *memGateway) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.syncs)
+}
+
+// A round whose pull fails still runs the gateway sync and posts the status, and the status post
+// ends its connection, so each round dials once.
 func TestPullerNewHandshakeAfterFailedPull(t *testing.T) {
-	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) { return firstBundle(f, rev(1, 2)), nil }, nil)
+	gw := &memGateway{}
+	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) {
+		cur, _ := f.base()
+		return firstBundle(f, rev(1, 2)), cur
+	}, func(c *PullerConfig) { c.Gateway = gw })
 	h.up.failGet.Store(true)
 	h.p.cfg.Client = h.up.shipped()
 	runRounds(t, h.p, h.clk)
 	if n := h.up.hs.Load(); n != 3 {
 		t.Fatalf("handshakes %d, want 3", n)
 	}
-	if len(h.up.got()) != 0 {
-		t.Error("a failed pull sent a report")
+	if n := gw.count(); n != 3 {
+		t.Errorf("gateway syncs %d, want 3", n)
+	}
+	reps := h.up.got()
+	if len(reps) != 3 {
+		t.Fatalf("a failed pull posted %d reports, want 3", len(reps))
+	}
+	for _, r := range reps {
+		if r.Gateway == nil {
+			t.Error("status report without a gateway status")
+		}
 	}
 }
 

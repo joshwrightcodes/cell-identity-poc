@@ -2,8 +2,8 @@
 # components/lib/spire-sidecar.sh adds the k8s_psat SPIRE agent, which gives cell-proxy the SVID
 # spiffe://mgmt.poc.internal/argocd/principal.
 #
-# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the agent ID and the cell
-# registry, and calls the principal on 127.0.0.1:8443 in plaintext gRPC with the header
+# cell-proxy ends SPIFFE mTLS on :8444 from the dev-cp relay, checks the agent ID, the cell registry
+# and the proof of the cell pod, and calls the principal on 127.0.0.1:8443 in plaintext gRPC with the header
 # x-cell-agent=<env>-<cell>. The principal takes the agent name from that header only.
 # The pod mounts no token for this account. Only the principal container gets a projected API token.
 apiVersion: v1
@@ -103,7 +103,7 @@ spec:
         app.kubernetes.io/name: argocd-agent-principal
       annotations:
         poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
-        poc.internal/registry-content-sha256: "@REGISTRY_SHA256@"
+        poc.internal/registry-signer-sha256: "@REGISTRY_SIGNER_SHA256@"
     spec:
       serviceAccountName: argocd-agent-principal
       automountServiceAccountToken: false
@@ -187,6 +187,9 @@ spec:
             - --upstream=127.0.0.1:8443
             - "--allow-id=@ALLOW_ID@"
             - --registry-dir=/run/cell-proxy/registry
+            - --registry-signer=/run/cell-proxy/registry-signer/signer.pub
+            - --registry-reload=10s
+            - --proof-subject=argocd-agent=argocd/argocd-agent
             - --peer-bundle=/run/cell-proxy/peer-root/root.crt
             - "--peer-trust-domain=@PEER_TRUST_DOMAIN@"
           env:
@@ -219,6 +222,9 @@ spec:
             - name: registry
               mountPath: /run/cell-proxy/registry
               readOnly: true
+            - name: registry-signer
+              mountPath: /run/cell-proxy/registry-signer
+              readOnly: true
             - name: peer-root
               mountPath: /run/cell-proxy/peer-root
               readOnly: true
@@ -226,6 +232,9 @@ spec:
         - name: registry
           configMap:
             name: cell-registry
+        - name: registry-signer
+          configMap:
+            name: registry-signer
         - name: peer-root
           configMap:
             name: peer-root

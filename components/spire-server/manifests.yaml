@@ -93,6 +93,33 @@ subjects:
     name: spire-server
     namespace: spire-system
 ---
+# The cluster_jwt plugin writes a key hint with a merge patch of ConfigMap attest-hints, which envd creates. It reads and patches
+# that one object and no other.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spire-server-hints
+  namespace: spire-system
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["attest-hints"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spire-server-hints
+  namespace: spire-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spire-server-hints
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire-system
+---
 # One ClusterStaticEntry per key. Each key name ends in .yaml.
 apiVersion: v1
 kind: ConfigMap

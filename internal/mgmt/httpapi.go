@@ -32,8 +32,24 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
-// maxRequestBody is the largest request body of either listener.
+// maxRequestBody is the largest body of a status post or an admin request. A report post has its
+// own larger limits.
 const maxRequestBody = 16 << 10
+
+// A report post holds at most maxReportBody bytes and maxReportItems items.
+const (
+	maxReportBody  = 1 << 20
+	maxReportItems = 100
+)
+
+// reportsHandlerTimeout is the deadline of one report post. Plane.Reports bounds its bind work
+// against the context that it gets, so a slow batch ends with retry outcomes under this deadline.
+// It stays below the write timeout of the API server, so that the answer still goes out.
+var reportsHandlerTimeout = 12 * time.Second
+
+// ReportsHandlerTimeout returns the deadline of one report post. A server stop that waits for
+// running handlers needs a budget above it.
+func ReportsHandlerTimeout() time.Duration { return reportsHandlerTimeout }
 
 // denialWindow and denialKeys bound the denial log lines of a handler.
 const (
@@ -41,16 +57,17 @@ const (
 	denialKeys   = 32
 )
 
-// SpecServer is what the API handler needs from the plane.
+// SpecServer is what the API handler needs from the plane for the spec and the status.
 type SpecServer interface {
 	Spec() mgmtapi.SpecBundle
 	Report(mgmtapi.StatusReport)
 }
 
-// Binder is what the bind handler needs from the plane.
-type Binder interface {
-	Nonce(cell string) (mgmtapi.NonceResponse, error)
-	Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) (mgmtapi.BindResponse, error)
+// APIServer is what the API handler needs from the plane.
+type APIServer interface {
+	SpecServer
+	OpenOps() mgmtapi.OpsBundle
+	Reports(context.Context, mgmtapi.ReportBatch) mgmtapi.ReportResult
 }
 
 func newRequestID() string {
@@ -71,13 +88,18 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(append(body, '\n'))
 }
 
-// readBody reads a body of at most maxRequestBody bytes. The detail is a fixed word, so that a log
-// line never echoes the body.
+// readBody reads a body of at most maxRequestBody bytes.
 func readBody(w http.ResponseWriter, r *http.Request) ([]byte, string) {
-	if r.ContentLength > maxRequestBody {
+	return readBodyLimit(w, r, maxRequestBody)
+}
+
+// readBodyLimit reads a body of at most limit bytes. The detail is a fixed word, so that a log line
+// never echoes the body.
+func readBodyLimit(w http.ResponseWriter, r *http.Request, limit int64) ([]byte, string) {
+	if r.ContentLength > limit {
 		return nil, "body_too_large"
 	}
-	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -109,7 +131,7 @@ func clip(s string) string {
 // ---- API
 
 type apiHandler struct {
-	p     SpecServer
+	p     APIServer
 	env   string
 	allow spiffeid.ID
 	log   *slog.Logger
@@ -117,13 +139,17 @@ type apiHandler struct {
 	mux   *http.ServeMux
 }
 
-// NewAPIHandler serves the signed spec of env to the one peer allow, and takes its status reports.
-// It checks the peer again on every request, from the TLS state or from the verified peer that the
-// listener recorded. Every other request gets 404.
-func NewAPIHandler(p SpecServer, env string, allow spiffeid.ID, log *slog.Logger) http.Handler {
+// NewAPIHandler serves the signed spec and the open operations of env to the one peer allow, and
+// takes its status posts and report batches. It checks the peer again on every request, from the TLS
+// state or from the verified peer that the listener recorded. A report batch has at most 1 MiB and
+// 100 items, and strict JSON; any other batch gets 403 and never reaches the plane. Every other
+// request gets 404.
+func NewAPIHandler(p APIServer, env string, allow spiffeid.ID, log *slog.Logger) http.Handler {
 	h := &apiHandler{p: p, env: env, allow: allow, log: log, limit: lograte.New(denialWindow, denialKeys, time.Now), mux: http.NewServeMux()}
 	h.mux.HandleFunc(mgmtapi.SpecPattern, h.spec)
 	h.mux.HandleFunc(mgmtapi.StatusPattern, h.status)
+	h.mux.HandleFunc(mgmtapi.OpsPattern, h.ops)
+	h.mux.HandleFunc(mgmtapi.ReportsPattern, h.reports)
 	h.mux.HandleFunc("/", http.NotFound)
 	return cleanPathOnly(h)
 }
@@ -183,160 +209,49 @@ func (h *apiHandler) status(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ---- Bind
-
-// bindHandlerTimeout is the deadline of one bind request. It stays below the 30 s attempt timeout
-// of celld.
-var bindHandlerTimeout = 25 * time.Second
-
-// bindWriteMargin is the time that the write timeout of a bind stream adds to the handler deadline,
-// so that a request that ends at the deadline still gets its answer.
-const bindWriteMargin = 2 * time.Second
-
-type bindHandler struct {
-	p     Binder
-	log   *slog.Logger
-	limit *lograte.Limiter
-	mux   *http.ServeMux
-	slots chan struct{}
-}
-
-// NewBindHandler serves the nonce and bind routes of the cells. Every denial is HTTP 403 with the
-// same body. The log line holds the reason, the detail, the cell and the request ID, and never the
-// token or the body.
-func NewBindHandler(p Binder, log *slog.Logger) http.Handler {
-	h := &bindHandler{p: p, log: log, limit: lograte.New(denialWindow, denialKeys, time.Now), mux: http.NewServeMux(), slots: make(chan struct{}, maxConns)}
-	h.mux.HandleFunc(mgmtapi.NoncePattern, h.nonce)
-	h.mux.HandleFunc(mgmtapi.BindPattern, h.bind)
-	h.mux.HandleFunc("/", http.NotFound)
-	return cleanPathOnly(h.mux)
-}
-
-func (h *bindHandler) onlyPost(w http.ResponseWriter, r *http.Request) bool {
-	if r.Method == http.MethodPost {
-		return true
-	}
-	w.Header().Set("Allow", http.MethodPost)
-	http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-	return false
-}
-
-func (h *bindHandler) nonce(w http.ResponseWriter, r *http.Request) {
-	if !h.onlyPost(w, r) {
+func (h *apiHandler) ops(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet || r.PathValue("env") != h.env {
+		http.NotFound(w, r)
 		return
 	}
-	cell := r.PathValue("cell")
-	body, bad := readBody(w, r)
-	if bad == "" && len(body) > 0 {
-		var none struct{}
-		if err := record.DecodeStrict(body, &none); err != nil {
-			bad = "body_invalid"
-		}
-	}
-	if bad == "" || bad == "body_invalid" {
-		release, ok := h.admit(w, r)
-		if !ok {
-			return
-		}
-		defer release()
-	}
-	if bad != "" {
-		h.deny(w, r, cell, "request_invalid", bad)
-		return
-	}
-	resp, err := h.p.Nonce(cell)
-	if err != nil {
-		h.fail(w, r, cell, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, resp)
+	writeJSON(w, http.StatusOK, h.p.OpenOps())
 }
 
-func (h *bindHandler) bind(w http.ResponseWriter, r *http.Request) {
-	if !h.onlyPost(w, r) {
+func (h *apiHandler) reports(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || r.PathValue("env") != h.env {
+		http.NotFound(w, r)
 		return
 	}
-	cell := r.PathValue("cell")
-	body, bad := readBody(w, r)
-	var req mgmtapi.BindRequest
+	body, bad := readBodyLimit(w, r, maxReportBody)
+	var batch mgmtapi.ReportBatch
 	if bad == "" {
-		if err := record.DecodeStrict(body, &req); err != nil {
+		if err := record.DecodeStrict(body, &batch); err != nil {
 			bad = "body_invalid"
+		} else if len(batch.Items) > maxReportItems {
+			bad = "too_many_items"
 		}
-	}
-	if bad == "" || bad == "body_invalid" {
-		release, ok := h.admit(w, r)
-		if !ok {
-			return
-		}
-		defer release()
 	}
 	if bad != "" {
-		h.deny(w, r, cell, "request_invalid", bad)
+		id := newRequestID()
+		writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: id})
+		if _, ok, suppressed, _ := h.limit.Allow("reports:" + bad); ok {
+			h.log.WarnContext(r.Context(), "reports_denied", "reason", bad, "request_id", id, "suppressed", suppressed)
+		}
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), bindHandlerTimeout)
+	ctx, cancel := context.WithTimeout(r.Context(), reportsHandlerTimeout)
 	defer cancel()
-	resp, err := h.p.Bind(ctx, cell, req)
-	if err != nil {
-		h.fail(w, r, cell, err)
-		return
+	res := h.p.Reports(ctx, batch)
+	if res.Outcomes == nil {
+		res.Outcomes = []mgmtapi.ItemOutcome{}
 	}
-	writeJSON(w, http.StatusOK, resp)
-}
-
-// admit is called when the request body is read. The request is then complete, so its connection
-// leaves the pending pool, and the request takes a bind slot for as long as the handler runs. When
-// the established connections or the bind slots are full, the answer is a fast 503 that closes the
-// connection, and the cell retries with backoff.
-func (h *bindHandler) admit(w http.ResponseWriter, r *http.Request) (release func(), ok bool) {
-	if bc, found := r.Context().Value(bindConnKey{}).(*bindConn); found && !bc.promote() {
-		h.busy(w, r, "established_full")
-		return nil, false
-	}
-	select {
-	case h.slots <- struct{}{}:
-		return func() { <-h.slots }, true
-	default:
-		h.busy(w, r, "slots_full")
-		return nil, false
-	}
-}
-
-func (h *bindHandler) busy(w http.ResponseWriter, r *http.Request, reason string) {
-	id := newRequestID()
-	w.Header().Set("Connection", "close")
-	w.Header().Set("Retry-After", "1")
-	writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "busy", "reason": reason, "request_id": id})
-	if _, ok, suppressed, _ := h.limit.Allow("busy"); ok {
-		h.log.WarnContext(r.Context(), "bind_busy", "reason", reason, "request_id", id, "suppressed", suppressed)
-	}
-}
-
-func (h *bindHandler) fail(w http.ResponseWriter, r *http.Request, cell string, err error) {
-	var e *Error
-	if errors.As(err, &e) {
-		h.deny(w, r, cell, e.Reason, e.Detail)
-		return
-	}
-	id := newRequestID()
-	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal", "request_id": id})
-	if _, ok, suppressed, _ := h.limit.Allow("internal"); ok {
-		h.log.ErrorContext(r.Context(), "bind_failed", "cell", clip(cell), "request_id", id, "error", err.Error(), "suppressed", suppressed)
-	}
-}
-
-func (h *bindHandler) deny(w http.ResponseWriter, r *http.Request, cell, reason, detail string) {
-	id := newRequestID()
-	writeJSON(w, http.StatusForbidden, mgmtapi.Denied{Error: mgmtapi.DeniedError, RequestID: id})
-	if _, ok, suppressed, _ := h.limit.Allow(reason); ok {
-		h.log.WarnContext(r.Context(), "bind_denied", "reason", reason, "detail", detail, "cell", clip(cell), "request_id", id, "suppressed", suppressed)
-	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ---- Admin
 
 type adminHandler struct {
+	rotMu   sync.Mutex
 	p       *Plane
 	publish func(context.Context, ed25519.PublicKey) error
 }
@@ -344,9 +259,11 @@ type adminHandler struct {
 // publishTimeout bounds the publish of a rotated key.
 const publishTimeout = 30 * time.Second
 
-// NewAdminHandler serves the commands of `mgmtd ctl` on the local admin socket. Each POST takes the
-// query expect-seq, and then runs only while the state version is that number. POST /rotate-key
-// calls publish with the new key before it answers.
+// NewAdminHandler serves the commands of `mgmtd ctl` on the local admin socket. The commands that
+// change keys or records take the query expect-seq, and then run only while the state version is
+// that number. POST /rotate-key calls publish before it answers: with the staged key for stage=1,
+// and with the new signing key for commit=1 and for a rotation with no query (the emergency
+// rotation, which needs no stage and moves any staged key aside).
 func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) error) http.Handler {
 	h := &adminHandler{p: p, publish: publish}
 	mux := http.NewServeMux()
@@ -357,19 +274,44 @@ func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) 
 	mux.HandleFunc("POST /keycheck/{cell}", h.keycheck)
 	mux.HandleFunc("POST /restore/{revision}", h.restore)
 	mux.HandleFunc("POST /rotate-key", h.rotate)
+	mux.HandleFunc("POST /ops", h.createOp)
+	mux.HandleFunc("GET /ops", h.listOps)
+	mux.HandleFunc("GET /ops/{id}", h.getOp)
+	mux.HandleFunc("POST /ops/{id}/close", h.closeOp)
 	return cleanPathOnly(mux)
 }
 
-// ReasonNotFound is the reason of a restore for a revision that the plane does not hold.
-const ReasonNotFound = "not_found"
+// ReasonNotFound is the reason of a restore for a revision that the plane does not hold, and
+// ReasonNotStaged the reason of a key commit when no key is staged.
+const (
+	ReasonNotFound  = "not_found"
+	ReasonNotStaged = "not_staged"
+)
 
 func adminError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
 	out := map[string]any{"error": err.Error()}
-	if errors.Is(err, ErrRevisionUnknown) {
+	switch {
+	case errors.Is(err, ErrRevisionUnknown):
 		out["reason"] = ReasonNotFound
 		status = http.StatusNotFound
-	} else if reason := ReasonOf(err); reason != "" {
+	case errors.Is(err, ErrOpUnknown):
+		out["reason"] = ErrOpUnknown.Error()
+		status = http.StatusNotFound
+	case errors.Is(err, ErrOpNotExpired):
+		out["reason"] = ErrOpNotExpired.Error()
+		status = http.StatusConflict
+	case errors.Is(err, ErrOpFinal):
+		out["reason"] = ErrOpFinal.Error()
+		status = http.StatusConflict
+	default:
+		status, out = refusalStatus(status, out, err)
+	}
+	writeJSON(w, status, out)
+}
+
+func refusalStatus(status int, out map[string]any, err error) (int, map[string]any) {
+	if reason := ReasonOf(err); reason != "" {
 		out["reason"] = reason
 		switch reason {
 		case mgmtapi.ReasonConflict:
@@ -380,7 +322,7 @@ func adminError(w http.ResponseWriter, err error) {
 			status = http.StatusUnprocessableEntity
 		}
 	}
-	writeJSON(w, status, out)
+	return status, out
 }
 
 func badRequest(w http.ResponseWriter, msg string) {
@@ -470,17 +412,64 @@ func (h *adminHandler) restore(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"served": st.Served, "restoreActive": st.RestoreActive, "seq": st.Seq})
 }
 
+// rotateMode reads the queries stage and commit. Each takes the value 1, and the two exclude each
+// other.
+func rotateMode(r *http.Request) (stage, commit bool, err error) {
+	q := r.URL.Query()
+	flag := func(name string) (bool, error) {
+		vals, present := q[name]
+		if !present {
+			return false, nil
+		}
+		if len(vals) != 1 || vals[0] != "1" {
+			return false, fmt.Errorf("%s must be 1", name)
+		}
+		return true, nil
+	}
+	if stage, err = flag("stage"); err != nil {
+		return false, false, err
+	}
+	if commit, err = flag("commit"); err != nil {
+		return false, false, err
+	}
+	if stage && commit {
+		return false, false, errors.New("stage and commit exclude each other")
+	}
+	return stage, commit, nil
+}
+
 func (h *adminHandler) rotate(w http.ResponseWriter, r *http.Request) {
 	seq, guarded, err := expectSeq(r)
 	if err != nil {
 		badRequest(w, err.Error())
 		return
 	}
+	stage, commit, err := rotateMode(r)
+	if err != nil {
+		badRequest(w, err.Error())
+		return
+	}
+	// One key change at a time, so that a commit cannot meet a stage that another commit used.
+	h.rotMu.Lock()
+	defer h.rotMu.Unlock()
+	if stage {
+		h.stage(w, r, seq, guarded)
+		return
+	}
 	var pub ed25519.PublicKey
-	if guarded {
-		pub, err = h.p.IfSeq(seq).RotateKey(r.Context())
-	} else {
-		pub, err = h.p.RotateKey(r.Context())
+	switch {
+	case commit && guarded:
+		pub, err = h.p.IfSeq(seq).CommitStagedKey(r.Context())
+	case commit:
+		pub, err = h.p.CommitStagedKey(r.Context())
+	case guarded:
+		pub, err = h.p.IfSeq(seq).RotateKeyEmergency(r.Context())
+	default:
+		pub, err = h.p.RotateKeyEmergency(r.Context())
+	}
+	if errors.Is(err, ErrNotStaged) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "no key is staged; run rotate-key --stage first", "reason": ReasonNotStaged})
+		return
 	}
 	if err != nil {
 		adminError(w, err)
@@ -501,6 +490,112 @@ func (h *adminHandler) rotate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"spec.pub": base64.StdEncoding.EncodeToString(pub), "signed": st.Signed, "seq": st.Seq})
 }
 
+// stage makes the next signing key and publishes its public half as next.pub. The signing key does
+// not change.
+func (h *adminHandler) stage(w http.ResponseWriter, r *http.Request, seq uint64, guarded bool) {
+	var pub ed25519.PublicKey
+	var err error
+	if guarded {
+		pub, err = h.p.IfSeq(seq).StageKey(r.Context())
+	} else {
+		pub, err = h.p.StageKey(r.Context())
+	}
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	if h.publish != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), publishTimeout)
+		defer cancel()
+		if err := h.publish(ctx, pub); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"error":  fmt.Sprintf("the key is staged, but its public half did not publish: %v", err),
+				"staged": true,
+			})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"next.pub": base64.StdEncoding.EncodeToString(pub), "staged": true, "seq": h.p.Status().Seq})
+}
+
+type createOpRequest struct {
+	Cell string          `json:"cell"`
+	Kind string          `json:"kind"`
+	Args json.RawMessage `json:"args"`
+	TTL  string          `json:"ttl"`
+}
+
+// createOp signs an operation. With the query serve=0 the operation is signed and recorded, and
+// OpenOps never offers it.
+func (h *adminHandler) createOp(w http.ResponseWriter, r *http.Request) {
+	serve := true
+	if vals, present := r.URL.Query()["serve"]; present {
+		switch {
+		case len(vals) == 1 && vals[0] == "0":
+			serve = false
+		case len(vals) == 1 && vals[0] == "1":
+		default:
+			badRequest(w, "serve must be 0 or 1")
+			return
+		}
+	}
+	body, bad := readBody(w, r)
+	var req createOpRequest
+	if bad == "" {
+		if err := record.DecodeStrict(body, &req); err != nil {
+			bad = "body_invalid"
+		}
+	}
+	var ttl time.Duration
+	if bad == "" && req.TTL != "" {
+		var err error
+		if ttl, err = time.ParseDuration(req.TTL); err != nil {
+			bad = "ttl_invalid"
+		}
+	}
+	if bad != "" {
+		badRequest(w, bad)
+		return
+	}
+	o, env, err := h.p.CreateOp(r.Context(), req.Cell, req.Kind, req.Args, ttl, serve)
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, OpView{
+		ID: o.ID, Cell: o.Cell, Kind: o.Kind, State: "open", Served: serve, KeyEpoch: o.KeyEpoch,
+		IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt, Envelope: json.RawMessage(env),
+	})
+}
+
+func (h *adminHandler) getOp(w http.ResponseWriter, r *http.Request) {
+	v, err := h.p.OpView(r.PathValue("id"))
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, v)
+}
+
+// listOps lists the operations of the query cell, or every operation, oldest first.
+func (h *adminHandler) listOps(w http.ResponseWriter, r *http.Request) {
+	views, err := h.p.OpViews(r.URL.Query().Get("cell"))
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ops": views})
+}
+
+func (h *adminHandler) closeOp(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := h.p.CloseOp(r.Context(), id); err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id, "final": OpAbandoned})
+}
+
 // ---- TLS
 
 func pinTLS13(cfg *tls.Config) *tls.Config {
@@ -514,14 +609,6 @@ func pinTLS13(cfg *tls.Config) *tls.Config {
 // certificate that chains to peer and carries exactly allow.
 func APIServerTLS(svids x509svid.Source, peer x509bundle.Source, allow spiffeid.ID) *tls.Config {
 	return pinTLS13(tlsconfig.MTLSServerConfig(svids, peer, tlsconfig.AuthorizeID(allow)))
-}
-
-// BindServerTLS returns the TLS settings of the bind listener: TLS 1.3 and ALPN h2 only, with the
-// server certificate of svids and no client certificate.
-func BindServerTLS(svids x509svid.Source) *tls.Config {
-	cfg := pinTLS13(tlsconfig.TLSServerConfig(svids))
-	cfg.ClientAuth = tls.NoClientCert
-	return cfg
 }
 
 // ErrPeerRootMissing is the error of a peer bundle file that does not exist.
@@ -574,10 +661,9 @@ func (f *fileBundle) GetX509BundleForTrustDomain(td spiffeid.TrustDomain) (*x509
 
 // ---- Servers
 
-// Limits of the shared table.
+// Limits of the API server.
 const (
 	apiStreams        = 4
-	bindStreams       = 2
 	readHeaderTimeout = 10 * time.Second
 	maxHeaderBytes    = 16 << 10
 )
@@ -585,37 +671,24 @@ const (
 // connContext marks the connection for the maximum age and adds the verified API peer.
 func connContext(ctx context.Context, c net.Conn) context.Context {
 	ctx = connlimit.ConnContext(ctx, c)
-	if v, ok := bindConns.Load(connKey(c)); ok {
-		ctx = context.WithValue(ctx, bindConnKey{}, v)
-	}
 	if v, ok := peerIDs.LoadAndDelete(connKey(c)); ok {
 		ctx = context.WithValue(ctx, peerCtxKey{}, v.(peerInfo))
 	}
 	return ctx
 }
 
-// NewServers returns the servers of the two listeners, with the limits of the shared table and
-// HTTP/2 only. Each handler runs under connlimit.MaxAge. Serve apiSrv on a listener from
-// ListenAPI and bindSrv on one from ListenBind.
-func NewServers(api, bind http.Handler, apiTLS, bindTLS *tls.Config) (apiSrv, bindSrv *http.Server) {
-	apiProtos := new(http.Protocols)
-	apiProtos.SetHTTP2(true)
+// NewServers returns the API server, with the limits of the shared table and HTTP/2 only. The
+// handler runs under connlimit.MaxAge. Serve it on a listener from ListenAPI.
+func NewServers(api http.Handler, apiTLS *tls.Config) *http.Server {
+	protos := new(http.Protocols)
+	protos.SetHTTP2(true)
 	// The API listener finishes the TLS handshake before the server sees the connection, so the
 	// server reads HTTP/2 from that connection as from a plain one.
-	apiProtos.SetUnencryptedHTTP2(true)
-	bindProtos := new(http.Protocols)
-	bindProtos.SetHTTP2(true)
-	apiSrv = &http.Server{
-		Handler: connlimit.MaxAge(api), TLSConfig: apiTLS, Protocols: apiProtos,
+	protos.SetUnencryptedHTTP2(true)
+	return &http.Server{
+		Handler: connlimit.MaxAge(api), TLSConfig: apiTLS, Protocols: protos,
 		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: apiStreams},
 		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: maxHeaderBytes, ConnContext: connContext,
 	}
-	bindSrv = &http.Server{
-		Handler: connlimit.MaxAge(bind), TLSConfig: bindTLS, Protocols: bindProtos,
-		HTTP2:             &http.HTTP2Config{MaxConcurrentStreams: bindStreams},
-		ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: 10 * time.Second, WriteTimeout: bindHandlerTimeout + bindWriteMargin, IdleTimeout: 30 * time.Second,
-		MaxHeaderBytes: maxHeaderBytes, ConnContext: connContext,
-	}
-	return apiSrv, bindSrv
 }

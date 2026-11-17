@@ -8,7 +8,8 @@
 #   3. Delete the Job and scale mgmtd to 1.
 #   4. Wait until mgmtd-0 is Ready.
 # A fresh state starts with a new key, so the plugin of the SPIRE server of dev-cp starts its marks again.
-# The script prints one JSON line with the moved files and the next commands. A failure prints one JSON error line on standard output.
+# The script prints one JSON line with the moved files and the next commands: the cell:up of dev-cp, the cell:up of each cell
+# of SPIRE_AGENT_CELLS, and the full link of management. A failure prints one JSON error line on standard output.
 # After a failure in step 2, and after an interrupt, the script scales mgmtd back to 1. The Job can have moved one file before it failed,
 # so the files can be partly moved. Read the moved list in the Job output, or run: mise run mgmt -- status.
 # MGMT_RESET_WAIT bounds each wait in seconds (default 180).
@@ -19,7 +20,13 @@ wait_seconds="${MGMT_RESET_WAIT:-180}"
 [[ "$wait_seconds" =~ ^[0-9]+$ ]] || json_fail mgmt-reset-state "MGMT_RESET_WAIT takes a number of seconds" step=read-wait next=""
 ns=mgmt-system
 job="mgmtd-reset-state-$(date +%s)"
-next=("CELL=dev-cp mise run cell:up" "CELL=management mise run cell:link")
+# After a reset the signing key is new, and the ConfigMap mgmt-op-key of each cell holds the old one. Each cell:up pins the
+# new key. They come after the cell:up of dev-cp, which pins the key in the gateway, and before the full link.
+next=("CELL=dev-cp mise run cell:up")
+# The cells are the ones that dev-cp lists in SPIRE_AGENT_CELLS, as dependents_of reads them.
+agent_cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
+for cell in $agent_cells; do next+=("CELL=$cell mise run cell:up"); done
+next+=("CELL=management mise run cell:link")
 
 scale() { "$ROOT/scripts/harness-replicas.sh" "$CELL_NAME" "$ns" statefulset/mgmtd "$1" >/dev/null; }
 
@@ -145,4 +152,4 @@ down=0
 poll "$wait_seconds" pod_ready ||
   fail wait-ready "mgmtd-0 is not Ready. The state moved aside" "mise run harness:status"
 
-jq -nc --argjson moved "$moved" --arg c1 "${next[0]}" --arg c2 "${next[1]}" '{reset: true, moved: $moved, next: [$c1, $c2]}'
+printf '%s\n' "${next[@]}" | jq -Rnc --argjson moved "$moved" '{reset: true, moved: $moved, next: [inputs]}'

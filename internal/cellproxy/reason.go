@@ -34,6 +34,12 @@ const (
 	PingTimeout Reason = "ping_timeout"
 	// LeafExpiring: the leaf of the cell has less than two minimum backoffs of life left, so the cell skips the tunnel.
 	LeafExpiring Reason = "leaf_expiring"
+	// ProofMissing: a cell source sent no proof, or the proof frame did not arrive in time.
+	ProofMissing Reason = "proof_missing"
+	// ProofInvalid: the proof of a cell source failed a check. The log line carries the detail.
+	ProofInvalid Reason = "proof_invalid"
+	// ProofFailed: a client could not make or write its proof, so it ends the connection.
+	ProofFailed Reason = "proof_failed"
 	// LibraryLog: a line that a library wrote to its logger.
 	LibraryLog Reason = "library_log"
 )

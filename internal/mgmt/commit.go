@@ -1,6 +1,7 @@
 package mgmt
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
@@ -29,7 +30,49 @@ type txn struct {
 	onFail  []func()
 }
 
-func (p *Plane) commit(fn func(*txn) error) (err error) {
+func (p *Plane) commit(fn func(*txn) error) error {
+	changed, err := p.commitTxn(fn)
+	if err == nil && changed {
+		p.notifyRecords()
+	}
+	return err
+}
+
+// notifyRecords hands the served records to Config.OnRecords. It reads the current snapshot, so a
+// callback that runs late still publishes the newest records. It runs outside the commit mutex.
+func (p *Plane) notifyRecords() {
+	if p.cfg.OnRecords == nil || !p.ready.Load() {
+		return
+	}
+	p.cbmu.Lock()
+	defer p.cbmu.Unlock()
+	cur := p.snap.Load()
+	if p.betweenLoads != nil {
+		p.betweenLoads()
+	}
+	// The records and the key come from one snapshot, so that a rotation that commits now cannot
+	// pair records of the new key with the old public key.
+	var records map[string]json.RawMessage
+	if s := cur.st.served(); s != nil {
+		records = maps.Clone(s.Bundle.Records)
+	}
+	p.cfg.OnRecords(records, slices.Clone(cur.pub))
+}
+
+// sameRecords reports whether two bundles hold the same record envelopes.
+func sameRecords(a, b *Signed) bool {
+	var ra, rb map[string]json.RawMessage
+	if a != nil {
+		ra = a.Bundle.Records
+	}
+	if b != nil {
+		rb = b.Bundle.Records
+	}
+	return maps.EqualFunc(ra, rb, func(x, y json.RawMessage) bool { return bytes.Equal(x, y) })
+}
+
+// commitTxn runs one change under the mutex. It reports whether the served records changed.
+func (p *Plane) commitTxn(fn func(*txn) error) (changed bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cur := p.snap.Load()
@@ -45,31 +88,32 @@ func (p *Plane) commit(fn func(*txn) error) (err error) {
 		maps.Copy(t.records, l.Bundle.Records)
 	}
 	if err = fn(t); err != nil {
-		return err
+		return false, err
 	}
 	switch {
 	case t.revised:
 		if err = t.seal(); err != nil {
-			return err
+			return false, err
 		}
 	case t.dirty:
 	default:
 		for _, f := range t.after {
 			f()
 		}
-		return nil
+		return false, nil
 	}
 	t.st.Seq++
 	if err = p.cfg.Store.Save(t.st); err != nil {
-		return fmt.Errorf("save state: %w", err)
+		return false, fmt.Errorf("save state: %w", err)
 	}
+	changed = !sameRecords(cur.st.served(), t.st.served()) || !bytes.Equal(cur.pub, t.key.Public().(ed25519.PublicKey))
 	p.key = t.key
 	p.snap.Store(&snapshot{st: t.st, pub: t.key.Public().(ed25519.PublicKey)})
 	p.noteLag()
 	for _, f := range t.after {
 		f()
 	}
-	return nil
+	return changed, nil
 }
 
 // revise starts a new spec revision. It refuses while a restore is active, unless the change is a
@@ -180,7 +224,7 @@ func (p *Plane) resignAll(fp string) func(*txn) error {
 				return err
 			}
 		}
-		return nil
+		return t.resignOps()
 	}
 }
 

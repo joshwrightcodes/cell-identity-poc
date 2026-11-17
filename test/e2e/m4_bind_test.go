@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -19,16 +18,15 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
-	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
-	bindNodePort = 30447
-	bindNS       = "m4-bind"
-	// denialQuiet is longer than the window (10 s) of the denial log limiter of mgmtd, which allows one line for each reason.
-	denialQuiet = 11 * time.Second
-	bindJobWait = 4 * time.Minute
+	// bindNodePort is the node port of the bind listener of the cell gateway in dev-cp.
+	bindNodePort = 30451
+	bindJobWait  = 4 * time.Minute
+	// trustBundlePath is where a probe Job mounts ConfigMap spire-trust-bundle.
+	trustBundlePath = "/run/spire/bundle/bundle.crt"
 )
 
 var (
@@ -36,7 +34,7 @@ var (
 	nonceLine  = regexp.MustCompile(`^nonce:(\S+) (\S+)$`)
 )
 
-// bindEnv is the pod environment that the mgmt-bind target of attestprobe reads.
+// bindEnv is the pod environment that the gw-bind target of attestprobe reads.
 func bindEnv() []map[string]any {
 	field := func(name, path string) map[string]any {
 		return map[string]any{"name": name, "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": path}}}
@@ -57,8 +55,8 @@ type probeJob struct {
 func (j probeJob) name() string { return "attestprobe-bind-" + j.run }
 
 func (j probeJob) manifest() []byte {
-	volumes := []map[string]any{{"name": "mgmt-root", "configMap": map[string]any{"name": "mgmt-root"}}}
-	mounts := []map[string]any{{"name": "mgmt-root", "mountPath": "/run/mgmt-root", "readOnly": true}}
+	volumes := []map[string]any{{"name": "bundle", "configMap": map[string]any{"name": trustBundleMap}}}
+	mounts := []map[string]any{{"name": "bundle", "mountPath": "/run/spire/bundle", "readOnly": true}}
 	if j.secret != "" {
 		volumes = append(volumes, map[string]any{"name": "token", "secret": map[string]any{"secretName": j.secret}})
 		mounts = append(mounts, map[string]any{"name": "token", "mountPath": "/run/attestprobe", "readOnly": true})
@@ -157,7 +155,7 @@ func (j probeJob) run1(t *testing.T) []string {
 }
 
 // allowBindEgress gives the probe pods of one run the egress rules of the live celld NetworkPolicy, which include the node port
-// 30447 of dev-cp, in any namespace of the cell.
+// 30451 of dev-cp, in any namespace of the cell.
 func allowBindEgress(t *testing.T, cell, ns, run string) {
 	t.Helper()
 	out, err := kubectl(t, cell, "", "-n", celldNamespace, "get", "networkpolicy", "celld", "-o", "json")
@@ -193,25 +191,6 @@ func allowBindEgress(t *testing.T, cell, ns, run string) {
 	})
 }
 
-// copyMgmtRoot copies ConfigMap mgmt-root of cell-identity-system into a namespace of the cell, with the probe label.
-func copyMgmtRoot(t *testing.T, cell, ns string) {
-	t.Helper()
-	root, err := kubectl(t, cell, "", "-n", celldNamespace, "get", "configmap", "mgmt-root", "-o", `jsonpath={.data.root\.crt}`)
-	if err != nil || strings.TrimSpace(root) == "" {
-		t.Fatalf("ConfigMap mgmt-root of %s holds no root: %v", cell, err)
-	}
-	cm, _ := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "ConfigMap",
-		"metadata": map[string]any{"name": "mgmt-root", "namespace": ns, "labels": map[string]string{probeLabel: "mgmt-root"}}, "data": map[string]string{"root.crt": root}})
-	if _, err := kubectl(t, cell, string(cm), "create", "-f", "-"); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if _, err := kubectl(t, cell, "", "-n", ns, "delete", "configmap", "mgmt-root", "--ignore-not-found"); err != nil {
-			t.Errorf("cleanup of ConfigMap mgmt-root in %s: %v", ns, err)
-		}
-	})
-}
-
 // tokenSecret stores a token in a Secret of the cell, with the probe label, and deletes it when the test ends.
 func tokenSecret(t *testing.T, cell, ns, token string) string {
 	t.Helper()
@@ -230,23 +209,27 @@ func tokenSecret(t *testing.T, cell, ns, token string) string {
 	return name
 }
 
-// bindProbe returns a Job that binds through the node port of dev-cp. The caller adds the arguments after the target.
+// bindProbe returns a Job that binds through the bind listener of the cell gateway. The namespace holds ConfigMap
+// spire-trust-bundle. The caller adds the arguments after the target.
 func bindProbe(t *testing.T, cell, ns, account string, extra ...string) probeJob {
 	t.Helper()
 	needAttestprobeImage(t)
 	run := randomHex(t, 4)
 	allowBindEgress(t, cell, ns, run)
-	args := append([]string{"--target", "mgmt-bind", "--upstream", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, bindNodePort),
-		"--expect-id", mgmtAPIID, "--peer-bundle", "/run/mgmt-root/root.crt", "--env", pocEnv}, extra...)
+	args := append([]string{"--target", "gw-bind", "--upstream", fmt.Sprintf("%s:%d", clusterFacts(t, spireCluster).NodeIP, bindNodePort),
+		"--expect-id", gatewayID, "--trust-bundle", trustBundlePath, "--env", pocEnv}, extra...)
 	return probeJob{cluster: cell, namespace: ns, account: account, run: run, args: args, backoffLimit: 0}
 }
 
-// mgmtdDenial waits for the mgmtd log line bind_denied with the request ID.
-func mgmtdDenial(t *testing.T, id string, since time.Time) logLine {
+// gatewayDenial waits for the cellgw log line bind_denied with the request ID.
+func gatewayDenial(t *testing.T, id string, since time.Time) logLine {
 	t.Helper()
 	var found logLine
-	waitFor(t, "the mgmtd log line bind_denied with the request ID "+id, time.Minute, func() (bool, string) {
-		logs := mgmtdLog(t, since)
+	waitFor(t, "the cellgw log line bind_denied with the request ID "+id, time.Minute, func() (bool, string) {
+		logs, err := kubectl(t, spireCluster, "", "-n", gatewayNamespace, "logs", gatewayPod, "-c", "cellgw", "--since-time="+since.UTC().Format(time.RFC3339))
+		if err != nil {
+			return false, err.Error()
+		}
 		for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "bind_denied" && l.str("request_id") == id }) {
 			found = l
 			return true, ""
@@ -254,6 +237,18 @@ func mgmtdDenial(t *testing.T, id string, since time.Time) logLine {
 		return false, lastLines(logs, 2)
 	})
 	return found
+}
+
+// bindNamespace makes a test namespace m5-probe-<hex> in cell for probe Jobs, with the service account celld, its RBAC and the trust
+// bundle of the cell.
+func bindNamespace(t *testing.T, cell string) string {
+	t.Helper()
+	ns := m5Namespace(t, cell)
+	if _, err := kubectl(t, cell, celldRBAC(ns), "create", "-f", "-"); err != nil {
+		t.Fatal(err)
+	}
+	copyTrustBundle(t, cell, ns)
+	return ns
 }
 
 // celldRBAC lets service account celld of a test namespace request a token for itself.
@@ -339,93 +334,6 @@ func nonceFor(t *testing.T, cell, ns, account, forCell string) (nonce, audience 
 	return m[1], m[2]
 }
 
-// TestM4BindRefusals sends bind requests to mgmtd through the node port 30447 of dev-cp, from Jobs in dev-cell-1. Each refusal
-// prints denied and a request ID, and the mgmtd log line with that request ID holds the reason. The record revisions of both
-// cells do not change.
-func TestM4BindRefusals(t *testing.T) {
-	const cell = rejectCell
-	needAttestprobeImage(t)
-	revisions := recordRevisions(t)
-	createNamespace(t, cell, bindNS)
-	if _, err := kubectl(t, cell, celldRBAC(bindNS), "create", "-f", "-"); err != nil {
-		t.Fatal(err)
-	}
-	copyMgmtRoot(t, cell, bindNS)
-
-	// An earlier test can have logged a denial just before, so the first subtest waits too.
-	last := time.Now()
-	// denied runs a one-pod Job and checks that its last line is a refusal that the mgmtd log explains.
-	denied := func(t *testing.T, j probeJob, reason string, details ...string) []string {
-		t.Helper()
-		// The log limiter of mgmtd allows one denial line for each reason in each window.
-		time.Sleep(time.Until(last.Add(denialQuiet)))
-		start := time.Now().Add(-logMargin)
-		lines := j.run1(t)
-		last = time.Now()
-		m := denialLine.FindStringSubmatch(lastLine(t, lines))
-		if m == nil {
-			t.Fatalf("the last line is %q, want denied:<request ID> with 16 hex digits", lastLine(t, lines))
-		}
-		l := mgmtdDenial(t, m[1], start)
-		if l.str("reason") != reason || (len(details) > 0 && !slices.Contains(details, l.str("detail"))) {
-			t.Errorf("the mgmtd line for %s has reason %q and detail %q, want %s and one of %v", m[1], l.str("reason"), l.str("detail"), reason, details)
-		}
-		t.Logf("request %s: reason %s, detail %q", m[1], l.str("reason"), l.str("detail"))
-		return lines
-	}
-
-	t.Run("other_subject", func(t *testing.T) {
-		denied(t, bindProbe(t, cell, bindNS, celldAccount, "--cell", cell, "--variant", "good"), mgmtapi.ReasonTokenInvalid, "subject_not_allowed")
-	})
-	t.Run("other_nonce", func(t *testing.T) {
-		denied(t, bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "other-nonce"), mgmtapi.ReasonTokenInvalid, "wrong_audience")
-	})
-	t.Run("attest_audience", func(t *testing.T) {
-		denied(t, bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "attest-audience"), mgmtapi.ReasonTokenInvalid, "wrong_audience")
-	})
-	t.Run("reused_nonce", func(t *testing.T) {
-		lines := denied(t, bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "good", "--reuse-nonce"), mgmtapi.ReasonNonceInvalid)
-		if len(lines) != 3 || !nonceLine.MatchString(lines[0]) || lines[1] != "bound:"+mgmtapi.StatusAlreadyBound {
-			t.Errorf("the reuse printed %q, want a nonce, bound:already_bound, then the refusal", lines)
-		}
-	})
-	t.Run("unknown_cell", func(t *testing.T) {
-		secret := tokenSecret(t, cell, celldNamespace, "not.a.token")
-		j := bindProbe(t, cell, celldNamespace, celldAccount, "--cell", "dev-cell-9", "--variant", "good", "--nonce", "x", "--token-file", "/run/attestprobe/token")
-		j.secret = secret
-		denied(t, j, mgmtapi.ReasonCellUnknown)
-	})
-	t.Run("good", func(t *testing.T) {
-		lines := bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "good").run1(t)
-		if len(lines) != 2 || !nonceLine.MatchString(lines[0]) || lines[1] != "bound:"+mgmtapi.StatusAlreadyBound {
-			t.Errorf("a good bind printed %q, want a nonce line and bound:already_bound", lines)
-		}
-	})
-	t.Run("rogue_token", func(t *testing.T) {
-		nonce, audience := nonceFor(t, cell, celldNamespace, celldAccount, cell)
-		secret := tokenSecret(t, cell, celldNamespace, rogueToken(t, audience))
-		j := bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
-		j.secret = secret
-		// The rogue cluster has another issuer, so the claim check can refuse the token before it looks up the key.
-		denied(t, j, mgmtapi.ReasonTokenInvalid, "issuer_mismatch", "unknown_kid", "bad_signature")
-	})
-	t.Run("unknown_kid", func(t *testing.T) {
-		// The token has the issuer and the claims of a good one, and a key ID that the cell does not publish, so only the key
-		// lookup can refuse it.
-		nonce, audience := nonceFor(t, cell, celldNamespace, celldAccount, cell)
-		secret := tokenSecret(t, cell, celldNamespace, forgedToken(t, cellStatusOf(t, cell).Issuer, audience))
-		j := bindProbe(t, cell, celldNamespace, celldAccount, "--cell", cell, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
-		j.secret = secret
-		denied(t, j, mgmtapi.ReasonTokenInvalid, "unknown_kid")
-	})
-
-	for name, rev := range revisions {
-		if now := recordRevisions(t)[name]; now != rev {
-			t.Errorf("the record of %s moved from %+v to %+v during the refusals", name, rev, now)
-		}
-	}
-}
-
 // forgedToken makes a bind token with the claims of a good one for a cell and a random key and signature.
 func forgedToken(t *testing.T, issuer, audience string) string {
 	t.Helper()
@@ -457,57 +365,4 @@ func forgedToken(t *testing.T, issuer, audience string) string {
 	_, _ = rand.Read(junk)
 	parts[2] = base64.RawURLEncoding.EncodeToString(junk)
 	return strings.Join(parts, ".")
-}
-
-// TestM4NonceFloodLive sends 200 nonce requests for dev-cell-2 from Jobs in the namespace default of dev-cell-1, and one bind
-// request for dev-cell-2 with a forged token: the right claims, a random key ID and a junk signature. mgmtd refuses the forged
-// request as token_invalid with the detail unknown_kid, and the log line with its request ID shows this. After the flood, a new celld
-// pod of dev-cell-2 binds: its log holds already_bound within two minutes. The test shows that the nonce requests do not stop a bind.
-// It does not show that the forged token started no update gap: the bind of the new pod answers already_bound, which never reads the gap.
-func TestM4NonceFloodLive(t *testing.T) {
-	const from, target, ns = rejectCell, "dev-cell-2", "default"
-	needAttestprobeImage(t)
-	copyMgmtRoot(t, from, ns)
-	issuer := cellStatusOf(t, target).Issuer
-	revisions := recordRevisions(t)
-
-	flood := bindProbe(t, from, ns, "default", "--cell", target, "--variant", "good", "--nonce-only")
-	flood.completions, flood.parallelism, flood.backoffLimit = 200, 25, 400
-	flood.start(t)
-
-	nonce, audience := nonceFor(t, from, ns, "default", target)
-	secret := tokenSecret(t, from, ns, forgedToken(t, issuer, audience))
-	forged := bindProbe(t, from, ns, "default", "--cell", target, "--variant", "good", "--nonce", nonce, "--token-file", "/run/attestprobe/token")
-	forged.secret = secret
-	// The denial log of mgmtd allows one line for each reason in each window, so the forged bind waits for a quiet window.
-	time.Sleep(denialQuiet)
-	forgedStart := time.Now().Add(-logMargin)
-	lines := forged.run1(t)
-	m := denialLine.FindStringSubmatch(lastLine(t, lines))
-	if m == nil {
-		t.Fatalf("the forged bind printed %q, want denied:<request ID>", lines)
-	}
-	if l := mgmtdDenial(t, m[1], forgedStart); l.str("reason") != mgmtapi.ReasonTokenInvalid || l.str("detail") != "unknown_kid" || l.str("cell") != target {
-		t.Errorf("the mgmtd line for the forged bind %s has reason %q, detail %q and cell %q, want token_invalid, unknown_kid and %s", m[1], l.str("reason"), l.str("detail"), l.str("cell"), target)
-	}
-
-	succeeded, failed, done := flood.wait(t, 5*time.Minute)
-	t.Logf("the flood Job: %d pods succeeded, %d failed, complete %t", succeeded, failed, done)
-	if succeeded < 200 {
-		t.Errorf("only %d of the 200 nonce requests went through", succeeded)
-	}
-
-	pod := replaceCelldPod(t, target)
-	waitFor(t, "the new celld pod of "+target+" to log a bind with the status already_bound", 2*time.Minute, func() (bool, string) {
-		logs, err := kubectl(t, target, "", "-n", celldNamespace, "logs", pod.Metadata.Name, "-c", celldContainer)
-		if err != nil {
-			return false, err.Error()
-		}
-		return len(matching(logs, func(l logLine) bool { return l.str("msg") == "bound" && l.str("status") == mgmtapi.StatusAlreadyBound })) > 0, lastLines(logs, 2)
-	})
-	for name, rev := range revisions {
-		if now := recordRevisions(t)[name]; now != rev {
-			t.Errorf("the record of %s moved from %+v to %+v during the flood", name, rev, now)
-		}
-	}
 }

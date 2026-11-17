@@ -28,7 +28,7 @@ func probeTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
 // ServerTLS requires a client SVID that chains to peer, matches allow, names a valid source and
 // passes the registry. It logs each refused peer as "peer refused", with the reason, the remote
 // address and the ID. The server issues no session tickets, so every connection runs these checks.
-func ServerTLS(svids x509svid.Source, peer x509bundle.Source, allow *regexp.Regexp, reg *Registry, log *slog.Logger) *tls.Config {
+func ServerTLS(svids x509svid.Source, peer x509bundle.Source, allow *regexp.Regexp, reg RegistrySource, log *slog.Logger) *tls.Config {
 	base := pin(tlsconfig.MTLSServerConfig(svids, peer, allowed(allow, reg)))
 	// The client must still send a certificate: pin refuses an empty chain as no_client_cert.
 	// RequestClientCert lets that refusal reach the verify callback, which logs it.
@@ -70,7 +70,7 @@ func exactID(expect spiffeid.ID) tlsconfig.Authorizer {
 	}
 }
 
-func allowed(allow *regexp.Regexp, reg *Registry) tlsconfig.Authorizer {
+func allowed(allow *regexp.Regexp, reg RegistrySource) tlsconfig.Authorizer {
 	return func(id spiffeid.ID, _ [][]*x509.Certificate) error {
 		refuse := func(format string, args ...any) error {
 			return &PeerError{Reason: PeerNotAllowed, ID: id.String(), Err: fmt.Errorf(format, args...)}
@@ -82,7 +82,7 @@ func allowed(allow *regexp.Regexp, reg *Registry) tlsconfig.Authorizer {
 		if err != nil {
 			return refuse("client ID %s: %w", id, err)
 		}
-		if !reg.Allows(src) {
+		if !reg.Current().Allows(src) {
 			return refuse("client ID %s has no valid record", id)
 		}
 		return nil

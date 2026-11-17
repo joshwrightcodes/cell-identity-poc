@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
+# m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
+# m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
+# After the tests, m5, m5-soak and m5-drill scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]}"
+# The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
+gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift
 pattern="$(echo "$milestone" | tr '[:lower:]' '[:upper:]')"
 budget_var="GATE_${pattern//-/_}_BUDGET_MINUTES"
+timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
+[[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
+[[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -97,6 +105,32 @@ if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
+# The M5 tests run against mgmtd, envd, the cell gateway, the SPIRE server of dev-cp (its plugin writes the key hints) and
+# the cells. An earlier run can leave a workload with no
+# replica, or a test namespace. Each of these workloads must run the images that `mise run images` recorded, and so
+# must celld in each cell and the three cell-proxy servers of management. The cell-proxy clients stay with the M3 check:
+# a new image of the server changes the digest of every user of cell-proxy.
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill ]]; then
+  "$ROOT/scripts/gate-m5-repair.sh" --check || exit 1
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up"
+    "management:central-view-system:deployment/argocd-agent-principal:mise run images -- cell-proxy, then CELL=management LINK_ONLY=central-view mise run cell:link"
+    "management:observability-system:deployment/telemetry-gateway:mise run images -- cell-proxy, then CELL=management LINK_ONLY=telemetry-gateway mise run cell:link"
+    "management:mesh-view-system:deployment/mesh-view-hub:mise run images -- cell-proxy, then CELL=management LINK_ONLY=mesh-view-hub mise run cell:link")
+  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+    targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
+  done
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
 # go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,
 # and the text of the run goes to standard output as it does without -json.
 mkdir -p "$BUILD_ROOT"
@@ -104,13 +138,17 @@ events="$BUILD_ROOT/gate-$milestone.json"
 durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS
 status=0
-# The test timeout is twice the budget, with a floor of 30 minutes, so the budget check reports a
-# slow run and the Go timeout never ends the run first.
-test_timeout="$(gate_test_timeout "$budget_minutes")"
+# The test timeout is twice the budget, with a floor of 30 minutes or GATE_<MILESTONE>_TEST_TIMEOUT_MINUTES, so the budget check
+# reports a slow run and the Go timeout never ends the run first.
+test_timeout="$(gate_test_timeout "$budget_minutes" "${!timeout_var:-}")"
 go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$pattern" "$@" \
   | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
+# No token may reach a log of the M5 components. A hit fails the gate, like a failed test.
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill ]]; then
+  "$ROOT/scripts/gate-token-scan.sh" "$gate_started" || { printf 'FAIL: gate %s found a token in a log\n' "$milestone" >&2; status=1; }
+fi
 # The duration of each top-level test, slowest first.
 jq -Rrn '[inputs | fromjson? | select(.Test != null and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
     | {test: .Test, action: .Action, elapsed: .Elapsed}] | sort_by(-.elapsed)[] | "\(.elapsed)s \(.action) \(.test)"' "$events" >"$durations" || true

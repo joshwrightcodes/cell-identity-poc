@@ -12,6 +12,10 @@
 #   telemetry     {ok, wait, verdict}: the result of obs:uplink-status. wait is true when the only bad hop is the
 #                 export of the collector and the store has a fresh sample, a state that clears by itself
 #   problems      one sentence for each bad value, with the command to run
+# The object of dev-cp also holds:
+#   gateway       {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt, recordOld, recordOldAt,
+#                 queued, streams, mostClaimed, lastBindRefusal, storeError}: the status of the cell gateway. When it does not
+#                 answer, the object holds only error
 # The object of management also holds:
 #   agents        {expected, connected, missing}: the Argo CD agents of VIEW_CELLS that the principal lists
 #   samples       the age in seconds of the last Prometheus sample for each k8s_cluster_name
@@ -22,7 +26,9 @@
 #   mesh          {ok, lines}: the result of mesh:status
 #   management    {env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError, restoreActive,
 #                 pendingDrops, cells, hostsvc}: the status of mgmtd, with the revisions as epoch and counter, and the
-#                 cells as {name, bound, lastCheck}. hostsvc is the status of hostsvc:serve and check, which holds
+#                 cells as {name, bound, lastCheck, lastStatusAt, unreported, oldestUnreportedAt,
+#                 records, openOps, expiredOps, forgedSeen, lastRefusal, lastHintCheck}. expiredOps lists the operations that expired with no final
+#                 result, as {id, cell, expiredAt}. hostsvc is the status of hostsvc:serve and check, which holds
 #                 the text of the first failed pin or root check and is empty when both pass. When mgmtd does not
 #                 answer, the object holds only error
 # The checks of cell:verify, the hops of obs:uplink-status and the parts of mesh:status are read from those
@@ -44,6 +50,16 @@ verify_limit="${STATUS_VERIFY_TIMEOUT:-900}"
 
 # kubectl with a bound on each request, so that a hung API server gives a problem and no hang.
 kubectl() { command kubectl --request-timeout=20s "$@"; }
+
+# read_clock sets now to the time of the node dev-cp-control-plane in epoch seconds, and clock_problem to "". Every age in this script is a
+# difference between now and a timestamp that a cluster wrote, so each check reads the clock again just before it compares, and the time
+# of the verify steps never counts as age. When the node does not answer, now is the time of the Mac, and clock_problem names the cause.
+read_clock() {
+  clock_problem=""
+  if now="$(node_now 2>/dev/null)" && [[ "$now" =~ ^[0-9]+$ ]]; then return 0; fi
+  now="$(date +%s)"
+  clock_problem="cannot read the time of the node dev-cp-control-plane, so the age checks use the clock of the Mac, which can differ from the clock of the VM. Run: docker ps"
+}
 
 # with_timeout <seconds> <command...> runs the command, and stops it with TERM after the time.
 with_timeout() {
@@ -96,7 +112,7 @@ run_telemetry() {
 # management_plane prints the field management: the status of mgmtd and of the host service. The pin and the root
 # of the host service are checked with the functions of cell:verify, which print the reason and the command.
 management_plane() {
-  local st rc=0 serve hs check="" crc=0
+  local st rc=0 serve hs check="" crc=0 ops opsFailed
   st="$(mise run mgmt -- status 2>/dev/null)" || rc=$?
   if ((rc != 0)) || ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
     jq -Rsc --argjson rc "$rc" '(split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
@@ -112,50 +128,121 @@ management_plane() {
     # A check that fails with no output still counts as a failure.
     if ((crc != 0)) && [[ -z "$check" ]]; then check="the host service check failed. Run: mise run hostsvc:serve -- status"; fi
   fi
-  jq -c --argjson hs "$hs" --arg check "$check" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
-    restoreActive, pendingDrops, cells: [.cells[]? | {name, bound, lastCheck}], hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
+  # The state of an operation is expired only while it has no final result. A list that fails gives opsFailed, and a problem.
+  ops="$(mise run mgmt -- op list 2>/dev/null)" || ops=""
+  opsFailed=false
+  jq -e 'type == "object" and has("ops")' >/dev/null 2>&1 <<<"$ops" || { ops='{"ops":[]}'; opsFailed=true; }
+  jq -c --argjson hs "$hs" --arg check "$check" --argjson ops "$ops" --argjson opsFailed "$opsFailed" '{env, signed, applied, appliedAt, lagSince, lastReportAt, lastRefusal, storeError,
+    restoreActive, pendingDrops,
+    cells: [.cells[]? | {name, bound, lastCheck, lastStatusAt, unreported, oldestUnreportedAt, records, openOps, expiredOps, forgedSeen, lastRefusal, lastHintCheck}],
+    opsFailed: $opsFailed,
+    expiredOps: [$ops.ops[]? | select(.state == "expired") | {id, cell, expiredAt}],
+    hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
 }
 
 # management_problems <cell-identity cells> reads the field management on standard input and prints one problem
 # for each bad value, as a JSON array of strings. Each problem ends with the command to run.
 management_problems() {
-  jq -c --arg bind "$1" 'def rev: "\(.epoch).\(.counter)";
+  local now clock_problem
+  read_clock
+  jq -c --arg bind "$1" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def cp: "CELL=dev-cp mise run cell:verify";
     if .error != null then ["mgmtd status failed: " + .error]
     else
       . as $m | ([.signed.epoch, .signed.counter]) as $sig | ([.applied.epoch, .applied.counter]) as $app
       | [
-        (if $sig > $app and .lagSince != null and (now - (.lagSince | ts)) > 120
+        (if $sig > $app and .lagSince != null and ($now - (.lagSince | ts)) > 120
          then "signed revision \(.signed | rev) is above applied \(.applied | rev) for more than 2 minutes. Run: \(cp)" else empty end),
         (if .lastRefusal != null and ((.lastRefusal.at | ts) == 0 or (.lastRefusal.at | ts) > ((.appliedAt // "") | ts))
          then "envd refused a spec: \(.lastRefusal.reason) at revision \(.lastRefusal.revision | rev), after the last apply. Run: \(cp)" else empty end),
         (if (.storeError // "") != "" then "envd reports a store error: \(.storeError). Run: \(cp)" else empty end),
         (if .restoreActive then "a restore is active, so mgmtd serves an older revision. Run: mise run mgmt -- restore --revision latest" else empty end),
-        (if .lastReportAt == null or (now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
+        (if .lastReportAt == null or ($now - (.lastReportAt | ts)) > 60 then "no report from envd in the last 60 seconds. Run: \(cp)" else empty end),
         (.cells[] | select(.lastCheck == "keys_untrusted") | "the key check of \(.name) is keys_untrusted. Run: CELL=\(.name) mise run cell:restart"),
         (.cells[] | select(.lastCheck == "issuer_untrusted") | "the key check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
         (.cells[] | select(.lastCheck == "issuer_unavailable") | "the key check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
+        (.cells[] | select(.lastHintCheck == "keys_untrusted") | "the hint check of \(.name) is keys_untrusted. Run: CELL=\(.name) mise run cell:restart"),
+        (.cells[] | select(.lastHintCheck == "issuer_untrusted") | "the hint check of \(.name) is issuer_untrusted. Run: mise run hostsvc:serve -- restart"),
+        (.cells[] | select(.lastHintCheck == "issuer_unavailable") | "the hint check of \(.name) is issuer_unavailable. Run: mise run hostsvc:serve -- status"),
+        (.cells[] | select(.lastHintCheck == "error") | "the hint check of \(.name) is error. Run: mise run mgmt -- keycheck --cell \(.name)"),
+        (.cells[] | select(.bound and ($now - ((.lastStatusAt // "") | ts)) > 120)
+          | "no status from the celld of \(.name) in the last 2 minutes. Run: CELL=\(.name) mise run cell:verify"),
+        (.cells[] | select((.unreported // 0) > 0 and ((.oldestUnreportedAt // "") | ts) > 1000000000 and ($now - (.oldestUnreportedAt | ts)) > 300)
+          | "\(.name) has \(.unreported) unreported items, the oldest from \(.oldestUnreportedAt), more than 5 minutes ago. Run: CELL=\(.name) mise run cell:verify"),
+        (.cells[] | select((.records // 0) > 800) | "\(.name) holds \(.records) operation records, above 800. Run: CELL=\(.name) mise run cell:verify"),
+        (if .opsFailed then "the list of operations failed, so expired operations are not checked. Run: mise run mgmt -- op list" else empty end),
+        (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and ($now - (.expiredAt | ts)) < 900)
+          | "operation \(.id) for \(.cell) expired at \(.expiredAt) with no final result. Run: mise run ops -- close \(.id)"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
           | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
         (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"
          elif .hostsvc.expires_soon then "the host service certificate expires soon. Run: mise run hostsvc:serve -- restart"
          elif .hostsvc.check != "" then "host service: " + .hostsvc.check else empty end)
-      ] end'
+      ] end | . + (if $clockp != "" then [$clockp] else [] end)'
+}
+
+# gateway_plane prints the field gateway, the cells that mgmtd reports as bound, and whether mgmtd answers, as one JSON
+# object. When the gateway does not answer, the field gateway holds only error.
+gateway_plane() {
+  local gw rc=0 mg mrc=0 bound='[]' up=false
+  gw="$(mise run gw -- status 2>/dev/null)" || rc=$?
+  if ((rc != 0)) || ! jq -e 'type == "object" and has("epoch")' >/dev/null 2>&1 <<<"$gw"; then
+    jq -Rsc --argjson rc "$rc" '{gateway: {error: ((split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
+      | $o.error // "mise run gw -- status exited with status \($rc) and printed no status. Run: CELL=dev-cp mise run cell:up")}, mgmt_up: false, bound: []}' <<<"$gw"
+    return
+  fi
+  mg="$(mise run mgmt -- status 2>/dev/null)" || mrc=$?
+  if ((mrc == 0)) && jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$mg"; then
+    up=true
+    bound="$(jq -c '[.cells[]? | select(.bound) | .name]' <<<"$mg")"
+  fi
+  jq -c --argjson up "$up" --argjson bound "$bound" '{gateway: {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt,
+    recordOld, recordOldAt, queued, streams, mostClaimed, lastBindRefusal, storeError}, mgmt_up: $up, bound: $bound}' <<<"$gw"
+}
+
+# gateway_problems reads the output of gateway_plane on standard input and prints one problem for each bad value, as a
+# JSON array of strings. The sync and the store error follow check_gateway_synced of cell:verify, with the same 2 minutes.
+gateway_problems() {
+  local now clock_problem
+  read_clock
+  jq -c --argjson now "$now" --arg clockp "$clock_problem" --argjson syncmax "$GATEWAY_SYNC_MAX_AGE" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    def recent($t; $secs): ($t | ts) > 1000000000 and ($now - ($t | ts)) < $secs;
+    .gateway as $g | .bound as $bound | .mgmt_up as $up
+    | if $g.error != null then ["gateway status failed: " + $g.error]
+      else [
+        (if ($g.storeError // "") != "" then "the cell gateway reports a store error: \($g.storeError). Run: mise run gw:reset" else empty end),
+        (if ($g.syncedAt | ts) < 1000000000 or ($now - ($g.syncedAt | ts)) > $syncmax
+         then "envd synced with the gateway at \($g.syncedAt // "never"), which is more than 2 minutes ago. Read the log of envd with: mise x -- kubectl --context kind-dev-cp -n envd-system logs deploy/envd -c envd. Then run: CELL=dev-cp mise run cell:up" else empty end),
+        (if $up and ($g.outboxItems // 0) > 0 and (($g.oldestOutboxAt | ts) > 1000000000) and ($now - ($g.oldestOutboxAt | ts)) > 120
+         then "the oldest outbox item of the gateway is from \($g.oldestOutboxAt), more than 2 minutes ago, and mgmtd answers. Run: mise run gw -- outbox" else empty end),
+        (if recent($g.droppedAt; 900) then "the gateway dropped an outbox item at \($g.droppedAt), within the last 15 minutes. Run: mise run gw -- outbox" else empty end),
+        (if recent($g.recordOldAt; 900) then "the gateway refused an older record at \($g.recordOldAt), within the last 15 minutes. Run: CELL=dev-cp mise run cell:up" else empty end),
+        ($bound[] as $c | select(($g.streams[$c] // 0) < 1) | "the gateway holds no stream of \($c). Run: CELL=\($c) mise run cell:up"),
+        (($g.mostClaimed // {}) | to_entries[] | select(.value.count > 3)
+          | "the cell \(.key) claimed operation \(.value.opId) \(.value.count) times. Run: mise run ops -- trace \(.value.opId)")
+      ] end | . + (if $clockp != "" then [$clockp] else [] end)'
 }
 
 # management_extras prints the fields of the management object, as one JSON object.
 management_extras() {
-  local logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
+  local now clock_problem logs agents samples kiali_json mesh_out mesh_rc=0 down="" absent="" entry cell ready conf expected plane
 
-  # The principal lists an agent as connected until its last stream line closes the stream.
+  # The principal lists an agent as connected until its last stream line closes the stream. The kubelet rotates the log after
+  # about 10 hours, and the connect line goes with it. An agent with no stream line in the log counts as connected when the
+  # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
   expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
-  agents="$(jq -Rsc --argjson expected "$expected" '[split("\n")[] | fromjson? | select(type == "object" and .client != null
-      and (.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream"))]
-    | group_by(.client) | map({client: .[0].client, up: (.[-1].msg != "Closing EventStream")}) as $last
-    | ([$last[] | select(.up) | .client] | sort) as $up
-    | {expected: $expected, connected: ($expected - ($expected - $up)), missing: ($expected - $up)}' <<<"$logs")"
+  read_clock
+  agents="$(jq -Rsc --argjson now "$now" --argjson expected "$expected" '
+      def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+      [split("\n")[] | fromjson? | select(type == "object" and .client != null)] as $lines
+      | [$lines[] | select(.msg == "An agent connected to the subscription stream" or .msg == "Closing EventStream")]
+      | group_by(.client) | map({client: .[0].client, up: (.[-1].msg != "Closing EventStream")}) as $last
+      | ([$last[].client]) as $seen
+      | ([$lines[] | select((.msg // "" | startswith("Event received")) and ((.time // "") | ts) > ($now - 300)) | .client] | unique) as $active
+      | ([$last[] | select(.up) | .client] + ($active - $seen) | unique | sort) as $up
+      | {expected: $expected, connected: ($expected - ($expected - $up)), missing: ($expected - $up)}' <<<"$logs")"
 
   # The age of the newest sample of each cluster in the Prometheus of lgtm.
   samples="$(kubectl --context kind-management -n observability-system exec lgtm-0 -c lgtm -- curl -s --max-time 20 \
@@ -208,13 +295,18 @@ management_extras() {
 
 # collect <cluster> writes the JSON object of one cluster to $tmp/<cluster>.json.
 collect() {
-  local cluster="$1" apps verify telemetry extras='{}' mp='[]'
+  local cluster="$1" apps verify telemetry extras='{}' mp='[]' plane
   apps="$(applications "$cluster")"
   verify="$(run_verify "$cluster")"
   telemetry="$(run_telemetry "$cluster")"
   if [[ "$cluster" == management ]]; then
     extras="$(management_extras)"
     mp="$(jq -c .management <<<"$extras" | management_problems "$(yq -r '.clusters[] | select(.components | contains(["cell-identity"])) | .name' "$ROOT/harness/topology.yaml" | paste -sd' ' -)")"
+  fi
+  if [[ "$cluster" == dev-cp ]]; then
+    plane="$(gateway_plane)"
+    extras="$(jq -c '{gateway}' <<<"$plane")"
+    mp="$(gateway_problems <<<"$plane")"
   fi
   jq -nc --argjson mp "$mp" --arg cluster "$cluster" --arg env "$POC_ENV" --argjson apps "$apps" --argjson verify "$verify" --argjson telemetry "$telemetry" --argjson extras "$extras" '
     ($apps.bad | map("Application " + .)) as $a

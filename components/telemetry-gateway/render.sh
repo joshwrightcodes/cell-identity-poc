@@ -2,7 +2,7 @@
 # Render the telemetry gateway of management, a link component in observability-system.
 #
 # The bundle holds ServiceAccount, Deployment and NetworkPolicy telemetry-gateway, Service
-# telemetry-listener on node port 31444, ConfigMaps peer-root and cell-registry, and the objects of
+# telemetry-listener on node port 31444, ConfigMaps peer-root and registry-signer, Role cell-registry-publish and its binding, and the objects of
 # the k8s_psat SPIRE agent sidecar (components/lib/spire-sidecar.sh). It holds no Namespace,
 # because the namespaces bundle owns observability-system, so every object carries the harness
 # label that cell:verify uses to tell them from the objects of the bundles.
@@ -14,11 +14,12 @@
 #     as ConfigMap peer-root (components/lib/peer-root.sh).
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
-#   - a signed record for each cell of VIEW_CELLS, as ConfigMap cell-registry
-#     (components/lib/registry.sh). Each cell must have a bound celld.
+#   - the public key of mgmtd, as ConfigMap registry-signer (components/lib/registry.sh). cell-proxy
+#     refuses a registry that another key signed. mgmtd publishes ConfigMap cell-registry, and the
+#     bundle holds the Role that lets mgmtd write it.
 #   - the cell-proxy image that `mise run images` built, by digest.
-# The pod template carries the SHA-256 of the peer root and of the registry content, so a new root
-# or a new set of cells restarts the pod.
+# The pod template carries the SHA-256 of the peer root and of the registry signer, so a new root
+# or a new signing key restarts the pod.
 # Inputs: VIEW_CELLS, VIEW_CONTROL_PLANE and SPIRE_TRUST_DOMAIN from cells/management.env, POC_ENV
 # from cells/common.env, and the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
@@ -59,16 +60,16 @@ env_peers="$(printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$env_ip" | jq -cs .)"
 cell_proxy_image="$(ko_image cell-proxy)" || die "no cell-proxy image"
 peer_root="$(peer_root_configmap peer-root "$namespace" "$env_cluster" "$env_td")" || exit 1
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
-registry="$(registry_configmap "$namespace" "$POC_ENV" "${cells[@]}")" || exit 1
+registry_signer="$(registry_signer_configmap "$namespace")" || exit 1
 peer_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$peer_root")"
-registry_sum="$(yq -r '.metadata.annotations["poc.internal/registry-content-sha256"]' <<<"$registry")"
-[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$registry_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry has no checksum"
+signer_sum="$(yq -r '.metadata.annotations["poc.internal/registry-signer-sha256"]' <<<"$registry_signer")"
+[[ "$peer_sum" =~ ^[0-9a-f]{64}$ && "$signer_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root or the registry signer has no checksum"
 
 # A sender is a cell or dev-cp, and its role is otel. The pattern holds the whole ID.
 allow_id="^spiffe://${env_td//./\\.}/(cell/[a-z0-9-]+|cp)/otel\$"
 
 gateway="$(sed -e "s|@CELL_PROXY_IMAGE@|$cell_proxy_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" \
-    -e "s|@REGISTRY_SHA256@|$registry_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|" "$here/gateway.yaml" \
+    -e "s|@REGISTRY_SIGNER_SHA256@|$signer_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|" "$here/gateway.yaml" \
   | ALLOW="$allow_id" PEERS="$env_peers" yq '(.. | select(. == "--allow-id=@ALLOW_ID@")) = "--allow-id=" + strenv(ALLOW)
       | (.. | select(. == "@ENV_NODE_PEERS@")) |= (env(PEERS) | ... style="")')"
 deployment="$(yq 'select(.kind == "Deployment")' <<<"$gateway" \
@@ -85,7 +86,9 @@ deployment="$(yq 'select(.kind == "Deployment")' <<<"$gateway" \
   echo "---"
   echo "$peer_root"
   echo "---"
-  echo "$registry"
+  echo "$registry_signer"
+  echo "---"
+  registry_publisher_rbac "$namespace"
 } | COMP="$component" yq 'select(.kind != null)
     | .metadata.labels["cell.poc.internal/harness"] = strenv(COMP)
     | with(select(.spec.template.metadata != null); .spec.template.metadata.labels["cell.poc.internal/harness"] = strenv(COMP))'

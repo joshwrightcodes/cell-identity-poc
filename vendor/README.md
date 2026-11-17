@@ -1361,3 +1361,121 @@ signature, and it did not inspect the layers or the binary. The image runs with 
 The NetworkPolicy lets it reach only the hub, `prom-readonly` and the API server of `management`.
 The root file system is read-only, and no capability remains. The Role of the pod covers its own
 namespace only. The review read no source line of Kiali beyond the files above.
+
+## modernc.org/sqlite v1.61.0 and its requirements (2026-11-14)
+
+The gateway queue uses `modernc.org/sqlite`, a pure Go driver. Because of this, ko can build it with CGO
+off for a distroless image. The review read the module in the Go module cache, not in a scratch clone.
+`go mod verify` checked the cache against `go.sum`, and nothing ran during the review. The review did not
+compare the cache with a scratch clone of the tag: not verified. The tests ran only after the review.
+
+### Dates
+
+`go list -m -json <module>@<version>` gave each `Time` below on 2026-11-14. The cut-off is 2026-10-26.
+The first attempt, `modernc.org/sqlite` v1.61.0, passed, so no older release was tried.
+
+| Module | Version | Time | Source of the date | Use |
+| --- | --- | --- | --- | --- |
+| `modernc.org/sqlite` | v1.61.0 | 2026-10-21 | Go module proxy, commit `4df1ebea0f1c` | driver |
+| `modernc.org/libc` | v1.79.0 | 2026-10-15 | Go module proxy, commit `02bd23164335` | in every build |
+| `modernc.org/memory` | v1.12.1 | 2026-08-19 | Go module proxy, commit `bb3d99379ed7` | in every build |
+| `modernc.org/mathutil` | v1.7.1 | 2024-12-26 | Go module proxy, commit `28129eec384c` | in every build |
+| `github.com/remyoudompheng/bigfft` | v0.0.0-20230129092748-24d4a6f8daec | 2023-01-29 | Go module proxy | in every build |
+| `github.com/dustin/go-humanize` | v1.1.0 | 2026-09-17 | Go module proxy, commit `40736da3e8ed` | in every build |
+| `golang.org/x/sys` | v0.49.0 (was v0.48.0, 2026-08-31) | 2026-10-06 | Go module proxy, commit `b6b8557e8e29` | in every build |
+| `github.com/mattn/go-isatty` | v0.0.24 (was v0.0.20, 2023-10-17) | 2026-07-23 | Go module proxy, commit `c44dc0b9c702` | `libc` on macOS, `go-hclog` |
+| `github.com/ncruces/go-strftime` | v1.1.0 | 2026-09-29 | Go module proxy, commit `fa91ab7a1dcb` | `libc` on macOS only |
+| `modernc.org/cc/v4` | v4.30.3 | 2026-10-13 | Go module proxy | `go.sum` only |
+| `modernc.org/ccgo/v4` | v4.37.0 | 2026-10-14 | Go module proxy | `go.sum` only |
+| `modernc.org/fileutil` | v1.4.0 | 2026-02-18 | Go module proxy | `go.sum` only |
+| `modernc.org/gc/v2` | v2.6.5 | 2025-03-12 | Go module proxy | `go.sum` only |
+| `modernc.org/gc/v3` | v3.2.0 | 2026-08-20 | Go module proxy | `go.sum` only |
+| `modernc.org/goabi0` | v0.2.0 | 2025-07-02 | Go module proxy | `go.sum` only |
+| `modernc.org/opt` | v0.2.0 | 2026-03-24 | Go module proxy | `go.sum` only |
+| `modernc.org/sortutil` | v1.2.1 | 2024-12-28 | Go module proxy | `go.sum` only |
+| `modernc.org/strutil` | v1.2.1 | 2024-12-27 | Go module proxy | `go.sum` only |
+| `modernc.org/token` | v1.1.0 | 2022-11-13 | Go module proxy | `go.sum` only |
+| `golang.org/x/mod` | v0.42.0 | 2026-10-09 | Go module proxy | `go.sum` only |
+| `golang.org/x/sync` | v0.24.0 | 2026-09-23 | Go module proxy | `go.sum` only |
+| `golang.org/x/tools` | v0.52.0 | 2026-10-10 | Go module proxy | `go.sum` only |
+| `github.com/google/pprof` | v0.0.0-20261016150608-1facf8f91b50 | 2026-10-16 | Go module proxy | `go.sum` only |
+| `github.com/hashicorp/golang-lru/v2` | v2.0.7 | 2023-09-21 | Go module proxy | `go.sum` only |
+
+The plan named `modernc.org/libc` and `golang.org/x/sys`. The requirement tree also bumps
+`github.com/mattn/go-isatty` from v0.0.20 to v0.0.24, because `modernc.org/libc` v1.79.0 requires v0.0.24.
+`go mod tidy` adds the `go.sum` only modules because it reads the tests of `modernc.org/sqlite`. No binary
+of the PoC links them. `go list -deps` ran for linux/arm64, linux/amd64 and darwin/arm64. The build graph
+holds only the modules marked "in every build" and the two for macOS.
+The newest `modernc.org/sqlite` releases at the time of the check were v1.61.1 (2026-10-31) and
+v1.62.0 (2026-11-07). Both are after the cut-off, so the PoC does not use them.
+
+The first build of `modernc.org/sqlite` with an empty Go build cache took 3.6 s wall time on an 18-core
+Mac (darwin/arm64). It used 8.4 s of user CPU. The CI time on a 2-CPU runner is not recorded, because the review
+has no CI run. The first CI run of Task 1 must record it here.
+
+### What the review checked
+
+- Hidden Unicode: no bidirectional control, zero-width or soft hyphen character appears in the modules
+  above. The one exception is two zero-width spaces in one comment of `golang.org/x/tools` v0.52.0 (`go/cfg/cfg.go`, line 245).
+  That module is `go.sum` only.
+- `modernc.org/sqlite` v1.61.0, hand-written files of the root package, `vfs`, `vtab` and `pcache`:
+  the only `net` import is `net/url` to read the DSN. There is no `os/exec`, `net/http`, `plugin` or
+  environment read. `dmesg.go` writes a log file in the temporary directory, but only with the build tag
+  `sqlite.dmesg`, which the PoC does not set. `addport.go` is a porting script with the tag `ignore`.
+  The package has one `init`: it registers the `sqlite` driver and calls a patch function of the
+  transpiled library. No `sudo`, `curl` or `wget` appears in code (only in test data and `VERIFYING.md`).
+- The module has a `CLAUDE.md` file with instructions for coding agents. The review read it as data and
+  followed none of it. It describes the repository and its build commands.
+- Transpiled library for linux/arm64, the ko target on the Apple Silicon VM. The 127 files of
+  `modernc.org/sqlite/lib` import `unsafe`, `sync`, `sync/atomic`, `reflect`, `runtime/debug`, `syscall` and
+  `modernc.org/libc`. The `syscall` import only reads the page size, and `runtime/debug` only sets the
+  panic-on-fault mode. They contain no `os/exec` or `net` import.
+  The generated code calls 89 `libc` functions. None of them is `system`, a socket call, `fork`, `exec`,
+  `getaddrinfo` or `popen`. Two are worth a note. `dlopen` and `dlsym` are in the
+  list, and the `libc` implementation of both returns 0, so SQLite cannot load an extension. `getenv` is in
+  the list, because SQLite reads the temporary directory settings.
+- `modernc.org/libc` v1.79.0 for linux/arm64: the hand-written files import `os/exec` once, in
+  `libc_musl.go`, for `Xsystem`, the C function `system`. Nothing in `modernc.org/sqlite` calls it. The
+  package has two `init` functions that matter. One reads `os.Executable` and the page size. The other, in
+  generated code, fills the three standard stream tables. `Xenviron` copies `os.Environ`, and `Xsetenv`
+  calls `os.Setenv`. The generated `ccgo_linux_arm64.go` contains socket functions of musl, which
+  nothing in `sqlite/lib` calls. The package has no `net` or `net/http` import and no `sudo`, `curl` or `wget`.
+- `modernc.org/memory`, `modernc.org/mathutil`, `bigfft`, `go-humanize`, `go-strftime` and `go-isatty`: no
+  `os/exec`, `net`, `net/http` or environment read in non-test code. `memory` and `go-isatty` use
+  `golang.org/x/sys` for `mmap` and `ioctl`. `mathutil` has `init` functions that build tables.
+- `golang.org/x/sys` v0.48.0 to v0.49.0: the review compared the two trees.
+  The non-generated changes are an alignment wrapper for `Getdents` on Linux and new `cpu` feature flags
+  for x86. They also hold a `//go:build` widening for `ppc64`, a pointer form of `fcntl` on Darwin, and
+  zOS and sparc64 files.
+  The changed `Dockerfile` of the generator clones the Linux kernel and glibc from `kernel.googlesource.com`
+  and `sourceware.org`. This is generator input and does not run in a build.
+  The added lines hold no `os/exec`, `net`, environment read or `init` function.
+- `github.com/mattn/go-isatty` v0.0.20 to v0.0.24: the diff changes the build tags of the fallback file.
+  It swaps the Linux check from `TCGETS` to `TIOCGWINSZ`. It also updates Windows files and workflows.
+- `go mod verify` printed "all modules verified" after the change.
+
+### What the review did not check
+
+- The review did not read the transpiled C of `lib/` or `vec/`, which has many hundred thousand lines. It
+  checked imports, the called `libc` functions and strings, not the logic.
+- The review did not rebuild the transpiled code from the SQLite sources, and it did not compare it with
+  the upstream `libsqlite3` repository.
+- The review did not read the modules marked `go.sum` only, apart from the Unicode scan.
+- The review did not read `modernc.org/libc` code that `sqlite/lib` never calls, and did not read the
+  `libc` files of other platforms.
+- The review did not run `govulncheck`. It did not read advisories for the modules above.
+
+### Provenance and later releases
+
+- `modernc.org/sqlite` v1.61.0 has no provenance document. The changelog of v1.61.1 says that the
+  attestation job of v1.61.0 failed its own verification, so no `provenance.json` exists for it. The
+  review did not look for one in the package registry of the project. The `go.sum` hashes and the module
+  proxy are the only integrity evidence for this version.
+- v1.61.1 (2026-10-31) fixes four things. Two concern a read-only file system made by `vfs.New`. The
+  third makes `Tx.Commit` stop waiting when its context ends, for a reader lock in rollback-journal mode.
+  The fourth stops a repeated prepare of cached statements, which costs time and not correctness. The queue
+  uses one connection on the OS file system in WAL mode, so the first three do not apply. The fourth can
+  cost some time for each prepared statement. The cut-off date excludes v1.61.1 either way.
+- The driver reads the DSN of the queue as intended. `TestQueueDSNPragmas` in `internal/gwapi` opens a
+  file with `_pragma=journal_mode(WAL)`, `_pragma=synchronous(FULL)`, `_pragma=busy_timeout(5000)` and
+  `_txlock=immediate`, and reads back `wal`, `2` and `5000`.

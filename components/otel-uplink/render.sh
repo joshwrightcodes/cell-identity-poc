@@ -95,6 +95,24 @@ peer_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$
 manifests="$(sed -e "s|@CELL_PROXY_IMAGE@|$cell_proxy_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" \
   -e "s|@PEER_ROOT_CONFIGMAP@|$peer_configmap|" -e "s|@UPSTREAM@|$upstream|" "$here/manifests.yaml")"
 
+# In a cell, cell-proxy sends the proof of its pod before the first payload byte: --proof, the four variables of
+# the pod identity, and a projected API token that only this container mounts. The uplink of dev-cp has an SVID of
+# the cp path, which sends no proof.
+if [[ "$COLLECTOR_PLANE" == cell ]]; then
+  manifests="$(yq '
+    (select(.kind == "Deployment") | .spec.template.spec.containers[] | select(.name == "cell-proxy")) |= (
+      .args += ["--proof"]
+      | .env += [
+        {"name": "POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}},
+        {"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}},
+        {"name": "SERVICE_ACCOUNT", "valueFrom": {"fieldRef": {"fieldPath": "spec.serviceAccountName"}}}]
+      | .volumeMounts += [{"name": "proof-api-token", "mountPath": "/var/run/secrets/kubernetes.io/serviceaccount", "readOnly": true}])
+    | (select(.kind == "Deployment") | .spec.template.spec.volumes) += [{"name": "proof-api-token", "projected": {"sources": [
+        {"serviceAccountToken": {"path": "token", "expirationSeconds": 3600}},
+        {"configMap": {"name": "kube-root-ca.crt", "items": [{"key": "ca.crt", "path": "ca.crt"}]}},
+        {"downwardAPI": {"items": [{"path": "namespace", "fieldRef": {"fieldPath": "metadata.namespace"}}]}}]}}]' <<<"$manifests")"
+fi
+
 if [[ "$sidecar_mode" == cluster_jwt ]]; then
   deployment="$(yq 'select(.kind == "Deployment")' <<<"$manifests" \
     | SPIRE_SIDECAR_SERVER_ADDRESS="$upstream_ip" SPIRE_SIDECAR_SERVER_PORT="$spire_node_port" SPIRE_SIDECAR_TRUST_DOMAIN="$env_td" \

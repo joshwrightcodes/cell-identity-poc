@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"log/slog"
 	"math/big"
 	"net"
@@ -29,6 +30,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/kubetoken"
 )
 
 const (
@@ -176,21 +178,23 @@ func serveTLS(t *testing.T, svid *x509svid.SVID) string {
 	return ln.Addr().String()
 }
 
-// testJWKS is a key set with one P-256 public key, as a cell record needs.
-var testJWKS = func() json.RawMessage {
-	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		panic(err)
-	}
-	raw, err := json.Marshal(jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &k.PublicKey, KeyID: "ec-1"}}})
-	if err != nil {
-		panic(err)
-	}
-	return raw
-}()
+// initT lets a package-level variable make a kubetoken signer before any test runs.
+type initT struct{ testing.TB }
+
+func (initT) Helper()                   {}
+func (initT) Fatal(a ...any)            { panic(fmt.Sprint(a...)) }
+func (initT) Fatalf(f string, a ...any) { panic(fmt.Sprintf(f, a...)) }
+
+// testSigner signs the proof tokens of every cell record that cell makes. Its key set is testJWKS.
+var testSigner = kubetoken.NewSigner(initT{}, "ec-1", jose.ES256)
+
+var testJWKS = testSigner.JWKS()
+
+// testSubject is the service account that sends the proof in the tests.
+var testSubject = record.Subject{Namespace: "cell-identity-system", ServiceAccount: "celld"}
 
 func cell(name string, revoked bool) record.Cell {
-	return record.Cell{Name: name, Env: "dev", Issuer: "https://" + name + ":6443", JWKS: testJWKS, Revoked: revoked, Epoch: 1, Counter: 1}
+	return record.Cell{Name: name, Env: "dev", Issuer: "https://" + name + ":6443", JWKS: testJWKS, Subjects: []record.Subject{testSubject}, Revoked: revoked, Epoch: 1, Counter: 1}
 }
 
 func signerKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {

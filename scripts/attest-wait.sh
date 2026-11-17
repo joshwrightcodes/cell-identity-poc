@@ -6,7 +6,9 @@
 # `mise run mgmt -- status` does not answer, the management plane is not up. The script then prints the
 # link command as a warning and exits 0 without a wait, because no bind can happen.
 # Otherwise it runs four stages, each with its own limit:
-#   bound     mgmt -- status shows the cell bound, within 120 s.
+#   bound     mgmt -- status shows the cell bound, within 120 s. A failure prints the last bind refusal of the gateway
+#             for the cell (gw -- status) and the last refusal of mgmtd for the cell. After source_mismatch or
+#             cell_unknown it prints CELL=<server cluster> mise run cell:up as the first next command.
 #   applied   ConfigMap cell-records in the SPIRE server cluster holds the spec revision of the record
 #             of the cell, within 60 s. A failure prints the link command of mgmt-api first when mgmtd has no
 #             peer-root for the SPIRE server cluster, or envd logs a TLS refusal.
@@ -78,11 +80,22 @@ if ! status_json="$(mgmt_status)"; then
 fi
 
 stage_start=$SECONDS
+# The gateway writes the time of a refusal from the clock of the VM, so the start of the stage comes from a node, as in gate.sh. With no
+# time, no refusal counts as new, and the hint to run cell:up is left out.
+stage_iso="$(node_now_iso 2>/dev/null || true)"
 if ! poll_until "${ATTEST_BOUND_WAIT:-120}" cell_bound; then
   celld_line="$(ctx "$cell" -n cell-identity-system logs deploy/celld -c celld --tail=200 2>&1 | grep -i bind | tail -n 1 || true)"
-  denial="$(ctx management -n mgmt-system logs mgmtd-0 -c mgmtd --tail=300 2>&1 | grep bind_denied | grep -F "\"$cell\"" | tail -n 1 || true)"
-  fail bound "mgmtd does not show $cell as bound after $((SECONDS - stage_start))s. Last celld bind log line: ${celld_line:-none}. Last mgmtd denial for $cell: ${denial:-none}" \
-    "mise x -- kubectl --context kind-$cell -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"
+  # Two sources name the cause. The gateway keeps the last bind refusal for the cell, and mgmtd keeps the last refused
+  # report item of the cell. A bind from a cell with another source address or an unknown cell needs a new gateway start.
+  gw_refusal="$(cd "$ROOT" && mise run gw -- status 2>/dev/null | jq -c --arg c "$cell" '.lastBindRefusal[$c] // "none"' 2>/dev/null)" || gw_refusal=""
+  mgmt_refusal="$(jq -c --arg c "$cell" '[.cells[]? | select(.name == $c)][0].lastRefusal // "none"' <<<"$(mgmt_status || echo '{}')" 2>/dev/null)" || mgmt_refusal=""
+  next="mise x -- kubectl --context kind-$cell -n cell-identity-system logs deploy/celld -c celld, and mise run mgmt -- status"
+  # Only a refusal from this stage counts, so an old one does not send the reader to cell:up.
+  if jq -e --arg since "$stage_iso" '(.reason == "source_mismatch" or .reason == "cell_unknown")
+      and ((.at // "1970-01-01T00:00:00Z") | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) >= ($since | fromdateiso8601)' <<<"${gw_refusal:-null}" >/dev/null 2>&1; then
+    next="CELL=$server_cluster mise run cell:up, then $next"
+  fi
+  fail bound "mgmtd does not show $cell as bound after $((SECONDS - stage_start))s. Last celld bind log line: ${celld_line:-none}. Last gateway bind refusal for $cell: ${gw_refusal:-unknown}. Last mgmtd refusal for $cell: ${mgmt_refusal:-unknown}" "$next"
 fi
 log "attest-wait $cell: stage bound took $((SECONDS - stage_start))s"
 

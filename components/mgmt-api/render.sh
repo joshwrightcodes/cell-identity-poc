@@ -2,10 +2,11 @@
 # Render the management plane stand-in of management, a link component in namespace mgmt-system.
 #
 # The bundle holds Namespace mgmt-system, ServiceAccount, Role and RoleBinding, StatefulSet mgmtd with
-# the k8s_psat SPIRE agent sidecar, Services mgmt-api (node port 31446) and mgmt-bind (31447), the
+# the k8s_psat SPIRE agent sidecar, Service mgmt-api (node port 31446), the
 # ConfigMaps mgmt-intent, hostsvc-pin and peer-root, the objects of the sidecar, and the
-# NetworkPolicies default-deny, allow-dns and mgmtd (flows N26 to N29, N8, N11 and N23). Every
-# object carries the harness label of the component. mgmtd makes ConfigMap mgmt-signing-pub itself.
+# NetworkPolicies default-deny, allow-dns and mgmtd (flows N26, N28, N29, N8, N11 and N23). Every
+# object carries the harness label of the component. mgmtd makes ConfigMap mgmt-signing-pub itself, and
+# ConfigMap cell-registry in the namespaces of the view servers (--registry-namespaces in manifests.yaml).
 #
 # The render reads these facts from outside the cluster, so it runs in the link phase:
 #   - the host service (components/lib/hostsvc-pin.sh): it starts when it does not serve, and the
@@ -17,8 +18,8 @@
 #   - the root of the environment trust domain, from the live SPIRE server of VIEW_CONTROL_PLANE, as
 #     ConfigMap peer-root. The render leaves it out only when VIEW_CONTROL_PLANE does not exist or its
 #     SPIRE server StatefulSet does not exist. When the StatefulSet exists, a failed read stops the
-#     render. The node address of VIEW_CONTROL_PLANE goes into the ingress rules of flows N26 and
-#     N27, and the render leaves those two rules out while the cluster does not exist.
+#     render. The node address of VIEW_CONTROL_PLANE goes into the ingress rule of flow N26, and the
+#     render leaves that rule out while the cluster does not exist.
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the mgmtd image that `mise run images` built, by digest.
@@ -114,12 +115,12 @@ statefulset="$(yq 'select(.kind == "StatefulSet")' <<<"$manifests" \
     spire_sidecar mgmtd k8s_psat)" || die "the SPIRE sidecar of mgmtd failed"
 
 # The mgmtd policy: flow N8 (SPIRE sidecar to the SPIRE server), N28 (key requests to the host
-# service), N29 (ConfigMap mgmt-signing-pub through the API server) and N11 (OTLP to the collector)
-# leave the pod. Flows N26 and N27 admit only the node of VIEW_CONTROL_PLANE, which the local traffic policy keeps as the source
-# address. While that cluster does not exist, the pod admits no peer on the API and bind ports.
+# service), N29 (ConfigMaps mgmt-signing-pub and cell-registry through the API server) and N11 (OTLP to the collector)
+# leave the pod. Flow N26 admits only the node of VIEW_CONTROL_PLANE, which the local traffic policy keeps as the source
+# address. While that cluster does not exist, the pod admits no peer on the API port.
 ingress="$(peers $node_ips | jq -c '[{from: ., ports: [{protocol: "TCP", port: 8080}]}]')"
 if [[ -n "$env_ip" ]]; then
-  ingress="$(jq -c --argjson from "$(peers "$env_ip")" '[{from: $from, ports: [{protocol: "TCP", port: 8446}, {protocol: "TCP", port: 8447}]}] + .' <<<"$ingress")"
+  ingress="$(jq -c --argjson from "$(peers "$env_ip")" '[{from: $from, ports: [{protocol: "TCP", port: 8446}]}] + .' <<<"$ingress")"
 fi
 api_peers="$(peers $api_ips)"
 policy="$(jq -n --arg ns "$namespace" --argjson ingress "$ingress" --argjson host "$(peers "$host_ip")" --argjson hostport "$HOSTSVC_PORT" \

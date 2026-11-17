@@ -238,8 +238,10 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 		t.Fatal(err)
 	}
 	log := jsonLog(h.serverLog)
+	reg := testRegistry(t)
 	srv := NewServer(ServerConfig{
-		TLS: ServerTLS(source(mgmt.svid(t, principalID)), env.bundle(), regexp.MustCompile(viewPattern), testRegistry(t), log),
+		TLS:   ServerTLS(source(mgmt.svid(t, principalID)), env.bundle(), regexp.MustCompile(viewPattern), reg, log),
+		Proof: testProofCheck(reg),
 	}, NewHeaderBackend(ln.Addr().String(), "x-cell-agent", log), log)
 	srvDone := make(chan struct{})
 	go func() { _ = srv.Serve(ctx, srvLn); close(srvDone) }()
@@ -249,7 +251,7 @@ func newHarness(t *testing.T, cfg harnessConfig) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli := &Client{TLS: ClientTLS(source(env.svid(t, cfg.agentID)), mgmt.bundle(), spiffeIDOf(principalID)), Upstream: h.server, Log: jsonLog(h.clientLog)}
+	cli := &Client{TLS: ClientTLS(source(env.svid(t, cfg.agentID)), mgmt.bundle(), spiffeIDOf(principalID)), Upstream: h.server, Log: jsonLog(h.clientLog), Proof: proofFor(t, cfg.agentID)}
 	cliDone := make(chan struct{})
 	go func() { _ = cli.Serve(ctx, cliLn); close(cliDone) }()
 	h.client = cliLn.Addr().String()
