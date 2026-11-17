@@ -231,7 +231,7 @@ macOS still sleeps when the lid closes on battery power.
 - A compromised `dev-cp` can mint the cell controller SVID. It can send the host service a step that the newest spec still indexes, until the step expires or closes.
 - A cancelled, retried or withdrawn step does not run again. A replayed step for a cell that the newest spec still indexes can create its cluster. That cluster gets network reach to the `dev-cp` listeners after the admit stage.
 - The host service learns the spec only from `mgmtd`. While `mgmtd` cannot reach it, open steps wait with `spec_behind`.
-- The real cell controller and a holder of a minted SVID share one peer ID. The holder can use the whole step queue (8), the rate (20 at once, then one each 3 seconds) and the in-flight slots (4). This can stall provisioning.
+- The real cell controller and a holder of a minted SVID share one peer ID. The holder can queue only steps that the newest spec indexes, at most one for each requested cell. The holder can use the whole rate (20 at once, then one each 3 seconds) and the in-flight slots (4). This can stall provisioning.
 - Key reads and spec pushes keep their own slots. The residual of the M4 connection slots still applies to the shared listener, so a flood from `rogue` or a cell pod also stalls step PUTs.
 - Every namespace of `dev-cp` has a default deny policy. Only a pod in a namespace with no egress policy, or a pod on the host network, can open a connection to the host service port.
 - Mutual TLS and the route check still refuse every peer except the cell controller. No test starts a handshake from a pod of `rogue`, because the probe image has no mode that presents its own certificate.

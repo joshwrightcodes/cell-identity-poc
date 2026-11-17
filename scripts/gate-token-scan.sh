@@ -40,7 +40,7 @@ for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' 
   done <<<"$targets"
 done
 
-# The step logs of the host service are on this Mac. A stage writes the output of cell:up, which holds no token.
+# The step logs of the host service are on this Mac.
 steps="$(steps_dir)"
 for file in "$steps"/*.log; do
   [[ -e "$file" ]] || continue
