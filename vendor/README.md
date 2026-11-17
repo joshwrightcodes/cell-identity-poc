@@ -44,7 +44,7 @@ Run these checks on each new version, and record the result here.
   this to manage the whole cluster. Its rules did not change from v3.5.6 to v3.6.1.
 - v3.6.1 adds one object compared with v3.5.6: a headless Service for the application controller.
 - Images: `quay.io/argoproj/argocd:v3.6.1`, `public.ecr.aws/docker/library/redis:8.10.1-alpine`,
-  and Istio images from `registry.istio.io/release`. The review did not inspect image contents.
+  and Istio images from `docker.io/istio`. The review did not inspect image contents.
 
 ## Go module, tools and CI actions (2026-11-08)
 
