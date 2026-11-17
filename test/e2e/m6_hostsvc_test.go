@@ -113,9 +113,9 @@ func TestM6HostServiceStepRoute(t *testing.T) {
 		if err := handshakeRefused(nil); err != nil {
 			t.Errorf("no certificate: %v", err)
 		}
-		// A certificate for the ID of the cell controller under a CA that the host service never saw. The check runs on the Mac, as the
-		// M4 refusals do; a pod in rogue that presents such a certificate fails the same handshake, because the server trusts the
-		// dev root by file and no other root.
+		// A forged certificate for cp/cell-controller, presented from the Mac under a CA that the host service never saw, fails the
+		// handshake. This shows the trust check of the server. It does not show the reach from a pod in rogue, because no tool of the
+		// harness presents a certificate from a pod: that case is a residual for the records of Task 11.
 		forged := foreignCert(t, "dev.env.poc.internal", cellControllerID)
 		if err := handshakeRefused(&forged); err != nil {
 			t.Errorf("a certificate for cp/cell-controller under another CA: %v", err)
@@ -368,11 +368,17 @@ func TestM6PortalRefusals(t *testing.T) {
 }
 
 // TestM6StepRouteFlood: a peer that floods the step route does not starve the key route, and it does not starve the key check of
-// mgmtd. The bucket gives 20 tokens and one more each 3 s, so the test waits 61 s first. Ten PUTs hold a slot with a slow body for
-// 5 s. At most 4 requests in flight pass for one peer, so at least 6 of the slow PUTs get 503 at once. The listener negotiates no
-// HTTP/2, so 40 more PUTs on one connection run one after the other: at most 23 get 403 (20 tokens, less the 4 slow ones, plus one
-// each 3 s), and the rest get 503. During the flood a key read of mgmtd answers 200 within 2 s, and mgmt -- keycheck answers neither
-// issuer_unavailable nor issuer_untrusted.
+// mgmtd. It runs in two phases, because the router applies the cap of 4 requests in flight for one peer before the token bucket:
+//
+//  1. After a wait of 61 s (the bucket is full at 20 tokens), 10 PUTs hold a slot with a slow body for 5 s. At most 4 pass the cap, so at
+//     least 6 get 503 at once. While they hold their slots, a key read of mgmtd answers 200 within 2 s, and mgmt -- keycheck answers
+//     neither issuer_unavailable nor issuer_untrusted.
+//  2. After the slow PUTs end (their slots are free), 40 PUTs run on one connection, one after the other (the listener negotiates no HTTP/2).
+//     Each passes the cap, so the bucket decides. The 4 slow PUTs that passed the cap took 4 tokens, so 16 are left, and one token returns
+//     each 3 s. The run takes a few seconds, so the bound is: at least 14 answers of 403 (the tokens, less a margin for a slow run) and at
+//     most 23 (20 tokens plus the refill of a run of up to 9 s). The other answers are 503 with Retry-After 60, and the log of the host
+//     service holds the reason rate_limited for at least one of them. With no bucket, all 40 would get 403; with a cap that is checked
+//     after the bucket, the first phase would give fewer than 6 answers of 503.
 func TestM6StepRouteFlood(t *testing.T) {
 	controller := cellControllerCert(t)
 	api := mgmtAPICert(t)
@@ -406,21 +412,12 @@ func TestM6StepRouteFlood(t *testing.T) {
 	}
 	time.Sleep(500 * time.Millisecond)
 
-	var fast []hostAnswer
-	one := hostClient(t, controller, true)
 	keysDone := make(chan result, 1)
 	go func() {
 		begin := time.Now()
 		a, err := hostDoErr(hostClient(t, api, false), http.MethodGet, mgmtapi.KeysPath("dev-cell-1"), nil)
 		keysDone <- result{a, err, time.Since(begin)}
 	}()
-	for range 40 {
-		a, err := hostDoErr(one, http.MethodPut, mgmtapi.StepPath(s.ID), bytes.NewReader(unsigned))
-		if err != nil {
-			t.Fatalf("a flood PUT failed: %v", err)
-		}
-		fast = append(fast, a)
-	}
 	keys := <-keysDone
 	if keys.err != nil || keys.answer.Code != http.StatusOK || keys.took > 2*time.Second {
 		t.Errorf("the key read during the flood: %+v, want 200 within 2 s", keys)
@@ -430,6 +427,16 @@ func TestM6StepRouteFlood(t *testing.T) {
 		t.Errorf("mgmt -- keycheck during the flood: %s", out)
 	}
 	wg.Wait()
+
+	var fast []hostAnswer
+	one := hostClient(t, controller, true)
+	for range 40 {
+		a, err := hostDoErr(one, http.MethodPut, mgmtapi.StepPath(s.ID), bytes.NewReader(unsigned))
+		if err != nil {
+			t.Fatalf("a flood PUT failed: %v", err)
+		}
+		fast = append(fast, a)
+	}
 
 	busy := 0
 	for i, r := range slow {
@@ -445,6 +452,7 @@ func TestM6StepRouteFlood(t *testing.T) {
 		t.Errorf("%d of the 10 slow PUTs got 503 at once, want at least 6 (at most 4 in flight for one peer)", busy)
 	}
 	denied403, busy503 := 0, 0
+	rateLimited := false
 	for _, a := range fast {
 		switch a.Code {
 		case http.StatusForbidden:
@@ -454,12 +462,18 @@ func TestM6StepRouteFlood(t *testing.T) {
 			if a.RetryAfter != "60" {
 				t.Errorf("a 503 has Retry-After %q, want 60", a.RetryAfter)
 			}
+			if !rateLimited && strings.Contains(hostLog(t, a.denied()), `"reason":"rate_limited"`) {
+				rateLimited = true
+			}
 		default:
 			t.Errorf("a flood PUT got %d %s, want 403 or 503", a.Code, a.Body)
 		}
 	}
-	if denied403 > 23 {
-		t.Errorf("%d answers of 403, want at most 23: the bucket must stop the rest before any signature check", denied403)
+	if denied403 > 23 || denied403 < 14 {
+		t.Errorf("%d answers of 403, want 14 to 23: the bucket must stop the rest before any signature check, and the tokens must pass", denied403)
+	}
+	if !rateLimited {
+		t.Errorf("no 503 of the 40 PUTs has the reason rate_limited in the log of the host service")
 	}
 	t.Logf("flood: %d answers of 403 and %d of 503 for the 40 PUTs, %d of 10 slow PUTs answered 503 at once", denied403, busy503, busy)
 }
