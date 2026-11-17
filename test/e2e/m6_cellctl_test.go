@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -425,6 +426,45 @@ func TestM6CancelReachesHostService(t *testing.T) {
 	}
 }
 
+// waitEnvdCaughtUp waits until ConfigMap cell-steps carries the spec counter that mgmtd signed last. envd polls the spec about once a
+// minute and writes the ConfigMap again when the spec changes, which drops a key that a test patched in. A test that patches a key
+// waits here first, so that the cancel of the step of the test before it (which changes the spec) has reached envd.
+func waitEnvdCaughtUp(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	waitFor(t, "envd to write ConfigMap cell-steps for the signed spec counter", timeout, func() (bool, string) {
+		_, annotations, _, err := cellStepsConfigMap(t)
+		if err != nil {
+			return false, err.Error()
+		}
+		signed := mgmtStatus(t).Signed
+		return annotations["poc.internal/spec-counter"] == fmt.Sprint(signed.Counter) && annotations["poc.internal/spec-epoch"] == fmt.Sprint(signed.Epoch),
+			fmt.Sprintf("annotations %v, signed %v", annotations, signed)
+	})
+}
+
+// captureOnFailure saves the log of the cell controller, the pods of its namespace and ConfigMap cell-steps (with the live spec index) to
+// build/gate/m6-capture-<name>-*.txt when the test fails. It is registered after patchStepKey, so it runs before the cleanup that
+// removes the key and scales the controller away.
+func captureOnFailure(t *testing.T, name string, since time.Time) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		save := func(suffix string, args ...string) {
+			out, err := kubectl(t, spireCluster, "", args...)
+			body := fmt.Sprintf("%s\nerror: %v\n", out, err)
+			if werr := os.WriteFile(filepath.Join(filepath.Dir(m6StepsFile), "m6-capture-"+name+"-"+suffix+".txt"), []byte(body), 0o644); werr != nil {
+				t.Logf("save the capture %s: %v", suffix, werr)
+			}
+		}
+		save("log", "-n", cellCtlNamespace, "logs", "deploy/"+cellCtlDeployment, "-c", cellCtlDeployment, "--since-time="+since.Add(-time.Minute).UTC().Format(time.RFC3339))
+		save("pods", "-n", cellCtlNamespace, "get", "pods", "-o", "wide")
+		save("cell-steps", "-n", cellCtlNamespace, "get", "configmap", cellStepsMap, "-o", "json")
+		save("status", "-n", cellCtlNamespace, "get", "configmap", "step-status", "-o", "json")
+	})
+}
+
 // stopCellController scales the cell controller to zero, so that a test can change ConfigMap cell-steps before the controller reads it.
 // The cleanup scales it back to one.
 func stopCellController(t *testing.T) {
@@ -496,12 +536,14 @@ func TestM6CellControllerRefusesUnsignedStep(t *testing.T) {
 				tampered = tc.tamper(t, stepEnvelopeOf(t, m6TestCell, id, 2*time.Minute))
 			} else {
 				m6RequireNoSteps(t)
+				waitEnvdCaughtUp(t, 3*time.Minute)
 				s := testStep(t, m6TestCell)
 				recordM6Step(t, s.ID)
 				id, tampered = s.ID, stepSign(t, s)
 			}
 			patchStepKey(t, m6TestCell, tampered)
 			since := time.Now().Add(-5 * time.Second)
+			captureOnFailure(t, tc.name, since)
 			startCellController(t)
 			waitFor(t, "the cell controller to refuse step "+id+" with "+tc.detail, 60*time.Second, func() (bool, string) {
 				var logged bool
