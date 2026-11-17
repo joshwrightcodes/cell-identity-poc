@@ -155,7 +155,7 @@ The table also covers a new root that no one planned. For a planned change of th
 | `management` | `mise run hostsvc -- up --only management`, `CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `CELL=dev-cp mise run cell:up`, `mise run portal -- request` and `mise run portal -- wait` for each live cell, `CELL=management mise run cell:link` | The relay targets the node address of `management`. The uplinks and the cells hold its root. `dev-cp` reads the signing key of `mgmtd`, so `mgmt-api` links before it. A new `mgmtd` has no request, so run the portal request again. A request for a cell that exists skips its creation. |
 | `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each live cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
 | a cell | `CELL=<cell> mise run cell:down` while the cluster exists, `mise run portal -- recreate --cell <cell> --wait`, `CELL=management mise run cell:link` | A new cluster has a new node address and new keys. The step admits the address in `dev-cp`. The bind proves the new keys, and `mgmtd` publishes the record of the cell to the registries of the views. |
-| the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. |
+| the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. Then it runs `CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up` when `dev-cp` exists, so the cell controller gets the new pin. It refuses while a step runs a stage, unless you add `--force`. |
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
@@ -488,12 +488,12 @@ The cells trust both keys while they roll, so an operation that `mgmtd` signed u
 The command runs these steps in order:
 
 1. It stages a next key with `rotate-key --stage`. `mgmtd` publishes the public half as key `next.pub` in ConfigMap `mgmt-signing-pub`. The signing key does not change.
-2. It waits until ConfigMap `mgmt-signing-pub` holds `next.pub`.
-3. It runs `cell:up` for each cluster with the `cell-identity` set. ConfigMap `mgmt-op-key` then holds the live key and the staged key, and each `celld` pod restarts with both.
+2. It waits until ConfigMap `mgmt-signing-pub` holds `next.pub`. Then it runs `hostsvc:serve -- sync`, so the host service trusts the staged key. It also runs `CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up`, so the cell controller trusts it.
+3. It runs `cell:up` for each live cell. A live cell is a cluster with the `cell-identity` set whose kind cluster exists. A cell that does not exist gets no pass, and its next `cell:up` pins the live key. ConfigMap `mgmt-op-key` then holds the live key and the staged key, and each `celld` pod restarts with both.
 4. It commits with `rotate-key --commit`. `mgmtd` signs the spec, every record and every open operation again at the first counter of the next epoch. Then it publishes the new key as `spec.pub`.
-5. It waits until ConfigMap `mgmt-signing-pub` holds the new key.
-6. It runs `cell:up` for `dev-cp`, which renders the new key into `envd`, the cell gateway and the SPIRE server. Then it runs `cell:link` for `management`.
-7. It runs `cell:up` for each cluster with the `cell-identity` set again. `mgmt-op-key` then holds the new key alone.
+5. It waits until ConfigMap `mgmt-signing-pub` holds the new key. Then it runs `hostsvc:serve -- sync`, so the host service trusts the new key alone.
+6. It renders the new key into `envd` and into the cell controller with `HARNESS_ONLY`, so that a step that `mgmtd` signed again reaches the host service soon. Then it runs `cell:up` for `dev-cp`, which renders the new key into the cell gateway and the SPIRE server. Then it runs `cell:link` for `management`.
+7. It runs `cell:up` for each live cell again. `mgmt-op-key` then holds the new key alone.
 8. It waits until the rollout of `celld` has finished in each of those clusters. Then it runs `cell:verify` for `management` and for `dev-cp`.
 
 The steps took 5 minutes 30 seconds in the measured run of 2026-11-15.
@@ -511,11 +511,12 @@ This is a planned state. If a person repairs a cell in that window, run `CELL=<c
 Do not rotate the signing key while a test runs that rotates a cell key. The servers of `cell-proxy` keep the last good registry from the commit until the link of step 6.
 
 To run one step, use `mise run mgmt -- rotate-signing-key --step stage|cells|commit|planes`.
-The step `stage` and the step `commit` include their wait. The step `planes` runs `CELL=dev-cp mise run cell:up` and `CELL=management mise run cell:link`, and no verify.
+The step `stage` and the step `commit` include their wait and their sync. The step `stage` also renders the cell controller. The step `planes` renders `envd` and the cell controller, runs `CELL=dev-cp mise run cell:up` and `CELL=management mise run cell:link`, and runs no verify.
+Every mode refuses to start while a step runs a stage, because a stage holds the lock of `dev-cp`, and the command cannot take it. The command also refuses when it cannot read the steps. Read them with `mise run hostsvc:serve -- steps`. Wait until the stage ends, or add `--force` to go on. With `--force`, each `cell:up` and `cell:link` of the run waits up to 900 seconds for the lock.
 Each `cell:up` pass takes the replica field of `celld` back, so a pass restores a `celld` that a test set to 0.
 
 For an emergency, run `mise run mgmt -- rotate-signing-key --emergency`.
-It makes a new key at once, and it skips the stage and the first cell pass.
+It makes a new key at once, runs `hostsvc:serve -- sync`, and skips the stage and the first cell pass. The sync removes `next.pub` from the host service, because the rotation discards a staged key. Until the sync, the host service refuses the new spec.
 `cell:verify` of each cell also fails in `check_op_key_pinned` between the `--emergency` rotation and its cell pass. The same `cell:up` fixes it.
 A bare `mise run mgmt -- rotate-key` and `rotate-key --emergency` discard a staged key. The file moves to `ed25519.next.key.stale-<unix>`, and `next.pub` leaves `mgmt-signing-pub`. Only `rotate-key --commit` promotes a staged key.
 A cell that has not rolled yet refuses an operation of the new key as `signature_invalid`. The gateway holds that operation for 5 minutes and offers it again. The operation applies after the cell rolls.
