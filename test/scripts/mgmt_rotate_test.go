@@ -33,6 +33,7 @@ own() {
     data: {"bundle.crt": $pem}}'
 }
 case " $* " in
+  *" --context kind-${STUB_GONE:-none} "*) echo "The connection to the server was refused" >&2; exit 1 ;;
   *" exec spire-server-0 "*)
     while (($#)) && [[ "$1" != -- ]]; do shift; done
     shift 2
@@ -134,6 +135,7 @@ func newRotateServer(t *testing.T) *rotateServer {
 		}
 	}
 	write("kubectl", caRotateKubectl, 0o755)
+	write("kind", stubKind, 0o755)
 	write("hostsvc-serve", fakeRotateHostsvc, 0o755)
 	write("spire-server", fakeSpireServer, 0o755)
 	for i := range 3 {
@@ -238,6 +240,21 @@ func TestRotateCARunsToTheEnd(t *testing.T) {
 		t.Fatalf("second rotation failed: %v\n%s", err, out)
 	}
 	s.rotated(t, s.x509[2], "j3")
+}
+
+// A cell with no cluster holds no copy of the root, so the copy search skips it.
+func TestRotateCASkipsAnAbsentCell(t *testing.T) {
+	s := newRotateServer(t)
+	out, _, err := s.run(t, "STUB_GONE=dev-cell-2", "STUB_KIND=management dev-cp dev-cell-1 rogue")
+	if err != nil {
+		t.Fatalf("rotation with an absent cell failed: %v\n%s", err, out)
+	}
+	s.rotated(t, s.x509[1], "j2")
+	// A cell that kind lists and whose API does not answer is an error, never a skipped cell.
+	s = newRotateServer(t)
+	if out, _, err := s.run(t, "STUB_GONE=dev-cell-2"); err == nil || !strings.Contains(out, "could not list the ConfigMaps of dev-cell-2") {
+		t.Errorf("a listed cell that does not answer: err %v, output %q, want the error", err, out)
+	}
 }
 
 // A rotation that stopped goes on from the failed step when it runs again. It never prepares

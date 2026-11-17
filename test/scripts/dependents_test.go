@@ -190,6 +190,41 @@ func TestHarnessDown(t *testing.T) {
 	if len(lines) != 2 || lines[0] != "hostsvc-serve stop" || !strings.HasPrefix(lines[1], "mise run hostsvc -- down") {
 		t.Fatalf("down calls\n%s\nwant hostsvc-serve stop first, then hostsvc down", log)
 	}
+	// TestHarnessDownDeletesTheSteps: the journal and the step logs name clusters that harness:down deletes, so they go too. The log
+	// of the host service and its key files stay. A stop that fails leaves the steps where they are.
+	t.Run("TestHarnessDownDeletesTheSteps", func(t *testing.T) {
+		root, calls := harnessRoot(t)
+		hostsvc := filepath.Join(root, "build", "hostsvc")
+		for _, f := range []string{"steps/journal.json", "steps/aaaa.log", "steps/spec.json", "serve.log", "mgmt-keys/spec.pub"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(hostsvc, f)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(hostsvc, f), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		failing := filepath.Join(root, "bin", "hostsvc-serve-fails")
+		if err := os.WriteFile(failing, []byte("#!/usr/bin/env bash\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := runHarness(t, root, calls, "down", "HOSTSVC_SERVE="+failing); err == nil {
+			t.Fatal("down succeeded with a failing stop")
+		}
+		if _, err := os.Stat(filepath.Join(hostsvc, "steps", "journal.json")); err != nil {
+			t.Errorf("a failed stop deleted the journal: %v", err)
+		}
+		if _, errOut, err := runHarness(t, root, calls, "down"); err != nil {
+			t.Fatalf("down failed: %v\n%s", err, errOut)
+		}
+		if _, err := os.Stat(filepath.Join(hostsvc, "steps")); !os.IsNotExist(err) {
+			t.Errorf("the steps directory is still there after down: %v", err)
+		}
+		for _, f := range []string{"serve.log", "mgmt-keys/spec.pub"} {
+			if _, err := os.Stat(filepath.Join(hostsvc, f)); err != nil {
+				t.Errorf("down deleted %s: %v", f, err)
+			}
+		}
+	})
 	// TestHarnessDownStopsHostFirst: the host service runs the steps that create and admit cells, so it stops before any
 	// cluster goes, and a failed stop leaves the clusters alone.
 	t.Run("TestHarnessDownStopsHostFirst", func(t *testing.T) {

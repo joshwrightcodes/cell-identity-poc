@@ -17,6 +17,10 @@
 #      c. removes the marker last, after each cell is bound with no open step.
 # It is safe to run again.
 #
+# After the steps above, it reports each journal entry that runs a stage past its timeout plus 5 minutes (it cannot end the stage;
+# hostsvc:serve -- restart --force does) and each live cell that mgmtd holds as not requested. Both make the exit status 1, with --check
+# or without. A restore skips the second read, because it has just requested every cell. HOSTSVC_STEPS_DIR names another journal directory.
+#
 # Usage: gate-m6-repair.sh [--check]
 #   --check prints each drift with the command that repairs it, and exits 1. It exits 0 when it finds none. It also fails when a step
 #   that no test recorded is open: a gate starts with no open step. It fails too while the marker build/gate/m6-provision exists.
@@ -24,6 +28,7 @@
 # and PORTAL another portal script, for the tests.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
+source "$ROOT/scripts/steps-lib.sh"
 
 check=0
 [[ "${1:-}" == "--check" ]] && check=1
@@ -231,13 +236,50 @@ restore_cells() {
   done
   rm -f "$marker" || die "could not remove $marker"
 }
+had_marker=0
 if [[ -e "$marker" ]]; then
+  had_marker=1
   if ((check)); then
     status=1
     echo "the marker $marker exists, so a provision run stopped early and a cell can be missing. Run: $repair"
   else
     log "restoring the cells, because $marker exists"
     restore_cells
+  fi
+fi
+
+# A journal entry that runs a stage past its timeout plus 5 minutes is stuck, and the gates must not start on it. The host service
+# writes these times with the clock of the Mac, so the check reads the clock of the Mac. Only the host service can end the stage.
+if stuck="$(stuck_steps "$(date +%s)")"; then
+  while read -r id cell state kind secs limit; do
+    [[ -n "$id" ]] || continue
+    status=1
+    if [[ "$kind" == heartbeat ]]; then
+      echo "step $id of $cell is in the stage $state, and its heartbeat is $secs seconds old, which is more than 2 minutes. Run: mise run hostsvc:serve -- restart --force"
+    else
+      echo "step $id of $cell has run the stage $state for $((secs / 60)) minutes, which is more than its timeout of $(((limit - STEP_STAGE_GRACE) / 60)) minutes plus 5. Run: mise run hostsvc:serve -- restart --force"
+    fi
+  done <<<"$stuck"
+else
+  status=1
+  echo "the step journal of the host service does not parse. Run: mise run hostsvc:serve -- steps --reset"
+fi
+
+# Each live cell must be requested at mgmtd. A cell that has a cluster and no request is a half-built or leftover cell, and the
+# next gate would test against it. A restore has just requested every catalog cell, so it skips this read.
+if ((!had_marker)); then
+  mgmt_json="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || mgmt_json=""
+  if jq -e 'type == "object" and has("cells")' >/dev/null 2>&1 <<<"$mgmt_json"; then
+    live="$(live_cells)" || die "could not list the live cells"
+    for cell in $live; do
+      if [[ "$(jq -r --arg c "$cell" '[.cells[]? | select(.name == $c and .requested == true)] | length' <<<"$mgmt_json")" != 1 ]]; then
+        status=1
+        echo "the cell $cell has a cluster and is not requested. Run: mise run portal -- request --cell $cell, or run: CELL=$cell mise run cell:down"
+      fi
+    done
+  else
+    status=1
+    echo "mise run mgmt -- status gave no status, so the requests of the live cells are unchecked. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
   fi
 fi
 exit "$status"

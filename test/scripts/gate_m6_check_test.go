@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -80,6 +81,84 @@ case " $* " in
 esac
 `
 
+// m6RepairMise answers mise run mgmt -- status for gate-m6-repair.sh: STUB_MGMT_STATUS, or both cells requested. Any other call fails.
+const m6RepairMise = `#!/usr/bin/env bash
+[[ "$*" == "run mgmt -- status" ]] || { echo "unexpected mise call: $*" >&2; exit 2; }
+[[ -z "${STUB_MGMT_FAIL:-}" ]] || exit 1
+if [[ -n "${STUB_MGMT_STATUS:-}" ]]; then printf '%s\n' "$STUB_MGMT_STATUS"; else echo '{"cells":[{"name":"dev-cell-1","requested":true},{"name":"dev-cell-2","requested":true}]}'; fi
+`
+
+// TestGateM6RepairChecksStuckStepsAndRequests: with a journal entry past its stage timeout plus 5 minutes, or with a live cell that mgmtd does not
+// hold as requested, the script exits 1, with --check or without, and names the command. A live heartbeat over a long stage, a stage inside
+// its limit, and an entry that runs no stage pass. The journal times come from the clock of the Mac.
+func TestGateM6RepairChecksStuckStepsAndRequests(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	requested := func(names ...string) string {
+		var cells []map[string]any
+		for _, n := range names {
+			cells = append(cells, map[string]any{"name": n, "requested": true})
+		}
+		out, _ := json.Marshal(map[string]any{"cells": cells})
+		return string(out)
+	}
+	for _, tc := range []struct {
+		name string
+		rows []journalRow
+		env  []string
+		args []string
+		code int
+		want []string
+	}{
+		{name: "check: nothing stuck"},
+		{name: "check: a long stage with a live heartbeat", rows: []journalRow{{id: id, cell: "dev-cell-2", state: "admitting", heartbeat: 20 * time.Second, stage: 34 * time.Minute}}, args: []string{"--check"}},
+		{name: "check: a stage past its limit", rows: []journalRow{{id: id, cell: "dev-cell-2", state: "admitting", heartbeat: 20 * time.Second, stage: 36 * time.Minute}}, args: []string{"--check"}, code: 1,
+			want: []string{"step " + id + " of dev-cell-2 has run the stage admitting for 36 minutes", "Run: mise run hostsvc:serve -- restart --force"}},
+		{name: "check: an old heartbeat", rows: []journalRow{{id: id, cell: "dev-cell-1", state: "creating", heartbeat: 5 * time.Minute, stage: time.Minute}}, args: []string{"--check"}, code: 1,
+			want: []string{"heartbeat is 30", "more than 2 minutes", "Run: mise run hostsvc:serve -- restart --force"}},
+		{name: "check: an entry that runs no stage", rows: []journalRow{{id: id, cell: "dev-cell-1", state: "failed", heartbeat: time.Hour, stage: time.Hour}}, args: []string{"--check"}},
+		{name: "repair: a stage past its limit", rows: []journalRow{{id: id, cell: "dev-cell-2", state: "bootstrapping", heartbeat: 20 * time.Second, stage: 51 * time.Minute}}, code: 1,
+			want: []string{"has run the stage bootstrapping for 51 minutes", "timeout of 45 minutes plus 5"}},
+		{name: "check: a live cell that is not requested", env: []string{"STUB_MGMT_STATUS=" + requested("dev-cell-1")}, args: []string{"--check"}, code: 1,
+			want: []string{"the cell dev-cell-2 has a cluster and is not requested. Run: mise run portal -- request --cell dev-cell-2, or run: CELL=dev-cell-2 mise run cell:down"}},
+		{name: "check: an absent cell needs no request", env: []string{"STUB_KIND=management dev-cp dev-cell-1 rogue", "STUB_MGMT_STATUS=" + requested("dev-cell-1")}, args: []string{"--check"}},
+		{name: "check: mgmtd gives no status", env: []string{"STUB_MGMT_FAIL=1"}, args: []string{"--check"}, code: 1,
+			want: []string{"gave no status, so the requests of the live cells are unchecked"}},
+		{name: "repair: a live cell that is not requested", env: []string{"STUB_MGMT_STATUS=" + requested("dev-cell-2")}, code: 1,
+			want: []string{"the cell dev-cell-1 has a cluster and is not requested"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, body := range map[string]string{
+				"repair-m5": "#!/usr/bin/env bash\nexit 0\n",
+				"replicas":  "#!/usr/bin/env bash\nexit 0\n",
+				"serve":     "#!/usr/bin/env bash\ncase \"$1\" in status) echo '{\"running\":true}' ;; steps) echo '{\"steps\":[]}' ;; esac\n",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stubs := map[string]string{"kubectl": m6RepairKubectl, "mise": m6RepairMise}
+			for name, body := range liveStubs {
+				stubs[name] = body
+			}
+			out, errOut, code := runScript(t, "gate-m6-repair.sh", stubs,
+				append([]string{"STUB_DIR=" + dir, "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
+					"HOSTSVC_SERVE=" + filepath.Join(dir, "serve"), "HOSTSVC_STEPS_DIR=" + writeJournal(t, tc.rows...)}, tc.env...), tc.args...)
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d\nstdout %s\nstderr %s", code, tc.code, out, errOut)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(out, w) {
+					t.Errorf("stdout %q lacks %q", out, w)
+				}
+			}
+			if strings.Contains(out+errOut, "secret-looking") {
+				t.Errorf("the output holds a line of a step log")
+			}
+		})
+	}
+}
+
 // TestGateM6RepairCellControllerReplicas: a test that scales the cell controller down and stops early leaves it at another number of
 // replicas. With --check the script names the Deployment and the repair command, and with no flag it sets the replicas back to 1
 // through harness-replicas.sh and waits for the rollout. One replica needs nothing, and an absent Deployment names cell:up.
@@ -112,7 +191,7 @@ func TestGateM6RepairCellControllerReplicas(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			stubs := map[string]string{"kubectl": m6RepairKubectl}
+			stubs := map[string]string{"kubectl": m6RepairKubectl, "mise": m6RepairMise}
 			for name, body := range liveStubs {
 				stubs[name] = body
 			}
@@ -184,7 +263,7 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			stubs := map[string]string{"kubectl": m6RepairKubectl}
+			stubs := map[string]string{"kubectl": m6RepairKubectl, "mise": m6RepairMise}
 			for name, body := range liveStubs {
 				stubs[name] = body
 			}

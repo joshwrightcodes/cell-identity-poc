@@ -81,6 +81,8 @@ case "${1:-}" in
     # clusters go, and no step re-creates a cell that this command deletes.
     "${HOSTSVC_SERVE:-$ROOT/scripts/hostsvc-serve.sh}" stop
     mise run hostsvc -- down
+    # The journal, the step logs and the stored spec name clusters that go now. The log of the service and its key files stay.
+    rm -rf "${BUILD_ROOT:?}/hostsvc/steps"
     names="$(yq -r '.clusters[].name' "$topology")"
     [[ -n "$names" ]] || die "no cluster in $topology"
     for name in $names; do
