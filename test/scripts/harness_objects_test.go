@@ -406,3 +406,170 @@ func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
 		}
 	}
 }
+
+// controllerKubectl answers the reads of check_harness_objects for the component cell-controller, which owns namespace
+// cell-controller-system. The bundle holds the Namespace, ConfigMaps hostsvc-pin and mgmt-spec-key, and the Role and RoleBinding
+// envd-steps for ServiceAccount envd. At run time envd writes ConfigMap cell-steps and the cell controller writes step-status.
+// STUB_STEPS describes the two: "ok" (each carries only the made-by label of its writer and the field manager of its writer),
+// "harness" (cell-steps also carries the harness label), "nomarker" (cell-steps has no made-by label), "swapped" (cell-steps
+// carries the marker and manager of the cell controller), "person" (step-status has the manager kubectl-edit), "crossed" (step-status has the manager envd), "other" (a third
+// ConfigMap with the marker envd) or "name" (cell-steps under another name). STUB_EXTRA=<kind>/<name>@<label> adds one object of
+// that kind with the harness label <label>.
+const controllerKubectl = `#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+mine='"labels":{"cell.poc.internal/harness":"cell-controller"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]'
+item() { printf '{"metadata":{"name":"%s",%s}}' "$1" "$mine"; }
+rt() { # rt <name> <labels> <manager>
+  printf '{"metadata":{"name":"%s","labels":{%s},"managedFields":[{"manager":"%s","operation":"Update"}]}}' "$1" "$2" "$3"
+}
+envd='"poc.internal/made-by":"envd"'
+ctl='"poc.internal/made-by":"cell-controller"'
+steps() {
+  case "${STUB_STEPS:-ok}" in
+    ok) printf '%s,%s' "$(rt cell-steps "$envd" envd)" "$(rt step-status "$ctl" cell-controller)" ;;
+    harness) printf '%s,%s' "$(rt cell-steps "$envd,\"cell.poc.internal/harness\":\"cell-controller\"" envd)" "$(rt step-status "$ctl" cell-controller)" ;;
+    nomarker) printf '%s,%s' "$(rt cell-steps "" envd)" "$(rt step-status "$ctl" cell-controller)" ;;
+    swapped) printf '%s,%s' "$(rt cell-steps "$ctl" cell-controller)" "$(rt step-status "$ctl" cell-controller)" ;;
+    person) printf '%s,%s' "$(rt cell-steps "$envd" envd)" "$(rt step-status "$ctl" kubectl-edit)" ;;
+    crossed) printf '%s,%s' "$(rt cell-steps "$envd" envd)" "$(rt step-status "$ctl" envd)" ;;
+    other) printf '%s,%s,%s' "$(rt cell-steps "$envd" envd)" "$(rt step-status "$ctl" cell-controller)" "$(rt step-other "$envd" envd)" ;;
+    name) printf '%s,%s' "$(rt cell-steps-old "$envd" envd)" "$(rt step-status "$ctl" cell-controller)" ;;
+  esac
+}
+extra() { # extra <kind> prints ,<item> when STUB_EXTRA names that kind
+  local want="${STUB_EXTRA:-}"
+  [[ "$want" == "$1/"* ]] || return 0
+  want="${want#*/}"
+  printf ',{"metadata":{"name":"%s","labels":{"cell.poc.internal/harness":"%s"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]}}' "${want%@*}" "${want#*@}"
+}
+list() { printf '{"items":[%s]}\n' "$1"; }
+case "$args" in
+  *" -n cell-controller-system get ConfigMap -o json "*)
+    list "$(item hostsvc-pin),$(item mgmt-spec-key),{\"metadata\":{\"name\":\"kube-root-ca.crt\",\"managedFields\":[{\"manager\":\"kube-controller-manager\",\"operation\":\"Update\"}]}},$(steps)$(extra ConfigMap)" ;;
+  *" -n cell-controller-system get Role -o json "*) list "$(item envd-steps)$(extra Role)" ;;
+  *" -n cell-controller-system get RoleBinding -o json "*) list "$(item envd-steps)$(extra RoleBinding)" ;;
+  *" get Namespace -l cell.poc.internal/harness=cell-controller -o json "*) list "$(item cell-controller-system)" ;;
+  *" get namespace cell-controller-system -o json "*) echo "{\"metadata\":{\"name\":\"cell-controller-system\",$mine}}" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`
+
+const controllerBundle = `apiVersion: v1
+kind: Namespace
+metadata:
+  name: cell-controller-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hostsvc-pin
+  namespace: cell-controller-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mgmt-spec-key
+  namespace: cell-controller-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-steps
+  namespace: cell-controller-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-steps
+  namespace: cell-controller-system
+`
+
+// runControllerObjects runs check_harness_objects for the cell controller with the fake kubectl above.
+func runControllerObjects(t *testing.T, steps, extra string) (string, error) {
+	t.Helper()
+	testtool.Need(t, "yq", "jq", "bash")
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(controllerKubectl), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(dir, "build", "dev-cp", "bundles", "cell-controller")
+	if err := os.MkdirAll(bundle, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bundle, "manifests.yaml"), []byte(controllerBundle), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	lib, err := filepath.Abs("../../scripts/lib.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects cell-controller cell-controller-system`, "_", lib)
+	cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+		"CELL=dev-cp", "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_STEPS=" + steps, "STUB_EXTRA=" + extra}
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err = cmd.Run()
+	return out.String(), err
+}
+
+// TestHarnessObjectsAcceptsStepConfigMaps: cell-controller-system holds two ConfigMaps that the bundle cannot hold. envd writes
+// cell-steps with the field manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes
+// step-status with its own manager and marker. check_harness_objects accepts each by name, marker and manager, and prints no
+// delete hint. A ConfigMap with the right name and the marker or the manager of the other writer, one with no marker, one that
+// a person edited, one with the harness label of the bundle and one with another name are reported.
+func TestHarnessObjectsAcceptsStepConfigMaps(t *testing.T) {
+	for _, tc := range []struct {
+		name, steps, want string
+	}{
+		{name: "both ConfigMaps as their writers made them", steps: "ok"},
+		{name: "cell-steps with the harness label of the bundle", steps: "harness", want: "ConfigMap objects 'cell-steps hostsvc-pin mgmt-spec-key'"},
+		{name: "cell-steps with no marker", steps: "nomarker", want: "ConfigMap objects 'cell-steps hostsvc-pin mgmt-spec-key'"},
+		{name: "cell-steps with the marker and manager of the cell controller", steps: "swapped", want: "ConfigMap objects 'cell-steps hostsvc-pin mgmt-spec-key'"},
+		{name: "step-status that a person edited", steps: "person", want: "ConfigMap objects 'hostsvc-pin mgmt-spec-key step-status'"},
+		{name: "step-status that envd wrote", steps: "crossed", want: "ConfigMap objects 'hostsvc-pin mgmt-spec-key step-status'"},
+		{name: "a third ConfigMap with the marker of envd", steps: "other", want: "ConfigMap objects 'hostsvc-pin mgmt-spec-key step-other'"},
+		{name: "cell-steps under another name", steps: "name", want: "ConfigMap objects 'cell-steps-old hostsvc-pin mgmt-spec-key'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runControllerObjects(t, tc.steps, "")
+			if tc.want == "" {
+				if err != nil || out != "" {
+					t.Fatalf("the check fails with the step ConfigMaps: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out, tc.want) {
+				t.Fatalf("err %v, output %q; want a failure that holds %s", err, out, tc.want)
+			}
+		})
+	}
+}
+
+// TestHarnessObjectsOwnedNamespaceRefusesOtherLabels: cell-controller-system is an owned namespace. A Role or RoleBinding that carries
+// the harness label of another component, such as the old Role envd-steps of an envd render, is an extra object, and the check
+// fails. The Role envd-steps of the bundle itself, with the label cell-controller, passes.
+func TestHarnessObjectsOwnedNamespaceRefusesOtherLabels(t *testing.T) {
+	for _, tc := range []struct {
+		name, extra, want string
+	}{
+		{name: "the bundle as applied"},
+		{name: "a Role of envd", extra: "Role/envd-records@envd", want: "Role objects 'envd-records envd-steps'"},
+		{name: "a RoleBinding of envd", extra: "RoleBinding/envd-records@envd", want: "RoleBinding objects 'envd-records envd-steps'"},
+		{name: "a Role of the cell controller that the bundle lacks", extra: "Role/cell-controller@cell-controller", want: "Role objects 'cell-controller envd-steps'"},
+		{name: "a ConfigMap of envd", extra: "ConfigMap/envd-extra@envd", want: "ConfigMap objects 'envd-extra hostsvc-pin mgmt-spec-key'"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := runControllerObjects(t, "ok", tc.extra)
+			if tc.want == "" {
+				if err != nil || out != "" {
+					t.Fatalf("the check fails on the bundle as applied: %v\n%s", err, out)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out, tc.want) {
+				t.Fatalf("err %v, output %q; want a failure that holds %s", err, out, tc.want)
+			}
+		})
+	}
+}

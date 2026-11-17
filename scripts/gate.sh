@@ -3,7 +3,7 @@
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
 # m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
-# m6 runs gate-m6-repair.sh --check and the image check of mgmtd first.
+# m6 runs gate-m6-repair.sh --check and the image check of mgmtd, envd, the cell controller, the cell gateway and the SPIRE server first.
 # After the tests, m5, m5-soak, m5-drill and m6 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
@@ -133,12 +133,24 @@ if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill 
   [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
-# The M6 tests run against mgmtd and the host service. mgmtd serves every M6 test, so its image must be the one that
-# `mise run images` recorded. gate-m6-repair.sh --check runs gate-m5-repair.sh, which runs the M4 and M2 repairs once.
+# The M6 tests run against mgmtd, the host service, envd, the cell controller, the cell gateway and the SPIRE server of dev-cp
+# (its plugin checks the cells). Each of these workloads must run the image that `mise run images` recorded, so a test does not
+# run old code, and a step does not end with bootstrap_mismatch because the images changed. gate-m6-repair.sh --check runs
+# gate-m5-repair.sh, which runs the M4 and M2 repairs once.
 if [[ "$milestone" == m6 ]]; then
   "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
-  found="$(live_image_mismatches management mgmt-system statefulset/mgmtd)" || die "could not read statefulset/mgmtd in management"
-  [[ -z "$found" ]] || die "the deployed images differ from build/images.env:"$'\n'"$found"$'\n'"Run: mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:cell-controller-system:deployment/cell-controller:mise run images -- cell-controller, then CELL=dev-cp mise run cell:up"
+    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
 fi
 
 # go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,

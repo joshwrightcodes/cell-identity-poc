@@ -72,7 +72,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 		}
 	}
 	var env strings.Builder
-	for _, n := range []string{"mgmtd", "envd", "cellgw", "celld", "cluster-jwt-agent", "cluster-jwt-server", "cell-proxy"} {
+	for _, n := range []string{"mgmtd", "envd", "cell-controller", "cellgw", "celld", "cluster-jwt-agent", "cluster-jwt-server", "cell-proxy"} {
 		fmt.Fprintf(&env, "IMAGE_%s=localhost:5001/%s@sha256:%s\n", strings.ToUpper(strings.ReplaceAll(n, "-", "_")), n, strings.Repeat("a", 64))
 	}
 	write("build/images.env", env.String())
@@ -99,6 +99,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	case " $* " in
 	  *" get statefulset/mgmtd "*) one mgmtd mgmtd ;;
 	  *" get deployment/envd "*) one envd envd ;;
+	  *" get deployment/cell-controller "*) one cell-controller cell-controller ;;
 	  *" get statefulset/cell-gateway "*) one cell-gateway cellgw ;;
 	  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
 	  *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;

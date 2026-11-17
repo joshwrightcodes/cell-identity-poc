@@ -82,6 +82,11 @@ case " $* " in
   *" delete pods "*) echo deleted ;;
   *" get pods -l app.kubernetes.io/name=spire-server -o json "*)
     echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+  *" get deployments,statefulsets -l cell.poc.internal/harness=cell-controller -o name "*) echo deployment.apps/cell-controller ;;
+  *" get deployment.apps/cell-controller -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"cell-controller"}}}}' ;;
+  *" get pods -l app.kubernetes.io/name=cell-controller -o jsonpath="*) echo old-uid ;;
+  *" get pods -l app.kubernetes.io/name=cell-controller -o json "*)
+    echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
   *" get deployments,statefulsets -l cell.poc.internal/harness=envd -o name "*) echo deployment.apps/envd ;;
   *" get deployment.apps/envd -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"envd"}}}}' ;;
   *" get pods -l app.kubernetes.io/name=envd -o jsonpath="*) echo old-uid ;;
@@ -131,8 +136,8 @@ func runRotate(t *testing.T, env ...string) rotateResult {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// dev-cp runs the harness components otel-uplink, envd and cell-gateway, and cell:restart restarts their workloads too.
-	for name, ns := range map[string]string{"otel-uplink": "observability-system", "envd": "envd-system", "cell-gateway": "gateway-system"} {
+	// dev-cp runs the harness components otel-uplink, cell-controller, envd and cell-gateway, and cell:restart restarts their workloads too.
+	for name, ns := range map[string]string{"otel-uplink": "observability-system", "cell-controller": "cell-controller-system", "envd": "envd-system", "cell-gateway": "gateway-system"} {
 		kind := "Deployment"
 		if name == "cell-gateway" {
 			kind = "StatefulSet"

@@ -553,3 +553,102 @@ check_gateway_spec_key() {
     return 1
   fi
 }
+
+# The cell controller copies the certificate of the host service and the address of the host service, and pins the keys of
+# mgmtd. Each can fall behind a restart of the host service, a rebuild or a rotation, so a check reads the copy and the
+# pod that uses it. A mismatch prints the render of the cell controller alone, which reads all four again.
+cell_controller_fix="CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up"
+
+# check_cell_controller_pin succeeds when ConfigMap cell-controller-system/hostsvc-pin holds the certificate that the host
+# service presents, and every running pod of the cell controller carries its SHA-256 in the annotation
+# poc.internal/hostsvc-pin-sha256. The process reads the pin once at start.
+check_cell_controller_pin() {
+  local live got status want pods bad
+  live="$("$(hostsvc_serve_script)" pin 2>&1)" || { echo "$live"; echo "Run: mise run hostsvc:serve -- start"; return 1; }
+  got="$(k -n cell-controller-system get configmap hostsvc-pin -o jsonpath='{.data.hostsvc\.crt}')" \
+    || { echo "could not read ConfigMap cell-controller-system/hostsvc-pin"; return 1; }
+  if [[ "$(pem_lines <<<"$got")" != "$(pem_lines <<<"$live")" ]]; then
+    echo "ConfigMap cell-controller-system/hostsvc-pin holds another certificate than the host service presents."
+    echo "Run: $cell_controller_fix"
+    return 1
+  fi
+  status="$("$(hostsvc_serve_script)" status)" || return 1
+  want="$(jq -r '.cert_sha256' <<<"$status")"
+  pods="$(k -n cell-controller-system get pods -l app.kubernetes.io/name=cell-controller -o json)" \
+    || { echo "could not read the pods of cell-controller in cell-controller-system"; return 1; }
+  if [[ "$(jq -r '[.items[] | select(.metadata.deletionTimestamp == null)] | length' <<<"$pods")" == 0 ]]; then
+    echo "cell-controller has no running pod in cell-controller-system."
+    echo "Run: $cell_controller_fix"
+    return 1
+  fi
+  bad="$(jq -r --arg want "$want" '.items[] | select(.metadata.deletionTimestamp == null)
+    | ((.metadata.annotations["poc.internal/hostsvc-pin-sha256"] // "none")) as $got | select($got != $want)
+    | "\(.metadata.name) carries the pin digest \($got)"' <<<"$pods")"
+  if [[ -n "$bad" ]]; then
+    printf '%s\n' "$bad"
+    echo "The host service presents $want, and a pod reads the pin only at start."
+    echo "Run: $cell_controller_fix"
+    return 1
+  fi
+}
+
+# check_cell_controller_key succeeds when the cell controller pins the keys that mgmtd signs with: ConfigMap mgmt-spec-key holds
+# spec.pub equal to the answer of `mise run mgmt -- pubkey` and, while mgmtd stages a key, next.pub equal to stagedKey, and holds
+# no next.pub otherwise. The pod template checksum must follow both files. mgmt_signing_pub and mgmt_signing_next_pub make the two
+# comparisons with mgmtd.
+check_cell_controller_key() {
+  local live next stored stored_next sum got
+  live="$(mgmt_signing_pub 2>&1)" || { echo "$live"; return 1; }
+  next="$(mgmt_signing_next_pub 2>&1)" || { echo "$next"; return 1; }
+  stored="$(k -n cell-controller-system get configmap mgmt-spec-key -o jsonpath='{.data.spec\.pub}')" \
+    || { echo "could not read ConfigMap cell-controller-system/mgmt-spec-key"; return 1; }
+  stored_next="$(k -n cell-controller-system get configmap mgmt-spec-key -o jsonpath='{.data.next\.pub}')" \
+    || { echo "could not read ConfigMap cell-controller-system/mgmt-spec-key"; return 1; }
+  sum="$(printf '%s' "$live${next:+$'\n'$next}" | shasum -a 256 | cut -d' ' -f1)"
+  got="$(k -n cell-controller-system get deployment cell-controller -o jsonpath='{.spec.template.metadata.annotations.poc\.internal/spec-key-sha256}')" \
+    || { echo "could not read deployment/cell-controller"; return 1; }
+  if [[ "$stored" != "$live" || "$stored_next" != "$next" || "$got" != "$sum" ]]; then
+    echo "mgmtd signs with '$live' and stages '${next:-none}', mgmt-spec-key of the cell controller holds '$stored' and '${stored_next:-none}', and the pod template carries '$got'."
+    echo "Run: $cell_controller_fix"
+    return 1
+  fi
+}
+
+# check_cell_steps_current succeeds when envd wrote ConfigMap cell-controller-system/cell-steps for the spec that mgmtd signed last:
+# the label poc.internal/made-by=envd, and the annotations spec-epoch and spec-counter equal to the signed revision. A test that
+# patches the ConfigMap, as a compromised dev-cp could, makes this check fail until envd writes its next change.
+check_cell_steps_current() {
+  local status signed epoch cm counter stored_epoch made
+  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  signed="$(jq -er '.signed.counter' <<<"$status")" && epoch="$(jq -er '.signed.epoch' <<<"$status")" \
+    || { echo "mgmtd reports no signed revision: $status"; return 1; }
+  cm="$(k -n cell-controller-system get configmap cell-steps -o json 2>&1)" \
+    || { echo "ConfigMap cell-controller-system/cell-steps is absent: $cm"; echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"; return 1; }
+  counter="$(jq -r '.metadata.annotations["poc.internal/spec-counter"] // "none"' <<<"$cm")"
+  stored_epoch="$(jq -r '.metadata.annotations["poc.internal/spec-epoch"] // "none"' <<<"$cm")"
+  made="$(jq -r '.metadata.labels["poc.internal/made-by"] // "none"' <<<"$cm")"
+  if [[ "$counter" != "$signed" || "$stored_epoch" != "$epoch" || "$made" != envd ]]; then
+    echo "cell-steps holds the spec revision $stored_epoch/$counter and the marker '$made', and mgmtd signed $epoch/$signed. envd writes it, with the marker envd."
+    echo "Read the status of envd: mise run mgmt -- status, and its log: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"
+    return 1
+  fi
+}
+
+# check_cell_controller_address succeeds when the egress rule of flow N42 admits the one address that host.docker.internal has in the
+# node container, on HOSTSVC_PORT only, and the pod runs --hostsvc-addr with the same address. Docker can give the name another
+# address after vm:up.
+check_cell_controller_address() {
+  local want got arg
+  want="$(hostsvc_address "$CELL_NAME" 2>&1)" || { echo "$want"; return 1; }
+  got="$(k -n cell-controller-system get networkpolicy cell-controller -o json \
+    | jq -r --argjson p "$HOSTSVC_PORT" '[.spec.egress[] | select(any(.ports[]; .port == $p)) | .to[].ipBlock.cidr] | join(" ")')" \
+    || { echo "could not read NetworkPolicy cell-controller-system/cell-controller"; return 1; }
+  arg="$(k -n cell-controller-system get deployment cell-controller -o json \
+    | jq -r '.spec.template.spec.containers[] | select(.name == "cell-controller") | .args[] | select(startswith("--hostsvc-addr="))')" \
+    || { echo "could not read deployment/cell-controller"; return 1; }
+  if [[ "$got" != "$want/32" || "$arg" != "--hostsvc-addr=$want:$HOSTSVC_PORT" ]]; then
+    echo "host.docker.internal is $want in the node, but the policy admits '$got' and the cell controller runs '$arg'."
+    echo "Run: $cell_controller_fix"
+    return 1
+  fi
+}

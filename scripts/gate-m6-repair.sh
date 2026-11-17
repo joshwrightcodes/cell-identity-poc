@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Repair what a gate:m6 run can leave behind. It runs gate-m5-repair.sh first, which runs the M4 and M2 repairs once. Then it
-#   1. runs hostsvc:serve -- sync, so the host service holds the dev root, the keys and the spec of mgmtd;
+#   1. runs hostsvc:serve -- sync, so the host service holds the dev root, the keys and the spec of mgmtd, and sets the replicas of
+#      Deployment cell-controller in dev-cp back to 1 (a test can scale it down to see the host side alone);
 #   2. cancels, through portal -- cancel, each open step whose ID a test recorded in build/gate/m6-steps. It never
 #      cancels a step that the provision test signed, because no test records those;
 #   3. deletes the test namespaces m6-* (label cell.poc.internal/e2e=true) in management, dev-cp, rogue and each live cell.
@@ -9,8 +10,8 @@
 # Usage: gate-m6-repair.sh [--check]
 #   --check prints each drift with the command that repairs it, and exits 1. It exits 0 when it finds none. It also fails when a step
 #   that no test recorded is open: a gate starts with no open step.
-# GATE_M5_REPAIR names another M5 repair script, HOSTSVC_SERVE another host service script and PORTAL another portal script, for
-# the tests.
+# GATE_M5_REPAIR names another M5 repair script, HOSTSVC_SERVE another host service script, HARNESS_REPLICAS another replicas script
+# and PORTAL another portal script, for the tests.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
 
@@ -28,6 +29,22 @@ if ((check)); then
 else
   "${GATE_M5_REPAIR:-$ROOT/scripts/gate-m5-repair.sh}" || die "the repair of gate:m5 failed. Run: mise run gate:m5:repair"
   "$serve" sync || die "could not sync the host service. Run: mise run hostsvc:serve -- sync"
+fi
+
+# A test that scales the cell controller to 0 and stops early leaves no controller, and its steps do not move.
+replicas="$(kubectl --context kind-dev-cp -n cell-controller-system get deployment cell-controller -o jsonpath='{.spec.replicas}' 2>/dev/null)" \
+  || { echo "Deployment cell-controller is absent in dev-cp. Run: CELL=dev-cp mise run cell:up"; exit 1; }
+if [[ "$replicas" != 1 ]]; then
+  if ((check)); then
+    status=1
+    echo "Deployment cell-controller has $replicas replicas. Run: $repair"
+  else
+    log "setting the replicas of cell-controller from $replicas to 1"
+    "${HARNESS_REPLICAS:-$ROOT/scripts/harness-replicas.sh}" dev-cp cell-controller-system deployment/cell-controller 1 \
+      || die "could not set the replicas of cell-controller. Run: scripts/harness-replicas.sh dev-cp cell-controller-system deployment/cell-controller 1"
+    kubectl --context kind-dev-cp -n cell-controller-system rollout status deployment/cell-controller --timeout=300s >/dev/null \
+      || die "deployment/cell-controller did not finish its rollout in 300s"
+  fi
 fi
 
 # open_steps prints "<id> <cell> <state>" for each step that has no final state at the host service.

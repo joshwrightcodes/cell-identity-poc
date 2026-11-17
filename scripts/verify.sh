@@ -920,6 +920,16 @@ if has_harness envd; then
   check "The SPIRE server and envd pin the key that mgmtd signs with" check_spec_key_pinned
   check "ConfigMap spire-system/attest-hints exists, and the SPIRE server config sets hint_configmap to it" check_attest_hints_exists
 fi
+if has_harness cell-controller; then
+  check "The cell-controller objects match the bundle" check_harness_drift cell-controller
+  check "cell-controller-system has exactly the cell-controller objects of the bundle, with no other field manager" check_harness_objects cell-controller cell-controller-system
+  check "The cell controller runs the images that build/images.env records" \
+    check_live_images cell-controller-system deployment/cell-controller "CELL=$CELL_NAME mise run cell:up"
+  check "ConfigMap hostsvc-pin of the cell controller equals the certificate that the host service presents" check_cell_controller_pin
+  check "The cell controller pins the key that mgmtd signs with, and the staged key" check_cell_controller_key
+  check "ConfigMap cell-steps holds the spec revision that mgmtd signed last" check_cell_steps_current
+  check "The cell controller and its NetworkPolicy use the address that the node resolves for the host service" check_cell_controller_address
+fi
 if has_harness cell-gateway; then
   gateway_ip="$(node_ip "$CELL_NAME" 2>/dev/null || true)"
   check "The cell-gateway objects match the bundle" check_harness_drift cell-gateway

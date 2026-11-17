@@ -464,8 +464,8 @@ func TestImagesNamed(t *testing.T) {
 	envFile := filepath.Join(root, "build", "images.env")
 	before, _ := os.ReadFile(envFile)
 	log, _ := os.ReadFile(logFile)
-	for _, name := range []string{"netprobe", "celld", "relay", "mgmtd"} {
-		if !strings.Contains(string(log), "./cmd/"+name) || !strings.Contains(string(before), "IMAGE_"+strings.ToUpper(name)+"=localhost:5001/"+name+"@sha256:") {
+	for _, name := range []string{"netprobe", "celld", "relay", "mgmtd", "envd", "cell-controller", "cellgw"} {
+		if !strings.Contains(string(log), "./cmd/"+name) || !strings.Contains(string(before), "IMAGE_"+strings.ToUpper(strings.ReplaceAll(name, "-", "_"))+"=localhost:5001/"+name+"@sha256:") {
 			t.Fatalf("a full build lacks %s\ncalls: %s\nimages.env:\n%s", name, log, before)
 		}
 	}
@@ -502,7 +502,7 @@ func TestImagesNamed(t *testing.T) {
 	if got, _ := os.ReadFile(envFile); !strings.HasPrefix(string(got), "# commit abc123\n") {
 		t.Fatalf("a partial build rewrote the commit line:\n%s", got)
 	}
-	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cellgw")
+	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cell-controller cellgw")
 	if out, err := run("6", allNames...); err != nil {
 		t.Fatalf("images.sh with every name failed: %v\n%s", err, out)
 	}
