@@ -258,12 +258,12 @@ func openStepPlane(id string) string {
 // problems of provisioning, and the M5 problem "is not bound" never names a cell that has no cluster.
 func TestStatusAbsentCell(t *testing.T) {
 	dir := writeJournal(t)
-	// The sources report what is true for a cell with no cluster: no agent, no sample, no Kiali cluster and no tunnel.
+	// The sources report what is true for a cell with no cluster: no agent, no sample, no Kiali cluster, a tunnel that is down and an API that does not answer.
 	absentSources := []string{"HOSTSVC_STEPS_DIR=" + dir, "STUB_KIND=management dev-cp dev-cell-1 rogue",
 		"STUB_PRINCIPAL=" + `{"client":"dev-dev-cell-1","msg":"An agent connected to the subscription stream"}`,
 		"STUB_SAMPLES=" + `{"data":{"result":[{"metric":{"k8s_cluster_name":"management"},"value":[0,"5"]},{"metric":{"k8s_cluster_name":"dev-cp"},"value":[0,"4"]},{"metric":{"k8s_cluster_name":"dev-cell-1"},"value":[0,"6"]}]}}`,
 		"STUB_KIALI_CONF=" + `{"clusters":{"dev-cell-1":{"accessible":true},"management":{"accessible":true}}}`,
-		"STUB_HUB=" + `{"cells":{"dev-cell-1":{"up":true}}}`}
+		"STUB_HUB=" + `{"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":false,"down_seconds":600}}}`, "STUB_CELL_DOWN=dev-cell-2"}
 	withPlane := func(plane string, more ...string) []string {
 		return append(append([]string{"STUB_MGMT_STATUS=" + plane}, absentSources...), more...)
 	}
