@@ -279,23 +279,29 @@ check_keytest_clean() {
   fi
 }
 
-# envd writes the signed counter of the spec as the annotation poc.internal/spec-counter of ConfigMap
-# cell-records. The counter must equal the one that mgmtd signed last.
-check_envd_applied() {
-  local status signed epoch cm counter stored_epoch
+# configmap_applied_spec <namespace> <ConfigMap> [marker] succeeds when envd wrote the ConfigMap for the spec that mgmtd signed
+# last: the annotations poc.internal/spec-epoch and poc.internal/spec-counter equal the signed revision, and, when a marker is
+# named, the label poc.internal/made-by has that value.
+configmap_applied_spec() {
+  local ns="$1" name="$2" marker="${3:-}" status signed epoch cm counter stored_epoch made
   status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
   signed="$(jq -er '.signed.counter' <<<"$status")" && epoch="$(jq -er '.signed.epoch' <<<"$status")" \
     || { echo "mgmtd reports no signed revision: $status"; return 1; }
-  cm="$(k -n spire-system get configmap cell-records -o json 2>&1)" \
-    || { echo "ConfigMap spire-system/cell-records is absent: $cm"; echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"; return 1; }
+  cm="$(k -n "$ns" get configmap "$name" -o json 2>&1)" \
+    || { echo "ConfigMap $ns/$name is absent: $cm"; echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"; return 1; }
   counter="$(jq -r '.metadata.annotations["poc.internal/spec-counter"] // "none"' <<<"$cm")"
   stored_epoch="$(jq -r '.metadata.annotations["poc.internal/spec-epoch"] // "none"' <<<"$cm")"
-  if [[ "$counter" != "$signed" || "$stored_epoch" != "$epoch" ]]; then
-    echo "cell-records holds the spec revision $stored_epoch/$counter, and mgmtd signed $epoch/$signed."
+  made="$(jq -r '.metadata.labels["poc.internal/made-by"] // "none"' <<<"$cm")"
+  if [[ "$counter" != "$signed" || "$stored_epoch" != "$epoch" || -n "$marker" && "$made" != "$marker" ]]; then
+    echo "$name holds the spec revision $stored_epoch/$counter${marker:+ and the marker '$made'}, and mgmtd signed $epoch/$signed${marker:+. envd writes it with the marker $marker}."
     echo "Read the status of envd: mise run mgmt -- status, and its log: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"
     return 1
   fi
 }
+
+# envd writes the signed counter of the spec as the annotation poc.internal/spec-counter of ConfigMap
+# cell-records. The counter must equal the one that mgmtd signed last.
+check_envd_applied() { configmap_applied_spec spire-system cell-records; }
 
 # The SPIRE server and envd pin the public key of mgmtd: record_public_keys in the server config, and
 # ConfigMap mgmt-spec-key. Both must equal ConfigMap mgmt-signing-pub in management.
@@ -614,34 +620,19 @@ check_cell_controller_key() {
   fi
 }
 
-# check_cell_steps_current succeeds when envd wrote ConfigMap cell-controller-system/cell-steps for the spec that mgmtd signed last:
-# the label poc.internal/made-by=envd, and the annotations spec-epoch and spec-counter equal to the signed revision. A test that
-# patches the ConfigMap, as a compromised dev-cp could, makes this check fail until envd writes its next change.
-check_cell_steps_current() {
-  local status signed epoch cm counter stored_epoch made
-  status="$(cd "$ROOT" && mise run mgmt -- status 2>/dev/null)" || { echo "mise run mgmt -- status failed: $status"; echo "Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
-  signed="$(jq -er '.signed.counter' <<<"$status")" && epoch="$(jq -er '.signed.epoch' <<<"$status")" \
-    || { echo "mgmtd reports no signed revision: $status"; return 1; }
-  cm="$(k -n cell-controller-system get configmap cell-steps -o json 2>&1)" \
-    || { echo "ConfigMap cell-controller-system/cell-steps is absent: $cm"; echo "Read the log of envd: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"; return 1; }
-  counter="$(jq -r '.metadata.annotations["poc.internal/spec-counter"] // "none"' <<<"$cm")"
-  stored_epoch="$(jq -r '.metadata.annotations["poc.internal/spec-epoch"] // "none"' <<<"$cm")"
-  made="$(jq -r '.metadata.labels["poc.internal/made-by"] // "none"' <<<"$cm")"
-  if [[ "$counter" != "$signed" || "$stored_epoch" != "$epoch" || "$made" != envd ]]; then
-    echo "cell-steps holds the spec revision $stored_epoch/$counter and the marker '$made', and mgmtd signed $epoch/$signed. envd writes it, with the marker envd."
-    echo "Read the status of envd: mise run mgmt -- status, and its log: mise x -- kubectl --context kind-$CELL_NAME -n envd-system logs deploy/envd -c envd"
-    return 1
-  fi
-}
+# check_cell_steps_current succeeds when envd wrote ConfigMap cell-controller-system/cell-steps for the spec that mgmtd signed last,
+# with the label poc.internal/made-by=envd. A test that patches the ConfigMap, as a compromised dev-cp could, makes this check fail until
+# envd writes its next change.
+check_cell_steps_current() { configmap_applied_spec cell-controller-system cell-steps envd; }
 
 # check_cell_controller_address succeeds when the egress rule of flow N42 admits the one address that host.docker.internal has in the
-# node container, on HOSTSVC_PORT only, and the pod runs --hostsvc-addr with the same address. Docker can give the name another
+# node container, on HOSTSVC_PORT only (a rule with another port beside it does not count), and the pod runs --hostsvc-addr with the same address. Docker can give the name another
 # address after vm:up.
 check_cell_controller_address() {
   local want got arg
   want="$(hostsvc_address "$CELL_NAME" 2>&1)" || { echo "$want"; return 1; }
   got="$(k -n cell-controller-system get networkpolicy cell-controller -o json \
-    | jq -r --argjson p "$HOSTSVC_PORT" '[.spec.egress[] | select(any(.ports[]; .port == $p)) | .to[].ipBlock.cidr] | join(" ")')" \
+    | jq -r --argjson p "$HOSTSVC_PORT" '[.spec.egress[] | select(any(.ports[]; .port == $p)) | select((.ports | length) == 1) | .to[].ipBlock.cidr] | join(" ")')" \
     || { echo "could not read NetworkPolicy cell-controller-system/cell-controller"; return 1; }
   arg="$(k -n cell-controller-system get deployment cell-controller -o json \
     | jq -r '.spec.template.spec.containers[] | select(.name == "cell-controller") | .args[] | select(startswith("--hostsvc-addr="))')" \

@@ -2,6 +2,7 @@
 # Repair what a gate:m6 run can leave behind. It runs gate-m5-repair.sh first, which runs the M4 and M2 repairs once. Then it
 #   1. runs hostsvc:serve -- sync, so the host service holds the dev root, the keys and the spec of mgmtd, and sets the replicas of
 #      Deployment cell-controller in dev-cp back to 1 (a test can scale it down to see the host side alone);
+#      It also removes each key <cell>.step.json of ConfigMap cell-steps that is not the step that the spec indexes;
 #   2. cancels, through portal -- cancel, each open step whose ID a test recorded in build/gate/m6-steps. It never
 #      cancels a step that the provision test signed, because no test records those;
 #   3. deletes the test namespaces m6-* (label cell.poc.internal/e2e=true) in management, dev-cp, rogue and each live cell.
@@ -46,6 +47,33 @@ if [[ "$replicas" != 1 ]]; then
       || die "deployment/cell-controller did not finish its rollout in 300s"
   fi
 fi
+
+# stray_step_keys prints each key <cell>.step.json of ConfigMap cell-steps whose envelope is not the step that the spec in the same
+# ConfigMap indexes for the cell: the SHA-256 of its payload differs from stepSHA256, or the spec indexes no step for the cell. A test
+# that patches the ConfigMap leaves such a key when it stops early, and envd rewrites the ConfigMap only when its own content changes.
+b64d() { if printf 'AA==' | base64 -d >/dev/null 2>&1; then base64 -d; else base64 -D; fi; }
+stray_step_keys() {
+  local cm index key cell sum want
+  cm="$(kubectl --context kind-dev-cp -n cell-controller-system get configmap cell-steps -o json 2>/dev/null)" || return 0
+  index="$(jq -r '.data["spec-envelope.json"] // empty | fromjson | .payload' <<<"$cm" 2>/dev/null | b64d 2>/dev/null \
+    | jq -r '.steps[]? | "\(.name) \(.stepSHA256)"' 2>/dev/null)" || index=""
+  for key in $(jq -r '(.data // {}) | keys[] | select(endswith(".step.json"))' <<<"$cm"); do
+    cell="${key%.step.json}"
+    sum="$(jq -r --arg k "$key" '.data[$k] | fromjson | .payload' <<<"$cm" 2>/dev/null | b64d 2>/dev/null | shasum -a 256 | cut -d' ' -f1)" || sum=""
+    want="$(awk -v c="$cell" '$1 == c { print $2 }' <<<"$index")"
+    [[ -n "$want" && "$sum" == "$want" ]] || echo "$key"
+  done
+}
+for key in $(stray_step_keys); do
+  if ((check)); then
+    status=1
+    echo "ConfigMap cell-steps holds the key $key, and it is not the step that the spec indexes. Run: $repair"
+  else
+    log "removing the key $key from ConfigMap cell-steps"
+    kubectl --context kind-dev-cp -n cell-controller-system patch configmap cell-steps --type merge -p "{\"data\":{\"$key\":null}}" >/dev/null \
+      || die "could not remove the key $key from ConfigMap cell-steps"
+  fi
+done
 
 # open_steps prints "<id> <cell> <state>" for each step that has no final state at the host service.
 open_steps() {

@@ -1,6 +1,10 @@
 package scripts
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,6 +69,10 @@ case " $* " in
   *" get deployment cell-controller "*)
     [[ -z "${STUB_CC_ABSENT:-}" ]] || { echo 'Error from server (NotFound): deployments.apps "cell-controller" not found' >&2; exit 1; }
     printf '%s' "${STUB_CC_REPLICAS:-1}" ;;
+  *" get configmap cell-steps "*)
+    [[ -n "${STUB_CELLSTEPS:-}" ]] || { echo 'Error from server (NotFound)' >&2; exit 1; }
+    printf '%s' "$STUB_CELLSTEPS" ;;
+  *" patch configmap cell-steps "*) echo "kubectl $*" >>"$STUB_DIR/calls" ;;
   *" get namespaces -o json"*) echo '{"items":[]}' ;;
   *" rollout status "*) echo "kubectl $*" >>"$STUB_DIR/calls" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
@@ -126,6 +134,71 @@ func TestGateM6RepairCellControllerReplicas(t *testing.T) {
 			}
 			if len(tc.calls) == 0 && len(b) != 0 {
 				t.Errorf("unexpected calls %q", b)
+			}
+		})
+	}
+}
+
+// TestGateM6RepairStraySteps: a test that patches key <cell>.step.json of ConfigMap cell-steps and stops early leaves it. The script
+// compares the SHA-256 of each envelope payload with the stepSHA256 of the spec in the same ConfigMap. --check names a key that differs
+// or that the spec does not index, and exits 1. A repair removes it with a merge patch. A key that matches stays.
+func TestGateM6RepairStraySteps(t *testing.T) {
+	b64 := base64.StdEncoding.EncodeToString
+	payload := `{"id":"` + strings.Repeat("a", 32) + `"}`
+	sum := fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
+	specPayload := func(entries string) string {
+		return b64([]byte(`{"steps":[` + entries + `]}`))
+	}
+	cm := func(index string, key string, stepPayload string) string {
+		spec, _ := json.Marshal(map[string]any{"payload": specPayload(index)})
+		env, _ := json.Marshal(map[string]any{"payload": b64([]byte(stepPayload))})
+		data := map[string]string{"spec-envelope.json": string(spec), key: string(env)}
+		out, _ := json.Marshal(map[string]any{"data": data})
+		return string(out)
+	}
+	entry := `{"name":"dev-cell-2","stepID":"x","stepSHA256":"` + sum + `"}`
+	for _, tc := range []struct {
+		name, cm string
+		args     []string
+		code     int
+		want     string
+		patched  bool
+	}{
+		{name: "check: the key is the indexed step", cm: cm(entry, "dev-cell-2.step.json", payload), args: []string{"--check"}},
+		{name: "check: the payload differs", cm: cm(entry, "dev-cell-2.step.json", `{"id":"other"}`), args: []string{"--check"}, code: 1,
+			want: "holds the key dev-cell-2.step.json, and it is not the step that the spec indexes. Run: mise run gate:m6:repair"},
+		{name: "check: the spec indexes no step", cm: cm("", "dev-cell-2.step.json", payload), args: []string{"--check"}, code: 1,
+			want: "holds the key dev-cell-2.step.json"},
+		{name: "repair: the payload differs", cm: cm(entry, "dev-cell-2.step.json", `{"id":"other"}`), patched: true},
+		{name: "repair: the key is the indexed step", cm: cm(entry, "dev-cell-2.step.json", payload)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for name, body := range map[string]string{
+				"repair-m5": "#!/usr/bin/env bash\nexit 0\n",
+				"replicas":  "#!/usr/bin/env bash\nexit 0\n",
+				"serve":     "#!/usr/bin/env bash\ncase \"$1\" in status) echo '{\"running\":true}' ;; steps) echo '{\"steps\":[]}' ;; esac\n",
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			stubs := map[string]string{"kubectl": m6RepairKubectl}
+			for name, body := range liveStubs {
+				stubs[name] = body
+			}
+			out, errOut, code := runScript(t, "gate-m6-repair.sh", stubs,
+				[]string{"STUB_DIR=" + dir, "STUB_CELLSTEPS=" + tc.cm, "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"),
+					"HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"), "HOSTSVC_SERVE=" + filepath.Join(dir, "serve")}, tc.args...)
+			if code != tc.code {
+				t.Fatalf("exit %d, want %d\nstdout %s\nstderr %s", code, tc.code, out, errOut)
+			}
+			if tc.want != "" && !strings.Contains(out, tc.want) {
+				t.Errorf("stdout %q lacks %q", out, tc.want)
+			}
+			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+			if got := strings.Contains(string(calls), `patch configmap cell-steps --type merge -p {"data":{"dev-cell-2.step.json":null}}`); got != tc.patched {
+				t.Errorf("patch ran %v, want %v; calls %q", got, tc.patched, calls)
 			}
 		})
 	}

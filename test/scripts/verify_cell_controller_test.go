@@ -180,8 +180,11 @@ func TestCellControllerChecks(t *testing.T) {
 		{name: "address: the argument is old and the policy is current", check: "check_cell_controller_address",
 			change: map[string]string{"deployment.json": `{"spec":{"template":{"spec":{"containers":[{"name":"cell-controller","args":["run","--hostsvc-addr=192.168.5.7:17443"]}]}}}}`},
 			wanted: []string{"the cell controller runs '--hostsvc-addr=192.168.5.7:17443'"}},
-		{name: "address: the policy admits a wider rule", check: "check_cell_controller_address",
-			change: map[string]string{"policy.json": `{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"192.168.5.2/32"}}],"ports":[{"port":17443},{"port":17444}]},{"to":[{"ipBlock":{"cidr":"192.168.5.3/32"}}],"ports":[{"port":17443}]}]}}`},
+		{name: "address: the rule of N42 names another port too", check: "check_cell_controller_address",
+			change: map[string]string{"policy.json": `{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"192.168.5.2/32"}}],"ports":[{"port":17443},{"port":17444}]}]}}`},
+			wanted: []string{"the policy admits ''", "Run: " + fix}},
+		{name: "address: the policy admits a second address", check: "check_cell_controller_address",
+			change: map[string]string{"policy.json": `{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"192.168.5.2/32"}},{"ipBlock":{"cidr":"192.168.5.3/32"}}],"ports":[{"port":17443}]}]}}`},
 			wanted: []string{"the policy admits '192.168.5.2/32 192.168.5.3/32'"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

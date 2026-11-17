@@ -547,7 +547,7 @@ func TestHarnessObjectsAcceptsStepConfigMaps(t *testing.T) {
 }
 
 // TestHarnessObjectsOwnedNamespaceRefusesOtherLabels: cell-controller-system is an owned namespace. A Role or RoleBinding that carries
-// the harness label of another component, such as the old Role envd-steps of an envd render, is an extra object, and the check
+// the harness label of another component, such as a Role envd-steps rendered by the component envd, is an extra object, and the check
 // fails. The Role envd-steps of the bundle itself, with the label cell-controller, passes.
 func TestHarnessObjectsOwnedNamespaceRefusesOtherLabels(t *testing.T) {
 	for _, tc := range []struct {
