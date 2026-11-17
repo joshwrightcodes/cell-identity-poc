@@ -204,6 +204,10 @@ func (t *txn) seal() error {
 	stepEnvs := map[string]json.RawMessage{}
 	for _, name := range sortedKeys(t.st.Requests) {
 		ss := t.st.Requests[name].Step
+		if ss != nil && !ss.open() {
+			s.Closed = append(s.Closed, ss.ID)
+			continue
+		}
 		if _, in := t.p.cellIn(t.st, name); !in || !ss.open() {
 			continue
 		}
@@ -217,6 +221,11 @@ func (t *txn) seal() error {
 			return refuse(mgmtapi.ReasonKeysUntrusted, "bundle_too_large")
 		}
 	}
+	// Closed holds each step that a bind closed, for as long as its request names the step. A retry,
+	// a recreate or a withdraw replaces or removes the step and so ends the entry. The host keeps a
+	// close that it applied and changes nothing in a step that has a final state, so the end of
+	// the entry only reaches a step that the host never saw closed.
+	slices.Sort(s.Closed)
 	for _, name := range sortedKeys(t.st.Retired) {
 		s.Retired = append(s.Retired, spec.Retired{Name: name, Revision: t.st.Retired[name]})
 	}

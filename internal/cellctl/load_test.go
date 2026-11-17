@@ -301,3 +301,22 @@ func TestLoadNeedsASpec(t *testing.T) {
 }
 
 func encodeKey(k []byte) string { return base64.StdEncoding.EncodeToString(k) + "\n" }
+
+func TestLoadAcceptsClosedList(t *testing.T) {
+	w := newWorld(t)
+	live := w.item("dev-cell-1", 0)
+	d := w.data(2, live)
+	closed := strings.Repeat("ab", 16)
+	env, err := spec.Sign(spec.Spec{
+		Env: w.env, Revision: spec.Revision{Epoch: 1, Counter: 3},
+		Steps: []spec.StepEntry{w.entry(live)}, Closed: []string{closed},
+	}, w.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d[SpecKey] = string(env)
+	steps, rev, refused := Load(d, "dev", w.keys(), spec.Revision{}, t0)
+	if len(refused) != 0 || len(steps) != 1 || rev.Counter != 3 {
+		t.Fatalf("steps %d, revision %v, refused %v", len(steps), rev, refused)
+	}
+}

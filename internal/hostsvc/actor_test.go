@@ -841,9 +841,9 @@ func TestSpecDropCancelsFailed(t *testing.T) {
 }
 
 func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
-	// closeSpec drops the step and holds a record of its cell above the revision that indexed it.
-	closeSpec := func(ae *actorEnv) {
-		ae.putSpec(nil, map[string]uint64{"dev-cell-1": ae.rev + 5})
+	// closeSpec drops the step and lists its ID in closed.
+	closeSpec := func(ae *actorEnv, id string) {
+		ae.putSpecClosed(nil, nil, id)
 	}
 	t.Run("closed_running_finishes", func(t *testing.T) {
 		ae := newActorEnv(t, nil)
@@ -853,7 +853,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		closeSpec(ae)
+		closeSpec(ae, s.ID)
 		waitUntil(t, "the step to be closed", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
 		if st := ae.status(s.ID); st.State != mgmtapi.StepCreating {
 			t.Fatalf("after the close: %s, want creating", st.State)
@@ -875,7 +875,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.submit(s1, e1)
 		ae.submit(s2, e2)
 		ae.waitState(s1.ID, mgmtapi.StepCreating)
-		ae.putSpec([]spec.StepEntry{ae.indexOf(s1, e1)}, map[string]uint64{"dev-cell-1": ae.rev + 5})
+		ae.putSpecClosed([]spec.StepEntry{ae.indexOf(s1, e1)}, nil, s2.ID)
 		st := ae.waitState(s2.ID, mgmtapi.StepDone)
 		if st.Stage != "" || st.Detail != "" {
 			t.Errorf("status = %+v, want done with no stage", st)
@@ -897,7 +897,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		closeSpec(ae)
+		closeSpec(ae, s.ID)
 		waitUntil(t, "the close", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
 		release()
 		st := ae.waitState(s.ID, mgmtapi.StepFailedFinal, mgmtapi.StepFailed)
@@ -913,7 +913,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		closeSpec(ae)
+		closeSpec(ae, s.ID)
 		waitUntil(t, "the close", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
 		newPub, _ := newKey(t)
 		ae.setKeys(newPub) // the old key left: a rotation does not sign a closed step again
@@ -928,7 +928,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		closeSpec(ae)
+		closeSpec(ae, s.ID)
 		waitUntil(t, "the close", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
 		ae.clock.Advance(step.MinTTL + time.Second)
 		release()
@@ -944,7 +944,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		closeSpec(ae)
+		closeSpec(ae, s.ID)
 		waitUntil(t, "the close", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
 		ae.digest.Store(strings.Repeat("f", 64))
 		release()
@@ -952,7 +952,7 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 			t.Errorf("status = %+v, want bootstrap_mismatch", st)
 		}
 	})
-	t.Run("record_not_above_cancels", func(t *testing.T) {
+	t.Run("closed_listing_other_step_cancels", func(t *testing.T) {
 		ae := newActorEnv(t, nil)
 		block, _ := ae.blocker("rel")
 		ae.setScript("creating", block)
@@ -960,9 +960,112 @@ func TestSpecDropClosedStepKeepsRunning(t *testing.T) {
 		ae.start()
 		ae.submit(s, env)
 		ae.waitState(s.ID, mgmtapi.StepCreating)
-		// A record of the cell at the revision of the indexing spec is not above it.
-		ae.putSpec(nil, map[string]uint64{"dev-cell-1": mustEntry(t, ae.j, s.ID).IndexedIn.Counter})
+		ae.putSpecClosed(nil, nil, strings.Repeat("e", 32))
 		ae.waitState(s.ID, mgmtapi.StepCancelled)
+	})
+	t.Run("record_above_without_closed_cancels", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		block, _ := ae.blocker("rel")
+		ae.setScript("creating", block)
+		s, env := ae.indexed("dev-cell-1", nil)
+		ae.start()
+		ae.submit(s, env)
+		ae.waitState(s.ID, mgmtapi.StepCreating)
+		ae.putSpec(nil, map[string]uint64{"dev-cell-1": ae.rev + 5})
+		ae.waitState(s.ID, mgmtapi.StepCancelled)
+	})
+	t.Run("closed_step_keeps_close_when_id_leaves_list", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		block, release := ae.blocker("rel")
+		ae.setScript("creating", block)
+		s, env := ae.indexed("dev-cell-1", nil)
+		ae.start()
+		ae.submit(s, env)
+		ae.waitState(s.ID, mgmtapi.StepCreating)
+		closeSpec(ae, s.ID)
+		waitUntil(t, "the step to be closed", 5*time.Second, func() bool { return mustEntry(t, ae.j, s.ID).Closed() })
+		ae.putSpec(nil, nil)
+		if st := ae.status(s.ID); st.State != mgmtapi.StepCreating {
+			t.Fatalf("after the ID left closed: %s, want creating", st.State)
+		}
+		release()
+		ae.waitState(s.ID, mgmtapi.StepDone)
+	})
+}
+
+// A cancel, a retry or a withdraw that the host reads after it missed a revision with a record
+// change of the cell is still a cancel: only a signed closed list closes a step.
+func TestReviewMissedRecordBumpThenCancel(t *testing.T) {
+	ae := newActorEnv(t, nil)
+	block, _ := ae.blocker("rel")
+	ae.setScript("creating", block)
+	s, env := ae.indexed("dev-cell-1", nil) // r1 indexes X, no record
+	ae.start()
+	ae.submit(s, env)
+	ae.waitState(s.ID, mgmtapi.StepCreating)
+	ae.rev++                                                                // r2 re-signs the record; the host never sees it
+	ae.putSpec([]spec.StepEntry{}, map[string]uint64{"dev-cell-1": ae.rev}) // r3 drops X, record at r2
+	ae.waitState(s.ID, mgmtapi.StepCancelled)
+	if mustEntry(t, ae.j, s.ID).Closed() {
+		t.Error("the step is closed, want cancelled")
+	}
+}
+
+func TestSpecMissedRecordBumpRetryAndWithdraw(t *testing.T) {
+	t.Run("retry_running", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		block, _ := ae.blocker("rel")
+		ae.setScript("creating", block)
+		x, ex := ae.indexed("dev-cell-1", nil)
+		ae.start()
+		ae.submit(x, ex)
+		ae.waitState(x.ID, mgmtapi.StepCreating)
+		y, ey := ae.newStep("dev-cell-1", func(s *step.Step) { s.IssuedAt = s.IssuedAt.Add(time.Second) })
+		ae.rev++
+		ae.putSpec([]spec.StepEntry{ae.indexOf(y, ey)}, map[string]uint64{"dev-cell-1": ae.rev})
+		ae.waitState(x.ID, mgmtapi.StepCancelled)
+		if mustEntry(t, ae.j, x.ID).Closed() {
+			t.Error("the retried step is closed, want cancelled")
+		}
+	})
+	t.Run("retry_queued", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		block, _ := ae.blocker("rel")
+		ae.setScript("creating", block)
+		s1, e1 := ae.newStep("dev-cell-2", nil)
+		x, ex := ae.newStep("dev-cell-1", func(s *step.Step) { s.IssuedAt = s.IssuedAt.Add(time.Second) })
+		ae.putSpec([]spec.StepEntry{ae.indexOf(x, ex), ae.indexOf(s1, e1)}, nil)
+		ae.start()
+		ae.submit(s1, e1)
+		ae.submit(x, ex)
+		ae.waitState(s1.ID, mgmtapi.StepCreating)
+		y, ey := ae.newStep("dev-cell-1", func(s *step.Step) { s.IssuedAt = s.IssuedAt.Add(2 * time.Second) })
+		ae.rev++
+		ae.putSpec([]spec.StepEntry{ae.indexOf(y, ey), ae.indexOf(s1, e1)}, map[string]uint64{"dev-cell-1": ae.rev})
+		if st := ae.waitState(x.ID, mgmtapi.StepCancelled); st.State != mgmtapi.StepCancelled {
+			t.Errorf("status = %+v, want cancelled", st)
+		}
+	})
+	t.Run("withdraw_failed", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		ae.setScript("creating", "exit 1")
+		x, ex := ae.indexed("dev-cell-1", nil)
+		ae.start()
+		ae.submit(x, ex)
+		ae.waitState(x.ID, mgmtapi.StepFailed)
+		ae.rev++
+		ae.putSpec(nil, map[string]uint64{"dev-cell-1": ae.rev})
+		ae.waitState(x.ID, mgmtapi.StepCancelled)
+	})
+	t.Run("closed_listed_failed_is_done", func(t *testing.T) {
+		ae := newActorEnv(t, nil)
+		ae.setScript("creating", "exit 1")
+		x, ex := ae.indexed("dev-cell-1", nil)
+		ae.start()
+		ae.submit(x, ex)
+		ae.waitState(x.ID, mgmtapi.StepFailed)
+		ae.putSpecClosed(nil, nil, x.ID)
+		ae.waitState(x.ID, mgmtapi.StepDone)
 	})
 }
 

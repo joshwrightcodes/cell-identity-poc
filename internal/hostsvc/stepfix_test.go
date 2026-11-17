@@ -143,8 +143,19 @@ func (e *stepEnv) putSpec(steps []spec.StepEntry, cells map[string]uint64) spec.
 
 func (e *stepEnv) putSpecKey(priv ed25519.PrivateKey, steps []spec.StepEntry, cells map[string]uint64) spec.Spec {
 	e.t.Helper()
+	return e.putSpecFull(priv, steps, cells, nil)
+}
+
+// putSpecClosed is putSpec with a list of closed step IDs, in ascending order.
+func (e *stepEnv) putSpecClosed(steps []spec.StepEntry, cells map[string]uint64, closed ...string) spec.Spec {
+	e.t.Helper()
+	return e.putSpecFull(e.priv, steps, cells, closed)
+}
+
+func (e *stepEnv) putSpecFull(priv ed25519.PrivateKey, steps []spec.StepEntry, cells map[string]uint64, closed []string) spec.Spec {
+	e.t.Helper()
 	e.rev++
-	sp := spec.Spec{Env: "dev", Revision: spec.Revision{Epoch: 1, Counter: e.rev}, Steps: steps}
+	sp := spec.Spec{Env: "dev", Revision: spec.Revision{Epoch: 1, Counter: e.rev}, Steps: steps, Closed: closed}
 	for _, name := range []string{"dev-cell-1", "dev-cell-2", "dev-cell-3"} {
 		if c, ok := cells[name]; ok {
 			sp.Cells = append(sp.Cells, spec.Entry{Name: name, Revision: spec.Revision{Epoch: 1, Counter: c}, RecordSHA256: strings.Repeat("0", 64)})

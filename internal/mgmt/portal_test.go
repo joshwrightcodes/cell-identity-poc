@@ -1048,3 +1048,83 @@ func TestAlreadyBoundInCommitDoesNotCloseStep(t *testing.T) {
 		t.Fatal("the step closed")
 	}
 }
+
+// specClosed returns the closed list of the newest spec.
+func (r *rig) specClosed() []string {
+	r.t.Helper()
+	l := r.plane.snap.Load().st.latest()
+	s, _, err := spec.Verify(l.Bundle.Spec, []ed25519.PublicKey{r.plane.PublicKey()})
+	if err != nil {
+		r.t.Fatalf("spec does not verify: %v", err)
+	}
+	return s.Closed
+}
+
+func TestSpecListsClosedStep(t *testing.T) {
+	r := newBareRig(t, cell1, cell2)
+	r.request(cell1, cell2)
+	if got := r.specClosed(); len(got) != 0 {
+		t.Fatalf("closed before a bind: %v", got)
+	}
+	id := r.stepOf(cell1).ID
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	if got := r.specClosed(); len(got) != 1 || got[0] != id {
+		t.Fatalf("closed after the bind = %v, want [%s]", got, id)
+	}
+	if _, ok := r.specSteps()[cell1]; ok {
+		t.Fatal("the closed step is still indexed")
+	}
+	// The ID stays for as long as the request names the step, through later commits and a rotation.
+	if _, err := r.plane.PortalCancel(t.Context(), cell2); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.specClosed(); len(got) != 1 || got[0] != id {
+		t.Fatalf("closed after a cancel of another cell = %v", got)
+	}
+	if _, err := r.plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.specClosed(); len(got) != 1 || got[0] != id {
+		t.Fatalf("closed after a rotation = %v", got)
+	}
+	r.restart(nil)
+	if got := r.specClosed(); len(got) != 1 || got[0] != id {
+		t.Fatalf("closed after a restart = %v", got)
+	}
+	// A recreate replaces the step, so the ID leaves the list.
+	if _, err := r.plane.PortalRecreate(t.Context(), cell1, testDigest); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.specClosed(); len(got) != 0 {
+		t.Fatalf("closed after a recreate = %v", got)
+	}
+}
+
+func TestSpecClosedEndsOnWithdraw(t *testing.T) {
+	r := newBareRig(t, cell1)
+	r.request(cell1)
+	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
+	if got := r.specClosed(); len(got) != 1 {
+		t.Fatalf("closed = %v", got)
+	}
+	if _, err := r.plane.PortalWithdraw(t.Context(), []string{cell1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.specClosed(); len(got) != 0 {
+		t.Fatalf("closed after a withdraw = %v", got)
+	}
+}
+
+func TestSpecCancelAndRetryListNoClosed(t *testing.T) {
+	r := newBareRig(t, cell1, cell2)
+	r.request(cell1, cell2)
+	if _, err := r.plane.PortalCancel(t.Context(), cell1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.plane.PortalRetry(t.Context(), cell2, testDigest); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.specClosed(); len(got) != 0 {
+		t.Fatalf("a cancel or a retry listed closed steps: %v", got)
+	}
+}

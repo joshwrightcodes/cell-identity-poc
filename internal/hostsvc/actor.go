@@ -433,8 +433,9 @@ func (a *Actor) setFinal(e *JournalEntry, stage, detail string) {
 }
 
 // handleSpec applies a spec that the store accepted to every open step. A step that the spec still
-// indexes keeps its place. A step that it no longer indexes is closed when the spec holds a record
-// of its cell above the revision that last indexed the step, and cancelled otherwise.
+// indexes keeps its place. A step that it no longer indexes is closed when the spec lists its ID in
+// Closed, which only the plane signs, and cancelled otherwise. A step that is already closed or
+// final keeps its state.
 func (a *Actor) handleSpec(sp spec.Spec) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -449,7 +450,7 @@ func (a *Actor) handleSpec(sp spec.Spec) {
 				a.updateLocked(e.Status.ID, func(e *JournalEntry) { e.IndexedIn = sp.Revision })
 			}
 		case e.Closed():
-		case recordAbove(sp, e.Status.Cell, e.IndexedIn):
+		case slices.Contains(sp.Closed, e.Status.ID):
 			a.cfg.Log.Info("step_closed", "step", e.Status.ID, "cell", e.Status.Cell, "revision", sp.Revision)
 			a.updateLocked(e.Status.ID, func(x *JournalEntry) {
 				x.ClosedIn = sp.Revision
@@ -463,15 +464,6 @@ func (a *Actor) handleSpec(sp spec.Spec) {
 			a.cancelLocked(e)
 		}
 	}
-}
-
-func recordAbove(sp spec.Spec, cell string, rev spec.Revision) bool {
-	for _, c := range sp.Cells {
-		if c.Name == cell {
-			return c.Revision.Compare(rev) > 0
-		}
-	}
-	return false
 }
 
 func (a *Actor) drainSpec() {

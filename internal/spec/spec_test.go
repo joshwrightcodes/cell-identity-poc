@@ -486,3 +486,55 @@ func TestSpecWithoutStepsUnchanged(t *testing.T) {
 		t.Fatalf("payload %s", payload)
 	}
 }
+
+func TestSpecClosedRules(t *testing.T) {
+	pub, priv := keyPair(t)
+	keys := []ed25519.PublicKey{pub}
+	a, b := strings.Repeat("ab", 16), strings.Repeat("cd", 16)
+	mod := func(steps []StepEntry, closed ...string) []byte {
+		s := goodSpec()
+		s.Steps, s.Closed = steps, closed
+		return signRaw(t, s, priv)
+	}
+	for _, tc := range []struct {
+		name string
+		env  []byte
+		bad  bool
+	}{
+		{"closed_two_ascending", mod(nil, a, b), false},
+		{"closed_one", mod(nil, a), false},
+		{"closed_out_of_order", mod(nil, b, a), true},
+		{"closed_duplicate", mod(nil, a, a), true},
+		{"closed_upper", mod(nil, strings.Repeat("AB", 16)), true},
+		{"closed_31_hex", mod(nil, strings.Repeat("a", 31)), true},
+		{"closed_also_indexed", mod([]StepEntry{{"dev-cell-1", a, digest}}, a), true},
+		{"closed_next_to_indexed", mod([]StepEntry{{"dev-cell-1", a, digest}}, b), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := Verify(tc.env, keys)
+			if tc.bad && !errors.Is(err, record.ErrDecode) {
+				t.Fatalf("got %v, want ErrDecode", err)
+			}
+			if !tc.bad && err != nil {
+				t.Fatalf("got %v, want success", err)
+			}
+		})
+	}
+	s := goodSpec()
+	s.Closed = []string{a}
+	env, err := Sign(s, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, payload, err := Verify(env, keys)
+	if err != nil || len(got.Closed) != 1 || got.Closed[0] != a {
+		t.Fatalf("round trip: %v %+v", err, got.Closed)
+	}
+	if !strings.Contains(string(payload), `"closed":["`+a+`"]`) {
+		t.Fatalf("payload %s", payload)
+	}
+	s.Closed = []string{b, a}
+	if _, err := Sign(s, priv); err == nil {
+		t.Fatal("Sign accepted closed out of order")
+	}
+}

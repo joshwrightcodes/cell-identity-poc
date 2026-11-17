@@ -700,3 +700,25 @@ func TestAcceptUnchangedLeavesCur(t *testing.T) {
 		t.Fatal("Accept changed cur")
 	}
 }
+
+func TestAcceptStepsAcceptsClosedList(t *testing.T) {
+	f := newFx(t)
+	cur, items := f.base()
+	st := f.stepFor("d", nil)
+	b := f.bundleSteps(rev(1, 6), slices.Clone(items), []spec.Retired{{Name: "r", Revision: rev(1, 3)}}, st)
+	s, _, err := spec.Verify(b.Spec, f.keys())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Closed = []string{strings.Repeat("ab", 16)}
+	if b.Spec, err = spec.Sign(s, f.priv); err != nil {
+		t.Fatal(err)
+	}
+	got, changed, err := Accept(cur, b, testEnv, f.keys())
+	if err != nil || !changed {
+		t.Fatalf("changed=%v err=%v", changed, err)
+	}
+	if len(got.Steps) != 1 {
+		t.Fatalf("steps=%d", len(got.Steps))
+	}
+}
