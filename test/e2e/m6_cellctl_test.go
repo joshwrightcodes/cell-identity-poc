@@ -551,7 +551,7 @@ func resignWithRogueKey(t *testing.T, envelope []byte) []byte {
 }
 
 // TestM6CellControllerIdentity: the SPIRE server issues the SVID spiffe://dev.env.poc.internal/cp/cell-controller to the cell controller, and the
-// log of the server shows it. The entry selects unix:uid:<ko uid>, under the node alias of its own namespace and ServiceAccount.
+// log of the spire-agent in its pod shows the renewal after the test start. The server entry selects unix:uid:<ko uid>, under the node alias of its own namespace and ServiceAccount.
 func TestM6CellControllerIdentity(t *testing.T) {
 	const id = cellControllerID
 	out, err := spireServerIn(t, spireCluster, "entry", "show", "-socketPath", spireSocket, "-spiffeID", id, "-output", "json")
@@ -581,16 +581,21 @@ func TestM6CellControllerIdentity(t *testing.T) {
 	if e.ParentID.Path != "/agents/"+cellCtlNamespace+"/"+cellCtlDeployment {
 		t.Errorf("the parent is %s, want the node alias /agents/%s/%s", e.ParentID.Path, cellCtlNamespace, cellCtlDeployment)
 	}
-	// The SVID of the cell controller lasts SPIRE_SVID_TTL, so the server signs it again about each half minute. The line is the
-	// one that says the server signed an X509 SVID, together with the ID.
-	waitFor(t, "the log of the SPIRE server to show a signed X509 SVID for "+id, 3*time.Minute, func() (bool, string) {
-		logs, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=5m")
+	// The SVID of the cell controller lasts SPIRE_SVID_TTL, so its spire-agent renews it about each half minute. The server logs no signed
+	// SVID at INFO, so the line is the one of the agent in the pod of the cell controller: msg "Renewing X509-SVID" with the ID.
+	started := time.Now().Add(-5 * time.Second)
+	waitFor(t, "the log of the spire-agent of the cell controller to show an X509-SVID for "+id, 3*time.Minute, func() (bool, string) {
+		logs, err := kubectl(t, spireCluster, "", "-n", cellCtlNamespace, "logs", "deploy/"+cellCtlDeployment, "-c", "spire-agent", "--since-time="+started.UTC().Format(time.RFC3339))
 		for line := range strings.SplitSeq(logs, "\n") {
-			if strings.Contains(line, "Signed X509 SVID") && strings.Contains(line, id) {
+			var rec map[string]any
+			if json.Unmarshal([]byte(line), &rec) != nil {
+				continue
+			}
+			if msg, _ := rec["msg"].(string); strings.Contains(msg, "X509-SVID") && rec["spiffe_id"] == id {
 				return true, ""
 			}
 		}
-		return false, fmt.Sprintf("no line with Signed X509 SVID and the ID (%v)", err)
+		return false, fmt.Sprintf("no agent line about an X509-SVID for the ID (%v)", err)
 	})
 	var ports []string
 	for _, a := range listenAddrs(t, spireCluster, cellCtlNamespace, cellCtlPod(t), cellCtlDeployment) {
