@@ -190,7 +190,7 @@ The host service writes at most one refusal line for each reason in 10 seconds.
 | `spec_behind` | The host service knows an older spec than the step needs. `mgmtd` pushes the spec, so this clears by itself. | Wait 2 minutes. If it stays, run `mise run hostsvc:serve -- sync`, or `CELL=management LINK_ONLY=mgmt-api mise run cell:link`. |
 | `cell_needs_step` | A command tried to create a cell directly. Only a signed step creates a cell. | Run `mise run portal -- request --cell <cell> --wait`. |
 | `journal_corrupt` | `journal.json` of the host service does not parse. The host service refuses every step. | Run `mise run portal -- retry --cell <cell>` or `mise run portal -- cancel --cell <cell>` for each open cell. Then run `mise run hostsvc:serve -- steps --reset`. The reset works only for a corrupt journal. |
-| `interrupted` | The host service stopped, or the Mac slept or logged out, while a stage ran. | Wait 1 minute. The cell controller sends the step again at its next poll, about 10 seconds later. Run `mise run portal -- retry --cell <cell>` if it does not. |
+| `interrupted` | The host service stopped, or the Mac slept or logged out, while a stage ran. | Wait for the first spec push of `mgmtd`, usually within 1 minute. The step then runs again at the next poll of the cell controller. If `mgmtd` cannot reach the host service, the step waits. Run `mise run mgmt -- status` to check `mgmtd`. |
 | `timeout` | A stage ran past its limit. | Read the step log, fix the cause, then run `mise run portal -- retry --cell <cell>`. |
 | `stage_failed` | A stage exited with an error. | Read the step log, fix the cause, then run `mise run portal -- retry --cell <cell>`. |
 
@@ -1476,6 +1476,18 @@ A new worktree also has no `.envrc.local`. Copy it from the same checkout, or se
 `harness:up` and `secrets:connect` print this fix when the file is absent.
 After a change under `cmd/` or `internal/`, run `cell:up` for `dev-cp` and for each cell before `cell:verify`.
 `gate:m2` first compares the deployed images with `build/images.env`, and it prints the `cell:up` commands when they differ.
+
+### Roll out a change to the spec format
+
+A signed spec can gain a member, for example `closed`. An older image of a reader refuses the whole spec, so roll out in this order.
+1. Build the images with `mise run images`.
+2. Roll out every image that decodes the spec: `envd`, the cell controller, `cellgw` and `cluster-jwt-server`.
+   Use `CELL=dev-cp mise run cell:up`, then `mise run hostsvc:serve -- restart` for the host service.
+3. Roll out `mgmtd` last, with `mise run images -- mgmtd` and `CELL=management LINK_ONLY=mgmt-api mise run cell:link`.
+
+After the first commit of the new `mgmtd`, an older `mgmtd` image cannot load its state. The way back is `mise run mgmt -- reset-state`.
+New image digests change the bootstrap digest. Each open step then fails with `bootstrap_mismatch`.
+Run `mise run portal -- retry --cell <cell>` for each open cell.
 
 ## Keys
 

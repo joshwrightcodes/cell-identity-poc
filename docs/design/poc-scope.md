@@ -231,7 +231,7 @@ macOS still sleeps when the lid closes on battery power.
 - A compromised `dev-cp` can mint the cell controller SVID. It can send the host service a step that the newest spec still indexes, until the step expires or closes.
 - A cancelled, retried or withdrawn step does not run again. A replayed step for a cell that the newest spec still indexes can create its cluster. That cluster gets network reach to the `dev-cp` listeners after the admit stage.
 - The host service learns the spec only from `mgmtd`. While `mgmtd` cannot reach it, open steps wait with `spec_behind`.
-- After a start, the host service runs no queued step, and queues no failed step again, until it accepts a spec push from `mgmtd`. While `mgmtd` cannot reach the host service, steps wait. The stored spec can be older than the intent, so a cancel that came during the stop reaches the step first.
+- After a start, the host service runs no step until it accepts a spec push from `mgmtd`. A PUT queues a failed step, and the step waits. While `mgmtd` cannot reach the host service, steps wait. The stored spec can be older than the intent, so a cancel that came during the stop reaches the step first.
 - The real cell controller and a holder of a minted SVID share one peer ID. The holder can queue only steps that the newest spec indexes, at most one for each requested cell. The holder can use the whole rate (20 at once, then one each 3 seconds) and the in-flight slots (4). This can stall provisioning.
 - Key reads and spec pushes keep their own slots. The residual of the M4 connection slots still applies to the shared listener, so a flood from `rogue` or a cell pod also stalls step PUTs.
 - Every namespace of `dev-cp` has a default deny policy. Only a pod in a namespace with no egress policy, or a pod on the host network, can open a connection to the host service port.
@@ -240,7 +240,7 @@ macOS still sleeps when the lid closes on battery power.
 - `valid` takes the applied record revision from envd in `dev-cp`, and `lastStatusAt` from the clock of the cell.
 - Each admit stage restarts the `dev-cp` SPIRE server and gateway, so other cells can show `status_stale` for a few minutes.
 - `cell:down`, a harness command with no signature, deletes cells. A withdrawn cell keeps its admit rule until its `cell:down`, because the admit lists follow the clusters that exist.
-- A host service restart or a Mac logout during a step ends the running stage. The step shows `failed` with `interrupted`. The cell controller sends it again at its next poll, about 10 seconds later.
+- A host service restart or a Mac logout during a step ends the running stage. The step shows `failed` with `interrupted`. It runs again only after the first spec push from `mgmtd` and the next poll of the cell controller.
 - A command that finds a stale cluster lock takes the lock over in a window of a few instructions. Two such commands can race for the same dead holder.
 - After `--emergency --force` across a stage boundary, a window of about 40 seconds can end the step `failed_final`. The host service trusts the new key before `mgmtd` pushes the new spec.
 - The host service reads the node address after the `creating` stage with no timeout. If Docker hangs after a good create, the read holds the actor.
