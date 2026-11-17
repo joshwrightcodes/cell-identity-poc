@@ -283,8 +283,9 @@ func stepEnvelopeOf(t *testing.T, cell, id string, timeout time.Duration) []byte
 }
 
 // TestM6CellControllerNetwork: from an ephemeral netprobe container in the cell controller pod, the host service port connects (the
-// control), and the next port of the same address and the API node port of mgmtd time out. In dev-cp, a pod in a fresh namespace times out
-// on the host service port and on the health port of the pod. The ephemeral container runs through the administrator kubeconfig,
+// control), and the next port of the same address and the API node port of mgmtd time out. In dev-cp, a pod in a fresh namespace connects
+// to the host service port, because no policy stops it and mTLS guards the service (a handshake with no certificate fails), and it times
+// out on the health port of the cell controller pod. The ephemeral container runs through the administrator kubeconfig,
 // with the pinned netprobe image and the restricted profile, because the namespace enforces Pod Security restricted.
 func TestM6CellControllerNetwork(t *testing.T) {
 	needProbeImage(t)
@@ -314,9 +315,15 @@ func TestM6CellControllerNetwork(t *testing.T) {
 			}
 		})
 	}
-	t.Run("a pod of another namespace to the host service", func(t *testing.T) {
-		if err := probeFromFreshNamespace(t, spireCluster, host, 17443, 10*time.Second); err != nil {
-			t.Error(err)
+	// No policy keeps a pod of another namespace from opening a connection to the host service: a fresh namespace has no egress
+	// policy. The guard is mTLS and the route check. So the pod connects, and a handshake with no client certificate fails.
+	t.Run("a pod of another namespace connects, and the host service refuses a handshake with no certificate", func(t *testing.T) {
+		ns := freshNamespace(t, spireCluster)
+		if got := dialFrom(t, spireCluster, ns, host, 17443, 10*time.Second); got != "connected" {
+			t.Errorf("a pod in %s dials %s:17443 and gets %q, want connected: only mTLS guards the host service", ns, host, got)
+		}
+		if err := handshakeRefused(nil); err != nil {
+			t.Errorf("a handshake with no certificate: %v", err)
 		}
 	})
 	t.Run("a pod of another namespace to the cell controller", func(t *testing.T) {
@@ -574,11 +581,26 @@ func TestM6CellControllerIdentity(t *testing.T) {
 	if e.ParentID.Path != "/agents/"+cellCtlNamespace+"/"+cellCtlDeployment {
 		t.Errorf("the parent is %s, want the node alias /agents/%s/%s", e.ParentID.Path, cellCtlNamespace, cellCtlDeployment)
 	}
-	// The SVID of the cell controller lasts SPIRE_SVID_TTL, so the server signs it again about each half minute.
-	waitFor(t, "the log of the SPIRE server to show an SVID for "+id, 3*time.Minute, func() (bool, string) {
+	// The SVID of the cell controller lasts SPIRE_SVID_TTL, so the server signs it again about each half minute. The line is the
+	// one that says the server signed an X509 SVID, together with the ID.
+	waitFor(t, "the log of the SPIRE server to show a signed X509 SVID for "+id, 3*time.Minute, func() (bool, string) {
 		logs, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=5m")
-		return err == nil && strings.Contains(logs, id), "the log holds no line for the ID"
+		for line := range strings.SplitSeq(logs, "\n") {
+			if strings.Contains(line, "Signed X509 SVID") && strings.Contains(line, id) {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("no line with Signed X509 SVID and the ID (%v)", err)
 	})
+	var ports []string
+	for _, a := range listenAddrs(t, spireCluster, cellCtlNamespace, cellCtlPod(t), cellCtlDeployment) {
+		if _, port, err := net.SplitHostPort(a); err == nil {
+			ports = append(ports, port)
+		}
+	}
+	if want := []string{"8080"}; !slices.Equal(ports, want) {
+		t.Errorf("the cell controller listens on %v, want %v", ports, want)
+	}
 }
 
 // TestM6EnvdWritesCellSteps: envd writes ConfigMap cell-steps with the marker poc.internal/made-by=envd. Its spec counter equals the counter
