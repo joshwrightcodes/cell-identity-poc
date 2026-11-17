@@ -120,6 +120,15 @@ func TestCellControllerRender(t *testing.T) {
 				t.Errorf("container %s: token mount is %v, want it in cell-controller only", name, has)
 			}
 		}
+		// The container listens on the health port only: one declared port, and the one listen flag.
+		if ports := get[[]any](t, ctr, "ports"); len(ports) != 1 || get[float64](t, ports[0], "containerPort") != 8080 {
+			t.Errorf("cell-controller declares the ports %v, want only 8080", ports)
+		}
+		for _, a := range get[[]any](t, ctr, "args") {
+			if f := fmt.Sprint(a); strings.Contains(f, "listen") && f != "--health-listen=:8080" {
+				t.Errorf("cell-controller argument %s opens a listener other than the health port", f)
+			}
+		}
 		for _, path := range []string{"/healthz"} {
 			for _, probe := range []string{"readinessProbe", "livenessProbe"} {
 				if lookupOr(ctr, probe, "httpGet", "path") != path || lookupOr(ctr, probe, "httpGet", "port") != float64(8080) {
@@ -191,7 +200,7 @@ func TestCellControllerRender(t *testing.T) {
 		}
 	})
 
-	t.Run("the Role of envd has the three rules of the shared names, and envd is its only subject", func(t *testing.T) {
+	t.Run("the Role of envd names create, get and update on cell-steps, and get on step-status, and envd is its only subject", func(t *testing.T) {
 		role, rb := objs["Role cell-controller-system/envd-steps"], objs["RoleBinding cell-controller-system/envd-steps"]
 		if role == nil || rb == nil {
 			t.Fatalf("no Role or RoleBinding envd-steps: %v", keysOfObjects(objs))

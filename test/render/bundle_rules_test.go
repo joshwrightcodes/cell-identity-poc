@@ -349,8 +349,8 @@ func TestRootBundleWaveOrder(t *testing.T) {
 
 // TestHarnessWritesOnlyIntoExistingNamespaces checks the order of the harness and link components of each cluster: no
 // component renders an object into a namespace that a later component creates. The apply of the earlier component
-// would stop with "namespace not found". The envd render once needed a Role in the namespace of the cell controller, so
-// the Role belongs to the component that creates the namespace, and that component comes first.
+// would stop with "namespace not found". The Role envd-steps lives in the namespace of the cell controller, so it belongs to
+// the component that creates that namespace, and that component comes first.
 func TestHarnessWritesOnlyIntoExistingNamespaces(t *testing.T) {
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
