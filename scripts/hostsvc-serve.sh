@@ -17,7 +17,8 @@
 #   stop     End the process of the pid file, but only when its command line is build/bin/hostsvc serve.
 #            Send TERM, wait up to HOSTSVC_STOP_WAIT seconds (default 20), then send KILL.
 #   restart  Run stop and start, then CELL=management LINK_ONLY=mgmt-api mise run cell:link, so mgmtd
-#            gets the new pin. It refuses while a step runs a stage, unless --force.
+#            gets the new pin, and CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up when dev-cp exists,
+#            so the cell controller gets it too. It refuses while a step runs a stage, unless --force.
 #   status   Print one JSON line: running, pid, cert_sha256, root_sha256, expires_soon, the last error line
 #            of the log, and dev_root_sha256 (the DER SHA-256 of dev-root.crt), keys (the SHA-256 of the
 #            bytes of each key in mgmt-keys), spec_revision (the revision in steps/spec.json) and binary_sha256.
@@ -388,6 +389,11 @@ case "${1:-}" in
     do_stop
     do_start --force
     (cd "$ROOT" && CELL=management LINK_ONLY=mgmt-api mise run cell:link)
+    # The service has a new certificate. The cell controller of dev-cp pins it through its render.
+    clusters="$(kind get clusters 2>/dev/null)" || die "kind does not answer, so the cell controller of dev-cp keeps the old pin. Run: CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up"
+    if grep -qx dev-cp <<<"$clusters"; then
+      (cd "$ROOT" && CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up)
+    fi
     ;;
   status) do_status ;;
   pin) do_pin ;;

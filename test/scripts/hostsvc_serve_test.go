@@ -203,13 +203,17 @@ case "$1 $2 $3 $4" in
     if [[ -z "$staged" && -n "${STUB_NEXT_PUB:-}" ]]; then staged="$(printf '%s' "$STUB_NEXT_PUB" | base64 -d | shasum -a 256 | cut -d' ' -f1)"; fi
     printf '{"signed":{"epoch":1,"counter":7},"stagedKey":"%s"}\n' "$staged" ;;
   "run cell:link"*) echo "link CELL=$CELL LINK_ONLY=${LINK_ONLY:-}" >>"$STUB_STATE/link.log" ;;
+  "run cell:up"*)
+    echo "up CELL=$CELL HARNESS_ONLY=${HARNESS_ONLY:-}" >>"$STUB_STATE/link.log"
+    [[ -z "${STUB_UP_FAIL:-}" ]] || { echo "cell:up failed" >&2; exit 1; } ;;
   *) echo "unexpected mise call: $*" >&2; exit 2 ;;
 esac
 `
 
-// fakeKind lists the clusters that exist: STUB_KIND, or management and dev-cp.
+// fakeKind lists the clusters that exist: STUB_KIND, or management and dev-cp. STUB_KIND_FAIL makes the listing fail.
 const fakeKind = `#!/usr/bin/env bash
 [[ "$*" == "get clusters" ]] || exit 2
+[[ -z "${STUB_KIND_FAIL:-}" ]] || exit 1
 printf '%s\n' ${STUB_KIND:-management dev-cp}
 `
 
@@ -591,8 +595,36 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		if *second.PID == *first.PID {
 			t.Fatal("restart kept the process")
 		}
+		want := "link CELL=management LINK_ONLY=mgmt-api\nup CELL=dev-cp HARNESS_ONLY=cell-controller\n"
+		if got := e.read("link.log"); got != want {
+			t.Fatalf("calls %q, want the link of mgmt-api and then the render of the cell controller: %q", got, want)
+		}
+	})
+
+	// The new pin of the host service reaches the cell controller through its render, so restart renders it when dev-cp exists.
+	t.Run("restart without dev-cp links mgmt-api only", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		e.mustServe(t, "restart", "STUB_KIND=management")
 		if got := e.read("link.log"); got != "link CELL=management LINK_ONLY=mgmt-api\n" {
-			t.Fatalf("link calls %q, want one link of mgmt-api", got)
+			t.Fatalf("calls %q, want the link of mgmt-api and no render", got)
+		}
+	})
+
+	t.Run("restart fails when the render of the cell controller fails", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		if _, _, err := e.serve(t, "restart", "STUB_UP_FAIL=1"); err == nil {
+			t.Fatal("restart succeeded although the render of the cell controller failed")
+		}
+	})
+
+	t.Run("restart fails when kind does not answer", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		_, errOut, err := e.serve(t, "restart", "STUB_KIND_FAIL=1")
+		if err == nil || strings.Contains(e.read("link.log"), "up CELL=dev-cp") {
+			t.Fatalf("err %v, stderr %q, calls %q; want a failure and no render", err, errOut, e.read("link.log"))
 		}
 	})
 

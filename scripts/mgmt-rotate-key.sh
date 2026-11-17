@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
-# Rotate the signing key of the management plane: mise run mgmt -- rotate-signing-key [--emergency | --step <name>].
+# Rotate the signing key of the management plane: mise run mgmt -- rotate-signing-key [--emergency | --step <name>] [--force].
 #
 # The default run is the overlap rotation. Each cell trusts both keys while it rolls, so an operation that mgmtd signed under
 # either key applies. The steps run in this order:
 #   1. stage:   mgmtd ctl rotate-key --stage makes the next key and publishes it as next.pub in ConfigMap
 #               mgmt-system/mgmt-signing-pub. The signing key does not change.
-#   2. The script waits until that ConfigMap holds next.pub.
-#   3. cells:   CELL=<cell> mise run cell:up for each cluster with the cell-identity set. mgmt-op-key then holds the live key
-#               and the staged key, and each celld pod restarts with both.
+#   2. The script waits until that ConfigMap holds next.pub. Then hostsvc:serve -- sync gives next.pub to the host service, and
+#      CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up gives it to the cell controller.
+#   3. cells:   CELL=<cell> mise run cell:up for each live cell (the cells of harness/topology.yaml with the cell-identity set whose
+#               cluster exists). mgmt-op-key then holds the live key and the staged key, and each celld pod restarts with both.
 #   4. commit:  mgmtd ctl rotate-key --commit makes the staged key the signing key, re-signs the spec, every record and every
 #               open operation at the first revision of the next epoch, and publishes the new key as spec.pub.
-#   5. The script waits until that ConfigMap holds the new key.
-#   6. planes:  CELL=dev-cp mise run cell:up renders the new key into envd, the cell gateway and the SPIRE server of dev-cp.
-#               CELL=management mise run cell:link renders it into the link components of management.
+#   5. The script waits until that ConfigMap holds the new key. Then hostsvc:serve -- sync gives the new key to the host service,
+#      which removes next.pub, because no key is staged.
+#   6. planes:  CELL=dev-cp HARNESS_ONLY=envd mise run cell:up and CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up render
+#               the new key into envd and the cell controller first, so a step that mgmtd re-signed reaches the host service
+#               without waiting for the full render. CELL=dev-cp mise run cell:up renders the new key into the cell gateway and
+#               the SPIRE server of dev-cp as well. CELL=management mise run cell:link renders it into the link components of
+#               management.
 #   7. cells:   the cell passes run again. mgmt-op-key then holds the new key alone, and each celld pod restarts with it.
 #   8. The script waits until celld of each cluster has finished its rollout. Then cell:verify runs for management and for dev-cp.
 # Between the commit and the second cell pass, cell:verify of each cell fails, because mgmt-op-key holds an old key that is neither
 # the live key nor a staged key. CELL=<cell> mise run cell:up repairs that.
-# --emergency makes a new key at once and skips the stage and the first cell pass: rotate-key --emergency, the wait, the planes,
-# the cell pass and the verify. A staged key moves aside. A cell that refuses an operation meanwhile keeps it queued until the cell
+# --emergency makes a new key at once and skips the stage and the first cell pass: rotate-key --emergency, the wait, the sync, the
+# planes, the cell pass and the verify. A staged key moves aside, and the sync removes next.pub from the host service. A cell that refuses an operation meanwhile keeps it queued until the cell
 # rolls.
 # --step stage|cells|commit|planes runs one step. cells and planes run no verify, so a test can hold a cell down between them.
-# stage and commit include their wait.
+# stage and commit include their wait and their sync.
+# The cell passes and the planes take the lock of their clusters, and an admit stage holds the lock of dev-cp. So the script refuses to
+# start while hostsvc:serve -- steps shows a step that runs a stage, or when it cannot read the steps. --force skips that check and
+# sets CLUSTER_LOCK_WAIT=900 for each cell command, so that it waits for the lock of the stage.
 #
 # The script prints one JSON line on standard output: the SHA-256 fingerprints of the old and the new key (of the public key, in
 # hex), the new epoch and the run time in seconds. A failure prints one JSON error line on standard output instead, with the failed
@@ -36,6 +44,16 @@ wait_seconds="${MGMT_ROTATE_KEY_WAIT:-180}"
 
 mode=default
 one_step=""
+force=0
+args=("$@")
+if ((${#args[@]} > 0)) && [[ "${args[${#args[@]}-1]}" == --force ]]; then
+  force=1
+  unset 'args[${#args[@]}-1]'
+elif ((${#args[@]} > 0)) && [[ "${args[0]}" == --force ]]; then
+  force=1
+  args=("${args[@]:1}")
+fi
+set -- ${args[@]+"${args[@]}"}
 case "${1:-}" in
   "") ;;
   --emergency)
@@ -48,19 +66,31 @@ case "${1:-}" in
     case "$one_step" in stage | cells | commit | planes) ;; *) die "--step takes stage, cells, commit or planes" ;; esac
     (($# == 2)) || die "--step takes one name"
     ;;
-  *) die "usage: mgmt-rotate-key.sh [--emergency | --step stage|cells|commit|planes]" ;;
+  *) die "usage: mgmt-rotate-key.sh [--emergency | --step stage|cells|commit|planes] [--force]" ;;
 esac
 cd "$ROOT"
 started=$SECONDS
+if ((force)); then
+  export CLUSTER_LOCK_WAIT="${CLUSTER_LOCK_WAIT:-900}"
+else
+  # stage_entries prints one line "<id> <cell> <state>" for each journal entry that runs a stage: creating, admitting or bootstrapping.
+  steps_json="$(mise run hostsvc:serve -- steps 2>&1)" \
+    || json_fail mgmt-rotate-key "cannot tell whether a step runs a stage, because the read failed: ${steps_json:-no output}. Read it with: mise run hostsvc:serve -- steps. To go on anyway, add --force"
+  running="$(jq -r '[(.steps // [] | .[] | {id, cell, state}), (.entries // [] | .[].status | {id, cell, state})]
+    | .[] | select(.state == "creating" or .state == "admitting" or .state == "bootstrapping") | "\(.id) \(.cell) \(.state)"' <<<"$steps_json")" \
+    || json_fail mgmt-rotate-key "cannot tell whether a step runs a stage, because the steps are no journal: $steps_json. To go on anyway, add --force"
+  [[ -z "$running" ]] \
+    || json_fail mgmt-rotate-key "a step runs a stage: ${running//$'\n'/; }. Wait until it ends, or cancel it with: mise run hostsvc:serve -- cancel --step <id>. To go on anyway, add --force"
+fi
 
 fingerprint() { printf '%s' "$1" | base64 -d | shasum -a 256 | cut -d' ' -f1; }
 
-# The clusters with the cell-identity set run celld, so each needs both cell passes.
+# The live cells run celld, so each needs both cell passes. A cell that does not exist gets no pass, and its next cell:up pins the live key.
+live="$(live_cells)" || json_fail mgmt-rotate-key "kind does not answer, so the live cells are unknown"
 cells=()
 while IFS= read -r c; do
   [[ -z "$c" ]] || cells+=("$c")
-done < <(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml")
-((${#cells[@]} > 0)) || die "harness/topology.yaml names no cluster with the cell-identity set"
+done <<<"$live"
 
 before="$(mise run mgmt -- pubkey)" || json_fail mgmt-rotate-key "could not read the current public key of mgmtd"
 old_pub="$(jq -er '."spec.pub"' <<<"$before")" || json_fail mgmt-rotate-key "mgmtd ctl pubkey printed no spec.pub: $before"
@@ -72,6 +102,8 @@ names=() cmds=() funcs=()
 add() { names+=("$1"); cmds+=("$2"); funcs+=("$3"); }
 
 cell_up() { CELL="$1" mise run cell:up >&2; }
+cell_up_only() { CELL=dev-cp HARNESS_ONLY="$1" mise run cell:up >&2; }
+hostsvc_sync() { mise run hostsvc:serve -- sync >&2; }
 cell_link() { CELL=management mise run cell:link >&2; }
 cell_verify() { CELL="$1" mise run cell:verify >&2; }
 rollout() { kubectl --context "kind-$1" -n cell-identity-system rollout status deployment/celld --timeout=300s >&2; }
@@ -80,7 +112,17 @@ add_cells() {
   local c
   for c in "${cells[@]}"; do add "cell:up-$c" "CELL=$c mise run cell:up" "cell_up $c"; done
 }
+# add_staged_sync gives the staged key to the host service and the cell controller, so each trusts next.pub before the commit.
+add_staged_sync() {
+  add hostsvc-sync-staged "mise run hostsvc:serve -- sync" hostsvc_sync
+  add cell-controller-next "CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up" "cell_up_only cell-controller"
+}
+# add_planes renders the new key into envd and the cell controller before the full render of dev-cp, because a step that mgmtd
+# re-signed reaches the host service only after envd and the cell controller hold the new key, and the host service holds a re-signed
+# step at a stage boundary for 10 minutes at most.
 add_planes() {
+  add envd-render "CELL=dev-cp HARNESS_ONLY=envd mise run cell:up" "cell_up_only envd"
+  add cell-controller-render "CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up" "cell_up_only cell-controller"
   add cell:up-dev-cp "CELL=dev-cp mise run cell:up" "cell_up dev-cp"
   add cell:link-management "CELL=management mise run cell:link" cell_link
 }
@@ -103,9 +145,11 @@ case "$mode" in
   default)
     add stage "mise run mgmt -- rotate-key --stage" do_stage
     add next-published "$(wait_cmd 'next\.pub')" wait_next
+    add_staged_sync
     add_cells
     add commit "mise run mgmt -- rotate-key --commit" "do_rotate --commit"
     add publish "$(wait_cmd 'spec\.pub')" wait_new
+    add hostsvc-sync-new "mise run hostsvc:serve -- sync" hostsvc_sync
     add_planes
     add_cells
     add_rollout
@@ -114,6 +158,7 @@ case "$mode" in
   emergency)
     add emergency "mise run mgmt -- rotate-key --emergency" "do_rotate --emergency"
     add publish "$(wait_cmd 'spec\.pub')" wait_new
+    add hostsvc-sync-new "mise run hostsvc:serve -- sync" hostsvc_sync
     add_planes
     add_cells
     add_rollout
@@ -124,11 +169,13 @@ case "$mode" in
       stage)
         add stage "mise run mgmt -- rotate-key --stage" do_stage
         add next-published "$(wait_cmd 'next\.pub')" wait_next
+        add_staged_sync
         ;;
       cells) add_cells ;;
       commit)
         add commit "mise run mgmt -- rotate-key --commit" "do_rotate --commit"
         add publish "$(wait_cmd 'spec\.pub')" wait_new
+        add hostsvc-sync-new "mise run hostsvc:serve -- sync" hostsvc_sync
         ;;
       planes) add_planes ;;
     esac
