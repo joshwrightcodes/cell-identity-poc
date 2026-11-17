@@ -315,9 +315,9 @@ check_spec_key_pinned() {
   stored="$(k -n envd-system get configmap mgmt-spec-key -o jsonpath='{.data.spec\.pub}')" || { echo "could not read ConfigMap envd-system/mgmt-spec-key"; return 1; }
   cells="$(live_cells)" || { echo "$cells"; return 1; }
   if [[ -z "$cells" ]]; then
-    if [[ -n "$pinned" ]] || grep -q cluster_jwt <<<"$conf" || [[ "$stored" != "$live" ]]; then
+    if [[ -n "$pinned" ]] || grep -q 'NodeAttestor "cluster_jwt"' <<<"$conf" || [[ "$stored" != "$live" ]]; then
       echo "no cell is live, so the server config must hold no cluster_jwt plugin and no record_public_keys, and mgmt-spec-key must hold $live."
-      echo "The server config pins '$pinned' (cluster_jwt plugin present: $(grep -q cluster_jwt <<<"$conf" && echo yes || echo no)), and mgmt-spec-key holds '$stored'."
+      echo "The server config pins '$pinned' (cluster_jwt plugin present: $(grep -q 'NodeAttestor "cluster_jwt"' <<<"$conf" && echo yes || echo no)), and mgmt-spec-key holds '$stored'."
       echo "Run: CELL=$CELL_NAME mise run cell:up"
       return 1
     fi

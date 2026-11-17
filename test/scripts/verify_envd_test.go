@@ -135,7 +135,7 @@ func TestVerifyEnvdChecks(t *testing.T) {
 	}
 	up := "Run: CELL=dev-cp mise run cell:up"
 	noCells := []string{"STUB_KIND=management dev-cp rogue"}
-	zeroConf := "      reload_interval = \"10s\"\n"
+	zeroConf := "  # The cluster_jwt plugin applies its own limit per cell.\n      reload_interval = \"10s\"\n"
 	for _, tc := range []struct {
 		name, check, cell string
 		change            map[string]string
