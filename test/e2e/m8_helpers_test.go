@@ -239,11 +239,17 @@ func m8RecordTarget(t *testing.T, target string) {
 	}
 }
 
-// m8PublishHydrated runs mise run bundle -- publish --target <target> --wait, and returns the last JSON line that it printed (the
+// m8PublishHydrated runs cell:hydrate and then mise run bundle -- publish --target <target> --wait, and returns the last JSON line that it printed (the
 // outcome of the set). The script exits 1 for any outcome other than applied and already_applied, and then the error holds the output.
 func m8PublishHydrated(t *testing.T, target string) (map[string]any, error) {
 	t.Helper()
-	out, err := m8Command(t, m8PublishBound, "", "run", "bundle", "--", "publish", "--target", target, "--wait")
+	// bundle.sh publish refuses a build that is older than its inputs, so the render of the target is made again first. The hydrate and the
+	// publish share one bound.
+	start := time.Now()
+	if out, err := miseRun(t, m8PublishBound, []string{"CELL=" + target, "CELL_UP_SKIP_LINK=1", "CELL_UP_SKIP_LATE=1"}, "cell:hydrate"); err != nil {
+		return nil, fmt.Errorf("cell:hydrate of %s failed: %w\n%s", target, err, strings.TrimSpace(out))
+	}
+	out, err := m8Command(t, max(m8PublishBound-time.Since(start), time.Minute), "", "run", "bundle", "--", "publish", "--target", target, "--wait")
 	if err != nil {
 		return nil, fmt.Errorf("%w\n%s", err, out)
 	}
