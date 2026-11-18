@@ -236,6 +236,9 @@ func packRender(path, name string) (bundle.Artifact, error) {
 	}
 	objs, err := bundle.DecodeManifests(raw, bundle.MaxObjects)
 	if err != nil {
+		if k := lostKey(raw, lenientObjects(raw)); k != "" {
+			return bundle.Artifact{}, fmt.Errorf("component %q: key %q: %s", name, k, boolText)
+		}
 		return bundle.Artifact{}, fmt.Errorf("component %q: the render has no canonical form (anchors, aliases, merge keys, tags, duplicate keys, lists and flow documents are not accepted)%s: %w", name, boolHint(raw), err)
 	}
 	if len(objs) == 0 {
@@ -253,6 +256,19 @@ func packRender(path, name string) (bundle.Artifact, error) {
 		return bundle.Artifact{}, fmt.Errorf("component %q: %w", name, err)
 	}
 	return art, nil
+}
+
+// lenientObjects reads the documents of raw as the readers of the cluster do, and returns the objects
+// that they see. A document that does not parse is skipped.
+func lenientObjects(raw []byte) []map[string]any {
+	var out []map[string]any
+	for _, chunk := range bytes.Split(raw, []byte("\n---")) {
+		var m map[string]any
+		if yaml.Unmarshal(chunk, &m) == nil && m != nil {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 var boolRE = regexp.MustCompile(`(?mi)^[ \t-]*(y|n|yes|no|on|off)[ \t]*:|:[ \t]+(y|n|yes|no|on|off)[ \t]*$`)

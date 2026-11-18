@@ -253,6 +253,21 @@ func singlePlainDocument(chunk []byte) bool {
 	return plainNode(&n)
 }
 
+// stringKey reports whether a map key reads as a string in YAML 1.1, the reading of yaml.v2. An
+// unquoted key such as y, on, 1 or 1.5 is a bool or a number there, and two such keys can merge
+// into one. A quoted key is always a string.
+func stringKey(k *yamlv3.Node) bool {
+	if k.Style&(yamlv3.DoubleQuotedStyle|yamlv3.SingleQuotedStyle|yamlv3.LiteralStyle|yamlv3.FoldedStyle) != 0 {
+		return true
+	}
+	var v any
+	if err := goyaml.Unmarshal([]byte(k.Value), &v); err != nil {
+		return false
+	}
+	_, isString := v.(string)
+	return isString
+}
+
 func plainNode(n *yamlv3.Node) bool {
 	if n.Anchor != "" || n.Kind == yamlv3.AliasNode || n.Style&yamlv3.TaggedStyle != 0 {
 		return false
@@ -262,7 +277,7 @@ func plainNode(n *yamlv3.Node) bool {
 		for i := 0; i+1 < len(n.Content); i += 2 {
 			k := n.Content[i]
 			if k.Kind == yamlv3.ScalarNode {
-				if k.Tag == "!!merge" || seen[k.Value] {
+				if k.Tag == "!!merge" || seen[k.Value] || !stringKey(k) {
 					return false
 				}
 				seen[k.Value] = true

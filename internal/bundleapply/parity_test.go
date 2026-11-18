@@ -210,6 +210,8 @@ func parityCases() []pcase {
 		{"items by merge", []byte("apiVersion: v1\nkind: ConfigMapList\n<<: {items: [{apiVersion: v1, kind: ConfigMap, metadata: {name: a, namespace: argocd}}]}\n")},
 		{"crlf separator", []byte(pGood + "---\r\n" + pNP)},
 		{"comment json yaml", []byte("# c\n" + pJSON + "\n" + pNP)},
+		{"bool keys merge", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {y: 1, on: 2}\n")},
+		{"quoted bool key", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {\"y\": 1, \"on\": 2}\n")},
 	}
 }
 
@@ -365,7 +367,7 @@ func canonicalSeeds(t testing.TB) [][]byte {
 	seeds := [][]byte{
 		canonicalOf(t, []byte(pGood+"---\n"+pNP)),
 		canonicalOf(t, generatedRender()),
-		canonicalOf(t, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {\"21\": a, 2B22: b, 9YAC: c, \"on\": \"yes\", n: \"1.0\", e: \"\", t: \"~\"}\n")),
+		canonicalOf(t, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {\"21\": a, 2B22: b, 9YAC: c, \"on\": \"yes\", \"n\": \"1.0\", e: \"\", t: \"~\"}\n")),
 		canonicalOf(t, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd, labels: {k: v}}\ndata:\n  k: |\n    multi\n    line: text\n  long: "+strings.Repeat("word ", 60)+"\n")),
 	}
 	for _, c := range parityCases() {
