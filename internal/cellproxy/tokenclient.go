@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 // maxTokenFile bounds the size of the token file.
@@ -23,6 +24,8 @@ type TokenClientConfig struct {
 	Upstream  string
 	TokenFile string
 	Log       *slog.Logger
+	// UpstreamTimeout bounds the wait for the response header of the upstream. Zero selects 60 seconds.
+	UpstreamTimeout time.Duration
 }
 
 // NewTokenClient returns a handler that sends each request to Upstream with the token of
@@ -39,6 +42,7 @@ func NewTokenClient(cfg TokenClientConfig) (http.Handler, error) {
 	}
 	c := &tokenClient{file: cfg.TokenFile, log: log}
 	c.proxy = &httputil.ReverseProxy{
+		Transport: upstreamTransport(cfg.UpstreamTimeout),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
 			pr.Out.Header.Del("Authorization")

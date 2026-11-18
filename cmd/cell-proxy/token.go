@@ -6,10 +6,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
+	"time"
 
 	authenticationv1client "k8s.io/client-go/kubernetes/typed/authentication/v1"
 	"k8s.io/client-go/rest"
@@ -183,14 +185,54 @@ func listenAndServe(ctx context.Context, listen, health string, h http.Handler, 
 		tel.Log.Info("health_listening", "addr", hl.Addr().String())
 		mux := http.NewServeMux()
 		mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
-		go func() { errc <- serveHTTP(ctx, hl, mux, tel.Log) }()
+		go func() { errc <- serveStore(ctx, hl, mux, tel.Log) }()
 	}
 	tel.Log.Info("listening", "addr", ln.Addr().String())
-	go func() { errc <- serveHTTP(ctx, ln, h, tel.Log) }()
+	go func() { errc <- serveStore(ctx, ln, h, tel.Log) }()
 	err = <-errc
 	cancel()
 	if health != "" {
 		<-errc
 	}
 	return err
+}
+
+// storeServerLimits bound how long a client may hold a connection of the token modes.
+type storeServerLimits struct {
+	readHeader, idle, write time.Duration
+	maxHeader               int
+}
+
+// storeLimits are the limits of the token modes. There is no read timeout, because a blob upload
+// is large. The write timeout covers the time from the end of the request header to the end of the
+// response, so it must allow the largest upload. Tests change it.
+var storeLimits = storeServerLimits{readHeader: 10 * time.Second, idle: 60 * time.Second, write: 5 * time.Minute, maxHeader: 16 << 10}
+
+// newStoreServer returns an HTTP server with the limits of storeLimits.
+func newStoreServer(h http.Handler, log *slog.Logger) *http.Server {
+	return &http.Server{
+		Handler:           h,
+		ReadHeaderTimeout: storeLimits.readHeader,
+		IdleTimeout:       storeLimits.idle,
+		WriteTimeout:      storeLimits.write,
+		MaxHeaderBytes:    storeLimits.maxHeader,
+		ErrorLog:          slog.NewLogLogger(log.Handler(), slog.LevelWarn),
+	}
+}
+
+// serveStore serves h on ln until ctx ends, then shuts the server down.
+func serveStore(ctx context.Context, ln net.Listener, h http.Handler, log *slog.Logger) error {
+	srv := newStoreServer(h, log)
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), httpShutdown)
+	defer cancel()
+	_ = srv.Shutdown(sctx)
+	<-errc
+	return nil
 }

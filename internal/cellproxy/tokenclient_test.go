@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTokenClientFixture(t *testing.T, upstream *recordingUpstream, file string) *httptest.Server {
@@ -131,4 +132,24 @@ func mustURL(t *testing.T, s string) *url.URL {
 		t.Fatal(err)
 	}
 	return u
+}
+
+func TestTokenClientSlowUpstream(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(2 * time.Second) }))
+	defer slow.Close()
+	h, err := NewTokenClient(TokenClientConfig{Upstream: strings.TrimPrefix(slow.URL, "http://"), TokenFile: writeTokenFile(t, "tok"), UpstreamTimeout: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	start := time.Now()
+	resp, err := http.Get(srv.URL + "/v2/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || time.Since(start) > time.Second {
+		t.Fatalf("status %d after %v, want 503 within the timeout", resp.StatusCode, time.Since(start))
+	}
 }

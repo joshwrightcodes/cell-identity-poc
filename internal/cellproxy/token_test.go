@@ -3,12 +3,15 @@ package cellproxy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -39,21 +42,39 @@ const (
 
 // fakeReviewer answers TokenReview from a table and counts the calls.
 type fakeReviewer struct {
-	mu      sync.Mutex
-	reviews map[string]TokenReview
-	err     error
-	calls   int
+	mu          sync.Mutex
+	reviews     map[string]TokenReview
+	err         error
+	calls       int
+	audiences   []string
+	inflight    int
+	maxInflight int
+	gate        chan struct{} // when set, a review waits until it closes
 }
 
 func (f *fakeReviewer) Review(_ context.Context, token, audience string) (TokenReview, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls++
+	f.audiences = append(f.audiences, audience)
+	f.inflight++
+	f.maxInflight = max(f.maxInflight, f.inflight)
+	gate := f.gate
+	f.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inflight--
 	if f.err != nil {
 		return TokenReview{}, f.err
 	}
-	if r, ok := f.reviews[token]; ok {
+	// Like the API server, a review for an audience that the token does not name is refused.
+	if r, ok := f.reviews[token]; ok && slices.Contains(r.Audiences, audience) {
 		return r, nil
+	}
+	if r, ok := f.reviews[token]; ok && r.Authenticated {
+		return TokenReview{Error: "token audiences are invalid for the current audience"}, nil
 	}
 	return TokenReview{Error: "invalid bearer token"}, nil
 }
@@ -127,6 +148,7 @@ func (s *syncBuf) String() string {
 }
 
 type tokenFixture struct {
+	handler  http.Handler
 	srv      *httptest.Server
 	upstream *recordingUpstream
 	reviewer *fakeReviewer
@@ -153,6 +175,7 @@ func newTokenFixture(t *testing.T, mut ...func(*TokenConfig)) *tokenFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	f.handler = h
 	f.srv = httptest.NewServer(h)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -316,13 +339,33 @@ func TestTokenNoToken(t *testing.T) {
 }
 
 func TestTokenWrongAudience(t *testing.T) {
+	// The API server refuses a token for another audience.
 	f := newTokenFixture(t)
-	f.wantDenied(t, f.do(t, http.MethodGet, pathManifest, tokAudience), PeerNotAllowed, "audience")
-	// The reviewer is asked for the audience of the store, and nothing else.
+	f.wantDenied(t, f.do(t, http.MethodGet, pathManifest, tokAudience), PeerNotAllowed, "token_invalid")
+	// A reviewer that accepts the token but returns other audiences is refused by the proxy itself.
+	f2 := newTokenFixture(t, func(c *TokenConfig) { c.Reviewer = laxReviewer{} })
+	f2.wantDenied(t, f2.do(t, http.MethodGet, pathManifest, tokAudience), PeerNotAllowed, "audience")
+}
+
+type laxReviewer struct{}
+
+func (laxReviewer) Review(context.Context, string, string) (TokenReview, error) {
+	return TokenReview{Authenticated: true, Username: subReader, Audiences: []string{"other"}}, nil
+}
+
+func TestTokenReviewerAskedForTheStoreAudience(t *testing.T) {
+	f := newTokenFixture(t)
+	f.do(t, http.MethodGet, pathManifest, tokReader)
+	f.do(t, http.MethodGet, pathManifest, tokBad)
 	f.reviewer.mu.Lock()
 	defer f.reviewer.mu.Unlock()
-	if f.reviewer.calls != 1 {
-		t.Fatalf("reviewer calls %d, want 1", f.reviewer.calls)
+	if len(f.reviewer.audiences) != 2 {
+		t.Fatalf("reviewer calls %d, want 2", len(f.reviewer.audiences))
+	}
+	for _, a := range f.reviewer.audiences {
+		if a != storeAudience {
+			t.Fatalf("reviewer asked for audience %q, want %q", a, storeAudience)
+		}
 	}
 }
 
@@ -424,11 +467,299 @@ func TestTokenCache(t *testing.T) {
 	if n := f.reviewer.count(); n != 2 {
 		t.Fatalf("reviewer calls %d after the TTL, want 2", n)
 	}
-	// A refused token is never cached.
+	// A refused token is cached for 10 seconds, and then reviewed again.
 	f.do(t, http.MethodGet, pathManifest, tokBad)
+	f.do(t, http.MethodGet, pathManifest, tokBad)
+	if n := f.reviewer.count(); n != 3 {
+		t.Fatalf("reviewer calls %d after two identical bad tokens, want 3", n)
+	}
+	mu.Lock()
+	now = now.Add(11 * time.Second)
+	mu.Unlock()
 	f.do(t, http.MethodGet, pathManifest, tokBad)
 	if n := f.reviewer.count(); n != 4 {
-		t.Fatalf("reviewer calls %d after two bad tokens, want 4", n)
+		t.Fatalf("reviewer calls %d after the refusal TTL, want 4", n)
+	}
+	// A reviewer error is never cached.
+	f.reviewer.err = io.ErrUnexpectedEOF
+	f.do(t, http.MethodGet, pathManifest, "unknown-a")
+	f.do(t, http.MethodGet, pathManifest, "unknown-a")
+	if n := f.reviewer.count(); n != 6 {
+		t.Fatalf("reviewer calls %d after two review errors, want 6", n)
+	}
+}
+
+// TestTokenCacheKeepsNoToken checks that the cache keys hold a hash and never the token.
+func TestTokenCacheKeepsNoToken(t *testing.T) {
+	f := newTokenFixture(t)
+	f.do(t, http.MethodGet, pathManifest, tokReader)
+	f.do(t, http.MethodGet, pathManifest, tokBad)
+	p := f.handler.(*tokenProxy)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k := range p.cache {
+		if bytes.Contains(k[:], []byte(tokReader)) || bytes.Contains(k[:], []byte(tokBad)) {
+			t.Fatal("a cache key holds a token")
+		}
+	}
+	if len(p.cache) != 2 {
+		t.Fatalf("cache holds %d entries, want 2", len(p.cache))
+	}
+}
+
+// TestTokenCacheCap checks that the cache never holds more than maxTokenCache entries.
+func TestTokenCacheCap(t *testing.T) {
+	f := newTokenFixture(t)
+	for i := 0; i < maxTokenCache+50; i++ {
+		f.do(t, http.MethodGet, pathManifest, fmt.Sprintf("bad-%d", i))
+	}
+	p := f.handler.(*tokenProxy)
+	p.mu.Lock()
+	n := len(p.cache)
+	p.mu.Unlock()
+	if n == 0 || n > maxTokenCache {
+		t.Fatalf("cache holds %d entries, want between 1 and %d", n, maxTokenCache)
+	}
+}
+
+// TestTokenSingleFlight checks that identical tokens in flight share one review.
+func TestTokenSingleFlight(t *testing.T) {
+	f := newTokenFixture(t)
+	gate := make(chan struct{})
+	f.reviewer.gate = gate
+	var wg sync.WaitGroup
+	codes := make(chan int, 20)
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); codes <- f.do(t, http.MethodGet, pathManifest, tokReader).Status }()
+	}
+	waitCond(t, func() bool { return f.reviewer.count() >= 1 })
+	time.Sleep(100 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+	close(codes)
+	for c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("status %d, want 200", c)
+		}
+	}
+	if n := f.reviewer.count(); n != 1 {
+		t.Fatalf("reviewer calls %d for 20 identical in-flight tokens, want 1", n)
+	}
+}
+
+// TestTokenReviewCap checks that at most maxReviews reviews run at once, and that the proxy
+// answers 503 overloaded beyond that.
+func TestTokenReviewCap(t *testing.T) {
+	f := newTokenFixture(t)
+	gate := make(chan struct{})
+	f.reviewer.gate = gate
+	const n = 40
+	var wg sync.WaitGroup
+	results := make(chan tokenResp, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- f.do(t, http.MethodGet, pathManifest, fmt.Sprintf("distinct-%d", i))
+		}()
+	}
+	waitCond(t, func() bool { return f.reviewer.count() >= maxReviews })
+	time.Sleep(200 * time.Millisecond)
+	f.reviewer.mu.Lock()
+	peak := f.reviewer.maxInflight
+	f.reviewer.mu.Unlock()
+	close(gate)
+	wg.Wait()
+	close(results)
+	if peak > maxReviews {
+		t.Fatalf("%d reviews ran at once, want at most %d", peak, maxReviews)
+	}
+	over := 0
+	for r := range results {
+		if r.Status == http.StatusServiceUnavailable && strings.Contains(r.Body, `"overloaded"`) {
+			over++
+		}
+	}
+	if over != n-maxReviews {
+		t.Fatalf("%d requests got 503 overloaded, want %d", over, n-maxReviews)
+	}
+	if v, ok := metricValue(t, f.reader, "store_proxy.denials", map[string]string{"reason": "overloaded"}); !ok || v != int64(n-maxReviews) {
+		t.Fatalf("denials{overloaded} = %d, %v, want %d", v, ok, n-maxReviews)
+	}
+}
+
+func waitCond(t *testing.T, cond func() bool) {
+	t.Helper()
+	for i := 0; i < 500; i++ {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met")
+}
+
+// jwtWithExp makes an unsigned token whose payload carries exp.
+func jwtWithExp(exp int64) string {
+	enc := base64.RawURLEncoding.EncodeToString
+	return enc([]byte(`{"alg":"RS256"}`)) + "." + enc([]byte(fmt.Sprintf(`{"exp":%d}`, exp))) + ".sig"
+}
+
+// TestTokenCacheStopsAtExp checks that an accepted token is cached no longer than its exp claim.
+func TestTokenCacheStopsAtExp(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	var mu sync.Mutex
+	f := newTokenFixture(t, func(c *TokenConfig) {
+		c.CacheTTL = 30 * time.Second
+		c.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	})
+	short := jwtWithExp(now.Add(5 * time.Second).Unix())
+	f.reviewer.reviews[short] = TokenReview{Authenticated: true, Username: subReader, Audiences: []string{storeAudience}}
+	f.do(t, http.MethodGet, pathManifest, short)
+	mu.Lock()
+	now = now.Add(3 * time.Second)
+	mu.Unlock()
+	f.do(t, http.MethodGet, pathManifest, short)
+	if n := f.reviewer.count(); n != 1 {
+		t.Fatalf("reviewer calls %d before exp, want 1", n)
+	}
+	mu.Lock()
+	now = now.Add(3 * time.Second)
+	mu.Unlock()
+	f.do(t, http.MethodGet, pathManifest, short)
+	if n := f.reviewer.count(); n != 2 {
+		t.Fatalf("reviewer calls %d after exp (6 s, TTL 30 s), want 2", n)
+	}
+	// A token with a late exp is bounded by the TTL, and one with garbage in the payload by the TTL too.
+	long := jwtWithExp(now.Add(time.Hour).Unix())
+	garbage := "a.!!!.c"
+	for _, tk := range []string{long, garbage} {
+		f.reviewer.reviews[tk] = TokenReview{Authenticated: true, Username: subReader, Audiences: []string{storeAudience}}
+		before := f.reviewer.count()
+		f.do(t, http.MethodGet, pathManifest, tk)
+		mu.Lock()
+		now = now.Add(31 * time.Second)
+		mu.Unlock()
+		f.do(t, http.MethodGet, pathManifest, tk)
+		if n := f.reviewer.count() - before; n != 2 {
+			t.Fatalf("token %q: %d reviews over 31 s, want 2 (TTL bound)", tk, n)
+		}
+	}
+}
+
+func TestTokenDuplicateAuthorization(t *testing.T) {
+	f := newTokenFixture(t)
+	r := f.do(t, http.MethodGet, pathManifest, "", func(r *http.Request) {
+		r.Header.Add("Authorization", "Bearer "+tokReader)
+		r.Header.Add("Authorization", "Bearer "+tokReader)
+	})
+	f.wantDenied(t, r, PeerNotAllowed, "no_token")
+	if n := f.reviewer.count(); n != 0 {
+		t.Fatalf("reviewer called %d times", n)
+	}
+}
+
+func TestTokenOversizeToken(t *testing.T) {
+	f := newTokenFixture(t)
+	f.wantDenied(t, f.do(t, http.MethodGet, pathManifest, strings.Repeat("a", maxBearerBytes+1)), PeerNotAllowed, "no_token")
+	if n := f.reviewer.count(); n != 0 {
+		t.Fatalf("reviewer called %d times", n)
+	}
+}
+
+func TestTokenReaderUploadRefused(t *testing.T) {
+	for _, m := range []string{http.MethodGet, http.MethodHead} {
+		t.Run(m, func(t *testing.T) {
+			f := newTokenFixture(t)
+			f.wantDenied(t, f.do(t, m, "/v2/bundles/argocd/blobs/uploads/abc", tokReader), RequestNotAllowed, "path")
+		})
+	}
+}
+
+func TestTokenMountRefused(t *testing.T) {
+	for _, q := range []string{"?mount=" + digestA + "&from=other", "?from=other", "?mount=" + digestA} {
+		t.Run(q, func(t *testing.T) {
+			f := newTokenFixture(t)
+			f.wantDenied(t, f.do(t, http.MethodPost, pathUploads+q, tokWriter), RequestNotAllowed, "path")
+		})
+	}
+	// A monolithic upload keeps its digest parameter.
+	f := newTokenFixture(t)
+	if r := f.do(t, http.MethodPost, pathUploads+"?digest="+digestA, tokWriter); r.Status != http.StatusOK {
+		t.Fatalf("status %d, want 200", r.Status)
+	}
+}
+
+func TestTokenReadQueryRefused(t *testing.T) {
+	f := newTokenFixture(t)
+	f.wantDenied(t, f.do(t, http.MethodGet, pathManifest+"?x=1", tokReader), RequestNotAllowed, "path")
+}
+
+func TestTokenDotSegmentsRefused(t *testing.T) {
+	for _, p := range []string{"/v2/bundles/root/manifests/..", "/v2/bundles/root/manifests/.", "/v2/bundles/root/blobs/uploads/..", "/v2/bundles/root/blobs/uploads/."} {
+		for _, tok := range []struct{ m, t string }{{http.MethodGet, tokReader}, {http.MethodPut, tokWriter}} {
+			t.Run(tok.m+p, func(t *testing.T) {
+				f := newTokenFixture(t)
+				f.wantDenied(t, f.do(t, tok.m, p, tok.t), RequestNotAllowed, "path")
+			})
+		}
+	}
+}
+
+// TestTokenUploadOfAnotherRepo checks that the writer cannot finish an upload in a repo that did
+// not start it. The registry owns the upload ID, so the registry refuses it.
+func TestTokenUploadOfAnotherRepo(t *testing.T) {
+	reg := ocitest.NewRegistry(t)
+	f := newTokenFixture(t, func(c *TokenConfig) { c.Upstream = reg.URL() })
+	req, _ := http.NewRequest(http.MethodPost, f.srv.URL+"/v2/bundles/one/blobs/uploads/", nil)
+	req.Header.Set("Authorization", "Bearer "+tokWriter)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	id := resp.Header.Get("Location")[strings.LastIndex(resp.Header.Get("Location"), "/")+1:]
+	data := []byte("x")
+	for _, m := range []string{http.MethodPut, http.MethodPatch} {
+		r := f.do(t, m, "/v2/bundles/two/blobs/uploads/"+id+"?digest="+ocitest.Digest(data), tokWriter)
+		if r.Status < 400 {
+			t.Fatalf("%s to the upload of another repo: status %d, want a refusal", m, r.Status)
+		}
+	}
+	if _, ok := reg.Blob("bundles/two", ocitest.Digest(data)); ok {
+		t.Fatal("the blob reached the other repo")
+	}
+}
+
+func TestRewriteLocation(t *testing.T) {
+	cases := map[string]string{
+		"http://127.0.0.1:5001/v2/a/blobs/uploads/1?x=y": "/v2/a/blobs/uploads/1?x=y",
+		"//127.0.0.1:5001/v2/a/blobs/uploads/1":          "/v2/a/blobs/uploads/1",
+		"/v2/a/blobs/uploads/1":                          "/v2/a/blobs/uploads/1",
+		"http://other:5001/v2/a":                         "http://other:5001/v2/a",
+		"//other:5001/v2/a":                              "//other:5001/v2/a",
+	}
+	for in, want := range cases {
+		resp := &http.Response{Header: http.Header{"Location": {in}}}
+		rewriteLocation(resp, "127.0.0.1:5001")
+		if got := resp.Header.Get("Location"); got != want {
+			t.Errorf("Location %q became %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestTokenSlowUpstream(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { time.Sleep(2 * time.Second) }))
+	defer slow.Close()
+	f := newTokenFixture(t, func(c *TokenConfig) {
+		c.Upstream = strings.TrimPrefix(slow.URL, "http://")
+		c.UpstreamTimeout = 150 * time.Millisecond
+	})
+	start := time.Now()
+	r := f.do(t, http.MethodGet, pathManifest, tokReader)
+	if r.Status != http.StatusServiceUnavailable || time.Since(start) > time.Second {
+		t.Fatalf("status %d after %v, want 503 within the timeout", r.Status, time.Since(start))
 	}
 }
 

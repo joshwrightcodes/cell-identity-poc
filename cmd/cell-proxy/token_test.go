@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 )
@@ -186,5 +189,106 @@ func TestTokenClientServes(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "projected") {
 		t.Fatalf("a log line holds the token:\n%s", out.String())
+	}
+}
+
+// serveStoreForTest serves h through serveStore with the given limits and returns the address.
+func serveStoreForTest(t *testing.T, limits storeServerLimits, h http.Handler) string {
+	t.Helper()
+	prev := storeLimits
+	storeLimits = limits
+	t.Cleanup(func() { storeLimits = prev })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = serveStore(ctx, ln, h, slog.New(slog.DiscardHandler)) }()
+	t.Cleanup(func() { cancel(); <-done })
+	return ln.Addr().String()
+}
+
+func okHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, "ok") })
+}
+
+func TestStoreServerLimits(t *testing.T) {
+	srv := newStoreServer(okHandler(), slog.New(slog.DiscardHandler))
+	if srv.IdleTimeout <= 0 || srv.WriteTimeout <= 0 || srv.ReadHeaderTimeout <= 0 || srv.MaxHeaderBytes != 16<<10 {
+		t.Fatalf("server limits %v %v %v %d", srv.IdleTimeout, srv.WriteTimeout, srv.ReadHeaderTimeout, srv.MaxHeaderBytes)
+	}
+}
+
+// readAll reads from conn until the peer closes it, or fails the test after d.
+func readAll(t *testing.T, conn net.Conn, d time.Duration) string {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(d))
+	b, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("connection stayed open for %v: %v (read %q)", d, err, b)
+	}
+	return string(b)
+}
+
+func TestStoreServerIdleConnectionCloses(t *testing.T) {
+	limits := storeLimits
+	limits.idle = 200 * time.Millisecond
+	addr := serveStoreForTest(t, limits, okHandler())
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	if got := readAll(t, conn, 3*time.Second); !strings.Contains(got, "200 OK") {
+		t.Fatalf("response %q", got)
+	}
+}
+
+func TestStoreServerHeaderLimit(t *testing.T) {
+	addr := serveStoreForTest(t, storeLimits, okHandler())
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\nX-Big: "+strings.Repeat("a", 20<<10)+"\r\n\r\n")
+	if got := readAll(t, conn, 3*time.Second); !strings.Contains(got, "431") {
+		t.Fatalf("response %q, want 431", got)
+	}
+}
+
+func TestStoreServerSlowClient(t *testing.T) {
+	limits := storeLimits
+	limits.readHeader = 200 * time.Millisecond
+	addr := serveStoreForTest(t, limits, okHandler())
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n") // the header never ends
+	if got := readAll(t, conn, 3*time.Second); strings.Contains(got, "200 OK") {
+		t.Fatalf("response %q", got)
+	}
+}
+
+func TestStoreServerWriteTimeout(t *testing.T) {
+	limits := storeLimits
+	limits.write = 200 * time.Millisecond
+	slow := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(600 * time.Millisecond)
+		_, _ = io.WriteString(w, "late")
+	})
+	addr := serveStoreForTest(t, limits, slow)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	if got := readAll(t, conn, 3*time.Second); strings.Contains(got, "late") {
+		t.Fatalf("response %q after the write timeout", got)
 	}
 }
