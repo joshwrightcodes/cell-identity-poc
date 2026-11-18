@@ -16,6 +16,7 @@ import (
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
@@ -49,11 +50,14 @@ type Config struct {
 	Now                               func() time.Time
 	Log                               *slog.Logger
 	Meter                             metric.Meter
+	// Bundle, when set, adds the kind bundle.apply to Kinds.
+	Bundle *bundleapply.Applier
 }
 
 // Executor applies signed operations to one cell.
 type Executor struct {
 	cfg     Config
+	bundle  bundleApplier
 	results metric.Int64Counter
 
 	applied, refused, forged atomic.Uint64
@@ -84,6 +88,10 @@ func New(cfg Config) *Executor {
 		cfg.Meter = metricnoop.NewMeterProvider().Meter("celld")
 	}
 	e := &Executor{cfg: cfg, renewEvery: renewEvery, margin: effectMargin}
+	if cfg.Bundle != nil {
+		e.bundle = cfg.Bundle
+		e.cfg.Kinds = withBundle(cfg.Kinds, cfg.Bundle)
+	}
 	e.results, _ = cfg.Meter.Int64Counter("celld.ops.results")
 	return e
 }
@@ -93,6 +101,18 @@ func (e *Executor) result(opID, outcome, reason string, f op.Fence, sha string) 
 		OpID: opID, Cell: e.cfg.Cell, Pod: e.cfg.Pod, Outcome: outcome, Reason: reason,
 		Fence: f, At: e.cfg.Now(), EnvelopeSHA256: sha,
 	}
+}
+
+// finishFinal records the final outcome of an effect, and returns it as the result.
+func (e *Executor) finishFinal(ctx context.Context, id string, f op.Fence, sha string, fin *Final) op.Result {
+	res := e.result(id, fin.Outcome, fin.Reason, f, sha)
+	if fin.Detail == "" || op.ValidDetail(fin.Detail) {
+		res.Detail = fin.Detail
+	}
+	if !e.finish(ctx, id, f, res) {
+		return e.result(id, op.OutcomeLeaseLost, op.ReasonLeaseLost, f, sha)
+	}
+	return res
 }
 
 // Execute verifies the envelope, claims its operation, runs the effect and records the result. It
@@ -138,6 +158,10 @@ func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.
 	effectCtx, stop := e.renewLease(ctx, o.ID, f, until)
 	err = e.cfg.Kinds[o.Kind](effectCtx, e, o)
 	stop()
+	var final *Final
+	if errors.As(err, &final) {
+		return e.finishFinal(ctx, o.ID, f, sha, final)
+	}
 	if err != nil {
 		e.cfg.Log.LogAttrs(ctx, slog.LevelWarn, "effect failed",
 			slog.String("op_id", o.ID), slog.String("error", err.Error()))

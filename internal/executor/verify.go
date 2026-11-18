@@ -76,5 +76,8 @@ func (e *Executor) check(ctx context.Context, envelope []byte, f op.Fence, sha s
 			return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
 		}
 	}
+	if o.Kind == op.KindBundleApply && len(o.Args) > op.MaxBundleArgsBytes {
+		return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
+	}
 	return o, nil
 }

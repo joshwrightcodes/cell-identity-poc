@@ -32,6 +32,11 @@ func NewStatus(cell, pod, podUID, version string, svidExpiry func() time.Time, e
 				s.OldestUnreportedAt = pending[0].At
 			}
 		}
+		if e.bundle != nil {
+			if b, err := e.bundle.Status(ctx); err == nil {
+				s.Bundle = b
+			}
+		}
 		return s
 	}
 }
