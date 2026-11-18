@@ -184,8 +184,9 @@ func (p *Plane) apply(ctx context.Context, o op.Operation, sha string) {
 }
 
 // expire answers an expired operation: with the result that the engine recorded for it, or with
-// expired when the engine has none. A failed lookup leaves no result, so the next offer of the same
-// envelope looks again. The engine never applies an expired operation.
+// expired when the engine has none. An operation that the engine started and has not finished, and a
+// failed lookup, leave no result, so the next offer of the same envelope looks again. The engine never
+// applies an expired operation.
 func (p *Plane) expire(ctx context.Context, expired *op.Result, sha string) {
 	out, ok, err := p.cfg.Applier.Recorded(ctx, expired.OpID)
 	p.mu.Lock()
@@ -197,8 +198,12 @@ func (p *Plane) expire(ctx context.Context, expired *op.Result, sha string) {
 	case err != nil:
 		p.cur = nil
 		msg := clip(err.Error())
+		what := "plane bundle record not read"
+		if errors.Is(err, bundleapply.ErrInFlight) {
+			what = "plane bundle operation expired while in flight"
+		}
 		if _, ok, suppressed, _ := p.logs.Allow(msg); ok {
-			p.cfg.Log.WarnContext(ctx, "plane bundle record not read", "op", expired.OpID, "error", msg, "suppressed", suppressed)
+			p.cfg.Log.WarnContext(ctx, what, "op", expired.OpID, "error", msg, "suppressed", suppressed)
 		}
 	case ok:
 		p.cur.res = p.engineResult(expired.OpID, out, sha)

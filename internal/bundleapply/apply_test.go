@@ -595,6 +595,17 @@ func TestRecorded(t *testing.T) {
 	if _, ok, err := e.applier(cfg).Recorded(t.Context(), "op2"); err == nil || ok {
 		t.Fatalf("a failed read gave ok %v err %v, want an error", ok, err)
 	}
+	for _, phase := range []string{"applying", "rolling_back"} {
+		st := e.state()
+		st.State, st.OpID = phase, "op5"
+		e.mustWriteState(st)
+		if _, ok, err := e.a.Recorded(t.Context(), "op5"); !errors.Is(err, ErrInFlight) || ok {
+			t.Fatalf("%s: ok %v err %v, want ErrInFlight", phase, ok, err)
+		}
+		if _, ok, err := e.a.Recorded(t.Context(), "op6"); err != nil || ok {
+			t.Fatalf("%s, another operation: ok %v err %v", phase, ok, err)
+		}
+	}
 }
 
 func TestApplyTargetMismatch(t *testing.T) {

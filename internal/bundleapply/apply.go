@@ -58,6 +58,10 @@ const DetailTarget = "target"
 // caller retries later.
 var ErrLockHeld = errors.New("bundle apply lock is held")
 
+// ErrInFlight means that the state names the operation in applying or rolling_back: the engine has
+// started it and holds no final result for it yet.
+var ErrInFlight = errors.New("bundle operation is in flight")
+
 var (
 	errLockLost = errors.New("bundle apply lock was lost")
 	errNoWrite  = errors.New("no state write needed")
@@ -186,16 +190,20 @@ func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
 
 // Recorded returns the final result that the state holds for the operation opID. The state keeps the
 // result of the last operation only, so an older operation gives false. It reads the state and writes
-// nothing. An error means that the answer is not known.
+// nothing. ErrInFlight means that the engine started the operation and has no final result for it
+// yet, and any other error means that the answer is not known.
 func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, error) {
 	st, _, err := a.cfg.State.Read(ctx)
 	if err != nil {
 		return Outcome{}, false, err
 	}
-	if st.Result == nil || st.Result.OpID != opID {
-		return Outcome{}, false, nil
+	if st.Result != nil && st.Result.OpID == opID {
+		return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
 	}
-	return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
+	if st.OpID == opID && (st.State == stateApplying || st.State == stateRollingBack) {
+		return Outcome{}, false, ErrInFlight
+	}
+	return Outcome{}, false, nil
 }
 
 func refused(reason, detail string) Outcome {

@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -311,6 +312,19 @@ func TestPlaneBundleExpired(t *testing.T) {
 		}
 		if n := len(r.eng.called()); n != 0 {
 			t.Fatalf("the engine ran %d times", n)
+		}
+	})
+	t.Run("expired while the engine still runs it", func(t *testing.T) {
+		// envd restarted after the tag moved: the state names the operation in applying.
+		r := newPlaneRig(t)
+		o := expired(r)
+		r.eng.recErr = fmt.Errorf("look up %s: %w", o.ID, bundleapply.ErrInFlight)
+		r.offer(r.sign(o))
+		if res := r.result(); res != nil {
+			t.Fatalf("result = %+v, want none while the operation is in flight", res)
+		}
+		if n := len(r.eng.called()); n != 0 {
+			t.Fatalf("the engine applied an expired operation %d times", n)
 		}
 	})
 	t.Run("not yet valid", func(t *testing.T) {
