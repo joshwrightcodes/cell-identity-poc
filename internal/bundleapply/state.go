@@ -50,6 +50,7 @@ type State struct {
 	Root          Root              `json:"root"`
 	Components    map[string]string `json:"components"`
 	Checked       []string          `json:"checked"`
+	CheckedBy     string            `json:"checkedBy"`
 	Good          []Good            `json:"good"`
 	Result        *op.Result        `json:"result,omitempty"`
 }

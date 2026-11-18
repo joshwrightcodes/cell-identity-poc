@@ -1211,8 +1211,8 @@ func TestApplyCheckedBounded(t *testing.T) {
 		wantOutcome(t, e.apply(fmt.Sprintf("op%d", i), b), op.OutcomeApplied, "", "")
 		if i == 1 {
 			st := e.state()
-			for _, d := range e.boot.digests() {
-				if slices.Contains(st.Checked, d) {
+			for name, d := range e.boot.digests() {
+				if slices.Contains(st.Checked, name+"@"+d) {
 					t.Fatalf("a bootstrap digest is in checked: %s", d)
 				}
 			}
@@ -1224,8 +1224,8 @@ func TestApplyCheckedBounded(t *testing.T) {
 	st := e.state()
 	var want []string
 	for _, b := range sets[1:] {
-		for _, d := range b.digests() {
-			want = append(want, d)
+		for name, d := range b.digests() {
+			want = append(want, name+"@"+d)
 		}
 	}
 	got := slices.Clone(st.Checked)
@@ -1236,6 +1236,141 @@ func TestApplyCheckedBounded(t *testing.T) {
 	}
 	if len(st.Good) != 2 {
 		t.Fatalf("good = %d entries", len(st.Good))
+	}
+}
+
+// TestApplyCheckedFollowsThePolicyInputs checks that a digest that an earlier set checked is checked
+// again when an input of the check has changed since: the live harness policies, the allow data, or a
+// state that an older build wrote with no record of its inputs.
+func TestApplyCheckedFollowsThePolicyInputs(t *testing.T) {
+	harness := func(e *env, ns, name string) {
+		t.Helper()
+		_, err := e.cs.NetworkingV1().NetworkPolicies(ns).Create(t.Context(), &netv1.NetworkPolicy{
+			ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: name, Labels: map[string]string{"cell.poc.internal/harness": "x"}},
+		}, metav1.CreateOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Run("new harness policy", func(t *testing.T) {
+		e := newEnv(t)
+		argocd := spec{"argocd", "argocd", netpol("argocd", "later")}
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{argocd, std("v1")[1]})), op.OutcomeApplied, "", "")
+		if e.state().CheckedBy == "" {
+			t.Fatal("the state does not record the inputs of the check")
+		}
+		harness(e, "argocd", "later")
+		wantOutcome(t, e.apply("op2", e.set(2, []spec{argocd, std("v2")[1]})), op.OutcomeRefused, op.ReasonPolicyBlocksPlanes, "argocd/later")
+	})
+	t.Run("entry of an older good root", func(t *testing.T) {
+		e := newEnv(t)
+		later := spec{"argocd", "argocd", netpol("argocd", "later")}
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{later, std("v1")[1]})), op.OutcomeApplied, "", "")
+		harness(e, "argocd", "later")
+		other := spec{"argocd", "argocd", netpol("argocd", "other")}
+		wantOutcome(t, e.apply("op2", e.set(2, []spec{other, std("v2")[1]})), op.OutcomeApplied, "", "")
+		// good[1] still names the argocd digest that the first set checked before the harness policy.
+		wantOutcome(t, e.apply("op3", e.set(3, []spec{later, std("v3")[1]})), op.OutcomeRefused, op.ReasonPolicyBlocksPlanes, "argocd/later")
+	})
+	t.Run("allow data changed", func(t *testing.T) {
+		e := newEnv(t)
+		wantOutcome(t, e.apply("op1", e.set(1, std("v1"))), op.OutcomeApplied, "", "")
+		raw, err := json.Marshal(e.cfg.Policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var narrow bundle.Policy
+		if err := json.Unmarshal(raw, &narrow); err != nil {
+			t.Fatal(err)
+		}
+		app := narrow.Classes["app"]
+		app.NamespacedKinds = slices.DeleteFunc(slices.Clone(app.NamespacedKinds), func(k string) bool { return k == "ConfigMap" })
+		narrow.Classes["app"] = app
+		cfg := e.cfg
+		cfg.Policy = narrow
+		e.a = e.applier(cfg)
+		next := e.set(2, []spec{std("v1")[0], std("v2")[1]})
+		wantOutcome(t, e.apply("op2", next), op.OutcomeRefused, op.ReasonComponentNotAllowed, "kind")
+	})
+	t.Run("state of an older build", func(t *testing.T) {
+		e := newEnv(t)
+		role := "apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: evil\nrules: []\n"
+		bad := e.build(tTarget, bundle.Version{}, badApp(role))
+		d := bad.set.Components[0].Digest
+		st := e.state()
+		st.Checked = []string{d, "apps-sample@" + d}
+		st.Components = map[string]string{"apps-sample": d, "network-policy": e.boot.digests()["network-policy"]}
+		e.mustWriteState(st)
+		b := e.build(tTarget, bundle.Version{Epoch: 1, Counter: 1}, std("v1"))
+		set := b.set
+		for i := range set.Components {
+			if set.Components[i].Name == "apps-sample" {
+				set.Components[i].Digest = d
+			}
+		}
+		b.set = set
+		root, err := bundle.ComposeRoot("cell", set, e.cfg.Policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b.att = e.sign(b, tEnv, tTarget, root.Digest, e.priv)
+		wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonComponentNotAllowed, "kind")
+	})
+}
+
+func TestCheckInputsCoverEveryInput(t *testing.T) {
+	p := bundle.DefaultPolicy()
+	refs := HarnessRefs{NetworkPolicies: []ObjectRef{{Namespace: "argocd", Name: "argocd-agent"}}}
+	base, err := checkInputs("cell", p, policySource, refs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := checkInputs("cell", p, policySource, refs); again != base {
+		t.Fatal("the fingerprint is not stable")
+	}
+	narrow := bundle.Policy{Version: p.Version, Classes: p.Classes, Roles: map[string]bundle.Role{"cell": p.Roles["cell"]}}
+	for name, got := range map[string]func() (string, error){
+		"role":    func() (string, error) { return checkInputs("cp", p, policySource, refs) },
+		"allow":   func() (string, error) { return checkInputs("cell", narrow, policySource, refs) },
+		"rego":    func() (string, error) { return checkInputs("cell", p, policySource+"\n", refs) },
+		"harness": func() (string, error) { return checkInputs("cell", p, policySource, HarnessRefs{}) },
+	} {
+		fp, err := got()
+		if err != nil || fp == base {
+			t.Errorf("a change of the %s gives the same fingerprint (%v)", name, err)
+		}
+	}
+}
+
+// TestApplyCheckedKeyedByComponent checks that a digest checked for one component is checked again
+// when another component names it, under the class of that component, and pushed to its repository.
+func TestApplyCheckedKeyedByComponent(t *testing.T) {
+	e := newEnv(t)
+	first := e.set(1, std("v1"))
+	wantOutcome(t, e.apply("op1", first), op.OutcomeApplied, "", "")
+	np := first.arts["network-policy"]
+	e.seed(e.mirrorReg, "bundles/"+tTarget+"/apps-sample", np)
+	b := e.set(2, std("v2"))
+	set := b.set
+	for i := range set.Components {
+		if set.Components[i].Name == "apps-sample" {
+			set.Components[i].Digest = np.Digest
+		}
+	}
+	b.set = set
+	root, err := bundle.ComposeRoot("cell", set, e.cfg.Policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.att = e.sign(b, tEnv, tTarget, root.Digest, e.priv)
+	out := e.apply("op2", b)
+	if out.Outcome != op.OutcomeRefused || out.Reason != op.ReasonComponentNotAllowed {
+		t.Fatalf("outcome = %+v, want a component_not_allowed refusal from the class app", out)
+	}
+	for _, c := range e.state().Checked {
+		if !strings.Contains(c, "@sha256:") {
+			t.Fatalf("checked entry %q does not name its component", c)
+		}
 	}
 }
 

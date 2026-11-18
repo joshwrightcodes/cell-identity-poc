@@ -1,11 +1,13 @@
 package bundleapply
 
 import (
+	"cmp"
 	"context"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -221,7 +223,10 @@ type run struct {
 	snap    State
 	// fetched lists the components that this apply read from the mirror and checked.
 	fetched []fetched
-	root    bundle.Artifact
+	// harness lists the live harness objects, and checkedBy is the fingerprint of the check inputs.
+	harness   HarnessRefs
+	checkedBy string
+	root      bundle.Artifact
 	// held is true while this process holds the lock and has not written a final state.
 	held bool
 }
@@ -445,9 +450,17 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 		return refused(op.ReasonDigestMismatch, "root"), nil
 	}
 
-	checked := make(map[string]bool, len(r.snap.Checked))
-	for _, d := range r.snap.Checked {
-		checked[d] = true
+	if r.harness, err = a.harnessRefs(ctx); err != nil {
+		return Outcome{}, err
+	}
+	if r.checkedBy, err = checkInputs(cfg.Role, cfg.Policy, policySource, r.harness); err != nil {
+		return Outcome{}, err
+	}
+	checked := map[string]bool{}
+	if r.snap.CheckedBy == r.checkedBy {
+		for _, c := range r.snap.Checked {
+			checked[c] = true
+		}
 	}
 	fctx, end := a.tel.step(ctx, spanFetch)
 	out, err := a.fetch(fctx, r, checked)
@@ -463,7 +476,7 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 
 func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (Outcome, error) {
 	for _, c := range r.set.Components {
-		if checked[c.Digest] {
+		if checked[checkedKey(c.Name, c.Digest)] {
 			continue
 		}
 		art, err := ocistore.Fetch(ctx, a.cfg.Mirror, "bundles/"+a.cfg.Target+"/"+c.Name, c.Digest)
@@ -497,21 +510,56 @@ func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (O
 	return Outcome{}, nil
 }
 
+// harnessRefs lists the harness NetworkPolicies of the live cluster, in name order.
+func (a *Applier) harnessRefs(ctx context.Context) (HarnessRefs, error) {
+	nps, err := a.cfg.Client.NetworkingV1().NetworkPolicies(metav1.NamespaceAll).List(ctx, metav1.ListOptions{LabelSelector: harnessLabel})
+	if err != nil {
+		return HarnessRefs{}, fmt.Errorf("list harness network policies: %w", err)
+	}
+	var refs HarnessRefs
+	for _, np := range nps.Items {
+		refs.NetworkPolicies = append(refs.NetworkPolicies, ObjectRef{Namespace: np.Namespace, Name: np.Name})
+	}
+	slices.SortFunc(refs.NetworkPolicies, func(x, y ObjectRef) int {
+		return cmp.Or(strings.Compare(x.Namespace, y.Namespace), strings.Compare(x.Name, y.Name))
+	})
+	return refs, nil
+}
+
+// checkRevision names the rules of the Go checks: the decoder of internal/bundle
+// (bundle.DecodeManifests, bundle.DecodeCanonical) and the checks of this package outside Rego. Raise
+// it when one of them changes, so that the components that an older build checked are checked again.
+const checkRevision = 1
+
+// checkInputs returns the fingerprint of every input of the check that is not the component itself:
+// the check revision, the role, the allow data, the Rego module and the live harness policies. A
+// component in State.Checked skips the check only while the state holds the same fingerprint.
+func checkInputs(role string, p bundle.Policy, module string, refs HarnessRefs) (string, error) {
+	body, err := json.Marshal(struct {
+		Revision int
+		Role     string
+		Allow    bundle.Policy
+		Rego     string
+		Harness  []ObjectRef
+	}{checkRevision, role, p, module, refs.NetworkPolicies})
+	if err != nil {
+		return "", fmt.Errorf("encode the check inputs: %w", err)
+	}
+	sum := sha256.Sum256(body)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// checkedKey is the entry of State.Checked for a component: its name and digest. The class of a
+// component comes from its name, so a digest that one component passed says nothing of another.
+func checkedKey(name, digest string) string { return name + "@" + digest }
+
 // check runs the policy over each component that the fetch read. It builds a new Checker for
 // the set, with the harness policies of the live cluster and the scopes of the live API, then the
 // CRD scopes of every component of the set. Cluster scope wins in the policy when two sources
 // disagree.
 func (a *Applier) check(ctx context.Context, r *run) (Outcome, error) {
 	cfg := a.cfg
-	nps, err := cfg.Client.NetworkingV1().NetworkPolicies(metav1.NamespaceAll).List(ctx, metav1.ListOptions{LabelSelector: harnessLabel})
-	if err != nil {
-		return Outcome{}, fmt.Errorf("list harness network policies: %w", err)
-	}
-	var refs HarnessRefs
-	for _, np := range nps.Items {
-		refs.NetworkPolicies = append(refs.NetworkPolicies, ObjectRef{Namespace: np.Namespace, Name: np.Name})
-	}
-	checker, err := NewChecker(cfg.Role, cfg.Policy, refs)
+	checker, err := NewChecker(cfg.Role, cfg.Policy, r.harness)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -623,7 +671,7 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 			if len(s.Good) > maxGood {
 				s.Good = s.Good[:maxGood]
 			}
-			s.Checked = a.boundChecked(s, r.fetched)
+			s.Checked, s.CheckedBy = a.boundChecked(s, r.checkedBy, r.fetched), r.checkedBy
 		})
 		return out, err
 	}
@@ -638,24 +686,27 @@ func (a *Applier) ensureGood(s *State) {
 	}
 }
 
-// boundChecked returns the digests that stay in checked: those that the state checked before, plus
-// those that this run checked, kept only while a component or a good root names them.
-func (a *Applier) boundChecked(s *State, added []fetched) []string {
+// boundChecked returns the entries that stay in checked: those that the state checked before with
+// the same check inputs, plus those that this run checked, kept only while a component or a good
+// root names them.
+func (a *Applier) boundChecked(s *State, by string, added []fetched) []string {
 	live := map[string]bool{}
-	for _, d := range s.Components {
-		live[d] = true
+	for name, d := range s.Components {
+		live[checkedKey(name, d)] = true
 	}
 	for _, g := range s.Good {
-		for _, d := range g.Components {
-			live[d] = true
+		for name, d := range g.Components {
+			live[checkedKey(name, d)] = true
 		}
 	}
 	have := map[string]bool{}
-	for _, d := range s.Checked {
-		have[d] = true
+	if s.CheckedBy == by {
+		for _, c := range s.Checked {
+			have[c] = true
+		}
 	}
 	for _, f := range added {
-		have[f.comp.Digest] = true
+		have[checkedKey(f.comp.Name, f.comp.Digest)] = true
 	}
 	var out []string
 	for d := range have {
@@ -842,7 +893,7 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome,
 		if good != nil {
 			s.Root, s.Components = good.Root, maps.Clone(good.Components)
 		}
-		s.Checked = a.boundChecked(s, nil)
+		s.Checked, s.CheckedBy = a.boundChecked(s, r.checkedBy, nil), r.checkedBy
 	})
 	return out, err
 }

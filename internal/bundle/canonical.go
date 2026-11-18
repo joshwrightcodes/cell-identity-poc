@@ -128,7 +128,8 @@ func DecodeCanonical(manifests []byte, maxObjects int) ([]map[string]any, error)
 // byte order mark, NUL, invalid UTF-8 or an odd line break, a document that starts with a flow
 // construct, a chunk with more than one document, an anchor, alias, merge key, tag or duplicate key,
 // and a document that is not an object with apiVersion, kind and a name. A null namespace is removed
-// from the object, and an empty document is skipped.
+// from the object, and an empty document is skipped. The applier keeps a record of the components
+// that it checked, so raise checkRevision in internal/bundleapply when these rules change.
 func DecodeManifests(manifests []byte, maxObjects int) ([]map[string]any, error) {
 	if !plainText(manifests) {
 		return nil, refuse("layout")
