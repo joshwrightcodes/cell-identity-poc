@@ -105,7 +105,7 @@ func runToken(ctx context.Context, args []string, stdout io.Writer) int {
 			return err
 		}
 		tel.Log.Info("token_starting", "upstream", cfg.upstream, "audience", cfg.audience, "readers", cfg.readers, "writers", cfg.writers)
-		return listenAndServe(ctx, cfg.listen, cfg.health, h, tel)
+		return listenAndServe(ctx, cfg.listen, cfg.health, h, upstreamHealth(cfg.upstream), tel)
 	})
 }
 
@@ -163,12 +163,42 @@ func runTokenClient(ctx context.Context, args []string, stdout io.Writer) int {
 			return err
 		}
 		tel.Log.Info("token_client_starting", "upstream", cfg.upstream)
-		return listenAndServe(ctx, cfg.listen, cfg.health, h, tel)
+		return listenAndServe(ctx, cfg.listen, cfg.health, h, nil, tel)
 	})
 }
 
-// listenAndServe serves h on listen, and a health answer on health when it is set.
-func listenAndServe(ctx context.Context, listen, health string, h http.Handler, tel *telemetry.T) error {
+// healthUpstreamTimeout bounds the registry check of the store proxy health route. Tests change it.
+var healthUpstreamTimeout = 2 * time.Second
+
+// upstreamHealth answers GET /healthz of the store proxy from the registry behind it: 200 when GET /v2/ on
+// the upstream answers 200 or 401, and 503 for any other answer, a failed connection or no answer within
+// healthUpstreamTimeout. The readiness of the pod follows the registry, which has no probe of its own.
+func upstreamHealth(upstream string) http.Handler {
+	client := &http.Client{
+		Timeout:       healthUpstreamTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), healthUpstreamTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+upstream+"/v2/", nil)
+		if err == nil {
+			var resp *http.Response
+			if resp, err = client.Do(req); err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusUnauthorized {
+					_, _ = io.WriteString(w, "ok\n")
+					return
+				}
+			}
+		}
+		http.Error(w, "upstream not ready", http.StatusServiceUnavailable)
+	})
+}
+
+// listenAndServe serves h on listen, and on health the route /healthz when health is set. A nil ready answers
+// 200, and the store proxy gives the handler of its registry check.
+func listenAndServe(ctx context.Context, listen, health string, h http.Handler, ready http.Handler, tel *telemetry.T) error {
 	ln, err := net.Listen("tcp", listen)
 	if err != nil {
 		return err
@@ -184,7 +214,10 @@ func listenAndServe(ctx context.Context, listen, health string, h http.Handler, 
 		}
 		tel.Log.Info("health_listening", "addr", hl.Addr().String())
 		mux := http.NewServeMux()
-		mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
+		if ready == nil {
+			ready = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok\n") })
+		}
+		mux.Handle("GET /healthz", ready)
 		go func() { errc <- serveStore(ctx, hl, mux, tel.Log) }()
 	}
 	tel.Log.Info("listening", "addr", ln.Addr().String())

@@ -463,7 +463,7 @@ func TestCollectorPolicies(t *testing.T) {
 				}
 				rest = in[2:]
 			}
-			if want := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:bundle-store]]]] 4318"; rest[0].String() != want {
+			if want := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:bundle-store]]]] 4317,4318"; rest[0].String() != want {
 				t.Errorf("the bundle store rule is %q, want %q", rest[0], want)
 			}
 			if !strings.HasPrefix(rest[1].String(), "[map[ipBlock:map[cidr:") || !strings.HasSuffix(rest[1].String(), "/32]]] 4317") {
@@ -529,8 +529,8 @@ func TestCollectorPolicies(t *testing.T) {
 			// Flow N47 adds the API server for the TokenReview calls of the store proxy: the node address on the API port,
 			// and the Service address on 443.
 			eg := peerRules(t, store, "egress")
-			if len(eg) != 3 || eg[0].String() != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]] 4318" {
-				t.Fatalf("the bundle store egress is %v, want the collector pod on 4318 and the two API server rules", eg)
+			if len(eg) != 3 || eg[0].String() != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]] 4317,4318" {
+				t.Fatalf("the bundle store egress is %v, want the collector pod on 4317 and 4318 and the two API server rules", eg)
 			}
 			if !strings.HasPrefix(eg[1].String(), "[map[ipBlock:map[cidr:") || !strings.HasSuffix(eg[1].String(), "/32]]] 6443") ||
 				!strings.HasPrefix(eg[2].String(), "[map[ipBlock:map[cidr:") || !strings.HasSuffix(eg[2].String(), "/32]]] 443") {

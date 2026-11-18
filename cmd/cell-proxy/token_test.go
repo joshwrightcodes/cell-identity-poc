@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -143,7 +144,8 @@ func TestTokenModeServes(t *testing.T) {
 	stop()
 	mu.Lock()
 	defer mu.Unlock()
-	if !slices.Equal(hits, []string{"GET /v2/bundles/root/manifests/current", "PUT /v2/bundles/root/manifests/current"}) {
+	// The first request is the registry check of /healthz.
+	if !slices.Equal(hits, []string{"GET /v2/", "GET /v2/bundles/root/manifests/current", "PUT /v2/bundles/root/manifests/current"}) {
 		t.Fatalf("upstream got %v", hits)
 	}
 	if strings.Contains(out.String(), "Bearer") {
@@ -291,4 +293,84 @@ func TestStoreServerWriteTimeout(t *testing.T) {
 	if got := readAll(t, conn, 3*time.Second); strings.Contains(got, "late") {
 		t.Fatalf("response %q after the write timeout", got)
 	}
+}
+
+// healthStatus starts the token mode against upstream and returns the status of GET /healthz.
+func healthStatus(t *testing.T, upstream string) int {
+	t.Helper()
+	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "300")
+	useReviewer(t, tableReviewer{})
+	out := &syncBuffer{}
+	stop := runUntilCanceled(t, with(tokenArgs(), "--upstream", upstream), out)
+	defer stop()
+	health := waitLine(t, out, "health_listening")["addr"].(string)
+	resp, err := http.Get("http://" + health + "/healthz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
+}
+
+// TestTokenHealthFollowsUpstream: /healthz is 200 only when GET /v2/ on the upstream answers 200 or 401, so the
+// readiness of the pod follows the loopback registry. Any other answer, a refused connection and a hung upstream give 503.
+func TestTokenHealthFollowsUpstream(t *testing.T) {
+	if healthUpstreamTimeout != 2*time.Second {
+		t.Fatalf("healthUpstreamTimeout = %v, want 2s", healthUpstreamTimeout)
+	}
+	prev := healthUpstreamTimeout
+	healthUpstreamTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { healthUpstreamTimeout = prev })
+	answer := func(code int) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet || r.URL.Path != "/v2/" {
+				t.Errorf("health asked the upstream %s %s, want GET /v2/", r.Method, r.URL.Path)
+			}
+			w.WriteHeader(code)
+		}))
+	}
+	for _, tc := range []struct{ code, want int }{
+		{200, 200}, {401, 200}, {404, 503}, {403, 503}, {500, 503}, {302, 503},
+	} {
+		t.Run(fmt.Sprint("upstream ", tc.code), func(t *testing.T) {
+			s := answer(tc.code)
+			defer s.Close()
+			if got := healthStatus(t, strings.TrimPrefix(s.URL, "http://")); got != tc.want {
+				t.Fatalf("/healthz = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	t.Run("upstream redirects to an answer of 200", func(t *testing.T) {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" {
+				http.Redirect(w, r, "/elsewhere", http.StatusFound)
+			}
+		}))
+		defer s.Close()
+		if got := healthStatus(t, strings.TrimPrefix(s.URL, "http://")); got != http.StatusServiceUnavailable {
+			t.Fatalf("/healthz = %d, want 503", got)
+		}
+	})
+	t.Run("upstream down", func(t *testing.T) {
+		s := answer(200)
+		addr := strings.TrimPrefix(s.URL, "http://")
+		s.Close()
+		if got := healthStatus(t, addr); got != http.StatusServiceUnavailable {
+			t.Fatalf("/healthz = %d, want 503", got)
+		}
+	})
+	t.Run("upstream hung", func(t *testing.T) {
+		release := make(chan struct{})
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+		defer s.Close()
+		defer close(release)
+		start := time.Now()
+		if got := healthStatus(t, strings.TrimPrefix(s.URL, "http://")); got != http.StatusServiceUnavailable {
+			t.Fatalf("/healthz = %d, want 503", got)
+		}
+		if d := time.Since(start); d > 3*time.Second {
+			t.Fatalf("the health answer took %v, want it near the timeout", d)
+		}
+	})
 }

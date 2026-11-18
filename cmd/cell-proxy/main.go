@@ -47,6 +47,7 @@
 // token fronts the in-cluster bundle store. It asks the TokenReview API who owns the bearer token of
 // each request, and passes a read (GET, HEAD) only for a --reader and a write (POST, PUT, PATCH)
 // only for a --writer. It refuses every other request with 403 and counts it in store_proxy.denials.
+// Its --health route answers 200 only while GET /v2/ on --upstream answers 200 or 401 within 2 s, and 503 otherwise.
 // With no --writer, it refuses every write. token-client listens on a loopback address only, and
 // sends each request to --upstream with the token that --token-file holds, which it reads again for
 // every request. Neither mode has an SVID.

@@ -79,6 +79,24 @@ func TestBundleStoreTokenProxy(t *testing.T) {
 				t.Errorf("store-proxy args are %v, want %v", args, want)
 			}
 			proxyResources(t, proxy)
+			// Readiness follows the registry through /healthz of the proxy, and the registry has no probe.
+			if got := fmt.Sprint(lookupOr(proxy, "readinessProbe")); got != "map[httpGet:map[path:/healthz port:health]]" {
+				t.Errorf("store-proxy readinessProbe = %s, want GET /healthz on the port health", got)
+			}
+			var health any
+			for _, p := range get[[]any](t, proxy, "ports") {
+				if p.(map[string]any)["name"] == "health" {
+					health = p.(map[string]any)["containerPort"]
+				}
+			}
+			if fmt.Sprint(health) != "8080" {
+				t.Errorf("store-proxy port health is %v, want 8080 as in --health", health)
+			}
+			for _, probe := range []string{"readinessProbe", "livenessProbe", "startupProbe"} {
+				if p, ok := lookup(reg, probe); ok {
+					t.Errorf("the registry container has %s %v, want none", probe, p)
+				}
+			}
 			// Only store-proxy mounts the API token.
 			for _, c := range containers {
 				m := c.(map[string]any)
