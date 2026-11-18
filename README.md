@@ -1837,6 +1837,9 @@ A signed spec can gain a member, for example `closed`. An older image of a reade
    Use `CELL=dev-cp mise run cell:up`, then `mise run hostsvc:serve -- restart` for the host service.
 3. Roll out `mgmtd` last, with `mise run images -- mgmtd` and `CELL=management LINK_ONLY=mgmt-api mise run cell:link`.
 
+`mise run hostsvc:serve -- restart` also restarts `mgmtd`, through the link `mgmt-api`, and renders the cell controller again.
+When `mgmtd` must roll last, restart the host service last too.
+
 After the first commit of the new `mgmtd`, an older `mgmtd` image cannot load its state. The way back is `mise run mgmt -- reset-state`.
 New image digests change the bootstrap digest. Each open step then fails with `bootstrap_mismatch`.
 Run `mise run portal -- retry --cell <cell>` for each open cell.
