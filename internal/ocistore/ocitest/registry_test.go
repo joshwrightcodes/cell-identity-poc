@@ -125,3 +125,36 @@ func TestRegistryRedirect(t *testing.T) {
 		t.Fatalf("same-host redirect body %q", body)
 	}
 }
+
+func TestRegistryDenyReadsAndAccept(t *testing.T) {
+	r := NewRegistry(t)
+	base := "http://" + r.URL()
+	idx := "application/vnd.oci.image.index.v1+json"
+	d := r.SeedManifest("n", "t", idx, []byte(`{}`))
+	for _, c := range []struct {
+		accept string
+		want   int
+	}{{"", 200}, {idx, 200}, {"application/vnd.oci.image.manifest.v1+json, */*", 404}} {
+		req, _ := http.NewRequest(http.MethodGet, base+"/v2/n/manifests/"+d, nil)
+		if c.accept != "" {
+			req.Header.Set("Accept", c.accept)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Fatalf("Accept %q: %d, want %d", c.accept, resp.StatusCode, c.want)
+		}
+	}
+	r.DenyReads(403)
+	for _, m := range []string{http.MethodGet, http.MethodHead} {
+		if resp, _ := get(t, http.DefaultClient, m, base+"/v2/n/manifests/t"); resp.StatusCode != 403 {
+			t.Fatalf("%s: %d", m, resp.StatusCode)
+		}
+	}
+	if resp, _ := get(t, http.DefaultClient, http.MethodPost, base+"/v2/n/blobs/uploads/"); resp.StatusCode != 202 {
+		t.Fatalf("POST: %d", resp.StatusCode)
+	}
+}

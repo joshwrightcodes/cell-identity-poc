@@ -81,8 +81,8 @@ func Fetch(ctx context.Context, s *Store, repo, dgst string) (bundle.Artifact, e
 		return bundle.Artifact{}, fmt.Errorf("%w: %d layers, want 1", ErrLayout, len(m.Layers))
 	case m.Config.MediaType != bundle.MediaTypeConfig:
 		return bundle.Artifact{}, fmt.Errorf("%w: config media type %q", ErrLayout, m.Config.MediaType)
-	case m.Layers[0].MediaType != bundle.MediaTypeLayer:
-		return bundle.Artifact{}, fmt.Errorf("%w: layer media type %q", ErrLayout, m.Layers[0].MediaType)
+	case bundle.CheckLayerMediaType(m.Layers[0].MediaType) != nil:
+		return bundle.Artifact{}, fmt.Errorf("%w: %w", ErrLayout, bundle.CheckLayerMediaType(m.Layers[0].MediaType))
 	case m.Config.Size < 0 || m.Config.Size > bundle.MaxConfigBytes:
 		return bundle.Artifact{}, fmt.Errorf("%w: config size %d", ErrLayout, m.Config.Size)
 	case m.Layers[0].Size <= 0 || m.Layers[0].Size > s.c.MaxBlob:
@@ -141,14 +141,15 @@ func (s *Store) referrersIndex(ctx context.Context, repo, subject string) ([]oci
 	if err != nil {
 		return nil, err
 	}
-	d, err := s.Resolve(ctx, repo, tag)
+	limit := max(s.c.MaxManifest, maxIndex)
+	d, err := s.resolve(ctx, repo, tag, limit)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	raw, err := s.Manifest(ctx, repo, d)
+	raw, err := s.manifest(ctx, repo, d, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -181,7 +182,9 @@ var attachLocks sync.Map // registry/repo:tag -> *sync.Mutex
 // referrer manifest first. Calls for the same subject run one at a time in this process, because
 // the update reads the index, changes it and writes it back. A referrer that the index already
 // lists leaves it unchanged. Another process that writes the same tag at the same time can still
-// lose an entry, because the registry has no compare-and-swap for tags.
+// lose an entry, because the registry has no compare-and-swap for tags. Only one writer may
+// attach to a subject. The call reads the index again after the write and fails when its entry is
+// missing, which detects such a loss.
 func (s *Store) AttachReferrer(ctx context.Context, repo, subject string, r Referrer) error {
 	desc, err := r.descriptor()
 	if err != nil {
@@ -219,5 +222,14 @@ func (s *Store) AttachReferrer(ctx context.Context, repo, subject string, r Refe
 	if _, err := s.PushManifest(ctx, repo, tag, ocispec.MediaTypeImageIndex, data); err != nil {
 		return fmt.Errorf("write referrers index: %w", err)
 	}
-	return nil
+	after, err := s.referrersIndex(ctx, repo, subject)
+	if err != nil {
+		return fmt.Errorf("read referrers index back: %w", err)
+	}
+	for _, e := range after {
+		if e.Digest == desc.Digest {
+			return nil
+		}
+	}
+	return fmt.Errorf("referrers index lost %s: another writer changed tag %s", desc.Digest, tag)
 }

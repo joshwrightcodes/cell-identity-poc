@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/sirupsen/logrus"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
@@ -384,14 +385,17 @@ func TestNoRedirectOffHost(t *testing.T) {
 	md := reg.SeedManifest(testRepo, "", mtOCIMan, []byte(`{}`))
 	_, err = s.Manifest(ctx, testRepo, md)
 	is(t, err, ErrOffHost)
+	other.SeedManifest(testRepo, "t", mtOCIMan, []byte(`{}`))
+	reg.SeedManifest(testRepo, "t", mtOCIMan, []byte(`{}`))
 	_, err = s.Resolve(ctx, testRepo, "t")
-	if err == nil {
-		t.Fatal("Resolve followed nothing and still succeeded")
-	}
+	is(t, err, ErrOffHost)
 	ok, err := s.HasBlob(ctx, testRepo, d)
 	is(t, err, ErrOffHost)
-	if ok || len(other.Requests()) != 0 {
-		t.Fatal("HasBlob left the host")
+	if ok {
+		t.Fatal("HasBlob followed the redirect")
+	}
+	if n := len(other.Requests()); n != 0 {
+		t.Fatalf("the other host got %d requests", n)
 	}
 
 	t.Run("same host is followed", func(t *testing.T) {
@@ -464,6 +468,8 @@ func TestDeniedIsTyped(t *testing.T) {
 			_, err = s.Manifest(ctx, testRepo, d)
 			is(t, err, ErrDenied)
 			is(t, s.PushBlob(ctx, testRepo, ocitest.Digest([]byte("n")), []byte("n")), ErrDenied)
+			_, err = s.PushManifest(ctx, testRepo, "t", mtOCIMan, []byte(`{}`))
+			is(t, err, ErrDenied)
 			_, err = s.Resolve(ctx, testRepo, "t")
 			is(t, err, ErrDenied)
 			is(t, s.Ping(ctx), ErrDenied)
@@ -546,7 +552,7 @@ func TestFetchLayout(t *testing.T) {
 	cases := map[string]func(m map[string]any){
 		"two layers": func(m map[string]any) { m["layers"] = append(m["layers"].([]any), layer(m)) },
 		"no layers":  func(m map[string]any) { m["layers"] = []any{} },
-		"layer type": func(m map[string]any) { layer(m)["mediaType"] = "application/vnd.oci.image.layer.v1.tar+gzip" },
+		"layer type": func(m map[string]any) { layer(m)["mediaType"] = bundle.MediaTypeLayer + "+zstd" },
 		"config type": func(m map[string]any) {
 			m["config"].(map[string]any)["mediaType"] = "application/vnd.oci.image.config.v1+json"
 		},
@@ -625,20 +631,44 @@ func TestResolverLogsThroughSlog(t *testing.T) {
 	defer stdLogger.SetOutput(oldOut)
 
 	reg := ocitest.NewRegistry(t)
-	s := newStore(t, reg)
+	const secret = "tok-must-not-be-logged"
+	s := newStore(t, reg, func(c *Client) { c.Token = func() (string, error) { return secret, nil } })
 	_, err := s.Resolve(context.Background(), testRepo, "missing")
 	is(t, err, ErrNotFound)
 	if std.Len() != 0 {
 		t.Fatalf("the resolver wrote to the global logrus logger: %q", std.String())
 	}
-	if !strings.Contains(buf.String(), `"level":"INFO"`) {
-		t.Fatalf("no slog record for the failed resolve: %q", buf.String())
+	if !strings.Contains(buf.String(), `"level":"DEBUG"`) || strings.Contains(buf.String(), `"level":"INFO"`) {
+		t.Fatalf("a missing tag must log at debug level only: %q", buf.String())
+	}
+	// Exercise the other paths, which log at higher levels.
+	reg.Deny(http.StatusForbidden)
+	_, _ = s.Resolve(context.Background(), testRepo, "t")
+	_, _ = s.Blob(context.Background(), testRepo, ocitest.Digest([]byte("x")))
+	_ = s.PushBlob(context.Background(), testRepo, ocitest.Digest([]byte("x")), []byte("x"))
+	if strings.Contains(buf.String(), secret) || strings.Contains(std.String(), secret) {
+		t.Fatal("the token appears in the log output")
 	}
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			t.Fatalf("slog line is not JSON: %q", line)
 		}
+	}
+}
+
+func TestGlobalContainerdLoggerRoutedToSlog(t *testing.T) {
+	newStore(t, ocitest.NewRegistry(t))
+	if stdLogger := logrus.StandardLogger(); stdLogger.Out != io.Discard {
+		t.Fatalf("the global logger writes to %T, not to nowhere", stdLogger.Out)
+	}
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	defer slog.SetDefault(old)
+	log.L.Warn("close error probe")
+	if !strings.Contains(buf.String(), "close error probe") || !strings.Contains(buf.String(), `"level":"WARN"`) {
+		t.Fatalf("the global logger did not reach slog: %q", buf.String())
 	}
 }
 
@@ -786,4 +816,248 @@ func TestAttachSerialized(t *testing.T) {
 	if err := s.AttachReferrer(ctx, testRepo, subject, Referrer{Digest: "sha256:x", Size: 1, MediaType: mtOCIMan}); err == nil {
 		t.Fatal("a bad referrer was accepted")
 	}
+}
+
+func TestDeniedReadsBlockPushWithoutWriteOnly(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	reg.DenyReads(http.StatusForbidden)
+	s := newStore(t, reg)
+	data := []byte("blocked")
+	is(t, s.PushBlob(ctx, testRepo, ocitest.Digest(data), data), ErrDenied)
+	_, err := s.PushManifest(ctx, testRepo, "current", mtOCIMan, []byte(`{"schemaVersion":2}`))
+	is(t, err, ErrDenied)
+	for _, r := range reg.Requests() {
+		if r.Method == http.MethodPost || r.Method == http.MethodPut {
+			t.Fatalf("a write reached the registry: %s %s", r.Method, r.Path)
+		}
+	}
+}
+
+func TestPushThroughWriteOnlyProxy(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	reg.DenyReads(http.StatusForbidden)
+	s := newStore(t, reg, func(c *Client) { c.WriteOnly = true })
+
+	data := []byte("pushed without a read")
+	d := ocitest.Digest(data)
+	if err := s.PushBlob(ctx, testRepo, d, data); err != nil {
+		t.Fatalf("PushBlob: %v", err)
+	}
+	if got, ok := reg.Blob(testRepo, d); !ok || !bytes.Equal(got, data) {
+		t.Fatal("the blob did not reach the registry")
+	}
+	man := []byte(`{"schemaVersion":2,"mediaType":"` + mtOCIMan + `"}`)
+	md, err := s.PushManifest(ctx, testRepo, "", mtOCIMan, man)
+	if err != nil {
+		t.Fatalf("PushManifest by digest: %v", err)
+	}
+	if got, ok := reg.Manifest(testRepo, md); !ok || !bytes.Equal(got, man) {
+		t.Fatal("the manifest did not reach the registry")
+	}
+	next := []byte(`{"schemaVersion":2,"mediaType":"` + mtOCIMan + `","x":1}`)
+	if _, err := s.PushManifest(ctx, testRepo, "current", mtOCIMan, next); err != nil {
+		t.Fatalf("PushManifest by tag: %v", err)
+	}
+	if got, ok := reg.Manifest(testRepo, "current"); !ok || !bytes.Equal(got, next) {
+		t.Fatal("the tag did not reach the registry")
+	}
+	for _, r := range reg.Requests() {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			t.Fatalf("a read was sent: %s %s", r.Method, r.Path)
+		}
+	}
+
+	// Every read method refuses at once and sends nothing.
+	before := len(reg.Requests())
+	_, e1 := s.Blob(ctx, testRepo, d)
+	_, e2 := s.Manifest(ctx, testRepo, md)
+	_, e3 := s.Resolve(ctx, testRepo, "current")
+	_, e4 := s.HasBlob(ctx, testRepo, d)
+	_, e5 := s.Referrers(ctx, testRepo, md)
+	_, e6 := Fetch(ctx, s, testRepo, md)
+	for i, e := range []error{e1, e2, e3, s.Ping(ctx), e4, e5, e6} {
+		if !errors.Is(e, ErrWriteOnly) {
+			t.Errorf("read %d: error = %v, want ErrWriteOnly", i, e)
+		}
+	}
+	if len(reg.Requests()) != before {
+		t.Fatal("a read method sent a request")
+	}
+}
+
+func TestWriteOnlyTransportAnswersLocally(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	s, err := New(Client{Base: strings.TrimPrefix(srv.URL, "http://"), WriteOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range []string{http.MethodGet, http.MethodHead} {
+		req, _ := http.NewRequest(m, srv.URL+"/v2/x/blobs/sha256:"+strings.Repeat("a", 64), nil)
+		resp, err := s.hc.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s answered %d", m, resp.StatusCode)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatal("a read reached the registry")
+	}
+}
+
+func TestOffHostUploadLocationRefused(t *testing.T) {
+	ctx := context.Background()
+	other := ocitest.NewRegistry(t)
+	reg := ocitest.NewRegistry(t)
+	reg.UploadLocation(other.URL())
+	s := newStore(t, reg, func(c *Client) {
+		c.Token = func() (string, error) { return "tok-up", nil }
+	})
+	data := []byte("upload elsewhere")
+	err := s.PushBlob(ctx, testRepo, ocitest.Digest(data), data)
+	is(t, err, ErrOffHost)
+	if n := len(other.Requests()); n != 0 {
+		t.Fatalf("the other host got %d requests", n)
+	}
+	if _, ok := other.Blob(testRepo, ocitest.Digest(data)); ok {
+		t.Fatal("the blob reached the other host")
+	}
+}
+
+func TestResolveBodyWithoutDigestHeader(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	reg.OmitDigestHeader(true)
+	ct := &countTransport{base: http.DefaultTransport.(*http.Transport).Clone()}
+	s := newStore(t, reg, func(c *Client) { c.MaxManifest = 16 << 10; c.Transport = ct })
+
+	small := []byte(`{"schemaVersion":2}`)
+	want := reg.SeedManifest(testRepo, "small", mtOCIMan, small)
+	got, err := s.Resolve(ctx, testRepo, "small")
+	if err != nil || got != want {
+		t.Fatalf("Resolve of a small manifest = %q, %v", got, err)
+	}
+	huge := append([]byte(`{"schemaVersion":2,"pad":"`), bytes.Repeat([]byte{'p'}, 1<<20)...)
+	huge = append(huge, '"', '}')
+	reg.SeedManifest(testRepo, "huge", mtOCIMan, huge)
+	ct.read.Store(0)
+	_, err = s.Resolve(ctx, testRepo, "huge")
+	is(t, err, ErrTooLarge)
+	if n := ct.read.Load(); n > maxIndex+1 {
+		t.Fatalf("the client read %d bytes of the body, want at most %d", n, maxIndex+1)
+	}
+}
+
+func TestReferrersIndexHasItsOwnCap(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	s := newStore(t, reg, func(c *Client) { c.MaxManifest = 16 << 10 })
+	subject := ocitest.Digest([]byte("subject"))
+	// An index of about 60 KiB is above the manifest cap and below the index cap.
+	for i := 0; i < 150; i++ {
+		d, size := referrerManifest(t, s, i)
+		err := s.AttachReferrer(ctx, testRepo, subject, Referrer{Digest: d, Size: size, MediaType: mtOCIMan,
+			ArtifactType: "application/vnd.dev.sigstore.bundle.v0.3+json",
+			Annotations:  map[string]string{"dev.sigstore.bundle.content": "dsse-envelope", "n": fmt.Sprint(i)}})
+		if err != nil {
+			t.Fatalf("attach %d: %v", i, err)
+		}
+	}
+	tag, _ := FallbackTag(subject)
+	if raw, _ := reg.Manifest(testRepo, tag); len(raw) <= 16<<10 {
+		t.Fatalf("the index is only %d bytes", len(raw))
+	}
+	got, err := s.Referrers(ctx, testRepo, subject)
+	if err != nil || len(got) != 150 {
+		t.Fatalf("Referrers = %d, %v", len(got), err)
+	}
+}
+
+func TestAttachThreeInARow(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	s := newStore(t, reg)
+	subject := ocitest.Digest([]byte("subject"))
+	var want []string
+	for i := 0; i < 3; i++ {
+		d, size := referrerManifest(t, s, i)
+		want = append(want, d)
+		if err := s.AttachReferrer(ctx, testRepo, subject, Referrer{Digest: d, Size: size, MediaType: mtOCIMan}); err != nil {
+			t.Fatalf("attach %d: %v", i, err)
+		}
+		got, err := s.Referrers(ctx, testRepo, subject)
+		if err != nil || len(got) != i+1 {
+			t.Fatalf("after attach %d: %d entries, %v", i, len(got), err)
+		}
+	}
+	got, _ := s.Referrers(ctx, testRepo, subject)
+	for i, g := range got {
+		if g.Digest.String() != want[i] {
+			t.Errorf("entry %d = %s, want %s", i, g.Digest, want[i])
+		}
+	}
+	// A registry that follows Distribution refuses an index read without the index type.
+	tag, _ := FallbackTag(subject)
+	idxDigest := ocitest.Digest(mustManifest(t, reg, tag))
+	req, _ := http.NewRequest(http.MethodGet, "http://"+reg.URL()+"/v2/"+testRepo+"/manifests/"+idxDigest, nil)
+	req.Header.Set("Accept", mtOCIMan+", */*")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("the test registry answered %d to an index read without the index type", resp.StatusCode)
+	}
+}
+
+func mustManifest(t *testing.T, reg *ocitest.Registry, ref string) []byte {
+	t.Helper()
+	b, ok := reg.Manifest(testRepo, ref)
+	if !ok {
+		t.Fatalf("no manifest %s", ref)
+	}
+	return b
+}
+
+func TestAttachDetectsLostEntry(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	s := newStore(t, reg)
+	subject := ocitest.Digest([]byte("subject"))
+	tag, _ := FallbackTag(subject)
+	d, size := referrerManifest(t, s, 1)
+	// A second writer replaces the tag as soon as the first write lands.
+	var once sync.Once
+	ct := &rewriteTransport{base: http.DefaultTransport.(*http.Transport).Clone(), after: func() {
+		once.Do(func() {
+			other := []byte(`{"schemaVersion":2,"mediaType":"` + mtOCIIdx + `","manifests":[]}`)
+			reg.SeedManifest(testRepo, tag, mtOCIIdx, other)
+		})
+	}}
+	s2 := newStore(t, reg, func(c *Client) { c.Transport = ct })
+	err := s2.AttachReferrer(ctx, testRepo, subject, Referrer{Digest: d, Size: size, MediaType: mtOCIMan})
+	if err == nil || !strings.Contains(err.Error(), "lost") {
+		t.Fatalf("a lost entry was not detected: %v", err)
+	}
+}
+
+// rewriteTransport runs a function after each PUT.
+type rewriteTransport struct {
+	base  http.RoundTripper
+	after func()
+}
+
+func (r *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := r.base.RoundTrip(req)
+	if err == nil && req.Method == http.MethodPut {
+		r.after()
+	}
+	return resp, err
 }

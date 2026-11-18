@@ -1560,6 +1560,9 @@ darwin/arm64:
 - Telemetry: OpenTelemetry only. Each request wraps the transport in `otelhttp`, so the resolver makes client spans and
   metrics through the global providers and sends a `traceparent` header. `containerd/log` writes text lines through `logrus`
   to standard error, so Task 5 must give the resolver a context logger.
+- `github.com/sirupsen/logrus/hooks/slog` v1.10.2 compiles into `internal/ocistore`, which uses it to send logrus entries to
+  `slog`. The Task 5 review read `slog.go`, `handler.go` and `level.go` (320 lines) on 2026-11-18. The files import no `os`,
+  `net`, `os/exec` or `syscall` package and read no environment variable. The package is benign.
 - Environment: `logrus` reads `CLICOLOR` and `CLICOLOR_FORCE`. `pkg/namespaces` reads `CONTAINERD_NAMESPACE` only in a
   helper that the resolver does not call.
 - `sudo`, `setuid`, persistence and credentials: none. Credentials come only from the callback of the caller. The packages

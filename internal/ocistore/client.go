@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/containerd/containerd/v2/core/remotes/docker"
@@ -42,11 +43,14 @@ var (
 	ErrLayout          = errors.New("unexpected artifact layout")
 	ErrOffHost         = errors.New("request to another host refused")
 	ErrContentEncoding = errors.New("content encoding refused")
+	ErrWriteOnly       = errors.New("store is write-only")
 )
 
 const (
-	mediaTypeBlob  = "application/octet-stream"
-	maxRedirects   = 10
+	mediaTypeBlob = "application/octet-stream"
+	maxRedirects  = 10
+	// maxIndex bounds the referrers index, which grows with each attestation.
+	maxIndex       = 256 << 10
 	defaultMaxMan  = bundle.MaxManifestBytes
 	defaultMaxBlob = bundle.MaxLayerBytes
 )
@@ -67,7 +71,11 @@ type Client struct {
 	// MaxManifest and MaxBlob bound the bytes that the store reads or writes for a manifest and
 	// for a blob. A value of zero or less selects the bundle limits.
 	MaxManifest, MaxBlob int64
-	// Transport carries the requests. Nil selects a clone of http.DefaultTransport.
+	// WriteOnly answers every HEAD and GET locally with 404 and sends it nowhere, so that the
+	// resolver goes straight to POST and PUT. Use it for a writer that the registry proxy refuses
+	// to let read. Every read method of the store then returns ErrWriteOnly.
+	WriteOnly bool
+	// Transport carries the requests. It is a seam for tests. Nil selects a clone of http.DefaultTransport.
 	Transport http.RoundTripper
 }
 
@@ -97,7 +105,7 @@ func New(c Client) (*Store, error) {
 		base = http.DefaultTransport.(*http.Transport).Clone()
 	}
 	hc := &http.Client{
-		Transport: &guard{host: host, token: c.Token, base: base},
+		Transport: &guard{host: host, token: c.Token, base: base, writeOnly: c.WriteOnly, bodyCap: max(c.MaxManifest, maxIndex) + 1},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
 				return fmt.Errorf("stopped after %d redirects", maxRedirects)
@@ -108,14 +116,26 @@ func New(c Client) (*Store, error) {
 			return nil
 		},
 	}
+	routeGlobalLogger()
 	return &Store{c: c, host: host, hc: hc, logr: newLogger()}, nil
 }
 
 // guard is the transport of the store. It is the only path to the network.
 type guard struct {
-	host  string
-	token func() (string, error)
-	base  http.RoundTripper
+	host      string
+	token     func() (string, error)
+	base      http.RoundTripper
+	writeOnly bool
+	bodyCap   int64
+}
+
+// acceptManifests is what a read of a manifest or index sends. A registry that follows Distribution
+// 3.1.2 answers 404 for a stored index when the OCI index type is not listed.
+const acceptManifests = ocispec.MediaTypeImageIndex + ", " + ocispec.MediaTypeImageManifest
+
+type limitedBody struct {
+	io.Reader
+	io.Closer
 }
 
 func (g *guard) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -128,7 +148,19 @@ func (g *guard) RoundTrip(req *http.Request) (*http.Response, error) {
 		closeBody()
 		return nil, fmt.Errorf("%w: %s://%s", ErrOffHost, req.URL.Scheme, req.URL.Host)
 	}
+	read := req.Method == http.MethodGet || req.Method == http.MethodHead
+	if g.writeOnly && read {
+		closeBody()
+		return &http.Response{
+			Status: "404 Not Found", StatusCode: http.StatusNotFound, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header: http.Header{}, Body: http.NoBody, Request: req,
+		}, nil
+	}
+	manifestRead := read && strings.Contains(req.URL.Path, "/manifests/")
 	out := req.Clone(req.Context())
+	if manifestRead {
+		out.Header.Set("Accept", acceptManifests)
+	}
 	out.Header.Del("Authorization")
 	out.Header.Set("Accept-Encoding", "identity")
 	if g.token != nil {
@@ -149,6 +181,10 @@ func (g *guard) RoundTrip(req *http.Request) (*http.Response, error) {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("%w: %q from %s", ErrContentEncoding, enc, req.URL.Host)
 	}
+	if manifestRead && req.Method == http.MethodGet {
+		// The resolver hashes a body that has no digest header without a bound of its own.
+		resp.Body = limitedBody{io.LimitReader(resp.Body, g.bodyCap), resp.Body}
+	}
 	return resp, nil
 }
 
@@ -166,14 +202,39 @@ func (slogHandler) WithAttrs(a []slog.Attr) slog.Handler {
 }
 func (slogHandler) WithGroup(n string) slog.Handler { return slog.Default().Handler().WithGroup(n) }
 
+// hook bridges logrus entries to slog. An info entry of the resolver, for example a missing tag,
+// is a normal result that the store returns as a typed error, so it goes out at debug level.
+func newHook() logrus.Hook {
+	return lslog.NewHook(slog.New(slogHandler{}), &lslog.HookOptions{LevelMapper: func(l logrus.Level) slog.Level {
+		if l == logrus.InfoLevel {
+			return slog.LevelDebug
+		}
+		return lslog.Level(l).Level()
+	}})
+}
+
 // newLogger returns the logger that the resolver uses. It writes nothing itself and passes records
 // of level info and above to slog, so request headers at debug level never leave the process.
 func newLogger() *logrus.Logger {
 	l := logrus.New()
 	l.SetOutput(io.Discard)
 	l.SetLevel(logrus.InfoLevel)
-	l.AddHook(lslog.NewHook(slog.New(slogHandler{}), nil))
+	l.AddHook(newHook())
 	return l
+}
+
+var routeOnce sync.Once
+
+// routeGlobalLogger points the global logger of containerd at slog, once. A few paths of the
+// resolver, for example a close error of a response body, log through it and not through the
+// context logger. This changes a process global: no other code of the process may rely on text
+// output of the containerd logger.
+func routeGlobalLogger() {
+	routeOnce.Do(func() {
+		g := log.L.Logger
+		g.SetOutput(io.Discard)
+		g.AddHook(newHook())
+	})
 }
 
 func (s *Store) logCtx(ctx context.Context) context.Context {
@@ -240,8 +301,18 @@ func mapErr(err error) error {
 	return err
 }
 
+func (s *Store) readable() error {
+	if s.c.WriteOnly {
+		return ErrWriteOnly
+	}
+	return nil
+}
+
 // Ping checks that the registry answers the version endpoint.
 func (s *Store) Ping(ctx context.Context) error {
+	if err := s.readable(); err != nil {
+		return err
+	}
 	resp, err := s.do(ctx, http.MethodGet, "/v2/")
 	if err != nil {
 		return err
@@ -252,6 +323,9 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // HasBlob reports whether the repository holds the blob.
 func (s *Store) HasBlob(ctx context.Context, repo, dgst string) (bool, error) {
+	if err := s.readable(); err != nil {
+		return false, err
+	}
 	if err := checkRepo(repo); err != nil {
 		return false, err
 	}
@@ -299,7 +373,11 @@ func statusErr(resp *http.Response, what string) error {
 // Manifest returns the manifest or index at the digest. The bytes match the digest, fit MaxManifest
 // and carry no urls.
 func (s *Store) Manifest(ctx context.Context, repo, dgst string) ([]byte, error) {
-	data, err := s.fetch(ctx, repo, dgst, ocispec.MediaTypeImageManifest, s.c.MaxManifest)
+	return s.manifest(ctx, repo, dgst, s.c.MaxManifest)
+}
+
+func (s *Store) manifest(ctx context.Context, repo, dgst string, limit int64) ([]byte, error) {
+	data, err := s.fetch(ctx, repo, dgst, ocispec.MediaTypeImageManifest, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -317,6 +395,9 @@ func (s *Store) Blob(ctx context.Context, repo, dgst string) ([]byte, error) {
 // fetch reads one object by digest. The descriptor has no urls, and its size is the limit, which
 // bounds the bytes that the resolver reads to limit plus one.
 func (s *Store) fetch(ctx context.Context, repo, dgst, mediaType string, limit int64) ([]byte, error) {
+	if err := s.readable(); err != nil {
+		return nil, err
+	}
 	if err := checkRepo(repo); err != nil {
 		return nil, err
 	}
@@ -353,6 +434,13 @@ func (s *Store) fetch(ctx context.Context, repo, dgst, mediaType string, limit i
 // Resolve returns the digest that the tag names. The registry is trusted for this answer only
 // as a pointer: Manifest checks the content against the digest.
 func (s *Store) Resolve(ctx context.Context, repo, tag string) (string, error) {
+	return s.resolve(ctx, repo, tag, s.c.MaxManifest)
+}
+
+func (s *Store) resolve(ctx context.Context, repo, tag string, limit int64) (string, error) {
+	if err := s.readable(); err != nil {
+		return "", err
+	}
 	if err := checkRepo(repo); err != nil {
 		return "", err
 	}
@@ -366,7 +454,7 @@ func (s *Store) Resolve(ctx context.Context, repo, tag string) (string, error) {
 	if _, err := checkDigest(desc.Digest.String()); err != nil {
 		return "", fmt.Errorf("registry answered: %w", err)
 	}
-	if desc.Size > s.c.MaxManifest {
+	if desc.Size > limit {
 		return "", fmt.Errorf("%w: %s names %d bytes", ErrTooLarge, tag, desc.Size)
 	}
 	return desc.Digest.String(), nil
@@ -395,8 +483,12 @@ func (s *Store) PushManifest(ctx context.Context, repo, ref, mediaType string, d
 	if mediaType != ocispec.MediaTypeImageManifest && mediaType != ocispec.MediaTypeImageIndex {
 		return "", fmt.Errorf("media type %q is not an OCI manifest or index", mediaType)
 	}
-	if int64(len(data)) > s.c.MaxManifest {
-		return "", fmt.Errorf("%w: manifest of %d bytes, limit %d", ErrTooLarge, len(data), s.c.MaxManifest)
+	limit := s.c.MaxManifest
+	if mediaType == ocispec.MediaTypeImageIndex {
+		limit = max(limit, maxIndex)
+	}
+	if int64(len(data)) > limit {
+		return "", fmt.Errorf("%w: manifest of %d bytes, limit %d", ErrTooLarge, len(data), limit)
 	}
 	if err := checkRepo(repo); err != nil {
 		return "", err

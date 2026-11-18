@@ -48,6 +48,9 @@ type Registry struct {
 	missing    map[string]bool
 	redirect   string
 	deny       int
+	denyReads  int
+	noDigest   bool
+	uploadLoc  string
 	encoding   string
 	delay      time.Duration
 	uploadSeq  int
@@ -120,6 +123,29 @@ func (r *Registry) Deny(status int) {
 	r.deny = status
 }
 
+// DenyReads makes every GET and HEAD answer with the status and no authentication challenge, and
+// lets POST, PATCH and PUT through, like a proxy for a writer that may not read. Zero turns it off.
+func (r *Registry) DenyReads(status int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.denyReads = status
+}
+
+// OmitDigestHeader leaves the Docker-Content-Digest header out of every manifest and blob read.
+func (r *Registry) OmitDigestHeader(on bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.noDigest = on
+}
+
+// UploadLocation makes the answer to a blob upload start name this host and port as the
+// Location, an absolute URL, instead of a path on this registry. An empty value turns it off.
+func (r *Registry) UploadLocation(hostPort string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.uploadLoc = hostPort
+}
+
 // Encode sets a Content-Encoding header on every response. An empty value turns it off.
 func (r *Registry) Encode(encoding string) {
 	r.mu.Lock()
@@ -158,6 +184,14 @@ func (r *Registry) SeedManifest(name, tag, mediaType string, data []byte) string
 	return d
 }
 
+// Blob returns the stored blob of a repository.
+func (r *Registry) Blob(name, digest string) ([]byte, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	b, ok := r.repo(name).blobs[digest]
+	return b, ok
+}
+
 // Manifest returns the stored manifest under a tag or digest.
 func (r *Registry) Manifest(name, ref string) ([]byte, bool) {
 	r.mu.Lock()
@@ -184,7 +218,7 @@ func (r *Registry) repo(name string) *repo {
 func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 	r.mu.Lock()
 	r.requests = append(r.requests, Request{Method: req.Method, Path: req.URL.RequestURI(), Header: req.Header.Clone()})
-	deny, encoding, redirect, delay := r.deny, r.encoding, r.redirect, r.delay
+	deny, encoding, redirect, delay, denyReads := r.deny, r.encoding, r.redirect, r.delay, r.denyReads
 	r.mu.Unlock()
 
 	if encoding != "" {
@@ -192,6 +226,10 @@ func (r *Registry) serve(w http.ResponseWriter, req *http.Request) {
 	}
 	if deny != 0 {
 		http.Error(w, "denied", deny)
+		return
+	}
+	if denyReads != 0 && (req.Method == http.MethodGet || req.Method == http.MethodHead) {
+		http.Error(w, "denied", denyReads)
 		return
 	}
 	path := req.URL.Path
@@ -238,7 +276,12 @@ func (r *Registry) send(w http.ResponseWriter, req *http.Request, mediaType, dig
 		data[0] ^= 0xff
 	}
 	w.Header().Set("Content-Type", mediaType)
-	w.Header().Set("Docker-Content-Digest", digest)
+	r.mu.Lock()
+	noDigest := r.noDigest
+	r.mu.Unlock()
+	if !noDigest {
+		w.Header().Set("Docker-Content-Digest", digest)
+	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.WriteHeader(http.StatusOK)
 	if req.Method != http.MethodHead {
@@ -270,6 +313,10 @@ func (r *Registry) manifest(w http.ResponseWriter, req *http.Request, name, ref 
 		d := Digest(m.data)
 		if !ok || r.isMissing(d) || r.isMissing(ref) {
 			http.Error(w, "manifest unknown", http.StatusNotFound)
+			return
+		}
+		if !accepts(req.Header.Get("Accept"), m.mediaType) {
+			http.Error(w, "MANIFEST_UNKNOWN: "+m.mediaType+" found, but the Accept header does not support it", http.StatusNotFound)
 			return
 		}
 		r.send(w, req, m.mediaType, d, m.data)
@@ -307,7 +354,13 @@ func (r *Registry) upload(w http.ResponseWriter, req *http.Request) {
 		id = strconv.Itoa(r.uploadSeq)
 		r.uploadRepo[id] = name
 		r.mu.Unlock()
-		w.Header().Set("Location", "/v2/"+name+"/blobs/uploads/"+id)
+		loc := "/v2/" + name + "/blobs/uploads/" + id
+		r.mu.Lock()
+		if r.uploadLoc != "" {
+			loc = "http://" + r.uploadLoc + loc
+		}
+		r.mu.Unlock()
+		w.Header().Set("Location", loc)
 		w.WriteHeader(http.StatusAccepted)
 	case http.MethodPut:
 		r.mu.Lock()
@@ -336,4 +389,19 @@ func (r *Registry) upload(w http.ResponseWriter, req *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+// accepts reports whether an Accept header lists the media type by name, as Distribution 3.1.2 does
+// for manifests and indexes: the wildcard does not match. An empty header accepts anything.
+func accepts(accept, mediaType string) bool {
+	if strings.TrimSpace(accept) == "" {
+		return true
+	}
+	for _, part := range strings.Split(accept, ",") {
+		name, _, _ := strings.Cut(part, ";")
+		if strings.TrimSpace(name) == mediaType {
+			return true
+		}
+	}
+	return false
 }
