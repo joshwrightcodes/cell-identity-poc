@@ -225,13 +225,15 @@ spec:
 	}
 }
 
-// TestM8AppSharedNameRolledBack, in dev-cell-1 (row 18): an app bundle that holds a Deployment with the name of the Deployment echo of
-// the platform component apps-demo passes the policy. Argo CD refuses the sync of apps-sample, because the Application syncs with
-// FailOnSharedResource=true and apps-demo already tracks echo. The set ends rolled_back with a timeout of apps-sample, and echo keeps its
-// resource version and its tracking ID. The test catches a component Application without the option, and an option that applies the
-// other objects of the sync before it fails.
+// TestM8AppSharedNameRolledBack, in dev-cell-1 (row 18): an app bundle holds a Deployment with the name, the selector and the pod labels of
+// the Deployment echo of the platform component apps-demo, with another image, and a ConfigMap m8-shared-sibling. The policy accepts both,
+// and the API server would accept the new echo. Argo CD refuses the sync of apps-sample with the operation message "Shared resource found",
+// because the Application syncs with FailOnSharedResource=true and apps-demo already tracks echo. The set ends rolled_back with a timeout
+// of apps-sample. echo keeps its resource version and its tracking ID, and the sibling never exists. The test catches a component
+// Application without the option, which would take echo over, and a sync that applies its other objects before it fails.
 func TestM8AppSharedNameRolledBack(t *testing.T) {
 	const cell = "dev-cell-1"
+	const sibling = "m8-shared-sibling"
 	m8RestoreTarget(t, cell)
 	live := m8LiveSet(t, cell)
 	var objs []map[string]any
@@ -248,49 +250,99 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: m8-shared-probe
+      app: echo
   template:
     metadata:
       labels:
-        app: m8-shared-probe
+        app: echo
     spec:
       containers:
-        - name: probe
+        - name: echo
           image: registry.invalid/m8-probe
 `))[0]
-	m8Annotate(probe, "cell.poc.internal/e2e-run", randomHex(t, 8))
-	objs = append(objs, probe)
-	tracking := func() string {
-		out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "deployment", "echo", "-o", `jsonpath={.metadata.annotations.argocd\.argoproj\.io/tracking-id}`)
+	// If Argo CD takes echo over by mistake, it must still never prune or delete it.
+	m8Annotate(probe, "argocd.argoproj.io/sync-options", "Prune=false,Delete=false")
+	added := append([]map[string]any{probe}, m8Objects(t, []byte(m8MarkerIn("apps-demo", sibling, "x")))...)
+	run := randomHex(t, 8)
+	for _, o := range added {
+		m8Annotate(o, "cell.poc.internal/e2e-run", run)
+	}
+	objs = append(objs, added...)
+
+	annotation := func(key string) string {
+		path := "jsonpath={.metadata.annotations." + strings.ReplaceAll(key, ".", `\.`) + "}"
+		out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "deployment", "echo", "-o", path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return strings.TrimSpace(out)
 	}
+	const trackingKey, optionsKey = "argocd.argoproj.io/tracking-id", "argocd.argoproj.io/sync-options"
 	rv := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo")
-	if rv == "" || !strings.HasPrefix(tracking(), "apps-demo:") {
-		t.Fatalf("Deployment apps-demo/echo of %s has the resource version %q and the tracking ID %q, want both, with the Application apps-demo", cell, rv, tracking())
+	tracking, options := annotation(trackingKey), annotation(optionsKey)
+	if rv == "" || !strings.HasPrefix(tracking, "apps-demo:") {
+		t.Fatalf("Deployment apps-demo/echo of %s has the resource version %q and the tracking ID %q, want both, with the Application apps-demo", cell, rv, tracking)
 	}
+	// This cleanup runs before the restore of the target. It never deletes echo. If the sync took echo over, it gives the tracking ID and
+	// the sync options back, so that the restore cannot prune echo and the self-heal of apps-demo writes its spec again.
+	t.Cleanup(func() {
+		if got := annotation(trackingKey); got != tracking {
+			t.Errorf("Argo CD took over Deployment apps-demo/echo of %s (tracking ID %q)", cell, got)
+			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "annotate", "--overwrite", "deployment", "echo", trackingKey+"="+tracking); err != nil {
+				t.Errorf("give the tracking ID of apps-demo/echo back: %v", err)
+			}
+		}
+		if got := annotation(optionsKey); got != options {
+			arg := optionsKey + "-"
+			if options != "" {
+				arg = optionsKey + "=" + options
+			}
+			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "annotate", "--overwrite", "deployment", "echo", arg); err != nil {
+				t.Errorf("give the sync options of apps-demo/echo back: %v", err)
+			}
+		}
+		if m8ResourceVersion(t, cell, "apps-demo", "configmap", sibling) != "" {
+			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "delete", "configmap", sibling, "--ignore-not-found"); err != nil {
+				t.Errorf("delete the probe ConfigMap %s: %v", sibling, err)
+			}
+		}
+	})
+
 	digest := m8PushBundle(t, cell, "apps-sample", m8Render(t, objs))
 	signed := m8Sign(t, cell, m8WithDigest(live, "apps-sample", m8AppWave, "apps-demo", digest), true)
-	seen := false
+	var message string
+	siblingSeen := false
 	tb := m8WaitEach(t, cell, signed.OpID, m8SetWait, func() {
-		if !seen && strings.Contains(strings.ToLower(m8ApplicationText(t, cell, "apps-sample")), "shared resource") {
-			seen = true
+		// The Application apps-sample exists only while the set is applied, so a missing one is "not seen yet".
+		out, err := kubectl(t, cell, "", "-n", "argocd", "get", "application", "apps-sample", "--ignore-not-found",
+			"-o", "jsonpath={.status.operationState.message}")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if msg := strings.TrimSpace(out); message == "" && strings.Contains(msg, "Shared resource found") {
+			message = msg
+		}
+		if m8ResourceVersion(t, cell, "apps-demo", "configmap", sibling) != "" {
+			siblingSeen = true
 		}
 	})
 	m8WantResult(t, tb.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "*")
 	if tb.Result != nil && !strings.HasPrefix(tb.Result.Detail, "timeout:apps-sample:") {
 		t.Errorf("the detail of the rollback is %q, want one that starts with timeout:apps-sample: (a failed sync does not turn the Application Degraded)", tb.Result.Detail)
 	}
-	if !seen {
-		t.Error("Argo CD never reported a shared resource for apps-sample")
+	if message == "" {
+		t.Error(`the operation of apps-sample never ended with the message "Shared resource found"`)
+	} else {
+		t.Logf("the operation of apps-sample ended with %q", message)
+	}
+	if siblingSeen {
+		t.Errorf("ConfigMap apps-demo/%s existed during the set, so the sync applied objects before it failed", sibling)
 	}
 	if got := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo"); got != rv {
 		t.Errorf("Deployment apps-demo/echo has the resource version %s, want %s", got, rv)
 	}
-	if got := tracking(); !strings.HasPrefix(got, "apps-demo:") {
-		t.Errorf("Deployment apps-demo/echo has the tracking ID %q, want the Application apps-demo", got)
+	if got := annotation(trackingKey); got != tracking {
+		t.Errorf("Deployment apps-demo/echo has the tracking ID %q, want %q", got, tracking)
 	}
 	m8RequireAtSet(t, cell, live, "")
 }
