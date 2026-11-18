@@ -32,6 +32,8 @@ _.file = ["cells/common.env", "cells/{{get_env(name='CELL', default='dev-cell-1'
 GOFLAGS = "-mod=readonly"
 # Every Docker and kind command talks to the PoC VM, whatever the current Docker context is.
 DOCKER_HOST = "unix://{{env.HOME}}/.colima/poc/docker.sock"
+# ko builds images for this platform, and scripts/deps-check.sh checks the module rules for the same platform.
+KO_DEFAULTPLATFORMS = "linux/arm64"
 
 [tasks."vm:up"]
 description = "Start the Colima VM that runs the kind clusters"
@@ -201,7 +203,7 @@ run = "scripts/harness.sh down"
 description = "Build and push the in-cluster images to the local registry at localhost:5001, and record their digests in build/images.env"
 depends = ["vm:up"]
 # Without VCS stamps, a binary changes only when its sources change, so a commit alone gives no new digests.
-env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64", GOFLAGS = "-mod=readonly -buildvcs=false" }
+env = { KO_DOCKER_REPO = "localhost:5001", GOFLAGS = "-mod=readonly -buildvcs=false" }
 run = "scripts/images.sh"
 
 [tasks."gate:m1"]
