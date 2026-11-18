@@ -4,6 +4,8 @@ go 1.27.3
 
 require (
 	github.com/containerd/containerd/v2 v2.4.2
+	github.com/containerd/errdefs v1.0.0
+	github.com/containerd/log v0.2.0
 	github.com/go-jose/go-jose/v4 v4.1.6
 	github.com/go-logr/logr v1.4.4
 	github.com/hashicorp/go-hclog v1.6.3
@@ -11,6 +13,7 @@ require (
 	github.com/open-policy-agent/opa v1.22.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
+	github.com/sirupsen/logrus v1.10.2
 	github.com/spiffe/go-spiffe/v2 v2.9.0
 	github.com/spiffe/spire-api-sdk v1.2.5-0.20260428072036-00f73a61093a
 	github.com/spiffe/spire-plugin-sdk v1.4.4-0.20260617144146-5dcde407c4d1
@@ -44,8 +47,6 @@ require (
 	github.com/agnivade/levenshtein v1.2.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
-	github.com/containerd/log v0.2.0 // indirect
 	github.com/containerd/log/otel v0.1.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.5 // indirect
 	github.com/containerd/ttrpc v1.2.9 // indirect
@@ -103,7 +104,6 @@ require (
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
-	github.com/sirupsen/logrus v1.10.2 // indirect
 	github.com/spf13/cobra v1.10.2 // indirect
 	github.com/spf13/pflag v1.0.10 // indirect
 	github.com/valyala/fastjson v1.6.10 // indirect
