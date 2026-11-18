@@ -407,14 +407,19 @@ type resendLog struct {
 	last map[string]time.Time
 }
 
-func (r *resendLog) allow(opID string, now time.Time) bool {
+// due reports whether opID may go up again at now.
+func (r *resendLog) due(opID string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if t, ok := r.last[opID]; ok && now.Sub(t) < minResendGap {
-		return false
-	}
+	t, ok := r.last[opID]
+	return !ok || now.Sub(t) >= minResendGap
+}
+
+// mark records that a frame with the result of opID was written at now.
+func (r *resendLog) mark(opID string, now time.Time) {
+	r.mu.Lock()
 	r.last[opID] = now
-	return true
+	r.mu.Unlock()
 }
 
 func (r *resendLog) forget(opID string) {

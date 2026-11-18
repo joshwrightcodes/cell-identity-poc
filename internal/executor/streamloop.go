@@ -24,9 +24,12 @@ type execOutcome struct {
 
 // effectSlot holds the one effect of a StreamConfig. The effect outlives the stream that started it:
 // the next streams open, send status and claim nothing while it runs, and the stream that is open
-// when it ends reports its result. Only the goroutine of RunStream reads and sets busy.
+// when it ends reports its result. Only the goroutine of RunStream reads and sets busy and opID.
 type effectSlot struct {
 	busy bool
+	// opID is the operation ID that the envelope of the running lease names, unverified. A resend
+	// skips it while busy is true, so the result of the effect goes up with its lease.
+	opID string
 	out  chan execOutcome
 	wg   sync.WaitGroup
 }
@@ -34,8 +37,8 @@ type effectSlot struct {
 func newEffectSlot() *effectSlot { return &effectSlot{out: make(chan execOutcome, 1)} }
 
 // start runs one effect in its own goroutine. out holds one outcome, so the send never blocks.
-func (s *effectSlot) start(run func() execOutcome) {
-	s.busy = true
+func (s *effectSlot) start(opID string, run func() execOutcome) {
+	s.busy, s.opID = true, opID
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -52,8 +55,6 @@ type loop struct {
 	parent context.Context
 	w      io.Writer
 	wg     sync.WaitGroup
-	// adopted is true while an effect that an earlier stream started runs.
-	adopted bool
 
 	frames  chan gwapi.Frame
 	readErr chan error
@@ -79,7 +80,7 @@ func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Deco
 	l.wantClaim = true
 	if cfg.effect.busy {
 		// The claim of the running effect stays in flight, so this stream claims nothing until it ends.
-		l.executing, l.claimInFlight, l.adopted = true, true, true
+		l.executing, l.claimInFlight = true, true
 	}
 	l.claimAt = now.Add(cfg.ClaimEvery)
 	// The deadline of the last stream carries over. A new stream sends a status at once when that deadline has passed.
@@ -129,16 +130,6 @@ func (l *loop) run(parent context.Context) error {
 	l.parent = parent
 	timer := time.NewTimer(0)
 	defer timer.Stop()
-	if l.adopted {
-		// An effect that ended between streams reports with its lease before the first resend.
-		select {
-		case o := <-l.cfg.effect.out:
-			if err := l.done(o); err != nil {
-				return err
-			}
-		default:
-		}
-	}
 	for {
 		if err := l.fire(l.cfg.Now()); err != nil {
 			return err
@@ -248,7 +239,8 @@ func (l *loop) handle(f gwapi.Frame) error {
 		if ectx == nil {
 			ectx = l.parent
 		}
-		c.effect.start(func() execOutcome {
+		opID, _, _, _ := op.Peek(f.Envelope)
+		c.effect.start(opID, func() execOutcome {
 			return execOutcome{res: c.Exec.Execute(ectx, f.Envelope, f.Fence), leaseID: f.LeaseID}
 		})
 	case gwapi.TypeNone:
@@ -311,19 +303,16 @@ func (l *loop) handleFinal(f gwapi.Frame) {
 
 // done takes the outcome of the effect, frees the slot and reports the result.
 func (l *loop) done(o execOutcome) error {
-	adopted := l.adopted
-	l.cfg.effect.busy = false
-	l.executing, l.claimInFlight, l.adopted = false, false, false
+	l.cfg.effect.busy, l.cfg.effect.opID = false, ""
+	l.executing, l.claimInFlight = false, false
 	l.wantClaim = op.IsFinal(o.res.Outcome)
-	return l.reportLease(o, adopted)
+	return l.reportLease(o)
 }
 
 // reportLease sends the result of a lease when it is final. A local outcome stays in the log. At most
 // one result with an empty operation ID goes up in forgedEvery, because a forged envelope can come
-// any number of times and the executor already counts each one in ForgedSeen. The result of an
-// adopted effect goes through the resend log, because the first resend of the stream can already
-// have sent its applied record.
-func (l *loop) reportLease(o execOutcome, adopted bool) error {
+// any number of times and the executor already counts each one in ForgedSeen.
+func (l *loop) reportLease(o execOutcome) error {
 	res := o.res
 	if !op.IsFinal(res.Outcome) {
 		l.cfg.Log.WarnContext(l.ctx, "local outcome stays here", "op_id", res.OpID, "outcome", res.Outcome, "reason", res.Reason)
@@ -336,35 +325,34 @@ func (l *loop) reportLease(o execOutcome, adopted bool) error {
 		}
 		l.lastForged = now
 	}
-	if adopted && res.OpID != "" && !l.cfg.resent.allow(res.OpID, l.cfg.Now()) {
-		return nil
-	}
-	return l.sendResult(res, o.leaseID)
+	_, err := l.sendResult(res, o.leaseID)
+	return err
 }
 
-// sendResult sends one result item with a new token. A failed token request is only logged, and
-// the next resend tries again. A failed write ends the stream.
-func (l *loop) sendResult(res op.Result, leaseID string) error {
+// sendResult sends one result item with a new token. It reports whether it wrote the frame. A failed
+// token request is only logged, and the next resend tries again. A failed write ends the stream.
+func (l *loop) sendResult(res op.Result, leaseID string) (bool, error) {
 	body, err := json.Marshal(res)
 	if err != nil {
-		return err
+		return false, err
 	}
 	return l.sendItem(gwapi.TypeResult, gwapi.KindResult, res.OpID, body, leaseID, res.Fence)
 }
 
-func (l *loop) sendItem(typ, kind, opID string, body []byte, leaseID string, fe op.Fence) error {
+func (l *loop) sendItem(typ, kind, opID string, body []byte, leaseID string, fe op.Fence) (bool, error) {
 	c := l.cfg
 	token, err := c.Tokens(l.ctx, proof.ReportAudience(c.Cell, kind, body))
 	if err != nil {
 		c.Log.WarnContext(l.ctx, "mint a report token failed", "kind", kind, "error", err.Error())
-		return nil
+		return false, nil
 	}
 	err = l.send(gwapi.Frame{Type: typ, LeaseID: leaseID, Fence: fe,
 		Item: &gwapi.Item{Kind: kind, Cell: c.Cell, OpID: opID, Body: body, Token: token}})
-	if err == nil {
-		l.ackDue = append(l.ackDue, c.Now().Add(c.AckTimeout))
+	if err != nil {
+		return false, err
 	}
-	return err
+	l.ackDue = append(l.ackDue, c.Now().Add(c.AckTimeout))
+	return true, nil
 }
 
 func (l *loop) sendStatus() error {
@@ -372,12 +360,15 @@ func (l *loop) sendStatus() error {
 	if err != nil {
 		return err
 	}
-	return l.sendItem(gwapi.TypeStatus, gwapi.KindStatus, "", body, "", op.Fence{})
+	_, err = l.sendItem(gwapi.TypeStatus, gwapi.KindStatus, "", body, "", op.Fence{})
+	return err
 }
 
 // resendPending sends again each unreported result, or only the one for opID when it is not empty.
-// An op goes up again at most once in minResendGap. One call sends at most maxResendBurst results,
-// so that the loop reads its frames in time. The rest follow when the acks of the burst are in.
+// An op goes up again at most once in minResendGap, counted from the last written frame. One call
+// sends at most maxResendBurst results, so that the loop reads its frames in time. The rest follow
+// when the acks of the burst are in. It skips the operation of the running effect, whose outcome
+// reports the result with its lease.
 func (l *loop) resendPending(opID string) error {
 	ctx, cancel := context.WithTimeout(l.ctx, kubeTimeout)
 	pending, err := l.cfg.Exec.Pending(ctx)
@@ -395,17 +386,24 @@ func (l *loop) resendPending(opID string) error {
 			continue
 		}
 		found = true
+		if l.cfg.effect.busy && res.OpID == l.cfg.effect.opID {
+			continue
+		}
 		if sent >= maxResendBurst {
 			l.resendMore = true
 			break
 		}
-		if !l.cfg.resent.allow(res.OpID, l.cfg.Now()) {
+		if !l.cfg.resent.due(res.OpID, l.cfg.Now()) {
 			continue
 		}
-		if err := l.sendResult(res, ""); err != nil {
+		wrote, err := l.sendResult(res, "")
+		if err != nil {
 			return err
 		}
-		sent++
+		if wrote {
+			l.cfg.resent.mark(res.OpID, l.cfg.Now())
+			sent++
+		}
 	}
 	if opID != "" && !found {
 		l.cfg.Log.InfoContext(l.ctx, "retry without a pending result", "op_id", opID)
