@@ -189,6 +189,10 @@ func TestStatementSubjectsMatchSet(t *testing.T) {
 			if !errors.Is(err, record.ErrDecode) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("want ErrDecode with %q, got %v", tc.want, err)
 			}
+			if subject := strings.Contains(tc.name, "subject") || strings.Contains(tc.name, "missing_") ||
+				strings.Contains(tc.name, "duplicate_") || strings.HasPrefix(tc.name, "digest_") || tc.name == "other_target"; errors.Is(err, bundle.ErrSubjects) != subject {
+				t.Fatalf("errors.Is(err, ErrSubjects) = %v, want %v: %v", !subject, subject, err)
+			}
 			// SignAttestation refuses what ParseAttestation refuses.
 			if _, err := bundle.SignAttestation(st, priv); !errors.Is(err, record.ErrDecode) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("SignAttestation: want ErrDecode with %q, got %v", tc.want, err)

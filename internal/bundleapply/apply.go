@@ -219,7 +219,7 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 	switch {
 	case errors.Is(err, record.ErrSignature):
 		return refused(op.ReasonSignatureInvalid, ""), nil
-	case err != nil && strings.Contains(err.Error(), "subject"):
+	case errors.Is(err, bundle.ErrSubjects):
 		return refused(op.ReasonPayloadInvalid, "subjects"), nil
 	case err != nil:
 		return refused(op.ReasonPayloadInvalid, "statement"), nil

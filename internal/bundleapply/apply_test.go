@@ -34,6 +34,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore/ocitest"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
 const (
@@ -564,6 +565,9 @@ func TestApplyAttestationInvalid(t *testing.T) {
 		{"not an envelope", []byte("not json"), op.ReasonPayloadInvalid, "statement"},
 		{"other environment", e.sign(b, "prod", tTarget, b.root.Digest, e.priv), op.ReasonEnvMismatch, ""},
 		{"too large", append([]byte(`{"payloadType":"`), make([]byte, op.MaxBundleArgsBytes)...), op.ReasonPayloadInvalid, "statement"},
+		{"subjects do not match the set", e.signRaw(t, func(st *bundle.Statement) { st.Subject = st.Subject[1:] }), op.ReasonPayloadInvalid, "subjects"},
+		{"subject digest malformed", e.signRaw(t, func(st *bundle.Statement) { st.Subject[1].Digest.SHA256 = "x" }), op.ReasonPayloadInvalid, "subjects"},
+		{"unknown field named like a subject", e.signBody(t, func(m map[string]any) { m["subjects"] = []any{} }), op.ReasonPayloadInvalid, "statement"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -577,6 +581,47 @@ func TestApplyAttestationInvalid(t *testing.T) {
 	if len(e.storeWrites()) != 0 || e.state().Source != "bootstrap" {
 		t.Fatal("a refused attestation changed the cluster")
 	}
+}
+
+// signRaw signs a statement of a valid set after mutate changes it, with no check of the result.
+func (e *env) signRaw(t *testing.T, mutate func(*bundle.Statement)) []byte {
+	t.Helper()
+	b := e.build(tTarget, bundle.Version{Epoch: 1, Counter: 1}, std("raw"))
+	st := bundle.NewStatement(tEnv, tTarget, b.set, b.root.Digest)
+	mutate(&st)
+	body, err := json.Marshal(st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := record.SignEnvelope(bundle.PayloadType, body, e.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// signBody signs the JSON form of a valid statement after mutate changes it.
+func (e *env) signBody(t *testing.T, mutate func(map[string]any)) []byte {
+	t.Helper()
+	b := e.build(tTarget, bundle.Version{Epoch: 1, Counter: 1}, std("raw"))
+	raw, err := json.Marshal(bundle.NewStatement(tEnv, tTarget, b.set, b.root.Digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	mutate(m)
+	body, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, err := record.SignEnvelope(bundle.PayloadType, body, e.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
 }
 
 func TestApplyRootSubjectMismatch(t *testing.T) {

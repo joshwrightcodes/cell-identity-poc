@@ -21,6 +21,17 @@ const (
 	maxTargetLabel = 59
 )
 
+// ErrSubjects marks a statement whose subjects are not the root and each component once.
+var ErrSubjects = errors.New("subjects do not match the set")
+
+// subjectsError is a subject fault. Its text names the fault, and errors.Is matches ErrSubjects.
+type subjectsError string
+
+func (e subjectsError) Error() string        { return string(e) }
+func (e subjectsError) Is(target error) bool { return target == ErrSubjects }
+
+func subjectsErr(format string, a ...any) error { return subjectsError(fmt.Sprintf(format, a...)) }
+
 // SubjectDigest holds the digest of a subject. The strict decoder refuses any other algorithm.
 type SubjectDigest struct {
 	SHA256 string `json:"sha256"`
@@ -134,7 +145,7 @@ func ParseAttestation(envelope []byte, keys []crypto.PublicKey) (Statement, Set,
 	}
 	set, err := st.set()
 	if err != nil {
-		return Statement{}, Set{}, fmt.Errorf("%w statement: %v", record.ErrDecode, err)
+		return Statement{}, Set{}, fmt.Errorf("%w statement: %w", record.ErrDecode, err)
 	}
 	return st, set, nil
 }
@@ -156,10 +167,10 @@ func (st Statement) set() (Set, error) {
 	digests := make(map[string]string, len(st.Subject))
 	for _, s := range st.Subject {
 		if _, dup := digests[s.Name]; dup {
-			return Set{}, fmt.Errorf("subject %q appears twice", s.Name)
+			return Set{}, subjectsErr("subject %q appears twice", s.Name)
 		}
 		if !digestRE.MatchString("sha256:" + s.Digest.SHA256) {
-			return Set{}, fmt.Errorf("subject %q has no sha256 digest of 64 lowercase hex characters", s.Name)
+			return Set{}, subjectsErr("subject %q has no sha256 digest of 64 lowercase hex characters", s.Name)
 		}
 		digests[s.Name] = s.Digest.SHA256
 	}
@@ -168,7 +179,7 @@ func (st Statement) set() (Set, error) {
 	for _, c := range p.Components {
 		d, ok := digests[prefix+c.Name]
 		if !ok {
-			return Set{}, fmt.Errorf("component %q has no subject", c.Name)
+			return Set{}, subjectsErr("component %q has no subject", c.Name)
 		}
 		set.Components = append(set.Components, Component{
 			Name: c.Name, Wave: c.Wave, Namespace: c.Namespace, Digest: "sha256:" + d, IgnoreDifferences: c.IgnoreDifferences,
@@ -178,10 +189,10 @@ func (st Statement) set() (Set, error) {
 		return Set{}, err
 	}
 	if _, ok := digests[prefix+"root"]; !ok {
-		return Set{}, errors.New("no root subject")
+		return Set{}, subjectsErr("no root subject")
 	}
 	if len(st.Subject) != len(set.Components)+1 {
-		return Set{}, fmt.Errorf("%d subjects for %d components", len(st.Subject), len(set.Components))
+		return Set{}, subjectsErr("%d subjects for %d components", len(st.Subject), len(set.Components))
 	}
 	return set, nil
 }
