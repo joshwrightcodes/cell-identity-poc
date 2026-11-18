@@ -239,6 +239,14 @@ func TestCpPlanePolicies(t *testing.T) {
 			wantFromEnvd(store, 5000)
 			wantFromEnvd(planePolicy(t, objs, "spire-system", "plane-envd"), 8081)
 
+			workloads := planePolicy(t, objs, "spire-system", "plane-workloads")
+			wIngress := get[[]any](t, workloads, "ingress")
+			if fmt.Sprint(workloads["policyTypes"]) != "[Ingress]" || len(workloads) != 3 || len(wIngress) != 1 ||
+				peerList(t, wIngress[0], "from") != "observability-system/otel-uplink,gateway-system/cell-gateway,cell-controller-system/cell-controller" ||
+				!slices.Equal(portList(t, wIngress[0]), []int{8081}) {
+				t.Errorf("plane-workloads spec is %v, want one ingress rule from otel-uplink, cell-gateway and cell-controller on 8081", workloads)
+			}
+
 			upstream := planePolicy(t, objs, "relay-system", "plane-upstream")
 			egress := get[[]any](t, upstream, "egress")
 			if fmt.Sprint(upstream["policyTypes"]) != "[Egress]" || len(upstream) != 3 || len(egress) != 1 ||
@@ -351,8 +359,16 @@ func TestSpireServerHasNoCellRules(t *testing.T) {
 				peers, _ := lookupOr(rule, "from").([]any)
 				peers = append(peers, func() []any { p, _ := lookupOr(rule, "to").([]any); return p }()...)
 				for _, p := range peers {
-					if cidr, ok := lookup(p, "ipBlock", "cidr"); ok && strings.HasPrefix(cidr.(string), "10.9.0.") {
-						t.Errorf("%s admits the address %v of a cell or of management", key, cidr)
+					if cidr, ok := lookup(p, "ipBlock", "cidr"); ok {
+						prefix, err := netip.ParsePrefix(cidr.(string))
+						if err != nil {
+							t.Fatalf("%s has the ipBlock %v: %v", key, cidr, err)
+						}
+						for _, addr := range []string{"10.9.0.1", "10.9.0.2", "10.9.0.10"} {
+							if prefix.Contains(netip.MustParseAddr(addr)) {
+								t.Errorf("%s admits %v, which holds the address %s of a cell or of management", key, cidr, addr)
+							}
+						}
 					}
 					if ns, ok := lookup(p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name"); ok && ns == "envd-system" {
 						t.Errorf("%s admits envd: %v", key, rule)
@@ -361,13 +377,8 @@ func TestSpireServerHasNoCellRules(t *testing.T) {
 			}
 		}
 	}
-	var peers []string
-	for _, p := range get[[]any](t, get[[]any](t, objs["NetworkPolicy/spire-server-workloads"], "spec", "ingress")[0], "from") {
-		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
-	}
-	slices.Sort(peers)
-	if want := []string{"cell-controller-system/cell-controller", "gateway-system/cell-gateway", "observability-system/otel-uplink"}; !slices.Equal(peers, want) {
-		t.Errorf("the workload policy admits %v, want %v", peers, want)
+	if np, ok := objs["NetworkPolicy/spire-server-workloads"]; ok {
+		t.Errorf("the render prints NetworkPolicy spire-server-workloads, which the harness plane policy spire-system/plane-workloads replaces: %v", np["spec"])
 	}
 	if conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf"); !strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
 		t.Error("server.conf lacks the cluster_jwt section with two live cells")
@@ -474,6 +485,8 @@ func TestPlaneFlowsHarnessOnly(t *testing.T) {
 	}{
 		{"spire-system", "ingress", "10.9.0.1", 8081}, {"spire-system", "ingress", "10.9.0.2", 8081},
 		{"spire-system", "ingress", envdPeer, 8081},
+		{"spire-system", "ingress", "observability-system/otel-uplink", 8081}, {"spire-system", "ingress", "gateway-system/cell-gateway", 8081},
+		{"spire-system", "ingress", "cell-controller-system/cell-controller", 8081},
 		{"relay-system", "ingress", "10.9.0.1", 8443}, {"relay-system", "ingress", "10.9.0.1", 8445}, {"relay-system", "ingress", "10.9.0.1", 8444},
 		{"relay-system", "ingress", "10.9.0.2", 8443}, {"relay-system", "ingress", "10.9.0.2", 8445}, {"relay-system", "ingress", "10.9.0.2", 8444},
 		{"relay-system", "egress", "10.9.0.10", 31443}, {"relay-system", "egress", "10.9.0.10", 31445}, {"relay-system", "egress", "10.9.0.10", 31444},
@@ -498,15 +511,14 @@ func TestPlaneFlowsHarnessOnly(t *testing.T) {
 		t.Error("role cell: no harness policy admits celld to the bundle store on 5000")
 	}
 
-	// The bundle renders hold none of these flows, so removing every bundle policy leaves the flows as they are. The workload
-	// policy of the SPIRE server keeps the flows of the other plane workloads on 8081, which this milestone does not move.
+	// The bundle renders hold none of these flows, so removing every bundle policy leaves the flows as they are.
 	spire := map[string]object{}
 	for k, o := range docs(t, hydrated(renderCell(t, "dev-cp").stdout, "dev-cp")) {
 		spire["NetworkPolicy spire-system/"+strings.TrimPrefix(k, "NetworkPolicy/")] = o
 	}
 	for name, objs := range map[string]map[string]object{"spire-server": spire, "relay-system": objectsIn(t, renderRelay(t).stdout)} {
 		for key, o := range objs {
-			if o["kind"] != "NetworkPolicy" || strings.HasSuffix(key, "/spire-server-workloads") {
+			if o["kind"] != "NetworkPolicy" {
 				continue
 			}
 			rules, _ := lookupOr(o, "spec", "ingress").([]any)
@@ -518,5 +530,31 @@ func TestPlaneFlowsHarnessOnly(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestEnvdPlaneCellsFollowTheCatalog: a cell that is live but that SPIRE_AGENT_CELLS leaves out gets no address in either
+// plane-cells policy, and the render reads no facts of it.
+func TestEnvdPlaneCellsFollowTheCatalog(t *testing.T) {
+	r := renderEnvd(t, "SPIRE_AGENT_CELLS=dev-cell-1")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	for _, ns := range []string{"spire-system", "relay-system"} {
+		if got := peerList(t, get[[]any](t, objs["NetworkPolicy "+ns+"/plane-cells"], "spec", "ingress")[0], "from"); got != "10.9.0.1/32" {
+			t.Errorf("%s/plane-cells admits %s, want 10.9.0.1/32 only", ns, got)
+		}
+	}
+	if strings.Contains(r.log, "facts --cluster dev-cell-2") {
+		t.Errorf("the render read the facts of a cell outside the catalog:\n%s", r.log)
+	}
+}
+
+// TestEnvdMirrorPortCheck: a registry mirror on another port stops the render, because rule N48 admits port 5000 only.
+func TestEnvdMirrorPortCheck(t *testing.T) {
+	r := renderEnvd(t, "STUB_REGISTRY_PORT=5001")
+	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "the registry mirror port is '5001'") {
+		t.Errorf("err %v, stdout %d bytes, stderr %q; want a stop that names the port", r.err, len(r.stdout), r.stderr)
 	}
 }

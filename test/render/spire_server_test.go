@@ -45,12 +45,12 @@ set -euo pipefail
 echo "$*" >>"$STUB_LOG"
 case "$2" in
   hostsvc)
-    # facts --registry answers the registry mirror: STUB_REGISTRY_IP sets its address, and STUB_REGISTRY_FAIL makes the call fail.
+    # facts --registry answers the registry mirror: STUB_REGISTRY_IP sets its address, and STUB_REGISTRY_PORT sets its port, and STUB_REGISTRY_FAIL makes the call fail.
     if [[ "${4:-}" == facts && "${5:-}" == --registry ]]; then
       if [[ -n "${STUB_REGISTRY_FAIL:-}" ]]; then
         echo '{"level":"ERROR","msg":"hostsvc failed","error":"registry-mirror has no address on the kind network"}'; exit 1
       fi
-      printf '{"name":"registry-mirror","address":"%s","port":5000,"host":"127.0.0.1:5001"}\n' "${STUB_REGISTRY_IP:-172.18.0.7}"
+      printf '{"name":"registry-mirror","address":"%s","port":%s,"host":"127.0.0.1:5001"}\n' "${STUB_REGISTRY_IP:-172.18.0.7}" "${STUB_REGISTRY_PORT:-5000}"
       exit 0
     fi
     cell="$6"
@@ -630,7 +630,8 @@ func TestRenderSpireServer(t *testing.T) {
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
 	t.Run("k8s_psat admits the plane workloads cp/otel, envd, cp/gateway and cp/cell-controller", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"}, "envd-system/envd")
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"},
+			"envd-system/envd", "observability-system/otel-uplink", "gateway-system/cell-gateway", "cell-controller-system/cell-controller")
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
@@ -1041,7 +1042,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
 	m2 := docs(t, string(want))
-	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
+	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
 		"Role/spire-server-hints", "RoleBinding/spire-server-hints"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("render has no %s", key)
@@ -1201,33 +1202,12 @@ func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloa
 
 	// Flow N8: each local workload pod reaches the server API. Flow N9: the server reaches the API server.
 	np := objs["NetworkPolicy/spire-server-workloads"]
-	if get[string](t, np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
-		t.Fatalf("workload policy selects %v", get[map[string]any](t, np, "spec", "podSelector"))
-	}
-	ingress := get[[]any](t, np, "spec", "ingress")
-	if len(ingress) != 1 || !slices.Equal(get[[]any](t, np, "spec", "policyTypes"), []any{"Ingress"}) {
-		t.Fatalf("workload policy spec is %v", np["spec"])
-	}
-	var peers, wantPeers []string
-	for _, p := range get[[]any](t, ingress[0], "from") {
-		if len(p.(map[string]any)) != 2 {
-			t.Fatalf("peer %v needs exactly a namespace and a pod selector", p)
+	if len(planePeers) == len(workloads) {
+		if np != nil {
+			t.Fatalf("every workload has a harness plane policy, and the render prints NetworkPolicy spire-server-workloads: %v", np["spec"])
 		}
-		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+
-			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
-	}
-	for _, sub := range workloads {
-		if !slices.Contains(planePeers, sub) {
-			wantPeers = append(wantPeers, sub)
-		}
-	}
-	slices.Sort(peers)
-	slices.Sort(wantPeers)
-	if !slices.Equal(peers, slices.Compact(wantPeers)) {
-		t.Fatalf("workload peers are %v, want %v", peers, wantPeers)
-	}
-	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
-		t.Fatalf("workload ports are %v", ports)
+	} else {
+		checkWorkloadPolicy(t, np, workloads, planePeers)
 	}
 	api := objs["NetworkPolicy/spire-server-api"]
 	if !slices.Equal(get[[]any](t, api, "spec", "policyTypes"), []any{"Egress"}) ||
@@ -1537,5 +1517,39 @@ func TestSpireServerRenderNoNodeAddressIsNotLive(t *testing.T) {
 	conf := get[string](t, docs(t, hydrated(r.stdout, "dev-cp"))["ConfigMap/spire-server"], "data", "server.conf")
 	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
 		t.Error("server.conf holds the cluster_jwt section while no cell has a node address")
+	}
+}
+
+// checkWorkloadPolicy checks the ingress policy of the local workloads: one rule, one peer for each workload that has no
+// harness plane policy, and port 8081.
+func checkWorkloadPolicy(t *testing.T, np object, workloads map[string]string, planePeers []string) {
+	t.Helper()
+	if get[string](t, np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
+		t.Fatalf("workload policy selects %v", get[map[string]any](t, np, "spec", "podSelector"))
+	}
+	ingress := get[[]any](t, np, "spec", "ingress")
+	if len(ingress) != 1 || !slices.Equal(get[[]any](t, np, "spec", "policyTypes"), []any{"Ingress"}) {
+		t.Fatalf("workload policy spec is %v", np["spec"])
+	}
+	var peers, wantPeers []string
+	for _, p := range get[[]any](t, ingress[0], "from") {
+		if len(p.(map[string]any)) != 2 {
+			t.Fatalf("peer %v needs exactly a namespace and a pod selector", p)
+		}
+		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+
+			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
+	}
+	for _, sub := range workloads {
+		if !slices.Contains(planePeers, sub) {
+			wantPeers = append(wantPeers, sub)
+		}
+	}
+	slices.Sort(peers)
+	slices.Sort(wantPeers)
+	if !slices.Equal(peers, slices.Compact(wantPeers)) {
+		t.Fatalf("workload peers are %v, want %v", peers, wantPeers)
+	}
+	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
+		t.Fatalf("workload ports are %v", ports)
 	}
 }

@@ -87,7 +87,7 @@ func TestDefaultPolicy(t *testing.T) {
 			AppComponents:         []string{},
 			AppProjects:           []string{"cell"},
 			PlanePolicies: []bundle.PolicyRef{{Namespace: "envd-system", Name: "envd"}, {Namespace: "cell-system", Name: "plane-envd-store"},
-				{Namespace: "spire-system", Name: "plane-cells"}, {Namespace: "spire-system", Name: "plane-envd"},
+				{Namespace: "spire-system", Name: "plane-cells"}, {Namespace: "spire-system", Name: "plane-envd"}, {Namespace: "spire-system", Name: "plane-workloads"},
 				{Namespace: "relay-system", Name: "plane-cells"}, {Namespace: "relay-system", Name: "plane-upstream"}},
 		},
 		"open": {

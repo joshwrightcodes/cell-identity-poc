@@ -18,6 +18,8 @@
 # namespace, so a bundle cannot move a pod out of the policy by a label:
 #   - cell-system/plane-envd-store: envd to the bundle store, TCP 5000 (flow N46).
 #   - spire-system/plane-envd: envd to the SPIRE server, TCP 8081.
+#   - spire-system/plane-workloads: the other local plane workloads of SPIRE_LOCAL_WORKLOADS (the pods of each service
+#     account) to the SPIRE server, TCP 8081.
 #   - spire-system/plane-cells: the node address of each live cell to the SPIRE server, TCP 8081.
 #   - relay-system/plane-cells: the node address of each live cell to the relay routes, TCP on each container port of
 #     RELAY_VIEW_ROUTES and RELAY_TELEMETRY_ROUTES.
@@ -44,7 +46,7 @@
 # cell settings, and the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
 : "${CELL_NAME:?}" "${POC_ENV:?}" "${SPIRE_TRUST_DOMAIN:?}" "${RELAY_TARGET:?}"
-: "${SPIRE_AGENT_CELLS:?}" "${RELAY_VIEW_ROUTES:?}" "${RELAY_TELEMETRY_ROUTES:?}"
+: "${SPIRE_AGENT_CELLS:?}" "${RELAY_VIEW_ROUTES:?}" "${RELAY_TELEMETRY_ROUTES:?}" "${SPIRE_LOCAL_WORKLOADS:?}"
 : "${NODE_IPS:?}" "${API_SERVER_IPS:?}" "${API_SERVER_PORT:?}" "${API_SERVICE_IP:?}" "${DNS_SERVICE_IP:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -122,6 +124,18 @@ for list in RELAY_VIEW_ROUTES RELAY_TELEMETRY_ROUTES; do
   done
 done
 
+# The local plane workloads other than envd, as peers: each is <spiffe path>=<namespace>/<service account>, and its pods carry
+# the label app.kubernetes.io/name=<service account>.
+workload_peers='[]'
+read -r -a local_workloads <<<"$SPIRE_LOCAL_WORKLOADS"
+for w in "${local_workloads[@]}"; do
+  [[ "$w" =~ ^[a-z0-9-]+(/[a-z0-9-]+)*=([a-z0-9-]+)/([a-z0-9-]+)$ ]] || die "SPIRE_LOCAL_WORKLOADS entry '$w' is not <spiffe path>=<namespace>/<service account>"
+  [[ "${BASH_REMATCH[2]}/${BASH_REMATCH[3]}" != envd-system/envd ]] || continue
+  workload_peers="$(jq -c --arg ns "${BASH_REMATCH[2]}" --arg sa "${BASH_REMATCH[3]}" '. + [{
+    namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": $ns}},
+    podSelector: {matchLabels: {"app.kubernetes.io/name": $sa}}}]' <<<"$workload_peers")"
+done
+
 peer_root="$(peer_root_configmap peer-root "$namespace" "$RELAY_TARGET" "$mgmt_td")" || exit 1
 peer_sum="$(yq -r '.metadata.annotations["poc.internal/peer-root-sha256"]' <<<"$peer_root")"
 [[ "$peer_sum" =~ ^[0-9a-f]{64}$ ]] || die "the peer root has no checksum"
@@ -177,12 +191,15 @@ policy="$(jq -n --arg ns "$namespace" --argjson mgmt "$(peers "$mgmt_ip")" --arg
 # rules of the SPIRE server and relay bundles held before these policies took the flows.
 envd_peer='{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"envd-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"envd"}}}'
 planes="$(jq -n --argjson envd "[$envd_peer]" --argjson cells "$(peers ${cell_ips[@]+"${cell_ips[@]}"})" --argjson routes "$route_ports" \
-  --argjson mgmt "$(peers "$mgmt_ip")" --argjson targets "$target_ports" '
+  --argjson mgmt "$(peers "$mgmt_ip")" --argjson targets "$target_ports" --argjson workloads "$workload_peers" '
   def plane($ns; $name; $types; $rules):
     {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: {name: $name, namespace: $ns},
      spec: ({podSelector: {}, policyTypes: $types} + (if $types == ["Ingress"] then {ingress: $rules} else {egress: $rules} end))};
   [plane("cell-system"; "plane-envd-store"; ["Ingress"]; [{from: $envd, ports: [{protocol: "TCP", port: 5000}]}]),
    plane("spire-system"; "plane-envd"; ["Ingress"]; [{from: $envd, ports: [{protocol: "TCP", port: 8081}]}]),
+   (if ($workloads | length) > 0 then
+     plane("spire-system"; "plane-workloads"; ["Ingress"]; [{from: $workloads, ports: [{protocol: "TCP", port: 8081}]}])
+   else empty end),
    (if ($cells | length) > 0 then
      plane("spire-system"; "plane-cells"; ["Ingress"]; [{from: $cells, ports: [{protocol: "TCP", port: 8081}]}]),
      plane("relay-system"; "plane-cells"; ["Ingress"]; [{from: $cells, ports: $routes}])

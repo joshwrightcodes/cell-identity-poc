@@ -183,7 +183,7 @@ func TestEnvdRender(t *testing.T) {
 		// Outside envd-system, the render prints only these Roles, and the plane policies of the harness.
 		for key := range objs {
 			if strings.Contains(key, " spire-system/") && key != "Role spire-system/envd-records" && key != "RoleBinding spire-system/envd-records" &&
-				key != "NetworkPolicy spire-system/plane-cells" && key != "NetworkPolicy spire-system/plane-envd" {
+				key != "NetworkPolicy spire-system/plane-cells" && key != "NetworkPolicy spire-system/plane-envd" && key != "NetworkPolicy spire-system/plane-workloads" {
 				t.Errorf("the render prints %s in spire-system", key)
 			}
 		}

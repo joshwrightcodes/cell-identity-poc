@@ -27,8 +27,9 @@
 #   - Key hints: the cluster_jwt plugin patches ConfigMap spire-system/attest-hints on unknown_kid (hint_configmap in
 #     server.conf). It reaches the API through the same token as k8s_psat, so the hint line and Role spire-server-hints
 #     stay only when the cluster has both agent cells and local workloads.
-# The ingress of envd to the server API is the harness plane policy spire-system/plane-envd, so the workload policy has
-# a peer for every local workload except the account envd-system/envd, which keeps its alias and entry.
+# In a cluster with the bundle role cp (components/lib/bundle-role.sh), the ingress of every local workload to the server API
+# is a harness plane policy that the envd render prints (spire-system/plane-envd and spire-system/plane-workloads), so the
+# bundle has no workload policy. The workloads keep their aliases and entries.
 # SPIRE_UPSTREAM=disk signs the server CA with the intermediate CA from Secret spire-upstream, and
 # the CA keys stay in memory. Without it, the CA is a self-signed root, and its key lives on the
 # data volume, so a restart keeps the root.
@@ -55,6 +56,7 @@ source "$root/scripts/gate-traces.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/mgmt-key.sh"
 source "$root/components/lib/live-cells.sh"
+source "$root/components/lib/bundle-role.sh"
 
 # seconds <duration> prints a duration of the form <n>s, <n>m or <n>h in seconds.
 seconds() {
@@ -187,8 +189,6 @@ if ((${#local_workloads[@]} > 0)); then
           spec: {spiffeID: ("spiffe://" + $td + "/" + $path), parentID: $alias, selectors: ["unix:uid:" + $uid]}}
       }' <<<"$entries")"
     psat_accounts="$(jq -c --arg a "$wns:$wsa" '. + [$a] | unique' <<<"$psat_accounts")"
-    # The plane policy spire-system/plane-envd carries the flow of envd, so the workload policy has no peer for it.
-    [[ "$wns/$wsa" != envd-system/envd ]] || continue
     workload_peers="$(jq -c --arg ns "$wns" --arg sa "$wsa" '. + [{
       namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": $ns}},
       podSelector: {matchLabels: {"app.kubernetes.io/name": $sa}}}] | unique' <<<"$workload_peers")"
@@ -249,7 +249,9 @@ if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
 fi
 eso_namespace="${EXTERNAL_SECRETS_NAMESPACE:-${SECRET_STORE_NAMESPACES:-}}"
 [[ "$eso_namespace" != "$namespace" ]] || drop_objects+=("Namespace/$namespace")
-[[ "$workload_peers" != "[]" ]] || drop_objects+=("NetworkPolicy/spire-server-workloads")
+if [[ -n "${CELL_NAME:-}" && "$(bundle_role_of "$CELL_NAME")" == cp ]]; then
+  drop_objects+=("NetworkPolicy/spire-server-workloads")
+fi
 for v in ${drop_volumes[@]+"${drop_volumes[@]}"}; do
   edits+=" | del($pod.volumes[] | select(.name == \"$v\")) | del($pod.containers[].volumeMounts[] | select(.name == \"$v\"))"
 done

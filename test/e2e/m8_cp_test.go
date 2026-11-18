@@ -82,9 +82,22 @@ func TestM8CpSignedBundleReachesArgoCD(t *testing.T) {
 	}
 }
 
-// TestM8CpAdmitStageSigned recreates dev-cell-2 through the portal. The admit stage renders dev-cp again, and on a signed cluster that
+// planeCellAddresses returns the node addresses that the policy plane-cells of a namespace of dev-cp admits, or nil when the policy
+// is absent.
+func planeCellAddresses(t *testing.T, ns string) []string {
+	t.Helper()
+	out, err := kubectl(t, cpClusterName, "", "-n", ns, "get", "networkpolicy", "plane-cells", "--ignore-not-found",
+		"-o", "jsonpath={.spec.ingress[*].from[*].ipBlock.cidr}")
+	if err != nil {
+		t.Fatalf("read plane-cells in %s: %v", ns, err)
+	}
+	return strings.Fields(out)
+}
+
+// TestM8CpAdmitStageSigned deletes dev-cell-2 with cell:down and recreates it through the portal. The re-render of dev-cp after the
+// delete takes the node address out of both plane-cells policies. The admit stage renders dev-cp again, and on a signed cluster that
 // means a signed publish and then the render of envd. The log of the admit stage names bundle.sh publish --target dev-cp, the version
-// of dev-cp rises by at least 1, the policy spire-system/plane-cells admits the node address of dev-cell-2, and dev-cell-2 turns valid.
+// of dev-cp rises by at least 1, both plane-cells policies admit the node address that the new cluster has, and dev-cell-2 turns valid.
 func TestM8CpAdmitStageSigned(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the admit stage creates a step and takes several minutes")
@@ -92,6 +105,25 @@ func TestM8CpAdmitStageSigned(t *testing.T) {
 	const cell = "dev-cell-2"
 	if st := m8State(t, cpClusterName); st.Source != "signed" {
 		t.Fatalf("the bundle state of %s has the source %q, and the test needs signed", cpClusterName, st.Source)
+	}
+	oldIP := clusterFacts(t, cell).NodeIP
+	if oldIP == "" {
+		t.Fatalf("%s has no node address, and the test starts from a live cell", cell)
+	}
+	for _, ns := range []string{"spire-system", "relay-system"} {
+		if !slices.Contains(planeCellAddresses(t, ns), oldIP+"/32") {
+			t.Fatalf("%s/plane-cells does not admit %s/32 before the test", ns, oldIP)
+		}
+	}
+
+	// cell:down renders dev-cp again. The address of the deleted cell must leave both policies, so a later admit adds it back.
+	if out, err := miseRun(t, cellDownWait, []string{"CELL=" + cell}, "cell:down"); err != nil {
+		t.Fatalf("cell:down of %s: %v\n%s", cell, err, out)
+	}
+	for _, ns := range []string{"spire-system", "relay-system"} {
+		if got := planeCellAddresses(t, ns); slices.Contains(got, oldIP+"/32") {
+			t.Fatalf("%s/plane-cells still admits %s/32 after cell:down of %s: %v", ns, oldIP, cell, got)
+		}
 	}
 	before := m8Get(t, cpClusterName).Version
 
@@ -126,12 +158,11 @@ func TestM8CpAdmitStageSigned(t *testing.T) {
 
 	ip := clusterFacts(t, cell).NodeIP
 	if ip == "" {
-		t.Fatalf("%s has no node address", cell)
+		t.Fatalf("%s has no node address after the admit stage", cell)
 	}
 	for _, ns := range []string{"spire-system", "relay-system"} {
-		out, err := kubectl(t, cpClusterName, "", "-n", ns, "get", "networkpolicy", "plane-cells", "-o", "jsonpath={.spec.ingress[*].from[*].ipBlock.cidr}")
-		if err != nil || !slices.Contains(strings.Fields(out), ip+"/32") {
-			t.Errorf("%s/plane-cells admits %q (%v), want %s/32", ns, out, err, ip)
+		if got := planeCellAddresses(t, ns); !slices.Contains(got, ip+"/32") {
+			t.Errorf("%s/plane-cells admits %v after the admit stage, want %s/32", ns, got, ip)
 		}
 	}
 	waitValid(t, []string{cell}, 5*time.Minute)

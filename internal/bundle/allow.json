@@ -229,6 +229,10 @@
           "name": "plane-envd"
         },
         {
+          "namespace": "spire-system",
+          "name": "plane-workloads"
+        },
+        {
           "namespace": "relay-system",
           "name": "plane-cells"
         },
