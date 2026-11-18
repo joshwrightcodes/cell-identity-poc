@@ -186,10 +186,12 @@ func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
 	return &op.BundleStatus{Version: st.Version, RootDigest: st.Root.Digest, State: st.State, AllowSHA256: bundle.AllowSHA256()}, nil
 }
 
-// Recorded returns the final result that the state holds for the operation opID. The state keeps the
-// result of the last operation only, so an older operation gives false. It reads the state and writes
-// nothing. ErrInFlight means that the engine started the operation and has no final result for it
-// yet, and any other error means that the answer is not known.
+// Recorded returns the final result that the state holds for the operation opID: the stored result,
+// or, when a later refusal overwrote it, the state of the set that the operation applied (healthy is
+// applied, rolled_back is rolled_back with no detail). An operation that the state no longer names
+// gives false. It reads the state and writes nothing. ErrInFlight means that the engine started the
+// operation and has no final result for it yet, and any other error means that the answer is not
+// known.
 func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, error) {
 	st, _, err := a.cfg.State.Read(ctx)
 	if err != nil {
@@ -198,8 +200,18 @@ func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, err
 	if st.Result != nil && st.Result.OpID == opID {
 		return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
 	}
-	if st.OpID == opID && (st.State == stateApplying || st.State == stateRollingBack) {
+	if st.OpID != opID {
+		return Outcome{}, false, nil
+	}
+	// A later refusal can overwrite the stored result. Only deploy writes OpID, so the state of the
+	// operation that it names still answers for it.
+	switch st.State {
+	case stateApplying, stateRollingBack:
 		return Outcome{}, false, ErrInFlight
+	case stateHealthy:
+		return Outcome{Outcome: op.OutcomeApplied}, true, nil
+	case stateRolledBack:
+		return Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy}, true, nil
 	}
 	return Outcome{}, false, nil
 }

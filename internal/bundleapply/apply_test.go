@@ -573,8 +573,12 @@ func TestRecorded(t *testing.T) {
 	if err != nil || !ok || out != (Outcome{Outcome: op.OutcomeRefused, Reason: op.ReasonVersionOld}) {
 		t.Fatalf("op2: %+v ok %v err %v", out, ok, err)
 	}
-	if _, ok, err := e.a.Recorded(t.Context(), "op1"); ok || err != nil {
-		t.Fatalf("op1 after op2: ok %v err %v; the state keeps the last result only", ok, err)
+	// The refusal of op2 overwrote the stored result. The state still names op1 as healthy, so the
+	// answer for op1 stays applied, on every repeat.
+	for range 2 {
+		if out, ok, err := e.a.Recorded(t.Context(), "op1"); err != nil || !ok || out != (Outcome{Outcome: op.OutcomeApplied}) {
+			t.Fatalf("op1 after op2: %+v ok %v err %v, want applied", out, ok, err)
+		}
 	}
 	wantOutcome(t, e.apply("op3", e.set(2, std("v9"))), op.OutcomeRefused, op.ReasonVersionOld, "version_conflict")
 	if out, ok, err := e.a.Recorded(t.Context(), "op3"); err != nil || !ok || out.Detail != "version_conflict" {
@@ -606,6 +610,28 @@ func TestRecorded(t *testing.T) {
 		if _, ok, err := e.a.Recorded(t.Context(), "op6"); err != nil || ok {
 			t.Fatalf("%s, another operation: ok %v err %v", phase, ok, err)
 		}
+	}
+}
+
+// TestRecordedRollbackAfterALaterRefusal checks that a rolled back operation keeps its answer when a
+// later refusal overwrites the stored result.
+func TestRecordedRollbackAfterALaterRefusal(t *testing.T) {
+	e, _, b := twoSets(t)
+	e.health = func(root, app string) (string, string) {
+		if root == b.root.Digest && app == "apps-sample" {
+			return "Synced", "Degraded"
+		}
+		return "Synced", "Healthy"
+	}
+	wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	e.health = nil
+	wantOutcome(t, e.apply("opOld", e.set(1, std("old"))), op.OutcomeRefused, op.ReasonVersionOld, "")
+	out, ok, err := e.a.Recorded(t.Context(), "opB")
+	if err != nil || !ok || out != (Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy}) {
+		t.Fatalf("opB: %+v ok %v err %v, want rolled_back unhealthy", out, ok, err)
+	}
+	if _, ok, err := e.a.Recorded(t.Context(), "opA"); ok || err != nil {
+		t.Fatalf("opA, which the state no longer names: ok %v err %v", ok, err)
 	}
 }
 
