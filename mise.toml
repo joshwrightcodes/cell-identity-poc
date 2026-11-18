@@ -20,6 +20,9 @@ kind = "0.33.0"
 argocd = "3.6.1"
 go = "1.27.3"
 ko = "0.19.1"
+# Mac-only tools. conftest runs the bundle policy over the renders, and cosign checks a signed bundle set.
+conftest = "0.71.1"
+cosign = "3.1.4"
 
 [env]
 # CELL picks the cluster. The default is dev-cell-1. An unknown name fails in scripts/lib.sh.
@@ -131,8 +134,8 @@ usage = 'arg "[packages]..." var=#true default="./..."'
 run = 'eval go test -timeout 20m ${usage_packages?}'
 
 [tasks.lint]
-description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag"
-run = ["go vet ./...", "go vet -tags e2e ./test/e2e/"]
+description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag. Then check the module rules of each binary in cmd/ with scripts/deps-check.sh"
+run = ["go vet ./...", "go vet -tags e2e ./test/e2e/", "scripts/deps-check.sh"]
 
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest, Istio charts and External Secrets Operator chart into vendor/ for review"
