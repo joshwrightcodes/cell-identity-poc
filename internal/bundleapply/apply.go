@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	opaversion "github.com/open-policy-agent/opa/v1/version"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -255,10 +256,14 @@ type run struct {
 	snap    State
 	// fetched lists the components that this apply read from the mirror and checked.
 	fetched []fetched
-	// harness lists the live harness objects, and checkedBy is the fingerprint of the check inputs.
-	harness   HarnessRefs
-	checkedBy string
-	root      bundle.Artifact
+	// harness lists the live harness objects, liveCluster and liveNamespaced the scopes that the API
+	// server serves, and checkedBy is the fingerprint of the check inputs.
+	harness                     HarnessRefs
+	liveCluster, liveNamespaced []string
+	checkedBy                   string
+	// fetchedBytes counts the layer bytes that the fetch holds.
+	fetchedBytes int
+	root         bundle.Artifact
 	// held is true while this process holds the lock and has not written a final state.
 	held bool
 	// rollingBack is true when the run resumes a rollback that another run started, and failed is
@@ -498,7 +503,12 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 	if r.harness, err = a.harnessRefs(ctx); err != nil {
 		return Outcome{}, err
 	}
-	if r.checkedBy, err = checkInputs(cfg.Role, cfg.Policy, policySource, r.harness); err != nil {
+	r.liveCluster, r.liveNamespaced = a.liveScopes()
+	r.checkedBy, err = checkInputs(checkIn{
+		role: cfg.Role, policy: cfg.Policy, module: policySource, harness: r.harness,
+		cluster: r.liveCluster, namespaced: r.liveNamespaced, opa: opaversion.Version,
+	})
+	if err != nil {
 		return Outcome{}, err
 	}
 	checked := map[string]bool{}
@@ -509,6 +519,15 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 	}
 	fctx, end := a.tel.step(ctx, spanFetch)
 	out, err := a.fetch(fctx, r, checked)
+	if err == nil && out == (Outcome{}) && len(checked) > 0 && a.setScopesDiffer(r) {
+		// A custom resource definition of the set gives a kind another scope than the live API, so
+		// the components that an earlier set checked are checked again under the scopes of this set.
+		done := map[string]bool{}
+		for _, f := range r.fetched {
+			done[checkedKey(f.comp.Name, f.comp.Digest)] = true
+		}
+		out, err = a.fetch(fctx, r, done)
+	}
 	end(err)
 	if err != nil || out != (Outcome{}) {
 		return out, err
@@ -519,10 +538,10 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 	return out, err
 }
 
-func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (Outcome, error) {
-	held := 0
+// fetch reads and decodes each component of the set whose key skip does not hold.
+func (a *Applier) fetch(ctx context.Context, r *run, skip map[string]bool) (Outcome, error) {
 	for _, c := range r.set.Components {
-		if checked[checkedKey(c.Name, c.Digest)] {
+		if skip[checkedKey(c.Name, c.Digest)] {
 			continue
 		}
 		art, err := ocistore.Fetch(ctx, a.cfg.Mirror, "bundles/"+a.cfg.Target+"/"+c.Name, c.Digest)
@@ -536,8 +555,8 @@ func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (O
 		if art.Digest != c.Digest {
 			return refused(op.ReasonDigestMismatch, c.Name), nil
 		}
-		if held += len(art.Layer); held > a.maxSetBytes {
-			a.log.Warn("bundle refused", "component", c.Name, "reason", op.ReasonComponentNotAllowed, "detail", "too_large", "set_bytes", held)
+		if r.fetchedBytes += len(art.Layer); r.fetchedBytes > a.maxSetBytes {
+			a.log.Warn("bundle refused", "component", c.Name, "reason", op.ReasonComponentNotAllowed, "detail", "too_large", "set_bytes", r.fetchedBytes)
 			return refused(op.ReasonComponentNotAllowed, "too_large"), nil
 		}
 		body, err := bundle.UnpackComponent(art.Layer, bundle.MaxUnpackedBytes)
@@ -581,17 +600,32 @@ func (a *Applier) harnessRefs(ctx context.Context) (HarnessRefs, error) {
 // it when one of them changes, so that the components that an older build checked are checked again.
 const checkRevision = 1
 
-// checkInputs returns the fingerprint of every input of the check that is not the component itself:
-// the check revision, the role, the allow data, the Rego module and the live harness policies. A
-// component in State.Checked skips the check only while the state holds the same fingerprint.
-func checkInputs(role string, p bundle.Policy, module string, refs HarnessRefs) (string, error) {
+// checkIn holds every input of the check that is not the component itself.
+type checkIn struct {
+	role                string
+	policy              bundle.Policy
+	module              string
+	harness             HarnessRefs
+	cluster, namespaced []string
+	opa                 string
+}
+
+// checkInputs returns the fingerprint of the check inputs: the check revision, the role, the allow
+// data, the Rego module, the live harness policies, the scopes that the live API serves and the OPA
+// version. A component in State.Checked skips the check only while the state holds the same
+// fingerprint. The custom resource definitions of the set are not known before the fetch, so prepare
+// checks every component again when one of them gives a kind another scope than the live API.
+func checkInputs(in checkIn) (string, error) {
+	sorted := func(v []string) []string { return slices.Sorted(slices.Values(v)) }
 	body, err := json.Marshal(struct {
-		Revision int
-		Role     string
-		Allow    bundle.Policy
-		Rego     string
-		Harness  []ObjectRef
-	}{checkRevision, role, p, module, refs.NetworkPolicies})
+		Revision            int
+		Role                string
+		Allow               bundle.Policy
+		Rego                string
+		Harness             []ObjectRef
+		Cluster, Namespaced []string
+		OPA                 string
+	}{checkRevision, in.role, in.policy, in.module, in.harness.NetworkPolicies, sorted(in.cluster), sorted(in.namespaced), in.opa})
 	if err != nil {
 		return "", fmt.Errorf("encode the check inputs: %w", err)
 	}
@@ -613,13 +647,8 @@ func (a *Applier) check(ctx context.Context, r *run) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
-	cluster, namespaced := a.liveScopes()
-	var all []Object
-	for _, f := range r.fetched {
-		all = append(all, f.objs...)
-	}
-	crdCluster, crdNamespaced := crdKinds(all)
-	checker.AddScopes(append(cluster, crdCluster...), append(namespaced, crdNamespaced...))
+	crdCluster, crdNamespaced := crdKinds(r.fetchedObjects())
+	checker.AddScopes(append(slices.Clone(r.liveCluster), crdCluster...), append(slices.Clone(r.liveNamespaced), crdNamespaced...))
 	for _, f := range r.fetched {
 		err := checker.Check(ctx, f.comp.Name, f.objs)
 		if err == nil {
@@ -637,6 +666,31 @@ func (a *Applier) check(ctx context.Context, r *run) (Outcome, error) {
 		return Outcome{}, err
 	}
 	return Outcome{}, nil
+}
+
+func (r *run) fetchedObjects() []Object {
+	var all []Object
+	for _, f := range r.fetched {
+		all = append(all, f.objs...)
+	}
+	return all
+}
+
+// setScopesDiffer reports whether a custom resource definition that the fetch read gives a kind a
+// scope that the live API does not serve it with.
+func (a *Applier) setScopesDiffer(r *run) bool {
+	crdCluster, crdNamespaced := crdKinds(r.fetchedObjects())
+	for _, k := range crdCluster {
+		if !slices.Contains(r.liveCluster, k) {
+			return true
+		}
+	}
+	for _, k := range crdNamespaced {
+		if !slices.Contains(r.liveNamespaced, k) {
+			return true
+		}
+	}
+	return false
 }
 
 // liveScopes lists the group/Kind of every resource that the API server serves, by scope. An error

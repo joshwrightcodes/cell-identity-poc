@@ -1592,6 +1592,50 @@ func TestApplyCheckedFollowsThePolicyInputs(t *testing.T) {
 		harness(e, "argocd", "later")
 		wantOutcome(t, e.apply("op2", e.set(2, []spec{argocd, std("v2")[1]})), op.OutcomeRefused, op.ReasonPolicyBlocksPlanes, "argocd/later")
 	})
+	widgets := func(ns string) spec {
+		return spec{"network-policy", "cell-system", fmt.Sprintf("apiVersion: example.io/v1\nkind: Widget\nmetadata:\n  name: w\n  namespace: %s\n", ns)}
+	}
+	widgetCRD := func(scope string) spec {
+		return spec{"argocd", "argocd", "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata:\n  name: widgets.example.io\nspec:\n  group: example.io\n  scope: " + scope + "\n  names:\n    kind: Widget\n    plural: widgets\n"}
+	}
+	served := func(e *env, namespaced bool) {
+		e.disc.Resources = []*metav1.APIResourceList{{GroupVersion: "example.io/v1", APIResources: []metav1.APIResource{{Name: "widgets", Kind: "Widget", Namespaced: namespaced}}}}
+	}
+	t.Run("live scope changed", func(t *testing.T) {
+		e := newEnv(t)
+		served(e, true)
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{std("v1")[0], widgets("cell-system")})), op.OutcomeApplied, "", "")
+		served(e, false)
+		out := e.apply("op2", e.set(2, []spec{std("v2")[0], widgets("cell-system")}))
+		if out.Outcome != op.OutcomeRefused || out.Reason != op.ReasonComponentNotAllowed {
+			t.Fatalf("outcome = %+v, want the checked Widget component checked again and refused", out)
+		}
+	})
+	t.Run("custom resource definition of the set disagrees with the live scope", func(t *testing.T) {
+		e := newEnv(t)
+		served(e, true)
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{widgetCRD("Namespaced"), widgets("cell-system")})), op.OutcomeApplied, "", "")
+		out := e.apply("op2", e.set(2, []spec{widgetCRD("Cluster"), widgets("cell-system")}))
+		if out.Outcome != op.OutcomeRefused || out.Reason != op.ReasonComponentNotAllowed {
+			t.Fatalf("outcome = %+v, want the checked Widget component checked again under cluster scope", out)
+		}
+	})
+	t.Run("custom resource definition of the set agrees with the live scope", func(t *testing.T) {
+		e := newEnv(t)
+		served(e, true)
+		first := e.set(1, []spec{widgetCRD("Namespaced"), widgets("cell-system")})
+		wantOutcome(t, e.apply("op1", first), op.OutcomeApplied, "", "")
+		seen := len(e.mirrorReg.Requests())
+		crd := widgetCRD("Namespaced")
+		crd.body += "  versions: []\n"
+		wantOutcome(t, e.apply("op2", e.set(2, []spec{crd, widgets("cell-system")})), op.OutcomeApplied, "", "")
+		hex := strings.TrimPrefix(first.digests()["network-policy"], "sha256:")
+		for _, r := range e.mirrorReg.Requests()[seen:] {
+			if strings.Contains(r.Path, hex) {
+				t.Fatalf("a checked component was fetched again: %s", r.Path)
+			}
+		}
+	})
 	t.Run("harness policy renamed", func(t *testing.T) {
 		e := newEnv(t)
 		harness(e, "argocd", "first")
@@ -1661,26 +1705,46 @@ func TestApplyCheckedFollowsThePolicyInputs(t *testing.T) {
 
 func TestCheckInputsCoverEveryInput(t *testing.T) {
 	p := bundle.DefaultPolicy()
-	refs := HarnessRefs{NetworkPolicies: []ObjectRef{{Namespace: "argocd", Name: "argocd-agent"}}}
-	base, err := checkInputs("cell", p, policySource, refs)
+	base := func() checkIn {
+		return checkIn{
+			role: "cell", policy: p, module: policySource,
+			harness:    HarnessRefs{NetworkPolicies: []ObjectRef{{Namespace: "argocd", Name: "argocd-agent"}}},
+			cluster:    []string{"example.io/Gadget"},
+			namespaced: []string{"example.io/Widget"},
+			opa:        "1.0.0",
+		}
+	}
+	want, err := checkInputs(base())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again, _ := checkInputs("cell", p, policySource, refs); again != base {
+	if again, _ := checkInputs(base()); again != want {
 		t.Fatal("the fingerprint is not stable")
 	}
+	reordered := base()
+	reordered.cluster = []string{"example.io/Gadget", "example.io/Bolt"}
+	sorted := base()
+	sorted.cluster = []string{"example.io/Bolt", "example.io/Gadget"}
+	if x, _ := checkInputs(reordered); x != func() string { y, _ := checkInputs(sorted); return y }() {
+		t.Fatal("the order of the live scopes changes the fingerprint")
+	}
 	narrow := bundle.Policy{Version: p.Version, Classes: p.Classes, Roles: map[string]bundle.Role{"cell": p.Roles["cell"]}}
-	for name, got := range map[string]func() (string, error){
-		"role":    func() (string, error) { return checkInputs("cp", p, policySource, refs) },
-		"allow":   func() (string, error) { return checkInputs("cell", narrow, policySource, refs) },
-		"rego":    func() (string, error) { return checkInputs("cell", p, policySource+"\n", refs) },
-		"harness": func() (string, error) { return checkInputs("cell", p, policySource, HarnessRefs{}) },
-		"harness name": func() (string, error) {
-			return checkInputs("cell", p, policySource, HarnessRefs{NetworkPolicies: []ObjectRef{{Namespace: "argocd", Name: "other"}}})
+	for name, mod := range map[string]func(*checkIn){
+		"role":         func(in *checkIn) { in.role = "cp" },
+		"allow":        func(in *checkIn) { in.policy = narrow },
+		"rego":         func(in *checkIn) { in.module += "\n" },
+		"harness":      func(in *checkIn) { in.harness = HarnessRefs{} },
+		"harness name": func(in *checkIn) { in.harness.NetworkPolicies = []ObjectRef{{Namespace: "argocd", Name: "other"}} },
+		"cluster scope": func(in *checkIn) {
+			in.cluster, in.namespaced = []string{"example.io/Gadget", "example.io/Widget"}, nil
 		},
+		"namespaced scope": func(in *checkIn) { in.namespaced = append(in.namespaced, "example.io/Sprocket") },
+		"opa version":      func(in *checkIn) { in.opa = "1.0.1" },
 	} {
-		fp, err := got()
-		if err != nil || fp == base {
+		in := base()
+		mod(&in)
+		fp, err := checkInputs(in)
+		if err != nil || fp == want {
 			t.Errorf("a change of the %s gives the same fingerprint (%v)", name, err)
 		}
 	}
