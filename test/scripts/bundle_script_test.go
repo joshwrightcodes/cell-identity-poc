@@ -53,8 +53,13 @@ case "$*" in
     [[ -d "${DOCKER_CONFIG:-}" && -z "$(ls -A "$DOCKER_CONFIG")" ]] || { echo "cosign needs an empty DOCKER_CONFIG" >&2; exit 3; }
     [[ "$*" == *" --insecure-ignore-tlog=true "* && "$*" == *" --allow-http-registry "* ]] || { echo "cosign flags" >&2; exit 4; }
     [[ -z "${STUB_COSIGN_FAIL:-}" ]] || { echo "Error: no matching signatures" >&2; exit 1; }
-    payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" --argjson v "${STUB_COSIGN_VERSION:-{\"epoch\":1,\"counter\":2\}}" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}})), predicate: {version: $v}}' | base64 | tr -d '\n')"
-    printf '{"payloadType":"application/vnd.in-toto+json","payload":"%s","signatures":[{"sig":"x"}]}\n' "$payload" ;;
+    # One envelope for each version of STUB_COSIGN_VERSIONS (a JSON array, oldest first), as cosign prints one for each attestation of the root. A null
+    # version gives a statement with no version. The default is the single version 1/2.
+    versions="${STUB_COSIGN_VERSIONS:-[${STUB_COSIGN_VERSION:-{\"epoch\":1,\"counter\":2\}}]}"
+    for v in $(jq -c '.[]' <<<"$versions"); do
+      payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" --argjson v "$v" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}})), predicate: (if $v == null then {} else {version: $v} end)}' | base64 | tr -d '\n')"
+      printf '{"payloadType":"application/vnd.in-toto+json","payload":"%s","signatures":[{"sig":"x"}]}\n' "$payload"
+    done ;;
   "run bundlectl -- push "*)
     [[ -z "${STUB_PUSH_FAIL:-}" ]] || fail "push failed"
     echo "$comps" ;;
@@ -168,7 +173,45 @@ func newBundleRoot(t *testing.T, clusters ...string) *bundleRoot {
 	for _, c := range clusters {
 		r.hydrate(c)
 	}
+	r.age()
 	return r
+}
+
+// age gives the inputs of a render (scripts, cell settings, components) a time three hours back and the hydrated bundles a time one hour back,
+// so a test makes a build stale by touching one input, and no test depends on the order of writes within one second.
+func (r *bundleRoot) age() {
+	r.t.Helper()
+	set := func(root string, at time.Time, only string) {
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && (only == "" || filepath.Base(path) == only) {
+				_ = os.Chtimes(path, at, at)
+			}
+			return nil
+		})
+	}
+	for _, d := range []string{"scripts", "cells", "harness", "components"} {
+		set(filepath.Join(r.dir, d), time.Now().Add(-3*time.Hour), "")
+	}
+	set(filepath.Join(r.dir, "build"), time.Now().Add(-time.Hour), "manifests.yaml")
+}
+
+// touch makes a file of the root newer than the hydrated bundles, and makes it when it is absent. The content of an existing file stays.
+func (r *bundleRoot) touch(rel string) {
+	r.t.Helper()
+	path := filepath.Join(r.dir, rel)
+	if _, err := os.Stat(path); err == nil {
+		now := time.Now()
+		if err := os.Chtimes(path, now, now); err != nil {
+			r.t.Fatal(err)
+		}
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("changed\n"), 0o644); err != nil {
+		r.t.Fatal(err)
+	}
 }
 
 // hydrate writes the hydrated bundles of a cluster, as scripts/hydrate.sh leaves them, and its root.json, as publish.sh leaves it.
@@ -712,6 +755,36 @@ func TestBundleRepairOrder(t *testing.T) {
 			t.Error("publish accepted --allow-older")
 		}
 	})
+	// cosign prints one statement for each signed version of a root. Republishing the same content signs the same root again, so the root of good[0]
+	// can carry several versions. The repair reads the one that equals the record, whatever the order cosign prints.
+	t.Run("a root with several signed versions", func(t *testing.T) {
+		v := func(c int) string { return fmt.Sprintf(`{"epoch":1,"counter":%d}`, c) }
+		for _, tc := range []struct {
+			name     string
+			versions string
+			record   int
+			ok       bool
+		}{
+			{"oldest first, the record is the newest", "[" + v(5) + "," + v(6) + "]", 6, true},
+			{"newest first, the record is the newest", "[" + v(6) + "," + v(5) + "]", 6, true},
+			{"the record is in the middle", "[" + v(5) + "," + v(6) + "," + v(7) + "]", 6, true},
+			{"every printed version is older", "[" + v(4) + "," + v(5) + "]", 6, false},
+			{"a statement with no version", "[null]", 6, false},
+		} {
+			r := newBundleRoot(t, "dev-cell-1")
+			f := newRepairFixture(t, r)
+			record := map[string]any{"version": map[string]any{"epoch": 1, "counter": tc.record}, "contentSHA256": "aa",
+				"root": map[string]any{"digest": f.root, "manifest": base64.StdEncoding.EncodeToString(f.rootManifest)}}
+			env := append(f.env(), "STUB_STATE_JSON="+f.state(record), "STUB_COSIGN_VERSIONS="+tc.versions)
+			out, errOut, log, err := r.run("bundle.sh", env, "repair", "--target", "dev-cell-1")
+			if (err == nil) != tc.ok {
+				t.Errorf("%s: err %v, want ok=%v\n%s%s", tc.name, err, tc.ok, out, errOut)
+			}
+			if !tc.ok {
+				noChange(t, log)
+			}
+		}
+	})
 	t.Run("a failed pin stops the repair before the apply", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		f := newRepairFixture(t, r)
@@ -1205,6 +1278,22 @@ func TestBundleVerifyArgs(t *testing.T) {
 			}
 		})
 	}
+	t.Run("a root with several signed versions prints the version of the state", func(t *testing.T) {
+		for _, versions := range []string{`[{"epoch":1,"counter":1},{"epoch":1,"counter":2}]`, `[{"epoch":1,"counter":2},{"epoch":1,"counter":1}]`} {
+			r := newBundleRoot(t, "dev-cell-1")
+			out, errOut, _, err := r.run("bundle.sh", append(slices.Clone(env), "STUB_COSIGN_VERSIONS="+versions), "verify", "--target", "dev-cell-1")
+			var res struct{ Version map[string]int }
+			if err != nil || json.Unmarshal([]byte(strings.TrimSpace(out)), &res) != nil || res.Version["counter"] != 2 {
+				t.Errorf("versions %s: err %v, output %q %q, want the version 1/2 of the state", versions, err, out, errOut)
+			}
+		}
+		// No printed statement has the version of the state: the root is not the set that the state says.
+		r := newBundleRoot(t, "dev-cell-1")
+		out, errOut, _, err := r.run("bundle.sh", append(slices.Clone(env), `STUB_COSIGN_VERSIONS=[{"epoch":1,"counter":1}]`), "verify", "--target", "dev-cell-1")
+		if err == nil || out != "" || !strings.Contains(errOut, "1/2") {
+			t.Errorf("err %v, stdout %q, stderr %q, want a failure that names the version 1/2", err, out, errOut)
+		}
+	})
 	t.Run("role open and a second target", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		if _, errOut, _, err := r.run("bundle.sh", env, "verify", "--target", "management"); err == nil || !strings.Contains(errOut, "role open") {
@@ -1212,6 +1301,64 @@ func TestBundleVerifyArgs(t *testing.T) {
 		}
 		if _, _, _, err := r.run("bundle.sh", env, "verify", "--target", "dev-cell-1", "--target", "dev-cell-2"); err == nil {
 			t.Error("verify took two targets")
+		}
+	})
+}
+
+// TestBundlePublishRefusesStaleBuild: publish packs build/<t>/bundles as it is, so a render change without a new hydrate would sign the old content.
+// The rule is the one of ko_image for build/images.env: a hydrated manifests.yaml of any component of the cluster that is older than a render input
+// stops the publish, and the message names the input and the command CELL=<t> mise run cell:hydrate. The inputs are the files of
+// components/<component> and components/lib, cells/common.env, cells/<t>.env, internal/bundle/allow.json and build/images.env. A missing bundle stops
+// it too. A fresh build, and a change outside these inputs, go on. Nothing is signed or pushed when it stops.
+func TestBundlePublishRefusesStaleBuild(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		touch string
+	}{
+		{"a component render", "components/argocd/render.sh"},
+		{"a shared render helper", "components/lib/addresses.sh"},
+		{"the cell settings", "cells/dev-cell-1.env"},
+		{"the common settings", "cells/common.env"},
+		{"the allow-list", "internal/bundle/allow.json"},
+		{"the images file", "build/images.env"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1")
+			r.touch(tc.touch)
+			env := []string{"IMAGES_ENV=" + filepath.Join(r.dir, "build", "images.env")}
+			out, errOut, log, err := r.run("bundle.sh", env, "publish", "--target", "dev-cell-1")
+			if err == nil || out != "" {
+				t.Fatalf("a stale build was published: err %v, output %q", err, out)
+			}
+			for _, want := range []string{tc.touch, "CELL=dev-cell-1 mise run cell:hydrate"} {
+				if !strings.Contains(errOut, want) {
+					t.Errorf("stderr %q lacks %q", errOut, want)
+				}
+			}
+			for _, bad := range []string{"bundlectl", "bundle sign", "create -f"} {
+				if strings.Contains(log, bad) {
+					t.Errorf("the publish went on (%q):\n%s", bad, log)
+				}
+			}
+		})
+	}
+	t.Run("a fresh build and an unrelated change go on", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		r.touch("components/lib/../../README.md")
+		r.touch("cells/dev-cell-2.env")
+		r.touch("components/other-component/render.sh")
+		if _, errOut, log, err := r.run("bundle.sh", []string{"IMAGES_ENV=" + filepath.Join(r.dir, "build", "images.env")}, "publish", "--target", "dev-cell-1"); err != nil {
+			t.Fatalf("publish failed: %v\n%s\n%s", err, errOut, log)
+		}
+	})
+	t.Run("a missing bundle", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		if err := os.Remove(filepath.Join(r.dir, "build", "dev-cell-1", "bundles", "argocd", "manifests.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		_, errOut, _, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "argocd") || !strings.Contains(errOut, "CELL=dev-cell-1 mise run cell:hydrate") {
+			t.Errorf("err %v, stderr %q", err, errOut)
 		}
 	})
 }

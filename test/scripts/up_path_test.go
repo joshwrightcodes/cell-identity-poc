@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,7 +23,13 @@ case " $* " in
   *" get configmap bundle-state "*) [[ -z "${STUB_STATE_JSON:-}" ]] || printf '%s' "$STUB_STATE_JSON"; exit 0 ;;
   *" create -f - "*) cat >"$STUB_CREATED"; exit 0 ;;
   *" apply "*" -f - "*) n=$(($(cat "$STUB_APPLIED/count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_APPLIED/count"; cat >"$STUB_APPLIED/applied-$n.yaml"; exit 0 ;;
-  *" get statefulset bundle-store "*) [[ -z "${STUB_STS_JSON:-}" ]] || printf '%s' "$STUB_STS_JSON"; exit 0 ;;
+  *" get statefulset bundle-store "*)
+    # STUB_STS_SEQ (JSON documents separated by |) answers the successive reads, the last one for every later read, as the controller catches up.
+    if [[ -n "${STUB_STS_SEQ:-}" ]]; then
+      n=$(($(cat "$STUB_APPLIED/sts-reads" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_APPLIED/sts-reads"
+      IFS='|' read -r -a seq <<<"$STUB_STS_SEQ"; i=$((n - 1)); ((i < ${#seq[@]})) || i=$((${#seq[@]} - 1)); printf '%s' "${seq[$i]}"; exit 0
+    fi
+    [[ -z "${STUB_STS_JSON:-}" ]] || printf '%s' "$STUB_STS_JSON"; exit 0 ;;
   *" get networkpolicy bundle-store "*) [[ -z "${STUB_NP_JSON:-}" ]] || printf '%s' "$STUB_NP_JSON"; exit 0 ;;
   *" get pod bundle-store-0 "*) [[ -z "${STUB_POD_JSON:-}" ]] || printf '%s' "$STUB_POD_JSON"; exit 0 ;;
   *" get applications -o json "*)
@@ -451,5 +458,22 @@ func TestUpCpBootstrapWritesState(t *testing.T) {
 		if strings.Contains(calls, " create -f -") {
 			t.Errorf("a %s state exists, and up.sh created one", state)
 		}
+	}
+}
+
+// TestUpStoreUpgradeWaitsForTheController: after the StatefulSet apply, the controller needs a moment to move status.updateRevision. A pod of the
+// bootstrap revision is "current" until then, so the upgrade waits until observedGeneration reaches the generation before it compares the pod
+// with the update revision. With the old read, the stuck pod would stay and the store wait would time out.
+func TestUpStoreUpgradeWaitsForTheController(t *testing.T) {
+	sts := func(generation, observed int, rev string) string {
+		spec := strings.TrimSuffix(staleSTS, revSTS)
+		return fmt.Sprintf(`{"kind":"StatefulSet","metadata":{"name":"bundle-store","generation":%d,"annotations":{"argocd.argoproj.io/tracking-id":%q}}%s,"status":{"observedGeneration":%d,"updateRevision":%q}}`,
+			generation, trackSTS, spec, observed, rev)
+	}
+	root, logFile := upRoot(t)
+	seq := strings.Join([]string{sts(1, 1, "bundle-store-rev1"), sts(2, 1, "bundle-store-rev1"), sts(2, 1, "bundle-store-rev1"), sts(2, 2, "bundle-store-rev2")}, "|")
+	_, calls := runUp(t, root, logFile, "STUB_NP_JSON="+objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_SEQ="+seq, "STUB_POD_JSON="+podStuck)
+	if callIndex(calls, "-n cell-system delete pod bundle-store-0") < 0 {
+		t.Errorf("the stuck pod of the bootstrap revision was not replaced after the controller caught up:\n%s", calls)
 	}
 }

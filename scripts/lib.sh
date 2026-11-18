@@ -970,7 +970,7 @@ apply_store_object() {
 #   - The store proxy reviews tokens through the API server, and the egress for that lives in the network-policy bundle, which Argo CD syncs after it reads
 #     the store. A live policy bundle-store that Argo CD manages gets the rendered policy first.
 store_upgrade() {
-  local live stale tid pod ready rev hash
+  local live stale tid pod ready rev hash i
   live="$(k -n cell-system get networkpolicy bundle-store --ignore-not-found -o json)" || die "could not read NetworkPolicy bundle-store in cell-system"
   if [[ -n "$live" && -f "$BUNDLES/network-policy/manifests.yaml" ]] \
     && [[ -n "$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")" ]]; then
@@ -981,7 +981,12 @@ store_upgrade() {
   stale="$(jq -r '[.spec.template.spec.containers[]? | select(.name == "bundle-store") | (.readinessProbe != null) or ((.ports // []) | length > 0)] | any' <<<"$live")"
   if [[ "$stale" == true && -f "$BUNDLES/cell-system/manifests.yaml" ]]; then
     apply_store_object StatefulSet "$BUNDLES/cell-system/manifests.yaml" "$live"
-    live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+    # status.updateRevision moves only when the controller has seen the new generation. Until then, the stuck pod still looks current.
+    for ((i = 0; i < ${STORE_UPGRADE_WAIT:-60}; i++)); do
+      live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+      jq -e '(.metadata.generation // 0) <= (.status.observedGeneration // 0)' >/dev/null <<<"$live" && break
+      sleep 1
+    done
   fi
   # The pod check runs on every pass, so a rerun after an interrupted upgrade also replaces a pod that never became Ready. A pod of the current
   # revision may still be starting, so only a pod of an older revision goes.

@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -176,10 +177,29 @@ func TestM8CosignVerifiesSet(t *testing.T) {
 			})
 			t.Run("one_byte_changed", func(t *testing.T) {
 				st := m8State(t, target)
-				file := filepath.Join("..", "..", "build", target, fmt.Sprintf("sigstore-%d.json", st.Version.Counter))
-				raw, err := os.ReadFile(file)
+				// The copy is made from the bundle that is attached to the root on the mirror, which is what cosign reads, and not from the local file.
+				ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+				defer cancel()
+				mirror, repo := m8Mirror(t), "bundles/"+target+"/root"
+				refs, err := mirror.Referrers(ctx, repo, st.Root.Digest)
+				if err != nil || len(refs) == 0 {
+					t.Fatalf("the root has no attached bundle on the mirror (%v). Run: mise run bundle -- cosign --target %s", err, target)
+				}
+				manifest, err := mirror.Manifest(ctx, repo, refs[len(refs)-1].Digest.String())
 				if err != nil {
-					t.Fatalf("no Sigstore bundle for the signed version: %v. Run: mise run bundle -- cosign --target %s", err, target)
+					t.Fatal(err)
+				}
+				var layers struct {
+					Layers []struct {
+						Digest string `json:"digest"`
+					} `json:"layers"`
+				}
+				if err := json.Unmarshal(manifest, &layers); err != nil || len(layers.Layers) == 0 {
+					t.Fatalf("the attached referrer has no layer: %v", err)
+				}
+				raw, err := mirror.Blob(ctx, repo, layers.Layers[0].Digest)
+				if err != nil {
+					t.Fatal(err)
 				}
 				var bundleDoc map[string]any
 				if err := json.Unmarshal(raw, &bundleDoc); err != nil {
@@ -203,14 +223,19 @@ func TestM8CosignVerifiesSet(t *testing.T) {
 					if err := os.WriteFile(path, b, 0o644); err != nil {
 						t.Fatal(err)
 					}
-					return m8Cosign(t, "verify-blob-attestation", "--bundle", path, "--key", key, "--digest", rootHex, "--digestAlg", "sha256", "--insecure-ignore-tlog=true")
+					return m8Cosign(t, "verify-blob-attestation", "--bundle", path, "--key", key, "--digest", rootHex, "--digestAlg", "sha256", "--type", "https://cell.poc.internal/bundle-set/v1", "--insecure-ignore-tlog=true")
 				}
 				if out, err := verify(bundleDoc); err != nil {
 					t.Fatalf("cosign does not verify an unchanged copy: %v\n%s", err, out)
 				}
 				sigs[0].(map[string]any)["sig"] = base64.StdEncoding.EncodeToString(decoded)
-				if out, err := verify(bundleDoc); err == nil {
+				out, err := verify(bundleDoc)
+				if err == nil {
 					t.Fatalf("cosign verifies a copy with one byte changed:\n%s", out)
+				}
+				// The unchanged copy passed with the same arguments, so the failure must come from the signature and not from the predicate type.
+				if strings.Contains(out, "invalid predicate type") {
+					t.Fatalf("the changed copy fails on the predicate type:\n%s", out)
 				}
 			})
 		})

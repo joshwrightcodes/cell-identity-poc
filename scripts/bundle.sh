@@ -78,11 +78,32 @@ _check() {
   esac
 }
 
+# check_build_fresh stops the publish when a hydrated bundle is older than an input of its render, because bundlectl packs build/<t>/bundles as it is,
+# and a render change without a new hydrate would sign the old content. The rule is the one of ko_image for build/images.env: a file that is newer than the
+# bundle. The inputs of the bundle of a component are the files of components/<component> and components/lib, cells/common.env, cells/<t>.env,
+# internal/bundle/allow.json and build/images.env (IMAGES_ENV names another file). Live facts that a render reads are not files, so a change in them still
+# needs cell:hydrate.
+check_build_fresh() {
+  local entry c file i newer inputs
+  for entry in "${COMPONENTS[@]}"; do
+    c="${entry%%:*}"
+    file="$BUNDLES/$c/manifests.yaml"
+    [[ -f "$file" ]] || die "no hydrated bundle $c for $CELL_NAME ($file). Run: CELL=$CELL_NAME mise run cell:hydrate"
+    inputs=()
+    for i in "$ROOT/components/$c" "$ROOT/components/lib" "$ROOT/cells/common.env" "$ROOT/cells/$CELL_NAME.env" "$ROOT/internal/bundle/allow.json" "${IMAGES_ENV:-$ROOT/build/images.env}"; do
+      [[ ! -e "$i" ]] || inputs+=("$i")
+    done
+    newer="$(find "${inputs[@]}" -type f -newer "$file" -print -quit 2>/dev/null)"
+    [[ -z "$newer" ]] || die "${newer#"$ROOT"/} is newer than the hydrated bundle $c ($file), so the bundle holds an old render. Run: CELL=$CELL_NAME mise run cell:hydrate"
+  done
+}
+
 _publish() {
   local role mirror set signed root_digest file pushed
   _check
   role="$(bundle_role)"
   [[ -d "$BUNDLES" ]] || die "no hydrated bundles for $CELL_NAME. Run: CELL=$CELL_NAME mise run cell:hydrate"
+  check_build_fresh
   mirror="$(mirror_host)" || exit 1
   bundle_state_bootstrap
   set="$(mise run bundlectl -- push --target "$CELL_NAME" --registry "$mirror" --build "$BUILD_ROOT" --root "$ROOT" "${COMPONENTS[@]}")" \
@@ -153,11 +174,11 @@ pull_bundle() {
   [[ "sha256:$(sha256 <"$dir/layer.tgz")" == "$layer" ]] || die "the layer of $repo on $host does not match its digest $layer"
 }
 
-# verify_signed_root <root digest> <statement file> checks with cosign, offline, that mgmtd signed the root bundle of this target with its
+# verify_signed_root <root digest> <statement file> [version as JSON] [1 for strict] checks with cosign, offline, that mgmtd signed the root bundle of this target with its
 # current key, and writes the in-toto statement of the signature to <statement file>. cosign gets an empty Docker configuration, and
 # it skips the transparency log, which no set uses. A root that a key before a rotation signed needs: mise run bundle -- cosign --target <t>.
 verify_signed_root() {
-  local root="$1" out="$2" keyline pem keydir dockerdir envelope reason
+  local root="$1" out="$2" want="${3:-null}" strict="${4:-0}" keyline pem keydir dockerdir envelope reason all mine
   keyline="$(CELL=management mise run mgmt -- pubkey)" || die "could not read the public key of mgmtd: $keyline"
   pem="$(printf '%s' "$keyline" | mise run bundlectl -- pubkey-pem)" || die "could not convert the public key of mgmtd"
   keydir="$(mktemp -d)"
@@ -168,9 +189,19 @@ verify_signed_root() {
     --type https://cell.poc.internal/bundle-set/v1 "$MIRROR/bundles/$CELL_NAME/root@$root" 2>"$keydir/cosign.err")" \
     || { reason="$(tail -n 1 "$keydir/cosign.err")"; rm -rf "$keydir" "$dockerdir"; die "cosign does not verify the root $root of $CELL_NAME against the current key of mgmtd (${reason:-no message}), so it is not trusted. If the key rotated, run: mise run bundle -- cosign --target $CELL_NAME"; }
   rm -rf "$keydir" "$dockerdir"
-  jq -s 'map(.payload | @base64d | fromjson) | .[0]' <<<"$envelope" >"$out" || die "the cosign answer for $root holds no statement"
-  jq -e --arg d "${root#sha256:}" --arg n "bundles/$CELL_NAME/root" '[.subject[]? | select(.name == $n and .digest.sha256 == $d)] | length == 1' "$out" >/dev/null \
-    || die "the signed statement has no subject bundles/$CELL_NAME/root with the digest $root"
+  # cosign prints one statement for each signed version of the root, because the same content signs the same root again. Keep the statements that
+  # name this root as their subject, and choose the one with the wanted version. Without one, a strict call fails, and any other call takes the
+  # highest version.
+  all="$(jq -sc 'map(.payload | @base64d | fromjson)' <<<"$envelope")" || die "the cosign answer for $root holds no statement"
+  mine="$(jq -c --arg d "${root#sha256:}" --arg n "bundles/$CELL_NAME/root" 'map(select([.subject[]? | select(.name == $n and .digest.sha256 == $d)] | length == 1))' <<<"$all")"
+  [[ "$(jq 'length' <<<"$mine")" -gt 0 ]] || die "the signed statement has no subject bundles/$CELL_NAME/root with the digest $root"
+  if [[ "$(jq -c --argjson v "$want" '[.[] | select($v != null and .predicate.version == $v)] | length' <<<"$mine")" -gt 0 ]]; then
+    jq -c --argjson v "$want" '[.[] | select(.predicate.version == $v)][0]' <<<"$mine" >"$out"
+  elif [[ "$strict" == 1 ]]; then
+    die "no signed statement for the root $root has the version $(jq -r 'if . == null then "none" else "\(.epoch)/\(.counter)" end' <<<"$want") that the state records. The root is not the set of that version"
+  else
+    jq -c 'sort_by([(.predicate.version.epoch // -1), (.predicate.version.counter // -1)]) | last' <<<"$mine" >"$out"
+  fi
 }
 
 _verify() {
@@ -184,7 +215,7 @@ _verify() {
   MIRROR="$(mirror_host)" || exit 1
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
-  verify_signed_root "$root" "$work/statement.json"
+  verify_signed_root "$root" "$work/statement.json" "$(jq -c '.version // null' <<<"$state")" 1
   jq -c --arg target "$CELL_NAME" --arg root "$root" '{target: $target, root: $root, version: .predicate.version,
     subjects: [.subject[] | {name, digest: ("sha256:" + .digest.sha256)}]}' "$work/statement.json"
 }
@@ -230,7 +261,7 @@ _repair() {
     origin=bootstrap host="$store" root_repo=bundles/root comp_repo=bundles
   else
     origin=signed host="$MIRROR" root_repo="bundles/$CELL_NAME/root" comp_repo="bundles/$CELL_NAME"
-    verify_signed_root "$root_digest" "$stmt"
+    verify_signed_root "$root_digest" "$stmt" "$(jq -c '.version // null' <<<"$good")" 0
     check_not_older "$good" "$stmt"
   fi
   pull_bundle "$host" "$root_repo" "$root_digest" "$work/root"
