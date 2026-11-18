@@ -52,7 +52,7 @@ func TestDefaultPolicy(t *testing.T) {
 			Project: "cell-app", ObjectNamespaces: []string{"apps-demo"}, DestinationNamespaces: []string{"apps-demo"},
 			ClusterKinds:         []string{},
 			NamespacedKinds:      []string{"ConfigMap", "Secret", "ServiceAccount", "Service", "apps/Deployment"},
-			ServiceClusterIPOnly: true, NoSidecarOptOut: true,
+			ServiceClusterIPOnly: true, NoSidecarOptOut: true, OwnServiceAccountsOnly: true,
 		},
 	}
 	if !reflect.DeepEqual(p.Classes, want) {

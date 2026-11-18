@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -128,6 +129,17 @@ func TestPolicyApp(t *testing.T) {
 		{name: "unknown_kind", want: not("kind"), namespace: []string{"widgets.example.invalid/Widget"}},
 		{name: "knative_service", want: not("kind_unknown_scope")},
 		{name: "knative_service", want: not("kind"), namespace: []string{"serving.knative.dev/Service"}},
+		{name: "secret_opaque"},
+		{name: "secret_sa_token", want: not("service_account_token")},
+		{name: "serviceaccount_client"},
+		{name: "deployment_sa_default"},
+		{name: "deployment_sa_client", want: not("foreign_service_account")},
+		{name: "deployment_sa_client", with: []string{"serviceaccount_client"}},
+		{name: "deployment_sa_legacy_field", want: not("foreign_service_account")},
+		{name: "deployment_sa_legacy_field", with: []string{"serviceaccount_client"}},
+		{name: "traffic_exclude_outbound", want: not("mesh_opt_out")},
+		{name: "interception_mode", want: not("mesh_opt_out")},
+		{name: "proxy_config", want: not("mesh_opt_out")},
 	})
 }
 
@@ -177,6 +189,8 @@ func TestPolicyPlatform(t *testing.T) {
 		{name: "unknown_component_object", component: "nope", want: not("component_unknown")},
 		{name: "namespace_argocd_injection", want: want{rPlane, "mesh_injection"}},
 		{name: "namespace_argocd_rev", want: want{rPlane, "mesh_injection"}},
+		{name: "secret_sa_token", component: "argocd", want: not("service_account_token")},
+		{name: "deployment_apps_demo_sa_client", component: "apps-demo"},
 	})
 }
 
@@ -194,6 +208,7 @@ func TestPolicyCp(t *testing.T) {
 		{name: "clusterpushsecret", component: "external-secrets", want: not("kind")},
 		{name: "generator_password", component: "external-secrets"},
 		{name: "namespace_spire_system_injection", component: "namespaces", want: want{rPlane, "mesh_injection"}},
+		{name: "secret_sa_token_spire_system", want: not("service_account_token")},
 	})
 }
 
@@ -633,4 +648,148 @@ func TestCheckArgocdSize(t *testing.T) {
 		fmt.Fprintf(&sb, "---\napiVersion: v1\nkind: %s\nmetadata: {name: o%d, namespace: argocd}\n", kinds[i%len(kinds)], i)
 	}
 	measure(t, "2000 objects", []byte(sb.String()), "argocd", 2000)
+}
+
+// widenedAppPolicy is the default policy with every pod workload kind added to the class app, so that the
+// service account rule shows for each kind and not only the kind rule.
+func widenedAppPolicy() bundle.Policy {
+	p := bundle.DefaultPolicy()
+	p.Classes = maps.Clone(p.Classes)
+	app := p.Classes["app"]
+	app.NamespacedKinds = append(slices.Clone(app.NamespacedKinds),
+		"Pod", "apps/StatefulSet", "apps/DaemonSet", "apps/ReplicaSet", "batch/Job", "batch/CronJob")
+	p.Classes["app"] = app
+	return p
+}
+
+// podObject returns an object of kind in apps-demo whose pod spec sets field to value. A nil value leaves
+// the field out.
+func podObject(t *testing.T, apiVersion, kind, field string, value any) Object {
+	t.Helper()
+	spec := map[string]any{"containers": []any{map[string]any{"name": "a", "image": "registry.invalid/a:1"}}}
+	if value != nil {
+		spec[field] = value
+	}
+	template := map[string]any{"metadata": map[string]any{"labels": map[string]any{"app": "a"}}, "spec": spec}
+	var body map[string]any
+	switch kind {
+	case "Pod":
+		body = spec
+	case "CronJob":
+		body = map[string]any{"schedule": "0 * * * *", "jobTemplate": map[string]any{"spec": map[string]any{"template": template}}}
+	default:
+		body = map[string]any{"selector": map[string]any{"matchLabels": map[string]any{"app": "a"}}, "template": template}
+	}
+	o, ok := toObject(map[string]any{
+		"apiVersion": apiVersion, "kind": kind,
+		"metadata": map[string]any{"name": "w", "namespace": "apps-demo"},
+		"spec":     body,
+	})
+	if !ok {
+		t.Fatalf("%s is not an object", kind)
+	}
+	return o
+}
+
+func serviceAccount(t *testing.T, apiVersion, namespace, name string) Object {
+	t.Helper()
+	o, ok := toObject(map[string]any{"apiVersion": apiVersion, "kind": "ServiceAccount",
+		"metadata": map[string]any{"name": name, "namespace": namespace}})
+	if !ok {
+		t.Fatal("ServiceAccount is not an object")
+	}
+	return o
+}
+
+// TestPolicyAppPodServiceAccounts checks that a pod of an app component runs only as a ServiceAccount that
+// the same component declares in the namespace of the pod, or as default, for every kind with a pod spec.
+func TestPolicyAppPodServiceAccounts(t *testing.T) {
+	c, err := NewChecker("cell", widenedAppPolicy(), HarnessRefs{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := []struct{ apiVersion, kind string }{
+		{"apps/v1", "Deployment"}, {"apps/v1", "StatefulSet"}, {"apps/v1", "DaemonSet"}, {"apps/v1", "ReplicaSet"},
+		{"batch/v1", "Job"}, {"batch/v1", "CronJob"}, {"v1", "Pod"},
+	}
+	own := serviceAccount(t, "v1", "apps-demo", "client")
+	for _, k := range kinds {
+		for _, field := range []string{"serviceAccountName", "serviceAccount"} {
+			t.Run(k.kind+"/"+field, func(t *testing.T) {
+				check := func(value any, with ...Object) error {
+					return c.Check(context.Background(), "apps-sample", append([]Object{podObject(t, k.apiVersion, k.kind, field, value)}, with...))
+				}
+				expect(t, check("client"), not("foreign_service_account"), k.kind+"/apps-demo/w")
+				expect(t, check("client", own), pass(), "")
+				expect(t, check(nil), pass(), "")
+				expect(t, check("default"), pass(), "")
+				expect(t, check(""), pass(), "")
+				expect(t, check("other", own), not("foreign_service_account"), "")
+				expect(t, check(map[string]any{"name": "client"}, own), not("foreign_service_account"), "")
+				expect(t, check(7), not("foreign_service_account"), "")
+				// A ServiceAccount of another namespace or of another API group is not the account of the pod.
+				expect(t, check("client", serviceAccount(t, "v1", "argocd", "client")), not("foreign_service_account"), "")
+				expect(t, check("client", serviceAccount(t, "example.invalid/v1", "apps-demo", "client")), not("foreign_service_account"), "")
+			})
+		}
+	}
+	t.Run("platform class names any account", func(t *testing.T) {
+		for _, k := range kinds {
+			expect(t, c.Check(context.Background(), "apps-demo", []Object{podObject(t, k.apiVersion, k.kind, "serviceAccountName", "client")}), pass(), "")
+		}
+	})
+}
+
+// TestPolicyServiceAccountsOfTheCheckedComponent checks that the declared accounts come from the objects of
+// one Check call, in any order, and do not stay for the next call.
+func TestPolicyServiceAccountsOfTheCheckedComponent(t *testing.T) {
+	c := newTestChecker(t, "cell", HarnessRefs{})
+	dep := loadObject(t, "app", "deployment_sa_client")
+	sa := loadObject(t, "app", "serviceaccount_client")
+	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep, sa}), pass(), "")
+	expect(t, c.Check(context.Background(), "apps-sample", []Object{sa}), pass(), "")
+	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep}), not("foreign_service_account"), "Deployment/apps-demo/thief")
+}
+
+// TestPolicyOptOutKeys checks that an app pod may carry no key that moves traffic past its sidecar or changes
+// how the sidecar intercepts, in labels or annotations, whatever the value. A platform pod may.
+func TestPolicyOptOutKeys(t *testing.T) {
+	app := newTestChecker(t, "cell", HarnessRefs{})
+	for key, refused := range map[string]bool{
+		"traffic.sidecar.istio.io/excludeOutboundIPRanges": true,
+		"traffic.sidecar.istio.io/excludeInboundPorts":     true,
+		"traffic.sidecar.istio.io/excludeOutboundPorts":    true,
+		"traffic.sidecar.istio.io/includeOutboundIPRanges": true,
+		"traffic.sidecar.istio.io/includeInboundPorts":     true,
+		"traffic.sidecar.istio.io/kubevirtInterfaces":      true,
+		"traffic.sidecar.istio.io/anyFutureKey":            true,
+		"sidecar.istio.io/interceptionMode":                true,
+		"sidecar.istio.io/interceptionmode":                true,
+		"proxy.istio.io/config":                            true,
+		"sidecar.istio.io/proxyCPU":                        false,
+		"example.invalid/traffic.sidecar.istio.io":         false,
+		"traffic.sidecar.istio.io":                         false,
+		"proxy.istio.io/other":                             false,
+	} {
+		for _, field := range []string{"annotations", "labels"} {
+			for _, value := range []string{"", "0.0.0.0/0", "NONE"} {
+				o := loadObject(t, "app", "deployment")
+				tmpl := o.Raw["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)
+				tmpl[field] = map[string]any{"app": "demo", key: value}
+				err := app.Check(context.Background(), "apps-sample", []Object{o})
+				if refused {
+					var r *Refusal
+					if !errors.As(err, &r) || r.Reason != rNot || r.Detail != "mesh_opt_out" {
+						t.Errorf("app %s %s=%q: %v, want mesh_opt_out", field, key, value, err)
+					}
+				} else if err != nil {
+					t.Errorf("app %s %s=%q: %v", field, key, value, err)
+				}
+				o.Raw["metadata"].(map[string]any)["namespace"] = "istio-system"
+				if err := app.Check(context.Background(), "istiod", []Object{o}); err != nil {
+					t.Errorf("platform %s %s=%q: %v", field, key, value, err)
+				}
+			}
+		}
+	}
 }

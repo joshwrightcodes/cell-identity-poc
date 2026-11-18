@@ -92,6 +92,7 @@ spec:
     syncOptions:
       - ServerSideApply=true
       - RespectIgnoreDifferences=true
+      - FailOnSharedResource=true
 EOF
     # A component can add fields to its Application spec, for example ignoreDifferences.
     extra="$ROOT/components/$c/application.yaml"

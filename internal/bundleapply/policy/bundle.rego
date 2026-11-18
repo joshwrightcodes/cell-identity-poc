@@ -1,6 +1,8 @@
 # Bundle object policy. Input: one decoded object. Data: data.allow (allow.json), data.context
-# ({"role","component"}), data.harness ({"networkPolicies":[{"namespace","name"}]}) and the optional
-# data.scope ({"cluster":[group/Kind],"namespaced":[group/Kind]}) with the scope of custom kinds.
+# ({"role","component"}), data.harness ({"networkPolicies":[{"namespace","name"}]}), the optional
+# data.scope ({"cluster":[group/Kind],"namespaced":[group/Kind]}) with the scope of custom kinds, and
+# the optional data.serviceAccounts ([{"namespace","name"}]) with the ServiceAccounts that the checked
+# component declares.
 package bundle.allow
 
 harness_label_key := "cell.poc.internal/harness"
@@ -10,6 +12,18 @@ inject_key := "sidecar.istio.io/inject"
 # Istio opts a pod out only for the exact value false. The policy also refuses n, no and off in any
 # case, as a chosen stricter rule.
 opt_out_values := {"false", "n", "no", "off"}
+
+# Keys that move pod traffic past the sidecar or change how the sidecar intercepts it. The policy
+# refuses each of them with any value: every key under traffic.sidecar.istio.io/, and the two below,
+# compared in lower case.
+traffic_prefix := "traffic.sidecar.istio.io"
+
+intercept_keys := {"sidecar.istio.io/interceptionmode", "proxy.istio.io/config"}
+
+sa_token_type := "kubernetes.io/service-account-token"
+
+# The pod fields that name the ServiceAccount of a pod. serviceAccount is the deprecated alias.
+account_fields := ["serviceAccountName", "serviceAccount"]
 
 # Kinds that are cluster scoped. A class must name each of them, with its group, in clusterKinds.
 builtin_cluster := {
@@ -134,6 +148,18 @@ pod_annotations contains a if {
 	input.kind == "Pod"
 	group == ""
 	a := annotations_of(input)
+}
+
+# The pod specs of the object: the spec of each template, or the spec of the Pod itself.
+pod_specs contains s if {
+	some t in template_objs
+	s := child(t, "spec")
+}
+
+pod_specs contains s if {
+	input.kind == "Pod"
+	group == ""
+	s := child(input, "spec")
 }
 
 all_labels contains l if {
@@ -380,6 +406,68 @@ deny contains entry("component_not_allowed", "mesh_opt_out") if {
 	class.noSidecarOptOut
 	some a in all_annotations
 	opted_out(a)
+}
+
+traffic_key(k) if {
+	parts := split(k, "/")
+	count(parts) == 2
+	parts[0] == traffic_prefix
+}
+
+intercept_key(k) if intercept_keys[lower(k)]
+
+all_meta contains m if {
+	some m in all_labels
+}
+
+all_meta contains m if {
+	some m in all_annotations
+}
+
+deny contains entry("component_not_allowed", "mesh_opt_out") if {
+	class.noSidecarOptOut
+	some m in all_meta
+	some k, _ in m
+	traffic_key(k)
+}
+
+deny contains entry("component_not_allowed", "mesh_opt_out") if {
+	class.noSidecarOptOut
+	some m in all_meta
+	some k, _ in m
+	intercept_key(k)
+}
+
+# A token Secret of a ServiceAccount gives an API token with no expiry, so no class may hold one.
+deny contains entry("component_not_allowed", "service_account_token") if {
+	class_name
+	input.kind == "Secret"
+	group == ""
+	object.get(input, "type", "") == sa_token_type
+}
+
+declared_account(n) if {
+	some a in data.serviceAccounts
+	a.namespace == ns
+	a.name == n
+}
+
+account_ok(v) if v == ""
+
+account_ok(v) if v == "default"
+
+account_ok(v) if {
+	is_string(v)
+	declared_account(v)
+}
+
+deny contains entry("component_not_allowed", "foreign_service_account") if {
+	class.ownServiceAccountsOnly
+	some s in pod_specs
+	some f in account_fields
+	v := object.get(s, f, null)
+	v != null
+	not account_ok(v)
 }
 
 # A guarded namespace keeps injection off: the Namespace carries istio-injection disabled and no

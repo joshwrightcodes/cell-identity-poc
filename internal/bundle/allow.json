@@ -90,7 +90,8 @@
         "apps/Deployment"
       ],
       "serviceClusterIPOnly": true,
-      "noSidecarOptOut": true
+      "noSidecarOptOut": true,
+      "ownServiceAccountsOnly": true
     }
   },
   "roles": {

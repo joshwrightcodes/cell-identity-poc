@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -68,6 +69,7 @@ spec:
     syncOptions:
       - ServerSideApply=true
       - RespectIgnoreDifferences=true
+      - FailOnSharedResource=true
 `
 	var m map[string]any
 	if err := yaml.Unmarshal([]byte(text), &m); err != nil {
@@ -109,6 +111,34 @@ func TestComposeRootMatchesPublish(t *testing.T) {
 		wj, _ := json.Marshal(want)
 		if string(gj) != string(wj) {
 			t.Errorf("%s differs from publish.sh\n got %s\nwant %s", c.Name, gj, wj)
+		}
+	}
+}
+
+// TestComposeRootFailsOnSharedResource checks that every Application of a root, of every class, refuses to
+// sync an object that another Application already tracks, and keeps the other sync options.
+func TestComposeRootFailsOnSharedResource(t *testing.T) {
+	want := []string{"ServerSideApply=true", "RespectIgnoreDifferences=true", "FailOnSharedResource=true"}
+	cp := bundle.Set{Version: bundle.Version{Epoch: 1, Counter: 2}, Components: composeSet().Components[1:]}
+	for role, s := range map[string]bundle.Set{"cell": composeSet(), "cp": cp} {
+		files := rootFiles(t, compose(t, role, s))
+		if len(files) != len(s.Components) {
+			t.Fatalf("%s: %d files for %d components", role, len(files), len(s.Components))
+		}
+		for name, body := range files {
+			var app struct {
+				Spec struct {
+					SyncPolicy struct {
+						SyncOptions []string `json:"syncOptions"`
+					} `json:"syncPolicy"`
+				} `json:"spec"`
+			}
+			if err := yaml.Unmarshal(body, &app); err != nil {
+				t.Fatal(err)
+			}
+			if got := app.Spec.SyncPolicy.SyncOptions; !slices.Equal(got, want) {
+				t.Errorf("%s/%s syncOptions %v, want %v", role, name, got, want)
+			}
 		}
 	}
 }

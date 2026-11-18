@@ -208,10 +208,11 @@ func newChecker(role string, p bundle.Policy, h HarnessRefs, module string) (*Ch
 		nps = append(nps, map[string]any{"namespace": r.Namespace, "name": r.Name})
 	}
 	st := inmem.NewFromObject(map[string]any{
-		"allow":   allow,
-		"context": map[string]any{"role": role, "component": ""},
-		"harness": map[string]any{"networkPolicies": nps},
-		"scope":   map[string]any{"cluster": []any{}, "namespaced": []any{}},
+		"allow":           allow,
+		"context":         map[string]any{"role": role, "component": ""},
+		"harness":         map[string]any{"networkPolicies": nps},
+		"scope":           map[string]any{"cluster": []any{}, "namespaced": []any{}},
+		"serviceAccounts": []any{},
 	})
 	q, err := rego.New(
 		rego.Module("bundle.rego", module),
@@ -246,7 +247,8 @@ var detailRank = map[string]int{
 	"component_unknown": 0, "harness_object": 1, "planePolicy": 2, "harness_namespace": 3,
 	"harness_label": 4, "mesh_injection": 5, "kind": 6, "kind_unknown_scope": 7,
 	"cluster_kind_namespaced": 8, "namespace_missing": 9, "namespace": 10, "layout": 11,
-	"service_type": 12, "mesh_opt_out": 13, "appproject_spec": 14,
+	"service_type": 12, "mesh_opt_out": 13, "appproject_spec": 14, "service_account_token": 15,
+	"foreign_service_account": 16,
 }
 
 const lastRank = 1 << 20
@@ -292,10 +294,23 @@ func crdKinds(objs []Object) (cluster, namespaced []string) {
 	return cluster, namespaced
 }
 
+// serviceAccounts returns the namespace and name of each core ServiceAccount among objs, as the policy
+// reads them in data.serviceAccounts.
+func serviceAccounts(objs []Object) []any {
+	out := []any{}
+	for _, o := range objs {
+		if o.Kind == "ServiceAccount" && o.APIVersion == "v1" {
+			out = append(out, map[string]any{"namespace": o.Namespace, "name": o.Name})
+		}
+	}
+	return out
+}
+
 // Check evaluates the policy for each object of component and returns the first refusal in input
 // order, as a *Refusal. Of several denials for one object, the most specific one wins. An
 // evaluation error or an empty result gives the refusal policy_error. Only a fault of the store or
-// a canceled context gives a plain error.
+// a canceled context gives a plain error. objs must hold every object of the component, because a
+// pod of a class with ownServiceAccountsOnly may name only a ServiceAccount among them.
 func (c *Checker) Check(ctx context.Context, component string, objs []Object) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -313,6 +328,9 @@ func (c *Checker) Check(ctx context.Context, component string, objs []Object) er
 	ns = append(ns, c.extraNamespaced...)
 	if err := c.store.Write(ctx, txn, storage.AddOp, storage.MustParsePath("/scope"),
 		map[string]any{"cluster": toAny(cl), "namespaced": toAny(ns)}); err != nil {
+		return err
+	}
+	if err := c.store.Write(ctx, txn, storage.AddOp, storage.MustParsePath("/serviceAccounts"), serviceAccounts(objs)); err != nil {
 		return err
 	}
 	if len(objs) == 0 {

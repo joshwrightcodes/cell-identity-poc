@@ -51,6 +51,8 @@ func CheckSet(role string, s Set, p Policy) error {
 // oci://StoreHost/bundles/<component>, carries the sync wave, syncs into the namespace of the
 // component and takes its project from the class of the component in role. Each Application
 // carries only the sync-wave annotation, so two sets with the same components give the same root.
+// Each Application syncs with FailOnSharedResource=true, so that Argo CD refuses to sync an object
+// that another Application already tracks, instead of letting the two take it in turns.
 // It runs CheckSet first.
 func ComposeRoot(role string, s Set, p Policy) (Artifact, error) {
 	if err := validateComponents(slices.Clone(s.Components)); err != nil {
@@ -85,7 +87,7 @@ func application(c Component, project, storeURL string) ([]byte, error) {
 		},
 		"syncPolicy": map[string]any{
 			"automated":   map[string]any{"prune": true, "selfHeal": true},
-			"syncOptions": []string{"ServerSideApply=true", "RespectIgnoreDifferences=true"},
+			"syncOptions": []string{"ServerSideApply=true", "RespectIgnoreDifferences=true", "FailOnSharedResource=true"},
 		},
 	}
 	if len(c.IgnoreDifferences) > 0 {

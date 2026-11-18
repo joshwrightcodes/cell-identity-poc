@@ -21,10 +21,11 @@ import (
 const harnessLabel = "cell.poc.internal/harness"
 
 // conftestData writes the data directory that conftest loads: allow.json as data.allow, the context of the
-// role and the component as data.context, the live harness NetworkPolicies as data.harness and, when scope is
-// not nil, the scope of custom kinds as data.scope. conftest loads a file under the path of its directory.
-// It reads no data.scope unless the test gives it one.
-func conftestData(t *testing.T, role, component string, nps []map[string]string, scope map[string][]string) string {
+// role and the component as data.context, the live harness NetworkPolicies as data.harness, when scope is
+// not nil, the scope of custom kinds as data.scope and, when accounts is not nil, the ServiceAccounts of the
+// component as data.serviceAccounts. conftest loads a file under the path of its directory. It reads no
+// data.scope and no data.serviceAccounts unless the test gives them.
+func conftestData(t *testing.T, role, component string, nps []map[string]string, scope map[string][]string, accounts []map[string]string) string {
 	t.Helper()
 	dir := t.TempDir()
 	allow, err := os.ReadFile("../../internal/bundle/allow.json")
@@ -54,6 +55,9 @@ func conftestData(t *testing.T, role, component string, nps []map[string]string,
 	write("harness", map[string]any{"networkPolicies": nps})
 	if scope != nil {
 		write("scope", scope)
+	}
+	if accounts != nil {
+		write("serviceAccounts", accounts)
 	}
 	return dir
 }
@@ -146,6 +150,19 @@ func scopeOf(objs []map[string]any) map[string][]string {
 	return scope
 }
 
+// accountsOf lists the ServiceAccounts among objs, as the engine reads them for the component (namespace and
+// name of each core ServiceAccount).
+func accountsOf(objs []map[string]any) []map[string]string {
+	out := []map[string]string{}
+	for _, o := range objs {
+		if o["kind"] != "ServiceAccount" || o["apiVersion"] != "v1" {
+			continue
+		}
+		out = append(out, map[string]string{"namespace": fmt.Sprint(lookupOr(o, "metadata", "namespace")), "name": fmt.Sprint(lookupOr(o, "metadata", "name"))})
+	}
+	return out
+}
+
 // TestRealBundlesPassPolicy runs conftest with bundle.rego over the canonical form of every rendered bundle of
 // the roles cell and cp, with allow.json, the role and the component, and the harness NetworkPolicies of the
 // cluster, and expects no denial. Each render must first have a canonical form, as the applier requires. The
@@ -182,7 +199,7 @@ func TestRealBundlesPassPolicy(t *testing.T) {
 					if err := os.WriteFile(file, canon, 0o644); err != nil {
 						t.Fatal(err)
 					}
-					data := conftestData(t, role, c.name, nps, scopeOf(objs))
+					data := conftestData(t, role, c.name, nps, scopeOf(objs), accountsOf(objs))
 					if denied := conftestDeny(t, data, file)[file]; len(denied) > 0 {
 						t.Errorf("conftest refuses %s of %s (%s): %v", c.name, cr.name, role, denied)
 					}
@@ -231,9 +248,11 @@ func engineVerdict(t *testing.T, checker *bundleapply.Checker, component string,
 // engine accepts has an empty deny set, and an object that it refuses has a deny set that holds its refusal
 // (the engine reports the most specific denial of its set).
 //
-// Two differences are part of the contract, and the test states each one.
+// Three differences are part of the contract, and the test states each one.
 //   - conftest has no data.scope, so it treats a custom kind as unknown scope unless the test passes the scope
 //     of the CRDs that the engine learns from the bundle.
+//   - conftest has no data.serviceAccounts, so it refuses an app pod that names any ServiceAccount other than
+//     default unless the test passes the ServiceAccounts of the component, which the engine reads from its objects.
 //   - The decoder refuses a document with items (items_list), a List (list) and other layouts before it runs
 //     the policy, so the policy alone accepts them. The applier and bundlectl decode first, so no render
 //     reaches conftest in that form.
@@ -258,7 +277,7 @@ func TestConftestMatchesEngine(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			denied := conftestDeny(t, conftestData(t, p.role, p.component, refs[p.role], nil), fixtures...)
+			denied := conftestDeny(t, conftestData(t, p.role, p.component, refs[p.role], nil, nil), fixtures...)
 			compared := 0
 			for _, f := range fixtures {
 				data, err := os.ReadFile(f)
@@ -313,7 +332,7 @@ func TestConftestMatchesEngine(t *testing.T) {
 			}
 			files = append(files, f)
 		}
-		set := conftestDeny(t, conftestData(t, "cell", "apps-sample", nil, nil), files...)
+		set := conftestDeny(t, conftestData(t, "cell", "apps-sample", nil, nil, nil), files...)
 		for name, c := range cases {
 			f := filepath.Join(dir, name+".yaml")
 			verdict, fromDecoder := engineVerdict(t, checker, "apps-sample", []byte(c.doc))
@@ -347,15 +366,82 @@ func TestConftestMatchesEngine(t *testing.T) {
 		if verdict, _ := engineVerdict(t, checker, "namespaces", []byte(crd+"---\n"+cr)); verdict != "" {
 			t.Errorf("the engine refuses a CRD with its custom resource: %s", verdict)
 		}
-		without := conftestDeny(t, conftestData(t, "cell", "namespaces", nil, nil), file)[file]
+		without := conftestDeny(t, conftestData(t, "cell", "namespaces", nil, nil, nil), file)[file]
 		if !slices.Equal(without, []string{"component_not_allowed:kind_unknown_scope"}) {
 			t.Errorf("conftest with no scope denies %v, want only kind_unknown_scope for the custom resource", without)
 		}
-		with := conftestDeny(t, conftestData(t, "cell", "namespaces", nil, map[string][]string{"cluster": {}, "namespaced": {"example.invalid/Widget"}}), file)[file]
+		with := conftestDeny(t, conftestData(t, "cell", "namespaces", nil, map[string][]string{"cluster": {}, "namespaced": {"example.invalid/Widget"}}, nil), file)[file]
 		if len(with) != 0 {
 			t.Errorf("conftest with the scope of the CRD denies %v, want none", with)
 		}
 	})
+
+	// The engine reads the ServiceAccounts of the checked component from its objects. conftest reads them from
+	// data.serviceAccounts, and without that list it refuses every account other than default.
+	t.Run("own_service_account", func(t *testing.T) {
+		sa := "apiVersion: v1\nkind: ServiceAccount\nmetadata: {name: client, namespace: apps-demo}\n"
+		dep := "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: w, namespace: apps-demo}\n" +
+			"spec:\n  selector: {matchLabels: {app: w}}\n  template:\n    metadata: {labels: {app: w}}\n" +
+			"    spec: {serviceAccountName: client, containers: [{name: w, image: registry.invalid/w}]}\n"
+		file := filepath.Join(t.TempDir(), "set.yaml")
+		if err := os.WriteFile(file, []byte(sa+"---\n"+dep), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		checker, err := bundleapply.NewChecker("cell", bundle.DefaultPolicy(), bundleapply.HarnessRefs{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if verdict, _ := engineVerdict(t, checker, "apps-sample", []byte(sa+"---\n"+dep)); verdict != "" {
+			t.Errorf("the engine refuses a Deployment with the ServiceAccount of its component: %s", verdict)
+		}
+		if verdict, _ := engineVerdict(t, checker, "apps-sample", []byte(dep)); verdict != "component_not_allowed:foreign_service_account" {
+			t.Errorf("the engine gives %q for a Deployment alone, want component_not_allowed:foreign_service_account", verdict)
+		}
+		want := []string{"component_not_allowed:foreign_service_account"}
+		cases := map[string]struct {
+			accounts []map[string]string
+			want     []string
+		}{
+			"no list":         {nil, want},
+			"empty list":      {[]map[string]string{}, want},
+			"other namespace": {[]map[string]string{{"namespace": "argocd", "name": "client"}}, want},
+			"own account":     {[]map[string]string{{"namespace": "apps-demo", "name": "client"}}, []string{}},
+		}
+		for name, c := range cases {
+			if got := conftestDeny(t, conftestData(t, "cell", "apps-sample", nil, nil, c.accounts), file)[file]; !slices.Equal(got, c.want) {
+				t.Errorf("%s: conftest denies %v, want %v", name, got, c.want)
+			}
+		}
+	})
+}
+
+// TestNoObjectInTwoBundles checks that no two bundles of one cluster render the same object. Every component
+// Application syncs with FailOnSharedResource=true, so Argo CD would refuse the sync of the second one.
+func TestNoObjectInTwoBundles(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			owner := map[string]string{}
+			for _, c := range cr.components {
+				if c.kind != "bundle" {
+					continue
+				}
+				for _, o := range c.objs {
+					group := ""
+					if g, _, ok := strings.Cut(fmt.Sprint(o["apiVersion"]), "/"); ok {
+						group = g
+					}
+					key := fmt.Sprintf("%s/%v %v/%v", group, o["kind"], lookupOr(o, "metadata", "namespace"), lookupOr(o, "metadata", "name"))
+					if prev, ok := owner[key]; ok && prev != c.name {
+						t.Errorf("%s is in the bundles %s and %s", key, prev, c.name)
+					}
+					owner[key] = c.name
+				}
+			}
+			if len(owner) == 0 {
+				t.Fatal("the cluster renders no bundle object")
+			}
+		})
+	}
 }
 
 // TestNoClusterNetworkPolicyKinds checks that no rendered object is an AdminNetworkPolicy, a
@@ -421,7 +507,7 @@ func TestWidenedDefaultProjectRefused(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := "component_not_allowed:appproject_spec"
-			if denied := conftestDeny(t, conftestData(t, role, "argocd", harnessPolicies(cr), scopeOf(objs)), file)[file]; !slices.Equal(denied, []string{want}) {
+			if denied := conftestDeny(t, conftestData(t, role, "argocd", harnessPolicies(cr), scopeOf(objs), accountsOf(objs)), file)[file]; !slices.Equal(denied, []string{want}) {
 				t.Errorf("conftest denies %v, want only %s", denied, want)
 			}
 			checker, err := bundleapply.NewChecker(role, bundle.DefaultPolicy(), harnessRefs(harnessPolicies(cr)))
