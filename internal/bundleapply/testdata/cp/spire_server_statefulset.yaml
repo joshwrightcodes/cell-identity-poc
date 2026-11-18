@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: spire-server, namespace: spire-system}
+spec:
+  serviceName: spire-server
+  selector: {matchLabels: {app: spire-server}}
+  template:
+    metadata: {labels: {app: spire-server}}
+    spec:
+      containers: [{name: spire-server, image: "registry.invalid/spire:1"}]

@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: demo, namespace: apps-demo}
+spec:
+  selector: {matchLabels: {app: demo}}
+  template:
+    metadata:
+      labels:
+        app: demo
+        sidecar.istio.io/inject: "false"
+    spec:
+      containers: [{name: demo, image: "registry.invalid/demo:1"}]
