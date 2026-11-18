@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"maps"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -626,16 +629,35 @@ func TestCelldBundleFlags(t *testing.T) {
 	}
 }
 
+// argoApps returns the Applications that the apply engine of a role may patch: root, for a refresh and to terminate its
+// sync on a rollback, and the Application of each component of the role in allow.json, to terminate its sync.
+func argoApps(t *testing.T, role string) []string {
+	t.Helper()
+	comps := slices.Sorted(maps.Keys(bundle.DefaultPolicy().Roles[role].Components))
+	if len(comps) == 0 || slices.Contains(comps, "root") {
+		t.Fatalf("allow.json lists the components %v for role %s", comps, role)
+	}
+	return append([]string{"root"}, comps...)
+}
+
+// argoRules returns the rules of the Role of the apply engine in argocd: list Applications, and patch only the
+// Applications that names gives.
+func argoRules(names []string) string {
+	return `[map[apiGroups:[argoproj.io] resources:[applications] verbs:[list]] map[apiGroups:[argoproj.io] resourceNames:` +
+		fmt.Sprint(names) + ` resources:[applications] verbs:[patch]]]`
+}
+
 // TestCelldRBACExact checks every right that the apply engine needs, and no other: Role celld-argocd in argocd (list
-// Applications, and patch only the Application root), ClusterRole celld-netpol-read (list NetworkPolicies), and a binding
-// of each to the celld account of cell-identity-system. Every object carries the harness label.
+// Applications, and patch only root and the Application of each component of role cell), ClusterRole celld-netpol-read
+// (list NetworkPolicies), and a binding of each to the celld account of cell-identity-system. Every object carries the
+// harness label.
 func TestCelldRBACExact(t *testing.T) {
 	objs := cellObjects(t)
 	role := objs["Role argocd/celld-argocd"]
 	if role == nil {
 		t.Fatal("the render prints no Role celld-argocd in argocd")
 	}
-	wantRules := `[map[apiGroups:[argoproj.io] resources:[applications] verbs:[list]] map[apiGroups:[argoproj.io] resourceNames:[root] resources:[applications] verbs:[patch]]]`
+	wantRules := argoRules(argoApps(t, "cell"))
 	if got := fmt.Sprint(get[[]any](t, role, "rules")); got != wantRules {
 		t.Errorf("Role celld-argocd rules are %s, want %s", got, wantRules)
 	}
@@ -671,6 +693,49 @@ func TestCelldRBACExact(t *testing.T) {
 	slices.Sort(rights)
 	if want := []string{"ClusterRole celld-netpol-read", "Role argocd/celld-argocd", "Role cell-identity-system/celld-token", "Role cell-ops-system/celld-ops"}; !slices.Equal(rights, want) {
 		t.Errorf("the render prints the roles %v, want %v", rights, want)
+	}
+}
+
+// TestArgoPatchNamesFollowAllowList checks that the renders of celld and envd take the Applications that the engine
+// may patch from the allow list at render time: a component that the allow list adds to a role appears in the Role of
+// that role.
+func TestArgoPatchNamesFollowAllowList(t *testing.T) {
+	body, err := os.ReadFile("../../internal/bundle/allow.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var allow map[string]any
+	if err := json.Unmarshal(body, &allow); err != nil {
+		t.Fatal(err)
+	}
+	for _, role := range []string{"cell", "cp"} {
+		get[map[string]any](t, allow, "roles", role, "components")["zz-extra"] = "platform"
+	}
+	out, err := json.Marshal(allow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "allow.json")
+	if err := os.WriteFile(path, out, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		role, key string
+		objects   func(*testing.T, ...string) map[string]object
+	}{
+		{"cell", "Role argocd/celld-argocd", cellObjects},
+		{"cp", "Role argocd/envd-argocd", envdObjects},
+	} {
+		t.Run(tc.role, func(t *testing.T) {
+			role := tc.objects(t, "BUNDLE_ALLOW_JSON="+path)[tc.key]
+			if role == nil {
+				t.Fatalf("the render prints no %s", tc.key)
+			}
+			want := argoRules(append(argoApps(t, tc.role), "zz-extra"))
+			if got := fmt.Sprint(get[[]any](t, role, "rules")); got != want {
+				t.Errorf("%s rules are %s, want %s", tc.key, got, want)
+			}
+		})
 	}
 }
 

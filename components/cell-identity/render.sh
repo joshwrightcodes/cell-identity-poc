@@ -18,7 +18,8 @@
 #   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
 #     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
 #     checks the binary before it runs it.
-# components/lib/bundle-guard.sh adds the harness guard and the app limits of role cell.
+# components/lib/bundle-guard.sh adds the harness guard and the app limits of role cell, and components/lib/bundle-apps.sh
+# names the Applications that Role celld-argocd lets celld patch.
 # components/lib/spire-sidecar.sh adds the agent to the celld Deployment, with the M2 names of its
 # ConfigMaps and socket volume, so the deployed pod stays the same.
 # Inputs: SPIRE_SERVER_CLUSTER from cells/<cluster>.env, POC_ENV from cells/common.env, and the
@@ -37,6 +38,7 @@ source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/bundle-apps.sh"
 guard="$root/components/lib/bundle-guard.sh"
 
 celld_image="$(ko_image celld)" || die "no celld image"
@@ -73,9 +75,13 @@ api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
 [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"
 
-manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
+argo_apps="$(bundle_argo_apps cell)" || die "no Applications of role cell in the allow list"
+
+manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" APPS="$argo_apps" yq '
   (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
     .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
+  | (select(.kind == "Role" and .metadata.name == "celld-argocd") | .rules[] | select(.resourceNames == "@ARGOCD_APPS@")
+    | .resourceNames) = (env(APPS) | ... style="flow")
 ' "$here/manifests.yaml" \
   | sed -e "s|@CELLD_IMAGE@|$celld_image|" -e "s|@TRUST_BUNDLE_SHA256@|$bundle_sum|" -e "s|@OP_KEY_SHA256@|$op_sum|" \
     -e "s|@CELL_NAME@|$CELL_NAME|" -e "s|@POC_ENV@|$POC_ENV|" \

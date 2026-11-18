@@ -10,8 +10,9 @@
 # cell-controller-system. The cell controller render holds the Role envd-steps for them, and its component comes
 # first in the topology.
 #
-# envd applies the signed bundle sets of dev-cp, so the bundle also holds Role envd-argocd in argocd, ClusterRole and
-# binding envd-netpol-read, Role and RoleBinding envd-bundle-state, the egress rules of flows N48 (the registry mirror) and
+# envd applies the signed bundle sets of dev-cp, so the bundle also holds Role envd-argocd in argocd (it may patch root
+# and the Applications of the components of role cp, from components/lib/bundle-apps.sh), ClusterRole and binding
+# envd-netpol-read, Role and RoleBinding envd-bundle-state, the egress rules of flows N48 (the registry mirror) and
 # N46 (the bundle store), and the guard bundles-spare-harness (components/lib/bundle-guard.sh, role cp).
 #
 # The bundle also holds the harness plane policies of role cp. Each one admits a plane flow for every pod of its
@@ -64,6 +65,7 @@ source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/mgmt-key.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/live-cells.sh"
+source "$root/components/lib/bundle-apps.sh"
 guard="$root/components/lib/bundle-guard.sh"
 
 [[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
@@ -148,8 +150,11 @@ spec_key="$(NS="$namespace" PUB="$spec_pub" SUM="$spec_sum" yq -n '
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
 envd_image="$(ko_image envd)" || die "no envd image"
 
+argo_apps="$(bundle_argo_apps cp)" || die "no Applications of role cp in the allow list"
 manifests="$(sed -e "s|@ENVD_IMAGE@|$envd_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" -e "s|@SPEC_KEY_SHA256@|$spec_sum|" \
-  -e "s|@UPSTREAM@|$mgmt_ip:$api_port|" -e "s|@CLUSTER@|$CELL_NAME|" -e "s|@REGISTRY_ADDRESS@|$registry_ip:$registry_port|" -e "s|@MGMT_TRUST_DOMAIN@|$mgmt_td|g" -e "s|@POC_ENV@|$POC_ENV|" -e "s|@POC_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" "$here/manifests.yaml")"
+  -e "s|@UPSTREAM@|$mgmt_ip:$api_port|" -e "s|@CLUSTER@|$CELL_NAME|" -e "s|@REGISTRY_ADDRESS@|$registry_ip:$registry_port|" -e "s|@MGMT_TRUST_DOMAIN@|$mgmt_td|g" -e "s|@POC_ENV@|$POC_ENV|" -e "s|@POC_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" "$here/manifests.yaml" \
+  | APPS="$argo_apps" yq '(select(.kind == "Role" and .metadata.name == "envd-argocd") | .rules[] | select(.resourceNames == "@ARGOCD_APPS@")
+    | .resourceNames) = (env(APPS) | ... style="flow")')"
 grep -q '@[A-Z_]*@' <<<"$manifests" && die "the manifests keep a token that the render does not replace"
 
 deployment="$(yq 'select(.kind == "Deployment")' <<<"$manifests" \

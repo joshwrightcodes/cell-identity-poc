@@ -95,7 +95,8 @@ func TestEnvdBundleFlags(t *testing.T) {
 }
 
 // TestEnvdRBACExact checks every right that the apply engine needs, and no other: Role envd-argocd in argocd (list
-// Applications, and patch only the Application root), ClusterRole envd-netpol-read (list NetworkPolicies), Role
+// Applications, and patch only root and the Application of each component of role cp), ClusterRole envd-netpol-read
+// (list NetworkPolicies), Role
 // envd-bundle-state in envd-system (create ConfigMaps, and get and update only bundle-state), the earlier Role envd-records, and a
 // binding of each to the envd account of envd-system. Every object carries the harness label.
 func TestEnvdRBACExact(t *testing.T) {
@@ -104,7 +105,7 @@ func TestEnvdRBACExact(t *testing.T) {
 	if role == nil {
 		t.Fatal("the render prints no Role envd-argocd in argocd")
 	}
-	wantRules := `[map[apiGroups:[argoproj.io] resources:[applications] verbs:[list]] map[apiGroups:[argoproj.io] resourceNames:[root] resources:[applications] verbs:[patch]]]`
+	wantRules := argoRules(argoApps(t, "cp"))
 	if got := fmt.Sprint(get[[]any](t, role, "rules")); got != wantRules {
 		t.Errorf("Role envd-argocd rules are %s, want %s", got, wantRules)
 	}
