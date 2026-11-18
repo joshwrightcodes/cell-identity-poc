@@ -50,6 +50,10 @@ const (
 	maxSetLayerBytes = 8 * bundle.MaxLayerBytes
 )
 
+// DetailTarget is the detail of a payload_invalid refusal for a set whose predicate names another
+// target than the applier or the operation. A cell reports it as wrong_target.
+const DetailTarget = "target"
+
 // ErrLockHeld means that another holder, or another Apply of this process, has the apply lock. The
 // caller retries later.
 var ErrLockHeld = errors.New("bundle apply lock is held")
@@ -265,7 +269,7 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 	case err != nil:
 		return refused(op.ReasonPayloadInvalid, "statement"), nil
 	case st.Predicate.Target != cfg.Target || st.Predicate.Target != opTarget:
-		return refused(op.ReasonPayloadInvalid, "target"), nil
+		return refused(op.ReasonPayloadInvalid, DetailTarget), nil
 	case st.Predicate.Env != cfg.Env:
 		return refused(op.ReasonEnvMismatch, ""), nil
 	}

@@ -18,9 +18,6 @@ import (
 // statusTimeout bounds the read of the bundle state for a status report.
 const statusTimeout = 5 * time.Second
 
-// detailTarget is the detail that the engine gives to a set that names another target.
-const detailTarget = "target"
-
 // BundleApplier is the part of bundleapply.Applier that the plane path uses.
 type BundleApplier interface {
 	Apply(ctx context.Context, opID, opTarget string, attestation []byte) (bundleapply.Outcome, error)
@@ -175,7 +172,7 @@ func (p *Plane) apply(ctx context.Context, o op.Operation, sha string) {
 		}
 		return
 	}
-	if out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == detailTarget {
+	if out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == bundleapply.DetailTarget {
 		out.Reason = op.ReasonWrongTarget
 	}
 	detail := out.Detail

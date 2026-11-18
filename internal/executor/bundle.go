@@ -14,9 +14,6 @@ type bundleApplier interface {
 	Status(ctx context.Context) (*op.BundleStatus, error)
 }
 
-// detailTarget is the detail that the engine gives to a set or an operation for another target.
-const detailTarget = "target"
-
 // applyBundle returns the effect of bundle.apply. A final outcome other than applied comes back as a
 // *Final, so that the executor records it. An error from the engine is a fault that a repeat of the
 // operation can resume: the executor records no result for it.
@@ -40,7 +37,7 @@ func finalOf(out bundleapply.Outcome) error {
 	switch {
 	case out.Outcome == op.OutcomeApplied:
 		return nil
-	case out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == detailTarget:
+	case out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == bundleapply.DetailTarget:
 		return &Final{Outcome: op.OutcomeRefused, Reason: op.ReasonWrongTarget, Detail: out.Detail}
 	}
 	return &Final{Outcome: out.Outcome, Reason: out.Reason, Detail: out.Detail}
