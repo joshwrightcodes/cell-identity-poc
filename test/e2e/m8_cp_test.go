@@ -118,14 +118,17 @@ func TestM8CpAdmitStageSigned(t *testing.T) {
 
 	// A failure after the delete must not leave the harness without the cell: the cleanup recreates it when its cluster is absent.
 	t.Cleanup(func() {
-		if slices.Contains(kindClusters(t), cell) {
-			return
+		if !slices.Contains(kindClusters(t), cell) {
+			if _, err := portal(t, "recreate", "--cell", cell, "--wait"); err != nil {
+				t.Logf("FAILED to restore %s: %v. Run: mise run portal -- recreate --cell %s --wait", cell, err, cell)
+				return
+			}
+			waitValid(t, []string{cell}, 5*time.Minute)
 		}
-		if _, err := portal(t, "recreate", "--cell", cell, "--wait"); err != nil {
-			t.Logf("FAILED to restore %s: %v. Run: mise run portal -- recreate --cell %s --wait", cell, err, cell)
-			return
+		// A recreated cell holds the bootstrap state until a signed set reaches it.
+		if m8State(t, cell).Source != "signed" {
+			m8PublishSigned(t, cell)
 		}
-		waitValid(t, []string{cell}, 5*time.Minute)
 	})
 
 	// cell:down renders dev-cp again. The address of the deleted cell must leave both policies, so a later admit adds it back.
@@ -178,4 +181,20 @@ func TestM8CpAdmitStageSigned(t *testing.T) {
 		}
 	}
 	waitValid(t, []string{cell}, 5*time.Minute)
+	m8PublishSigned(t, cell)
+}
+
+// m8PublishSigned publishes the hydrated set to a target with a signed publish and waits for the outcome applied, so that the target
+// leaves the bootstrap state. It records the target for gate:m8:repair, and logs a failure instead of failing.
+func m8PublishSigned(t *testing.T, target string) {
+	t.Helper()
+	m8RecordTarget(t, target)
+	res, err := m8PublishHydrated(t, target)
+	if err != nil {
+		t.Logf("FAILED to publish a signed set to %s: %v. Run: mise run bundle -- publish --target %s --wait", target, err, target)
+		return
+	}
+	if res["outcome"] != op.OutcomeApplied && res["outcome"] != op.OutcomeAlreadyApplied {
+		t.Logf("the signed set of %s ended %v, want applied", target, res)
+	}
 }
