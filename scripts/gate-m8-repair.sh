@@ -116,9 +116,28 @@ signs() {
   done
 }
 
+# unserved_expired prints the ID of each bundle.apply operation that expired and was never served (signed with --no-serve). A refusal test leaves one, and it
+# blocks nothing: mgmtd refuses a new set only for a served one. A served operation that expires stays a finding of harness:status.
+unserved_expired() {
+  local ops
+  ops="$(mise run mgmt -- op list 2>/dev/null)" || die "could not list the operations of mgmtd. Run: mise run mgmt -- op list"
+  jq -r '.ops[]? | select(.state == "expired" and .kind == "bundle.apply" and .served == false) | .id' <<<"$ops" || die "mise run mgmt -- op list printed no operation list"
+}
+
 found="$(probes)" || exit 1
 reasons="$(signs)" || exit 1
-[[ -n "$found$reasons" ]] || exit 0
+unserved="$(unserved_expired)" || exit 1
+if [[ -z "$found$reasons" ]]; then
+  if ((check)); then
+    for id in $unserved; do echo "info: the operation $id expired and was never served. It is no failure. $repair closes it"; done
+  else
+    for id in $unserved; do
+      log "closing the expired operation $id, which was never served"
+      mise run mgmt -- op close "$id" >/dev/null || die "could not close the operation $id. Run: mise run mgmt -- op close $id"
+    done
+  fi
+  exit 0
+fi
 
 if ((check)); then
   while read -r cluster name; do
@@ -132,6 +151,7 @@ if ((check)); then
     [[ -n "$cluster" ]] || continue
     echo "$cluster $text. Run: $repair"
   done <<<"$reasons"
+  for id in $unserved; do echo "info: the operation $id expired and was never served. It is no failure. $repair closes it"; done
   exit 1
 fi
 
@@ -188,3 +208,7 @@ for target in "${targets[@]}"; do
   fi
 done
 rm -f "$recorded"
+for id in $unserved; do
+  log "closing the expired operation $id, which was never served"
+  mise run mgmt -- op close "$id" >/dev/null || die "could not close the operation $id. Run: mise run mgmt -- op close $id"
+done

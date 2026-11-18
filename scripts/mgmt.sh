@@ -7,7 +7,8 @@
 # names the link command, and exits with status 1. A failed kubectl exec with no output also prints one JSON error line.
 # The commands step sign and bundle sign read JSON on standard input (the step, or the components of a set), so only these
 # commands run kubectl exec with -i. Another command would take the standard input of a shell loop that calls this script.
-export CELL="${CELL:-management}"
+# mgmtd runs in management only. A caller can inherit another CELL (scripts/ops.sh exports dev-cp), so the script never takes it.
+export CELL=management
 source "$(dirname "$0")/lib.sh"
 
 if [[ "${1:-}" == rotate-signing-key ]]; then

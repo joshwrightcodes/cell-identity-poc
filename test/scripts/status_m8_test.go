@@ -195,3 +195,28 @@ func TestStatusBundles(t *testing.T) {
 		})
 	}
 }
+
+// TestStatusExpiredUnservedBundleOps: an expired bundle.apply operation that was never served (signed with --no-serve) is information in the management
+// object (unservedExpiredOps) and no problem. An expired operation that was served, or that has no served field, stays a problem with the close command.
+func TestStatusExpiredUnservedBundleOps(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	ops := func(extra map[string]any) string {
+		o := map[string]any{"id": id, "cell": "dev-cell-1", "state": "expired", "kind": "bundle.apply", "expiredAt": timeAgo(5 * time.Minute)}
+		for k, v := range extra {
+			o[k] = v
+		}
+		b, _ := json.Marshal(map[string]any{"ops": []any{o}})
+		return "STUB_MGMT_OPS=" + string(b)
+	}
+	byName, _, _, code := runStatus(t, ops(map[string]any{"served": false}))
+	m := byName["management"]["management"].(map[string]any)
+	if list, _ := m["unservedExpiredOps"].([]any); code != 0 || len(list) != 1 || len(m["expiredOps"].([]any)) != 0 {
+		t.Errorf("an unserved expired op: exit %d, unservedExpiredOps %v, expiredOps %v; want exit 0, one information entry and no failure", code, m["unservedExpiredOps"], m["expiredOps"])
+	}
+	for name, extra := range map[string]map[string]any{"served": {"served": true}, "no served field": nil, "another kind": {"served": false, "kind": "step"}} {
+		byName, _, _, code = runStatus(t, ops(extra))
+		if code != 1 || !strings.Contains(problemsOf(byName["management"]), "mise run ops -- close "+id) {
+			t.Errorf("%s: exit %d, problems %q; want exit 1 with the close command", name, code, problemsOf(byName["management"]))
+		}
+	}
+}

@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,6 +50,8 @@ esac
 const m8RepairMise = `#!/usr/bin/env bash
 echo "mise $*" >>"$STUB_DIR/calls"
 case "$*" in
+  "run mgmt -- op list") ops="${STUB_OPS:-}"; [[ -n "$ops" ]] || ops='{"ops":[]}'; printf '%s\n' "$ops" ;;
+  "run mgmt -- op close "*) echo '{"closed":true}' ;;
   "run bundle -- get --target "*)
     # STUB_GET_<cluster> is the last signed set of a target. STUB_GET_OPEN_<cluster>=n makes the first n reads print it, and every later read print a closed set.
     v="STUB_GET_FAIL"; [[ " ${!v:-} " != *" $6 "* ]] || { echo "error: could not reach mgmtd" >&2; exit 1; }
@@ -328,5 +331,35 @@ func TestGateM8RepairUnreadableSet(t *testing.T) {
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_GET_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
 	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
 		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
+	}
+}
+
+// m8Ops is the answer of mise run mgmt -- op list for one operation: state expired, kind bundle.apply, served or not. kind and state can change.
+func m8Ops(id, kind, state string, served bool) string {
+	return fmt.Sprintf(`{"ops":[{"id":%q,"cell":"dev-cell-1","kind":%q,"state":%q,"served":%v,"expiredAt":"2026-11-19T01:00:00Z"}]}`, id, kind, state, served)
+}
+
+// TestGateM8RepairClosesUnservedExpiredOps: an expired bundle.apply operation that was never served (signed with --no-serve) is a trace of a refusal test, and
+// the repair closes it with mise run mgmt -- op close. --check lists it and does not fail. A served operation, an operation that is not expired and an operation of
+// another kind are left alone.
+func TestGateM8RepairClosesUnservedExpiredOps(t *testing.T) {
+	const id = "0123456789abcdef0123456789abcdef"
+	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_OPS=" + m8Ops(id, "bundle.apply", "expired", false)}, "--check")
+	if code != 0 || !strings.Contains(out, id) || strings.Contains(calls, "op close") {
+		t.Errorf("--check: exit %d, output %q, calls %s; want exit 0 that lists %s and closes nothing", code, out, calls, id)
+	}
+	out, calls, _, code = m8RepairRun(t, "", []string{"STUB_OPS=" + m8Ops(id, "bundle.apply", "expired", false)})
+	if code != 0 || at(calls, "mise run mgmt -- op close "+id) < 0 {
+		t.Errorf("repair: exit %d\n%s\ncalls %s; want op close %s", code, out, calls, id)
+	}
+	for _, tc := range []struct{ name, ops string }{
+		{"a served expired operation", m8Ops(id, "bundle.apply", "expired", true)},
+		{"an open operation", m8Ops(id, "bundle.apply", "open", false)},
+		{"an operation of another kind", m8Ops(id, "step", "expired", false)},
+	} {
+		_, calls, _, code = m8RepairRun(t, "", []string{"STUB_OPS=" + tc.ops})
+		if code != 0 || strings.Contains(calls, "op close") {
+			t.Errorf("%s: exit %d, calls %s; want no close", tc.name, code, calls)
+		}
 	}
 }

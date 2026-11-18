@@ -36,7 +36,8 @@
 #                 pendingDrops, cells, hostsvc}: the status of mgmtd, with the revisions as epoch and counter, and the
 #                 cells as {name, bound, lastCheck, lastStatusAt, unreported, oldestUnreportedAt,
 #                 records, openOps, expiredOps, forgedSeen, lastRefusal, lastHintCheck}. expiredOps lists the operations that expired with no final
-#                 result, as {id, cell, expiredAt}. hostsvc is the status of hostsvc:serve and check, which holds
+#                 result, as {id, cell, expiredAt}. An expired bundle.apply operation that was never served is no failure: unservedExpiredOps lists it
+#                 (gate:m8:repair closes it). hostsvc is the status of hostsvc:serve and check, which holds
 #                 the text of the first failed pin or root check and is empty when both pass. When mgmtd does not
 #                 answer, the object holds only error
 # The problems of the signed bundle sets name each cell and dev-cp with: a live cluster with no signed bundle state, the state rolled_back (with the
@@ -155,7 +156,8 @@ management_plane() {
     restoreActive, pendingDrops,
     cells: [.cells[]? | {name, bound, lastCheck, lastStatusAt, unreported, oldestUnreportedAt, records, openOps, expiredOps, forgedSeen, lastRefusal, lastHintCheck}],
     opsFailed: $opsFailed,
-    expiredOps: [$ops.ops[]? | select(.state == "expired") | {id, cell, expiredAt}],
+    expiredOps: [$ops.ops[]? | select(.state == "expired" and ((.kind == "bundle.apply" and .served == false) | not)) | {id, cell, expiredAt}],
+    unservedExpiredOps: [$ops.ops[]? | select(.state == "expired" and .kind == "bundle.apply" and .served == false) | {id, cell, expiredAt}],
     hostsvc: ($hs + {check: ($check | gsub("\n"; " "))})}' <<<"$st"
 }
 
