@@ -162,7 +162,7 @@ func TestUnpackComponent(t *testing.T) {
 	}
 	for name, files := range map[string]map[string][]byte{
 		"other_name":   {"other.yaml": []byte("x")},
-		"extra_file":   {"manifests.yaml": []byte("x"), "extra.yaml": []byte("y")},
+		"extra_file":   {"manifests.yaml": []byte("kind: X\n"), "extra.yaml": []byte("y")},
 		"only_a_wrong": {"manifest.yaml": []byte("x")},
 	} {
 		b, err := bundle.Pack(files)

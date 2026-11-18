@@ -189,6 +189,10 @@ func TestPolicyCp(t *testing.T) {
 		{name: "namespace_gateway_system", component: "namespaces", want: not("harness_namespace")},
 		{name: "role_cell_controller_system", want: not("harness_namespace")},
 		{name: "configmap_apps_sample", component: "apps-sample", want: not("component_unknown")},
+		{name: "clustergenerator", component: "external-secrets", want: not("kind")},
+		{name: "clustergenerator_namespaced", component: "external-secrets", want: not("kind")},
+		{name: "clusterpushsecret", component: "external-secrets", want: not("kind")},
+		{name: "generator_password", component: "external-secrets"},
 		{name: "namespace_spire_system_injection", component: "namespaces", want: want{rPlane, "mesh_injection"}},
 	})
 }
@@ -542,7 +546,11 @@ func TestPolicyCompilerIsStrict(t *testing.T) {
 // and workloads, services, roles and policies of the namespace argocd.
 func generatedRender() []byte {
 	var sb strings.Builder
-	big := strings.Repeat("        field: {type: string, description: \"generated description of one field\"}\n", 5000)
+	var fields strings.Builder
+	for i := 0; i < 5000; i++ {
+		fmt.Fprintf(&fields, "          f%d: {type: string, description: \"generated description of one field\"}\n", i)
+	}
+	big := fields.String()
 	for i := 0; i < 3; i++ {
 		fmt.Fprintf(&sb, "---\napiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata: {name: w%d.argoproj.io}\n"+
 			"spec:\n  group: argoproj.io\n  scope: Namespaced\n  names: {kind: W%d, plural: w%ds}\n  versions:\n  - name: v1\n    schema:\n"+

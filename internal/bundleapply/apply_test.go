@@ -107,6 +107,12 @@ type env struct {
 	polls int
 }
 
+// canonBody returns the canonical form of body.
+func canonBody(t testing.TB, body string) []byte {
+	t.Helper()
+	return canonicalOf(t, []byte(body))
+}
+
 func cmap(ns, name, v string) string {
 	return fmt.Sprintf("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: %s\n  namespace: %s\ndata:\n  v: %q\n", name, ns, v)
 }
@@ -174,7 +180,7 @@ func (e *env) build(target string, v bundle.Version, specs []spec) built {
 	b := built{arts: map[string]bundle.Artifact{}}
 	b.set.Version = v
 	for _, s := range specs {
-		art, err := bundle.Pack(map[string][]byte{bundle.ManifestsFile: []byte(s.body)})
+		art, err := bundle.Pack(map[string][]byte{bundle.ManifestsFile: canonBody(e.t, s.body)})
 		if err != nil {
 			e.t.Fatal(err)
 		}
@@ -610,9 +616,42 @@ func TestApplyComponentNotAllowed(t *testing.T) {
 		wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonComponentNotAllowed, "namespace")
 		e.assertUntouched(t)
 	})
+	for name, body := range map[string]string{
+		"not canonical": cmap("apps-demo", "x", "1"),
+		"json then yaml": `{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"apps-demo"}}` + "\n" +
+			"apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata: {name: pwn}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			art, err := bundle.PackUnchecked(map[string][]byte{"manifests.yaml": []byte(body)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.seed(e.mirrorReg, "bundles/"+tTarget+"/apps-sample", art)
+			b := e.set(1, std("v1"))
+			set := b.set
+			for i := range set.Components {
+				if set.Components[i].Name == "apps-sample" {
+					set.Components[i].Digest = art.Digest
+				}
+			}
+			root, err := bundle.ComposeRoot("cell", set, e.cfg.Policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b.set = set
+			b.att = e.sign(b, tEnv, tTarget, root.Digest, e.priv)
+			want := "not_canonical"
+			if name == "json then yaml" {
+				want = "layout"
+			}
+			wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonComponentNotAllowed, want)
+			e.assertUntouched(t)
+		})
+	}
 	t.Run("layout", func(t *testing.T) {
 		e := newEnv(t)
-		art, err := bundle.Pack(map[string][]byte{"manifests.yaml": []byte(cmap("apps-demo", "x", "1")), "extra.yaml": []byte("a: b\n")})
+		art, err := bundle.Pack(map[string][]byte{"manifests.yaml": canonBody(t, cmap("apps-demo", "x", "1")), "extra.yaml": []byte("a: b\n")})
 		if err != nil {
 			t.Fatal(err)
 		}

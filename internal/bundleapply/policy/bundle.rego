@@ -36,7 +36,7 @@ builtin_cluster := {
 	"policy.networking.k8s.io/ClusterNetworkPolicy",
 	"gateway.networking.k8s.io/GatewayClass",
 	"external-secrets.io/ClusterSecretStore", "external-secrets.io/ClusterExternalSecret",
-	"external-secrets.io/ClusterGenerator",
+	"external-secrets.io/ClusterPushSecret", "generators.external-secrets.io/ClusterGenerator",
 	"authentication.k8s.io/TokenReview", "authorization.k8s.io/SubjectAccessReview",
 	"authorization.k8s.io/SelfSubjectAccessReview", "authorization.k8s.io/SelfSubjectRulesReview",
 }
@@ -52,7 +52,7 @@ builtin_namespaced_groups := {
 	"apps", "batch", "autoscaling", "policy", "coordination.k8s.io", "discovery.k8s.io",
 	"events.k8s.io", "networking.k8s.io", "rbac.authorization.k8s.io", "security.istio.io",
 	"networking.istio.io", "telemetry.istio.io", "extensions.istio.io",
-	"gateway.networking.k8s.io", "external-secrets.io", "argoproj.io",
+	"gateway.networking.k8s.io", "external-secrets.io", "generators.external-secrets.io", "argoproj.io",
 }
 
 entry(reason, detail) := {

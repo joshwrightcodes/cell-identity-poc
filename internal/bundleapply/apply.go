@@ -457,7 +457,7 @@ func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (O
 			}
 			return refused(op.ReasonComponentNotAllowed, "layout"), nil
 		}
-		objs, err := Decode(body, bundle.MaxObjects)
+		objs, err := DecodeCanonical(body, bundle.MaxObjects)
 		if err != nil {
 			if ref, ok := asRefusal(err); ok {
 				a.log.Warn("bundle refused", "component", c.Name, "reason", ref.Reason, "detail", ref.Detail)

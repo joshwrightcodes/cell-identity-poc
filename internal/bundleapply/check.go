@@ -14,11 +14,14 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/storage"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
+	yamlv3 "go.yaml.in/yaml/v3"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"sigs.k8s.io/yaml"
 
@@ -80,6 +83,9 @@ func layout(detail string) *Refusal {
 // objects give too_large, and a document that is not an object with apiVersion, kind and a name
 // gives layout.
 func Decode(manifests []byte, maxObjects int) ([]Object, error) {
+	if !plainText(manifests) {
+		return nil, layout("layout")
+	}
 	rd := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(manifests)))
 	var objs []Object
 	for {
@@ -88,6 +94,9 @@ func Decode(manifests []byte, maxObjects int) ([]Object, error) {
 			return objs, nil
 		}
 		if err != nil {
+			return nil, layout("layout")
+		}
+		if !singlePlainDocument(doc) {
 			return nil, layout("layout")
 		}
 		var raw map[string]any
@@ -401,4 +410,94 @@ func denials(rs rego.ResultSet, evalErr error) ([]denial, error) {
 		out = append(out, d)
 	}
 	return out, nil
+}
+
+// plainText reports whether the bytes hold only text that every YAML reader splits into lines in
+// the same way: valid UTF-8 with no byte order mark, no NUL byte, no lone carriage return, no
+// NEL, line separator or paragraph separator, and no line that starts a YAML document end marker.
+func plainText(b []byte) bool {
+	if !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 || bytes.Contains(b, []byte("\xef\xbb\xbf")) {
+		return false
+	}
+	for i := 0; i < len(b); i++ {
+		if b[i] == '\r' && (i+1 >= len(b) || b[i+1] != '\n') {
+			return false
+		}
+	}
+	for _, r := range string(b) {
+		if r == '\u0085' || r == '\u2028' || r == '\u2029' {
+			return false
+		}
+	}
+	for _, line := range bytes.Split(b, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("...")) && (len(line) == 3 || line[3] == ' ' || line[3] == '\t' || line[3] == '\r') {
+			return false
+		}
+	}
+	return true
+}
+
+// singlePlainDocument reports whether chunk is zero or one YAML document that starts with a block
+// construct and holds no anchor, alias, merge key, tag or duplicate key.
+func singlePlainDocument(chunk []byte) bool {
+	first := bytes.TrimLeftFunc(chunk, unicode.IsSpace)
+	if len(first) > 0 && (first[0] == '{' || first[0] == '[') {
+		return false
+	}
+	dec := yamlv3.NewDecoder(bytes.NewReader(chunk))
+	var n yamlv3.Node
+	if err := dec.Decode(&n); err != nil {
+		return errors.Is(err, io.EOF)
+	}
+	var again yamlv3.Node
+	if err := dec.Decode(&again); !errors.Is(err, io.EOF) {
+		return false
+	}
+	return plainNode(&n)
+}
+
+func plainNode(n *yamlv3.Node) bool {
+	if n.Anchor != "" || n.Kind == yamlv3.AliasNode || n.Style&yamlv3.TaggedStyle != 0 {
+		return false
+	}
+	if n.Kind == yamlv3.MappingNode {
+		seen := make(map[string]bool, len(n.Content)/2)
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			k := n.Content[i]
+			if k.Kind == yamlv3.ScalarNode {
+				if k.Tag == "!!merge" || seen[k.Value] {
+					return false
+				}
+				seen[k.Value] = true
+			}
+		}
+	}
+	for _, c := range n.Content {
+		if !plainNode(c) {
+			return false
+		}
+	}
+	return true
+}
+
+// DecodeCanonical decodes manifests and refuses them unless they are the canonical form of their own
+// objects (bundle.Canonical). Only that form reads the same in every YAML and JSON reader, so the
+// objects that the policy sees are the objects that Argo CD applies.
+func DecodeCanonical(manifests []byte, maxObjects int) ([]Object, error) {
+	objs, err := Decode(manifests, maxObjects)
+	if err != nil {
+		return nil, err
+	}
+	raws := make([]map[string]any, len(objs))
+	for i, o := range objs {
+		raws[i] = o.Raw
+	}
+	canon, err := bundle.Canonical(raws)
+	if err != nil {
+		return nil, layout("layout")
+	}
+	if !bytes.Equal(canon, manifests) {
+		return nil, layout("not_canonical")
+	}
+	return objs, nil
 }
