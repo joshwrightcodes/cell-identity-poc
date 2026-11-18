@@ -16,7 +16,10 @@ dns_service_ip="$(k -n kube-system get service kube-dns -o jsonpath='{.spec.clus
 
 [[ -n "$pod_cidr" && -n "$service_cidr" && -n "$node_ips" && -n "$api_ips" && -n "$dns_service_ip" ]] || die "could not read the cluster facts"
 
-cat >"$FACTS" <<EOF
+# A render and the publish check read the time of facts.env, so the file keeps its time when the facts are the same.
+tmp="$(mktemp "$BUILD/.facts.env.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<EOF
 POD_CIDR='$pod_cidr'
 SERVICE_CIDR='$service_cidr'
 NODE_IPS='${node_ips% }'
@@ -25,5 +28,12 @@ API_SERVER_PORT='$api_port'
 API_SERVICE_IP='$api_service_ip'
 DNS_SERVICE_IP='$dns_service_ip'
 EOF
-log "wrote $FACTS"
+if [[ -f "$FACTS" ]] && cmp -s "$tmp" "$FACTS"; then
+  log "$FACTS is unchanged"
+else
+  mv "$tmp" "$FACTS"
+  log "wrote $FACTS"
+fi
+trap - EXIT
+rm -f "$tmp"
 cat "$FACTS" >&2

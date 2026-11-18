@@ -100,3 +100,59 @@ func TestImagesEnvChangesOnlyWithADigest(t *testing.T) {
 		t.Errorf("temporary files left: %v", left)
 	}
 }
+
+// koImageCheck runs ko_image for the image celld in the temporary root, with a stub oras that finds every reference. It returns the reference
+// from standard output, the standard error, and the error.
+func koImageCheck(t *testing.T, root string) (string, string, error) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(root, "bin", "oras"), []byte("#!/usr/bin/env bash\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", "-c", `source "$1/scripts/ko-image.sh"; ko_image celld`, "bash", root)
+	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME")}
+	var stdout, stderr strings.Builder
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	err := cmd.Run()
+	return stdout.String(), stderr.String(), err
+}
+
+// TestImagesStampClearsKoImage: ko_image compares the Go sources with a build stamp that every successful images.sh run touches, and not with
+// images.env, which keeps its time when no digest changes. A Go edit that changes no digest must therefore stop ko_image until images.sh runs, and
+// one run must clear it, while images.env keeps its time for the bundle freshness rule.
+func TestImagesStampClearsKoImage(t *testing.T) {
+	root := imagesRoot(t)
+	src := filepath.Join(root, "internal", "x", "x.go")
+	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(src, []byte("package x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	envFile := imagesRun(t, root, nil)
+	if _, errOut, err := koImageCheck(t, root); err != nil {
+		t.Fatalf("a fresh build failed: %v\n%s", err, errOut)
+	}
+	// The build is old, and a Go file changed after it.
+	past := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	for _, f := range []string{envFile, filepath.Join(root, "build", "images.stamp")} {
+		if err := os.Chtimes(f, past, past); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+	}
+	edit := past.Add(time.Hour)
+	if err := os.Chtimes(src, edit, edit); err != nil {
+		t.Fatal(err)
+	}
+	if _, errOut, err := koImageCheck(t, root); err == nil || !strings.Contains(errOut, "internal/x/x.go") || !strings.Contains(errOut, "Run mise run images again") {
+		t.Fatalf("a Go edit without images.sh: err %v, stderr %q; want a failure that names the file and the command", err, errOut)
+	}
+	// The same digests: images.env keeps its time, and the check passes.
+	imagesRun(t, root, nil)
+	if info, _ := os.Stat(envFile); !info.ModTime().Equal(past) {
+		t.Errorf("images.env changed with the same digests (mtime %s, want %s)", info.ModTime(), past)
+	}
+	if out, errOut, err := koImageCheck(t, root); err != nil || !strings.HasPrefix(out, "localhost:5001/celld@sha256:") {
+		t.Fatalf("after images.sh the check failed: err %v, stdout %q, stderr %q", err, out, errOut)
+	}
+}

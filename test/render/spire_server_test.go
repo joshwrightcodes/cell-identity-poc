@@ -423,12 +423,13 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
+	stampFile := write("images.stamp", "", 0o644)
 	switch opts["STUB_IMAGES"] {
 	case "missing":
 		imagesFile = filepath.Join(dir, "no-images.env")
 	case "stale":
 		old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		if err := os.Chtimes(imagesFile, old, old); err != nil {
+		if err := os.Chtimes(stampFile, old, old); err != nil {
 			t.Fatal(err)
 		}
 	}

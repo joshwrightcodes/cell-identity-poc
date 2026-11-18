@@ -4,26 +4,33 @@
 #
 # `mise run images` records the reference of each image that this Mac built in build/images.env.
 # The helpers read only those references and never resolve a tag. IMAGES_ENV overrides the path.
+# Every successful run of `mise run images` also touches build/images.stamp, next to that file, even when no digest changed and the
+# file keeps its time. The helpers compare the Go sources with the stamp. IMAGES_STAMP overrides its path.
 
 sha256() {
   if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
 }
 
 # ko_image <name> prints the pinned reference <repo>@sha256:<digest> of the image cmd/<name>.
-# It fails when build/images.env is missing, older than the Go sources, or names an image that the
-# registry does not hold.
+# It fails when build/images.env is missing, when the last image build is older than the Go sources, or when the file names an image
+# that the registry does not hold.
 ko_image() {
-  local name="$1" root file var ref newer
+  local name="$1" root file stamp var ref newer
   root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
   file="${IMAGES_ENV:-$root/build/images.env}"
   if [[ ! -f "$file" ]]; then
     printf 'error: no %s. Run mise run images first.\n' "$file" >&2
     return 1
   fi
+  stamp="${IMAGES_STAMP:-$(dirname "$file")/images.stamp}"
+  if [[ ! -f "$stamp" ]]; then
+    printf 'error: no %s. Run mise run images first.\n' "$stamp" >&2
+    return 1
+  fi
   newer="$(find "$root/cmd/$name" "$root/internal" "$root/go.mod" "$root/go.sum" "$root/.ko.yaml" \
-    -newer "$file" \( -name '*.go' ! -name '*_test.go' -o -name go.mod -o -name go.sum -o -name .ko.yaml \) -print 2>/dev/null | head -n 1)"
+    -newer "$stamp" \( -name '*.go' ! -name '*_test.go' -o -name go.mod -o -name go.sum -o -name .ko.yaml \) -print 2>/dev/null | head -n 1)"
   if [[ -n "$newer" ]]; then
-    printf 'error: %s is older than %s. Run mise run images again.\n' "$file" "${newer#"$root"/}" >&2
+    printf 'error: the last image build (%s) is older than %s. Run mise run images again.\n' "$stamp" "${newer#"$root"/}" >&2
     return 1
   fi
   var="IMAGE_$(tr 'a-z-' 'A-Z_' <<<"$name")"
