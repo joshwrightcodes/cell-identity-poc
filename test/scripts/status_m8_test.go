@@ -155,6 +155,17 @@ func TestStatusBundles(t *testing.T) {
 					})}
 				},
 				want: []string{"dev-cell-2", "allowSHA256", otherAllowSHA, statusAllowSHA, pub("dev-cell-2")}},
+			{name: "the Application root cannot be read", cluster: "dev-cell-1", env: func() []string { return []string{"STUB_ROOT_FAIL=dev-cell-1"} },
+				want: []string{"dev-cell-1", "Application root", "cannot be read", "connection to the server was refused"}},
+			{name: "the Application root of dev-cp cannot be read", cluster: "dev-cp", env: func() []string { return []string{"STUB_ROOT_FAIL=dev-cp"} },
+				want: []string{"dev-cp", "Application root", "cannot be read"}},
+			{name: "the AppProjects cannot be read", cluster: "dev-cell-2", env: func() []string { return []string{"STUB_PROJECTS_FAIL=dev-cell-2"} },
+				want: []string{"dev-cell-2", "AppProjects", "cannot be read", "connection to the server was refused"}},
+			{name: "the root of a rolled_back state is compared too", cluster: "dev-cell-1",
+				env: func() []string {
+					return []string{stubVar("BUNDLE_STATE", "dev-cell-1") + "=" + bundleState(rolledBack), stubVar("ROOT_REV", "dev-cell-1") + "=" + otherRoot}
+				},
+				want: []string{"dev-cell-1", "Application root", otherRoot, statusRootDigest}},
 			{name: "a cell that reported no bundle status is no allow-list mismatch",
 				env: func() []string {
 					return []string{"STUB_MGMT_STATUS=" + healthyPlane(func(m map[string]any) {
@@ -218,5 +229,14 @@ func TestStatusExpiredUnservedBundleOps(t *testing.T) {
 		if code != 1 || !strings.Contains(problemsOf(byName["management"]), "mise run ops -- close "+id) {
 			t.Errorf("%s: exit %d, problems %q; want exit 1 with the close command", name, code, problemsOf(byName["management"]))
 		}
+	}
+}
+
+// TestStatusBundleChecksNeedMgmtStatus: the allow-list comparison and the open-set check read mise run mgmt -- status. When it cannot be read, the object of
+// management says that these checks did not run, and no cluster passes in silence.
+func TestStatusBundleChecksNeedMgmtStatus(t *testing.T) {
+	byName, _, _, code := runStatus(t, "STUB_MGMT_RC=1")
+	if code != 1 || !strings.Contains(problemsOf(byName["management"]), "bundle checks that read the status of mgmtd") {
+		t.Errorf("exit %d, problems %q; want a problem that names the skipped bundle checks", code, problemsOf(byName["management"]))
 	}
 }

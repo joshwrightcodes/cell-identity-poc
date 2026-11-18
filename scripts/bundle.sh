@@ -246,6 +246,32 @@ check_not_older() {
   die "the verified root is signed at version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$signed"), which is older than the version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$recorded") that the state records for good[0]. Repair would roll $CELL_NAME back to older signed content. If that is intended, run it again with --allow-older"
 }
 
+# police_bundle <component> <directory> runs conftest with bundle.rego, allow.json, the role and the component, the harness plane policies of the role and the
+# scope of the custom kinds that the bundle defines (as the engine learns it), over manifests.yaml of the pulled bundle. A denial stops the repair
+# with each message printed. Nothing has changed in the cluster at this point.
+police_bundle() {
+  local comp="$1" dir="$2" allow data file out rc=0
+  allow="${BUNDLE_ALLOW_JSON:-$ROOT/internal/bundle/allow.json}"
+  data="$work/policy-$comp"
+  file="$work/$comp.manifests.yaml"
+  mkdir -p "$data/allow" "$data/context" "$data/harness" "$data/scope"
+  tar -xzOf "$dir/layer.tgz" manifests.yaml >"$file" || die "the bundle $comp of the good root holds no manifests.yaml"
+  cp "$allow" "$data/allow/data.json"
+  jq -nc --arg role "$role" --arg c "$comp" '{role: $role, component: $c}' >"$data/context/data.json"
+  jq -c --arg role "$role" '{networkPolicies: [.roles[$role].planePolicies[]? | {namespace, name}]}' "$allow" >"$data/harness/data.json" \
+    || die "could not read the plane policies of role $role from $allow"
+  yq -N -r 'select(.kind == "CustomResourceDefinition") | .spec.group + "/" + .spec.names.kind + " " + .spec.scope' "$file" \
+    | jq -Rsc '[split("\n")[] | select(length > 0) | split(" ")] | {cluster: [.[] | select(.[1] == "Cluster") | .[0]], namespaced: [.[] | select(.[1] == "Namespaced") | .[0]]}' >"$data/scope/data.json" \
+    || die "could not read the custom kinds of the bundle $comp"
+  out="$(mise x -- conftest test --policy "$ROOT/internal/bundleapply/policy" --namespace bundle.allow --data "$data" --output json --no-color "$file" 2>"$work/conftest.err")" || rc=$?
+  if ((rc != 0 && rc != 1)) || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$out"; then
+    die "conftest failed for the bundle $comp of the good root (exit $rc): $(tail -n 1 "$work/conftest.err")"
+  fi
+  if jq -e 'any(.[]; (.failures // []) | length > 0)' >/dev/null <<<"$out"; then
+    die "the bundle policy refuses the bundle $comp of the good root of $CELL_NAME, so repair does not apply it: $(jq -r '[.[].failures[]?.msg] | join("; ")' <<<"$out"). The signature proves that mgmtd signed the root, not that the engine accepted it"
+  fi
+}
+
 _repair() {
   local role state good root_digest store anchor origin host root_repo comp_repo stmt component rev text apps_want
   _check
@@ -282,6 +308,12 @@ _repair() {
         || die "the signed statement names another digest for $component than the root layer ($rev)"
     fi
     pull_bundle "$host" "$comp_repo/$component" "$rev" "$work/$component"
+  done
+  # A signature proves that mgmtd signed this root for this target. It does not prove that an engine ever accepted it: mgmtd signs every set of the
+  # right shape, and the cosign bundle reaches the mirror before any engine reads the set. The repair applies the two bundles as the administrator, so
+  # the bundle policy (the bundle.rego and the allow.json that the engine runs) must pass them first.
+  for component in argocd cell-system; do
+    police_bundle "$component" "$work/$component"
   done
   # Every Application of the good root must come back: the root layer names each one.
   apps_want="$(for f in $(tar -tzf "$work/root/layer.tgz" | grep '\.yaml$'); do

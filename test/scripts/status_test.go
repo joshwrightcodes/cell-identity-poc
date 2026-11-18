@@ -215,9 +215,11 @@ case "$args" in
     var="STUB_BUNDLE_STATE_${ctx#kind-}"; var="${var//-/_}"
     if [[ -n "${!var+x}" ]]; then printf '%s' "${!var}"; else printf '%s' '{"source":"signed","state":"healthy","root":{"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}}'; fi ;;
   *" -n argocd get application root "*)
+    [[ " ${STUB_ROOT_FAIL:-} " != *" ${ctx#kind-} "* ]] || { echo "error: the connection to the server was refused" >&2; exit 1; }
     var="STUB_ROOT_REV_${ctx#kind-}"; var="${var//-/_}"
     printf '%s' "${!var-sha256:1111111111111111111111111111111111111111111111111111111111111111}" ;;
   *" -n argocd get appprojects -o json "*)
+    [[ " ${STUB_PROJECTS_FAIL:-} " != *" ${ctx#kind-} "* ]] || { echo "error: the connection to the server was refused" >&2; exit 1; }
     var="STUB_ALLOW_ANN_${ctx#kind-}"; var="${var//-/_}"
     jq -nc --arg a "${!var-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" '(if $a == "" then {} else {"poc.internal/allow-sha256": $a} end) as $ann
       | {items: [{metadata: {name: "cell", annotations: $ann}}, {metadata: {name: "cell-app", annotations: $ann}}, {metadata: {name: "default"}}]}' ;;

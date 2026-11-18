@@ -429,8 +429,12 @@ provisioning_problems() {
 bundle_problems() {
   local st cluster role ns state root_rev projects projs reported out now clock_problem extra='[]'
   st="$(mise run mgmt -- status 2>/dev/null)" || st=""
-  jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st" || st='{}'
   addp() { extra="$(jq -c --arg c "$1" --arg p "$2" '. + [{cluster: $c, problem: $p}]' <<<"$extra")"; }
+  # The allow-list comparison and the open-set check of dev-cp read this status. Without it they cannot run, and the object of management says so.
+  if ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
+    st='{}'
+    addp management "the bundle checks that read the status of mgmtd (the allow-list digest of each applier and the open set of dev-cp) did not run, because mise run mgmt -- status gave no status. Run: mise run mgmt -- status"
+  fi
   read_clock
   for cluster in $clusters; do
     role="$(bundle_role_of "$cluster" 2>/dev/null)" || continue
@@ -446,10 +450,19 @@ bundle_problems() {
       addp "$cluster" "ConfigMap bundle-state of $cluster holds no JSON object. Run: mise run bundle -- publish --target $cluster --wait"
       continue
     fi
-    root_rev="$(kubectl --context "kind-$cluster" -n argocd get application root -o 'jsonpath={.status.sync.revision}' 2>/dev/null)" || root_rev=""
-    projects="$(kubectl --context "kind-$cluster" -n argocd get appprojects -o json 2>/dev/null)" || projects='{"items":[]}'
-    projs="$(jq -c --arg role "$role" --argjson p "$projects" '[.roles[$role].appProjects[]? as $n
-      | {name: $n, annotation: ([$p.items[]? | select(.metadata.name == $n) | .metadata.annotations["poc.internal/allow-sha256"]][0] // "")}]' "${BUNDLE_ALLOW_JSON:-$ROOT/internal/bundle/allow.json}")" || projs='[]'
+    if ! root_rev="$(kubectl --context "kind-$cluster" -n argocd get application root -o 'jsonpath={.status.sync.revision}' 2>&1)"; then
+      addp "$cluster" "the Application root of $cluster cannot be read, so its root is not compared with the bundle state: ${root_rev//$'\n'/ }. Run: CELL=$cluster mise run cell:verify"
+      root_rev=""
+    fi
+    if ! projects="$(kubectl --context "kind-$cluster" -n argocd get appprojects -o json 2>&1)"; then
+      addp "$cluster" "the AppProjects of $cluster cannot be read, so their allow-list digest is not compared: ${projects//$'\n'/ }. Run: CELL=$cluster mise run cell:verify"
+      projects='{"items":[]}'
+      projs='[]'
+    elif ! projs="$(jq -c --arg role "$role" --argjson p "$projects" '[.roles[$role].appProjects[]? as $n
+      | {name: $n, annotation: ([$p.items[]? | select(.metadata.name == $n) | .metadata.annotations["poc.internal/allow-sha256"]][0] // "")}]' "${BUNDLE_ALLOW_JSON:-$ROOT/internal/bundle/allow.json}")"; then
+      addp "$cluster" "the AppProjects of $cluster could not be evaluated. Run: CELL=$cluster mise run cell:verify"
+      projs='[]'
+    fi
     reported="$(jq -r --arg role "$role" --arg c "$cluster" 'if $role == "cp" then .planeBundleStatus.allowSHA256 // ""
       else [.cells[]? | select(.name == $c) | .bundleStatus.allowSHA256 // empty][0] // "" end' <<<"$st")"
     out="$(jq -c --arg c "$cluster" --arg role "$role" --arg rootrev "$root_rev" --arg reported "$reported" --argjson projs "$projs" --argjson now "$now" --argjson m "$st" '
@@ -465,7 +478,7 @@ bundle_problems() {
           else empty end),
          (if (.state == "applying" or .state == "rolling_back") and ((.until // "") | ts) > 1000000000 and ($now - ((.until // "") | ts)) > 600
           then "the bundle state of \($c) has been \(.state) since before \(.until), which is more than 10 minutes. \(pub)" else empty end),
-         (if .state == "healthy" and $rootrev != "" and $rootrev != (.root.digest // "")
+         (if (.state == "healthy" or .state == "rolled_back") and $rootrev != "" and $rootrev != (.root.digest // "")
           then "the Application root of \($c) is at \($rootrev), and the bundle state records the root \(.root.digest // "none"). \(pub)" else empty end)]
       end)
       + (if $reported == "" then [] else

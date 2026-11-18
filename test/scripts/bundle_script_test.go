@@ -60,6 +60,9 @@ case "$*" in
       payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" --argjson v "$v" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}})), predicate: (if $v == null then {} else {version: $v} end)}' | base64 | tr -d '\n')"
       printf '{"payloadType":"application/vnd.in-toto+json","payload":"%s","signatures":[{"sig":"x"}]}\n' "$payload"
     done ;;
+  "x -- conftest "*)
+    # The policy check of repair runs the real conftest over the real bundle.rego and allow.json of the checkout.
+    shift 3; exec conftest "$@" ;;
   "run bundlectl -- push "*)
     [[ -z "${STUB_PUSH_FAIL:-}" ]] || fail "push failed"
     echo "$comps" ;;
@@ -152,9 +155,9 @@ type bundleRoot struct {
 
 func newBundleRoot(t *testing.T, clusters ...string) *bundleRoot {
 	t.Helper()
-	testtool.Need(t, "yq", "jq", "bash", "tar")
+	testtool.Need(t, "yq", "jq", "bash", "tar", "conftest")
 	r := &bundleRoot{t: t, dir: t.TempDir()}
-	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib", "internal/bundle", "internal/bundleapply/policy"} {
 		copyFiles(t, r.dir, d)
 	}
 	r.log = filepath.Join(r.dir, "calls.log")
@@ -189,7 +192,7 @@ func (r *bundleRoot) age() {
 			return nil
 		})
 	}
-	for _, d := range []string{"scripts", "cells", "harness", "components"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components", "internal"} {
 		set(filepath.Join(r.dir, d), time.Now().Add(-3*time.Hour), "")
 	}
 	set(filepath.Join(r.dir, "build"), time.Now().Add(-time.Hour), "manifests.yaml")
