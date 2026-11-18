@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -134,6 +135,9 @@ func hopWith(base m7Hop, name, expect string) m7Hop {
 	return base
 }
 
+// m7NonceLine matches the line that attestprobe prints when the server sent a nonce. The error text "request a nonce: ..." is no such line.
+var m7NonceLine = regexp.MustCompile(`(?m)^nonce:`)
+
 // TestM7InterceptCelldBind (hop A) points the bind client of celld, through the attestprobe gw-bind target that uses internal/bind, at
 // an impostor. celld has no mode that runs only the bind client, so the probe stands in; it builds the same TLS settings with
 // bind.ClientTLS. The nonce request is the first request of every bind, and it fails before any token exists. The error names the
@@ -151,7 +155,7 @@ func TestM7InterceptCelldBind(t *testing.T) {
 		}
 		return logs
 	}, func(t *testing.T, out string, c m7Case) {
-		if !strings.Contains(out, c.reason+":") || strings.Contains(out, "nonce:") {
+		if !strings.Contains(out, c.reason+":") || m7NonceLine.MatchString(out) {
 			t.Errorf("the bind client printed %q, want the error text to name %s and no nonce", out, c.reason)
 		}
 	}, nil)

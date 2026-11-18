@@ -238,7 +238,7 @@ func TestM7PolicyWindow(t *testing.T) {
 	items := []any{
 		testPod(names[0], probeImage, watchArgs(targets[0]), nil, nil),
 		testPod(names[1], probeImage, watchArgs(targets[1]), nil, nil),
-		attestProbePod(names[2], []string{"--variant", "other-subject", "--cell", cell, "--env", pocEnv, "--server", spireAddr, "--timeout", "25s"}),
+		attestProbePod(names[2], []string{"--variant", "other-subject", "--cell", cell, "--env", pocEnv, "--server", spireAddr, "--bundle", "/run/m7/" + trustBundleMap + "/bundle.crt", "--timeout", "25s"}),
 	}
 	list, _ := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "List", "items": items})
 	if _, err := kubectl(t, cell, string(list), "-n", ns, "create", "-f", "-"); err != nil {
