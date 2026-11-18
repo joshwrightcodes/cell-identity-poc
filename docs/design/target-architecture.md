@@ -683,15 +683,15 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 
 | # | Attacker | Stopped at | Result | Phase |
 | --- | --- | --- | --- | --- |
-| 1 | Rogue cluster runs a genuine `celld` | Attestor: keys match no record | `unknown_cluster_keys` | 1 |
-| 2 | Rogue cluster claims a real cell's name, with the same default issuer | Signature check | `token_invalid` | 1 |
+| 1 | Rogue cluster runs a genuine `celld` | Attestor: keys match no record | `unknown_kid` at the attestor, and `token_invalid` with the detail `unknown_kid` at bind | 1 |
+| 2 | Rogue cluster claims a real cell's name, with the same default issuer | Signature check | `bad_signature` or `unknown_kid` at the attestor, and `token_invalid` at bind | 1 |
 | 3 | Pod with another service account or namespace | Attestor | `subject_mismatch` | 1 |
 | 4 | Token for the wrong audience | Attestor | `audience_mismatch` | 1 |
 | 5 | Expired token | Attestor | `token_expired` | 1 |
 | 6 | Token requested with a lifetime of 1 year | Attestor | `token_lifetime` | 1 |
 | 7 | Token not bound to a pod | Attestor | `token_unbound` | 1 |
 | 8 | Copied token used again, or for another attestation | Attestor nonce check | `token_replayed` | 1 |
-| 9 | Rogue serves its own JWKS for a real cell, or calls the host service | Kiln pinned TLS; host service mTLS | `issuer_untrusted` | 1 |
+| 9 | Rogue serves its own JWKS for a real cell, or calls the host service | Kiln pinned TLS; host service mTLS | `issuer_untrusted` at the client. A rogue caller of the host service gets `handshake_failed` | 1 |
 | 10 | Pod beyond the replica cap, or claiming another pod's UID | Cell gateway | `replica_cap` | 1 |
 | 11 | `celld` in cell A claims cell B | ID from verified claims | `cell_mismatch` | 1 |
 | 12 | Environment control plane forges or changes an operation or bundle | `celld` signature check | `signature_invalid` | 1 |
@@ -705,11 +705,11 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 20 | Spec with a lower revision, no Kiln signature, or invalidating several cells | envd | `spec_invalid` | 1 |
 | 21 | Cell controller step without a Kiln signature, or with a modified bootstrap set | Cell controller; bootstrap actor | `step_invalid` | 1 |
 | 22 | Environment control plane poses as a cell to Kiln, on a stream or in a reported result | Kiln second proof | `proof_missing` | 1 |
-| 23 | TLS interception, `celld` to the cell gateway | `celld` | `peer_untrusted`, or `peer_not_allowed` | 1 |
-| 24 | TLS interception, sidecar to SPIRE server | Sidecar | Connection refused | 1 |
+| 23 | TLS interception, `celld` to the cell gateway | `celld` | The `reason` field of the `bind failed` and `stream ended` logs: `peer_untrusted`, `peer_not_allowed` or `handshake_failed` | 1 |
+| 24 | TLS interception, sidecar to SPIRE server | Sidecar | The SPIRE agent refuses the server certificate, and the impostor receives no token | 1 |
 | 25 | Relay or Kiln impostor between agent and principal, with an environment-minted SVID | `cell-proxy` exact ID | `peer_not_allowed` | 1 |
-| 26 | envd connects to a fake Kiln | Pinned Kiln root | `peer_untrusted` | 1 |
-| 27 | TCP relay that only forwards, or alters bytes | TLS | Ciphertext only; `peer_untrusted` | 1 |
+| 26 | envd connects to a fake Kiln | Pinned Kiln root | `peer_untrusted` in the error field of the `pull failed` log line | 1 |
+| 27 | TCP relay that only forwards, or alters bytes | TLS | Ciphertext only, `handshake_failed`, or the connection closes | 1 |
 | 28 | Revoked cell's existing relay and principal streams | Relay; Kiln `cell-proxy` | Closed within 5 seconds | 1 |
 | 29 | Forged identity header sent straight to the principal port | Principal on `127.0.0.1` | Connection refused | 1 |
 | 30 | Annotation change other than refresh, `.operation`, or any write through the view | Admission policy in the cell | Denied; the cell does not change | 1 |
@@ -852,6 +852,11 @@ this order, each with its own scope document:
 | The M3 Kiali tunnel wait and the M5 `registry_wait` pass in a `cell:link` that runs after cells were recreated, and with zero live cells | M6 | None. Stop and report. Result: 2026-11-17, passed in both runs of `gate:m6:provision`, whose step 10 links `management` after `cell:down` of both cells, and in the drill that rebuilt `management` |
 | A server-side apply that deletes a rule or an `ipBlock` peer removes it from the live NetworkPolicy | M6 | None. Stop and report. Result 2026-11-17, in step 2 of both runs of `gate:m6:provision`, `cell:verify` of `dev-cp` with no cell found no rule or peer left from the render with cells (the drift check passed) |
 | `POC_SECRET_TOKEN_CMD` is set inside `cell:up` after mise loads the global and parent configs under the actor | M6 | The actor sets `MISE_GLOBAL_CONFIG_FILE=/dev/null` and `MISE_CEILING_PATHS`, not verified for the pinned mise. Report first. Result 2026-11-18: no step log read `.envrc.local` (0 of 7), and the global mise config does not name the variable. The value inside the actor was not printed |
+| A client refuses an impostor server at each hop with the reason of the rejection table, and the impostor receives no byte after the handshake | M7 | None. Stop and report. Result <measured in the live part> |
+| A forwarder that flips one byte of the handshake or of an application data record ends the connection, and the principal accepts no peer | M7 | None. Stop and report. Result <measured in the live part> |
+| A new pod in `dev-cell-1` with a default deny egress policy has its first blocked dial within 10 seconds, and an attestation probe of another subject gets no SVID | M7 | None. Report a time above 10 seconds. Result <measured in the live part> |
+| A host network pod in `rogue` reaches only the residual ports of the `dev-cp` and `management` nodes, and one in a cell reaches only the ports that admit its node address | M7 | None. Stop and report. Result <measured in the live part> |
+| A handshake from a pod of `rogue` to the host service, with no certificate or a wrong one, ends in a TLS alert and a `handshake refused` log line | M7 | None. Stop and report. Result <measured in the live part> |
 
 ## Departures from the Kiln canon
 
