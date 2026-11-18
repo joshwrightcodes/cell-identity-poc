@@ -1043,7 +1043,7 @@ func TestAttachDetectsLostEntry(t *testing.T) {
 	}}
 	s2 := newStore(t, reg, func(c *Client) { c.Transport = ct })
 	err := s2.AttachReferrer(ctx, testRepo, subject, Referrer{Digest: d, Size: size, MediaType: mtOCIMan})
-	if err == nil || !strings.Contains(err.Error(), "lost") {
+	if err == nil || !strings.Contains(err.Error(), "lost") || !errors.Is(err, ErrLost) {
 		t.Fatalf("a lost entry was not detected: %v", err)
 	}
 }

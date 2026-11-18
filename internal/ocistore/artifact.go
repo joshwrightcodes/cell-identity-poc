@@ -176,6 +176,10 @@ func (s *Store) Referrers(ctx context.Context, repo, subject string) ([]ocispec.
 	return s.referrersIndex(ctx, repo, subject)
 }
 
+// ErrLost is wrapped by the error of AttachReferrer when the read back finds that another writer
+// replaced the index and dropped the new entry.
+var ErrLost = errors.New("referrer entry lost")
+
 var attachLocks sync.Map // registry/repo:tag -> *sync.Mutex
 
 // AttachReferrer adds a referrer to the fallback index of the subject. The caller pushes the
@@ -231,5 +235,5 @@ func (s *Store) AttachReferrer(ctx context.Context, repo, subject string, r Refe
 			return nil
 		}
 	}
-	return fmt.Errorf("referrers index lost %s: another writer changed tag %s", desc.Digest, tag)
+	return fmt.Errorf("%w: referrers index lost %s: another writer changed tag %s", ErrLost, desc.Digest, tag)
 }
