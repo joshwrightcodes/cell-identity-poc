@@ -1,11 +1,17 @@
 package executor
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime"
+	k8stesting "k8s.io/client-go/testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
@@ -67,5 +73,55 @@ func TestStatusSeqRises(t *testing.T) {
 			t.Fatalf("call %d: seq %d after %d, want a rising value", i, s.Seq, last)
 		}
 		last = s.Seq
+	}
+}
+
+// slowStatus is a bundle applier that records how much of the status deadline is left when its
+// read starts.
+type slowStatus struct {
+	left       time.Duration
+	noDeadline bool
+}
+
+func (s *slowStatus) Apply(context.Context, string, string, []byte) (bundleapply.Outcome, error) {
+	return bundleapply.Outcome{}, nil
+}
+
+func (s *slowStatus) Status(ctx context.Context) (*op.BundleStatus, error) {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		s.noDeadline = true
+		return nil, errors.New("no deadline")
+	}
+	s.left = time.Until(dl)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestStatusReadsShareOneDeadline(t *testing.T) {
+	r := newRig(t)
+	const budget = 400 * time.Millisecond
+	r.client.PrependReactor("list", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		time.Sleep(100 * time.Millisecond)
+		return false, nil, nil
+	})
+	e := r.executor("uid-1")
+	s := &slowStatus{}
+	e.bundle = s
+	e.statusTimeout = budget
+	start := time.Now()
+	st := NewStatus("cell-1", "p", "u", "v", func() time.Time { return time.Time{} }, e)()
+	took := time.Since(start)
+	if st.Bundle != nil {
+		t.Errorf("bundle = %+v", st.Bundle)
+	}
+	if took > budget+200*time.Millisecond {
+		t.Errorf("status took %s with a budget of %s", took, budget)
+	}
+	if s.noDeadline {
+		t.Fatal("the bundle read had no deadline")
+	}
+	if s.left > budget-150*time.Millisecond {
+		t.Errorf("the bundle read had %s left, want the time of the earlier reads taken from %s", s.left, budget)
 	}
 }

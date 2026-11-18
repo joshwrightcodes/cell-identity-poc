@@ -56,11 +56,13 @@ type Config struct {
 
 // Executor applies signed operations to one cell.
 type Executor struct {
-	cfg     Config
-	bundle  bundleApplier
-	results metric.Int64Counter
+	cfg    Config
+	bundle bundleApplier
+	// statusTimeout is the one deadline for the reads of a status.
+	statusTimeout time.Duration
+	results       metric.Int64Counter
 
-	applied, refused, forged atomic.Uint64
+	applied, refused, forged, rolledBack, alreadyApplied atomic.Uint64
 
 	renewEvery time.Duration
 	// margin is how long before the lease end the context of an effect ends.
@@ -87,7 +89,7 @@ func New(cfg Config) *Executor {
 	if cfg.Meter == nil {
 		cfg.Meter = metricnoop.NewMeterProvider().Meter("celld")
 	}
-	e := &Executor{cfg: cfg, renewEvery: renewEvery, margin: effectMargin}
+	e := &Executor{cfg: cfg, renewEvery: renewEvery, margin: effectMargin, statusTimeout: statusReadTimeout}
 	if cfg.Bundle != nil {
 		e.bundle = cfg.Bundle
 		e.cfg.Kinds = withBundle(cfg.Kinds, cfg.Bundle)
@@ -105,6 +107,11 @@ func (e *Executor) result(opID, outcome, reason string, f op.Fence, sha string) 
 
 // finishFinal records the final outcome of an effect, and returns it as the result.
 func (e *Executor) finishFinal(ctx context.Context, id string, f op.Fence, sha string, fin *Final) op.Result {
+	if !op.IsFinal(fin.Outcome) {
+		e.cfg.Log.LogAttrs(ctx, slog.LevelWarn, "effect gave a final result with a local outcome",
+			slog.String("op_id", id), slog.String("outcome", fin.Outcome))
+		return e.result(id, op.OutcomeLeaseLost, ReasonEffectFailed, f, sha)
+	}
 	res := e.result(id, fin.Outcome, fin.Reason, f, sha)
 	if fin.Detail == "" || op.ValidDetail(fin.Detail) {
 		res.Detail = fin.Detail
@@ -175,14 +182,16 @@ func (e *Executor) execute(ctx context.Context, envelope []byte, f op.Fence) op.
 }
 
 // Counts holds how many results of each kind the executor has returned. ForgedSeen counts the
-// refusals for a bad signature or a wrong target (environment or cell).
+// refusals for a bad signature or a wrong target (environment or cell). RolledBack and AlreadyApplied
+// count the results of those outcomes.
 type Counts struct {
-	Applied, Refused, ForgedSeen uint64
+	Applied, Refused, ForgedSeen, RolledBack, AlreadyApplied uint64
 }
 
 // Counts returns the running totals.
 func (e *Executor) Counts() Counts {
-	return Counts{Applied: e.applied.Load(), Refused: e.refused.Load(), ForgedSeen: e.forged.Load()}
+	return Counts{Applied: e.applied.Load(), Refused: e.refused.Load(), ForgedSeen: e.forged.Load(),
+		RolledBack: e.rolledBack.Load(), AlreadyApplied: e.alreadyApplied.Load()}
 }
 
 func (e *Executor) count(res op.Result) {
@@ -191,9 +200,16 @@ func (e *Executor) count(res op.Result) {
 		e.applied.Add(1)
 	case op.OutcomeRefused:
 		e.refused.Add(1)
+		// A result of an effect carries a detail, and its set is signed, so it is not a forgery.
 		switch res.Reason {
 		case op.ReasonSignatureInvalid, op.ReasonWrongTarget, op.ReasonEnvMismatch:
-			e.forged.Add(1)
+			if res.Detail == "" {
+				e.forged.Add(1)
+			}
 		}
+	case op.OutcomeRolledBack:
+		e.rolledBack.Add(1)
+	case op.OutcomeAlreadyApplied:
+		e.alreadyApplied.Add(1)
 	}
 }

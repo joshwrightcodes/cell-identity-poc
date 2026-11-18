@@ -330,3 +330,45 @@ func TestStatusCarriesBundle(t *testing.T) {
 		t.Errorf("bundle = %+v after a failed read", broken.Bundle)
 	}
 }
+
+func TestFinalWithNonFinalOutcome(t *testing.T) {
+	r := newRig(t)
+	e := r.executor("uid-a")
+	e.cfg.Kinds[testKind] = func(context.Context, *Executor, op.Operation) error {
+		return &Final{Outcome: op.OutcomeLeaseLost, Reason: "x"}
+	}
+	o := r.operation(testKind, `{}`)
+	res := e.Execute(ctx, r.sign(o), fence(1, 1))
+	if res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonEffectFailed {
+		t.Fatalf("result = %+v", res)
+	}
+	if rec := r.record(o.ID); rec.State != stateClaimed || rec.Result != nil {
+		t.Fatalf("record = %+v, want the claim with no result", rec)
+	}
+}
+
+func TestCountsRolledBackAndAlreadyApplied(t *testing.T) {
+	r := newRig(t)
+	reader, meter := testMeter()
+	f := &fakeApplier{answers: []fakeAnswer{
+		{out: bundleapply.Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: "rollback_unhealthy"}},
+		{out: bundleapply.Outcome{Outcome: op.OutcomeAlreadyApplied}},
+		{out: bundleapply.Outcome{Outcome: op.OutcomeRefused, Reason: op.ReasonPayloadInvalid, Detail: "target"}},
+	}}
+	e := r.executor("uid-a", func(c *Config) { c.Meter = meter })
+	e.cfg.Kinds[op.KindBundleApply] = applyBundle(f)
+	for i := range 3 {
+		e.Execute(ctx, r.sign(r.operation(op.KindBundleApply, attestation)), fence(1, uint64(i+1)))
+	}
+	c := e.Counts()
+	if c.RolledBack != 1 || c.AlreadyApplied != 1 || c.Refused != 1 || c.Applied != 0 {
+		t.Fatalf("counts = %+v", c)
+	}
+	if c.ForgedSeen != 0 {
+		t.Errorf("a signed set for another target raised ForgedSeen to %d", c.ForgedSeen)
+	}
+	got := collect(t, reader, "celld.ops.results")
+	if got["rolled_back/unhealthy"] != 1 || got["already_applied/"] != 1 || got["refused/wrong_target"] != 1 {
+		t.Errorf("metric = %v", got)
+	}
+}
