@@ -545,6 +545,53 @@ func TestApplyRepeatedOpID(t *testing.T) {
 	}
 }
 
+// brokenState is a state store whose reads fail.
+type brokenState struct{ Store }
+
+func (brokenState) Read(context.Context) (State, string, error) {
+	return State{}, "", errors.New("state read refused")
+}
+
+func TestRecorded(t *testing.T) {
+	e := newEnv(t)
+	if _, ok, err := e.a.Recorded(t.Context(), "op1"); ok || err != nil {
+		t.Fatalf("before any apply: ok %v err %v", ok, err)
+	}
+	wantOutcome(t, e.apply("op1", e.set(2, std("v1"))), op.OutcomeApplied, "", "")
+	out, ok, err := e.a.Recorded(t.Context(), "op1")
+	if err != nil || !ok || out != (Outcome{Outcome: op.OutcomeApplied}) {
+		t.Fatalf("op1: %+v ok %v err %v", out, ok, err)
+	}
+	wantOutcome(t, e.apply("op2", e.set(1, std("v0"))), op.OutcomeRefused, op.ReasonVersionOld, "")
+	out, ok, err = e.a.Recorded(t.Context(), "op2")
+	if err != nil || !ok || out != (Outcome{Outcome: op.OutcomeRefused, Reason: op.ReasonVersionOld}) {
+		t.Fatalf("op2: %+v ok %v err %v", out, ok, err)
+	}
+	if _, ok, err := e.a.Recorded(t.Context(), "op1"); ok || err != nil {
+		t.Fatalf("op1 after op2: ok %v err %v; the state keeps the last result only", ok, err)
+	}
+	wantOutcome(t, e.apply("op3", e.set(2, std("v9"))), op.OutcomeRefused, op.ReasonVersionOld, "version_conflict")
+	if out, ok, err := e.a.Recorded(t.Context(), "op3"); err != nil || !ok || out.Detail != "version_conflict" {
+		t.Fatalf("op3: %+v ok %v err %v", out, ok, err)
+	}
+	writes := len(e.storeWrites())
+	_, rv, err := e.gate.Store.Read(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.a.Recorded(t.Context(), "op4"); err != nil {
+		t.Fatal(err)
+	}
+	if _, after, _ := e.gate.Store.Read(t.Context()); len(e.storeWrites()) != writes || after != rv {
+		t.Fatal("a lookup wrote something")
+	}
+	cfg := e.cfg
+	cfg.State = brokenState{}
+	if _, ok, err := e.applier(cfg).Recorded(t.Context(), "op2"); err == nil || ok {
+		t.Fatalf("a failed read gave ok %v err %v, want an error", ok, err)
+	}
+}
+
 func TestApplyTargetMismatch(t *testing.T) {
 	t.Run("predicate names another target", func(t *testing.T) {
 		e := newEnv(t)

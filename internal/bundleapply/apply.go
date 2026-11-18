@@ -184,6 +184,20 @@ func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
 	return &op.BundleStatus{Version: st.Version, RootDigest: st.Root.Digest, State: st.State, AllowSHA256: bundle.AllowSHA256()}, nil
 }
 
+// Recorded returns the final result that the state holds for the operation opID. The state keeps the
+// result of the last operation only, so an older operation gives false. It reads the state and writes
+// nothing. An error means that the answer is not known.
+func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, error) {
+	st, _, err := a.cfg.State.Read(ctx)
+	if err != nil {
+		return Outcome{}, false, err
+	}
+	if st.Result == nil || st.Result.OpID != opID {
+		return Outcome{}, false, nil
+	}
+	return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
+}
+
 func refused(reason, detail string) Outcome {
 	return Outcome{Outcome: op.OutcomeRefused, Reason: reason, Detail: detail}
 }
