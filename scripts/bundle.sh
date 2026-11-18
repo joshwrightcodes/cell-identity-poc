@@ -14,6 +14,9 @@
 #   bundle.sh cosign --target <cluster>
 #       Attach the Sigstore bundle that mgmtd holds now for the last set. After a rotation of the signing key, the bundle has the
 #       new key, and the referrer of the old key stays.
+#   bundle.sh verify --target <cluster>
+#       Check on this Mac that mgmtd signed the root of the state: cosign verify-attestation, offline, against the current public key of mgmtd.
+#       It prints one JSON line with the signed version and the subjects of the statement (the root and each component). It changes nothing.
 #   bundle.sh repair --target <cluster> [--allow-older]
 #       Break glass for a set of argocd or cell-system that left the cluster unable to read the store, so that no rollback can
 #       finish. It trusts only what it verifies. The root of good[0] is either the bootstrap root that build/<t>/root.json names, or a
@@ -35,11 +38,11 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: mise run bundle -- publish --target <cluster>... [--wait] | get --target <cluster> | cosign --target <cluster> | repair --target <cluster> [--allow-older]"
+usage="usage: mise run bundle -- publish --target <cluster>... [--wait] | get --target <cluster> | cosign --target <cluster> | verify --target <cluster> | repair --target <cluster> [--allow-older]"
 
 # A phase runs for one cluster, with the settings of that cluster. The script starts itself again for each target, with CELL set.
 case "${1:-}" in
-  _check | _publish | _wait | _cosign | _repair) source "$here/lib.sh" ;;
+  _check | _publish | _wait | _cosign | _repair | _verify) source "$here/lib.sh" ;;
   *) fail() { printf 'error: %s\n' "$*" >&2; exit 1; } ;;
 esac
 
@@ -168,6 +171,22 @@ verify_signed_root() {
   jq -s 'map(.payload | @base64d | fromjson) | .[0]' <<<"$envelope" >"$out" || die "the cosign answer for $root holds no statement"
   jq -e --arg d "${root#sha256:}" --arg n "bundles/$CELL_NAME/root" '[.subject[]? | select(.name == $n and .digest.sha256 == $d)] | length == 1' "$out" >/dev/null \
     || die "the signed statement has no subject bundles/$CELL_NAME/root with the digest $root"
+}
+
+_verify() {
+  local state root
+  _check
+  state="$(bundle_state_json)" || exit 1
+  [[ -n "$state" ]] || die "$CELL_NAME has no bundle state, so it has no root to verify"
+  [[ "$(jq -r '.source // ""' <<<"$state")" == signed ]] || die "the bundle state of $CELL_NAME has source '$(jq -r '.source // ""' <<<"$state")', so its root is a bootstrap root that nobody signed"
+  root="$(jq -r '.root.digest // ""' <<<"$state")"
+  [[ "$root" =~ ^sha256:[0-9a-f]{64}$ ]] || die "the bundle state of $CELL_NAME holds no root digest"
+  MIRROR="$(mirror_host)" || exit 1
+  work="$(mktemp -d)"
+  trap 'rm -rf "$work"' EXIT
+  verify_signed_root "$root" "$work/statement.json"
+  jq -c --arg target "$CELL_NAME" --arg root "$root" '{target: $target, root: $root, version: .predicate.version,
+    subjects: [.subject[] | {name, digest: ("sha256:" + .digest.sha256)}]}' "$work/statement.json"
 }
 
 # check_not_older <good[0] as JSON> <statement file> refuses a verified root whose signed version is lower than the version that the state records
@@ -300,7 +319,7 @@ done
 ((${#targets[@]} > 0)) || fail "$cmd needs --target. $usage"
 case "$cmd" in
   publish) ;;
-  get | cosign | repair) ((${#targets[@]} == 1)) || fail "$cmd takes one --target. $usage" ;;
+  get | cosign | repair | verify) ((${#targets[@]} == 1)) || fail "$cmd takes one --target. $usage" ;;
   *) fail "unknown command '$cmd'. $usage" ;;
 esac
 
@@ -344,4 +363,5 @@ case "$cmd" in
     exit "$rc" ;;
   cosign) run_for "${targets[0]}" _cosign ;;
   repair) BUNDLE_ALLOW_OLDER="$allow_older" run_for "${targets[0]}" _repair ;;
+  verify) run_for "${targets[0]}" _verify ;;
 esac

@@ -3,10 +3,14 @@
 package e2e
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,5 +136,83 @@ func TestM8SameContentIsNoOp(t *testing.T) {
 		before, _ := json.Marshal(startedBefore)
 		after, _ := json.Marshal(startedAfter)
 		t.Errorf("a child started a new operation (children %v)\nbefore %s\nafter  %s", keys, before, after)
+	}
+}
+
+// TestM8CosignVerifiesSet, in dev-cell-1 and dev-cp: cosign on this Mac verifies the signed set offline against the public key of mgmtd.
+// Subtest verifies: mise run bundle -- verify prints the subjects of the statement, which are the root of the state and each component of the
+// last signed set. Subtest one_byte_changed: cosign verifies a copy of the attached Sigstore bundle, and fails on a copy in which one byte of
+// the signature changed.
+func TestM8CosignVerifiesSet(t *testing.T) {
+	for _, target := range []string{"dev-cell-1", cpClusterName} {
+		t.Run(target, func(t *testing.T) {
+			t.Run("verifies", func(t *testing.T) {
+				out, err := m8Command(t, 5*time.Minute, "", "run", "bundle", "--", "verify", "--target", target)
+				if err != nil {
+					t.Fatalf("%v\n%s", err, out)
+				}
+				var res struct {
+					Root     string `json:"root"`
+					Subjects []struct {
+						Name   string `json:"name"`
+						Digest string `json:"digest"`
+					} `json:"subjects"`
+				}
+				if err := json.Unmarshal([]byte(m8LastLine(out)), &res); err != nil {
+					t.Fatalf("verify printed %q: %v", out, err)
+				}
+				got := map[string]string{}
+				for _, s := range res.Subjects {
+					got[s.Name] = s.Digest
+				}
+				st := m8State(t, target)
+				want := map[string]string{"bundles/" + target + "/root": st.Root.Digest}
+				for _, c := range m8LastSet(t, target).Components {
+					want["bundles/"+target+"/"+c.Name] = c.Digest
+				}
+				if res.Root != st.Root.Digest || !maps.Equal(got, want) {
+					t.Errorf("the verified subjects are %v, want the root of the state and the last set: %v", got, want)
+				}
+			})
+			t.Run("one_byte_changed", func(t *testing.T) {
+				st := m8State(t, target)
+				file := filepath.Join("..", "..", "build", target, fmt.Sprintf("sigstore-%d.json", st.Version.Counter))
+				raw, err := os.ReadFile(file)
+				if err != nil {
+					t.Fatalf("no Sigstore bundle for the signed version: %v. Run: mise run bundle -- cosign --target %s", err, target)
+				}
+				var bundleDoc map[string]any
+				if err := json.Unmarshal(raw, &bundleDoc); err != nil {
+					t.Fatal(err)
+				}
+				sigs, _ := bundleDoc["dsseEnvelope"].(map[string]any)["signatures"].([]any)
+				if len(sigs) == 0 {
+					t.Fatal("the bundle holds no signature")
+				}
+				sig, _ := sigs[0].(map[string]any)["sig"].(string)
+				decoded, err := base64.StdEncoding.DecodeString(sig)
+				if err != nil || len(decoded) == 0 {
+					t.Fatalf("the signature is no base64: %v", err)
+				}
+				decoded[0] ^= 0x01
+				key, rootHex := m8PubKeyPEM(t), strings.TrimPrefix(st.Root.Digest, "sha256:")
+				dir := t.TempDir()
+				verify := func(doc map[string]any) (string, error) {
+					b, _ := json.Marshal(doc)
+					path := filepath.Join(dir, "bundle.json")
+					if err := os.WriteFile(path, b, 0o644); err != nil {
+						t.Fatal(err)
+					}
+					return m8Cosign(t, "verify-blob-attestation", "--bundle", path, "--key", key, "--digest", rootHex, "--digestAlg", "sha256", "--insecure-ignore-tlog=true")
+				}
+				if out, err := verify(bundleDoc); err != nil {
+					t.Fatalf("cosign does not verify an unchanged copy: %v\n%s", err, out)
+				}
+				sigs[0].(map[string]any)["sig"] = base64.StdEncoding.EncodeToString(decoded)
+				if out, err := verify(bundleDoc); err == nil {
+					t.Fatalf("cosign verifies a copy with one byte changed:\n%s", out)
+				}
+			})
+		})
 	}
 }

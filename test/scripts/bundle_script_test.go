@@ -1130,3 +1130,88 @@ func TestBundlePublishWritesBootstrapState(t *testing.T) {
 		t.Errorf("a cluster with a state: err %v %s\n%s", err, errOut, log)
 	}
 }
+
+// TestBundleVerifyArgs: verify reads the root digest of the state, converts the public key of mgmtd, and runs cosign verify-attestation
+// offline with exactly these arguments: --key, --insecure-ignore-tlog=true, --allow-http-registry, --type of the set predicate, and the
+// root on the mirror by digest. It gives cosign an empty Docker configuration, passes no --rekor-url and no --certificate-identity, and prints
+// one JSON line with the signed version and the subjects. It changes no cluster and takes no lock. A state with no signed root, a root that
+// cosign does not verify, and a statement with no subject for the root fail with no output.
+func TestBundleVerifyArgs(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1")
+	f := newRepairFixture(t, r)
+	state := `{"source":"signed","state":"healthy","version":{"epoch":1,"counter":2},"root":{"digest":"` + f.root + `"},"good":[]}`
+	env := []string{"STUB_STATE_JSON=" + state, "STUB_COSIGN_SUBJECTS=" + f.subjects}
+	holder := bundleHolder(t, r, "up.sh", "dev-cell-1")
+	out, errOut, log, err := r.run("bundle.sh", env, "verify", "--target", "dev-cell-1")
+	if err != nil {
+		t.Fatalf("verify failed under a held lock: %v\n%s\n%s\n%s", err, out, errOut, log)
+	}
+	_ = holder
+	lines := calls(log, "mise x -- cosign")
+	if len(lines) != 1 {
+		t.Fatalf("%d cosign calls:\n%s", len(lines), log)
+	}
+	call := strings.TrimSpace(strings.SplitN(lines[0], " | CELL=", 2)[0])
+	want := regexp.MustCompile(`^mise x -- cosign verify-attestation --key \S+ --insecure-ignore-tlog=true --allow-http-registry --type https://cell\.poc\.internal/bundle-set/v1 127\.0\.0\.1:5001/bundles/dev-cell-1/root@` + f.root + `$`)
+	if !want.MatchString(call) {
+		t.Errorf("the cosign call is %q", call)
+	}
+	for _, bad := range []string{"--rekor-url", "--certificate-identity", "--certificate-oidc-issuer", "--insecure-ignore-sct", "sign-blob"} {
+		if strings.Contains(call, bad) {
+			t.Errorf("the cosign call has %s", bad)
+		}
+	}
+	if callIndex(log, "run mgmt -- pubkey | CELL=management") < 0 || callIndex(log, "run bundlectl -- pubkey-pem") < 0 {
+		t.Errorf("the public key is not read from mgmtd:\n%s", log)
+	}
+	for _, bad := range []string{" apply ", " patch ", " delete ", "oras", "create -f"} {
+		if strings.Contains(log, bad) {
+			t.Errorf("verify changed something (%q):\n%s", bad, log)
+		}
+	}
+	var res struct {
+		Target   string
+		Root     string
+		Version  map[string]int
+		Subjects []struct{ Name, Digest string }
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &res); err != nil || strings.Count(strings.TrimSpace(out), "\n") != 0 {
+		t.Fatalf("verify printed %q", out)
+	}
+	got := map[string]string{}
+	for _, s := range res.Subjects {
+		got[s.Name] = s.Digest
+	}
+	wantSubjects := map[string]string{"bundles/dev-cell-1/root": f.root, "bundles/dev-cell-1/argocd": f.argocd, "bundles/dev-cell-1/cell-system": f.cellSys, "bundles/dev-cell-1/network-policy": f.netpol}
+	if res.Target != "dev-cell-1" || res.Root != f.root || res.Version["counter"] != 2 || !maps.Equal(got, wantSubjects) {
+		t.Errorf("verify printed %+v, want the target, the root, the version and the subjects %v", res, wantSubjects)
+	}
+
+	for name, tc := range map[string]struct {
+		env  []string
+		want string
+	}{
+		"cosign does not verify":      {[]string{"STUB_COSIGN_FAIL=1"}, "no matching signatures"},
+		"no subject for the root":     {[]string{"STUB_COSIGN_SUBJECTS=" + strings.Replace(f.subjects, strings.TrimPrefix(f.root, "sha256:"), strings.Repeat("9", 64), 1)}, "subject"},
+		"a bootstrap state":           {[]string{`STUB_STATE_JSON={"source":"bootstrap","root":{"digest":"` + f.root + `"}}`}, "bootstrap"},
+		"no state":                    {[]string{"STUB_STATE_JSON="}, "state"},
+		"a state with no root digest": {[]string{`STUB_STATE_JSON={"source":"signed"}`}, "root digest"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1")
+			out, errOut, _, err := r.run("bundle.sh", append(slices.Clone(env), tc.env...), "verify", "--target", "dev-cell-1")
+			if err == nil || out != "" || !strings.Contains(errOut, tc.want) {
+				t.Errorf("err %v, stdout %q, stderr %q, want a failure with no output that names %q", err, out, errOut, tc.want)
+			}
+		})
+	}
+	t.Run("role open and a second target", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		if _, errOut, _, err := r.run("bundle.sh", env, "verify", "--target", "management"); err == nil || !strings.Contains(errOut, "role open") {
+			t.Errorf("management: err %v %q", err, errOut)
+		}
+		if _, _, _, err := r.run("bundle.sh", env, "verify", "--target", "dev-cell-1", "--target", "dev-cell-2"); err == nil {
+			t.Error("verify took two targets")
+		}
+	})
+}
