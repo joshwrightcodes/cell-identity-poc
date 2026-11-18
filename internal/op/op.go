@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
 
@@ -36,6 +37,9 @@ const (
 
 // KindDemoAppend appends one line to the demo log of a cell.
 const KindDemoAppend = "demo.append"
+
+// KindBundleApply applies one signed bundle set to a target. The args are one attestation envelope.
+const KindBundleApply = "bundle.apply"
 
 var (
 	idRE    = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -207,13 +211,14 @@ func (f Fence) Compare(o Fence) int {
 	return 0
 }
 
-// The outcomes of an operation. The first four are final and go up to the management plane. The
-// last two are local to a cell.
+// The outcomes of an operation. The first four and OutcomeRolledBack are final and go up to the
+// management plane. OutcomeLeaseLost and OutcomeStoreFull are local to a cell.
 const (
 	OutcomeApplied        = "applied"
 	OutcomeAlreadyApplied = "already_applied"
 	OutcomeExpired        = "expired"
 	OutcomeRefused        = "refused"
+	OutcomeRolledBack     = "rolled_back"
 	OutcomeLeaseLost      = "lease_lost"
 	OutcomeStoreFull      = "store_full"
 )
@@ -229,17 +234,35 @@ const (
 	ReasonLeaseLost        = "lease_lost"
 )
 
-// IsFinal reports whether outcome ends an operation: applied, already_applied, expired or refused.
+// The reasons of a bundle.apply operation.
+const (
+	ReasonVersionOld          = "version_old"
+	ReasonComponentNotAllowed = "component_not_allowed"
+	ReasonPolicyBlocksPlanes  = "policy_blocks_planes"
+	ReasonDigestMismatch      = "digest_mismatch"
+	ReasonUnhealthy           = "unhealthy"
+)
+
+// IsFinal reports whether outcome ends an operation: applied, already_applied, expired, refused or
+// rolled_back.
 func IsFinal(outcome string) bool {
 	switch outcome {
-	case OutcomeApplied, OutcomeAlreadyApplied, OutcomeExpired, OutcomeRefused:
+	case OutcomeApplied, OutcomeAlreadyApplied, OutcomeExpired, OutcomeRefused, OutcomeRolledBack:
 		return true
 	}
 	return false
 }
 
+var detailRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,95}$`)
+
+// ValidDetail reports whether s is a valid Result.Detail: 1 to 96 characters of letters, digits and
+// _ . : / -, with a letter or digit first. The detail of an unhealthy bundle holds the Argo CD
+// sync and health words, which start with a capital letter.
+func ValidDetail(s string) bool { return detailRE.MatchString(s) }
+
 // Result is what celld reports for one envelope. A refusal before the signature passes has an empty
 // OpID and the peeked ID in PeekedID. EnvelopeSHA256 is the digest of the bytes that celld received.
+// Detail refines Reason and is empty when there is nothing to add.
 type Result struct {
 	OpID           string    `json:"opId,omitempty"`
 	PeekedID       string    `json:"peekedId,omitempty"`
@@ -247,6 +270,7 @@ type Result struct {
 	Pod            string    `json:"pod,omitempty"`
 	Outcome        string    `json:"outcome"`
 	Reason         string    `json:"reason,omitempty"`
+	Detail         string    `json:"detail,omitempty"`
 	Fence          Fence     `json:"fence"`
 	At             time.Time `json:"at"`
 	EnvelopeSHA256 string    `json:"envelopeSHA256"`
@@ -267,4 +291,16 @@ type Status struct {
 	Unreported         uint64    `json:"unreported"`
 	Records            uint64    `json:"records"`
 	Version            string    `json:"version"`
+	// Bundle is the state of the bundle applier, and is absent when the pod runs none.
+	Bundle *BundleStatus `json:"bundle,omitempty"`
+}
+
+// BundleStatus is the state of the bundle applier of a cluster: the version of the last set that
+// it accepted, the digest of its root manifest, the state (applying, healthy or rolled_back) and the
+// SHA-256 of the allow-list data that it runs.
+type BundleStatus struct {
+	Version     bundle.Version `json:"version"`
+	RootDigest  string         `json:"rootDigest"`
+	State       string         `json:"state"`
+	AllowSHA256 string         `json:"allowSHA256"`
 }

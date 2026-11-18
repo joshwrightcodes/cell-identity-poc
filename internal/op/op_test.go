@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
@@ -346,5 +347,74 @@ func TestResultAndStatusWireNames(t *testing.T) {
 				t.Errorf("%T lacks %q in %s", tc.v, k, raw)
 			}
 		}
+	}
+}
+
+func TestResultDetail(t *testing.T) {
+	for _, d := range []string{
+		"timeout:apps-sample:Synced/Progressing", "apps-sample:OutOfSync/Degraded", "rollback_unhealthy", "version_conflict",
+		"istio-system/default-deny", "mesh_injection", "0", strings.Repeat("a", 96),
+	} {
+		if !ValidDetail(d) {
+			t.Errorf("%q should be valid", d)
+		}
+		want := Result{Cell: "c", Outcome: OutcomeRolledBack, Reason: ReasonUnhealthy, Detail: d, At: t0}
+		raw, err := json.Marshal(want)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got Result
+		if err := record.DecodeStrict(raw, &got); err != nil {
+			t.Fatalf("%q: %v", d, err)
+		}
+		if got.Detail != d || got.Outcome != OutcomeRolledBack || got.Reason != "unhealthy" {
+			t.Errorf("round trip of %q gave %+v", d, got)
+		}
+	}
+	for _, d := range []string{"", "_x", ":x", "-x", ".x", "/x", "a b", "a\n", "a;b", "é", strings.Repeat("a", 97)} {
+		if ValidDetail(d) {
+			t.Errorf("%q should be invalid", d)
+		}
+	}
+	raw, _ := json.Marshal(Result{Cell: "c", Outcome: OutcomeApplied, At: t0})
+	if strings.Contains(string(raw), "detail") {
+		t.Errorf("an empty detail is encoded: %s", raw)
+	}
+}
+
+func TestIsFinalRolledBack(t *testing.T) {
+	if !IsFinal(OutcomeRolledBack) || OutcomeRolledBack != "rolled_back" {
+		t.Error("rolled_back must be final")
+	}
+	for got, want := range map[string]string{
+		KindBundleApply: "bundle.apply", ReasonVersionOld: "version_old", ReasonComponentNotAllowed: "component_not_allowed",
+		ReasonPolicyBlocksPlanes: "policy_blocks_planes", ReasonDigestMismatch: "digest_mismatch", ReasonUnhealthy: "unhealthy",
+	} {
+		if got != want {
+			t.Errorf("got %q, want %q", got, want)
+		}
+	}
+}
+
+func TestStatusNoBundleKey(t *testing.T) {
+	raw, _ := json.Marshal(Status{Cell: "c", Pod: "p", At: t0})
+	if strings.Contains(string(raw), "bundle") {
+		t.Errorf("a status with no bundle has a bundle key: %s", raw)
+	}
+	raw, err := json.Marshal(Status{Cell: "c", Bundle: &BundleStatus{
+		Version: bundle.Version{Epoch: 2, Counter: 3}, RootDigest: "sha256:ab", State: "healthy", AllowSHA256: "cd",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m struct {
+		Bundle map[string]json.RawMessage `json:"bundle"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Bundle) != 4 || string(m.Bundle["version"]) != `{"epoch":2,"counter":3}` ||
+		string(m.Bundle["rootDigest"]) != `"sha256:ab"` || string(m.Bundle["state"]) != `"healthy"` || string(m.Bundle["allowSHA256"]) != `"cd"` {
+		t.Errorf("bundle status %s", raw)
 	}
 }

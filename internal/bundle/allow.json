@@ -1,0 +1,187 @@
+{
+  "version": 1,
+  "classes": {
+    "platform": {
+      "project": "cell",
+      "objectNamespaces": [
+        "argocd",
+        "cell-system",
+        "istio-system",
+        "istio-egress",
+        "observability-system",
+        "apps-demo"
+      ],
+      "destinationNamespaces": [
+        "argocd",
+        "cell-system",
+        "istio-system",
+        "istio-egress",
+        "observability-system",
+        "apps-demo",
+        "default"
+      ],
+      "clusterKinds": [
+        "Namespace",
+        "CustomResourceDefinition",
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "ValidatingWebhookConfiguration",
+        "MutatingWebhookConfiguration",
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding"
+      ],
+      "namespacedKinds": [
+        "*"
+      ]
+    },
+    "cp-platform": {
+      "project": "cell",
+      "objectNamespaces": [
+        "argocd",
+        "cell-system",
+        "istio-system",
+        "istio-egress",
+        "observability-system",
+        "apps-demo",
+        "external-secrets",
+        "spire-system",
+        "relay-system"
+      ],
+      "destinationNamespaces": [
+        "argocd",
+        "cell-system",
+        "istio-system",
+        "istio-egress",
+        "observability-system",
+        "apps-demo",
+        "default",
+        "external-secrets",
+        "spire-system",
+        "relay-system"
+      ],
+      "clusterKinds": [
+        "Namespace",
+        "CustomResourceDefinition",
+        "ClusterRole",
+        "ClusterRoleBinding",
+        "ValidatingWebhookConfiguration",
+        "MutatingWebhookConfiguration",
+        "ValidatingAdmissionPolicy",
+        "ValidatingAdmissionPolicyBinding"
+      ],
+      "namespacedKinds": [
+        "*"
+      ]
+    },
+    "app": {
+      "project": "cell-app",
+      "objectNamespaces": [
+        "apps-demo"
+      ],
+      "destinationNamespaces": [
+        "apps-demo"
+      ],
+      "clusterKinds": [],
+      "namespacedKinds": [
+        "ConfigMap",
+        "Secret",
+        "ServiceAccount",
+        "Service",
+        "apps/Deployment"
+      ],
+      "serviceClusterIPOnly": true,
+      "noSidecarOptOut": true
+    }
+  },
+  "roles": {
+    "cell": {
+      "components": {
+        "namespaces": "platform",
+        "argocd": "platform",
+        "cell-system": "platform",
+        "network-policy": "platform",
+        "istio-base": "platform",
+        "istio-cni": "platform",
+        "istiod": "platform",
+        "observability-system": "platform",
+        "istio-egress": "platform",
+        "mesh-policy": "platform",
+        "apps-demo": "platform",
+        "apps-sample": "app"
+      },
+      "harnessNamespaces": [
+        "cell-identity-system",
+        "cell-ops-system",
+        "mesh-view-system"
+      ],
+      "harnessClusterObjects": [
+        {
+          "kind": "ValidatingAdmissionPolicy",
+          "name": "bundles-spare-harness"
+        },
+        {
+          "kind": "ValidatingAdmissionPolicyBinding",
+          "name": "bundles-spare-harness"
+        },
+        {
+          "kind": "ValidatingAdmissionPolicy",
+          "name": "bundles-app-limits"
+        },
+        {
+          "kind": "ValidatingAdmissionPolicyBinding",
+          "name": "bundles-app-limits"
+        }
+      ],
+      "meshGuarded": [
+        "argocd",
+        "cell-system",
+        "observability-system"
+      ],
+      "appComponents": [
+        "apps-sample"
+      ]
+    },
+    "cp": {
+      "components": {
+        "namespaces": "cp-platform",
+        "argocd": "cp-platform",
+        "cell-system": "cp-platform",
+        "network-policy": "cp-platform",
+        "istio-base": "cp-platform",
+        "istio-cni": "cp-platform",
+        "istiod": "cp-platform",
+        "observability-system": "cp-platform",
+        "istio-egress": "cp-platform",
+        "mesh-policy": "cp-platform",
+        "apps-demo": "cp-platform",
+        "external-secrets": "cp-platform",
+        "spire-server": "cp-platform",
+        "relay-system": "cp-platform"
+      },
+      "harnessNamespaces": [
+        "envd-system",
+        "gateway-system",
+        "cell-controller-system"
+      ],
+      "harnessClusterObjects": [
+        {
+          "kind": "ValidatingAdmissionPolicy",
+          "name": "bundles-spare-harness"
+        },
+        {
+          "kind": "ValidatingAdmissionPolicyBinding",
+          "name": "bundles-spare-harness"
+        }
+      ],
+      "meshGuarded": [
+        "argocd",
+        "cell-system",
+        "observability-system",
+        "spire-system",
+        "relay-system",
+        "external-secrets"
+      ],
+      "appComponents": []
+    }
+  }
+}
