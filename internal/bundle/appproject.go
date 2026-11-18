@@ -2,6 +2,7 @@ package bundle
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -23,16 +24,21 @@ func ExpectedAppProjectSpec(role, name string, p Policy) (map[string]any, error)
 	if !ok || !slices.Contains(r.AppProjects, name) {
 		return nil, fmt.Errorf("role %q has no AppProject %q", role, name)
 	}
-	var class *Class
-	for _, cn := range r.Components {
-		if c, ok := p.Classes[cn]; ok && c.Project == name {
-			class = &c
-			break
+	var className string
+	for _, comp := range slices.Sorted(maps.Keys(r.Components)) {
+		cn := r.Components[comp]
+		if c, ok := p.Classes[cn]; !ok || c.Project != name || cn == className {
+			continue
 		}
+		if className != "" {
+			return nil, fmt.Errorf("role %q has classes %q and %q for AppProject %q", role, className, cn, name)
+		}
+		className = cn
 	}
-	if class == nil {
+	if className == "" {
 		return nil, fmt.Errorf("role %q has no component in the class of AppProject %q", role, name)
 	}
+	class := p.Classes[className]
 	spec := map[string]any{"sourceRepos": []any{"oci://" + StoreHost + "/bundles/*"}}
 	var dests []any
 	for _, ns := range class.DestinationNamespaces {

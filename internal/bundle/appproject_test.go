@@ -68,3 +68,28 @@ func TestExpectedAppProjectSpecGolden(t *testing.T) {
 		}
 	}
 }
+
+// TestExpectedAppProjectSpecOneClassPerProject checks that two classes of one role that name the same
+// project give an error, not the spec of whichever class a map walk meets first.
+func TestExpectedAppProjectSpecOneClassPerProject(t *testing.T) {
+	raw, err := json.Marshal(DefaultPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p Policy
+	if err := json.Unmarshal(raw, &p); err != nil {
+		t.Fatal(err)
+	}
+	wide := p.Classes["app"]
+	wide.DestinationNamespaces = append([]string{"argocd"}, wide.DestinationNamespaces...)
+	p.Classes["app-wide"] = wide
+	p.Roles["cell"].Components["extra"] = "app-wide"
+	for range 20 {
+		if spec, err := ExpectedAppProjectSpec("cell", "cell-app", p); err == nil {
+			t.Fatalf("two classes for project cell-app gave a spec: %v", spec["destinations"])
+		}
+	}
+	if _, err := ExpectedAppProjectSpec("cell", "cell", p); err != nil {
+		t.Fatalf("project cell has one class: %v", err)
+	}
+}
