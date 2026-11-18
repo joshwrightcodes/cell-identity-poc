@@ -20,7 +20,30 @@ func runGateM7(t *testing.T, stale, repair string, hit bool) (out, calls string,
 // runGateM7With is runGateM7 with the body of the gate-m6-repair.sh stub.
 func runGateM7With(t *testing.T, stale, repair, m6Repair string, hit bool) (out, calls string, err error) {
 	t.Helper()
+	return runGateM7Registry(t, stale, repair, m6Repair, hit, `["PATH=/bin","REGISTRY_STORAGE_DELETE_ENABLED=false"]`)
+}
+
+// m7Docker stands in for docker: the time of the node, the address of a node container, and the environment of registry-mirror, which
+// STUB_REGISTRY_ENV gives as JSON. STUB_REGISTRY_FAIL makes the inspect of the registry fail.
+const m7Docker = `#!/usr/bin/env bash
+case "$*" in
+  "inspect -f {{json .Config.Env}} registry-mirror")
+    [[ -z "${STUB_REGISTRY_FAIL:-}" ]] || { echo "Error: No such container: registry-mirror" >&2; exit 1; }
+    echo "$STUB_REGISTRY_ENV" ;;
+  "exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ") echo 2026-11-16T01:02:03Z ;;
+  "inspect "*) echo 172.18.0.9 ;;
+  *) exit 2 ;;
+esac
+`
+
+// runGateM7Registry is runGateM7With with the environment that docker inspect reports for registry-mirror. An empty value makes the
+// inspect fail.
+func runGateM7Registry(t *testing.T, stale, repair, m6Repair string, hit bool, registryEnv string) (out, calls string, err error) {
+	t.Helper()
 	root := newM5GateRoot(t, stale)
+	if err := os.WriteFile(filepath.Join(root, "bin", "docker"), []byte(m7Docker), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	write := func(name, body string) {
 		if err := os.WriteFile(filepath.Join(root, "scripts", name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
@@ -38,7 +61,11 @@ echo "scan $*" >>"$STUB_LOG"
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m7")
 	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
-		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + stale, "STUB_HIT=" + h}
+		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + stale, "STUB_HIT=" + h,
+		"STUB_REGISTRY_ENV=" + registryEnv}
+	if registryEnv == "" {
+		cmd.Env = append(cmd.Env, "STUB_REGISTRY_FAIL=1")
+	}
 	b, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(filepath.Join(root, "calls"))
 	return string(b), string(c), err
@@ -125,5 +152,31 @@ func TestGateM7PatternAndTimeout(t *testing.T) {
 	}
 	if !strings.Contains(calls, "-run ^TestM7\n") || !strings.Contains(calls, "-timeout 90m ") {
 		t.Errorf("the go test call lacks the pattern ^TestM7 at its end or the timeout of 90 minutes: %s", calls)
+	}
+}
+
+// TestGateM7RegistryDeletesOff: before the tests, gate.sh m7 requires that registry-mirror runs with deletes off, because the registry
+// test deletes a manifest by digest. A mirror with deletes on, or no mirror, stops the gate with the command that recreates it.
+func TestGateM7RegistryDeletesOff(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	for _, tc := range []struct{ name, env, want string }{
+		{name: "deletes off", env: `["REGISTRY_STORAGE_DELETE_ENABLED=false"]`},
+		{name: "no setting", env: `["PATH=/bin"]`, want: "Run: mise run hostsvc -- up"},
+		{name: "deletes on", env: `["REGISTRY_STORAGE_DELETE_ENABLED=true"]`, want: "Run: mise run hostsvc -- up"},
+		{name: "no container", env: "", want: "could not read the container registry-mirror"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, calls, err := runGateM7Registry(t, "", m7RepairOK, m6RepairOK, false, tc.env)
+			ran := strings.Contains(calls, "-run ^TestM7")
+			if tc.want == "" {
+				if err != nil || !ran {
+					t.Fatalf("err %v, ran %v, output %s", err, ran, out)
+				}
+				return
+			}
+			if err == nil || ran || !strings.Contains(out, tc.want) {
+				t.Fatalf("err %v, tests ran %v, output %s; want a stop before the tests that says %q", err, ran, out, tc.want)
+			}
+		})
 	}
 }

@@ -109,8 +109,12 @@ func TLSReason(err error) Reason {
 		return HandshakeFailed
 	case errors.As(err, &hdr), errors.As(err, &alert), errors.Is(err, http.ErrSchemeMismatch):
 		return HandshakeFailed
-	case err != nil && strings.HasPrefix(err.Error(), "tls: "):
-		return HandshakeFailed
+	}
+	// crypto/tls returns some failures as plain errors that start with "tls: ". A caller wraps them, so each error in the chain counts.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), "tls: ") {
+			return HandshakeFailed
+		}
 	}
 	return ""
 }

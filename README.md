@@ -1328,8 +1328,13 @@ mise run images
 mise run gate:m7
 ```
 
+`gate:m7` stops before the tests when `registry-mirror` runs with deletes on, because the registry test deletes a manifest.
+In that case, run `mise run hostsvc -- up`. The host service recreates the registry and keeps its volume.
+
 Each test runs in a namespace with the prefix `m7-` and the label `cell.poc.internal/e2e=true`.
-The registry delete test is the only exception, and it runs in `rogue/default`.
+The registry delete test is an exception, and it runs in `rogue/default`.
+`TestM7PrincipalLoopbackOnly` is another exception. It adds an ephemeral container to the principal pod.
+The container stays in the pod spec until the pod restarts, and `gate:m7:repair` cannot remove it.
 A test that needs the host network makes its own `m7-` namespace with Pod Security `privileged`.
 No test changes the label of a namespace that a bundle owns.
 
@@ -1342,6 +1347,7 @@ mise run gate:m7:repair
 
 The first command lists each `m7-` namespace that is left.
 The second command deletes them in every cluster and waits until none is left.
+It also deletes the pods of the registry test in `rogue/default`.
 It is safe to run again.
 
 ## Side effects of gate:m2

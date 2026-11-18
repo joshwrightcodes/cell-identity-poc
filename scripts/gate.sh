@@ -147,6 +147,11 @@ if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]
   "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
   if [[ "$milestone" == m7 ]]; then
     "$ROOT/scripts/gate-m7-repair.sh" --check || exit 1
+    # TestM7RegistryRefusesDelete sends a manifest delete. A mirror that still runs with deletes on would lose the image of netprobe.
+    registry_env="$(docker inspect -f '{{json .Config.Env}}' registry-mirror)" \
+      || die "could not read the container registry-mirror. Run: mise run harness:status"
+    jq -e 'index("REGISTRY_STORAGE_DELETE_ENABLED=false") != null' >/dev/null <<<"$registry_env" \
+      || die "the container registry-mirror runs with deletes on, so a test could delete a live image. Run: mise run hostsvc -- up, then run the gate again"
   fi
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"

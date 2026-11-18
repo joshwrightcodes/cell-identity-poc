@@ -160,10 +160,11 @@ func TestM7InterceptCelldBind(t *testing.T) {
 // TestM7InterceptCelldStream (hop B) dials an impostor gateway as the stream client of celld does: mutual TLS with an SVID of
 // spiffe://.../cell/dev-cell-1/celld, and the exact gateway ID. celld cannot run in an m7 namespace, because the SPIRE agent
 // gives an SVID only to the celld namespace, so netprobe tlsdial stands in. It uses cellproxy.ProbeTLS, which builds the same checks as
-// cellproxy.ClientTLS. The impostor never asks for the client certificate, so the SVID of celld stays with the client.
+// cellproxy.ClientTLS. The impostor never asks for the client certificate, so the client certificate is never used in the handshake.
+// It is a self-made certificate with the celld ID, not a real SVID, so no valid credential leaves the harness.
 func TestM7InterceptCelldStream(t *testing.T) {
 	h := hopWith(devCellTrust, "hop B celld stream", gatewayID)
-	clientChain, clientKey := mintSVID(t, envCluster, "spiffe://"+envTrustDomain+"/cell/"+celldCell+"/celld", 10*time.Minute)
+	clientChain, clientKey := selfMadeChain(t, "spiffe://"+envTrustDomain+"/cell/"+celldCell+"/celld")
 	run, control := tlsdialHop(t, h, append(append([]byte{}, clientChain...), clientKey...))
 	m7Intercept(t, h, 1, run, checkTLSDialRefused, control)
 }
@@ -306,7 +307,9 @@ func TestM7RogueHandshakeToHostService(t *testing.T) {
 		return lastJSONLine(t, logs)
 	}
 
-	chain, key := mintSVID(t, mgmtCluster, mgmtAPIID, 10*time.Minute)
+	// The control needs a real SVID, because only a certificate that the host service accepts shows that the pod reaches it and that the
+	// refusals below come from the certificate. The lifetime is the shortest that the test needs, so the SVID expires soon after the test.
+	chain, key := mintSVID(t, mgmtCluster, mgmtAPIID, 2*time.Minute)
 	control := dial(&hostsvcSource{name: "control", chain: chain, key: key})
 	if control["handshake"] != "ok" || strings.HasPrefix(fmt.Sprint(control["after"]), "alert:") {
 		t.Fatalf("the control with a real SVID of mgmtd gave %v, want a passed handshake, so the refusals below prove nothing otherwise", control)

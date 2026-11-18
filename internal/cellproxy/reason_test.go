@@ -153,6 +153,10 @@ func TestTLSReasonOtherErrors(t *testing.T) {
 		"connection error": {dialErr, ""},
 		"context end":      {fmt.Errorf("dial: %w", context.DeadlineExceeded), ""},
 		"plain error":      {errors.New("connection refused"), ""},
+		"wrapped plain tls error": {fmt.Errorf("request a nonce: %w", fmt.Errorf("TLS handshake: %w",
+			errors.New("tls: received unexpected handshake message of type *tls.clientHelloMsg when waiting for *tls.serverHelloMsg"))), HandshakeFailed},
+		"bare plain tls error": {errors.New("tls: received unexpected handshake message of type *tls.clientHelloMsg when waiting for *tls.serverHelloMsg"), HandshakeFailed},
+		"tls word inside text": {fmt.Errorf("dial: %w", errors.New("connection reset, tls: not at the start")), ""},
 	} {
 		if got := TLSReason(tc.err); got != tc.want {
 			t.Errorf("%s: TLSReason = %q, want %q", name, got, tc.want)

@@ -43,6 +43,21 @@ func deleteLabeledPods(t *testing.T, value string) {
 	})
 }
 
+// requireDeletesOff fails the test when the registry container runs with deletes on. The delete below would then remove the manifest that every
+// later test pulls. gate:m7 checks the same before the run, and the host service recreates the container with the switch off.
+func requireDeletesOff(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{json .Config.Env}}", hostsvc.RegistryName).Output()
+	if err != nil {
+		t.Fatalf("docker inspect %s: %v", hostsvc.RegistryName, err)
+	}
+	if !strings.Contains(string(out), `"REGISTRY_STORAGE_DELETE_ENABLED=false"`) {
+		t.Fatalf("container %s does not run with REGISTRY_STORAGE_DELETE_ENABLED=false, so the test would delete a live image. Run: mise run hostsvc -- up", hostsvc.RegistryName)
+	}
+}
+
 // registryRepository returns the repository path of an image reference: the part after the host and before the digest.
 func registryRepository(ref string) (string, bool) {
 	name, _, ok := strings.Cut(ref, "@")
@@ -54,6 +69,7 @@ func registryRepository(ref string) (string, bool) {
 // The registry answers 405 with the error code UNSUPPORTED, and a pull of the same digest still works afterwards.
 func TestM7RegistryRefusesDelete(t *testing.T) {
 	needProbeImage(t)
+	requireDeletesOff(t)
 	repo, ok := registryRepository(probeImage)
 	if !ok {
 		t.Fatalf("IMAGE_NETPROBE %q has no repository and digest", probeImage)

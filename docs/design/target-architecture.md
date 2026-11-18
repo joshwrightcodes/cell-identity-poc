@@ -146,7 +146,7 @@ Local instances use `dev` as `<env>`: the clusters are `management`, `dev-cp`, `
 | `management` | Kiln stand-in: intent, approvals, signed specs, key checks, Argo CD Agent principal, telemetry gateway. Also a SPIRE server for Kiln's own workloads, the observability stack and Kiali | `mgmt.poc.internal` |
 | `dev-cp` | envd, SPIRE server, cell gateway, relay, cell controller with ACK, local alert rules | `dev.env.poc.internal` |
 | `dev-cell-1`, `dev-cell-2` | The base cell, plus `celld`, its watchdog, `ops-runs`, `ack-system` controllers | Identities from `dev.env.poc.internal`; mesh in `<cell>.mesh.poc.internal` |
-| `rogue` | Genuine `celld` and agent images, plus attack tools | Unregistered |
+| `rogue` | The attestation client of `celld`, plus attack tools | Unregistered |
 
 Local size is measured at M1, and the README states it. The Mac has 18 cores and 64 GB, so the
 gate keeps headroom for the builder and ko. **[call]**
@@ -683,7 +683,7 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 
 | # | Attacker | Stopped at | Result | Phase |
 | --- | --- | --- | --- | --- |
-| 1 | Rogue cluster runs a genuine `celld` | Attestor: keys match no record | `unknown_kid` at the attestor, and `token_invalid` with the detail `unknown_kid` at bind | 1 |
+| 1 | Rogue cluster presents its own token with the attestation client of `celld` | Attestor: keys match no record | `unknown_kid` at the attestor, and `token_invalid` with the detail `unknown_kid` at bind | 1 |
 | 2 | Rogue cluster claims a real cell's name, with the same default issuer | Signature check | `bad_signature` or `unknown_kid` at the attestor, and `token_invalid` at bind | 1 |
 | 3 | Pod with another service account or namespace | Attestor | `subject_mismatch` | 1 |
 | 4 | Token for the wrong audience | Attestor | `audience_mismatch` | 1 |
@@ -705,9 +705,9 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 20 | Spec with a lower revision, no Kiln signature, or invalidating several cells | envd | `spec_invalid` | 1 |
 | 21 | Cell controller step without a Kiln signature, or with a modified bootstrap set | Cell controller; bootstrap actor | `step_invalid` | 1 |
 | 22 | Environment control plane poses as a cell to Kiln, on a stream or in a reported result | Kiln second proof | `proof_missing` | 1 |
-| 23 | TLS interception, `celld` to the cell gateway | `celld` | The `reason` field of the `bind failed` and `stream ended` logs: `peer_untrusted`, `peer_not_allowed` or `handshake_failed` | 1 |
+| 23 | TLS interception, `celld` to the cell gateway | `celld` | The `reason` field of the `bind failed` and `stream ended` logs, which unit tests check: `peer_untrusted`, `peer_not_allowed` or `handshake_failed` | 1 |
 | 24 | TLS interception, sidecar to SPIRE server | Sidecar | The attestation client refuses the server certificate, and the impostor receives no token | 1 |
-| 25 | Relay or Kiln impostor between agent and principal, with an environment-minted SVID | `cell-proxy` exact ID | `peer_not_allowed` | 1 |
+| 25 | Relay or Kiln impostor between agent and principal, with an environment-minted SVID | `cell-proxy` exact ID | `peer_untrusted` for an SVID of the environment CA, and `peer_not_allowed` for a Kiln SVID with another ID | 1 |
 | 26 | envd connects to a fake Kiln | Pinned Kiln root | `peer_untrusted` in the error field of the `pull failed` log line | 1 |
 | 27 | TCP relay that only forwards, or alters bytes | TLS | Ciphertext only, `handshake_failed`, or the connection closes | 1 |
 | 28 | Revoked cell's existing relay and principal streams | Relay; Kiln `cell-proxy` | Closed within 5 seconds | 1 |
@@ -717,7 +717,7 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 32 | Agent from environment X claims a cell of environment Y | Per-environment listener | `peer_not_allowed` | 1 |
 | 33 | Argo CD's token writes to the bundle store, or `celld`'s reads as Argo CD | Store `cell-proxy` | `peer_not_allowed` | 1 |
 | 34 | Stale fencing token after lease loss or a restore | Queue; in-cell Lease | `lease_lost` | 1 |
-| 35 | Pod in cell A, or in `rogue`, scans cell B, with NodePort and hostNetwork attackers | Isolation rules and admission policy | Every connection fails | 1 |
+| 35 | Pod in cell A, or in `rogue`, scans cell B, and a host network pod scans `dev-cp` and `management` | Isolation rules and admission policy | Every connection fails, except the residual ports of the shared network | 1 |
 | 36 | Cell A asks to reach cell B with no policy, or names another sender | Environment control plane | `cross_cell_denied`, `cell_mismatch` | 1 |
 | 37 | Revoked cell reconnects, or reappears after the next spec revision | Attestor overlay; gateway | `cell_revoked` | 1 |
 | 38 | Operation Job reaches a host that is not its target | Run NetworkPolicy | Connection fails | 1 |
@@ -852,11 +852,12 @@ this order, each with its own scope document:
 | The M3 Kiali tunnel wait and the M5 `registry_wait` pass in a `cell:link` that runs after cells were recreated, and with zero live cells | M6 | None. Stop and report. Result: 2026-11-17, passed in both runs of `gate:m6:provision`, whose step 10 links `management` after `cell:down` of both cells, and in the drill that rebuilt `management` |
 | A server-side apply that deletes a rule or an `ipBlock` peer removes it from the live NetworkPolicy | M6 | None. Stop and report. Result 2026-11-17, in step 2 of both runs of `gate:m6:provision`, `cell:verify` of `dev-cp` with no cell found no rule or peer left from the render with cells (the drift check passed) |
 | `POC_SECRET_TOKEN_CMD` is set inside `cell:up` after mise loads the global and parent configs under the actor | M6 | The actor sets `MISE_GLOBAL_CONFIG_FILE=/dev/null` and `MISE_CEILING_PATHS`, not verified for the pinned mise. Report first. Result 2026-11-18: no step log read `.envrc.local` (0 of 7), and the global mise config does not name the variable. The value inside the actor was not printed |
-| A client that verifies its peer sends nothing to an impostor server, and each hop gives the reason of the rejection table. The SPIRE agent binary is not under test, because it is upstream code | M7 | None. Stop and report. Result <measured in the live part> |
+| A client that verifies its peer sends nothing to an impostor server, and each hop gives the reason of the rejection table. The SPIRE agent binary is not under test, because it is upstream code. Unit tests check the `reason` field of the `celld` logs. The live tests check the probe output of the same TLS settings | M7 | None. Stop and report. Result <measured in the live part> |
 | A forwarder that flips one byte of the handshake or of the proof record ends the connection. The principal accepts no peer. A clean request through the same forwarder succeeds | M7 | None. Stop and report. Result <measured in the live part> |
 | In a namespace with a policy that denies all egress, no dial from a new `dev-cell-1` pod connects after 10 seconds. An attestation probe of another subject gets no SVID | M7 | None. Report a time above 10 seconds. Result <measured in the live part> |
 | A host network pod in `rogue` reaches exactly the residual ports of the `dev-cp` and `management` nodes. One in a cell also reaches the ports that admit its node address, and no others. Each mutual TLS port answers a handshake with no certificate with a TLS alert or a closed connection | M7 | None. Stop and report. Result <measured in the live part> |
 | A pod of `rogue` that sends no certificate, or a wrong one, to the host service gets a TLS alert. The host service logs `handshake refused` | M7 | None. Stop and report. Result <measured in the live part> |
+| A token that `rogue` signs fails at the attestor and at bind, and a client with another pin gets `issuer_untrusted`. `TestM2RejectRogueKey`, `TestM5BindRefusalsLive` and `TestM4HostServiceServesPinnedKeys` prove this in the gates of M2, M4 and M5 | M7 | None. Run those gates at the head of M7. Result <measured in the live part> |
 
 ## Departures from the Kiln canon
 
