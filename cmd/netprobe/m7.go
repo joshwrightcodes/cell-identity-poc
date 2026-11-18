@@ -29,7 +29,9 @@ type tlsDialResult struct {
 	PeerID    string `json:"peer_id,omitempty"`
 	Reason    string `json:"reason,omitempty"`
 	After     string `json:"after,omitempty"`
-	Error     string `json:"error,omitempty"`
+	// CanarySent is true when the probe wrote the canary after the handshake.
+	CanarySent bool   `json:"canary_sent,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // runTLSDial parses the flags of tlsdial and prints one result line.
@@ -40,6 +42,7 @@ func runTLSDial(ctx context.Context, fs *flag.FlagSet, args []string, stdout io.
 	noVerify := fs.Bool("no-verify", false, "accept any server certificate")
 	clientCert := fs.Bool("client-cert-stdin", false, "present the PEM chain and key from stdin")
 	source := fs.String("source", "", "local IP address of the dial")
+	canary := fs.Bool("canary", false, "write 32 fixed bytes after a passed handshake, as a client that trusts its peer sends a request")
 	timeout := fs.Duration("timeout", 5*time.Second, "dial and handshake timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -71,7 +74,7 @@ func runTLSDial(ctx context.Context, fs *flag.FlagSet, args []string, stdout io.
 		}
 		d.LocalAddr = &net.TCPAddr{IP: ip}
 	}
-	return json.NewEncoder(stdout).Encode(tlsDial(ctx, &d, *addr, cfg, !*noVerify, *timeout))
+	return json.NewEncoder(stdout).Encode(tlsDial(ctx, &d, *addr, cfg, !*noVerify, *canary, *timeout))
 }
 
 // tlsDialConfig returns the client config: the cell-proxy pin for an exact ID, or no server check.
@@ -90,9 +93,12 @@ func tlsDialConfig(expect, bundlePath string, noVerify bool) (*tls.Config, error
 	return cellproxy.ProbeTLS(b, id), nil
 }
 
+// canaryBytes is what tlsdial --canary writes after a passed handshake: 32 fixed bytes with no secret.
+const canaryBytes = "m7-canary-0123456789abcdefghijk-"
+
 // tlsDial dials addr, runs the handshake and waits up to timeout for the first read. The read
 // shows a refusal that a TLS 1.3 server sends after the client has finished its handshake.
-func tlsDial(ctx context.Context, d *net.Dialer, addr string, cfg *tls.Config, verified bool, timeout time.Duration) tlsDialResult {
+func tlsDial(ctx context.Context, d *net.Dialer, addr string, cfg *tls.Config, verified, canary bool, timeout time.Duration) tlsDialResult {
 	out := tlsDialResult{Addr: addr}
 	raw, err := d.DialContext(ctx, "tcp", addr)
 	if err != nil {
@@ -114,6 +120,10 @@ func tlsDial(ctx context.Context, d *net.Dialer, addr string, cfg *tls.Config, v
 	out.Verified = verified
 	if len(st.PeerCertificates) > 0 && len(st.PeerCertificates[0].URIs) > 0 {
 		out.PeerID = st.PeerCertificates[0].URIs[0].String()
+	}
+	if canary {
+		_, werr := c.Write([]byte(canaryBytes))
+		out.CanarySent = werr == nil
 	}
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	_, err = c.Read(make([]byte, 1))
@@ -203,7 +213,7 @@ func flipForward(ctx context.Context, ln net.Listener, upstream string, flipAt i
 			inner.Go(func() { down = copyFlip(c, u, downFlip, nil) })
 			inner.Wait()
 			slog.Info("connection closed", "conn", n, "bytes_up", up.n, "bytes_down", down.n,
-				"flipped", up.flipped || down.flipped, "max_printable_run_up", upScan.maxRun)
+				"flipped", up.flipped || down.flipped, "max_printable_run_up", upScan.maxRun, "tls", upScan.tls())
 		})
 	}
 }
@@ -254,11 +264,16 @@ type recordScanner struct {
 	run     int
 	maxRun  int
 	seen    int
+	// notTLS is set when a record header is not a TLS record: a type outside 20 to 23, or a version other than 0x03 0x0x.
+	notTLS bool
 }
+
+// tls reports whether the scanner saw at least one record header, and every header was a TLS record.
+func (s *recordScanner) tls() bool { return s.seen >= 5 && !s.notTLS }
 
 func (s *recordScanner) Write(p []byte) {
 	for _, b := range p {
-		if s.seen >= 64*1024 {
+		if s.notTLS || s.seen >= 64*1024 {
 			return
 		}
 		s.seen++
@@ -267,6 +282,11 @@ func (s *recordScanner) Write(p []byte) {
 			s.hdrN++
 			if s.hdrN == 5 {
 				s.hdrN = 0
+				if s.hdr[0] < 20 || s.hdr[0] > 23 || s.hdr[1] != 3 {
+					s.notTLS = true
+					s.maxRun = max(s.maxRun, s.seen)
+					return
+				}
 				s.appData = s.hdr[0] == 23
 				s.left = int(s.hdr[3])<<8 | int(s.hdr[4])
 				s.run = 0

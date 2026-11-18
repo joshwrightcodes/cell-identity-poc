@@ -387,3 +387,101 @@ func TestTLSDialHandshakeFlip(t *testing.T) {
 		t.Errorf("handshake %q reason %q, want failed and handshake_failed: %+v", r.Handshake, r.Reason, r)
 	}
 }
+
+// countingServer serves TLS 1.3 h2 and sends the number of bytes that each connection carried after its handshake on the channel,
+// when the connection ends.
+func countingServer(t *testing.T, chain, key []byte) (string, <-chan int) {
+	t.Helper()
+	cert, err := tls.X509KeyPair(chain, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	counts := make(chan int, 8)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(5 * time.Second))
+				if err := c.(*tls.Conn).Handshake(); err != nil {
+					counts <- 0
+					return
+				}
+				n, _ := io.Copy(io.Discard, c)
+				counts <- int(n)
+			}()
+		}
+	}()
+	return ln.Addr().String(), counts
+}
+
+// TestTLSDialCanary: with --canary, a client that passes the handshake writes 32 bytes, and a client that refuses the server writes none.
+// --no-verify accepts any server, so it writes to an impostor, which is the positive control of the disclosure check.
+func TestTLSDialCanary(t *testing.T) {
+	const id = "spiffe://mgmt.poc.internal/telemetry"
+	chain, key, _ := testChain(t, id)
+	otherChain, _, _ := testChain(t, id)
+	for _, c := range []struct {
+		name  string
+		args  func(roots []byte) []string
+		roots []byte
+		sent  bool
+		bytes int
+	}{
+		{"verified server", func(r []byte) []string { return []string{"--expect-id", id, "--bundle", writeFile(t, r)} }, caPEM(t, chain), true, 32},
+		{"wrong ID", func(r []byte) []string {
+			return []string{"--expect-id", "spiffe://mgmt.poc.internal/api", "--bundle", writeFile(t, r)}
+		}, caPEM(t, chain), false, 0},
+		{"other CA", func(r []byte) []string { return []string{"--expect-id", id, "--bundle", writeFile(t, r)} }, caPEM(t, otherChain), false, 0},
+		{"no verify", func(_ []byte) []string { return []string{"--no-verify"} }, nil, true, 32},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			addr, counts := countingServer(t, chain, key)
+			var out bytes.Buffer
+			args := append([]string{"tlsdial", "--addr", addr, "--canary"}, c.args(c.roots)...)
+			if code := execute(context.Background(), args, &out); code != 0 {
+				t.Fatalf("exit status %d: %s", code, out.String())
+			}
+			var r tlsDialResult
+			if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+				t.Fatalf("output is not one JSON line: %q", out.String())
+			}
+			if r.CanarySent != c.sent {
+				t.Errorf("canary_sent %v, want %v: %+v", r.CanarySent, c.sent, r)
+			}
+			select {
+			case n := <-counts:
+				if n != c.bytes {
+					t.Errorf("the server counted %d bytes after the handshake, want %d", n, c.bytes)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the server logged no ended connection")
+			}
+		})
+	}
+}
+
+// TestRecordScannerFlagsNonTLS: a stream whose first header is not a TLS record is not TLS, and its run count is not below the bytes read.
+func TestRecordScannerFlagsNonTLS(t *testing.T) {
+	plain := &recordScanner{}
+	plain.Write([]byte("GET / HTTP/1.1\r\nHost: example\r\n\r\n"))
+	if plain.tls() || plain.maxRun < 5 {
+		t.Errorf("plaintext: tls %v, max run %d, want not TLS", plain.tls(), plain.maxRun)
+	}
+	good := &recordScanner{}
+	good.Write(append(record(22, "hello"), record(23, "\x00\x01\x02")...))
+	if !good.tls() {
+		t.Error("a stream of TLS records is reported as not TLS")
+	}
+	if (&recordScanner{}).tls() {
+		t.Error("an empty stream is reported as TLS")
+	}
+}
