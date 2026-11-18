@@ -17,8 +17,9 @@ test_label="cell.poc.internal/e2e"
 
 # m7_namespaces prints "<cluster> <namespace>" for each test namespace of M7, one on each line.
 m7_namespaces() {
-  local cluster names name
-  for cluster in $(existing_clusters); do
+  local cluster clusters names name
+  clusters="$(existing_clusters)" || die "could not list the clusters. Run: mise run harness:status"
+  for cluster in $clusters; do
     names="$(kubectl --context "kind-$cluster" get namespaces -o json | jq -r --arg l "$test_label" '.items[]
       | select(.metadata.labels[$l] == "true" and (.metadata.name | startswith("m7-"))) | .metadata.name')" \
       || die "could not list the namespaces of $cluster"

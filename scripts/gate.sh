@@ -24,6 +24,7 @@ timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
 [[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
 [[ "$milestone" != m6-provision ]] || pattern="^TestProvisionFromPortal$"
+[[ "$milestone" != m7 ]] || pattern="^TestM7"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -154,7 +155,8 @@ if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]
     "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
     "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
   if [[ "$milestone" == m7 ]]; then
-    for cluster in $(live_cells); do
+    cells="$(live_cells)" || die "$cells"
+    for cluster in $cells; do
       targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
     done
   fi

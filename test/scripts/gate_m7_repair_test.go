@@ -44,6 +44,8 @@ func TestGateM7Repair(t *testing.T) {
 		deny  []string
 	}{
 		{name: "check: nothing left", args: []string{"--check"}},
+		{name: "check: kind fails", args: []string{"--check"}, code: 1, env: []string{"STUB_KIND_FAIL=1"},
+			want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
 		{name: "check: m7 namespaces in two clusters", args: []string{"--check"}, code: 1,
 			env: []string{"STUB_NS_dev_cell_1=m7-aa:true", "STUB_NS_rogue=m7-bb:true m7-cc:true"},
 			want: []string{"dev-cell-1 holds the test namespace m7-aa. Run: mise run gate:m7:repair",

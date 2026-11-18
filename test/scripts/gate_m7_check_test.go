@@ -61,7 +61,7 @@ func TestGateM7ImageCheck(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, calls, err := runGateM7(t, tc.stale, m7RepairOK, false)
-			ran := strings.Contains(calls, "-run M7")
+			ran := strings.Contains(calls, "-run ^TestM7")
 			if m6, m7 := strings.Index(calls, "m6 repair --check"), strings.Index(calls, "m7 repair --check"); m6 < 0 || m7 < 0 || m6 > m7 {
 				t.Errorf("gate-m6-repair.sh --check and then gate-m7-repair.sh --check must run: calls %s", calls)
 			}
@@ -82,7 +82,7 @@ func TestGateM7ImageCheck(t *testing.T) {
 func TestGateM7RepairCheckStops(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	out, calls, err := runGateM7(t, "", "#!/usr/bin/env bash\necho 'dev-cell-1 holds the test namespace m7-aa. Run: mise run gate:m7:repair'\nexit 1\n", false)
-	if err == nil || strings.Contains(calls, "-run M7") || !strings.Contains(out, "Run: mise run gate:m7:repair") {
+	if err == nil || strings.Contains(calls, "-run ^TestM7") || !strings.Contains(out, "Run: mise run gate:m7:repair") {
 		t.Fatalf("err %v, output %s, calls %s; want a stop before the tests", err, out, calls)
 	}
 }
@@ -92,7 +92,7 @@ func TestGateM7TokenScan(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, hit := range []bool{false, true} {
 		out, calls, err := runGateM7(t, "", m7RepairOK, hit)
-		if !strings.Contains(calls, "-run M7") || !strings.Contains(calls, "scan 2026-11-16T01:02:03Z") {
+		if !strings.Contains(calls, "-run ^TestM7") || !strings.Contains(calls, "scan 2026-11-16T01:02:03Z") {
 			t.Fatalf("hit %v: the tests or the scan did not run: calls %s\noutput %s", hit, calls, out)
 		}
 		if hit && (err == nil || !strings.Contains(out, "a token is in the log: dev-cp ns/pod container line 7") || !strings.Contains(out, "FAIL")) {
@@ -110,7 +110,20 @@ func TestGateM7OpenProvisionStep(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	m6 := "#!/usr/bin/env bash\necho \"m6 repair $*\" >>\"$STUB_LOG\"\necho 'step provision-1 is open. Run: mise run gate:m6:repair'\nexit 1\n"
 	out, calls, err := runGateM7With(t, "", m7RepairOK, m6, false)
-	if err == nil || strings.Contains(calls, "-run M7") || strings.Contains(calls, "m7 repair") || !strings.Contains(out, "Run: mise run gate:m6:repair") {
+	if err == nil || strings.Contains(calls, "-run ^TestM7") || strings.Contains(calls, "m7 repair") || !strings.Contains(out, "Run: mise run gate:m6:repair") {
 		t.Fatalf("err %v, output %s, calls %s; want a stop before the M7 check and the tests", err, out, calls)
+	}
+}
+
+// TestGateM7PatternAndTimeout: the tests run with the anchored pattern ^TestM7, so no other test that holds M7 in its name runs, and with
+// the provisional go test timeout of 90 minutes from harness/versions.env.
+func TestGateM7PatternAndTimeout(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	_, calls, err := runGateM7(t, "", m7RepairOK, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(calls, "-run ^TestM7\n") || !strings.Contains(calls, "-timeout 90m ") {
+		t.Errorf("the go test call lacks the pattern ^TestM7 at its end or the timeout of 90 minutes: %s", calls)
 	}
 }
