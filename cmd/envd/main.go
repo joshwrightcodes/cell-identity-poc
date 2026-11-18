@@ -17,7 +17,8 @@
 //
 // With --bundle-mirror, run also applies the signed bundle set of --cluster (operation kind
 // bundle.apply) that the ops pull carries in planeBundle, and reports the result in its status. run
-// never forwards an operation for --cluster to the gateway.
+// never forwards an operation for --cluster to the gateway. The plane path runs only after run accepts
+// a spec and only when a gateway is set, because the ops pull belongs to the relay legs.
 //
 // check reads one SpecBundle from standard input, loads the current state without writing it, and
 // prints one JSON line. It starts no telemetry. The exit status is 0 for accepted and unchanged, and
@@ -419,7 +420,7 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		if err != nil {
 			return err
 		}
-		if pc.Plane, err = newPlane(cfg, kube, dyn, tel); err != nil {
+		if pc.Plane, err = newPlane(cfg, kube, dyn, tel, func(c bundleapply.Config) envd.BundleApplier { return bundleapply.New(c) }); err != nil {
 			return err
 		}
 	}
@@ -467,7 +468,7 @@ func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, g
 // newPlane builds the plane path: the engine of role cp, which reads sets from the mirror, writes
 // them to the in-cluster store with the projected token and keeps its state in the ConfigMap of
 // --bundle-state-configmap.
-func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T) (*envd.Plane, error) {
+func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T, build func(bundleapply.Config) envd.BundleApplier) (*envd.Plane, error) {
 	mirror, err := ocistore.New(ocistore.Client{Base: cfg.bundleMirror})
 	if err != nil {
 		return nil, fmt.Errorf("--bundle-mirror: %w", err)
@@ -480,8 +481,8 @@ func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, t
 	if err != nil || holder == "" {
 		holder = name
 	}
-	keys := planeKeys(cfg.keyFile, tel.Log)
-	engine := bundleapply.New(bundleapply.Config{
+	keys := planeKeys(cfg.keyFile, cfg.key, tel.Log)
+	engine := build(bundleapply.Config{
 		Role: "cp", Env: cfg.env, Target: cfg.cluster, Holder: holder,
 		Mirror: mirror, Store: store, Dynamic: dyn, Client: kube,
 		Policy: bundle.DefaultPolicy(), Keys: keys,
@@ -489,14 +490,14 @@ func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, t
 		HealthTimeout: cfg.bundleHealthTimeout,
 		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
 	})
-	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, Log: tel.Log}), nil
+	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, Log: tel.Log})
 }
 
 // planeKeys returns a function that reads the pinned key in path again on each call. A failed read
-// gives the last key that loaded, so a rotation in progress does not stop an apply.
-func planeKeys(path string, log *slog.Logger) func() []crypto.PublicKey {
+// gives the last key that loaded, or seed (the key that envd read at startup) before any read works, so a rotation in progress does not stop an apply.
+func planeKeys(path string, seed ed25519.PublicKey, log *slog.Logger) func() []crypto.PublicKey {
 	var mu sync.Mutex
-	var last []crypto.PublicKey
+	last := []crypto.PublicKey{seed}
 	return func() []crypto.PublicKey {
 		mu.Lock()
 		defer mu.Unlock()

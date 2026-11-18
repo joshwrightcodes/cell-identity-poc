@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -84,6 +85,17 @@ type planeRig struct {
 	logs   *syncBuffer
 	plane  *Plane
 	status *op.BundleStatus
+	// keyFn gives the keys of the plane; a test swaps it to model a failed read or a rotation.
+	keyFn func() []crypto.PublicKey
+}
+
+func mustPlane(t *testing.T, cfg PlaneConfig) *Plane {
+	t.Helper()
+	p, err := NewPlane(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func newPlaneRig(t *testing.T) *planeRig {
@@ -91,8 +103,9 @@ func newPlaneRig(t *testing.T) *planeRig {
 	f := newFx(t)
 	st := &op.BundleStatus{Version: bundle.Version{Epoch: 1, Counter: 3}, RootDigest: "sha256:" + strings.Repeat("a", 64), State: "healthy", AllowSHA256: strings.Repeat("b", 64)}
 	r := &planeRig{t: t, f: f, eng: &fakeEngine{status: st}, clk: newClock(0), logs: &syncBuffer{}, status: st}
-	r.plane = NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: r.eng, Now: r.clk.Now, Log: newLog(r.logs),
-		Keys: func() []crypto.PublicKey { return []crypto.PublicKey{f.pub} }})
+	r.keyFn = func() []crypto.PublicKey { return []crypto.PublicKey{f.pub} }
+	r.plane = mustPlane(t, PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: r.eng, Now: r.clk.Now, Log: newLog(r.logs),
+		Keys: func() []crypto.PublicKey { return r.keyFn() }})
 	return r
 }
 
@@ -244,11 +257,16 @@ func TestPlaneBundleExpired(t *testing.T) {
 		})
 		r.offer(r.sign(o))
 		res := r.result()
-		if res == nil || res.Outcome != op.OutcomeRefused || res.Reason != op.ReasonPayloadInvalid {
+		if res == nil || res.Outcome != op.OutcomeLeaseLost || res.Reason != op.ReasonLeaseLost || res.Detail != "clock" || op.IsFinal(res.Outcome) {
 			t.Fatalf("result = %+v", res)
 		}
 		if n := len(r.eng.called()); n != 0 {
 			t.Fatalf("the engine ran %d times", n)
+		}
+		r.clk.now = r.clk.now.Add(5 * time.Minute)
+		r.offer(r.sign(o))
+		if res := r.result(); res == nil || res.Outcome != op.OutcomeApplied {
+			t.Fatalf("after the clock passes the issue time: %+v", res)
 		}
 	})
 	t.Run("skew inside the limit", func(t *testing.T) {
@@ -397,7 +415,7 @@ func TestPlaneOpNotForwarded(t *testing.T) {
 	r := newRig(t, 2)
 	pr := newPlaneRig(t)
 	pr.f = r.f
-	pr.plane = NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: pr.eng, Now: r.clk.Now, Log: newLog(r.logs),
+	pr.plane = mustPlane(t, PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: pr.eng, Now: r.clk.Now, Log: newLog(r.logs),
 		Keys: func() []crypto.PublicKey { return []crypto.PublicKey{r.f.pub} }})
 	planeOp := pr.operation(nil)
 	cellOp := pr.operation(func(o *op.Operation) { o.Cell = "dev-cell-1"; o.Args = json.RawMessage(`{"line":"x"}`) })
@@ -437,7 +455,7 @@ func TestPlaneOpsKeepForwardedWithoutPlane(t *testing.T) {
 func TestStatusReportPlaneKeys(t *testing.T) {
 	r := newRig(t, 3)
 	pr := newPlaneRig(t)
-	pr.plane = NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: pr.eng, Now: r.clk.Now, Log: newLog(io.Discard),
+	pr.plane = mustPlane(t, PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: pr.eng, Now: r.clk.Now, Log: newLog(io.Discard),
 		Keys: func() []crypto.PublicKey { return []crypto.PublicKey{r.f.pub} }})
 	pr.f = r.f
 	o := pr.operation(nil)
@@ -472,5 +490,74 @@ func TestStatusReportPlaneKeys(t *testing.T) {
 	raw, _ = json.Marshal(plain.mgmt.reports()[0])
 	if strings.Contains(string(raw), "planeBundle") {
 		t.Errorf("plain report = %s", raw)
+	}
+}
+
+func TestPlaneBundleSignatureRefusalRechecks(t *testing.T) {
+	t.Run("keys fail to load at first", func(t *testing.T) {
+		r := newPlaneRig(t)
+		r.keyFn = func() []crypto.PublicKey { return nil }
+		env := r.sign(r.operation(nil))
+		r.offer(env)
+		if res := r.result(); res == nil || res.Reason != op.ReasonSignatureInvalid {
+			t.Fatalf("first result = %+v", res)
+		}
+		r.keyFn = func() []crypto.PublicKey { return []crypto.PublicKey{r.f.pub} }
+		r.offer(env)
+		if res := r.result(); res == nil || res.Outcome != op.OutcomeApplied {
+			t.Fatalf("second result = %+v", res)
+		}
+	})
+	t.Run("key rotates", func(t *testing.T) {
+		r := newPlaneRig(t)
+		old, _, _ := ed25519.GenerateKey(rand.Reader)
+		r.keyFn = func() []crypto.PublicKey { return []crypto.PublicKey{old} }
+		env := r.sign(r.operation(nil))
+		r.offer(env)
+		if res := r.result(); res == nil || res.Reason != op.ReasonSignatureInvalid {
+			t.Fatalf("first result = %+v", res)
+		}
+		r.keyFn = func() []crypto.PublicKey { return []crypto.PublicKey{r.f.pub} }
+		r.offer(env)
+		if res := r.result(); res == nil || res.Outcome != op.OutcomeApplied {
+			t.Fatalf("second result = %+v", res)
+		}
+	})
+}
+
+func TestNewPlaneRefusesMissingParts(t *testing.T) {
+	keys := func() []crypto.PublicKey { return nil }
+	if _, err := NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Applier: &fakeEngine{}}); err == nil {
+		t.Error("nil Keys accepted")
+	}
+	if _, err := NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Keys: keys}); err == nil {
+		t.Error("nil Applier accepted")
+	}
+	if _, err := NewPlane(PlaneConfig{Env: testEnv, Cluster: planeCluster, Keys: keys, Applier: &fakeEngine{}}); err != nil {
+		t.Errorf("complete config: %v", err)
+	}
+}
+
+func TestPlaneBundleLogsRepeatedFaultOnce(t *testing.T) {
+	const msg = "plane bundle apply did not finish"
+	r := newPlaneRig(t)
+	fault := errors.New("mirror down")
+	r.eng.answers = []planeAnswer{{err: fault}, {err: fault}, {err: fault}, {err: errors.New("store down")}, {err: fault}}
+	env := r.sign(r.operation(func(o *op.Operation) { o.ExpiresAt = o.IssuedAt.Add(time.Hour) }))
+	for range 3 {
+		r.offer(env)
+		r.clk.now = r.clk.now.Add(10 * time.Second)
+	}
+	if n := r.logs.count(msg); n != 1 {
+		t.Fatalf("after three equal faults: %d lines", n)
+	}
+	r.offer(env)
+	if n := r.logs.count(msg); n != 2 {
+		t.Fatalf("after another fault: %d lines", n)
+	}
+	r.clk.now = r.clk.now.Add(2 * time.Minute)
+	r.offer(env)
+	if n := r.logs.count(msg); n != 3 {
+		t.Fatalf("after the window: %d lines", n)
 	}
 }

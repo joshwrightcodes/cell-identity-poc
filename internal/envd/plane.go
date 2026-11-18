@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
@@ -43,31 +44,44 @@ type Plane struct {
 	cfg PlaneConfig
 	wg  sync.WaitGroup
 
+	logs *lograte.Limiter
+
 	mu  sync.Mutex
 	cur *planeEntry
 }
 
-// planeEntry is the envelope that the plane has taken. res is nil while the apply runs.
+// planeEntry is the envelope that the plane has taken. res is nil while the apply runs. recheck is
+// true when res can change without a new envelope: a signature or payload refusal (the keys can
+// change) and an operation that is not yet valid (the clock moves).
 type planeEntry struct {
-	sha string
-	res *op.Result
+	sha     string
+	res     *op.Result
+	recheck bool
 }
 
-// NewPlane returns a Plane for cfg.
-func NewPlane(cfg PlaneConfig) *Plane {
+// logWindow is how long an equal engine fault stays silent in the log.
+const logWindow = time.Minute
+
+// NewPlane returns a Plane for cfg. It fails when Keys or Applier is nil.
+func NewPlane(cfg PlaneConfig) (*Plane, error) {
+	if cfg.Keys == nil || cfg.Applier == nil {
+		return nil, errors.New("a plane needs Keys and an Applier")
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.Default()
 	}
-	return &Plane{cfg: cfg}
+	return &Plane{cfg: cfg, logs: lograte.New(logWindow, 16, cfg.Now)}, nil
 }
 
 // Offer hands the open plane envelope of the ops pull to the plane, or nil when the pull holds none.
 // It never blocks on the engine. An envelope that the plane already holds changes nothing, and so
-// does a different envelope while an apply runs. An empty offer drops the held result, unless an
-// apply is still running.
+// does a different envelope while an apply runs, except that a held refusal that the keys or the
+// clock can undo is checked again. An empty offer drops the held result, unless an apply is still
+// running. The plane runs only after envd accepts a spec and only when a gateway is set, because the
+// ops pull belongs to the relay legs.
 func (p *Plane) Offer(ctx context.Context, envelope []byte) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -78,20 +92,21 @@ func (p *Plane) Offer(ctx context.Context, envelope []byte) {
 		return
 	}
 	sha := op.EnvelopeSHA256(envelope)
-	if p.cur != nil && (p.cur.sha == sha || p.cur.res == nil) {
+	if p.cur != nil && (p.cur.res == nil || p.cur.sha == sha && !p.cur.recheck) {
 		return
 	}
-	o, res := p.check(envelope, sha)
+	o, res, recheck := p.check(envelope, sha)
 	if res != nil {
-		p.cur = &planeEntry{sha: sha, res: res}
+		p.cur = &planeEntry{sha: sha, res: res, recheck: recheck}
 		return
 	}
 	p.cur = &planeEntry{sha: sha}
 	p.wg.Go(func() { p.apply(ctx, o, sha) })
 }
 
-// check runs every rule that needs no engine and returns the operation, or the refusal result.
-func (p *Plane) check(envelope []byte, sha string) (op.Operation, *op.Result) {
+// check runs every rule that needs no engine and returns the operation, or the refusal result and
+// whether a later check can undo it.
+func (p *Plane) check(envelope []byte, sha string) (op.Operation, *op.Result, bool) {
 	o, _, err := op.Verify(envelope, p.keys())
 	if err != nil {
 		reason := op.ReasonPayloadInvalid
@@ -102,10 +117,10 @@ func (p *Plane) check(envelope []byte, sha string) (op.Operation, *op.Result) {
 		if id, _, _, perr := op.Peek(envelope); perr == nil {
 			res.PeekedID = id
 		}
-		return op.Operation{}, res
+		return op.Operation{}, res, true
 	}
-	refuse := func(outcome, reason string) (op.Operation, *op.Result) {
-		return op.Operation{}, p.result(o.ID, outcome, reason, "", sha)
+	refuse := func(outcome, reason string) (op.Operation, *op.Result, bool) {
+		return op.Operation{}, p.result(o.ID, outcome, reason, "", sha), false
 	}
 	now := p.cfg.Now()
 	switch {
@@ -116,13 +131,16 @@ func (p *Plane) check(envelope []byte, sha string) (op.Operation, *op.Result) {
 	case o.Cell != p.cfg.Cluster:
 		return refuse(op.OutcomeRefused, op.ReasonWrongTarget)
 	case o.IssuedAt.After(now.Add(op.MaxSkew)):
-		return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
+		// The clock of envd runs behind the signer. The result is not final, so the operation stays
+		// open until the clock passes the issue time.
+		res := p.result(o.ID, op.OutcomeLeaseLost, op.ReasonLeaseLost, "clock", sha)
+		return op.Operation{}, res, true
 	case !now.Before(o.ExpiresAt):
 		return refuse(op.OutcomeExpired, "")
 	case len(o.Args) > op.MaxBundleArgsBytes:
 		return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
 	}
-	return o, nil
+	return o, nil, false
 }
 
 func (p *Plane) keys() []ed25519.PublicKey {
@@ -151,7 +169,10 @@ func (p *Plane) apply(ctx context.Context, o op.Operation, sha string) {
 	}
 	if err != nil {
 		p.cur = nil
-		p.cfg.Log.WarnContext(ctx, "plane bundle apply did not finish", "op", o.ID, "error", clip(err.Error()))
+		msg := clip(err.Error())
+		if _, ok, suppressed, _ := p.logs.Allow(msg); ok {
+			p.cfg.Log.WarnContext(ctx, "plane bundle apply did not finish", "op", o.ID, "error", msg, "suppressed", suppressed)
+		}
 		return
 	}
 	if out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == detailTarget {
