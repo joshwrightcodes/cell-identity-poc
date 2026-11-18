@@ -14,9 +14,6 @@ role="$(bundle_role)" || exit 1
 bundle_store_forward
 local_store="127.0.0.1:${CELL_BUNDLE_STORE_PORT}"
 
-root_dir="$BUILD/root"
-rm -rf "$root_dir"
-mkdir -p "$root_dir"
 published="$(mktemp "$BUILD/.published.env.XXXXXX")"
 trap 'rm -f "$published"; kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
 
@@ -27,7 +24,7 @@ publish_signed_role() {
     --build "$BUILD_ROOT" --root "$ROOT" "${COMPONENTS[@]}")" || die "bundlectl bootstrap failed: $result"
   digest="$(jq -er '.digest' <<<"$result")" || die "bundlectl bootstrap returned no root digest"
   [[ "$digest" == sha256:* ]] || die "bundlectl bootstrap returned the root digest '$digest'"
-  # The result holds the digests and the root manifest. It holds no secret.
+  # The result holds the digests and the root manifest.
   printf '%s\n' "$result" >"$BUILD/root.json"
   for entry in "${COMPONENTS[@]}"; do
     c="${entry%%:*}"
@@ -39,7 +36,9 @@ publish_signed_role() {
 
 # publish_open_role pushes the bundles with oras, writes one Application for each, and sets digest to the digest of the root.
 publish_open_role() {
-  local entry c wave ns d app extra
+  local entry c wave ns d app extra root_dir="$BUILD/root"
+  rm -rf "$root_dir"
+  mkdir -p "$root_dir"
   for entry in "${COMPONENTS[@]}"; do
     IFS=: read -r c wave ns <<<"$entry"
     d="$(cd "$BUNDLES/$c" && oras push --plain-http --format json "$local_store/bundles/$c:current" . | jq -r .digest)"

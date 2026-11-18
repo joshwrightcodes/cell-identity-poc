@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -153,6 +156,44 @@ func TestPublishWritesRootJSON(t *testing.T) {
 				app, err := os.ReadFile(filepath.Join(build, "root", "argocd.yaml"))
 				if err != nil || !strings.Contains(string(app), "repoURL: oci://127.0.0.1:5000/bundles/argocd\n") {
 					t.Errorf("the Application argocd is %q, %v, want repoURL oci://127.0.0.1:5000/bundles/argocd", app, err)
+				}
+				// Every Application that publish.sh writes must read a source that the project cell of
+				// components/argocd/project.yaml allows.
+				var project struct {
+					Spec struct {
+						SourceRepos []string `json:"sourceRepos"`
+					} `json:"spec"`
+				}
+				raw, err := os.ReadFile("../../components/argocd/project.yaml")
+				if err != nil || yaml.Unmarshal(raw, &project) != nil || len(project.Spec.SourceRepos) == 0 {
+					t.Fatalf("read project.yaml: %v", err)
+				}
+				apps, _ := filepath.Glob(filepath.Join(build, "root", "*.yaml"))
+				if len(apps) != len(components) {
+					t.Fatalf("publish.sh wrote %d Application files for %d components", len(apps), len(components))
+				}
+				for _, f := range apps {
+					data, _ := os.ReadFile(f)
+					var app struct {
+						Spec struct {
+							Project string `json:"project"`
+							Source  struct {
+								RepoURL string `json:"repoURL"`
+							} `json:"source"`
+						} `json:"spec"`
+					}
+					if err := yaml.Unmarshal(data, &app); err != nil || app.Spec.Project != "cell" {
+						t.Fatalf("%s: %v, project %q", f, err, app.Spec.Project)
+					}
+					allowed := false
+					for _, g := range project.Spec.SourceRepos {
+						if ok, _ := path.Match(g, app.Spec.Source.RepoURL); ok {
+							allowed = true
+						}
+					}
+					if !allowed {
+						t.Errorf("%s reads %s, which project.yaml does not allow (%v)", filepath.Base(f), app.Spec.Source.RepoURL, project.Spec.SourceRepos)
+					}
 				}
 				if !strings.Contains(string(published), "root=sha256:pushed\n") {
 					t.Errorf("published.env is %q", published)

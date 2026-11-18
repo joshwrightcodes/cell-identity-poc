@@ -168,7 +168,7 @@ func runTokenClient(ctx context.Context, args []string, stdout io.Writer) int {
 }
 
 // healthUpstreamTimeout bounds the registry check of the store proxy health route. Tests change it.
-var healthUpstreamTimeout = 2 * time.Second
+var healthUpstreamTimeout = cellproxy.StoreHealthTimeout
 
 // upstreamHealth answers GET /healthz of the store proxy from the registry behind it: 200 when GET /v2/ on
 // the upstream answers 200 or 401, and 503 for any other answer, a failed connection or no answer within

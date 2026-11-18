@@ -103,6 +103,8 @@ spec:
             httpGet:
               path: /healthz
               port: health
+            # The check of the proxy on the registry takes at most 2 s, so the probe waits longer.
+            timeoutSeconds: 3
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

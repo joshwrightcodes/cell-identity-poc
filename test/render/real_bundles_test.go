@@ -182,54 +182,16 @@ func TestRealBundlesPassPolicy(t *testing.T) {
 					if err := os.WriteFile(file, canon, 0o644); err != nil {
 						t.Fatal(err)
 					}
-					// Finding: the policy refuses the locked AppProject default of the argocd bundle (appproject_ok lists
-					// only the names of appProjects in allow.json). The test holds that one object apart and expects
-					// exactly this refusal from both evaluators, so a fix of the policy fails the test and removes
-					// the exception. Every other object must pass.
-					var rest, locked []map[string]any
-					for _, o := range objs {
-						if o["kind"] == "AppProject" && lookupOr(o, "metadata", "name") == "default" {
-							locked = append(locked, o)
-						} else {
-							rest = append(rest, o)
-						}
-					}
-					if len(locked) > 0 && c.name != "argocd" {
-						t.Fatalf("%s holds an AppProject default", c.name)
-					}
-					writeFile := func(name string, objs []map[string]any) string {
-						body, err := bundle.Canonical(objs)
-						if err != nil {
-							t.Fatal(err)
-						}
-						f := filepath.Join(t.TempDir(), name)
-						if err := os.WriteFile(f, body, 0o644); err != nil {
-							t.Fatal(err)
-						}
-						return f
-					}
 					data := conftestData(t, role, c.name, nps, scopeOf(objs))
-					restFile := writeFile("rest.yaml", rest)
-					if denied := conftestDeny(t, data, restFile)[restFile]; len(denied) > 0 {
+					if denied := conftestDeny(t, data, file)[file]; len(denied) > 0 {
 						t.Errorf("conftest refuses %s of %s (%s): %v", c.name, cr.name, role, denied)
 					}
 					decoded, err := bundleapply.DecodeCanonical(canon, bundle.MaxObjects)
 					if err != nil {
 						t.Fatalf("the engine refuses the canonical bytes of %s: %v", c.name, err)
 					}
-					err = checker.Check(context.Background(), c.name, decoded)
-					var refusal *bundleapply.Refusal
-					switch {
-					case len(locked) == 0 && err != nil:
+					if err := checker.Check(context.Background(), c.name, decoded); err != nil {
 						t.Errorf("the engine refuses %s of %s: %v", c.name, cr.name, err)
-					case len(locked) > 0:
-						lockedFile := writeFile("locked.yaml", locked)
-						if got := conftestDeny(t, data, lockedFile)[lockedFile]; !slices.Equal(got, []string{"component_not_allowed:kind"}) {
-							t.Errorf("conftest on AppProject default gives %v, want the known refusal component_not_allowed:kind (finding)", got)
-						}
-						if !errors.As(err, &refusal) || refusal.Detail != "kind" || refusal.Object != "AppProject/argocd/default" {
-							t.Errorf("the engine gives %v on the argocd bundle, want the known refusal kind for AppProject/argocd/default (finding)", err)
-						}
 					}
 				})
 			}
@@ -417,5 +379,63 @@ func TestNoClusterNetworkPolicyKinds(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestWidenedDefaultProjectRefused takes the rendered argocd bundle of each cluster with role cell or cp, widens the
+// locked AppProject default (one more source), and expects both conftest and the engine to refuse that bundle with
+// component_not_allowed:appproject_spec. The unchanged bundle passes (TestRealBundlesPassPolicy).
+func TestWidenedDefaultProjectRefused(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		role := roleOf[cr.name]
+		if role == "open" {
+			continue
+		}
+		t.Run(cr.name, func(t *testing.T) {
+			var raw string
+			for _, c := range cr.components {
+				if c.name == "argocd" {
+					raw = c.raw
+				}
+			}
+			objs, err := bundle.DecodeManifests([]byte(raw), bundle.MaxObjects)
+			if err != nil {
+				t.Fatal(err)
+			}
+			widened := 0
+			for _, o := range objs {
+				if o["kind"] == "AppProject" && lookupOr(o, "metadata", "name") == "default" {
+					o["spec"].(map[string]any)["sourceRepos"] = []any{"*"}
+					widened++
+				}
+			}
+			if widened != 1 {
+				t.Fatalf("the argocd bundle holds %d AppProject default objects, want 1", widened)
+			}
+			canon, err := bundle.Canonical(objs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file := filepath.Join(t.TempDir(), bundle.ManifestsFile)
+			if err := os.WriteFile(file, canon, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			want := "component_not_allowed:appproject_spec"
+			if denied := conftestDeny(t, conftestData(t, role, "argocd", harnessPolicies(cr), scopeOf(objs)), file)[file]; !slices.Equal(denied, []string{want}) {
+				t.Errorf("conftest denies %v, want only %s", denied, want)
+			}
+			checker, err := bundleapply.NewChecker(role, bundle.DefaultPolicy(), harnessRefs(harnessPolicies(cr)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := bundleapply.DecodeCanonical(canon, bundle.MaxObjects)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var refusal *bundleapply.Refusal
+			if err := checker.Check(context.Background(), "argocd", decoded); !errors.As(err, &refusal) || refusal.Reason+":"+refusal.Detail != want {
+				t.Errorf("the engine gives %v, want %s", err, want)
+			}
+		})
 	}
 }

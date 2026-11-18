@@ -34,6 +34,10 @@ const (
 	detailUpstream     = "upstream"
 )
 
+// StoreHealthTimeout bounds the registry check of the health route of the store proxy. The readiness probe of the
+// pod must wait longer, or the kubelet gives up before the proxy answers 503 (components/cell-system/bundle-store.yaml).
+const StoreHealthTimeout = 2 * time.Second
+
 const (
 	defaultTokenCacheTTL = 30 * time.Second
 	// refusalCacheTTL is how long the proxy keeps a refused token, so a flood of one bad token costs one review.

@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 )
 
 // storeWriter is the --writer argument that each cluster gets: the account of the applier of its role.
@@ -28,6 +31,61 @@ func proxyResources(t *testing.T, c map[string]any) {
 	t.Helper()
 	if got := fmt.Sprint(lookupOr(c, "resources")); got != "map[limits:map[memory:64Mi] requests:map[cpu:5m memory:16Mi]]" {
 		t.Errorf("resources are %s, want requests 5m and 16Mi and limit 64Mi", got)
+	}
+}
+
+// mountsOf lists the containers and init containers of a pod that mount the volume.
+func mountsOf(pod map[string]any, volume string) []string {
+	var out []string
+	for _, key := range []string{"initContainers", "containers"} {
+		list, _ := pod[key].([]any)
+		for _, c := range list {
+			m, _ := c.(map[string]any)
+			mounts, _ := m["volumeMounts"].([]any)
+			for _, v := range mounts {
+				if v.(map[string]any)["name"] == volume {
+					out = append(out, fmt.Sprint(m["name"]))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// wantToken checks that the pod has exactly one volume with a serviceAccountToken source (in a projected volume), that
+// it is the named volume with exactly the expected token source, and that exactly the named container mounts it.
+// A second token volume, or another mount of the first, would give a container a token that it must not have.
+func wantToken(t *testing.T, pod map[string]any, volume, source, container string) {
+	t.Helper()
+	var tokenVolumes []string
+	for _, v := range get[[]any](t, pod, "volumes") {
+		m := v.(map[string]any)
+		sources, _ := lookupOr(m, "projected", "sources").([]any)
+		for _, src := range sources {
+			if tok, ok := src.(map[string]any)["serviceAccountToken"]; ok {
+				tokenVolumes = append(tokenVolumes, fmt.Sprint(m["name"]))
+				if m["name"] == volume && fmt.Sprint(tok) != source {
+					t.Errorf("volume %s token source is %v, want %s", volume, tok, source)
+				}
+			}
+		}
+	}
+	if fmt.Sprint(tokenVolumes) != fmt.Sprint([]string{volume}) {
+		t.Errorf("the pod has the token volumes %v, want only %s", tokenVolumes, volume)
+	}
+	if got := mountsOf(pod, volume); fmt.Sprint(got) != fmt.Sprint([]string{container}) {
+		t.Errorf("volume %s is mounted by %v, want only %s", volume, got, container)
+	}
+}
+
+// noSharedNamespaces checks that the pod shares no namespace with the host and no process namespace between its
+// containers, so that no container reads the token of another through /proc or the host network.
+func noSharedNamespaces(t *testing.T, pod map[string]any) {
+	t.Helper()
+	for _, field := range []string{"shareProcessNamespace", "hostNetwork", "hostPID", "hostIPC"} {
+		if v, ok := pod[field]; ok {
+			t.Errorf("the pod sets %s = %v, want it absent", field, v)
+		}
 	}
 }
 
@@ -80,8 +138,13 @@ func TestBundleStoreTokenProxy(t *testing.T) {
 			}
 			proxyResources(t, proxy)
 			// Readiness follows the registry through /healthz of the proxy, and the registry has no probe.
-			if got := fmt.Sprint(lookupOr(proxy, "readinessProbe")); got != "map[httpGet:map[path:/healthz port:health]]" {
-				t.Errorf("store-proxy readinessProbe = %s, want GET /healthz on the port health", got)
+			if got := fmt.Sprint(lookupOr(proxy, "readinessProbe")); got != "map[httpGet:map[path:/healthz port:health] timeoutSeconds:3]" {
+				t.Errorf("store-proxy readinessProbe = %s, want GET /healthz on the port health with timeoutSeconds 3", got)
+			}
+			// The probe waits longer than the registry check of the proxy, so a slow registry gives the 503 of the proxy.
+			timeout, _ := lookupOr(proxy, "readinessProbe", "timeoutSeconds").(float64)
+			if time.Duration(timeout*float64(time.Second)) <= cellproxy.StoreHealthTimeout {
+				t.Errorf("the readiness probe timeoutSeconds is %v, want more than the %v of the registry check", timeout, cellproxy.StoreHealthTimeout)
 			}
 			var health any
 			for _, p := range get[[]any](t, proxy, "ports") {
@@ -97,28 +160,9 @@ func TestBundleStoreTokenProxy(t *testing.T) {
 					t.Errorf("the registry container has %s %v, want none", probe, p)
 				}
 			}
-			// Only store-proxy mounts the API token.
-			for _, c := range containers {
-				m := c.(map[string]any)
-				has := false
-				for _, v := range lookupOr(m, "volumeMounts").([]any) {
-					if v.(map[string]any)["name"] == "api-token" {
-						has = true
-					}
-				}
-				if has != (m["name"] == "store-proxy") {
-					t.Errorf("container %v mounts the API token = %v", m["name"], has)
-				}
-			}
-			var vol map[string]any
-			for _, v := range get[[]any](t, pod, "volumes") {
-				if v.(map[string]any)["name"] == "api-token" {
-					vol = v.(map[string]any)
-				}
-			}
-			if vol == nil || fmt.Sprint(lookupOr(vol, "projected", "sources", 0, "serviceAccountToken")) != "map[expirationSeconds:3600 path:token]" {
-				t.Errorf("the api-token volume is %v, want a projected token of 3600 s", vol)
-			}
+			// The one serviceAccountToken volume of the pod is the API token, and only store-proxy mounts it.
+			wantToken(t, pod, "api-token", "map[expirationSeconds:3600 path:token]", "store-proxy")
+			noSharedNamespaces(t, pod)
 			svc := objs["Service cell-system/bundle-store"]
 			ports := get[[]any](t, svc, "spec", "ports")
 			if len(ports) != 1 || fmt.Sprint(lookupOr(ports[0], "port")) != "5000" || lookupOr(ports[0], "targetPort") != "http" {
@@ -161,41 +205,9 @@ func TestRepoServerTokenSidecar(t *testing.T) {
 				t.Errorf("store-token args are %s, want %s", got, want)
 			}
 			proxyResources(t, tok)
-			var vol map[string]any
-			for _, v := range get[[]any](t, pod, "volumes") {
-				if v.(map[string]any)["name"] == "bundle-store-token" {
-					vol = v.(map[string]any)
-				}
-			}
-			if vol == nil {
-				t.Fatal("no volume bundle-store-token")
-			}
-			if got := fmt.Sprint(lookupOr(vol, "projected")); got != "map[sources:[map[serviceAccountToken:map[audience:bundle-store expirationSeconds:600 path:token]]]]" {
-				t.Errorf("the token volume is %s, want one token of 600 s with audience bundle-store", got)
-			}
-			for _, c := range containers {
-				m := c.(map[string]any)
-				mounts, _ := lookupOr(m, "volumeMounts").([]any)
-				has := false
-				for _, v := range mounts {
-					if v.(map[string]any)["name"] == "bundle-store-token" {
-						has = true
-						if v.(map[string]any)["mountPath"] != "/var/run/secrets/bundle-store" {
-							t.Errorf("the token mounts at %v", v)
-						}
-					}
-				}
-				if has != (m["name"] == "store-token") {
-					t.Errorf("container %v mounts the bundle store token = %v", m["name"], has)
-				}
-			}
-			for _, c := range get[[]any](t, pod, "initContainers") {
-				for _, v := range lookupOr(c, "volumeMounts").([]any) {
-					if v.(map[string]any)["name"] == "bundle-store-token" {
-						t.Errorf("init container %v mounts the bundle store token", c.(map[string]any)["name"])
-					}
-				}
-			}
+			// The one serviceAccountToken volume of the pod is the bundle-store token, and only store-token mounts it.
+			wantToken(t, pod, "bundle-store-token", "map[audience:bundle-store expirationSeconds:600 path:token]", "store-token")
+			noSharedNamespaces(t, pod)
 		})
 	}
 }

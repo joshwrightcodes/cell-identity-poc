@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 )
@@ -76,6 +80,10 @@ func TestAppProjectsRepeatAllowList(t *testing.T) {
 				if got, want := jsonOf(t, get[any](t, projects["cell"], "spec")), jsonOf(t, get[any](t, m7, "spec")); got != want {
 					t.Errorf("the project cell of management is\n%s\nwant the M7 spec\n%s", got, want)
 				}
+				// The M7 spec keeps every field of project.yaml but the source host, which moved to the token client.
+				if got := fmt.Sprint(lookupOr(projects["cell"], "spec", "sourceRepos")); got != "[oci://"+bundle.StoreHost+"/bundles/*]" {
+					t.Errorf("the project cell of management has sourceRepos %s, want oci://%s/bundles/*", got, bundle.StoreHost)
+				}
 				if _, ok := lookup(projects["cell"], "metadata", "annotations", "poc.internal/allow-sha256"); ok {
 					t.Error("the M7 project carries the allow-list annotation")
 				}
@@ -122,5 +130,75 @@ func mapKeys[V any](m map[string]V) func(func(string) bool) {
 				return
 			}
 		}
+	}
+}
+
+// sourceAllowed reports whether repoURL matches one of the sourceRepos globs of a project, as Argo CD matches them.
+func sourceAllowed(repos []any, repoURL string) bool {
+	for _, r := range repos {
+		if ok, err := path.Match(fmt.Sprint(r), repoURL); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// TestApplicationSourcesMatchProjects checks, in every cluster, that the root Application of bootstrap/root.yaml and every
+// child Application of the root bundle (the files of bundle.ComposeRoot in roles cell and cp) name a repoURL that a
+// sourceRepos entry of the project of the Application allows, and a project that the cluster renders. The children of
+// role open come from scripts/publish.sh, and test/scripts checks them against the same project.
+func TestApplicationSourcesMatchProjects(t *testing.T) {
+	policy := bundle.DefaultPolicy()
+	root := readObject(t, "../../bootstrap/root.yaml")
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			projects := map[string][]any{}
+			for _, o := range clusterComponent(t, cr.name, "argocd") {
+				if o["kind"] == "AppProject" {
+					projects[get[string](t, o, "metadata", "name")] = get[[]any](t, o, "spec", "sourceRepos")
+				}
+			}
+			check := func(what string, app map[string]any) {
+				project := fmt.Sprint(lookupOr(app, "spec", "project"))
+				repos, ok := projects[project]
+				if !ok {
+					t.Errorf("%s names the project %q, which %s does not render", what, project, cr.name)
+					return
+				}
+				if url := fmt.Sprint(lookupOr(app, "spec", "source", "repoURL")); !sourceAllowed(repos, url) {
+					t.Errorf("%s reads %s, which the project %s does not allow (sourceRepos %v)", what, url, project, repos)
+				}
+			}
+			check("the root Application", root)
+			role := roleOf[cr.name]
+			if role == "open" {
+				return
+			}
+			var comps []bundle.Component
+			for _, c := range cr.components {
+				if c.kind == "bundle" {
+					comps = append(comps, bundle.Component{Name: c.name, Wave: c.wave, Namespace: c.ns, Digest: "sha256:" + strings.Repeat("a", 64)})
+				}
+			}
+			slices.SortFunc(comps, func(a, b bundle.Component) int { return strings.Compare(a.Name, b.Name) })
+			art, err := bundle.ComposeRoot(role, bundle.Set{Components: comps}, policy)
+			if err != nil {
+				t.Fatal(err)
+			}
+			files, err := bundle.Unpack(art.Layer, bundle.MaxLayerBytes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(files) != len(comps) {
+				t.Fatalf("the root holds %d files for %d components", len(files), len(comps))
+			}
+			for name, data := range files {
+				var app map[string]any
+				if err := yaml.Unmarshal(data, &app); err != nil {
+					t.Fatal(err)
+				}
+				check("the Application "+name, app)
+			}
+		})
 	}
 }
