@@ -14,6 +14,12 @@ import (
 // the output, the calls that the stubs logged and the error.
 func runGateM7(t *testing.T, stale, repair string, hit bool) (out, calls string, err error) {
 	t.Helper()
+	return runGateM7With(t, stale, repair, m6RepairOK, hit)
+}
+
+// runGateM7With is runGateM7 with the body of the gate-m6-repair.sh stub.
+func runGateM7With(t *testing.T, stale, repair, m6Repair string, hit bool) (out, calls string, err error) {
+	t.Helper()
 	root := newM5GateRoot(t, stale)
 	write := func(name, body string) {
 		if err := os.WriteFile(filepath.Join(root, "scripts", name), []byte(body), 0o755); err != nil {
@@ -21,7 +27,7 @@ func runGateM7(t *testing.T, stale, repair string, hit bool) (out, calls string,
 		}
 	}
 	write("gate-m7-repair.sh", repair)
-	write("gate-m6-repair.sh", "#!/usr/bin/env bash\necho \"m6 repair $*\" >>\"$STUB_LOG\"\nexit 0\n")
+	write("gate-m6-repair.sh", m6Repair)
 	write("gate-token-scan.sh", `#!/usr/bin/env bash
 echo "scan $*" >>"$STUB_LOG"
 [[ -z "$STUB_HIT" ]] || { echo "a token is in the log: dev-cp ns/pod container line 7"; exit 1; }
@@ -38,9 +44,11 @@ echo "scan $*" >>"$STUB_LOG"
 	return string(b), string(c), err
 }
 
+const m6RepairOK = "#!/usr/bin/env bash\necho \"m6 repair $*\" >>\"$STUB_LOG\"\nexit 0\n"
+
 const m7RepairOK = "#!/usr/bin/env bash\necho \"m7 repair $*\" >>\"$STUB_LOG\"\nexit 0\n"
 
-// TestGateM7ImageCheck: gate.sh m7 runs gate-m7-repair.sh --check, and then the image check of M6 with celld of each live cell added. A
+// TestGateM7ImageCheck: gate.sh m7 runs gate-m6-repair.sh --check, then gate-m7-repair.sh --check, and then the image check of M6 with celld of each live cell added. A
 // stale image stops the run before the tests and names the command that updates the workload.
 func TestGateM7ImageCheck(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
@@ -54,8 +62,8 @@ func TestGateM7ImageCheck(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			out, calls, err := runGateM7(t, tc.stale, m7RepairOK, false)
 			ran := strings.Contains(calls, "-run M7")
-			if !strings.Contains(calls, "m7 repair --check") || strings.Contains(calls, "m6 repair") {
-				t.Errorf("gate-m7-repair.sh --check must run, and the M6 repair must not: calls %s", calls)
+			if m6, m7 := strings.Index(calls, "m6 repair --check"), strings.Index(calls, "m7 repair --check"); m6 < 0 || m7 < 0 || m6 > m7 {
+				t.Errorf("gate-m6-repair.sh --check and then gate-m7-repair.sh --check must run: calls %s", calls)
 			}
 			if tc.want == "" {
 				if err != nil || !ran {
@@ -93,5 +101,16 @@ func TestGateM7TokenScan(t *testing.T) {
 		if !hit && err != nil {
 			t.Errorf("err %v, output %s; want a pass", err, out)
 		}
+	}
+}
+
+// TestGateM7OpenProvisionStep: an open provisioning step makes gate-m6-repair.sh --check fail, and gate.sh m7 stops before the M7 check and
+// the tests.
+func TestGateM7OpenProvisionStep(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	m6 := "#!/usr/bin/env bash\necho \"m6 repair $*\" >>\"$STUB_LOG\"\necho 'step provision-1 is open. Run: mise run gate:m6:repair'\nexit 1\n"
+	out, calls, err := runGateM7With(t, "", m7RepairOK, m6, false)
+	if err == nil || strings.Contains(calls, "-run M7") || strings.Contains(calls, "m7 repair") || !strings.Contains(out, "Run: mise run gate:m6:repair") {
+		t.Fatalf("err %v, output %s, calls %s; want a stop before the M7 check and the tests", err, out, calls)
 	}
 }

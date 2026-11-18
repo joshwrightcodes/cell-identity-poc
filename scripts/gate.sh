@@ -6,7 +6,7 @@
 # m6 runs gate-m6-repair.sh --check and the image check of mgmtd, envd, the cell controller, the cell gateway and the SPIRE server first.
 # m6-provision runs the one test that deletes both cells and creates them again through the portal, after the same checks. It is not
 # part of m6, because it deletes the cells. An interrupted run leaves build/gate/m6-provision, and mise run gate:m6:repair restores the cells.
-# m7 runs gate-m7-repair.sh --check and the image check of m6 with celld added, because M7 tests run the celld bind client and the cell-proxy images.
+# m7 runs gate-m6-repair.sh --check, gate-m7-repair.sh --check and the image check of m6 with celld added, because M7 tests run the celld bind client and the cell-proxy images.
 # After the tests, m5, m5-soak, m5-drill, m6, m6-provision and m7 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
@@ -143,10 +143,9 @@ fi
 # gate-m5-repair.sh, which runs the M4 and M2 repairs once. The provision gate checks the same, and the check fails while the marker
 # of an earlier provision run exists.
 if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]]; then
+  "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
   if [[ "$milestone" == m7 ]]; then
     "$ROOT/scripts/gate-m7-repair.sh" --check || exit 1
-  else
-    "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
   fi
   stale=""
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
