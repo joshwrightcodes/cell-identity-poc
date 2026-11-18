@@ -17,9 +17,16 @@ import (
 // policy-gateway.json and gateway.json (the StatefulSet). A policy with no file is absent, as plane-cells is while no cell is live.
 const admitKubectl = `#!/usr/bin/env bash
 d="$STUB_DIR"
+# plane-cells is read with --ignore-not-found: a file that does not exist is an absent policy (no output, exit 0), and a file that holds ERR is a read that fails.
+plane() {
+  [[ " ${*:2} " == *" --ignore-not-found "* ]] || { echo "plane-cells must be read with --ignore-not-found" >&2; exit 2; }
+  [[ -f "$1" ]] || exit 0
+  [[ "$(cat "$1")" != ERR ]] || { echo "error: the connection to the server was refused" >&2; exit 1; }
+  cat "$1"
+}
 case " $* " in
-  *" -n spire-system get networkpolicy plane-cells "*) cat "$d/policy-spire.json" ;;
-  *" -n relay-system get networkpolicy plane-cells "*) cat "$d/policy-relay-cells.json" ;;
+  *" -n spire-system get networkpolicy plane-cells "*) plane "$d/policy-spire.json" "$@" ;;
+  *" -n relay-system get networkpolicy plane-cells "*) plane "$d/policy-relay-cells.json" "$@" ;;
   *" -n relay-system get networkpolicy plane-upstream "*) cat "$d/policy-relay-upstream.json" ;;
   *" -n relay-system get deployment "*) cat "$d/relay-deployment.json" ;;
   *" -n gateway-system get networkpolicy cell-gateway "*) cat "$d/policy-gateway.json" ;;
@@ -151,6 +158,10 @@ func TestCheckAdmitLists(t *testing.T) {
 			fail: true, wanted: []string{"the relay plane policy plane-cells admits '172.18.0.5/32' on its route ports", "Run: CELL=dev-cp mise run cell:up"}},
 		{name: "the relay has no plane policy for the live cells", files: withFiles(healthy, map[string]string{"policy-relay-cells.json": ""}),
 			fail: true, wanted: []string{"the relay plane policy plane-cells admits '' on its route ports"}},
+		{name: "an unreadable plane-cells policy of the SPIRE server fails and is no absent policy", files: withFiles(healthy, map[string]string{"policy-spire.json": "ERR"}), env: []string{"STUB_KIND=management dev-cp rogue"},
+			fail: true, wanted: []string{"cannot read NetworkPolicy spire-system/plane-cells", "Run: CELL=dev-cp mise run cell:up"}},
+		{name: "an unreadable plane-cells policy of the relay fails", files: withFiles(healthy, map[string]string{"policy-relay-cells.json": "ERR"}), env: []string{"STUB_KIND=management dev-cp rogue"},
+			fail: true, wanted: []string{"cannot read NetworkPolicy relay-system/plane-cells"}},
 		{name: "a stale address on port 8451 of the gateway", files: withFiles(healthy, map[string]string{"policy-gateway.json": policyJSON(cidrRule(8450, cells...), cidrRule(8451, "172.18.0.5/32", "172.18.0.77/32"))}),
 			fail: true, wanted: []string{"the gateway admits '172.18.0.5/32 172.18.0.77/32' on port 8451"}},
 		{name: "a fake stale --cell-node address", files: withFiles(healthy, map[string]string{"gateway.json": `{"spec":{"template":{"spec":{"containers":[{"name":"cellgw","args":["serve","--cell-node=dev-cell-1=172.18.0.50","--cell-node=dev-cell-2=172.18.0.6"]}]}}}}`}),
@@ -204,6 +215,16 @@ func TestVerifySelectsRulesByPort(t *testing.T) {
 		moved := withFiles(files, map[string]string{"policy-relay-upstream.json": strings.Replace(files["policy-relay-upstream.json"], "172.18.0.3/32", "172.18.0.9/32", 1)})
 		if out, err = runAdmit(t, "check_relay_current", moved); err == nil || !strings.Contains(out, "the egress policy plane-upstream admits '172.18.0.9/32'") {
 			t.Fatalf("err %v, output %q; want a failure for the stale target in plane-upstream", err, out)
+		}
+	})
+	t.Run("check_relay_current fails when plane-cells cannot be read", func(t *testing.T) {
+		files := withFiles(healthy, map[string]string{
+			"relay-deployment.json":      `{"spec":{"template":{"spec":{"containers":[{"args":["--route","8443=172.18.0.3:31443"]}]}}}}`,
+			"policy-relay-cells.json":    "ERR",
+			"policy-relay-upstream.json": `{"spec":{"egress":[` + cidrToRule(31443, "172.18.0.3/32") + `]}}`,
+		})
+		if out, err := runAdmit(t, "check_relay_current", files, "STUB_KIND=management dev-cp rogue"); err == nil || !strings.Contains(out, "cannot read NetworkPolicy relay-system/plane-cells") {
+			t.Fatalf("err %v, output %q; want a failure for the unreadable policy", err, out)
 		}
 	})
 	t.Run("check_relay_current passes with no live cell and no plane-cells policy", func(t *testing.T) {

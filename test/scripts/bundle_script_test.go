@@ -53,7 +53,7 @@ case "$*" in
     [[ -d "${DOCKER_CONFIG:-}" && -z "$(ls -A "$DOCKER_CONFIG")" ]] || { echo "cosign needs an empty DOCKER_CONFIG" >&2; exit 3; }
     [[ "$*" == *" --insecure-ignore-tlog=true "* && "$*" == *" --allow-http-registry "* ]] || { echo "cosign flags" >&2; exit 4; }
     [[ -z "${STUB_COSIGN_FAIL:-}" ]] || { echo "Error: no matching signatures" >&2; exit 1; }
-    payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}}))}' | base64 | tr -d '\n')"
+    payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" --argjson v "${STUB_COSIGN_VERSION:-{\"epoch\":1,\"counter\":2\}}" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}})), predicate: {version: $v}}' | base64 | tr -d '\n')"
     printf '{"payloadType":"application/vnd.in-toto+json","payload":"%s","signatures":[{"sig":"x"}]}\n' "$payload" ;;
   "run bundlectl -- push "*)
     [[ -z "${STUB_PUSH_FAIL:-}" ]] || fail "push failed"
@@ -93,6 +93,8 @@ const bundleKubectl = `#!/usr/bin/env bash
 echo "kubectl $*" >>"$STUB_LOG"
 case " $* " in
   *" port-forward "*) exec sleep 30 ;;
+  *" patch application "*) [[ -z "${STUB_PATCH_FAIL:-}" ]] || { echo "error: patch failed" >&2; exit 1; }; exit 0 ;;
+  *" annotate application "*) [[ -z "${STUB_ANNOTATE_FAIL:-}" ]] || { echo "error: annotate failed" >&2; exit 1; }; exit 0 ;;
   *" create -f - "*) cat >"$STUB_STATE/created.json"; exit 0 ;;
   *" apply "*" -f - "*) n=$(($(cat "$STUB_STATE/apply-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_STATE/apply-count"; cat >"$STUB_STATE/applied-$n.yaml"; exit 0 ;;
   *" get configmap bundle-state "*)
@@ -615,7 +617,11 @@ func TestBundleRepairOrder(t *testing.T) {
 		env  func(f repairFixture) []string
 		want string
 	}{
-		"a root that cosign does not verify": {func(f repairFixture) []string { return append(f.env(), "STUB_COSIGN_FAIL=1") }, "cosign"},
+		"a root that cosign does not verify": {func(f repairFixture) []string { return append(f.env(), "STUB_COSIGN_FAIL=1") }, "no matching signatures"},
+		"a verified root older than the record of good[0]": {func(f repairFixture) []string {
+			return append(f.env(), `STUB_COSIGN_VERSION={"epoch":1,"counter":1}`)
+		}, "--allow-older"},
+		"a verified root of an older epoch": {func(f repairFixture) []string { return append(f.env(), `STUB_COSIGN_VERSION={"epoch":0,"counter":9}`) }, "older"},
 		"a verified root for another digest": {func(f repairFixture) []string {
 			return append(f.env(), "STUB_COSIGN_SUBJECTS="+strings.Replace(f.subjects, strings.TrimPrefix(f.root, "sha256:"), strings.Repeat("9", 64), 1))
 		}, "subject"},
@@ -674,6 +680,56 @@ func TestBundleRepairOrder(t *testing.T) {
 			t.Error("a root that matches no anchor was repaired")
 		}
 		noChange(t, log)
+	})
+	t.Run("an older root is applied with --allow-older, and a newer or equal one needs no flag", func(t *testing.T) {
+		for _, tc := range []struct {
+			version string
+			args    []string
+			ok      bool
+		}{
+			{`{"epoch":1,"counter":1}`, []string{"--allow-older"}, true},
+			{`{"epoch":1,"counter":2}`, nil, true},
+			{`{"epoch":1,"counter":5}`, nil, true},
+			{`{"epoch":2,"counter":1}`, nil, true},
+			{`{"epoch":1,"counter":1}`, nil, false},
+		} {
+			r := newBundleRoot(t, "dev-cell-1")
+			f := newRepairFixture(t, r)
+			out, errOut, log, err := r.run("bundle.sh", append(f.env(), "STUB_COSIGN_VERSION="+tc.version), append([]string{"repair", "--target", "dev-cell-1"}, tc.args...)...)
+			if (err == nil) != tc.ok {
+				t.Errorf("version %s args %v: err %v, want ok=%v\n%s%s", tc.version, tc.args, err, tc.ok, out, errOut)
+			}
+			if !tc.ok {
+				noChange(t, log)
+				if !strings.Contains(errOut, "older") || !strings.Contains(errOut, "1/2") {
+					t.Errorf("the refusal does not say why: %q", errOut)
+				}
+			}
+		}
+		// The flag belongs to repair.
+		r := newBundleRoot(t, "dev-cell-1")
+		if _, _, _, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1", "--allow-older"); err == nil {
+			t.Error("publish accepted --allow-older")
+		}
+	})
+	t.Run("a failed pin stops the repair before the apply", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		f := newRepairFixture(t, r)
+		_, errOut, log, err := r.run("bundle.sh", append(f.env(), "STUB_PATCH_FAIL=1"), "repair", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "pin") {
+			t.Errorf("err %v, stderr %q, want a failure that names the pin", err, errOut)
+		}
+		if strings.Contains(log, " apply ") || strings.Contains(log, " delete pod") || strings.Contains(log, "refresh=hard") {
+			t.Errorf("the repair went on after a failed pin:\n%s", log)
+		}
+	})
+	t.Run("a failed refresh is reported", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		f := newRepairFixture(t, r)
+		_, errOut, _, err := r.run("bundle.sh", append(f.env(), "STUB_ANNOTATE_FAIL=1"), "repair", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "refresh") {
+			t.Errorf("err %v, stderr %q, want a failure that names the refresh", err, errOut)
+		}
 	})
 	t.Run("an Application that stays off the digest fails the wait", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")

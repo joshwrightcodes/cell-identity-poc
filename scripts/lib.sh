@@ -707,7 +707,9 @@ check_relay_current() {
   json="$(k -n relay-system get networkpolicy plane-upstream -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-upstream"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
   cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
   [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy plane-upstream admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
-  cidrs="$(k -n relay-system get networkpolicy plane-cells -o json 2>/dev/null | jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")')" || cidrs=""
+  json="$(k -n relay-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  cidrs=""
+  [[ -z "$json" ]] || cidrs="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
   [[ "$cidrs" == "$want_cells" ]] || stale+=("the plane policy relay-system/plane-cells admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   if ((${#stale[@]} > 0)); then
     printf '%s\n' "${stale[@]}"
@@ -968,23 +970,29 @@ apply_store_object() {
 #   - The store proxy reviews tokens through the API server, and the egress for that lives in the network-policy bundle, which Argo CD syncs after it reads
 #     the store. A live policy bundle-store that Argo CD manages gets the rendered policy first.
 store_upgrade() {
-  local live stale tid pod ready
+  local live stale tid pod ready rev hash
   live="$(k -n cell-system get networkpolicy bundle-store --ignore-not-found -o json)" || die "could not read NetworkPolicy bundle-store in cell-system"
   if [[ -n "$live" && -f "$BUNDLES/network-policy/manifests.yaml" ]] \
     && [[ -n "$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")" ]]; then
     apply_store_object NetworkPolicy "$BUNDLES/network-policy/manifests.yaml" "$live"
   fi
   live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
-  [[ -n "$live" && -f "$BUNDLES/cell-system/manifests.yaml" ]] || return 0
+  [[ -n "$live" ]] || return 0
   stale="$(jq -r '[.spec.template.spec.containers[]? | select(.name == "bundle-store") | (.readinessProbe != null) or ((.ports // []) | length > 0)] | any' <<<"$live")"
-  [[ "$stale" == true ]] || return 0
-  apply_store_object StatefulSet "$BUNDLES/cell-system/manifests.yaml" "$live"
+  if [[ "$stale" == true && -f "$BUNDLES/cell-system/manifests.yaml" ]]; then
+    apply_store_object StatefulSet "$BUNDLES/cell-system/manifests.yaml" "$live"
+    live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+  fi
+  # The pod check runs on every pass, so a rerun after an interrupted upgrade also replaces a pod that never became Ready. A pod of the current
+  # revision may still be starting, so only a pod of an older revision goes.
+  rev="$(jq -r '.status.updateRevision // ""' <<<"$live")"
   pod="$(k -n cell-system get pod bundle-store-0 --ignore-not-found -o json)" || die "could not read pod bundle-store-0"
-  [[ -n "$pod" ]] || return 0
+  [[ -n "$pod" && -n "$rev" ]] || return 0
   ready="$(jq -r '[.status.conditions[]? | select(.type == "Ready") | .status][0] // "False"' <<<"$pod")"
-  if [[ "$ready" != True ]]; then
+  hash="$(jq -r '.metadata.labels["controller-revision-hash"] // ""' <<<"$pod")"
+  if [[ "$ready" != True && "$hash" != "$rev" ]]; then
     k -n cell-system delete pod bundle-store-0 --wait=true --timeout=120s >/dev/null || die "could not delete the pod bundle-store-0, which never became Ready"
-    log "deleted the pod bundle-store-0, which never became Ready with the M7 probe"
+    log "deleted the pod bundle-store-0, which never became Ready at revision $hash"
   fi
 }
 

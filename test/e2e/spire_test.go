@@ -140,7 +140,7 @@ spec:
 	if out := runTool(t, nil, "yq", selectEntries+` | .data | keys | join(",")`, manifests); !strings.Contains(out, "m2-test-entry.yaml") {
 		t.Fatalf("edited spire-server bundle: want key m2-test-entry.yaml in ConfigMap spire-entries, got keys %q", out)
 	}
-	testSpire := orasPush(t, spireDir, spireRef+":current")
+	testSpire := orasPush(t, spireDir, spireRef+":m2-test")
 
 	// A root bundle that pins the test spire-server bundle.
 	rootDir := orasPull(t, rootRef+"@"+origRoot)

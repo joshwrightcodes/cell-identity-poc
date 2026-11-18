@@ -22,7 +22,7 @@ case " $* " in
   *" --context kind-management "*" get configmap mgmt-signing-pub "*) printf '{"data":{"spec.pub":"%s"}}\n' "$(cat "$d/signing-pub")" ;;
   *" --context kind-management "*" get pod mgmtd-0 "*) printf 'True' ;;
   *" -n spire-system get configmap cell-records -o json "*) cat "$d/cell-records.json" ;;
-  *" -n spire-system get networkpolicy plane-cells "*) cat "$d/agents-policy.json" ;;
+  *" -n spire-system get networkpolicy plane-cells "*) [[ "$(cat "$d/agents-policy.json")" != ERR ]] || { echo "error: connection refused" >&2; exit 1; }; cat "$d/agents-policy.json" ;;
   *" -n spire-system get service spire-server "*) cat "$d/service.json" ;;
   *" -n spire-system get configmap attest-hints "*) [[ -s "$d/attest-hints" ]] || { echo 'not found' >&2; exit 1; }; echo configmap/attest-hints ;;
   *" -n spire-system get configmap spire-server "*) cat "$d/server.conf" ;;
@@ -219,6 +219,8 @@ func TestVerifyEnvdChecks(t *testing.T) {
 		{name: "agent cells: a test trace comes first", check: "check_agent_cells_current", cell: "dev-cp",
 			change: map[string]string{"cell-records.json": records("7", map[string]string{"dev-cell-1": jwks("a")}), "traces": "the node names the test key"},
 			want:   []string{"the node names the test key", "Run: mise run gate:m2:repair"}},
+		{name: "agent cells: an unreadable plane-cells policy is a failure", check: "check_agent_cells_current", cell: "dev-cp", change: map[string]string{"agents-policy.json": "ERR"},
+			want: []string{"cannot read NetworkPolicy spire-system/plane-cells", "Run: CELL=dev-cp mise run cell:up"}},
 		{name: "key test clean ok", check: "check_keytest_clean", cell: "dev-cell-1"},
 		{name: "key test clean: the cell publishes other keys", check: "check_keytest_clean", cell: "dev-cell-1", change: map[string]string{"live-jwks.json": jwks("a", "z")},
 			want: []string{"publishes other keys than its record in dev-cp", "Run: mise run mgmt -- keycheck --cell dev-cell-1"}},

@@ -193,7 +193,9 @@ check_agent_cells_current() {
       keycheck+=("mise run mgmt -- keycheck --cell $cell")
     fi
   done
-  cidrs="$(k -n spire-system get networkpolicy plane-cells -o json 2>/dev/null | jq -r '[.spec.ingress[]? | select(any(.ports[]?; .port == 8081)) | .from[]?.ipBlock.cidr] | sort | join(" ")')" || cidrs=""
+  json="$(k -n spire-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy spire-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  cidrs=""
+  [[ -z "$json" ]] || cidrs="$(jq -r '[.spec.ingress[]? | select(any(.ports[]?; .port == 8081)) | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
   # jq sorts both sides, so the comparison does not depend on the locale of sort.
   want="$(printf '%s\n' ${want_cidrs[@]+"${want_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   [[ "$cidrs" == "$want" ]] || stale+=("the NetworkPolicy admits '$cidrs', but the agent cell nodes are '$want'")
@@ -232,17 +234,13 @@ check_admit_lists() {
   done
   want="$(printf '%s\n' ${want_cidrs[@]+"${want_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   list_of() { jq -r --argjson p "$2" '[.spec.ingress[]? | select(any(.ports[]?; .port == $p)) | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$1"; }
-  if json="$(k -n spire-system get networkpolicy plane-cells -o json 2>/dev/null)"; then
-    got="$(list_of "$json" 8081)"
-  else
-    got=""
-  fi
+  json="$(k -n spire-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy spire-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  got=""
+  [[ -z "$json" ]] || got="$(list_of "$json" 8081)"
   [[ "$got" == "$want" ]] || problems+=("the SPIRE server admits '$got' on port 8081, and the live cells are '$want'")
-  if json="$(k -n relay-system get networkpolicy plane-cells -o json 2>/dev/null)"; then
-    got="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-  else
-    got=""
-  fi
+  json="$(k -n relay-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  got=""
+  [[ -z "$json" ]] || got="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
   [[ "$got" == "$want" ]] || problems+=("the relay plane policy plane-cells admits '$got' on its route ports, and the live cells are '$want'")
   json="$(k -n gateway-system get networkpolicy cell-gateway -o json 2>/dev/null)" || { problems+=("cannot read NetworkPolicy gateway-system/cell-gateway"); json='{}'; }
   for port in 8450 8451; do

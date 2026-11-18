@@ -310,11 +310,12 @@ for name in relay-view relay-telemetry; do
     f="$STUB_DIR/d-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
   fi
 done
-for name in plane-cells plane-upstream; do
-  if [[ "$args" == *" get networkpolicy $name -o json "* ]]; then
-    f="$STUB_DIR/n-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
-  fi
-done
+if [[ "$args" == *" get networkpolicy plane-cells --ignore-not-found -o json "* ]]; then
+  f="$STUB_DIR/n-plane-cells.json"; [[ -f "$f" ]] && cat "$f"; exit 0
+fi
+if [[ "$args" == *" get networkpolicy plane-upstream -o json "* ]]; then
+  f="$STUB_DIR/n-plane-upstream.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
+fi
 echo "unexpected kubectl call: $*" >&2
 exit 2
 `
@@ -425,5 +426,13 @@ func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "is the only other") {
 		t.Error("scripts/verify.sh still says that cell is the only other project")
+	}
+}
+
+// Component bundles have no tag, so the M2 gate repair retags only root.
+func TestComponentBundlesHaveNoTestTag(t *testing.T) {
+	out, err := runLib(t, nil, `echo "${BUNDLE_TEST_NAMES[*]}"`)
+	if err != nil || strings.TrimSpace(out) != "root" {
+		t.Fatalf("err %v, BUNDLE_TEST_NAMES is %q, want root alone", err, out)
 	}
 }

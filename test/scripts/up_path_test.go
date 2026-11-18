@@ -258,10 +258,13 @@ func objJSON(kind, track, extra string) string {
 }
 
 const (
-	staleSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store","readinessProbe":{"httpGet":{"path":"/v2/","port":"http"}},"ports":[{"name":"http","containerPort":5000}]},{"name":"store-proxy"}]}}}`
-	freshSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store"},{"name":"store-proxy","ports":[{"name":"http","containerPort":5000}]}]}}}`
-	podReady = `{"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
-	podStuck = `{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`
+	staleSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store","readinessProbe":{"httpGet":{"path":"/v2/","port":"http"}},"ports":[{"name":"http","containerPort":5000}]},{"name":"store-proxy"}]}}}` + revSTS
+	freshSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store"},{"name":"store-proxy","ports":[{"name":"http","containerPort":5000}]}]}}}` + revSTS
+	podReady = `{"metadata":{"labels":{"controller-revision-hash":"bundle-store-rev2"}},"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
+	// podStuck belongs to an earlier revision than the StatefulSet (rev2) and never became Ready. podStarting is a pod of the current revision.
+	podStuck    = `{"metadata":{"labels":{"controller-revision-hash":"bundle-store-rev1"}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}`
+	podStarting = `{"metadata":{"labels":{"controller-revision-hash":"bundle-store-rev2"}},"status":{"conditions":[{"type":"Ready","status":"False"}]}}`
+	revSTS      = `,"status":{"updateRevision":"bundle-store-rev2"}`
 )
 
 // storeApplies returns the objects that the store upgrade applied, by kind, with the call that applied each.
@@ -303,7 +306,10 @@ func TestUpStoreUpgrade(t *testing.T) {
 		{"M7 store with a Ready pod", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, staleSTS), "STUB_POD_JSON=" + podReady}, true, true, false},
 		{"upgraded store", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, freshSTS), "STUB_POD_JSON=" + podReady}, true, false, false},
 		{"new cluster", nil, false, false, false},
-		{"new cluster with a starting pod", []string{"STUB_STS_JSON=" + objJSON("StatefulSet", "", freshSTS), "STUB_POD_JSON=" + podStuck}, false, false, false},
+		{"new cluster with a starting pod", []string{"STUB_STS_JSON=" + objJSON("StatefulSet", "", freshSTS), "STUB_POD_JSON=" + podStarting}, false, false, false},
+		// A rerun after an interrupted upgrade: the template is fixed already, and the pod of the old revision never became Ready.
+		{"fixed template and a stuck pod of the old revision", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, freshSTS), "STUB_POD_JSON=" + podStuck}, true, false, true},
+		{"a policy that Argo CD does not manage", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", "", ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, freshSTS), "STUB_POD_JSON=" + podReady}, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root, logFile := upRoot(t)
@@ -328,6 +334,11 @@ func TestUpStoreUpgrade(t *testing.T) {
 			del := callIndex(calls, "-n cell-system delete pod bundle-store-0")
 			if (del >= 0) != tc.wantDelete {
 				t.Errorf("delete of the store pod = %v, want %v:\n%s", del >= 0, tc.wantDelete, calls)
+			}
+			if tc.wantDelete {
+				if wait := callIndex(calls, "rollout status statefulset/bundle-store"); !(del >= 0 && del < wait) {
+					t.Errorf("the pod delete (%d) is not before the wait for the store (%d)", del, wait)
+				}
 			}
 			// The upgrade runs after the bootstrap apply of cell-system and before the wait for the store.
 			if tc.wantSTS {

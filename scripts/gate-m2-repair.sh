@@ -7,8 +7,8 @@
 #   --check prints each trace and exits 1, or exits 0 when it finds none.
 #
 # The repair:
-#   1. dev-cp: tags root:current and spire-server:current with the digests in
-#      build/dev-cp/published.env again, refreshes root, waits for the Applications at those digests,
+#   1. dev-cp: tags root:current with the digest in
+#      build/dev-cp/published.env again (component bundles have no tag), refreshes root, waits for the Applications at those digests,
 #      and waits until the SPIRE server holds no entry under /m2-test/;
 #   2. dev-cell-1: puts back the manifest that the key rotation test saved, or removes the two test
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes

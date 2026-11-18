@@ -14,7 +14,7 @@
 #   bundle.sh cosign --target <cluster>
 #       Attach the Sigstore bundle that mgmtd holds now for the last set. After a rotation of the signing key, the bundle has the
 #       new key, and the referrer of the old key stays.
-#   bundle.sh repair --target <cluster>
+#   bundle.sh repair --target <cluster> [--allow-older]
 #       Break glass for a set of argocd or cell-system that left the cluster unable to read the store, so that no rollback can
 #       finish. It trusts only what it verifies. The root of good[0] is either the bootstrap root that build/<t>/root.json names, or a
 #       root that cosign verifies offline against the current public key of mgmtd (mise run mgmt -- pubkey) with the signed digest as
@@ -23,7 +23,9 @@
 #       pod, pin the Applications cell-system and argocd at the good digests (Argo CD would serve the bad set from its cache), apply the
 #       two bundles server side with --force-conflicts, delete the pod bundle-store-0 (a pod that never became Ready stays), refresh the
 #       root Application, and wait until every Application of the good root is Synced and Healthy at its digest. It prints one JSON line.
-#       The Mac administrator applies the bundles, and no new signature covers the act.
+#       The Mac administrator applies the bundles, and no new signature covers the act. A verified root whose signed version is lower than the
+#       version that the state records for good[0] is refused, because repair would roll the cluster back to older signed content, unless
+#       --allow-older is given.
 #
 # publish and repair take the cluster lock of each target, in sorted order, and hold it until the end. cell:up holds it and runs publish,
 # so a nested call passes. BUNDLE_WAIT_SECONDS is one bound for every target.
@@ -33,7 +35,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-usage="usage: mise run bundle -- publish --target <cluster>... [--wait] | get --target <cluster> | cosign --target <cluster> | repair --target <cluster>"
+usage="usage: mise run bundle -- publish --target <cluster>... [--wait] | get --target <cluster> | cosign --target <cluster> | repair --target <cluster> [--allow-older]"
 
 # A phase runs for one cluster, with the settings of that cluster. The script starts itself again for each target, with CELL set.
 case "${1:-}" in
@@ -152,19 +154,37 @@ pull_bundle() {
 # current key, and writes the in-toto statement of the signature to <statement file>. cosign gets an empty Docker configuration, and
 # it skips the transparency log, which no set uses. A root that a key before a rotation signed needs: mise run bundle -- cosign --target <t>.
 verify_signed_root() {
-  local root="$1" out="$2" keyline pem keydir dockerdir envelope
+  local root="$1" out="$2" keyline pem keydir dockerdir envelope reason
   keyline="$(CELL=management mise run mgmt -- pubkey)" || die "could not read the public key of mgmtd: $keyline"
   pem="$(printf '%s' "$keyline" | mise run bundlectl -- pubkey-pem)" || die "could not convert the public key of mgmtd"
   keydir="$(mktemp -d)"
   dockerdir="$(mktemp -d)"
   printf '%s\n' "$pem" >"$keydir/mgmt.pub"
+  # The standard error of cosign holds no secret. Its last line tells a key mismatch from a network error.
   envelope="$(DOCKER_CONFIG="$dockerdir" mise x -- cosign verify-attestation --key "$keydir/mgmt.pub" --insecure-ignore-tlog=true --allow-http-registry \
-    --type https://cell.poc.internal/bundle-set/v1 "$MIRROR/bundles/$CELL_NAME/root@$root" 2>/dev/null)" \
-    || { rm -rf "$keydir" "$dockerdir"; die "cosign does not verify the root $root of $CELL_NAME against the current key of mgmtd, so repair does not trust it. If the key rotated, run: mise run bundle -- cosign --target $CELL_NAME"; }
+    --type https://cell.poc.internal/bundle-set/v1 "$MIRROR/bundles/$CELL_NAME/root@$root" 2>"$keydir/cosign.err")" \
+    || { reason="$(tail -n 1 "$keydir/cosign.err")"; rm -rf "$keydir" "$dockerdir"; die "cosign does not verify the root $root of $CELL_NAME against the current key of mgmtd (${reason:-no message}), so it is not trusted. If the key rotated, run: mise run bundle -- cosign --target $CELL_NAME"; }
   rm -rf "$keydir" "$dockerdir"
   jq -s 'map(.payload | @base64d | fromjson) | .[0]' <<<"$envelope" >"$out" || die "the cosign answer for $root holds no statement"
   jq -e --arg d "${root#sha256:}" --arg n "bundles/$CELL_NAME/root" '[.subject[]? | select(.name == $n and .digest.sha256 == $d)] | length == 1' "$out" >/dev/null \
     || die "the signed statement has no subject bundles/$CELL_NAME/root with the digest $root"
+}
+
+# check_not_older <good[0] as JSON> <statement file> refuses a verified root whose signed version is lower than the version that the state records
+# for good[0], unless BUNDLE_ALLOW_OLDER=1. The signature proves that mgmtd signed the root once, and not that it is the newest good one.
+check_not_older() {
+  local recorded signed older
+  recorded="$(jq -c '.version // empty' <<<"$1")"
+  [[ -n "$recorded" ]] || return 0
+  signed="$(jq -c '.predicate.version // empty' "$2")"
+  [[ -n "$signed" ]] || die "the signed statement of $CELL_NAME holds no version"
+  older="$(jq -n --argjson s "$signed" --argjson r "$recorded" '($s.epoch < $r.epoch) or ($s.epoch == $r.epoch and $s.counter < $r.counter)')"
+  [[ "$older" == true ]] || return 0
+  if [[ "${BUNDLE_ALLOW_OLDER:-}" == 1 ]]; then
+    log "the verified root is signed at version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$signed"), older than the version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$recorded") that the state records, and --allow-older goes on"
+    return 0
+  fi
+  die "the verified root is signed at version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$signed"), which is older than the version $(jq -r '"\(.epoch)/\(.counter)"' <<<"$recorded") that the state records for good[0]. Repair would roll $CELL_NAME back to older signed content. If that is intended, run it again with --allow-older"
 }
 
 _repair() {
@@ -192,6 +212,7 @@ _repair() {
   else
     origin=signed host="$MIRROR" root_repo="bundles/$CELL_NAME/root" comp_repo="bundles/$CELL_NAME"
     verify_signed_root "$root_digest" "$stmt"
+    check_not_older "$good" "$stmt"
   fi
   pull_bundle "$host" "$root_repo" "$root_digest" "$work/root"
   for component in argocd cell-system; do
@@ -200,9 +221,6 @@ _repair() {
     if [[ "$origin" == signed ]]; then
       [[ "$(jq -r --arg n "bundles/$CELL_NAME/$component" '[.subject[]? | select(.name == $n) | .digest.sha256][0] // ""' "$stmt")" == "${rev#sha256:}" ]] \
         || die "the signed statement names another digest for $component than the root layer ($rev)"
-    elif [[ -f "$BUILD/root.json" ]]; then
-      [[ "$(jq -r --arg c "$component" '.components[$c] // ""' "$BUILD/root.json")" == "" || "$(jq -r --arg c "$component" '.components[$c]' "$BUILD/root.json")" == "$rev" ]] \
-        || die "build/$CELL_NAME/root.json names another digest for $component than the root layer ($rev)"
     fi
     pull_bundle "$host" "$comp_repo/$component" "$rev" "$work/$component"
   done
@@ -219,7 +237,7 @@ _repair() {
   for component in cell-system argocd; do
     rev="$(jq -r --arg c "$component" '.[$c]' <<<"$apps_want")"
     k -n argocd patch application "$component" --type merge -p "$(jq -nc --arg d "$rev" '{spec: {source: {targetRevision: $d}}}')" >/dev/null \
-      || log "could not pin the Application $component at $rev"
+      || die "could not pin the Application $component at $rev, so Argo CD could serve the bad set from its cache again. Nothing was applied"
   done
   for component in argocd cell-system; do
     text="$(tar -xzOf "$work/$component/layer.tgz" manifests.yaml && printf x)" || die "the bundle $component holds no manifests.yaml"
@@ -232,7 +250,7 @@ _repair() {
     log "applied $component of good[0]"
   done
   k -n cell-system delete pod bundle-store-0 --ignore-not-found --wait=true --timeout=120s >/dev/null || die "could not delete the pod bundle-store-0"
-  k -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+  k -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null || die "could not ask Argo CD for a refresh of the Application root"
 
   local apps blockers end
   end=$((SECONDS + ${BUNDLE_REPAIR_SECONDS:-900}))
@@ -261,13 +279,17 @@ fi
 cmd="${1:-}"
 [[ -n "$cmd" ]] || fail "$usage"
 shift
-targets=() wait=0
+targets=() wait=0 allow_older=0
 while (($#)); do
   case "$1" in
     --target)
       [[ -n "${2:-}" ]] || fail "--target needs a cluster name. $usage"
       targets+=("$2")
       shift 2 ;;
+    --allow-older)
+      [[ "$cmd" == repair ]] || fail "--allow-older belongs to repair. $usage"
+      allow_older=1
+      shift ;;
     --wait)
       [[ "$cmd" == publish ]] || fail "--wait belongs to publish. $usage"
       wait=1
@@ -293,7 +315,7 @@ for t in "${targets[@]}"; do
 done
 # Every target is checked before the first lock and the first signature, so a call with a wrong target changes nothing.
 for t in "${targets[@]}"; do run_for "$t" _check || exit 1; done
-if [[ "$cmd" != cosign ]]; then
+if [[ "$cmd" == publish || "$cmd" == repair ]]; then
   # Publish and repair change a cluster, so they take its lock, as cell:up does. The locks go in sorted order, and the phases below inherit
   # them (POC_HELD_LOCKS). cosign reads mgmtd and writes a referrer on the mirror of this Mac, so it takes none.
   sorted=()
@@ -321,5 +343,5 @@ case "$cmd" in
     done
     exit "$rc" ;;
   cosign) run_for "${targets[0]}" _cosign ;;
-  repair) run_for "${targets[0]}" _repair ;;
+  repair) BUNDLE_ALLOW_OLDER="$allow_older" run_for "${targets[0]}" _repair ;;
 esac

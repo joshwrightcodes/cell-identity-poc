@@ -60,8 +60,8 @@ store_forward_stop() {
   wait "${STORE_PF_PID:-}" 2>/dev/null || true
 }
 
-# The entries test publishes test bundles of root and spire-server, and an entry under /m2-test/.
-BUNDLE_TEST_NAMES=(root spire-server)
+# The entries test publishes a test root bundle and a test spire-server bundle, and an entry under /m2-test/. Only root has a tag.
+BUNDLE_TEST_NAMES=(root)
 BUNDLE_TEST_PATH=/m2-test/
 
 # published_digest <cluster> <bundle> prints the digest that the last cell:publish pushed.
