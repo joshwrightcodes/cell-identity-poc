@@ -2,6 +2,8 @@ package bundleapply
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -141,4 +143,74 @@ func TestCheckAppProjects(t *testing.T) {
 			t.Fatalf("unknown name: %v", err)
 		}
 	})
+}
+
+// lockedDefault returns AppProject default as components/argocd/default-project.yaml renders it, with
+// mutate applied to a copy of its spec.
+func lockedDefault(t *testing.T, mutate func(spec map[string]any)) Object {
+	t.Helper()
+	raw, err := os.ReadFile("../../components/argocd/default-project.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	objs, err := Decode(raw, 10)
+	if err != nil || len(objs) != 1 {
+		t.Fatalf("decode: %v", err)
+	}
+	o := objs[0]
+	// kustomize gives every object of the argocd component the namespace argocd.
+	o.Namespace = "argocd"
+	o.Raw["metadata"].(map[string]any)["namespace"] = "argocd"
+	if mutate != nil {
+		spec, _ := o.Raw["spec"].(map[string]any)
+		mutate(spec)
+	}
+	return o
+}
+
+// TestLockedDefaultProject checks that the Rego policy (which conftest runs) and the Go spec check
+// both allow AppProject default with exactly the locked spec, and refuse any other spec with detail
+// appproject_spec.
+func TestLockedDefaultProject(t *testing.T) {
+	cases := map[string]func(map[string]any){
+		"a source":      func(s map[string]any) { s["sourceRepos"] = []any{"*"} },
+		"a destination": func(s map[string]any) { s["destinations"] = []any{map[string]any{"server": "*", "namespace": "*"}} },
+		"a cluster kind": func(s map[string]any) {
+			s["clusterResourceWhitelist"] = []any{map[string]any{"group": "*", "kind": "*"}}
+		},
+		"a namespaced kind": func(s map[string]any) {
+			s["namespaceResourceWhitelist"] = []any{map[string]any{"group": "*", "kind": "*"}}
+		},
+		"no sourceRepos": func(s map[string]any) { delete(s, "sourceRepos") },
+		"an extra field": func(s map[string]any) { s["sourceNamespaces"] = []any{"*"} },
+		"another text":   func(s map[string]any) { s["description"] = "Allows everything" },
+		"no spec at all": func(s map[string]any) {
+			for k := range s {
+				delete(s, k)
+			}
+		},
+	}
+	for _, role := range []string{"cell", "cp"} {
+		t.Run(role, func(t *testing.T) {
+			p := bundle.DefaultPolicy()
+			c := newTestChecker(t, role, HarnessRefs{})
+			if err := c.Check(t.Context(), "argocd", []Object{lockedDefault(t, nil)}); err != nil {
+				t.Fatalf("policy: the locked default is refused: %v", err)
+			}
+			if ref := checkAppProjects(role, p, []Object{lockedDefault(t, nil)}); ref != nil {
+				t.Fatalf("spec check: the locked default is refused: %v", ref)
+			}
+			for name, mutate := range cases {
+				o := lockedDefault(t, mutate)
+				err := c.Check(t.Context(), "argocd", []Object{o})
+				var ref *Refusal
+				if !errors.As(err, &ref) || ref.Reason != op.ReasonComponentNotAllowed || ref.Detail != "appproject_spec" {
+					t.Errorf("policy, %s: %v, want component_not_allowed appproject_spec", name, err)
+				}
+				if got := checkAppProjects(role, p, []Object{o}); got == nil || got.Detail != "appproject_spec" {
+					t.Errorf("spec check, %s: %v, want appproject_spec", name, got)
+				}
+			}
+		})
+	}
 }

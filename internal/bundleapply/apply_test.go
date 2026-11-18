@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -1849,6 +1850,23 @@ func TestApplyAppProjectSpec(t *testing.T) {
 		e := newEnv(t)
 		body := projectYAML(t, "cell", nil) + "---\n" + projectYAML(t, "cell-app", nil)
 		wantOutcome(t, e.apply("op1", e.set(1, []spec{{"argocd", "argocd", body}})), op.OutcomeApplied, "", "")
+	})
+	t.Run("locked default project", func(t *testing.T) {
+		e := newEnv(t)
+		raw, err := os.ReadFile("../../components/argocd/default-project.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// kustomize gives every object of the argocd component the namespace argocd.
+		locked := strings.Replace(string(raw), "  name: default\n", "  name: default\n  namespace: argocd\n", 1)
+		body := projectYAML(t, "cell", nil) + "---\n" + locked
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{{"argocd", "argocd", body}})), op.OutcomeApplied, "", "")
+	})
+	t.Run("widened default project", func(t *testing.T) {
+		e := newEnv(t)
+		body := "apiVersion: argoproj.io/v1alpha1\nkind: AppProject\nmetadata:\n  name: default\n  namespace: argocd\nspec:\n  sourceRepos: ['*']\n  destinations: []\n  clusterResourceWhitelist: []\n  namespaceResourceWhitelist: []\n  description: Allows nothing. Applications use the project cell\n"
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{{"argocd", "argocd", body}})), op.OutcomeRefused, op.ReasonComponentNotAllowed, "appproject_spec")
+		e.assertUntouched(t)
 	})
 	t.Run("widened destinations", func(t *testing.T) {
 		e := newEnv(t)

@@ -19,13 +19,20 @@ func ExpectedAppProjectSpec(role, name string, p bundle.Policy) (map[string]any,
 	return bundle.ExpectedAppProjectSpec(role, name, p)
 }
 
-// checkAppProjects refuses an AppProject object whose spec differs from ExpectedAppProjectSpec.
+// checkAppProjects refuses an AppProject object whose spec differs from ExpectedAppProjectSpec, or,
+// for a name that allow.json locks, from its locked spec exactly.
 func checkAppProjects(role string, p bundle.Policy, objs []Object) *Refusal {
 	for _, o := range objs {
 		if o.Kind != "AppProject" || !strings.HasPrefix(o.APIVersion, "argoproj.io/") {
 			continue
 		}
 		refuse := &Refusal{Reason: op.ReasonComponentNotAllowed, Detail: detailProject, Object: o.ref()}
+		if locked, ok := p.LockedAppProjects[o.Name]; ok {
+			if !reflect.DeepEqual(plain(locked), plain(o.Raw["spec"])) {
+				return refuse
+			}
+			continue
+		}
 		want, err := ExpectedAppProjectSpec(role, o.Name, p)
 		if err != nil {
 			return refuse
@@ -36,6 +43,20 @@ func checkAppProjects(role string, p bundle.Policy, objs []Object) *Refusal {
 		}
 	}
 	return nil
+}
+
+// plain converts v to plain JSON values and keeps everything else as it is: order, empty lists and
+// empty objects.
+func plain(v any) any {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var out any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 // normalise converts v to plain JSON values, drops empty lists and objects, and sorts every list

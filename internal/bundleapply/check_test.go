@@ -171,7 +171,7 @@ func TestPolicyPlatform(t *testing.T) {
 		{name: "application", component: "mesh-policy", want: not("kind")},
 		{name: "appproject_cell", component: "argocd"},
 		{name: "appproject_cell", component: "istiod", want: not("kind")},
-		{name: "appproject_default", component: "argocd", want: not("kind")},
+		{name: "appproject_default", component: "argocd", want: not("appproject_spec")},
 		{name: "appproject_other", component: "argocd", want: not("kind")},
 		{name: "deployment_harness_label_template", want: not("harness_label")},
 		{name: "unknown_component_object", component: "nope", want: not("component_unknown")},

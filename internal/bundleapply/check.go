@@ -246,7 +246,7 @@ var detailRank = map[string]int{
 	"component_unknown": 0, "harness_object": 1, "planePolicy": 2, "harness_namespace": 3,
 	"harness_label": 4, "mesh_injection": 5, "kind": 6, "kind_unknown_scope": 7,
 	"cluster_kind_namespaced": 8, "namespace_missing": 9, "namespace": 10, "layout": 11,
-	"service_type": 12, "mesh_opt_out": 13,
+	"service_type": 12, "mesh_opt_out": 13, "appproject_spec": 14,
 }
 
 const lastRank = 1 << 20

@@ -247,5 +247,14 @@
       "appProjects": [],
       "planePolicies": []
     }
+  },
+  "lockedAppProjects": {
+    "default": {
+      "description": "Allows nothing. Applications use the project cell",
+      "sourceRepos": [],
+      "destinations": [],
+      "clusterResourceWhitelist": [],
+      "namespaceResourceWhitelist": []
+    }
   }
 }

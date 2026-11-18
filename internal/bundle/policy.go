@@ -56,6 +56,9 @@ type Policy struct {
 	Version int              `json:"version"`
 	Classes map[string]Class `json:"classes"`
 	Roles   map[string]Role  `json:"roles"`
+	// LockedAppProjects gives, by name, the exact spec of an AppProject that the argocd component
+	// carries as is, such as default. Any other spec for that name is refused.
+	LockedAppProjects map[string]map[string]any `json:"lockedAppProjects"`
 }
 
 var (

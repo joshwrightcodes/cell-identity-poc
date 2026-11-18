@@ -202,6 +202,17 @@ appproject_ok if {
 	p == name
 }
 
+# An AppProject that allow.json locks, such as default, may come only with exactly its locked spec.
+appproject_ok if {
+	component == "argocd"
+	data.allow.lockedAppProjects[name]
+}
+
+locked_spec_differs if {
+	locked := data.allow.lockedAppProjects[name]
+	object.get(input, "spec", null) != locked
+}
+
 is_netpol if {
 	input.kind == "NetworkPolicy"
 	group == "networking.k8s.io"
@@ -260,6 +271,13 @@ deny contains entry("component_not_allowed", "kind") if {
 	class_name
 	kind_key == "argoproj.io/AppProject"
 	not appproject_ok
+}
+
+deny contains entry("component_not_allowed", "appproject_spec") if {
+	class_name
+	kind_key == "argoproj.io/AppProject"
+	component == "argocd"
+	locked_spec_differs
 }
 
 deny contains entry("component_not_allowed", "kind_unknown_scope") if {

@@ -5,9 +5,12 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"os"
 	"reflect"
 	"slices"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 )
@@ -183,10 +186,10 @@ func TestAllowJSONShape(t *testing.T) {
 	if err := json.Unmarshal(allowFile, &top); err != nil {
 		t.Fatal(err)
 	}
-	if len(top) != 3 {
+	if len(top) != 4 {
 		t.Errorf("top-level keys %v", top)
 	}
-	for _, k := range []string{"version", "classes", "roles"} {
+	for _, k := range []string{"version", "classes", "roles", "lockedAppProjects"} {
 		if _, ok := top[k]; !ok {
 			t.Errorf("no %q key", k)
 		}
@@ -224,5 +227,27 @@ func TestParsePolicyRefuses(t *testing.T) {
 		if _, err := bundle.ParsePolicy([]byte(in)); err == nil {
 			t.Errorf("%s parsed", name)
 		}
+	}
+}
+
+// TestLockedDefaultProjectMatchesTheComponent checks that the locked spec of AppProject default in
+// allow.json is the spec of components/argocd/default-project.yaml, value for value.
+func TestLockedDefaultProjectMatchesTheComponent(t *testing.T) {
+	raw, err := os.ReadFile("../../components/argocd/default-project.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj struct {
+		Spec map[string]any `json:"spec"`
+	}
+	if err := yaml.Unmarshal(raw, &obj); err != nil {
+		t.Fatal(err)
+	}
+	locked, ok := bundle.DefaultPolicy().LockedAppProjects["default"]
+	if !ok {
+		t.Fatal("allow.json has no locked spec for AppProject default")
+	}
+	if len(obj.Spec) == 0 || !reflect.DeepEqual(locked, obj.Spec) {
+		t.Fatalf("locked spec %v, want the component spec %v", locked, obj.Spec)
 	}
 }
