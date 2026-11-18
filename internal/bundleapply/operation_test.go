@@ -3,6 +3,7 @@ package bundleapply
 import (
 	"context"
 	"errors"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -397,4 +398,73 @@ func TestApplyRollbackReadFails(t *testing.T) {
 	}
 	wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
 	e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+}
+
+// TestApplyUnchangedComponentWithoutASync checks the forward wait for a component that keeps its digest
+// of the last good set while Argo CD shows its last sync for another revision: Argo CD moved its revision
+// without a sync, because the content compared equal, and starts no sync for it now. Such a component
+// counts when it is Synced and Healthy at its digest and runs no operation. A changed component and
+// root keep the strict rule (TestApplyCountsOnlyASyncAfterTheMove/no_sync).
+func TestApplyUnchangedComponentWithoutASync(t *testing.T) {
+	// keepNP builds a set that changes apps-sample and keeps network-policy of set a.
+	keepNP := func(e *env, a built) built {
+		b := e.set(2, []spec{
+			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "b")},
+			{"network-policy", "cell-system", cmap("cell-system", "np", "a")},
+		})
+		if b.digests()["network-policy"] != a.digests()["network-policy"] {
+			t.Fatal("the test set changes network-policy")
+		}
+		return b
+	}
+	t.Run("idle", func(t *testing.T) {
+		e, a, _ := twoSets(t)
+		b := keepNP(e, a)
+		e.clk.Advance(time.Hour)
+		e.movedWithoutSync("network-policy", a.digests()["network-policy"])
+		wantOutcome(t, e.apply("opB", b), op.OutcomeApplied, "", "")
+		if st := e.state(); st.Good[0].Root.Digest != b.root.Digest {
+			t.Fatalf("good[0] = %s, want the root of the set", st.Good[0].Root.Digest)
+		}
+	})
+	t.Run("runs a sync", func(t *testing.T) {
+		e, a, _ := twoSets(t)
+		b := keepNP(e, a)
+		e.clk.Advance(time.Hour)
+		e.movedWithoutSync("network-policy", a.digests()["network-policy"])
+		e.ops["network-policy"].phase = "Running"
+		e.step()
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:network-policy:Synced/Healthy")
+	})
+	// The digest that counts is the one of good[0], not the one that the tag held: after a rollback that
+	// could not move the tag, the tag still holds the failed set.
+	t.Run("digest of the failed set that the tag still holds", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.health = func(root, app string) (string, string) {
+			if root == b.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		first := e.polls + 1
+		e.hook = func(n int) {
+			if n == first {
+				e.storeReg.Deny(http.StatusForbidden)
+			}
+		}
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+		e.storeReg.Deny(0)
+		e.health, e.hook = nil, nil
+		if st := e.state(); st.Root.Digest != b.root.Digest || st.Good[0].Root.Digest != a.root.Digest {
+			t.Fatalf("state root %s good[0] %s, want the failed root and good root a", st.Root.Digest, st.Good[0].Root.Digest)
+		}
+		// Set c keeps apps-sample of the failed set b, whose sync Argo CD shows for another revision.
+		c := e.set(3, []spec{
+			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "b")},
+			{"network-policy", "cell-system", cmap("cell-system", "np", "c")},
+		})
+		e.clk.Advance(time.Hour)
+		e.movedWithoutSync("apps-sample", b.digests()["apps-sample"])
+		wantOutcome(t, e.apply("opC", c), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
+	})
 }

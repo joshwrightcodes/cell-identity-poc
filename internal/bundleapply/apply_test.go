@@ -146,6 +146,9 @@ type env struct {
 	// results, when it names an Application, gives the revision that its operation shows as synced
 	// (syncResult.revision) in place of the revision that the operation was started for.
 	results map[string]string
+	// equal names, for an Application, a revision that the simulated Argo CD compares equal to the live
+	// state, so that it starts no sync when the Application moves to it.
+	equal map[string]string
 }
 
 // simOp is a sync operation of the simulated Argo CD.
@@ -421,6 +424,18 @@ func (e *env) lagged(d time.Duration) {
 	e.lag, e.shown, e.seenRoot, e.seenAt = d, e.currentRoot(), e.currentRoot(), e.clk.Now()
 }
 
+// movedWithoutSync makes the simulated Argo CD show app at rev with its last sync for another revision,
+// from an hour before, as after a change that Argo CD compared equal and so never synced (for example
+// a new repository URL with the same content). Argo CD starts no sync of rev for the Application.
+func (e *env) movedWithoutSync(app, rev string) {
+	if e.equal == nil {
+		e.equal = map[string]string{}
+	}
+	e.equal[app] = rev
+	e.ops[app] = &simOp{"Succeeded", "sha256:" + strings.Repeat("0", 64), e.clk.Now().Add(-time.Hour)}
+	e.step()
+}
+
 // bumpRV gives the stored Application a new resource version through the tracker, which a reactor
 // may call while the fake client holds its lock.
 func (e *env) bumpRV(name string) {
@@ -465,7 +480,7 @@ func (e *env) step() {
 		if o != nil && o.phase == "Terminating" {
 			o.phase = "Failed"
 		}
-		if o != nil && (o.phase == "Running" || o.rev == rev) {
+		if o != nil && (o.phase == "Running" || o.rev == rev) || e.equal[app] == rev {
 			return
 		}
 		phase, started := "Succeeded", now

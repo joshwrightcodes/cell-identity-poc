@@ -745,11 +745,16 @@ func (a *Applier) liveScopes() (cluster, namespaced []string) {
 // the root, moves the tag, waits for health and rolls back when the wait fails.
 func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 	cfg := a.cfg
+	var good map[string]string
 	err := a.update(ctx, func(s *State) error {
 		if err := a.mine(s); err != nil {
 			return err
 		}
 		a.ensureGood(s)
+		good = nil
+		if len(s.Good) > 0 {
+			good = maps.Clone(s.Good[0].Components)
+		}
 		s.Source, s.Version, s.ContentSHA256, s.KeySHA256 = sourceSigned, r.set.Version, r.content, r.keySHA
 		s.OpID, s.State, s.Failed = r.opID, stateApplying, ""
 		s.Until = cfg.Now().Add(a.lockTTL())
@@ -774,7 +779,7 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
-	moved := judge{since: cfg.Now(), before: before}
+	moved := judge{since: cfg.Now(), before: before, good: good}
 	tctx, end := a.tel.step(ctx, spanTag)
 	err = a.tag(tctx, r, comps)
 	end(err)
@@ -900,22 +905,28 @@ func (a *Applier) refresh(ctx context.Context) {
 
 // judge holds what the waits need to tell a sync of this tag move from an older one: the time just
 // before the move, and the Applications as they were then. restore is true for the rollback wait,
-// whose good root was applied before.
+// whose good root was applied before. good holds the component digests of good[0] at the start of the
+// apply.
 type judge struct {
 	since   time.Time
 	before  map[string]appState
 	restore bool
+	good    map[string]string
 }
 
 // counts reports whether an Application that is Synced at digest has reached it for the wait. The
-// health wait needs judge.applied. The rollback wait also takes an Application that runs no operation:
-// a sync of the failed set that applied nothing leaves the live state at the good revision, and Argo
-// CD then starts no sync for it.
+// health wait needs judge.applied, apart from a component that keeps its digest of good[0]. That one,
+// and in the rollback wait every Application, also counts when it runs no operation: Argo CD starts no
+// sync for an Application whose live state already compares equal, for example after a sync of the
+// failed set that applied nothing, or after a change of the source that kept the content. root and a
+// changed component keep the strict rule in the health wait.
 func (j judge) counts(name, digest string, s appState) bool {
 	if j.applied(name, digest, s) {
 		return true
 	}
-	return j.restore && !s.Operation && s.Op.Phase != phaseRunning && s.Op.Phase != phaseTerminating
+	idle := !s.Operation && s.Op.Phase != phaseRunning && s.Op.Phase != phaseTerminating
+	kept := name != "root" && digest != "" && j.good[name] == digest
+	return idle && (j.restore || kept)
 }
 
 // applied reports whether the last sync operation of an Application applied digest for this move: it

@@ -560,6 +560,8 @@ The applier works in these steps:
 4. It waits for up to 5 minutes until each Application is Synced and Healthy at its digest.
    Each Application also needs a sync operation that succeeded at its digest after the tag moved.
    An Application whose digest did not change keeps the sync that applied it before.
+   A component that keeps its digest of the last good set also counts when it runs no sync and is Synced and Healthy at it.
+   Argo CD starts no sync when the content compares equal, for example after a change of the repository URL.
    A component that is `Degraded` for 60 seconds after such a sync ends the wait early.
    `root` never ends the wait early, because its health is the health of its children.
 5. When the set does not turn healthy, it moves `current` to the last good root.
