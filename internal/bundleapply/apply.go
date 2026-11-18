@@ -1,0 +1,824 @@
+package bundleapply
+
+import (
+	"context"
+	"crypto"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+)
+
+// The values of State.State and State.Source.
+const (
+	stateApplying    = "applying"
+	stateHealthy     = "healthy"
+	stateRolledBack  = "rolled_back"
+	sourceSigned     = "signed"
+	repoRoot         = "bundles/root"
+	tagCurrent       = "current"
+	harnessLabel     = "cell.poc.internal/harness"
+	maxGood          = 2
+	lockSlack        = 2 * time.Minute
+	maxStateAttempts = 8
+	detailRollback   = "rollback_unhealthy"
+)
+
+// ErrLockHeld means that another holder has the apply lock. The caller retries later.
+var ErrLockHeld = errors.New("bundle apply lock is held")
+
+var (
+	errLockLost = errors.New("bundle apply lock was lost")
+	errNoWrite  = errors.New("no state write needed")
+)
+
+// Config holds what an Applier needs.
+type Config struct {
+	// Role is cell, cp or open. Env and Target name the environment and the cluster that this
+	// applier serves, and Holder names this process in the apply lock.
+	Role, Env, Target, Holder string
+	// Mirror reads bundles from the shared registry. Store writes them to the in-cluster store with
+	// a write-only client.
+	Mirror, Store *ocistore.Store
+	Dynamic       dynamic.Interface
+	Client        kubernetes.Interface
+	Policy        bundle.Policy
+	// Keys returns the keys that sign attestations, read again for each apply.
+	Keys                                                func() []crypto.PublicKey
+	State                                               Store
+	HealthTimeout, DegradedGrace, RollbackTimeout, Poll time.Duration
+	Now                                                 func() time.Time
+	Log                                                 *slog.Logger
+	Tracer                                              trace.Tracer
+	Meter                                               metric.Meter
+}
+
+// Outcome is the final result of one Apply.
+type Outcome struct{ Outcome, Reason, Detail string }
+
+// Applier applies signed bundle sets.
+type Applier struct {
+	cfg   Config
+	tel   telemetry
+	log   *slog.Logger
+	sleep func(ctx context.Context, d time.Duration) error
+}
+
+// New returns an Applier for cfg. Zero timers take the plan values: a poll of 5 s, a health
+// deadline of 5 min, a degraded grace of 60 s and a rollback wait of 5 min. Nil telemetry and a nil
+// logger discard their output.
+func New(cfg Config) *Applier {
+	if cfg.Poll <= 0 {
+		cfg.Poll = 5 * time.Second
+	}
+	if cfg.HealthTimeout <= 0 {
+		cfg.HealthTimeout = 5 * time.Minute
+	}
+	if cfg.DegradedGrace <= 0 {
+		cfg.DegradedGrace = time.Minute
+	}
+	if cfg.RollbackTimeout <= 0 {
+		cfg.RollbackTimeout = 5 * time.Minute
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	log := cfg.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	tel, err := newTelemetry(cfg.Tracer, cfg.Meter)
+	if err != nil {
+		log.Error("bundle telemetry", "error", err)
+		tel, _ = newTelemetry(nil, nil)
+	}
+	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep}
+}
+
+func realSleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+func (a *Applier) lockTTL() time.Duration {
+	return a.cfg.HealthTimeout + a.cfg.RollbackTimeout + lockSlack
+}
+
+// Apply verifies the attestation and applies the set that it signs. A final result, including a
+// refusal and a rollback, comes back as the Outcome with a nil error and is stored in the state. An
+// error means that the apply did not finish, and the caller can try again with the same operation ID:
+// the lock is held by another process (ErrLockHeld), the mirror or the store failed, or ctx ended.
+func (a *Applier) Apply(ctx context.Context, opID, opTarget string, attestation []byte) (Outcome, error) {
+	start := a.cfg.Now()
+	ctx, span := a.tel.tracer.Start(ctx, spanApply, trace.WithAttributes(
+		attribute.String("op.id", opID), attribute.String("target", a.cfg.Target), attribute.String("role", a.cfg.Role)))
+	defer span.End()
+	out, err := a.apply(ctx, opID, opTarget, attestation)
+	outcome, reason := out.Outcome, out.Reason
+	if err != nil {
+		outcome, reason = "error", "failed"
+		switch {
+		case errors.Is(err, ErrLockHeld):
+			reason = "lock_held"
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			reason = "canceled"
+		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+	}
+	span.SetAttributes(attribute.String("outcome", outcome), attribute.String("reason", reason))
+	a.tel.record(ctx, a.cfg.Role, outcome, reason, a.cfg.Now().Sub(start))
+	return out, err
+}
+
+// Status reports the state of the applier.
+func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
+	st, _, err := a.cfg.State.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &op.BundleStatus{Version: st.Version, RootDigest: st.Root.Digest, State: st.State, AllowSHA256: bundle.AllowSHA256()}, nil
+}
+
+func refused(reason, detail string) Outcome {
+	return Outcome{Outcome: op.OutcomeRefused, Reason: reason, Detail: detail}
+}
+
+func keySHA(k crypto.PublicKey) string {
+	pub, ok := k.(ed25519.PublicKey)
+	if !ok {
+		return ""
+	}
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:])
+}
+
+// signer returns the SHA-256 of the key that signed the attestation.
+func signer(att []byte, keys []crypto.PublicKey) string {
+	for _, k := range keys {
+		if _, _, err := bundle.ParseAttestation(att, []crypto.PublicKey{k}); err == nil {
+			return keySHA(k)
+		}
+	}
+	return ""
+}
+
+// run is one apply under the lock.
+type run struct {
+	opID    string
+	set     bundle.Set
+	st      bundle.Statement
+	content string
+	keySHA  string
+	snap    State
+	// fetched lists the components that this apply read from the mirror and checked.
+	fetched []fetched
+	root    bundle.Artifact
+	// held is true while this process holds the lock and has not written a final state.
+	held bool
+}
+
+type fetched struct {
+	comp bundle.Component
+	art  bundle.Artifact
+	objs []Object
+}
+
+func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) (Outcome, error) {
+	cfg := a.cfg
+	if len(att) > op.MaxBundleArgsBytes {
+		return refused(op.ReasonPayloadInvalid, "statement"), nil
+	}
+	keys := cfg.Keys()
+	st, set, err := bundle.ParseAttestation(att, keys)
+	switch {
+	case errors.Is(err, record.ErrSignature):
+		return refused(op.ReasonSignatureInvalid, ""), nil
+	case err != nil && strings.Contains(err.Error(), "subject"):
+		return refused(op.ReasonPayloadInvalid, "subjects"), nil
+	case err != nil:
+		return refused(op.ReasonPayloadInvalid, "statement"), nil
+	case st.Predicate.Target != cfg.Target || st.Predicate.Target != opTarget:
+		return refused(op.ReasonPayloadInvalid, "target"), nil
+	case st.Predicate.Env != cfg.Env:
+		return refused(op.ReasonEnvMismatch, ""), nil
+	}
+	r := &run{opID: opID, set: set, st: st, content: bundle.ContentSHA256(set), keySHA: signer(att, keys)}
+	trusted := map[string]bool{}
+	for _, k := range keys {
+		trusted[keySHA(k)] = true
+	}
+
+	out, proceed, err := a.admit(ctx, r, trusted)
+	if err != nil || !proceed {
+		return out, err
+	}
+	r.held = true
+	defer a.release(r)
+
+	out, err = a.prepare(ctx, r)
+	if err != nil || out != (Outcome{}) {
+		if err == nil {
+			err = a.finish(ctx, r, out, nil)
+		}
+		return out, err
+	}
+	return a.deploy(ctx, r)
+}
+
+// admit takes the lock and decides from the state whether the set goes on: a repeated operation ID
+// gets its stored result, and the version rules refuse or accept the set. The mark moves later,
+// when the state enters applying.
+func (a *Applier) admit(ctx context.Context, r *run, trusted map[string]bool) (Outcome, bool, error) {
+	var out Outcome
+	var proceed, reset bool
+	err := a.update(ctx, func(s *State) error {
+		out, proceed, reset = Outcome{}, false, false
+		now := a.cfg.Now()
+		if s.Holder != "" && s.Holder != a.cfg.Holder && now.Before(s.Until) {
+			return ErrLockHeld
+		}
+		if s.Result != nil && s.Result.OpID == r.opID {
+			out = Outcome{s.Result.Outcome, s.Result.Reason, s.Result.Detail}
+			return errNoWrite
+		}
+		mark := s.Version
+		if s.KeySHA256 != "" && !trusted[s.KeySHA256] {
+			mark, reset = bundle.Version{}, true
+		}
+		resume := !reset && s.State == stateApplying && s.Version == r.set.Version && s.ContentSHA256 == r.content
+		if !resume {
+			switch cmp := r.set.Version.Compare(mark); {
+			case cmp < 0:
+				out = refused(op.ReasonVersionOld, "")
+			case cmp == 0 && s.ContentSHA256 != r.content:
+				out = refused(op.ReasonVersionOld, "version_conflict")
+			case cmp == 0 && s.State == stateRolledBack:
+				out = refused(op.ReasonVersionOld, "")
+			case cmp == 0:
+				out = Outcome{Outcome: op.OutcomeAlreadyApplied}
+			}
+		}
+		if out != (Outcome{}) {
+			s.Result = a.result(r.opID, out)
+			return nil
+		}
+		proceed = true
+		s.Holder, s.Until = a.cfg.Holder, now.Add(a.lockTTL())
+		r.snap = *s
+		return nil
+	})
+	if err != nil {
+		return Outcome{}, false, err
+	}
+	if proceed && reset {
+		a.log.Warn("bundle_version_reset", "target", a.cfg.Target, "key", r.snap.KeySHA256)
+	}
+	return out, proceed, nil
+}
+
+func (a *Applier) result(opID string, out Outcome) *op.Result {
+	return &op.Result{OpID: opID, Cell: a.cfg.Target, Outcome: out.Outcome, Reason: out.Reason, Detail: out.Detail, At: a.cfg.Now()}
+}
+
+// update reads the state, applies fn and writes it, and tries again when another writer won. fn
+// may return errNoWrite to skip the write.
+func (a *Applier) update(ctx context.Context, fn func(*State) error) error {
+	for range maxStateAttempts {
+		st, rv, err := a.cfg.State.Read(ctx)
+		if err != nil {
+			return err
+		}
+		if err := fn(&st); err != nil {
+			if errors.Is(err, errNoWrite) {
+				return nil
+			}
+			return err
+		}
+		err = a.cfg.State.Write(ctx, st, rv)
+		if errors.Is(err, ErrConflict) {
+			continue
+		}
+		return err
+	}
+	return fmt.Errorf("bundle state changed %d times while it was written", maxStateAttempts)
+}
+
+// mine checks that this process still holds the lock.
+func (a *Applier) mine(s *State) error {
+	if s.Holder != a.cfg.Holder {
+		return errLockLost
+	}
+	return nil
+}
+
+// release frees the lock of a run that ended with no final state, as a best effort.
+func (a *Applier) release(r *run) {
+	if !r.held {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := a.update(ctx, func(s *State) error {
+		if s.Holder != a.cfg.Holder {
+			return errNoWrite
+		}
+		s.Holder, s.Until = "", time.Time{}
+		return nil
+	})
+	if err != nil {
+		a.log.Warn("bundle lock not released", "error", err)
+	}
+}
+
+// finish writes the final state of a run: the result, the lock freed, and the change that mutate makes.
+func (a *Applier) finish(ctx context.Context, r *run, out Outcome, mutate func(*State)) error {
+	err := a.update(ctx, func(s *State) error {
+		if err := a.mine(s); err != nil {
+			return err
+		}
+		if mutate != nil {
+			mutate(s)
+		}
+		s.Result = a.result(r.opID, out)
+		s.Holder, s.Until = "", time.Time{}
+		return nil
+	})
+	if err == nil {
+		r.held = false
+	}
+	return err
+}
+
+func asRefusal(err error) (*Refusal, bool) {
+	var r *Refusal
+	if errors.As(err, &r) {
+		return r, true
+	}
+	return nil, false
+}
+
+func (r *Refusal) outcome() Outcome { return refused(r.Reason, r.Detail) }
+
+// fetchRefusal maps the errors of a bundle read that come from the bytes, not from the transport.
+func fetchRefusal(name string, err error) *Refusal {
+	switch {
+	case errors.Is(err, ocistore.ErrDigestMismatch):
+		return &Refusal{Reason: op.ReasonDigestMismatch, Detail: name}
+	case errors.Is(err, ocistore.ErrTooLarge), errors.Is(err, bundle.ErrTooLarge):
+		return &Refusal{Reason: op.ReasonComponentNotAllowed, Detail: "too_large", Object: name}
+	case errors.Is(err, ocistore.ErrLayout), errors.Is(err, bundle.ErrLayout), errors.Is(err, bundle.ErrMediaType):
+		return &Refusal{Reason: op.ReasonComponentNotAllowed, Detail: "layout", Object: name}
+	}
+	return nil
+}
+
+// prepare composes the root, reads and checks every component that the state has not checked, and
+// compares the root with the signed subject. It writes nothing. It returns a refusal as an Outcome.
+func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
+	cfg := a.cfg
+	root, err := bundle.ComposeRoot(cfg.Role, r.set, cfg.Policy)
+	var na *bundle.NotAllowed
+	switch {
+	case errors.As(err, &na):
+		return refused(op.ReasonComponentNotAllowed, na.Detail), nil
+	case err != nil:
+		return refused(op.ReasonPayloadInvalid, "statement"), nil
+	}
+	r.root = root
+
+	checked := make(map[string]bool, len(r.snap.Checked))
+	for _, d := range r.snap.Checked {
+		checked[d] = true
+	}
+	fctx, end := a.tel.step(ctx, spanFetch)
+	out, err := a.fetch(fctx, r, checked)
+	end(err)
+	if err != nil || out != (Outcome{}) {
+		return out, err
+	}
+	cctx, end := a.tel.step(ctx, spanCheck)
+	out, err = a.check(cctx, r)
+	end(err)
+	if err != nil || out != (Outcome{}) {
+		return out, err
+	}
+	if root.Digest != r.st.RootDigest() {
+		return refused(op.ReasonDigestMismatch, "root"), nil
+	}
+	return Outcome{}, nil
+}
+
+func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (Outcome, error) {
+	for _, c := range r.set.Components {
+		if checked[c.Digest] {
+			continue
+		}
+		art, err := ocistore.Fetch(ctx, a.cfg.Mirror, "bundles/"+a.cfg.Target+"/"+c.Name, c.Digest)
+		if err != nil {
+			if ref := fetchRefusal(c.Name, err); ref != nil {
+				a.log.Warn("bundle refused", "component", c.Name, "reason", ref.Reason, "detail", ref.Detail, "error", err)
+				return ref.outcome(), nil
+			}
+			return Outcome{}, fmt.Errorf("read component %s from the mirror: %w", c.Name, err)
+		}
+		if art.Digest != c.Digest {
+			return refused(op.ReasonDigestMismatch, c.Name), nil
+		}
+		body, err := bundle.UnpackComponent(art.Layer, bundle.MaxUnpackedBytes)
+		if err != nil {
+			if ref := fetchRefusal(c.Name, err); ref != nil {
+				return ref.outcome(), nil
+			}
+			return refused(op.ReasonComponentNotAllowed, "layout"), nil
+		}
+		objs, err := Decode(body, bundle.MaxObjects)
+		if err != nil {
+			if ref, ok := asRefusal(err); ok {
+				a.log.Warn("bundle refused", "component", c.Name, "reason", ref.Reason, "detail", ref.Detail)
+				return ref.outcome(), nil
+			}
+			return Outcome{}, err
+		}
+		r.fetched = append(r.fetched, fetched{comp: c, art: art, objs: objs})
+	}
+	return Outcome{}, nil
+}
+
+// check runs the policy over each component that the fetch read. It builds a new Checker for
+// the set, with the harness policies of the live cluster and the scopes of the live API, then the
+// CRD scopes of every component of the set. Cluster scope wins in the policy when two sources
+// disagree.
+func (a *Applier) check(ctx context.Context, r *run) (Outcome, error) {
+	cfg := a.cfg
+	nps, err := cfg.Client.NetworkingV1().NetworkPolicies(metav1.NamespaceAll).List(ctx, metav1.ListOptions{LabelSelector: harnessLabel})
+	if err != nil {
+		return Outcome{}, fmt.Errorf("list harness network policies: %w", err)
+	}
+	var refs HarnessRefs
+	for _, np := range nps.Items {
+		refs.NetworkPolicies = append(refs.NetworkPolicies, ObjectRef{Namespace: np.Namespace, Name: np.Name})
+	}
+	checker, err := NewChecker(cfg.Role, cfg.Policy, refs)
+	if err != nil {
+		return Outcome{}, err
+	}
+	cluster, namespaced := a.liveScopes()
+	var all []Object
+	for _, f := range r.fetched {
+		all = append(all, f.objs...)
+	}
+	crdCluster, crdNamespaced := crdKinds(all)
+	checker.AddScopes(append(cluster, crdCluster...), append(namespaced, crdNamespaced...))
+	for _, f := range r.fetched {
+		err := checker.Check(ctx, f.comp.Name, f.objs)
+		if err == nil {
+			if ref := checkAppProjects(cfg.Role, cfg.Policy, f.objs); ref != nil {
+				err = ref
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if ref, ok := asRefusal(err); ok {
+			a.log.Warn("bundle refused", "component", f.comp.Name, "reason", ref.Reason, "detail", ref.Detail, "object", ref.Object)
+			return ref.outcome(), nil
+		}
+		return Outcome{}, err
+	}
+	return Outcome{}, nil
+}
+
+// liveScopes lists the group/Kind of every resource that the API server serves, by scope. An error
+// of discovery leaves the lists short, and the policy then refuses a kind of unknown scope.
+func (a *Applier) liveScopes() (cluster, namespaced []string) {
+	_, lists, err := a.cfg.Client.Discovery().ServerGroupsAndResources()
+	if err != nil {
+		a.log.Warn("bundle discovery incomplete", "error", err)
+	}
+	for _, l := range lists {
+		group, _, _ := strings.Cut(l.GroupVersion, "/")
+		if !strings.Contains(l.GroupVersion, "/") {
+			group = ""
+		}
+		for _, res := range l.APIResources {
+			if strings.Contains(res.Name, "/") || res.Kind == "" {
+				continue
+			}
+			key := res.Kind
+			if group != "" {
+				key = group + "/" + res.Kind
+			}
+			if res.Namespaced {
+				namespaced = append(namespaced, key)
+			} else {
+				cluster = append(cluster, key)
+			}
+		}
+	}
+	return cluster, namespaced
+}
+
+// deploy runs a set that passed every check: it moves the state to applying, pushes the bundles and
+// the root, moves the tag, waits for health and rolls back when the wait fails.
+func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
+	cfg := a.cfg
+	err := a.update(ctx, func(s *State) error {
+		if err := a.mine(s); err != nil {
+			return err
+		}
+		a.ensureGood(s)
+		s.Source, s.Version, s.ContentSHA256, s.KeySHA256 = sourceSigned, r.set.Version, r.content, r.keySHA
+		s.OpID, s.State = r.opID, stateApplying
+		s.Until = cfg.Now().Add(a.lockTTL())
+		return nil
+	})
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	pctx, end := a.tel.step(ctx, spanPush)
+	err = a.push(pctx, r)
+	end(err)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	comps := map[string]string{}
+	for _, c := range r.set.Components {
+		comps[c.Name] = c.Digest
+	}
+	tctx, end := a.tel.step(ctx, spanTag)
+	err = a.tag(tctx, r, comps)
+	end(err)
+	if err != nil {
+		return Outcome{}, err
+	}
+
+	wctx, end := a.tel.step(ctx, spanWait)
+	detail, err := a.wait(wctx, r.set, r.root.Digest, comps, cfg.HealthTimeout)
+	end(err)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if detail == "" {
+		out := Outcome{Outcome: op.OutcomeApplied}
+		err = a.finish(ctx, r, out, func(s *State) {
+			s.State = stateHealthy
+			g := Good{Version: r.set.Version, ContentSHA256: r.content, Root: s.Root, Components: maps.Clone(s.Components), At: cfg.Now()}
+			s.Good = slices.DeleteFunc(s.Good, func(o Good) bool { return o.Root.Digest == g.Root.Digest })
+			s.Good = append([]Good{g}, s.Good...)
+			if len(s.Good) > maxGood {
+				s.Good = s.Good[:maxGood]
+			}
+			s.Checked = a.boundChecked(s, r.fetched)
+		})
+		return out, err
+	}
+	return a.rollback(ctx, r, detail)
+}
+
+// ensureGood records the current root as the first good root when the state holds a healthy root
+// that no signed set made, such as the bootstrap root.
+func (a *Applier) ensureGood(s *State) {
+	if s.State == stateHealthy && len(s.Good) == 0 && s.Root.Digest != "" {
+		s.Good = []Good{{Root: s.Root, Components: maps.Clone(s.Components), At: a.cfg.Now()}}
+	}
+}
+
+// boundChecked returns the digests that stay in checked: those that the state checked before, plus
+// those that this run checked, kept only while a component or a good root names them.
+func (a *Applier) boundChecked(s *State, added []fetched) []string {
+	live := map[string]bool{}
+	for _, d := range s.Components {
+		live[d] = true
+	}
+	for _, g := range s.Good {
+		for _, d := range g.Components {
+			live[d] = true
+		}
+	}
+	have := map[string]bool{}
+	for _, d := range s.Checked {
+		have[d] = true
+	}
+	for _, f := range added {
+		have[f.comp.Digest] = true
+	}
+	var out []string
+	for d := range have {
+		if live[d] {
+			out = append(out, d)
+		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+func (a *Applier) push(ctx context.Context, r *run) error {
+	st := a.cfg.Store
+	one := func(repo string, art bundle.Artifact) error {
+		if err := st.PushBlob(ctx, repo, art.ConfigDigest, art.Config); err != nil {
+			return err
+		}
+		if err := st.PushBlob(ctx, repo, art.LayerDigest, art.Layer); err != nil {
+			return err
+		}
+		if _, err := st.PushManifest(ctx, repo, "", bundle.MediaTypeManifest, art.Manifest); err != nil {
+			return err
+		}
+		return nil
+	}
+	for _, f := range r.fetched {
+		if err := one("bundles/"+f.comp.Name, f.art); err != nil {
+			return fmt.Errorf("push component %s: %w", f.comp.Name, err)
+		}
+	}
+	if err := one(repoRoot, r.root); err != nil {
+		return fmt.Errorf("push root: %w", err)
+	}
+	return nil
+}
+
+func (a *Applier) tag(ctx context.Context, r *run, comps map[string]string) error {
+	err := a.update(ctx, func(s *State) error {
+		if err := a.mine(s); err != nil {
+			return err
+		}
+		s.Root = Root{Digest: r.root.Digest, Manifest: r.root.Manifest}
+		s.Components = comps
+		s.Until = a.cfg.Now().Add(a.lockTTL())
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := a.cfg.Store.PushManifest(ctx, repoRoot, tagCurrent, bundle.MediaTypeManifest, r.root.Manifest); err != nil {
+		return fmt.Errorf("move the tag %s: %w", tagCurrent, err)
+	}
+	a.refresh(ctx)
+	return nil
+}
+
+// refresh asks Argo CD for a hard refresh of root. A failure is not final, because Argo CD
+// polls the tag by itself.
+func (a *Applier) refresh(ctx context.Context) {
+	if err := refreshApp(ctx, a.cfg.Dynamic, "root"); err != nil {
+		a.log.Warn("bundle root refresh failed", "error", err)
+	}
+}
+
+// wait polls the Applications until the root and every component are Synced at their digest and
+// Healthy. It returns "" when they are. It returns <app>:<sync>/<health> for an Application that stays
+// Degraded for the grace period, and timeout:<app>:<sync>/<health> for the first Application that is
+// not healthy at the deadline. An error means that ctx ended.
+func (a *Applier) wait(ctx context.Context, set bundle.Set, rootDigest string, comps map[string]string, timeout time.Duration) (string, error) {
+	type want struct{ name, digest string }
+	var wants []want
+	for _, c := range set.Components {
+		if d, ok := comps[c.Name]; ok {
+			wants = append(wants, want{c.Name, d})
+		}
+	}
+	wants = append(wants, want{"root", rootDigest})
+	return a.waitFor(ctx, func(yield func(string, string)) {
+		for _, w := range wants {
+			yield(w.name, w.digest)
+		}
+	}, timeout)
+}
+
+func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, digest string)), timeout time.Duration) (string, error) {
+	cfg := a.cfg
+	deadline := cfg.Now().Add(timeout)
+	degraded := map[string]time.Time{}
+	for {
+		apps, err := listApps(ctx, cfg.Dynamic)
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			a.log.Warn("bundle health read failed", "error", err)
+		}
+		now := cfg.Now()
+		var first, early string
+		wants(func(name, digest string) {
+			s, ok := apps[name]
+			if !ok {
+				s = appState{Sync: unknownStatus, Health: unknownStatus}
+			}
+			if s.Health == statusDegraded {
+				since, seen := degraded[name]
+				if !seen {
+					degraded[name] = now
+				} else if now.Sub(since) >= cfg.DegradedGrace && early == "" {
+					early = name + ":" + s.String()
+				}
+			} else {
+				delete(degraded, name)
+			}
+			if first == "" && !(s.Sync == statusSynced && s.Revision == digest && s.Health == statusHealthy) {
+				first = name + ":" + s.String()
+			}
+		})
+		switch {
+		case early != "":
+			return early, nil
+		case first == "":
+			return "", nil
+		case !now.Before(deadline):
+			return "timeout:" + first, nil
+		}
+		if err := a.sleep(ctx, cfg.Poll); err != nil {
+			return "", err
+		}
+	}
+}
+
+// rollback points the tag back at the last good root, with the manifest bytes that the state holds,
+// and waits for that root to become healthy. It creates no version and deletes nothing.
+func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome, error) {
+	cfg := a.cfg
+	rctx, end := a.tel.step(ctx, spanRollback)
+	defer func() { end(nil) }()
+	var good *Good
+	st, _, err := cfg.State.Read(rctx)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if len(st.Good) > 0 {
+		good = &st.Good[0]
+	}
+	detail := failed
+	switch {
+	case good == nil || sha256Digest(good.Root.Manifest) != good.Root.Digest:
+		detail = detailRollback
+	default:
+		if err := a.update(rctx, func(s *State) error {
+			if err := a.mine(s); err != nil {
+				return err
+			}
+			s.Until = cfg.Now().Add(a.lockTTL())
+			return nil
+		}); err != nil {
+			return Outcome{}, err
+		}
+		if _, err := cfg.Store.PushManifest(rctx, repoRoot, tagCurrent, bundle.MediaTypeManifest, good.Root.Manifest); err != nil {
+			a.log.Error("bundle rollback tag failed", "error", err)
+			detail = detailRollback
+			break
+		}
+		a.refresh(rctx)
+		left, err := a.waitFor(rctx, func(yield func(name, digest string)) {
+			for _, name := range slices.Sorted(maps.Keys(good.Components)) {
+				yield(name, good.Components[name])
+			}
+			yield("root", good.Root.Digest)
+		}, cfg.RollbackTimeout)
+		if err != nil {
+			return Outcome{}, err
+		}
+		if left != "" {
+			detail = detailRollback
+		}
+	}
+	out := Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: detail}
+	err = a.finish(rctx, r, out, func(s *State) {
+		s.State = stateRolledBack
+		if good != nil {
+			s.Root, s.Components = good.Root, maps.Clone(good.Components)
+		}
+		s.Checked = a.boundChecked(s, nil)
+	})
+	return out, err
+}
+
+func sha256Digest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
