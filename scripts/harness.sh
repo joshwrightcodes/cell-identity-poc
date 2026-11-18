@@ -8,7 +8,8 @@
 # A cluster with link components (management) comes first with the link phase skipped, because its links need the other clusters.
 # Its first link step runs only mgmt-api, right after its cell:up and before dev-cp. The same step runs again right after the
 # cell:up of dev-cp, which adds the dev-cp root that mgmtd needs to accept envd. The full link phase runs last, with cell:link,
-# after the cells are valid. When a step fails, the script prints that step and every later one. harness:down stops the host service first.
+# after the cells are valid. The last step publishes a signed bundle set to each cell (bundle -- publish --wait). When a step
+# fails, the script prints that step and every later one. harness:down stops the host service first.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
@@ -23,7 +24,7 @@ case "${1:-}" in
     [[ -n "$names" ]] || die "no cluster in $topology has components"
     read -r -a order <<<"$(echo $names)"
     cells="$(catalog_cells)" || die "could not read the cells of $topology"
-    linked=() early=() again=() cellargs=()
+    linked=() early=() again=() cellargs=() targetargs=()
     for name in "${order[@]}"; do
       comps="$(CELL="$name" bash -c 'source "$1/scripts/lib.sh"; printf "%s\n" ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"}' _ "$ROOT")" \
         || die "could not read the component sets of $name"
@@ -43,6 +44,7 @@ case "${1:-}" in
       # A cell exists only through its signed step, so cell:up of a cell would refuse. The portal steps follow the loop.
       if grep -qx -- "$name" <<<"$cells"; then
         cellargs+=(--cell "$name")
+        targetargs+=(--target "$name")
         continue
       fi
       if [[ " ${linked[*]-} " == *" $name "* ]]; then
@@ -61,6 +63,10 @@ case "${1:-}" in
       steps+=("|portal -- request ${cellargs[*]}" "|portal -- wait ${cellargs[*]}")
     fi
     for name in ${linked[@]+"${linked[@]}"}; do steps+=("CELL=$name|cell:link"); done
+    # Each cell applies its own signed set. The last step signs one set for every cell of the catalog and waits until each cell is healthy.
+    if ((${#targetargs[@]} > 0)); then
+      steps+=("|bundle -- publish ${targetargs[*]} --wait")
+    fi
     # show_step <entry> prints the command of a step as a person types it.
     show_step() { local env="${1%%|*}"; printf '%smise run %s' "${env:+$env }" "${1#*|}"; }
     for i in "${!steps[@]}"; do

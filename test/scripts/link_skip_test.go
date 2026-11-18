@@ -70,6 +70,7 @@ func linkRoot(t *testing.T) (root, logFile string) {
 source "$(dirname "$0")/lib.sh"
 echo publish >>"$STUB_LOG"
 { echo root=sha256:1; for e in "${COMPONENTS[@]}"; do echo "${e%%:*}=sha256:1"; done; } >"$PUBLISHED"
+echo '{"digest":"sha256:1","manifest":"Ym9vdA==","components":{}}' >"$BUILD/root.json"
 `)
 	write("scripts/link.sh", "#!/usr/bin/env bash\necho link >>\"$STUB_LOG\"\n")
 	write("bin/mise", "#!/usr/bin/env bash\necho \"mise $*\" >>\"$STUB_LOG\"\n")

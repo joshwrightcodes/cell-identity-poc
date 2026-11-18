@@ -57,7 +57,7 @@ description = "Render every component into build/<cluster>/bundles/<component>/m
 run = "scripts/hydrate.sh"
 
 [tasks."cell:publish"]
-description = "Push the hydrated bundles to the in-cluster store and point the root bundle at their digests"
+description = "Push the hydrated bundles to the in-cluster store and point the root bundle at their digests. A cluster whose bundle state has source signed refuses this task, unless BUNDLE_PUBLISH_UNSIGNED=1 (break glass); use bundle -- publish there"
 run = "scripts/publish.sh"
 
 [tasks."cell:verify"]
@@ -73,7 +73,7 @@ description = "Remove what the server of cell:ui wrote into argocd: the initial 
 run = "scripts/ui.sh --clean"
 
 [tasks."cell:restart"]
-description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. STORE_TOKENS=1 also restarts bundle-store-0 and argocd-repo-server, which rotates the projected store tokens. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
 
 [tasks."cell:restart-mesh"]
@@ -167,6 +167,10 @@ run = "go run ./cmd/hostsvc"
 description = "Run bundlectl, which packs, pushes and composes bundle sets on this Mac: set, push, bootstrap, push-root, compose, attach, projects or pubkey-pem, with the arguments after --"
 run = "go run ./cmd/bundlectl"
 
+[tasks.bundle]
+description = "Publish and repair signed bundle sets of a cell or dev-cp, with the arguments after --: publish --target <cluster>... [--wait] signs and pushes the hydrated set, get --target <cluster> prints the last signed set, cosign --target <cluster> attaches the Sigstore bundle that mgmtd holds now (after a key rotation), repair --target <cluster> is the break glass that applies the argocd and cell-system bundles of the last good set"
+run = "scripts/bundle.sh"
+
 [tasks."hostsvc:serve"]
 description = "Run the host service on this Mac, which answers the key requests and the spec pushes of mgmtd and the step requests of the cell controller on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status, pin, sync (write the dev root and the keys after the cross-check with mgmtd), steps [--reset], log --step <id> [--follow] or cancel --cell <c> | --step <id>. start and restart refuse while a step runs a stage, unless --force"
 env = { CELL = "management" }
@@ -178,7 +182,7 @@ env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
+description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell. The last step runs bundle -- publish --wait for both cells, so each cell applies a signed bundle set"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 

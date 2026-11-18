@@ -45,6 +45,14 @@ set -euo pipefail
 echo "$*" >>"$STUB_LOG"
 case "$2" in
   hostsvc)
+    # facts --registry answers the registry mirror: STUB_REGISTRY_IP sets its address, and STUB_REGISTRY_FAIL makes the call fail.
+    if [[ "${4:-}" == facts && "${5:-}" == --registry ]]; then
+      if [[ -n "${STUB_REGISTRY_FAIL:-}" ]]; then
+        echo '{"level":"ERROR","msg":"hostsvc failed","error":"registry-mirror has no address on the kind network"}'; exit 1
+      fi
+      printf '{"name":"registry-mirror","address":"%s","port":5000,"host":"127.0.0.1:5001"}\n' "${STUB_REGISTRY_IP:-172.18.0.7}"
+      exit 0
+    fi
     cell="$6"
     # STUB_FACTS_FAIL and STUB_FACTS_NOIP name cells (space separated) whose facts fail, or have no node address.
     if [[ " ${STUB_FACTS_FAIL:-} " == *" $cell "* ]]; then
@@ -517,8 +525,9 @@ var clusterScoped = []string{"Namespace", "CustomResourceDefinition", "ClusterRo
 	"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
 
 // docsIn parses the render output by kind and name. Every namespaced object must be in ns, and no
-// Namespace other than ns may appear. The cell-identity render also holds the objects of namespace
-// cell-ops-system (TestCellOpsNamespace), and docsIn skips them for ns cell-identity-system.
+// Namespace other than ns may appear. The cell-identity render also holds the objects of the namespaces
+// cell-ops-system (TestCellOpsNamespace), argocd and cell-system (TestCelldRBACExact, TestCellStorePlanePolicy),
+// and docsIn skips them for ns cell-identity-system.
 func docsIn(t *testing.T, out, ns string) map[string]object {
 	t.Helper()
 	byKey := map[string]object{}
@@ -535,7 +544,8 @@ func docsIn(t *testing.T, out, ns string) map[string]object {
 		}
 		key := get[string](t, o, "kind") + "/" + get[string](t, o, "metadata", "name")
 		if ns == "cell-identity-system" {
-			if opsNS, _ := lookup(o, "metadata", "namespace"); opsNS == "cell-ops-system" || key == "Namespace/cell-ops-system" {
+			// The render also holds the objects that the celld account needs in cell-ops-system, argocd and cell-system.
+			if other, _ := lookup(o, "metadata", "namespace"); other == "cell-ops-system" || other == "argocd" || other == "cell-system" || key == "Namespace/cell-ops-system" {
 				continue
 			}
 		}

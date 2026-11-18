@@ -4,6 +4,8 @@
 # published revision. In a cluster with SECRET_STORE_NAMESPACES, the wait also connects the secret
 # store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
 # for their rollouts (scripts/attest-wait.sh for cell-identity). UP_WAIT sets the bound of the Application wait in seconds (default 900).
+# A cluster whose bundle state has source signed takes the signed path: no bootstrap apply and no root apply, and scripts/bundle.sh
+# publish in place of scripts/publish.sh. After the harness apply, a cluster with a bundle role and no state gets the bootstrap state.
 # Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
 # The run takes the lock of the cluster (cluster_lock in scripts/lib.sh), and a step of the host service waits for it.
 # A cell has no cluster until a signed step creates it, so cell:up of an absent cell stops with cell_needs_step and the
@@ -67,16 +69,24 @@ k wait --for=condition=Ready nodes --all --timeout=300s >/dev/null \
 # The link components render in the link phase, after every wave, because they read live facts.
 CELL_UP_SKIP_LINK=1 CELL_UP_SKIP_LATE=1 "$ROOT/scripts/hydrate.sh"
 
-for c in "${BOOTSTRAP[@]}"; do
-  apply_bundle "$c"
-done
-k -n cell-system rollout status statefulset/bundle-store --timeout=300s >/dev/null
-k -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null
-k -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null
-k apply --server-side -f "$ROOT/bootstrap/root.yaml" >/dev/null
-log "applied the root Application"
+# A cluster whose bundle state has source signed takes its bundles only from signed sets: the bootstrap apply and the root
+# Application would overwrite what Argo CD syncs, so this path runs scripts/bundle.sh publish and nothing of the bootstrap.
+state_source="$(bundle_state_source)" || die "could not read the bundle state of $CELL_NAME, so cell:up cannot tell the bootstrap path from the signed path"
+if [[ "$state_source" == signed ]]; then
+  log "the bundle state of $CELL_NAME has source signed: publishing a signed set, with no bootstrap apply"
+  "$ROOT/scripts/bundle.sh" publish --target "$CELL_NAME" --wait
+else
+  for c in "${BOOTSTRAP[@]}"; do
+    apply_bundle "$c"
+  done
+  k -n cell-system rollout status statefulset/bundle-store --timeout=300s >/dev/null
+  k -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null
+  k -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null
+  k apply --server-side -f "$ROOT/bootstrap/root.yaml" >/dev/null
+  log "applied the root Application"
 
-"$ROOT/scripts/publish.sh"
+  "$ROOT/scripts/publish.sh"
+fi
 
 expected=$((${#COMPONENTS[@]} + 1))
 log "waiting for $expected Applications to be Synced and Healthy at the published revisions"
@@ -111,6 +121,8 @@ HYDRATE_ONLY=late "$ROOT/scripts/hydrate.sh"
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
   harness_apply "${entry%%:*}"
 done
+# The harness apply made the namespace of the state. A cluster with a bundle role and no state gets the bootstrap state.
+bundle_state_bootstrap
 # celld cannot become Ready before its record reaches the SPIRE server, so attest-wait.sh waits for
 # each stage of the first attestation and names the stage that fails. The other components keep the
 # plain rollout wait.

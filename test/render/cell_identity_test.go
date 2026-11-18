@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"slices"
@@ -14,7 +16,9 @@ import (
 
 	"github.com/hashicorp/hcl"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
 var cellIdentityFacts = []string{
@@ -145,7 +149,7 @@ func TestRenderCellIdentity(t *testing.T) {
 			}
 			return out
 		}
-		if m := mounts("celld"); !slices.Equal(m, []string{"agent-socket", "spire-trust-bundle", "mgmt-op-key", "celld-api-token"}) {
+		if m := mounts("celld"); !slices.Equal(m, []string{"agent-socket", "spire-trust-bundle", "mgmt-op-key", "celld-api-token", "bundle-store-token"}) {
 			t.Fatalf("celld mounts %v", m)
 		}
 		if m := mounts("spire-agent"); !slices.Contains(m, "api-token") || !slices.Contains(m, "agent-socket") || !slices.Contains(m, "trust-bundle") {
@@ -265,7 +269,8 @@ func TestRenderCellIdentity(t *testing.T) {
 			}
 			rules = append(rules, strings.Join(peers, ",")+" "+strings.Join(ports, ","))
 		}
-		want := []string{"10.9.0.9/32 TCP/30081", "10.9.0.9/32 TCP/30450,TCP/30451", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system/app=otel-collector TCP/4317"}
+		want := []string{"10.9.0.9/32 TCP/30081", "10.9.0.9/32 TCP/30450,TCP/30451", "172.18.0.5/32 TCP/6443", "10.120.0.1/32 TCP/443", "ns=observability-system/app=otel-collector TCP/4317",
+			"172.18.0.7/32 TCP/5000", "ns=cell-system/app=bundle-store TCP/5000"}
 		if !slices.Equal(rules, want) {
 			t.Fatalf("egress rules are %v, want %v", rules, want)
 		}
@@ -289,7 +294,8 @@ func TestCellIdentityGatewayFlags(t *testing.T) {
 	dep := objs["Deployment/celld"]
 	pod := get[map[string]any](t, dep, "spec", "template", "spec")
 	celld := named(t, get[[]any](t, pod, "containers"), "celld")
-	if got, want := fmt.Sprint(get[[]any](t, celld, "args")), fmt.Sprint([]string{
+	// The four bundle flags follow these eight (TestCelldBundleFlags).
+	if got, want := fmt.Sprint(get[[]any](t, celld, "args")[:8]), fmt.Sprint([]string{
 		"--cell=dev-cell-1", "--env=dev", "--gateway=10.9.0.9:30450", "--gateway-bind=10.9.0.9:30451",
 		"--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--trust-bundle=/run/celld/trust-bundle/bundle.crt",
 		"--op-key-dir=/run/celld/op-key", "--ops-namespace=cell-ops-system"}); got != want {
@@ -457,6 +463,7 @@ func TestRenderCellIdentityFailsClosed(t *testing.T) {
 		{"no images file", []string{"STUB_IMAGES=missing"}, "Run mise run images first"},
 		{"stale images file", []string{"STUB_IMAGES=stale"}, "Run mise run images again"},
 		{"bad API server address", []string{"API_SERVER_IPS=api.example"}, "not IPv4"},
+		{"no registry mirror", []string{"STUB_REGISTRY_FAIL=1"}, "no registry mirror address"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -545,5 +552,400 @@ func TestCellIdentityNextKey(t *testing.T) {
 				t.Error("the failed render still printed a staged key")
 			}
 		})
+	}
+}
+
+// cellObjects renders cell-identity for dev-cell-1 and returns every object, keyed as "<Kind> <namespace>/<name>", or
+// "<Kind> <name>" for a cluster object.
+func cellObjects(t *testing.T, env ...string) map[string]object {
+	t.Helper()
+	r := renderCellIdentity(t, env...)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	return objectsIn(t, r.stdout)
+}
+
+// TestCelldBundleFlags checks what celld needs to apply signed bundle sets: the four bundle flags with the mirror address
+// from the host service, the store token that only celld mounts (projected, audience bundle-store, 600 s, read only), and
+// the memory limit of 256Mi, which is a hypothesis that the live part of M8 measures.
+func TestCelldBundleFlags(t *testing.T) {
+	objs := cellObjects(t)
+	dep := objs["Deployment cell-identity-system/celld"]
+	pod := get[map[string]any](t, dep, "spec", "template", "spec")
+	celld := named(t, get[[]any](t, pod, "containers"), "celld")
+	args := get[[]any](t, celld, "args")
+	if len(args) < 8 {
+		t.Fatalf("celld has %d args", len(args))
+	}
+	if got, want := fmt.Sprint(args[8:]), fmt.Sprint([]string{
+		"--bundle-mirror=172.18.0.7:5000",
+		"--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
+		"--bundle-store-token=/var/run/secrets/bundle-store/token",
+		"--bundle-health-timeout=5m"}); got != want {
+		t.Errorf("the bundle flags are %s, want %s", got, want)
+	}
+	if len(args) != 12 {
+		t.Errorf("celld has %d args, want 12", len(args))
+	}
+	other := cellObjects(t, "STUB_REGISTRY_IP=172.18.0.99")
+	otherArgs := get[[]any](t, named(t, get[[]any](t, get[map[string]any](t, other["Deployment cell-identity-system/celld"], "spec", "template", "spec"), "containers"), "celld"), "args")
+	if !slices.Contains(otherArgs, any("--bundle-mirror=172.18.0.99:5000")) {
+		t.Errorf("another mirror address gives the args %v", otherArgs)
+	}
+
+	vol := named(t, get[[]any](t, pod, "volumes"), "bundle-store-token")
+	sources := get[[]any](t, vol, "projected", "sources")
+	if len(sources) != 1 {
+		t.Fatalf("volume bundle-store-token has %d sources, want the token alone: %v", len(sources), vol)
+	}
+	tok := get[map[string]any](t, sources[0], "serviceAccountToken")
+	if tok["audience"] != "bundle-store" || tok["expirationSeconds"] != float64(600) || tok["path"] != "token" {
+		t.Errorf("the store token is %v, want audience bundle-store, 600 s and path token", tok)
+	}
+	users := map[string]bool{}
+	for _, c := range append(slices.Clone(get[[]any](t, pod, "initContainers")), get[[]any](t, pod, "containers")...) {
+		for _, m := range get[[]any](t, c, "volumeMounts") {
+			if get[string](t, m, "name") != "bundle-store-token" {
+				continue
+			}
+			users[get[string](t, c, "name")] = true
+			if get[string](t, m, "mountPath") != "/var/run/secrets/bundle-store" || m.(map[string]any)["readOnly"] != true {
+				t.Errorf("the store token mount is %v, want a read-only mount at /var/run/secrets/bundle-store", m)
+			}
+		}
+	}
+	if len(users) != 1 || !users["celld"] {
+		t.Errorf("containers that mount the store token: %v, want celld alone", users)
+	}
+	if got := get[string](t, celld, "resources", "limits", "memory"); got != "256Mi" {
+		t.Errorf("celld memory limit is %s, want 256Mi", got)
+	}
+	if pod["automountServiceAccountToken"] != false {
+		t.Error("the pod mounts the default API token")
+	}
+}
+
+// TestCelldRBACExact checks every right that the apply engine needs, and no other: Role celld-argocd in argocd (list
+// Applications, and patch only the Application root), ClusterRole celld-netpol-read (list NetworkPolicies), and a binding
+// of each to the celld account of cell-identity-system. Every object carries the harness label.
+func TestCelldRBACExact(t *testing.T) {
+	objs := cellObjects(t)
+	role := objs["Role argocd/celld-argocd"]
+	if role == nil {
+		t.Fatal("the render prints no Role celld-argocd in argocd")
+	}
+	wantRules := `[map[apiGroups:[argoproj.io] resources:[applications] verbs:[list]] map[apiGroups:[argoproj.io] resourceNames:[root] resources:[applications] verbs:[patch]]]`
+	if got := fmt.Sprint(get[[]any](t, role, "rules")); got != wantRules {
+		t.Errorf("Role celld-argocd rules are %s, want %s", got, wantRules)
+	}
+	cr := objs["ClusterRole celld-netpol-read"]
+	if cr == nil {
+		t.Fatal("the render prints no ClusterRole celld-netpol-read")
+	}
+	if got, want := fmt.Sprint(get[[]any](t, cr, "rules")), `[map[apiGroups:[networking.k8s.io] resources:[networkpolicies] verbs:[list]]]`; got != want {
+		t.Errorf("ClusterRole celld-netpol-read rules are %s, want %s", got, want)
+	}
+	subject := `[map[kind:ServiceAccount name:celld namespace:cell-identity-system]]`
+	for key, want := range map[string]string{"RoleBinding argocd/celld-argocd": "Role celld-argocd", "ClusterRoleBinding celld-netpol-read": "ClusterRole celld-netpol-read"} {
+		b := objs[key]
+		if b == nil {
+			t.Fatalf("the render prints no %s", key)
+		}
+		if got := get[string](t, b, "roleRef", "kind") + " " + get[string](t, b, "roleRef", "name"); got != want || get[string](t, b, "roleRef", "apiGroup") != "rbac.authorization.k8s.io" {
+			t.Errorf("%s binds %s, want %s", key, got, want)
+		}
+		if got := fmt.Sprint(get[[]any](t, b, "subjects")); got != subject {
+			t.Errorf("%s has the subjects %s, want %s", key, got, subject)
+		}
+	}
+	var rights []string
+	for key, o := range objs {
+		if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
+			t.Errorf("%s has harness label %v, want cell-identity", key, v)
+		}
+		if strings.HasPrefix(key, "Role ") || strings.HasPrefix(key, "ClusterRole ") {
+			rights = append(rights, key)
+		}
+	}
+	slices.Sort(rights)
+	if want := []string{"ClusterRole celld-netpol-read", "Role argocd/celld-argocd", "Role cell-identity-system/celld-token", "Role cell-ops-system/celld-ops"}; !slices.Equal(rights, want) {
+		t.Errorf("the render prints the roles %v, want %v", rights, want)
+	}
+}
+
+// TestCelldMirrorRule checks flow N45 (celld to the registry mirror on the kind network, port 5000) and flow N46 (celld to the
+// pods of bundle-store, port 5000), as the last two egress rules of policy celld. The mirror address comes from the host
+// service, and a render without it fails.
+func TestCelldMirrorRule(t *testing.T) {
+	rules := func(env ...string) []any {
+		np := cellObjects(t, env...)["NetworkPolicy cell-identity-system/celld"]
+		return get[[]any](t, np, "spec", "egress")
+	}
+	for _, ip := range []string{"172.18.0.7", "172.18.0.99"} {
+		egress := rules("STUB_REGISTRY_IP=" + ip)
+		if len(egress) != 7 {
+			t.Fatalf("policy celld has %d egress rules, want 7", len(egress))
+		}
+		mirror, store := egress[5], egress[6]
+		if got, want := fmt.Sprint(mirror), "map[ports:[map[port:5000 protocol:TCP]] to:[map[ipBlock:map[cidr:"+ip+"/32]]]]"; got != want {
+			t.Errorf("rule N45 is %s, want %s", got, want)
+		}
+		wantStore := "map[ports:[map[port:5000 protocol:TCP]] to:[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:bundle-store]]]]]"
+		if got := fmt.Sprint(store); got != wantStore {
+			t.Errorf("rule N46 is %s, want %s", got, wantStore)
+		}
+	}
+	r := renderCellIdentity(t, "STUB_REGISTRY_FAIL=1")
+	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "no registry mirror address") {
+		t.Errorf("a render without the mirror address: err %v, stdout %q, stderr %q", r.err, r.stdout, r.stderr)
+	}
+}
+
+// TestCellStorePlanePolicy checks the harness plane policy cell-system/plane-celld-store: every pod of cell-system, one ingress
+// rule from the celld pods of cell-identity-system on port 5000, no egress, and the harness label. The pod selector is empty,
+// so a bundle cannot move the store out of the policy by a label.
+func TestCellStorePlanePolicy(t *testing.T) {
+	np := cellObjects(t)["NetworkPolicy cell-system/plane-celld-store"]
+	if np == nil {
+		t.Fatal("the render prints no NetworkPolicy plane-celld-store in cell-system")
+	}
+	spec := get[map[string]any](t, np, "spec")
+	if len(get[map[string]any](t, spec, "podSelector")) != 0 {
+		t.Errorf("podSelector is %v, want {}", spec["podSelector"])
+	}
+	if got := fmt.Sprint(spec["policyTypes"]); got != "[Ingress]" {
+		t.Errorf("policyTypes is %s, want [Ingress]", got)
+	}
+	want := "[map[from:[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:cell-identity-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:celld]]]] ports:[map[port:5000 protocol:TCP]]]]"
+	if got := fmt.Sprint(spec["ingress"]); got != want {
+		t.Errorf("ingress is %s, want %s", got, want)
+	}
+	if _, ok := spec["egress"]; ok || len(spec) != 3 {
+		t.Errorf("spec is %v, want podSelector, policyTypes and ingress only", spec)
+	}
+	if v, _ := lookup(np, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
+		t.Errorf("harness label is %v", v)
+	}
+	// The allow-list names this policy as a plane policy of role cell, so the engine refuses a bundle that blocks it.
+	if !slices.Contains(bundle.DefaultPolicy().Roles["cell"].PlanePolicies, bundle.PolicyRef{Namespace: "cell-system", Name: "plane-celld-store"}) {
+		t.Error("allow.json lacks the plane policy cell-system/plane-celld-store for role cell")
+	}
+}
+
+// celExprBalanced reports whether the brackets and the quotes of a CEL text pair up. It is the only check of the text that
+// the render tests can make, because no CEL library is in the module graph, and the live part runs a server dry run.
+func celExprBalanced(expr string) bool {
+	var stack []rune
+	var quote rune
+	pairs := map[rune]rune{')': '(', ']': '['}
+	for _, r := range expr {
+		switch {
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == '(' || r == '[':
+			stack = append(stack, r)
+		case r == ')' || r == ']':
+			if len(stack) == 0 || stack[len(stack)-1] != pairs[r] {
+				return false
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	return quote == 0 && len(stack) == 0
+}
+
+const celController = "request.userInfo.username == 'system:serviceaccount:argocd:argocd-application-controller'"
+
+// quotedList prints names as a CEL list: ['a', 'b'].
+func quotedList(names []string) string {
+	return "['" + strings.Join(names, "', '") + "']"
+}
+
+// TestHarnessGuardRender checks ValidatingAdmissionPolicy bundles-spare-harness and its binding in a cell: the controller of
+// Argo CD may not create, change or delete an object in a harness namespace of role cell, and may not touch an object that
+// has the harness label before or after the request. The lists come from allow.json, failurePolicy is Fail, and the binding
+// denies for every namespace. Both objects carry the harness label themselves.
+func TestHarnessGuardRender(t *testing.T) {
+	objs := cellObjects(t)
+	role := bundle.DefaultPolicy().Roles["cell"]
+	var names []string
+	for _, o := range role.HarnessClusterObjects {
+		if o.Name == "bundles-spare-harness" {
+			names = append(names, o.Kind)
+		}
+	}
+	slices.Sort(names)
+	if !slices.Equal(names, []string{"ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}) {
+		t.Fatalf("allow.json names the kinds %v for bundles-spare-harness", names)
+	}
+	vap := objs["ValidatingAdmissionPolicy bundles-spare-harness"]
+	if vap == nil {
+		t.Fatal("the render prints no ValidatingAdmissionPolicy bundles-spare-harness")
+	}
+	spec := get[map[string]any](t, vap, "spec")
+	if spec["failurePolicy"] != "Fail" {
+		t.Errorf("failurePolicy is %v, want Fail", spec["failurePolicy"])
+	}
+	if got, want := fmt.Sprint(spec["matchConstraints"]), "map[resourceRules:[map[apiGroups:[*] apiVersions:[*] operations:[CREATE UPDATE DELETE] resources:[*] scope:*]]]"; got != want {
+		t.Errorf("matchConstraints is %s, want %s", got, want)
+	}
+	if got, want := fmt.Sprint(spec["matchConditions"]), "[map[expression:"+celController+" name:argocd-controller]]"; got != want {
+		t.Errorf("matchConditions is %s, want %s", got, want)
+	}
+	wantExpr := []string{
+		"!(request.namespace in " + quotedList(role.HarnessNamespaces) + ")",
+		"oldObject == null || !has(oldObject.metadata.labels) || !('" + harnessLabel + "' in oldObject.metadata.labels)",
+		"object == null || !has(object.metadata.labels) || !('" + harnessLabel + "' in object.metadata.labels)",
+	}
+	vals := get[[]any](t, spec, "validations")
+	if len(vals) != len(wantExpr) {
+		t.Fatalf("the policy has %d validations, want %d", len(vals), len(wantExpr))
+	}
+	for i, want := range wantExpr {
+		if got := get[string](t, vals[i], "expression"); got != want {
+			t.Errorf("validation %d is %q, want %q", i, got, want)
+		}
+		if !celExprBalanced(want) || get[string](t, vals[i], "reason") != "Forbidden" || get[string](t, vals[i], "message") == "" {
+			t.Errorf("validation %d is %v, want balanced text, reason Forbidden and a message", i, vals[i])
+		}
+	}
+	if !slices.Equal(role.HarnessNamespaces, []string{"cell-identity-system", "cell-ops-system", "mesh-view-system"}) {
+		t.Errorf("allow.json harness namespaces of role cell are %v", role.HarnessNamespaces)
+	}
+	b := objs["ValidatingAdmissionPolicyBinding bundles-spare-harness"]
+	if b == nil {
+		t.Fatal("the render prints no binding bundles-spare-harness")
+	}
+	if got, want := fmt.Sprint(get[map[string]any](t, b, "spec")), "map[policyName:bundles-spare-harness validationActions:[Deny]]"; got != want {
+		t.Errorf("binding spec is %s, want %s", got, want)
+	}
+	for _, o := range []object{vap, b} {
+		if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
+			t.Errorf("%s has harness label %v", objName(o), v)
+		}
+	}
+}
+
+// TestAppLimitsRender checks ValidatingAdmissionPolicy bundles-app-limits and its binding: for an object of the Argo CD
+// controller whose tracking ID starts with one name of appComponents (one match for each name), it denies a Service that is
+// not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out, and an object that has the harness label.
+func TestAppLimitsRender(t *testing.T) {
+	objs := cellObjects(t)
+	apps := bundle.DefaultPolicy().Roles["cell"].AppComponents
+	if len(apps) == 0 {
+		t.Fatal("allow.json lists no app component for role cell")
+	}
+	vap := objs["ValidatingAdmissionPolicy bundles-app-limits"]
+	if vap == nil {
+		t.Fatal("the render prints no ValidatingAdmissionPolicy bundles-app-limits")
+	}
+	spec := get[map[string]any](t, vap, "spec")
+	if spec["failurePolicy"] != "Fail" {
+		t.Errorf("failurePolicy is %v, want Fail", spec["failurePolicy"])
+	}
+	if got, want := fmt.Sprint(spec["matchConstraints"]), "map[resourceRules:[map[apiGroups:[*] apiVersions:[*] operations:[CREATE UPDATE] resources:[*] scope:*]]]"; got != want {
+		t.Errorf("matchConstraints is %s, want %s", got, want)
+	}
+	conds := get[[]any](t, spec, "matchConditions")
+	if len(conds) != 2 || get[string](t, conds[0], "name") != "argocd-controller" || get[string](t, conds[0], "expression") != celController {
+		t.Fatalf("matchConditions are %v, want the controller and the app component", conds)
+	}
+	const track = "argocd.argoproj.io/tracking-id"
+	var starts []string
+	for _, a := range apps {
+		starts = append(starts, "object.metadata.annotations['"+track+"'].startsWith('"+a+":')")
+	}
+	wantApp := "object != null && has(object.metadata.annotations) && '" + track + "' in object.metadata.annotations && (" + strings.Join(starts, " || ") + ")"
+	if got := get[string](t, conds[1], "expression"); got != wantApp || get[string](t, conds[1], "name") != "app-component" || !celExprBalanced(wantApp) {
+		t.Errorf("the app component condition is %q, want %q", got, wantApp)
+	}
+	if n := strings.Count(wantApp, "startsWith("); n != len(apps) {
+		t.Errorf("%d matches for %d app components", n, len(apps))
+	}
+	const inject = "sidecar.istio.io/inject"
+	optOut := func(field string) string {
+		m := "object.spec.template.metadata." + field
+		return "(has(" + m + ") && '" + inject + "' in " + m + " && " + m + "['" + inject + "'].lowerAscii() in ['false', 'n', 'no', 'off'])"
+	}
+	wantExpr := []string{
+		"object.kind != 'Service' || ((!has(object.spec.type) || object.spec.type == 'ClusterIP') && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))",
+		"object.kind != 'Deployment' || !(has(object.spec.template.metadata) && (" + optOut("labels") + " || " + optOut("annotations") + "))",
+		"!has(object.metadata.labels) || !('" + harnessLabel + "' in object.metadata.labels)",
+	}
+	vals := get[[]any](t, spec, "validations")
+	if len(vals) != 3 {
+		t.Fatalf("the policy has %d validations, want the three deny rules", len(vals))
+	}
+	for i, want := range wantExpr {
+		if got := get[string](t, vals[i], "expression"); got != want {
+			t.Errorf("validation %d is %q, want %q", i, got, want)
+		}
+		if !celExprBalanced(want) || get[string](t, vals[i], "reason") != "Forbidden" || get[string](t, vals[i], "message") == "" {
+			t.Errorf("validation %d is %v, want balanced text, reason Forbidden and a message", i, vals[i])
+		}
+	}
+	b := objs["ValidatingAdmissionPolicyBinding bundles-app-limits"]
+	if b == nil {
+		t.Fatal("the render prints no binding bundles-app-limits")
+	}
+	if got, want := fmt.Sprint(get[map[string]any](t, b, "spec")), "map[policyName:bundles-app-limits validationActions:[Deny]]"; got != want {
+		t.Errorf("binding spec is %s, want %s", got, want)
+	}
+	for _, o := range []object{vap, b} {
+		if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
+			t.Errorf("%s has harness label %v", objName(o), v)
+		}
+	}
+	// Every harness cluster object that allow.json names for role cell is in the render.
+	for _, o := range bundle.DefaultPolicy().Roles["cell"].HarnessClusterObjects {
+		if objs[o.Kind+" "+o.Name] == nil {
+			t.Errorf("allow.json names %s %s as a harness object, and the render prints none", o.Kind, o.Name)
+		}
+	}
+}
+
+// TestBundleGuardScript runs components/lib/bundle-guard.sh for each role. A cell gets both policies. dev-cp gets the harness
+// policy with its own namespaces and no app limits. Role open has no signed sets, and an unknown role fails.
+func TestBundleGuardScript(t *testing.T) {
+	testtool.Need(t, "jq", "bash")
+	script, err := filepath.Abs("../../components/lib/bundle-guard.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) (string, string, error) {
+		cmd := exec.Command("bash", append([]string{script}, args...)...)
+		var out, errOut bytes.Buffer
+		cmd.Stdout, cmd.Stderr = &out, &errOut
+		err := cmd.Run()
+		return out.String(), errOut.String(), err
+	}
+	out, errOut, err := run("cp")
+	if err != nil {
+		t.Fatalf("role cp: %v\n%s", err, errOut)
+	}
+	objs := objectsIn(t, out)
+	if got := keysOfObjects(objs); !slices.Equal(got, []string{"ValidatingAdmissionPolicy bundles-spare-harness", "ValidatingAdmissionPolicyBinding bundles-spare-harness"}) {
+		t.Errorf("role cp prints %v", got)
+	}
+	cp := bundle.DefaultPolicy().Roles["cp"]
+	if got := get[string](t, get[[]any](t, objs["ValidatingAdmissionPolicy bundles-spare-harness"], "spec", "validations")[0], "expression"); got != "!(request.namespace in "+quotedList(cp.HarnessNamespaces)+")" {
+		t.Errorf("role cp namespaces: %s", got)
+	}
+	out, errOut, err = run("cell")
+	if err != nil {
+		t.Fatalf("role cell: %v\n%s", err, errOut)
+	}
+	if got := len(objectsIn(t, out)); got != 4 {
+		t.Errorf("role cell prints %d objects, want 4", got)
+	}
+	for _, args := range [][]string{{"open"}, {"nope"}, {}} {
+		if out, _, err := run(args...); err == nil || out != "" {
+			t.Errorf("run %v: err %v, stdout %q, want a failure with no output", args, err, out)
+		}
 	}
 }

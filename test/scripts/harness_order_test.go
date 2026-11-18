@@ -18,6 +18,7 @@ var harnessUpHint = []string{
 	"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2",
 	"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2",
 	"CELL=management mise run cell:link",
+	"mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait",
 }
 
 // hintLines returns the commands that follow the hint line of harness.sh in its standard error.
@@ -36,7 +37,8 @@ func hintLines(t *testing.T, errOut string) []string {
 
 // TestHarnessUpOrderM6: harness:up creates cells only through the portal. The host service creates management, dev-cp and rogue,
 // and the images follow. Then come the cell:up of management, the first link of mgmt-api, the cell:up of dev-cp, the second link
-// of mgmt-api, one portal request that names both cells, one portal wait, and the full link of management. No cell gets cell:up.
+// of mgmt-api, one portal request that names both cells, one portal wait, the full link of management, and the signed publish for both
+// cells (TestHarnessUpPublishesTargets). No cell gets cell:up.
 // The request runs on every call, even when both cells are requested already, because mgmtd answers alreadyRequested (ruling m6).
 func TestHarnessUpOrderM6(t *testing.T) {
 	root, calls := harnessRoot(t)
@@ -54,6 +56,7 @@ func TestHarnessUpOrderM6(t *testing.T) {
 		"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cell-1 LINK_ONLY= SKIP=",
 		"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cell-1 LINK_ONLY= SKIP=",
 		"mise run cell:link | CELL=management LINK_ONLY= SKIP=",
+		harnessUpPublish,
 	}
 	if got := strings.Split(strings.TrimSpace(log), "\n"); !slices.Equal(got, want) {
 		t.Fatalf("calls\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))

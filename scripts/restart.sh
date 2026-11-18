@@ -12,6 +12,8 @@
 # Deployment or the StatefulSet, so their field managers stay the same.
 # HARNESS_ONLY=<component> restarts only the workloads of that harness component, and leaves the SPIRE server and the other
 # components alone. An unknown name fails.
+# STORE_TOKENS=1 also restarts bundle-store-0 and argocd-repo-server, first the store and then the repo server. Their pods hold
+# projected tokens for the bundle store, and a new pod gets new tokens. With the harness workloads, this rotates every store token.
 source "$(dirname "$0")/lib.sh"
 
 runs_spire_server=0
@@ -23,7 +25,7 @@ if [[ -n "${HARNESS_ONLY:-}" ]]; then
   restart_entries=("$(harness_only_entry)") || exit 1
   runs_spire_server=0
 fi
-((${#restart_entries[@]} > 0 || runs_spire_server)) \
+((${#restart_entries[@]} > 0 || runs_spire_server)) || [[ "${STORE_TOKENS:-}" == 1 ]] \
   || die "cluster $CELL_NAME has no harness or link component and no SPIRE server in harness/topology.yaml, so cell:restart has nothing to restart"
 
 # rollout_hint <namespace> <deployment> prints the commands that show why a rollout failed.
@@ -48,24 +50,36 @@ if ((runs_spire_server)); then
   log "restarted the SPIRE server in spire-system. It answered no agent for $((SECONDS - stopped))s"
 fi
 
+# restart_workload <namespace> <workload> deletes the pods of a Deployment or StatefulSet, waits for new Ready pods and for
+# the rollout. The workload is written as <kind>.apps/<name>.
+restart_workload() {
+  local ns="$1" workload="$2" selector old uids end
+  selector="$(k -n "$ns" get "$workload" -o json \
+    | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
+  [[ -n "$selector" ]] || die "$workload in $ns has no label selector"
+  old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
+  k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of $workload in $ns"
+  end=$((SECONDS + 300))
+  until uids="$(new_ready_pods "$ns" "$selector" "$old")" && [[ -n "$uids" ]]; do
+    if ((SECONDS >= end)); then
+      rollout_hint "$ns" "$workload" >&2
+      die "$workload in $ns has no new Ready pod after 300s"
+    fi
+    sleep 2
+  done
+  k -n "$ns" rollout status "$workload" --timeout=300s >/dev/null || { rollout_hint "$ns" "$workload" >&2; die "$workload in $ns did not finish its rollout"; }
+  log "restarted $workload in $ns"
+}
+
+if [[ "${STORE_TOKENS:-}" == 1 ]]; then
+  restart_workload cell-system statefulset.apps/bundle-store
+  restart_workload argocd deployment.apps/argocd-repo-server
+fi
+
 for entry in ${restart_entries[@]+"${restart_entries[@]}"}; do
   ns="${entry#*:}"
   workloads="$(harness_workloads "${entry%%:*}" "$ns")" || exit 1
   for workload in $workloads; do
-    selector="$(k -n "$ns" get "$workload" -o json \
-      | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
-    [[ -n "$selector" ]] || die "$workload in $ns has no label selector"
-    old="$(k -n "$ns" get pods -l "$selector" -o jsonpath='{.items[*].metadata.uid}')"
-    k -n "$ns" delete pods -l "$selector" --wait=true --timeout=120s >/dev/null || die "could not delete the pods of $workload in $ns"
-    end=$((SECONDS + 300))
-    until uids="$(new_ready_pods "$ns" "$selector" "$old")" && [[ -n "$uids" ]]; do
-      if ((SECONDS >= end)); then
-        rollout_hint "$ns" "$workload" >&2
-        die "$workload in $ns has no new Ready pod after 300s"
-      fi
-      sleep 2
-    done
-    k -n "$ns" rollout status "$workload" --timeout=300s >/dev/null || { rollout_hint "$ns" "$workload" >&2; die "$workload in $ns did not finish its rollout"; }
-    log "restarted $workload in $ns"
+    restart_workload "$ns" "$workload"
   done
 done

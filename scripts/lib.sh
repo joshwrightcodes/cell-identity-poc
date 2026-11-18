@@ -223,6 +223,63 @@ source "$ROOT/components/lib/bundle-role.sh"
 # bundle_role prints the bundle role of $CELL: cell, cp or open (components/lib/bundle-role.sh).
 bundle_role() { bundle_role_of "$CELL_NAME"; }
 
+# bundle_state_ns <role> prints the namespace of ConfigMap bundle-state: cell-ops-system for role cell, envd-system for role cp,
+# and nothing for role open, which has no bundle state.
+bundle_state_ns() {
+  case "$1" in
+    cell) echo cell-ops-system ;;
+    cp) echo envd-system ;;
+    open) ;;
+    *) die "unknown bundle role '$1'" ;;
+  esac
+}
+
+# bundle_state_json prints state.json of ConfigMap bundle-state in the cluster CELL, and nothing when the ConfigMap is absent or
+# the role has none. A read that fails returns 1, so a caller never takes an unreadable state for an absent one.
+bundle_state_json() {
+  local role ns raw
+  role="$(bundle_role)" || return 1
+  ns="$(bundle_state_ns "$role")" || return 1
+  [[ -n "$ns" ]] || return 0
+  raw="$(k -n "$ns" get configmap bundle-state --ignore-not-found -o 'jsonpath={.data.state\.json}')" \
+    || { echo "error: could not read ConfigMap bundle-state in $ns of $CELL_NAME" >&2; return 1; }
+  printf '%s' "$raw"
+}
+
+# bundle_state_source prints the source of the bundle state (bootstrap or signed), and nothing when there is no state.
+bundle_state_source() {
+  local state
+  state="$(bundle_state_json)" || return 1
+  [[ -z "$state" ]] || jq -r '.source // ""' <<<"$state"
+}
+
+# bundle_state_bootstrap writes the bootstrap state of the cluster CELL when the role has a state and none exists: ConfigMap
+# bundle-state with the label poc.internal/made-by=bundle-bootstrap, from build/<cluster>/root.json (the result of publish.sh).
+# The state holds the root that publish.sh pushed as its first good root, state healthy and no version, so the first signed set
+# of any version is newer. The write is a create, so a state that celld wrote first stays.
+bundle_state_bootstrap() {
+  local role ns state doc
+  role="$(bundle_role)" || return 1
+  ns="$(bundle_state_ns "$role")" || return 1
+  [[ -n "$ns" ]] || return 0
+  state="$(bundle_state_json)" || return 1
+  [[ -z "$state" ]] || return 0
+  [[ -f "$BUILD/root.json" ]] || die "no $BUILD/root.json, so there is no bootstrap root to record. Run: CELL=$CELL_NAME mise run cell:publish"
+  doc="$(jq -c --arg ns "$ns" '{
+      apiVersion: "v1", kind: "ConfigMap",
+      metadata: {name: "bundle-state", namespace: $ns, labels: {"poc.internal/made-by": "bundle-bootstrap"}},
+      data: {"state.json": ({source: "bootstrap", version: {epoch: 0, counter: 0}, contentSHA256: "", keySHA256: "", opId: "",
+        state: "healthy", holder: "", until: "0001-01-01T00:00:00Z", root: {digest: .digest, manifest: .manifest},
+        components: .components, checked: [], checkedBy: "", good: []} | tojson)}}' "$BUILD/root.json")" \
+    || die "could not read the root of $BUILD/root.json"
+  if ! k -n "$ns" create -f - >/dev/null <<<"$doc"; then
+    state="$(bundle_state_json)" || return 1
+    [[ -n "$state" ]] || die "could not create ConfigMap bundle-state in $ns of $CELL_NAME"
+    return 0
+  fi
+  log "wrote the bootstrap bundle state of $CELL_NAME to $ns/bundle-state"
+}
+
 # hydrate_store_tokens replaces @CELL_PROXY_IMAGE@ and @BUNDLE_STORE_WRITER@ in the render on standard input and
 # prints the result. The image is the pinned reference from build/images.env. The writer is the account of the applier
 # of the role of $CELL, and a role with no writer drops the line with the token, so the proxy refuses every write. A
@@ -1064,7 +1121,9 @@ check_plane_pods() {
 # harness label and the marker label poc.internal/made-by=mgmtd.
 # The fourth case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
-# the check skips them, and prints no delete hint for them.
+# the check skips them, and prints no delete hint for them. The ConfigMap bundle-state is a runtime object too:
+# cell:up creates it with kubectl create and the marker poc.internal/made-by=bundle-bootstrap, and celld
+# updates it and changes the marker to celld.
 # The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
 # manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
@@ -1082,7 +1141,9 @@ runtime_objects() {
     return
   fi
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
-    jq -cn '{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}}'
+    jq -cn '[{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
+      {names: "^bundle-state$", managers: ["celld", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
     return
   fi
   if [[ "$1:$2" =~ ^(central-view:central-view-system|telemetry-gateway:observability-system|mesh-view-hub:mesh-view-system)$ && "$3" == ConfigMap ]]; then
@@ -1204,8 +1265,9 @@ pem_der_sha256() {
 
 # dependents_of <name> prints the commands that bring the copies of a change up to date, one command on each
 # line, in the order to run them. The name is a cluster that was rebuilt (management, dev-cp or a cell),
-# hostsvc for a restart of the host service, gateway-nodes for a gateway that holds old cell node addresses, or
-# gateway-store for a store of the gateway that is lost, corrupt or full. The cell:up of dev-cp renders the
+# hostsvc for a restart of the host service, gateway-nodes for a gateway that holds old cell node addresses,
+# gateway-store for a store of the gateway that is lost, corrupt or full, mirror for a registry mirror with a new address, or
+# store-tokens for new projected store tokens. The cell:up of dev-cp renders the
 # cell gateway again, so the rows of a rebuilt cell and of dev-cp cover it. The README section
 # "Rebuild one cluster" holds the same table.
 # A cell exists only through a signed step, so the rows of a cell and of management go through the portal. The
@@ -1244,6 +1306,12 @@ dependents_of() {
       for cell in $live; do echo "CELL=$cell mise run cell:up"; done
       for cell in $live; do echo "CELL=$cell mise run cell:restart"; done
       echo "CELL=management mise run cell:link" ;;
+    # A new address of the registry mirror changes rules N45 in the render of celld. New store tokens need new pods.
+    mirror | store-tokens)
+      live="$(live_cells)" || return 1
+      for cell in $live; do
+        if [[ "$1" == mirror ]]; then echo "CELL=$cell HARNESS_ONLY=cell-identity mise run cell:up"; else echo "CELL=$cell STORE_TOKENS=1 mise run cell:restart"; fi
+      done ;;
     *)
       for cell in $catalog; do
         [[ "$cell" == "$1" ]] || continue
@@ -1254,7 +1322,7 @@ dependents_of() {
         echo "CELL=management mise run cell:link"
         return
       done
-      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $catalog, not '$1'" ;;
+      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store, mirror, store-tokens and $catalog, not '$1'" ;;
   esac
 }
 

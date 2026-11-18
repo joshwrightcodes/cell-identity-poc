@@ -7,10 +7,24 @@
 # proxy, so it needs no token. A cluster with role cell or cp gets its bundles and its root from
 # `bundlectl bootstrap`, which writes the result to build/<cluster>/root.json. A cluster with role open
 # (management) gets the same objects from oras and the Application files below, and no root.json.
+# A cluster with a signed bundle state refuses this script, unless BUNDLE_PUBLISH_UNSIGNED=1 (scripts/bundle.sh publishes there).
 source "$(dirname "$0")/lib.sh"
 
 [[ -d "$BUNDLES" ]] || die "no hydrated bundles: run mise run cell:hydrate first"
 role="$(bundle_role)" || exit 1
+
+# A cluster with a signed bundle state takes only signed sets. A harness publish would put an unsigned root under the tag
+# current, which the engine of the cluster does not know. BUNDLE_PUBLISH_UNSIGNED=1 is the break glass.
+if [[ "$role" != open ]]; then
+  state_source="$(bundle_state_source)" || die "could not read the bundle state of $CELL_NAME, so publish.sh cannot tell whether the root is signed"
+  if [[ "$state_source" == signed ]]; then
+    if [[ "${BUNDLE_PUBLISH_UNSIGNED:-}" == 1 ]]; then
+      log "BUNDLE_PUBLISH_UNSIGNED=1: this publish puts an unsigned root over the signed state of $CELL_NAME. cell:verify fails until a signed publish: mise run bundle -- publish --target $CELL_NAME --wait"
+    else
+      die "the bundle state of $CELL_NAME has source: signed, and cell:publish would overwrite a signed root. Publish a signed set: mise run bundle -- publish --target $CELL_NAME --wait. Break glass: BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish"
+    fi
+  fi
+fi
 bundle_store_forward
 local_store="127.0.0.1:${CELL_BUNDLE_STORE_PORT}"
 

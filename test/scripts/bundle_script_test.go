@@ -1,0 +1,840 @@
+package scripts
+
+import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
+)
+
+const (
+	stubOpID     = "cccccccccccccccccccccccccccccccc"
+	stubRootSHA  = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	stubArgocdD  = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	stubCellSysD = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+)
+
+// bundleMise stands in for mise in the tests of bundle.sh. It logs each call with the CELL of the call and answers the calls that
+// bundle.sh makes: the mirror facts, bundlectl push, push-root and attach, and mgmt bundle sign, get and cosign. STUB_SIGN_FAIL,
+// STUB_PUSH_FAIL, STUB_ATTACH_FAIL and STUB_NO_MIRROR make the call fail with one JSON error line. STUB_MIRROR_HOST replaces the mirror host. STUB_ROOT_PUSHED replaces the digest
+// that push-root answers. STUB_OUTCOMES lists what the successive calls of bundle get answer: open (no result), or an outcome. The last
+// answer repeats. STUB_OTHER_OP makes bundle get answer another operation.
+const bundleMise = `#!/usr/bin/env bash
+echo "mise $* | CELL=${CELL:-}" >>"$STUB_LOG"
+fail() { echo "{\"level\":\"ERROR\",\"msg\":\"stub failed\",\"error\":\"$1\"}"; exit 1; }
+root=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+opid=cccccccccccccccccccccccccccccccc
+comps='[{"name":"argocd","wave":-1,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"name":"cell-system","wave":-1,"namespace":"cell-system","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]'
+case "$*" in
+  "run hostsvc -- facts --registry")
+    [[ -z "${STUB_NO_MIRROR:-}" ]] || fail "registry-mirror has no address"
+    printf '{"name":"registry-mirror","address":"172.18.0.7","port":5000,"host":"%s"}\n' "${STUB_MIRROR_HOST:-127.0.0.1:5001}" ;;
+  "run bundlectl -- push "*)
+    [[ -z "${STUB_PUSH_FAIL:-}" ]] || fail "push failed"
+    echo "$comps" ;;
+  "run bundlectl -- push-root "*)
+    cat >"$STUB_STATE/push-root.stdin"
+    printf '{"digest":"%s","manifest":"bWFuaWZlc3Q="}\n' "${STUB_ROOT_PUSHED:-$root}" ;;
+  "run bundlectl -- attach "*)
+    [[ -z "${STUB_ATTACH_FAIL:-}" ]] || fail "attach failed"
+    echo '{"root":"x","referrer":"y","repository":"z"}' ;;
+  "run mgmt -- bundle sign "*)
+    cat >"$STUB_STATE/sign.stdin"
+    [[ -z "${STUB_SIGN_FAIL:-}" ]] || fail "bundle_open"
+    jq -nc --arg op "$opid" --arg root "$root" '{opId: $op, version: {epoch: 1, counter: 3}, contentSHA256: "ee", rootDigest: $root,
+      envelope: {payloadType: "application/vnd.in-toto+json", payload: "e30=", signatures: []},
+      sigstoreBundle: {mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", dsseEnvelope: {payload: "e30="}, marker: "public"}}' ;;
+  "run mgmt -- bundle cosign "*)
+    jq -nc --arg op "$opid" --arg root "$root" '{opId: $op, version: {epoch: 1, counter: 3}, rootDigest: $root,
+      envelope: {}, sigstoreBundle: {mediaType: "application/vnd.dev.sigstore.bundle.v0.3+json", marker: "rotated"}}' ;;
+  "run mgmt -- bundle get "*)
+    n=$(($(cat "$STUB_STATE/get-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_STATE/get-count"
+    read -r -a seq <<<"${STUB_OUTCOMES:-applied}"
+    i=$((n - 1)); ((i < ${#seq[@]})) || i=$((${#seq[@]} - 1))
+    out="${seq[$i]}"; op="$opid"; [[ -z "${STUB_OTHER_OP:-}" ]] || op=dddddddddddddddddddddddddddddddd
+    jq -nc --arg op "$op" --arg root "$root" --arg out "$out" --argjson comps "$comps" '{opId: $op, version: {epoch: 1, counter: 3},
+      contentSHA256: "ee", rootDigest: $root, components: $comps, served: true}
+      + (if $out == "open" then {} elif $out == "rolled_back" then {result: {opId: $op, outcome: $out, reason: "unhealthy", detail: "apps-demo:Synced/Degraded"}}
+         else {result: {opId: $op, outcome: $out}} end)' ;;
+  *) echo "unexpected mise call: $*" >&2; exit 2 ;;
+esac
+`
+
+// bundleKubectl logs its call and answers what bundle.sh asks. get configmap bundle-state prints STUB_STATE_JSON, or nothing when
+// the ConfigMap is absent, and STUB_STATE_FAIL makes the call fail. create -f - and apply -f - keep their standard input. A
+// port-forward sleeps. get applications prints STUB_APPS_OLD_JSON for the first STUB_APPS_OLD_POLLS calls, and then STUB_APPS_JSON.
+const bundleKubectl = `#!/usr/bin/env bash
+echo "kubectl $*" >>"$STUB_LOG"
+case " $* " in
+  *" port-forward "*) exec sleep 30 ;;
+  *" create -f - "*) cat >"$STUB_STATE/created.json"; exit 0 ;;
+  *" apply "*" -f - "*) n=$(($(cat "$STUB_STATE/apply-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_STATE/apply-count"; cat >"$STUB_STATE/applied-$n.yaml"; exit 0 ;;
+  *" get configmap bundle-state "*)
+    if [[ -n "${STUB_STATE_FAIL:-}" ]]; then echo "error: connection refused" >&2; exit 1; fi
+    [[ -z "${STUB_STATE_JSON:-}" ]] || printf '%s' "$STUB_STATE_JSON"
+    exit 0 ;;
+  *" get applications -o json "*)
+    n=$(($(cat "$STUB_STATE/apps-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_STATE/apps-count"
+    if ((n <= ${STUB_APPS_OLD_POLLS:-0})); then printf '%s\n' "$STUB_APPS_OLD_JSON"; else printf '%s\n' "${STUB_APPS_JSON:-}"; fi
+    exit 0 ;;
+esac
+exit 0
+`
+
+// bundleCurl fails on its first call, as when no old port-forward holds the port, and then succeeds.
+const bundleCurl = `#!/usr/bin/env bash
+echo "curl $*" >>"$STUB_LOG"
+if [[ ! -e "$STUB_STATE/curl-seen" ]]; then touch "$STUB_STATE/curl-seen"; exit 22; fi
+exit 0
+`
+
+// bundleOras serves the manifest and the layer of the bundle that the test names, and keeps what it pushes. STUB_ORAS_BAD makes the
+// manifest differ from its digest.
+const bundleOras = `#!/usr/bin/env bash
+echo "oras $*" >>"$STUB_LOG"
+args=("$@"); out=-
+for ((i = 0; i < ${#args[@]}; i++)); do [[ "${args[i]}" == --output ]] && out="${args[i+1]}"; done
+ref="${args[${#args[@]}-1]}"
+case "${args[0]} ${args[1]}" in
+  "manifest fetch")
+    name="${ref##*/}"; name="${name%%@*}"
+    cat "$STUB_BUNDLES/$name.manifest.json"
+    [[ -z "${STUB_ORAS_BAD:-}" ]] || printf ' ' ;;
+  "blob fetch") name="${ref##*/}"; name="${name%%@*}"; cat "$STUB_BUNDLES/$name.layer.tgz" ;;
+  "manifest push") cat >"$STUB_STATE/tagged.json" ;;
+  *) exit 2 ;;
+esac
+`
+
+// bundleRoot makes a temporary root with the scripts, the cell settings and the stubs, and one hydrated bundle for each component of
+// the cluster. It returns the root and the environment of a run.
+type bundleRoot struct {
+	t      *testing.T
+	dir    string
+	log    string
+	state  string
+	extras []string
+}
+
+func newBundleRoot(t *testing.T, clusters ...string) *bundleRoot {
+	t.Helper()
+	testtool.Need(t, "yq", "jq", "bash", "tar")
+	r := &bundleRoot{t: t, dir: t.TempDir()}
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
+		copyFiles(t, r.dir, d)
+	}
+	r.log = filepath.Join(r.dir, "calls.log")
+	r.state = filepath.Join(r.dir, "state")
+	bin := filepath.Join(r.dir, "bin")
+	for _, d := range []string{bin, r.state, filepath.Join(r.dir, "bundles")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for name, body := range map[string]string{"mise": bundleMise, "kubectl": bundleKubectl, "curl": bundleCurl, "oras": bundleOras} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, c := range clusters {
+		r.hydrate(c)
+	}
+	return r
+}
+
+// hydrate writes the hydrated bundles of a cluster, as scripts/hydrate.sh leaves them, and its root.json, as publish.sh leaves it.
+func (r *bundleRoot) hydrate(cluster string) {
+	r.t.Helper()
+	list := exec.Command("bash", "-c", `source "$1"; printf '%s\n' "${COMPONENTS[@]}"`, "_", filepath.Join(r.dir, "scripts", "lib.sh"))
+	list.Env = append(os.Environ(), "CELL="+cluster, "POC_BUILD_ROOT="+filepath.Join(r.dir, "build"))
+	out, err := list.Output()
+	if err != nil {
+		r.t.Fatalf("read COMPONENTS of %s: %v", cluster, err)
+	}
+	for _, e := range strings.Fields(string(out)) {
+		dir := filepath.Join(r.dir, "build", cluster, "bundles", strings.SplitN(e, ":", 2)[0])
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			r.t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifests.yaml"), []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x, namespace: default}\n"), 0o644); err != nil {
+			r.t.Fatal(err)
+		}
+	}
+	root := `{"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","manifest":"Ym9vdA==","components":{"argocd":"` + stubArgocdD + `","cell-system":"` + stubCellSysD + `"}}`
+	if err := os.WriteFile(filepath.Join(r.dir, "build", cluster, "root.json"), []byte(root+"\n"), 0o644); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// run runs a script of the root with the given variables and returns standard output, standard error, the log of the stub calls and
+// the error.
+func (r *bundleRoot) run(script string, env []string, args ...string) (string, string, string, error) {
+	r.t.Helper()
+	cmd := exec.Command(filepath.Join(r.dir, "scripts", script), args...)
+	cmd.Env = append([]string{"PATH=" + filepath.Join(r.dir, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+		"CELL=dev-cell-1", "POC_BUILD_ROOT=" + filepath.Join(r.dir, "build"), "STUB_LOG=" + r.log, "STUB_STATE=" + r.state,
+		"STUB_BUNDLES=" + filepath.Join(r.dir, "bundles"), "BUNDLE_WAIT_POLL=0.05", "BUNDLE_WAIT_SECONDS=20"}, append(r.extras, env...)...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err := cmd.Run()
+	logData, _ := os.ReadFile(r.log)
+	return out.String(), errOut.String(), string(logData), err
+}
+
+func (r *bundleRoot) file(path ...string) string {
+	b, err := os.ReadFile(filepath.Join(append([]string{r.dir}, path...)...))
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// callIndex returns the index of the first line of the log that holds all of the parts, or -1.
+func callIndex(log string, parts ...string) int {
+	for i, l := range strings.Split(log, "\n") {
+		ok := true
+		for _, p := range parts {
+			ok = ok && strings.Contains(l, p)
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+func calls(log, prefix string) []string {
+	var out []string
+	for _, l := range strings.Split(log, "\n") {
+		if strings.HasPrefix(l, prefix) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// TestBundleAttachesSigstore: publish pushes the components to the mirror, signs the set with the components on standard input, writes
+// the sigstoreBundle (public data) to build/<target>/sigstore-<counter>.json, pushes the root to the mirror, and attaches the file to
+// the root with bundlectl attach, under the loopback mirror address. oras never attaches. A failure of the signature stops the publish
+// before any root or attach, and a root that differs from the signed root stops it before the attach.
+func TestBundleAttachesSigstore(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1")
+	out, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
+	if err != nil {
+		t.Fatalf("publish failed: %v\n%s\n%s", err, errOut, log)
+	}
+	order := []int{
+		callIndex(log, "run hostsvc -- facts --registry"),
+		callIndex(log, "run bundlectl -- push --target dev-cell-1 --registry 127.0.0.1:5001"),
+		callIndex(log, "run mgmt -- bundle sign --target dev-cell-1 | CELL=management"),
+		callIndex(log, "run bundlectl -- push-root --role cell --target dev-cell-1", "--registry 127.0.0.1:5001"),
+		callIndex(log, "run bundlectl -- attach --target dev-cell-1 --digest "+stubRootSHA, "--registry 127.0.0.1:5001"),
+	}
+	if !slices.IsSorted(order) || order[0] < 0 || slices.Contains(order, -1) {
+		t.Fatalf("calls in the wrong order or missing (indexes %v):\n%s", order, log)
+	}
+	if strings.Contains(log, "oras") {
+		t.Errorf("publish.sh called oras:\n%s", log)
+	}
+	file := filepath.Join("build", "dev-cell-1", "sigstore-3.json")
+	want := `{"dsseEnvelope":{"payload":"e30="},"marker":"public","mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json"}`
+	var got, exp any
+	if json.Unmarshal([]byte(r.file(file)), &got) != nil || json.Unmarshal([]byte(want), &exp) != nil || fmt.Sprint(got) != fmt.Sprint(exp) {
+		t.Errorf("%s holds %q, want the sigstoreBundle %s", file, r.file(file), want)
+	}
+	if attach := calls(log, "mise run bundlectl -- attach")[0]; !strings.Contains(attach, "--bundle "+filepath.Join(r.dir, file)) {
+		t.Errorf("attach call %q does not name the file %s", attach, file)
+	}
+	// The set that goes to mgmtd and to push-root is the answer of bundlectl push, on standard input.
+	for _, f := range []string{"sign.stdin", "push-root.stdin"} {
+		var comps []map[string]any
+		if err := json.Unmarshal([]byte(r.file("state", f)), &comps); err != nil || len(comps) != 2 || comps[0]["name"] != "argocd" {
+			t.Errorf("%s holds %q, want the components of bundlectl push", f, r.file("state", f))
+		}
+	}
+	var line map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil || line["opId"] != stubOpID || line["rootDigest"] != stubRootSHA || line["target"] != "dev-cell-1" {
+		t.Errorf("publish printed %q, want one JSON line with the target, the opId and the rootDigest", out)
+	}
+	if strings.Contains(out, "dsseEnvelope") || strings.Contains(out, "payload") {
+		t.Errorf("publish printed the envelope: %q", out)
+	}
+
+	t.Run("a refused signature stops before the root", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, errOut, log, err := r.run("bundle.sh", []string{"STUB_SIGN_FAIL=1"}, "publish", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "bundle_open") {
+			t.Fatalf("err %v, stderr %q, want a failure that names the reason", err, errOut)
+		}
+		if strings.Contains(log, "push-root") || strings.Contains(log, "attach") {
+			t.Errorf("a root or an attach after a failed signature:\n%s", log)
+		}
+	})
+	t.Run("a root that differs from the signed root is not attached", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, errOut, log, err := r.run("bundle.sh", []string{"STUB_ROOT_PUSHED=sha256:" + strings.Repeat("9", 64)}, "publish", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "root") {
+			t.Fatalf("err %v, stderr %q", err, errOut)
+		}
+		if strings.Contains(log, "attach") {
+			t.Errorf("attach after a root mismatch:\n%s", log)
+		}
+	})
+	t.Run("a failed push of the components stops before the signature", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, _, log, err := r.run("bundle.sh", []string{"STUB_PUSH_FAIL=1"}, "publish", "--target", "dev-cell-1")
+		if err == nil || strings.Contains(log, "bundle sign") {
+			t.Fatalf("err %v, calls:\n%s", err, log)
+		}
+	})
+	t.Run("a missing mirror address stops the publish", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, _, log, err := r.run("bundle.sh", []string{"STUB_NO_MIRROR=1"}, "publish", "--target", "dev-cell-1")
+		if err == nil || strings.Contains(log, "bundlectl") {
+			t.Fatalf("err %v, calls:\n%s", err, log)
+		}
+	})
+	t.Run("a mirror that is no loopback address stops the publish", func(t *testing.T) {
+		for _, host := range []string{"10.0.0.5:5001", "evil.example:5001", "127.0.0.1"} {
+			r := newBundleRoot(t, "dev-cell-1")
+			_, errOut, log, err := r.run("bundle.sh", []string{"STUB_MIRROR_HOST=" + host}, "publish", "--target", "dev-cell-1")
+			if err == nil || !strings.Contains(errOut, "loopback") || strings.Contains(log, "bundlectl") {
+				t.Errorf("mirror %s: err %v, stderr %q, calls:\n%s", host, err, errOut, log)
+			}
+		}
+	})
+	t.Run("cosign attaches the bundle that mgmtd holds now, under the key of the plane", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		out, errOut, log, err := r.run("bundle.sh", nil, "cosign", "--target", "dev-cell-1")
+		if err != nil {
+			t.Fatalf("cosign failed: %v\n%s\n%s", err, errOut, log)
+		}
+		if !strings.Contains(r.file("build", "dev-cell-1", "sigstore-3.json"), `"marker":"rotated"`) {
+			t.Errorf("sigstore-3.json is %q, want the bundle of mgmt bundle cosign", r.file("build", "dev-cell-1", "sigstore-3.json"))
+		}
+		if callIndex(log, "run mgmt -- bundle cosign --target dev-cell-1 | CELL=management") < 0 || callIndex(log, "run bundlectl -- attach --target dev-cell-1 --digest "+stubRootSHA) < 0 {
+			t.Errorf("cosign calls:\n%s", log)
+		}
+		if strings.Contains(log, "bundle sign") || strings.Contains(log, "push-root") || !strings.Contains(out, stubRootSHA) {
+			t.Errorf("cosign signed or pushed a root, or printed no digest: %q\n%s", out, log)
+		}
+	})
+}
+
+// TestBundleWaitOutcomes: with --wait, publish polls mgmt bundle get until the operation has a result. It exits 0 for applied and
+// already_applied, and writes published.env (one name=digest line for each component, and root=<digest>). It exits 1 for rolled_back,
+// refused and expired, for another operation, and for a deadline, and then it writes no published.env.
+func TestBundleWaitOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		outcomes string
+		env      []string
+		ok       bool
+		polls    int
+		want     string
+	}{
+		{name: "applied at once", outcomes: "applied", ok: true, polls: 1},
+		{name: "applied after two polls", outcomes: "open open applied", ok: true, polls: 3},
+		{name: "already applied", outcomes: "already_applied", ok: true, polls: 1},
+		{name: "rolled back", outcomes: "open rolled_back", polls: 2, want: "apps-demo:Synced/Degraded"},
+		{name: "refused", outcomes: "refused", polls: 1, want: "refused"},
+		{name: "expired", outcomes: "open expired", polls: 2, want: "expired"},
+		{name: "superseded by another operation", outcomes: "applied", env: []string{"STUB_OTHER_OP=1"}, polls: 1, want: "another"},
+		{name: "deadline", outcomes: "open", env: []string{"BUNDLE_WAIT_SECONDS=1"}, polls: -1, want: "timeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1")
+			out, errOut, log, err := r.run("bundle.sh", append([]string{"STUB_OUTCOMES=" + tc.outcomes}, tc.env...), "publish", "--target", "dev-cell-1", "--wait")
+			if (err == nil) != tc.ok {
+				t.Fatalf("err %v, want ok=%v\nstdout %s\nstderr %s", err, tc.ok, out, errOut)
+			}
+			if n := len(calls(log, "mise run mgmt -- bundle get")); tc.polls >= 0 && n != tc.polls || tc.polls < 0 && n < 2 {
+				t.Errorf("%d polls, want %d\n%s", n, tc.polls, log)
+			}
+			published := r.file("build", "dev-cell-1", "published.env")
+			if tc.ok {
+				want := "argocd=" + stubArgocdD + "\ncell-system=" + stubCellSysD + "\nroot=" + stubRootSHA + "\n"
+				if published != want {
+					t.Errorf("published.env is %q, want %q", published, want)
+				}
+				if !strings.Contains(out, `"outcome":"`+strings.Fields(tc.outcomes)[len(strings.Fields(tc.outcomes))-1]+`"`) {
+					t.Errorf("stdout lacks the outcome: %q", out)
+				}
+				return
+			}
+			if published != "" {
+				t.Errorf("published.env exists after a failure: %q", published)
+			}
+			if !strings.Contains(out+errOut, tc.want) {
+				t.Errorf("output %q lacks %q", out+errOut, tc.want)
+			}
+		})
+	}
+
+	// Two targets are signed first and waited for after, so the cells apply at the same time.
+	t.Run("two targets", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+		_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2", "--wait")
+		if err != nil {
+			t.Fatalf("publish failed: %v\n%s\n%s", err, errOut, log)
+		}
+		last := max(callIndex(log, "bundle sign --target dev-cell-1"), callIndex(log, "bundle sign --target dev-cell-2"))
+		first := min(callIndex(log, "bundle get --target dev-cell-1"), callIndex(log, "bundle get --target dev-cell-2"))
+		if last < 0 || first < 0 || first < last {
+			t.Errorf("a wait starts before the last signature (%d, %d):\n%s", first, last, log)
+		}
+		for _, c := range []string{"dev-cell-1", "dev-cell-2"} {
+			if r.file("build", c, "published.env") == "" {
+				t.Errorf("no published.env for %s", c)
+			}
+		}
+	})
+}
+
+// TestBundleRefusesOpenRole: management has role open, and keeps the harness publish. bundle.sh stops at once, names mise run
+// cell:publish, and signs nothing. An unknown target stops too, and publish needs a target.
+func TestBundleRefusesOpenRole(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1")
+	for _, sub := range []string{"publish", "repair", "cosign"} {
+		out, errOut, log, err := r.run("bundle.sh", nil, sub, "--target", "management")
+		if err == nil || !strings.Contains(out+errOut, "cell:publish") || !strings.Contains(out+errOut, "role open") {
+			t.Errorf("%s: err %v, output %q, want a refusal that names role open and cell:publish", sub, err, out+errOut)
+		}
+		if strings.Contains(log, "bundlectl") || strings.Contains(log, "bundle sign") || strings.Contains(log, "kubectl") {
+			t.Errorf("%s ran a command:\n%s", sub, log)
+		}
+	}
+	// Another target in the same call stops the whole call before the first signature.
+	_, _, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1", "--target", "management")
+	if err == nil || strings.Contains(log, "bundle sign") {
+		t.Errorf("a call with management signed a set: err %v\n%s", err, log)
+	}
+	for _, args := range [][]string{{"publish"}, {"publish", "--target", "nope"}, {"nope", "--target", "dev-cell-1"}, {"get"}} {
+		if _, _, log, err := r.run("bundle.sh", nil, args...); err == nil || strings.Contains(log, "bundle sign") {
+			t.Errorf("bundle.sh %v: err %v\n%s", args, err, log)
+		}
+	}
+	t.Run("get prints the answer of mgmtd for the target", func(t *testing.T) {
+		out, _, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=applied"}, "get", "--target", "dev-cell-1")
+		if err != nil || !strings.Contains(out, `"outcome":"applied"`) || callIndex(log, "run mgmt -- bundle get --target dev-cell-1 | CELL=management") < 0 {
+			t.Errorf("err %v, output %q, calls:\n%s", err, out, log)
+		}
+	})
+}
+
+// repairBundles writes the manifest and the layer of one component into the stub directory and returns the digest of the manifest.
+func repairBundles(t *testing.T, r *bundleRoot, name, content string) string {
+	t.Helper()
+	var layer bytes.Buffer
+	gz := gzip.NewWriter(&layer)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "manifests.yaml", Mode: 0o644, Size: int64(len(content))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(layer.Bytes())
+	manifest := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:` + hex.EncodeToString(sum[:]) + `","size":1}]}`
+	msum := sha256.Sum256([]byte(manifest))
+	for f, b := range map[string][]byte{name + ".manifest.json": []byte(manifest), name + ".layer.tgz": layer.Bytes()} {
+		if err := os.WriteFile(filepath.Join(r.dir, "bundles", f), b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return "sha256:" + hex.EncodeToString(msum[:])
+}
+
+func appsJSON(revisions map[string]string, health string) string {
+	var items []string
+	for _, name := range []string{"argocd", "cell-system", "network-policy", "root"} {
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":%q},"status":{"sync":{"status":"Synced","revision":%q},"health":{"status":%q}}}`, name, revisions[name], health))
+	}
+	return `{"items":[` + strings.Join(items, ",") + `]}`
+}
+
+// TestBundleRepairOrder: repair reads good[0] from the state ConfigMap, pulls its argocd and cell-system bundles from the mirror, applies
+// them server side with --force-conflicts (argocd first), puts the root of good[0] back under the tag current through the loopback
+// port-forward of the pod, refreshes the root Application, and waits until every Application is Synced and Healthy at the digests
+// of good[0]. The four steps run in this order. A state with no good root, a bundle that differs from its digest, and a role open
+// stop the repair before any change.
+func TestBundleRepairOrder(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1")
+	argocd := repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
+	cellSys := repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
+	rootManifest := []byte(`{"schemaVersion":2,"layers":[]}`)
+	rsum := sha256.Sum256(rootManifest)
+	rootDigest := "sha256:" + hex.EncodeToString(rsum[:])
+	good := map[string]any{"version": map[string]any{"epoch": 1, "counter": 2}, "contentSHA256": "aa", "at": "2026-11-18T00:00:00Z",
+		"root":       map[string]any{"digest": rootDigest, "manifest": base64.StdEncoding.EncodeToString(rootManifest)},
+		"components": map[string]string{"argocd": argocd, "cell-system": cellSys, "network-policy": "sha256:" + strings.Repeat("7", 64)}}
+	older := map[string]any{"version": map[string]any{"epoch": 1, "counter": 1}, "root": map[string]any{"digest": "sha256:" + strings.Repeat("5", 64), "manifest": ""},
+		"components": map[string]string{"argocd": "sha256:" + strings.Repeat("5", 64)}}
+	stateJSON := func(goods ...any) string {
+		b, _ := json.Marshal(map[string]any{"source": "signed", "state": "rolled_back", "version": map[string]any{"epoch": 1, "counter": 3}, "good": goods})
+		return string(b)
+	}
+	want := map[string]string{"argocd": argocd, "cell-system": cellSys, "network-policy": "sha256:" + strings.Repeat("7", 64), "root": rootDigest}
+	stale := map[string]string{"argocd": argocd, "cell-system": "sha256:" + strings.Repeat("6", 64), "network-policy": want["network-policy"], "root": "sha256:" + strings.Repeat("6", 64)}
+	env := []string{"STUB_STATE_JSON=" + stateJSON(good, older), "STUB_APPS_JSON=" + appsJSON(want, "Healthy"), "STUB_APPS_OLD_JSON=" + appsJSON(stale, "Healthy"), "STUB_APPS_OLD_POLLS=2"}
+	out, errOut, log, err := r.run("bundle.sh", env, "repair", "--target", "dev-cell-1")
+	if err != nil {
+		t.Fatalf("repair failed: %v\n%s\n%s\n%s", err, out, errOut, log)
+	}
+	idx := map[string]int{
+		"state":   callIndex(log, "kubectl --context kind-dev-cell-1", "-n cell-ops-system get configmap bundle-state"),
+		"apply-1": callIndex(log, "kubectl --context kind-dev-cell-1 apply --server-side --force-conflicts -f -"),
+		"tag":     callIndex(log, "oras manifest push", "--plain-http", "127.0.0.1:", "/bundles/root:current"),
+		"refresh": callIndex(log, "-n argocd annotate application root argocd.argoproj.io/refresh=hard"),
+		"wait":    callIndex(log, "-n argocd get applications -o json"),
+	}
+	lastApply := -1
+	for i, l := range strings.Split(log, "\n") {
+		if strings.Contains(l, " apply --server-side --force-conflicts -f -") {
+			lastApply = i
+		}
+	}
+	if idx["state"] < 0 || idx["apply-1"] < 0 || idx["tag"] < 0 || idx["refresh"] < 0 || idx["wait"] < 0 ||
+		!(idx["state"] < idx["apply-1"] && lastApply < idx["tag"] && idx["tag"] < idx["refresh"] && idx["refresh"] < idx["wait"]) {
+		t.Fatalf("the repair does not run read, apply, tag, refresh, wait in this order (%v, last apply %d):\n%s", idx, lastApply, log)
+	}
+	if n := len(calls(log, "kubectl --context kind-dev-cell-1 -n argocd get applications")); n != 3 {
+		t.Errorf("%d reads of the Applications, want 3 (two stale and one current)", n)
+	}
+	applies := calls(log, "kubectl --context kind-dev-cell-1 apply ")
+	if len(applies) != 2 {
+		t.Fatalf("%d applies, want one for argocd and one for cell-system:\n%s", len(applies), log)
+	}
+	if !strings.Contains(r.file("state", "applied-1.yaml"), "argocd-marker") || !strings.Contains(r.file("state", "applied-2.yaml"), "store-marker") {
+		t.Errorf("the applies hold %q then %q, want argocd then cell-system", r.file("state", "applied-1.yaml"), r.file("state", "applied-2.yaml"))
+	}
+	for _, l := range calls(log, "oras manifest fetch") {
+		if !strings.Contains(l, "127.0.0.1:5001/bundles/dev-cell-1/") {
+			t.Errorf("a fetch outside the mirror repository of the target: %q", l)
+		}
+	}
+	if got := r.file("state", "tagged.json"); got != string(rootManifest) {
+		t.Errorf("the tag holds %q, want the manifest bytes of good[0]: %q", got, rootManifest)
+	}
+	pf := calls(log, "kubectl --context kind-dev-cell-1 -n cell-system port-forward pod/bundle-store-0 ")
+	if len(pf) != 1 || !strings.HasSuffix(pf[0], ":5001") {
+		t.Errorf("the tag does not go through the loopback forward of the pod: %v", pf)
+	}
+	var line map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil || strings.Count(strings.TrimSpace(out), "\n") != 0 || line["root"] != rootDigest || line["target"] != "dev-cell-1" {
+		t.Errorf("repair printed %q, want one JSON line with the target and the root", out)
+	}
+
+	t.Run("no good root stops before any change", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		out, errOut, log, err := r.run("bundle.sh", []string{"STUB_STATE_JSON=" + stateJSON()}, "repair", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(out+errOut, "good") || strings.Contains(log, " apply ") || strings.Contains(log, "oras manifest push") {
+			t.Errorf("err %v, output %q, calls:\n%s", err, out+errOut, log)
+		}
+	})
+	t.Run("a bundle that differs from its digest is not applied", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
+		repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
+		_, errOut, log, err := r.run("bundle.sh", append([]string{"STUB_ORAS_BAD=1"}, env...), "repair", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "digest") || strings.Contains(log, " apply ") || strings.Contains(log, "oras manifest push") {
+			t.Errorf("err %v, stderr %q, calls:\n%s", err, errOut, log)
+		}
+	})
+	t.Run("an Application that stays off the digest fails the wait", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
+		repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
+		bad := append(slices.Clone(env[:1]), "STUB_APPS_JSON="+appsJSON(want, "Degraded"), "STUB_APPS_OLD_POLLS=0", "BUNDLE_REPAIR_SECONDS=1")
+		out, errOut, _, err := r.run("bundle.sh", bad, "repair", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(out+errOut, "Degraded") {
+			t.Errorf("err %v, output %q, want a failure that names the Application state", err, out+errOut)
+		}
+	})
+}
+
+// publishVariant runs publish.sh of a cluster in a temporary root, like runPublish, with the kubectl stub of bundle.sh in front. It
+// returns the output, the log of the calls and the error.
+func publishVariant(t *testing.T, cell string, env ...string) (string, string, error) {
+	t.Helper()
+	r := newBundleRoot(t, cell)
+	// publish.sh stubs: bundlectl bootstrap answers with a root digest, oras pushes and finds no tag.
+	if err := os.WriteFile(filepath.Join(r.dir, "bin", "mise"), []byte(publishStubs["mise"]), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.dir, "bin", "oras"), []byte(publishStubs["oras"]), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, log, err := r.run("publish.sh", append([]string{"CELL=" + cell}, env...))
+	return out + errOut, log, err
+}
+
+// TestPublishRefusesSignedCluster: cell:publish stops in a cluster whose bundle state has source signed, because a harness publish
+// would overwrite a signed root. It names mise run bundle and the break glass. A bootstrap state, no state, a cluster with role open,
+// and a role that has no applier yet all go on. A state that cannot be read stops the publish too.
+func TestPublishRefusesSignedCluster(t *testing.T) {
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2", "dev-cp"} {
+		t.Run(cell, func(t *testing.T) {
+			out, log, err := publishVariant(t, cell, `STUB_STATE_JSON={"source":"signed","state":"healthy"}`)
+			if err == nil {
+				t.Fatalf("publish.sh passed in a signed cluster:\n%s\n%s", out, log)
+			}
+			for _, want := range []string{"mise run bundle -- publish --target " + cell + " --wait", "BUNDLE_PUBLISH_UNSIGNED=1", "source: signed"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("the refusal lacks %q:\n%s", want, out)
+				}
+			}
+			if strings.Contains(log, "bundlectl") || strings.Contains(log, "port-forward") {
+				t.Errorf("publish.sh changed the store before it refused:\n%s", log)
+			}
+			ns := map[string]string{"dev-cell-1": "cell-ops-system", "dev-cell-2": "cell-ops-system", "dev-cp": "envd-system"}[cell]
+			if callIndex(log, "kubectl --context kind-"+cell+" -n "+ns+" get configmap bundle-state") < 0 {
+				t.Errorf("publish.sh did not read the state in %s:\n%s", ns, log)
+			}
+		})
+	}
+	t.Run("bootstrap, absent and unreadable states", func(t *testing.T) {
+		if out, log, err := publishVariant(t, "dev-cell-1", `STUB_STATE_JSON={"source":"bootstrap","state":"healthy"}`); err != nil || !strings.Contains(log, "bundlectl -- bootstrap") {
+			t.Errorf("a bootstrap state: err %v\n%s\n%s", err, out, log)
+		}
+		if out, log, err := publishVariant(t, "dev-cell-1"); err != nil || !strings.Contains(log, "bundlectl -- bootstrap") {
+			t.Errorf("no state: err %v\n%s\n%s", err, out, log)
+		}
+		out, log, err := publishVariant(t, "dev-cell-1", "STUB_STATE_FAIL=1")
+		if err == nil || strings.Contains(log, "bundlectl") || !strings.Contains(out, "state") {
+			t.Errorf("an unreadable state: err %v\n%s\n%s", err, out, log)
+		}
+	})
+	t.Run("management has no state to read", func(t *testing.T) {
+		out, log, err := publishVariant(t, "management", `STUB_STATE_JSON={"source":"signed"}`)
+		if err != nil || strings.Contains(log, "get configmap bundle-state") {
+			t.Errorf("err %v\n%s\n%s", err, out, log)
+		}
+	})
+}
+
+// TestPublishUnsignedBreakGlass: BUNDLE_PUBLISH_UNSIGNED=1 lets cell:publish go on in a signed cluster, and says in its output that the
+// root is no longer signed, and which command signs it again.
+func TestPublishUnsignedBreakGlass(t *testing.T) {
+	out, log, err := publishVariant(t, "dev-cell-1", `STUB_STATE_JSON={"source":"signed","state":"healthy"}`, "BUNDLE_PUBLISH_UNSIGNED=1")
+	if err != nil {
+		t.Fatalf("publish.sh failed with the break glass: %v\n%s\n%s", err, out, log)
+	}
+	if !strings.Contains(log, "bundlectl -- bootstrap --role cell --target dev-cell-1") {
+		t.Errorf("publish.sh did not publish:\n%s", log)
+	}
+	for _, want := range []string{"BUNDLE_PUBLISH_UNSIGNED", "mise run bundle -- publish --target dev-cell-1 --wait"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the output lacks %q:\n%s", want, out)
+		}
+	}
+	// Any other value does not count.
+	if _, _, err := publishVariant(t, "dev-cell-1", `STUB_STATE_JSON={"source":"signed"}`, "BUNDLE_PUBLISH_UNSIGNED=yes"); err == nil {
+		t.Error("BUNDLE_PUBLISH_UNSIGNED=yes opened the break glass")
+	}
+}
+
+// harnessUpPublish is the step that harness:up ends with: one publish for the cells, which waits until each cell applied the set.
+const harnessUpPublish = "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait | CELL=dev-cell-1 LINK_ONLY= SKIP="
+
+// TestHarnessUpPublishesTargets: harness:up ends with one signed publish that names each cell of the catalog and waits for it, after
+// the full link of management. A failed publish prints itself in the hint list. The cells apply their own sets, so dev-cp is no target.
+func TestHarnessUpPublishesTargets(t *testing.T) {
+	root, calls := harnessRoot(t)
+	log, errOut, err := runHarness(t, root, calls, "up")
+	if err != nil {
+		t.Fatalf("harness up failed: %v\n%s", err, errOut)
+	}
+	lines := strings.Split(strings.TrimSpace(log), "\n")
+	if n := len(lines); n < 2 || lines[n-1] != harnessUpPublish || lines[n-2] != "mise run cell:link | CELL=management LINK_ONLY= SKIP=" {
+		t.Fatalf("calls\n%s\nwant the signed publish after the full link as the last call", log)
+	}
+	if strings.Contains(harnessUpPublish, "dev-cp") {
+		t.Error("the publish names dev-cp")
+	}
+	root, calls = harnessRoot(t)
+	_, errOut, err = runHarness(t, root, calls, "up", "STUB_FAIL_ARGS=run bundle -- publish")
+	if err == nil {
+		t.Fatal("harness up passed with a failing publish")
+	}
+	hint := hintLines(t, errOut)
+	if want := "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait"; hint[len(hint)-1] != want || len(hint) != 1 {
+		t.Errorf("hint %v, want only %q", hint, want)
+	}
+}
+
+// TestRestartStoreTokens: STORE_TOKENS=1 cell:restart also restarts the pods of bundle-store-0 and argocd-repo-server, which hold
+// the projected store tokens, besides the harness workloads. Without the variable, it restarts only the harness workloads.
+func TestRestartStoreTokens(t *testing.T) {
+	setup := func(t *testing.T) (*bundleRoot, string) {
+		r := newBundleRoot(t)
+		dir := filepath.Join(r.dir, "build", "dev-cell-1", "bundles", "cell-identity")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "manifests.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: celld, namespace: cell-identity-system}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		kubectl := `#!/usr/bin/env bash
+echo "kubectl $*" >>"$STUB_LOG"
+case " $* " in
+  *" get deployments,statefulsets "*"harness=cell-identity "*) echo deployment.apps/celld ;;
+  *" get deployment.apps/celld -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"celld"}}}}' ;;
+  *" get deployment.apps/argocd-repo-server -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"argocd-repo-server"}}}}' ;;
+  *" get statefulset.apps/bundle-store -o json "*) echo '{"spec":{"selector":{"matchLabels":{"app.kubernetes.io/name":"bundle-store"}}}}' ;;
+  *" get pods -l "*" -o jsonpath"*) echo "old-uid" ;;
+  *" get pods -l "*" -o json "*) echo '{"items":[{"metadata":{"uid":"new-uid"},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}' ;;
+esac
+exit 0
+`
+		if err := os.WriteFile(filepath.Join(r.dir, "bin", "kubectl"), []byte(kubectl), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return r, "cell-identity"
+	}
+	t.Run("with STORE_TOKENS", func(t *testing.T) {
+		r, only := setup(t)
+		out, errOut, log, err := r.run("restart.sh", []string{"HARNESS_ONLY=" + only, "STORE_TOKENS=1"})
+		if err != nil {
+			t.Fatalf("restart.sh failed: %v\n%s\n%s\n%s", err, out, errOut, log)
+		}
+		for _, want := range []string{
+			"-n cell-system delete pods -l app.kubernetes.io/name=bundle-store",
+			"-n argocd delete pods -l app.kubernetes.io/name=argocd-repo-server",
+			"-n cell-identity-system delete pods -l app.kubernetes.io/name=celld",
+			"-n cell-system rollout status statefulset.apps/bundle-store",
+			"-n argocd rollout status deployment.apps/argocd-repo-server",
+		} {
+			if callIndex(log, want) < 0 {
+				t.Errorf("the log lacks %q:\n%s", want, log)
+			}
+		}
+		if callIndex(log, "-n cell-system delete pods") > callIndex(log, "-n argocd delete pods") {
+			t.Errorf("the store restarts after the repo server:\n%s", log)
+		}
+	})
+	t.Run("without STORE_TOKENS", func(t *testing.T) {
+		r, only := setup(t)
+		_, _, log, err := r.run("restart.sh", []string{"HARNESS_ONLY=" + only})
+		if err != nil || callIndex(log, "-n cell-identity-system delete pods") < 0 {
+			t.Fatalf("err %v\n%s", err, log)
+		}
+		if strings.Contains(log, "bundle-store") || strings.Contains(log, "argocd-repo-server") {
+			t.Errorf("a restart without STORE_TOKENS touched the store or the repo server:\n%s", log)
+		}
+	})
+	t.Run("another value is no request", func(t *testing.T) {
+		r, only := setup(t)
+		_, _, log, _ := r.run("restart.sh", []string{"HARNESS_ONLY=" + only, "STORE_TOKENS=0"})
+		if strings.Contains(log, "bundle-store") {
+			t.Errorf("STORE_TOKENS=0 restarted the store:\n%s", log)
+		}
+	})
+}
+
+// TestMgmtBundleSignReadsStdin: mgmt -- bundle sign reads the components as JSON on standard input, so the script runs kubectl exec with -i,
+// as it does for step sign. Any other command runs without it, because a stray -i would take the input of a shell loop.
+func TestMgmtBundleSignReadsStdin(t *testing.T) {
+	kubectl := `#!/usr/bin/env bash
+echo "kubectl $*" >>"$STUB_LOG"
+if [[ " $* " == *" get pod mgmtd-0 "* ]]; then printf True; exit 0; fi
+echo '{}'
+`
+	for _, tc := range []struct {
+		args []string
+		want bool
+	}{
+		{[]string{"bundle", "sign", "--target", "dev-cell-1"}, true},
+		{[]string{"step", "sign"}, true},
+		{[]string{"bundle", "get", "--target", "dev-cell-1"}, false},
+		{[]string{"status"}, false},
+	} {
+		logFile := filepath.Join(t.TempDir(), "log")
+		_, errOut, code := runScript(t, "mgmt.sh", map[string]string{"kubectl": kubectl}, []string{"STUB_LOG=" + logFile}, tc.args...)
+		if code != 0 {
+			t.Fatalf("mgmt.sh %v: exit %d\n%s", tc.args, code, errOut)
+		}
+		b, _ := os.ReadFile(logFile)
+		m := regexp.MustCompile(`(?m)^kubectl .* exec( -i)? mgmtd-0`).FindStringSubmatch(string(b))
+		if m == nil || (m[1] == " -i") != tc.want {
+			t.Errorf("mgmt.sh %v: the exec call is %q, want -i=%v", tc.args, m, tc.want)
+		}
+	}
+}
+
+// TestDependentsOfStoreChanges: a new address of the registry mirror needs the harness render of each live cell again, and new
+// store tokens need a restart of each live cell with STORE_TOKENS=1.
+func TestDependentsOfStoreChanges(t *testing.T) {
+	for name, want := range map[string]string{
+		"mirror":       "CELL=%s HARNESS_ONLY=cell-identity mise run cell:up",
+		"store-tokens": "CELL=%s STORE_TOKENS=1 mise run cell:restart",
+	} {
+		t.Run(name, func(t *testing.T) {
+			out, errOut, err := libFunc(t, "dev-cell-1", "dependents_of "+name)
+			if err != nil {
+				t.Fatalf("dependents_of %s: %v\n%s", name, err, errOut)
+			}
+			if got, exp := strings.TrimSpace(out), fmt.Sprintf(want, "dev-cell-1")+"\n"+fmt.Sprintf(want, "dev-cell-2"); got != exp {
+				t.Errorf("dependents_of %s prints\n%s\nwant\n%s", name, got, exp)
+			}
+			out, _, err = libFunc(t, "dev-cell-1", "dependents_of "+name, "STUB_KIND=management dev-cp rogue dev-cell-2")
+			if err != nil || strings.TrimSpace(out) != fmt.Sprintf(want, "dev-cell-2") {
+				t.Errorf("with one live cell: err %v, output %q", err, out)
+			}
+		})
+	}
+}
+
+// TestRuntimeObjectsBundleState: the bundle state in cell-ops-system is a runtime object that celld writes (marker celld) after
+// the harness wrote it first with kubectl create (marker bundle-bootstrap), so check_harness_objects skips it in both forms.
+func TestRuntimeObjectsBundleState(t *testing.T) {
+	out, errOut, err := libFunc(t, "dev-cell-1", "runtime_objects cell-identity cell-ops-system ConfigMap")
+	if err != nil {
+		t.Fatalf("runtime_objects: %v\n%s", err, errOut)
+	}
+	var cases []struct {
+		Names    string   `json:"names"`
+		Managers []string `json:"managers"`
+		Marker   struct{ Key, Value string }
+	}
+	if err := json.Unmarshal([]byte(out), &cases); err != nil {
+		t.Fatalf("runtime_objects printed %q: %v", out, err)
+	}
+	seen := map[string]bool{}
+	for _, c := range cases {
+		if c.Names == "^bundle-state$" {
+			seen[c.Marker.Value] = true
+			if c.Marker.Key != "poc.internal/made-by" {
+				t.Errorf("marker key is %q", c.Marker.Key)
+			}
+			if len(c.Managers) == 0 || slices.Contains(c.Managers, "argocd-controller") {
+				t.Errorf("managers %v", c.Managers)
+			}
+		}
+	}
+	if !seen["celld"] || !seen["bundle-bootstrap"] || len(seen) != 2 {
+		t.Errorf("markers of bundle-state: %v, want celld and bundle-bootstrap\n%s", seen, out)
+	}
+	if !strings.Contains(out, "op-[0-9a-f]{32}") {
+		t.Errorf("the operation records are no runtime objects any more: %s", out)
+	}
+}
