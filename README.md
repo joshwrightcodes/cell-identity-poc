@@ -1497,6 +1497,21 @@ The bundle store keeps bundles on a persistent volume, so they survive a pod res
 A harness component, for example `cell-identity`, reaches a cell only through `CELL=<cell> mise run cell:up`.
 `cell:publish` does not push it. `cell:up` applies it with server-side apply and does not prune.
 An object that leaves the bundle therefore stays in the cluster until you delete it.
+
+A change under `internal/cellproxy` changes many images, because `cell-proxy`, `celld`, `envd` and the gateway use that package.
+After `mise run images`, roll out every cluster that runs a changed image.
+Run these commands in this order:
+
+```sh
+CELL=dev-cp mise run cell:up
+CELL=management mise run cell:link
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
+mise run harness:status
+```
+
+`harness:status` fails for each pod that runs an image other than the one in `build/images.env`.
+A collector export retry can fail it once, and it clears within 5 minutes.
 `cell:verify` compares the live objects with the bundle.
 It checks the field values, the objects of each kind that the bundle holds, and the field managers of those objects.
 It does not report an extra object of a kind that the bundle does not hold.
