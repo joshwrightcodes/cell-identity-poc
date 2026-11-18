@@ -160,37 +160,59 @@ func TestImagesStampClearsKoImage(t *testing.T) {
 // TestImagesStampOnlyAfterAFullBuild: the stamp says that every image was built from the Go sources of that time. A run of named images, and a run
 // where ko fails, leave it as it is. A missing stamp stops ko_image.
 func TestImagesStampOnlyAfterAFullBuild(t *testing.T) {
-	root := imagesRoot(t)
-	imagesRun(t, root, nil)
-	stamp := filepath.Join(root, "build", "images.stamp")
-	past := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
-	if err := os.Chtimes(stamp, past, past); err != nil {
-		t.Fatal(err)
+	// stampedRoot is a root with a full build, and a stamp that is two hours old.
+	stampedRoot := func(t *testing.T) (root, stamp string, past time.Time) {
+		t.Helper()
+		root = imagesRoot(t)
+		imagesRun(t, root, nil)
+		stamp = filepath.Join(root, "build", "images.stamp")
+		past = time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+		if err := os.Chtimes(stamp, past, past); err != nil {
+			t.Fatal(err)
+		}
+		return root, stamp, past
 	}
-	same := func(why string) {
+	unmoved := func(t *testing.T, stamp string, past time.Time) {
 		t.Helper()
 		if info, err := os.Stat(stamp); err != nil || !info.ModTime().Equal(past) {
-			t.Errorf("%s moved the stamp: %v, %v", why, info, err)
+			t.Errorf("the stamp moved: %v, %v; want mtime %s", info, err, past)
 		}
 	}
-	imagesRun(t, root, nil, "celld")
-	same("a named run")
-	imagesRun(t, root, []string{"STUB_DIGEST_CELLD=b"}, "celld")
-	same("a named run with a new digest")
-	failing := "#!/usr/bin/env bash\necho ko failed >&2\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(root, "bin", "ko"), []byte(failing), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.Command(filepath.Join(root, "scripts", "images.sh"))
-	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "KO_DOCKER_REPO=localhost:5001"}
-	if err := cmd.Run(); err == nil {
-		t.Fatal("a failed ko build succeeded")
-	}
-	same("a failed build")
-	if err := os.Remove(stamp); err != nil {
-		t.Fatal(err)
-	}
-	if _, errOut, err := koImageCheck(t, root); err == nil || !strings.Contains(errOut, "images.stamp") {
-		t.Fatalf("a missing stamp: err %v, stderr %q; want a refusal that names the stamp", err, errOut)
-	}
+	t.Run("a named run", func(t *testing.T) {
+		root, stamp, past := stampedRoot(t)
+		imagesRun(t, root, []string{"STUB_DIGEST_CELLD=b"}, "celld")
+		unmoved(t, stamp, past)
+	})
+	t.Run("a full run where ko fails", func(t *testing.T) {
+		root, stamp, past := stampedRoot(t)
+		if err := os.WriteFile(filepath.Join(root, "bin", "ko"), []byte("#!/usr/bin/env bash\necho ko failed >&2\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(filepath.Join(root, "scripts", "images.sh"))
+		cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "KO_DOCKER_REPO=localhost:5001"}
+		if err := cmd.Run(); err == nil {
+			t.Fatal("a failed ko build succeeded")
+		}
+		unmoved(t, stamp, past)
+	})
+	t.Run("a missing stamp", func(t *testing.T) {
+		root, stamp, _ := stampedRoot(t)
+		src := filepath.Join(root, "internal", "x", "x.go")
+		if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(src, []byte("package x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-3 * time.Hour)
+		if err := os.Chtimes(src, old, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(stamp); err != nil {
+			t.Fatal(err)
+		}
+		if out, errOut, err := koImageCheck(t, root); err == nil || !strings.Contains(errOut, "images.stamp") {
+			t.Fatalf("a missing stamp: err %v, stdout %q, stderr %q; want a refusal that names the stamp", err, out, errOut)
+		}
+	})
 }
