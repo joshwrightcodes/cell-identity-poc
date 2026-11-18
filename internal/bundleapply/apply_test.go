@@ -1647,6 +1647,32 @@ func TestApplyCheckedFollowsThePolicyInputs(t *testing.T) {
 			t.Fatalf("outcome = %+v, want the checked Widget component checked again under cluster scope", out)
 		}
 	})
+	t.Run("custom resource definition of the set makes a kind namespaced", func(t *testing.T) {
+		// The live API does not serve Widget. The first set defines it as Cluster, in a policy whose
+		// platform class allows it as a cluster kind, and holds a Widget with no namespace. The next set
+		// makes Widget Namespaced: the checked component must be checked again under that scope.
+		e := newEnv(t)
+		raw, err := json.Marshal(e.cfg.Policy)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var wide bundle.Policy
+		if err := json.Unmarshal(raw, &wide); err != nil {
+			t.Fatal(err)
+		}
+		platform := wide.Classes["platform"]
+		platform.ClusterKinds = append(slices.Clone(platform.ClusterKinds), "example.io/Widget")
+		wide.Classes["platform"] = platform
+		cfg := e.cfg
+		cfg.Policy = wide
+		e.a = e.applier(cfg)
+		clusterWidget := spec{"network-policy", "cell-system", "apiVersion: example.io/v1\nkind: Widget\nmetadata:\n  name: w\n"}
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{widgetCRD("Cluster"), clusterWidget})), op.OutcomeApplied, "", "")
+		out := e.apply("op2", e.set(2, []spec{widgetCRD("Namespaced"), clusterWidget}))
+		if out.Outcome != op.OutcomeRefused || out.Reason != op.ReasonComponentNotAllowed {
+			t.Fatalf("outcome = %+v, want the checked Widget component checked again under namespaced scope", out)
+		}
+	})
 	t.Run("custom resource definition of the set agrees with the live scope", func(t *testing.T) {
 		e := newEnv(t)
 		served(e, true)
