@@ -234,14 +234,20 @@ check_admit_lists() {
   done
   want="$(printf '%s\n' ${want_cidrs[@]+"${want_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   list_of() { jq -r --argjson p "$2" '[.spec.ingress[]? | select(any(.ports[]?; .port == $p)) | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$1"; }
-  json="$(k -n spire-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy spire-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
   got=""
-  [[ -z "$json" ]] || got="$(list_of "$json" 8081)"
-  [[ "$got" == "$want" ]] || problems+=("the SPIRE server admits '$got' on port 8081, and the live cells are '$want'")
-  json="$(k -n relay-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  if json="$(k -n spire-system get networkpolicy plane-cells --ignore-not-found -o json)"; then
+    [[ -z "$json" ]] || got="$(list_of "$json" 8081)"
+    [[ "$got" == "$want" ]] || problems+=("the SPIRE server admits '$got' on port 8081, and the live cells are '$want'")
+  else
+    problems+=("cannot read NetworkPolicy spire-system/plane-cells")
+  fi
   got=""
-  [[ -z "$json" ]] || got="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-  [[ "$got" == "$want" ]] || problems+=("the relay plane policy plane-cells admits '$got' on its route ports, and the live cells are '$want'")
+  if json="$(k -n relay-system get networkpolicy plane-cells --ignore-not-found -o json)"; then
+    [[ -z "$json" ]] || got="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+    [[ "$got" == "$want" ]] || problems+=("the relay plane policy plane-cells admits '$got' on its route ports, and the live cells are '$want'")
+  else
+    problems+=("cannot read NetworkPolicy relay-system/plane-cells")
+  fi
   json="$(k -n gateway-system get networkpolicy cell-gateway -o json 2>/dev/null)" || { problems+=("cannot read NetworkPolicy gateway-system/cell-gateway"); json='{}'; }
   for port in 8450 8451; do
     got="$(list_of "$json" "$port")"
@@ -674,6 +680,130 @@ check_cell_controller_address() {
   if [[ "$got" != "$want/32" || "$arg" != "--hostsvc-addr=$want:$HOSTSVC_PORT" ]]; then
     echo "host.docker.internal is $want in the node, but the policy admits '$got' and the cell controller runs '$arg'."
     echo "Run: $cell_controller_fix"
+    return 1
+  fi
+}
+
+# The checks of the signed bundle sets. A cluster with the bundle role cell or cp runs all five, and a cluster with the role open (management) runs
+# only check_store_proxy, because it has no writer and no set. They need scripts/lib.sh.
+
+# bundle_allow_json prints the path of the allow-list data. BUNDLE_ALLOW_JSON names another file, for the tests.
+bundle_allow_json() { printf '%s\n' "${BUNDLE_ALLOW_JSON:-$ROOT/internal/bundle/allow.json}"; }
+
+# check_signed_root succeeds when cosign verifies, on this Mac and offline, that mgmtd signed the root that the bundle state of the cluster records
+# (mise run bundle -- verify). A bootstrap state has no signed root.
+check_signed_root() {
+  local out reason
+  if ! out="$(cd "$ROOT" && mise run bundle -- verify --target "$CELL_NAME" 2>&1)"; then
+    reason="$(grep '^error:' <<<"$out" | tail -n 1 || true)"
+    printf '%s\n' "${reason:-$(tail -n 1 <<<"$out")}"
+    echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    return 1
+  fi
+}
+
+# check_bundle_guard succeeds when the admission policies that keep Argo CD away from the harness equal the render of components/lib/bundle-guard.sh
+# for the role: bundles-spare-harness and its binding in a cell and in dev-cp, and bundles-app-limits and its binding in a cell.
+check_bundle_guard() {
+  local role docs names comp out rc
+  role="$(bundle_role)" || return 1
+  case "$role" in
+    cell) names="bundles-spare-harness and bundles-app-limits" comp=cell-identity ;;
+    cp) names="bundles-spare-harness" comp=envd ;;
+    *) echo "$CELL_NAME has role $role, so it has no bundle guard"; return 1 ;;
+  esac
+  docs="$("$ROOT/components/lib/bundle-guard.sh" "$role" 2>&1)" || { echo "could not render the guards of role $role: $docs"; return 1; }
+  # The harness apply puts the label of the component on each object, so the render needs it too, or the diff would remove it.
+  docs="$(COMP="$comp" yq '.metadata.labels["cell.poc.internal/harness"] = strenv(COMP)' <<<"$docs")" || { echo "could not label the guards of role $role"; return 1; }
+  rc=0
+  out="$(k diff --server-side --force-conflicts -f - <<<"$docs" 2>&1)" || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1)
+      printf '%s\n' "$out" | head -n 40
+      echo "The guards $names of $CELL_NAME differ from the render of components/lib/bundle-guard.sh $role."
+      echo "Run: CELL=$CELL_NAME mise run cell:up"
+      return 1 ;;
+    *) echo "kubectl diff failed: $out"; return 1 ;;
+  esac
+}
+
+# check_store_proxy succeeds when the proxy in front of the bundle store admits the one writer of the role and the reader that Argo CD uses (the
+# token client of the repo server), with the audience bundle-store. A cluster with no writer (role open) lists none.
+check_store_proxy() {
+  local role want sts repo problems
+  role="$(bundle_role)" || return 1
+  want="$(bundle_store_writer_of "$role")" || return 1
+  sts="$(k -n cell-system get statefulset/bundle-store -o json)" || { echo "could not read statefulset/bundle-store in cell-system"; return 1; }
+  problems="$(jq -r --arg want "${want:+--writer=$want}" --arg cluster "$CELL_NAME" '
+    [.spec.template.spec.containers[] | select(.name == "store-proxy")] as $c
+    | if ($c | length) != 1 then "statefulset/bundle-store has no container store-proxy"
+      else ($c[0].args // []) as $a
+        | ([$a[] | select(startswith("--writer="))]) as $w
+        | (if ($a | index("--audience=bundle-store")) == null then "store-proxy lacks --audience=bundle-store" else empty end),
+          (if ($a | index("--reader=system:serviceaccount:argocd:argocd-repo-server")) == null then "store-proxy lacks --reader=system:serviceaccount:argocd:argocd-repo-server" else empty end),
+          (if $want == "" then (if ($w | length) > 0 then "\($cluster) has no bundle writer, but store-proxy admits \($w | join(" "))" else empty end)
+           elif $w != [$want] then "store-proxy admits the writers \(if ($w | length) == 0 then "none" else $w | join(" ") end), want \($want)" else empty end)
+      end' <<<"$sts")" || { echo "could not read the arguments of store-proxy"; return 1; }
+  repo="$(k -n argocd get deployment/argocd-repo-server -o json)" || { echo "could not read deployment/argocd-repo-server in argocd"; return 1; }
+  jq -e --arg up "--upstream=$BUNDLE_STORE_SERVICE" 'any(.spec.template.spec.containers[]; .name == "store-token" and ((.args // []) | index($up)) != null)' >/dev/null <<<"$repo" \
+    || problems+="${problems:+$'\n'}deployment/argocd-repo-server has no container store-token with --upstream=$BUNDLE_STORE_SERVICE"
+  if [[ -n "$problems" ]]; then
+    printf '%s\n' "$problems"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# check_plane_policies succeeds when each harness plane policy that the allow list names for the role exists with the label
+# cell.poc.internal/harness. The apply engine spares these policies, so a missing one is not restored by a bundle.
+check_plane_policies() {
+  local role ns name json problems=()
+  role="$(bundle_role)" || return 1
+  while read -r ns name; do
+    [[ -n "$name" ]] || continue
+    if ! json="$(k -n "$ns" get networkpolicy "$name" -o json 2>/dev/null)"; then
+      problems+=("NetworkPolicy $ns/$name is absent")
+    elif ! jq -e '(.metadata.labels["cell.poc.internal/harness"] // "") != ""' >/dev/null <<<"$json"; then
+      problems+=("NetworkPolicy $ns/$name has no label cell.poc.internal/harness")
+    fi
+  done < <(jq -r --arg role "$role" '.roles[$role].planePolicies[]? | "\(.namespace) \(.name)"' "$(bundle_allow_json)")
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
+}
+
+# check_allow_list_version succeeds when the allow-list digest that the applier of the cluster reports to mgmtd (allowSHA256 of mise run mgmt -- status)
+# equals the annotation poc.internal/allow-sha256 of each AppProject of the role, so the project limits and the engine read one list.
+check_allow_list_version() {
+  local role st reported name ann problems=()
+  role="$(bundle_role)" || return 1
+  st="$(CELL=management mise run mgmt -- status 2>/dev/null)" || { echo "could not read mise run mgmt -- status. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"; return 1; }
+  case "$role" in
+    cell) reported="$(jq -r --arg c "$CELL_NAME" '[.cells[]? | select(.name == $c) | .bundleStatus.allowSHA256 // empty][0] // ""' <<<"$st")" ;;
+    cp) reported="$(jq -r '.planeBundleStatus.allowSHA256 // ""' <<<"$st")" ;;
+    *) echo "$CELL_NAME has role $role, so it has no allow list"; return 1 ;;
+  esac || { echo "mise run mgmt -- status printed no JSON object"; return 1; }
+  if [[ -z "$reported" ]]; then
+    echo "mgmtd holds no allowSHA256 for $CELL_NAME, so its applier has not reported a bundle state."
+    echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    return 1
+  fi
+  for name in $(jq -r --arg role "$role" '.roles[$role].appProjects[]?' "$(bundle_allow_json)"); do
+    ann="$(k -n argocd get appproject "$name" -o jsonpath='{.metadata.annotations.poc\.internal/allow-sha256}')" \
+      || { echo "could not read AppProject $name in argocd"; return 1; }
+    if [[ -z "$ann" ]]; then
+      problems+=("AppProject $name has no annotation poc.internal/allow-sha256, and the applier of $CELL_NAME reports allowSHA256 $reported")
+    elif [[ "$ann" != "$reported" ]]; then
+      problems+=("AppProject $name carries allowSHA256 $ann, and the applier of $CELL_NAME reports allowSHA256 $reported")
+    fi
+  done
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    echo "If the images of celld and envd are older than this checkout, run first: mise run images -- celld envd, then CELL=$CELL_NAME mise run cell:hydrate"
     return 1
   fi
 }

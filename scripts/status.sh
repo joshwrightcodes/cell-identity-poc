@@ -39,6 +39,11 @@
 #                 result, as {id, cell, expiredAt}. hostsvc is the status of hostsvc:serve and check, which holds
 #                 the text of the first failed pin or root check and is empty when both pass. When mgmtd does not
 #                 answer, the object holds only error
+# The problems of the signed bundle sets name each cell and dev-cp with: a live cluster with no signed bundle state, the state rolled_back (with the
+# command bundle -- publish, or bundle -- repair when the rollback itself failed with rollback_unhealthy), a state applying or rolling_back with an
+# until more than 10 minutes in the past, an Application root at another digest than root.digest of a healthy state, an AppProject whose annotation
+# poc.internal/allow-sha256 differs from the allowSHA256 that the applier reports, and, in dev-cp, a set that envd applied and mgmtd has not closed
+# for more than 5 minutes.
 # The checks of cell:verify, the hops of obs:uplink-status and the parts of mesh:status are read from those
 # tasks and not repeated here. STATUS_SAMPLE_MAX_AGE (default 300) is the age limit for a sample, and
 # STATUS_VERIFY_TIMEOUT (default 900) is the time in seconds that the task waits for cell:verify of one cluster.
@@ -415,6 +420,66 @@ provisioning_problems() {
       + (if $clockp != "" then [{cluster: "management", problem: $clockp}] else [] end))' <<<"$st"
 }
 
+# bundle_problems prints the problems of the signed bundle sets as a JSON array of {cluster, problem}, for each cluster with the bundle role cell or cp
+# that exists. It reads ConfigMap bundle-state, the sync revision of the Application root and the AppProjects of the cluster, and mise run mgmt -- status
+# for the allow-list digest that the applier reports and for the set of the control plane. A cell with no cluster has none of them. The ages come from the
+# clock of a node. A state that is a wait gives no problem: applying or rolling_back with an until in the future or less than 10 minutes in the past.
+bundle_problems() {
+  local st cluster role ns state root_rev projects projs reported out now clock_problem extra='[]'
+  st="$(mise run mgmt -- status 2>/dev/null)" || st=""
+  jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st" || st='{}'
+  addp() { extra="$(jq -c --arg c "$1" --arg p "$2" '. + [{cluster: $c, problem: $p}]' <<<"$extra")"; }
+  read_clock
+  for cluster in $clusters; do
+    role="$(bundle_role_of "$cluster" 2>/dev/null)" || continue
+    [[ "$role" == cell || "$role" == cp ]] || continue
+    if grep -qx -- "$cluster" <<<"$catalog" && [[ " $live " != *" $cluster "* ]]; then continue; fi
+    ns="$(bundle_state_ns "$role")"
+    if ! state="$(kubectl --context "kind-$cluster" -n "$ns" get configmap bundle-state --ignore-not-found -o 'jsonpath={.data.state\.json}' 2>&1)"; then
+      addp "$cluster" "the bundle state of $cluster cannot be read: ${state//$'\n'/ }. Run: CELL=$cluster mise run cell:verify"
+      continue
+    fi
+    [[ -n "$state" ]] || state='{}'
+    if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$state"; then
+      addp "$cluster" "ConfigMap bundle-state of $cluster holds no JSON object. Run: mise run bundle -- publish --target $cluster --wait"
+      continue
+    fi
+    root_rev="$(kubectl --context "kind-$cluster" -n argocd get application root -o 'jsonpath={.status.sync.revision}' 2>/dev/null)" || root_rev=""
+    projects="$(kubectl --context "kind-$cluster" -n argocd get appprojects -o json 2>/dev/null)" || projects='{"items":[]}'
+    projs="$(jq -c --arg role "$role" --argjson p "$projects" '[.roles[$role].appProjects[]? as $n
+      | {name: $n, annotation: ([$p.items[]? | select(.metadata.name == $n) | .metadata.annotations["poc.internal/allow-sha256"]][0] // "")}]' "${BUNDLE_ALLOW_JSON:-$ROOT/internal/bundle/allow.json}")" || projs='[]'
+    reported="$(jq -r --arg role "$role" --arg c "$cluster" 'if $role == "cp" then .planeBundleStatus.allowSHA256 // ""
+      else [.cells[]? | select(.name == $c) | .bundleStatus.allowSHA256 // empty][0] // "" end' <<<"$st")"
+    out="$(jq -c --arg c "$cluster" --arg role "$role" --arg rootrev "$root_rev" --arg reported "$reported" --argjson projs "$projs" --argjson now "$now" --argjson m "$st" '
+      def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+      def pub: "Run: mise run bundle -- publish --target \($c) --wait";
+      (if (.source // "") != "signed" then
+        ["\($c) has no signed bundle state (source \(.source // "absent")), so it runs no set that mgmtd signed. \(pub)"]
+      else
+        [(if .state == "rolled_back" and (.result.detail // "") == "rollback_unhealthy"
+          then "the bundle state of \($c) is rolled_back with rollback_unhealthy, so the rollback did not finish and the cluster does not run the last good root. Run: mise run bundle -- repair --target \($c)"
+          elif .state == "rolled_back"
+          then "the bundle state of \($c) is rolled_back (\(.result.detail // "no detail")), so it runs the last good set and not the newest one. \(pub)"
+          else empty end),
+         (if (.state == "applying" or .state == "rolling_back") and ((.until // "") | ts) > 1000000000 and ($now - ((.until // "") | ts)) > 600
+          then "the bundle state of \($c) has been \(.state) since before \(.until), which is more than 10 minutes. \(pub)" else empty end),
+         (if .state == "healthy" and $rootrev != "" and $rootrev != (.root.digest // "")
+          then "the Application root of \($c) is at \($rootrev), and the bundle state records the root \(.root.digest // "none"). \(pub)" else empty end)]
+      end)
+      + (if $reported == "" then [] else
+          [$projs[] | select(.annotation != $reported)
+            | if .annotation == "" then "the AppProject \(.name) of \($c) has no annotation poc.internal/allow-sha256, and the applier reports allowSHA256 \($reported). \(pub)"
+              else "the AppProject \(.name) of \($c) carries allowSHA256 \(.annotation), and the applier reports allowSHA256 \($reported). \(pub)" end] end)
+      + (if $role == "cp" and ($m.planeBundle // null) != null and $m.planeBundle.served == true and ($m.planeBundle.result // null) == null
+            and (($m.planeBundle.issuedAt // "") | ts) > 1000000000 and ($now - (($m.planeBundle.issuedAt // "") | ts)) > 300
+            and ((($m.planeBundleStatus.state // "") | IN("applying", "rolling_back")) | not)
+          then ["envd reported the set \($m.planeBundle.opId // "") of \($c), and mgmtd has not closed its result for more than 5 minutes (issued at \($m.planeBundle.issuedAt)). Run: CELL=\($c) mise run cell:verify"]
+          else [] end)' <<<"$state")" || { addp "$cluster" "the bundle state of $cluster could not be evaluated. Run: CELL=$cluster mise run cell:verify"; continue; }
+    extra="$(jq -c --arg c "$cluster" --argjson add "$out" '. + [$add[] | {cluster: $c, problem: .}]' <<<"$extra")"
+  done
+  printf '%s\n' "$extra"
+}
+
 # collect <cluster> writes the JSON object of one cluster to $tmp/<cluster>.json.
 collect() {
   local cluster="$1" apps verify telemetry extras='{}' mp='[]' plane
@@ -470,6 +535,12 @@ log "reading the steps"
 if ! m6="$(provisioning_problems 2>"$tmp/m6.err")" || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$m6"; then
   m6="$(jq -nc --arg e "$(tail -n 1 "$tmp/m6.err" 2>/dev/null)" '[{cluster: "management", problem: "the steps could not be read\(if $e != "" then ": " + $e else "" end). Run: mise run mgmt -- status"}]')"
 fi
+
+log "reading the bundle states"
+if ! m8="$(bundle_problems 2>"$tmp/m8.err")" || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$m8"; then
+  m8="$(jq -nc --arg e "$(tail -n 1 "$tmp/m8.err" 2>/dev/null)" '[{cluster: "management", problem: "the bundle states could not be read\(if $e != "" then ": " + $e else "" end). Run: mise run mgmt -- status"}]')"
+fi
+m6="$(jq -c --argjson b "$m8" '. + $b' <<<"$m6")"
 
 status=0
 for cluster in $clusters; do

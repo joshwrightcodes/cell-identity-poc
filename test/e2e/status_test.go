@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cmdrun"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
 // statusAttemptMax bounds one run of a mise task in this file. harness:status takes about 2 minutes.
@@ -413,5 +415,76 @@ func TestM6StatusShowsCells(t *testing.T) {
 		case "creating", "admitting", "bootstrapping":
 			t.Errorf("step %s of %s runs the stage %s, and a healthy harness has no stage that runs", id, st.Cell, st.State)
 		}
+	}
+}
+
+// TestM8StatusShowsBundles checks that harness:status exits 0 with a signed, healthy bundle state in each live cell and in dev-cp, and that mgmtd reports
+// for each of them the bundle state, the root digest of its last signed set and the allow-list digest that the engine in this checkout runs. It reads the
+// status again for up to the retry window, because a report can lag.
+func TestM8StatusShowsBundles(t *testing.T) {
+	var (
+		objs   map[string]statusObject
+		stdout string
+		code   int
+	)
+	deadline := time.Now().Add(statusRetryWindow)
+	for attempt := 1; ; attempt++ {
+		objs, stdout, code = statusOnce(t)
+		if code == 0 || time.Now().After(deadline) {
+			break
+		}
+		t.Logf("attempt %d: harness:status exited %d:\n%s", attempt, code, stdout)
+		time.Sleep(30 * time.Second)
+	}
+	if code != 0 {
+		t.Fatalf("harness:status exited %d, want 0:\n%s", code, stdout)
+	}
+	status := mgmtStatus(t)
+	check := func(name string, last *op.Result, shown *op.BundleStatus, signedRoot string) {
+		t.Helper()
+		if shown == nil {
+			t.Errorf("mgmtd holds no bundle status for %s", name)
+			return
+		}
+		if shown.State != "healthy" {
+			t.Errorf("the bundle state of %s is %q, want healthy", name, shown.State)
+		}
+		if shown.AllowSHA256 != bundle.AllowSHA256() {
+			t.Errorf("%s runs the allow list %q, want %q", name, shown.AllowSHA256, bundle.AllowSHA256())
+		}
+		if signedRoot != "" && shown.RootDigest != signedRoot {
+			t.Errorf("%s runs the root %s, and the last signed set has the root %s", name, shown.RootDigest, signedRoot)
+		}
+		if last == nil || (last.Outcome != op.OutcomeApplied && last.Outcome != op.OutcomeAlreadyApplied) {
+			t.Errorf("the last signed set of %s has the result %+v, want applied or already_applied", name, last)
+		}
+	}
+	for _, cell := range clustersWith(t, agentCellSet) {
+		if o, ok := objs[cell]; !ok || !o.OK || len(o.Problems) != 0 {
+			t.Errorf("object of %s is %+v (present %v), want an ok object with no problem", cell, o, ok)
+		}
+		found := false
+		for _, c := range status.Cells {
+			if c.Name != cell {
+				continue
+			}
+			found = true
+			if c.Bundle == nil {
+				t.Errorf("mgmtd holds no signed set for %s", cell)
+				continue
+			}
+			check(cell, c.Bundle.Result, c.BundleStatus, c.Bundle.RootDigest)
+		}
+		if !found {
+			t.Errorf("mgmtd lists no cell %s", cell)
+		}
+	}
+	if o, ok := objs[spireCluster]; !ok || !o.OK || len(o.Problems) != 0 {
+		t.Errorf("object of %s is %+v (present %v), want an ok object with no problem", spireCluster, o, ok)
+	}
+	if status.PlaneBundle == nil {
+		t.Errorf("mgmtd holds no signed set for %s", spireCluster)
+	} else {
+		check(spireCluster, status.PlaneBundle.Result, status.PlaneBundleStatus, status.PlaneBundle.RootDigest)
 	}
 }

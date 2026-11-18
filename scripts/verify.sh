@@ -1190,6 +1190,17 @@ check_hub_tunnels() {
   done
 }
 
+# The bundle store of every cluster, and the signed bundle sets of a cluster with the role cell or cp.
+check "The bundle store proxy admits the one writer of the role of $CELL_NAME, and the repo server reads through its token client" check_store_proxy
+case "$(bundle_role)" in
+  cell | cp)
+    check "The root in the bundle state of $CELL_NAME is signed by mgmtd (cosign, offline)" check_signed_root
+    check "The guards that keep Argo CD away from the harness equal the render of the role" check_bundle_guard
+    check "Each harness plane policy of the role exists with the harness label" check_plane_policies
+    check "The allow-list digest that the applier reports equals the annotation of each AppProject" check_allow_list_version
+    ;;
+esac
+
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.
 for entry in ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]}"}; do

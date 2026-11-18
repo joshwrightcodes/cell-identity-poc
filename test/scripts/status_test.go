@@ -211,6 +211,16 @@ case "$args" in
   *" get --raw "*) printf '%s' "${STUB_KIALI_CONF:-}" ;;
   *" exec deploy/mesh-view-hub "*) printf '%s' "${STUB_HUB:-}" ;;
   *" get configmap step-status "*) [[ -n "${STUB_STEP_STATUS:-}" ]] && printf '%s' "$STUB_STEP_STATUS" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
+  *" get configmap bundle-state "*)
+    var="STUB_BUNDLE_STATE_${ctx#kind-}"; var="${var//-/_}"
+    if [[ -n "${!var+x}" ]]; then printf '%s' "${!var}"; else printf '%s' '{"source":"signed","state":"healthy","root":{"digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111"}}'; fi ;;
+  *" -n argocd get application root "*)
+    var="STUB_ROOT_REV_${ctx#kind-}"; var="${var//-/_}"
+    printf '%s' "${!var-sha256:1111111111111111111111111111111111111111111111111111111111111111}" ;;
+  *" -n argocd get appprojects -o json "*)
+    var="STUB_ALLOW_ANN_${ctx#kind-}"; var="${var//-/_}"
+    jq -nc --arg a "${!var-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" '(if $a == "" then {} else {"poc.internal/allow-sha256": $a} end) as $ann
+      | {items: [{metadata: {name: "cell", annotations: $ann}}, {metadata: {name: "cell-app", annotations: $ann}}, {metadata: {name: "default"}}]}' ;;
   *" get configmap hostsvc-pin "*) printf '%s' "${STUB_CM_PIN:-$STUB_PIN_PEM}" ;;
   *" get pod mgmtd-0 "*) printf '%s' "${STUB_POD_PIN:-}" ;;
   *" exec spire-server-0 "*) printf '%s\n' "${STUB_ROOT_PEM:-}" ;;
@@ -319,7 +329,8 @@ const zeroTime = "0001-01-01T00:00:00Z"
 func planeCell(name string, over map[string]any) map[string]any {
 	c := map[string]any{"name": name, "bound": true, "lastCheck": "unchanged", "lastStatusAt": timeAgo(20 * time.Second), "unreported": 0,
 		"oldestUnreportedAt": zeroTime, "records": 3, "openOps": 0, "expiredOps": 0, "forgedSeen": 0, "lastHintCheck": "unchanged",
-		"requested": true, "valid": true}
+		"requested": true, "valid": true,
+		"bundleStatus": map[string]any{"version": map[string]any{"epoch": 1, "counter": 3}, "rootDigest": statusRootDigest, "state": "healthy", "allowSHA256": statusAllowSHA}}
 	maps.Copy(c, over)
 	return c
 }
@@ -345,7 +356,8 @@ func healthyPlane(mutate func(m map[string]any)) string {
 	rev := map[string]any{"epoch": 1, "counter": 4}
 	cell := func(name string) map[string]any { return planeCell(name, nil) }
 	m := map[string]any{"env": "dev", "signed": rev, "served": rev, "applied": rev, "restoreActive": false, "appliedAt": at(time.Hour),
-		"lastReportAt": at(10 * time.Second), "hostSpecPushedAt": at(30 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")}}
+		"lastReportAt": at(10 * time.Second), "hostSpecPushedAt": at(30 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")},
+		"planeBundleStatus": map[string]any{"version": map[string]any{"epoch": 1, "counter": 3}, "rootDigest": statusRootDigest, "state": "healthy", "allowSHA256": statusAllowSHA}}
 	if mutate != nil {
 		mutate(m)
 	}

@@ -286,6 +286,14 @@ run = "scripts/gate.sh m7"
 description = "Delete the test namespaces m7-* of every cluster, and wait until they are gone. With --check, only report and fail with the repair command. Safe to run again"
 run = "scripts/gate-m7-repair.sh"
 
+[tasks."gate:m8"]
+description = "Run the M8 end-to-end tests: signed bundle sets that reach Argo CD in each cell and in dev-cp, refusals outside the allow list, and rollbacks, plus the go test arguments after --. The tests run with -short, which skips the long tests, unless GATE_M8_LONG=1. It runs gate:m7:repair --check and gate:m8:repair --check first, and checks the deployed images of the M7 gate and of cell-proxy in the bundle store and the repo server. It scans the logs for a token afterwards. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m8"
+
+[tasks."gate:m8:repair"]
+description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap apps-demo/m8-marker, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m8-repair.sh"
+
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"
 env = { CELL = "dev-cp" }
