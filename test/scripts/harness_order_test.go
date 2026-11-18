@@ -18,7 +18,7 @@ var harnessUpHint = []string{
 	"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2",
 	"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2",
 	"CELL=management mise run cell:link",
-	"mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait",
+	"mise run bundle -- publish --target dev-cp --target dev-cell-1 --target dev-cell-2 --wait",
 }
 
 // hintLines returns the commands that follow the hint line of harness.sh in its standard error.

@@ -74,11 +74,19 @@ CELL_UP_SKIP_LINK=1 CELL_UP_SKIP_LATE=1 "$ROOT/scripts/hydrate.sh"
 state_source="$(bundle_state_source)" || die "could not read the bundle state of $CELL_NAME, so cell:up cannot tell the bootstrap path from the signed path"
 if [[ "$state_source" == signed ]]; then
   log "the bundle state of $CELL_NAME has source signed: publishing a signed set, with no bootstrap apply"
+  log "running scripts/bundle.sh publish --target $CELL_NAME --wait"
   "$ROOT/scripts/bundle.sh" publish --target "$CELL_NAME" --wait
+  # envd holds the harness plane policies of dev-cp, and the signed set no longer carries the rules that they replace. So a signed publish in
+  # dev-cp ends with a new render of envd, which reads the live cells again: a cell that came or went changes plane-cells.
+  if [[ "$(bundle_role)" == cp ]]; then
+    HARNESS_ONLY=envd "$ROOT/scripts/hydrate.sh"
+    harness_apply envd
+  fi
 else
   for c in "${BOOTSTRAP[@]}"; do
     apply_bundle "$c"
   done
+  store_upgrade
   k -n cell-system rollout status statefulset/bundle-store --timeout=300s >/dev/null
   k -n argocd rollout status deploy/argocd-repo-server --timeout=300s >/dev/null
   k -n argocd rollout status statefulset/argocd-application-controller --timeout=300s >/dev/null

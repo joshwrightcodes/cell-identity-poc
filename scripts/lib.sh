@@ -387,7 +387,7 @@ cluster_lock_holder() {
   pid="$(tr -d '[:space:]' <"$dir/pid" 2>/dev/null)" || return 0
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
   # The system can give the pid of an ended run to another process, so the command line must show a harness script.
-  [[ "$(ps -ww -p "$pid" -o command= 2>/dev/null)" =~ (^|[[:space:]/])(up|down|link|restart)\.sh([[:space:]]|$) ]] || return 0
+  [[ "$(ps -ww -p "$pid" -o command= 2>/dev/null)" =~ (^|[[:space:]/])(up|down|link|restart|bundle)\.sh([[:space:]]|$) ]] || return 0
   step="$(cat "$dir/step" 2>/dev/null || true)"
   printf '%s|%s\n' "$pid" "$step"
 }
@@ -682,11 +682,10 @@ check_agent_grants() {
 }
 
 # The relay copies the node address of RELAY_TARGET into its routes and its egress policy, and the
-# node addresses of the live cells into its ingress policy. Docker can give a rebuilt node a new
+# node addresses of the live cells into the harness plane policies of dev-cp. Docker can give a rebuilt node a new
 # address, and the relay then sends the streams of the cells to the wrong node. With no live cell, the
-# render deletes the cell ingress rule. Each rule is selected by its ports, never by its index: the rule
-# of the cells has the route ports, the rule of the nodes has the health port 8080, and the egress rule of
-# the target has the target node ports, from 30000.
+# render of envd leaves out plane-cells. The egress rule of the target is selected by its ports, never by its
+# index: the target node ports start at 30000.
 # check_relay_current needs the function node_ip <cluster>, which verify.sh defines.
 check_relay_current() {
   local target cell ip name json hosts cidrs want_cells stale=() cell_cidrs=() live cells_text
@@ -702,12 +701,14 @@ check_relay_current() {
     json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
-    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
-    cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
-    cidrs="$(jq -r '[.spec.ingress[] | select(any(.ports[]?; .port != 8080)) | .from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$cidrs" == "$want_cells" ]] || stale+=("the ingress policy of $name admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   done
+  # The harness plane policies of dev-cp hold both lists: relay-system/plane-upstream (the relays to the target node) and relay-system/plane-cells
+  # (the cells to the route ports, absent while no cell is live).
+  json="$(k -n relay-system get networkpolicy plane-upstream -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-upstream"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+  [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy plane-upstream admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
+  cidrs="$(k -n relay-system get networkpolicy plane-cells -o json 2>/dev/null | jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")')" || cidrs=""
+  [[ "$cidrs" == "$want_cells" ]] || stale+=("the plane policy relay-system/plane-cells admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   if ((${#stale[@]} > 0)); then
     printf '%s\n' "${stale[@]}"
     echo "Run: CELL=$CELL_NAME mise run cell:up"
@@ -943,6 +944,48 @@ apply_bundle() {
     k apply --server-side --force-conflicts -f "$file" >/dev/null
   fi
   log "applied bundle $1"
+}
+
+# apply_store_object <kind> <rendered file> <live object as JSON> applies the object bundle-store of kind <kind> from the rendered file with the field
+# manager argocd-controller, as an Argo CD sync does, and keeps the live tracking annotation, so the apply leaves one owner and no field of Argo CD behind.
+apply_store_object() {
+  local kind="$1" file="$2" live="$3" obj tid
+  obj="$(KIND="$kind" yq 'select(.kind == strenv(KIND) and .metadata.name == "bundle-store" and .metadata.namespace == "cell-system")' "$file")" \
+    || die "could not read $kind bundle-store in $file"
+  [[ -n "$obj" ]] || return 0
+  tid="$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")"
+  [[ -z "$tid" ]] || obj="$(TID="$tid" yq '.metadata.annotations["argocd.argoproj.io/tracking-id"] = strenv(TID)' <<<"$obj")"
+  k apply --server-side --field-manager=argocd-controller --force-conflicts -f - >/dev/null <<<"$obj" \
+    || die "could not apply $kind bundle-store as argocd-controller"
+  log "applied $kind bundle-store from the render, as an Argo CD sync does"
+}
+
+# store_upgrade moves the bundle store of a cluster from M7 to M8 after the bootstrap apply. It changes nothing in a new cluster or in an upgraded one.
+#   - The M7 registry has a readiness probe and a port that Argo CD owns (field manager argocd-controller). The bootstrap apply runs as kubectl and cannot
+#     remove them, and the new port 5000 is the store proxy, so the probe never passes and Argo CD cannot read the store to remove them. A StatefulSet
+#     that has such a field gets the rendered object with the manager argocd-controller, and a pod that never became Ready is deleted, because a StatefulSet
+#     does not replace a pod of the current revision.
+#   - The store proxy reviews tokens through the API server, and the egress for that lives in the network-policy bundle, which Argo CD syncs after it reads
+#     the store. A live policy bundle-store that Argo CD manages gets the rendered policy first.
+store_upgrade() {
+  local live stale tid pod ready
+  live="$(k -n cell-system get networkpolicy bundle-store --ignore-not-found -o json)" || die "could not read NetworkPolicy bundle-store in cell-system"
+  if [[ -n "$live" && -f "$BUNDLES/network-policy/manifests.yaml" ]] \
+    && [[ -n "$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")" ]]; then
+    apply_store_object NetworkPolicy "$BUNDLES/network-policy/manifests.yaml" "$live"
+  fi
+  live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+  [[ -n "$live" && -f "$BUNDLES/cell-system/manifests.yaml" ]] || return 0
+  stale="$(jq -r '[.spec.template.spec.containers[]? | select(.name == "bundle-store") | (.readinessProbe != null) or ((.ports // []) | length > 0)] | any' <<<"$live")"
+  [[ "$stale" == true ]] || return 0
+  apply_store_object StatefulSet "$BUNDLES/cell-system/manifests.yaml" "$live"
+  pod="$(k -n cell-system get pod bundle-store-0 --ignore-not-found -o json)" || die "could not read pod bundle-store-0"
+  [[ -n "$pod" ]] || return 0
+  ready="$(jq -r '[.status.conditions[]? | select(.type == "Ready") | .status][0] // "False"' <<<"$pod")"
+  if [[ "$ready" != True ]]; then
+    k -n cell-system delete pod bundle-store-0 --wait=true --timeout=120s >/dev/null || die "could not delete the pod bundle-store-0, which never became Ready"
+    log "deleted the pod bundle-store-0, which never became Ready with the M7 probe"
+  fi
 }
 
 # release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD

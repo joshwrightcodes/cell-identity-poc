@@ -5,6 +5,7 @@ package e2e
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -287,4 +288,36 @@ func m8StartedAt(t *testing.T, cluster string) map[string]string {
 		}
 	}
 	return got
+}
+
+// m8Subject returns the digest of the subject with this name in the in-toto statement of a signed envelope, as sha256:<hex>. It fails the
+// test when the envelope holds no such subject. The statement is what mgmtd signed, and the cell checks the root against it.
+func m8Subject(t *testing.T, envelope json.RawMessage, name string) string {
+	t.Helper()
+	var env struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(envelope, &env); err != nil {
+		t.Fatalf("the envelope does not decode: %v", err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatalf("the payload of the envelope is no base64: %v", err)
+	}
+	var st struct {
+		Subject []struct {
+			Name   string            `json:"name"`
+			Digest map[string]string `json:"digest"`
+		} `json:"subject"`
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatalf("the statement does not decode: %v", err)
+	}
+	for _, sub := range st.Subject {
+		if sub.Name == name && sub.Digest["sha256"] != "" {
+			return "sha256:" + sub.Digest["sha256"]
+		}
+	}
+	t.Fatalf("the signed statement names no subject %s", name)
+	return ""
 }

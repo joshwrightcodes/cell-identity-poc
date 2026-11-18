@@ -797,7 +797,7 @@ func checkHarnessGuard(t *testing.T, objs map[string]object, roleName, component
 	if spec["failurePolicy"] != "Fail" {
 		t.Errorf("failurePolicy is %v, want Fail", spec["failurePolicy"])
 	}
-	if got, want := fmt.Sprint(spec["matchConstraints"]), "map[resourceRules:[map[apiGroups:[*] apiVersions:[*] operations:[CREATE UPDATE DELETE] resources:[*] scope:*]]]"; got != want {
+	if got, want := fmt.Sprint(spec["matchConstraints"]), "map[resourceRules:[map[apiGroups:[*] apiVersions:[*] operations:[CREATE UPDATE DELETE] resources:[* */*] scope:*]]]"; got != want {
 		t.Errorf("matchConstraints is %s, want %s", got, want)
 	}
 	if got, want := fmt.Sprint(spec["matchConditions"]), "[map[expression:"+celController+" name:argocd-controller]]"; got != want {

@@ -74,8 +74,10 @@ data:
 			if st.Source != "signed" || st.State != "healthy" || st.Version != signed.Version {
 				t.Errorf("the state is %s/%s at %+v, want signed/healthy at %+v", st.Source, st.State, st.Version, signed.Version)
 			}
-			if st.Root.Digest != signed.RootDigest {
-				t.Errorf("the state holds the root %s, want the root subject %s", st.Root.Digest, signed.RootDigest)
+			// The root subject is the digest that the signed statement names, and not the digest that mgmtd reports next to it.
+			subject := m8Subject(t, signed.Envelope, "bundles/"+cell+"/root")
+			if st.Root.Digest != subject || signed.RootDigest != subject {
+				t.Errorf("the state holds the root %s and mgmtd reports %s, want the signed root subject %s", st.Root.Digest, signed.RootDigest, subject)
 			}
 			if got := m8Field(m8Application(t, cell, "root"), "status", "sync", "revision"); got != st.Root.Digest {
 				t.Errorf("root is at %s, want the root of the state %s", got, st.Root.Digest)
@@ -97,13 +99,26 @@ func TestM8SameContentIsNoOp(t *testing.T) {
 	if first["outcome"] != op.OutcomeApplied {
 		t.Fatalf("the first publish ended %v, want applied", first)
 	}
+	// Every child of the hydrated set must have run a sync, so an empty read cannot pass as "no new operation".
+	children := m8LastSet(t, cell).Components
+	if len(children) == 0 {
+		t.Fatal("the last set of the cell holds no component")
+	}
 	stBefore, startedBefore := m8State(t, cell), m8StartedAt(t, cell)
+	for _, c := range children {
+		if startedBefore[c.Name] == "" {
+			t.Fatalf("the Application %s has no operationState.startedAt (read %v)", c.Name, startedBefore)
+		}
+	}
 	second, err := m8PublishHydrated(t, cell)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if second["outcome"] != op.OutcomeApplied {
 		t.Fatalf("the second publish ended %v, want applied", second)
+	}
+	if first["rootDigest"] == "" || first["rootDigest"] != second["rootDigest"] {
+		t.Errorf("the two publishes name the roots %v and %v, want one root", first["rootDigest"], second["rootDigest"])
 	}
 	stAfter, startedAfter := m8State(t, cell), m8StartedAt(t, cell)
 	if stAfter.Root.Digest != stBefore.Root.Digest {

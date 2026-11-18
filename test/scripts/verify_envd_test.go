@@ -22,7 +22,7 @@ case " $* " in
   *" --context kind-management "*" get configmap mgmt-signing-pub "*) printf '{"data":{"spec.pub":"%s"}}\n' "$(cat "$d/signing-pub")" ;;
   *" --context kind-management "*" get pod mgmtd-0 "*) printf 'True' ;;
   *" -n spire-system get configmap cell-records -o json "*) cat "$d/cell-records.json" ;;
-  *" -n spire-system get networkpolicy spire-server-agents "*) cat "$d/agents-policy.json" ;;
+  *" -n spire-system get networkpolicy plane-cells "*) cat "$d/agents-policy.json" ;;
   *" -n spire-system get service spire-server "*) cat "$d/service.json" ;;
   *" -n spire-system get configmap attest-hints "*) [[ -s "$d/attest-hints" ]] || { echo 'not found' >&2; exit 1; }; echo configmap/attest-hints ;;
   *" -n spire-system get configmap spire-server "*) cat "$d/server.conf" ;;

@@ -8,7 +8,7 @@
 # A cluster with link components (management) comes first with the link phase skipped, because its links need the other clusters.
 # Its first link step runs only mgmt-api, right after its cell:up and before dev-cp. The same step runs again right after the
 # cell:up of dev-cp, which adds the dev-cp root that mgmtd needs to accept envd. The full link phase runs last, with cell:link,
-# after the cells are valid. The last step publishes a signed bundle set to each cell (bundle -- publish --wait). When a step
+# after the cells are valid. The last step publishes a signed bundle set to dev-cp and to each cell (bundle -- publish --wait). When a step
 # fails, the script prints that step and every later one. harness:down stops the host service first.
 source "$(dirname "$0")/lib.sh"
 
@@ -63,9 +63,14 @@ case "${1:-}" in
       steps+=("|portal -- request ${cellargs[*]}" "|portal -- wait ${cellargs[*]}")
     fi
     for name in ${linked[@]+"${linked[@]}"}; do steps+=("CELL=$name|cell:link"); done
-    # Each cell applies its own signed set. The last step signs one set for every cell of the catalog and waits until each cell is healthy.
-    if ((${#targetargs[@]} > 0)); then
-      steps+=("|bundle -- publish ${targetargs[*]} --wait")
+    # Every cluster with a bundle role applies its own signed set. The last step signs one set for each of them and waits until each is healthy.
+    # dev-cp comes first, because the cells attest through the plane policies that envd holds there.
+    cps="$(yq -r '.clusters[] | select(.components | contains(["envd"])) | .name' "$topology")" || die "could not read the clusters with envd in $topology"
+    publish_targets=()
+    for name in $cps; do publish_targets+=(--target "$name"); done
+    publish_targets+=(${targetargs[@]+"${targetargs[@]}"})
+    if ((${#publish_targets[@]} > 0)); then
+      steps+=("|bundle -- publish ${publish_targets[*]} --wait")
     fi
     # show_step <entry> prints the command of a step as a person types it.
     show_step() { local env="${1%%|*}"; printf '%smise run %s' "${env:+$env }" "${1#*|}"; }

@@ -241,6 +241,8 @@ The table also covers a new root that no one planned. For a planned change of th
 | a cell | `CELL=<cell> mise run cell:down` while the cluster exists, `mise run portal -- recreate --cell <cell> --wait`, `CELL=management mise run cell:link` | A new cluster has a new node address and new keys. The step admits the address in `dev-cp`. The bind proves the new keys, and `mgmtd` publishes the record of the cell to the registries of the views. |
 | the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. Then it runs `CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up` when `dev-cp` exists, so the cell controller gets the new pin. It refuses while a step runs a stage, unless you add `--force`. |
 
+A cluster that ran the M7 bundle store needs `mise run images`, then `CELL=<cluster> mise run cell:up`. The command replaces the old store probe and the old store policy, and deletes a store pod that never became Ready.
+
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
 `mise run harness:status` lists each copy that is out of date, and `cell:verify` prints the command for it.

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -33,7 +35,7 @@ const (
 // that push-root answers. STUB_OUTCOMES lists what the successive calls of bundle get answer: open (no result), or an outcome. The last
 // answer repeats. STUB_OTHER_OP makes bundle get answer another operation.
 const bundleMise = `#!/usr/bin/env bash
-echo "mise $* | CELL=${CELL:-}" >>"$STUB_LOG"
+echo "mise $* | CELL=${CELL:-} | locks=$(ls "$POC_BUILD_ROOT/locks" 2>/dev/null | tr '\n' ' ')" >>"$STUB_LOG"
 fail() { echo "{\"level\":\"ERROR\",\"msg\":\"stub failed\",\"error\":\"$1\"}"; exit 1; }
 root=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 opid=cccccccccccccccccccccccccccccccc
@@ -42,6 +44,17 @@ case "$*" in
   "run hostsvc -- facts --registry")
     [[ -z "${STUB_NO_MIRROR:-}" ]] || fail "registry-mirror has no address"
     printf '{"name":"registry-mirror","address":"172.18.0.7","port":5000,"host":"%s"}\n' "${STUB_MIRROR_HOST:-127.0.0.1:5001}" ;;
+  "run mgmt -- pubkey")
+    echo '{"spec.pub":"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="}' ;;
+  "run bundlectl -- pubkey-pem")
+    cat >/dev/null; printf -- '-----BEGIN PUBLIC KEY-----\nstub\n-----END PUBLIC KEY-----\n' ;;
+  "x -- cosign verify-attestation "*)
+    # cosign runs with an empty DOCKER_CONFIG and the flags of the spike. STUB_COSIGN_FAIL fails it. STUB_COSIGN_SUBJECTS holds the hex digests that the statement names.
+    [[ -d "${DOCKER_CONFIG:-}" && -z "$(ls -A "$DOCKER_CONFIG")" ]] || { echo "cosign needs an empty DOCKER_CONFIG" >&2; exit 3; }
+    [[ "$*" == *" --insecure-ignore-tlog=true "* && "$*" == *" --allow-http-registry "* ]] || { echo "cosign flags" >&2; exit 4; }
+    [[ -z "${STUB_COSIGN_FAIL:-}" ]] || { echo "Error: no matching signatures" >&2; exit 1; }
+    payload="$(jq -nc --argjson s "${STUB_COSIGN_SUBJECTS:-{\}}" '{_type: "https://in-toto.io/Statement/v1", subject: ($s | to_entries | map({name: ("bundles/dev-cell-1/" + .key), digest: {sha256: .value}}))}' | base64 | tr -d '\n')"
+    printf '{"payloadType":"application/vnd.in-toto+json","payload":"%s","signatures":[{"sig":"x"}]}\n' "$payload" ;;
   "run bundlectl -- push "*)
     [[ -z "${STUB_PUSH_FAIL:-}" ]] || fail "push failed"
     echo "$comps" ;;
@@ -113,7 +126,8 @@ case "${args[0]} ${args[1]}" in
     name="${ref##*/}"; name="${name%%@*}"
     cat "$STUB_BUNDLES/$name.manifest.json"
     [[ -z "${STUB_ORAS_BAD:-}" ]] || printf ' ' ;;
-  "blob fetch") name="${ref##*/}"; name="${name%%@*}"; cat "$STUB_BUNDLES/$name.layer.tgz" ;;
+  "blob fetch") name="${ref##*/}"; name="${name%%@*}"; cat "$STUB_BUNDLES/$name.layer.tgz"
+    [[ -z "${STUB_ORAS_BAD_LAYER:-}" ]] || printf ' ' ;;
   "manifest push") cat >"$STUB_STATE/tagged.json" ;;
   *) exit 2 ;;
 esac
@@ -435,17 +449,20 @@ func TestBundleRefusesOpenRole(t *testing.T) {
 	})
 }
 
-// repairBundles writes the manifest and the layer of one component into the stub directory and returns the digest of the manifest.
-func repairBundles(t *testing.T, r *bundleRoot, name, content string) string {
+// packBundle writes the manifest and the layer of a bundle (a gzip tar with the files at its root) into the stub directory and returns
+// the digest of the manifest.
+func packBundle(t *testing.T, r *bundleRoot, name string, files map[string]string) string {
 	t.Helper()
 	var layer bytes.Buffer
 	gz := gzip.NewWriter(&layer)
 	tw := tar.NewWriter(gz)
-	if err := tw.WriteHeader(&tar.Header{Name: "manifests.yaml", Mode: 0o644, Size: int64(len(content))}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := tw.Write([]byte(content)); err != nil {
-		t.Fatal(err)
+	for _, f := range slices.Sorted(maps.Keys(files)) {
+		if err := tw.WriteHeader(&tar.Header{Name: f, Mode: 0o644, Size: int64(len(files[f]))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(files[f])); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := tw.Close(); err != nil {
 		t.Fatal(err)
@@ -472,38 +489,71 @@ func appsJSON(revisions map[string]string, health string) string {
 	return `{"items":[` + strings.Join(items, ",") + `]}`
 }
 
-// TestBundleRepairOrder: repair reads good[0] from the state ConfigMap, pulls its argocd and cell-system bundles from the mirror, applies
-// them server side with --force-conflicts (argocd first), puts the root of good[0] back under the tag current through the loopback
-// port-forward of the pod, refreshes the root Application, and waits until every Application is Synced and Healthy at the digests
-// of good[0]. The four steps run in this order. A state with no good root, a bundle that differs from its digest, and a role open
-// stop the repair before any change.
+// repairFixture is a good root with two bundles that the repair applies, as the mirror (or the store) holds them.
+type repairFixture struct {
+	argocd, cellSys, netpol, root string
+	rootManifest                  []byte
+	want                          map[string]string
+	subjects                      string
+}
+
+func newRepairFixture(t *testing.T, r *bundleRoot) repairFixture {
+	t.Helper()
+	f := repairFixture{netpol: "sha256:" + strings.Repeat("7", 64)}
+	f.argocd = packBundle(t, r, "argocd", map[string]string{"manifests.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n"})
+	f.cellSys = packBundle(t, r, "cell-system", map[string]string{"manifests.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n"})
+	app := func(name, digest string) string {
+		return "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata: {name: " + name + ", namespace: argocd}\nspec:\n  source:\n    targetRevision: " + digest + "\n"
+	}
+	f.root = packBundle(t, r, "root", map[string]string{"argocd.yaml": app("argocd", f.argocd), "cell-system.yaml": app("cell-system", f.cellSys), "network-policy.yaml": app("network-policy", f.netpol)})
+	var err error
+	if f.rootManifest, err = os.ReadFile(filepath.Join(r.dir, "bundles", "root.manifest.json")); err != nil {
+		t.Fatal(err)
+	}
+	f.want = map[string]string{"argocd": f.argocd, "cell-system": f.cellSys, "network-policy": f.netpol, "root": f.root}
+	hexOf := func(d string) string { return strings.TrimPrefix(d, "sha256:") }
+	f.subjects = fmt.Sprintf(`{"root":%q,"argocd":%q,"cell-system":%q,"network-policy":%q}`, hexOf(f.root), hexOf(f.argocd), hexOf(f.cellSys), hexOf(f.netpol))
+	return f
+}
+
+// state returns a state ConfigMap whose good[0] names the root. Its component digests are wrong on purpose: the repair takes them from the root layer.
+func (f repairFixture) state(goods ...any) string {
+	if len(goods) == 0 {
+		lie := "sha256:" + strings.Repeat("6", 64)
+		goods = []any{map[string]any{"version": map[string]any{"epoch": 1, "counter": 2}, "contentSHA256": "aa", "at": "2026-11-18T00:00:00Z",
+			"root":       map[string]any{"digest": f.root, "manifest": base64.StdEncoding.EncodeToString(f.rootManifest)},
+			"components": map[string]string{"argocd": lie, "cell-system": lie, "network-policy": lie}}}
+	}
+	b, _ := json.Marshal(map[string]any{"source": "signed", "state": "rolled_back", "version": map[string]any{"epoch": 1, "counter": 3}, "good": goods})
+	return string(b)
+}
+
+func (f repairFixture) env() []string {
+	stale := map[string]string{"argocd": f.argocd, "cell-system": "sha256:" + strings.Repeat("6", 64), "network-policy": f.netpol, "root": "sha256:" + strings.Repeat("6", 64)}
+	return []string{"STUB_STATE_JSON=" + f.state(), "STUB_COSIGN_SUBJECTS=" + f.subjects, "STUB_APPS_JSON=" + appsJSON(f.want, "Healthy"),
+		"STUB_APPS_OLD_JSON=" + appsJSON(stale, "Healthy"), "STUB_APPS_OLD_POLLS=2"}
+}
+
+// TestBundleRepairOrder: repair trusts only what it verifies. A good root that a signed set made must verify offline with cosign against the
+// current public key of mgmtd, and its subject must be the root digest. The digests of the bundles come from the root layer, and never from
+// the state. Then the repair runs in this order: put the root back under the tag current through the loopback forward, pin the Application
+// cell-system at its good digest, apply argocd and cell-system server side with --force-conflicts, delete the pod of the store, refresh root,
+// and wait until every Application of the good root is Synced and Healthy at its digest.
 func TestBundleRepairOrder(t *testing.T) {
 	r := newBundleRoot(t, "dev-cell-1")
-	argocd := repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
-	cellSys := repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
-	rootManifest := []byte(`{"schemaVersion":2,"layers":[]}`)
-	rsum := sha256.Sum256(rootManifest)
-	rootDigest := "sha256:" + hex.EncodeToString(rsum[:])
-	good := map[string]any{"version": map[string]any{"epoch": 1, "counter": 2}, "contentSHA256": "aa", "at": "2026-11-18T00:00:00Z",
-		"root":       map[string]any{"digest": rootDigest, "manifest": base64.StdEncoding.EncodeToString(rootManifest)},
-		"components": map[string]string{"argocd": argocd, "cell-system": cellSys, "network-policy": "sha256:" + strings.Repeat("7", 64)}}
-	older := map[string]any{"version": map[string]any{"epoch": 1, "counter": 1}, "root": map[string]any{"digest": "sha256:" + strings.Repeat("5", 64), "manifest": ""},
-		"components": map[string]string{"argocd": "sha256:" + strings.Repeat("5", 64)}}
-	stateJSON := func(goods ...any) string {
-		b, _ := json.Marshal(map[string]any{"source": "signed", "state": "rolled_back", "version": map[string]any{"epoch": 1, "counter": 3}, "good": goods})
-		return string(b)
-	}
-	want := map[string]string{"argocd": argocd, "cell-system": cellSys, "network-policy": "sha256:" + strings.Repeat("7", 64), "root": rootDigest}
-	stale := map[string]string{"argocd": argocd, "cell-system": "sha256:" + strings.Repeat("6", 64), "network-policy": want["network-policy"], "root": "sha256:" + strings.Repeat("6", 64)}
-	env := []string{"STUB_STATE_JSON=" + stateJSON(good, older), "STUB_APPS_JSON=" + appsJSON(want, "Healthy"), "STUB_APPS_OLD_JSON=" + appsJSON(stale, "Healthy"), "STUB_APPS_OLD_POLLS=2"}
-	out, errOut, log, err := r.run("bundle.sh", env, "repair", "--target", "dev-cell-1")
+	f := newRepairFixture(t, r)
+	out, errOut, log, err := r.run("bundle.sh", f.env(), "repair", "--target", "dev-cell-1")
 	if err != nil {
 		t.Fatalf("repair failed: %v\n%s\n%s\n%s", err, out, errOut, log)
 	}
 	idx := map[string]int{
 		"state":   callIndex(log, "kubectl --context kind-dev-cell-1", "-n cell-ops-system get configmap bundle-state"),
-		"apply-1": callIndex(log, "kubectl --context kind-dev-cell-1 apply --server-side --force-conflicts -f -"),
+		"pubkey":  callIndex(log, "run mgmt -- pubkey | CELL=management"),
+		"cosign":  callIndex(log, "x -- cosign verify-attestation", "--key ", "--insecure-ignore-tlog=true", "--allow-http-registry", "--type https://cell.poc.internal/bundle-set/v1", "127.0.0.1:5001/bundles/dev-cell-1/root@"+f.root),
 		"tag":     callIndex(log, "oras manifest push", "--plain-http", "127.0.0.1:", "/bundles/root:current"),
+		"patch":   callIndex(log, "-n argocd patch application cell-system --type merge", `"targetRevision":"`+f.cellSys+`"`),
+		"apply1":  callIndex(log, "kubectl --context kind-dev-cell-1 apply --server-side --force-conflicts -f -"),
+		"delete":  callIndex(log, "-n cell-system delete pod bundle-store-0"),
 		"refresh": callIndex(log, "-n argocd annotate application root argocd.argoproj.io/refresh=hard"),
 		"wait":    callIndex(log, "-n argocd get applications -o json"),
 	}
@@ -513,58 +563,122 @@ func TestBundleRepairOrder(t *testing.T) {
 			lastApply = i
 		}
 	}
-	if idx["state"] < 0 || idx["apply-1"] < 0 || idx["tag"] < 0 || idx["refresh"] < 0 || idx["wait"] < 0 ||
-		!(idx["state"] < idx["apply-1"] && lastApply < idx["tag"] && idx["tag"] < idx["refresh"] && idx["refresh"] < idx["wait"]) {
-		t.Fatalf("the repair does not run read, apply, tag, refresh, wait in this order (%v, last apply %d):\n%s", idx, lastApply, log)
+	order := []int{idx["state"], idx["pubkey"], idx["cosign"], idx["tag"], idx["patch"], idx["apply1"], lastApply, idx["delete"], idx["refresh"], idx["wait"]}
+	if slices.Contains(order, -1) || !slices.IsSorted(order) {
+		t.Fatalf("the repair does not run read, verify, tag, pin, apply, delete pod, refresh, wait in this order (%v, last apply %d):\n%s", idx, lastApply, log)
 	}
 	if n := len(calls(log, "kubectl --context kind-dev-cell-1 -n argocd get applications")); n != 3 {
 		t.Errorf("%d reads of the Applications, want 3 (two stale and one current)", n)
 	}
-	applies := calls(log, "kubectl --context kind-dev-cell-1 apply ")
-	if len(applies) != 2 {
+	if applies := calls(log, "kubectl --context kind-dev-cell-1 apply "); len(applies) != 2 {
 		t.Fatalf("%d applies, want one for argocd and one for cell-system:\n%s", len(applies), log)
 	}
 	if !strings.Contains(r.file("state", "applied-1.yaml"), "argocd-marker") || !strings.Contains(r.file("state", "applied-2.yaml"), "store-marker") {
 		t.Errorf("the applies hold %q then %q, want argocd then cell-system", r.file("state", "applied-1.yaml"), r.file("state", "applied-2.yaml"))
 	}
+	// The state names other digests than the root layer. The fetches use the digests of the layer.
 	for _, l := range calls(log, "oras manifest fetch") {
 		if !strings.Contains(l, "127.0.0.1:5001/bundles/dev-cell-1/") {
 			t.Errorf("a fetch outside the mirror repository of the target: %q", l)
 		}
 	}
-	if got := r.file("state", "tagged.json"); got != string(rootManifest) {
-		t.Errorf("the tag holds %q, want the manifest bytes of good[0]: %q", got, rootManifest)
+	for _, want := range []string{"/argocd@" + f.argocd, "/cell-system@" + f.cellSys} {
+		if callIndex(log, "oras manifest fetch", want) < 0 {
+			t.Errorf("no fetch of %s:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, strings.Repeat("6", 64)) && callIndex(log, "oras", strings.Repeat("6", 64)) >= 0 {
+		t.Errorf("a fetch used a digest from the state:\n%s", log)
+	}
+	if got := r.file("state", "tagged.json"); got != string(f.rootManifest) {
+		t.Errorf("the tag holds %q, want the verified root manifest %q", got, f.rootManifest)
 	}
 	pf := calls(log, "kubectl --context kind-dev-cell-1 -n cell-system port-forward pod/bundle-store-0 ")
 	if len(pf) != 1 || !strings.HasSuffix(pf[0], ":5001") {
 		t.Errorf("the tag does not go through the loopback forward of the pod: %v", pf)
 	}
 	var line map[string]any
-	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil || strings.Count(strings.TrimSpace(out), "\n") != 0 || line["root"] != rootDigest || line["target"] != "dev-cell-1" {
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &line); err != nil || strings.Count(strings.TrimSpace(out), "\n") != 0 || line["root"] != f.root || line["target"] != "dev-cell-1" {
 		t.Errorf("repair printed %q, want one JSON line with the target and the root", out)
 	}
 
-	t.Run("no good root stops before any change", func(t *testing.T) {
+	noChange := func(t *testing.T, log string) {
+		t.Helper()
+		for _, bad := range []string{" apply ", "oras manifest push", " patch application", " delete pod"} {
+			if strings.Contains(log, bad) {
+				t.Errorf("the repair changed the cluster (%q):\n%s", bad, log)
+			}
+		}
+	}
+	// Each case below fails one check. The mutation that removes the check makes the repair apply what it should refuse.
+	for name, tc := range map[string]struct {
+		env  func(f repairFixture) []string
+		want string
+	}{
+		"a root that cosign does not verify": {func(f repairFixture) []string { return append(f.env(), "STUB_COSIGN_FAIL=1") }, "cosign"},
+		"a verified root for another digest": {func(f repairFixture) []string {
+			return append(f.env(), "STUB_COSIGN_SUBJECTS="+strings.Replace(f.subjects, strings.TrimPrefix(f.root, "sha256:"), strings.Repeat("9", 64), 1))
+		}, "subject"},
+		"a component that the signature does not name": {func(f repairFixture) []string {
+			return append(f.env(), "STUB_COSIGN_SUBJECTS="+strings.Replace(f.subjects, strings.TrimPrefix(f.cellSys, "sha256:"), strings.Repeat("9", 64), 1))
+		}, "cell-system"},
+		"a root manifest that differs from its digest": {func(f repairFixture) []string { return append(f.env(), "STUB_ORAS_BAD=1") }, "digest"},
+		"a layer that differs from its digest":         {func(f repairFixture) []string { return append(f.env(), "STUB_ORAS_BAD_LAYER=1") }, "digest"},
+		"no good root": {func(f repairFixture) []string {
+			return append(f.env(), `STUB_STATE_JSON={"source":"signed","good":[]}`)
+		}, "good"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1")
+			f := newRepairFixture(t, r)
+			out, errOut, log, err := r.run("bundle.sh", tc.env(f), "repair", "--target", "dev-cell-1")
+			if err == nil || !strings.Contains(out+errOut, tc.want) {
+				t.Errorf("err %v, output %q, want a failure that names %q", err, out+errOut, tc.want)
+			}
+			noChange(t, log)
+		})
+	}
+
+	t.Run("a bootstrap root is checked against root.json and fetched from the store", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
-		out, errOut, log, err := r.run("bundle.sh", []string{"STUB_STATE_JSON=" + stateJSON()}, "repair", "--target", "dev-cell-1")
-		if err == nil || !strings.Contains(out+errOut, "good") || strings.Contains(log, " apply ") || strings.Contains(log, "oras manifest push") {
-			t.Errorf("err %v, output %q, calls:\n%s", err, out+errOut, log)
+		f := newRepairFixture(t, r)
+		rootJSON := `{"digest":"` + f.root + `","manifest":"x","components":{}}`
+		if err := os.WriteFile(filepath.Join(r.dir, "build", "dev-cell-1", "root.json"), []byte(rootJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		out, errOut, log, err := r.run("bundle.sh", append(f.env(), "STUB_COSIGN_FAIL=1"), "repair", "--target", "dev-cell-1")
+		if err != nil {
+			t.Fatalf("repair failed: %v\n%s\n%s\n%s", err, out, errOut, log)
+		}
+		if strings.Contains(log, "cosign") {
+			t.Errorf("a bootstrap root went through cosign:\n%s", log)
+		}
+		for _, l := range calls(log, "oras manifest fetch") {
+			if !strings.Contains(l, "127.0.0.1:5052/bundles/") || strings.Contains(l, "/dev-cell-1/") {
+				t.Errorf("a bootstrap bundle is not read from the store through the forward: %q", l)
+			}
+		}
+		if callIndex(log, "-n argocd patch application cell-system") < 0 || len(calls(log, "kubectl --context kind-dev-cell-1 apply ")) != 2 {
+			t.Errorf("the bootstrap repair did not pin and apply:\n%s", log)
 		}
 	})
-	t.Run("a bundle that differs from its digest is not applied", func(t *testing.T) {
+	t.Run("a root that is neither the bootstrap root nor signed", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
-		repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
-		repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
-		_, errOut, log, err := r.run("bundle.sh", append([]string{"STUB_ORAS_BAD=1"}, env...), "repair", "--target", "dev-cell-1")
-		if err == nil || !strings.Contains(errOut, "digest") || strings.Contains(log, " apply ") || strings.Contains(log, "oras manifest push") {
-			t.Errorf("err %v, stderr %q, calls:\n%s", err, errOut, log)
+		f := newRepairFixture(t, r)
+		rootJSON := `{"digest":"sha256:` + strings.Repeat("1", 64) + `","manifest":"x","components":{}}`
+		if err := os.WriteFile(filepath.Join(r.dir, "build", "dev-cell-1", "root.json"), []byte(rootJSON), 0o644); err != nil {
+			t.Fatal(err)
 		}
+		_, _, log, err := r.run("bundle.sh", append(f.env(), "STUB_COSIGN_FAIL=1"), "repair", "--target", "dev-cell-1")
+		if err == nil {
+			t.Error("a root that matches no anchor was repaired")
+		}
+		noChange(t, log)
 	})
 	t.Run("an Application that stays off the digest fails the wait", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
-		repairBundles(t, r, "argocd", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: argocd-marker, namespace: argocd}\n")
-		repairBundles(t, r, "cell-system", "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: store-marker, namespace: cell-system}\n")
-		bad := append(slices.Clone(env[:1]), "STUB_APPS_JSON="+appsJSON(want, "Degraded"), "STUB_APPS_OLD_POLLS=0", "BUNDLE_REPAIR_SECONDS=1")
+		f := newRepairFixture(t, r)
+		bad := append(f.env(), "STUB_APPS_JSON="+appsJSON(f.want, "Degraded"), "STUB_APPS_OLD_POLLS=0", "BUNDLE_REPAIR_SECONDS=1")
 		out, errOut, _, err := r.run("bundle.sh", bad, "repair", "--target", "dev-cell-1")
 		if err == nil || !strings.Contains(out+errOut, "Degraded") {
 			t.Errorf("err %v, output %q, want a failure that names the Application state", err, out+errOut)
@@ -653,11 +767,12 @@ func TestPublishUnsignedBreakGlass(t *testing.T) {
 	}
 }
 
-// harnessUpPublish is the step that harness:up ends with: one publish for the cells, which waits until each cell applied the set.
-const harnessUpPublish = "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait | CELL=dev-cell-1 LINK_ONLY= SKIP="
+// harnessUpPublish is the step that harness:up ends with: one publish for dev-cp and the cells, which waits until each applied the set.
+const harnessUpPublish = "mise run bundle -- publish --target dev-cp --target dev-cell-1 --target dev-cell-2 --wait | CELL=dev-cell-1 LINK_ONLY= SKIP="
 
-// TestHarnessUpPublishesTargets: harness:up ends with one signed publish that names each cell of the catalog and waits for it, after
-// the full link of management. A failed publish prints itself in the hint list. The cells apply their own sets, so dev-cp is no target.
+// TestHarnessUpPublishesTargets: harness:up ends with one signed publish that names dev-cp first and then each cell of the catalog, and waits for
+// them, after the full link of management. The cells attest through the plane policies that envd holds in dev-cp, so dev-cp comes first. A failed
+// publish prints itself in the hint list.
 func TestHarnessUpPublishesTargets(t *testing.T) {
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "up")
@@ -668,16 +783,13 @@ func TestHarnessUpPublishesTargets(t *testing.T) {
 	if n := len(lines); n < 2 || lines[n-1] != harnessUpPublish || lines[n-2] != "mise run cell:link | CELL=management LINK_ONLY= SKIP=" {
 		t.Fatalf("calls\n%s\nwant the signed publish after the full link as the last call", log)
 	}
-	if strings.Contains(harnessUpPublish, "dev-cp") {
-		t.Error("the publish names dev-cp")
-	}
 	root, calls = harnessRoot(t)
 	_, errOut, err = runHarness(t, root, calls, "up", "STUB_FAIL_ARGS=run bundle -- publish")
 	if err == nil {
 		t.Fatal("harness up passed with a failing publish")
 	}
 	hint := hintLines(t, errOut)
-	if want := "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait"; hint[len(hint)-1] != want || len(hint) != 1 {
+	if want := "mise run bundle -- publish --target dev-cp --target dev-cell-1 --target dev-cell-2 --wait"; hint[len(hint)-1] != want || len(hint) != 1 {
 		t.Errorf("hint %v, want only %q", hint, want)
 	}
 }
@@ -836,5 +948,129 @@ func TestRuntimeObjectsBundleState(t *testing.T) {
 	}
 	if !strings.Contains(out, "op-[0-9a-f]{32}") {
 		t.Errorf("the operation records are no runtime objects any more: %s", out)
+	}
+}
+
+// bundleHolder starts a process whose command line is bash <dir>/<script>, which the lock accepts as a harness script, and
+// writes the lock directory of the cluster with its pid. It returns the pid. The process ends with the test.
+func bundleHolder(t *testing.T, r *bundleRoot, script, cluster string) int {
+	t.Helper()
+	dir := filepath.Join(r.dir, "holder")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, script)
+	if err := os.WriteFile(path, []byte("#!/usr/bin/env bash\nsleep 120\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("bash", path)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _, _ = cmd.Process.Wait() })
+	lock := filepath.Join(r.dir, "build", "locks", cluster+".lock")
+	if err := os.MkdirAll(lock, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(lock, "pid"), []byte(fmt.Sprintf("%d\n", cmd.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return cmd.Process.Pid
+}
+
+// TestBundleLocks: publish and repair take the cluster lock of each target before the first change, in sorted order, hold it until the
+// last wait ends, and release it. A live holder (a harness script, bundle.sh included) stops them at once. A nested call that inherits
+// POC_HELD_LOCKS (cell:up runs bundle.sh) passes. cosign and get change no cluster and take no lock.
+func TestBundleLocks(t *testing.T) {
+	both := "dev-cell-1.lock dev-cell-2.lock"
+	t.Run("both locks are held from the first signature to the last wait", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+		_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-2", "--target", "dev-cell-1", "--wait")
+		if err != nil {
+			t.Fatalf("publish failed: %v\n%s\n%s", err, errOut, log)
+		}
+		for _, l := range strings.Split(log, "\n") {
+			if (strings.Contains(l, "bundle sign") || strings.Contains(l, "bundle get") || strings.Contains(l, "push-root")) && !strings.HasSuffix(strings.TrimSpace(l), "locks="+both) {
+				t.Errorf("the call %q does not run under both locks (%s)", l, both)
+			}
+		}
+		if left, _ := os.ReadDir(filepath.Join(r.dir, "build", "locks")); len(left) != 0 {
+			t.Errorf("locks left after the run: %v", left)
+		}
+	})
+	for _, script := range []string{"bundle.sh", "up.sh"} {
+		t.Run("a live "+script+" holds dev-cell-1", func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+			pid := bundleHolder(t, r, script, "dev-cell-1")
+			for _, args := range [][]string{{"publish", "--target", "dev-cell-1"}, {"publish", "--target", "dev-cell-2", "--target", "dev-cell-1"}, {"repair", "--target", "dev-cell-1"}} {
+				out, errOut, log, err := r.run("bundle.sh", []string{"STUB_STATE_JSON={}"}, args...)
+				if err == nil || !strings.Contains(errOut, fmt.Sprintf("process %d", pid)) {
+					t.Errorf("%v: err %v, stderr %q, want a stop that names process %d", args, err, errOut, pid)
+				}
+				if strings.Contains(log, "bundle sign") || strings.Contains(log, "oras") || strings.Contains(log, " apply ") || out != "" {
+					t.Errorf("%v changed something under a held lock:\n%s\n%s", args, out, log)
+				}
+				// The first target is not left locked.
+				if _, err := os.Stat(filepath.Join(r.dir, "build", "locks", "dev-cell-2.lock")); err == nil {
+					t.Errorf("%v left the lock of dev-cell-2", args)
+				}
+			}
+		})
+	}
+	t.Run("a nested call under POC_HELD_LOCKS passes", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		bundleHolder(t, r, "up.sh", "dev-cell-1")
+		_, errOut, log, err := r.run("bundle.sh", []string{"POC_HELD_LOCKS=dev-cell-1"}, "publish", "--target", "dev-cell-1", "--wait")
+		if err != nil {
+			t.Fatalf("the nested publish failed: %v\n%s\n%s", err, errOut, log)
+		}
+	})
+	t.Run("cosign and get take no lock", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		bundleHolder(t, r, "up.sh", "dev-cell-1")
+		for _, sub := range []string{"cosign", "get"} {
+			_, errOut, log, err := r.run("bundle.sh", nil, sub, "--target", "dev-cell-1")
+			if err != nil {
+				t.Errorf("%s under a held lock: err %v\n%s\n%s", sub, err, errOut, log)
+			}
+		}
+	})
+}
+
+// TestBundleWaitSharesOneDeadline: --wait has one bound for every target, so two targets that never settle fail after one bound and not two.
+func TestBundleWaitSharesOneDeadline(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+	start := time.Now()
+	out, errOut, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=open", "BUNDLE_WAIT_SECONDS=3", "BUNDLE_WAIT_POLL=0.2"}, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2", "--wait")
+	took := time.Since(start)
+	if err == nil || !strings.Contains(out+errOut, "timeout") {
+		t.Fatalf("err %v, output %q", err, out+errOut)
+	}
+	if took > 5500*time.Millisecond {
+		t.Errorf("two targets waited %s with a bound of 3 s, so the bound is not shared", took)
+	}
+	if callIndex(log, "bundle get --target dev-cell-2") < 0 {
+		t.Errorf("the second target was never polled:\n%s", log)
+	}
+}
+
+// TestBundlePublishWritesBootstrapState: a publish to a cluster with no bundle state writes the bootstrap state before it pushes anything,
+// and a cluster with a state gets none.
+func TestBundlePublishWritesBootstrapState(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1")
+	_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
+	if err != nil {
+		t.Fatalf("publish failed: %v\n%s", err, errOut)
+	}
+	create, push := callIndex(log, "-n cell-ops-system create -f -"), callIndex(log, "run bundlectl -- push --target")
+	if create < 0 || push < 0 || create > push {
+		t.Errorf("want the bootstrap state before the first push (%d, %d):\n%s", create, push, log)
+	}
+	if !strings.Contains(r.file("state", "created.json"), `bundle-bootstrap`) {
+		t.Errorf("the created object is %q", r.file("state", "created.json"))
+	}
+	r = newBundleRoot(t, "dev-cell-1")
+	if _, errOut, log, err = r.run("bundle.sh", []string{`STUB_STATE_JSON={"source":"signed"}`}, "publish", "--target", "dev-cell-1"); err != nil || strings.Contains(log, " create -f -") {
+		t.Errorf("a cluster with a state: err %v %s\n%s", err, errOut, log)
 	}
 }

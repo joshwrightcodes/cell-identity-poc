@@ -12,14 +12,15 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
 
-// admitKubectl answers the reads of the checks of the admit lists from the files in $STUB_DIR: policy-spire.json,
-// policy-relay-view.json, policy-relay-telemetry.json, policy-gateway.json and gateway.json (the StatefulSet).
+// admitKubectl answers the reads of the checks of the admit lists from the files in $STUB_DIR: policy-spire.json (the harness plane policy
+// spire-system/plane-cells), policy-relay-cells.json (relay-system/plane-cells), policy-relay-upstream.json (relay-system/plane-upstream),
+// policy-gateway.json and gateway.json (the StatefulSet). A policy with no file is absent, as plane-cells is while no cell is live.
 const admitKubectl = `#!/usr/bin/env bash
 d="$STUB_DIR"
 case " $* " in
-  *" -n spire-system get networkpolicy spire-server-agents "*) cat "$d/policy-spire.json" ;;
-  *" -n relay-system get networkpolicy relay-view "*) cat "$d/policy-relay-view.json" ;;
-  *" -n relay-system get networkpolicy relay-telemetry "*) cat "$d/policy-relay-telemetry.json" ;;
+  *" -n spire-system get networkpolicy plane-cells "*) cat "$d/policy-spire.json" ;;
+  *" -n relay-system get networkpolicy plane-cells "*) cat "$d/policy-relay-cells.json" ;;
+  *" -n relay-system get networkpolicy plane-upstream "*) cat "$d/policy-relay-upstream.json" ;;
   *" -n relay-system get deployment "*) cat "$d/relay-deployment.json" ;;
   *" -n gateway-system get networkpolicy cell-gateway "*) cat "$d/policy-gateway.json" ;;
   *" -n gateway-system get statefulset cell-gateway "*) cat "$d/gateway.json" ;;
@@ -35,6 +36,27 @@ func cidrRule(port int, cidrs ...string) string {
 	return fmt.Sprintf(`{"from":[%s],"ports":[{"protocol":"TCP","port":%d}]}`, strings.Join(from, ","), port)
 }
 
+// routesRule is the ingress rule of relay-system/plane-cells: the cells on every route port of both relays.
+func routesRule(cidrs []string, ports ...int) string {
+	var from, pp []string
+	for _, c := range cidrs {
+		from = append(from, `{"ipBlock":{"cidr":"`+c+`"}}`)
+	}
+	for _, p := range ports {
+		pp = append(pp, fmt.Sprintf(`{"protocol":"TCP","port":%d}`, p))
+	}
+	return fmt.Sprintf(`{"from":[%s],"ports":[%s]}`, strings.Join(from, ","), strings.Join(pp, ","))
+}
+
+// upstreamJSON is relay-system/plane-upstream: the egress of the relays to the node of management on the target ports.
+func upstreamJSON(ports ...int) string {
+	var pp []string
+	for _, p := range ports {
+		pp = append(pp, fmt.Sprintf(`{"protocol":"TCP","port":%d}`, p))
+	}
+	return `{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"172.18.0.3/32"}}],"ports":[` + strings.Join(pp, ",") + `]}]}}`
+}
+
 func policyJSON(ingress ...string) string {
 	return `{"spec":{"ingress":[` + strings.Join(ingress, ",") + `]}}`
 }
@@ -45,9 +67,9 @@ func admitFixture() map[string]string {
 	decoy := cidrRule(9999, "10.250.0.1/32")
 	cells := []string{"172.18.0.5/32", "172.18.0.6/32"}
 	return map[string]string{
-		"policy-spire.json":           policyJSON(decoy, cidrRule(8081, cells...)),
-		"policy-relay-view.json":      policyJSON(cidrRule(8080, "172.18.0.3/32"), cidrRule(8443, cells...)),
-		"policy-relay-telemetry.json": policyJSON(cidrRule(8080, "172.18.0.3/32"), cidrRule(8444, cells...)),
+		"policy-spire.json":          policyJSON(decoy, cidrRule(8081, cells...)),
+		"policy-relay-cells.json":    policyJSON(routesRule(cells, 8443, 8444, 8445)),
+		"policy-relay-upstream.json": upstreamJSON(31443, 31444, 31445),
 		"policy-gateway.json": policyJSON(cidrRule(8452, "10.250.0.2/32"), cidrRule(8450, cells...), cidrRule(8451, cells...),
 			cidrRule(8080, "172.18.0.3/32")),
 		"gateway.json": `{"spec":{"template":{"spec":{"containers":[{"name":"spire-agent","args":[]},{"name":"cellgw","args":["serve","--cell-node=dev-cell-1=172.18.0.5","--cell-node=dev-cell-2=172.18.0.6"]}]}}}}`,
@@ -72,6 +94,10 @@ func runAdmit(t *testing.T, check string, files map[string]string, env ...string
 		t.Fatal(err)
 	}
 	for name, body := range files {
+		// An empty body is an absent policy: the stub reads a file that does not exist as a failed kubectl call.
+		if body == "" {
+			continue
+		}
 		if err := os.WriteFile(filepath.Join(stub, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
@@ -106,11 +132,9 @@ func withFiles(files map[string]string, change map[string]string) map[string]str
 func TestCheckAdmitLists(t *testing.T) {
 	healthy := admitFixture()
 	empty := map[string]string{
-		"policy-spire.json":           policyJSON(cidrRule(9999, "10.250.0.1/32")),
-		"policy-relay-view.json":      policyJSON(cidrRule(8080, "172.18.0.3/32")),
-		"policy-relay-telemetry.json": policyJSON(cidrRule(8080, "172.18.0.3/32")),
-		"policy-gateway.json":         policyJSON(cidrRule(8452, "10.250.0.2/32"), cidrRule(8080, "172.18.0.3/32")),
-		"gateway.json":                `{"spec":{"template":{"spec":{"containers":[{"name":"cellgw","args":["serve"]}]}}}}`,
+		"policy-spire.json":   policyJSON(cidrRule(9999, "10.250.0.1/32")),
+		"policy-gateway.json": policyJSON(cidrRule(8452, "10.250.0.2/32"), cidrRule(8080, "172.18.0.3/32")),
+		"gateway.json":        `{"spec":{"template":{"spec":{"containers":[{"name":"cellgw","args":["serve"]}]}}}}`,
 	}
 	cells := []string{"172.18.0.5/32", "172.18.0.6/32"}
 	for _, tc := range []struct {
@@ -123,8 +147,10 @@ func TestCheckAdmitLists(t *testing.T) {
 		{name: "healthy", files: healthy},
 		{name: "a stale address in the SPIRE server policy", files: withFiles(healthy, map[string]string{"policy-spire.json": policyJSON(cidrRule(9999, "10.250.0.1/32"), cidrRule(8081, append(cells, "172.18.0.99/32")...))}),
 			fail: true, wanted: []string{"the SPIRE server admits '172.18.0.5/32 172.18.0.6/32 172.18.0.99/32' on port 8081", "Run: CELL=dev-cp mise run cell:up"}},
-		{name: "a live cell is missing from the relay", files: withFiles(healthy, map[string]string{"policy-relay-telemetry.json": policyJSON(cidrRule(8080, "172.18.0.3/32"), cidrRule(8444, "172.18.0.5/32"))}),
-			fail: true, wanted: []string{"the relay relay-telemetry admits '172.18.0.5/32' on its route ports", "Run: CELL=dev-cp mise run cell:up"}},
+		{name: "a live cell is missing from the relay", files: withFiles(healthy, map[string]string{"policy-relay-cells.json": policyJSON(routesRule([]string{"172.18.0.5/32"}, 8443, 8444, 8445))}),
+			fail: true, wanted: []string{"the relay plane policy plane-cells admits '172.18.0.5/32' on its route ports", "Run: CELL=dev-cp mise run cell:up"}},
+		{name: "the relay has no plane policy for the live cells", files: withFiles(healthy, map[string]string{"policy-relay-cells.json": ""}),
+			fail: true, wanted: []string{"the relay plane policy plane-cells admits '' on its route ports"}},
 		{name: "a stale address on port 8451 of the gateway", files: withFiles(healthy, map[string]string{"policy-gateway.json": policyJSON(cidrRule(8450, cells...), cidrRule(8451, "172.18.0.5/32", "172.18.0.77/32"))}),
 			fail: true, wanted: []string{"the gateway admits '172.18.0.5/32 172.18.0.77/32' on port 8451"}},
 		{name: "a fake stale --cell-node address", files: withFiles(healthy, map[string]string{"gateway.json": `{"spec":{"template":{"spec":{"containers":[{"name":"cellgw","args":["serve","--cell-node=dev-cell-1=172.18.0.50","--cell-node=dev-cell-2=172.18.0.6"]}]}}}}`}),
@@ -159,32 +185,36 @@ func TestCheckAdmitLists(t *testing.T) {
 // rule in front of the cell rule, or no cell rule at all, they still read the right one.
 func TestVerifySelectsRulesByPort(t *testing.T) {
 	healthy := admitFixture()
-	t.Run("check_relay_current reads the route rule behind the node rule", func(t *testing.T) {
+	t.Run("check_relay_current reads the plane policies, with the cell rule behind a decoy", func(t *testing.T) {
 		files := withFiles(healthy, map[string]string{
-			"relay-deployment.json": `{"spec":{"template":{"spec":{"containers":[{"args":["--route","8443=172.18.0.3:31443","--health",":8080"]}]}}}}`,
-			"policy-relay-view.json": `{"spec":{"ingress":[` + cidrRule(8080, "172.18.0.3/32") + `,` + cidrRule(8443, "172.18.0.5/32", "172.18.0.6/32") + `],"egress":[` +
-				`{"to":[{"namespaceSelector":{}}],"ports":[{"port":4317}]},` + cidrToRule(31443, "172.18.0.3/32") + `]}}`,
-			"policy-relay-telemetry.json": `{"spec":{"ingress":[` + cidrRule(8080, "172.18.0.3/32") + `,` + cidrRule(8444, "172.18.0.5/32", "172.18.0.6/32") + `],"egress":[` +
-				`{"to":[{"namespaceSelector":{}}],"ports":[{"port":4317}]},` + cidrToRule(31444, "172.18.0.3/32") + `]}}`,
+			"relay-deployment.json":      `{"spec":{"template":{"spec":{"containers":[{"args":["--route","8443=172.18.0.3:31443","--health",":8080"]}]}}}}`,
+			"policy-relay-cells.json":    policyJSON(cidrRule(9999, "10.250.0.1/32")[:0] + routesRule([]string{"172.18.0.5/32", "172.18.0.6/32"}, 8443, 8444)),
+			"policy-relay-upstream.json": `{"spec":{"egress":[{"to":[{"namespaceSelector":{}}],"ports":[{"port":4317}]},` + cidrToRule(31443, "172.18.0.3/32") + `]}}`,
 		})
 		out, err := runAdmit(t, "check_relay_current", files)
 		if err != nil {
-			t.Fatalf("check_relay_current failed on a state with the rules in another order: %v\n%s", err, out)
+			t.Fatalf("check_relay_current failed on the plane policies: %v\n%s", err, out)
 		}
-		// With a stale cell address in the route rule, it still fails, and it names that rule.
-		files["policy-relay-view.json"] = strings.Replace(files["policy-relay-view.json"], "172.18.0.6/32", "172.18.0.66/32", 1)
-		if out, err = runAdmit(t, "check_relay_current", files); err == nil || !strings.Contains(out, "the ingress policy of relay-view admits") {
+		// With a stale cell address in plane-cells, it still fails, and it names that policy.
+		stale := withFiles(files, map[string]string{"policy-relay-cells.json": strings.Replace(files["policy-relay-cells.json"], "172.18.0.6/32", "172.18.0.66/32", 1)})
+		if out, err = runAdmit(t, "check_relay_current", stale); err == nil || !strings.Contains(out, "the plane policy relay-system/plane-cells admits") {
 			t.Fatalf("err %v, output %q; want a failure for the stale address on the route ports", err, out)
 		}
+		// A management node that moved shows in plane-upstream.
+		moved := withFiles(files, map[string]string{"policy-relay-upstream.json": strings.Replace(files["policy-relay-upstream.json"], "172.18.0.3/32", "172.18.0.9/32", 1)})
+		if out, err = runAdmit(t, "check_relay_current", moved); err == nil || !strings.Contains(out, "the egress policy plane-upstream admits '172.18.0.9/32'") {
+			t.Fatalf("err %v, output %q; want a failure for the stale target in plane-upstream", err, out)
+		}
 	})
-	t.Run("check_relay_current passes with no live cell and no cell rule", func(t *testing.T) {
+	t.Run("check_relay_current passes with no live cell and no plane-cells policy", func(t *testing.T) {
 		files := withFiles(healthy, map[string]string{
-			"relay-deployment.json":       `{"spec":{"template":{"spec":{"containers":[{"args":["--route","8443=172.18.0.3:31443"]}]}}}}`,
-			"policy-relay-view.json":      `{"spec":{"ingress":[` + cidrRule(8080, "172.18.0.3/32") + `],"egress":[` + cidrToRule(31443, "172.18.0.3/32") + `]}}`,
-			"policy-relay-telemetry.json": `{"spec":{"ingress":[` + cidrRule(8080, "172.18.0.3/32") + `],"egress":[` + cidrToRule(31444, "172.18.0.3/32") + `]}}`,
+			"relay-deployment.json":      `{"spec":{"template":{"spec":{"containers":[{"args":["--route","8443=172.18.0.3:31443"]}]}}}}`,
+			"policy-relay-cells.json":    "",
+			"policy-relay-upstream.json": `{"spec":{"egress":[` + cidrToRule(31443, "172.18.0.3/32") + `]}}`,
 		})
+		delete(files, "policy-relay-cells.json")
 		if out, err := runAdmit(t, "check_relay_current", files, "STUB_KIND=management dev-cp rogue"); err != nil {
-			t.Fatalf("a relay with no cell rule fails while no cell is live: %v\n%s", err, out)
+			t.Fatalf("a relay with no cell policy fails while no cell is live: %v\n%s", err, out)
 		}
 	})
 	t.Run("check_gateway_cells reads the arguments, and the policy is the other check", func(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -20,6 +21,10 @@ echo "kubectl $*" >>"$STUB_LOG"
 case " $* " in
   *" get configmap bundle-state "*) [[ -z "${STUB_STATE_JSON:-}" ]] || printf '%s' "$STUB_STATE_JSON"; exit 0 ;;
   *" create -f - "*) cat >"$STUB_CREATED"; exit 0 ;;
+  *" apply "*" -f - "*) n=$(($(cat "$STUB_APPLIED/count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_APPLIED/count"; cat >"$STUB_APPLIED/applied-$n.yaml"; exit 0 ;;
+  *" get statefulset bundle-store "*) [[ -z "${STUB_STS_JSON:-}" ]] || printf '%s' "$STUB_STS_JSON"; exit 0 ;;
+  *" get networkpolicy bundle-store "*) [[ -z "${STUB_NP_JSON:-}" ]] || printf '%s' "$STUB_NP_JSON"; exit 0 ;;
+  *" get pod bundle-store-0 "*) [[ -z "${STUB_POD_JSON:-}" ]] || printf '%s' "$STUB_POD_JSON"; exit 0 ;;
   *" get applications -o json "*)
     cut -d= -f1 "$POC_BUILD_ROOT/${CELL:-management}/published.env" | jq -Rn '{items: [inputs | {metadata: {name: ., namespace: "x"},
       status: {sync: {status: "Synced", revision: "sha256:1"}, health: {status: "Healthy"}}}]}'
@@ -44,6 +49,36 @@ func upRoot(t *testing.T) (root, logFile string) {
 		}
 	}
 	write("bin/kubectl", upKubectl)
+	if err := os.MkdirAll(filepath.Join(root, "applied"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The renders of network-policy and cell-system hold the objects of the store, as the real bundles do.
+	write("components/network-policy/render.sh", `#!/usr/bin/env bash
+echo "render network-policy" >>"$STUB_LOG"
+cat <<'EOF2'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: bundle-store, namespace: cell-system}
+spec:
+  podSelector: {matchLabels: {app.kubernetes.io/name: bundle-store}}
+  policyTypes: [Egress]
+  egress: [{ports: [{port: 4317}]}, {ports: [{port: 4318}]}, {ports: [{port: 443}]}]
+EOF2
+`)
+	write("components/cell-system/render.sh", `#!/usr/bin/env bash
+echo "render cell-system" >>"$STUB_LOG"
+cat <<'EOF2'
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: bundle-store, namespace: cell-system}
+spec:
+  template:
+    spec:
+      containers:
+        - {name: bundle-store, image: registry}
+        - {name: store-proxy, image: proxy}
+EOF2
+`)
 	write("scripts/attest-wait.sh", "#!/usr/bin/env bash\ntrue\n")
 	write("scripts/publish.sh", `#!/usr/bin/env bash
 source "$(dirname "$0")/lib.sh"
@@ -61,7 +96,11 @@ echo "bundle.sh $*" >>"$STUB_LOG"
 
 // harnessApplyIndex returns the index of the call that applies the hydrated bundle of a component, or -1.
 func harnessApplyIndex(calls, component string) int {
-	return callIndex(calls, "apply --server-side --force-conflicts -f ", "/build/dev-cell-1/bundles/"+component+"/manifests.yaml")
+	return harnessApplyIndexIn(calls, "dev-cell-1", component)
+}
+
+func harnessApplyIndexIn(calls, cluster, component string) int {
+	return callIndex(calls, "apply --server-side --force-conflicts -f ", "/build/"+cluster+"/bundles/"+component+"/manifests.yaml")
 }
 
 func runUp(t *testing.T, root, logFile string, env ...string) (string, string) {
@@ -69,7 +108,7 @@ func runUp(t *testing.T, root, logFile string, env ...string) (string, string) {
 	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))
 	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"CELL=dev-cell-1", "CELL_UP_SKIP_LINK=1", "UP_WAIT=20", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + logFile,
-		"STUB_CREATED=" + filepath.Join(root, "created.json")}, env...)
+		"STUB_CREATED=" + filepath.Join(root, "created.json"), "STUB_APPLIED=" + filepath.Join(root, "applied")}, env...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("up.sh failed: %v\n%s", err, out)
@@ -207,4 +246,199 @@ func TestUpBootstrapWritesState(t *testing.T) {
 			t.Errorf("management has no bundle state:\n%s", calls)
 		}
 	})
+}
+
+const (
+	trackNP  = "cell-system:networking.k8s.io/NetworkPolicy:cell-system/bundle-store"
+	trackSTS = "cell-system:apps/StatefulSet:cell-system/bundle-store"
+)
+
+func objJSON(kind, track, extra string) string {
+	return `{"kind":"` + kind + `","metadata":{"name":"bundle-store","annotations":{"argocd.argoproj.io/tracking-id":"` + track + `"}}` + extra + `}`
+}
+
+const (
+	staleSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store","readinessProbe":{"httpGet":{"path":"/v2/","port":"http"}},"ports":[{"name":"http","containerPort":5000}]},{"name":"store-proxy"}]}}}`
+	freshSTS = `,"spec":{"template":{"spec":{"containers":[{"name":"bundle-store"},{"name":"store-proxy","ports":[{"name":"http","containerPort":5000}]}]}}}`
+	podReady = `{"status":{"conditions":[{"type":"Ready","status":"True"}]}}`
+	podStuck = `{"status":{"conditions":[{"type":"Ready","status":"False"}]}}`
+)
+
+// storeApplies returns the objects that the store upgrade applied, by kind, with the call that applied each.
+func storeApplies(t *testing.T, root, calls string) (map[string]string, []string) {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(root, "applied", "applied-*.yaml"))
+	out := map[string]string{}
+	for _, f := range files {
+		b, _ := os.ReadFile(f)
+		for _, kind := range []string{"NetworkPolicy", "StatefulSet"} {
+			if strings.Contains(string(b), "kind: "+kind) {
+				out[kind] = string(b)
+			}
+		}
+	}
+	var lines []string
+	for _, l := range strings.Split(calls, "\n") {
+		if strings.Contains(l, "--field-manager=argocd-controller") {
+			lines = append(lines, l)
+		}
+	}
+	return out, lines
+}
+
+// TestUpStoreUpgrade: a cluster that moves from M7 to M8 keeps fields that Argo CD owned in the M7 store (the registry probe and port), and its
+// store policy lacks the API egress, which only the Argo CD set carries, so the proxy cannot review a token and Argo CD cannot sync. After the
+// bootstrap apply, up.sh applies the rendered NetworkPolicy and StatefulSet of the store with the field manager argocd-controller, keeps the
+// tracking annotation, and deletes a store pod that never became Ready. A new cluster and an upgraded cluster get no StatefulSet apply and no
+// pod delete.
+func TestUpStoreUpgrade(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		env        []string
+		wantNP     bool
+		wantSTS    bool
+		wantDelete bool
+	}{
+		{"M7 store with a stuck pod", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, staleSTS), "STUB_POD_JSON=" + podStuck}, true, true, true},
+		{"M7 store with a Ready pod", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, staleSTS), "STUB_POD_JSON=" + podReady}, true, true, false},
+		{"upgraded store", []string{"STUB_NP_JSON=" + objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON=" + objJSON("StatefulSet", trackSTS, freshSTS), "STUB_POD_JSON=" + podReady}, true, false, false},
+		{"new cluster", nil, false, false, false},
+		{"new cluster with a starting pod", []string{"STUB_STS_JSON=" + objJSON("StatefulSet", "", freshSTS), "STUB_POD_JSON=" + podStuck}, false, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, logFile := upRoot(t)
+			_, calls := runUp(t, root, logFile, tc.env...)
+			objs, lines := storeApplies(t, root, calls)
+			for kind, want := range map[string]bool{"NetworkPolicy": tc.wantNP, "StatefulSet": tc.wantSTS} {
+				if _, got := objs[kind]; got != want {
+					t.Errorf("applied %s = %v, want %v:\n%s", kind, got, want, calls)
+				}
+			}
+			for _, l := range lines {
+				if !strings.Contains(l, "apply --server-side --field-manager=argocd-controller --force-conflicts -f -") {
+					t.Errorf("the apply call is %q", l)
+				}
+			}
+			if tc.wantNP && !strings.Contains(objs["NetworkPolicy"], trackNP) {
+				t.Errorf("the NetworkPolicy lost the tracking annotation:\n%s", objs["NetworkPolicy"])
+			}
+			if tc.wantSTS && (!strings.Contains(objs["StatefulSet"], trackSTS) || strings.Contains(objs["StatefulSet"], "readinessProbe")) {
+				t.Errorf("the StatefulSet is %s, want the tracking annotation and no probe", objs["StatefulSet"])
+			}
+			del := callIndex(calls, "-n cell-system delete pod bundle-store-0")
+			if (del >= 0) != tc.wantDelete {
+				t.Errorf("delete of the store pod = %v, want %v:\n%s", del >= 0, tc.wantDelete, calls)
+			}
+			// The upgrade runs after the bootstrap apply of cell-system and before the wait for the store.
+			if tc.wantSTS {
+				boot, up, wait := harnessApplyIndex(calls, "cell-system"), callIndex(calls, "--field-manager=argocd-controller"), callIndex(calls, "rollout status statefulset/bundle-store")
+				if !(boot < up && up < wait) {
+					t.Errorf("order: bootstrap apply %d, upgrade %d, rollout wait %d:\n%s", boot, up, wait, calls)
+				}
+				if tc.wantDelete && !(up < del && del < wait) {
+					t.Errorf("the pod delete (%d) is not between the upgrade (%d) and the wait (%d)", del, up, wait)
+				}
+			}
+		})
+	}
+	t.Run("the signed path runs no upgrade", func(t *testing.T) {
+		root, logFile := upRoot(t)
+		_, calls := runUp(t, root, logFile, `STUB_STATE_JSON={"source":"signed"}`, "STUB_STS_JSON="+objJSON("StatefulSet", trackSTS, staleSTS), "STUB_NP_JSON="+objJSON("NetworkPolicy", trackNP, ""))
+		if strings.Contains(calls, "field-manager") {
+			t.Errorf("the signed path upgraded the store:\n%s", calls)
+		}
+	})
+}
+
+// TestUpCpRerendersEnvdAfterPublish: in dev-cp, the signed path publishes a signed set, and then renders envd again and applies it, before the
+// wait for the Applications. envd holds the harness plane policies of dev-cp (plane-cells for the live cells), and the signed set no longer
+// carries those rules, so a cell:up of dev-cp that left envd as it was would leave the node address of a new cell out. up.sh logs the command
+// of the publish. A cell renders nothing between the publish and the wait, and the bootstrap path of dev-cp has no signed publish.
+func TestUpCpRerendersEnvdAfterPublish(t *testing.T) {
+	waitIndex := func(calls string, after int) int {
+		lines := strings.Split(calls, "\n")
+		for i := after + 1; i < len(lines); i++ {
+			if strings.Contains(lines[i], "-n argocd get applications -o json") {
+				return i
+			}
+		}
+		return -1
+	}
+	t.Run("signed dev-cp", func(t *testing.T) {
+		root, logFile := upRoot(t)
+		out, calls := runUp(t, root, logFile, "CELL=dev-cp", `STUB_STATE_JSON={"source":"signed","state":"healthy"}`)
+		if !strings.Contains(out, "bundle.sh publish --target dev-cp") {
+			t.Errorf("up.sh does not log the publish command:\n%s", out)
+		}
+		pub := callIndex(calls, "bundle.sh publish --target dev-cp --wait")
+		wait := waitIndex(calls, pub)
+		render, apply := callIndex(calls, "render envd"), harnessApplyIndexIn(calls, "dev-cp", "envd")
+		if pub < 0 || !(pub < render && render < apply && apply < wait) {
+			t.Errorf("order: publish %d, render envd %d, apply envd %d, wait %d:\n%s", pub, render, apply, wait, calls)
+		}
+		if n := strings.Count(calls, "render spire-server"); n != 1 {
+			t.Errorf("envd alone is rendered again, and spire-server was rendered %d times, want once", n)
+		}
+	})
+	t.Run("a cell renders nothing between the publish and the wait", func(t *testing.T) {
+		root, logFile := upRoot(t)
+		_, calls := runUp(t, root, logFile, `STUB_STATE_JSON={"source":"signed","state":"healthy"}`)
+		pub := callIndex(calls, "bundle.sh publish --target dev-cell-1 --wait")
+		wait := waitIndex(calls, pub)
+		lines := strings.Split(calls, "\n")
+		for i := pub + 1; i < wait; i++ {
+			if strings.HasPrefix(lines[i], "render ") || strings.Contains(lines[i], " apply ") {
+				t.Errorf("a cell does %q between the publish and the wait", lines[i])
+			}
+		}
+	})
+	t.Run("the bootstrap path of dev-cp", func(t *testing.T) {
+		root, logFile := upRoot(t)
+		_, calls := runUp(t, root, logFile, "CELL=dev-cp")
+		pub := slices.Index(strings.Split(calls, "\n"), "publish")
+		if strings.Contains(calls, "bundle.sh") || pub < 0 {
+			t.Fatalf("the bootstrap path ran bundle.sh or no publish.sh:\n%s", calls)
+		}
+		wait := waitIndex(calls, pub)
+		lines := strings.Split(calls, "\n")
+		for i := pub + 1; i < wait; i++ {
+			if strings.HasPrefix(lines[i], "render ") {
+				t.Errorf("the bootstrap path renders %q before the wait", lines[i])
+			}
+		}
+	})
+}
+
+// TestUpCpBootstrapWritesState: dev-cp keeps its bundle state in envd-system. A cluster with no state gets the bootstrap state there, after the
+// harness apply of envd, from build/dev-cp/root.json.
+func TestUpCpBootstrapWritesState(t *testing.T) {
+	root, logFile := upRoot(t)
+	_, calls := runUp(t, root, logFile, "CELL=dev-cp")
+	create := callIndex(calls, "kubectl --context kind-dev-cp -n envd-system create -f -")
+	apply := harnessApplyIndexIn(calls, "dev-cp", "envd")
+	if create < 0 || apply < 0 || create < apply {
+		t.Fatalf("want one create of the state in envd-system after the harness apply of envd (%d, %d):\n%s", create, apply, calls)
+	}
+	var cm struct {
+		Metadata struct {
+			Name, Namespace string
+			Labels          map[string]string
+		}
+		Data map[string]string
+	}
+	raw, _ := os.ReadFile(filepath.Join(root, "created.json"))
+	if err := json.Unmarshal(raw, &cm); err != nil || cm.Metadata.Namespace != "envd-system" || cm.Metadata.Name != "bundle-state" || cm.Metadata.Labels["poc.internal/made-by"] != "bundle-bootstrap" {
+		t.Fatalf("the created object is %s (%v)", raw, err)
+	}
+	var st bundleapply.State
+	if err := record.DecodeStrict([]byte(cm.Data["state.json"]), &st); err != nil || st.Source != "bootstrap" || st.State != "healthy" || st.Root.Digest == "" {
+		t.Errorf("the bootstrap state is %+v (%v)", st, err)
+	}
+	for _, state := range []string{"bootstrap", "signed"} {
+		root, logFile := upRoot(t)
+		_, calls := runUp(t, root, logFile, "CELL=dev-cp", `STUB_STATE_JSON={"source":"`+state+`"}`)
+		if strings.Contains(calls, " create -f -") {
+			t.Errorf("a %s state exists, and up.sh created one", state)
+		}
+	}
 }

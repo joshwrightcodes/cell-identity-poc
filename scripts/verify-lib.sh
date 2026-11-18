@@ -193,7 +193,7 @@ check_agent_cells_current() {
       keycheck+=("mise run mgmt -- keycheck --cell $cell")
     fi
   done
-  cidrs="$(k -n spire-system get networkpolicy spire-server-agents -o json 2>/dev/null | jq -r '[.spec.ingress[]? | select(any(.ports[]?; .port == 8081)) | .from[]?.ipBlock.cidr] | sort | join(" ")')" || cidrs=""
+  cidrs="$(k -n spire-system get networkpolicy plane-cells -o json 2>/dev/null | jq -r '[.spec.ingress[]? | select(any(.ports[]?; .port == 8081)) | .from[]?.ipBlock.cidr] | sort | join(" ")')" || cidrs=""
   # jq sorts both sides, so the comparison does not depend on the locale of sort.
   want="$(printf '%s\n' ${want_cidrs[@]+"${want_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   [[ "$cidrs" == "$want" ]] || stale+=("the NetworkPolicy admits '$cidrs', but the agent cell nodes are '$want'")
@@ -218,7 +218,7 @@ check_agent_cells_current() {
 }
 
 # check_admit_lists succeeds when every list that admits cells by node address equals the node addresses of the live cells, in
-# both directions: the SPIRE server rule of port 8081, the ingress rules of the route ports of the relay (both Deployments), the
+# both directions: the plane-cells policy of the SPIRE server (port 8081), the plane-cells policy of the relay (its route ports), the
 # rules of N37 (8450) and N38 (8451) of the gateway, and the --cell-node arguments of the gateway. An address of a cell that has
 # no cluster fails the check as well as a live cell that is missing. A policy rule is selected by its port, never by its index.
 # While no cell is live, each cell rule is absent and each list is empty.
@@ -232,17 +232,18 @@ check_admit_lists() {
   done
   want="$(printf '%s\n' ${want_cidrs[@]+"${want_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   list_of() { jq -r --argjson p "$2" '[.spec.ingress[]? | select(any(.ports[]?; .port == $p)) | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$1"; }
-  if json="$(k -n spire-system get networkpolicy spire-server-agents -o json 2>/dev/null)"; then
+  if json="$(k -n spire-system get networkpolicy plane-cells -o json 2>/dev/null)"; then
     got="$(list_of "$json" 8081)"
   else
     got=""
   fi
   [[ "$got" == "$want" ]] || problems+=("the SPIRE server admits '$got' on port 8081, and the live cells are '$want'")
-  for name in relay-view relay-telemetry; do
-    json="$(k -n relay-system get networkpolicy "$name" -o json 2>/dev/null)" || { problems+=("cannot read NetworkPolicy relay-system/$name"); continue; }
-    got="$(jq -r '[.spec.ingress[]? | select(any(.ports[]?; .port != 8080)) | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$got" == "$want" ]] || problems+=("the relay $name admits '$got' on its route ports, and the live cells are '$want'")
-  done
+  if json="$(k -n relay-system get networkpolicy plane-cells -o json 2>/dev/null)"; then
+    got="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+  else
+    got=""
+  fi
+  [[ "$got" == "$want" ]] || problems+=("the relay plane policy plane-cells admits '$got' on its route ports, and the live cells are '$want'")
   json="$(k -n gateway-system get networkpolicy cell-gateway -o json 2>/dev/null)" || { problems+=("cannot read NetworkPolicy gateway-system/cell-gateway"); json='{}'; }
   for port in 8450 8451; do
     got="$(list_of "$json" "$port")"

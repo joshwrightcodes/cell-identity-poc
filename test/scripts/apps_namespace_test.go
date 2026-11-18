@@ -305,12 +305,15 @@ func TestCheckArgocdSecrets(t *testing.T) {
 // n-<name>.json.
 const relayKubectl = `#!/usr/bin/env bash
 args=" $* "
-for kind in deployment networkpolicy; do
-  for name in relay-view relay-telemetry; do
-    if [[ "$args" == *" get $kind $name -o json "* ]]; then
-      f="$STUB_DIR/${kind:0:1}-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
-    fi
-  done
+for name in relay-view relay-telemetry; do
+  if [[ "$args" == *" get deployment $name -o json "* ]]; then
+    f="$STUB_DIR/d-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
+  fi
+done
+for name in plane-cells plane-upstream; do
+  if [[ "$args" == *" get networkpolicy $name -o json "* ]]; then
+    f="$STUB_DIR/n-$name.json"; [[ -f "$f" ]] && cat "$f" && exit 0; exit 1
+  fi
 done
 echo "unexpected kubectl call: $*" >&2
 exit 2
@@ -326,24 +329,26 @@ func relayFixture(t *testing.T, target string, cells ...string) string {
 	for _, c := range cells {
 		from = append(from, `{"ipBlock":{"cidr":"`+c+`/32"}}`)
 	}
+	var routePorts, targetPorts []string
 	for name, ports := range map[string][]string{"relay-view": {"8443=" + target + ":31443", "8445=" + target + ":31445"}, "relay-telemetry": {"8444=" + target + ":31444"}} {
 		var args []string
 		for _, p := range ports {
 			args = append(args, `"--route"`, `"`+p+`"`)
-		}
-		deploy := `{"spec":{"template":{"spec":{"containers":[{"args":[` + strings.Join(args, ",") + `,"--health",":8080"]}]}}}}`
-		var routePorts, targetPorts []string
-		for _, p := range ports {
 			container, rest, _ := strings.Cut(p, "=")
 			routePorts = append(routePorts, `{"port":`+container+`}`)
 			targetPorts = append(targetPorts, `{"port":`+rest[strings.LastIndex(rest, ":")+1:]+`}`)
 		}
-		np := `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]},{"from":[` + strings.Join(from, ",") + `],"ports":[` + strings.Join(routePorts, ",") + `]}],` +
-			`"egress":[{"to":[],"ports":[{"port":4317}]},{"to":[{"ipBlock":{"cidr":"` + target + `/32"}}],"ports":[` + strings.Join(targetPorts, ",") + `]}]}}`
-		for f, data := range map[string]string{"d-" + name + ".json": deploy, "n-" + name + ".json": np} {
-			if err := os.WriteFile(filepath.Join(dir, f), []byte(data), 0o644); err != nil {
-				t.Fatal(err)
-			}
+		deploy := `{"spec":{"template":{"spec":{"containers":[{"args":[` + strings.Join(args, ",") + `,"--health",":8080"]}]}}}}`
+		if err := os.WriteFile(filepath.Join(dir, "d-"+name+".json"), []byte(deploy), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The two plane policies of role cp: the cells reach the route ports, and the relays reach the target node.
+	cellsPolicy := `{"spec":{"ingress":[{"from":[` + strings.Join(from, ",") + `],"ports":[` + strings.Join(routePorts, ",") + `]}]}}`
+	upstream := `{"spec":{"egress":[{"to":[{"ipBlock":{"cidr":"` + target + `/32"}}],"ports":[` + strings.Join(targetPorts, ",") + `]}]}}`
+	for f, data := range map[string]string{"n-plane-cells.json": cellsPolicy, "n-plane-upstream.json": upstream} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte(data), 0o644); err != nil {
+			t.Fatal(err)
 		}
 	}
 	return dir
@@ -358,7 +363,7 @@ func TestCheckRelayCurrent(t *testing.T) {
 	}{
 		{"current", "172.18.0.3", "172.18.0.6", ""},
 		{"the management node moved", "172.18.0.9", "172.18.0.6", "relay-view routes to '172.18.0.3'"},
-		{"a cell node moved", "172.18.0.3", "172.18.0.7", "the ingress policy of relay-view admits"},
+		{"a cell node moved", "172.18.0.3", "172.18.0.7", "the plane policy relay-system/plane-cells admits"},
 		{"the telemetry relay is missing", "172.18.0.3", "172.18.0.6", "cannot read Deployment relay-system/relay-telemetry"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -382,5 +387,43 @@ check_relay_current`
 				t.Fatalf("err %v, output %q; want a failure that names %q and the next command", err, out, tc.want)
 			}
 		})
+	}
+}
+
+// Component bundles are pushed by digest only, so a stale tag current on a component bundle is no trace: only the tag of root and the
+// Application pin of spire-server are compared with published.env.
+func TestBundleTracesIgnoreComponentTags(t *testing.T) {
+	snippet := `store_forward_start() { STORE_ADDR=x; }; store_forward_stop() { :; }
+oras() { case "${@: -1}" in *spire-server*) echo "$STUB_SPIRE_TAG" ;; *) echo sha256:r ;; esac; }
+published_digest() { sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env"; }
+kubectl() { if [[ " $* " == *" exec "* ]]; then echo '{"entries":[]}'; else command kubectl "$@"; fi; }
+mkdir -p "$BUILD_ROOT/dev-cp"; cp "$PUBLISHED" "$BUILD_ROOT/dev-cp/published.env"
+printf 'spire-server=sha256:s\n' >>"$BUILD_ROOT/dev-cp/published.env"
+bundle_traces dev-cp`
+	apps := []stubApp{
+		{"argocd", "root", "Synced", "Healthy", "sha256:r"},
+		{"argocd", "spire-server", "Synced", "Healthy", "sha256:s"},
+	}
+	for _, tag := range []string{"sha256:stale", "", "unreadable"} {
+		out, err := runLib(t, apps, snippet, "STUB_SPIRE_TAG="+tag)
+		if err != nil || strings.TrimSpace(out) != "" {
+			t.Errorf("spire-server:current is %q: err %v, output %q; want no trace", tag, err, out)
+		}
+	}
+	// The root tag still counts.
+	out, _ := runLib(t, apps, strings.Replace(snippet, "echo sha256:r", "echo sha256:old", 1), "STUB_SPIRE_TAG=sha256:s")
+	if !strings.Contains(out, "root:current in the bundle store of dev-cp is sha256:old") {
+		t.Errorf("output %q; want the trace of the stale root tag", out)
+	}
+}
+
+// The check of the AppProjects names no single other project, because a cell has two.
+func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
+	raw, err := os.ReadFile("../../scripts/verify.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "is the only other") {
+		t.Error("scripts/verify.sh still says that cell is the only other project")
 	}
 }

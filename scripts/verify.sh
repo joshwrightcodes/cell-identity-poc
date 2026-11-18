@@ -754,7 +754,7 @@ log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "No Application is outside argocd, except the mirrors of the central view" check_apps_namespace
-check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
+check "AppProject default in argocd allows nothing, and the projects of the role are the only others" check_argocd_projects
 check "argocd holds no admin password" check_no_admin_credentials
 check "argocd holds only the allowed Secrets, and the agent can list them but not get or change them" check_argocd_secrets
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only

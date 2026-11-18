@@ -4,7 +4,7 @@
 #
 #   bundle-guard.sh <role>     role cell or cp (components/lib/bundle-role.sh)
 #
-# ValidatingAdmissionPolicy bundles-spare-harness (role cell and role cp) denies each request of the application
+# ValidatingAdmissionPolicy bundles-spare-harness (role cell and role cp, resources and subresources) denies each request of the application
 # controller of Argo CD that creates, changes or deletes an object in a harness namespace of the role, that touches an
 # object whose old version carries the label cell.poc.internal/harness, or that gives an object the label.
 # ValidatingAdmissionPolicy bundles-app-limits (role cell only) denies, for an object whose tracking ID starts with the
@@ -41,7 +41,7 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
   | s("argocd.argoproj.io/tracking-id") as $track
   | {name: "argocd-controller", expression: "request.userInfo.username == \(s("system:serviceaccount:argocd:argocd-application-controller"))"} as $ctl
   | policy("bundles-spare-harness";
-      {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE", "DELETE"], resources: ["*"], scope: "*"};
+      {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE", "DELETE"], resources: ["*", "*/*"], scope: "*"};
       [$ctl];
       [{expression: "!(request.namespace in \($r.harnessNamespaces | celist))", message: "Argo CD may not change an object in a harness namespace"},
        {expression: "oldObject == null || !has(oldObject.metadata.labels) || !(\($label) in oldObject.metadata.labels)", message: "Argo CD may not change or delete an object that carries the harness label"},

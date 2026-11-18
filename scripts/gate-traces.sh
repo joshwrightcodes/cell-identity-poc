@@ -69,17 +69,17 @@ published_digest() {
   sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env" 2>/dev/null
 }
 
-# bundle_traces <cluster> prints each trace of the entries test in the cluster: a current tag or an
-# Application revision that differs from build/<cluster>/published.env, and a test entry.
+# bundle_traces <cluster> prints each trace of the entries test in the cluster: a root tag or an
+# Application revision that differs from build/<cluster>/published.env, and a test entry. Component
+# bundles are pushed by digest only, so a tag on a component bundle is no trace, and the Application
+# pin of spire-server is the check.
 bundle_traces() {
   local cluster="$1" name want got apps entries
   [[ -f "$BUILD_ROOT/$cluster/published.env" ]] || { echo "no build/$cluster/published.env. Run: CELL=$cluster mise run cell:up"; return 1; }
   store_forward_start "$cluster" || { echo "cannot reach the bundle store of $cluster"; return 1; }
-  for name in "${BUNDLE_TEST_NAMES[@]}"; do
-    want="$(published_digest "$cluster" "$name")"
-    got="$(oras resolve --plain-http "$STORE_ADDR/bundles/$name:current" 2>/dev/null)" || got="unreadable"
-    [[ -n "$want" && "$got" == "$want" ]] || echo "$name:current in the bundle store of $cluster is $got, and build/$cluster/published.env has '${want:-nothing}'"
-  done
+  want="$(published_digest "$cluster" root)"
+  got="$(oras resolve --plain-http "$STORE_ADDR/bundles/root:current" 2>/dev/null)" || got="unreadable"
+  [[ -n "$want" && "$got" == "$want" ]] || echo "root:current in the bundle store of $cluster is $got, and build/$cluster/published.env has '${want:-nothing}'"
   store_forward_stop
   apps="$(applications_json kubectl --context "kind-$cluster")" || {
     echo "cannot read the Applications of $cluster in argocd"; return 1; }
