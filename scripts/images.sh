@@ -6,12 +6,13 @@
 # images and replaces only their lines, so each other image keeps its digest, and the checks of the
 # deployed images stay green. It keeps the `# commit` line too, unless the names cover every image.
 # It replaces the file only when an image line changes, so the time of the file moves only with a digest.
-# Every successful run touches build/images.stamp, which ko_image compares with the Go sources.
+# A run of every image that succeeds touches build/images.stamp, which ko_image compares with the Go sources. A run of some images does not.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 out_file="$root/build/images.env"
 stamp_file="$root/build/images.stamp"
+full=1
 : "${KO_DOCKER_REPO:?}"
 all=(netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cell-controller cellgw)
 
@@ -48,6 +49,7 @@ if ((named)); then
   all_named=1
   for name in "${all[@]}"; do [[ " ${images[*]} " == *" $name "* ]] || all_named=0; done
   ((all_named)) && old_commit=""
+  ((all_named)) || full=0
 fi
 if [[ -n "$old_commit" ]]; then printf '%s\n' "$old_commit" >"$tmp"; else printf '# commit %s\n' "$commit" >"$tmp"; fi
 # line_for <name> prints the new IMAGE_<NAME>=<reference> line.
@@ -86,12 +88,12 @@ fi
 if [[ -f "$out_file" ]] && [[ "$(grep -v '^#' "$out_file" | sed '/^$/d')" == "$(grep -v '^#' "$tmp" | sed '/^$/d')" ]]; then
   rm -f "$tmp"
   trap - EXIT
-  touch "$stamp_file"
+  ((!full)) || touch "$stamp_file"
   printf '==> %s is unchanged: no image digest changed\n' "$out_file" >&2
   exit 0
 fi
 mv "$tmp" "$out_file"
-touch "$stamp_file"
+((!full)) || touch "$stamp_file"
 trap - EXIT
 printf '==> wrote %s\n' "$out_file" >&2
 cat "$out_file" >&2
