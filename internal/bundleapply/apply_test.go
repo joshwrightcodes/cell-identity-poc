@@ -157,7 +157,7 @@ func newEnv(t *testing.T) *env {
 		Role: "cell", Env: tEnv, Target: tTarget, Holder: "pod-a",
 		Mirror: mirror, Store: store, Dynamic: e.dyn, Client: e.cs,
 		Policy: bundle.DefaultPolicy(),
-		Keys:   func() []crypto.PublicKey { return []crypto.PublicKey{e.pub} },
+		Keys:   func() ([]crypto.PublicKey, error) { return []crypto.PublicKey{e.pub}, nil },
 		State:  e.gate, HealthTimeout: 5 * time.Minute, DegradedGrace: time.Minute, RollbackTimeout: 5 * time.Minute,
 		Poll: 5 * time.Second, Now: e.clk.Now, Log: slog.New(slog.DiscardHandler),
 	}
@@ -622,6 +622,43 @@ func (e *env) signBody(t *testing.T, mutate func(map[string]any)) []byte {
 		t.Fatal(err)
 	}
 	return env
+}
+
+// TestApplyKeysUnavailable checks that a missing key function, a failed key read and an empty key
+// list give an error that the caller can retry, and no recorded refusal.
+func TestApplyKeysUnavailable(t *testing.T) {
+	readErr := errors.New("key directory not readable")
+	cases := map[string]func(e *env) func() ([]crypto.PublicKey, error){
+		"no key function": func(*env) func() ([]crypto.PublicKey, error) { return nil },
+		"read fails": func(*env) func() ([]crypto.PublicKey, error) {
+			return func() ([]crypto.PublicKey, error) { return nil, readErr }
+		},
+		"read fails with the last keys": func(e *env) func() ([]crypto.PublicKey, error) {
+			return func() ([]crypto.PublicKey, error) { return []crypto.PublicKey{e.pub}, readErr }
+		},
+		"no keys": func(*env) func() ([]crypto.PublicKey, error) {
+			return func() ([]crypto.PublicKey, error) { return nil, nil }
+		},
+	}
+	for name, keys := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			b := e.set(1, std("v1"))
+			cfg := e.cfg
+			cfg.Keys = keys(e)
+			out, err := e.applier(cfg).Apply(t.Context(), "op1", tTarget, b.att)
+			if err == nil || out != (Outcome{}) {
+				t.Fatalf("out %+v err %v, want an error and no outcome", out, err)
+			}
+			if strings.HasPrefix(name, "read fails") && !errors.Is(err, readErr) {
+				t.Fatalf("err = %v, want the read error", err)
+			}
+			if st := e.state(); st.Result != nil || st.Holder != "" || st.Source != "bootstrap" || len(e.storeWrites()) != 0 {
+				t.Fatalf("a key fault changed the state: %+v", st)
+			}
+			wantOutcome(t, e.apply("op1", b), op.OutcomeApplied, "", "")
+		})
+	}
 }
 
 func TestApplyRootSubjectMismatch(t *testing.T) {

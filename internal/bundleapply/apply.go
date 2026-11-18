@@ -62,8 +62,9 @@ type Config struct {
 	Dynamic       dynamic.Interface
 	Client        kubernetes.Interface
 	Policy        bundle.Policy
-	// Keys returns the keys that sign attestations, read again for each apply.
-	Keys                                                func() []crypto.PublicKey
+	// Keys returns the keys that sign attestations, read again for each apply. An error or an empty
+	// list makes Apply return an error, so the caller tries the operation again.
+	Keys                                                func() ([]crypto.PublicKey, error)
 	State                                               Store
 	HealthTimeout, DegradedGrace, RollbackTimeout, Poll time.Duration
 	Now                                                 func() time.Time
@@ -132,7 +133,8 @@ func (a *Applier) lockTTL() time.Duration {
 // Apply verifies the attestation and applies the set that it signs. A final result, including a
 // refusal and a rollback, comes back as the Outcome with a nil error and is stored in the state. An
 // error means that the apply did not finish, and the caller can try again with the same operation ID:
-// the lock is held by another process (ErrLockHeld), the mirror or the store failed, or ctx ended.
+// the lock is held by another process (ErrLockHeld), the keys could not be read, the mirror or the
+// store failed, or ctx ended.
 func (a *Applier) Apply(ctx context.Context, opID, opTarget string, attestation []byte) (Outcome, error) {
 	start := a.cfg.Now()
 	ctx, span := a.tel.tracer.Start(ctx, spanApply, trace.WithAttributes(
@@ -188,6 +190,22 @@ func signer(att []byte, keys []crypto.PublicKey) string {
 	return ""
 }
 
+// keys returns the trusted keys. A missing key function, a failed read and an empty list are errors,
+// so that the caller tries again and no signature refusal is recorded for a key fault.
+func (a *Applier) keys() ([]crypto.PublicKey, error) {
+	if a.cfg.Keys == nil {
+		return nil, errors.New("bundle applier has no key function")
+	}
+	keys, err := a.cfg.Keys()
+	if err != nil {
+		return nil, fmt.Errorf("read the attestation keys: %w", err)
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("no attestation keys")
+	}
+	return keys, nil
+}
+
 // run is one apply under the lock.
 type run struct {
 	opID    string
@@ -214,7 +232,10 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 	if len(att) > op.MaxBundleArgsBytes {
 		return refused(op.ReasonPayloadInvalid, "statement"), nil
 	}
-	keys := cfg.Keys()
+	keys, err := a.keys()
+	if err != nil {
+		return Outcome{}, err
+	}
 	st, set, err := bundle.ParseAttestation(att, keys)
 	switch {
 	case errors.Is(err, record.ErrSignature):

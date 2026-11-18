@@ -485,7 +485,7 @@ func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, t
 	engine := build(bundleapply.Config{
 		Role: "cp", Env: cfg.env, Target: cfg.cluster, Holder: holder,
 		Mirror: mirror, Store: store, Dynamic: dyn, Client: kube,
-		Policy: bundle.DefaultPolicy(), Keys: keys,
+		Policy: bundle.DefaultPolicy(), Keys: engineKeys(cfg.keyFile),
 		State:         &bundleapply.ConfigMapStore{Client: kube, Namespace: cfg.bundleNS, Name: cfg.bundleName, MadeBy: name},
 		HealthTimeout: cfg.bundleHealthTimeout,
 		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
@@ -508,6 +508,18 @@ func planeKeys(path string, seed ed25519.PublicKey, log *slog.Logger) func() []c
 		}
 		last = []crypto.PublicKey{key}
 		return last
+	}
+}
+
+// engineKeys returns a function that reads the pinned key in path again on each call, for the
+// engine. A failed read is an error, so the engine leaves the operation open and tries it again later.
+func engineKeys(path string) func() ([]crypto.PublicKey, error) {
+	return func() ([]crypto.PublicKey, error) {
+		key, err := readSpecKey(path)
+		if err != nil {
+			return nil, err
+		}
+		return []crypto.PublicKey{key}, nil
 	}
 }
 

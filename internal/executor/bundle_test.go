@@ -190,7 +190,7 @@ func TestBundleKindOnlyWithApplier(t *testing.T) {
 func TestBundleEffectRealEngineRefusal(t *testing.T) {
 	r := newRig(t)
 	a := bundleapply.New(bundleapply.Config{Role: "cell", Env: "dev", Target: "cell-1",
-		Keys:  func() []crypto.PublicKey { return []crypto.PublicKey{r.pub} },
+		Keys:  func() ([]crypto.PublicKey, error) { return []crypto.PublicKey{r.pub}, nil },
 		State: &bundleapply.ConfigMapStore{Client: r.client, Namespace: DefaultNamespace, Name: "bundle-state"}})
 	e := r.executor("uid-a", func(c *Config) { c.Bundle = a })
 	res := e.Execute(ctx, r.sign(r.operation(op.KindBundleApply, `{"not":"an envelope"}`)), fence(1, 1))

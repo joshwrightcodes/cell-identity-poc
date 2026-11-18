@@ -1053,48 +1053,24 @@ func TestBundleStoreTokenReadsTheFile(t *testing.T) {
 
 func TestOpKeysReloadForBundles(t *testing.T) {
 	dir := opKeyDir(t)
-	startup, err := loadOpKeys(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	keys := bundleKeys(dir, slog.New(slog.DiscardHandler), startup)
-	if n := len(keys()); n != 2 {
-		t.Fatalf("%d keys", n)
+	keys := bundleKeys(dir)
+	if got, err := keys(); err != nil || len(got) != 2 {
+		t.Fatalf("%d keys, err %v", len(got), err)
 	}
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
 	if err := os.WriteFile(filepath.Join(dir, "third.pub"), []byte(base64.StdEncoding.EncodeToString(pub)), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(keys()); n != 3 {
-		t.Fatalf("%d keys after a new file", n)
+	if got, err := keys(); err != nil || len(got) != 3 {
+		t.Fatalf("%d keys after a new file, err %v", len(got), err)
 	}
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(keys()); n != 3 {
-		t.Fatalf("%d keys after the directory went, want the last good set", n)
-	}
-}
-
-// A failed read of the key directory before the first apply gives the keys that celld loaded at
-// startup, never an empty list, so the engine does not record a signature_invalid refusal.
-func TestBundleKeysStartWithTheStartupKeys(t *testing.T) {
-	dir := opKeyDir(t)
-	startup, err := loadOpKeys(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatal(err)
-	}
-	got := bundleKeys(dir, slog.New(slog.DiscardHandler), startup)()
-	if len(got) != len(startup) {
-		t.Fatalf("%d keys, want the %d startup keys", len(got), len(startup))
-	}
-	for i, k := range got {
-		if !k.(ed25519.PublicKey).Equal(startup[i]) {
-			t.Errorf("key %d differs from the startup key", i)
-		}
+	// A failed read is an error, so the engine leaves the operation open for a retry and records no
+	// signature refusal with keys that may be stale.
+	if got, err := keys(); err == nil || len(got) != 0 {
+		t.Fatalf("after the directory went: %d keys, err %v; want an error and no keys", len(got), err)
 	}
 }
 
@@ -1110,7 +1086,7 @@ func TestBundleFlagsReachTheEngineConfig(t *testing.T) {
 	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Tracer: tracenoop.NewTracerProvider().Tracer("t"), Meter: noop.NewMeterProvider().Meter("t")}
 	build := func(o options) bundleapply.Config {
 		t.Helper()
-		cfg, err := bundleConfig(o, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel, nil)
+		cfg, err := bundleConfig(o, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel)
 		if err != nil {
 			t.Fatal(err)
 		}

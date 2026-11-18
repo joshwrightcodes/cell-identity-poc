@@ -850,6 +850,23 @@ func TestPlaneKeysStartWithTheStartupKey(t *testing.T) {
 	}
 }
 
+// TestEngineKeysReadFailureIsAnError checks that the engine gets an error, not the startup key, when
+// the key file cannot be read, so that the engine records no signature refusal with a stale key.
+func TestEngineKeysReadFailureIsAnError(t *testing.T) {
+	b := newSigner(t)
+	path := filepath.Join(t.TempDir(), "key")
+	keys := engineKeys(path)
+	if got, err := keys(); err == nil || len(got) != 0 {
+		t.Fatalf("missing file: %v, err %v; want an error and no keys", got, err)
+	}
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(b.pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := keys(); err != nil || len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("after the file appears: %v, err %v", got, err)
+	}
+}
+
 // capture holds the engine Config that newPlane built.
 type capture struct{ cfg bundleapply.Config }
 
@@ -877,7 +894,11 @@ func TestNewPlaneBuildsTheEngine(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := newSigner(t)
-	cfg := runConfig{env: "dev", cluster: "dev-cp", key: s.pub, keyFile: filepath.Join(t.TempDir(), "missing"), bundleMirror: strings.TrimPrefix(mirror.URL, "http://"),
+	keyPath := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(s.pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := runConfig{env: "dev", cluster: "dev-cp", key: s.pub, keyFile: keyPath, bundleMirror: strings.TrimPrefix(mirror.URL, "http://"),
 		bundleStore: strings.TrimPrefix(store.URL, "http://"), bundleStoreToken: tokenPath,
 		bundleNS: "envd-system", bundleName: "bundle-state", bundleHealthTimeout: 90 * time.Second}
 	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
@@ -924,8 +945,8 @@ func TestNewPlaneBuildsTheEngine(t *testing.T) {
 		if got.Keys == nil {
 			t.Fatal("no keys")
 		}
-		if ks := got.Keys(); len(ks) != 1 || !ks[0].(ed25519.PublicKey).Equal(s.pub) {
-			t.Errorf("keys %v", ks)
+		if ks, err := got.Keys(); err != nil || len(ks) != 1 || !ks[0].(ed25519.PublicKey).Equal(s.pub) {
+			t.Errorf("keys %v, err %v", ks, err)
 		}
 	})
 	t.Run("policy", func(t *testing.T) {
