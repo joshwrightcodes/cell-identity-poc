@@ -146,6 +146,12 @@ const (
 // the restricted profile in each test namespace.
 func createNamespace(t *testing.T, cluster, ns string) {
 	t.Helper()
+	createNamespaceAt(t, cluster, ns, "restricted")
+}
+
+// createNamespaceAt is createNamespace with the named Pod Security level.
+func createNamespaceAt(t *testing.T, cluster, ns, level string) {
+	t.Helper()
 	deleteNamespace := func() error {
 		_, err := kubectl(t, cluster, "", "delete", "namespace", ns, "--ignore-not-found", "--wait=true", "--timeout=180s")
 		return err
@@ -164,8 +170,8 @@ func createNamespace(t *testing.T, cluster, ns string) {
 	default:
 		t.Fatalf("namespace %s exists in %s without the label %s=true, so it is not a test namespace", ns, cluster, testNamespaceLabel)
 	}
-	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true", %q: "restricted"}}}`,
-		ns, testNamespaceLabel, podSecurityLabel)
+	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true", %q: %q}}}`,
+		ns, testNamespaceLabel, podSecurityLabel, level)
 	if _, err := kubectl(t, cluster, manifest, "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
