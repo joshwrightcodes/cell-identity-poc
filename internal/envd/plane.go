@@ -21,6 +21,7 @@ const statusTimeout = 5 * time.Second
 // BundleApplier is the part of bundleapply.Applier that the plane path uses.
 type BundleApplier interface {
 	Apply(ctx context.Context, opID, opTarget string, attestation []byte) (bundleapply.Outcome, error)
+	Recorded(ctx context.Context, opID string) (bundleapply.Outcome, bool, error)
 	Status(ctx context.Context) (*op.BundleStatus, error)
 }
 
@@ -93,6 +94,12 @@ func (p *Plane) Offer(ctx context.Context, envelope []byte) {
 		return
 	}
 	o, res, recheck := p.check(envelope, sha)
+	if res != nil && res.Outcome == op.OutcomeExpired {
+		// The engine may have applied the operation before envd restarted. Its record answers first.
+		p.cur = &planeEntry{sha: sha}
+		p.wg.Go(func() { p.expire(ctx, res, sha) })
+		return
+	}
 	if res != nil {
 		p.cur = &planeEntry{sha: sha, res: res, recheck: recheck}
 		return
@@ -172,6 +179,37 @@ func (p *Plane) apply(ctx context.Context, o op.Operation, sha string) {
 		}
 		return
 	}
+	p.cur.res = p.engineResult(o.ID, out, sha)
+	p.cfg.Log.InfoContext(ctx, "plane bundle applied", "op", o.ID, "outcome", out.Outcome, "reason", out.Reason)
+}
+
+// expire answers an expired operation: with the result that the engine recorded for it, or with
+// expired when the engine has none. A failed lookup leaves no result, so the next offer of the same
+// envelope looks again. The engine never applies an expired operation.
+func (p *Plane) expire(ctx context.Context, expired *op.Result, sha string) {
+	out, ok, err := p.cfg.Applier.Recorded(ctx, expired.OpID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cur == nil || p.cur.sha != sha {
+		return
+	}
+	switch {
+	case err != nil:
+		p.cur = nil
+		msg := clip(err.Error())
+		if _, ok, suppressed, _ := p.logs.Allow(msg); ok {
+			p.cfg.Log.WarnContext(ctx, "plane bundle record not read", "op", expired.OpID, "error", msg, "suppressed", suppressed)
+		}
+	case ok:
+		p.cur.res = p.engineResult(expired.OpID, out, sha)
+	default:
+		p.cur.res = expired
+	}
+}
+
+// engineResult turns an engine outcome into the result of the operation. A set for another target
+// is wrong_target, and a detail that the result cannot carry is dropped.
+func (p *Plane) engineResult(opID string, out bundleapply.Outcome, sha string) *op.Result {
 	if out.Outcome == op.OutcomeRefused && out.Reason == op.ReasonPayloadInvalid && out.Detail == bundleapply.DetailTarget {
 		out.Reason = op.ReasonWrongTarget
 	}
@@ -179,8 +217,7 @@ func (p *Plane) apply(ctx context.Context, o op.Operation, sha string) {
 	if detail != "" && !op.ValidDetail(detail) {
 		detail = ""
 	}
-	p.cur.res = p.result(o.ID, out.Outcome, out.Reason, detail, sha)
-	p.cfg.Log.InfoContext(ctx, "plane bundle applied", "op", o.ID, "outcome", out.Outcome, "reason", out.Reason)
+	return p.result(opID, out.Outcome, out.Reason, detail, sha)
 }
 
 // Report returns the final result that the status report carries, and the bundle state of the

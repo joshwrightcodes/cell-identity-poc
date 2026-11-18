@@ -40,6 +40,21 @@ type fakeEngine struct {
 	release chan struct{}
 	started chan struct{}
 	status  *op.BundleStatus
+	// recorded holds the stored results that Recorded returns, and recErr fails Recorded.
+	recorded map[string]bundleapply.Outcome
+	recErr   error
+	lookups  int
+}
+
+func (e *fakeEngine) Recorded(_ context.Context, opID string) (bundleapply.Outcome, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.lookups++
+	if e.recErr != nil {
+		return bundleapply.Outcome{}, false, e.recErr
+	}
+	out, ok := e.recorded[opID]
+	return out, ok, nil
 }
 
 func (e *fakeEngine) Apply(ctx context.Context, opID, target string, att []byte) (bundleapply.Outcome, error) {
@@ -244,6 +259,55 @@ func TestPlaneBundleExpired(t *testing.T) {
 		res := r.result()
 		if res == nil || res.Outcome != op.OutcomeExpired || res.OpID != o.ID {
 			t.Fatalf("result = %+v", res)
+		}
+		if n := len(r.eng.called()); n != 0 {
+			t.Fatalf("the engine ran %d times", n)
+		}
+	})
+	expired := func(r *planeRig) op.Operation {
+		return r.operation(func(o *op.Operation) {
+			o.IssuedAt = r.clk.Now().Add(-20 * time.Minute)
+			o.ExpiresAt = r.clk.Now().Add(-10 * time.Minute)
+		})
+	}
+	t.Run("expired after the engine applied it", func(t *testing.T) {
+		// envd restarted after the apply and before mgmtd closed the operation.
+		r := newPlaneRig(t)
+		o := expired(r)
+		r.eng.recorded = map[string]bundleapply.Outcome{o.ID: {Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: "apps-sample:Synced/Degraded"}}
+		r.offer(r.sign(o))
+		res := r.result()
+		if res == nil || res.Outcome != op.OutcomeRolledBack || res.Reason != op.ReasonUnhealthy || res.Detail != "apps-sample:Synced/Degraded" || res.OpID != o.ID {
+			t.Fatalf("result = %+v, want the recorded outcome", res)
+		}
+		if n := len(r.eng.called()); n != 0 {
+			t.Fatalf("the engine applied an expired operation %d times", n)
+		}
+	})
+	t.Run("expired with a recorded set for another target", func(t *testing.T) {
+		r := newPlaneRig(t)
+		o := expired(r)
+		r.eng.recorded = map[string]bundleapply.Outcome{o.ID: {Outcome: op.OutcomeRefused, Reason: op.ReasonPayloadInvalid, Detail: bundleapply.DetailTarget}}
+		r.offer(r.sign(o))
+		if res := r.result(); res == nil || res.Outcome != op.OutcomeRefused || res.Reason != op.ReasonWrongTarget {
+			t.Fatalf("result = %+v, want wrong_target", res)
+		}
+	})
+	t.Run("expired and the lookup fails", func(t *testing.T) {
+		r := newPlaneRig(t)
+		o := expired(r)
+		r.eng.recErr = errors.New("state read refused")
+		env := r.sign(o)
+		r.offer(env)
+		if res := r.result(); res != nil {
+			t.Fatalf("result = %+v, want none while the answer is not known", res)
+		}
+		r.eng.mu.Lock()
+		r.eng.recErr = nil
+		r.eng.mu.Unlock()
+		r.offer(env)
+		if res := r.result(); res == nil || res.Outcome != op.OutcomeExpired || res.OpID != o.ID {
+			t.Fatalf("after the lookup works: %+v", res)
 		}
 		if n := len(r.eng.called()); n != 0 {
 			t.Fatalf("the engine ran %d times", n)
