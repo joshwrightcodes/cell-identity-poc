@@ -702,3 +702,141 @@ func TestCtlStepSignNotServed(t *testing.T) {
 		t.Fatalf("16 KiB: exit %d output %q", code, out)
 	}
 }
+
+// bundleCtl serves the admin socket of a plane with dev-cell-1 bound. ctl runs a command with the
+// given text on standard input.
+func bundleCtl(t *testing.T) (func(stdin string, args ...string) (int, string), *mgmt.Plane) {
+	t.Helper()
+	f := newFixture(t)
+	plane := seedBoundState(t, f)
+	sock := filepath.Join(f.sockDir, "d.sock")
+	ln, err := listenAdmin(sock)
+	must(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go serveAdmin(ctx, ln, mgmt.NewAdminHandler(plane, nil))
+	return func(stdin string, args ...string) (int, string) {
+		var out bytes.Buffer
+		d := f.deps()
+		d.stdin = strings.NewReader(stdin)
+		code := execute(ctx, append([]string{"ctl", "--socket", sock}, args...), &out, d)
+		return code, out.String()
+	}, plane
+}
+
+const bundleComponents = `[{"name":"apps-sample","wave":10,"namespace":"apps-demo","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
+
+func jsonLine(t *testing.T, out string) map[string]any {
+	t.Helper()
+	if strings.Count(out, "\n") != 1 || !strings.HasSuffix(out, "\n") {
+		t.Fatalf("output %q is not one line", out)
+	}
+	var m map[string]any
+	must(t, json.Unmarshal([]byte(out), &m))
+	return m
+}
+
+func TestCtlBundleSign(t *testing.T) {
+	ctl, plane := bundleCtl(t)
+	code, out := ctl(bundleComponents, "bundle", "sign", "--target", "dev-cell-1", "--ttl", "5m")
+	if code != 0 {
+		t.Fatalf("sign: exit %d output %q", code, out)
+	}
+	m := jsonLine(t, out)
+	opID, _ := m["opId"].(string)
+	if len(opID) != 32 || m["envelope"] == nil || m["sigstoreBundle"] == nil || m["rootDigest"] == nil || m["contentSHA256"] == nil {
+		t.Fatalf("answer %v", m)
+	}
+	if v, _ := m["version"].(map[string]any); v["counter"] != float64(1) || v["epoch"] != float64(1) {
+		t.Fatalf("version %v", m["version"])
+	}
+	sb, _ := m["sigstoreBundle"].(map[string]any)
+	if sb["mediaType"] != "application/vnd.dev.sigstore.bundle.v0.3+json" || sb["dsseEnvelope"] == nil {
+		t.Fatalf("cosign bundle %v", sb)
+	}
+	if got := len(plane.OpenOps().Ops); got != 1 {
+		t.Fatalf("%d served ops", got)
+	}
+	// A second served set is refused while the first is open, and the refusal is one line with a reason.
+	code, out = ctl(bundleComponents, "bundle", "sign", "--target", "dev-cell-1")
+	lines := jsonLines(t, out)
+	if code != 1 || len(lines) != 1 || lines[0]["reason"] != "bundle_open" {
+		t.Fatalf("second sign: exit %d output %q", code, out)
+	}
+	// --no-serve signs and never offers.
+	code, out = ctl(bundleComponents, "bundle", "sign", "--target", "dev-cell-1", "--no-serve")
+	if code != 0 || jsonLine(t, out)["version"].(map[string]any)["counter"] != float64(2) {
+		t.Fatalf("no-serve: exit %d output %q", code, out)
+	}
+	if got := len(plane.OpenOps().Ops); got != 1 {
+		t.Fatalf("%d served ops after --no-serve", got)
+	}
+	// The control plane takes a set too, and it stays out of the ops.
+	cp := `[` + cpBundleComponents + `]`
+	code, out = ctl(cp, "bundle", "sign", "--target", "dev-cp")
+	if code != 0 || len(plane.OpenOps().Ops) != 1 || len(plane.OpenOps().PlaneBundle) == 0 {
+		t.Fatalf("control plane: exit %d output %q", code, out)
+	}
+	for name, tc := range map[string]struct {
+		stdin  string
+		args   []string
+		code   int
+		reason string
+	}{
+		"no target":     {bundleComponents, []string{"bundle", "sign"}, 2, ""},
+		"unknown":       {bundleComponents, []string{"bundle", "sign", "--target", "dev-cell-9"}, 1, "payload_invalid"},
+		"empty input":   {"", []string{"bundle", "sign", "--target", "dev-cell-1", "--no-serve"}, 1, "body_invalid"},
+		"not a list":    {`{"name":"x"}`, []string{"bundle", "sign", "--target", "dev-cell-1", "--no-serve"}, 1, "body_invalid"},
+		"bad set":       {`[]`, []string{"bundle", "sign", "--target", "dev-cell-1", "--no-serve"}, 1, "payload_invalid"},
+		"bad ttl":       {bundleComponents, []string{"bundle", "sign", "--target", "dev-cell-1", "--no-serve", "--ttl", "soon"}, 1, "ttl_invalid"},
+		"line flag":     {bundleComponents, []string{"bundle", "sign", "--target", "dev-cell-1", "--line", "x"}, 2, ""},
+		"get with ttl":  {"", []string{"bundle", "get", "--target", "dev-cell-1", "--ttl", "5m"}, 2, ""},
+		"missing verb":  {"", []string{"bundle"}, 2, ""},
+		"unknown verb":  {"", []string{"bundle", "list", "--target", "dev-cell-1"}, 2, ""},
+		"positional":    {"", []string{"bundle", "get", "dev-cell-1"}, 2, ""},
+		"unknown query": {"", []string{"bundle", "get", "--target", "dev-cell-9"}, 1, "bundle_unknown"},
+	} {
+		code, out := ctl(tc.stdin, tc.args...)
+		if code != tc.code {
+			t.Errorf("%s: exit %d output %q", name, code, out)
+			continue
+		}
+		if tc.reason != "" {
+			if lines := jsonLines(t, out); len(lines) != 1 || lines[0]["reason"] != tc.reason {
+				t.Errorf("%s: output %q", name, out)
+			}
+		}
+	}
+}
+
+const cpBundleComponents = `{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"name":"spire-server","wave":5,"namespace":"spire-system","digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}`
+
+func TestCtlBundleGet(t *testing.T) {
+	ctl, _ := bundleCtl(t)
+	if code, out := ctl("", "bundle", "get", "--target", "dev-cell-1"); code != 1 || jsonLines(t, out)[0]["reason"] != "bundle_unknown" {
+		t.Fatalf("get before a set: exit %d output %q", code, out)
+	}
+	code, out := ctl(bundleComponents, "bundle", "sign", "--target", "dev-cell-1")
+	if code != 0 {
+		t.Fatalf("sign: %d %q", code, out)
+	}
+	signed := jsonLine(t, out)
+	code, out = ctl("", "bundle", "get", "--target", "dev-cell-1")
+	if code != 0 {
+		t.Fatalf("get: %d %q", code, out)
+	}
+	got := jsonLine(t, out)
+	if got["opId"] != signed["opId"] || got["rootDigest"] != signed["rootDigest"] || got["contentSHA256"] != signed["contentSHA256"] || got["served"] != true || got["result"] != nil {
+		t.Fatalf("get %v, sign %v", got, signed)
+	}
+	if comps, _ := got["components"].([]any); len(comps) != 2 {
+		t.Fatalf("components %v", got["components"])
+	}
+	// status shows the set under the cell.
+	code, out = ctl("", "status")
+	st := jsonLine(t, out)
+	cells, _ := st["cells"].([]any)
+	if code != 0 || len(cells) == 0 || cells[0].(map[string]any)["bundle"] == nil {
+		t.Fatalf("status %q", out)
+	}
+}

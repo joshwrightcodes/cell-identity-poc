@@ -76,43 +76,51 @@ func (p *Plane) CreateOp(ctx context.Context, cell, kind string, args json.RawMe
 		if t.st.Cells[cell] == nil {
 			return refuse(mgmtapi.ReasonNotBound, "")
 		}
-		open := 0
-		for _, s := range t.st.Ops {
-			if s.open(t.now) {
-				open++
-			}
-		}
-		if open >= MaxOpenOps {
-			return refuse(mgmtapi.ReasonRateLimited, "too_many_open_ops")
-		}
-		id := op.NewID()
-		for t.st.Ops[id] != nil {
-			id = op.NewID()
-		}
-		issued := t.now.UTC().Truncate(time.Second)
-		o = op.Operation{
-			ID: id, Env: t.p.cfg.Intent.Env, Cell: cell, Kind: kind, Version: 1, KeyEpoch: t.st.Last.Epoch,
-			IssuedAt: issued, ExpiresAt: issued.Add(ttl), Args: slices.Clone(args),
-		}
 		var err error
-		if env, err = op.Sign(o, t.key); err != nil {
-			return err
-		}
-		t.st.Ops[id] = &OpState{
-			Cell: cell, Envelopes: []string{op.EnvelopeSHA256(env)}, Envelope: env, KeyEpoch: o.KeyEpoch,
-			IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt, Served: serve,
-		}
-		t.st.OpOrder = append(t.st.OpOrder, id)
-		if !trimOps(t.st, t.now) {
-			return refuse(mgmtapi.ReasonRateLimited, "too_many_open_ops")
-		}
-		t.dirty = true
-		return nil
+		o, env, err = t.addOp(cell, kind, args, ttl, serve)
+		return err
 	})
 	if err != nil {
 		return op.Operation{}, nil, err
 	}
 	return o, slices.Clone(env), nil
+}
+
+// addOp signs an operation for target, records it and marks the state dirty. It refuses at
+// MaxOpenOps open operations.
+func (t *txn) addOp(target, kind string, args json.RawMessage, ttl time.Duration, serve bool) (op.Operation, []byte, error) {
+	open := 0
+	for _, s := range t.st.Ops {
+		if s.open(t.now) {
+			open++
+		}
+	}
+	if open >= MaxOpenOps {
+		return op.Operation{}, nil, refuse(mgmtapi.ReasonRateLimited, "too_many_open_ops")
+	}
+	id := op.NewID()
+	for t.st.Ops[id] != nil {
+		id = op.NewID()
+	}
+	issued := t.now.UTC().Truncate(time.Second)
+	o := op.Operation{
+		ID: id, Env: t.p.cfg.Intent.Env, Cell: target, Kind: kind, Version: 1, KeyEpoch: t.st.Last.Epoch,
+		IssuedAt: issued, ExpiresAt: issued.Add(ttl), Args: slices.Clone(args),
+	}
+	env, err := op.Sign(o, t.key)
+	if err != nil {
+		return op.Operation{}, nil, err
+	}
+	t.st.Ops[id] = &OpState{
+		Cell: target, Envelopes: []string{op.EnvelopeSHA256(env)}, Envelope: env, KeyEpoch: o.KeyEpoch,
+		IssuedAt: o.IssuedAt, ExpiresAt: o.ExpiresAt, Served: serve,
+	}
+	t.st.OpOrder = append(t.st.OpOrder, id)
+	if !trimOps(t.st, t.now) {
+		return op.Operation{}, nil, refuse(mgmtapi.ReasonRateLimited, "too_many_open_ops")
+	}
+	t.dirty = true
+	return o, env, nil
 }
 
 // trimOps drops operations until OpHistory remain: the oldest final one first, then the oldest one
@@ -135,7 +143,8 @@ func trimOps(st *State, now time.Time) bool {
 
 // OpenOps returns the envelopes of the served operations that have no final result and are not
 // past ExpiresAt plus 60 s, and one CellInfo with a fresh nonce for each intent cell. An operation
-// past that time gets ExpiredAt.
+// past that time gets ExpiredAt. An operation for the control plane is never in Ops: the newest one
+// is PlaneBundle, so that it never reaches the queue of the gateway.
 func (p *Plane) OpenOps() mgmtapi.OpsBundle {
 	now := p.cfg.Now()
 	st := p.snap.Load().st
@@ -157,11 +166,18 @@ func (p *Plane) OpenOps() mgmtapi.OpsBundle {
 		}
 		st = p.snap.Load().st
 	}
+	cp := p.cfg.Intent.ControlPlaneName()
 	b := mgmtapi.OpsBundle{Ops: []json.RawMessage{}, Cells: []mgmtapi.CellInfo{}}
 	for _, id := range st.OpOrder {
-		if o := st.Ops[id]; o.Served && o.open(now) {
-			b.Ops = append(b.Ops, slices.Clone(json.RawMessage(o.Envelope)))
+		o := st.Ops[id]
+		if !o.Served || !o.open(now) {
+			continue
 		}
+		if o.Cell == cp {
+			b.PlaneBundle = slices.Clone(json.RawMessage(o.Envelope))
+			continue
+		}
+		b.Ops = append(b.Ops, slices.Clone(json.RawMessage(o.Envelope)))
 	}
 	for _, name := range p.intentNames(st) {
 		nonce, exp := p.nonces.Issue(name)
@@ -209,6 +225,11 @@ func (t *txn) resignOps() error {
 			return fmt.Errorf("operation %s: %w", id, err)
 		}
 		cur.KeyEpoch = t.rev.Epoch
+		if cur.Kind == op.KindBundleApply {
+			if cur.Args, err = resignAttestation(cur.Args, t.key); err != nil {
+				return fmt.Errorf("operation %s: %w", id, err)
+			}
+		}
 		env, err := op.Sign(cur, t.key)
 		if err != nil {
 			return err

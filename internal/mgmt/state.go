@@ -104,6 +104,8 @@ type State struct {
 	// Requests holds the portal requests by cell. The field is never omitted: a state without it
 	// predates the portal, and NewPlane turns each bound cell of that state into a request once.
 	Requests map[string]*Request `json:"requests"`
+	// Bundles holds the bundle state of each target, by target name.
+	Bundles map[string]*BundleState `json:"bundles,omitempty"`
 }
 
 func newState(keySHA string) *State {
@@ -132,6 +134,13 @@ func (s *State) clone() *State {
 		c.Ops[k] = &o
 	}
 	c.OpOrder = slices.Clone(s.OpOrder)
+	if s.Bundles != nil {
+		c.Bundles = make(map[string]*BundleState, len(s.Bundles))
+		for k, v := range s.Bundles {
+			b := *v
+			c.Bundles[k] = &b
+		}
+	}
 	if s.Requests != nil {
 		c.Requests = make(map[string]*Request, len(s.Requests))
 		for k, v := range s.Requests {
