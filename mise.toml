@@ -182,7 +182,7 @@ env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell. The last step runs bundle -- publish --wait for both cells, so each cell applies a signed bundle set"
+description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell. The last step runs bundle -- publish --wait for dev-cp and both cells, so each of them applies a signed bundle set"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 
