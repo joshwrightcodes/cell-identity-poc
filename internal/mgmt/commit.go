@@ -13,6 +13,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 )
 
 // txn is one change under the mutex. It works on a clone of the current state.
@@ -31,11 +32,27 @@ type txn struct {
 }
 
 func (p *Plane) commit(fn func(*txn) error) error {
-	changed, err := p.commitTxn(fn)
+	changed, sealed, err := p.commitTxn(fn)
 	if err == nil && changed {
 		p.notifyRecords()
 	}
+	if err == nil && sealed {
+		p.notifySpec()
+	}
 	return err
+}
+
+// notifySpec hands the newest signed spec to Config.OnSpec. It reads the current snapshot, so a
+// callback that runs late still publishes the newest spec. It runs outside the commit mutex.
+func (p *Plane) notifySpec() {
+	if p.cfg.OnSpec == nil || !p.ready.Load() {
+		return
+	}
+	p.cbmu.Lock()
+	defer p.cbmu.Unlock()
+	if l := p.snap.Load().st.latest(); l != nil {
+		p.cfg.OnSpec(slices.Clone(l.Bundle.Spec))
+	}
 }
 
 // notifyRecords hands the served records to Config.OnRecords. It reads the current snapshot, so a
@@ -71,8 +88,9 @@ func sameRecords(a, b *Signed) bool {
 	return maps.EqualFunc(ra, rb, func(x, y json.RawMessage) bool { return bytes.Equal(x, y) })
 }
 
-// commitTxn runs one change under the mutex. It reports whether the served records changed.
-func (p *Plane) commitTxn(fn func(*txn) error) (changed bool, err error) {
+// commitTxn runs one change under the mutex. It reports whether the served records changed and
+// whether it signed a spec.
+func (p *Plane) commitTxn(fn func(*txn) error) (changed, sealed bool, err error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	cur := p.snap.Load()
@@ -88,23 +106,23 @@ func (p *Plane) commitTxn(fn func(*txn) error) (changed bool, err error) {
 		maps.Copy(t.records, l.Bundle.Records)
 	}
 	if err = fn(t); err != nil {
-		return false, err
+		return false, false, err
 	}
 	switch {
 	case t.revised:
 		if err = t.seal(); err != nil {
-			return false, err
+			return false, false, err
 		}
 	case t.dirty:
 	default:
 		for _, f := range t.after {
 			f()
 		}
-		return false, nil
+		return false, false, nil
 	}
 	t.st.Seq++
 	if err = p.cfg.Store.Save(t.st); err != nil {
-		return false, fmt.Errorf("save state: %w", err)
+		return false, false, fmt.Errorf("save state: %w", err)
 	}
 	changed = !sameRecords(cur.st.served(), t.st.served()) || !bytes.Equal(cur.pub, t.key.Public().(ed25519.PublicKey))
 	p.key = t.key
@@ -113,7 +131,7 @@ func (p *Plane) commitTxn(fn func(*txn) error) (changed bool, err error) {
 	for _, f := range t.after {
 		f()
 	}
-	return changed, nil
+	return changed, t.revised, nil
 }
 
 // revise starts a new spec revision. It refuses while a restore is active, unless the change is a
@@ -144,7 +162,7 @@ func (t *txn) signCell(name string) error {
 	if cs == nil {
 		return fmt.Errorf("cell %q is not bound", name)
 	}
-	if ic, ok := t.p.intent[name]; ok {
+	if ic, ok := t.p.cellIn(t.st, name); ok {
 		cs.Subjects = sortedSubjects(ic.Subjects)
 	}
 	env, err := record.Sign(record.Cell{
@@ -183,6 +201,31 @@ func (t *txn) seal() error {
 			return refuse(mgmtapi.ReasonKeysUntrusted, "bundle_too_large")
 		}
 	}
+	stepEnvs := map[string]json.RawMessage{}
+	for _, name := range sortedKeys(t.st.Requests) {
+		ss := t.st.Requests[name].Step
+		if ss != nil && !ss.open() {
+			s.Closed = append(s.Closed, ss.ID)
+			continue
+		}
+		if _, in := t.p.cellIn(t.st, name); !in || !ss.open() {
+			continue
+		}
+		_, payload, err := step.Verify(ss.Envelope, pubs)
+		if err != nil {
+			return fmt.Errorf("step of %q: %w", name, err)
+		}
+		s.Steps = append(s.Steps, spec.StepEntry{Name: name, StepID: ss.ID, StepSHA256: step.PayloadSHA256(payload)})
+		stepEnvs[name] = ss.Envelope
+		if total += len(ss.Envelope); total > maxBundleBytes {
+			return refuse(mgmtapi.ReasonKeysUntrusted, "bundle_too_large")
+		}
+	}
+	// Closed holds each step that a bind closed, for as long as its request names the step. A retry,
+	// a recreate or a withdraw replaces or removes the step and so ends the entry. The host keeps a
+	// close that it applied and changes nothing in a step that has a final state, so the end of
+	// the entry only reaches a step that the host never saw closed.
+	slices.Sort(s.Closed)
 	for _, name := range sortedKeys(t.st.Retired) {
 		s.Retired = append(s.Retired, spec.Retired{Name: name, Revision: t.st.Retired[name]})
 	}
@@ -194,7 +237,7 @@ func (t *txn) seal() error {
 	if t.reset {
 		t.st.History = nil
 	}
-	t.st.History = append(t.st.History, Signed{Revision: t.rev, Bundle: mgmtapi.SpecBundle{Spec: env, Records: records}})
+	t.st.History = append(t.st.History, Signed{Revision: t.rev, Bundle: mgmtapi.SpecBundle{Spec: env, Records: records, Steps: bundleSteps(stepEnvs)}})
 	if n := len(t.st.History); n > t.p.cfg.HistoryLen {
 		t.st.History = slices.Clone(t.st.History[n-t.p.cfg.HistoryLen:])
 	}
@@ -224,7 +267,10 @@ func (p *Plane) resignAll(fp string) func(*txn) error {
 				return err
 			}
 		}
-		return t.resignOps()
+		if err := t.resignOps(); err != nil {
+			return err
+		}
+		return t.resignSteps()
 	}
 }
 
@@ -233,4 +279,12 @@ func (t *txn) expectSeq(expect *uint64) error {
 		return refuse(mgmtapi.ReasonConflict, fmt.Sprintf("state version is %d, not %d", t.st.Seq, *expect))
 	}
 	return nil
+}
+
+// bundleSteps returns nil for no step, so that a bundle without steps marshals as in M4.
+func bundleSteps(m map[string]json.RawMessage) map[string]json.RawMessage {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
 }

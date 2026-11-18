@@ -71,8 +71,12 @@ type PullerConfig struct {
 	// legs out, and a nil Hints leaves out the hints of the key plugin.
 	Gateway GatewayClient
 	Hints   HintSource
-	Now     func() time.Time
-	Sleep   func(context.Context, time.Duration) error
+	// Steps and StepStatus switch on the step legs. A nil Steps writes no steps ConfigMap, and a nil
+	// StepStatus forwards no step status.
+	Steps      StepStore
+	StepStatus StepStatusSource
+	Now        func() time.Time
+	Sleep      func(context.Context, time.Duration) error
 }
 
 // Puller pulls the bundle of one environment in rounds, accepts it, saves it and reports.
@@ -102,6 +106,8 @@ type Puller struct {
 	hintPending map[string]time.Time
 	// relaySkipped is true while the relay legs wait for the first accepted spec.
 	relaySkipped bool
+	// stepsWritten identifies the content that this process last wrote to the steps ConfigMap.
+	stepsWritten string
 }
 
 // NewPuller returns a Puller for cfg.
@@ -277,8 +283,9 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 		gw = p.relay(ctx)
 	}
 	hints := p.pendingHints(ctx, gw)
+	steps, stepsAt := p.stepStatus(ctx)
 	if p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
-		KeyHints: hints, Gateway: gw}) {
+		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt}) {
 		p.forwarded(hints)
 	}
 	return failed
@@ -305,6 +312,9 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 		if saveErr != nil && p.unverifiable && errors.Is(saveErr, ErrStoreNewer) {
 			saveErr = p.cfg.Store.Replace(sctx, next)
 		}
+		if saveErr == nil {
+			saveErr = p.saveSteps(sctx, next)
+		}
 		if err := saveErr; err != nil {
 			fail(saveSpan, err)
 			p.storeErr = mgmtapi.ReasonStoreFailed
@@ -323,6 +333,12 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 		}
 		saveSpan.End()
 	default:
+		if err := p.saveSteps(rctx, next); err != nil {
+			p.storeErr = mgmtapi.ReasonStoreFailed
+			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
+		} else {
+			p.state = next
+		}
 		if !p.refusedNow {
 			p.refusal = nil
 			p.lastPair = ""
@@ -330,6 +346,43 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 	}
 	acceptSpan.End()
 	return failed
+}
+
+// saveSteps writes the steps ConfigMap from st when st holds steps that Accept verified and the
+// content differs from what this process last wrote. A state that the store loaded or that syncStore
+// adopted holds no verified steps, so it never writes.
+func (p *Puller) saveSteps(ctx context.Context, st *State) error {
+	if p.cfg.Steps == nil || !st.stepsVerified {
+		return nil
+	}
+	digest := stepsDigest(st)
+	if digest == p.stepsWritten {
+		return nil
+	}
+	if err := p.cfg.Steps.Save(ctx, st); err != nil {
+		return err
+	}
+	p.stepsWritten = digest
+	return nil
+}
+
+// stepStatus reads the step status that the cell controller wrote. It returns nothing when there is
+// no status source or no entry, so the report then carries no step keys.
+func (p *Puller) stepStatus(ctx context.Context) ([]mgmtapi.StepStatus, time.Time) {
+	if p.cfg.StepStatus == nil {
+		return nil, time.Time{}
+	}
+	rctx, cancel := context.WithTimeout(ctx, min(hintsTimeout, p.cfg.RoundTimeout))
+	defer cancel()
+	steps, at, err := p.cfg.StepStatus.Read(rctx)
+	if err != nil {
+		p.logLimited(ctx, "step status read failed", "stepstatus", "error", clip(err.Error()))
+		return nil, time.Time{}
+	}
+	if len(steps) == 0 {
+		return nil, time.Time{}
+	}
+	return steps, at
 }
 
 // sameContent reports whether two states hold the same signed spec and records.
@@ -375,7 +428,7 @@ func (p *Puller) syncStore(ctx context.Context) {
 		for k, v := range live.Records {
 			b.Records[k] = v
 		}
-		next, changed, aerr := Accept(p.state, b, p.cfg.Env, p.cfg.Keys)
+		next, changed, _, aerr := acceptRecords(p.state, b, p.cfg.Env, p.cfg.Keys)
 		var refused *Refused
 		switch {
 		case errors.As(aerr, &refused):

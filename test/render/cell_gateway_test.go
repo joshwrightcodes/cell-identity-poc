@@ -232,3 +232,60 @@ func TestCellGatewayRenderFailsClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestCellGatewayRenderNoLiveCells: with no cell cluster the render succeeds, passes no --cell-node, reads no cell
+// facts, and prints neither the N37 rule nor the N38 rule. The envd and kubelet rules stay.
+func TestCellGatewayRenderNoLiveCells(t *testing.T) {
+	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	if strings.Contains(r.stdout, "--cell-node") {
+		t.Errorf("the render passes --cell-node with no live cell:\n%s", r.stdout)
+	}
+	if strings.Contains(r.log, "facts --cluster dev-cell") {
+		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
+	}
+	objs := objectsIn(t, r.stdout)
+	np := objs["NetworkPolicy gateway-system/cell-gateway"]
+	var ingress []string
+	for _, rule := range get[[]any](t, np, "spec", "ingress") {
+		ingress = append(ingress, fmt.Sprintf("%s %v", peerList(t, rule, "from"), portList(t, rule)))
+	}
+	if want := []string{"envd-system/envd [8452]", "172.18.0.4/32 [8080]"}; !slices.Equal(ingress, want) {
+		t.Errorf("ingress rules are %v, want %v", ingress, want)
+	}
+	sts := objs["StatefulSet gateway-system/cell-gateway"]
+	ctr := named(t, get[[]any](t, sts, "spec", "template", "spec", "containers"), "cellgw")
+	for _, a := range get[[]any](t, ctr, "args") {
+		if a == "" {
+			t.Errorf("the cellgw args hold an empty entry: %v", get[[]any](t, ctr, "args"))
+		}
+	}
+}
+
+// TestCellGatewayRenderOneLiveCell: one live cell gives one --cell-node and one address in the N37 and N38 rules.
+func TestCellGatewayRenderOneLiveCell(t *testing.T) {
+	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-2")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	if strings.Count(r.stdout, "--cell-node=") != 1 || !strings.Contains(r.stdout, "--cell-node=dev-cell-2=10.9.0.2") {
+		t.Errorf("the render must pass --cell-node=dev-cell-2=10.9.0.2 only:\n%s", r.stdout)
+	}
+	np := objectsIn(t, r.stdout)["NetworkPolicy gateway-system/cell-gateway"]
+	rules := get[[]any](t, np, "spec", "ingress")
+	if len(rules) != 4 || peerList(t, rules[0], "from") != "10.9.0.2/32" || peerList(t, rules[1], "from") != "10.9.0.2/32" {
+		t.Errorf("ingress rules %v, want the two cell rules to admit 10.9.0.2/32", rules)
+	}
+}
+
+// TestCellGatewayRenderLiveCellWithoutFacts: a live cell whose facts fail stops the render, so a read error never
+// removes a cell from the admit list.
+func TestCellGatewayRenderLiveCellWithoutFacts(t *testing.T) {
+	r := renderGateway(t, "STUB_FACTS_FAIL=dev-cell-2")
+	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "no host service facts for the live cell dev-cell-2") ||
+		!strings.Contains(r.stderr, "mise run hostsvc -- facts --cluster dev-cell-2") {
+		t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that names the facts command", r.err, len(r.stdout), r.stderr)
+	}
+}

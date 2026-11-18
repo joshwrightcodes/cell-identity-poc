@@ -5,9 +5,53 @@
 # store, or asks for secrets:connect in a second shell. Then apply the harness components and wait
 # for their rollouts (scripts/attest-wait.sh for cell-identity). UP_WAIT sets the bound of the Application wait in seconds (default 900).
 # Last, run the link phase (scripts/link.sh), unless CELL_UP_SKIP_LINK=1.
+# The run takes the lock of the cluster (cluster_lock in scripts/lib.sh), and a step of the host service waits for it.
+# A cell has no cluster until a signed step creates it, so cell:up of an absent cell stops with cell_needs_step and the
+# portal command. A step creates the cluster first, and then this script runs.
+# HARNESS_ONLY=<component> renders and applies only that harness component of an existing cluster, prunes what its bundle
+# no longer holds, and waits for its rollout. It skips the host service, the bootstrap set, the publish and the Application wait.
 source "$(dirname "$0")/lib.sh"
 
 ((${#COMPONENTS[@]} > 0)) || die "cell $CELL_NAME has no components in harness/topology.yaml"
+
+# wait_component <component> <namespace> waits for the rollout of a harness component. The component cell-identity gets
+# the stage by stage wait of scripts/attest-wait.sh, and the others the plain rollout wait.
+wait_component() {
+  local waited
+  if [[ "$1" == cell-identity ]]; then
+    harness_workloads cell-identity "$2" >/dev/null || exit 1
+    # The script prints "skipped" on standard output when the management plane does not answer.
+    waited="$("$ROOT/scripts/attest-wait.sh" "$CELL_NAME")"
+    if [[ "$waited" == skipped ]]; then
+      log "harness component cell-identity was not waited for, so it may not be Ready. Link management first, then run: CELL=$CELL_NAME mise run cell:up"
+      return 0
+    fi
+  else
+    harness_rollout_wait "$1" "$2"
+  fi
+  log "harness component $1 is rolled out"
+}
+
+cluster_lock "$CELL_NAME"
+
+if [[ -n "${HARNESS_ONLY:-}" ]]; then
+  entry="$(harness_only_entry)" || exit 1
+  kind get clusters 2>/dev/null | grep -qx -- "$CELL_NAME" \
+    || die "HARNESS_ONLY needs the cluster $CELL_NAME, and it does not exist. Run: CELL=$CELL_NAME mise run cell:up"
+  log "applying only the harness component ${entry%%:*} of $CELL_NAME"
+  "$ROOT/scripts/facts.sh"
+  HARNESS_ONLY="${entry%%:*}" "$ROOT/scripts/hydrate.sh"
+  harness_apply "${entry%%:*}"
+  wait_component "${entry%%:*}" "${entry#*:}"
+  log "cell $CELL_NAME has the harness component ${entry%%:*} up to date."
+  exit 0
+fi
+
+# A cell of the catalog exists only through a signed step. cell:up of a cell that has no cluster says so, and it names the
+# portal command. A re-apply to an existing cluster stays allowed: repairs and rotations use it.
+if grep -qx -- "$CELL_NAME" <<<"$(catalog_cells)" && ! kind get clusters 2>/dev/null | grep -qx -- "$CELL_NAME"; then
+  die "cell_needs_step: cell $CELL_NAME has no cluster, and only a signed step creates it. Run: mise run portal -- request --cell $CELL_NAME --wait"
+fi
 # The link phase comes last, and it needs other clusters. Check them before the first step, so a
 # missing cluster stops cell:up in seconds and not after the base cell.
 if [[ "${CELL_UP_SKIP_LINK:-}" != 1 ]]; then
@@ -42,6 +86,8 @@ store_done=0
 last_hint=-60
 # Without direnv, the token command still comes from .envrc.local.
 [[ -z "${SECRET_STORE_NAMESPACES:-}" ]] || load_local_settings POC_SECRET_TOKEN_CMD
+# A step of the host service runs with no secret manager command. The log line shows that, and never the value.
+[[ -z "${POC_STEP_ID:-}" ]] || log "secret_token_cmd_set=$([[ -n "${POC_SECRET_TOKEN_CMD:-}" ]] && echo true || echo false)"
 until apps_at_published 2>/dev/null; do
   if [[ -n "${SECRET_STORE_NAMESPACES:-}" ]] && ((!store_done)); then
     connect_store_step "$ROOT/scripts/secrets-connect.sh"
@@ -69,18 +115,7 @@ done
 # each stage of the first attestation and names the stage that fails. The other components keep the
 # plain rollout wait.
 for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
-  if [[ "${entry%%:*}" == cell-identity ]]; then
-    harness_workloads cell-identity "${entry#*:}" >/dev/null || exit 1
-    # The script prints "skipped" on standard output when the management plane does not answer.
-    waited="$("$ROOT/scripts/attest-wait.sh" "$CELL_NAME")"
-    if [[ "$waited" == skipped ]]; then
-      log "harness component cell-identity was not waited for, so it may not be Ready. Link management first, then run: CELL=$CELL_NAME mise run cell:up"
-      continue
-    fi
-  else
-    harness_rollout_wait "${entry%%:*}" "${entry#*:}"
-  fi
-  log "harness component ${entry%%:*} is rolled out"
+  wait_component "${entry%%:*}" "${entry#*:}"
 done
 if ((${#LINK_COMPONENTS[@]} > 0)); then
   if [[ "${CELL_UP_SKIP_LINK:-}" == 1 ]]; then

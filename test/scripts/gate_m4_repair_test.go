@@ -73,7 +73,7 @@ func TestGateM4Repair(t *testing.T) {
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2} {
+	for name, body := range map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "bin/kind": stubKind, "bin/docker": stubDocker, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2} {
 		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -163,7 +163,7 @@ func TestGateM4RepairTestState(t *testing.T) {
 	live := caPEM(t, 1)
 	block, _ := pem.Decode([]byte(live))
 	sum := sha256.Sum256(block.Bytes)
-	files := map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2,
+	files := map[string]string{"bin/kubectl": repairKubectl, "bin/mise": repairMise, "bin/kind": stubKind, "bin/docker": stubDocker, "stub/serve": repairServe, "stub/replicas": repairReplicas, "stub/m2": repairM2,
 		"stub/live-root.pem": live, "stub/pin.pem": live,
 		"stub/namespaces.json": `{"items":[
  {"metadata":{"name":"m4-bind","labels":{"cell.poc.internal/e2e":"true"}}},

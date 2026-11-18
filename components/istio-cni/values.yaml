@@ -1,3 +1,5 @@
+global:
+  hub: docker.io/istio
 resources:
   requests:
     cpu: 50m

@@ -2,7 +2,8 @@
 # Print the log lines of the pods that match a label selector, as JSON lines on standard output, each with
 # the fields cluster, namespace, pod and container. Usage: logs.sh <cluster or all> <label selector>
 #
-# "all" reads every cluster that has components in harness/topology.yaml. A line that is not a JSON object
+# "all" reads every cluster that has components in harness/topology.yaml and exists now. A cell with no cluster is skipped with one line on
+# standard error. A cell that is named and has no cluster gives one JSON error line with the portal command. A line that is not a JSON object
 # becomes {"cluster": ..., "raw": <line>} with the same fields. A field "cluster" that a log line already holds
 # moves to "source_cluster". A cluster that cannot be read gives one error line with its name, and the exit
 # status is 1 at the end, so the logs of the other clusters stay readable. LOGS_TAIL (default 200) is the number
@@ -15,10 +16,19 @@ clusters="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROO
 if [[ -z "$target" || -z "$selector" ]]; then
   json_fail harness:logs "two arguments are required. Usage: mise run harness:logs <cluster or all> <label selector>"
 fi
+existing="$(existing_clusters)" || json_fail harness:logs "could not list the clusters. Run: docker ps"
 targets=()
 if [[ "$target" == all ]]; then
-  while IFS= read -r name; do targets+=("$name"); done <<<"$clusters"
+  while IFS= read -r name; do
+    if grep -Fxq -- "$name" <<<"$existing"; then targets+=("$name"); else log "$name has no cluster, so its logs are skipped"; fi
+  done <<<"$clusters"
 elif grep -Fxq -- "$target" <<<"$clusters"; then
+  if ! grep -Fxq -- "$target" <<<"$existing"; then
+    if catalog_cells | grep -Fxq -- "$target"; then
+      json_fail harness:logs "the cluster $target does not exist. Run: mise run portal -- recreate --cell $target"
+    fi
+    json_fail harness:logs "the cluster $target does not exist. Rebuild it with the commands in the README section Rebuild one cluster, or run: mise run harness:up"
+  fi
   targets=("$target")
 else
   json_fail harness:logs "the argument '$target' is not all or a cluster with components: $(paste -sd' ' - <<<"$clusters"). Usage: mise run harness:logs <cluster or all> <label selector>"

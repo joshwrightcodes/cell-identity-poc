@@ -146,7 +146,7 @@ func runPrune(t *testing.T, render string) (calls, stderr string, err error) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
-	for _, d := range []string{"scripts", "cells", "harness"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 		copyFiles(t, root, d)
 	}
 	stub := filepath.Join(root, "stub")

@@ -75,6 +75,15 @@ if holder="$(lock_holder)"; then
   die "a repair already runs as process $holder. Wait until it ends, or stop it with kill $holder. Then run the command again"
 fi
 
+# The repair works on dev-cell-1, which exists only through a signed step. A cell that is not live has nothing to repair.
+if ! live="$(live_cells)"; then
+  die "$live"
+fi
+if ! grep -qx -- "$CELL_NAME" <<<"$live"; then
+  log "$CELL_NAME is not live (no cluster, or no node address), so there is nothing to repair there"
+  exit 0
+fi
+
 if [[ "${1:-}" == "--check" ]]; then
   found=()
   # The node traces come first. The JWKS counts only on a node without traces, because the API

@@ -13,7 +13,7 @@
 | Task | Command |
 | --- | --- |
 | Start or stop the Colima VM | `mise run vm:up`, `mise run vm:down` |
-| Create all five clusters, build the images and set up each cluster with components | `mise run harness:up` |
+| Create `management`, `dev-cp` and `rogue`, build the images, set up each cluster with components, and create the two cells through the portal (see README "Provisioning") | `mise run harness:up` |
 | Report whether the PoC is healthy: one JSON object for each cluster (see README "Operator status and logs") | `mise run harness:status` |
 | Run `cell:verify` on every cluster with components | `mise run harness:verify` |
 | Print the JSON logs of pods by label selector, with a `cluster` field | `mise run harness:logs all app.kubernetes.io/name=otel-uplink` |
@@ -48,7 +48,8 @@
 | Run the M3 end-to-end gate against the management plane and `dev-cp` | `mise run gate:m3` |
 | Repair the objects and firewall rules that a `gate:m3` run left when it stopped before its cleanups (`--check` only lists them) | `mise run gate:m3:repair` |
 | Repair `dev-cp` and `dev-cell-1` after any `gate:m2` run that stopped before its cleanups (usually a few minutes; the README lists the bounds) | `mise run gate:m2:repair` |
-| Run the host service on this Mac (see README "Host service and mgmtd"): `start`, `stop`, `restart`, `status` or `pin` | `mise run hostsvc:serve -- status` |
+| Run the host service on this Mac (see README "Host service and mgmtd"): `start`, `stop`, `restart [--force]`, `status`, `pin`, `sync`, `steps [--reset]`, `log --step <id> [--follow]` or `cancel` | `mise run hostsvc:serve -- status` |
+| Ask for a cell, wait for it, withdraw it, ask again, retry or cancel its step (see README "Provisioning"): `request`, `wait`, `withdraw`, `recreate`, `retry`, `cancel` | `mise run portal -- request --cell dev-cell-1 --wait` |
 | Run `mgmtd ctl` in `mgmtd-0`: `status`, `records`, `pubkey`, `keys`, `keycheck`, `restore`, `rotate-key [--stage|--commit|--emergency]`, `rotate-signing-key [--emergency|--step <name>]` for the overlap rotation of the signing key, with the cell passes and the render of the new key (see README "Rotate the signing key of mgmtd"), or `reset-state` to start `mgmtd` with a fresh state (see README "Recover lost management state") | `mise run mgmt -- status` |
 | Run the M4 end-to-end gate (build the images first with `mise run images`) | `mise run gate:m4` |
 | Rotate the signing key of `mgmtd` and print the attestation gap. Run it alone, after `gate:m4` | `mise run gate:m4:rotate` |
@@ -59,6 +60,9 @@
 | Send one operation a minute for 30 minutes and check that each applies once. Run it alone, after `gate:m5` | `mise run gate:m5:soak` |
 | Lose the gateway volume with an operation in flight, run `gw:reset` and check the operation. Run it alone, after `gate:m5` | `mise run gate:m5:drill` |
 | Repair what `gate:m5` leaves: replicas of the gateway and `celld`, test namespaces `m5-*`, and each `celld` stream (`--check` only reports) | `mise run gate:m5:repair` |
+| Run the M6 end-to-end gate: signed steps, the host service and the cell controller (build the images first with `mise run images`) | `mise run gate:m6` |
+| Delete both cells and create them again through one portal request. Run it alone, after `gate:m6` | `mise run gate:m6:provision` |
+| Repair what `gate:m6` and `gate:m6:provision` leave: the key files, the replicas of the cell controller, recorded steps, test namespaces `m6-*`, and the cells after an interrupted provision run (`--check` only reports) | `mise run gate:m6:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 

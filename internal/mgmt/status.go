@@ -3,6 +3,7 @@ package mgmt
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"slices"
 	"sort"
 	"time"
@@ -41,6 +42,21 @@ type Status struct {
 	DroppedAt      time.Time              `json:"droppedAt,omitzero"`
 	EpochChangedAt time.Time              `json:"epochChangedAt,omitzero"`
 	StagedKey      string                 `json:"stagedKey,omitempty"`
+
+	// HostSpecPushedAt and HostSpecPushError describe the last spec push to the host service, from
+	// Config.SpecPushState.
+	HostSpecPushedAt  time.Time `json:"hostSpecPushedAt,omitzero"`
+	HostSpecPushError string    `json:"hostSpecPushError,omitempty"`
+}
+
+// StepView is the step of a cell as the status shows it. Host is the last status that the host
+// service reported for the step, kept in memory only.
+type StepView struct {
+	ID        string              `json:"id"`
+	IssuedAt  time.Time           `json:"issuedAt"`
+	ExpiresAt time.Time           `json:"expiresAt"`
+	DoneAt    time.Time           `json:"doneAt,omitzero"`
+	Host      *mgmtapi.StepStatus `json:"host,omitempty"`
 }
 
 // CellStatus is the status of one intent cell.
@@ -65,6 +81,14 @@ type CellStatus struct {
 	ForgedSeen         int          `json:"forgedSeen"`
 	HintAt             time.Time    `json:"hintAt,omitzero"`
 	LastHintCheck      string       `json:"lastHintCheck,omitempty"`
+
+	Requested    bool      `json:"requested"`
+	RequestedAt  time.Time `json:"requestedAt,omitzero"`
+	RequestID    string    `json:"requestId,omitempty"`
+	Step         *StepView `json:"step,omitempty"`
+	Valid        bool      `json:"valid"`
+	ValidReason  string    `json:"validReason,omitempty"`
+	InvalidSince time.Time `json:"invalidSince,omitzero"`
 }
 
 type reports struct {
@@ -80,7 +104,14 @@ type reports struct {
 	gatewayAt      time.Time
 	droppedAt      time.Time
 	epochChangedAt time.Time
+
+	// stepHost is the last host status of each open step, by step ID. It lives in memory, so a
+	// report never raises the state version.
+	stepHost map[string]mgmtapi.StepStatus
 }
+
+// maxStepStatuses is the most step statuses that one report stores.
+const maxStepStatuses = 32
 
 func servedRevision(st *State) spec.Revision {
 	if s := st.served(); s != nil {
@@ -131,6 +162,7 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		p.noteGateway(r.Gateway, now)
 		hints = append(hints, r.Gateway.KeyHints...)
 	}
+	p.noteSteps(st, r.Steps)
 	p.lagLocked(st, now)
 	logBehind := behind && !p.rep.behindLogged
 	p.rep.behindLogged = behind
@@ -146,6 +178,35 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		if err := p.dropNext(r.Applied); err != nil && ReasonOf(err) != mgmtapi.ReasonRestoreActive {
 			p.logLimited(context.Background(), slog.LevelError, "drop_failed", "drop_failed", "error", err.Error())
 		}
+	}
+}
+
+// noteSteps keeps the host status of each open step that the report names, and forgets the status
+// of every step that is no longer open. An entry that fails ValidStepStatus, names an unknown step
+// or another cell than its step is dropped. The caller holds rmu.
+func (p *Plane) noteSteps(st *State, steps []mgmtapi.StepStatus) {
+	open := map[string]string{}
+	for name, r := range st.Requests {
+		if _, in := p.cellIn(st, name); in && r.Step.open() {
+			open[r.Step.ID] = name
+		}
+	}
+	for id := range p.rep.stepHost {
+		if _, ok := open[id]; !ok {
+			delete(p.rep.stepHost, id)
+		}
+	}
+	if len(steps) > maxStepStatuses {
+		steps = steps[:maxStepStatuses]
+	}
+	for _, s := range steps {
+		if cell, ok := open[s.ID]; !ok || cell != s.Cell || !mgmtapi.ValidStepStatus(s) {
+			continue
+		}
+		if p.rep.stepHost == nil {
+			p.rep.stepHost = map[string]mgmtapi.StepStatus{}
+		}
+		p.rep.stepHost[s.ID] = s
 	}
 }
 
@@ -192,6 +253,7 @@ func (p *Plane) Status() Status {
 		rep.gateway = &cp
 	}
 	live := p.rt.snapshot()
+	hosts := maps.Clone(p.rep.stepHost)
 	p.rmu.Unlock()
 	now := p.cfg.Now()
 	s := Status{
@@ -204,10 +266,17 @@ func (p *Plane) Status() Status {
 		Gateway:            rep.gateway, GatewayAt: rep.gatewayAt, DroppedAt: rep.droppedAt, EpochChangedAt: rep.epochChangedAt,
 		StagedKey: st.StagedKeySHA256,
 	}
-	names := sortedKeys(p.intent)
-	for name := range st.Cells {
-		if _, ok := p.intent[name]; !ok {
-			names = append(names, name)
+	if p.cfg.SpecPushState != nil {
+		s.HostSpecPushedAt, s.HostSpecPushError = p.cfg.SpecPushState()
+	}
+	seen := map[string]bool{}
+	var names []string
+	for _, set := range [][]string{sortedKeys(p.catalog), sortedKeys(st.Cells)} {
+		for _, name := range set {
+			if !seen[name] {
+				seen[name] = true
+				names = append(names, name)
+			}
 		}
 	}
 	sort.Strings(names)
@@ -218,6 +287,18 @@ func (p *Plane) Status() Status {
 			cs.CheckedAt, cs.LastCheck = c.CheckedAt, c.LastCheck
 		}
 		cs.fill(live[name], st, now)
+		if _, in := p.cellIn(st, name); in {
+			r := st.Requests[name]
+			cs.Requested, cs.RequestedAt, cs.RequestID = true, r.RequestedAt, r.RequestID
+			if r.Step != nil {
+				cs.Step = &StepView{ID: r.Step.ID, IssuedAt: r.Step.IssuedAt, ExpiresAt: r.Step.ExpiresAt, DoneAt: r.Step.DoneAt}
+				if h, ok := hosts[r.Step.ID]; ok && r.Step.open() {
+					cs.Step.Host = &h
+				}
+			}
+		}
+		cs.Valid, cs.ValidReason = p.validOf(st, name, live[name], rep.applied, now)
+		cs.InvalidSince = p.noteValid(name, cs.Valid, now)
 		s.Cells = append(s.Cells, cs)
 	}
 	return s

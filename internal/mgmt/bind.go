@@ -16,13 +16,14 @@ import (
 
 // Nonce returns a stateless bind nonce for a cell of the intent.
 func (p *Plane) Nonce(cell string) (mgmtapi.NonceResponse, error) {
-	if _, ok := p.intent[cell]; !ok {
+	st := p.snap.Load().st
+	if _, ok := p.cellIn(st, cell); !ok {
 		return mgmtapi.NonceResponse{}, refuse(mgmtapi.ReasonCellUnknown, "")
 	}
 	nonce, exp := p.nonces.Issue(cell)
 	return mgmtapi.NonceResponse{
 		Nonce: nonce, Audience: mgmtapi.BindAudience(cell, nonce), ExpiresAt: exp,
-		Bound: p.snap.Load().st.Cells[cell] != nil,
+		Bound: st.Cells[cell] != nil,
 	}, nil
 }
 
@@ -30,14 +31,14 @@ func (p *Plane) Nonce(cell string) (mgmtapi.NonceResponse, error) {
 // refused bind writes no file and consumes no nonce.
 func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) (resp mgmtapi.BindResponse, err error) {
 	defer func() { p.countBind(ctx, cell, resp, err) }()
-	if _, ok := p.intent[cell]; !ok {
+	pre := p.snap.Load().st
+	if _, ok := p.cellIn(pre, cell); !ok {
 		return resp, refuse(mgmtapi.ReasonCellUnknown, "")
 	}
 	if err := p.nonces.Check(cell, req.Nonce); err != nil {
 		return resp, err
 	}
 	now := p.cfg.Now()
-	pre := p.snap.Load().st
 	cs := pre.Cells[cell]
 	issuer := ""
 	if cs != nil {
@@ -57,6 +58,7 @@ func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) 
 		}
 	}
 
+	var claims clusterjwt.Claims
 	prepare := func(keys mgmtapi.ClusterKeys) ([]keyInfo, json.RawMessage, error) {
 		if keys.Issuer == "" || (issuer != "" && keys.Issuer != issuer) {
 			return nil, nil, refuse(mgmtapi.ReasonIssuerUntrusted, "issuer_changed")
@@ -66,9 +68,11 @@ func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) 
 		if err != nil {
 			return nil, nil, refuse(mgmtapi.ReasonKeysUntrusted, "unreadable_set")
 		}
-		if _, verr := clusterjwt.ValidateFor(p.cellRecord(cell, keys.Issuer, jwks), req.Token, aud, now); verr != nil {
+		c, verr := clusterjwt.ValidateFor(p.cellRecord(cell, keys.Issuer, jwks), req.Token, aud, now)
+		if verr != nil {
 			return nil, nil, tokenError(verr)
 		}
+		claims = c
 		if len(fresh) > maxKeys {
 			return nil, nil, refuse(mgmtapi.ReasonKeysUntrusted, "too_many_keys")
 		}
@@ -91,6 +95,9 @@ func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) 
 	}
 
 	err = p.commit(func(t *txn) error {
+		if _, ok := p.cellIn(t.st, cell); !ok {
+			return refuse(mgmtapi.ReasonCellUnknown, "")
+		}
 		if p.nonces.Used(req.Nonce) {
 			return refuse(mgmtapi.ReasonNonceInvalid, "consumed")
 		}
@@ -133,6 +140,7 @@ func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) 
 		if err := t.signCell(cell); err != nil {
 			return err
 		}
+		t.closeStep(cell, claims.IssuedAt, fresh)
 		resp = mgmtapi.BindResponse{Status: status, Record: t.rev}
 		t.after = append(t.after, func() {
 			if err := p.nonces.Consume(cell, req.Nonce); err != nil {

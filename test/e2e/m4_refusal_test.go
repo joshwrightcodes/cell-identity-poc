@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"os/exec"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -69,17 +70,42 @@ func refusalText(r *mgmtapi.Refusal) string {
 	return r.Reason
 }
 
-// liveBundle returns the spec bundle that envd holds in cell-records.
+// liveBundle returns the spec bundle that envd holds in cell-records, with the step envelopes that it holds in ConfigMap
+// cell-controller-system/cell-steps, one for each key <cell>.step.json. While a step is open, the spec indexes it, and a bundle
+// with no envelope for it is not the live bundle: envd check refuses it. An absent cell-steps holds no step. The two reads must
+// see one spec revision, so the bundle is read again once when the revision of cell-records changed between them.
 func liveBundle(t *testing.T) mgmtapi.SpecBundle {
 	t.Helper()
-	data, _, _, err := recordsConfigMap(t)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sp, _ := liveRecords(t)
-	b := mgmtapi.SpecBundle{Spec: json.RawMessage(data["spec-envelope.json"]), Records: map[string]json.RawMessage{}}
-	for _, e := range sp.Cells {
-		b.Records[e.Name] = json.RawMessage(data[e.Name+".dsse.json"])
+	var b mgmtapi.SpecBundle
+	for attempt := 0; attempt < 2; attempt++ {
+		data, before, _, err := recordsConfigMap(t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sp, _ := liveRecords(t)
+		b = mgmtapi.SpecBundle{Spec: json.RawMessage(data["spec-envelope.json"]), Records: map[string]json.RawMessage{}}
+		for _, e := range sp.Cells {
+			b.Records[e.Name] = json.RawMessage(data[e.Name+".dsse.json"])
+		}
+		if stepData, _, _, err := cellStepsConfigMap(t); err == nil {
+			for key, envelope := range stepData {
+				if cell, ok := strings.CutSuffix(key, ".step.json"); ok {
+					if b.Steps == nil {
+						b.Steps = map[string]json.RawMessage{}
+					}
+					b.Steps[cell] = json.RawMessage(envelope)
+				}
+			}
+		} else if !strings.Contains(err.Error(), "NotFound") {
+			t.Fatalf("read ConfigMap cell-steps: %v", err)
+		}
+		_, after, _, err := recordsConfigMap(t)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if before["poc.internal/spec-counter"] == after["poc.internal/spec-counter"] && before["poc.internal/spec-epoch"] == after["poc.internal/spec-epoch"] {
+			break
+		}
 	}
 	return b
 }

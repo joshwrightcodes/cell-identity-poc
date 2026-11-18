@@ -102,7 +102,8 @@ fi
 # The test namespaces and objects of the attestprobe label.
 probe_label="cell.poc.internal/attestprobe"
 test_label="cell.poc.internal/e2e"
-for cluster in $(yq -r '.clusters[].name' "$ROOT/harness/topology.yaml"); do
+# An absent cell has no namespaces, so the repair walks the clusters that exist.
+for cluster in $(existing_clusters); do
   names="$(kubectl --context "kind-$cluster" get namespaces -o json | jq -r --arg l "$test_label" '.items[]
     | select(.metadata.labels[$l] == "true" and (.metadata.name == "m4-bind" or (.metadata.name | startswith("m4-probe-")))) | .metadata.name')" \
     || die "could not list the namespaces of $cluster"

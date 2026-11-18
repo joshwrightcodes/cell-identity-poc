@@ -20,6 +20,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/kubetoken"
 )
 
@@ -38,6 +39,7 @@ func TestAdminCommandsPrintOneLine(t *testing.T) {
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	var published atomic.Int32
 	publish := func(context.Context, ed25519.PublicKey) error { published.Add(1); return nil }
 	sock := filepath.Join(f.sockDir, "c.sock")
@@ -139,6 +141,7 @@ func newAdminRig(t *testing.T, publish func(context.Context, ed25519.PublicKey) 
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	sock := filepath.Join(f.sockDir, "c.sock")
 	ln, err := listenAdmin(sock)
 	must(t, err)
@@ -296,6 +299,27 @@ func bindFixture(t *testing.T, f *fixture) (func(args ...string) (int, string), 
 	}, plane
 }
 
+// requestCell asks for dev-cell-1 through the portal, as the cell fixtures of the catalog need.
+func requestCell(t *testing.T, plane *mgmt.Plane) {
+	t.Helper()
+	_, err := plane.PortalRequest(t.Context(), []string{"dev-cell-1"}, strings.Repeat("a", 64))
+	must(t, err)
+}
+
+// seedRequestedState leaves a state with dev-cell-1 requested and not bound in the data directory
+// of f, where a serve then finds it.
+func seedRequestedState(t *testing.T, f *fixture) {
+	t.Helper()
+	in, err := mgmt.LoadIntent(f.args["intent"])
+	must(t, err)
+	plane, err := mgmt.NewPlane(mgmt.Config{
+		Intent: in, KeyPath: filepath.Join(f.dir, "data", "ed25519.key"), Keys: stubKeys{},
+		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
+	})
+	must(t, err)
+	requestCell(t, plane)
+}
+
 // seedBoundState binds dev-cell-1 with a token that a stub key source accepts, and leaves the state
 // and the signing key in the data directory of f, where a serve then finds a record.
 func seedBoundState(t *testing.T, f *fixture) *mgmt.Plane {
@@ -308,6 +332,7 @@ func seedBoundState(t *testing.T, f *fixture) *mgmt.Plane {
 		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
 	})
 	must(t, err)
+	requestCell(t, plane)
 	nonce, err := plane.Nonce("dev-cell-1")
 	must(t, err)
 	tok := signer.Token(t, kubetoken.Claims{
@@ -470,5 +495,210 @@ func TestCtlBareRotateKeyIsEmergency(t *testing.T) {
 	}
 	if _, ok := plane.StagedPublicKey(); ok {
 		t.Fatal("the bare rotate-key left a staged key")
+	}
+}
+
+const twoCellIntent = `{"env":"dev","bindSubject":{"namespace":"cell-identity-system","serviceAccount":"celld"},"cells":[` +
+	`{"name":"dev-cell-1","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"}],"cluster":{"podSubnet":"10.20.0.0/16","serviceSubnet":"10.21.0.0/16","issuer":"https://dev-cell-1.test"}},` +
+	`{"name":"dev-cell-2","subjects":[{"namespace":"cell-identity-system","serviceAccount":"celld"}],"cluster":{"podSubnet":"10.22.0.0/16","serviceSubnet":"10.23.0.0/16","issuer":"https://dev-cell-2.test"}}]}`
+
+// portalRig serves the admin socket of a plane with two cells and no request. ctl runs a command
+// with the given text on standard input.
+type portalRig struct {
+	plane *mgmt.Plane
+	ctl   func(stdin string, args ...string) (int, string)
+}
+
+func newPortalRig(t *testing.T) *portalRig {
+	t.Helper()
+	f := newFixture(t)
+	must(t, os.WriteFile(f.args["intent"], []byte(twoCellIntent), 0o600))
+	in, err := mgmt.LoadIntent(f.args["intent"])
+	must(t, err)
+	plane, err := mgmt.NewPlane(mgmt.Config{
+		Intent: in, KeyPath: filepath.Join(f.dir, "data", "ed25519.key"), Keys: stubKeys{},
+		Store: &mgmt.FileStore{Path: filepath.Join(f.dir, "data", "state.json")},
+	})
+	must(t, err)
+	sock := filepath.Join(f.sockDir, "c.sock")
+	ln, err := listenAdmin(sock)
+	must(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	go serveAdmin(ctx, ln, mgmt.NewAdminHandler(plane, nil))
+	return &portalRig{plane: plane, ctl: func(stdin string, args ...string) (int, string) {
+		var out bytes.Buffer
+		d := f.deps()
+		d.stdin = strings.NewReader(stdin)
+		code := execute(ctx, append([]string{"ctl", "--socket", sock}, args...), &out, d)
+		return code, out.String()
+	}}
+}
+
+func TestPortalCommandsPrintOneLine(t *testing.T) {
+	r := newPortalRig(t)
+	digest := strings.Repeat("a", 64)
+	oneLine := func(args ...string) map[string]any {
+		t.Helper()
+		code, out := r.ctl("", args...)
+		if code != 0 || strings.Count(out, "\n") != 1 || !strings.HasSuffix(out, "\n") {
+			t.Fatalf("ctl %v: exit %d output %q", args, code, out)
+		}
+		var m map[string]any
+		must(t, json.Unmarshal([]byte(out), &m))
+		return m
+	}
+	stepIDs := func(m map[string]any) []string {
+		var ids []string
+		for _, s := range m["steps"].([]any) {
+			ids = append(ids, s.(map[string]any)["stepID"].(string))
+		}
+		return ids
+	}
+
+	// Two --cell values request both cells in one commit.
+	before := r.plane.Status().Signed
+	res := oneLine("portal", "request", "--cell", "dev-cell-1", "--cell", "dev-cell-2", "--bootstrap-sha256", digest)
+	first := stepIDs(res)
+	if len(first) != 2 || res["requestId"] == "" || len(res["alreadyRequested"].([]any)) != 0 {
+		t.Fatalf("request %v", res)
+	}
+	if now := r.plane.Status().Signed; now.Counter != before.Counter+1 {
+		t.Fatalf("two cells took %d commits", now.Counter-before.Counter)
+	}
+	again := oneLine("portal", "request", "--cell", "dev-cell-1", "--cell", "dev-cell-2", "--bootstrap-sha256", digest)
+	if len(stepIDs(again)) != 0 || len(again["alreadyRequested"].([]any)) != 2 {
+		t.Fatalf("second request %v", again)
+	}
+	retried := oneLine("portal", "retry", "--cell", "dev-cell-1", "--bootstrap-sha256", digest)
+	if ids := stepIDs(retried); len(ids) != 1 || ids[0] == first[0] {
+		t.Fatalf("retry %v", retried)
+	}
+	oneLine("portal", "cancel", "--cell", "dev-cell-2")
+	oneLine("portal", "withdraw", "--cell", "dev-cell-1", "--cell", "dev-cell-2")
+	if rr := oneLine("status")["cells"].([]any); rr[0].(map[string]any)["requested"] != false || rr[1].(map[string]any)["requested"] != false {
+		t.Fatalf("withdraw left a request: %v", rr)
+	}
+}
+
+func TestPortalUsageErrors(t *testing.T) {
+	r := newPortalRig(t)
+	digest := strings.Repeat("a", 64)
+	for name, args := range map[string][]string{
+		"portal_alone":              {"portal"},
+		"portal_unknown":            {"portal", "nope"},
+		"request_without_cell":      {"portal", "request", "--bootstrap-sha256", digest},
+		"request_without_digest":    {"portal", "request", "--cell", "dev-cell-1"},
+		"withdraw_without_cell":     {"portal", "withdraw"},
+		"withdraw_with_digest":      {"portal", "withdraw", "--cell", "dev-cell-1", "--bootstrap-sha256", digest},
+		"cancel_with_digest":        {"portal", "cancel", "--cell", "dev-cell-1", "--bootstrap-sha256", digest},
+		"cancel_two_cells":          {"portal", "cancel", "--cell", "dev-cell-1", "--cell", "dev-cell-2"},
+		"retry_two_cells":           {"portal", "retry", "--cell", "dev-cell-1", "--cell", "dev-cell-2", "--bootstrap-sha256", digest},
+		"recreate_two_cells":        {"portal", "recreate", "--cell", "dev-cell-1", "--cell", "dev-cell-2", "--bootstrap-sha256", digest},
+		"retry_without_digest":      {"portal", "retry", "--cell", "dev-cell-1"},
+		"keys_two_cells":            {"keys", "--cell", "dev-cell-1", "--cell", "dev-cell-2"},
+		"op_list_two_cells":         {"op", "list", "--cell", "dev-cell-1", "--cell", "dev-cell-2"},
+		"portal_expect_seq":         {"--expect-seq", "1", "portal", "cancel", "--cell", "dev-cell-1"},
+		"portal_positional":         {"portal", "cancel", "dev-cell-1"},
+		"portal_line_flag":          {"portal", "cancel", "--cell", "dev-cell-1", "--line", "x"},
+		"digest_on_status":          {"status", "--bootstrap-sha256", digest},
+		"digest_on_op_create":       {"op", "create", "--cell", "dev-cell-1", "--line", "x", "--bootstrap-sha256", digest},
+		"step_alone":                {"step"},
+		"step_unknown":              {"step", "nope"},
+		"step_sign_with_cell":       {"step", "sign", "--cell", "dev-cell-1"},
+		"step_sign_expect_seq":      {"--expect-seq", "1", "step", "sign"},
+		"step_sign_stdin_too_large": {"step", "sign"},
+	} {
+		stdin := ""
+		if name == "step_sign_stdin_too_large" {
+			stdin = strings.Repeat(" ", maxStepInput+1)
+		}
+		code, out := r.ctl(stdin, args...)
+		if lines := jsonLines(t, out); code != 2 || len(lines) != 1 || lines[0]["level"] != "ERROR" {
+			t.Errorf("%s: exit %d output %q, want exit 2 and one error line", name, code, out)
+		}
+	}
+	if st := r.plane.Status(); len(st.Cells) != 2 || st.Cells[0].Requested || st.Cells[1].Requested {
+		t.Fatal("a usage error reached the plane")
+	}
+}
+
+func TestPortalRefusalJSON(t *testing.T) {
+	r := newPortalRig(t)
+	digest := strings.Repeat("a", 64)
+	nine := []string{"portal", "request", "--bootstrap-sha256", digest}
+	for range 9 {
+		nine = append(nine, "--cell", "dev-cell-1")
+	}
+	for name, tc := range map[string]struct {
+		args   []string
+		reason string
+	}{
+		"unknown_cell":         {[]string{"portal", "request", "--cell", "nope", "--bootstrap-sha256", digest}, mgmtapi.ReasonCellUnknown},
+		"bad_digest":           {[]string{"portal", "request", "--cell", "dev-cell-1", "--bootstrap-sha256", "short"}, mgmtapi.ReasonBootstrapInvalid},
+		"too_many_cells":       {nine, mgmtapi.ReasonTooManyCells},
+		"retry_not_requested":  {[]string{"portal", "retry", "--cell", "dev-cell-1", "--bootstrap-sha256", digest}, mgmtapi.ReasonNoStep},
+		"recreate_unrequested": {[]string{"portal", "recreate", "--cell", "dev-cell-1", "--bootstrap-sha256", digest}, mgmtapi.ReasonNotRequested},
+		"cancel_no_step":       {[]string{"portal", "cancel", "--cell", "dev-cell-1"}, mgmtapi.ReasonNoStep},
+		"withdraw_unknown":     {[]string{"portal", "withdraw", "--cell", "nope"}, mgmtapi.ReasonCellUnknown},
+	} {
+		code, out := r.ctl("", tc.args...)
+		lines := jsonLines(t, out)
+		if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["reason"] != tc.reason || lines[0]["error"] == "" || lines[0]["error"] == nil {
+			t.Errorf("%s: exit %d output %q, want exit 1 and reason %q", name, code, out, tc.reason)
+		}
+	}
+	if st := r.plane.Status(); st.Cells[0].Requested || st.Cells[1].Requested {
+		t.Fatal("a refusal changed the state")
+	}
+}
+
+func TestCtlStepSignNotServed(t *testing.T) {
+	r := newPortalRig(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	body := step.Step{
+		Env: "dev", Cell: "dev-cell-1", Kind: step.KindCellCreate, Version: 1, IssuedAt: now, ExpiresAt: now.Add(time.Hour),
+		Cluster:         step.ClusterRef{PodSubnet: "10.20.0.0/16", ServiceSubnet: "10.21.0.0/16", Issuer: "https://dev-cell-1.test"},
+		BootstrapSHA256: step.TestDigest,
+	}
+	enc := func(s step.Step) string { b, err := json.Marshal(s); must(t, err); return string(b) }
+	spec0, status0 := r.plane.Spec(), r.plane.Status()
+
+	code, out := r.ctl(enc(body), "step", "sign")
+	if code != 0 || strings.Count(out, "\n") != 1 {
+		t.Fatalf("sign: exit %d output %q", code, out)
+	}
+	got, _, err := step.Verify([]byte(strings.TrimSpace(out)), []ed25519.PublicKey{r.plane.PublicKey()})
+	if err != nil || got.Cell != "dev-cell-1" || got.ID == "" || got.BootstrapSHA256 != step.TestDigest {
+		t.Fatalf("envelope: %+v %v", got, err)
+	}
+	if after := r.plane.Status(); after.Seq != status0.Seq || after.Signed != status0.Signed || after.Cells[0].Requested || after.Cells[0].Step != nil {
+		t.Fatalf("step sign recorded something: %+v", after)
+	}
+	if now := r.plane.Spec(); string(now.Spec) != string(spec0.Spec) || len(now.Steps) != 0 {
+		t.Fatal("step sign changed the served spec")
+	}
+
+	other := body
+	other.BootstrapSHA256 = strings.Repeat("a", 64)
+	for name, tc := range map[string]struct {
+		stdin  string
+		code   int
+		reason string
+	}{
+		"other_digest":  {enc(other), 1, mgmtapi.ReasonTestDigestOnly},
+		"empty_input":   {"", 1, "body_invalid"},
+		"unknown_field": {strings.Replace(enc(body), `{`, `{"force":true,`, 1), 1, "body_invalid"},
+		"bad_cell":      {strings.Replace(enc(body), `dev-cell-1`, `Not A Cell`, 1), 1, "body_invalid"},
+	} {
+		code, out := r.ctl(tc.stdin, "step", "sign")
+		lines := jsonLines(t, out)
+		if code != tc.code || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["reason"] != tc.reason {
+			t.Errorf("%s: exit %d output %q", name, code, out)
+		}
+	}
+	// A body of exactly 16 KiB is read whole.
+	if code, out := r.ctl(enc(body)+strings.Repeat(" ", maxStepInput-len(enc(body))), "step", "sign"); code != 0 {
+		t.Fatalf("16 KiB: exit %d output %q", code, out)
 	}
 }

@@ -27,7 +27,7 @@ func stageRoot(t *testing.T) (root, calls string) {
 			t.Fatal(err)
 		}
 	}
-	for _, dir := range []string{"scripts", "cells"} {
+	for _, dir := range []string{"scripts", "cells", "components/lib"} {
 		files, _ := filepath.Glob(filepath.Join("../..", dir, "*"))
 		for _, f := range files {
 			if info, err := os.Stat(f); err == nil && !info.IsDir() {
@@ -36,7 +36,8 @@ func stageRoot(t *testing.T) (root, calls string) {
 			}
 		}
 	}
-	write("harness/topology.yaml", "clusters:\n  - name: management\n    components: [mesh-view-hub]\n  - name: dev-cell-1\n    components: [cell-identity]\n", 0o644)
+	write("harness/topology.yaml", "clusters:\n  - name: management\n    components: [mesh-view-hub]\n  - name: dev-cell-1\n    components: [cell-identity]\n  - name: dev-cell-2\n    components: [cell-identity]\n", 0o644)
+	writeLiveStubs(t, filepath.Join(root, "bin"))
 	// harness_apply waits for the registry that mgmtd publishes, before it prunes.
 	for _, f := range []string{"registry.sh", "mgmt-key.sh"} {
 		b, err := os.ReadFile(filepath.Join("../../components/lib", f))
@@ -69,7 +70,7 @@ case "$args" in
   *" rollout status "*) echo "rollout ${*: -2:1}" >>"$STUB_LOG" ;;
   *" logs "*) echo "logs" >>"$STUB_LOG"; printf '%s\n' "${STUB_HUB_LOG:-}" ;;
   *" exec "*) [[ -n "${STUB_STATUS:-}" ]] || exit 1; printf '%s\n' "$STUB_STATUS" ;;
-  *" get configmap cell-registry "*) echo '{"metadata":{"labels":{"poc.internal/made-by":"mgmtd"}},"data":{"signers.pub":"k\n","dev-cell-1.dsse.json":"{}"}}' ;;
+  *" get configmap cell-registry "*) echo '{"metadata":{"labels":{"poc.internal/made-by":"mgmtd"}},"data":{"signers.pub":"k\n","dev-cell-1.dsse.json":"{}","dev-cell-2.dsse.json":"{}"}}' ;;
   *" get pod spire-server-0 "*) echo Running ;;
   *" get -f "*) echo '{"kind":"List","items":[]}' ;;
   *" get deployments,statefulsets "*) printf 'deployment.apps/kiali\ndeployment.apps/mesh-view-hub\n' ;;

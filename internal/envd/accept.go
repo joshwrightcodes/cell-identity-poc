@@ -61,6 +61,10 @@ type State struct {
 	Records      map[string][]byte
 	Cells        map[string]record.Cell
 	Marks        map[string]spec.Revision
+	// Steps holds the signed step envelope of each cell that the spec indexes a step for.
+	Steps map[string][]byte
+	// stepsVerified is true only when Accept filled Steps from a bundle that it checked.
+	stepsVerified bool
 }
 
 // Empty returns the state of a first start.
@@ -69,13 +73,44 @@ func Empty() *State {
 		Records: map[string][]byte{},
 		Cells:   map[string]record.Cell{},
 		Marks:   map[string]spec.Revision{},
+		Steps:   map[string][]byte{},
 	}
 }
 
-// Accept checks the bundle against cur and returns the state that follows from it. It returns cur
-// and false when the bundle holds the spec that cur already has. A refusal is a *Refused. Accept
-// never changes cur.
+// Accept checks the bundle against cur and returns the state that follows from it. It returns a
+// state with the same spec and false when the bundle holds the spec that cur already has. The steps
+// of the bundle are checked in both cases, and the returned state holds them. A refusal is a
+// *Refused. Accept never changes cur.
 func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicKey) (*State, bool, error) {
+	next, changed, s, err := acceptRecords(cur, b, env, keys)
+	if err != nil {
+		return nil, false, err
+	}
+	steps, err := checkSteps(s, b, env, keys)
+	if err != nil {
+		return nil, false, err
+	}
+	if !changed {
+		n := *next
+		next = &n
+	}
+	next.Steps = steps
+	next.stepsVerified = true
+	return next, changed, nil
+}
+
+// acceptRecords runs every check of Accept except the steps. The store paths use it, because they
+// build a bundle from the records ConfigMap, which holds no step envelopes. It returns the verified
+// spec too. The state that it returns when the spec is unchanged is cur itself.
+func acceptRecords(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicKey) (*State, bool, spec.Spec, error) {
+	next, changed, s, err := acceptRecordsCore(cur, b, env, keys)
+	if next != nil && changed && next.Steps == nil {
+		next.Steps = map[string][]byte{}
+	}
+	return next, changed, s, err
+}
+
+func acceptRecordsCore(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicKey) (*State, bool, spec.Spec, error) {
 	if cur == nil {
 		cur = Empty()
 	}
@@ -85,23 +120,23 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		if errors.Is(err, record.ErrSignature) {
 			reason = mgmtapi.ReasonSignatureInvalid
 		}
-		return nil, false, &Refused{Reason: reason, Detail: clip(err.Error())}
+		return nil, false, spec.Spec{}, &Refused{Reason: reason, Detail: clip(err.Error())}
 	}
 	refuse := func(reason, cell, format string, args ...any) error {
 		return &Refused{Reason: reason, Cell: clip(cell), Revision: s.Revision, Detail: clip(fmt.Sprintf(format, args...))}
 	}
 	if s.Env != env {
-		return nil, false, refuse(mgmtapi.ReasonEnvMismatch, "", "spec env %q, want %q", s.Env, env)
+		return nil, false, s, refuse(mgmtapi.ReasonEnvMismatch, "", "spec env %q, want %q", s.Env, env)
 	}
 	digest := spec.RecordDigest(payload)
 	switch s.Revision.Compare(cur.Revision) {
 	case -1:
-		return nil, false, refuse(mgmtapi.ReasonRevisionOld, "", "spec revision %v is below %v", s.Revision, cur.Revision)
+		return nil, false, s, refuse(mgmtapi.ReasonRevisionOld, "", "spec revision %v is below %v", s.Revision, cur.Revision)
 	case 0:
 		if digest == cur.SpecSHA256 {
-			return cur, false, nil
+			return cur, false, s, nil
 		}
-		return nil, false, refuse(mgmtapi.ReasonRevisionConflict, "", "another spec at revision %v", s.Revision)
+		return nil, false, s, refuse(mgmtapi.ReasonRevisionConflict, "", "another spec at revision %v", s.Revision)
 	}
 
 	retired := make(map[string]spec.Revision, len(s.Retired))
@@ -115,10 +150,10 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 	for name, mark := range cur.Marks {
 		if r, ok := retired[name]; ok {
 			if r.Compare(mark) < 0 {
-				return nil, false, refuse(mgmtapi.ReasonSpecInvalid, name, "retired mark %v is below the mark %v", r, mark)
+				return nil, false, s, refuse(mgmtapi.ReasonSpecInvalid, name, "retired mark %v is below the mark %v", r, mark)
 			}
 		} else if !listed[name] {
-			return nil, false, refuse(mgmtapi.ReasonSpecInvalid, name, "cell has a mark %v and is in neither list", mark)
+			return nil, false, s, refuse(mgmtapi.ReasonSpecInvalid, name, "cell has a mark %v and is in neither list", mark)
 		}
 	}
 
@@ -127,24 +162,24 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 	for _, e := range s.Cells {
 		raw, ok := b.Records[e.Name]
 		if !ok {
-			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "bundle has no record")
+			return nil, false, s, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "bundle has no record")
 		}
 		if len(raw) > MaxRecordBytes {
-			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "record envelope has %d bytes, the limit is %d", len(raw), MaxRecordBytes)
+			return nil, false, s, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "record envelope has %d bytes, the limit is %d", len(raw), MaxRecordBytes)
 		}
 		c, recPayload, err := record.VerifyWithPayload(raw, keys)
 		if err != nil {
-			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "%v", err)
+			return nil, false, s, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "%v", err)
 		}
 		if err := s.CheckRecord(e.Name, c, recPayload); err != nil {
-			return nil, false, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "%v", err)
+			return nil, false, s, refuse(mgmtapi.ReasonRecordInvalid, e.Name, "%v", err)
 		}
 		cells[e.Name] = c
 		records[e.Name] = slices.Clone(raw)
 	}
 	for name := range b.Records {
 		if _, ok := cells[name]; !ok {
-			return nil, false, refuse(mgmtapi.ReasonRecordUnindexed, name, "bundle has a record that the spec does not index")
+			return nil, false, s, refuse(mgmtapi.ReasonRecordUnindexed, name, "bundle has a record that the spec does not index")
 		}
 	}
 
@@ -155,18 +190,18 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		}
 		switch e.Revision.Compare(mark) {
 		case -1:
-			return nil, false, refuse(mgmtapi.ReasonRecordOld, e.Name, "record revision %v is below its mark %v", e.Revision, mark)
+			return nil, false, s, refuse(mgmtapi.ReasonRecordOld, e.Name, "record revision %v is below its mark %v", e.Revision, mark)
 		case 0:
 			held, present := cur.Records[e.Name]
 			if !present {
-				return nil, false, refuse(mgmtapi.ReasonRecordOld, e.Name, "record revision %v equals the mark of a retired cell", e.Revision)
+				return nil, false, s, refuse(mgmtapi.ReasonRecordOld, e.Name, "record revision %v equals the mark of a retired cell", e.Revision)
 			}
 			_, heldPayload, err := record.VerifyWithPayload(held, keys)
 			if err != nil {
-				return nil, false, fmt.Errorf("current state is inconsistent: record of cell %q: %w", e.Name, err)
+				return nil, false, s, fmt.Errorf("current state is inconsistent: record of cell %q: %w", e.Name, err)
 			}
 			if spec.RecordDigest(heldPayload) != e.RecordSHA256 {
-				return nil, false, refuse(mgmtapi.ReasonRecordConflict, e.Name, "another record at revision %v", e.Revision)
+				return nil, false, s, refuse(mgmtapi.ReasonRecordConflict, e.Name, "another record at revision %v", e.Revision)
 			}
 		}
 	}
@@ -181,7 +216,7 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		}
 	}
 	if invalidated > 1 {
-		return nil, false, refuse(mgmtapi.ReasonTooManyInvalidated, "", "%d cells become invalid at once", invalidated)
+		return nil, false, s, refuse(mgmtapi.ReasonTooManyInvalidated, "", "%d cells become invalid at once", invalidated)
 	}
 
 	marks := make(map[string]spec.Revision, len(cur.Marks)+len(s.Cells))
@@ -206,5 +241,5 @@ func Accept(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25519.PublicK
 		Records:      records,
 		Cells:        cells,
 		Marks:        marks,
-	}, true, nil
+	}, true, s, nil
 }

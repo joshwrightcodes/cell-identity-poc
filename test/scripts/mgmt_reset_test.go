@@ -41,7 +41,7 @@ esac
 func resetRun(t *testing.T, env ...string) (out, errOut string, code int, calls []string) {
 	t.Helper()
 	dir := t.TempDir()
-	out, errOut, code = runScript(t, "mgmt.sh", map[string]string{"kubectl": resetKubectl}, append([]string{"STUB_DIR=" + dir, "MGMT_RESET_WAIT=4"}, env...), "reset-state")
+	out, errOut, code = runScript(t, "mgmt.sh", map[string]string{"kubectl": resetKubectl, "kind": stubKind, "docker": stubDocker}, append([]string{"STUB_DIR=" + dir, "MGMT_RESET_WAIT=4"}, env...), "reset-state")
 	b, _ := os.ReadFile(filepath.Join(dir, "calls"))
 	calls = strings.Split(strings.TrimSpace(string(b)), "\n")
 	if y, err := os.ReadFile(filepath.Join(dir, "job.yaml")); err == nil {
@@ -80,9 +80,19 @@ func TestResetStateOrderAndNextCommands(t *testing.T) {
 		t.Fatalf("stdout %q, want one JSON line with reset true", out)
 	}
 	next, _ := lines[0]["next"].([]any)
-	want := []any{"CELL=dev-cp mise run cell:up", "CELL=dev-cell-1 mise run cell:up", "CELL=dev-cell-2 mise run cell:up", "CELL=management mise run cell:link"}
+	want := []any{"CELL=dev-cp mise run cell:up", "CELL=dev-cell-1 mise run cell:up", "CELL=dev-cell-2 mise run cell:up",
+		"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2", "mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2", "CELL=management mise run cell:link"}
 	if !reflect.DeepEqual(next, want) {
-		t.Fatalf("next %v, want the cell:up of dev-cp, the cell:up of each cell, and then the cell:link of management: %v", next, want)
+		t.Fatalf("next %v, want the cell:up of dev-cp and of each live cell, the portal request and wait for them, and then the cell:link of management: %v", next, want)
+	}
+	// A new state holds no request, so each bind gets cell_unknown until the portal asks again. With no live cell, nothing is requested.
+	out, _, code, _ = resetRun(t, "STUB_KIND=management dev-cp rogue")
+	if code != 0 {
+		t.Fatalf("exit %d with no live cell", code)
+	}
+	next, _ = jsonLines(t, out)[0]["next"].([]any)
+	if want := []any{"CELL=dev-cp mise run cell:up", "CELL=management mise run cell:link"}; !reflect.DeepEqual(next, want) {
+		t.Fatalf("next %v with no live cell, want %v", next, want)
 	}
 	if moved, _ := lines[0]["moved"].([]any); len(moved) != 2 {
 		t.Fatalf("moved %v, want two files", lines[0]["moved"])
@@ -167,6 +177,7 @@ func TestResetStateInterruptScalesMgmtdBack(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte(resetKubectl), 0o755); err != nil {
 				t.Fatal(err)
 			}
+			writeLiveStubs(t, bin)
 			path, err := filepath.Abs("../../scripts/mgmt.sh")
 			if err != nil {
 				t.Fatal(err)

@@ -118,6 +118,7 @@ func TestGateM3Repair(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(guardKubectl), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		writeLiveStubs(t, dir)
 		logFile := filepath.Join(dir, "kubectl.log")
 		cmd := exec.Command("bash", append([]string{script}, args...)...)
 		cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
@@ -178,6 +179,7 @@ spec:
 		if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(guardKubectl), 0o755); err != nil {
 			t.Fatal(err)
 		}
+		writeLiveStubs(t, dir)
 		if bundleText != "" {
 			bdir := filepath.Join(dir, "build", "dev-cell-1", "bundles", "mesh-view")
 			if err := os.MkdirAll(bdir, 0o755); err != nil {

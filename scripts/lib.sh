@@ -120,6 +120,14 @@ OTEL_UPLINK_HARNESS=(
   "otel-uplink:observability-system"
 )
 
+# The cell controller sends the signed steps that envd keeps in ConfigMap cell-controller-system/cell-steps to the host
+# service. It owns the namespace cell-controller-system, which also holds the Role and RoleBinding envd-steps of envd,
+# so it comes before envd: the new envd needs the namespace and the Role at its first round. Its render reads the live
+# SPIRE server of its own cluster and the host service, so it renders after the waves.
+CELL_CONTROLLER_HARNESS=(
+  "cell-controller:cell-controller-system"
+)
+
 # envd pulls the signed spec and records from mgmtd and writes ConfigMap spire-system/cell-records, which
 # the SPIRE server of dev-cp reads. It owns the namespace envd-system, and its Role and RoleBinding live
 # in spire-system, next to the objects of the spire-server bundle. Its render reads the live SPIRE server
@@ -146,7 +154,7 @@ MESH_VIEW_HARNESS=(
 # itself. On a clean harness:up that server does not exist at the first hydrate, so up.sh renders
 # these components after the waves (HYDRATE_ONLY=late) and the first hydrate skips them
 # (CELL_UP_SKIP_LATE=1).
-LATE_HARNESS=(otel-uplink envd cell-gateway)
+LATE_HARNESS=(otel-uplink cell-controller envd cell-gateway)
 
 # Link components. scripts/link.sh renders and applies them in the link phase, after every wave
 # and harness component, because their render reads the live roots and node addresses of other
@@ -191,6 +199,7 @@ for set_name in $set_names; do
     argocd-agent) HARNESS_COMPONENTS+=("${ARGOCD_AGENT_HARNESS[@]}") ;;
     mesh-view) HARNESS_COMPONENTS+=("${MESH_VIEW_HARNESS[@]}") ;;
     otel-uplink | telemetry-uplink) HARNESS_COMPONENTS+=("${OTEL_UPLINK_HARNESS[@]}") ;;
+    cell-controller) HARNESS_COMPONENTS+=("${CELL_CONTROLLER_HARNESS[@]}") ;;
     envd) HARNESS_COMPONENTS+=("${ENVD_HARNESS[@]}") ;;
     cell-gateway) HARNESS_COMPONENTS+=("${CELL_GATEWAY_HARNESS[@]}") ;;
     mgmt-plane) LINK_COMPONENTS+=("${MGMT_PLANE_LINK[@]}") ;;
@@ -232,12 +241,15 @@ bundle_store_forward() {
 }
 
 source "$ROOT/scripts/gate-traces.sh"
+source "$ROOT/components/lib/live-cells.sh"
 
 # load_local_settings reads the gitignored .envrc.local when one of the given variables is unset.
 # direnv loads the file after direnv allow, so this matters only without direnv. POC_ENVRC_LOCAL
-# names another file, for the tests.
+# names another file, for the tests. The host service sets it to /dev/null for each step, so that no
+# step reads the file, and the function then returns with no line.
 load_local_settings() {
   local file="${POC_ENVRC_LOCAL:-$ROOT/.envrc.local}" name
+  [[ "$file" != /dev/null ]] || return 0
   for name in "$@"; do
     if [[ -z "${!name:-}" ]]; then
       if [[ ! -f "$file" ]]; then
@@ -255,6 +267,96 @@ load_local_settings() {
       return 0
     fi
   done
+}
+
+# cluster_lock <cluster> takes the lock of one cluster for this process tree: cell:up, cell:link and cell:down
+# change a cluster, and two runs on one cluster must not overlap. The lock is the directory
+# build/locks/<cluster>.lock with the files pid and step. It lives outside build/<cluster>, because cell:down
+# deletes that directory and gate.sh reads the presence of that directory as a set up cluster.
+#   - A holder counts only while its pid runs a harness script (up, down, link or restart). A lock whose
+#     process is gone, or is another program that reuses the pid, is taken over.
+#   - A live holder fails the call at once with its pid and its POC_STEP_ID. When CLUSTER_LOCK_WAIT is set, the
+#     call waits up to that many seconds instead. CLUSTER_LOCK_POLL sets the poll interval, for the tests.
+#   - The lock is re-entrant inside one process tree: the exported POC_HELD_LOCKS names the clusters whose lock an
+#     ancestor holds, and a nested call for one of them returns at once.
+# The process releases its locks when it exits.
+CLUSTER_LOCKS_TAKEN=()
+
+cluster_lock_dir() { printf '%s/locks/%s.lock\n' "$BUILD_ROOT" "$1"; }
+
+# cluster_lock_holder <cluster> prints "<pid> <step>" for the live holder, and nothing when no live harness
+# script holds the lock. A lock directory with no pid file is one that another run made a moment ago.
+cluster_lock_holder() {
+  local dir pid step i
+  dir="$(cluster_lock_dir "$1")"
+  for i in 1 2 3 4 5; do
+    [[ -d "$dir" && ! -f "$dir/pid" ]] || break
+    sleep 0.2
+  done
+  pid="$(tr -d '[:space:]' <"$dir/pid" 2>/dev/null)" || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  # The system can give the pid of an ended run to another process, so the command line must show a harness script.
+  [[ "$(ps -ww -p "$pid" -o command= 2>/dev/null)" =~ (^|[[:space:]/])(up|down|link|restart)\.sh([[:space:]]|$) ]] || return 0
+  step="$(cat "$dir/step" 2>/dev/null || true)"
+  printf '%s|%s\n' "$pid" "$step"
+}
+
+# cluster_lock_trap adds cluster_lock_release to the EXIT trap, and keeps the trap that the script already set.
+cluster_lock_trap() {
+  local -a parts=()
+  local old=""
+  eval "parts=($(trap -p EXIT))"
+  ((${#parts[@]} < 3)) || old="${parts[2]}"
+  [[ "$old" == *cluster_lock_release* ]] || trap "${old:+$old; }cluster_lock_release" EXIT
+}
+
+cluster_lock() {
+  local cluster="$1" dir holder end stale who seen
+  [[ " ${POC_HELD_LOCKS:-} " != *" $cluster "* ]] || return 0
+  dir="$(cluster_lock_dir "$cluster")"
+  mkdir -p "$(dirname "$dir")"
+  end=$((SECONDS + ${CLUSTER_LOCK_WAIT:-0}))
+  until mkdir "$dir" 2>/dev/null; do
+    holder="$(cluster_lock_holder "$cluster")"
+    if [[ -z "$holder" ]]; then
+      # A rename to a name of this run moves the stale lock aside in one step. The pid that this run judged stale must be the pid in the
+      # moved directory. When another run took the lock in between, the moved directory is a live lock: put it back. A window of a few
+      # instructions stays between the check and the put back (residual).
+      seen="$(cat "$dir/pid" 2>/dev/null || true)"
+      stale="$dir.stale.$$"
+      if mv "$dir" "$stale" 2>/dev/null; then
+        if [[ "$(cat "$stale/pid" 2>/dev/null || true)" == "$seen" ]]; then rm -rf "$stale"; else mv -n "$stale" "$dir" 2>/dev/null || rm -rf "$stale"; fi
+      fi
+      continue
+    fi
+    if ((SECONDS >= end)); then
+      who="process ${holder%%|*}"
+      [[ -z "${holder#*|}" ]] || who+=", step ${holder#*|}"
+      die "cluster $cluster is locked by $who${CLUSTER_LOCK_WAIT:+, and it still held the lock after ${CLUSTER_LOCK_WAIT}s}. Wait until it ends, or stop it with: kill ${holder%%|*}. Then run the command again"
+    fi
+    sleep "${CLUSTER_LOCK_POLL:-1}"
+  done
+  printf '%s\n' "$$" >"$dir/pid"
+  printf '%s\n' "${POC_STEP_ID:-}" >"$dir/step"
+  CLUSTER_LOCKS_TAKEN+=("$cluster")
+  export POC_HELD_LOCKS="${POC_HELD_LOCKS:+$POC_HELD_LOCKS }$cluster"
+  cluster_lock_trap
+}
+
+# cluster_lock_release releases each lock that this shell took. A subshell never releases the lock of its parent.
+cluster_lock_release() {
+  local cluster dir kept=""
+  [[ "$BASHPID" == "$$" ]] || return 0
+  for cluster in ${CLUSTER_LOCKS_TAKEN[@]+"${CLUSTER_LOCKS_TAKEN[@]}"}; do
+    dir="$(cluster_lock_dir "$cluster")"
+    [[ "$(cat "$dir/pid" 2>/dev/null)" != "$$" ]] || rm -rf "$dir"
+  done
+  # A child that starts later must take the lock itself.
+  for cluster in ${POC_HELD_LOCKS:-}; do
+    [[ " ${CLUSTER_LOCKS_TAKEN[*]-} " == *" $cluster "* ]] || kept+="${kept:+ }$cluster"
+  done
+  CLUSTER_LOCKS_TAKEN=()
+  export POC_HELD_LOCKS="$kept"
 }
 
 # SECRET_STORE is the name of the SecretStore that secrets:connect applies in each namespace of
@@ -484,26 +586,31 @@ check_agent_grants() {
 }
 
 # The relay copies the node address of RELAY_TARGET into its routes and its egress policy, and the
-# node addresses of SPIRE_AGENT_CELLS into its ingress policy. Docker can give a rebuilt node a new
-# address, and the relay then sends the streams of the cells to the wrong node.
+# node addresses of the live cells into its ingress policy. Docker can give a rebuilt node a new
+# address, and the relay then sends the streams of the cells to the wrong node. With no live cell, the
+# render deletes the cell ingress rule. Each rule is selected by its ports, never by its index: the rule
+# of the cells has the route ports, the rule of the nodes has the health port 8080, and the egress rule of
+# the target has the target node ports, from 30000.
 # check_relay_current needs the function node_ip <cluster>, which verify.sh defines.
 check_relay_current() {
-  local target cell ip name json hosts cidrs want_cells stale=() cell_cidrs=()
+  local target cell ip name json hosts cidrs want_cells stale=() cell_cidrs=() live cells_text
   target="$(node_ip "$RELAY_TARGET")" || { echo "$target"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
-  for cell in $SPIRE_AGENT_CELLS; do
+  live="$(live_cells)" || { echo "$live"; return 1; }
+  for cell in $live; do
     ip="$(node_ip "$cell")" || { echo "$ip"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     cell_cidrs+=("$ip/32")
   done
-  want_cells="$(printf '%s\n' "${cell_cidrs[@]}" | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
+  cells_text="$(paste -sd' ' - <<<"$live")"
+  want_cells="$(printf '%s\n' ${cell_cidrs[@]+"${cell_cidrs[@]}"} | jq -Rrs 'split("\n") | map(select(length > 0)) | sort | join(" ")')"
   for name in relay-view relay-telemetry; do
     json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
     json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
-    cidrs="$(jq -r '[.spec.egress[0].to[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+    cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
     [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
-    cidrs="$(jq -r '[.spec.ingress[0].from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$cidrs" == "$want_cells" ]] || stale+=("the ingress policy of $name admits '$cidrs', but the nodes of $SPIRE_AGENT_CELLS are '$want_cells'")
+    cidrs="$(jq -r '[.spec.ingress[] | select(any(.ports[]?; .port != 8080)) | .from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+    [[ "$cidrs" == "$want_cells" ]] || stale+=("the ingress policy of $name admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   done
   if ((${#stale[@]} > 0)); then
     printf '%s\n' "${stale[@]}"
@@ -605,15 +712,31 @@ link_entries() {
   die "LINK_ONLY '$LINK_ONLY' is not a link component of $CELL_NAME. Known: $(printf '%s ' ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"})"
 }
 
+# harness_only_entry prints the <component>:<namespace> entry of the harness component that HARNESS_ONLY names,
+# for cell:up, cell:restart and hydrate. A name that is no harness component of the cluster stops the caller
+# with the known names. Call it as: entry="$(harness_only_entry)" || exit 1
+harness_only_entry() {
+  local entry
+  for entry in ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]}"}; do
+    [[ "${entry%%:*}" == "${HARNESS_ONLY:?}" ]] && { echo "$entry"; return; }
+  done
+  die "HARNESS_ONLY '$HARNESS_ONLY' is not a harness component of $CELL_NAME. Known: $(printf '%s ' ${HARNESS_COMPONENTS[@]+"${HARNESS_COMPONENTS[@]%%:*}"})"
+}
+
 # link_preflight prints one line for each cluster that the link phase of $CELL needs and that does
-# not answer: the environment control plane VIEW_CONTROL_PLANE with its SPIRE server, and each cell
+# not answer: the environment control plane VIEW_CONTROL_PLANE with its SPIRE server, and each live cell
 # of VIEW_CELLS. It prints nothing when the link phase can run, or when the cluster has none.
 link_preflight() {
-  local c
+  local c live
   ((${#LINK_COMPONENTS[@]} > 0)) || return 0
   # mgmt-api reads the other clusters only when they exist, so it runs before them.
   [[ "${LINK_ONLY:-}" != mgmt-api ]] || return 0
+  # A cell exists only through a signed step, so the link phase serves the live cells and needs no other.
+  live="$(live_cells)" || { echo "kind does not answer, so the live cells are unknown"; return 0; }
   for c in ${VIEW_CONTROL_PLANE:-} ${VIEW_CELLS:-}; do
+    if [[ "$c" != "${VIEW_CONTROL_PLANE:-}" ]] && ! grep -qx -- "$c" <<<"$live"; then
+      continue
+    fi
     if ! (cd "$ROOT" && mise run hostsvc -- facts --cluster "$c" >/dev/null 2>&1); then
       echo "cluster $c does not exist. Create it: CELL=$c mise run cell:up"
     elif [[ "$c" == "${VIEW_CONTROL_PLANE:-}" ]] \
@@ -903,8 +1026,18 @@ check_plane_pods() {
 # The fourth case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
 # the check skips them, and prints no delete hint for them.
+# The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
+# manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
+# cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
+# runtime_objects prints one case object, or a JSON list of cases when a namespace holds writers that differ. An object is a
+# runtime object when it fits one case.
 runtime_objects() {
   local cell agents=()
+  if [[ "$1" == cell-controller && "$2" == cell-controller-system && "$3" == ConfigMap ]]; then
+    jq -cn '[{names: "^cell-steps$", managers: ["envd"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
+      {names: "^step-status$", managers: ["cell-controller"], labels: [], marker: {key: "poc.internal/made-by", value: "cell-controller"}}]'
+    return
+  fi
   if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
     jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
     return
@@ -948,14 +1081,17 @@ check_harness_objects() {
   for kind in $(yq -N -r 'select(.kind != null and (.metadata.namespace // "") != "") | .kind' "$bundle" | sort -u); do
     want="$(KIND="$kind" NS="$ns" yq -o=json -I=0 'select(.kind == strenv(KIND) and .metadata.namespace == strenv(NS)) | .metadata.name' "$bundle" | jq -rs 'sort | join(" ")')"
     live="$(k -n "$ns" get "$kind" -o json --show-managed-fields)" || { echo "could not list $kind in $ns"; return 1; }
-    runtime="$(runtime_objects "$comp" "$ns" "$kind")"
+    # runtime is the list of cases that fit a runtime object of this kind, empty when there is none.
+    runtime="$(runtime_objects "$comp" "$ns" "$kind" | jq -c 'if . == null then [] elif type == "array" then . else [.] end')" \
+      || { echo "could not read the runtime objects of $kind in $ns"; return 1; }
     if [[ -n "$owned" ]]; then
       got="$(jq -r --arg label "$HARNESS_LABEL" --argjson runtime "$runtime" '[.items[]
-        | select(($runtime == null) or ((((.metadata.labels[$label] // "") as $l | $l == "" or ($runtime.labels | index($l)) != null)
-            and (.metadata.name | test($runtime.names))
-            and (($runtime.marker // null) == null or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
-            and ((.metadata.managedFields // []) | length) > 0
-            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not))
+        | select(. as $o | any($runtime[]; . as $c
+            | (($o.metadata.labels[$label] // "") as $l | $l == "" or ($c.labels | index($l)) != null)
+            and ($o.metadata.name | test($c.names))
+            and (($c.marker // null) == null or $o.metadata.labels[$c.marker.key] == $c.marker.value)
+            and (($o.metadata.managedFields // []) | length) > 0
+            and all($o.metadata.managedFields[]; .manager as $m | $c.managers | index($m) != null)) | not)
         | select((.metadata.labels[$label] // "") != ""
           or any(.metadata.managedFields[]?; .manager != "kube-controller-manager" and .manager != "pilot-discovery"))
         | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
@@ -967,11 +1103,12 @@ check_harness_objects() {
       [[ "$got" == "$want" ]] || problems+=("$ns has the $kind objects '$got' with the label $HARNESS_LABEL=$comp, and the bundle $comp has '$want'")
       # A runtime object has no harness label, so the label list above never shows it. It must still carry the marker and
       # only the field managers of its writer.
-      if [[ "$runtime" != null ]]; then
-        stray="$(jq -r --argjson runtime "$runtime" '[.items[] | select(.metadata.name | test($runtime.names))
-          | select((((($runtime.marker // null) == null) or .metadata.labels[$runtime.marker.key] == $runtime.marker.value)
-            and ((.metadata.managedFields // []) | length) > 0
-            and all(.metadata.managedFields[]; .manager as $m | $runtime.managers | index($m) != null)) | not)
+      if [[ "$runtime" != "[]" ]]; then
+        stray="$(jq -r --argjson runtime "$runtime" '[.items[] | . as $o | select(any($runtime[]; . as $c | $o.metadata.name | test($c.names)))
+          | select(any($runtime[]; . as $c | ($o.metadata.name | test($c.names))
+            and ((($c.marker // null) == null) or $o.metadata.labels[$c.marker.key] == $c.marker.value)
+            and (($o.metadata.managedFields // []) | length) > 0
+            and all($o.metadata.managedFields[]; .manager as $m | $c.managers | index($m) != null)) | not)
           | .metadata.name] | sort | join(" ")' <<<"$live")" || { echo "could not read the $kind objects in $ns"; return 1; }
         [[ -z "$stray" ]] || problems+=("$ns has the runtime $kind objects '$stray' that a person or another manager wrote")
       fi
@@ -1032,11 +1169,13 @@ pem_der_sha256() {
 # gateway-store for a store of the gateway that is lost, corrupt or full. The cell:up of dev-cp renders the
 # cell gateway again, so the rows of a rebuilt cell and of dev-cp cover it. The README section
 # "Rebuild one cluster" holds the same table.
-# No step waits until every cell is bound: a cell binds on its own once its cell:up has run.
+# A cell exists only through a signed step, so the rows of a cell and of management go through the portal. The
+# rows of management and dev-cp name the live cells: the cells whose cluster exists now. No step waits until every
+# cell is bound, except the portal wait that the rows name.
 dependents_of() {
-  local cell cells comp
-  # The cells are the clusters that dev-cp lists in SPIRE_AGENT_CELLS.
-  cells="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
+  local cell catalog live args=""
+  # The catalog is the list of cells that dev-cp admits.
+  catalog="$(sed -n 's/^SPIRE_AGENT_CELLS="\(.*\)"$/\1/p' "$ROOT/cells/dev-cp.env")"
   case "$1" in
     hostsvc) echo "mise run hostsvc:serve -- restart" ;;
     # The gateway admits a cell by its node address, and a rebuilt cell gets a new address. After a restart of the VM the harness is rebuilt instead.
@@ -1044,27 +1183,39 @@ dependents_of() {
     # A lost, corrupt or full store of the gateway: gw:reset wipes it, and envd fills it again.
     gateway-store) echo "mise run gw:reset" ;;
     management)
+      live="$(live_cells)" || return 1
       echo "mise run hostsvc -- up --only management"
       echo "CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up"
       echo "CELL=management LINK_ONLY=mgmt-api mise run cell:link"
       echo "CELL=dev-cp mise run cell:up"
-      for cell in $cells; do echo "CELL=$cell mise run cell:up"; done
+      # A new mgmtd has no request. A request for a cell whose cluster exists skips the creation, and its bind proves the cell to the new plane.
+      for cell in $live; do args+=" --cell $cell"; done
+      if [[ -n "$args" ]]; then
+        echo "mise run portal -- request$args"
+        echo "mise run portal -- wait$args"
+      fi
+      # Each cell holds the root and the node address of management in its uplinks and its mesh tunnel.
+      for cell in $live; do echo "CELL=$cell mise run cell:up"; done
       echo "CELL=management mise run cell:link" ;;
     dev-cp)
+      live="$(live_cells)" || return 1
       echo "CELL=dev-cp mise run cell:up"
       # mgmtd admits envd by the dev-cp root and by the node address, so the link of mgmt-api follows the cell:up of dev-cp.
       echo "CELL=management LINK_ONLY=mgmt-api mise run cell:link"
-      for cell in $cells; do echo "CELL=$cell mise run cell:up"; done
-      for cell in $cells; do echo "CELL=$cell mise run cell:restart"; done
+      for cell in $live; do echo "CELL=$cell mise run cell:up"; done
+      for cell in $live; do echo "CELL=$cell mise run cell:restart"; done
       echo "CELL=management mise run cell:link" ;;
     *)
-      for cell in $cells; do
+      for cell in $catalog; do
         [[ "$cell" == "$1" ]] || continue
-        echo "CELL=dev-cp mise run cell:up"
-        echo "CELL=$cell mise run cell:up"
+        # A cluster that still exists goes first. A new cluster has new keys and a new node address, and its bind proves them.
+        live="$(live_cells)" || return 1
+        if grep -qx -- "$cell" <<<"$live"; then echo "CELL=$cell mise run cell:down"; fi
+        echo "mise run portal -- recreate --cell $cell --wait"
+        echo "CELL=management mise run cell:link"
         return
       done
-      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $cells, not '$1'" ;;
+      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $catalog, not '$1'" ;;
   esac
 }
 

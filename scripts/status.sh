@@ -12,6 +12,14 @@
 #   telemetry     {ok, wait, verdict}: the result of obs:uplink-status. wait is true when the only bad hop is the
 #                 export of the collector and the store has a fresh sample, a state that clears by itself
 #   problems      one sentence for each bad value, with the command to run
+# A cell with the cell-identity set exists only after its step creates it. For a cell that is not live, the object holds
+# only cluster, ok, absent (true) and problems: the problems of provisioning that name the cell. It holds no applications,
+# verify or telemetry, because there is no cluster to read.
+# The problems of provisioning follow the steps of the host service on this Mac and the steps that mgmtd reports. They name a cell
+# that is invalid for more than 5 minutes with no open step, an open step that is expired, failed or refused, a journal entry with an
+# old heartbeat or a stage past its timeout, a cell controller that stopped to write step-status, a host error older than 2 minutes, a
+# requested cell with no cluster, a live cell that is not requested, and a host service that does not hold the dev root, the keys or
+# the spec revision of mgmtd. The times of the journal come from the clock of the Mac, and the times of the clusters from a node.
 # The object of dev-cp also holds:
 #   gateway       {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt, recordOld, recordOldAt,
 #                 queued, streams, mostClaimed, lastBindRefusal, storeError}: the status of the cell gateway. When it does not
@@ -34,15 +42,21 @@
 # The checks of cell:verify, the hops of obs:uplink-status and the parts of mesh:status are read from those
 # tasks and not repeated here. STATUS_SAMPLE_MAX_AGE (default 300) is the age limit for a sample, and
 # STATUS_VERIFY_TIMEOUT (default 900) is the time in seconds that the task waits for cell:verify of one cluster.
+# HOSTSVC_STEPS_DIR names another directory for the journal and the step logs, for the tests.
 export CELL="${CELL:-management}"
 source "$(dirname "$0")/lib.sh"
 source "$ROOT/components/lib/peer-root.sh"
 source "$ROOT/components/lib/hostsvc-pin.sh"
 source "$ROOT/scripts/verify-lib.sh"
+source "$ROOT/scripts/steps-lib.sh"
 
 cd "$ROOT"
 clusters="$(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml")"
 [[ -n "$clusters" ]] || json_fail harness:status "no cluster in harness/topology.yaml has components"
+# A cell exists only through its step. The cells that are not live get an object with absent: true, and no read of a cluster.
+catalog="$(catalog_cells)" || json_fail harness:status "could not read the cells of harness/topology.yaml"
+live="$(live_cells 2>&1)" || json_fail harness:status "could not tell which cells are live: $live. Run: docker ps"
+live="$(paste -sd' ' - <<<"$live")"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 max_age="${STATUS_SAMPLE_MAX_AGE:-300}"
@@ -143,9 +157,10 @@ management_plane() {
 # management_problems <cell-identity cells> reads the field management on standard input and prints one problem
 # for each bad value, as a JSON array of strings. Each problem ends with the command to run.
 management_problems() {
-  local now clock_problem
+  local now clock_problem staged=""
+  staged="$(stage_cells 2>/dev/null)" || staged=""
   read_clock
-  jq -c --arg bind "$1" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
+  jq -c --arg bind "$1" --arg staged "$staged" --argjson now "$now" --arg clockp "$clock_problem" 'def rev: "\(.epoch).\(.counter)";
     def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     def cp: "CELL=dev-cp mise run cell:verify";
     if .error != null then ["mgmtd status failed: " + .error]
@@ -175,7 +190,8 @@ management_problems() {
         (.expiredOps[]? | select(((.expiredAt // "") | ts) > 1000000000 and ($now - (.expiredAt | ts)) < 900)
           | "operation \(.id) for \(.cell) expired at \(.expiredAt) with no final result. Run: mise run ops -- close \(.id)"),
         ($bind | split(" ") | map(select(length > 0))[] as $c | select(any($m.cells[]; .name == $c and .bound) | not)
-          | "\($c) is not bound. Run: CELL=\($c) mise run cell:up"),
+          | ($staged | split(" ") | map(select(startswith($c + ":"))) | first // "") as $run
+          | if $run != "" then "\($c) is not bound while its stage \($run | sub("^[^:]*:"; "")) runs. Wait for the stage" else "\($c) is not bound. Run: CELL=\($c) mise run cell:up" end),
         (if .hostsvc.running != true then "the host service is not running. Run: mise run hostsvc:serve -- start"
          elif .hostsvc.expires_soon then "the host service certificate expires soon. Run: mise run hostsvc:serve -- restart"
          elif .hostsvc.check != "" then "host service: " + .hostsvc.check else empty end)
@@ -232,7 +248,12 @@ management_extras() {
   # about 10 hours, and the connect line goes with it. An agent with no stream line in the log counts as connected when the
   # principal received an event from it in the last 5 minutes, because events arrive for as long as the stream is open.
   logs="$(kubectl --context kind-management -n central-view-system logs deploy/argocd-agent-principal -c argocd-agent-principal 2>/dev/null || true)"
-  expected="$(for cell in $VIEW_CELLS; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  # A cell with no cluster has no agent, sample or tunnel, so the lists hold only the cells that are live.
+  view_live="" mesh_live="" clusters_live=""
+  for cell in $VIEW_CELLS; do [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || view_live+="$cell "; done
+  for entry in $MESH_VIEW_CELLS; do cell="${entry%%=*}"; [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || mesh_live+="$entry "; done
+  for cell in $clusters; do [[ " $live " != *" $cell "* ]] && grep -qx -- "$cell" <<<"$catalog" || clusters_live+="$cell"$'\n'; done
+  expected="$(for cell in $view_live; do echo "$POC_ENV-$cell"; done | jq -Rsc 'split("\n") | map(select(length > 0))')"
   read_clock
   agents="$(jq -Rsc --argjson now "$now" --argjson expected "$expected" '
       def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
@@ -249,11 +270,11 @@ management_extras() {
     --data-urlencode 'query=time() - max by (k8s_cluster_name) (timestamp(up))' http://127.0.0.1:9090/api/v1/query 2>/dev/null \
     | jq -c '[.data.result[]? | select(.metric.k8s_cluster_name != null) | {key: .metric.k8s_cluster_name, value: (.value[1] | tonumber | floor)}] | from_entries' 2>/dev/null)" || samples=""
   [[ -n "$samples" ]] || samples='{}'
-  samples="$(jq -c --arg clusters "$clusters" --argjson max "$max_age" '. as $s | {samples: ., stale: [$clusters | split("\n")[] | select(length > 0) | select(($s[.] == null) or $s[.] >= $max)]}' <<<"$samples")"
+  samples="$(jq -c --arg clusters "$clusters_live" --argjson max "$max_age" '. as $s | {samples: ., stale: [$clusters | split("\n")[] | select(length > 0) | select(($s[.] == null) or $s[.] >= $max)]}' <<<"$samples")"
 
   # Kiali reads every cell once at start. While a cell is down, it stops in discovery and restarts until all answer.
   # A cell is absent only when its own API does not answer. A tunnel that is down while the API answers has another cause.
-  for entry in $MESH_VIEW_CELLS; do
+  for entry in $mesh_live; do
     cell="${entry%%=*}"
     if ! hub_cell_state "$cell"; then
       down+="$cell "
@@ -264,7 +285,7 @@ management_extras() {
   conf=""
   [[ "${ready:-0}" == 1 ]] && conf="$(kubectl --context kind-management get --raw \
     /api/v1/namespaces/mesh-view-system/services/kiali:20001/proxy/kiali/api/config 2>/dev/null || true)"
-  kiali_json="$(jq -Rsc --arg ready "${ready:-0}" --arg cells "$MESH_VIEW_CELLS" --arg down "$down" --arg absent "$absent" '
+  kiali_json="$(jq -Rsc --arg ready "${ready:-0}" --arg cells "$mesh_live" --arg down "$down" --arg absent "$absent" '
       def names: map(select(length > 0));
       (fromjson? // {}) as $c
       | ([$c.clusters // {} | to_entries[] | select(.value.accessible == true) | .key] | sort) as $acc
@@ -293,6 +314,107 @@ management_extras() {
       mesh: {ok: ($rc == 0), lines: ($out | split("\n") | map(select(length > 0)))}}'
 }
 
+# provisioning_problems prints the problems of provisioning as a JSON array of {cluster, problem}. A problem names the cluster whose
+# object carries it. It reads mgmt -- status for the cells and their steps, the journal and the step logs of the host service, the
+# ConfigMap step-status of dev-cp and the status of the host service. When mgmtd does not answer it prints [], because the object of
+# management already reports that. The times of the journal come from the clock of the Mac and every other time from a node.
+provisioning_problems() {
+  local st now clock_problem mac_now states stuck id cell state kind secs limit hs serve pub staged wantkeys='null' sat="" jadmit=false admit_at=0
+  local extra='[]' marker=false open_steps=false flag=-d
+  st="$(mise run mgmt -- status 2>/dev/null)" || st=""
+  if ! jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$st"; then
+    echo '[]'
+    return
+  fi
+  addp() { extra="$(jq -c --arg c "$1" --arg p "$2" '. + [{cluster: $c, problem: $p}]' <<<"$extra")"; }
+  [[ ! -e "$BUILD_ROOT/gate/m6-provision" ]] || marker=true
+
+  # The journal and the step logs hold the times of the Mac.
+  mac_now="$(date +%s)"
+  if states="$(journal_states 2>/dev/null)" && stuck="$(stuck_steps "$mac_now" 2>/dev/null)"; then
+    ! grep -qx admitting <<<"$states" || jadmit=true
+    admit_at="$(admit_end 2>/dev/null)" || admit_at=0
+    [[ "$admit_at" =~ ^[0-9]+$ ]] || admit_at=0
+    while read -r id cell state kind secs limit; do
+      [[ -n "$id" ]] || continue
+      if [[ "$kind" == heartbeat ]]; then
+        addp "$cell" "the step $id of $cell is in the stage $state, and its heartbeat is $secs seconds old, which is more than 2 minutes. Run: mise run hostsvc:serve -- restart --force"
+      else
+        addp "$cell" "the step $id of $cell has run the stage $state for $((secs / 60)) minutes, which is more than its timeout of $(((limit - STEP_STAGE_GRACE) / 60)) minutes plus 5. Run: mise run hostsvc:serve -- restart --force"
+      fi
+    done <<<"$stuck"
+  else
+    addp management "the step journal of the host service does not parse. Run: mise run hostsvc:serve -- steps --reset"
+  fi
+
+  # step-status is the progress that the cell controller writes while a step is open, so its time is read only then.
+  if jq -e '[.cells[]? | select(.step != null and ((.step.doneAt // "") == "" or (.step.doneAt | startswith("0001-"))))] | length > 0' >/dev/null <<<"$st"; then
+    open_steps=true
+  fi
+  if [[ "$open_steps" == true ]] && grep -qx dev-cp <<<"$(existing_clusters 2>/dev/null)"; then
+    sat="$(kubectl --context kind-dev-cp -n cell-controller-system get configmap step-status -o jsonpath='{.data.status\.json}' 2>/dev/null | jq -r '.at // ""' 2>/dev/null)" || sat=""
+  fi
+
+  # The keys that the host service must trust are the signing key of mgmtd and the staged key.
+  serve="$(hostsvc_serve_script)"
+  hs="$("$serve" status 2>/dev/null)" || hs=""
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$hs" || hs='{"running":false}'
+  printf 'AA==' | base64 -d >/dev/null 2>&1 || flag=-D
+  pub="$(mise run mgmt -- pubkey 2>/dev/null | jq -r '."spec.pub" // ""' 2>/dev/null)" || pub=""
+  if [[ -n "$pub" ]]; then
+    staged="$(jq -r '.stagedKey // ""' <<<"$st")"
+    wantkeys="$({ printf '%s' "$pub" | base64 "$flag" | shasum -a 256 | cut -d' ' -f1; [[ -z "$staged" ]] || echo "$staged"; } | jq -Rcn '[inputs] | sort')"
+  fi
+
+  # retryAt and the journal times come from the clock of the Mac (macnow). Every other time comes from a node (now).
+  read_clock
+  jq -c --arg live "$live" --arg catalog "$(catalog_cells | paste -sd' ' -)" --argjson now "$now" --arg clockp "$clock_problem" \
+    --argjson marker "$marker" --argjson jadmit "$jadmit" --argjson admitat "$admit_at" --argjson macnow "$mac_now" --arg sat "$sat" --argjson hs "$hs" --argjson wantkeys "$wantkeys" --argjson extra "$extra" '
+    def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    def isopen: . != null and .step != null and ((.step.doneAt // "") | (. == "" or startswith("0001-")));
+    def words: split(" ") | map(select(length > 0));
+    . as $m | ($live | words) as $lv | ($catalog | words) as $cat | .cells as $cells
+    | (any($cells[]?; isopen and .step.host != null and .step.host.id == .step.id and .step.host.state == "admitting") or $jadmit) as $admitting
+    | ([$cat[] as $c
+        | ([$cells[]? | select(.name == $c)] | first // null) as $cs
+        | ($lv | index($c) != null) as $islive
+        | ($cs != null and $cs.requested == true) as $req
+        | ($cs | isopen) as $open
+        | ($cs.step.host // null) as $host
+        | (if $host != null and $host.id == $cs.step.id then $host else null end) as $h
+        | (
+          (if $islive and $req and ($cs.invalidSince | ts) > 1000000000 and ($now - ([($cs.invalidSince | ts), $admitat] | max)) > 300 and ($open | not) and ($admitting | not)
+           then {cluster: $c, problem: "the cell \($c) has been invalid since \($cs.invalidSince) (\($cs.validReason // "no reason")), which is more than 5 minutes, and no step is open. Run: CELL=\($c) mise run cell:verify"} else empty end),
+          (if $open and ($cs.step.expiresAt | ts) > 1000000000 and ($cs.step.expiresAt | ts) < $now
+           then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) expired at \($cs.step.expiresAt). Run: mise run portal -- retry --cell \($c)"} else empty end),
+          (if $open and $h != null and $h.state == "failed" and ($h.retryAt | ts) > 1000000000 and ($h.retryAt | ts) + 30 > $macnow
+           then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) is failed\(if ($h.reason // "") != "" then " (" + $h.reason + ")" else "" end), and the cell controller sends it again at \($h.retryAt). Wait until then"} else empty end),
+          (if $open and $h != null and (($h.state == "failed" and (($h.retryAt | ts) + 30 <= $macnow)) or $h.state == "failed_final" or $h.state == "refused")
+           then {cluster: $c, problem: "the open step \($cs.step.id) of \($c) is \($h.state)\(if ($h.reason // "") != "" then " (" + $h.reason + ")" else "" end). Run: mise run portal -- retry --cell \($c)"} else empty end),
+          (if $open and $h != null and $h.lastHostError != null and ($h.lastHostError.at | ts) > 1000000000 and ($now - ($h.lastHostError.at | ts)) > 120
+           then {cluster: $c, problem: (if $h.lastHostError.reason == "hostsvc_untrusted"
+              then "the cell controller has not trusted the host service since \($h.lastHostError.at), for the step of \($c). Run: mise run hostsvc:serve -- restart"
+              else "the cell controller has not reached the host service since \($h.lastHostError.at) (\($h.lastHostError.reason)), for the step of \($c). Run: mise run hostsvc:serve -- status" end)} else empty end),
+          (if $req and ($islive | not) and ($open | not)
+           then {cluster: $c, problem: "the cell \($c) is requested and has no cluster, and no step is open. Run: mise run portal -- recreate --cell \($c)"} else empty end),
+          (if $islive and ($req | not)
+           then {cluster: $c, problem: "the cell \($c) has a cluster and is not requested. Run: mise run portal -- request --cell \($c), or run: CELL=\($c) mise run cell:down"} else empty end),
+          (if ($req | not) and ($islive | not)
+           then {cluster: $c, problem: "the cell \($c) is neither requested nor live. Run: \(if $marker then "mise run gate:m6:repair" else "mise run portal -- request --cell \($c) --wait" end)"} else empty end)
+        )]
+      + [if ([$cells[]? | select(isopen)] | length) > 0 and ($sat == "" or ($sat | ts) == 0 or ($now - ($sat | ts)) > 90)
+         then {cluster: "dev-cp", problem: "a step is open, and step-status of the cell controller is \(if $sat == "" then "absent" else "from \($sat)" end), which is more than 90 seconds old. Run: CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:restart"} else empty end]
+      + [if $hs.running == true then
+          (if ($hs.dev_root_sha256 // "") == "" then {cluster: "management", problem: "the host service has no dev-root.crt. Run: mise run hostsvc:serve -- sync"} else empty end),
+          (if $wantkeys == null then {cluster: "management", problem: "mgmtd prints no signing key, so the keys of the host service are unchecked. Run: mise run mgmt -- pubkey"}
+           elif (($hs.keys // []) | sort) != $wantkeys then {cluster: "management", problem: "the host service trusts the keys \(($hs.keys // []) | tojson), and mgmtd holds \($wantkeys | tojson). Run: mise run hostsvc:serve -- sync"} else empty end),
+          (if ($hs.spec_revision | tojson) != ($m.signed | tojson) and (($m.hostSpecPushedAt // "") | ts) < ($now - 120)
+           then {cluster: "management", problem: "the host service knows the spec revision \($hs.spec_revision | tojson), and mgmtd signed \($m.signed | tojson), for more than 2 minutes. Run: mise run hostsvc:serve -- sync, or run: CELL=management LINK_ONLY=mgmt-api mise run cell:link"} else empty end)
+        else empty end]
+      + $extra
+      + (if $clockp != "" then [{cluster: "management", problem: $clockp}] else [] end))' <<<"$st"
+}
+
 # collect <cluster> writes the JSON object of one cluster to $tmp/<cluster>.json.
 collect() {
   local cluster="$1" apps verify telemetry extras='{}' mp='[]' plane
@@ -301,7 +423,7 @@ collect() {
   telemetry="$(run_telemetry "$cluster")"
   if [[ "$cluster" == management ]]; then
     extras="$(management_extras)"
-    mp="$(jq -c .management <<<"$extras" | management_problems "$(yq -r '.clusters[] | select(.components | contains(["cell-identity"])) | .name' "$ROOT/harness/topology.yaml" | paste -sd' ' -)")"
+    mp="$(jq -c .management <<<"$extras" | management_problems "$live")"
   fi
   if [[ "$cluster" == dev-cp ]]; then
     plane="$(gateway_plane)"
@@ -324,22 +446,37 @@ collect() {
         else empty end]
       + [if $extras.kiali != null and $extras.kiali.note != "" then "Kiali: " + $extras.kiali.note else empty end]
       + [if $extras.mesh != null and ($extras.mesh.ok | not) then "mesh:status reports a part that is not up. Run: mise run mesh:status" else empty end]) as $m
-    | ($a + $v + $t + $m + $mp) as $problems
+    | ([if $cluster == "dev-cp" and any($verify.failed[]; contains("admit lists"))
+        then "the admit lists of dev-cp differ from the live cells. Run: CELL=dev-cp mise run cell:up" else empty end]) as $l
+    | ($a + $v + $t + $m + $l + $mp) as $problems
     | {cluster: $cluster, ok: ($problems | length == 0), applications: $apps, verify: $verify, telemetry: $telemetry}
       + $extras + {problems: $problems}' >"$tmp/$cluster.json"
 }
 
 for cluster in $clusters; do
+  if grep -qx -- "$cluster" <<<"$catalog" && [[ " $live " != *" $cluster "* ]]; then
+    log "$cluster has no cluster"
+    jq -nc --arg cluster "$cluster" '{cluster: $cluster, ok: true, absent: true, problems: []}' >"$tmp/$cluster.json"
+    continue
+  fi
   log "reading $cluster"
   collect "$cluster" &
 done
 wait
 
+# The problems of provisioning read the clocks after the verify steps, so their ages are current. Each one joins the object of the
+# cluster that it names.
+log "reading the steps"
+if ! m6="$(provisioning_problems 2>"$tmp/m6.err")" || ! jq -e 'type == "array"' >/dev/null 2>&1 <<<"$m6"; then
+  m6="$(jq -nc --arg e "$(tail -n 1 "$tmp/m6.err" 2>/dev/null)" '[{cluster: "management", problem: "the steps could not be read\(if $e != "" then ": " + $e else "" end). Run: mise run mgmt -- status"}]')"
+fi
+
 status=0
 for cluster in $clusters; do
   if [[ -s "$tmp/$cluster.json" ]]; then
-    cat "$tmp/$cluster.json"
-    jq -e .ok "$tmp/$cluster.json" >/dev/null || status=1
+    jq -c --arg c "$cluster" --argjson m6 "$m6" '.problems += [$m6[] | select(.cluster == $c) | .problem] | .ok = (.problems | length == 0)' "$tmp/$cluster.json" >"$tmp/$cluster.out"
+    cat "$tmp/$cluster.out"
+    jq -e .ok "$tmp/$cluster.out" >/dev/null || status=1
   else
     jq -nc --arg cluster "$cluster" '"the status script could not read the cluster" as $why
       | {cluster: $cluster, ok: false, applications: {total: 0, bad: [$why]}, verify: {ok: false, failed: [$why]},

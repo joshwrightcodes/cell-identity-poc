@@ -5,7 +5,7 @@
 //
 //	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m] [--registry-namespaces <ns>,<ns>]
 //	mgmtd reset-state [--data-dir /var/lib/mgmtd]
-//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>]
+//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
 // JSON on stdout. Logs, traces and metrics also go out as OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is
@@ -69,10 +69,13 @@ type deps struct {
 	nofile    func() (uint64, error)
 	// beforePlane runs before the plane loads. Tests use it to hold the load.
 	beforePlane func()
+	// stdin is where ctl step sign reads the step. A nil reader is an empty input.
+	stdin io.Reader
 }
 
 func realDeps() deps {
 	return deps{
+		stdin: os.Stdin,
 		telemetry: func(ctx context.Context, stdout io.Writer) (*telemetry.T, error) {
 			return telemetry.Start(ctx, name, stdout)
 		},
@@ -136,7 +139,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 			return 1
 		}
 	case "ctl":
-		return ctlCommand(ctx, args[1:], stdout)
+		return ctlCommand(ctx, args[1:], d.stdin, stdout)
 	case "reset-state":
 		return resetCommand(args[1:], stdout, time.Now)
 	}
@@ -372,6 +375,13 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		Meter:      meter,
 		CheckEvery: cfg.checkEvery,
 	}
+	pusher := NewSpecPusher(keyClient, specRepushEvery, logger)
+	pcfg.OnSpec, pcfg.SpecPushState = pusher.Offer, pusher.State
+	if meter != nil {
+		if err := pusher.Observe(meter); err != nil {
+			return fmt.Errorf("spec push gauge: %w", err)
+		}
+	}
 	var registry *registryPublisher
 	if len(cfg.registryNamespaces) > 0 {
 		registry = newRegistryPublisher()
@@ -406,6 +416,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	spawn("api", func() error { return ignoreClosed(apiSrv.Serve(mgmt.ListenAPI(apiRaw, apiSrv.TLSConfig, logger))) })
 	spawn("admin", func() error { return serveAdmin(ctx, adminLn, mgmt.NewAdminHandler(plane, publisher.adminPublish)) })
 	wg.Go(func() { _ = plane.RunChecks(ctx) })
+	wg.Go(func() { pusher.Run(ctx) })
 	wg.Go(func() { publisher.run(ctx, logger, time.Second, 5*time.Minute) })
 	if registry != nil {
 		wg.Go(func() { registry.run(ctx, kube, cfg.registryNamespaces, logger, registryBackoff, registryResync) })

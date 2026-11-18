@@ -54,7 +54,7 @@ func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) 
 			p.checkResults.Add(ctx, 1, metric.WithAttributes(attribute.String("result", string(res)), attribute.String("via", via)))
 		}
 	}()
-	if _, ok := p.intent[cell]; !ok {
+	if _, ok := p.cellIn(p.snap.Load().st, cell); !ok {
 		return "", refuse(mgmtapi.ReasonCellUnknown, "")
 	}
 	if expect != nil && p.snapshotSeq() != *expect {
@@ -77,6 +77,9 @@ func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) 
 	err = p.commit(func(t *txn) error {
 		if err := t.expectSeq(expect); err != nil {
 			return err
+		}
+		if _, ok := p.cellIn(t.st, cell); !ok {
+			return refuse(mgmtapi.ReasonCellUnknown, "")
 		}
 		cs := t.st.Cells[cell]
 		if cs == nil {
@@ -180,7 +183,7 @@ func (p *Plane) RunChecks(ctx context.Context) error {
 		}
 		st := p.snap.Load().st
 		for _, name := range sortedKeys(st.Cells) {
-			if _, ok := p.intent[name]; !ok || p.cfg.Now().Sub(st.Cells[name].CheckedAt) < p.cfg.CheckEvery {
+			if _, ok := p.cellIn(st, name); !ok || p.cfg.Now().Sub(st.Cells[name].CheckedAt) < p.cfg.CheckEvery {
 				continue
 			}
 			if _, err := p.KeyCheckVia(ctx, name, ViaPeriodic); err != nil {
@@ -192,7 +195,7 @@ func (p *Plane) RunChecks(ctx context.Context) error {
 
 // PreviewKeys reads the keys of a cell without a cache and changes no state.
 func (p *Plane) PreviewKeys(ctx context.Context, cell string) (mgmtapi.ClusterKeys, error) {
-	if _, ok := p.intent[cell]; !ok {
+	if _, ok := p.cellIn(p.snap.Load().st, cell); !ok {
 		return mgmtapi.ClusterKeys{}, refuse(mgmtapi.ReasonCellUnknown, "")
 	}
 	keys, err := p.cfg.Keys.Keys(ctx, cell)

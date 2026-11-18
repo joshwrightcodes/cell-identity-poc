@@ -8,8 +8,9 @@
 # object carries the harness label of the component.
 #
 # The render reads these facts from outside the cluster, so the harness runs it after the waves:
-#   - the node address of each cell of the topology that has the cell-identity set, from the host
+#   - the node address of each live cell (live_cells in components/lib/live-cells.sh), from the host
 #     service. Each one goes into a --cell-node argument and into the ingress rules of flows N37 and N38.
+#     With no live cell, the render passes no --cell-node and deletes both rules.
 #   - the public signing key of mgmtd, from ConfigMap mgmt-signing-pub in management, as ConfigMap
 #     mgmt-spec-key. envd and the SPIRE server of this cluster pin the same key.
 #   - the root of the environment trust domain, from the live SPIRE server of this cluster, for the
@@ -34,6 +35,7 @@ source "$root/components/lib/addresses.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/mgmt-key.sh"
 source "$root/components/lib/spire-sidecar.sh"
+source "$root/components/lib/live-cells.sh"
 
 [[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 [[ "$SPIRE_TRUST_DOMAIN" == dev.env.poc.internal ]] || die "SPIRE_TRUST_DOMAIN '$SPIRE_TRUST_DOMAIN' is not dev.env.poc.internal, the domain of the gateway ID"
@@ -41,12 +43,12 @@ ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$DNS_SERVICE_IP" =~ $ipv4 ]] || die "DNS_SERVICE_IP is not an IPv4 address"
 node_ips="$(ipv4_list NODE_IPS)" || exit 1
 
-cells="$(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$root/harness/topology.yaml")" || die "could not read the topology"
-[[ -n "$cells" ]] || die "no cluster in harness/topology.yaml has the cell-identity set, so the gateway has no cell"
+cells="$(live_cells)" || die "could not list the live cells"
 cell_ips=() cell_args=""
 for cell in $cells; do
+  # A live cell has a cluster, so its facts must read. A read error stops the render, and no cell drops out of the admit list.
   if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
-    die "no host service facts for $cell: ${facts:-no output}. Create the cluster: mise run hostsvc -- up --only $cell"
+    die "no host service facts for the live cell $cell: ${facts:-no output}. Read them: mise run hostsvc -- facts --cluster $cell"
   fi
   ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
   [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
@@ -66,7 +68,7 @@ gateway_image="$(ko_image cellgw)" || die "no cellgw image"
 
 manifests="$(sed -e "s|@CELLGW_IMAGE@|$gateway_image|" -e "s|@SPEC_KEY_SHA256@|$spec_sum|" \
   -e "s|@SPIRE_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" -e "s|@POC_ENV@|$POC_ENV|" "$here/manifests.yaml" \
-  | ARGS="$cell_args" awk '$0 == "@CELL_NODE_ARGS@" { print ENVIRON["ARGS"]; next } { print }')"
+  | ARGS="$cell_args" awk '$0 == "@CELL_NODE_ARGS@" { if (ENVIRON["ARGS"] != "") print ENVIRON["ARGS"]; next } { print }')"
 grep -q '@[A-Z_]*@' <<<"$manifests" && die "the manifests keep a token that the render does not replace"
 
 statefulset="$(yq 'select(.kind == "StatefulSet")' <<<"$manifests" \
@@ -79,12 +81,12 @@ statefulset="$(yq 'select(.kind == "StatefulSet")' <<<"$manifests" \
 # health port for the kubelet probes. Flow N8 reaches the SPIRE server for the sidecar, and N11 the collector.
 # Flow N40 is allow-dns, which the namespace has apart from this policy.
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }
-policy="$(jq -n --arg ns "$namespace" --argjson cells "$(peers "${cell_ips[@]}")" --argjson nodes "$(peers $node_ips)" '
+policy="$(jq -n --arg ns "$namespace" --argjson cells "$(peers ${cell_ips[@]+"${cell_ips[@]}"})" --argjson nodes "$(peers $node_ips)" '
   {apiVersion: "networking.k8s.io/v1", kind: "NetworkPolicy", metadata: {name: "cell-gateway", namespace: $ns},
    spec: {podSelector: {matchLabels: {"app.kubernetes.io/name": "cell-gateway"}}, policyTypes: ["Ingress", "Egress"],
-     ingress: [
+     ingress: ([
        {from: $cells, ports: [{protocol: "TCP", port: 8450}]},
-       {from: $cells, ports: [{protocol: "TCP", port: 8451}]},
+       {from: $cells, ports: [{protocol: "TCP", port: 8451}]}] | map(select(.from | length > 0))) + [
        {from: [{namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": "envd-system"}},
                 podSelector: {matchLabels: {"app.kubernetes.io/name": "envd"}}}],
         ports: [{protocol: "TCP", port: 8452}]},

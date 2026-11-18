@@ -43,7 +43,9 @@ if [[ "$replicas" != 1 ]]; then
 fi
 
 # TestM5ReplicaCap runs two celld pods in a cell, and a run that stops early leaves them.
-for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+# A cell that is not live has no celld to repair.
+live="$(live_cells)" || die "$live"
+for cluster in $live; do
   replicas="$(kubectl --context "kind-$cluster" -n cell-identity-system get deployment celld -o jsonpath='{.spec.replicas}' 2>/dev/null)" \
     || { echo "Deployment celld is absent in $cluster. Run: CELL=$cluster mise run cell:up"; status=1; continue; }
   [[ "$replicas" != 1 ]] || continue
@@ -61,7 +63,7 @@ done
 
 # The test namespaces of the M5 tests carry the label cell.poc.internal/e2e=true.
 test_label="cell.poc.internal/e2e"
-for cluster in $(yq -r '.clusters[].name' "$ROOT/harness/topology.yaml"); do
+for cluster in $(existing_clusters); do
   names="$(kubectl --context "kind-$cluster" get namespaces -o json | jq -r --arg l "$test_label" '.items[]
     | select(.metadata.labels[$l] == "true" and (.metadata.name | startswith("m5-"))) | .metadata.name')" \
     || die "could not list the namespaces of $cluster"
@@ -86,7 +88,7 @@ streams_missing() {
     echo "the gateway status failed: $(jq -Rsr '(split("\n") | map(fromjson? | select(type == "object")) | .[0].error) // "no status"' <<<"$gw"). Run: CELL=dev-cp mise run cell:up"
     return 1
   fi
-  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+  for cluster in $(live_cells); do
     n="$(jq -r --arg c "$cluster" '.streams[$c] // 0' <<<"$gw")"
     ((n >= 1)) || out+="the gateway holds no stream of $cluster. Run: CELL=$cluster mise run cell:up"$'\n'
   done

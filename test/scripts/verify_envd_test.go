@@ -23,6 +23,7 @@ case " $* " in
   *" --context kind-management "*" get pod mgmtd-0 "*) printf 'True' ;;
   *" -n spire-system get configmap cell-records -o json "*) cat "$d/cell-records.json" ;;
   *" -n spire-system get networkpolicy spire-server-agents "*) cat "$d/agents-policy.json" ;;
+  *" -n spire-system get service spire-server "*) cat "$d/service.json" ;;
   *" -n spire-system get configmap attest-hints "*) [[ -s "$d/attest-hints" ]] || { echo 'not found' >&2; exit 1; }; echo configmap/attest-hints ;;
   *" -n spire-system get configmap spire-server "*) cat "$d/server.conf" ;;
   *" -n envd-system get configmap mgmt-spec-key "*) printf '%s' "$(cat "$d/spec-key")" ;;
@@ -72,6 +73,7 @@ func TestVerifyEnvdChecks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	writeLiveStubs(t, bin)
 	pub := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("k", 32)))
 	otherPub := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("o", 32)))
 	mgmtRoot, otherRoot := caPEM(t, 1), caPEM(t, 2)
@@ -123,18 +125,21 @@ func TestVerifyEnvdChecks(t *testing.T) {
 	healthy := map[string]string{
 		"mgmt-root.pem": mgmtRoot, "signing-pub": pub, "status.json": `{"signed":{"epoch":1,"counter":7}}`,
 		"cell-records.json":  records("7", map[string]string{"dev-cell-1": jwks("a", "b"), "dev-cell-2": jwks("c")}),
-		"agents-policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"10.9.0.1/32"}},{"ipBlock":{"cidr":"10.9.0.2/32"}}]}]}}`,
+		"agents-policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"10.250.0.1/32"}}],"ports":[{"port":9999}]},{"from":[{"ipBlock":{"cidr":"10.9.0.1/32"}},{"ipBlock":{"cidr":"10.9.0.2/32"}}],"ports":[{"port":8081}]}]}}`,
 		"server.conf":        conf(pub) + "      hint_configmap = \"spire-system/attest-hints\"\n", "attest-hints": "{}", "spec-key": pub, "envd-deployment.json": envd("10.9.0.10"), "envd-policy.json": envdPolicy("10.9.0.10"),
 		"envd-peer-root.pem": mgmtRoot, "envd-pods.json": pods("envd", rootSum(mgmtRoot)), "op-key.json": opKey(map[string]string{"op.pub": pub}), "celld-pods.json": opPods(opSum(pub)), "gw-status.json": `{"epoch":1,"streams":{"dev-cell-1":1,"dev-cell-2":2}}`,
-		"live-jwks.json": jwks("a", "b"), "traces": "",
+		"live-jwks.json": jwks("a", "b"), "traces": "", "service.json": `{"spec":{"ports":[{"port":8081,"nodePort":30081}]}}`,
 		"facts-management.json": `{"name":"management","nodeIP":"10.9.0.10"}`,
 		"facts-dev-cell-1.json": `{"name":"dev-cell-1","nodeIP":"10.9.0.1","jwks":` + jwks("a", "b") + `}`,
 		"facts-dev-cell-2.json": `{"name":"dev-cell-2","nodeIP":"10.9.0.2","jwks":` + jwks("c") + `}`,
 	}
 	up := "Run: CELL=dev-cp mise run cell:up"
+	noCells := []string{"STUB_KIND=management dev-cp rogue"}
+	zeroConf := "  # The cluster_jwt plugin applies its own limit per cell.\n      reload_interval = \"10s\"\n"
 	for _, tc := range []struct {
 		name, check, cell string
 		change            map[string]string
+		env               []string
 		want              []string
 	}{
 		{name: "envd applied ok", check: "check_envd_applied", cell: "dev-cp"},
@@ -156,6 +161,19 @@ func TestVerifyEnvdChecks(t *testing.T) {
 			change: map[string]string{"server.conf": conf(pub) + "      hint_configmap = \"spire-system/other\"\n"}, want: []string{"sets hint_configmap 'spire-system/other'", up}},
 		{name: "attest hints: the server config sets none", check: "check_attest_hints_exists", cell: "dev-cp", want: []string{"sets hint_configmap ''", up},
 			change: map[string]string{"server.conf": conf(pub)}},
+		// With no live cell the render drops the cluster_jwt plugin: no record_public_keys, no hint_configmap, no node port.
+		{name: "zero cells: spec key ok", check: "check_spec_key_pinned", cell: "dev-cp", env: noCells, change: map[string]string{"server.conf": zeroConf}},
+		{name: "zero cells: spec key: the server still pins a key", check: "check_spec_key_pinned", cell: "dev-cp", env: noCells, change: map[string]string{"server.conf": conf(pub)},
+			want: []string{"no cell is live", "pins '" + pub + "'", up}},
+		{name: "zero cells: spec key: the cluster_jwt plugin stays", check: "check_spec_key_pinned", cell: "dev-cp", env: noCells,
+			change: map[string]string{"server.conf": zeroConf + "    NodeAttestor \"cluster_jwt\" {\n"}, want: []string{"no cell is live", "cluster_jwt plugin present: yes", up}},
+		{name: "zero cells: spec key: envd holds an old key", check: "check_spec_key_pinned", cell: "dev-cp", env: noCells,
+			change: map[string]string{"server.conf": zeroConf, "spec-key": otherPub}, want: []string{"no cell is live", "mgmt-spec-key holds '" + otherPub + "'", up}},
+		{name: "zero cells: attest hints ok", check: "check_attest_hints_exists", cell: "dev-cp", env: noCells, change: map[string]string{"server.conf": zeroConf, "attest-hints": ""}},
+		{name: "zero cells: attest hints: the server config still sets one", check: "check_attest_hints_exists", cell: "dev-cp", env: noCells,
+			want: []string{"no cell is live", "sets hint_configmap 'spire-system/attest-hints', want none", up}},
+		{name: "zero cells: node port closed ok", check: "check_spire_node_port_closed", cell: "dev-cp", env: noCells, change: map[string]string{"service.json": `{"spec":{"ports":[{"port":8081}]}}`}},
+		{name: "zero cells: node port still open", check: "check_spire_node_port_closed", cell: "dev-cp", env: noCells, want: []string{"still has the node port 30081", up}},
 		{name: "management address ok", check: "check_envd_mgmt_address", cell: "dev-cp"},
 		{name: "management address: the node moved", check: "check_envd_mgmt_address", cell: "dev-cp", change: map[string]string{"facts-management.json": `{"name":"management","nodeIP":"10.9.0.77"}`},
 			want: []string{"the management node is 10.9.0.77", "runs '--upstream=10.9.0.10:31446'", up}},
@@ -192,9 +210,9 @@ func TestVerifyEnvdChecks(t *testing.T) {
 		{name: "agent cells: a record holds old keys", check: "check_agent_cells_current", cell: "dev-cp",
 			change: map[string]string{"cell-records.json": records("7", map[string]string{"dev-cell-1": jwks("a"), "dev-cell-2": jwks("c")})},
 			want:   []string{"the record of dev-cell-1 in ConfigMap cell-records holds other service account keys", "Run: mise run mgmt -- keycheck --cell dev-cell-1"}},
-		{name: "agent cells: no record for a cell", check: "check_agent_cells_current", cell: "dev-cp",
-			change: map[string]string{"cell-records.json": records("7", map[string]string{"dev-cell-1": jwks("a", "b")})},
-			want:   []string{"the record of dev-cell-2", "Run: mise run mgmt -- keycheck --cell dev-cell-2"}},
+		// A live cell with no record has not bound yet. The check names it and does not fail (D7-14).
+		{name: "agent cells: no record for a live cell is no failure", check: "check_agent_cells_current", cell: "dev-cp",
+			change: map[string]string{"cell-records.json": records("7", map[string]string{"dev-cell-1": jwks("a", "b")})}},
 		{name: "agent cells: a node moved", check: "check_agent_cells_current", cell: "dev-cp",
 			change: map[string]string{"facts-dev-cell-2.json": `{"name":"dev-cell-2","nodeIP":"10.9.0.8","jwks":` + jwks("c") + `}`},
 			want:   []string{"the NetworkPolicy admits '10.9.0.1/32 10.9.0.2/32'", "Run: CELL=dev-cp mise run cell:up"}},
@@ -231,6 +249,7 @@ gateway_status() { cat "$STUB_DIR/gw-status.json"; }
 set +e; `+tc.check, "_", root)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + tc.cell,
 				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub}
+			cmd.Env = append(cmd.Env, tc.env...)
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err := cmd.Run()

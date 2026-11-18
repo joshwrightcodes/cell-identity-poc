@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
 # m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
-# After the tests, m5, m5-soak and m5-drill scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
+# m6 runs gate-m6-repair.sh --check and the image check of mgmtd, envd, the cell controller, the cell gateway and the SPIRE server first.
+# m6-provision runs the one test that deletes both cells and creates them again through the portal, after the same checks. It is not
+# part of m6, because it deletes the cells. An interrupted run leaves build/gate/m6-provision, and mise run gate:m6:repair restores the cells.
+# After the tests, m5, m5-soak, m5-drill, m6 and m6-provision scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision [go test arguments]}"
 # The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
 gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift
@@ -19,6 +22,7 @@ timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m4-rotate ]] || pattern="^TestRotationSigningKey$"
 [[ "$milestone" != m5-soak ]] || pattern="^TestStreamSoakHalfHour$"
 [[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
+[[ "$milestone" != m6-provision ]] || pattern="^TestProvisionFromPortal$"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -26,8 +30,9 @@ budget_minutes="${!budget_var:-}"
 if [[ "$milestone" != m1 ]]; then
   [[ -f "$BUILD_ROOT/images.env" ]] \
     || die "$BUILD_ROOT/images.env is missing. Run: mise run images, or copy it from the checkout that set up the clusters: cp <that checkout>/build/images.env $BUILD_ROOT/"
-  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
-    [[ -d "$BUILD_ROOT/$cluster" ]] \
+  # A cell has no build directory until its step creates it, so only the clusters that exist need one.
+  for cluster in $(existing_clusters); do
+    [[ -d "$BUILD_ROOT/$cluster" || -z "$(yq -r ".clusters[] | select(.name == \"$cluster\") | .components[]" "$ROOT/harness/topology.yaml")" ]] \
       || die "$BUILD_ROOT/$cluster is missing. Copy it from the checkout that set up the clusters: cp -R <that checkout>/build/$cluster $BUILD_ROOT/"
   done
 fi
@@ -52,7 +57,7 @@ if [[ "$milestone" == m2 ]]; then
   for cluster in $(yq -r '.clusters[] | select(.components[] == "spire-server") | .name' "$topology"); do
     targets+=("$cluster:spire-system:statefulset/spire-server")
   done
-  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$topology"); do
+  for cluster in $(live_cells); do
     targets+=("$cluster:cell-identity-system:deployment/celld")
   done
   for target in "${targets[@]}"; do
@@ -70,7 +75,7 @@ if [[ "$milestone" == m3 ]]; then
   # An earlier run that stopped before its cleanups can leave a grant for the test group in a cell.
   "$ROOT/scripts/gate-m3-repair.sh" --check || exit 1
   stale=""
-  for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+  for cluster in $(existing_clusters); do
     workloads="$(kubectl --context "kind-$cluster" get deployments,statefulsets -A -o json | jq -r '.items[]
       | select(any(.spec.template.spec | ((.initContainers // []) + .containers)[]; .image | startswith("localhost:5001/")))
       | "\(.metadata.namespace) \(.kind | ascii_downcase)/\(.metadata.name)"')" || die "could not list the workloads of $cluster"
@@ -94,7 +99,7 @@ if [[ "$milestone" == m4 || "$milestone" == m4-rotate ]]; then
   targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
     "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
     "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
-  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+  for cluster in $(live_cells); do
     targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
   done
   for target in "${targets[@]}"; do
@@ -120,9 +125,30 @@ if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill 
     "management:central-view-system:deployment/argocd-agent-principal:mise run images -- cell-proxy, then CELL=management LINK_ONLY=central-view mise run cell:link"
     "management:observability-system:deployment/telemetry-gateway:mise run images -- cell-proxy, then CELL=management LINK_ONLY=telemetry-gateway mise run cell:link"
     "management:mesh-view-system:deployment/mesh-view-hub:mise run images -- cell-proxy, then CELL=management LINK_ONLY=mesh-view-hub mise run cell:link")
-  for cluster in $(yq -r '.clusters[] | select(.components[] == "cell-identity") | .name' "$ROOT/harness/topology.yaml"); do
+  for cluster in $(live_cells); do
     targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
   done
+  for target in "${targets[@]}"; do
+    IFS=: read -r cluster ns workload fix <<<"$target"
+    found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
+    [[ -z "$found" ]] || stale+="$found"$'\n'"Run: $fix"$'\n'
+  done
+  [[ -z "$stale" ]] || die "the deployed images differ from build/images.env:"$'\n'"$stale"
+fi
+
+# The M6 tests run against mgmtd, the host service, envd, the cell controller, the cell gateway and the SPIRE server of dev-cp
+# (its plugin checks the cells). Each of these workloads must run the image that `mise run images` recorded, so a test does not
+# run old code, and a step does not end with bootstrap_mismatch because the images changed. gate-m6-repair.sh --check runs
+# gate-m5-repair.sh, which runs the M4 and M2 repairs once. The provision gate checks the same, and the check fails while the marker
+# of an earlier provision run exists.
+if [[ "$milestone" == m6 || "$milestone" == m6-provision ]]; then
+  "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
+  stale=""
+  targets=("management:mgmt-system:statefulset/mgmtd:mise run images -- mgmtd, then CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+    "dev-cp:envd-system:deployment/envd:mise run images -- envd, then CELL=dev-cp mise run cell:up"
+    "dev-cp:cell-controller-system:deployment/cell-controller:mise run images -- cell-controller, then CELL=dev-cp mise run cell:up"
+    "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
+    "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
   for target in "${targets[@]}"; do
     IFS=: read -r cluster ns workload fix <<<"$target"
     found="$(live_image_mismatches "$cluster" "$ns" "$workload")" || die "could not read $workload in $cluster"
@@ -146,7 +172,7 @@ go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
 # No token may reach a log of the M5 components. A hit fails the gate, like a failed test.
-if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill ]]; then
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill || "$milestone" == m6 || "$milestone" == m6-provision ]]; then
   "$ROOT/scripts/gate-token-scan.sh" "$gate_started" || { printf 'FAIL: gate %s found a token in a log\n' "$milestone" >&2; status=1; }
 fi
 # The duration of each top-level test, slowest first.

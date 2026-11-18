@@ -6,12 +6,15 @@
 # LINK_ONLY=<component> runs only that component, with no check of the other clusters. For example,
 # the first pass of mgmt-api runs before dev-cp exists. An unknown name fails. A run that stops
 # prints one command for the component that failed and for each later one.
+# The run takes the lock of the cluster (cluster_lock in scripts/lib.sh). The waits and the lists of the cells use the live
+# cells: a cell that has no cluster has no tunnel and no record to wait for.
 source "$(dirname "$0")/lib.sh"
 
 if ((${#LINK_COMPONENTS[@]} == 0)); then
   log "cluster $CELL_NAME has no link component in harness/topology.yaml"
   exit 0
 fi
+cluster_lock "$CELL_NAME"
 entries=()
 chosen="$(link_entries)" || exit 1
 while read -r entry; do [[ -z "$entry" ]] || entries+=("$entry"); done <<<"$chosen"
@@ -33,7 +36,8 @@ link_hint() {
     printf '  CELL=%s LINK_ONLY=%s mise run cell:link\n' "$CELL_NAME" "${entries[$i]%%:*}" >&2
   done
 }
-trap link_hint EXIT
+# One handler: the hint first, and then the release of the lock, which a second trap would replace.
+trap 'link_hint; cluster_lock_release' EXIT
 
 # job_state <namespace> <job> prints Complete, Failed or nothing.
 job_state() {
@@ -41,17 +45,19 @@ job_state() {
     | select(.type == "Complete" or .type == "Failed") | .type][0] // ""'
 }
 
-# tunnel_gaps prints the name of each cell of MESH_VIEW_CELLS whose tunnel is not up. hub_cell_state
-# (scripts/lib.sh) reads the state that the hub process serves.
+# tunnel_gaps prints the name of each live cell of MESH_VIEW_CELLS whose tunnel is not up. A cell with no cluster has
+# no tunnel and is skipped. hub_cell_state (scripts/lib.sh) reads the state that the hub process serves.
 tunnel_gaps() {
-  local entry cell
+  local entry cell live
+  live="$(live_cells)" || die "could not list the live cells"
   for entry in $MESH_VIEW_CELLS; do
     cell="${entry%%=*}"
+    grep -qx -- "$cell" <<<"$live" || continue
     hub_cell_state "$cell" || echo "$cell"
   done
 }
 
-# wait_for_tunnels waits up to 300 seconds for the hub to log tunnel_up for each cell of
+# wait_for_tunnels waits up to 300 seconds for the hub to log tunnel_up for each live cell of
 # MESH_VIEW_CELLS. Kiali reads its remote clusters once at start, so it must come after the tunnels.
 # LINK_TUNNEL_WAIT and LINK_TUNNEL_POLL change the bound and the poll interval, for the tests.
 wait_for_tunnels() {
@@ -62,7 +68,7 @@ wait_for_tunnels() {
     fi
     sleep "${LINK_TUNNEL_POLL:-5}"
   done
-  log "the hub holds a tunnel from each cell of MESH_VIEW_CELLS"
+  log "the hub holds a tunnel from each live cell of MESH_VIEW_CELLS"
 }
 
 for i in "${!entries[@]}"; do

@@ -252,7 +252,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 	// SPIRE server does not exist at the first hydrate) and in each cell.
 	want := map[string][]string{
 		"management": {"bundle observability-store 8 observability-system", "bundle observability-system 3 observability-system", "link mesh-view-hub 0 mesh-view-system", "link mgmt-api 0 mgmt-system"},
-		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness envd 0 envd-system", "harness cell-gateway 0 gateway-system"},
+		"dev-cp":     {"bundle relay-system 8 relay-system", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness cell-controller 0 cell-controller-system", "harness envd 0 envd-system", "harness cell-gateway 0 gateway-system"},
 		"dev-cell-1": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 		"dev-cell-2": {"harness argocd-agent 0 argocd", "bundle observability-system 3 observability-system", "harness otel-uplink 0 observability-system", "harness mesh-view 0 mesh-view-system"},
 	}
@@ -344,6 +344,58 @@ func TestRootBundleWaveOrder(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHarnessWritesOnlyIntoExistingNamespaces checks the order of the harness and link components of each cluster: no
+// component renders an object into a namespace that a later component creates. The apply of the earlier component
+// would stop with "namespace not found". The Role envd-steps lives in the namespace of the cell controller, so it belongs to
+// the component that creates that namespace, and that component comes first.
+func TestHarnessWritesOnlyIntoExistingNamespaces(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			creator := map[string]int{}
+			for i, c := range cr.components {
+				for _, o := range c.objs {
+					if o["kind"] == "Namespace" {
+						creator[fmt.Sprint(lookupOr(o, "metadata", "name"))] = i
+					}
+				}
+			}
+			for i, c := range cr.components {
+				if c.kind == "bundle" {
+					continue
+				}
+				for _, o := range c.objs {
+					ns, ok := lookup(o, "metadata", "namespace")
+					if !ok {
+						continue
+					}
+					if at, made := creator[fmt.Sprint(ns)]; made && at > i {
+						t.Errorf("%s: the %s component %s renders %s, and the later component %s creates namespace %v", cr.name, c.kind, c.name, objName(o), cr.components[at].name, ns)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestCellControllerComesBeforeEnvd: the new envd needs the namespace cell-controller-system and the Role envd-steps at its first
+// round, and both come with the cell controller component. Without them each round ends with store_failed.
+func TestCellControllerComesBeforeEnvd(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		if cr.name != "dev-cp" {
+			continue
+		}
+		index := map[string]int{}
+		for i, c := range cr.components {
+			index[c.name] = i
+		}
+		cc, okCC := index["cell-controller"]
+		envd, okEnvd := index["envd"]
+		if !okCC || !okEnvd || cc >= envd {
+			t.Errorf("the components of dev-cp are %v, want cell-controller before envd", index)
+		}
 	}
 }
 
@@ -517,6 +569,7 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 	}
 	for _, name := range []string{"relay-system Deployment relay-system/relay-view relay", "relay-system Deployment relay-system/relay-telemetry relay",
 		"envd Deployment envd-system/envd envd", "envd Deployment envd-system/envd spire-agent",
+		"cell-controller Deployment cell-controller-system/cell-controller cell-controller", "cell-controller Deployment cell-controller-system/cell-controller spire-agent",
 		"cell-gateway StatefulSet gateway-system/cell-gateway cellgw", "cell-gateway StatefulSet gateway-system/cell-gateway spire-agent",
 		"argocd-agent Deployment argocd/argocd-agent argocd-agent", "argocd-agent Deployment argocd/argocd-agent cell-proxy",
 		"argocd-agent Deployment argocd/argocd-agent spire-agent", "argocd-agent Deployment argocd/argocd-agent install-agent-plugin",
@@ -542,8 +595,39 @@ func TestRenderedPodsPinnedAndBounded(t *testing.T) {
 	}
 }
 
+// emptyPeerRules returns one line for each NetworkPolicy rule in objs that has ports, or any other field, and
+// names no peer. A rule with an empty or missing from or to list admits every peer.
+func emptyPeerRules(label string, objs []object) []string {
+	var out []string
+	for _, o := range objs {
+		if o["kind"] != "NetworkPolicy" {
+			continue
+		}
+		for _, dir := range [][2]string{{"ingress", "from"}, {"egress", "to"}} {
+			rules, _ := lookup(o, "spec", dir[0])
+			list, _ := rules.([]any)
+			for i, rule := range list {
+				peers, _ := lookup(rule, dir[1])
+				if l, ok := peers.([]any); !ok || len(l) == 0 {
+					out = append(out, fmt.Sprintf("%s: %s rule %d of %s has no %s peers", label, dir[0], i, objName(o), dir[1]))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// liveCellVariants are the clusters that kind lists in the renders of dev-cp that admit cells by node address: none of
+// the cells, and one of them.
+var liveCellVariants = map[string]string{
+	"no live cell":  "STUB_KIND_CLUSTERS=management dev-cp rogue",
+	"one live cell": "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-2",
+}
+
 // TestNoEmptyPeerList checks that every NetworkPolicy rule in every render names its peers. A rule
-// with an empty or missing from or to list admits every peer.
+// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay and cell-gateway in
+// dev-cp run again with no live cell and with one, because their cell rules lose the peers when a cell is absent, and
+// the rule must then go, not stay with an empty list.
 func TestNoEmptyPeerList(t *testing.T) {
 	// The collector policies and both forms of the uplink must be among the policies that the loop sees.
 	seen := map[string]bool{}
@@ -559,28 +643,52 @@ func TestNoEmptyPeerList(t *testing.T) {
 		if !seen["management mgmtd"] {
 			t.Error("the loop saw no mgmtd policy in management")
 		}
-		if !seen["dev-cp envd"] || !seen["dev-cp cell-gateway"] || !seen["dev-cp relay-view"] {
-			t.Error("the loop saw no envd, cell-gateway or relay-view policy in dev-cp")
+		if !seen["dev-cp envd"] || !seen["dev-cp cell-gateway"] || !seen["dev-cp relay-view"] || !seen["dev-cp cell-controller"] {
+			t.Error("the loop saw no envd, cell-gateway, cell-controller or relay-view policy in dev-cp")
 		}
 	}()
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
 			for _, o := range c.objs {
-				if o["kind"] != "NetworkPolicy" {
-					continue
-				}
-				seen[cr.name+" "+fmt.Sprint(lookupOr(o, "metadata", "name"))] = true
-				for _, dir := range [][2]string{{"ingress", "from"}, {"egress", "to"}} {
-					rules, _ := lookup(o, "spec", dir[0])
-					list, _ := rules.([]any)
-					for i, rule := range list {
-						peers, _ := lookup(rule, dir[1])
-						if l, ok := peers.([]any); !ok || len(l) == 0 {
-							t.Errorf("%s: %s %s rule %d of %s has no %s peers", cr.name, c.name, dir[0], i, objName(o), dir[1])
-						}
-					}
+				if o["kind"] == "NetworkPolicy" {
+					seen[cr.name+" "+fmt.Sprint(lookupOr(o, "metadata", "name"))] = true
 				}
 			}
+			for _, p := range emptyPeerRules(cr.name+" "+c.name, c.objs) {
+				t.Error(p)
+			}
+		}
+	}
+	for label, kindEnv := range liveCellVariants {
+		for _, tc := range []struct{ component, binary string }{
+			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"},
+		} {
+			t.Run(label+" "+tc.component, func(t *testing.T) {
+				script, err := filepath.Abs("../../components/" + tc.component + "/render.sh")
+				if err != nil {
+					t.Fatal(err)
+				}
+				r := runStubbed(t, tc.binary, "", []string{script}, append([]string{"STUB_CELL=dev-cp", kindEnv}, bundleFacts...)...)
+				if r.err != nil {
+					t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+				}
+				objs, err := parseDocs(r.stdout)
+				if err != nil {
+					t.Fatal(err)
+				}
+				policies := 0
+				for _, o := range objs {
+					if o["kind"] == "NetworkPolicy" {
+						policies++
+					}
+				}
+				if policies == 0 {
+					t.Fatalf("the %s render of %s holds no NetworkPolicy, so the check proves nothing", label, tc.component)
+				}
+				for _, p := range emptyPeerRules(label+" "+tc.component, objs) {
+					t.Error(p)
+				}
+			})
 		}
 	}
 }
@@ -641,6 +749,7 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		{"otel-uplink of dev-cp", script("otel-uplink", "dev-cp"), []string{"NODE_IPS"}},
 		{"mgmt-api", script("mgmt-api", "management"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"envd", script("envd", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
+		{"cell-controller", script("cell-controller", "dev-cp"), []string{"API_SERVER_IPS", "NODE_IPS"}},
 		{"cell-gateway", script("cell-gateway", "dev-cp"), []string{"NODE_IPS"}},
 	}
 	for _, tc := range cases {

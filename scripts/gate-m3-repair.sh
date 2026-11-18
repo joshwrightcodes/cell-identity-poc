@@ -12,7 +12,9 @@
 export CELL=dev-cell-1
 source "$(dirname "$0")/lib.sh"
 
-cells="${GATE_M3_CELLS:-$(yq -r '.clusters[] | select(.components[] == "argocd-agent") | .name' "$ROOT/harness/topology.yaml")}"
+# A cell that has no cluster has no leftover, so the default is the cells that exist.
+existing="$(existing_clusters)" || die "could not list the clusters"
+cells="${GATE_M3_CELLS:-$(for c in $(yq -r '.clusters[] | select(.components[] == "argocd-agent") | .name' "$ROOT/harness/topology.yaml"); do ! grep -qx -- "$c" <<<"$existing" || echo "$c"; done)}"
 check=0
 [[ "${1:-}" == "--check" ]] && check=1
 

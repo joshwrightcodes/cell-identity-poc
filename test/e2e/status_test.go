@@ -343,3 +343,75 @@ func TestM5StatusShowsWork(t *testing.T) {
 		}
 	}
 }
+
+// TestM6StatusShowsCells checks harness:status on a provisioned harness. It exits 0, and each cell has an object that is not absent, is ok and
+// holds applications, verify and telemetry. mgmtd holds each cell as requested, valid and with no open step, and the journal of the host service
+// holds no step that runs a stage, so the problems of provisioning name nothing. The status reads again for up to the retry window, because a
+// report can lag after a link or an admit stage.
+func TestM6StatusShowsCells(t *testing.T) {
+	type object struct {
+		Cluster      string `json:"cluster"`
+		OK           bool   `json:"ok"`
+		Absent       bool   `json:"absent"`
+		Applications *struct {
+			Total int `json:"total"`
+		} `json:"applications"`
+		Verify *struct {
+			OK bool `json:"ok"`
+		} `json:"verify"`
+		Telemetry *struct {
+			OK bool `json:"ok"`
+		} `json:"telemetry"`
+		Problems []string `json:"problems"`
+	}
+	var (
+		objs   map[string]object
+		stdout string
+		code   int
+	)
+	deadline := time.Now().Add(statusRetryWindow)
+	for attempt := 1; ; attempt++ {
+		_, stdout, code = statusOnce(t)
+		objs = map[string]object{}
+		for line := range strings.SplitSeq(strings.TrimSpace(stdout), "\n") {
+			var o object
+			if json.Unmarshal([]byte(line), &o) == nil {
+				objs[o.Cluster] = o
+			}
+		}
+		if code == 0 || time.Now().After(deadline) {
+			break
+		}
+		t.Logf("attempt %d: harness:status exited %d:\n%s", attempt, code, stdout)
+		time.Sleep(30 * time.Second)
+	}
+	if code != 0 {
+		t.Fatalf("harness:status exited %d, want 0:\n%s", code, stdout)
+	}
+	status := mgmtStatus(t)
+	for _, cell := range clustersWith(t, agentCellSet) {
+		o, ok := objs[cell]
+		if !ok || o.Absent || !o.OK || o.Applications == nil || o.Verify == nil || o.Telemetry == nil || len(o.Problems) != 0 {
+			t.Errorf("object of %s is %+v (present %v), want an ok object that is not absent, with applications, verify and telemetry", cell, o, ok)
+		}
+		found := false
+		for _, c := range status.Cells {
+			if c.Name != cell {
+				continue
+			}
+			found = true
+			if !c.Requested || !c.Valid || (c.Step != nil && c.Step.DoneAt.IsZero()) {
+				t.Errorf("mgmtd holds %s as requested %v, valid %v, step %+v, want requested, valid and no open step", cell, c.Requested, c.Valid, c.Step)
+			}
+		}
+		if !found {
+			t.Errorf("mgmtd lists no cell %s", cell)
+		}
+	}
+	for id, st := range hostSteps(t) {
+		switch st.State {
+		case "creating", "admitting", "bootstrapping":
+			t.Errorf("step %s of %s runs the stage %s, and a healthy harness has no stage that runs", id, st.Cell, st.State)
+		}
+	}
+}

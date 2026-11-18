@@ -59,7 +59,7 @@ func TestGateM5ImageCheck(t *testing.T) {
 func newM5GateRoot(t *testing.T, stale string) string {
 	t.Helper()
 	root := t.TempDir()
-	for _, d := range []string{"scripts", "cells", "harness"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 		copyFiles(t, root, d)
 	}
 	write := func(path, body string) {
@@ -72,7 +72,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 		}
 	}
 	var env strings.Builder
-	for _, n := range []string{"mgmtd", "envd", "cellgw", "celld", "cluster-jwt-agent", "cluster-jwt-server", "cell-proxy"} {
+	for _, n := range []string{"mgmtd", "envd", "cell-controller", "cellgw", "celld", "cluster-jwt-agent", "cluster-jwt-server", "cell-proxy"} {
 		fmt.Fprintf(&env, "IMAGE_%s=localhost:5001/%s@sha256:%s\n", strings.ToUpper(strings.ReplaceAll(n, "-", "_")), n, strings.Repeat("a", 64))
 	}
 	write("build/images.env", env.String())
@@ -81,7 +81,8 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	}
 	write("scripts/gate-m5-repair.sh", "#!/usr/bin/env bash\nexit 0\n")
 	write("scripts/gate-token-scan.sh", "#!/usr/bin/env bash\nexit 0\n")
-	write("bin/docker", "#!/usr/bin/env bash\n[[ \"$*\" == \"exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ\" ]] || exit 2\necho 2026-11-16T01:02:03Z\n")
+	write("bin/docker", "#!/usr/bin/env bash\n[[ \"$1\" == inspect ]] && { echo 172.18.0.9; exit 0; }\n[[ \"$*\" == \"exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ\" ]] || exit 2\necho 2026-11-16T01:02:03Z\n")
+	write("bin/kind", stubKind)
 	write("bin/go", "#!/usr/bin/env bash\necho \"go $*\" >>\"$STUB_LOG\"\n")
 	// The fake answers "get <workload> -o json". Each workload runs the images that build/images.env records, except
 	// the one that STUB_STALE names, as <image>@<namespace> or <image>@<cluster>.
@@ -98,6 +99,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	case " $* " in
 	  *" get statefulset/mgmtd "*) one mgmtd mgmtd ;;
 	  *" get deployment/envd "*) one envd envd ;;
+	  *" get deployment/cell-controller "*) one cell-controller cell-controller ;;
 	  *" get statefulset/cell-gateway "*) one cell-gateway cellgw ;;
 	  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
 	  *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;

@@ -80,7 +80,7 @@ func jsonLines(t *testing.T, out string) []map[string]any {
 // cluster. A plain line and a JSON line that is no object get the field raw, and a field cluster of a log
 // line moves to source_cluster.
 func TestLogsMergesWithClusterField(t *testing.T) {
-	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl}, nil, "all", "app=x")
+	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl, "kind": stubKind}, nil, "all", "app=x")
 	lines := jsonLines(t, out)
 	if code != 0 || len(lines) != 16 {
 		t.Fatalf("exit %d with %d lines, want exit 0 and 16 lines (4 clusters, 4 lines each):\n%s", code, len(lines), out)
@@ -124,7 +124,7 @@ func TestLogsMergesWithClusterField(t *testing.T) {
 // TestLogsReportsAnUnreadableCluster checks that the other clusters stay readable, that the unreadable one
 // gives one error line with its name, and that the exit status is 1. A wrong argument gives one JSON error.
 func TestLogsReportsAnUnreadableCluster(t *testing.T) {
-	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl}, []string{"STUB_FAIL_CLUSTER=dev-cp"}, "all", "app=x")
+	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl, "kind": stubKind}, []string{"STUB_FAIL_CLUSTER=dev-cp"}, "all", "app=x")
 	lines := jsonLines(t, out)
 	errs := 0
 	for _, m := range lines {
@@ -139,7 +139,7 @@ func TestLogsReportsAnUnreadableCluster(t *testing.T) {
 		t.Fatalf("exit %d, %d error lines, %d lines in all, want exit 1, 1 error line and 13 lines:\n%s", code, errs, len(lines), out)
 	}
 	for _, args := range [][]string{{"rogue", "app=x"}, {"all"}} {
-		out, _, code = runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl}, nil, args...)
+		out, _, code = runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl, "kind": stubKind}, nil, args...)
 		if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" {
 			t.Errorf("arguments %v: exit %d, output %q, want one JSON error line and exit 1", args, code, out)
 		}
@@ -149,7 +149,7 @@ func TestLogsReportsAnUnreadableCluster(t *testing.T) {
 // TestLogsBoundsAndCluster checks that the call of kubectl logs carries the line bound and the age limit (the stub
 // refuses a call without them), and that a pattern as the cluster argument is no cluster and expands to nothing.
 func TestLogsBoundsAndCluster(t *testing.T) {
-	stubs := map[string]string{"kubectl": logsKubectl}
+	stubs := map[string]string{"kubectl": logsKubectl, "kind": stubKind}
 	out, _, code := runScript(t, "logs.sh", stubs, []string{"STUB_WANT_TAIL=7", "STUB_WANT_SINCE=10m", "LOGS_TAIL=7", "LOGS_SINCE=10m"}, "dev-cp", "app=x")
 	if lines := jsonLines(t, out); code != 0 || len(lines) != 4 {
 		t.Errorf("exit %d with %d lines, want exit 0 and 4 lines for --tail=7 and --since=10m:\n%s", code, len(lines), out)
@@ -159,6 +159,36 @@ func TestLogsBoundsAndCluster(t *testing.T) {
 		if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" {
 			t.Errorf("cluster argument %q: exit %d, output %q, want one JSON error line and exit 1", arg, code, out)
 		}
+	}
+}
+
+// TestLogsSkipsAnAbsentCell checks that "all" reads only the clusters that exist: a cell with no cluster gives no error line, one line on
+// standard error, and the exit status stays 0. A cell that is named and has no cluster gives one JSON error line with the portal command.
+func TestLogsSkipsAnAbsentCell(t *testing.T) {
+	stubs := map[string]string{"kubectl": logsKubectl, "kind": stubKind}
+	env := []string{"STUB_KIND=management dev-cp dev-cell-1 rogue", "STUB_FAIL_CLUSTER=dev-cell-2"}
+	out, stderr, code := runScript(t, "logs.sh", stubs, env, "all", "app=x")
+	lines := jsonLines(t, out)
+	if code != 0 || len(lines) != 12 || !strings.Contains(stderr, "dev-cell-2 has no cluster") {
+		t.Fatalf("exit %d with %d lines and stderr %q, want exit 0, 12 lines (3 clusters) and the skip line:\n%s", code, len(lines), stderr, out)
+	}
+	for _, m := range lines {
+		if m["cluster"] == "dev-cell-2" || m["level"] == "ERROR" {
+			t.Errorf("line %v belongs to the absent cell or is an error", m)
+		}
+	}
+	out, _, code = runScript(t, "logs.sh", stubs, env, "dev-cell-2", "app=x")
+	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" || !strings.Contains(m[0]["error"].(string), "Run: mise run portal -- recreate --cell dev-cell-2") {
+		t.Errorf("a named absent cell: exit %d, output %q, want one JSON error line with the portal command", code, out)
+	}
+	// A cluster outside the catalog has no portal command: the hint names the rebuild.
+	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND=dev-cp dev-cell-1 dev-cell-2"}, "management", "app=x")
+	if m := jsonLines(t, out); code != 1 || len(m) != 1 || strings.Contains(m[0]["error"].(string), "portal") || !strings.Contains(m[0]["error"].(string), "Rebuild one cluster") {
+		t.Errorf("a missing management: exit %d, output %q, want the rebuild hint and no portal command", code, out)
+	}
+	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND_FAIL=1"}, "all", "app=x")
+	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" {
+		t.Errorf("kind down: exit %d, output %q, want one JSON error line", code, out)
 	}
 }
 
@@ -180,6 +210,7 @@ case "$args" in
   *" get --raw /readyz "*) [[ " ${STUB_CELL_DOWN:-} " == *" ${ctx#kind-} "* ]] && { echo "no answer" >&2; exit 1; }; echo ok ;;
   *" get --raw "*) printf '%s' "${STUB_KIALI_CONF:-}" ;;
   *" exec deploy/mesh-view-hub "*) printf '%s' "${STUB_HUB:-}" ;;
+  *" get configmap step-status "*) [[ -n "${STUB_STEP_STATUS:-}" ]] && printf '%s' "$STUB_STEP_STATUS" || { echo "Error from server (NotFound)" >&2; exit 1; } ;;
   *" get configmap hostsvc-pin "*) printf '%s' "${STUB_CM_PIN:-$STUB_PIN_PEM}" ;;
   *" get pod mgmtd-0 "*) printf '%s' "${STUB_POD_PIN:-}" ;;
   *" exec spire-server-0 "*) printf '%s\n' "${STUB_ROOT_PEM:-}" ;;
@@ -209,6 +240,7 @@ case "$*" in
   "run mgmt -- op list")
     if [[ -n "${STUB_MGMT_OPS:-}" ]]; then printf '%s\n' "$STUB_MGMT_OPS"; else echo '{"ops":[]}'; fi
     exit "${STUB_MGMT_OPS_RC:-0}" ;;
+  "run mgmt -- pubkey") printf '{"spec.pub":"%s"}\n' "${STUB_PUBKEY:-AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=}" ;;
   "run gw -- status")
     printf '%s\n' "${STUB_GW_STATUS:-}"
     exit "${STUB_GW_RC:-0}" ;;
@@ -239,7 +271,8 @@ case "$1" in
       echo $((n + 1)) >"$STUB_COUNT"
       [[ -z "${STUB_SERVE_STATUS_FAILS_LATER:-}" || "$n" == 0 ]] || exit 1
     fi
-    printf '%s\n' "$STUB_SERVE_STATUS" ;;
+    # STUB_SERVE_PATCH is a JSON object that replaces fields of the status.
+    if [[ -n "${STUB_SERVE_PATCH:-}" ]]; then jq -c ". + $STUB_SERVE_PATCH" <<<"$STUB_SERVE_STATUS"; else printf '%s\n' "$STUB_SERVE_STATUS"; fi ;;
   pin) printf '%s\n' "$STUB_PIN_PEM" ;;
   *) exit 2 ;;
 esac
@@ -259,11 +292,23 @@ func derSHA(t *testing.T, pemText string) string {
 // nodeClockDocker stands in for docker. It answers `exec dev-cp-control-plane date` with the time of a node, which is STUB_CLOCK_SKEW
 // seconds behind the clock of the Mac (default 0), in epoch seconds or in the form of date -u.
 const nodeClockDocker = `#!/usr/bin/env bash
+if [[ "$1" == inspect ]]; then
+  name="${*: -1}"; cell="${name%-control-plane}"
+  if [[ " ${STUB_NO_NODE_IP:-} " == *" $cell "* ]]; then echo; exit 0; fi
+  case "$cell" in dev-cell-1) echo 172.18.0.5 ;; dev-cell-2) echo 172.18.0.6 ;; *) echo 172.18.0.9 ;; esac
+  exit 0
+fi
 [[ "$1 $2" == "exec dev-cp-control-plane" && "$3" == date ]] || { echo "unexpected docker call: $*" >&2; exit 2; }
 [[ -z "${STUB_CLOCK_FAIL:-}" ]] || { echo "Error: No such container: dev-cp-control-plane" >&2; exit 1; }
 t=$(( $(date +%s) - ${STUB_CLOCK_SKEW:-0} ))
 if [[ "$4" == +%s ]]; then echo "$t"; else date -u -d "@$t" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r "$t" +%Y-%m-%dT%H:%M:%SZ; fi
 `
+
+// stubPubSHA is the SHA-256 of the 32 bytes that the stub of mgmt -- pubkey prints (every byte is 1), as the host service lists its key.
+var stubPubSHA = func() string {
+	sum := sha256.Sum256(bytes.Repeat([]byte{1}, 32))
+	return hex.EncodeToString(sum[:])
+}()
 
 // timeAgo formats the time that is d before now, as mgmtd prints it.
 func timeAgo(d time.Duration) string { return time.Now().Add(-d).UTC().Format(time.RFC3339Nano) }
@@ -273,7 +318,8 @@ const zeroTime = "0001-01-01T00:00:00Z"
 // planeCell is one cell of mise run mgmt -- status, with a status from 20 seconds ago and nothing unreported. over replaces fields.
 func planeCell(name string, over map[string]any) map[string]any {
 	c := map[string]any{"name": name, "bound": true, "lastCheck": "unchanged", "lastStatusAt": timeAgo(20 * time.Second), "unreported": 0,
-		"oldestUnreportedAt": zeroTime, "records": 3, "openOps": 0, "expiredOps": 0, "forgedSeen": 0, "lastHintCheck": "unchanged"}
+		"oldestUnreportedAt": zeroTime, "records": 3, "openOps": 0, "expiredOps": 0, "forgedSeen": 0, "lastHintCheck": "unchanged",
+		"requested": true, "valid": true}
 	maps.Copy(c, over)
 	return c
 }
@@ -299,7 +345,7 @@ func healthyPlane(mutate func(m map[string]any)) string {
 	rev := map[string]any{"epoch": 1, "counter": 4}
 	cell := func(name string) map[string]any { return planeCell(name, nil) }
 	m := map[string]any{"env": "dev", "signed": rev, "served": rev, "applied": rev, "restoreActive": false, "appliedAt": at(time.Hour),
-		"lastReportAt": at(10 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")}}
+		"lastReportAt": at(10 * time.Second), "hostSpecPushedAt": at(30 * time.Second), "pendingDrops": []string{}, "cells": []any{cell("dev-cell-1"), cell("dev-cell-2")}}
 	if mutate != nil {
 		mutate(m)
 	}
@@ -309,7 +355,8 @@ func healthyPlane(mutate func(m map[string]any)) string {
 
 // fakeServeStatus is what hostsvc-serve.sh status prints for a running service with this certificate and root.
 func fakeServeStatus(cert, root string, mutate func(m map[string]any)) string {
-	m := map[string]any{"running": true, "pid": 4242, "cert_sha256": cert, "root_sha256": root, "expires_soon": false, "last_error": ""}
+	m := map[string]any{"running": true, "pid": 4242, "cert_sha256": cert, "root_sha256": root, "expires_soon": false, "last_error": "",
+		"dev_root_sha256": strings.Repeat("d", 64), "keys": []string{stubPubSHA}, "spec_revision": map[string]any{"epoch": 1, "counter": 4}}
 	if mutate != nil {
 		mutate(m)
 	}
@@ -329,7 +376,9 @@ func runStatus(t *testing.T, extra ...string) (map[string]map[string]any, []map[
 	env := append([]string{"STUB_PRINCIPAL=" + stubConnected, "STUB_SAMPLES=" + stubSamples, "STUB_KIALI_CONF=" + stubKialiConf, "STUB_HUB=" + stubHubUp,
 		"STUB_MGMT_STATUS=" + healthyPlane(nil), "STUB_GW_STATUS=" + healthyGateway(nil), "HOSTSVC_SERVE=" + serve, "STUB_PIN_PEM=" + pin, "STUB_ROOT_PEM=" + root, "STUB_POD_PIN=" + derSHA(t, pin),
 		"STUB_SERVE_STATUS=" + fakeServeStatus(derSHA(t, pin), derSHA(t, root), nil)}, extra...)
-	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker}, env)
+	steps := t.TempDir()
+	env = append([]string{"HOSTSVC_STEPS_DIR=" + steps}, env...)
+	out, stderr, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker, "kind": stubKind}, env)
 	lines := jsonLines(t, out)
 	byName := map[string]map[string]any{}
 	for _, m := range lines {
@@ -845,7 +894,9 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 				t.Errorf("problems %q hold a placeholder, and each command must work as printed", problems)
 			}
 			for _, m := range lines {
-				if m["cluster"] != "management" && m["ok"] != true {
+				// A cell that mgmtd does not list is not requested, so its own object reports that too.
+				own := tc.name == "a cell with cell-identity is not in the status" && m["cluster"] == "dev-cell-2"
+				if m["cluster"] != "management" && !own && m["ok"] != true {
 					t.Errorf("the object of %s is not ok, and only management has a bad value: %v", m["cluster"], m)
 				}
 			}

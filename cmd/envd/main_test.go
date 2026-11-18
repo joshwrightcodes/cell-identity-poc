@@ -30,6 +30,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/metric/noop"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -135,8 +137,14 @@ func workloadSource(t *testing.T, ca *spiffetest.CA) func(context.Context) (x509
 
 // gatewayFlags are the flags that run requires besides the M4 ones.
 func gatewayFlags() []string {
-	return []string{"--gateway", "https://cell-gateway.gateway-system.svc:8452",
-		"--gateway-id", "spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap", "spire-system/attest-hints"}
+	return append([]string{"--gateway", "https://cell-gateway.gateway-system.svc:8452",
+		"--gateway-id", "spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap", "spire-system/attest-hints"}, stepFlags()...)
+}
+
+// stepFlags are the flags that run requires for the provisioning steps.
+func stepFlags() []string {
+	return []string{"--steps-configmap", "cell-controller-system/cell-steps",
+		"--step-status-configmap", "cell-controller-system/step-status"}
 }
 
 func fakeDeps(kube kubernetes.Interface, started *int) deps {
@@ -358,10 +366,10 @@ func TestRunRefusesExpectIDOutsideTrustDomain(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := func(id string) []string {
-		return []string{"--upstream", "x:1", "--expect-id", id, "--peer-bundle", peer, "--peer-trust-domain", "mgmt.poc.internal",
+		return append([]string{"--upstream", "x:1", "--expect-id", id, "--peer-bundle", peer, "--peer-trust-domain", "mgmt.poc.internal",
 			"--spec-key-file", s.keyFile(), "--env", "dev", "--output-configmap", "a/b",
 			"--gateway", "https://cell-gateway.gateway-system.svc:8452", "--gateway-id", "spiffe://dev.env.poc.internal/cp/gateway",
-			"--hints-configmap", "spire-system/attest-hints"}
+			"--hints-configmap", "spire-system/attest-hints"}, stepFlags()...)
 	}
 	if _, err := parseRun(args("spiffe://mgmt.poc.internal/api")); err != nil {
 		t.Fatalf("control: %v", err)
@@ -417,14 +425,86 @@ func TestEnvdRequiresGatewayFlags(t *testing.T) {
 	}
 	for name, val := range map[string]string{"http_scheme": "http://cell-gateway:8452", "query": "https://g:1?x=y", "empty_query": "https://g:1?", "fragment": "https://g:1#f", "user": "https://u@g:1", "no_host": "https://", "with_path": "https://g:1/x", "not_a_url": "::"} {
 		args := append(slices.Clone(base), "--gateway", val, "--gateway-id", "spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap", "a/b")
+		args = append(args, stepFlags()...)
 		if _, err := parseRun(args); err == nil {
 			t.Errorf("%s: --gateway %q accepted", name, val)
 		}
 	}
 	bad := append(slices.Clone(base), "--gateway", "https://g:1", "--gateway-id", "not an id", "--hints-configmap", "a/b")
+	bad = append(bad, stepFlags()...)
 	if _, err := parseRun(bad); err == nil || !strings.Contains(err.Error(), "--gateway-id") {
 		t.Errorf("bad gateway id: %v", err)
 	}
+}
+
+func TestEnvdRequiresStepFlags(t *testing.T) {
+	s := newSigner(t)
+	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	pem, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := filepath.Join(t.TempDir(), "peer.pem")
+	if err := os.WriteFile(peer, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	key := s.keyFile()
+	base := []string{"--upstream", "x:1", "--expect-id", "spiffe://mgmt.poc.internal/api", "--peer-bundle", peer,
+		"--peer-trust-domain", "mgmt.poc.internal", "--spec-key-file", key, "--env", "dev", "--output-configmap", "a/b"}
+	full := append(append(slices.Clone(base), gatewayFlags()[:6]...), stepFlags()...)
+	cfg, err := parseRun(full)
+	if err != nil {
+		t.Fatalf("control: %v", err)
+	}
+	if cfg.stepsNS != "cell-controller-system" || cfg.stepsName != "cell-steps" ||
+		cfg.statusNS != "cell-controller-system" || cfg.statusName != "step-status" {
+		t.Fatalf("parsed %+v", cfg)
+	}
+	for _, flag := range []string{"--steps-configmap", "--step-status-configmap"} {
+		t.Run("missing"+flag, func(t *testing.T) {
+			var args []string
+			for i := 0; i < len(full); i++ {
+				if full[i] == flag {
+					i++
+					continue
+				}
+				args = append(args, full[i])
+			}
+			_, err := parseRun(args)
+			if err == nil || !slices.Contains(strings.Split(strings.TrimSuffix(err.Error(), " required"), ", "), flag) {
+				t.Fatalf("without %s: %v", flag, err)
+			}
+			var out bytes.Buffer
+			started := 0
+			code := execute(t.Context(), append([]string{"run"}, args...), strings.NewReader(""), &out, fakeDeps(fake.NewClientset(), &started))
+			msg, _ := oneLine(t, out.String())["error"].(string)
+			if code != exitConfig || started != 0 || !strings.Contains(msg, flag) {
+				t.Fatalf("exit %d, started %d, error %q", code, started, msg)
+			}
+		})
+	}
+	for name, v := range map[string]string{"no_slash": "cell-steps", "empty_name": "ns/", "empty_ns": "/n", "extra_slash": "a/b/c"} {
+		for _, flag := range []string{"--steps-configmap", "--step-status-configmap"} {
+			args := slices.Clone(full)
+			i := slices.Index(args, flag)
+			args[i+1] = v
+			if _, err := parseRun(args); err == nil || !strings.Contains(err.Error(), flag) {
+				t.Errorf("%s %s=%q: %v", name, flag, v, err)
+			}
+		}
+	}
+	t.Run("check_needs_neither", func(t *testing.T) {
+		var out bytes.Buffer
+		started := 0
+		code := execute(t.Context(), []string{"check", "--env", "dev", "--spec-key-file", key, "--current-configmap", "a/b"},
+			s.stdin(s.bundle(1)), &out, fakeDeps(fake.NewClientset(), &started))
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out.String())
+		}
+		if m := oneLine(t, out.String()); m["result"] != "accepted" {
+			t.Fatalf("result %v", m)
+		}
+	})
 }
 
 // A log line of envd carries trace_id when the round runs under a span.
@@ -558,5 +638,51 @@ func TestNewClientsBuildsGatewayClient(t *testing.T) {
 	cfg.gatewayID = spiffeid.RequireFromString(gwID)
 	if _, _, err := newClients(envCA.Source(t, "spiffe://dev.env.poc.internal/envd"), cfg); err == nil {
 		t.Error("a source with no bundles was accepted")
+	}
+}
+
+// pullerConfig wires the step store and the step status to the ConfigMaps of the flags.
+func TestPullerConfigWiresStepConfigMaps(t *testing.T) {
+	s := newSigner(t)
+	cfg := runConfig{upstream: "x:1", env: "dev", key: s.pub, namespace: "spire-system", configMap: "cell-records",
+		hintsNS: "spire-system", hintsName: "hints", stepsNS: "steps-ns", stepsName: "steps-name",
+		statusNS: "status-ns", statusName: "status-name", interval: time.Second}
+	kube := fake.NewClientset()
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	pc := pullerConfig(cfg, kube, &http.Client{}, nil, tel)
+	if pc.Steps == nil || pc.StepStatus == nil || pc.Env != "dev" || pc.BaseURL != "https://x:1" {
+		t.Fatalf("config %+v", pc)
+	}
+
+	// The step store writes the ConfigMap of --steps-configmap.
+	b := s.bundle(1)
+	var sp spec.Spec
+	sp.Env, sp.Revision = "dev", spec.Revision{Epoch: 1, Counter: 2}
+	_, payload, _ := record.VerifyWithPayload(b.Records["a"], []ed25519.PublicKey{s.pub})
+	sp.Cells = []spec.Entry{{Name: "a", Revision: spec.Revision{Epoch: 1, Counter: 1}, RecordSHA256: spec.RecordDigest(payload)}}
+	raw, err := spec.Sign(sp, s.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, _, err := envd.Accept(envd.Empty(), mgmtapi.SpecBundle{Spec: raw, Records: b.Records}, "dev", []ed25519.PublicKey{s.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pc.Steps.Save(t.Context(), st); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kube.CoreV1().ConfigMaps("steps-ns").Get(t.Context(), "steps-name", metav1.GetOptions{}); err != nil {
+		t.Fatalf("steps ConfigMap: %v", err)
+	}
+
+	// The step status is read from the ConfigMap of --step-status-configmap.
+	body := `{"at":"2026-11-12T09:00:00Z","steps":[{"id":"` + strings.Repeat("ab", 16) + `","cell":"d","state":"done"}]}`
+	if _, err := kube.CoreV1().ConfigMaps("status-ns").Create(t.Context(), &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "status-name", Namespace: "status-ns"}, Data: map[string]string{"status.json": body}}, metav1.CreateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := pc.StepStatus.Read(t.Context())
+	if err != nil || len(got) != 1 || got[0].Cell != "d" {
+		t.Fatalf("step status %v %v", got, err)
 	}
 }

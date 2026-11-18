@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,10 +60,49 @@ func flagValue(args []string, name string) string {
 	return ""
 }
 
+func appendLine(path, line string) {
+	f, _ := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	fmt.Fprintln(f, line)
+	f.Close()
+}
+
 func main() {
 	st := os.Getenv("STUB_STATE")
+	if st == "" {
+		// The service runs under env -i, so the state directory comes from the place of the binary: <root>/build/bin/hostsvc.
+		self, _ := filepath.Abs(os.Args[0])
+		st = filepath.Join(filepath.Dir(self), "..", "..", "state")
+	}
 	switch os.Args[1] {
+	case "ctl":
+		appendLine(filepath.Join(st, "ctl.log"), strings.Join(os.Args[2:], " "))
+		switch os.Args[2] {
+		case "steps":
+			if _, err := os.Stat(filepath.Join(st, "ctl-fail")); err == nil {
+				fmt.Println("{\"level\":\"ERROR\",\"msg\":\"hostsvc failed\",\"error\":\"admin socket: connection refused\"}")
+				os.Exit(1)
+			}
+			data, err := os.ReadFile(filepath.Join(st, "steps.json"))
+			if err != nil {
+				data = []byte("{\"steps\":[],\"corrupt\":false}\n")
+			}
+			os.Stdout.Write(data)
+		case "cancel":
+			if mode, err := os.ReadFile(filepath.Join(st, "cancel-mode")); err == nil {
+				fmt.Printf("{\"level\":\"ERROR\",\"msg\":\"hostsvc failed\",\"error\":\"%s\"}\n", strings.TrimSpace(string(mode)))
+				os.Exit(1)
+			}
+			fmt.Println("{\"cancelled\":true}")
+		case "reset-journal":
+			fmt.Println("{\"reset\":true}")
+		case "log":
+			fmt.Println("the log of the step")
+		}
 	case "serve":
+		wd, _ := os.Getwd()
+		_ = os.WriteFile(filepath.Join(st, "cwd"), []byte(wd), 0o644)
+		_ = os.WriteFile(filepath.Join(st, "args"), []byte(strings.Join(os.Args[2:], "\n")+"\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(st, "env"), []byte(strings.Join(os.Environ(), "\n")+"\n"), 0o644)
 		listen, bundle := flagValue(os.Args, "--listen"), flagValue(os.Args, "--client-bundle")
 		port := listen[strings.LastIndex(listen, ":")+1:]
 		data, _ := os.ReadFile(bundle)
@@ -79,7 +120,13 @@ func main() {
 		f.Close()
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGTERM)
-		fmt.Printf("{\"time\":\"2026-11-13T00:00:00Z\",\"level\":\"INFO\",\"msg\":\"serving\",\"addr\":\"%s\",\"cert_sha256\":\"%s\",\"root_sha256\":\"%s\",\"pid\":%d}\n", listen, cert, root, os.Getpid())
+		fmt.Printf("{\"time\":\"2026-11-13T00:00:00Z\",\"level\":\"INFO\",\"msg\":\"serving\",\"addr\":\"%s\",\"cert_sha256\":\"%s\",\"root_sha256\":\"%s\",\"binary_sha256\":\"%s\",\"pid\":%d}\n", listen, cert, root, strings.Repeat("b", 64), os.Getpid())
+		if _, err := os.Stat(filepath.Join(st, "ignore-term")); err == nil {
+			signal.Ignore(syscall.SIGTERM)
+			for {
+				time.Sleep(time.Second)
+			}
+		}
 		<-ch
 		os.Remove(filepath.Join(st, "listen."+port))
 		os.Remove(filepath.Join(st, "cert."+port))
@@ -130,20 +177,44 @@ func fakeHostsvcBinary(t *testing.T) string {
 	return fakeBinPath
 }
 
+// fakeServeKubectl answers the live roots of management and dev-cp, the state of mgmtd-0 (STUB_READY, empty by default,
+// so mgmtd is not Ready), and the ConfigMaps that the key helpers read.
 const fakeServeKubectl = `#!/usr/bin/env bash
 case " $* " in
-  *" exec spire-server-0 "*) cat "$STUB_STATE/live-root.pem" ;;
+  *" exec spire-server-0 "*)
+    if [[ " $* " == *"kind-dev-cp"* ]]; then cat "$STUB_STATE/dev-root.pem"; else cat "$STUB_STATE/live-root.pem"; fi ;;
+  *" get pod mgmtd-0 "*) printf '%s' "${STUB_READY:-}" ;;
+  *" get configmap mgmt-signing-pub "*)
+    if [[ -n "${STUB_CM_NEXT:-}" ]]; then printf '{"data":{"spec.pub":"%s","next.pub":"%s"}}\n' "$STUB_CM_PUB" "$STUB_CM_NEXT"
+    else printf '{"data":{"spec.pub":"%s"}}\n' "$STUB_CM_PUB"; fi ;;
+  *" get configmap mgmt-spec-key "*) printf '%s' "${STUB_PINNED:-}" ;;
   *) echo "kubectl $*" >>"$STUB_STATE/kubectl.log" ;;
 esac
 `
 
+// fakeServeMise answers the certificate helpers, the link, and the two reads of mgmtd that the key cross-check makes.
 const fakeServeMise = `#!/usr/bin/env bash
 case "$1 $2 $3 $4" in
   "run pki -- trust-bundle") cat ;;
   "run pki -- info") printf '{"subject_key_id":"","not_after":"%s"}\n' "${STUB_NOT_AFTER:-2099-01-01T00:00:00Z}" ;;
+  "run mgmt -- pubkey") printf '{"spec.pub":"%s"}\n' "$STUB_LIVE_PUB" ;;
+  "run mgmt -- status")
+    staged="${STUB_STAGED_KEY:-}"
+    if [[ -z "$staged" && -n "${STUB_NEXT_PUB:-}" ]]; then staged="$(printf '%s' "$STUB_NEXT_PUB" | base64 -d | shasum -a 256 | cut -d' ' -f1)"; fi
+    printf '{"signed":{"epoch":1,"counter":7},"stagedKey":"%s"}\n' "$staged" ;;
   "run cell:link"*) echo "link CELL=$CELL LINK_ONLY=${LINK_ONLY:-}" >>"$STUB_STATE/link.log" ;;
+  "run cell:up"*)
+    echo "up CELL=$CELL HARNESS_ONLY=${HARNESS_ONLY:-}" >>"$STUB_STATE/link.log"
+    [[ -z "${STUB_UP_FAIL:-}" ]] || { echo "cell:up failed" >&2; exit 1; } ;;
   *) echo "unexpected mise call: $*" >&2; exit 2 ;;
 esac
+`
+
+// fakeKind lists the clusters that exist: STUB_KIND, or management and dev-cp. STUB_KIND_FAIL makes the listing fail.
+const fakeKind = `#!/usr/bin/env bash
+[[ "$*" == "get clusters" ]] || exit 2
+[[ -z "${STUB_KIND_FAIL:-}" ]] || exit 1
+printf '%s\n' ${STUB_KIND:-management dev-cp}
 `
 
 const fakeServeGo = `#!/usr/bin/env bash
@@ -160,9 +231,16 @@ for a in "$@"; do [[ "$a" == -iTCP:* ]] && port="${a#-iTCP:}"; done
 exit 0
 `
 
+const (
+	keyGood  = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+	keyOther = "/wECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+	keyNext  = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
+)
+
 type serveEnv struct {
 	root, state, build string
 	rootA, rootB       string // PEM
+	devPEM             string // the live root of dev-cp
 	shaA, shaB         string // the root_sha256 of the Go code
 }
 
@@ -220,12 +298,15 @@ func newServeEnv(t *testing.T) *serveEnv {
 	write("bin/mise", fakeServeMise, 0o755)
 	write("bin/go", fakeServeGo, 0o755)
 	write("bin/lsof", fakeLsof, 0o755)
+	write("bin/kind", fakeKind, 0o755)
 	bin, err := os.ReadFile(fakeHostsvcBinary(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	write("state/hostsvc", string(bin), 0o755)
 	write("state/pin.pem", caPEM(t, 99), 0o644)
+	e.devPEM = caPEM(t, 77)
+	write("state/dev-root.pem", e.devPEM, 0o644)
 	e.rootA, e.rootB = caPEM(t, 1), caPEM(t, 2)
 	e.shaA, e.shaB = goRootSHA(t, e.rootA), goRootSHA(t, e.rootB)
 	for pemText, sha := range map[string]string{e.rootA: e.shaA, e.rootB: e.shaB} {
@@ -266,6 +347,16 @@ func (e *serveEnv) serve(t *testing.T, verb string, env ...string) (string, stri
 	return e.script("hostsvc-serve.sh", []string{verb}, env...)
 }
 
+// mustRun runs scripts/hostsvc-serve.sh with several arguments, and fails when it fails.
+func (e *serveEnv) mustRun(t *testing.T, args ...string) string {
+	t.Helper()
+	out, errOut, err := e.script("hostsvc-serve.sh", args)
+	if err != nil {
+		t.Fatalf("hostsvc-serve.sh %v failed: %v\nstdout: %s\nstderr: %s", args, err, out, errOut)
+	}
+	return out + errOut
+}
+
 func (e *serveEnv) mustServe(t *testing.T, verb string, env ...string) string {
 	t.Helper()
 	out, errOut, err := e.serve(t, verb, env...)
@@ -276,12 +367,16 @@ func (e *serveEnv) mustServe(t *testing.T, verb string, env ...string) string {
 }
 
 type serveStatus struct {
-	Running     bool   `json:"running"`
-	PID         *int   `json:"pid"`
-	CertSHA256  string `json:"cert_sha256"`
-	RootSHA256  string `json:"root_sha256"`
-	ExpiresSoon bool   `json:"expires_soon"`
-	LastError   string `json:"last_error"`
+	Running       bool            `json:"running"`
+	PID           *int            `json:"pid"`
+	CertSHA256    string          `json:"cert_sha256"`
+	RootSHA256    string          `json:"root_sha256"`
+	ExpiresSoon   bool            `json:"expires_soon"`
+	LastError     string          `json:"last_error"`
+	DevRootSHA256 string          `json:"dev_root_sha256"`
+	Keys          []string        `json:"keys"`
+	SpecRevision  json.RawMessage `json:"spec_revision"`
+	BinarySHA256  string          `json:"binary_sha256"`
 }
 
 func (e *serveEnv) status(t *testing.T, env ...string) serveStatus {
@@ -500,8 +595,36 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		if *second.PID == *first.PID {
 			t.Fatal("restart kept the process")
 		}
+		want := "link CELL=management LINK_ONLY=mgmt-api\nup CELL=dev-cp HARNESS_ONLY=cell-controller\n"
+		if got := e.read("link.log"); got != want {
+			t.Fatalf("calls %q, want the link of mgmt-api and then the render of the cell controller: %q", got, want)
+		}
+	})
+
+	// The new pin of the host service reaches the cell controller through its render, so restart renders it when dev-cp exists.
+	t.Run("restart without dev-cp links mgmt-api only", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		e.mustServe(t, "restart", "STUB_KIND=management")
 		if got := e.read("link.log"); got != "link CELL=management LINK_ONLY=mgmt-api\n" {
-			t.Fatalf("link calls %q, want one link of mgmt-api", got)
+			t.Fatalf("calls %q, want the link of mgmt-api and no render", got)
+		}
+	})
+
+	t.Run("restart fails when the render of the cell controller fails", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		if _, _, err := e.serve(t, "restart", "STUB_UP_FAIL=1"); err == nil {
+			t.Fatal("restart succeeded although the render of the cell controller failed")
+		}
+	})
+
+	t.Run("restart fails when kind does not answer", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		_, errOut, err := e.serve(t, "restart", "STUB_KIND_FAIL=1")
+		if err == nil || strings.Contains(e.read("link.log"), "up CELL=dev-cp") {
+			t.Fatalf("err %v, stderr %q, calls %q; want a failure and no render", err, errOut, e.read("link.log"))
 		}
 	})
 
@@ -516,6 +639,401 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 			t.Fatalf("pin printed %q (%v), want the certificate", out, err)
 		}
 	})
+	t.Run("start_without_mgmtd", func(t *testing.T) {
+		// The mgmt-api render starts the service before mgmtd exists on a clean harness. The start keeps the files and serves.
+		e := newServeEnv(t)
+		out := e.mustServe(t, "start")
+		if !strings.Contains(out, "mgmtd-0 is not Ready") || !e.status(t).Running {
+			t.Fatalf("start output %q, status %+v; want a running service and the hint", out, e.status(t))
+		}
+		if entries, _ := os.ReadDir(filepath.Join(e.build, "hostsvc", "mgmt-keys")); len(entries) != 0 {
+			t.Fatalf("start wrote %d key files while mgmtd was down", len(entries))
+		}
+		if _, err := os.Stat(filepath.Join(e.build, "hostsvc", "dev-root.crt")); err == nil {
+			t.Fatal("start wrote dev-root.crt while mgmtd was down")
+		}
+		if _, _, err := e.serve(t, "sync"); err == nil {
+			t.Fatal("sync succeeded while mgmtd was down")
+		}
+	})
+
+	t.Run("start passes the step flags and runs in the repository root", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		args := strings.Split(strings.TrimSpace(e.read("args")), "\n")
+		for flag, want := range map[string]string{"--repo-root": e.root, "--journal-dir": "build/hostsvc/steps", "--step-keys-dir": "build/hostsvc/mgmt-keys",
+			"--step-client-bundle": "build/hostsvc/dev-root.crt", "--admin-socket": "build/hostsvc/admin.sock"} {
+			i := slices.Index(args, flag)
+			if i < 0 || i+1 >= len(args) || args[i+1] != want {
+				t.Errorf("serve flag %s is %v, want %q (args %v)", flag, args[min(i+1, len(args)-1)], want, args)
+			}
+		}
+		wantWD, _ := filepath.EvalSymlinks(e.root)
+		if got := e.read("cwd"); got != wantWD {
+			t.Errorf("the service runs in %q, want the repository root %q, which each stage child inherits", got, wantWD)
+		}
+	})
+
+	t.Run("env_cleared", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start", "POC_SECRET_TOKEN_CMD=print-a-secret", "SOME_TOKEN=abc", "OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318",
+			"DOCKER_HOST=unix:///tmp/docker.sock", "POC_ENVRC_LOCAL=/tmp/x")
+		got := map[string]string{}
+		for _, line := range strings.Split(strings.TrimSpace(e.read("env")), "\n") {
+			k, v, _ := strings.Cut(line, "=")
+			got[k] = v
+		}
+		for k := range got {
+			if !slices.Contains([]string{"HOME", "PATH", "USER", "TMPDIR", "DOCKER_HOST"}, k) && !strings.HasPrefix(k, "OTEL_") {
+				t.Errorf("the service holds the variable %s, and env -i allows only HOME, PATH, USER, TMPDIR, DOCKER_HOST and OTEL_*", k)
+			}
+		}
+		if got["OTEL_EXPORTER_OTLP_ENDPOINT"] != "http://collector:4318" || got["DOCKER_HOST"] != "unix:///tmp/docker.sock" || got["PATH"] == "" || got["HOME"] == "" {
+			t.Errorf("the service lacks an allowed variable: %v", got)
+		}
+	})
+
+	stageJournal := func(t *testing.T, e *serveEnv, state string) {
+		t.Helper()
+		dir := filepath.Join(e.build, "hostsvc", "steps")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		doc := `{"entries":[{"status":{"id":"` + strings.Repeat("a", 32) + `","cell":"dev-cell-1","state":"` + state + `"}}]}`
+		if err := os.WriteFile(filepath.Join(dir, "journal.json"), []byte(doc), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stageSteps := func(t *testing.T, e *serveEnv, state string) {
+		t.Helper()
+		doc := `{"steps":[{"id":"` + strings.Repeat("a", 32) + `","cell":"dev-cell-1","state":"` + state + `"}],"corrupt":false}`
+		if err := os.WriteFile(filepath.Join(e.state, "steps.json"), []byte(doc+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// stages is what rotate-signing-key reads: one line for each step that runs a stage, from the service or from journal.json.
+	t.Run("stages lists the steps that run a stage", func(t *testing.T) {
+		line := func(state string) string { return strings.Repeat("a", 32) + " dev-cell-1 " + state + "\n" }
+		for _, state := range []string{"creating", "admitting", "bootstrapping"} {
+			e := newServeEnv(t)
+			stageJournal(t, e, state)
+			if out, errOut, err := e.serve(t, "stages"); err != nil || out != line(state) {
+				t.Fatalf("journal file, %s: err %v, stdout %q, stderr %q; want %q", state, err, out, errOut, line(state))
+			}
+			e = newServeEnv(t)
+			e.mustServe(t, "start")
+			stageSteps(t, e, state)
+			if out, errOut, err := e.serve(t, "stages"); err != nil || out != line(state) {
+				t.Fatalf("running service, %s: err %v, stdout %q, stderr %q; want %q", state, err, out, errOut, line(state))
+			}
+		}
+		for _, state := range []string{"queued", "done", "failed_final"} {
+			e := newServeEnv(t)
+			stageJournal(t, e, state)
+			if out, _, err := e.serve(t, "stages"); err != nil || out != "" {
+				t.Fatalf("%s: err %v, stdout %q; want no line", state, err, out)
+			}
+		}
+		e := newServeEnv(t)
+		if out, _, err := e.serve(t, "stages"); err != nil || out != "" {
+			t.Fatalf("no journal: err %v, stdout %q; want no line", err, out)
+		}
+		e = newServeEnv(t)
+		e.mustServe(t, "start")
+		if err := os.WriteFile(filepath.Join(e.state, "ctl-fail"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, errOut, err := e.serve(t, "stages"); err == nil || !strings.Contains(errOut, "could not read the steps") {
+			t.Fatalf("a failed read: err %v, stderr %q; want a failure", err, errOut)
+		}
+	})
+
+	t.Run("start_refuses_during_stage", func(t *testing.T) {
+		for _, state := range []string{"creating", "admitting", "bootstrapping"} {
+			e := newServeEnv(t)
+			stageJournal(t, e, state)
+			_, errOut, err := e.serve(t, "start")
+			if err == nil || !strings.Contains(errOut, "a step runs a stage") || !strings.Contains(errOut, state) || e.read("starts") != "" {
+				t.Fatalf("%s: err %v, stderr %q, starts %q; want a refusal before any start", state, err, errOut, e.read("starts"))
+			}
+			e.mustRun(t, "start", "--force")
+			if !e.status(t).Running {
+				t.Fatalf("%s: start --force did not start the service", state)
+			}
+		}
+		// A step that ended, or waits, is no stage.
+		e := newServeEnv(t)
+		stageJournal(t, e, "queued")
+		e.mustServe(t, "start")
+
+		// While the service runs, the state comes from the service, and restart refuses too.
+		e = newServeEnv(t)
+		e.mustServe(t, "start")
+		first := e.status(t)
+		e.setRoot(t, e.rootB)
+		stageSteps(t, e, "bootstrapping")
+		for _, verb := range []string{"start", "restart"} {
+			_, errOut, err := e.serve(t, verb)
+			if err == nil || !strings.Contains(errOut, "a step runs a stage") || *e.status(t).PID != *first.PID {
+				t.Fatalf("%s: err %v, stderr %q; want a refusal that leaves the process %d", verb, err, errOut, *first.PID)
+			}
+		}
+		if got := e.read("link.log"); got != "" {
+			t.Fatalf("a refused restart linked mgmt-api: %q", got)
+		}
+		e.mustRun(t, "restart", "--force")
+		if second := e.status(t); *second.PID == *first.PID || second.RootSHA256 != e.shaB {
+			t.Fatalf("restart --force: %+v, want a new process with the new root", second)
+		}
+	})
+
+	t.Run("a failed read of the steps refuses start and restart", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		first := e.status(t)
+		e.setRoot(t, e.rootB)
+		if err := os.WriteFile(filepath.Join(e.state, "ctl-fail"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for _, verb := range []string{"start", "restart"} {
+			_, errOut, err := e.serve(t, verb)
+			if err == nil || !strings.Contains(errOut, "cannot tell whether a step runs a stage") || !strings.Contains(errOut, "--force") || *e.status(t).PID != *first.PID {
+				t.Fatalf("%s: err %v, stderr %q; want a refusal that leaves process %d", verb, err, errOut, *first.PID)
+			}
+		}
+		// A journal file that does not parse refuses too, while the service does not run.
+		e = newServeEnv(t)
+		dir := filepath.Join(e.build, "hostsvc", "steps")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "journal.json"), []byte("{not json"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, errOut, err := e.serve(t, "start"); err == nil || !strings.Contains(errOut, "cannot tell whether a step runs a stage") || e.read("starts") != "" {
+			t.Fatalf("a corrupt journal: err %v, stderr %q", err, errOut)
+		}
+	})
+
+	t.Run("step_context_no_restart", func(t *testing.T) {
+		id := strings.Repeat("c", 32)
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		first := e.status(t)
+		// A current service: the step runs sync only.
+		out := e.mustServe(t, "start", "POC_STEP_ID="+id, "STUB_READY=True", "STUB_CM_PUB="+keyGood, "STUB_LIVE_PUB="+keyGood)
+		if !strings.Contains(out, "serves already") || *e.status(t).PID != *first.PID {
+			t.Fatalf("step start: %q, status %+v; want the same process", out, e.status(t))
+		}
+		if b, err := os.ReadFile(filepath.Join(e.build, "hostsvc", "mgmt-keys", "spec.pub")); err != nil || strings.TrimSpace(string(b)) != keyGood {
+			t.Fatalf("the step start did not run sync: spec.pub %q (%v)", b, err)
+		}
+		// A service that needs a restart: the step fails and leaves the process, with no build.
+		e.setRoot(t, e.rootB)
+		_, errOut, err := e.serve(t, "start", "POC_STEP_ID="+id)
+		want := "run mise run hostsvc:serve -- restart after step " + id
+		if err == nil || !strings.Contains(errOut, want) {
+			t.Fatalf("err %v, stderr %q; want %q", err, errOut, want)
+		}
+		if second := e.status(t); *second.PID != *first.PID {
+			t.Fatal("the step start restarted the service")
+		}
+		if n := strings.Count(e.read("go.log"), "go build"); n != 1 {
+			t.Fatalf("%d builds, want the one of the first start", n)
+		}
+		if n := strings.Count(e.read("starts"), "\n"); n != 1 {
+			t.Fatalf("%d processes started, want 1", n)
+		}
+		// With no service at all, a step start builds nothing and starts nothing.
+		e = newServeEnv(t)
+		_, errOut, err = e.serve(t, "start", "POC_STEP_ID="+id)
+		if err == nil || !strings.Contains(errOut, want) || e.read("go.log") != "" || e.read("starts") != "" {
+			t.Fatalf("no service: err %v, stderr %q, builds %q; want the restart hint and no build", err, errOut, e.read("go.log"))
+		}
+		// restart is no step command.
+		e = newServeEnv(t)
+		if _, errOut, err = e.serve(t, "restart", "POC_STEP_ID="+id); err == nil || !strings.Contains(errOut, "would end the host service that runs step "+id) {
+			t.Fatalf("restart in a step: err %v, stderr %q", err, errOut)
+		}
+	})
+
+	t.Run("stop sends KILL after the wait", func(t *testing.T) {
+		e := newServeEnv(t)
+		if err := os.WriteFile(filepath.Join(e.state, "ignore-term"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		e.mustServe(t, "start")
+		pid := *e.status(t).PID
+		begin := time.Now()
+		_, errOut, err := e.serve(t, "stop", "HOSTSVC_STOP_WAIT=1")
+		if err != nil || !strings.Contains(errOut, "did not stop within 1s, so it gets KILL") {
+			t.Fatalf("err %v, stderr %q; want a KILL after the wait", err, errOut)
+		}
+		if d := time.Since(begin); d < 500*time.Millisecond || d > 15*time.Second {
+			t.Fatalf("stop took %s, want the wait of 1s and then the KILL", d)
+		}
+		for i := 0; i < 50 && alive(pid); i++ {
+			time.Sleep(100 * time.Millisecond)
+		}
+		if alive(pid) {
+			t.Fatalf("process %d still runs after the KILL", pid)
+		}
+	})
+
+	t.Run("steps, log and cancel run hostsvc ctl on the admin socket", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		stageSteps(t, e, "done")
+		if out := e.mustServe(t, "steps"); !strings.Contains(out, `"corrupt":false`) {
+			t.Fatalf("steps printed %q", out)
+		}
+		e.mustRun(t, "steps", "--reset")
+		cmd := func(args ...string) (string, string, error) { return e.script("hostsvc-serve.sh", args) }
+		if out, _, err := cmd("log", "--step", strings.Repeat("a", 32), "--follow"); err != nil || !strings.Contains(out, "the log of the step") {
+			t.Fatalf("log: %q (%v)", out, err)
+		}
+		if out, _, err := cmd("cancel", "--cell", "dev-cell-1"); err != nil || !strings.Contains(out, `"cancelled":true`) {
+			t.Fatalf("cancel: %q (%v)", out, err)
+		}
+		calls := e.read("ctl.log")
+		for _, want := range []string{"steps --admin-socket build/hostsvc/admin.sock", "reset-journal --admin-socket build/hostsvc/admin.sock",
+			"log --admin-socket build/hostsvc/admin.sock --step " + strings.Repeat("a", 32) + " --follow", "cancel --admin-socket build/hostsvc/admin.sock --cell dev-cell-1"} {
+			if !strings.Contains(calls, want) {
+				t.Errorf("ctl calls\n%s\nlack %q", calls, want)
+			}
+		}
+		// A cancel with no open step is no failure, so cell:down can go on. Any other refusal is one.
+		if err := os.WriteFile(filepath.Join(e.state, "cancel-mode"), []byte("no open step matches\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, errOut, err := cmd("cancel", "--cell", "dev-cell-2"); err != nil || !strings.Contains(errOut, "nothing to cancel") {
+			t.Fatalf("cancel with no open step: err %v, stderr %q; want exit 0 and a log line", err, errOut)
+		}
+		if err := os.WriteFile(filepath.Join(e.state, "cancel-mode"), []byte("socket is gone\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if out, _, err := cmd("cancel", "--cell", "dev-cell-2"); err == nil || !strings.Contains(out, "socket is gone") {
+			t.Fatalf("cancel with another error: %q (%v); want exit 1", out, err)
+		}
+	})
+
+	t.Run("sync writes the roots and the keys after the cross-check", func(t *testing.T) {
+		e := newServeEnv(t)
+		env := []string{"STUB_READY=True", "STUB_CM_PUB=" + keyGood, "STUB_LIVE_PUB=" + keyGood, "STUB_CM_NEXT=" + keyNext, "STUB_NEXT_PUB=" + keyNext}
+		e.mustServe(t, "start", env...)
+		out, errOut, err := e.serve(t, "sync", env...)
+		if err != nil {
+			t.Fatalf("sync: %v\n%s\n%s", err, out, errOut)
+		}
+		hostFile := func(name string) string {
+			b, _ := os.ReadFile(filepath.Join(e.build, "hostsvc", name))
+			return strings.TrimSpace(string(b))
+		}
+		if hostFile("mgmt-keys/spec.pub") != keyGood || hostFile("mgmt-keys/next.pub") != keyNext || hostFile("dev-root.crt") != strings.TrimSpace(e.devPEM) {
+			t.Fatalf("files: spec.pub %q, next.pub %q, dev-root.crt %q", hostFile("mgmt-keys/spec.pub"), hostFile("mgmt-keys/next.pub"), hostFile("dev-root.crt"))
+		}
+		for _, f := range []string{"mgmt-keys/spec.pub", "mgmt-keys/next.pub", "dev-root.crt"} {
+			if fi, _ := os.Stat(filepath.Join(e.build, "hostsvc", f)); fi == nil || fi.Mode().Perm() != 0o644 {
+				t.Errorf("%s is not a file of mode 0644: %v", f, fi)
+			}
+		}
+		// status reads three values from the files, and binary_sha256 from the serving line.
+		stepsDir := filepath.Join(e.build, "hostsvc", "steps")
+		if err := os.MkdirAll(stepsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		payload := base64.StdEncoding.EncodeToString([]byte(`{"revision":{"epoch":1,"counter":7}}`))
+		envelope, _ := json.Marshal(map[string]string{"payload": payload})
+		specJSON, _ := json.Marshal(map[string]string{"envelope": string(envelope)})
+		if err := os.WriteFile(filepath.Join(stepsDir, "spec.json"), specJSON, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		st := e.status(t)
+		block, _ := pem.Decode([]byte(e.devPEM))
+		der := sha256.Sum256(block.Bytes)
+		raw := func(b64 string) string {
+			b, _ := base64.StdEncoding.DecodeString(b64)
+			sum := sha256.Sum256(b)
+			return hex.EncodeToString(sum[:])
+		}
+		wantKeys := []string{raw(keyGood), raw(keyNext)}
+		slices.Sort(wantKeys)
+		if st.DevRootSHA256 != hex.EncodeToString(der[:]) || !slices.Equal(st.Keys, wantKeys) || string(st.SpecRevision) != `{"epoch":1,"counter":7}` || st.BinarySHA256 != strings.Repeat("b", 64) {
+			t.Fatalf("status %+v, want dev_root_sha256 %x, keys %v, spec_revision {epoch 1, counter 7}, binary_sha256 of the serving line", st, der, wantKeys)
+		}
+		// A staged key that mgmtd no longer shows leaves with the next sync.
+		env = []string{"STUB_READY=True", "STUB_CM_PUB=" + keyGood, "STUB_LIVE_PUB=" + keyGood}
+		e.mustServe(t, "sync", env...)
+		if _, err := os.Stat(filepath.Join(e.build, "hostsvc", "mgmt-keys", "next.pub")); err == nil {
+			t.Fatal("sync kept next.pub though no key is staged")
+		}
+		if st := e.status(t); len(st.Keys) != 1 {
+			t.Fatalf("keys %v, want only spec.pub", st.Keys)
+		}
+	})
+
+	// The refusals write nothing: each starts from an empty directory and ends with one, or with the files that it had.
+	hostFiles := func(e *serveEnv) []string {
+		var out []string
+		root := filepath.Join(e.build, "hostsvc")
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && (strings.HasSuffix(path, ".pub") || strings.HasSuffix(path, "dev-root.crt")) {
+				b, _ := os.ReadFile(path)
+				out = append(out, strings.TrimPrefix(path, root)+"="+strings.TrimSpace(string(b)))
+			}
+			return nil
+		})
+		slices.Sort(out)
+		return out
+	}
+
+	t.Run("next_pub_not_staged", func(t *testing.T) {
+		for name, env := range map[string][]string{
+			"mgmtd shows no staged key": {"STUB_CM_NEXT=" + keyNext, "STUB_STAGED_KEY=none-staged"},
+			"another staged key":        {"STUB_CM_NEXT=" + keyNext, "STUB_NEXT_PUB=" + keyOther},
+			"a next.pub that is no key": {"STUB_CM_NEXT=not-a-key", "STUB_STAGED_KEY=abc"},
+		} {
+			e := newServeEnv(t)
+			all := append([]string{"STUB_READY=True", "STUB_CM_PUB=" + keyGood, "STUB_LIVE_PUB=" + keyGood}, env...)
+			_, errOut, err := e.serve(t, "sync", all...)
+			if err == nil || !strings.Contains(errOut, "next.pub") {
+				t.Fatalf("%s: err %v, stderr %q; want a refusal that names next.pub", name, err, errOut)
+			}
+			if files := hostFiles(e); len(files) != 0 {
+				t.Fatalf("%s: sync wrote %v, want no file", name, files)
+			}
+		}
+	})
+
+	t.Run("mgmtd_down_keeps_keys", func(t *testing.T) {
+		e := newServeEnv(t)
+		up := []string{"STUB_READY=True", "STUB_CM_PUB=" + keyGood, "STUB_LIVE_PUB=" + keyGood}
+		e.mustServe(t, "sync", up...)
+		before := hostFiles(e)
+		if len(before) != 2 {
+			t.Fatalf("files after the first sync: %v", before)
+		}
+		_, errOut, err := e.serve(t, "sync", "STUB_READY=False", "STUB_CM_PUB="+keyOther, "STUB_LIVE_PUB="+keyOther)
+		if err == nil || !strings.Contains(errOut, "CELL=management LINK_ONLY=mgmt-api mise run cell:link") {
+			t.Fatalf("err %v, stderr %q; want exit 1 with the link hint", err, errOut)
+		}
+		if after := hostFiles(e); !slices.Equal(after, before) {
+			t.Fatalf("files changed while mgmtd was down: %v, was %v", after, before)
+		}
+	})
+
+	t.Run("spec_pub_differs", func(t *testing.T) {
+		e := newServeEnv(t)
+		_, errOut, err := e.serve(t, "sync", "STUB_READY=True", "STUB_CM_PUB="+keyGood, "STUB_LIVE_PUB="+keyOther)
+		if err == nil || !strings.Contains(errOut, "mgmtd-0 signs with "+keyOther) {
+			t.Fatalf("err %v, stderr %q; want a refusal that names the live key", err, errOut)
+		}
+		if files := hostFiles(e); len(files) != 0 {
+			t.Fatalf("sync wrote %v with a spec.pub that mgmtd does not hold", files)
+		}
+	})
+
 }
 
 // fakeSigningKubectl serves the ConfigMap and the pod that mgmt_signing_pub reads.
@@ -595,7 +1113,7 @@ func TestMgmtSigningPub(t *testing.T) {
 func TestMgmtTaskNamesTheLinkCommand(t *testing.T) {
 	testtool.Need(t, "jq", "yq", "bash")
 	root := t.TempDir()
-	for _, d := range []string{"scripts", "cells", "harness"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 		copyFiles(t, root, d)
 	}
 	kubectl := `#!/usr/bin/env bash

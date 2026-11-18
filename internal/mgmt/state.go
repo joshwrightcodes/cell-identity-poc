@@ -58,6 +58,30 @@ type OpState struct {
 	Final     string     `json:"final,omitempty"`
 }
 
+// Request is one portal request for a cell. Step is the signed step of the request, nil after a
+// cancel. A step with DoneAt set is closed and no longer indexed in the spec.
+type Request struct {
+	RequestID   string     `json:"requestId"`
+	RequestedAt time.Time  `json:"requestedAt"`
+	Step        *StepState `json:"step,omitempty"`
+}
+
+// StepState is one step that the plane signed. KeysAtIssue holds the sorted key identities of the
+// cell when the step was signed; the close rule compares them with the keys that a bind proves.
+type StepState struct {
+	ID            string    `json:"id"`
+	Envelope      []byte    `json:"envelope"`
+	PayloadSHA256 string    `json:"payloadSHA256"`
+	KeyEpoch      uint64    `json:"keyEpoch"`
+	IssuedAt      time.Time `json:"issuedAt"`
+	ExpiresAt     time.Time `json:"expiresAt"`
+	DoneAt        time.Time `json:"doneAt,omitzero"`
+	KeysAtIssue   []string  `json:"keysAtIssue"`
+}
+
+// open reports whether the step is signed and not closed.
+func (s *StepState) open() bool { return s != nil && s.DoneAt.IsZero() }
+
 // State is the persistent state of the plane. Seq is the compare-and-swap version and rises at every
 // saved change. DropRevision is the revision that released the last drop; the queue in PendingDrops
 // releases its next drop only after envd reports a revision at or above it. Served is the counter of a restored revision, and 0 means the latest.
@@ -77,10 +101,13 @@ type State struct {
 	Ops             map[string]*OpState `json:"ops,omitempty"`
 	OpOrder         []string            `json:"opOrder,omitempty"`
 	StagedKeySHA256 string              `json:"stagedKeySHA256,omitempty"`
+	// Requests holds the portal requests by cell. The field is never omitted: a state without it
+	// predates the portal, and NewPlane turns each bound cell of that state into a request once.
+	Requests map[string]*Request `json:"requests"`
 }
 
 func newState(keySHA string) *State {
-	return &State{Version: stateVersion, KeySHA256: keySHA, Cells: map[string]*CellState{}, Retired: map[string]spec.Revision{}, Ops: map[string]*OpState{}}
+	return &State{Version: stateVersion, KeySHA256: keySHA, Cells: map[string]*CellState{}, Retired: map[string]spec.Revision{}, Ops: map[string]*OpState{}, Requests: map[string]*Request{}}
 }
 
 // clone copies the parts that a change mutates. Byte slices and bundles are never mutated in place,
@@ -105,6 +132,18 @@ func (s *State) clone() *State {
 		c.Ops[k] = &o
 	}
 	c.OpOrder = slices.Clone(s.OpOrder)
+	if s.Requests != nil {
+		c.Requests = make(map[string]*Request, len(s.Requests))
+		for k, v := range s.Requests {
+			r := *v
+			if v.Step != nil {
+				st := *v.Step
+				st.KeysAtIssue = slices.Clone(v.Step.KeysAtIssue)
+				r.Step = &st
+			}
+			c.Requests[k] = &r
+		}
+	}
 	return &c
 }
 
@@ -149,6 +188,11 @@ func (s *State) validate() error {
 	for id, o := range s.Ops {
 		if o == nil {
 			return fmt.Errorf("operation %q has no state", id)
+		}
+	}
+	for name, r := range s.Requests {
+		if r == nil {
+			return fmt.Errorf("request for %q is empty", name)
 		}
 	}
 	if len(s.OpOrder) != len(s.Ops) {

@@ -65,10 +65,13 @@ bundle_blocks() {
 
 # copies prints "<cluster> <namespace> <name> <key>" for each copy of the root.
 copies() {
-  local cluster list ns name key links
+  local cluster list ns name key links existing
   # Only cell:link renders the copies of this cluster, so only link components count.
   links="$(printf '%s\n' ${LINK_COMPONENTS[@]+"${LINK_COMPONENTS[@]%%:*}"} | jq -Rn '[inputs | select(length > 0)]')"
+  # A cell with no cluster holds no copy, so only the clusters that exist are read.
+  existing="$(existing_clusters)" || die "could not list the clusters"
   for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
+    grep -qx -- "$cluster" <<<"$existing" || continue
     list="$(kubectl --context "kind-$cluster" get configmaps -A -o json)" || die "could not list the ConfigMaps of $cluster"
     while read -r ns name key; do
       [[ -n "$ns" ]] || continue

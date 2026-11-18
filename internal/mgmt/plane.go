@@ -56,6 +56,12 @@ type Config struct {
 	// OnRecords is called with the served record envelopes and the signing public key after each
 	// commit that changes a record, and once after NewPlane. A failed save never calls it.
 	OnRecords func(records map[string]json.RawMessage, pub ed25519.PublicKey)
+	// OnSpec is called with the newest signed spec envelope after each commit that signs a spec,
+	// and once after NewPlane. A failed save never calls it.
+	OnSpec func(envelope []byte)
+	// SpecPushState returns the time and the error of the last spec push to the host service. A nil
+	// func leaves both empty in the status.
+	SpecPushState func() (time.Time, string)
 
 	NonceTTL, CheckEvery, KeyUpdateGap, KeyCacheTTL, NonceKeyEvery time.Duration
 	HistoryLen                                                     int
@@ -96,11 +102,11 @@ type snapshot struct {
 // the token before it takes the mutex, then re-reads the current state, applies, signs, saves and
 // swaps an immutable snapshot that readers load without a lock.
 type Plane struct {
-	cfg    Config
-	intent map[string]IntentCell
-	nonces *Nonces
-	cache  keyCache
-	logs   *lograte.Limiter
+	cfg     Config
+	catalog map[string]IntentCell
+	nonces  *Nonces
+	cache   keyCache
+	logs    *lograte.Limiter
 
 	mu  sync.Mutex // the commit path, and key
 	key ed25519.PrivateKey
@@ -151,10 +157,10 @@ func NewPlane(cfg Config) (*Plane, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Plane{cfg: cfg, key: key, logs: lograte.New(logWindow, 256, cfg.Now), nonces: nonces.WithKeyEvery(cfg.NonceKeyEvery), intent: map[string]IntentCell{}}
+	p := &Plane{cfg: cfg, key: key, logs: lograte.New(logWindow, 256, cfg.Now), nonces: nonces.WithKeyEvery(cfg.NonceKeyEvery), catalog: map[string]IntentCell{}}
 	p.cache.m = map[string]*cacheEntry{}
 	for _, c := range cfg.Intent.Cells {
-		p.intent[c.Name] = c
+		p.catalog[c.Name] = c
 	}
 	p.bindResults, _ = cfg.Meter.Int64Counter("mgmtd.bind.results")
 	p.checkResults, _ = cfg.Meter.Int64Counter("mgmtd.keycheck.results")
@@ -162,6 +168,9 @@ func NewPlane(cfg Config) (*Plane, error) {
 	p.retryUnknownKID, _ = cfg.Meter.Int64Counter("mgmtd.report.retry_unknown_kid")
 	p.rt.cells = map[string]*cellRuntime{}
 	if _, err := cfg.Meter.Int64ObservableGauge("mgmtd.spec.revision.lag", metric.WithInt64Callback(p.observeLag)); err != nil {
+		return nil, err
+	}
+	if _, err := cfg.Meter.Int64ObservableGauge("mgmtd.cells.valid", metric.WithInt64Callback(p.observeValid)); err != nil {
 		return nil, err
 	}
 
@@ -200,6 +209,9 @@ func NewPlane(cfg Config) (*Plane, error) {
 		p.snap.Store(&snapshot{st: st, pub: pub})
 	}
 
+	if err := p.commit(p.migrateRequests); err != nil {
+		return nil, fmt.Errorf("migrate the intent: %w", err)
+	}
 	if err := p.checkStaged(); err != nil {
 		return nil, err
 	}
@@ -209,7 +221,25 @@ func NewPlane(cfg Config) (*Plane, error) {
 	p.noteLag()
 	p.ready.Store(true)
 	p.notifyRecords()
+	p.notifySpec()
 	return p, nil
+}
+
+// migrateRequests turns each bound cell that the catalog lists into a request with the ID
+// migrated, for a state that has no requests field. It runs once: the field is never absent in a
+// state that this binary saved.
+func (p *Plane) migrateRequests(t *txn) error {
+	if t.st.Requests != nil {
+		return nil
+	}
+	t.st.Requests = map[string]*Request{}
+	for _, name := range sortedKeys(t.st.Cells) {
+		if _, ok := p.catalog[name]; ok {
+			t.st.Requests[name] = &Request{RequestID: "migrated", RequestedAt: t.now}
+		}
+	}
+	t.dirty = true
+	return nil
 }
 
 // replaceKey writes a new signing key over the key file.
@@ -527,7 +557,7 @@ func (p *Plane) PublicKey() ed25519.PublicKey { return slices.Clone(p.snap.Load(
 // Spec returns a copy of the served bundle.
 func (p *Plane) Spec() mgmtapi.SpecBundle {
 	if s := p.snap.Load().st.served(); s != nil {
-		return mgmtapi.SpecBundle{Spec: slices.Clone(s.Bundle.Spec), Records: maps.Clone(s.Bundle.Records)}
+		return mgmtapi.SpecBundle{Spec: slices.Clone(s.Bundle.Spec), Records: maps.Clone(s.Bundle.Records), Steps: maps.Clone(s.Bundle.Steps)}
 	}
 	return mgmtapi.SpecBundle{}
 }

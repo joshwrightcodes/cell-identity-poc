@@ -19,71 +19,111 @@ import (
 )
 
 // libFunc runs a function of scripts/lib.sh in the cluster CELL and returns its standard output.
-func libFunc(t *testing.T, cell, call string) (string, string, error) {
+func libFunc(t *testing.T, cell, call string, env ...string) (string, string, error) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
+	bin := t.TempDir()
+	writeLiveStubs(t, bin)
 	cmd := exec.Command("bash", "-c", `source "$1"; `+call, "_", lib)
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + cell, "POC_BUILD_ROOT=" + t.TempDir()}
+	cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + cell, "POC_BUILD_ROOT=" + t.TempDir()}, env...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
 	return out.String(), errOut.String(), err
 }
 
-// TestDependentsManagementOrder: the rebuild order of management runs the first link of mgmt-api before
-// dev-cp and before each cell, and no step waits until every cell is bound.
-func TestDependentsManagementOrder(t *testing.T) {
-	out, errOut, err := libFunc(t, "management", "dependents_of management")
-	if err != nil {
-		t.Fatalf("dependents_of management: %v\n%s", err, errOut)
-	}
-	lines := strings.Split(strings.TrimSpace(out), "\n")
-	index := func(prefix string) int {
-		for i, l := range lines {
-			if l == prefix {
-				return i
+// TestDependentsManagementRebuild: the rebuild order of management runs the first link of mgmt-api before dev-cp and before
+// each cell. A new mgmtd has no request, so the portal asks again for each live cell and waits for it. Each live cell then
+// runs cell:up, because its uplinks and mesh tunnel hold the root and node address of management. The full link comes last.
+// A cell that has no cluster is neither requested nor waited for.
+func TestDependentsManagementRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{"both cells are live", nil, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"mise run portal -- request --cell dev-cell-1 --cell dev-cell-2",
+			"mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2",
+			"CELL=dev-cell-1 mise run cell:up",
+			"CELL=dev-cell-2 mise run cell:up",
+			"CELL=management mise run cell:link",
+		}},
+		{"one cell is live", []string{"STUB_KIND=management dev-cp rogue dev-cell-2"}, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"mise run portal -- request --cell dev-cell-2",
+			"mise run portal -- wait --cell dev-cell-2",
+			"CELL=dev-cell-2 mise run cell:up",
+			"CELL=management mise run cell:link",
+		}},
+		{"no cell is live", []string{"STUB_KIND=management dev-cp rogue"}, []string{
+			"mise run hostsvc -- up --only management",
+			"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
+			"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
+			"CELL=dev-cp mise run cell:up",
+			"CELL=management mise run cell:link",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, err := libFunc(t, "management", "dependents_of management", tc.env...)
+			if err != nil {
+				t.Fatalf("dependents_of management: %v\n%s", err, errOut)
 			}
-		}
-		t.Fatalf("the order has no line %q:\n%s", prefix, out)
-		return -1
+			if got := strings.Split(strings.TrimSpace(out), "\n"); !slices.Equal(got, tc.want) {
+				t.Fatalf("order\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.want, "\n"))
+			}
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			link := slices.Index(lines, "CELL=management LINK_ONLY=mgmt-api mise run cell:link")
+			if devcp := slices.Index(lines, "CELL=dev-cp mise run cell:up"); link < 0 || devcp < link {
+				t.Errorf("the link of mgmt-api (%d) must come before the cell:up of dev-cp (%d)", link, devcp)
+			}
+			for _, l := range lines {
+				if strings.Contains(l, "bound") || strings.Contains(l, "attest") {
+					t.Errorf("step %q waits for a bind: a cell exists only through its step", l)
+				}
+			}
+		})
 	}
-	want := []string{
-		"mise run hostsvc -- up --only management",
-		"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cp mise run cell:up",
-		"CELL=dev-cell-1 mise run cell:up",
-		"CELL=dev-cell-2 mise run cell:up",
-		"CELL=management mise run cell:link",
-	}
-	if !slices.Equal(lines, want) {
-		t.Fatalf("order\n%s\nwant\n%s", strings.Join(lines, "\n"), strings.Join(want, "\n"))
-	}
-	link := index("CELL=management LINK_ONLY=mgmt-api mise run cell:link")
-	for _, later := range []string{"CELL=dev-cp mise run cell:up", "CELL=dev-cell-1 mise run cell:up", "CELL=dev-cell-2 mise run cell:up"} {
-		if index(later) < link {
-			t.Errorf("%q comes before the link of mgmt-api", later)
-		}
-	}
-	for _, l := range lines {
-		if strings.Contains(l, "wait") || strings.Contains(l, "bound") || strings.Contains(l, "attest") {
-			t.Errorf("step %q waits for a bind", l)
-		}
+}
+
+// TestDependentsCellRebuild: a lost or rebuilt cell goes through cell:down (while its cluster exists), a portal recreate
+// that waits, and the management link. A cell that must be created first goes through the portal too.
+func TestDependentsCellRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"the cluster exists", nil, "CELL=dev-cell-1 mise run cell:down\nmise run portal -- recreate --cell dev-cell-1 --wait\nCELL=management mise run cell:link"},
+		{"the cluster is gone", []string{"STUB_KIND=management dev-cp rogue dev-cell-2"}, "mise run portal -- recreate --cell dev-cell-1 --wait\nCELL=management mise run cell:link"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, errOut, err := libFunc(t, "management", "dependents_of dev-cell-1", tc.env...)
+			if err != nil || strings.TrimSpace(out) != tc.want {
+				t.Fatalf("err %v, output %q, stderr %q; want %q", err, out, errOut, tc.want)
+			}
+		})
 	}
 }
 
 // dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
-// admits envd by the dev-cp root and the node address. A rebuilt cell links no registry: mgmtd publishes them.
+// admits envd by the dev-cp root and the node address. It names the live cells only.
 func TestDependentsOfOtherChanges(t *testing.T) {
 	for call, want := range map[string]string{
 		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
 		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
 		"dependents_of gateway-store": "mise run gw:reset",
-		"dependents_of dev-cell-1":    "CELL=dev-cp mise run cell:up\nCELL=dev-cell-1 mise run cell:up",
 		"dependents_of dev-cp":        "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-2 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=dev-cell-2 mise run cell:restart\nCELL=management mise run cell:link",
 	} {
 		out, errOut, err := libFunc(t, "management", call)
@@ -91,22 +131,27 @@ func TestDependentsOfOtherChanges(t *testing.T) {
 			t.Errorf("%s: err %v, output %q, stderr %q; want %q", call, err, out, errOut, want)
 		}
 	}
+	out, errOut, err := libFunc(t, "management", "dependents_of dev-cp", "STUB_KIND=management dev-cp rogue dev-cell-1")
+	if want := "CELL=dev-cp mise run cell:up\nCELL=management LINK_ONLY=mgmt-api mise run cell:link\nCELL=dev-cell-1 mise run cell:up\nCELL=dev-cell-1 mise run cell:restart\nCELL=management mise run cell:link"; err != nil || strings.TrimSpace(out) != want {
+		t.Errorf("dependents_of dev-cp with one live cell: err %v, output %q, stderr %q; want %q", err, out, errOut, want)
+	}
 	if _, errOut, err := libFunc(t, "management", "dependents_of rogue"); err == nil || !strings.Contains(errOut, "dependents_of knows") {
 		t.Errorf("an unknown cluster: err %v, stderr %q", err, errOut)
 	}
 }
 
 // harnessRoot copies the scripts, cell settings and topology, and puts a fake mise in front. The fake logs
-// each call with the settings of the step, and fails the step that STUB_FAIL_AT names as
-// <CELL>/<task>/<LINK_ONLY>.
+// each call with the settings of the step, fails the step that STUB_FAIL_AT names as
+// <CELL>/<task>/<LINK_ONLY>, and fails each call whose arguments start with STUB_FAIL_ARGS.
 func harnessRoot(t *testing.T) (root, calls string) {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "bash")
 	root = t.TempDir()
 	calls = filepath.Join(root, "calls.log")
-	for _, d := range []string{"scripts", "cells", "harness"} {
+	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
 		copyFiles(t, root, d)
 	}
+	writeLiveStubs(t, filepath.Join(root, "bin"))
 	write := func(path, content string) {
 		p := filepath.Join(root, path)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -119,6 +164,7 @@ func harnessRoot(t *testing.T) (root, calls string) {
 	write("bin/mise", `#!/usr/bin/env bash
 echo "mise $* | CELL=${CELL:-} LINK_ONLY=${LINK_ONLY:-} SKIP=${CELL_UP_SKIP_LINK:-}" >>"$STUB_LOG"
 [[ "${CELL:-}/$2/${LINK_ONLY:-}" != "${STUB_FAIL_AT:-none}" ]] || exit 1
+[[ -z "${STUB_FAIL_ARGS:-}" || "$*" != "$STUB_FAIL_ARGS"* ]] || exit 1
 `)
 	write("bin/hostsvc-serve", "#!/usr/bin/env bash\necho \"hostsvc-serve $*\" >>\"$STUB_LOG\"\n")
 	return root, calls
@@ -136,69 +182,93 @@ func runHarness(t *testing.T, root, calls, verb string, env ...string) (string, 
 	return string(log), errOut.String(), err
 }
 
-// harness:up follows the rebuild order: the first link of mgmt-api comes right after the cell:up of
-// management, before dev-cp. The second comes right after the cell:up of dev-cp, with the dev-cp root.
-// harness:down stops the host service last.
-func TestHarnessUpOrderAndDown(t *testing.T) {
+// harness:down stops the host service first, then deletes the clusters. The order of harness:up is in
+// TestHarnessUpOrderM6.
+func TestHarnessDown(t *testing.T) {
 	root, calls := harnessRoot(t)
-	log, errOut, err := runHarness(t, root, calls, "up")
-	if err != nil {
-		t.Fatalf("harness up failed: %v\n%s", err, errOut)
-	}
-	want := []string{
-		"mise run hostsvc -- up | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run images | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run cell:up | CELL=management LINK_ONLY= SKIP=1",
-		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
-		"mise run cell:up | CELL=dev-cp LINK_ONLY= SKIP=",
-		"mise run cell:link | CELL=management LINK_ONLY=mgmt-api SKIP=",
-		"mise run cell:up | CELL=dev-cell-1 LINK_ONLY= SKIP=",
-		"mise run cell:up | CELL=dev-cell-2 LINK_ONLY= SKIP=",
-		"mise run cell:link | CELL=management LINK_ONLY= SKIP=",
-	}
-	if got := strings.Split(strings.TrimSpace(log), "\n"); !slices.Equal(got, want) {
-		t.Fatalf("calls\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
-	}
-
-	root, calls = harnessRoot(t)
-	log, errOut, err = runHarness(t, root, calls, "down")
+	log, errOut, err := runHarness(t, root, calls, "down")
 	if err != nil {
 		t.Fatalf("harness down failed: %v\n%s", err, errOut)
 	}
 	lines := strings.Split(strings.TrimSpace(log), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "mise run hostsvc -- down") || lines[1] != "hostsvc-serve stop" {
-		t.Fatalf("down calls\n%s\nwant hostsvc down, then hostsvc-serve stop last", log)
+	if len(lines) != 2 || lines[0] != "hostsvc-serve stop" || !strings.HasPrefix(lines[1], "mise run hostsvc -- down") {
+		t.Fatalf("down calls\n%s\nwant hostsvc-serve stop first, then hostsvc down", log)
 	}
+	// TestHarnessDownDeletesTheSteps: the journal and the step logs name clusters that harness:down deletes, so they go too. The log
+	// of the host service and its key files stay. A stop that fails leaves the steps where they are.
+	t.Run("TestHarnessDownDeletesTheSteps", func(t *testing.T) {
+		root, calls := harnessRoot(t)
+		hostsvc := filepath.Join(root, "build", "hostsvc")
+		for _, f := range []string{"steps/journal.json", "steps/aaaa.log", "steps/spec.json", "serve.log", "mgmt-keys/spec.pub"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(hostsvc, f)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(hostsvc, f), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		marker := filepath.Join(root, "build", "gate", "m6-provision")
+		if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(marker, []byte("dev-cell-1\ndev-cell-2\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		failing := filepath.Join(root, "bin", "hostsvc-serve-fails")
+		if err := os.WriteFile(failing, []byte("#!/usr/bin/env bash\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := runHarness(t, root, calls, "down", "HOSTSVC_SERVE="+failing); err == nil {
+			t.Fatal("down succeeded with a failing stop")
+		}
+		if _, err := os.Stat(marker); err != nil {
+			t.Errorf("a failed stop deleted the provision marker: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(hostsvc, "steps", "journal.json")); err != nil {
+			t.Errorf("a failed stop deleted the journal: %v", err)
+		}
+		if _, errOut, err := runHarness(t, root, calls, "down"); err != nil {
+			t.Fatalf("down failed: %v\n%s", err, errOut)
+		}
+		if _, err := os.Stat(filepath.Join(hostsvc, "steps")); !os.IsNotExist(err) {
+			t.Errorf("the steps directory is still there after down: %v", err)
+		}
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Errorf("the provision marker is still there after down: %v", err)
+		}
+		for _, f := range []string{"serve.log", "mgmt-keys/spec.pub"} {
+			if _, err := os.Stat(filepath.Join(hostsvc, f)); err != nil {
+				t.Errorf("down deleted %s: %v", f, err)
+			}
+		}
+	})
+	// TestHarnessDownStopsHostFirst: the host service runs the steps that create and admit cells, so it stops before any
+	// cluster goes, and a failed stop leaves the clusters alone.
+	t.Run("TestHarnessDownStopsHostFirst", func(t *testing.T) {
+		root, calls := harnessRoot(t)
+		failing := filepath.Join(root, "bin", "hostsvc-serve-fails")
+		if err := os.WriteFile(failing, []byte("#!/usr/bin/env bash\necho \"hostsvc-serve $*\" >>\"$STUB_LOG\"\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		log, _, err := runHarness(t, root, calls, "down", "HOSTSVC_SERVE="+failing)
+		if err == nil || strings.Contains(log, "hostsvc -- down") || !strings.HasPrefix(log, "hostsvc-serve stop") {
+			t.Fatalf("err %v, calls\n%s\nwant a stop that fails first, and no cluster deleted after it", err, log)
+		}
+	})
 }
 
-// TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps
-// included.
+// TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps and the portal
+// steps included. The commands are those of TestHarnessUpOrderM6.
 func TestHarnessUpHintListsAllSteps(t *testing.T) {
-	all := []string{
-		"CELL_UP_SKIP_LINK=1 CELL=management mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cp mise run cell:up",
-		"CELL=management LINK_ONLY=mgmt-api mise run cell:link",
-		"CELL=dev-cell-1 mise run cell:up",
-		"CELL=dev-cell-2 mise run cell:up",
-		"CELL=management mise run cell:link",
-	}
-	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2, "dev-cell-2/cell:up/": 5} {
+	all := harnessUpHint
+	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2} {
 		t.Run(failAt, func(t *testing.T) {
 			root, calls := harnessRoot(t)
 			_, errOut, err := runHarness(t, root, calls, "up", "STUB_FAIL_AT="+failAt)
 			if err == nil {
 				t.Fatal("harness up passed with a failing step")
 			}
-			_, hint, ok := strings.Cut(errOut, "Fix the cause, then run these commands in this order:\n")
-			if !ok {
-				t.Fatalf("no hint in\n%s", errOut)
-			}
-			var got []string
-			for _, l := range strings.Split(strings.TrimSpace(hint), "\n") {
-				got = append(got, strings.TrimSpace(l))
-			}
-			if !slices.Equal(got, all[from:]) {
+			if got := hintLines(t, errOut); !slices.Equal(got, all[from:]) {
 				t.Fatalf("hint\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(all[from:], "\n"))
 			}
 		})
@@ -410,8 +480,8 @@ func TestImagesNamed(t *testing.T) {
 	envFile := filepath.Join(root, "build", "images.env")
 	before, _ := os.ReadFile(envFile)
 	log, _ := os.ReadFile(logFile)
-	for _, name := range []string{"netprobe", "celld", "relay", "mgmtd"} {
-		if !strings.Contains(string(log), "./cmd/"+name) || !strings.Contains(string(before), "IMAGE_"+strings.ToUpper(name)+"=localhost:5001/"+name+"@sha256:") {
+	for _, name := range []string{"netprobe", "celld", "relay", "mgmtd", "envd", "cell-controller", "cellgw"} {
+		if !strings.Contains(string(log), "./cmd/"+name) || !strings.Contains(string(before), "IMAGE_"+strings.ToUpper(strings.ReplaceAll(name, "-", "_"))+"=localhost:5001/"+name+"@sha256:") {
 			t.Fatalf("a full build lacks %s\ncalls: %s\nimages.env:\n%s", name, log, before)
 		}
 	}
@@ -448,7 +518,7 @@ func TestImagesNamed(t *testing.T) {
 	if got, _ := os.ReadFile(envFile); !strings.HasPrefix(string(got), "# commit abc123\n") {
 		t.Fatalf("a partial build rewrote the commit line:\n%s", got)
 	}
-	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cellgw")
+	allNames := strings.Fields("netprobe cluster-jwt-server cluster-jwt-agent celld attestprobe cell-proxy viewkeys relay mgmtd envd cell-controller cellgw")
 	if out, err := run("6", allNames...); err != nil {
 		t.Fatalf("images.sh with every name failed: %v\n%s", err, out)
 	}
@@ -666,7 +736,10 @@ current-context: kind-management
 	if err != nil {
 		t.Fatal(err)
 	}
-	env := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "KUBECONFIG=" + kubeconfig, "KUBECACHEDIR=" + filepath.Join(dir, "cache"),
+	// The real kubectl talks to the fake API server above, through the KUBECONFIG below and a HOME of its own.
+	realBin := t.TempDir()
+	useRealTool(t, realBin, "kubectl")
+	env := []string{"PATH=" + realBin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + dir, "KUBECONFIG=" + kubeconfig, "KUBECACHEDIR=" + filepath.Join(dir, "cache"),
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(dir, "build")}
 	scale := func(n string) {
 		t.Helper()

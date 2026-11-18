@@ -692,7 +692,7 @@ func TestOnRecordsTakesRecordsAndKeyFromOneSnapshot(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		_, err = r.plane.commitTxn(func(tx *txn) error {
+		_, _, err = r.plane.commitTxn(func(tx *txn) error {
 			tx.key = next
 			return r.plane.resignAll(fingerprint(next.Public().(ed25519.PublicKey)))(tx)
 		})

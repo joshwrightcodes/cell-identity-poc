@@ -107,7 +107,7 @@ func (s *configMapStore) decode(cm *corev1.ConfigMap) (st *State, clean bool, er
 			b.Records[e.Name] = json.RawMessage(v)
 		}
 	}
-	st, _, err = Accept(Empty(), b, s.env, s.keys)
+	st, _, _, err = acceptRecords(Empty(), b, s.env, s.keys)
 	if err != nil {
 		return nil, false, unverifiable("configmap %s/%s: %v", s.namespace, s.name, err)
 	}
