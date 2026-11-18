@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	mrand "math/rand/v2"
+	"net"
 	"slices"
 	"strings"
 	"sync"
@@ -17,6 +19,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -998,6 +1001,70 @@ func streamEndedReasons(t *testing.T, mkGateway func(f *streamFixture) *gateway)
 		}
 	})
 	return reasons
+}
+
+// A gateway that offers another ALPN protocol, or only TLS 1.2, ends the handshake with an alert from
+// the peer. A gateway that closes the connection is no TLS failure and logs no reason.
+func TestStreamHandshakeAndConnectionReasons(t *testing.T) {
+	for name, tc := range map[string]struct {
+		want string
+		mk   func(f *streamFixture) *gateway
+		dial func(f *streamFixture) func(context.Context, string, string) (net.Conn, error)
+	}{
+		"alpn mismatch": {want: "handshake_failed", dial: func(f *streamFixture) func(context.Context, string, string) (net.Conn, error) {
+			return tlsOnlyDial(t, f, tls.VersionTLS13, "http/1.1")
+		}},
+		"tls 1.2 only": {want: "handshake_failed", dial: func(f *streamFixture) func(context.Context, string, string) (net.Conn, error) {
+			return tlsOnlyDial(t, f, tls.VersionTLS12, "h2")
+		}},
+		"no connection": {want: "", dial: func(*streamFixture) func(context.Context, string, string) (net.Conn, error) {
+			return func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("connection refused") }
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var reasons []string
+			var hasField bool
+			synctest.Test(t, func(t *testing.T) {
+				var out syncBuf
+				f := newFixture(t)
+				f.cfg.Log = slog.New(slog.NewJSONHandler(&out, nil))
+				f.cfg.dial = tc.dial(f)
+				f.start()
+				waitFor(t, time.Minute, "a stream ended line", func() bool { return bytes.Contains(out.bytes(), []byte(`"stream ended"`)) })
+				f.cancel()
+				<-f.done
+				f.g.close()
+				for _, l := range bytes.Split(out.bytes(), []byte("\n")) {
+					var m map[string]any
+					if json.Unmarshal(l, &m) == nil && m["msg"] == "stream ended" {
+						r, ok := m["reason"].(string)
+						reasons, hasField = append(reasons, r), hasField || ok
+					}
+				}
+			})
+			if tc.want == "" && hasField {
+				t.Fatalf("a non-TLS failure logged a reason: %v", reasons)
+			}
+			if tc.want != "" && (len(reasons) == 0 || reasons[0] != tc.want) {
+				t.Fatalf("reasons = %v, want %s", reasons, tc.want)
+			}
+		})
+	}
+}
+
+// tlsOnlyDial returns a dial function whose server runs a handshake with the given maximum version and
+// ALPN protocol, signed by the CA of the fixture gateway.
+func tlsOnlyDial(t *testing.T, f *streamFixture, maxVersion uint16, proto string) func(context.Context, string, string) (net.Conn, error) {
+	cfg := tlsconfig.MTLSServerConfig(f.g.ca.Source(t, gwID), f.g.ca.Bundle(), tlsconfig.AuthorizeAny())
+	cfg.MinVersion, cfg.MaxVersion, cfg.NextProtos = tls.VersionTLS12, maxVersion, []string{proto}
+	return func(context.Context, string, string) (net.Conn, error) {
+		c, s := net.Pipe()
+		go func() {
+			defer s.Close()
+			_ = tls.Server(s, cfg).Handshake()
+		}()
+		return c, nil
+	}
 }
 
 func TestStreamRefusalReason(t *testing.T) {

@@ -206,7 +206,7 @@ func RunStream(ctx context.Context, cfg StreamConfig) error {
 		}
 		wait := cfg.backoff(failures)
 		failures++
-		cfg.Log.WarnContext(ctx, "stream ended", "cell", cfg.Cell, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
+		cfg.Log.WarnContext(ctx, "stream ended", append([]any{"cell", cfg.Cell, "error", err.Error()}, append(cellproxy.ReasonAttrs(err), "retry_in", wait.String())...)...)
 		if err := cfg.wait(ctx, wait); err != nil {
 			return err
 		}

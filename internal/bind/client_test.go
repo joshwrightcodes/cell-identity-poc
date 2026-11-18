@@ -19,6 +19,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 
@@ -841,5 +842,98 @@ func TestBindRefusalReasonUntrusted(t *testing.T) {
 	cfg.TLS = ClientTLS(spiffetest.NewCA(t, mgmtTD).Bundle(), spiffeid.RequireFromString(apiID))
 	if reason, line := bindFailedReason(t, ctx, cfg, rec, &out); reason != "peer_untrusted" {
 		t.Fatalf("reason = %q in %v", reason, line)
+	}
+}
+
+// lineOf returns the first JSON log line with the message msg.
+func lineOf(t *testing.T, out *bytes.Buffer, msg string) map[string]any {
+	t.Helper()
+	for _, l := range strings.Split(out.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == msg {
+			return m
+		}
+	}
+	t.Fatalf("no %q line in %s", msg, out.String())
+	return nil
+}
+
+// A non-TLS failure logs no reason field at all.
+func TestBindFailedWithoutTLSFailureHasNoReason(t *testing.T) {
+	f := newServer(t, apiID)
+	f.nonce = func(w http.ResponseWriter, _ *http.Request, _ int) {
+		writeJSON(w, 503, map[string]string{"error": "down"})
+	}
+	var out bytes.Buffer
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	cfg, ctx := runCfg(t, f, rec)
+	if _, line := bindFailedReason(t, ctx, cfg, rec, &out); line["result"] != "error" {
+		t.Fatalf("line %v", line)
+	}
+	if _, ok := lineOf(t, &out, "bind failed")["reason"]; ok {
+		t.Fatalf("a non-TLS failure logged a reason: %s", out.String())
+	}
+}
+
+// A gateway that offers another ALPN protocol ends the handshake with an alert from the peer.
+func TestBindRefusalReasonALPNMismatch(t *testing.T) {
+	ca := spiffetest.NewCA(t, mgmtTD)
+	scfg := tlsconfig.TLSServerConfig(ca.Source(t, apiID))
+	scfg.MinVersion, scfg.MaxVersion, scfg.NextProtos = tls.VersionTLS12, tls.VersionTLS13, []string{"http/1.1"}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", scfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); _ = c.(*tls.Conn).Handshake() }()
+		}
+	}()
+	f := newServer(t, apiID)
+	f.addr = ln.Addr().String()
+	f.ca = ca
+	var out bytes.Buffer
+	rec := &sleepRecorder{stopAt: func(n int, _ time.Duration) bool { return n >= 1 }}
+	cfg, ctx := runCfg(t, f, rec)
+	if reason, line := bindFailedReason(t, ctx, cfg, rec, &out); reason != "handshake_failed" {
+		t.Fatalf("reason = %q in %v", reason, line)
+	}
+}
+
+// switchSource trusts the CA of good until flip, and the CA of other after it.
+type switchSource struct {
+	good, other x509bundle.Source
+	flipped     atomic.Bool
+}
+
+func (s *switchSource) GetX509BundleForTrustDomain(td spiffeid.TrustDomain) (*x509bundle.Bundle, error) {
+	if s.flipped.Load() {
+		return s.other.GetX509BundleForTrustDomain(td)
+	}
+	return s.good.GetX509BundleForTrustDomain(td)
+}
+
+func TestBindRecheckFailedReason(t *testing.T) {
+	f := newServer(t, apiID)
+	src := &switchSource{good: f.ca.Bundle(), other: spiffetest.NewCA(t, mgmtTD).Bundle()}
+	var out bytes.Buffer
+	rec := &sleepRecorder{}
+	rec.stopAt = func(n int, _ time.Duration) bool {
+		if n == 1 {
+			src.flipped.Store(true) // The first wait is the recheck wait, after a good bind.
+		}
+		return n >= 2
+	}
+	cfg, ctx := runCfg(t, f, rec)
+	cfg.TLS = ClientTLS(src, spiffeid.RequireFromString(apiID))
+	cfg.Log = slog.New(slog.NewJSONHandler(&out, nil))
+	_ = Run(ctx, cfg)
+	if got := lineOf(t, &out, "bind recheck failed")["reason"]; got != "peer_untrusted" {
+		t.Fatalf("reason = %v in %s", got, out.String())
 	}
 }

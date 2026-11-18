@@ -366,3 +366,24 @@ func TestTLSServeCountsBytesAfterHandshake(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestTLSDialHandshakeFlip dials a TLS server through flipforward, which flips a byte of the server
+// handshake. The client fails the handshake and names handshake_failed.
+func TestTLSDialHandshakeFlip(t *testing.T) {
+	const id = "spiffe://mgmt.poc.internal/telemetry"
+	chain, key, _ := testChain(t, id)
+	upstream := tlsServer(t, chain, key, nil)
+	addr, _ := startFlipForward(t, "--upstream", upstream, "--flip-at", "100", "--dir", "down")
+	var out bytes.Buffer
+	code := execute(context.Background(), []string{"tlsdial", "--addr", addr, "--expect-id", id, "--bundle", writeFile(t, caPEM(t, chain))}, &out)
+	if code != 0 {
+		t.Fatalf("exit status %d: %s", code, out.String())
+	}
+	var r tlsDialResult
+	if err := json.Unmarshal(out.Bytes(), &r); err != nil {
+		t.Fatalf("output is not one JSON line: %q", out.String())
+	}
+	if r.Handshake != "failed" || r.Reason != "handshake_failed" {
+		t.Errorf("handshake %q reason %q, want failed and handshake_failed: %+v", r.Handshake, r.Reason, r)
+	}
+}

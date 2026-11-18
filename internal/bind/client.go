@@ -432,7 +432,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 			wait = backoff(cfg, failures)
 		}
 		cfg.observe(ctx, result)
-		cfg.Log.WarnContext(actx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
+		cfg.Log.WarnContext(actx, "bind failed", append([]any{"cell", cfg.Cell, "result", result, "error", err.Error()}, append(cellproxy.ReasonAttrs(err), "retry_in", wait.String())...)...)
 		if err := cfg.Sleep(ctx, wait); err != nil {
 			return err
 		}
@@ -456,7 +456,7 @@ func recheck(ctx context.Context, cfg Config) error {
 		case err != nil:
 			wait = backoff(cfg, failures)
 			failures++
-			cfg.Log.WarnContext(ctx, "bind recheck failed", "cell", cfg.Cell, "error", err.Error(), "reason", string(cellproxy.TLSReason(err)), "retry_in", wait.String())
+			cfg.Log.WarnContext(ctx, "bind recheck failed", append([]any{"cell", cfg.Cell, "error", err.Error()}, append(cellproxy.ReasonAttrs(err), "retry_in", wait.String())...)...)
 		case !bound:
 			cfg.Log.WarnContext(ctx, "the management plane holds no record", "cell", cfg.Cell)
 			return nil

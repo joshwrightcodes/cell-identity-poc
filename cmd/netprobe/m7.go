@@ -105,7 +105,7 @@ func tlsDial(ctx context.Context, d *net.Dialer, addr string, cfg *tls.Config, v
 	c := tls.Client(raw, cfg)
 	if err := c.HandshakeContext(ctx); err != nil {
 		out.Handshake = "failed"
-		out.Reason = string(cellproxy.TLSReason(err))
+		out.Reason = string(cellproxy.HandshakeReason(err))
 		out.Error = err.Error()
 		return out
 	}
