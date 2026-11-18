@@ -13,12 +13,18 @@ inject_key := "sidecar.istio.io/inject"
 # case, as a chosen stricter rule.
 opt_out_values := {"false", "n", "no", "off"}
 
-# Keys that move pod traffic past the sidecar or change how the sidecar intercepts it. The policy
-# refuses each of them with any value: every key under traffic.sidecar.istio.io/, and the two below,
-# compared in lower case.
-traffic_prefix := "traffic.sidecar.istio.io"
+# Label and annotation keys that change, bypass or remove the sidecar of a pod. A class with
+# noSidecarOptOut refuses each of them with any value, compared in lower case: every key under the
+# prefixes, and the keys below. sidecar.istio.io/inject stays allowed, and opt_out_values bound it.
+mesh_key_prefixes := {"sidecar.istio.io", "inject.istio.io", "traffic.sidecar.istio.io"}
 
-intercept_keys := {"sidecar.istio.io/interceptionmode", "proxy.istio.io/config"}
+mesh_keys := {"istio.io/rev", "proxy.istio.io/config"}
+
+mesh_keys_allowed := {"sidecar.istio.io/inject"}
+
+# Objects that cluster controllers create in every namespace. No Application tracks them, so
+# FailOnSharedResource does not keep a component from taking them over. Written Kind/name, core group.
+reserved_objects := {"ConfigMap/kube-root-ca.crt", "ConfigMap/istio-ca-root-cert", "ServiceAccount/default"}
 
 sa_token_type := "kubernetes.io/service-account-token"
 
@@ -408,13 +414,15 @@ deny contains entry("component_not_allowed", "mesh_opt_out") if {
 	opted_out(a)
 }
 
-traffic_key(k) if {
-	parts := split(k, "/")
+mesh_key(k) if {
+	lk := lower(k)
+	not mesh_keys_allowed[lk]
+	parts := split(lk, "/")
 	count(parts) == 2
-	parts[0] == traffic_prefix
+	mesh_key_prefixes[parts[0]]
 }
 
-intercept_key(k) if intercept_keys[lower(k)]
+mesh_key(k) if mesh_keys[lower(k)]
 
 all_meta contains m if {
 	some m in all_labels
@@ -428,14 +436,12 @@ deny contains entry("component_not_allowed", "mesh_opt_out") if {
 	class.noSidecarOptOut
 	some m in all_meta
 	some k, _ in m
-	traffic_key(k)
+	mesh_key(k)
 }
 
-deny contains entry("component_not_allowed", "mesh_opt_out") if {
-	class.noSidecarOptOut
-	some m in all_meta
-	some k, _ in m
-	intercept_key(k)
+deny contains entry("component_not_allowed", "reserved_object") if {
+	class.noReservedObjects
+	reserved_objects[concat("/", [kind_key, name])]
 }
 
 # A token Secret of a ServiceAccount gives an API token with no expiry, so no class may hold one.

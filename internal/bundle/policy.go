@@ -22,7 +22,8 @@ type ObjectRef struct {
 // Class is what a component of that class may contain and where it may sync. A namespaced kind of
 // "*" stands for every namespaced kind, and a kind with a group is written group/Kind.
 // OwnServiceAccountsOnly lets a pod of the class run only as default or as a ServiceAccount that the
-// same component declares in the namespace of the pod.
+// same component declares in the namespace of the pod. NoReservedObjects refuses the objects that
+// cluster controllers create in every namespace, which no Application tracks.
 type Class struct {
 	Project                string   `json:"project"`
 	ObjectNamespaces       []string `json:"objectNamespaces"`
@@ -32,6 +33,7 @@ type Class struct {
 	ServiceClusterIPOnly   bool     `json:"serviceClusterIPOnly,omitempty"`
 	NoSidecarOptOut        bool     `json:"noSidecarOptOut,omitempty"`
 	OwnServiceAccountsOnly bool     `json:"ownServiceAccountsOnly,omitempty"`
+	NoReservedObjects      bool     `json:"noReservedObjects,omitempty"`
 }
 
 // PolicyRef names one namespaced object.

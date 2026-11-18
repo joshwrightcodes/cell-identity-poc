@@ -140,6 +140,12 @@ func TestPolicyApp(t *testing.T) {
 		{name: "traffic_exclude_outbound", want: not("mesh_opt_out")},
 		{name: "interception_mode", want: not("mesh_opt_out")},
 		{name: "proxy_config", want: not("mesh_opt_out")},
+		{name: "proxy_image", want: not("mesh_opt_out")},
+		{name: "inject_templates", want: not("mesh_opt_out")},
+		{name: "rev_label", want: not("mesh_opt_out")},
+		{name: "configmap_kube_root_ca", want: not("reserved_object")},
+		{name: "configmap_istio_ca_root_cert", want: not("reserved_object")},
+		{name: "serviceaccount_default", want: not("reserved_object")},
 	})
 }
 
@@ -191,6 +197,7 @@ func TestPolicyPlatform(t *testing.T) {
 		{name: "namespace_argocd_rev", want: want{rPlane, "mesh_injection"}},
 		{name: "secret_sa_token", component: "argocd", want: not("service_account_token")},
 		{name: "deployment_apps_demo_sa_client", component: "apps-demo"},
+		{name: "serviceaccount_default_apps_demo", component: "apps-demo"},
 	})
 }
 
@@ -751,8 +758,9 @@ func TestPolicyServiceAccountsOfTheCheckedComponent(t *testing.T) {
 	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep}), not("foreign_service_account"), "Deployment/apps-demo/thief")
 }
 
-// TestPolicyOptOutKeys checks that an app pod may carry no key that moves traffic past its sidecar or changes
-// how the sidecar intercepts, in labels or annotations, whatever the value. A platform pod may.
+// TestPolicyOptOutKeys checks that an app pod may carry no key that changes, moves traffic past, or removes
+// its sidecar, in labels or annotations, whatever the value. The only mesh key it may carry is
+// sidecar.istio.io/inject, whose opt-out values TestPolicyOptOutValues covers. A platform pod may carry any.
 func TestPolicyOptOutKeys(t *testing.T) {
 	app := newTestChecker(t, "cell", HarnessRefs{})
 	for key, refused := range map[string]bool{
@@ -766,10 +774,21 @@ func TestPolicyOptOutKeys(t *testing.T) {
 		"sidecar.istio.io/interceptionMode":                true,
 		"sidecar.istio.io/interceptionmode":                true,
 		"proxy.istio.io/config":                            true,
-		"sidecar.istio.io/proxyCPU":                        false,
+		"sidecar.istio.io/proxyCPU":                        true,
+		"sidecar.istio.io/proxyImage":                      true,
+		"sidecar.istio.io/bootstrapOverride":               true,
+		"sidecar.istio.io/userVolume":                      true,
+		"sidecar.istio.io/status":                          true,
+		"inject.istio.io/templates":                        true,
+		"istio.io/rev":                                     true,
+		"Istio.io/Rev":                                     true,
+		"sidecar.istio.io/inject":                          false,
 		"example.invalid/traffic.sidecar.istio.io":         false,
 		"traffic.sidecar.istio.io":                         false,
+		"sidecar.istio.io":                                 false,
 		"proxy.istio.io/other":                             false,
+		"istio.io/other":                                   false,
+		"security.istio.io/tlsMode":                        false,
 	} {
 		for _, field := range []string{"annotations", "labels"} {
 			for _, value := range []string{"", "0.0.0.0/0", "NONE"} {

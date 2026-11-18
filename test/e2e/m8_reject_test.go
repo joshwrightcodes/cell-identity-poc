@@ -201,7 +201,98 @@ spec:
         - name: probe
           image: registry.invalid/m8-probe
 `, "mesh_opt_out"),
+		app("foreign_service_account", `apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: m8-probe
+  namespace: apps-demo
+  labels:
+    cell.poc.internal/e2e: "true"
+spec:
+  selector:
+    matchLabels:
+      app: m8-probe
+  template:
+    metadata:
+      labels:
+        app: m8-probe
+    spec:
+      serviceAccountName: client
+      containers:
+        - name: probe
+          image: registry.invalid/m8-probe
+`, "foreign_service_account"),
 	}
+}
+
+// TestM8AppSharedNameRolledBack, in dev-cell-1 (row 18): an app bundle that holds a Deployment with the name of the Deployment echo of
+// the platform component apps-demo passes the policy. Argo CD refuses the sync of apps-sample, because the Application syncs with
+// FailOnSharedResource=true and apps-demo already tracks echo. The set ends rolled_back with a timeout of apps-sample, and echo keeps its
+// resource version and its tracking ID. The test catches a component Application without the option, and an option that applies the
+// other objects of the sync before it fails.
+func TestM8AppSharedNameRolledBack(t *testing.T) {
+	const cell = "dev-cell-1"
+	m8RestoreTarget(t, cell)
+	live := m8LiveSet(t, cell)
+	var objs []map[string]any
+	if d := m8LiveDigest(live, "apps-sample"); d != "" {
+		objs = m8Objects(t, m8LiveManifests(t, cell, "apps-sample", d))
+	}
+	probe := m8Objects(t, []byte(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo
+  namespace: apps-demo
+  labels:
+    cell.poc.internal/e2e: "true"
+spec:
+  selector:
+    matchLabels:
+      app: m8-shared-probe
+  template:
+    metadata:
+      labels:
+        app: m8-shared-probe
+    spec:
+      containers:
+        - name: probe
+          image: registry.invalid/m8-probe
+`))[0]
+	m8Annotate(probe, "cell.poc.internal/e2e-run", randomHex(t, 8))
+	objs = append(objs, probe)
+	tracking := func() string {
+		out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "deployment", "echo", "-o", `jsonpath={.metadata.annotations.argocd\.argoproj\.io/tracking-id}`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return strings.TrimSpace(out)
+	}
+	rv := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo")
+	if rv == "" || !strings.HasPrefix(tracking(), "apps-demo:") {
+		t.Fatalf("Deployment apps-demo/echo of %s has the resource version %q and the tracking ID %q, want both, with the Application apps-demo", cell, rv, tracking())
+	}
+	digest := m8PushBundle(t, cell, "apps-sample", m8Render(t, objs))
+	signed := m8Sign(t, cell, m8WithDigest(live, "apps-sample", m8AppWave, "apps-demo", digest), true)
+	seen := false
+	tb := m8WaitEach(t, cell, signed.OpID, m8SetWait, func() {
+		if !seen && strings.Contains(strings.ToLower(m8ApplicationText(t, cell, "apps-sample")), "shared resource") {
+			seen = true
+		}
+	})
+	m8WantResult(t, tb.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "*")
+	if tb.Result != nil && !strings.HasPrefix(tb.Result.Detail, "timeout:apps-sample:") {
+		t.Errorf("the detail of the rollback is %q, want one that starts with timeout:apps-sample: (a failed sync does not turn the Application Degraded)", tb.Result.Detail)
+	}
+	if !seen {
+		t.Error("Argo CD never reported a shared resource for apps-sample")
+	}
+	if got := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo"); got != rv {
+		t.Errorf("Deployment apps-demo/echo has the resource version %s, want %s", got, rv)
+	}
+	if got := tracking(); !strings.HasPrefix(got, "apps-demo:") {
+		t.Errorf("Deployment apps-demo/echo has the tracking ID %q, want the Application apps-demo", got)
+	}
+	m8RequireAtSet(t, cell, live, "")
 }
 
 // TestM8AppBundleOutsideAllowList, in dev-cell-1 (row 18, first layer): the engine refuses each app bundle that the class app does not

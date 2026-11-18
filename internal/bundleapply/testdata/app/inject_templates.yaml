@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: bypass, namespace: apps-demo}
+spec:
+  selector: {matchLabels: {app: bypass}}
+  template:
+    metadata:
+      labels: {app: bypass}
+      annotations:
+        inject.istio.io/templates: custom
+    spec:
+      containers: [{name: bypass, image: "registry.invalid/bypass:1"}]

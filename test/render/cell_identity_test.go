@@ -908,7 +908,8 @@ func checkHarnessGuard(t *testing.T, objs map[string]object, roleName, component
 
 // TestAppLimitsRender checks ValidatingAdmissionPolicy bundles-app-limits and its binding: for an object of the Argo CD
 // controller whose tracking ID starts with one name of appComponents (one match for each name), it denies a Service that is
-// not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out, and an object that has the harness label.
+// not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out, an object that has the harness label, and a
+// Secret of type kubernetes.io/service-account-token.
 func TestAppLimitsRender(t *testing.T) {
 	objs := cellObjects(t)
 	apps := bundle.DefaultPolicy().Roles["cell"].AppComponents
@@ -951,10 +952,11 @@ func TestAppLimitsRender(t *testing.T) {
 		"object.kind != 'Service' || ((!has(object.spec.type) || object.spec.type == 'ClusterIP') && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))",
 		"object.kind != 'Deployment' || !(has(object.spec.template.metadata) && (" + optOut("labels") + " || " + optOut("annotations") + "))",
 		"!has(object.metadata.labels) || !('" + harnessLabel + "' in object.metadata.labels)",
+		"object.kind != 'Secret' || !has(object.type) || object.type != 'kubernetes.io/service-account-token'",
 	}
 	vals := get[[]any](t, spec, "validations")
-	if len(vals) != 3 {
-		t.Fatalf("the policy has %d validations, want the three deny rules", len(vals))
+	if len(vals) != len(wantExpr) {
+		t.Fatalf("the policy has %d validations, want the %d deny rules", len(vals), len(wantExpr))
 	}
 	for i, want := range wantExpr {
 		if got := get[string](t, vals[i], "expression"); got != want {

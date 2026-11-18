@@ -53,6 +53,7 @@ func TestDefaultPolicy(t *testing.T) {
 			ClusterKinds:         []string{},
 			NamespacedKinds:      []string{"ConfigMap", "Secret", "ServiceAccount", "Service", "apps/Deployment"},
 			ServiceClusterIPOnly: true, NoSidecarOptOut: true, OwnServiceAccountsOnly: true,
+			NoReservedObjects: true,
 		},
 	}
 	if !reflect.DeepEqual(p.Classes, want) {

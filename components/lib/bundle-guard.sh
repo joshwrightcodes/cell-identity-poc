@@ -9,7 +9,7 @@
 # object whose old version carries the label cell.poc.internal/harness, or that gives an object the label.
 # ValidatingAdmissionPolicy bundles-app-limits (role cell only) denies, for an object whose tracking ID starts with the
 # name of an app component, a Service that is not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out,
-# and an object with the harness label.
+# an object with the harness label, and a Secret of type kubernetes.io/service-account-token.
 # The namespaces and the app components come from internal/bundle/allow.json, so the guards and the apply engine read one list.
 # BUNDLE_ALLOW_JSON names another allow-list file, for the tests.
 set -euo pipefail
@@ -52,7 +52,8 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
         [$ctl, {name: "app-component", expression: "object != null && has(object.metadata.annotations) && \($track) in object.metadata.annotations && (\($r.appComponents | map("object.metadata.annotations[\($track)].startsWith(\(s(. + ":")))") | join(" || ")))"}];
         [{expression: "object.kind != \(s("Service")) || ((!has(object.spec.type) || object.spec.type == \(s("ClusterIP"))) && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))", message: "An app component may create only a Service of type ClusterIP with no externalIPs"},
          {expression: "object.kind != \(s("Deployment")) || !(has(object.spec.template.metadata) && (\(optout("labels")) || \(optout("annotations"))))", message: "An app component may not opt a Deployment out of the sidecar"},
-         {expression: "!has(object.metadata.labels) || !(\($label) in object.metadata.labels)", message: "An app component may not create an object with the harness label"}])
+         {expression: "!has(object.metadata.labels) || !(\($label) in object.metadata.labels)", message: "An app component may not create an object with the harness label"},
+         {expression: "object.kind != \(s("Secret")) || !has(object.type) || object.type != \(s("kubernetes.io/service-account-token"))", message: "An app component may not create a ServiceAccount token Secret"}])
     else empty end)
 ' "$allow")" || { echo "error: bundle-guard: could not read $allow" >&2; exit 1; }
 
