@@ -841,12 +841,15 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 }
 
 // rollback points the tag back at the last good root, with the manifest bytes that the state holds,
-// and waits for that root to become healthy. It creates no version and deletes nothing.
+// and waits for that root to become healthy. It creates no version and deletes nothing. The state
+// names the good root only when the tag holds it.
 func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome, error) {
 	cfg := a.cfg
 	rctx, end := a.tel.step(ctx, spanRollback)
 	defer func() { end(nil) }()
 	var good *Good
+	// moved is true once the tag holds the good root again.
+	var moved bool
 	st, _, err := cfg.State.Read(rctx)
 	if err != nil {
 		return Outcome{}, err
@@ -873,6 +876,7 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome,
 			detail = detailRollback
 			break
 		}
+		moved = true
 		a.refresh(rctx)
 		left, err := a.waitFor(rctx, func(yield func(name, digest string)) {
 			for _, name := range slices.Sorted(maps.Keys(good.Components)) {
@@ -890,7 +894,7 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome,
 	out := Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: detail}
 	err = a.finish(rctx, r, out, func(s *State) {
 		s.State = stateRolledBack
-		if good != nil {
+		if moved {
 			s.Root, s.Components = good.Root, maps.Clone(good.Components)
 		}
 		s.Checked, s.CheckedBy = a.boundChecked(s, r.checkedBy, nil), r.checkedBy

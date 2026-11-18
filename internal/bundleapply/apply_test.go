@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"slices"
 	"strings"
 	"sync"
@@ -499,18 +500,30 @@ func TestApplySameVersion(t *testing.T) {
 
 func TestApplyKeyResetAllowsLowerVersion(t *testing.T) {
 	e := newEnv(t)
+	var logs bytes.Buffer
+	cfg := e.cfg
+	cfg.Log = slog.New(slog.NewJSONHandler(&logs, nil))
+	e.a = e.applier(cfg)
+	resets := func() int { return strings.Count(logs.String(), `"msg":"bundle_version_reset"`) }
 	wantOutcome(t, e.apply("op1", e.set(9, std("v1"))), op.OutcomeApplied, "", "")
-	if e.state().KeySHA256 == "" {
+	oldKey := e.state().KeySHA256
+	if oldKey == "" {
 		t.Fatal("the state does not record the key")
 	}
 	same := e.set(1, std("v2"))
 	wantOutcome(t, e.apply("op2", same), op.OutcomeRefused, op.ReasonVersionOld, "")
+	if n := resets(); n != 0 {
+		t.Fatalf("%d reset log lines with the same key", n)
+	}
 
 	e.pub, e.priv, _ = ed25519.GenerateKey(rand.Reader)
 	low := e.set(1, std("v3"))
 	wantOutcome(t, e.apply("op3", low), op.OutcomeApplied, "", "")
 	if st := e.state(); st.Version.Counter != 1 || st.State != "healthy" {
 		t.Fatalf("state = %+v", st)
+	}
+	if n := resets(); n != 1 || !strings.Contains(logs.String(), `"key":"`+oldKey+`"`) {
+		t.Fatalf("%d reset log lines, want one that names the old key: %s", n, logs.String())
 	}
 }
 
@@ -1028,6 +1041,57 @@ func TestApplyDegradedCountsOnlyTheWantedRevision(t *testing.T) {
 		e.lagged(90 * time.Second)
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
 		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+	})
+}
+
+// TestApplyRollbackStateFollowsTheTag checks that the state names the root that the tag holds when a
+// rollback cannot move the tag: a corrupt last good root, or a refused tag write.
+func TestApplyRollbackStateFollowsTheTag(t *testing.T) {
+	degraded := func(e *env, b built) {
+		e.health = func(root, app string) (string, string) {
+			if root == b.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+	}
+	check := func(t *testing.T, e *env, b built) {
+		t.Helper()
+		if got := e.currentRoot(); got != b.root.Digest {
+			t.Fatalf("tag current = %s, want the failed root %s", got, b.root.Digest)
+		}
+		st := e.state()
+		if st.State != "rolled_back" || st.Holder != "" || st.Root.Digest != b.root.Digest || string(st.Root.Manifest) != string(b.root.Manifest) {
+			t.Fatalf("state root %s state %s, want the root that the tag holds", st.Root.Digest, st.State)
+		}
+		if fmt.Sprint(st.Components) != fmt.Sprint(b.digests()) {
+			t.Fatalf("components = %v, want those of the root that the tag holds", st.Components)
+		}
+		s, err := e.a.Status(t.Context())
+		if err != nil || s.RootDigest != b.root.Digest {
+			t.Fatalf("status = %+v, %v", s, err)
+		}
+	}
+	t.Run("last good root corrupt", func(t *testing.T) {
+		e, _, b := twoSets(t)
+		st := e.state()
+		st.Good[0].Root.Manifest = append(slices.Clone(st.Good[0].Root.Manifest), ' ')
+		e.mustWriteState(st)
+		degraded(e, b)
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+		check(t, e, b)
+	})
+	t.Run("rollback tag write refused", func(t *testing.T) {
+		e, _, b := twoSets(t)
+		degraded(e, b)
+		first := e.polls + 1
+		e.hook = func(n int) {
+			if n == first {
+				e.storeReg.Deny(http.StatusForbidden)
+			}
+		}
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+		check(t, e, b)
 	})
 }
 
