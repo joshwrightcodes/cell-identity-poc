@@ -671,7 +671,7 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 		}
 		a.ensureGood(s)
 		s.Source, s.Version, s.ContentSHA256, s.KeySHA256 = sourceSigned, r.set.Version, r.content, r.keySHA
-		s.OpID, s.State = r.opID, stateApplying
+		s.OpID, s.State, s.Failed = r.opID, stateApplying, ""
 		s.Until = cfg.Now().Add(a.lockTTL())
 		return nil
 	})

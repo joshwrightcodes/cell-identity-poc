@@ -1350,6 +1350,62 @@ func TestApplyResumeRollbackAfterRestart(t *testing.T) {
 	}
 }
 
+// TestApplyOtherSetDuringRollingBack checks that a state in rolling_back resumes only for the set
+// that failed, which the state names, and that any other set follows the version rules.
+func TestApplyOtherSetDuringRollingBack(t *testing.T) {
+	crash := func(t *testing.T) (*env, built, built) {
+		t.Helper()
+		e, a, b := twoSets(t)
+		e.health = func(root, app string) (string, string) {
+			if root == b.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		e.hook = func(int) {
+			if e.currentRoot() == a.root.Digest {
+				e.gate.fail.Store(true)
+				cancel()
+			}
+		}
+		if _, err := e.a.Apply(ctx, "opB", tTarget, b.att); err == nil {
+			t.Fatal("an apply with a canceled context succeeded")
+		}
+		e.gate.fail.Store(false)
+		e.hook, e.health = nil, nil
+		if st := e.state(); st.State != "rolling_back" {
+			t.Fatalf("state after the crash = %s", st.State)
+		}
+		cfg := e.cfg
+		cfg.Holder = "pod-b"
+		e.a = e.applier(cfg)
+		e.clk.Advance(time.Hour)
+		return e, a, b
+	}
+	t.Run("higher set", func(t *testing.T) {
+		e, _, _ := crash(t)
+		c := e.set(3, std("c"))
+		wantOutcome(t, e.apply("opC", c), op.OutcomeApplied, "", "")
+		st := e.state()
+		if e.currentRoot() != c.root.Digest || st.State != "healthy" || st.Root.Digest != c.root.Digest {
+			t.Fatalf("tag %s state %s root %s, want the higher set applied", e.currentRoot(), st.State, st.Root.Digest)
+		}
+		if st.Failed != "" {
+			t.Fatalf("failed = %q after a later set", st.Failed)
+		}
+	})
+	t.Run("same version, other content", func(t *testing.T) {
+		e, _, _ := crash(t)
+		other := e.set(2, std("other"))
+		wantOutcome(t, e.apply("opX", other), op.OutcomeRefused, op.ReasonVersionOld, "version_conflict")
+		if st := e.state(); st.State != "rolling_back" || e.currentRoot() == other.root.Digest {
+			t.Fatalf("state %s tag %s", st.State, e.currentRoot())
+		}
+	})
+}
+
 func TestApplyLockHeld(t *testing.T) {
 	t.Run("live lock", func(t *testing.T) {
 		e := newEnv(t)
@@ -1525,6 +1581,17 @@ func TestApplyCheckedFollowsThePolicyInputs(t *testing.T) {
 		harness(e, "argocd", "later")
 		wantOutcome(t, e.apply("op2", e.set(2, []spec{argocd, std("v2")[1]})), op.OutcomeRefused, op.ReasonPolicyBlocksPlanes, "argocd/later")
 	})
+	t.Run("harness policy renamed", func(t *testing.T) {
+		e := newEnv(t)
+		harness(e, "argocd", "first")
+		later := spec{"argocd", "argocd", netpol("argocd", "later")}
+		wantOutcome(t, e.apply("op1", e.set(1, []spec{later, std("v1")[1]})), op.OutcomeApplied, "", "")
+		if err := e.cs.NetworkingV1().NetworkPolicies("argocd").Delete(t.Context(), "first", metav1.DeleteOptions{}); err != nil {
+			t.Fatal(err)
+		}
+		harness(e, "argocd", "later")
+		wantOutcome(t, e.apply("op2", e.set(2, []spec{later, std("v2")[1]})), op.OutcomeRefused, op.ReasonPolicyBlocksPlanes, "argocd/later")
+	})
 	t.Run("entry of an older good root", func(t *testing.T) {
 		e := newEnv(t)
 		later := spec{"argocd", "argocd", netpol("argocd", "later")}
@@ -1597,6 +1664,9 @@ func TestCheckInputsCoverEveryInput(t *testing.T) {
 		"allow":   func() (string, error) { return checkInputs("cell", narrow, policySource, refs) },
 		"rego":    func() (string, error) { return checkInputs("cell", p, policySource+"\n", refs) },
 		"harness": func() (string, error) { return checkInputs("cell", p, policySource, HarnessRefs{}) },
+		"harness name": func() (string, error) {
+			return checkInputs("cell", p, policySource, HarnessRefs{NetworkPolicies: []ObjectRef{{Namespace: "argocd", Name: "other"}}})
+		},
 	} {
 		fp, err := got()
 		if err != nil || fp == base {
