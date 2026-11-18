@@ -63,7 +63,7 @@
 | Run the M6 end-to-end gate: signed steps, the host service and the cell controller (build the images first with `mise run images`) | `mise run gate:m6` |
 | Delete both cells and create them again through one portal request. Run it alone, after `gate:m6` | `mise run gate:m6:provision` |
 | Repair what `gate:m6` and `gate:m6:provision` leave: the key files, the replicas of the cell controller, recorded steps, test namespaces `m6-*`, and the cells after an interrupted provision run (`--check` only reports) | `mise run gate:m6:repair` |
-| Run the M7 end-to-end gate: a malicious cell, interception at each hop and a relay that alters bytes (build the images first with `mise run images`) | `mise run gate:m7` |
+| Run the M7 end-to-end gate: a malicious cell, interception at each hop and a relay that alters bytes (build the images first) | `mise run gate:m7` |
 | Delete the test namespaces `m7-*` of every cluster and wait until they are gone (`--check` only reports) | `mise run gate:m7:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |

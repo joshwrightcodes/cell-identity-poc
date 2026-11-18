@@ -1314,10 +1314,12 @@ M7 measured values come from the live part of M7. Each value below is a marker u
 
 ## Malicious cell tests
 
-The M7 tests try to break each identity check of the PoC. A test points a real client binary at an impostor server.
+The M7 tests try to break each identity check of the PoC. A test points a client at an impostor server.
+For some hops the real client needs an SVID from its own pod, so a probe with the same TLS checks stands in.
 Another test puts a forwarder between a client and the real server, and changes one byte.
-Each test names the reason code that the client logs.
-Each impostor test also checks that the client sent no byte after the handshake.
+Most tests check the reason code of the rejection. The scan tests check the set of open ports.
+A client that verifies its peer sends nothing to an impostor. Each impostor test counts the bytes after the handshake.
+A control shows that a probe that does not verify its peer sends 32 bytes.
 
 Build the images, and then run the tests:
 
@@ -1326,7 +1328,8 @@ mise run images
 mise run gate:m7
 ```
 
-Every test runs in a namespace with the prefix `m7-` and the label `cell.poc.internal/e2e=true`.
+Each test runs in a namespace with the prefix `m7-` and the label `cell.poc.internal/e2e=true`.
+The registry delete test is the only exception, and it runs in `rogue/default`.
 A test that needs the host network makes its own `m7-` namespace with Pod Security `privileged`.
 No test changes the label of a namespace that a bundle owns.
 

@@ -706,12 +706,12 @@ SVID with the wrong ID, including one minted by the environment's own CA.
 | 21 | Cell controller step without a Kiln signature, or with a modified bootstrap set | Cell controller; bootstrap actor | `step_invalid` | 1 |
 | 22 | Environment control plane poses as a cell to Kiln, on a stream or in a reported result | Kiln second proof | `proof_missing` | 1 |
 | 23 | TLS interception, `celld` to the cell gateway | `celld` | The `reason` field of the `bind failed` and `stream ended` logs: `peer_untrusted`, `peer_not_allowed` or `handshake_failed` | 1 |
-| 24 | TLS interception, sidecar to SPIRE server | Sidecar | The SPIRE agent refuses the server certificate, and the impostor receives no token | 1 |
+| 24 | TLS interception, sidecar to SPIRE server | Sidecar | The attestation client refuses the server certificate, and the impostor receives no token | 1 |
 | 25 | Relay or Kiln impostor between agent and principal, with an environment-minted SVID | `cell-proxy` exact ID | `peer_not_allowed` | 1 |
 | 26 | envd connects to a fake Kiln | Pinned Kiln root | `peer_untrusted` in the error field of the `pull failed` log line | 1 |
 | 27 | TCP relay that only forwards, or alters bytes | TLS | Ciphertext only, `handshake_failed`, or the connection closes | 1 |
 | 28 | Revoked cell's existing relay and principal streams | Relay; Kiln `cell-proxy` | Closed within 5 seconds | 1 |
-| 29 | Forged identity header sent straight to the principal port | Principal on `127.0.0.1` | Connection refused | 1 |
+| 29 | Forged identity header sent straight to the principal port | Principal on `127.0.0.1` | Connection refused on the pod address | 1 |
 | 30 | Annotation change other than refresh, `.operation`, or any write through the view | Admission policy in the cell | Denied; the cell does not change | 1 |
 | 31 | Read a Secret, or `ops-runs` logs, through the view | Agent RBAC in the cell | Forbidden | 1 |
 | 32 | Agent from environment X claims a cell of environment Y | Per-environment listener | `peer_not_allowed` | 1 |
@@ -852,11 +852,11 @@ this order, each with its own scope document:
 | The M3 Kiali tunnel wait and the M5 `registry_wait` pass in a `cell:link` that runs after cells were recreated, and with zero live cells | M6 | None. Stop and report. Result: 2026-11-17, passed in both runs of `gate:m6:provision`, whose step 10 links `management` after `cell:down` of both cells, and in the drill that rebuilt `management` |
 | A server-side apply that deletes a rule or an `ipBlock` peer removes it from the live NetworkPolicy | M6 | None. Stop and report. Result 2026-11-17, in step 2 of both runs of `gate:m6:provision`, `cell:verify` of `dev-cp` with no cell found no rule or peer left from the render with cells (the drift check passed) |
 | `POC_SECRET_TOKEN_CMD` is set inside `cell:up` after mise loads the global and parent configs under the actor | M6 | The actor sets `MISE_GLOBAL_CONFIG_FILE=/dev/null` and `MISE_CEILING_PATHS`, not verified for the pinned mise. Report first. Result 2026-11-18: no step log read `.envrc.local` (0 of 7), and the global mise config does not name the variable. The value inside the actor was not printed |
-| A client refuses an impostor server at each hop with the reason of the rejection table, and the impostor receives no byte after the handshake | M7 | None. Stop and report. Result <measured in the live part> |
-| A forwarder that flips one byte of the handshake or of an application data record ends the connection, and the principal accepts no peer | M7 | None. Stop and report. Result <measured in the live part> |
-| A new pod in `dev-cell-1` with a default deny egress policy has its first blocked dial within 10 seconds, and an attestation probe of another subject gets no SVID | M7 | None. Report a time above 10 seconds. Result <measured in the live part> |
-| A host network pod in `rogue` reaches only the residual ports of the `dev-cp` and `management` nodes, and one in a cell reaches only the ports that admit its node address | M7 | None. Stop and report. Result <measured in the live part> |
-| A handshake from a pod of `rogue` to the host service, with no certificate or a wrong one, ends in a TLS alert and a `handshake refused` log line | M7 | None. Stop and report. Result <measured in the live part> |
+| A client that verifies its peer sends nothing to an impostor server, and each hop gives the reason of the rejection table. The SPIRE agent binary is not under test, because it is upstream code | M7 | None. Stop and report. Result <measured in the live part> |
+| A forwarder that flips one byte of the handshake or of the proof record ends the connection. The principal accepts no peer. A clean request through the same forwarder succeeds | M7 | None. Stop and report. Result <measured in the live part> |
+| In a namespace with a policy that denies all egress, no dial from a new `dev-cell-1` pod connects after 10 seconds. An attestation probe of another subject gets no SVID | M7 | None. Report a time above 10 seconds. Result <measured in the live part> |
+| A host network pod in `rogue` reaches exactly the residual ports of the `dev-cp` and `management` nodes. One in a cell also reaches the ports that admit its node address, and no others. Each mutual TLS port answers a handshake with no certificate with a TLS alert or a closed connection | M7 | None. Stop and report. Result <measured in the live part> |
+| A pod of `rogue` that sends no certificate, or a wrong one, to the host service gets a TLS alert. The host service logs `handshake refused` | M7 | None. Stop and report. Result <measured in the live part> |
 
 ## Departures from the Kiln canon
 
