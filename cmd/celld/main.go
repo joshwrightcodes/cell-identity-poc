@@ -226,10 +226,13 @@ func tokenFromFile(path string) func() (string, error) {
 
 // bundleKeys returns a function that reads the operation keys in dir again on each call. Bundle
 // attestations carry the signature of the management plane key, which also signs operations. A
-// failed read gives the last keys that loaded, so a rotation in progress does not stop an apply.
-func bundleKeys(dir string, log *slog.Logger) func() []crypto.PublicKey {
+// failed read gives the last keys that loaded (at first, the keys that celld loaded at startup), so a rotation in progress does not stop an apply.
+func bundleKeys(dir string, log *slog.Logger, startup []ed25519.PublicKey) func() []crypto.PublicKey {
 	var mu sync.Mutex
-	var last []crypto.PublicKey
+	last := make([]crypto.PublicKey, 0, len(startup))
+	for _, k := range startup {
+		last = append(last, k)
+	}
 	return func() []crypto.PublicKey {
 		mu.Lock()
 		defer mu.Unlock()
@@ -248,23 +251,32 @@ func bundleKeys(dir string, log *slog.Logger) func() []crypto.PublicKey {
 
 // newBundleApplier builds the applier of bundle.apply: it reads from the mirror, writes to the
 // in-cluster store with the projected token, and keeps its state in the operations namespace.
-func newBundleApplier(o options, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T) (*bundleapply.Applier, error) {
+func newBundleApplier(o options, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T, startup []ed25519.PublicKey) (*bundleapply.Applier, error) {
+	cfg, err := bundleConfig(o, kube, dyn, tel, startup)
+	if err != nil {
+		return nil, err
+	}
+	return bundleapply.New(cfg), nil
+}
+
+// bundleConfig returns the engine configuration that the flags give.
+func bundleConfig(o options, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T, startup []ed25519.PublicKey) (bundleapply.Config, error) {
 	mirror, err := ocistore.New(ocistore.Client{Base: o.bundleMirror})
 	if err != nil {
-		return nil, fmt.Errorf("--bundle-mirror: %w", err)
+		return bundleapply.Config{}, fmt.Errorf("--bundle-mirror: %w", err)
 	}
 	store, err := ocistore.New(ocistore.Client{Base: o.bundleStore, Token: tokenFromFile(o.bundleStoreToken), WriteOnly: true})
 	if err != nil {
-		return nil, fmt.Errorf("--bundle-store: %w", err)
+		return bundleapply.Config{}, fmt.Errorf("--bundle-store: %w", err)
 	}
-	return bundleapply.New(bundleapply.Config{
+	return bundleapply.Config{
 		Role: "cell", Env: o.env, Target: o.cell, Holder: o.pod.name,
 		Mirror: mirror, Store: store, Dynamic: dyn, Client: kube,
-		Policy: bundle.DefaultPolicy(), Keys: bundleKeys(o.opKeyDir, tel.Log),
+		Policy: bundle.DefaultPolicy(), Keys: bundleKeys(o.opKeyDir, tel.Log, startup),
 		State:         &bundleapply.ConfigMapStore{Client: kube, Namespace: o.opsNamespace, Name: bundleStateName, MadeBy: "celld"},
 		HealthTimeout: o.bundleHealthTimeout,
 		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
-	}), nil
+	}, nil
 }
 
 func buildVersion() string {
@@ -344,7 +356,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 			tel.Log.Error("celld failed", "error", err.Error())
 			return 1
 		}
-		if execCfg.Bundle, err = newBundleApplier(opts, kube, dyn, tel); err != nil {
+		if execCfg.Bundle, err = newBundleApplier(opts, kube, dyn, tel, keys); err != nil {
 			tel.Log.Error("celld failed", "error", err.Error())
 			return 1
 		}

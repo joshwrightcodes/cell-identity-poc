@@ -36,6 +36,7 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -47,6 +48,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bind"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -1051,7 +1053,11 @@ func TestBundleStoreTokenReadsTheFile(t *testing.T) {
 
 func TestOpKeysReloadForBundles(t *testing.T) {
 	dir := opKeyDir(t)
-	keys := bundleKeys(dir, slog.New(slog.DiscardHandler))
+	startup, err := loadOpKeys(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := bundleKeys(dir, slog.New(slog.DiscardHandler), startup)
 	if n := len(keys()); n != 2 {
 		t.Fatalf("%d keys", n)
 	}
@@ -1067,5 +1073,61 @@ func TestOpKeysReloadForBundles(t *testing.T) {
 	}
 	if n := len(keys()); n != 3 {
 		t.Fatalf("%d keys after the directory went, want the last good set", n)
+	}
+}
+
+// A failed read of the key directory before the first apply gives the keys that celld loaded at
+// startup, never an empty list, so the engine does not record a signature_invalid refusal.
+func TestBundleKeysStartWithTheStartupKeys(t *testing.T) {
+	dir := opKeyDir(t)
+	startup, err := loadOpKeys(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	got := bundleKeys(dir, slog.New(slog.DiscardHandler), startup)()
+	if len(got) != len(startup) {
+		t.Fatalf("%d keys, want the %d startup keys", len(got), len(startup))
+	}
+	for i, k := range got {
+		if !k.(ed25519.PublicKey).Equal(startup[i]) {
+			t.Errorf("key %d differs from the startup key", i)
+		}
+	}
+}
+
+func TestBundleFlagsReachTheEngineConfig(t *testing.T) {
+	parse := func(extra ...string) options {
+		t.Helper()
+		o, err := parseOptions(bundleArgs(t, extra...), testEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Tracer: tracenoop.NewTracerProvider().Tracer("t"), Meter: noop.NewMeterProvider().Meter("t")}
+	build := func(o options) bundleapply.Config {
+		t.Helper()
+		cfg, err := bundleConfig(o, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	def := parse("--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "s:5000", "--bundle-store-token", "/t")
+	if def.bundleHealthTimeout != 5*time.Minute || build(def).HealthTimeout != 5*time.Minute {
+		t.Errorf("default health timeout = %s, engine %s", def.bundleHealthTimeout, build(def).HealthTimeout)
+	}
+	cfg := build(parse(bundleFlags...))
+	if cfg.HealthTimeout != 4*time.Minute {
+		t.Errorf("engine health timeout = %s, want 4m", cfg.HealthTimeout)
+	}
+	if cfg.Role != "cell" || cfg.Target != "dev-cell-1" || cfg.Env != "dev" || cfg.Holder != "celld-abc" {
+		t.Errorf("engine config = role %q target %q env %q holder %q", cfg.Role, cfg.Target, cfg.Env, cfg.Holder)
+	}
+	if st, ok := cfg.State.(*bundleapply.ConfigMapStore); !ok || st.Namespace != "cell-ops-system" || st.Name != "bundle-state" {
+		t.Errorf("state = %+v", cfg.State)
 	}
 }
