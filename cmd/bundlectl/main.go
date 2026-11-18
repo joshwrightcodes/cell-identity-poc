@@ -46,6 +46,7 @@ import (
 	"strings"
 	"syscall"
 
+	yamlv3 "go.yaml.in/yaml/v3"
 	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
@@ -92,6 +93,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, out io.Writer) err
 		return fmt.Errorf("%s: %w", cmd, err)
 	}
 	f.entries = fs.Args()
+	if f.lock == "" {
+		f.lock = filepath.Join(f.build, "bundle-attach.lock")
+	}
 	switch cmd {
 	case "set":
 		return cmdSet(ctx, f, out, false)
@@ -131,7 +135,7 @@ func (f *flags) register(fs *flag.FlagSet) {
 	fs.StringVar(&f.role, "role", "", "cluster role: cell, cp or open")
 	fs.StringVar(&f.set, "set", "", "file with the components as a JSON array, or - for standard input")
 	fs.StringVar(&f.bundleFile, "bundle", "", "file with the cosign bundle (attach)")
-	fs.StringVar(&f.lock, "lock", filepath.Join("build", "bundle-attach.lock"), "lock file of attach")
+	fs.StringVar(&f.lock, "lock", "", "lock file of attach (default <build>/bundle-attach.lock)")
 	f.lockWait = defaultLockWait
 	fs.Var(&f.lockWait, "lock-wait", "how long attach waits for the lock")
 }
@@ -232,10 +236,13 @@ func packRender(path, name string) (bundle.Artifact, error) {
 	}
 	objs, err := bundle.DecodeManifests(raw, bundle.MaxObjects)
 	if err != nil {
-		return bundle.Artifact{}, fmt.Errorf("component %q: the render has no canonical form (anchors, aliases, merge keys, tags, duplicate keys, lists and flow documents are not accepted): %w", name, err)
+		return bundle.Artifact{}, fmt.Errorf("component %q: the render has no canonical form (anchors, aliases, merge keys, tags, duplicate keys, lists and flow documents are not accepted)%s: %w", name, boolHint(raw), err)
 	}
 	if len(objs) == 0 {
 		return bundle.Artifact{}, fmt.Errorf("component %q: the render holds no object", name)
+	}
+	if k := lostKey(raw, objs); k != "" {
+		return bundle.Artifact{}, fmt.Errorf("component %q: key %q: %s", name, k, boolText)
 	}
 	canon, err := bundle.Canonical(objs)
 	if err != nil {
@@ -246,6 +253,71 @@ func packRender(path, name string) (bundle.Artifact, error) {
 		return bundle.Artifact{}, fmt.Errorf("component %q: %w", name, err)
 	}
 	return art, nil
+}
+
+var boolRE = regexp.MustCompile(`(?mi)^[ \t-]*(y|n|yes|no|on|off)[ \t]*:|:[ \t]+(y|n|yes|no|on|off)[ \t]*$`)
+
+const boolText = "an unquoted y, n, yes, no, on or off is read as a boolean, so quote it"
+
+// lostKey returns a map key of the render that the readers of the cluster change: they read the
+// key y as the boolean true and write it as "true", so the key is lost or merged with another one.
+// It compares the keys that a YAML 1.2 reader sees with the keys of objs, and returns "" for none.
+func lostKey(raw []byte, objs []map[string]any) string {
+	have := map[string]bool{}
+	var collect func(v any)
+	collect = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			for k, e := range x {
+				have[k] = true
+				collect(e)
+			}
+		case []any:
+			for _, e := range x {
+				collect(e)
+			}
+		}
+	}
+	for _, o := range objs {
+		collect(o)
+	}
+	dec := yamlv3.NewDecoder(bytes.NewReader(raw))
+	for {
+		var doc any
+		if err := dec.Decode(&doc); err != nil {
+			return ""
+		}
+		var bad string
+		var walk func(v any)
+		walk = func(v any) {
+			switch x := v.(type) {
+			case map[string]any:
+				for k, e := range x {
+					if !have[k] && (bad == "" || k < bad) {
+						bad = k
+					}
+					walk(e)
+				}
+			case []any:
+				for _, e := range x {
+					walk(e)
+				}
+			}
+		}
+		walk(doc)
+		if bad != "" {
+			return bad
+		}
+	}
+}
+
+// boolHint names a likely cause of a refusal: the YAML readers of the cluster read an unquoted y, n,
+// yes, no, on or off as a boolean, so a name or a key with such a text is not a string.
+func boolHint(raw []byte) string {
+	if boolRE.Match(raw) {
+		return "; " + boolText
+	}
+	return ""
 }
 
 // readExtras returns the ignoreDifferences list of components/<name>/application.yaml, or nil when
@@ -281,7 +353,7 @@ func readExtras(root, name string) (json.RawMessage, error) {
 	return b, nil
 }
 
-// mirror checks that addr is a loopback host and a port, and returns a store for it.
+// openStore returns a store for addr. It refuses an address that is not a loopback host with a port.
 func openStore(addr string) (*ocistore.Store, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {

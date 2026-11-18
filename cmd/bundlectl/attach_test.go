@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 
@@ -293,6 +295,121 @@ func TestAttachRetriesOnceOnLost(t *testing.T) {
 			t.Errorf("index written %d times, want 2 (one retry)", rt.writes())
 		}
 	})
+}
+
+// lockProbe tries the lock on a second descriptor at every request. While an attach runs, the lock
+// must be held, so the probe must never get it.
+type lockProbe struct {
+	base    http.RoundTripper
+	path    string
+	checked atomic.Int32
+	got     atomic.Int32
+}
+
+func (p *lockProbe) RoundTrip(req *http.Request) (*http.Response, error) {
+	if f, err := os.OpenFile(p.path, os.O_RDWR, 0); err == nil {
+		p.checked.Add(1)
+		if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) == nil {
+			p.got.Add(1)
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		}
+		_ = f.Close()
+	}
+	return p.base.RoundTrip(req)
+}
+
+// failTag fails each PUT of the fallback index with an error that has the word "lost" in it.
+type failTag struct {
+	base http.RoundTripper
+	tag  string
+	puts atomic.Int32
+}
+
+func (f *failTag) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPut && strings.HasSuffix(req.URL.Path, "/manifests/"+f.tag) {
+		f.puts.Add(1)
+		_, _ = io.Copy(io.Discard, req.Body)
+		_ = req.Body.Close()
+		return &http.Response{
+			StatusCode: http.StatusBadRequest, Status: "400 Bad Request", Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header: http.Header{"Content-Type": {"application/json"}}, Request: req,
+			Body: io.NopCloser(strings.NewReader(`{"errors":[{"code":"UNKNOWN","message":"connection lost"}]}`)),
+		}, nil
+	}
+	return f.base.RoundTrip(req)
+}
+
+// Only a lost entry earns the retry, whatever the text of another error says.
+func TestAttachRetriesOnlyOnLostEntry(t *testing.T) {
+	f := newAttachFix(t)
+	file, _ := sigstoreFile(t, f.dir, 1)
+	tag, _ := ocistore.FallbackTag(f.root)
+	rt := &failTag{base: http.DefaultTransport, tag: tag}
+	useTransport(t, rt)
+	code, out := runCLI(t, "", f.args(file)...)
+	if code != 1 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	errorLine(t, out)
+	if rt.puts.Load() != 1 {
+		t.Fatalf("index write tried %d times, want 1", rt.puts.Load())
+	}
+}
+
+// The lock spans every request of an attach: the blob and manifest pushes, the index read and
+// write, and the retry after a lost entry.
+func TestAttachHoldsLockForEveryRequest(t *testing.T) {
+	other := []byte(`{"schemaVersion":2,"mediaType":"` + mtIndex + `","manifests":[]}`)
+	for _, retry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%v", retry), func(t *testing.T) {
+			f := newAttachFix(t)
+			file, _ := sigstoreFile(t, f.dir, 1)
+			tag, _ := ocistore.FallbackTag(f.root)
+			probe := &lockProbe{base: http.DefaultTransport, path: f.lock}
+			var base http.RoundTripper = probe
+			var rt *afterPut
+			if retry {
+				rt = &afterPut{base: probe, tag: tag, fn: func(n int) {
+					if n == 1 {
+						f.reg.SeedManifest("bundles/dev-cell-1/root", tag, mtIndex, other)
+					}
+				}}
+				base = rt
+			}
+			// The lock file must exist for the probe to open it.
+			if err := os.MkdirAll(filepath.Dir(f.lock), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f.lock, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			useTransport(t, base)
+			mustRun(t, "", f.args(file)...)
+			if retry && rt.writes() != 2 {
+				t.Fatalf("index written %d times, want 2", rt.writes())
+			}
+			if probe.checked.Load() < 8 {
+				t.Fatalf("the probe ran %d times", probe.checked.Load())
+			}
+			if n := probe.got.Load(); n != 0 {
+				t.Fatalf("the lock was free during %d of %d requests", n, probe.checked.Load())
+			}
+		})
+	}
+}
+
+// The default lock file lies under the build directory, so a run from another directory takes the same lock.
+func TestAttachDefaultLockUnderBuild(t *testing.T) {
+	f := newAttachFix(t)
+	file, _ := sigstoreFile(t, f.dir, 1)
+	build := filepath.Join(f.dir, "somebuild")
+	mustRun(t, "", "attach", "--target", f.target, "--digest", f.root, "--bundle", file, "--registry", f.host, "--build", build)
+	if _, err := os.Stat(filepath.Join(build, "bundle-attach.lock")); err != nil {
+		t.Fatalf("no lock file under --build: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join("build", "bundle-attach.lock")); err == nil {
+		t.Fatal("a lock file appeared under the working directory")
+	}
 }
 
 func TestAttachRefusals(t *testing.T) {

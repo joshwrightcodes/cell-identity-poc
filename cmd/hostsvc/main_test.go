@@ -694,7 +694,13 @@ func TestFactsRegistry(t *testing.T) {
 		t.Fatalf("docker args = %v", asked)
 	}
 
-	for _, args := range [][]string{{"facts", "--registry", "--cluster", "dev-cp"}} {
+	for _, args := range [][]string{
+		{"facts", "--registry", "--cluster", "dev-cp"},
+		{"facts", "--cluster", "dev-cp", "--registry"},
+		{"facts"},
+		{"facts", "--registry", "--nope"},
+		{"facts", "--registry=maybe"},
+	} {
 		var o strings.Builder
 		if code := execute(context.Background(), args, &o); code != 1 {
 			t.Fatalf("%v: exit %d, want 1", args, code)
@@ -704,14 +710,21 @@ func TestFactsRegistry(t *testing.T) {
 		}
 	}
 
-	registryDocker = func(context.Context, ...string) ([]byte, error) {
-		return []byte("Error: No such container: registry-mirror"), errors.New("exit 1")
-	}
-	var o strings.Builder
-	if code := execute(context.Background(), []string{"facts", "--registry"}, &o); code != 1 {
-		t.Fatalf("missing registry: exit %d", code)
-	}
-	if l := jsonLines(t, o.String()); len(l) != 1 || l[0]["error"] == nil {
-		t.Fatalf("missing registry: %q", o.String())
+	for name, docker := range map[string]hostsvc.DockerFunc{
+		"missing container": func(context.Context, ...string) ([]byte, error) {
+			return []byte("Error: No such container: registry-mirror"), errors.New("exit 1")
+		},
+		"not on the network": func(context.Context, ...string) ([]byte, error) { return []byte("\n"), nil },
+		"not an address":     func(context.Context, ...string) ([]byte, error) { return []byte("registry-mirror"), nil },
+		"IPv6 address":       func(context.Context, ...string) ([]byte, error) { return []byte("fe80::1"), nil },
+	} {
+		registryDocker = docker
+		var o strings.Builder
+		if code := execute(context.Background(), []string{"facts", "--registry"}, &o); code != 1 {
+			t.Fatalf("%s: exit %d: %s", name, code, o.String())
+		}
+		if l := jsonLines(t, o.String()); len(l) != 1 || l[0]["error"] == nil {
+			t.Fatalf("%s: %q", name, o.String())
+		}
 	}
 }

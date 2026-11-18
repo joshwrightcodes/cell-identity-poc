@@ -715,3 +715,37 @@ func TestErrorLine(t *testing.T) {
 		errorLine(t, out)
 	}
 }
+
+// A YAML 1.1 boolean such as y is read as a boolean by the readers. The error says so.
+func TestPushNamesTheBooleanCause(t *testing.T) {
+	cases := map[string]string{
+		"key":   "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\ndata:\n  y: v\n",
+		"value": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n  namespace: n\ndata:\n  k: v\n",
+	}
+	cases["value"] = "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n  namespace: y\n"
+	for name, body := range cases {
+		build := render(t, t.TempDir(), "t", map[string]string{"bad": body})
+		code, out := runCLI(t, "", "set", "--target", "t", "--build", build, "--root", t.TempDir(), "bad:0:x")
+		if code != 1 {
+			t.Fatalf("%s: exit %d: %s", name, code, out)
+		}
+		if msg := errorLine(t, out); !strings.Contains(msg, "unquoted y, n, yes, no, on or off") {
+			t.Errorf("%s: error %q does not name the cause", name, msg)
+		}
+	}
+	// Two keys that read as the same boolean would merge silently. They are refused by name.
+	build := render(t, t.TempDir(), "t", map[string]string{"bad": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\ndata:\n  y: v\n  on: w\n"})
+	code, out := runCLI(t, "", "set", "--target", "t", "--build", build, "--root", t.TempDir(), "bad:0:x")
+	if msg := errorLine(t, out); code != 1 || !strings.Contains(msg, `key "on"`) {
+		t.Errorf("merged keys: exit %d: %s", code, out)
+	}
+	// Text inside a block scalar is not a key.
+	build = render(t, t.TempDir(), "t", map[string]string{"ok": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\ndata:\n  f: |\n    on: yes\n    y: n\n  \"y\": quoted\n"})
+	mustRun(t, "", "set", "--target", "t", "--build", build, "--root", t.TempDir(), "ok:0:x")
+	// A render that is refused for another reason gets no such hint.
+	build = render(t, t.TempDir(), "t", map[string]string{"bad": "apiVersion: v1\nkind: List\nitems: []\n"})
+	_, out = runCLI(t, "", "set", "--target", "t", "--build", build, "--root", t.TempDir(), "bad:0:x")
+	if msg := errorLine(t, out); strings.Contains(msg, "unquoted") {
+		t.Errorf("hint for a list: %q", msg)
+	}
+}

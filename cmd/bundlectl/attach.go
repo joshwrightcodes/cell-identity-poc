@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"syscall"
 	"time"
 
@@ -179,7 +178,7 @@ func cmdAttach(ctx context.Context, f flags, out io.Writer) error {
 		Annotations: map[string]string{annContent: "dsse-envelope", annPredicate: bundle.PredicateType},
 	}
 	err = s.AttachReferrer(ctx, repo, f.digest, ref)
-	if err != nil && strings.Contains(err.Error(), "lost") {
+	if errors.Is(err, ocistore.ErrLost) {
 		err = s.AttachReferrer(ctx, repo, f.digest, ref)
 	}
 	if err != nil {
