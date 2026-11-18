@@ -31,6 +31,11 @@ const (
 	maxNamespaceLabel = 63
 )
 
+// MaxSetLayerBytes limits the layer bytes of the components of one set: eight layers of the largest
+// size. The applier holds the layers that it reads until the push, and refuses a set above this
+// limit. bundlectl refuses such a set before it pushes anything.
+const MaxSetLayerBytes = 8 * MaxLayerBytes
+
 // Version orders the signed sets of one target: the epoch first, then the counter.
 type Version struct {
 	Epoch   uint64 `json:"epoch"`

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -326,6 +327,39 @@ func TestPushRefusesRendersWithNoCanonicalForm(t *testing.T) {
 			}
 			if n := len(reg.Requests()); n != 0 {
 				t.Errorf("%d requests reached the mirror", n)
+			}
+		})
+	}
+}
+
+// A set whose layers hold more bytes than the applier reads for one set fails with a clear error,
+// before the first request, in every command that loads a set.
+func TestSetAboveTheLayerLimit(t *testing.T) {
+	if maxSetBytes != bundle.MaxSetLayerBytes || bundle.MaxSetLayerBytes != 64<<20 {
+		t.Fatalf("limit %d, shared constant %d, want both 64 MiB", maxSetBytes, bundle.MaxSetLayerBytes)
+	}
+	total := len(packOracle(t, cmA).Layer) + len(packOracle(t, cmB).Layer)
+	t.Cleanup(func() { maxSetBytes = bundle.MaxSetLayerBytes })
+	for _, cmd := range []string{"set", "push", "bootstrap"} {
+		t.Run(cmd, func(t *testing.T) {
+			reg, host := newMirror(t)
+			build := render(t, t.TempDir(), "dev-cell-1", map[string]string{"apps-sample": cmA, "network-policy": cmB})
+			args := []string{cmd, "--target", "dev-cell-1", "--build", build, "--root", t.TempDir(), "--registry", host, "--role", "cell",
+				"apps-sample:0:apps-demo", "network-policy:0:cell-system"}
+			maxSetBytes = total - 1
+			code, out := runCLI(t, "", args...)
+			if code != 1 {
+				t.Fatalf("exit %d: %s", code, out)
+			}
+			if msg := errorLine(t, out); !strings.Contains(msg, fmt.Sprintf("%d layer bytes", total)) || !strings.Contains(msg, fmt.Sprint(total-1)) {
+				t.Errorf("error %q does not give the set size and the limit", msg)
+			}
+			if n := len(reg.Requests()); n != 0 {
+				t.Errorf("%d requests reached the registry", n)
+			}
+			maxSetBytes = total
+			if code, out := runCLI(t, "", args...); code != 0 {
+				t.Fatalf("a set at the limit: exit %d: %s", code, out)
 			}
 		})
 	}

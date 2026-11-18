@@ -186,8 +186,9 @@ type built struct {
 	artifacts  map[string]bundle.Artifact
 }
 
-// load reads the render of each entry, writes it in the canonical form and packs it. It reads and
-// writes only files, so a failure leaves a registry untouched.
+// load reads the render of each entry, writes it in the canonical form and packs it. It refuses a set
+// whose layers hold more than maxSetBytes. It reads and writes only files, so a failure leaves a
+// registry untouched.
 func load(f flags) (built, error) {
 	if err := checkTarget(f.target); err != nil {
 		return built{}, err
@@ -211,6 +212,13 @@ func load(f flags) (built, error) {
 			Name: e.name, Wave: e.wave, Namespace: e.namespace, Digest: art.Digest, IgnoreDifferences: extra,
 		})
 	}
+	total := 0
+	for _, a := range b.artifacts {
+		total += len(a.Layer)
+	}
+	if total > maxSetBytes {
+		return built{}, fmt.Errorf("the set holds %d layer bytes, above the limit of %d bytes that the applier reads for one set; split the set or shrink its components", total, maxSetBytes)
+	}
 	slices.SortFunc(b.components, func(x, y bundle.Component) int { return strings.Compare(x.Name, y.Name) })
 	raw, err := json.Marshal(b.components)
 	if err != nil {
@@ -221,6 +229,9 @@ func load(f flags) (built, error) {
 	}
 	return b, nil
 }
+
+// maxSetBytes limits the layer bytes of one set, as the applier does. Tests lower it.
+var maxSetBytes = bundle.MaxSetLayerBytes
 
 func packRender(path, name string) (bundle.Artifact, error) {
 	fi, err := os.Stat(path)

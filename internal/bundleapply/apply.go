@@ -46,9 +46,6 @@ const (
 	lockSlack        = 2 * time.Minute
 	maxStateAttempts = 8
 	detailRollback   = "rollback_unhealthy"
-	// maxSetLayerBytes limits the layer bytes that one apply reads and holds until the push: eight
-	// layers of the largest size, a quarter of the most that 32 components could hold.
-	maxSetLayerBytes = 8 * bundle.MaxLayerBytes
 )
 
 // DetailTarget is the detail of a payload_invalid refusal for a set whose predicate names another
@@ -134,7 +131,7 @@ func New(cfg Config) *Applier {
 		log.Error("bundle telemetry", "error", err)
 		tel, _ = newTelemetry(nil, nil)
 	}
-	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep, maxSetBytes: maxSetLayerBytes}
+	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep, maxSetBytes: bundle.MaxSetLayerBytes}
 }
 
 func realSleep(ctx context.Context, d time.Duration) error {
