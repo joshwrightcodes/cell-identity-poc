@@ -39,18 +39,24 @@ func newTelemetryEnv(t *testing.T) *telemetryEnv {
 // counter returns the value of bundle.apply.outcomes for the attributes.
 func (te *telemetryEnv) counter(t *testing.T, want attribute.Set) int64 {
 	t.Helper()
+	return te.sum(t, "bundle.apply.outcomes", want)
+}
+
+// sum returns the value of the counter name for the attributes.
+func (te *telemetryEnv) sum(t *testing.T, name string, want attribute.Set) int64 {
+	t.Helper()
 	var rm metricdata.ResourceMetrics
 	if err := te.reader.Collect(t.Context(), &rm); err != nil {
 		t.Fatal(err)
 	}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			if m.Name != "bundle.apply.outcomes" {
+			if m.Name != name {
 				continue
 			}
 			sum, ok := m.Data.(metricdata.Sum[int64])
 			if !ok {
-				t.Fatalf("outcomes is %T", m.Data)
+				t.Fatalf("%s is %T", name, m.Data)
 			}
 			for _, dp := range sum.DataPoints {
 				if dp.Attributes.Equals(&want) {
@@ -198,4 +204,22 @@ func TestApplyTelemetry(t *testing.T) {
 			t.Fatalf("outcomes error/lock_held = %d", n)
 		}
 	})
+}
+
+// TestTelemetryTerminateFailures checks that each Application whose running sync the rollback could not
+// terminate counts in bundle.rollback.terminate.failures, by role and Application: a Role that lacks the
+// patch right brings back a rollback that waits behind the retries of Argo CD, and the result does not
+// show it.
+func TestTelemetryTerminateFailures(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.sync = syncOf("apps-sample", b.digests()["apps-sample"], func(now time.Time) (string, time.Time) { return "Running", now })
+	te.conflicts = 5
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+	want := attribute.NewSet(attribute.String("role", "cell"), attribute.String("app", "apps-sample"))
+	if got := te.sum(t, "bundle.rollback.terminate.failures", want); got != 1 {
+		t.Fatalf("bundle.rollback.terminate.failures for apps-sample = %d, want 1", got)
+	}
 }

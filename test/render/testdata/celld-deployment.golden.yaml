@@ -213,6 +213,8 @@ subjects:
 # The apply engine of celld lists the Applications and asks Argo CD for a hard refresh of the Application root. On a
 # rollback it terminates the running sync operation of root and of the component Applications. The render puts root and
 # the components of the role in allow.json into resourceNames (components/lib/bundle-apps.sh). Nothing else in argocd.
+# The right to patch also covers the spec of these Applications. That is no more than patch on root already gives,
+# because root writes the spec of each component Application.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

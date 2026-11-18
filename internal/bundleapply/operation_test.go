@@ -1,8 +1,10 @@
 package bundleapply
 
 import (
+	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +68,13 @@ func TestApplyCountsOnlyASyncAfterTheMove(t *testing.T) {
 		e.clk.Advance(time.Hour)
 		last := e.ops["apps-sample"].started
 		e.sync = syncOf("apps-sample", b.digests()["apps-sample"], func(time.Time) (string, time.Time) { return "Succeeded", last })
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
+		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+	})
+	// The operation was started for the wanted revision, but it synced another one.
+	t.Run("sync that resolved another revision", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.results = map[string]string{"apps-sample": "sha256:" + strings.Repeat("e", 64)}
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
 		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
 	})
@@ -173,6 +182,20 @@ func TestApplyRollbackTerminatesRunningSyncs(t *testing.T) {
 			t.Fatalf("root shows the operation %+v, want a sync of the good root", o)
 		}
 	})
+	t.Run("root first", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.sync = func(_, app, rev string, now time.Time) (string, time.Time) {
+			if (app == "root" && rev == b.root.Digest) || (app == "apps-sample" && rev == b.digests()["apps-sample"]) {
+				return "Running", now
+			}
+			return "Succeeded", now
+		}
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
+		e.assertRolledBackTo(t, a, v2)
+		if !slices.Equal(e.terminated, []string{"root", "apps-sample"}) {
+			t.Fatalf("terminated %v, want root, then apps-sample", e.terminated)
+		}
+	})
 	t.Run("conflict", func(t *testing.T) {
 		e, a, b := twoSets(t)
 		childStuck(e, b)
@@ -199,10 +222,13 @@ func TestApplyRollbackTerminatesRunningSyncs(t *testing.T) {
 	})
 }
 
-// TestApplyRollbackCountsOnlyASyncAfterTheRollbackMove checks that the rollback wait judges root and the
-// children by the rule of the health wait: a sync of the good revision that started after the tag moved
-// back, or, for an Application that never left the good revision, the sync that applied it before.
-func TestApplyRollbackCountsOnlyASyncAfterTheRollbackMove(t *testing.T) {
+// TestApplyRollbackRestoredAtTheGoodRevision checks the rule of the rollback wait. The good root was
+// applied before, so an Application counts as restored when it is Synced and Healthy at the good
+// revision and runs no operation, also with no sync after the tag moved back: Argo CD starts no sync for
+// an Application whose live state already matches. An Application that still runs a sync does not
+// count.
+func TestApplyRollbackRestoredAtTheGoodRevision(t *testing.T) {
+	v2 := bundle.Version{Epoch: 1, Counter: 2}
 	degraded := func(e *env, b built) {
 		e.health = func(root, app string) (string, string) {
 			if root == b.root.Digest && app == "apps-sample" {
@@ -211,6 +237,33 @@ func TestApplyRollbackCountsOnlyASyncAfterTheRollbackMove(t *testing.T) {
 			return "Synced", "Healthy"
 		}
 	}
+	// The sync of b fails before it applies anything, for example at an admission denial, and Argo CD
+	// retries it. The live state stays at a, so after the rollback apps-sample compares Synced at the
+	// good revision and Argo CD starts no sync.
+	t.Run("failed sync applied nothing", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		bad, good := b.digests()["apps-sample"], a.digests()["apps-sample"]
+		e.sync = func(_, app, rev string, now time.Time) (string, time.Time) {
+			switch {
+			case app == "apps-sample" && rev == bad:
+				return "Running", now
+			case app == "apps-sample" && rev == good:
+				return "", now
+			}
+			return "Succeeded", now
+		}
+		e.health = func(root, app string) (string, string) {
+			if o := e.ops["apps-sample"]; app == "apps-sample" && o.rev == bad && root == b.root.Digest {
+				return "OutOfSync", "Healthy"
+			}
+			return "Synced", "Healthy"
+		}
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:OutOfSync/Healthy")
+		e.assertRolledBackTo(t, a, v2)
+		if o := e.ops["apps-sample"]; o.phase != "Failed" || o.rev != bad {
+			t.Fatalf("apps-sample shows the operation %+v, want the terminated sync of b", o)
+		}
+	})
 	for _, tc := range []struct {
 		name, app string
 		op        func(now time.Time) (string, time.Time)
@@ -225,7 +278,6 @@ func TestApplyRollbackCountsOnlyASyncAfterTheRollbackMove(t *testing.T) {
 			if tc.app != "root" {
 				rev = a.digests()[tc.app]
 			}
-			// The Application synced the failed set, so the sync that applied the good revision before is not its last.
 			moved := false
 			e.sync = func(root, app, r string, now time.Time) (string, time.Time) {
 				if moved && app == tc.app && r == rev {
@@ -234,15 +286,29 @@ func TestApplyRollbackCountsOnlyASyncAfterTheRollbackMove(t *testing.T) {
 				return "Succeeded", now
 			}
 			e.hook = func(int) { moved = moved || e.currentRoot() == b.root.Digest }
-			wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+			wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+			e.assertRolledBackTo(t, a, v2)
 		})
 	}
+	// The terminate of the sync of b fails, so apps-sample still runs it while it shows the good revision.
+	t.Run("child still runs a sync", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.sync = syncOf("apps-sample", b.digests()["apps-sample"], func(now time.Time) (string, time.Time) { return "Running", now })
+		e.conflicts = 5
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
+		if got := e.currentRoot(); got != a.root.Digest {
+			t.Fatalf("tag current = %s, want the good root", got)
+		}
+		if len(e.terminated) != 0 || len(e.terminateRVs) != terminateAttempts {
+			t.Fatalf("terminated %v after %d patches, want no terminate after %d patches", e.terminated, len(e.terminateRVs), terminateAttempts)
+		}
+	})
 	t.Run("child that never left the good revision", func(t *testing.T) {
 		e, a, b := twoSets(t)
 		e.sync = syncOf("apps-sample", b.digests()["apps-sample"], func(time.Time) (string, time.Time) { return "", time.Time{} })
 		before := *e.ops["apps-sample"]
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
-		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+		e.assertRolledBackTo(t, a, v2)
 		if got := *e.ops["apps-sample"]; got != before {
 			t.Fatalf("apps-sample shows the operation %+v, want the sync of set A %+v", got, before)
 		}
@@ -300,4 +366,35 @@ func TestApplyRollbackKeepsASyncOfTheGoodRevision(t *testing.T) {
 	if len(e.terminated) != 0 {
 		t.Fatalf("terminated %v, want none", e.terminated)
 	}
+}
+
+// TestApplyRollbackReadFails checks that the engine does not move the tag back when it cannot read the
+// Applications before the rollback move: without that read it could neither terminate the syncs of the
+// failed set nor tell an old sync from a new one. The state stays rolling_back, and the next try of the
+// operation resumes the rollback.
+func TestApplyRollbackReadFails(t *testing.T) {
+	e, a, b := twoSets(t)
+	e.health = func(root, app string) (string, string) {
+		if root == b.root.Digest && app == "apps-sample" {
+			return "Synced", "Degraded"
+		}
+		return "Synced", "Healthy"
+	}
+	failed := false
+	e.dyn.PrependReactor("list", "applications", func(k8stesting.Action) (bool, runtime.Object, error) {
+		st, _, err := e.gate.Store.Read(context.Background())
+		if err != nil || failed || st.State != "rolling_back" {
+			return false, nil, nil
+		}
+		failed = true
+		return true, nil, errors.New("the API server is not reachable")
+	})
+	if _, err := e.a.Apply(t.Context(), "opB", tTarget, b.att); err == nil {
+		t.Fatal("a rollback with no read of the Applications succeeded")
+	}
+	if got, st := e.currentRoot(), e.state(); got != b.root.Digest || st.State != "rolling_back" {
+		t.Fatalf("tag current = %s, state %s; want the failed root in rolling_back", got, st.State)
+	}
+	wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
 }

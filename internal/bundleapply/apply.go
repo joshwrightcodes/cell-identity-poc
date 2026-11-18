@@ -899,10 +899,23 @@ func (a *Applier) refresh(ctx context.Context) {
 }
 
 // judge holds what the waits need to tell a sync of this tag move from an older one: the time just
-// before the move, and the Applications as they were then.
+// before the move, and the Applications as they were then. restore is true for the rollback wait,
+// whose good root was applied before.
 type judge struct {
-	since  time.Time
-	before map[string]appState
+	since   time.Time
+	before  map[string]appState
+	restore bool
+}
+
+// counts reports whether an Application that is Synced at digest has reached it for the wait. The
+// health wait needs judge.applied. The rollback wait also takes an Application that runs no operation:
+// a sync of the failed set that applied nothing leaves the live state at the good revision, and Argo
+// CD then starts no sync for it.
+func (j judge) counts(name, digest string, s appState) bool {
+	if j.applied(name, digest, s) {
+		return true
+	}
+	return j.restore && !s.Operation && s.Op.Phase != phaseRunning && s.Op.Phase != phaseTerminating
 }
 
 // applied reports whether the last sync operation of an Application applied digest for this move: it
@@ -922,8 +935,8 @@ func (j judge) applied(name, digest string, s appState) bool {
 	return ok && b.Op.StartedAt.Equal(s.Op.StartedAt) && (b.Op.Revision == digest || b.Op.Target == digest)
 }
 
-// wait polls the Applications until the root and every component have applied their digest (see
-// judge.applied), are Synced at it and Healthy. It returns "" when they are. It returns
+// wait polls the Applications until the root and every component have reached their digest (see
+// judge.counts), are Synced at it and Healthy. It returns "" when they are. It returns
 // <app>:<sync>/<health> for a component that stays Synced and Degraded at its digest for the grace
 // period after it applied it, and timeout:<app>:<sync>/<health> for the first Application that is not
 // healthy at the deadline. Argo CD sets the revision when it compares, before the sync applies
@@ -967,7 +980,7 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 			if !ok {
 				s = appState{Sync: unknownStatus, Health: unknownStatus}
 			}
-			at := s.Sync == statusSynced && s.Revision == digest && j.applied(name, digest, s)
+			at := s.Sync == statusSynced && s.Revision == digest && j.counts(name, digest, s)
 			if at && s.Health == statusDegraded && name != "root" {
 				since, seen := degraded[name]
 				if !seen {
@@ -1022,12 +1035,12 @@ func (a *Applier) terminate(ctx context.Context, before map[string]appState, wan
 				break
 			}
 			if !apierrors.IsConflict(err) || attempt == terminateAttempts {
-				a.log.Warn("bundle rollback terminate failed", "app", name, "error", err)
+				a.terminateFailed(ctx, name, err)
 				break
 			}
 			fresh, lerr := listApps(ctx, a.cfg.Dynamic)
 			if lerr != nil {
-				a.log.Warn("bundle rollback terminate failed", "app", name, "error", lerr)
+				a.terminateFailed(ctx, name, lerr)
 				break
 			}
 			apps = fresh
@@ -1035,10 +1048,18 @@ func (a *Applier) terminate(ctx context.Context, before map[string]appState, wan
 	}
 }
 
+// terminateFailed logs and counts a sync that the rollback could not terminate.
+func (a *Applier) terminateFailed(ctx context.Context, name string, err error) {
+	a.log.Warn("bundle rollback terminate failed", "app", name, "error", err)
+	a.tel.terminateFailures.Add(context.WithoutCancel(ctx), 1, metric.WithAttributes(
+		attribute.String("role", a.cfg.Role), attribute.String("app", name)))
+}
+
 // rollback points the tag back at the last good root, with the manifest bytes that the state holds,
 // terminates the sync operations that still run for the failed set, asks for a hard refresh of root,
-// and waits for the good root to become healthy, judged by the syncs that started after the tag moved
-// back. It creates no version and deletes nothing. It first writes the state rolling_back with the
+// and waits for the good root to become healthy (judge.counts with restore). It returns an error when
+// it cannot read the Applications before the move, so that the next try resumes the rollback. It
+// creates no version and deletes nothing. It first writes the state rolling_back with the
 // failed detail, so that a run that takes over after a crash resumes the rollback and does not push
 // the failed root again. The state names the good root only when the tag holds it.
 func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcome, err error) {
@@ -1069,11 +1090,11 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcom
 	case good == nil || sha256Digest(good.Root.Manifest) != good.Root.Digest:
 		detail = detailRollback
 	default:
-		before, lerr := listApps(rctx, cfg.Dynamic)
-		if lerr != nil {
-			a.log.Warn("bundle rollback read failed", "error", lerr)
+		before, err := listApps(rctx, cfg.Dynamic)
+		if err != nil {
+			return Outcome{}, err
 		}
-		j := judge{since: cfg.Now(), before: before}
+		j := judge{since: cfg.Now(), before: before, restore: true}
 		if _, err := cfg.Store.PushManifest(rctx, repoRoot, tagCurrent, bundle.MediaTypeManifest, good.Root.Manifest); err != nil {
 			a.log.Error("bundle rollback tag failed", "error", err)
 			detail = detailRollback

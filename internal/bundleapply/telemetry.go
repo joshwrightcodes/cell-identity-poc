@@ -22,14 +22,16 @@ const (
 	spanWait     = "wait"
 	spanRollback = "rollback"
 
-	metricOutcomes = "bundle.apply.outcomes"
-	metricDuration = "bundle.apply.duration"
+	metricOutcomes          = "bundle.apply.outcomes"
+	metricDuration          = "bundle.apply.duration"
+	metricTerminateFailures = "bundle.rollback.terminate.failures"
 )
 
 type telemetry struct {
-	tracer   trace.Tracer
-	outcomes metric.Int64Counter
-	duration metric.Float64Histogram
+	tracer            trace.Tracer
+	outcomes          metric.Int64Counter
+	duration          metric.Float64Histogram
+	terminateFailures metric.Int64Counter
 }
 
 func newTelemetry(tr trace.Tracer, m metric.Meter) (telemetry, error) {
@@ -47,7 +49,12 @@ func newTelemetry(tr trace.Tracer, m metric.Meter) (telemetry, error) {
 	if err != nil {
 		return telemetry{}, err
 	}
-	return telemetry{tracer: tr, outcomes: outcomes, duration: duration}, nil
+	terminateFailures, err := m.Int64Counter(metricTerminateFailures,
+		metric.WithDescription("Running sync operations that a rollback could not terminate, by role and Application."))
+	if err != nil {
+		return telemetry{}, err
+	}
+	return telemetry{tracer: tr, outcomes: outcomes, duration: duration, terminateFailures: terminateFailures}, nil
 }
 
 // step starts a child span and returns the function that ends it. The function records err on the span.

@@ -26,6 +26,7 @@ import (
 	netv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -142,6 +143,9 @@ type env struct {
 	terminated   []string
 	terminateRVs []string
 	conflicts    int
+	// results, when it names an Application, gives the revision that its operation shows as synced
+	// (syncResult.revision) in place of the revision that the operation was started for.
+	results map[string]string
 }
 
 // simOp is a sync operation of the simulated Argo CD.
@@ -324,9 +328,13 @@ func (e *env) putApp(name string, s appState) {
 	var operation map[string]any
 	if o := e.ops[name]; o != nil {
 		sync := map[string]any{"revision": o.rev}
+		result := o.rev
+		if r, ok := e.results[name]; ok {
+			result = r
+		}
 		status["operationState"] = map[string]any{
 			"phase": o.phase, "startedAt": o.started.UTC().Format(time.RFC3339),
-			"operation": map[string]any{"sync": sync}, "syncResult": map[string]any{"revision": o.rev},
+			"operation": map[string]any{"sync": sync}, "syncResult": map[string]any{"revision": result},
 		}
 		if o.phase == "Running" || o.phase == "Terminating" {
 			operation = map[string]any{"sync": sync}
@@ -359,8 +367,9 @@ func (e *env) putApp(name string, s appState) {
 
 // terminateReactor is the API server and the controller of the simulated Argo CD for a patch that
 // sets status.operationState.phase: it refuses a patch whose resource version is not current with a
-// conflict, and marks the operation Terminating, which the next step ends as Failed. Other patches go
-// on to the default reactor.
+// conflict, and marks the operation Terminating, which the next step ends as Failed. A conflict that
+// e.conflicts forces also gives the Application a new resource version, as a status write of the
+// controller would. Other patches go on to the default reactor.
 func (e *env) terminateReactor(action k8stesting.Action) (bool, runtime.Object, error) {
 	p, ok := action.(k8stesting.PatchAction)
 	if !ok {
@@ -385,7 +394,10 @@ func (e *env) terminateReactor(action k8stesting.Action) (bool, runtime.Object, 
 		return true, nil, fmt.Errorf("unexpected patch of %s: %s %s", name, p.GetPatchType(), p.GetPatch())
 	}
 	if e.conflicts > 0 || body.Metadata.ResourceVersion != e.rvs[name] {
-		e.conflicts--
+		if e.conflicts > 0 {
+			e.conflicts--
+			e.bumpRV(name)
+		}
 		return true, nil, apierrors.NewConflict(applicationGVR.GroupResource(), name, errors.New("the object has been modified"))
 	}
 	e.terminated = append(e.terminated, name)
@@ -407,6 +419,24 @@ func (e *env) currentRoot() string {
 // lagged makes the simulated Argo CD show each new root tag only d after the tag moved.
 func (e *env) lagged(d time.Duration) {
 	e.lag, e.shown, e.seenRoot, e.seenAt = d, e.currentRoot(), e.currentRoot(), e.clk.Now()
+}
+
+// bumpRV gives the stored Application a new resource version through the tracker, which a reactor
+// may call while the fake client holds its lock.
+func (e *env) bumpRV(name string) {
+	gvr := applicationGVR.GroupVersion().WithResource("applications")
+	obj, err := e.dyn.Tracker().Get(gvr, "argocd", name)
+	if err != nil {
+		e.t.Errorf("get %s: %v", name, err)
+		return
+	}
+	u := obj.(*unstructured.Unstructured).DeepCopy()
+	e.nextRV++
+	e.rvs[name] = strconv.Itoa(e.nextRV)
+	u.SetResourceVersion(e.rvs[name])
+	if err := e.dyn.Tracker().Update(gvr, u, "argocd"); err != nil {
+		e.t.Errorf("update %s: %v", name, err)
+	}
 }
 
 // step is the simulated Argo CD. The root Application reads the current root tag, or the root that it

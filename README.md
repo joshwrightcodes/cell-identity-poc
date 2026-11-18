@@ -564,7 +564,8 @@ The applier works in these steps:
    `root` never ends the wait early, because its health is the health of its children.
 5. When the set does not turn healthy, it moves `current` to the last good root.
    It terminates each sync of the failed set that still runs, in `root` and in the component Applications.
-   It asks for a hard refresh of `root`, and waits for up to 5 minutes again by the same rule.
+   It asks for a hard refresh of `root`, and waits for up to 5 minutes again.
+   The good root was applied before, so an Application that runs no sync and is Synced and Healthy at it counts.
    It then reports `rolled_back`.
 
 A rollback creates no version and deletes no resource.
@@ -601,7 +602,7 @@ A live fact that a render reads from a cluster is not a file, so a change in it 
 | --- | --- | --- |
 | A render input of a cell or `dev-cp` bundle changes | `CELL=<cluster> mise run cell:up` | A cluster with a signed state takes bundles only from signed sets, and `cell:up` publishes one |
 | A target shows `rolled_back`, or has no signed root | Run `mise run mgmt -- bundle get --target <target>`. Fix the cause. Run `mise run bundle -- publish --target <target> --wait` | The next set gets a version above the failed one |
-| A target shows `rolled_back` with the detail `rollback_unhealthy` | Run `mise run bundle -- repair --target <target>`. Then follow the row above | A bad `argocd` or `cell-system` set stops the path that a rollback needs |
+| A target shows `rolled_back` with the detail `rollback_unhealthy` | Run `mise run bundle -- repair --target <target>` before the next set, because a sync that still retries holds its Application. Then follow the row above | A bad `argocd` or `cell-system` set stops the path that a rollback needs |
 | `internal/bundle/allow.json` or `internal/bundleapply/policy/bundle.rego` changes | Run `mise run images` with no image names. Roll each component whose digest changed: `CELL=management LINK_ONLY=mgmt-api mise run cell:link` for `mgmtd`, `CELL=<cell> HARNESS_ONLY=cell-identity mise run cell:up` for `celld` in each cell, and `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` for `envd`. Then run `CELL=<cluster> mise run cell:up` for each cluster | `mgmtd`, `celld` and `envd` embed both files, and the `argocd` bundle repeats the list in the AppProjects. Images come first, then the set. An old `mgmtd` refuses a set with a new component as `payload_invalid` with the detail `set`. An old applier refuses it as `component_unknown`. A change of the list moved six image digests in the live runs |
 | A person creates or deletes a cell | Follow the rows of [Provisioning](#provisioning). The admit stage and `cell:down` publish a signed `dev-cp` set and render `envd` again | The SPIRE cell subjects live in the signed `spire-server` bundle, and the cell rules live in the `envd` harness component |
 | You rotate the store tokens | `CELL=<cluster> STORE_TOKENS=1 mise run cell:restart` | New pods get new projected tokens |
