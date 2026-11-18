@@ -8,6 +8,13 @@
 # `bundlectl bootstrap`, which writes the result to build/<cluster>/root.json. A cluster with role open
 # (management) gets the same objects from oras and the Application files below, and no root.json.
 # A cluster with a signed bundle state refuses this script, unless BUNDLE_PUBLISH_UNSIGNED=1 (scripts/bundle.sh publishes there).
+# lib.sh defaults an unset CELL to dev-cell-1, so the caller's own value is read first. The break glass overwrites a signed root, and it must not
+# reach a cluster that the caller did not name.
+caller_cell="${CELL:-}"
+if [[ "${BUNDLE_PUBLISH_UNSIGNED:-}" == 1 && -z "$caller_cell" ]]; then
+  printf 'error: BUNDLE_PUBLISH_UNSIGNED=1 overwrites a signed root, and CELL is not set, so the default cluster would take it. Name the cluster: CELL=<cluster> BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish\n' >&2
+  exit 1
+fi
 source "$(dirname "$0")/lib.sh"
 
 [[ -d "$BUNDLES" ]] || die "no hydrated bundles: run mise run cell:hydrate first"
@@ -21,7 +28,7 @@ if [[ "$role" != open ]]; then
     if [[ "${BUNDLE_PUBLISH_UNSIGNED:-}" == 1 ]]; then
       log "BUNDLE_PUBLISH_UNSIGNED=1: this publish puts an unsigned root over the signed state of $CELL_NAME. cell:verify fails until a signed publish: mise run bundle -- publish --target $CELL_NAME --wait"
     else
-      die "the bundle state of $CELL_NAME has source: signed, and cell:publish would overwrite a signed root. Publish a signed set: mise run bundle -- publish --target $CELL_NAME --wait. Break glass: BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish"
+      die "the bundle state of $CELL_NAME has source: signed, and cell:publish would overwrite a signed root. Publish a signed set: mise run bundle -- publish --target $CELL_NAME --wait. Break glass: CELL=$CELL_NAME BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish"
     fi
   fi
 fi

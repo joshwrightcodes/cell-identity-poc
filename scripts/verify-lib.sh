@@ -841,7 +841,9 @@ check_allow_list_version() {
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
     echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
-    echo "If the images of celld and envd are older than this checkout, run first: mise run images -- celld envd, then CELL=$CELL_NAME mise run cell:hydrate"
+    # A build does not deploy: the applier reports the allow list of the binary that runs. A named images run leaves build/images.stamp alone, so the
+    # next hydrate would refuse. So the hint runs the full images task, rolls the applier of the role and mgmtd, and then publishes.
+    echo "If the images of celld, envd and mgmtd are older than this checkout, run first: mise run images (a named run leaves the stamp unchanged), then roll the applier: CELL=$CELL_NAME HARNESS_ONLY=$([[ "$role" == cp ]] && echo envd || echo cell-identity) mise run cell:up, and mgmtd: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
     return 1
   fi
 }
