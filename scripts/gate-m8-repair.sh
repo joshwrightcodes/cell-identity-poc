@@ -55,8 +55,16 @@ state_of() {
 # open_set <target> prints "<op ID> <expiry>" when the last signed set of the target is served, has no final result and has not expired, and nothing
 # otherwise. A target that has no set yet gives nothing.
 open_set() {
-  local got
-  got="$(mise run bundle -- get --target "$1" 2>/dev/null)" || return 0
+  local got err
+  err="$(mktemp)"
+  if ! got="$(mise run bundle -- get --target "$1" 2>"$err")"; then
+    # Only the answer bundle_unknown means that the target has no set. Any other failure can hide an open set.
+    if grep -q bundle_unknown "$err" || grep -q bundle_unknown <<<"$got"; then rm -f "$err"; return 0; fi
+    echo "error: could not read the last set of $1: $(tail -n 1 "$err")" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
   jq -r --argjson now "$(date +%s)" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
     select(.served == true and (.result // null) == null and ((.expiresAt // "") | ts) > $now) | "\(.opId) \(.expiresAt)"' <<<"$got" 2>/dev/null || true
 }
@@ -92,7 +100,7 @@ signs() {
     if [[ -n "$(kubectl --context "kind-$target" -n apps-demo get configmap "$marker_cm" --ignore-not-found -o name)" ]]; then
       printf '%s marker holds the ConfigMap apps-demo/%s\n' "$target" "$marker_cm"
     fi
-    open="$(open_set "$target")"
+    open="$(open_set "$target")" || exit 1
     if [[ -n "$open" ]]; then
       printf '%s open holds the open set %s, which expires at %s and has no final result\n' "$target" "${open% *}" "${open#* }"
     fi
@@ -160,7 +168,9 @@ done <<<"$reasons"
 for target in "${targets[@]}"; do
   grep -q "^$target " <<<"$reasons" || continue
   open_end=$((SECONDS + open_wait))
-  while open="$(open_set "$target")" && [[ -n "$open" ]]; do
+  while :; do
+    open="$(open_set "$target")" || exit 1
+    [[ -n "$open" ]] || break
     ((SECONDS < open_end)) || die "the set ${open% *} of $target is open until ${open#* }, and mgmtd refuses a new set until it ends. Wait, then run: $repair"
     log "waiting for the open set ${open% *} of $target (until ${open#* })"
     sleep "${GATE_M8_POLL:-5}"

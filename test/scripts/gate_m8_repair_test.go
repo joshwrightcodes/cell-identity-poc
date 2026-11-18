@@ -51,7 +51,8 @@ echo "mise $*" >>"$STUB_DIR/calls"
 case "$*" in
   "run bundle -- get --target "*)
     # STUB_GET_<cluster> is the last signed set of a target. STUB_GET_OPEN_<cluster>=n makes the first n reads print it, and every later read print a closed set.
-    v="STUB_GET_${6//-/_}"; [[ -n "${!v:-}" ]] || exit 1
+    v="STUB_GET_FAIL"; [[ " ${!v:-} " != *" $6 "* ]] || { echo "error: could not reach mgmtd" >&2; exit 1; }
+    v="STUB_GET_${6//-/_}"; [[ -n "${!v:-}" ]] || { echo "error: bundle_unknown" >&2; exit 1; }
     n="$(cat "$STUB_DIR/gets-$6" 2>/dev/null || echo 0)"; echo $((n + 1)) >"$STUB_DIR/gets-$6"
     a="STUB_GET_OPEN_${6//-/_}"
     if [[ -n "${!a:-}" ]] && ((n >= ${!a})); then echo '{"opId":"op1","served":true,"result":{"outcome":"applied"}}'; else printf '%s\n' "${!v}"; fi ;;
@@ -232,6 +233,7 @@ func TestGateM8CheckNamesRepair(t *testing.T) {
 		{name: "an open served set", code: 1, env: []string{"STUB_GET_dev_cell_1=" + m8OpenSet()}, want: []string{"dev-cell-1", "op1", "expires at", repair}},
 		{name: "a final set is no open set", env: []string{"STUB_GET_dev_cell_1=" + m8ClosedSet(), "STUB_GET_dev_cp=" + m8ExpiredSet()}},
 		{name: "an unreadable bundle state fails", code: 1, env: []string{"STUB_STATE_FAIL=dev-cell-2"}, want: []string{"could not read ConfigMap bundle-state of dev-cell-2"}},
+		{name: "a failed read of the last set is no absent set", code: 1, env: []string{"STUB_GET_FAIL=dev-cell-1"}, want: []string{"dev-cell-1", "could not read the last set"}},
 		{name: "kind fails", code: 1, env: []string{"STUB_KIND_FAIL=1"}, want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -315,6 +317,15 @@ func TestGateM8RepairRefusesUnknownArguments(t *testing.T) {
 // TestGateM8RepairUnreadableState: a bundle state that cannot be read is an error, never "nothing to repair". Nothing changes.
 func TestGateM8RepairUnreadableState(t *testing.T) {
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_STATE_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
+	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
+		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
+	}
+}
+
+// TestGateM8RepairUnreadableSet: only the answer bundle_unknown means that a target has no set. Any other failure of the read stops the repair and names the target,
+// because the set can be open.
+func TestGateM8RepairUnreadableSet(t *testing.T) {
+	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_GET_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
 	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
 		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
 	}

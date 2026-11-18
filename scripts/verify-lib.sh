@@ -753,6 +753,7 @@ check_bundle_guard() {
       def checks: [.spec.validations[]? | {expression, message}];
       if .kind == "ValidatingAdmissionPolicy" then
         (.spec.matchConditions // []) == ($r.spec.matchConditions // []) and checks == ($r | checks) and rules == ($r | rules)
+        and ((.spec.matchConstraints.namespaceSelector // {}) == {} and (.spec.matchConstraints.objectSelector // {}) == {} and (.spec.matchConstraints.excludeResourceRules // []) == [])
       else
         .spec.policyName == $r.spec.policyName and .spec.validationActions == $r.spec.validationActions and (.spec.paramRef // null) == null
         and ((.spec.matchResources // {}) | (.namespaceSelector // {}) == {} and (.objectSelector // {}) == {} and (.resourceRules // []) == [] and (.excludeResourceRules // []) == [])
