@@ -815,10 +815,11 @@ func (a *Applier) refresh(ctx context.Context) {
 
 // wait polls the Applications until the root and every component are Synced at their digest and
 // Healthy. It returns "" when they are. It returns <app>:<sync>/<health> for an Application that stays
-// Degraded at its digest for the grace period, and timeout:<app>:<sync>/<health> for the first
-// Application that is not healthy at the deadline. An Application that is Degraded at another
-// revision has not read the root yet, so only the deadline ends the wait for it. An error means that
-// ctx ended.
+// Synced and Degraded at its digest for the grace period, and timeout:<app>:<sync>/<health> for the
+// first Application that is not healthy at the deadline. Argo CD sets the revision when it compares,
+// before the sync applies anything, so an Application that is Degraded while OutOfSync, or at another
+// revision, still shows the old resources, and only the deadline ends the wait for it. An error means
+// that ctx ended.
 func (a *Applier) wait(ctx context.Context, set bundle.Set, rootDigest string, comps map[string]string, timeout time.Duration) (string, error) {
 	type want struct{ name, digest string }
 	var wants []want
@@ -854,7 +855,7 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 			if !ok {
 				s = appState{Sync: unknownStatus, Health: unknownStatus}
 			}
-			if s.Health == statusDegraded && s.Revision == digest {
+			if s.Health == statusDegraded && s.Sync == statusSynced && s.Revision == digest {
 				since, seen := degraded[name]
 				if !seen {
 					degraded[name] = now

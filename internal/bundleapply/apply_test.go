@@ -109,6 +109,8 @@ type env struct {
 	// health returns the sync and health status that the simulated Argo CD gives an Application
 	// while the root tag of the store is root. A nil function means Synced and Healthy.
 	health func(root, app string) (string, string)
+	// revision, when set, gives the revision that the simulated Argo CD shows in place of rev.
+	revision func(root, app, rev string) string
 	// hook runs after each simulated poll. A non-nil error ends the wait.
 	hook  func(n int)
 	polls int
@@ -330,6 +332,9 @@ func (e *env) step() {
 		s, h := "Synced", "Healthy"
 		if e.health != nil {
 			s, h = e.health(cur, app)
+		}
+		if e.revision != nil {
+			rev = e.revision(cur, app, rev)
 		}
 		return appState{Sync: s, Health: h, Revision: rev}
 	}
@@ -1106,6 +1111,78 @@ func TestApplyDegradedCountsOnlyTheWantedRevision(t *testing.T) {
 		e.lagged(90 * time.Second)
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
 		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+	})
+	// Argo CD sets the revision when it compares, before the sync applies anything: the app shows the
+	// new revision, OutOfSync, and the health of the old resources.
+	t.Run("compared but not synced", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		var t0 time.Time
+		e.health = func(root, app string) (string, string) {
+			switch {
+			case app == "apps-sample" && root == a.root.Digest:
+				return "Synced", "Degraded"
+			case app == "apps-sample" && root == b.root.Digest && e.clk.Now().Sub(t0) < 90*time.Second:
+				return "OutOfSync", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		e.step()
+		t0 = e.clk.Now()
+		wantOutcome(t, e.apply("opB", b), op.OutcomeApplied, "", "")
+	})
+	// The root takes the worst health of its children, so it stays Degraded at the new root while the
+	// waves run, for example while the Argo CD controller restarts.
+	t.Run("root shows the old child", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		var t0 time.Time
+		e.health = func(root, app string) (string, string) {
+			slow := root == b.root.Digest && e.clk.Now().Sub(t0) < 90*time.Second
+			switch {
+			case root == a.root.Digest && (app == "apps-sample" || app == "root"):
+				return "Synced", "Degraded"
+			case app == "root" && slow:
+				return "OutOfSync", "Degraded"
+			case slow:
+				return "OutOfSync", "Progressing"
+			}
+			return "Synced", "Healthy"
+		}
+		e.step()
+		t0 = e.clk.Now()
+		wantOutcome(t, e.apply("opB", b), op.OutcomeApplied, "", "")
+	})
+	t.Run("Degraded before the first compare", func(t *testing.T) {
+		e, _, b := twoSets(t)
+		var t0 time.Time
+		early := func(root string) bool { return root == b.root.Digest && e.clk.Now().Sub(t0) < 90*time.Second }
+		e.health = func(root, app string) (string, string) {
+			if early(root) && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		e.revision = func(root, app, rev string) string {
+			if early(root) && app == "apps-sample" {
+				return ""
+			}
+			return rev
+		}
+		t0 = e.clk.Now()
+		wantOutcome(t, e.apply("opB", b), op.OutcomeApplied, "", "")
+	})
+	t.Run("synced and Degraded at the wanted revision", func(t *testing.T) {
+		e, _, b := twoSets(t)
+		e.health = func(root, app string) (string, string) {
+			if root == b.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		start := e.clk.Now()
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+		if el := e.clk.Now().Sub(start); el >= 3*time.Minute {
+			t.Fatalf("the wait took %v, want the degraded grace", el)
+		}
 	})
 }
 
