@@ -714,10 +714,13 @@ A set that breaks the repo server, the token client or the store proxy can end `
 Nothing then reads the restored tag, so the rollback cannot finish.
 `harness:status` names `mise run bundle -- repair --target <target>`.
 
-The repair trusts only what it verifies:
+The repair verifies the signature of the root:
 
 - The root of `good[0]` is the bootstrap root that `build/<target>/root.json` names, or a root that `cosign` verifies offline against the current key of `mgmtd`.
 - The digests of `argocd` and `cell-system` come from the root layer, and the signed statement names the same digests.
+
+A signature proves that `mgmtd` signed the set, and not that the set was good.
+When the policy check of the repair is in place, it runs the bundle policy on the two bundles first. It refuses on any deny.
 
 Then the repair restores the verified root under `current` through a port-forward to the loopback registry of the store pod.
 It pins the Applications `cell-system` and `argocd` at the good digests.
