@@ -428,8 +428,8 @@ func fetchRefusal(name string, err error) *Refusal {
 	return nil
 }
 
-// prepare composes the root, reads and checks every component that the state has not checked, and
-// compares the root with the signed subject. It writes nothing. It returns a refusal as an Outcome.
+// prepare composes the root and compares it with the signed subject, then reads and checks every
+// component that the state has not checked. It writes nothing. It returns a refusal as an Outcome.
 func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 	cfg := a.cfg
 	root, err := bundle.ComposeRoot(cfg.Role, r.set, cfg.Policy)
@@ -441,6 +441,9 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 		return refused(op.ReasonPayloadInvalid, "statement"), nil
 	}
 	r.root = root
+	if root.Digest != r.st.RootDigest() {
+		return refused(op.ReasonDigestMismatch, "root"), nil
+	}
 
 	checked := make(map[string]bool, len(r.snap.Checked))
 	for _, d := range r.snap.Checked {
@@ -455,13 +458,7 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 	cctx, end := a.tel.step(ctx, spanCheck)
 	out, err = a.check(cctx, r)
 	end(err)
-	if err != nil || out != (Outcome{}) {
-		return out, err
-	}
-	if root.Digest != r.st.RootDigest() {
-		return refused(op.ReasonDigestMismatch, "root"), nil
-	}
-	return Outcome{}, nil
+	return out, err
 }
 
 func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (Outcome, error) {

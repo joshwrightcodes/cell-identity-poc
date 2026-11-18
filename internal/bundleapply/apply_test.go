@@ -688,6 +688,9 @@ func TestApplyRootSubjectMismatch(t *testing.T) {
 	b := e.build(tTarget, bundle.Version{Epoch: 1, Counter: 1}, std("v1"))
 	b.att = e.sign(b, tEnv, tTarget, "sha256:"+strings.Repeat("a", 64), e.priv)
 	wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonDigestMismatch, "root")
+	if r := e.mirrorReg.Requests(); len(r) != 0 {
+		t.Fatalf("the mirror was read before the root compare: %d requests", len(r))
+	}
 	if e.tagWrites() != 0 || e.currentRoot() != e.boot.root.Digest {
 		t.Fatal("the root tag moved")
 	}
