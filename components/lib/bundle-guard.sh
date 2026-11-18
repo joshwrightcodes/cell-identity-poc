@@ -41,7 +41,7 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
   | s("argocd.argoproj.io/tracking-id") as $track
   | {name: "argocd-controller", expression: "request.userInfo.username == \(s("system:serviceaccount:argocd:argocd-application-controller"))"} as $ctl
   | policy("bundles-spare-harness";
-      {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE", "DELETE"], resources: ["*", "*/*"], scope: "*"};
+      {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE", "DELETE"], resources: ["*/*"], scope: "*"};
       [$ctl];
       [{expression: "!(request.namespace in \($r.harnessNamespaces | celist))", message: "Argo CD may not change an object in a harness namespace"},
        {expression: "oldObject == null || !has(oldObject.metadata.labels) || !(\($label) in oldObject.metadata.labels)", message: "Argo CD may not change or delete an object that carries the harness label"},
