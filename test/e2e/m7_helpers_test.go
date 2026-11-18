@@ -229,15 +229,34 @@ func startImpostor(t *testing.T, cluster, ns string, chainPEM, keyPEM []byte) (a
 	return addr, closed
 }
 
-// requireImpostorSilent waits until the impostor has logged at least one ended connection, and then fails the test for every connection
-// that carried a byte after the handshake. A client that refuses the certificate sends no byte.
-func requireImpostorSilent(t *testing.T, what string, closed func() []int64) {
+// settledConns waits until the impostor has logged at least want ended connections, and then until two reads 2 s apart return the same
+// list. The client has ended before the call, so no connection stays open and the list stops growing. A deadline bounds both waits.
+func settledConns(t *testing.T, what string, closed func() []int64, want int) []int64 {
 	t.Helper()
 	var got []int64
-	waitFor(t, "the impostor of "+what+" logs an ended connection", time.Minute, func() (bool, string) {
+	waitFor(t, fmt.Sprintf("the impostor of %s logs %d ended connections", what, want), time.Minute, func() (bool, string) {
 		got = closed()
-		return len(got) > 0, "no connection logged yet"
+		return len(got) >= want, fmt.Sprintf("%d connections logged", len(got))
 	})
+	deadline := time.Now().Add(time.Minute)
+	for {
+		time.Sleep(2 * time.Second)
+		next := closed()
+		if len(next) == len(got) {
+			return next
+		}
+		got = next
+		if time.Now().After(deadline) {
+			t.Fatalf("the impostor of %s keeps logging new connections: %v", what, got)
+		}
+	}
+}
+
+// requireImpostorSilent waits for at least want ended connections on the impostor, lets the list settle, and then fails the test for
+// every connection that carried a byte after the handshake. A client that refuses the certificate sends no byte.
+func requireImpostorSilent(t *testing.T, what string, closed func() []int64, want int) {
+	t.Helper()
+	got := settledConns(t, what, closed, want)
 	for i, n := range got {
 		if n != 0 {
 			t.Errorf("%s: connection %d of the impostor carried %d bytes after the handshake, want 0", what, i, n)
@@ -253,6 +272,8 @@ type flipConn struct {
 	BytesDown int64
 	Flipped   bool
 	MaxRunUp  int64
+	// TLS is true when the upstream half holds only TLS records.
+	TLS bool
 }
 
 // startFlipForward runs netprobe flipforward in namespace ns of a cluster, between a local port-forward and upstream. It flips the byte
@@ -278,7 +299,8 @@ func startFlipForward(t *testing.T, cluster, ns, upstream string, flipAt int64, 
 		for _, l := range matching(logs, func(l logLine) bool { return l.str("msg") == "connection closed" }) {
 			num := func(k string) int64 { n, _ := l[k].(float64); return int64(n) }
 			flipped, _ := l["flipped"].(bool)
-			out = append(out, flipConn{ID: num("conn"), BytesUp: num("bytes_up"), BytesDown: num("bytes_down"), Flipped: flipped, MaxRunUp: num("max_printable_run_up")})
+			isTLS, _ := l["tls"].(bool)
+			out = append(out, flipConn{ID: num("conn"), BytesUp: num("bytes_up"), BytesDown: num("bytes_down"), Flipped: flipped, MaxRunUp: num("max_printable_run_up"), TLS: isTLS})
 		}
 		return out
 	}

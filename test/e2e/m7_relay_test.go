@@ -58,8 +58,8 @@ func TestM7RelayForwardsCiphertextOnly(t *testing.T) {
 	}
 	got := waitConns(t, "the request with no flip", conns, 1)
 	c := got[0]
-	if c.Flipped || c.BytesUp == 0 || c.BytesDown == 0 {
-		t.Errorf("connection %+v, want no flip and bytes in both directions", c)
+	if c.Flipped || !c.TLS || c.BytesUp == 0 || c.BytesDown == 0 {
+		t.Errorf("connection %+v, want no flip, TLS records only, and bytes in both directions", c)
 	}
 	if c.MaxRunUp >= printableRunLimit {
 		t.Errorf("the upstream half holds a printable run of %d bytes, want fewer than %d", c.MaxRunUp, printableRunLimit)
@@ -67,10 +67,29 @@ func TestM7RelayForwardsCiphertextOnly(t *testing.T) {
 	t.Logf("flipforward relayed %d bytes up and %d bytes down, longest printable run %d", c.BytesUp, c.BytesDown, c.MaxRunUp)
 }
 
+// relayControl sends one clean request through a forwarder that flips nothing, in the namespace of the flip test, and requires that it
+// succeeds and that the principal accepts exactly one connection of the identity of the test. A flip test that failed because the relay
+// or the principal was down would pass its own checks, so the control comes first.
+func relayControl(t *testing.T, ns string) {
+	t.Helper()
+	addr, conns := startFlipForward(t, relayCell, ns, relayUpstream(t), -1, "up")
+	since := time.Now().Add(-2 * time.Second)
+	if err := viewDial(t, addr, relayIdentityCell, relayClientCert(t), streamProof(t, relayIdentityCell, "argocd-agent")); err != nil {
+		t.Fatalf("the control request through flipforward with no flip failed, so a flip test would prove nothing: %v", err)
+	}
+	waitConns(t, "the control request", conns, 1)
+	waitFor(t, "the principal accepts the control connection", time.Minute, func() (bool, string) {
+		n := principalAccepted(t, since)
+		return n == 1, fmt.Sprintf("%d accepted connections", n)
+	})
+}
+
 // TestM7RelayAlteredHandshakeFails flips one byte of the ClientHello (offset 100, upstream). The client handshake fails, and the
-// principal logs no accepted peer for the identity of the test.
+// principal logs no accepted peer for the identity of the test. The client reason is handshake_failed, and the server answered, so the
+// failure comes from the altered bytes and not from a relay that was down. A clean control request goes first.
 func TestM7RelayAlteredHandshakeFails(t *testing.T) {
 	ns := m7Namespace(t, relayCell, false)
+	relayControl(t, ns)
 	addr, conns := startFlipForward(t, relayCell, ns, relayUpstream(t), 100, "up")
 	cert, proofToken := relayClientCert(t), streamProof(t, relayIdentityCell, "argocd-agent")
 	since := time.Now().Add(-2 * time.Second)
@@ -78,9 +97,11 @@ func TestM7RelayAlteredHandshakeFails(t *testing.T) {
 	if err == nil {
 		t.Fatal("the client finished a request through flipforward with a flipped byte in its ClientHello")
 	}
-	t.Logf("the client failed with reason %q: %v", cellproxy.TLSReason(err), err)
-	if c := waitConns(t, "the altered handshake", conns, 1)[0]; !c.Flipped {
-		t.Errorf("flipforward did not flip a byte in %+v", c)
+	if reason := cellproxy.TLSReason(err); reason != cellproxy.HandshakeFailed {
+		t.Errorf("the client failed with reason %q: %v, want %s", reason, err, cellproxy.HandshakeFailed)
+	}
+	if c := waitConns(t, "the altered handshake", conns, 1)[0]; !c.Flipped || c.BytesDown == 0 {
+		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
 	if n := principalAccepted(t, since); n != 0 {
 		t.Errorf("the principal accepted %d connections of %s after the flip, want 0", n, relayIdentityCell)
@@ -117,6 +138,7 @@ func handshakeUpBytes(t *testing.T, cell string, ns, upstream string) int64 {
 // no accepted peer for the identity of the test, so its backend receives no request from the connection.
 func TestM7RelayAlteredRecordFails(t *testing.T) {
 	ns := m7Namespace(t, relayCell, false)
+	relayControl(t, ns)
 	hs := handshakeUpBytes(t, relayCell, ns, relayUpstream(t))
 	flipAt := hs + 20
 	t.Logf("the handshake sends %d bytes upstream, so the flip is at offset %d", hs, flipAt)
@@ -129,8 +151,8 @@ func TestM7RelayAlteredRecordFails(t *testing.T) {
 	}
 	t.Logf("the client failed: %v", err)
 	c := waitConns(t, "the altered record", conns, 1)[0]
-	if !c.Flipped {
-		t.Errorf("flipforward did not flip a byte in %+v", c)
+	if !c.Flipped || c.BytesDown == 0 {
+		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
 	t.Logf("flipforward relayed %d bytes up and %d bytes down before the connection closed", c.BytesUp, c.BytesDown)
 	if n := principalAccepted(t, since); n != 0 {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -50,13 +51,19 @@ func m7Cases(t *testing.T, h m7Hop) []m7Case {
 	return cases
 }
 
+// canaryBytes is the number of bytes that tlsdial --canary writes after a passed handshake.
+const canaryBytes = 32
+
 // m7Intercept runs one subtest for each certificate of a hop. run starts the client against the impostor address in the namespace, and
-// returns what the client printed and whether it ended in failure. check reads that output. The test then waits for the impostor log
-// and requires 0 bytes after the handshake on every connection.
-func m7Intercept(t *testing.T, h m7Hop, run func(t *testing.T, ns, addr string, c m7Case) string, check func(t *testing.T, out string, c m7Case)) {
+// returns what the client printed. check reads that output. The test then waits for wantConns ended connections on the impostor and
+// requires 0 bytes after the handshake on every one. A hop with a control also runs it as a last subtest, against the self-made
+// impostor: a client that does not verify the server writes its canary, so the check of the other subtests can fail.
+func m7Intercept(t *testing.T, h m7Hop, wantConns int, run func(t *testing.T, ns, addr string, c m7Case) string, check func(t *testing.T, out string, c m7Case),
+	control func(t *testing.T, ns, addr string) string) {
 	t.Helper()
 	needProbeImage(t)
-	for _, c := range m7Cases(t, h) {
+	cases := m7Cases(t, h)
+	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			ns := m7Namespace(t, h.cluster, false)
 			copyConfigMap(t, h.cluster, h.bundleNS, h.bundleCM, h.cluster, ns)
@@ -64,9 +71,49 @@ func m7Intercept(t *testing.T, h m7Hop, run func(t *testing.T, ns, addr string, 
 			out := run(t, ns, addr, c)
 			t.Logf("%s %s: the client printed %q", h.name, c.name, out)
 			check(t, out, c)
-			requireImpostorSilent(t, h.name+" "+c.name, closed)
+			requireImpostorSilent(t, h.name+" "+c.name, closed, wantConns)
 		})
 	}
+	if control == nil {
+		return
+	}
+	t.Run("control_no_verify_writes_the_canary", func(t *testing.T) {
+		ns := m7Namespace(t, h.cluster, false)
+		copyConfigMap(t, h.cluster, h.bundleNS, h.bundleCM, h.cluster, ns)
+		addr, closed := startImpostor(t, h.cluster, ns, cases[0].chain, cases[0].key)
+		out := control(t, ns, addr)
+		var res map[string]any
+		if json.Unmarshal([]byte(lastOutputLine(out)), &res) != nil || res["handshake"] != "ok" || res["canary_sent"] != true {
+			t.Fatalf("the control client printed %q, want a passed handshake and the canary sent", out)
+		}
+		if got := settledConns(t, h.name+" control", closed, 1); !slices.Contains(got, int64(canaryBytes)) {
+			t.Errorf("%s: the impostor counted %v bytes after the handshake, want %d from the canary, so a leak would be seen", h.name, got, canaryBytes)
+		}
+	})
+}
+
+// tlsdialHop returns the run, check and control functions of a hop whose client is netprobe tlsdial with --canary. A non-nil
+// clientCert (a PEM chain and key) goes to the client on standard input.
+func tlsdialHop(t *testing.T, h m7Hop, clientCert []byte) (run func(t *testing.T, ns, addr string, c m7Case) string, control func(t *testing.T, ns, addr string) string) {
+	t.Helper()
+	vol, mount := configMapMount(h.bundleCM)
+	client := func(t *testing.T, ns, addr string, verify bool) string {
+		args := []string{"tlsdial", "--addr", addr, "--canary"}
+		if verify {
+			args = append(args, "--expect-id", h.expect, "--bundle", h.bundlePath())
+		} else {
+			args = append(args, "--no-verify")
+		}
+		var stdin []byte
+		if clientCert != nil {
+			args = append(args, "--client-cert-stdin")
+			stdin = clientCert
+		}
+		_, logs := runM7Client(t, h.cluster, ns, probeImage, args, []map[string]any{vol}, []map[string]any{mount}, stdin)
+		return logs
+	}
+	return func(t *testing.T, ns, addr string, _ m7Case) string { return client(t, ns, addr, true) },
+		func(t *testing.T, ns, addr string) string { return client(t, ns, addr, false) }
 }
 
 const (
@@ -95,7 +142,7 @@ func TestM7InterceptCelldBind(t *testing.T) {
 	needAttestprobeImage(t)
 	h := hopWith(devCellTrust, "hop A celld bind", gatewayID)
 	vol, mount := configMapMount(trustBundleMap)
-	m7Intercept(t, h, func(t *testing.T, ns, addr string, c m7Case) string {
+	m7Intercept(t, h, 1, func(t *testing.T, ns, addr string, c m7Case) string {
 		phase, logs := runM7Client(t, h.cluster, ns, attestprobeImage, []string{"--target", "gw-bind", "--upstream", addr, "--expect-id", h.expect,
 			"--trust-bundle", h.bundlePath(), "--cell", celldCell, "--nonce-only", "--timeout", "30s"},
 			[]map[string]any{vol}, []map[string]any{mount}, nil)
@@ -107,7 +154,7 @@ func TestM7InterceptCelldBind(t *testing.T) {
 		if !strings.Contains(out, c.reason+":") || strings.Contains(out, "nonce:") {
 			t.Errorf("the bind client printed %q, want the error text to name %s and no nonce", out, c.reason)
 		}
-	})
+	}, nil)
 }
 
 // TestM7InterceptCelldStream (hop B) dials an impostor gateway as the stream client of celld does: mutual TLS with an SVID of
@@ -116,13 +163,9 @@ func TestM7InterceptCelldBind(t *testing.T) {
 // cellproxy.ClientTLS. The impostor never asks for the client certificate, so the SVID of celld stays with the client.
 func TestM7InterceptCelldStream(t *testing.T) {
 	h := hopWith(devCellTrust, "hop B celld stream", gatewayID)
-	vol, mount := configMapMount(trustBundleMap)
 	clientChain, clientKey := mintSVID(t, envCluster, "spiffe://"+envTrustDomain+"/cell/"+celldCell+"/celld", 10*time.Minute)
-	m7Intercept(t, h, func(t *testing.T, ns, addr string, c m7Case) string {
-		_, logs := runM7Client(t, h.cluster, ns, probeImage, []string{"tlsdial", "--addr", addr, "--expect-id", h.expect, "--bundle", h.bundlePath(),
-			"--client-cert-stdin"}, []map[string]any{vol}, []map[string]any{mount}, append(append([]byte{}, clientChain...), clientKey...))
-		return logs
-	}, checkTLSDialRefused)
+	run, control := tlsdialHop(t, h, append(append([]byte{}, clientChain...), clientKey...))
+	m7Intercept(t, h, 1, run, checkTLSDialRefused, control)
 }
 
 // checkTLSDialRefused requires the tlsdial result of a failed handshake with the reason of the case.
@@ -132,7 +175,7 @@ func checkTLSDialRefused(t *testing.T, out string, c m7Case) {
 	if json.Unmarshal([]byte(lastOutputLine(out)), &res) != nil {
 		t.Fatalf("tlsdial printed %q, want one JSON line", out)
 	}
-	if res["handshake"] != "failed" || res["reason"] != c.reason || res["verified"] == true {
+	if res["handshake"] != "failed" || res["reason"] != c.reason || res["verified"] == true || res["canary_sent"] == true {
 		t.Errorf("tlsdial gave %v, want a failed handshake with the reason %s", res, c.reason)
 	}
 }
@@ -149,7 +192,7 @@ func TestM7InterceptSpireSidecar(t *testing.T) {
 	needAttestprobeImage(t)
 	h := hopWith(devCellTrust, "hop C spire sidecar", spireServerID)
 	vol, mount := configMapMount(trustBundleMap)
-	m7Intercept(t, h, func(t *testing.T, ns, addr string, c m7Case) string {
+	m7Intercept(t, h, 1, func(t *testing.T, ns, addr string, c m7Case) string {
 		secretName := tokenSecret(t, h.cluster, ns, "m7-canary-token-not-a-credential")
 		tvol := map[string]any{"name": "token", "secret": map[string]any{"secretName": secretName}}
 		tmount := map[string]any{"name": "token", "mountPath": "/run/attestprobe", "readOnly": true}
@@ -168,7 +211,7 @@ func TestM7InterceptSpireSidecar(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("the SPIRE client printed %q, want %q for %s", out, want, c.reason)
 		}
-	})
+	}, nil)
 }
 
 // proxyHop describes the three hops that cell-proxy serves and the hop of envd.
@@ -187,42 +230,25 @@ func proxyHops(cell string) []m7Hop {
 }
 
 // TestM7InterceptCellProxyHops (hops D, E, F and G) points the client of each hop at an impostor with the production management root
-// and the exact server ID. (a) and (c) give peer_untrusted, and (b) an SVID of management with another ID gives peer_not_allowed. The
-// clients of D, E and F are cell-proxy probe, which builds ProbeTLS, the checks of cell-proxy spiffe-client and tunnel without the
-// client certificate; those two modes get their SVID from the workload API, which an m7 namespace has not. Hop G is netprobe tlsdial with
-// the root of envd, because envd gets its SVID from the workload API too.
+// and the exact server ID. (a) and (c) give peer_untrusted, and (b) an SVID of management with another ID gives peer_not_allowed.
+// The clients are netprobe tlsdial with --canary. The real clients (cell-proxy spiffe-client and tunnel, and envd) get their SVID from
+// the workload API, which an m7 namespace has not. tlsdial builds the same checks with cellproxy.ProbeTLS, from the same trust file and
+// ID, and it writes 32 bytes after a passed handshake, as the real clients write a preface or a proof. A client that verifies its peer
+// sends nothing to an impostor. The control shows that tlsdial --no-verify does send them.
 func TestM7InterceptCellProxyHops(t *testing.T) {
-	if cellProxyImage == "" {
-		t.Fatal("build/images.env has no IMAGE_CELL_PROXY. Run mise run images")
-	}
 	for _, h := range proxyHops(celldCell) {
 		t.Run(strings.ReplaceAll(h.name, " ", "_"), func(t *testing.T) {
-			vol, mount := configMapMount(h.bundleCM)
-			vols, mounts := []map[string]any{vol}, []map[string]any{mount}
-			if h.cluster == envCluster {
-				m7Intercept(t, h, func(t *testing.T, ns, addr string, c m7Case) string {
-					_, logs := runM7Client(t, h.cluster, ns, probeImage, []string{"tlsdial", "--addr", addr, "--expect-id", h.expect, "--bundle", h.bundlePath()}, vols, mounts, nil)
-					return logs
-				}, checkTLSDialRefused)
-				return
-			}
-			m7Intercept(t, h, func(t *testing.T, ns, addr string, c m7Case) string {
-				_, logs := runM7Client(t, h.cluster, ns, cellProxyImage, []string{"probe", "--upstream", addr, "--expect-id", h.expect,
-					"--peer-bundle", h.bundlePath(), "--peer-trust-domain", mgmtTD}, vols, mounts, nil)
-				return logs
-			}, func(t *testing.T, out string, c m7Case) {
-				var res map[string]any
-				if json.Unmarshal([]byte(lastOutputLine(out)), &res) != nil || res["reason"] != c.reason || res["verified"] == true {
-					t.Errorf("cell-proxy probe printed %q, want the reason %s", out, c.reason)
-				}
-			})
+			run, control := tlsdialHop(t, h, nil)
+			m7Intercept(t, h, 1, run, checkTLSDialRefused, control)
 		})
 	}
 }
 
 // hostsvcSource is one client of the host service in TestM7RogueHandshakeToHostService.
 type hostsvcSource struct {
-	name       string
+	name string
+	// errText is the text that the "handshake refused" line of the host service holds for this source.
+	errText    string
 	chain, key []byte
 }
 
@@ -243,11 +269,12 @@ func readHostLog(t *testing.T) []map[string]any {
 	return out
 }
 
-// hostRefusalAfter returns the time of the first "handshake refused" line of the host service after since, or the zero time.
-func hostRefusalAfter(t *testing.T, since time.Time) time.Time {
+// hostRefusalAfter returns the time of the first "handshake refused" line of the host service after since whose error holds errText,
+// or the zero time. The text ties the line to its source.
+func hostRefusalAfter(t *testing.T, since time.Time, errText string) time.Time {
 	t.Helper()
 	for _, rec := range readHostLog(t) {
-		if rec["msg"] != "handshake refused" || rec["reason"] != "handshake_failed" {
+		if rec["msg"] != "handshake refused" || rec["reason"] != "handshake_failed" || !strings.Contains(fmt.Sprint(rec["error"]), errText) {
 			continue
 		}
 		if at, err := time.Parse(time.RFC3339Nano, fmt.Sprint(rec["time"])); err == nil && at.After(since) {
@@ -280,19 +307,21 @@ func TestM7RogueHandshakeToHostService(t *testing.T) {
 	}
 
 	chain, key := mintSVID(t, mgmtCluster, mgmtAPIID, 10*time.Minute)
-	control := dial(&hostsvcSource{"control", chain, key})
+	control := dial(&hostsvcSource{name: "control", chain: chain, key: key})
 	if control["handshake"] != "ok" || strings.HasPrefix(fmt.Sprint(control["after"]), "alert:") {
 		t.Fatalf("the control with a real SVID of mgmtd gave %v, want a passed handshake, so the refusals below prove nothing otherwise", control)
 	}
 
 	selfChain, selfKey := selfMadeChain(t, mgmtAPIID)
 	devChain, devKey := mintSVID(t, envCluster, "spiffe://"+envTrustDomain+"/cp/otel", 10*time.Minute)
-	sources := []*hostsvcSource{nil, {"self_made_with_mgmtd_id", selfChain, selfKey}, {"dev_cp_cp_otel", devChain, devKey}}
+	sources := []*hostsvcSource{nil,
+		{name: "self_made_with_mgmtd_id", errText: "could not verify leaf certificate", chain: selfChain, key: selfKey},
+		{name: "dev_cp_cp_otel", errText: "unexpected ID", chain: devChain, key: devKey}}
 	var last time.Time
 	for _, src := range sources {
-		name := "no_certificate"
+		name, errText := "no_certificate", "client didn't provide a certificate"
 		if src != nil {
-			name = src.name
+			name, errText = src.name, src.errText
 		}
 		waitFor(t, "a new log window of the host service before "+name, time.Minute, func() (bool, string) {
 			return last.IsZero() || time.Since(last) > 11*time.Second, "waiting for the 10 s window to end"
@@ -303,7 +332,7 @@ func TestM7RogueHandshakeToHostService(t *testing.T) {
 			t.Errorf("%s: tlsdial gave %v, want a TLS alert from the server", name, res)
 		}
 		waitFor(t, "a handshake refused line of the host service for "+name, time.Minute, func() (bool, string) {
-			last = hostRefusalAfter(t, start)
+			last = hostRefusalAfter(t, start, errText)
 			return !last.IsZero(), "no line after " + start.Format(time.RFC3339Nano)
 		})
 	}
