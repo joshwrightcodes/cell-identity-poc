@@ -1308,9 +1308,9 @@ M7 measured values come from the live part of M7. Each value below is a marker u
 
 | Value | Result |
 | --- | --- |
-| `gate:m7`, two runs | <measured in the live part> |
-| `GATE_M7_BUDGET_MINUTES` | <set in the live part>, 1.5 times the slower run, rounded up to 5 minutes |
-| Longest policy window of a new pod in `dev-cell-1` | <measured in the live part> |
+| `gate:m7`, two runs | 731 seconds and 737 seconds (2026-11-18), both pass, 13 tests. The slowest test is `TestM7InterceptCellProxyHops`, about 5.4 minutes |
+| `GATE_M7_BUDGET_MINUTES` | 20 minutes, 1.5 times the slower run, rounded up to 5 minutes. The go test timeout is 40 minutes |
+| Longest policy window of a new pod in `dev-cell-1` | 807 ms to 1.1.1.1:443 and 801 ms to the SPIRE node port of `dev-cp` (2026-11-18, four runs) |
 
 ## Malicious cell tests
 

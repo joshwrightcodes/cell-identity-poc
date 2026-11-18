@@ -150,8 +150,8 @@ func TestGateM7PatternAndTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(calls, "-run ^TestM7\n") || !strings.Contains(calls, "-timeout 90m ") {
-		t.Errorf("the go test call lacks the pattern ^TestM7 at its end or the timeout of 90 minutes: %s", calls)
+	if !strings.Contains(calls, "-run ^TestM7\n") || !strings.Contains(calls, "-timeout 40m ") {
+		t.Errorf("the go test call lacks the pattern ^TestM7 at its end or the timeout of 40 minutes: %s", calls)
 	}
 }
 
