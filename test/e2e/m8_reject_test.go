@@ -261,18 +261,21 @@ func signRefused(t *testing.T, target string, comps []bundle.Component) (string,
 func TestM8AppProjectRefusesKind(t *testing.T) {
 	const cell = "dev-cell-1"
 	_, store := m8ForwardStore(t, cell)
-	name := "m8-probe-" + randomHex(t, 4)
+	name, run := "m8-probe-"+randomHex(t, 4), randomHex(t, 8)
 	manifests := fmt.Sprintf(`apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: %s
   namespace: apps-demo
+  annotations:
+    cell.poc.internal/e2e-run: %q
   labels:
     cell.poc.internal/e2e: "true"
 spec:
   podSelector: {}
   policyTypes: ["Ingress"]
-`, name)
+`, name, run)
+	m8DeleteIfRun(t, cell, "apps-demo", "networkpolicy", name, run)
 	digest := m8PushTo(t, store, "bundles/m8-project-probe", []byte(manifests))
 	m8CreateApplication(t, cell, "m8-project-probe", "cell-app", "m8-project-probe", digest, "apps-demo")
 	m8WaitApplicationText(t, cell, "m8-project-probe", "not permitted in project", 2*time.Minute)
@@ -289,12 +292,14 @@ spec:
 func TestM8AppLimitsPolicy(t *testing.T) {
 	const cell = "dev-cell-1"
 	_, store := m8ForwardStore(t, cell)
-	name := "m8-nodeport-" + randomHex(t, 4)
+	name, run := "m8-nodeport-"+randomHex(t, 4), randomHex(t, 8)
 	manifests := fmt.Sprintf(`apiVersion: v1
 kind: Service
 metadata:
   name: %s
   namespace: apps-demo
+  annotations:
+    cell.poc.internal/e2e-run: %q
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -303,7 +308,8 @@ spec:
     app: %s
   ports:
     - port: 80
-`, name, name)
+`, name, run, name)
+	m8DeleteIfRun(t, cell, "apps-demo", "service", name, run)
 	digest := m8PushTo(t, store, "bundles/m8-app-limits", []byte(manifests))
 	m8CreateApplication(t, cell, "apps-sample", "cell-app", "m8-app-limits", digest, "apps-demo")
 	m8WaitApplicationText(t, cell, "apps-sample", "bundles-app-limits", 3*time.Minute)

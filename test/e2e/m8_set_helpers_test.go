@@ -177,9 +177,28 @@ func m8WaitNoOpen(t *testing.T, target string) {
 // a probe bundle and leaves its objects.
 func m8DeleteProbeObjects(t *testing.T, cluster string) {
 	t.Helper()
-	if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "configmap,deployment,service", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
+	if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "configmap,deployment,service,networkpolicy", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
 		t.Errorf("delete the probe objects of apps-demo in %s: %v", cluster, err)
 	}
+}
+
+// m8DeleteIfRun deletes a namespaced probe object when the test ends, and only when it carries the annotation e2e-run with this run's
+// value. A harness object, or a probe of another run, is never deleted.
+func m8DeleteIfRun(t *testing.T, cluster, ns, kind, name, run string) {
+	t.Helper()
+	t.Cleanup(func() {
+		got, err := kubectl(t, cluster, "", "-n", ns, "get", kind, name, "--ignore-not-found", "-o", `jsonpath={.metadata.annotations.cell\.poc\.internal/e2e-run}`)
+		if err != nil {
+			t.Errorf("read the probe %s/%s of %s: %v", kind, name, cluster, err)
+			return
+		}
+		if strings.TrimSpace(got) != run {
+			return
+		}
+		if _, err := kubectl(t, cluster, "", "-n", ns, "delete", kind, name, "--ignore-not-found"); err != nil {
+			t.Errorf("delete the probe %s/%s of %s: %v", kind, name, cluster, err)
+		}
+	})
 }
 
 // m8RestoreOnFailure records the target, and publishes its hydrated set again when the test, or one of its subtests, failed. A
