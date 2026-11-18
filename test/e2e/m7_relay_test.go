@@ -47,6 +47,23 @@ func principalAccepted(t *testing.T, since time.Time) int {
 	return len(matching(logs, func(l logLine) bool { return l.str("msg") == "peer accepted" && l.str("spiffe_id") == id }))
 }
 
+// requireNoPrincipalAccept fails the test as soon as the principal logs a "peer accepted" line for the identity of the test since a
+// time. It reads the log for 15 seconds, because the principal can log the line after the client has seen the connection end.
+func requireNoPrincipalAccept(t *testing.T, since time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		if n := principalAccepted(t, since); n != 0 {
+			t.Errorf("the principal accepted %d connections of %s after the flip, want 0", n, relayIdentityCell)
+			return
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
+
 // TestM7RelayForwardsCiphertextOnly sends one mutual TLS connection with the SVID and the proof of a cell through flipforward, which
 // flips nothing, to the relay of dev-cp. The principal answers the HTTP/2 preface. The upstream half of the connection holds no run of
 // 16 printable bytes in its application data records, so the proof token and the request travel as ciphertext.
@@ -103,9 +120,7 @@ func TestM7RelayAlteredHandshakeFails(t *testing.T) {
 	if c := waitConns(t, "the altered handshake", conns, 1)[0]; !c.Flipped || c.BytesDown == 0 {
 		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
-	if n := principalAccepted(t, since); n != 0 {
-		t.Errorf("the principal accepted %d connections of %s after the flip, want 0", n, relayIdentityCell)
-	}
+	requireNoPrincipalAccept(t, since)
 }
 
 // handshakeUpBytes returns how many bytes the client sends upstream before its first application byte, from a connection that ends
@@ -155,7 +170,5 @@ func TestM7RelayAlteredRecordFails(t *testing.T) {
 		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
 	t.Logf("flipforward relayed %d bytes up and %d bytes down before the connection closed", c.BytesUp, c.BytesDown)
-	if n := principalAccepted(t, since); n != 0 {
-		t.Errorf("the principal accepted %d connections of %s after the flip, want 0", n, relayIdentityCell)
-	}
+	requireNoPrincipalAccept(t, since)
 }

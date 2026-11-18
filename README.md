@@ -1315,11 +1315,11 @@ M7 measured values come from the live part of M7. Each value below is a marker u
 ## Malicious cell tests
 
 The M7 tests try to break each identity check of the PoC. A test points a client at an impostor server.
-For some hops the real client needs an SVID from its own pod, so a probe with the same TLS checks stands in.
+For some hops the real client needs an SVID from its own pod, so a probe with the same TLS checks replaces it.
 Another test puts a forwarder between a client and the real server, and changes one byte.
 Most tests check the reason code of the rejection. The scan tests check the set of open ports.
 A client that verifies its peer sends nothing to an impostor. Each impostor test counts the bytes after the handshake.
-A control shows that a probe that does not verify its peer sends 32 bytes.
+For the hops that use `tlsdial`, a control shows that a probe that does not verify its peer sends 32 bytes.
 
 Build the images, and then run the tests:
 

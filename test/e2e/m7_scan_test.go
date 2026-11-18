@@ -271,9 +271,20 @@ func TestM7PolicyWindow(t *testing.T) {
 		}
 		denied = denied || (strings.HasPrefix(l, "denied:") && strings.Contains(l, "subject_not_allowed"))
 		var rec map[string]any
-		failed = failed || (json.Unmarshal([]byte(l), &rec) == nil && rec["error"] != nil)
+		failed = failed || (json.Unmarshal([]byte(l), &rec) == nil && blockedDialError(fmt.Sprint(rec["error"])))
 	}
 	if !denied && !failed {
 		t.Errorf("the probe output %q holds neither a subject_not_allowed denial nor an error line, so it did not run to an outcome", logs)
 	}
+}
+
+// blockedDialError reports whether an error text is a dial that the network stopped: a timeout or a refused connection. Any other
+// error, such as a failed token request, means the probe did not reach the attestation step.
+func blockedDialError(s string) bool {
+	for _, k := range []string{"i/o timeout", "context deadline exceeded", "DeadlineExceeded", "connection refused", "Unavailable"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
 }
