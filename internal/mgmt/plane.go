@@ -64,9 +64,10 @@ type Config struct {
 	// func leaves both empty in the status.
 	SpecPushState func() (time.Time, string)
 
-	// Policy is the allow-list data that SignBundle checks a set against. The zero value takes
-	// bundle.DefaultPolicy.
-	Policy bundle.Policy
+	// bundlePolicy is a test seam for the allow-list data that SignBundle checks a set against. The
+	// zero value takes bundle.DefaultPolicy. No flag sets it: mgmtd must sign against the list that
+	// the appliers embed.
+	bundlePolicy bundle.Policy
 
 	NonceTTL, CheckEvery, KeyUpdateGap, KeyCacheTTL, NonceKeyEvery time.Duration
 	HistoryLen                                                     int

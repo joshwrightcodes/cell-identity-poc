@@ -44,13 +44,13 @@ type Status struct {
 	EpochChangedAt time.Time              `json:"epochChangedAt,omitzero"`
 	StagedKey      string                 `json:"stagedKey,omitempty"`
 
-	// HostSpecPushedAt and HostSpecPushError describe the last spec push to the host service, from
-	// Config.SpecPushState.
-	// PlaneBundle is the last signed set of the control plane, and PlaneBundleStatus the bundle state
+	// PlaneBundle is the last served set of the control plane, and PlaneBundleStatus the bundle state
 	// that envd reported for it.
 	PlaneBundle       *mgmtapi.TargetBundle `json:"planeBundle,omitempty"`
 	PlaneBundleStatus *op.BundleStatus      `json:"planeBundleStatus,omitempty"`
 
+	// HostSpecPushedAt and HostSpecPushError describe the last spec push to the host service, from
+	// Config.SpecPushState.
 	HostSpecPushedAt  time.Time `json:"hostSpecPushedAt,omitzero"`
 	HostSpecPushError string    `json:"hostSpecPushError,omitempty"`
 }
@@ -284,9 +284,8 @@ func (p *Plane) Status() Status {
 		Gateway:            rep.gateway, GatewayAt: rep.gatewayAt, DroppedAt: rep.droppedAt, EpochChangedAt: rep.epochChangedAt,
 		StagedKey: st.StagedKeySHA256,
 	}
-	if b := st.Bundles[p.cfg.Intent.ControlPlaneName()]; b != nil {
-		last := b.Last
-		s.PlaneBundle = &last
+	if tb, ok := st.Bundles[p.cfg.Intent.ControlPlaneName()].shown(); ok {
+		s.PlaneBundle = &tb
 	}
 	s.PlaneBundleStatus = rep.planeBundle
 	if p.cfg.SpecPushState != nil {

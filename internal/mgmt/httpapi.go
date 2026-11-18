@@ -287,6 +287,7 @@ func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) 
 	mux.HandleFunc("POST /ops/{id}/close", h.closeOp)
 	mux.HandleFunc("POST /bundles", h.bundleSign)
 	mux.HandleFunc("GET /bundles", h.bundleGet)
+	mux.HandleFunc("GET /bundles/cosign", h.bundleCosign)
 	mux.HandleFunc("POST /portal/request", h.portalRequest)
 	mux.HandleFunc("POST /portal/withdraw", h.portalWithdraw)
 	mux.HandleFunc("POST /portal/recreate", h.portalRecreate)
@@ -316,6 +317,9 @@ func adminError(w http.ResponseWriter, err error) {
 	case errors.Is(err, ErrBundleUnknown):
 		out["reason"] = ErrBundleUnknown.Error()
 		status = http.StatusNotFound
+	case errors.Is(err, ErrBundleRetired):
+		out["reason"] = ErrBundleRetired.Error()
+		status = http.StatusConflict
 	case errors.Is(err, ErrOpNotExpired):
 		out["reason"] = ErrOpNotExpired.Error()
 		status = http.StatusConflict
@@ -348,7 +352,7 @@ func refusalStatus(status int, out map[string]any, err error) (int, map[string]a
 func badRequest(w http.ResponseWriter, msg string) {
 	out := map[string]any{"error": msg}
 	switch msg {
-	case "body_invalid", "body_too_large", "body_unreadable", "ttl_invalid":
+	case "body_invalid", "body_too_large", "body_unreadable", "ttl_invalid", "query_invalid":
 		out["reason"] = msg
 	}
 	writeJSON(w, http.StatusBadRequest, out)
@@ -632,6 +636,12 @@ func (h *adminHandler) bundleSign(w http.ResponseWriter, r *http.Request) {
 			bad = "body_invalid"
 		}
 	}
+	if bad == "" {
+		if _, err := bundle.ParseComponents(body); err != nil {
+			adminError(w, refuse(mgmtapi.ReasonPayloadInvalid, "set"))
+			return
+		}
+	}
 	if bad != "" {
 		badRequest(w, bad)
 		return
@@ -644,12 +654,44 @@ func (h *adminHandler) bundleSign(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// bundleTarget reads the query of a bundle read route: the key target once, and no other key. On a
+// refusal it has written the answer.
+func bundleTarget(w http.ResponseWriter, r *http.Request) (string, bool) {
+	q := r.URL.Query()
+	for k, v := range q {
+		if k != "target" || len(v) != 1 {
+			badRequest(w, "query_invalid")
+			return "", false
+		}
+	}
+	return q.Get("target"), true
+}
+
+// bundleCosign answers with the attestation and the cosign bundle that the plane holds now for the
+// query target.
+func (h *adminHandler) bundleCosign(w http.ResponseWriter, r *http.Request) {
+	target, ok := bundleTarget(w, r)
+	if !ok {
+		return
+	}
+	res, err := h.p.BundleCosign(target)
+	if err != nil {
+		adminError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
 // maxBundleBody is the most bytes of a component list that the admin socket takes.
 const maxBundleBody = 256 << 10
 
 // bundleGet answers with the last signed set of the query target.
 func (h *adminHandler) bundleGet(w http.ResponseWriter, r *http.Request) {
-	b, err := h.p.BundleView(r.URL.Query().Get("target"))
+	target, ok := bundleTarget(w, r)
+	if !ok {
+		return
+	}
+	b, err := h.p.BundleView(target)
 	if err != nil {
 		adminError(w, err)
 		return

@@ -840,3 +840,39 @@ func TestCtlBundleGet(t *testing.T) {
 		t.Fatalf("status %q", out)
 	}
 }
+
+func TestCtlBundleCosign(t *testing.T) {
+	ctl, plane := bundleCtl(t)
+	if code, out := ctl("", "bundle", "cosign", "--target", "dev-cell-1"); code != 1 || jsonLines(t, out)[0]["reason"] != "bundle_unknown" {
+		t.Fatalf("cosign before a set: exit %d output %q", code, out)
+	}
+	code, out := ctl(bundleComponents, "bundle", "sign", "--target", "dev-cell-1")
+	if code != 0 {
+		t.Fatalf("sign: %d %q", code, out)
+	}
+	signed := jsonLine(t, out)
+	if _, err := plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	code, out = ctl("", "bundle", "cosign", "--target", "dev-cell-1")
+	if code != 0 {
+		t.Fatalf("cosign: %d %q", code, out)
+	}
+	got := jsonLine(t, out)
+	if got["opId"] != signed["opId"] || got["rootDigest"] != signed["rootDigest"] || got["envelope"] == nil || got["sigstoreBundle"] == nil {
+		t.Fatalf("cosign %v, sign %v", got, signed)
+	}
+	oldBundle, _ := json.Marshal(signed["sigstoreBundle"])
+	newBundle, _ := json.Marshal(got["sigstoreBundle"])
+	if bytes.Equal(oldBundle, newBundle) {
+		t.Fatal("the cosign bundle did not change after the rotation")
+	}
+	for name, args := range map[string][]string{
+		"no target": {"bundle", "cosign"},
+		"ttl":       {"bundle", "cosign", "--target", "dev-cell-1", "--ttl", "5m"},
+	} {
+		if code, out := ctl("", args...); code != 2 {
+			t.Errorf("%s: exit %d output %q", name, code, out)
+		}
+	}
+}

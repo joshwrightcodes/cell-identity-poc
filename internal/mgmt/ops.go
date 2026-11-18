@@ -211,7 +211,9 @@ func (p *Plane) CloseOp(ctx context.Context, id string) error {
 	})
 }
 
-// resignOps signs every open operation again under the new key, with the same ID and expiry and
+// resignOps signs every open operation again under the new key, except a bundle.apply operation
+// that is not served: a new key signature over an old version would be input that an applier accepts
+// after its mark reset, with the same ID and expiry and
 // the key epoch of the new revision. The new digest joins Envelopes, so a result for either
 // envelope closes the operation. It runs after t.revise.
 func (t *txn) resignOps() error {
@@ -223,6 +225,9 @@ func (t *txn) resignOps() error {
 		cur, err := decodeOpUnverified(o.Envelope)
 		if err != nil {
 			return fmt.Errorf("operation %s: %w", id, err)
+		}
+		if cur.Kind == op.KindBundleApply && !o.Served {
+			continue
 		}
 		cur.KeyEpoch = t.rev.Epoch
 		if cur.Kind == op.KindBundleApply {

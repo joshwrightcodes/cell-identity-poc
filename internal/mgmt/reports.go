@@ -117,9 +117,8 @@ func (l *liveState) snapshot() map[string]cellRuntime {
 
 // fill adds the report fields of a cell to its status.
 func (cs *CellStatus) fill(live cellRuntime, st *State, now time.Time) {
-	if b := st.Bundles[cs.Name]; b != nil {
-		last := b.Last
-		cs.Bundle = &last
+	if tb, ok := st.Bundles[cs.Name].shown(); ok {
+		cs.Bundle = &tb
 	}
 	cs.BundleStatus = live.bundle
 	cs.LastStatusAt, cs.LastStatusPod = live.lastStatusAt, live.lastStatusPod
@@ -334,6 +333,10 @@ func decodeResult(it mgmtapi.ReportItem, claims clusterjwt.Claims) (op.Result, *
 		return bad("outcome")
 	case res.Pod != "" && res.Pod != claims.PodName:
 		return bad("pod")
+	case res.Reason != "" && !op.ValidDetail(res.Reason):
+		return bad("reason")
+	case res.Detail != "" && !op.ValidDetail(res.Detail):
+		return bad("detail")
 	}
 	return res, nil
 }

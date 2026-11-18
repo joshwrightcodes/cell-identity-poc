@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -101,8 +102,8 @@ func TestSignBundleVersionRises(t *testing.T) {
 	if res := r.signBundle(cell1, cellComps(), false); res.Version != (bundle.Version{Epoch: 2, Counter: 5}) {
 		t.Fatalf("after a rotation %+v", res.Version)
 	}
-	if got := r.bundleOf(cell1).Last.Version; got != (bundle.Version{Epoch: 2, Counter: 5}) {
-		t.Fatalf("state holds %+v", got)
+	if tb, _ := r.bundleOf(cell1).shown(); tb.Version != (bundle.Version{Epoch: 2, Counter: 5}) {
+		t.Fatalf("state holds %+v", tb.Version)
 	}
 }
 
@@ -328,7 +329,7 @@ func bigPolicy(t *testing.T) (bundle.Policy, []bundle.Component) {
 func TestSignBundleOpSize(t *testing.T) {
 	policy, comps := bigPolicy(t)
 	r := newRig(t)
-	r.mod = func(c *Config) { c.Policy = policy }
+	r.mod = func(c *Config) { c.bundlePolicy = policy }
 	r.restart(nil)
 	r.mustBind(cell1, r.signers[cell1], mgmtapi.StatusBound)
 	// Grow the predicate until the statement is close to its limit.
@@ -463,8 +464,12 @@ func TestPlaneResultOtherOpIgnored(t *testing.T) {
 		return &c
 	}
 	for name, res := range map[string]*op.Result{
-		"demo op":        ptr(resultFor(demo, demoEnv, op.OutcomeApplied)),
-		"cell set":       ptr(r.bundleResult(cellSet.OpID, op.OutcomeApplied)),
+		"demo op":  ptr(resultFor(demo, demoEnv, op.OutcomeApplied)),
+		"cell set": ptr(r.bundleResult(cellSet.OpID, op.OutcomeApplied)),
+		"cell set claimed as plane": mod(func(c *op.Result) {
+			*c = r.bundleResult(cellSet.OpID, op.OutcomeApplied)
+			c.Cell = cpTarget
+		}),
 		"unknown op":     mod(func(c *op.Result) { c.OpID = strings.Repeat("0", 32) }),
 		"other envelope": mod(func(c *op.Result) { c.EnvelopeSHA256 = strings.Repeat("1", 64) }),
 		"other cell":     mod(func(c *op.Result) { c.Cell = cell1 }),
@@ -488,8 +493,11 @@ func TestPlaneResultOtherOpIgnored(t *testing.T) {
 	if st := r.opState(demo.ID); st.Final != "" {
 		t.Fatal("a plane report closed a cell op")
 	}
-	if st := r.opState(cellSet.OpID); st.Final != "" {
+	if st := r.opState(cellSet.OpID); st.Final != "" || st.Result != nil {
 		t.Fatal("a plane report closed a cell set")
+	}
+	if r.bundleOf(cell1).Last.Result != nil {
+		t.Fatal("a plane report recorded a result on a cell set")
 	}
 	// The matching result still closes it.
 	r.reportPlane(&good)
@@ -557,10 +565,35 @@ func TestBundleFinalRecorded(t *testing.T) {
 	if got := r.bundleOf(cell1).Last.Result; got == nil || got.Outcome != op.OutcomeRolledBack {
 		t.Fatalf("after a restart %+v", got)
 	}
-	// A result for an older set does not replace the record of a newer one.
-	newer := r.signBundle(cell1, cellComps(), false)
-	if r.bundleOf(cell1).Last.OpID != newer.OpID || r.bundleOf(cell1).Last.Result != nil {
-		t.Fatalf("newer set %+v", r.bundleOf(cell1).Last)
+}
+
+// A set that is signed and not served never hides the outcome of the last served set.
+func TestNoServeSetKeepsLastServed(t *testing.T) {
+	r, _ := boundRig(t)
+	// A target with no served set shows the set that was signed and not served.
+	only := r.signBundle(cell1, cellComps(), false)
+	if got, err := r.plane.BundleView(cell1); err != nil || got.OpID != only.OpID || got.Served {
+		t.Fatalf("view %+v, %v", got, err)
+	}
+	served := r.signBundle(cell1, cellComps(), true)
+	res := r.bundleResult(served.OpID, op.OutcomeRolledBack)
+	res.Reason, res.Detail = op.ReasonUnhealthy, "rollback_unhealthy"
+	want(t, r.one(r.resultItem(res, r.signers[cell1])), mgmtapi.OutcomeAccepted, "", "")
+	injected := r.signBundle(cell1, cellComps(), false)
+	got, err := r.plane.BundleView(cell1)
+	if err != nil || got.OpID != served.OpID || got.Result == nil || got.Result.Outcome != op.OutcomeRolledBack {
+		t.Fatalf("bundle get shows %+v, %v", got, err)
+	}
+	if c := cellStatus(r.status(), cell1); c.Bundle == nil || c.Bundle.OpID != served.OpID || c.Bundle.Result == nil {
+		t.Fatalf("status shows %+v", c.Bundle)
+	}
+	// The next version still counts the injected set.
+	if next := r.signBundle(cell1, cellComps(), false); next.Version.Counter != injected.Version.Counter+1 {
+		t.Fatalf("version %+v after %+v", next.Version, injected.Version)
+	}
+	r.restart(nil)
+	if got, _ := r.plane.BundleView(cell1); got.OpID != served.OpID {
+		t.Fatalf("after a restart %+v", got)
 	}
 }
 
@@ -697,28 +730,96 @@ func TestAdminBundleRoutes(t *testing.T) {
 	}
 }
 
+// payloadOf returns the payload bytes of a DSSE envelope.
+func payloadOf(t *testing.T, envelope []byte) []byte {
+	t.Helper()
+	var env struct {
+		Payload string `json:"payload"`
+	}
+	if err := json.Unmarshal(envelope, &env); err != nil {
+		t.Fatal(err)
+	}
+	body, err := base64.StdEncoding.DecodeString(env.Payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return body
+}
+
+func ignoringComps() []bundle.Component {
+	c := cellComps()
+	c[0].IgnoreDifferences = json.RawMessage(`[{"group":"apps","kind":"Deployment","jsonPointers":["/spec/replicas"],"jqPathExpressions":[".spec.template<x>&y"]}]`)
+	return c
+}
+
 func TestRotateKeyResignsBundleAttestation(t *testing.T) {
+	for _, c := range []struct {
+		name, target string
+		comps        []bundle.Component
+	}{
+		{"cell with ignoreDifferences", cell1, ignoringComps()},
+		{"plane op", cpTarget, cpComps()},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r, _ := boundRig(t)
+			set := r.signBundle(c.target, c.comps, true)
+			before := r.bundleResult(set.OpID, op.OutcomeApplied)
+			old := r.plane.PublicKey()
+			if _, err := r.plane.RotateKey(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			fresh := r.plane.PublicKey()
+			v, _ := r.plane.OpView(set.OpID)
+			o, err := decodeOpUnverified(v.Envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{fresh}); err != nil {
+				t.Fatalf("the attestation of an open op does not verify under the new key: %v", err)
+			}
+			if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{old}); err == nil {
+				t.Fatal("the attestation still verifies under the old key")
+			}
+			if !bytes.Equal(payloadOf(t, o.Args), payloadOf(t, set.Envelope)) {
+				t.Fatalf("the signed payload changed:\n%s\n%s", payloadOf(t, o.Args), payloadOf(t, set.Envelope))
+			}
+			if c.target == cpTarget {
+				if got := r.plane.OpenOps().PlaneBundle; !bytes.Equal(got, v.Envelope) {
+					t.Fatal("the plane op that is served is not the re-signed one")
+				}
+			}
+			// A result for the envelope that was current before the rotation still closes the op.
+			if c.target == cpTarget {
+				r.reportPlane(&before)
+			} else {
+				want(t, r.one(r.resultItem(before, r.signers[cell1])), mgmtapi.OutcomeAccepted, "", "")
+			}
+			if r.opState(set.OpID).Final != op.OutcomeApplied {
+				t.Fatal("a result for the old envelope did not close the op")
+			}
+		})
+	}
+}
+
+// A set that is not served is not signed again: a new-key attestation at an old version would be
+// valid input for an applier after its mark reset.
+func TestRotateKeyLeavesUnservedBundleOps(t *testing.T) {
 	r, _ := boundRig(t)
-	set := r.signBundle(cell1, cellComps(), true)
+	set := r.signBundle(cell1, cellComps(), false)
 	old := r.plane.PublicKey()
 	if _, err := r.plane.RotateKey(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	fresh := r.plane.PublicKey()
 	v, _ := r.plane.OpView(set.OpID)
-	o, err := decodeOpUnverified(v.Envelope)
-	if err != nil {
-		t.Fatal(err)
+	o, _ := decodeOpUnverified(v.Envelope)
+	if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{r.plane.PublicKey()}); err == nil {
+		t.Fatal("an unserved set verifies under the new key")
 	}
-	if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{fresh}); err != nil {
-		t.Fatalf("the attestation of an open op does not verify under the new key: %v", err)
+	if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{old}); err != nil {
+		t.Fatalf("the unserved set changed: %v", err)
 	}
-	if _, _, err := bundle.ParseAttestation(o.Args, []crypto.PublicKey{old}); err == nil {
-		t.Fatal("the attestation still verifies under the old key")
-	}
-	st, _, _ := bundle.ParseAttestation(o.Args, []crypto.PublicKey{fresh})
-	if st.Predicate.Version != set.Version || st.RootDigest() != set.RootDigest {
-		t.Fatalf("the re-signed statement changed: %+v", st.Predicate)
+	if len(v.Envelopes) != 1 {
+		t.Fatalf("envelopes %v", v.Envelopes)
 	}
 }
 
@@ -749,5 +850,181 @@ func TestStatusShowsCellBundleStatus(t *testing.T) {
 	want(t, r.one(it), mgmtapi.OutcomeAccepted, "", "")
 	if got := cellStatus(r.status(), cell1).BundleStatus; got == nil || *got != *bs {
 		t.Fatalf("bundle status %+v", got)
+	}
+}
+
+func TestAdminBundleRequiresWave(t *testing.T) {
+	r, _ := boundRig(t)
+	h := NewAdminHandler(r.plane, nil)
+	noWave := `[{"name":"argocd","namespace":"argocd","digest":"` + digestOf('a') + `"}]`
+	rec := adminDo(h, "POST", "/bundles?target="+cell1+"&serve=0", noWave)
+	if rec.Code != http.StatusUnprocessableEntity || !strings.Contains(rec.Body.String(), `"reason":"payload_invalid"`) {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if len(r.plane.snap.Load().st.Ops) != 0 || r.bundleOf(cell1) != nil {
+		t.Fatal("a refused request left state")
+	}
+	// The same component with a wave signs.
+	withWave := strings.Replace(noWave, `"name"`, `"wave":0,"name"`, 1)
+	if rec := adminDo(h, "POST", "/bundles?target="+cell1+"&serve=0", withWave); rec.Code != 200 {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+}
+
+func TestAdminBundleGetRefusesUnknownQuery(t *testing.T) {
+	r, _ := boundRig(t)
+	r.signBundle(cell1, cellComps(), true)
+	h := NewAdminHandler(r.plane, nil)
+	for _, q := range []string{"?target=" + cell1 + "&x=1", "?target=" + cell1 + "&target=" + cell1, "?target=" + cell1 + "&serve=0"} {
+		for _, path := range []string{"/bundles", "/bundles/cosign"} {
+			if rec := adminDo(h, "GET", path+q, ""); rec.Code != 400 || !strings.Contains(rec.Body.String(), `"reason":"query_invalid"`) {
+				t.Errorf("%s%s: %d %s", path, q, rec.Code, rec.Body)
+			}
+		}
+	}
+}
+
+func TestBundleCosignFollowsRotation(t *testing.T) {
+	r, _ := boundRig(t)
+	set := r.signBundle(cell1, cellComps(), true)
+	h := NewAdminHandler(r.plane, nil)
+	get := func() map[string]any {
+		rec := adminDo(h, "GET", "/bundles/cosign?target="+cell1, "")
+		if rec.Code != 200 {
+			t.Fatalf("%d %s", rec.Code, rec.Body)
+		}
+		return decodeMap(t, rec)
+	}
+	hint := func(m map[string]any) string {
+		raw, _ := json.Marshal(m["sigstoreBundle"])
+		var b struct {
+			VM struct {
+				PK struct {
+					Hint string `json:"hint"`
+				} `json:"publicKey"`
+			} `json:"verificationMaterial"`
+		}
+		if err := json.Unmarshal(raw, &b); err != nil {
+			t.Fatal(err)
+		}
+		return b.VM.PK.Hint
+	}
+	first := get()
+	if first["opId"] != set.OpID || hint(first) != fingerprint(r.plane.PublicKey()) {
+		t.Fatalf("before a rotation %v", first)
+	}
+	if _, err := r.plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	after := get()
+	if hint(after) != fingerprint(r.plane.PublicKey()) || hint(after) == hint(first) {
+		t.Fatalf("after a rotation the hint is %s", hint(after))
+	}
+	sb, err := r.plane.BundleCosign(cell1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := bundle.ParseAttestation(sb.Envelope, []crypto.PublicKey{r.plane.PublicKey()}); err != nil {
+		t.Fatalf("the envelope does not verify under the current key: %v", err)
+	}
+	if !bytes.Contains(sb.SigstoreBundle, []byte(`"dsseEnvelope":`+string(sb.Envelope)+`}`)) {
+		t.Fatal("the cosign bundle does not wrap the current envelope unchanged")
+	}
+	// A set that is not served stays under its own key, so no bundle exists for the current one.
+	r2, _ := boundRig(t)
+	r2.signBundle(cell1, cellComps(), false)
+	if _, err := r2.plane.BundleCosign(cell1); err != nil {
+		t.Fatalf("before a rotation: %v", err)
+	}
+	if _, err := r2.plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	h2 := NewAdminHandler(r2.plane, nil)
+	if rec := adminDo(h2, "GET", "/bundles/cosign?target="+cell1, ""); rec.Code != 409 || !strings.Contains(rec.Body.String(), "bundle_key_retired") {
+		t.Fatalf("%d %s", rec.Code, rec.Body)
+	}
+	if rec := adminDo(h2, "GET", "/bundles/cosign?target="+cell2, ""); rec.Code != 404 {
+		t.Fatalf("%d", rec.Code)
+	}
+}
+
+// A result whose reason or detail breaks the shape never reaches the state.
+func TestResultReasonAndDetailAreValidated(t *testing.T) {
+	r, _ := boundRig(t)
+	set := r.signBundle(cell1, cellComps(), true)
+	for field, bad := range map[string]func(*op.Result){
+		"reason": func(c *op.Result) { c.Reason = "bad reason!" },
+		"detail": func(c *op.Result) { c.Detail = strings.Repeat("a", 97) },
+	} {
+		res := r.bundleResult(set.OpID, op.OutcomeRefused)
+		bad(&res)
+		want(t, r.one(r.resultItem(res, r.signers[cell1])), mgmtapi.OutcomeRefused, mgmtapi.ReasonPayloadInvalid, field)
+		if st := r.opState(set.OpID); st.Final != "" || st.Result != nil {
+			t.Fatalf("a result with a bad %s closed the op", field)
+		}
+	}
+	good := r.bundleResult(set.OpID, op.OutcomeRolledBack)
+	good.Reason, good.Detail = op.ReasonUnhealthy, "timeout:apps-sample:Synced/Progressing"
+	want(t, r.one(r.resultItem(good, r.signers[cell1])), mgmtapi.OutcomeAccepted, "", "")
+
+	// The plane path ignores such a result.
+	cp := r.signBundle(cpTarget, cpComps(), true)
+	for _, bad := range []func(*op.Result){
+		func(c *op.Result) { c.Reason = "bad reason!" },
+		func(c *op.Result) { c.Detail = "has space" },
+	} {
+		res := r.bundleResult(cp.OpID, op.OutcomeRefused)
+		bad(&res)
+		r.reportPlane(&res)
+		if st := r.opState(cp.OpID); st.Final != "" || st.Result != nil {
+			t.Fatal("a plane result with a bad reason or detail closed the op")
+		}
+	}
+}
+
+// A plane result that is dropped leaves one warning with the op ID and the reason class, and no
+// forged-seen record.
+func TestPlaneResultDroppedIsLogged(t *testing.T) {
+	r, _ := boundRig(t)
+	set := r.signBundle(cpTarget, cpComps(), true)
+	bad := r.bundleResult(set.OpID, op.OutcomeApplied)
+	bad.EnvelopeSHA256 = strings.Repeat("1", 64)
+	for i := 0; i < 3; i++ {
+		r.reportPlane(&bad)
+	}
+	if n := r.logs.count("plane_result_ignored"); n != 1 {
+		t.Fatalf("%d lines for a repeated result, want 1", n)
+	}
+	line := ""
+	for _, l := range strings.Split(r.logs.buf.String(), "\n") {
+		if strings.Contains(l, `"msg":"plane_result_ignored"`) {
+			line = l
+		}
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(line), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["level"] != "WARN" || m["op_id"] != set.OpID || m["reason"] != "envelope" {
+		t.Fatalf("log line %s", line)
+	}
+	if got := r.plane.ForgedSeen(cpTarget); len(got) != 0 || r.plane.Status().Cells[0].ForgedSeen != 0 {
+		t.Fatalf("a forged_seen record %v", got)
+	}
+	// A result with no ID and a result that is not final each give their own line.
+	noID := r.bundleResult(set.OpID, op.OutcomeRefused)
+	noID.OpID, noID.PeekedID = "", set.OpID
+	r.reportPlane(&noID)
+	late := r.bundleResult(set.OpID, op.OutcomeLeaseLost)
+	r.reportPlane(&late)
+	if n := r.logs.count("plane_result_ignored"); n != 3 {
+		t.Fatalf("%d lines, want 3", n)
+	}
+	// A repeat after the op closed is not a drop.
+	done := r.bundleResult(set.OpID, op.OutcomeApplied)
+	r.reportPlane(&done)
+	r.reportPlane(&done)
+	if n := r.logs.count("plane_result_ignored"); n != 3 {
+		t.Fatalf("%d lines after a close, want 3", n)
 	}
 }
