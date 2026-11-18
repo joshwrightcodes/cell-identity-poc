@@ -1102,6 +1102,49 @@ func TestApplyLockHeld(t *testing.T) {
 			t.Fatal("work started under a held lock")
 		}
 	})
+	t.Run("same holder", func(t *testing.T) {
+		e := newEnv(t)
+		b := e.set(1, std("v1"))
+		next := e.set(2, std("v2"))
+		type answer struct {
+			out Outcome
+			err error
+		}
+		var second []answer
+		e.health = func(root, app string) (string, string) { return "Synced", "Progressing" }
+		e.hook = func(n int) {
+			if n != 1 {
+				return
+			}
+			// A second call of the same process, while the first waits for health: an effect retry
+			// or the next ops pull of envd.
+			ch := make(chan answer, 2)
+			for _, id := range []string{"op1", "op2"} {
+				att := b.att
+				if id == "op2" {
+					att = next.att
+				}
+				go func() {
+					out, err := e.a.Apply(t.Context(), id, tTarget, att)
+					ch <- answer{out, err}
+				}()
+			}
+			second = append(second, <-ch, <-ch)
+			e.health = nil
+		}
+		wantOutcome(t, e.apply("op1", b), op.OutcomeApplied, "", "")
+		if len(second) != 2 {
+			t.Fatalf("%d second calls ran", len(second))
+		}
+		for _, a := range second {
+			if !errors.Is(a.err, ErrLockHeld) || a.out != (Outcome{}) {
+				t.Fatalf("a second call of the same holder gave %+v, %v; want ErrLockHeld", a.out, a.err)
+			}
+		}
+		if st := e.state(); st.State != "healthy" || st.Holder != "" || st.Version.Counter != 1 || st.Result.OpID != "op1" {
+			t.Fatalf("state = %+v", st)
+		}
+	})
 	t.Run("expired lock", func(t *testing.T) {
 		e := newEnv(t)
 		st := e.state()

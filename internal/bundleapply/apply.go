@@ -12,6 +12,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
@@ -43,7 +44,8 @@ const (
 	detailRollback   = "rollback_unhealthy"
 )
 
-// ErrLockHeld means that another holder has the apply lock. The caller retries later.
+// ErrLockHeld means that another holder, or another Apply of this process, has the apply lock. The
+// caller retries later.
 var ErrLockHeld = errors.New("bundle apply lock is held")
 
 var (
@@ -82,6 +84,9 @@ type Applier struct {
 	tel   telemetry
 	log   *slog.Logger
 	sleep func(ctx context.Context, d time.Duration) error
+	// running is held while one Apply of this process works under the lock. The state lock names
+	// the holder only, so it cannot tell two runs of one process apart.
+	running sync.Mutex
 }
 
 // New returns an Applier for cfg. Zero timers take the plan values: a poll of 5 s, a health
@@ -255,6 +260,10 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 		trusted[keySHA(k)] = true
 	}
 
+	if !a.running.TryLock() {
+		return Outcome{}, ErrLockHeld
+	}
+	defer a.running.Unlock()
 	out, proceed, err := a.admit(ctx, r, trusted)
 	if err != nil || !proceed {
 		return out, err
