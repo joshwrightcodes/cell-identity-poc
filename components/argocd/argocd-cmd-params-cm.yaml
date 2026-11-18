@@ -11,3 +11,5 @@ data:
   # HTTP 500 (upstream Argo CD Agent issue 1107). Argo CD v3.6.1 accepts at most 10h and falls back to
   # 1h for a larger value. 10h makes that window ten times rarer.
   controller.app.state.cache.expiration: 10h
+  # A sync that waits on a later wave ends after 240 s, so the applier can roll back within its wait.
+  controller.sync.timeout.seconds: "240"

@@ -92,6 +92,7 @@ case "$2" in
     echo "$out"
     ;;
   pki) shift 3; exec "$STUB_PKIGEN" "$@" ;;
+  bundlectl) shift 3; cd "$STUB_REPO" && exec go run ./cmd/bundlectl "$@" ;;
   *) exit 2 ;;
 esac
 `
@@ -459,7 +460,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"HOSTSVC_SERVE="+hostsvcServe, "STUB_PIN_FILE="+write("hostsvc.crt", caPEM(t, "host.docker.internal"), 0o644),
-		"POC_ENV="+commonEnv(t, "POC_ENV"))
+		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"))
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -469,6 +470,16 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	err := cmd.Run()
 	logData, _ := os.ReadFile(logFile)
 	return result{stdout.String(), stderr.String(), err, string(logData), digest, bundle}
+}
+
+// repoRoot returns the absolute path of the repository root.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
 }
 
 func layerTarGz(t *testing.T, binary string) []byte {

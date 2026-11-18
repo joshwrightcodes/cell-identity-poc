@@ -1,0 +1,53 @@
+# The token client of the repo server. Argo CD reads bundles from oci://127.0.0.1:5000, which this
+# container serves. It sends each request to the bundle store with the projected token of the pod, and
+# the store proxy lets only this account read. Only this container mounts the token. The container
+# holds no SVID and has no API access. render.sh and scripts/hydrate.sh fill in @CELL_PROXY_IMAGE@.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-repo-server
+spec:
+  template:
+    spec:
+      containers:
+        - name: store-token
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - token-client
+            - --listen=127.0.0.1:5000
+            - --upstream=bundle-store.cell-system.svc.cluster.local:5000
+            - --token-file=/var/run/secrets/bundle-store/token
+            - --health=127.0.0.1:8085
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: store-token
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: bundle-store-token
+              mountPath: /var/run/secrets/bundle-store
+              readOnly: true
+      volumes:
+        - name: bundle-store-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: bundle-store
+                  path: token
+                  expirationSeconds: 600

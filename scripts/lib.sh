@@ -213,7 +213,39 @@ done
 # The bootstrap set. Bootstrap applies these bundles once, before Argo CD takes over.
 BOOTSTRAP=(namespaces argocd cell-system)
 
-BUNDLE_STORE_HOST="bundle-store.cell-system.svc.cluster.local:5000"
+# Argo CD reads bundles from BUNDLE_STORE_HOST, which is the token client in the repo server pod. The token client
+# sends each request to BUNDLE_STORE_SERVICE, the service of the bundle store, with the token of the pod.
+BUNDLE_STORE_HOST="127.0.0.1:5000"
+BUNDLE_STORE_SERVICE="bundle-store.cell-system.svc.cluster.local:5000"
+
+source "$ROOT/components/lib/bundle-role.sh"
+
+# bundle_role prints the bundle role of $CELL: cell, cp or open (components/lib/bundle-role.sh).
+bundle_role() { bundle_role_of "$CELL_NAME"; }
+
+# hydrate_store_tokens replaces @CELL_PROXY_IMAGE@ and @BUNDLE_STORE_WRITER@ in the render on standard input and
+# prints the result. The image is the pinned reference from build/images.env. The writer is the account of the applier
+# of the role of $CELL, and a role with no writer drops the line with the token, so the proxy refuses every write. A
+# render without a token passes unchanged, and needs no image.
+hydrate_store_tokens() {
+  local text image="" writer="" role
+  text="$(cat; echo x)"; text="${text%x}"
+  if [[ "$text" == *@CELL_PROXY_IMAGE@* ]]; then
+    source "$ROOT/scripts/ko-image.sh"
+    image="$(ko_image cell-proxy)" || return 1
+    text="${text//@CELL_PROXY_IMAGE@/$image}"
+  fi
+  if [[ "$text" == *@BUNDLE_STORE_WRITER@* ]]; then
+    role="$(bundle_role)" || return 1
+    writer="$(bundle_store_writer_of "$role")" || return 1
+    if [[ -n "$writer" ]]; then
+      text="${text//@BUNDLE_STORE_WRITER@/$writer}"
+    else
+      text="$(grep -v '@BUNDLE_STORE_WRITER@' <<<"$text"; echo x)"; text="${text%x}"
+    fi
+  fi
+  printf '%s' "$text"
+}
 
 k() { kubectl --context "kind-$CELL_NAME" "$@"; }
 
@@ -227,13 +259,15 @@ wait_for() {
   done
 }
 
-# Start a port-forward to the bundle store. Sets BUNDLE_BUNDLE_STORE_PF_PID.
+# Start a port-forward to the registry of the bundle store. Sets BUNDLE_STORE_PF_PID. The registry listens on the
+# loopback address of the pod (port 5001), behind the token proxy, so the forward goes to the pod and no token is
+# needed. Only a person on this Mac reaches it, through kubectl. This is the path of the bootstrap publish and of the repair.
 bundle_store_forward() {
   if curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/" >/dev/null 2>&1; then
     die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store, probably from an old port-forward. Find its process with: lsof -nP -iTCP:${CELL_BUNDLE_STORE_PORT} -sTCP:LISTEN. Stop that process, then run the command again."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
-  kubectl --context "kind-$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
+  kubectl --context "kind-$CELL_NAME" -n cell-system port-forward pod/bundle-store-0 "${CELL_BUNDLE_STORE_PORT}:5001" \
     >/dev/null 2>&1 &
   BUNDLE_STORE_PF_PID=$!
   trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
@@ -483,14 +517,19 @@ check_apps_namespace() {
   k -n argocd get application root >/dev/null 2>&1 || { echo "argocd has no root Application. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
 }
 
-# check_argocd_projects succeeds when argocd holds exactly the AppProjects cell and default, and
-# default allows no source, no destination and no kind. The server of argocd admin dashboard
-# creates a permissive default when none exists.
+# check_argocd_projects succeeds when argocd holds exactly the AppProjects of the role of the cluster and default, and
+# default allows no source, no destination and no kind. The role gives cell and cell-app in a cell, and cell in every other
+# cluster. The server of argocd admin dashboard creates a permissive default when none exists.
 check_argocd_projects() {
-  local json
+  local json role want
   json="$(k -n argocd get appprojects -o json)" || return 1
-  jq -e '(.items | map(.metadata.name) | sort) == ["cell", "default"]' >/dev/null <<<"$json" \
-    || { echo "AppProjects in argocd: $(jq -r '[.items[].metadata.name] | join(" ")' <<<"$json"), want cell and default. Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
+  role="$(bundle_role)" || return 1
+  case "$role" in
+    cell) want='["cell", "cell-app", "default"]' ;;
+    *) want='["cell", "default"]' ;;
+  esac
+  jq -e --argjson want "$want" '(.items | map(.metadata.name) | sort) == $want' >/dev/null <<<"$json" \
+    || { echo "AppProjects in argocd: $(jq -r '[.items[].metadata.name] | join(" ")' <<<"$json"), want $(jq -r 'join(", ")' <<<"$want"). Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
   jq -e '.items[] | select(.metadata.name == "default") | .spec
     | ((.sourceRepos // []) | length) == 0 and ((.destinations // []) | length) == 0
       and ((.clusterResourceWhitelist // []) | length) == 0 and ((.namespaceResourceWhitelist // []) | length) == 0' >/dev/null <<<"$json" \

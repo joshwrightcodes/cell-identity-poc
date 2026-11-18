@@ -1,10 +1,31 @@
-# The in-cluster bundle store. Argo CD reads hydrated bundles from it, and nothing else.
-# Bundles live on a PersistentVolumeClaim from the default StorageClass, so they survive a pod restart.
+# The in-cluster bundle store. Argo CD reads hydrated bundles from it, and the applier of the cluster
+# writes them. Bundles live on a PersistentVolumeClaim from the default StorageClass, so they survive a
+# pod restart.
+#
+# The registry listens on the loopback address of the pod only. Container store-proxy listens on port
+# 5000, asks the TokenReview API who owns the bearer token of each request, and passes a read only for
+# the repo server of Argo CD and a write only for the writer of the role (hydrate replaces
+# @BUNDLE_STORE_WRITER@, and a cluster with no writer gets no --writer flag). Only store-proxy gets an
+# API token. The bootstrap publish reaches the registry through a port-forward to port 5001 of the pod.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: bundle-store
 automountServiceAccountToken: false
+---
+# store-proxy asks the TokenReview API about each token, so its account needs that one right.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bundle-store-auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+  - kind: ServiceAccount
+    name: bundle-store
+    namespace: cell-system
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -24,6 +45,7 @@ spec:
         app.kubernetes.io/name: bundle-store
     spec:
       serviceAccountName: bundle-store
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
@@ -34,20 +56,15 @@ spec:
       containers:
         - name: bundle-store
           image: docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c
-          ports:
-            - name: http
-              containerPort: 5000
           env:
             - name: OTEL_SERVICE_NAME
               value: bundle-store
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4318
+            - name: REGISTRY_HTTP_ADDR
+              value: 127.0.0.1:5001
             - name: REGISTRY_HTTP_DEBUG_ADDR
               value: ""
-          readinessProbe:
-            httpGet:
-              path: /v2/
-              port: http
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -62,6 +79,62 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /var/lib/registry
+        - name: store-proxy
+          image: "@CELL_PROXY_IMAGE@"
+          args:
+            - token
+            - --listen=:5000
+            - --upstream=127.0.0.1:5001
+            - --audience=bundle-store
+            - --reader=system:serviceaccount:argocd:argocd-repo-server
+            - --writer=@BUNDLE_STORE_WRITER@
+            - --health=:8080
+          ports:
+            - name: http
+              containerPort: 5000
+            - name: health
+              containerPort: 8080
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: store-proxy
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 5m
+              memory: 16Mi
+            limits:
+              memory: 64Mi
+          volumeMounts:
+            - name: api-token
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: api-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        fieldPath: metadata.namespace
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -30,15 +30,16 @@ keytest_leftover() {
     true"
 }
 
-# store_forward_start <cluster> starts a port-forward to the bundle store of the cluster on a free
-# local port, and sets STORE_ADDR and STORE_PF_PID. store_forward_stop ends it.
+# store_forward_start <cluster> starts a port-forward to the registry of the bundle store of the cluster on a
+# free local port, and sets STORE_ADDR and STORE_PF_PID. store_forward_stop ends it. The registry listens on
+# the loopback address of the pod (port 5001), behind the token proxy on port 5000, so the forward goes to the pod.
 store_forward_start() {
   local out port="" i
   out="$(mktemp)"
-  kubectl --context "kind-$1" -n cell-system port-forward --address 127.0.0.1 svc/bundle-store :5000 >"$out" 2>&1 &
+  kubectl --context "kind-$1" -n cell-system port-forward --address 127.0.0.1 pod/bundle-store-0 :5001 >"$out" 2>&1 &
   STORE_PF_PID=$!
   for i in $(seq 1 60); do
-    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 5000$/\1/p' "$out" | head -n 1)"
+    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 5001$/\1/p' "$out" | head -n 1)"
     [[ -n "$port" ]] && break
     sleep 0.5
   done

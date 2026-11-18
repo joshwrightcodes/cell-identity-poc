@@ -177,6 +177,8 @@ $(namespace_peer observability-system)
       ports:
         - protocol: TCP
           port: 4318
+    # N47: the store proxy asks the API server which account owns a token.
+$(api_server_rule)
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

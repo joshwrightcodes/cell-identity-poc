@@ -767,8 +767,8 @@ check "plaintext cannot reach echo, because mTLS is strict" expect_no_connection
 check "client reaches the allowed host through the egress gateway" check_egress_through_gateway
 check "client cannot reach a host that is not allowed" expect_no_connection client https://example.org/
 check "plaintext cannot reach the internet, because of NetworkPolicy" expect_no_connection plaintext https://example.com/
-check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_HOST/v2/"
-check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_HOST/v2/"
+check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_SERVICE/v2/"
+check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_SERVICE/v2/"
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
 if [[ -n "${COLLECTOR_STORE:-}" ]]; then
   check "lgtm runs as user 10001, and Grafana answers 401 to an anonymous read" check_lgtm_hardened

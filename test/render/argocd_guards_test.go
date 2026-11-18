@@ -4,12 +4,13 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 )
 
 // TestArgocdGuardsRender checks, in every cluster, the objects that keep argocd closed: the
 // admission policy and binding that allow three Secrets, the policy and binding that require the
-// project cell, the locked AppProject default, and the absence of the settings and the namespace
+// project cell or cell-app, the locked AppProject default, and the absence of the settings and the namespace
 // that older cells used for child Applications.
 func TestArgocdGuardsRender(t *testing.T) {
 	rootFile, err := os.ReadFile("../../bootstrap/root.yaml")
@@ -41,6 +42,17 @@ func TestArgocdGuardsRender(t *testing.T) {
 			}
 			if v, ok := lookup(argo["AppProject argocd/cell"], "spec", "sourceNamespaces"); ok {
 				t.Errorf("AppProject cell sourceNamespaces = %v, want it unset", v)
+			}
+			// Case cell-app: the project of the app class carries no sourceNamespaces either, and the guard names it.
+			if app := argo["AppProject argocd/cell-app"]; app != nil {
+				if v, ok := lookup(app, "spec", "sourceNamespaces"); ok {
+					t.Errorf("AppProject cell-app sourceNamespaces = %v, want it unset", v)
+				}
+			} else if roleOf[cr.name] == "cell" {
+				t.Error("a cell renders no AppProject cell-app")
+			}
+			if msg, _ := lookup(get[[]any](t, argo["ValidatingAdmissionPolicy argocd-cell-project"], "spec", "validations")[0], "message"); !strings.Contains(fmt.Sprint(msg), "cell-app") {
+				t.Errorf("the project guard message is %v, want it to name cell-app", msg)
 			}
 			ctrl := argo["StatefulSet argocd/argocd-application-controller"]
 			if v, ok := lookup(ctrl, "spec", "template", "metadata", "annotations", "poc.internal/cmd-params-sha256"); ok {
@@ -97,7 +109,7 @@ func TestArgocdGuardsRender(t *testing.T) {
 			for _, v := range get[[]any](t, project, "spec", "validations") {
 				exprs = append(exprs, get[string](t, v, "expression"))
 			}
-			if want := []string{"object.spec.project == 'cell'"}; !slices.Equal(exprs, want) || get[string](t, project, "spec", "failurePolicy") != "Fail" {
+			if want := []string{"object.spec.project in ['cell', 'cell-app']"}; !slices.Equal(exprs, want) || get[string](t, project, "spec", "failurePolicy") != "Fail" {
 				t.Errorf("the project policy has %q with failurePolicy %v, want %q and Fail", exprs, lookupOr(project, "spec", "failurePolicy"), want)
 			}
 			pb := argo["ValidatingAdmissionPolicyBinding argocd-cell-project"]

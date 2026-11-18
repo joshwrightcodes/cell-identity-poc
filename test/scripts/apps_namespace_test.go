@@ -220,16 +220,27 @@ bundle_traces dev-cp`
 }
 
 func TestClusterChecksOfArgocd(t *testing.T) {
-	locked := `{"items":[{"metadata":{"name":"cell"},"spec":{"sourceRepos":["oci://x"]}},{"metadata":{"name":"default"},"spec":{"sourceRepos":[],"destinations":[],"clusterResourceWhitelist":[]}}]}`
-	open := `{"items":[{"metadata":{"name":"cell"},"spec":{}},{"metadata":{"name":"default"},"spec":{"sourceRepos":["*"],"destinations":[{"server":"*","namespace":"*"}],"clusterResourceWhitelist":[{"group":"*","kind":"*"}]}}]}`
+	// The role of the cluster gives the projects: cell and cell-app in a cell, and cell in every other cluster.
+	def := `{"metadata":{"name":"default"},"spec":{"sourceRepos":[],"destinations":[],"clusterResourceWhitelist":[]}}`
+	cellProject := `{"metadata":{"name":"cell"},"spec":{"sourceRepos":["oci://x"]}}`
+	appProject := `{"metadata":{"name":"cell-app"},"spec":{}}`
+	list := func(items ...string) string { return `{"items":[` + strings.Join(items, ",") + `]}` }
+	open := list(`{"metadata":{"name":"cell"},"spec":{}}`, `{"metadata":{"name":"default"},"spec":{"sourceRepos":["*"],"destinations":[{"server":"*","namespace":"*"}],"clusterResourceWhitelist":[{"group":"*","kind":"*"}]}}`)
 	for _, tc := range []struct {
-		name, projects string
-		ok             bool
-	}{{"locked default", locked, true}, {"permissive default", open, false},
-		{"no default", `{"items":[{"metadata":{"name":"cell"},"spec":{}}]}`, false},
-		{"a third project", strings.Replace(locked, `{"items":[`, `{"items":[{"metadata":{"name":"evil"},"spec":{}},`, 1), false}} {
+		name, cell, projects string
+		ok                   bool
+	}{
+		{"locked default", "dev-cell-1", list(cellProject, appProject, def), true},
+		{"permissive default", "dev-cell-1", strings.Replace(list(cellProject, appProject, def), def, open[strings.Index(open, `{"metadata":{"name":"default"`):len(open)-2], 1), false},
+		{"no default", "dev-cell-1", list(cellProject, appProject), false},
+		{"a cell without cell-app", "dev-cell-1", list(cellProject, def), false},
+		{"a third project", "dev-cell-1", list(`{"metadata":{"name":"evil"},"spec":{}}`, cellProject, appProject, def), false},
+		{"dev-cp with cell", "dev-cp", list(cellProject, def), true},
+		{"dev-cp with cell-app", "dev-cp", list(cellProject, appProject, def), false},
+		{"management with cell", "management", list(cellProject, def), true},
+	} {
 		t.Run("projects/"+tc.name, func(t *testing.T) {
-			out, err := runLib(t, nil, `check_argocd_projects`, "STUB_PROJECTS="+tc.projects)
+			out, err := runLib(t, nil, `check_argocd_projects`, "STUB_PROJECTS="+tc.projects, "CELL="+tc.cell)
 			if (err == nil) != tc.ok {
 				t.Fatalf("err %v, want success %v; output %q", err, tc.ok, out)
 			}
