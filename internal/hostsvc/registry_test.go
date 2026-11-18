@@ -18,12 +18,19 @@ type fakeDocker struct {
 	rootUser bool
 	// env replaces the JSON environment that inspect reports. Empty means the expected environment.
 	env string
+	// ranEnv holds the -e values of the last "run -d". With echoRun, inspect reports them as the environment.
+	ranEnv  []string
+	echoRun bool
 }
 
 const goodEnv = `["PATH=/bin","REGISTRY_HTTP_DEBUG_ADDR=","REGISTRY_STORAGE_DELETE_ENABLED=false"]`
 
 func (f *fakeDocker) inspect(user string) []byte {
 	env := f.env
+	if f.echoRun {
+		b, _ := json.Marshal(append([]string{"PATH=/bin"}, f.ranEnv...))
+		env = string(b)
+	}
 	if env == "" {
 		env = goodEnv
 	}
@@ -33,6 +40,14 @@ func (f *fakeDocker) inspect(user string) []byte {
 func (f *fakeDocker) run(_ context.Context, args ...string) ([]byte, error) {
 	line := strings.Join(args, " ")
 	f.calls = append(f.calls, line)
+	if strings.HasPrefix(line, "run -d ") {
+		f.ranEnv = nil
+		for i, a := range args {
+			if a == "-e" && i+1 < len(args) {
+				f.ranEnv = append(f.ranEnv, args[i+1])
+			}
+		}
+	}
 	switch {
 	case strings.HasPrefix(line, "container inspect") && f.missing:
 		return []byte("Error: No such container"), errors.New("exit 1")
@@ -246,4 +261,24 @@ func TestEnsureRegistryLogsReplacedField(t *testing.T) {
 		}
 	}
 	t.Errorf("no registry_replaced line in %s", buf.String())
+}
+
+// A container that EnsureRegistry started has the environment that EnsureRegistry checks, so a second call keeps it.
+func TestEnsureRegistryKeepsContainerItStarted(t *testing.T) {
+	d := &fakeDocker{missing: true, echoRun: true}
+	s := newTestService(&fakeRuntime{clusters: map[string]bool{}}, matchingObs())
+	s.Docker = d.run
+	if err := s.EnsureRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	d.missing, d.calls = false, nil
+	if err := s.EnsureRegistry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if d.has("rm -f") || d.has("run ") {
+		t.Errorf("a second call replaced the container: %q", d.calls)
+	}
+	if len(d.ranEnv) != len(registryEnv) {
+		t.Errorf("run -e values %v, want %v", d.ranEnv, registryEnv)
+	}
 }

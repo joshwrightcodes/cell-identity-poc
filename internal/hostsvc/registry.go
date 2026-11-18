@@ -119,9 +119,13 @@ func (s *Service) runRegistry(ctx context.Context) error {
 		"-v", RegistryVolume+":/var/lib/registry", RegistryImage, registryUser, "/var/lib/registry"); err != nil {
 		return fmt.Errorf("prepare volume %s: %w: %s", RegistryVolume, err, strings.TrimSpace(string(out)))
 	}
-	if out, err := s.Docker(ctx, "run", "-d", "--restart=always", "--name", RegistryName,
-		"--user", registryUser, "-v", RegistryVolume+":/var/lib/registry",
-		"-e", "REGISTRY_HTTP_DEBUG_ADDR=", "-e", "REGISTRY_STORAGE_DELETE_ENABLED=false", "-p", "127.0.0.1:5001:5000", RegistryImage); err != nil {
+	args := []string{"run", "-d", "--restart=always", "--name", RegistryName,
+		"--user", registryUser, "-v", RegistryVolume + ":/var/lib/registry"}
+	for _, e := range registryEnv {
+		args = append(args, "-e", e)
+	}
+	args = append(args, "-p", "127.0.0.1:5001:5000", RegistryImage)
+	if out, err := s.Docker(ctx, args...); err != nil {
 		return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 	}
 	return nil
