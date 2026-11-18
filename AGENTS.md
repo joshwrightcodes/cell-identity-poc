@@ -32,7 +32,8 @@
 | New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |
 | Report each hop of the telemetry path of one cluster, and the first failing hop (see README "Collectors and uplinks") | `mise run obs:uplink-status dev-cell-1` |
 | Render bundles only | `mise run cell:hydrate` |
-| Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
+| Push bundles after a change to a cell or `dev-cp`, which take only signed sets | `CELL=<cluster> mise run cell:hydrate && mise run bundle -- publish --target <cluster> --wait` |
+| Push bundles to `management`, or break glass in a cluster with a signed state (name the cluster in `CELL`) | `CELL=management mise run cell:publish`, or `CELL=<cluster> BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
 | Remove what the `cell:ui` server wrote into `argocd` | `mise run cell:ui:clean` |
 | Delete the cell | `mise run cell:down` |
