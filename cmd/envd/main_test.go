@@ -32,6 +32,8 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
@@ -684,5 +686,170 @@ func TestPullerConfigWiresStepConfigMaps(t *testing.T) {
 	got, _, err := pc.StepStatus.Read(t.Context())
 	if err != nil || len(got) != 1 || got[0].Cell != "d" {
 		t.Fatalf("step status %v %v", got, err)
+	}
+}
+
+// planeBase returns the flags of a complete run command.
+func planeBase(t *testing.T) []string {
+	t.Helper()
+	s := newSigner(t)
+	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	pem, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := filepath.Join(t.TempDir(), "peer.pem")
+	if err := os.WriteFile(peer, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"--upstream", "x:1", "--expect-id", "spiffe://mgmt.poc.internal/api", "--peer-bundle", peer,
+		"--peer-trust-domain", "mgmt.poc.internal", "--spec-key-file", s.keyFile(), "--env", "dev", "--output-configmap", "a/b"}
+	return append(base, gatewayFlags()...)
+}
+
+func planeFlags() []string {
+	return []string{"--cluster", "dev-cp", "--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "bundle-store.cell-system.svc:5000",
+		"--bundle-store-token", "/var/run/secrets/store/token", "--bundle-state-configmap", "envd-system/bundle-state"}
+}
+
+func TestEnvdPlaneFlags(t *testing.T) {
+	base := planeBase(t)
+	plain, err := parseRun(base)
+	if err != nil {
+		t.Fatalf("without the plane flags: %v", err)
+	}
+	if plain.bundleMirror != "" || plain.cluster != "" {
+		t.Fatalf("plane is on without flags: %+v", plain)
+	}
+	cfg, err := parseRun(append(slices.Clone(base), planeFlags()...))
+	if err != nil {
+		t.Fatalf("full plane flags: %v", err)
+	}
+	if cfg.cluster != "dev-cp" || cfg.bundleMirror != "10.0.0.5:5000" || cfg.bundleStore != "bundle-store.cell-system.svc:5000" ||
+		cfg.bundleStoreToken != "/var/run/secrets/store/token" || cfg.bundleNS != "envd-system" || cfg.bundleName != "bundle-state" ||
+		cfg.bundleHealthTimeout != 5*time.Minute {
+		t.Fatalf("parsed %+v", cfg)
+	}
+	if cfg2, err := parseRun(append(slices.Clone(base), "--cluster", "dev-cp")); err != nil || cfg2.cluster != "dev-cp" || cfg2.bundleMirror != "" {
+		t.Fatalf("cluster alone: %+v %v", cfg2, err)
+	}
+	if cfg3, err := parseRun(append(append(slices.Clone(base), planeFlags()...), "--bundle-health-timeout", "90s")); err != nil || cfg3.bundleHealthTimeout != 90*time.Second {
+		t.Fatalf("health timeout: %+v %v", cfg3, err)
+	}
+	drop := func(args []string, flag string) []string {
+		var out []string
+		for i := 0; i < len(args); i++ {
+			if args[i] == flag {
+				i++
+				continue
+			}
+			out = append(out, args[i])
+		}
+		return out
+	}
+	for _, flag := range []string{"--cluster", "--bundle-store", "--bundle-store-token", "--bundle-state-configmap"} {
+		t.Run("missing"+flag, func(t *testing.T) {
+			_, err := parseRun(append(slices.Clone(base), drop(planeFlags(), flag)...))
+			if err == nil || !strings.Contains(err.Error(), flag) {
+				t.Fatalf("without %s: %v", flag, err)
+			}
+		})
+	}
+	for _, flag := range []string{"--bundle-store", "--bundle-store-token", "--bundle-state-configmap", "--bundle-health-timeout"} {
+		t.Run("needs_mirror"+flag, func(t *testing.T) {
+			v := "x/y"
+			if flag == "--bundle-health-timeout" {
+				v = "1m"
+			}
+			if _, err := parseRun(append(slices.Clone(base), flag, v)); err == nil || !strings.Contains(err.Error(), "--bundle-mirror") {
+				t.Fatalf("%s without the mirror: %v", flag, err)
+			}
+		})
+	}
+	for name, extra := range map[string][]string{
+		"timeout zero":        {"--bundle-health-timeout", "0s"},
+		"bad state":           {"--bundle-state-configmap", "nostate"},
+		"cluster not a label": {"--cluster", "Dev_CP"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRun(append(append(slices.Clone(base), planeFlags()...), extra...)); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+}
+
+func TestPullerConfigWiresCluster(t *testing.T) {
+	s := newSigner(t)
+	cfg := runConfig{upstream: "x:1", env: "dev", key: s.pub, cluster: "dev-cp", namespace: "n", configMap: "c",
+		hintsNS: "n", hintsName: "h", stepsNS: "n", stepsName: "s", statusNS: "n", statusName: "t", interval: time.Second}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	if pc := pullerConfig(cfg, fake.NewClientset(), &http.Client{}, nil, tel); pc.Cluster != "dev-cp" {
+		t.Fatalf("cluster = %q", pc.Cluster)
+	}
+}
+
+func TestPlaneKeysReadTheFileEachCall(t *testing.T) {
+	a, b := newSigner(t), newSigner(t)
+	path := filepath.Join(t.TempDir(), "key")
+	write := func(s *signer) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(s.pub)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(a)
+	keys := planeKeys(path, slog.New(slog.DiscardHandler))
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(a.pub) {
+		t.Fatalf("first read %v", got)
+	}
+	write(b)
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("second read %v", got)
+	}
+	if err := os.WriteFile(path, []byte("not a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("after a failed read %v", got)
+	}
+}
+
+func TestStoreTokenReadsTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("tok-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read := tokenFromFile(path)
+	if got, err := read(); err != nil || got != "tok-1" {
+		t.Fatalf("token %q %v", got, err)
+	}
+	if err := os.WriteFile(path, []byte("tok-2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := read(); got != "tok-2" {
+		t.Fatalf("rotated token %q", got)
+	}
+	if err := os.WriteFile(path, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := read(); err == nil {
+		t.Fatal("empty token accepted")
+	}
+}
+
+func TestNewPlaneBuildsTheEngine(t *testing.T) {
+	s := newSigner(t)
+	cfg := runConfig{env: "dev", cluster: "dev-cp", key: s.pub, keyFile: s.keyFile(), bundleMirror: "10.0.0.5:5000",
+		bundleStore: "bundle-store.cell-system.svc:5000", bundleStoreToken: filepath.Join(t.TempDir(), "token"),
+		bundleNS: "envd-system", bundleName: "bundle-state", bundleHealthTimeout: time.Minute}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	p, err := newPlane(cfg, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel)
+	if err != nil || p == nil {
+		t.Fatalf("newPlane: %v %v", p, err)
+	}
+	cfg.bundleMirror = "not an address"
+	if _, err := newPlane(cfg, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel); err == nil {
+		t.Fatal("a bad mirror address was accepted")
 	}
 }

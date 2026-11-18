@@ -75,8 +75,12 @@ type PullerConfig struct {
 	// StepStatus forwards no step status.
 	Steps      StepStore
 	StepStatus StepStatusSource
-	Now        func() time.Time
-	Sleep      func(context.Context, time.Duration) error
+	// Cluster is the name of the cluster that envd runs in. The gateway never receives an operation
+	// whose target is Cluster. A non-nil Plane applies the bundle set for Cluster.
+	Cluster string
+	Plane   *Plane
+	Now     func() time.Time
+	Sleep   func(context.Context, time.Duration) error
 }
 
 // Puller pulls the bundle of one environment in rounds, accepts it, saves it and reports.
@@ -284,8 +288,12 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	}
 	hints := p.pendingHints(ctx, gw)
 	steps, stepsAt := p.stepStatus(ctx)
-	if p.report(ctx, mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
-		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt}) {
+	rep := mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
+		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt}
+	if p.cfg.Plane != nil {
+		rep.PlaneBundle, rep.PlaneBundleStatus = p.cfg.Plane.Report()
+	}
+	if p.report(ctx, rep) {
 		p.forwarded(hints)
 	}
 	return failed
