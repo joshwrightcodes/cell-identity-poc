@@ -268,6 +268,11 @@ func startStepHost(t *testing.T, fakeCreate string, extra ...string) *stepHost {
 	old := selfExecutable
 	selfExecutable = func() (string, error) { return script, nil }
 	t.Cleanup(func() { selfExecutable = old })
+	// The create stage of a step reads the node address of the new cluster. These tests create no cluster, so the lookup
+	// answers with a fixed address and does not depend on Docker or a live kind cluster.
+	oldNodeIP := nodeIPLookup
+	nodeIPLookup = func(string) (string, error) { return "172.18.0.9", nil }
+	t.Cleanup(func() { nodeIPLookup = oldNodeIP })
 	args := append([]string{
 		"--step-client-bundle", h.devBundle, "--step-keys-dir", h.keys, "--journal-dir", h.journal,
 		"--repo-root", h.repo, "--admin-socket", h.sock, "--bootstrap-cmd", "true",

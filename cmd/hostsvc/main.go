@@ -92,6 +92,7 @@ func (e *exitError) Unwrap() error { return e.err }
 var (
 	startTelemetry  = telemetry.Start
 	selfExecutable  = os.Executable
+	nodeIPLookup    = func(cell string) (string, error) { return hostsvc.NewKindRuntime().NodeIP(cell) }
 	newService      = func(topo *topology.Topology) *hostsvc.Service { return hostsvc.New(hostsvc.NewKindRuntime(), topo) }
 	nofileSoftLimit = func() (uint64, error) {
 		var r syscall.Rlimit
@@ -269,7 +270,7 @@ func newStepStack(topo *topology.Topology, sf serveFlags, log *slog.Logger, mete
 	}
 	actor, err := hostsvc.NewActor(hostsvc.ActorConfig{
 		Journal: j, Verifier: v, Spec: store, Stages: hostsvc.DefaultStages(exe, cmdline, sf.cpCluster),
-		Start: hostsvc.StartGroup, NodeIP: hostsvc.NewKindRuntime().NodeIP, Log: log, Meter: meter,
+		Start: hostsvc.StartGroup, NodeIP: nodeIPLookup, Log: log, Meter: meter,
 	})
 	if err != nil {
 		return nil, err

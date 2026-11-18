@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -61,6 +62,9 @@ func TestStartGroup(t *testing.T) {
 }
 
 func TestCaffeinated(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("caffeinate is a macOS tool")
+	}
 	testtool.Need(t, "caffeinate")
 	got := caffeinated([]string{"mise", "run", "cell:up"})
 	if len(got) != 5 || filepath.Base(got[0]) != "caffeinate" || got[1] != "-i" || got[2] != "mise" || got[4] != "cell:up" {
