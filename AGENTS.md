@@ -65,6 +65,9 @@
 | Repair what `gate:m6` and `gate:m6:provision` leave: the key files, the replicas of the cell controller, recorded steps, test namespaces `m6-*`, and the cells after an interrupted provision run (`--check` only reports) | `mise run gate:m6:repair` |
 | Run the M7 end-to-end gate: a malicious cell, interception at each hop and a relay that alters bytes (build the images first) | `mise run gate:m7` |
 | Delete the test namespaces `m7-*` of every cluster and wait until they are gone (`--check` only reports) | `mise run gate:m7:repair` |
+| Publish and repair the signed bundle sets of a cell or `dev-cp` with `publish`, `get`, `verify`, `cosign` or `repair` (see README "Signed bundle sets") | `mise run bundle -- publish --target dev-cp --wait` |
+| Run the M8 end-to-end gate: signed bundle sets, rejections, rollback and the repair of a bad `argocd` set (build the images first) | `mise run gate:m8` |
+| Repair what `gate:m8` leaves: test namespaces `m8-*`, test Applications, and targets in `rolled_back` or with a test set (`--check` only reports) | `mise run gate:m8:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
