@@ -173,6 +173,13 @@ func TestBundleKindOnlyWithApplier(t *testing.T) {
 	if _, ok := with.cfg.Kinds[op.KindDemoAppend]; !ok {
 		t.Fatal("New dropped demo.append")
 	}
+	demo := r.operation(op.KindDemoAppend, `{"line":"x"}`)
+	if res := with.Execute(ctx, r.sign(demo), fence(1, 1)); res.Outcome != op.OutcomeApplied {
+		t.Fatalf("demo.append with an applier = %+v", res)
+	}
+	if got := mustGet(t, r, demoLogName).Data[demoLogKey]; got != demo.ID+" x" {
+		t.Fatalf("demo log = %q, want the demo effect to have run", got)
+	}
 	given := map[string]Effect{op.KindDemoAppend: applyDemoAppend}
 	r.executor("uid-c", func(c *Config) { c.Bundle = a; c.Kinds = given })
 	if _, ok := given[op.KindBundleApply]; ok {
