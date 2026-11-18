@@ -207,6 +207,25 @@ func TestRepoServerTokenSidecar(t *testing.T) {
 			proxyResources(t, tok)
 			// The one serviceAccountToken volume of the pod is the bundle-store token, and only store-token mounts it.
 			wantToken(t, pod, "bundle-store-token", "map[audience:bundle-store expirationSeconds:600 path:token]", "store-token")
+			// The mount path of the token volume plus the file name is the --token-file argument of the same container.
+			var mountPath any
+			for _, v := range get[[]any](t, tok, "volumeMounts") {
+				if v.(map[string]any)["name"] == "bundle-store-token" {
+					mountPath = v.(map[string]any)["mountPath"]
+				}
+			}
+			var tokenFile string
+			for _, a := range get[[]any](t, tok, "args") {
+				if f, ok := strings.CutPrefix(a.(string), "--token-file="); ok {
+					tokenFile = f
+				}
+			}
+			if fmt.Sprint(mountPath)+"/token" != tokenFile {
+				t.Errorf("the token mounts at %v and --token-file is %q, want <mountPath>/token", mountPath, tokenFile)
+			}
+			if got := lookupOr(pod, "automountServiceAccountToken"); got != false {
+				t.Errorf("the repo server pod has automountServiceAccountToken = %v, want false", got)
+			}
 			noSharedNamespaces(t, pod)
 		})
 	}
