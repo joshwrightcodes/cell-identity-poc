@@ -560,14 +560,15 @@ The applier works in these steps:
 4. It waits for up to 5 minutes until each Application is Synced and Healthy at its digest.
    Each Application also needs a sync operation that succeeded at its digest after the tag moved.
    An Application whose digest did not change keeps the sync that applied it before.
-   A component that keeps its digest of the last good set also counts when it runs no sync and is Synced and Healthy at it.
-   Argo CD starts no sync when the content compares equal, for example after a change of the repository URL.
+   An Application that keeps its digest of the last good set also counts when it runs no sync and is Synced and Healthy at it.
+   This includes `root` for a set with the components of the last good set.
+   Argo CD starts no sync when the content compares equal, for example after a repair or a change of the repository URL.
    A component that is `Degraded` for 60 seconds after such a sync ends the wait early.
    `root` never ends the wait early, because its health is the health of its children.
 5. When the set does not turn healthy, it moves `current` to the last good root.
    It terminates each sync of the failed set that still runs, in `root` and in the component Applications.
    It asks for a hard refresh of `root`, and waits for up to 5 minutes again.
-   The good root was applied before, so an Application that runs no sync and is Synced and Healthy at it counts.
+   The good root was applied before, so an Application counts as restored when it is Synced and Healthy at that root and runs no sync.
    It then reports `rolled_back`.
 
 A rollback creates no version and deletes no resource.
@@ -668,7 +669,9 @@ Read it with `mise run harness:logs <cell> app.kubernetes.io/name=celld`, or wit
 | `component_not_allowed`, `component_unknown` | A hand-built set names a component outside the role of the target. `publish` refuses an unknown name earlier, at `mgmtd`, as `payload_invalid` with the detail `set` | Fix the name. A cell takes the platform components and `apps-sample`. `dev-cp` takes the platform components and the three of its own |
 | `component_not_allowed`, `kind`, `namespace`, `namespace_missing`, `cluster_kind_namespaced`, `kind_unknown_scope` or `items_list` | An object has a kind or a namespace that the class of the component does not allow, or the engine cannot place it | Remove the object, or move it to a component of the right class |
 | `component_not_allowed`, `harness_namespace`, `harness_label` or `harness_object` | A bundle names a harness namespace, carries the harness label, or names a guard policy | Remove the object. The harness owns these |
-| `component_not_allowed`, `service_type` or `mesh_opt_out` | An application bundle has a Service that is not `ClusterIP`, or a pod that refuses the sidecar | Remove the Service type or the opt-out |
+| `component_not_allowed`, `service_type` or `mesh_opt_out` | An application bundle has a Service that is not `ClusterIP`, or an object that changes the sidecar. The keys are `sidecar.istio.io/inject`, `traffic.sidecar.istio.io/*`, `sidecar.istio.io/interceptionMode` and `proxy.istio.io/config` | Remove the Service type or the key |
+| `component_not_allowed`, `service_account_token` | A bundle of any class holds a Secret of type `kubernetes.io/service-account-token` | Remove the Secret |
+| `component_not_allowed`, `foreign_service_account` | A pod of an application bundle names a ServiceAccount that the same bundle does not declare, other than `default` | Declare the ServiceAccount in the bundle, or remove the name |
 | `component_not_allowed`, `appproject_spec`, `not_canonical`, `layout`, `list`, `too_large` or `policy_error` | An AppProject differs from the locked one. Or the bytes have no canonical form, the layout or the list is wrong, the set exceeds a limit, or the policy failed | Read the `bundle refused` log line for the object |
 | `policy_blocks_planes`, `<namespace>/<name>` | The bundle names a harness plane policy | Remove the object. The plane policies belong to the harness |
 | `policy_blocks_planes`, `mesh_injection` | A Namespace or a pod template in a guarded namespace sets mesh injection | Remove the label |
@@ -685,8 +688,12 @@ Four more cases:
 
 - `timeout` is the usual end of a bad Deployment.
   Argo CD marks a Deployment `Degraded` only after `progressDeadlineSeconds`, so the wait runs to its end.
-  Argo CD fails a sync at once when a resource of an earlier wave turns `Degraded`, and retries the same revision for minutes.
+  Argo CD fails a sync at once when a resource of an earlier wave turns `Degraded`.
+  It does not wait for `controller.sync.timeout.seconds`. It retries the same revision with a backoff of 10 seconds that doubles, five times, which holds the Application for about 6 minutes.
   The rollback terminates these syncs, so the good root does not wait for the retries.
+  The forward path terminates nothing, so run the repair before the next set after `rollback_unhealthy`.
+  Argo CD does not sync a digest again when its last sync of that digest failed.
+  A set that sends that digest again times out and rolls back, unless someone syncs the Application by hand or the set changes its content.
   A set whose workloads need more than 5 minutes ends in a rollback.
   A bad `dev-cp` set can stop attestation and the relay for up to 5 minutes before the rollback.
 - A recreated cell fails the telemetry check for up to 5 minutes after it turns valid.
@@ -714,13 +721,13 @@ A set that breaks the repo server, the token client or the store proxy can end `
 Nothing then reads the restored tag, so the rollback cannot finish.
 `harness:status` names `mise run bundle -- repair --target <target>`.
 
-The repair verifies the signature of the root:
+The repair verifies the signature of the root and runs the bundle policy on the bundles that it applies:
 
 - The root of `good[0]` is the bootstrap root that `build/<target>/root.json` names, or a root that `cosign` verifies offline against the current key of `mgmtd`.
 - The digests of `argocd` and `cell-system` come from the root layer, and the signed statement names the same digests.
 
 A signature proves that `mgmtd` signed the set, and not that the set was good.
-When the policy check of the repair is in place, it runs the bundle policy on the two bundles first. It refuses on any deny.
+So the repair runs the bundle policy on the two bundles before it applies them, and refuses on any deny.
 
 Then the repair restores the verified root under `current` through a port-forward to the loopback registry of the store pod.
 It pins the Applications `cell-system` and `argocd` at the good digests.
