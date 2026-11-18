@@ -38,6 +38,10 @@ const (
 // KindDemoAppend appends one line to the demo log of a cell.
 const KindDemoAppend = "demo.append"
 
+// MaxBundleArgsBytes is the most bytes in the args of a bundle.apply operation: one attestation
+// envelope. It lies below the frame limit of the gateway. mgmtd, celld and envd refuse more.
+const MaxBundleArgsBytes = 24 << 10
+
 // KindBundleApply applies one signed bundle set to a target. The args are one attestation envelope.
 const KindBundleApply = "bundle.apply"
 

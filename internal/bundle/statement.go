@@ -89,12 +89,15 @@ func NewStatement(env, target string, s Set, rootDigest string) Statement {
 }
 
 // SignAttestation returns a DSSE envelope with payload type PayloadType that holds st, signed with
-// key through record.SignEnvelope. key must be an Ed25519 private key. It refuses a statement of
-// more than MaxStatementBytes.
+// key through record.SignEnvelope. key must be an Ed25519 private key. It refuses a statement that
+// ParseAttestation would refuse, and a statement of more than MaxStatementBytes.
 func SignAttestation(st Statement, key crypto.Signer) ([]byte, error) {
 	priv, ok := key.(ed25519.PrivateKey)
 	if !ok {
 		return nil, errors.New("attestation key is not an Ed25519 private key")
+	}
+	if _, err := st.set(); err != nil {
+		return nil, fmt.Errorf("%w statement: %v", record.ErrDecode, err)
 	}
 	body, err := json.Marshal(st)
 	if err != nil {

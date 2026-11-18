@@ -7,16 +7,38 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"maps"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 )
+
+var update = flag.Bool("update", false, "rewrite the golden files")
+
+// checkGolden compares the digests of a with the golden file, or writes the file with -update.
+func checkGolden(t testing.TB, path string, a bundle.Artifact) {
+	t.Helper()
+	got := fmt.Sprintf("manifest %s\nlayer %s\nconfig %s\n", a.Digest, a.LayerDigest, a.ConfigDigest)
+	if *update {
+		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(want) != got {
+		t.Errorf("digests differ from %s\n got:\n%s want:\n%s", path, got, want)
+	}
+}
 
 func sampleFiles() map[string][]byte {
 	return map[string][]byte{
@@ -26,13 +48,19 @@ func sampleFiles() map[string][]byte {
 	}
 }
 
-// The mtime of a tar entry has a resolution of one second, so the runs below sit more than a second apart.
+func TestPackGolden(t *testing.T) {
+	a, err := bundle.Pack(sampleFiles())
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkGolden(t, "testdata/pack.golden", a)
+}
+
 func TestPackDeterministic(t *testing.T) {
 	a, err := bundle.Pack(sampleFiles())
 	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(1100 * time.Millisecond)
 	// A map copy has a new iteration order for each range.
 	b, err := bundle.Pack(maps.Clone(sampleFiles()))
 	if err != nil {
@@ -42,14 +70,7 @@ func TestPackDeterministic(t *testing.T) {
 		t.Fatalf("two runs differ: %s %s", a.Digest, b.Digest)
 	}
 
-	zr, err := gzip.NewReader(bytes.NewReader(a.Layer))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if h := zr.Header; h.Name != "" || h.Comment != "" || !h.ModTime.IsZero() || len(h.Extra) != 0 {
-		t.Errorf("gzip header %+v", h)
-	}
-	tr := tar.NewReader(zr)
+	tr := tar.NewReader(bytes.NewReader(a.Layer))
 	var names []string
 	for {
 		hdr, err := tr.Next()
@@ -61,12 +82,15 @@ func TestPackDeterministic(t *testing.T) {
 		}
 		names = append(names, hdr.Name)
 		if hdr.Mode != 0o644 || hdr.Uid != 0 || hdr.Gid != 0 || hdr.Uname != "" || hdr.Gname != "" ||
-			hdr.ModTime.Unix() != 0 || hdr.Typeflag != tar.TypeReg || len(hdr.PAXRecords) != 0 {
+			hdr.ModTime.Unix() != 0 || hdr.Typeflag != tar.TypeReg || len(hdr.PAXRecords) != 0 || hdr.Format != tar.FormatUSTAR {
 			t.Errorf("entry %q: %+v", hdr.Name, hdr)
 		}
 	}
 	if want := []string{"alpha.yaml", "mid.yaml", "zeta.yaml"}; !reflect.DeepEqual(names, want) {
 		t.Errorf("entries %v, want %v", names, want)
+	}
+	if a.Layer[0] == 0x1f && a.Layer[1] == 0x8b {
+		t.Error("the layer is gzip")
 	}
 }
 
@@ -99,7 +123,7 @@ func TestPackManifest(t *testing.T) {
 	}
 	if m.SchemaVersion != 2 || m.MediaType != "application/vnd.oci.image.manifest.v1+json" ||
 		m.Config.MediaType != "application/vnd.oci.empty.v1+json" || m.Config.Digest != a.ConfigDigest || m.Config.Size != 2 ||
-		len(m.Layers) != 1 || m.Layers[0].MediaType != "application/vnd.oci.image.layer.v1.tar+gzip" ||
+		len(m.Layers) != 1 || m.Layers[0].MediaType != "application/vnd.oci.image.layer.v1.tar" ||
 		m.Layers[0].Digest != a.LayerDigest || m.Layers[0].Size != len(a.Layer) {
 		t.Errorf("manifest %s", a.Manifest)
 	}
@@ -117,36 +141,65 @@ func TestPackUnpackRoundTrip(t *testing.T) {
 	if !reflect.DeepEqual(got, sampleFiles()) {
 		t.Errorf("got %v", got)
 	}
-	// An empty file survives.
-	b, err := bundle.Pack(map[string][]byte{"empty.yaml": {}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, err := bundle.Unpack(b.Layer, 10); err != nil || len(got["empty.yaml"]) != 0 || len(got) != 1 {
-		t.Errorf("empty file: %v %v", got, err)
-	}
-	// The unpack limit counts exactly.
-	size := int64(len(sampleFiles()["zeta.yaml"]) + len(sampleFiles()["alpha.yaml"]) + 3000)
+	// The unpack limit counts the bytes of the files exactly.
+	size := int64(len("kind: ConfigMap\n") + len("kind: Secret\n") + 3000)
 	if _, err := bundle.Unpack(a.Layer, size); err != nil {
 		t.Errorf("limit equal to the size: %v", err)
 	}
-	if _, err := bundle.Unpack(a.Layer, size-1); err == nil {
-		t.Error("limit one below the size passed")
+	if _, err := bundle.Unpack(a.Layer, size-1); !errors.Is(err, bundle.ErrTooLarge) {
+		t.Errorf("limit one below the size: %v", err)
+	}
+}
+
+func TestUnpackComponent(t *testing.T) {
+	a, err := bundle.Pack(map[string][]byte{"manifests.yaml": []byte("kind: ConfigMap\n")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := bundle.UnpackComponent(a.Layer, 1<<20)
+	if err != nil || string(got) != "kind: ConfigMap\n" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	for name, files := range map[string]map[string][]byte{
+		"other_name":   {"other.yaml": []byte("x")},
+		"extra_file":   {"manifests.yaml": []byte("x"), "extra.yaml": []byte("y")},
+		"only_a_wrong": {"manifest.yaml": []byte("x")},
+	} {
+		b, err := bundle.Pack(files)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := bundle.UnpackComponent(b.Layer, 1<<20); !errors.Is(err, bundle.ErrLayout) {
+			t.Errorf("%s: want ErrLayout, got %v", name, err)
+		}
+	}
+	if _, err := bundle.UnpackComponent(a.Layer, 3); !errors.Is(err, bundle.ErrTooLarge) {
+		t.Errorf("limit: %v", err)
 	}
 }
 
 func TestPackRefuses(t *testing.T) {
-	for name, files := range map[string]map[string][]byte{
-		"nil":       nil,
-		"empty_map": {},
-		"slash":     {"a/b.yaml": []byte("x")},
-		"dotdot":    {"..": []byte("x")},
-		"dot":       {".": []byte("x")},
-		"empty":     {"": []byte("x")},
-		"backslash": {`a\b`: []byte("x")},
+	over := map[string][]byte{}
+	for i := range bundle.MaxEntries + 1 {
+		over[fmt.Sprintf("f%02d", i)] = []byte("x")
+	}
+	for name, tc := range map[string]struct {
+		files map[string][]byte
+		want  error
+	}{
+		"nil":        {nil, bundle.ErrLayout},
+		"empty_map":  {map[string][]byte{}, bundle.ErrLayout},
+		"slash":      {map[string][]byte{"a/b.yaml": []byte("x")}, bundle.ErrLayout},
+		"dotdot":     {map[string][]byte{"..": []byte("x")}, bundle.ErrLayout},
+		"dot":        {map[string][]byte{".": []byte("x")}, bundle.ErrLayout},
+		"empty":      {map[string][]byte{"": []byte("x")}, bundle.ErrLayout},
+		"backslash":  {map[string][]byte{`a\b`: []byte("x")}, bundle.ErrLayout},
+		"empty_file": {map[string][]byte{"a": {}}, bundle.ErrLayout},
+		"33_files":   {over, bundle.ErrLayout},
+		"too_big":    {map[string][]byte{"a": make([]byte, bundle.MaxLayerBytes+1)}, bundle.ErrTooLarge},
 	} {
-		if _, err := bundle.Pack(files); err == nil {
-			t.Errorf("%s packed", name)
+		if _, err := bundle.Pack(tc.files); !errors.Is(err, tc.want) {
+			t.Errorf("%s: want %v, got %v", name, tc.want, err)
 		}
 	}
 }
@@ -154,8 +207,7 @@ func TestPackRefuses(t *testing.T) {
 func rawTar(t testing.TB, entries ...*tar.Header) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	tw := tar.NewWriter(zw)
+	tw := tar.NewWriter(&buf)
 	for _, h := range entries {
 		body := []byte(strings.Repeat("x", int(h.Size)))
 		if err := tw.WriteHeader(h); err != nil {
@@ -168,9 +220,6 @@ func rawTar(t testing.TB, entries ...*tar.Header) []byte {
 	if err := tw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
 	return buf.Bytes()
 }
 
@@ -178,46 +227,60 @@ func TestUnpackRefuses(t *testing.T) {
 	reg := func(name string, size int64) *tar.Header {
 		return &tar.Header{Typeflag: tar.TypeReg, Name: name, Mode: 0o644, Size: size}
 	}
-	many := make([]*tar.Header, 0, bundle.MaxObjects+1)
-	for i := range bundle.MaxObjects + 1 {
-		many = append(many, reg(fmt.Sprintf("f%04d", i), 0))
+	many := make([]*tar.Header, 0, bundle.MaxEntries+1)
+	for i := range bundle.MaxEntries + 1 {
+		many = append(many, reg(fmt.Sprintf("f%02d", i), 1))
 	}
 	good, _ := bundle.Pack(sampleFiles())
 	var gz bytes.Buffer
 	zw := gzip.NewWriter(&gz)
-	zw.Write(bytes.Repeat([]byte{0}, 4<<20))
+	zw.Write(good.Layer)
 	zw.Close()
 
 	for _, tc := range []struct {
 		name  string
 		layer []byte
 		max   int64
+		want  error
 	}{
-		{"traversal", rawTar(t, reg("../evil", 1)), 1 << 20},
-		{"absolute", rawTar(t, reg("/etc/passwd", 1)), 1 << 20},
-		{"subdirectory", rawTar(t, reg("a/b", 1)), 1 << 20},
-		{"dot_name", rawTar(t, reg(".", 1)), 1 << 20},
-		{"directory", rawTar(t, &tar.Header{Typeflag: tar.TypeDir, Name: "d", Mode: 0o755}), 1 << 20},
-		{"symlink", rawTar(t, &tar.Header{Typeflag: tar.TypeSymlink, Name: "l", Linkname: "/etc/passwd"}), 1 << 20},
-		{"hardlink", rawTar(t, &tar.Header{Typeflag: tar.TypeLink, Name: "l", Linkname: "a"}), 1 << 20},
-		{"duplicate", rawTar(t, reg("a", 1), reg("a", 2)), 1 << 20},
-		{"too_many_entries", rawTar(t, many...), 1 << 20},
-		{"over_limit", rawTar(t, reg("a", 100)), 99},
-		{"over_limit_two_files", rawTar(t, reg("a", 60), reg("b", 60)), 100},
-		{"bomb_not_tar", gz.Bytes(), 1000},
-		{"not_gzip", []byte("plain text, not gzip"), 1 << 20},
-		{"empty_input", nil, 1 << 20},
-		{"truncated", good.Layer[:len(good.Layer)/2], 1 << 20},
-		{"layer_over_8_mib", make([]byte, bundle.MaxLayerBytes+1), 1 << 20},
-		{"trailing_gzip_garbage", append(append([]byte(nil), good.Layer...), []byte("garbage after the member")...), 1 << 20},
+		{"traversal", rawTar(t, reg("../evil", 1)), 1 << 20, bundle.ErrLayout},
+		{"absolute", rawTar(t, reg("/etc/passwd", 1)), 1 << 20, bundle.ErrLayout},
+		{"subdirectory", rawTar(t, reg("a/b", 1)), 1 << 20, bundle.ErrLayout},
+		{"dot_name", rawTar(t, reg(".", 1)), 1 << 20, bundle.ErrLayout},
+		{"directory", rawTar(t, &tar.Header{Typeflag: tar.TypeDir, Name: "d", Mode: 0o755}), 1 << 20, bundle.ErrLayout},
+		{"symlink", rawTar(t, &tar.Header{Typeflag: tar.TypeSymlink, Name: "l", Linkname: "/etc/passwd"}), 1 << 20, bundle.ErrLayout},
+		{"hardlink", rawTar(t, &tar.Header{Typeflag: tar.TypeLink, Name: "l", Linkname: "a"}), 1 << 20, bundle.ErrLayout},
+		{"duplicate", rawTar(t, reg("a", 1), reg("a", 2)), 1 << 20, bundle.ErrLayout},
+		{"empty_file", rawTar(t, reg("a", 0)), 1 << 20, bundle.ErrLayout},
+		{"zero_entries", rawTar(t), 1 << 20, bundle.ErrLayout},
+		{"33_entries", rawTar(t, many...), 1 << 20, bundle.ErrTooLarge},
+		{"over_limit", rawTar(t, reg("a", 100)), 99, bundle.ErrTooLarge},
+		{"over_limit_two_files", rawTar(t, reg("a", 60), reg("b", 60)), 100, bundle.ErrTooLarge},
+		{"gzip_layer", gz.Bytes(), 1 << 20, bundle.ErrMediaType},
+		{"not_a_tar", []byte(strings.Repeat("plain text, not a tar. ", 100)), 1 << 20, bundle.ErrLayout},
+		{"empty_input", nil, 1 << 20, bundle.ErrLayout},
+		{"truncated", good.Layer[:len(good.Layer)/2], 1 << 20, bundle.ErrLayout},
+		{"layer_over_8_mib", make([]byte, bundle.MaxLayerBytes+1), 1 << 20, bundle.ErrTooLarge},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, err := bundle.Unpack(tc.layer, tc.max); err == nil {
-				t.Fatalf("unpacked %d files", len(got))
+			got, err := bundle.Unpack(tc.layer, tc.max)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("want %v, got %v (%d files)", tc.want, err, len(got))
 			}
 		})
 	}
 	if _, err := bundle.Unpack(rawTar(t, reg("a", 100)), 100); err != nil {
 		t.Errorf("control at the limit: %v", err)
+	}
+}
+
+func TestCheckLayerMediaType(t *testing.T) {
+	if err := bundle.CheckLayerMediaType("application/vnd.oci.image.layer.v1.tar"); err != nil {
+		t.Error(err)
+	}
+	for _, mt := range []string{"application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.oci.image.layer.v1.tar+zstd", "", "text/plain"} {
+		if err := bundle.CheckLayerMediaType(mt); !errors.Is(err, bundle.ErrMediaType) {
+			t.Errorf("%q: %v", mt, err)
+		}
 	}
 }

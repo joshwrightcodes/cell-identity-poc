@@ -302,6 +302,17 @@ func TestBundleWireNames(t *testing.T) {
 			}
 		}
 	}
+	res, err := json.Marshal(BundleSignResult{Envelope: json.RawMessage(`{"payloadType":"x"}`), SigstoreBundle: json.RawMessage(`{"mediaType":"y"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj struct {
+		Envelope       map[string]string `json:"envelope"`
+		SigstoreBundle map[string]string `json:"sigstoreBundle"`
+	}
+	if err := json.Unmarshal(res, &obj); err != nil || obj.Envelope["payloadType"] != "x" || obj.SigstoreBundle["mediaType"] != "y" {
+		t.Errorf("envelope and sigstoreBundle must encode as JSON objects: %s, %v", res, err)
+	}
 	if ReasonBundleOpen != "bundle_open" {
 		t.Errorf("ReasonBundleOpen is %q", ReasonBundleOpen)
 	}

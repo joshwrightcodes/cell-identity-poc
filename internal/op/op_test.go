@@ -396,6 +396,12 @@ func TestIsFinalRolledBack(t *testing.T) {
 	}
 }
 
+func TestMaxBundleArgsBytes(t *testing.T) {
+	if MaxBundleArgsBytes != 24*1024 {
+		t.Errorf("MaxBundleArgsBytes is %d", MaxBundleArgsBytes)
+	}
+}
+
 func TestStatusNoBundleKey(t *testing.T) {
 	raw, _ := json.Marshal(Status{Cell: "c", Pod: "p", At: t0})
 	if strings.Contains(string(raw), "bundle") {

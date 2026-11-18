@@ -546,7 +546,7 @@ func TestFetchLayout(t *testing.T) {
 	cases := map[string]func(m map[string]any){
 		"two layers": func(m map[string]any) { m["layers"] = append(m["layers"].([]any), layer(m)) },
 		"no layers":  func(m map[string]any) { m["layers"] = []any{} },
-		"layer type": func(m map[string]any) { layer(m)["mediaType"] = "application/vnd.oci.image.layer.v1.tar" },
+		"layer type": func(m map[string]any) { layer(m)["mediaType"] = "application/vnd.oci.image.layer.v1.tar+gzip" },
 		"config type": func(m map[string]any) {
 			m["config"].(map[string]any)["mediaType"] = "application/vnd.oci.image.config.v1+json"
 		},

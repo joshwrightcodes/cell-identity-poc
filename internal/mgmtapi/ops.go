@@ -109,12 +109,12 @@ type GatewayStatus struct {
 // content and root digests, the attestation envelope and the cosign bundle that wraps it. Both are
 // public data.
 type BundleSignResult struct {
-	OpID           string         `json:"opId"`
-	Version        bundle.Version `json:"version"`
-	ContentSHA256  string         `json:"contentSHA256"`
-	RootDigest     string         `json:"rootDigest"`
-	Envelope       []byte         `json:"envelope"`
-	SigstoreBundle []byte         `json:"sigstoreBundle"`
+	OpID           string          `json:"opId"`
+	Version        bundle.Version  `json:"version"`
+	ContentSHA256  string          `json:"contentSHA256"`
+	RootDigest     string          `json:"rootDigest"`
+	Envelope       json.RawMessage `json:"envelope"`
+	SigstoreBundle json.RawMessage `json:"sigstoreBundle"`
 }
 
 // TargetBundle is the last signed set of one target, as the management plane reports it. Result is

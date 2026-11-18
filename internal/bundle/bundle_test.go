@@ -47,47 +47,52 @@ func TestParseComponentsRules(t *testing.T) {
 		}
 		return out
 	}
+	noWave := []map[string]any{{"name": "a", "namespace": "default", "digest": hexDigest('a')}}
 	for _, tc := range []struct {
 		name string
 		in   any
-		ok   bool
+		want string // empty means the input is valid; otherwise a fragment of the error
 	}{
-		{"valid", []map[string]any{comp("a", 0), comp("b", 3)}, true},
-		{"wave_minus_10", []map[string]any{comp("a", -10)}, true},
-		{"wave_20", []map[string]any{comp("a", 20)}, true},
-		{"32_components", many(32), true},
-		{"name_40_chars", []map[string]any{comp(strings.Repeat("a", 40), 0)}, true},
-		{"ignore_8_entries", with("ignoreDifferences", entries(8)), true},
+		{"valid", []map[string]any{comp("a", 0), comp("b", 3)}, ""},
+		{"wave_minus_10", []map[string]any{comp("a", -10)}, ""},
+		{"wave_20", []map[string]any{comp("a", 20)}, ""},
+		{"32_components", many(32), ""},
+		{"name_40_chars", []map[string]any{comp(strings.Repeat("a", 40), 0)}, ""},
+		{"ignore_8_entries", with("ignoreDifferences", entries(8)), ""},
 		{"ignore_known_keys", with("ignoreDifferences", []any{map[string]any{
 			"group": "g", "kind": "k", "name": "n", "namespace": "ns",
 			"jsonPointers": []string{"/a"}, "jqPathExpressions": []string{".a"}, "managedFieldsManagers": []string{"m"},
-		}}), true},
-		{"name_upper", []map[string]any{comp("Abc", 0)}, false},
-		{"name_41_chars", []map[string]any{comp(strings.Repeat("a", 41), 0)}, false},
-		{"name_root", []map[string]any{comp("root", 0)}, false},
-		{"name_empty", []map[string]any{comp("", 0)}, false},
-		{"names_out_of_order", []map[string]any{comp("b", 0), comp("a", 0)}, false},
-		{"duplicate_name", []map[string]any{comp("a", 0), comp("a", 1)}, false},
-		{"wave_21", []map[string]any{comp("a", 21)}, false},
-		{"wave_minus_11", []map[string]any{comp("a", -11)}, false},
-		{"digest_63_hex", with("digest", "sha256:"+strings.Repeat("a", 63)), false},
-		{"digest_65_hex", with("digest", "sha256:"+strings.Repeat("a", 65)), false},
-		{"digest_no_prefix", with("digest", strings.Repeat("a", 64)), false},
-		{"digest_upper", with("digest", "sha256:"+strings.Repeat("A", 64)), false},
-		{"namespace_bad", with("namespace", "Not_A_Label"), false},
-		{"ignore_unknown_key", with("ignoreDifferences", []any{map[string]any{"group": "g", "extra": 1}}), false},
-		{"ignore_9_entries", with("ignoreDifferences", entries(9)), false},
-		{"ignore_empty_list", with("ignoreDifferences", []any{}), false},
-		{"ignore_not_a_list", with("ignoreDifferences", map[string]any{"group": "g"}), false},
-		{"ignore_entry_not_object", with("ignoreDifferences", []any{"x"}), false},
-		{"zero_components", []map[string]any{}, false},
-		{"33_components", many(33), false},
-		{"unknown_field", with("extra", true), false},
-		{"not_a_list", map[string]any{"name": "a"}, false},
+		}}), ""},
+		{"wave_zero_given", []map[string]any{comp("a", 0)}, ""},
+		{"name_upper", []map[string]any{comp("Abc", 0)}, "is not a DNS label"},
+		{"name_41_chars", []map[string]any{comp(strings.Repeat("a", 41), 0)}, "is not a DNS label"},
+		{"name_empty", []map[string]any{comp("", 0)}, "is not a DNS label"},
+		{"name_root", []map[string]any{comp("root", 0)}, "taken by the root bundle"},
+		{"names_out_of_order", []map[string]any{comp("b", 0), comp("a", 0)}, `name "a" is not above "b"`},
+		{"duplicate_name", []map[string]any{comp("a", 0), comp("a", 1)}, `name "a" is not above "a"`},
+		{"wave_21", []map[string]any{comp("a", 21)}, "wave 21"},
+		{"wave_minus_11", []map[string]any{comp("a", -11)}, "wave -11"},
+		{"wave_missing", noWave, "has no wave"},
+		{"digest_63_hex", with("digest", "sha256:"+strings.Repeat("a", 63)), "digest of"},
+		{"digest_65_hex", with("digest", "sha256:"+strings.Repeat("a", 65)), "digest of"},
+		{"digest_no_prefix", with("digest", strings.Repeat("a", 64)), "digest of"},
+		{"digest_upper", with("digest", "sha256:"+strings.Repeat("A", 64)), "digest of"},
+		{"namespace_bad", with("namespace", "Not_A_Label"), "namespace"},
+		{"ignore_unknown_key", with("ignoreDifferences", []any{map[string]any{"group": "g", "extra": 1}}), "ignoreDifferences of"},
+		{"ignore_9_entries", with("ignoreDifferences", entries(9)), "9 entries"},
+		{"ignore_empty_list", with("ignoreDifferences", []any{}), "0 entries"},
+		{"ignore_empty_entry", with("ignoreDifferences", []any{map[string]any{}}), "empty entry"},
+		{"ignore_catch_all", with("ignoreDifferences", []any{map[string]any{"kind": "Deployment", "jqPathExpressions": []string{".a", "."}}}), "catch-all"},
+		{"ignore_not_a_list", with("ignoreDifferences", map[string]any{"group": "g"}), "ignoreDifferences of"},
+		{"ignore_entry_not_object", with("ignoreDifferences", []any{"x"}), "ignoreDifferences of"},
+		{"zero_components", []map[string]any{}, "0 components"},
+		{"33_components", many(33), "33 components"},
+		{"unknown_field", with("extra", true), "extra"},
+		{"not_a_list", map[string]any{"name": "a"}, "components:"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := bundle.ParseComponents(raw(t, tc.in))
-			if tc.ok {
+			if tc.want == "" {
 				if err != nil {
 					t.Fatalf("want ok, got %v", err)
 				}
@@ -96,8 +101,8 @@ func TestParseComponentsRules(t *testing.T) {
 				}
 				return
 			}
-			if !errors.Is(err, record.ErrDecode) {
-				t.Fatalf("want ErrDecode, got %v", err)
+			if !errors.Is(err, record.ErrDecode) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want ErrDecode with %q, got %v", tc.want, err)
 			}
 		})
 	}

@@ -1,16 +1,16 @@
 package bundle_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"sigs.k8s.io/yaml"
 )
-
-const store = "127.0.0.1:5000"
 
 func composeSet() bundle.Set {
 	return bundle.Set{Version: bundle.Version{Epoch: 1, Counter: 1}, Components: []bundle.Component{
@@ -24,7 +24,7 @@ func composeSet() bundle.Set {
 
 func compose(t testing.TB, role string, s bundle.Set) bundle.Artifact {
 	t.Helper()
-	a, err := bundle.ComposeRoot(role, s, bundle.DefaultPolicy(), store)
+	a, err := bundle.ComposeRoot(role, s, bundle.DefaultPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ metadata:
 spec:
   project: ` + project + `
   source:
-    repoURL: oci://` + store + `/bundles/` + c.Name + `
+    repoURL: oci://` + bundle.StoreHost + `/bundles/` + c.Name + `
     targetRevision: ` + c.Digest + `
     path: .
   destination:
@@ -179,35 +179,73 @@ func TestComposeRootProjectByClass(t *testing.T) {
 
 func TestComposeRootRefuses(t *testing.T) {
 	p := bundle.DefaultPolicy()
-	cp := composeSet() // apps-sample is not a component of role cp
-	if _, err := bundle.ComposeRoot("cp", cp, p, store); err == nil {
-		t.Error("cp composed apps-sample")
+	withNS := func(i int, ns string) bundle.Set {
+		s := composeSet()
+		s.Components[i].Namespace = ns
+		return s
 	}
-	if _, err := bundle.ComposeRoot("open", composeSet(), p, store); err == nil {
-		t.Error("role open composed")
+	for _, tc := range []struct {
+		name         string
+		role         string
+		set          bundle.Set
+		detail, comp string
+	}{
+		{"cp_apps_sample", "cp", composeSet(), "component_unknown", "apps-sample"},
+		{"role_open", "open", composeSet(), "component_unknown", "apps-sample"},
+		{"role_unknown", "nope", composeSet(), "component_unknown", "apps-sample"},
+		{"unknown_component", "cell", bundle.Set{Components: append(composeSet().Components, bundle.Component{Name: "zzz", Namespace: "argocd", Digest: hexDigest('9')})}, "component_unknown", "zzz"},
+		{"platform_namespace_outside", "cell", withNS(1, "kube-system"), "namespace", "argocd"},
+		{"platform_harness_namespace", "cell", withNS(1, "cell-identity-system"), "namespace", "argocd"},
+		{"app_namespace_outside", "cell", withNS(0, "argocd"), "namespace", "apps-sample"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for name, err := range map[string]error{
+				"CheckSet":    bundle.CheckSet(tc.role, tc.set, p),
+				"ComposeRoot": func() error { _, err := bundle.ComposeRoot(tc.role, tc.set, p); return err }(),
+			} {
+				var na *bundle.NotAllowed
+				if !errors.Is(err, bundle.ErrComponentNotAllowed) || !errors.As(err, &na) || na.Detail != tc.detail || na.Component != tc.comp {
+					t.Errorf("%s: got %v, want not allowed %s %s", name, err, tc.detail, tc.comp)
+				}
+			}
+		})
 	}
-	unknown := composeSet()
-	unknown.Components = append(unknown.Components, bundle.Component{Name: "zzz", Namespace: "x", Digest: hexDigest('9')})
-	if _, err := bundle.ComposeRoot("cell", unknown, p, store); err == nil {
-		t.Error("an unknown component composed")
+	// The cp class adds three namespaces that the cell class does not have.
+	cp := bundle.Set{Components: []bundle.Component{{Name: "relay-system", Wave: 8, Namespace: "relay-system", Digest: hexDigest('5')}}}
+	if err := bundle.CheckSet("cp", cp, p); err != nil {
+		t.Errorf("cp relay-system: %v", err)
 	}
-	for _, u := range []string{"", "oci://127.0.0.1:5000", "127.0.0.1:5000/bundles", "a b"} {
-		if _, err := bundle.ComposeRoot("cell", composeSet(), p, u); err == nil {
-			t.Errorf("store URL %q accepted", u)
-		}
+	if err := bundle.CheckSet("cell", cp, p); !errors.Is(err, bundle.ErrComponentNotAllowed) {
+		t.Errorf("cell relay-system: %v", err)
+	}
+	if err := bundle.CheckSet("cell", composeSet(), p); err != nil {
+		t.Errorf("control: %v", err)
 	}
 	bad := composeSet()
 	bad.Components[0].Digest = "sha256:short"
-	if _, err := bundle.ComposeRoot("cell", bad, p, store); err == nil {
-		t.Error("a bad digest composed")
+	if _, err := bundle.ComposeRoot("cell", bad, p); !errors.Is(err, record.ErrDecode) {
+		t.Errorf("a bad digest composed: %v", err)
 	}
 }
 
-func TestComposeRootDeterministic(t *testing.T) {
+func TestComposeRootStoreHost(t *testing.T) {
+	if bundle.StoreHost != "127.0.0.1:5000" {
+		t.Fatalf("StoreHost %q", bundle.StoreHost)
+	}
+	for _, body := range rootFiles(t, compose(t, "cell", composeSet())) {
+		if !strings.Contains(string(body), "oci://127.0.0.1:5000/bundles/") {
+			t.Errorf("Application without the store host:\n%s", body)
+		}
+	}
+}
+
+// The root digest must agree between mgmtd, the appliers and bundlectl. The golden file pins it, so
+// a change of the YAML encoder, the tar encoder or the Application shape shows up as a failure.
+func TestComposeRootGolden(t *testing.T) {
 	a := compose(t, "cell", composeSet())
-	time.Sleep(1100 * time.Millisecond)
+	checkGolden(t, "testdata/root.golden", a)
 	b := compose(t, "cell", composeSet())
-	if a.Digest != b.Digest || string(a.Layer) != string(b.Layer) || string(a.Manifest) != string(b.Manifest) {
+	if a.Digest != b.Digest || !bytes.Equal(a.Layer, b.Layer) || !bytes.Equal(a.Manifest, b.Manifest) {
 		t.Fatalf("two runs differ: %s %s", a.Digest, b.Digest)
 	}
 	other := composeSet()

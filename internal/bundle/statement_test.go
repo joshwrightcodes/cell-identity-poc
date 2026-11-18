@@ -4,8 +4,11 @@ import (
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -155,25 +158,26 @@ func TestStatementSubjectsMatchSet(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name string
+		want string
 		mod  func(*bundle.Statement)
 	}{
-		{"missing_root", func(s *bundle.Statement) { s.Subject = s.Subject[1:] }},
-		{"missing_component", func(s *bundle.Statement) { s.Subject = append(s.Subject[:2:2], s.Subject[3:]...) }},
-		{"extra_subject", func(s *bundle.Statement) { s.Subject = append(s.Subject, sub("bundles/dev-cell-1/other", '9')) }},
-		{"duplicate_root", func(s *bundle.Statement) { s.Subject = append(s.Subject, s.Subject[0]) }},
-		{"duplicate_component", func(s *bundle.Statement) { s.Subject = append(s.Subject, s.Subject[1]) }},
-		{"duplicate_swaps_missing", func(s *bundle.Statement) { s.Subject[3] = s.Subject[2] }},
-		{"other_target", func(s *bundle.Statement) { s.Predicate.Target = "dev-cell-2" }},
-		{"no_subjects", func(s *bundle.Statement) { s.Subject = nil }},
-		{"digest_short", func(s *bundle.Statement) { s.Subject[1].Digest.SHA256 = strings.Repeat("a", 63) }},
-		{"digest_upper", func(s *bundle.Statement) { s.Subject[1].Digest.SHA256 = strings.Repeat("A", 64) }},
-		{"wrong_type", func(s *bundle.Statement) { s.Type = "https://in-toto.io/Statement/v0.1" }},
-		{"wrong_predicate_type", func(s *bundle.Statement) { s.PredicateType = "https://slsa.dev/provenance/v1" }},
-		{"env_bad", func(s *bundle.Statement) { s.Predicate.Env = "Dev" }},
-		{"target_bad", func(s *bundle.Statement) { s.Predicate.Target = "a/b" }},
-		{"epoch_zero", func(s *bundle.Statement) { s.Predicate.Version.Epoch = 0 }},
-		{"no_components", func(s *bundle.Statement) { s.Predicate.Components = nil }},
-		{"components_unordered", func(s *bundle.Statement) {
+		{"missing_root", "no root subject", func(s *bundle.Statement) { s.Subject = s.Subject[1:] }},
+		{"missing_component", "has no subject", func(s *bundle.Statement) { s.Subject = append(s.Subject[:2:2], s.Subject[3:]...) }},
+		{"extra_subject", "subjects for", func(s *bundle.Statement) { s.Subject = append(s.Subject, sub("bundles/dev-cell-1/other", '9')) }},
+		{"duplicate_root", "appears twice", func(s *bundle.Statement) { s.Subject = append(s.Subject, s.Subject[0]) }},
+		{"duplicate_component", "appears twice", func(s *bundle.Statement) { s.Subject = append(s.Subject, s.Subject[1]) }},
+		{"duplicate_swaps_missing", "appears twice", func(s *bundle.Statement) { s.Subject[3] = s.Subject[2] }},
+		{"other_target", "has no subject", func(s *bundle.Statement) { s.Predicate.Target = "dev-cell-2" }},
+		{"no_subjects", "has no subject", func(s *bundle.Statement) { s.Subject = nil }},
+		{"digest_short", "64 lowercase", func(s *bundle.Statement) { s.Subject[1].Digest.SHA256 = strings.Repeat("a", 63) }},
+		{"digest_upper", "64 lowercase", func(s *bundle.Statement) { s.Subject[1].Digest.SHA256 = strings.Repeat("A", 64) }},
+		{"wrong_type", "_type is", func(s *bundle.Statement) { s.Type = "https://in-toto.io/Statement/v0.1" }},
+		{"wrong_predicate_type", "predicateType is", func(s *bundle.Statement) { s.PredicateType = "https://slsa.dev/provenance/v1" }},
+		{"env_bad", "env is not", func(s *bundle.Statement) { s.Predicate.Env = "Dev" }},
+		{"target_bad", "target is not", func(s *bundle.Statement) { s.Predicate.Target = "a/b" }},
+		{"epoch_zero", "epoch is 0", func(s *bundle.Statement) { s.Predicate.Version.Epoch = 0 }},
+		{"no_components", "0 components", func(s *bundle.Statement) { s.Predicate.Components = nil }},
+		{"components_unordered", "is not above", func(s *bundle.Statement) {
 			c := s.Predicate.Components
 			c[0], c[1] = c[1], c[0]
 		}},
@@ -182,8 +186,12 @@ func TestStatementSubjectsMatchSet(t *testing.T) {
 			st := base()
 			tc.mod(&st)
 			_, _, err := bundle.ParseAttestation(signStatement(t, st, priv), trust(pub))
-			if !errors.Is(err, record.ErrDecode) {
-				t.Fatalf("want ErrDecode, got %v", err)
+			if !errors.Is(err, record.ErrDecode) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want ErrDecode with %q, got %v", tc.want, err)
+			}
+			// SignAttestation refuses what ParseAttestation refuses.
+			if _, err := bundle.SignAttestation(st, priv); !errors.Is(err, record.ErrDecode) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("SignAttestation: want ErrDecode with %q, got %v", tc.want, err)
 			}
 		})
 	}
@@ -284,5 +292,35 @@ func TestAttestationOtherTypes(t *testing.T) {
 	}
 	if _, _, err := op.Verify(att, []ed25519.PublicKey{pub}); !errors.Is(err, record.ErrPayloadType) {
 		t.Errorf("op.Verify of an attestation: want ErrPayloadType, got %v", err)
+	}
+}
+
+// cosign attest signs Ed25519ph with an Ed25519 key. The verifier accepts only pure Ed25519, the
+// scheme of record.SignEnvelope.
+func TestAttestationRefusesEd25519ph(t *testing.T) {
+	pub, priv := keypair(t)
+	body, _ := json.Marshal(bundle.NewStatement("dev", "c", testSet(), rootDigest))
+	pae := []byte(fmt.Sprintf("DSSEv1 %d %s %d %s", len(bundle.PayloadType), bundle.PayloadType, len(body), body))
+	digest := sha512.Sum512(pae)
+	sig, err := priv.Sign(nil, digest[:], &ed25519.Options{Hash: crypto.SHA512})
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, _ := json.Marshal(map[string]any{
+		"payloadType": bundle.PayloadType,
+		"payload":     base64.StdEncoding.EncodeToString(body),
+		"signatures":  []map[string]string{{"sig": base64.StdEncoding.EncodeToString(sig)}},
+	})
+	if _, _, err := bundle.ParseAttestation(env, trust(pub)); !errors.Is(err, record.ErrSignature) {
+		t.Fatalf("Ed25519ph: want ErrSignature, got %v", err)
+	}
+	// Control: the pure signature over the same PAE passes.
+	pure, _ := json.Marshal(map[string]any{
+		"payloadType": bundle.PayloadType,
+		"payload":     base64.StdEncoding.EncodeToString(body),
+		"signatures":  []map[string]string{{"sig": base64.StdEncoding.EncodeToString(ed25519.Sign(priv, pae))}},
+	})
+	if _, _, err := bundle.ParseAttestation(pure, trust(pub)); err != nil {
+		t.Fatalf("pure Ed25519: %v", err)
 	}
 }

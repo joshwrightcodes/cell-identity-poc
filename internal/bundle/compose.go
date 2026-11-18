@@ -4,32 +4,65 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
-	"strings"
 
 	"sigs.k8s.io/yaml"
 )
 
+// StoreHost is the registry host and port that every Argo CD Application of a root names. Argo CD
+// reaches the bundle store through the token client on this loopback address in every cluster. The
+// pushes of the applier use another address and never appear in a root.
+const StoreHost = "127.0.0.1:5000"
+
+// ErrComponentNotAllowed is wrapped by the error of CheckSet. The applier reports it as the reason
+// component_not_allowed, and NotAllowed holds the detail.
+var ErrComponentNotAllowed = errors.New("component not allowed")
+
+// NotAllowed is the error of CheckSet. Detail is component_unknown or namespace.
+type NotAllowed struct {
+	Detail    string
+	Component string
+}
+
+func (e *NotAllowed) Error() string {
+	return fmt.Sprintf("component not allowed: %s: %s", e.Detail, e.Component)
+}
+
+func (e *NotAllowed) Is(target error) bool { return target == ErrComponentNotAllowed }
+
+// CheckSet checks that every component of s is a component of role and that its destination
+// namespace is one that its class allows. The role and the component name fix the class.
+func CheckSet(role string, s Set, p Policy) error {
+	for _, c := range s.Components {
+		class, ok := p.ClassOf(role, c.Name)
+		if !ok {
+			return &NotAllowed{Detail: "component_unknown", Component: c.Name}
+		}
+		if !slices.Contains(class.DestinationNamespaces, c.Namespace) {
+			return &NotAllowed{Detail: "namespace", Component: c.Name}
+		}
+	}
+	return nil
+}
+
 // ComposeRoot returns the root bundle of set s for role: one Argo CD Application for each
 // component, in the file <component>.yaml. Each Application pins its bundle by digest at
-// oci://<storeURL>/bundles/<component>, carries the sync wave, syncs into the namespace of the
-// component and takes its project from the class of the component in role. storeURL is the
-// registry host and port, with no scheme and no path. Each Application carries only the sync-wave
-// annotation, so two sets with the same components give the same root.
-func ComposeRoot(role string, s Set, p Policy, storeURL string) (Artifact, error) {
-	if storeURL == "" || strings.ContainsAny(storeURL, "/ ") {
-		return Artifact{}, errors.New("store URL is not a host and port")
+// oci://StoreHost/bundles/<component>, carries the sync wave, syncs into the namespace of the
+// component and takes its project from the class of the component in role. Each Application
+// carries only the sync-wave annotation, so two sets with the same components give the same root.
+// It runs CheckSet first.
+func ComposeRoot(role string, s Set, p Policy) (Artifact, error) {
+	if err := validateComponents(slices.Clone(s.Components)); err != nil {
+		return Artifact{}, err
 	}
-	if err := validateComponents(slicesClone(s.Components)); err != nil {
+	if err := CheckSet(role, s, p); err != nil {
 		return Artifact{}, err
 	}
 	files := make(map[string][]byte, len(s.Components))
 	for _, c := range s.Components {
-		class, ok := p.ClassOf(role, c.Name)
-		if !ok {
-			return Artifact{}, fmt.Errorf("component %q has no class in role %q", c.Name, role)
-		}
-		app, err := application(c, class.Project, storeURL)
+		class, _ := p.ClassOf(role, c.Name)
+		app, err := application(c, class.Project, StoreHost)
 		if err != nil {
 			return Artifact{}, err
 		}
@@ -37,8 +70,6 @@ func ComposeRoot(role string, s Set, p Policy, storeURL string) (Artifact, error
 	}
 	return Pack(files)
 }
-
-func slicesClone(cs []Component) []Component { return append([]Component(nil), cs...) }
 
 func application(c Component, project, storeURL string) ([]byte, error) {
 	spec := map[string]any{

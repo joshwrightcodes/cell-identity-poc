@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"encoding/json"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -14,66 +15,99 @@ import (
 //go:embed allow.json
 var allowFile []byte
 
+var (
+	platformNS = []string{"argocd", "cell-system", "istio-system", "istio-egress", "observability-system", "apps-demo"}
+	clusterKs  = []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
+		"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
+	cellComps = []string{"namespaces", "argocd", "cell-system", "network-policy", "istio-base", "istio-cni", "istiod",
+		"observability-system", "istio-egress", "mesh-policy", "apps-demo"}
+	cpExtra = []string{"external-secrets", "spire-server", "relay-system"}
+)
+
 func TestDefaultPolicy(t *testing.T) {
 	p := bundle.DefaultPolicy()
 	if p.Version != 1 {
 		t.Errorf("version %d", p.Version)
 	}
-	cellComps := []string{"namespaces", "argocd", "cell-system", "network-policy", "istio-base", "istio-cni", "istiod",
-		"observability-system", "istio-egress", "mesh-policy", "apps-demo"}
-	for _, c := range cellComps {
-		if cl, ok := p.ClassOf("cell", c); !ok || cl.Project != "cell" || !slices.Contains(cl.ObjectNamespaces, "argocd") {
-			t.Errorf("cell/%s: %v %+v", c, ok, cl)
-		}
-		if cl, ok := p.ClassOf("cp", c); !ok || cl.Project != "cell" {
-			t.Errorf("cp/%s: %v %+v", c, ok, cl)
-		}
+	catList := func(parts ...[]string) []string { return slices.Concat(parts...) }
+
+	want := map[string]bundle.Class{
+		"platform": {
+			Project: "cell", ObjectNamespaces: platformNS,
+			DestinationNamespaces: catList(platformNS, []string{"default"}),
+			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"},
+		},
+		"cp-platform": {
+			Project:               "cell",
+			ObjectNamespaces:      catList(platformNS, []string{"external-secrets", "spire-system", "relay-system"}),
+			DestinationNamespaces: catList(platformNS, []string{"default", "external-secrets", "spire-system", "relay-system"}),
+			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"},
+		},
+		"app": {
+			Project: "cell-app", ObjectNamespaces: []string{"apps-demo"}, DestinationNamespaces: []string{"apps-demo"},
+			ClusterKinds:         []string{},
+			NamespacedKinds:      []string{"ConfigMap", "Secret", "ServiceAccount", "Service", "apps/Deployment"},
+			ServiceClusterIPOnly: true, NoSidecarOptOut: true,
+		},
 	}
-	for _, c := range []string{"external-secrets", "spire-server", "relay-system"} {
-		if _, ok := p.ClassOf("cp", c); !ok {
-			t.Errorf("cp/%s missing", c)
-		}
-		if _, ok := p.ClassOf("cell", c); ok {
-			t.Errorf("cell/%s should be unknown", c)
-		}
+	if !reflect.DeepEqual(p.Classes, want) {
+		t.Errorf("classes differ\n got %+v\nwant %+v", p.Classes, want)
 	}
-	if cl, ok := p.ClassOf("cell", "apps-sample"); !ok || cl.Project != "cell-app" ||
-		!slices.Equal(cl.ObjectNamespaces, []string{"apps-demo"}) || len(cl.ClusterKinds) != 0 ||
-		!slices.Equal(cl.NamespacedKinds, []string{"ConfigMap", "Secret", "ServiceAccount", "Service", "apps/Deployment"}) ||
-		!cl.ServiceClusterIPOnly || !cl.NoSidecarOptOut {
+
+	comps := func(names []string, class string) map[string]string {
+		m := map[string]string{}
+		for _, n := range names {
+			m[n] = class
+		}
+		return m
+	}
+	guard := []bundle.ObjectRef{{Kind: "ValidatingAdmissionPolicy", Name: "bundles-spare-harness"}, {Kind: "ValidatingAdmissionPolicyBinding", Name: "bundles-spare-harness"}}
+	wantRoles := map[string]bundle.Role{
+		"cell": {
+			Components:            func() map[string]string { m := comps(cellComps, "platform"); m["apps-sample"] = "app"; return m }(),
+			HarnessNamespaces:     []string{"cell-identity-system", "cell-ops-system", "mesh-view-system"},
+			HarnessClusterObjects: append(slices.Clone(guard), bundle.ObjectRef{Kind: "ValidatingAdmissionPolicy", Name: "bundles-app-limits"}, bundle.ObjectRef{Kind: "ValidatingAdmissionPolicyBinding", Name: "bundles-app-limits"}),
+			MeshGuarded:           []string{"argocd", "cell-system", "observability-system"},
+			AppComponents:         []string{"apps-sample"},
+		},
+		"cp": {
+			Components:            comps(catList(cellComps, cpExtra), "cp-platform"),
+			HarnessNamespaces:     []string{"envd-system", "gateway-system", "cell-controller-system"},
+			HarnessClusterObjects: guard,
+			MeshGuarded:           []string{"argocd", "cell-system", "observability-system", "spire-system", "relay-system", "external-secrets"},
+			AppComponents:         []string{},
+		},
+		"open": {
+			Components: map[string]string{}, HarnessNamespaces: []string{}, HarnessClusterObjects: []bundle.ObjectRef{},
+			MeshGuarded: []string{}, AppComponents: []string{},
+		},
+	}
+	if !reflect.DeepEqual(p.Roles, wantRoles) {
+		t.Errorf("roles differ\n got %+v\nwant %+v", p.Roles, wantRoles)
+	}
+	if len(p.Roles["cell"].Components) != 12 || len(p.Roles["cp"].Components) != 14 {
+		t.Errorf("component counts %d %d", len(p.Roles["cell"].Components), len(p.Roles["cp"].Components))
+	}
+
+	// ClassOf follows the data. The role open has no class, so management has no signed root.
+	if cl, ok := p.ClassOf("cell", "apps-sample"); !ok || cl.Project != "cell-app" {
 		t.Errorf("cell/apps-sample: %v %+v", ok, cl)
+	}
+	for _, c := range []string{"apps-sample", "argocd", "istiod", "namespaces"} {
+		for _, role := range []string{"open", "", "Cell", "nope"} {
+			if _, ok := p.ClassOf(role, c); ok {
+				t.Errorf("role %q has a class for %s", role, c)
+			}
+		}
 	}
 	if _, ok := p.ClassOf("cp", "apps-sample"); ok {
 		t.Error("apps-sample must exist only in role cell")
 	}
-	for _, role := range []string{"open", "", "Cell"} {
-		if _, ok := p.ClassOf(role, "argocd"); ok {
-			t.Errorf("role %q has a class", role)
-		}
+	if _, ok := p.ClassOf("cell", "external-secrets"); ok {
+		t.Error("external-secrets must exist only in role cp")
 	}
 	if _, ok := p.ClassOf("cell", "nope"); ok {
 		t.Error("unknown component has a class")
-	}
-
-	// Platform destinations add default. The cp class adds three namespaces.
-	plat, _ := p.ClassOf("cell", "argocd")
-	if !slices.Contains(plat.DestinationNamespaces, "default") || slices.Contains(plat.ObjectNamespaces, "default") {
-		t.Errorf("platform namespaces %+v", plat)
-	}
-	cp, _ := p.ClassOf("cp", "spire-server")
-	for _, ns := range []string{"external-secrets", "spire-system", "relay-system"} {
-		if !slices.Contains(cp.ObjectNamespaces, ns) || slices.Contains(plat.ObjectNamespaces, ns) {
-			t.Errorf("namespace %s: cp %v, platform %v", ns, cp.ObjectNamespaces, plat.ObjectNamespaces)
-		}
-	}
-	if !slices.Equal(plat.NamespacedKinds, []string{"*"}) {
-		t.Errorf("platform namespaced kinds %v", plat.NamespacedKinds)
-	}
-	for _, k := range []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-		"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"} {
-		if !slices.Contains(plat.ClusterKinds, k) {
-			t.Errorf("platform cluster kinds lack %s", k)
-		}
 	}
 
 	// No class lists a network-policy kind that an operator of the cluster network owns.
@@ -84,29 +118,44 @@ func TestDefaultPolicy(t *testing.T) {
 			}
 		}
 	}
+}
 
-	guard := []bundle.ObjectRef{{Kind: "ValidatingAdmissionPolicy", Name: "bundles-spare-harness"}, {Kind: "ValidatingAdmissionPolicyBinding", Name: "bundles-spare-harness"}}
-	for role, r := range p.Roles {
-		for _, g := range guard {
-			if !slices.Contains(r.HarnessClusterObjects, g) {
-				t.Errorf("role %s lacks harness object %v", role, g)
+// harnessComponents are the harness components of scripts/lib.sh and the planned harness names. No
+// role may let a bundle write to one of them.
+var harnessComponents = []string{"cell-identity", "cell-ops", "mesh-view", "envd", "gateway", "cell-controller"}
+
+func TestPolicyInvariants(t *testing.T) {
+	p := bundle.DefaultPolicy()
+	var harnessNS []string
+	for _, r := range p.Roles {
+		harnessNS = append(harnessNS, r.HarnessNamespaces...)
+	}
+	for name, cl := range p.Classes {
+		for _, ns := range slices.Concat(cl.ObjectNamespaces, cl.DestinationNamespaces) {
+			if slices.Contains(harnessNS, ns) {
+				t.Errorf("class %s names the harness namespace %s", name, ns)
+			}
+		}
+		for _, ns := range cl.ObjectNamespaces {
+			if !slices.Contains(cl.DestinationNamespaces, ns) {
+				t.Errorf("class %s has object namespace %s outside its destinations", name, ns)
 			}
 		}
 	}
-	limits := bundle.ObjectRef{Kind: "ValidatingAdmissionPolicy", Name: "bundles-app-limits"}
-	if !slices.Contains(p.Roles["cell"].HarnessClusterObjects, limits) || slices.Contains(p.Roles["cp"].HarnessClusterObjects, limits) {
-		t.Error("bundles-app-limits belongs to role cell only")
-	}
-	if !slices.Equal(p.Roles["cell"].HarnessNamespaces, []string{"cell-identity-system", "cell-ops-system", "mesh-view-system"}) ||
-		!slices.Equal(p.Roles["cp"].HarnessNamespaces, []string{"envd-system", "gateway-system", "cell-controller-system"}) {
-		t.Errorf("harness namespaces %v %v", p.Roles["cell"].HarnessNamespaces, p.Roles["cp"].HarnessNamespaces)
-	}
-	if !slices.Equal(p.Roles["cell"].MeshGuarded, []string{"argocd", "cell-system", "observability-system"}) ||
-		!slices.Equal(p.Roles["cp"].MeshGuarded, []string{"argocd", "cell-system", "observability-system", "spire-system", "relay-system", "external-secrets"}) {
-		t.Errorf("mesh guarded %v %v", p.Roles["cell"].MeshGuarded, p.Roles["cp"].MeshGuarded)
-	}
-	if !slices.Equal(p.Roles["cell"].AppComponents, []string{"apps-sample"}) || len(p.Roles["cp"].AppComponents) != 0 {
-		t.Errorf("app components %v %v", p.Roles["cell"].AppComponents, p.Roles["cp"].AppComponents)
+	for role, r := range p.Roles {
+		for comp, class := range r.Components {
+			if slices.Contains(harnessComponents, comp) {
+				t.Errorf("role %s lists the harness component %s", role, comp)
+			}
+			if _, ok := p.Classes[class]; !ok {
+				t.Errorf("role %s: %s has the unknown class %s", role, comp, class)
+			}
+		}
+		for _, a := range r.AppComponents {
+			if p.Classes[r.Components[a]].Project != "cell-app" {
+				t.Errorf("role %s: app component %s is not in the app class", role, a)
+			}
+		}
 	}
 }
 

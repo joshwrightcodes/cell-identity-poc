@@ -182,6 +182,13 @@
         "external-secrets"
       ],
       "appComponents": []
+    },
+    "open": {
+      "components": {},
+      "harnessNamespaces": [],
+      "harnessClusterObjects": [],
+      "meshGuarded": [],
+      "appComponents": []
     }
   }
 }

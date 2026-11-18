@@ -41,7 +41,9 @@ type Role struct {
 	AppComponents         []string          `json:"appComponents"`
 }
 
-// Policy is the allow-list data. The Rego policy reads it as data.allow.
+// Policy is the allow-list data. The Rego policy reads it as data.allow. The role open is the
+// cluster management. It lists no component, so it has no signed root: management keeps the harness
+// publish, and CheckSet and ComposeRoot refuse every component for that role.
 type Policy struct {
 	Version int              `json:"version"`
 	Classes map[string]Class `json:"classes"`

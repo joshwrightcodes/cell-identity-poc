@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
+	"slices"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
@@ -91,6 +93,15 @@ func ParseComponents(raw json.RawMessage) ([]Component, error) {
 	if err := record.DecodeStrict(raw, &cs); err != nil {
 		return nil, fmt.Errorf("components: %w", err)
 	}
+	var members []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil {
+		return nil, fmt.Errorf("%w components: %v", record.ErrDecode, err)
+	}
+	for i, m := range members {
+		if _, ok := m["wave"]; !ok {
+			return nil, fmt.Errorf("%w components: component %d has no wave", record.ErrDecode, i)
+		}
+	}
 	if err := validateComponents(cs); err != nil {
 		return nil, err
 	}
@@ -127,6 +138,14 @@ func validateComponents(cs []Component) error {
 		}
 		if len(entries) < 1 || len(entries) > MaxIgnoreEntries {
 			return fmt.Errorf("%w components: ignoreDifferences of %q has %d entries, outside 1 to %d", record.ErrDecode, c.Name, len(entries), MaxIgnoreEntries)
+		}
+		for _, e := range entries {
+			if reflect.DeepEqual(e, ignoreEntry{}) {
+				return fmt.Errorf("%w components: ignoreDifferences of %q has an empty entry", record.ErrDecode, c.Name)
+			}
+			if slices.Contains(e.JQPathExpressions, ".") {
+				return fmt.Errorf("%w components: ignoreDifferences of %q has the catch-all expression %q", record.ErrDecode, c.Name, ".")
+			}
 		}
 		var buf bytes.Buffer
 		if err := json.Compact(&buf, c.IgnoreDifferences); err != nil {
