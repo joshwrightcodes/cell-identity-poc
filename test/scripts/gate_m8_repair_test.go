@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -32,7 +33,9 @@ listing() { # listing <variable> <kind>
 case " $* " in
   *" get namespaces -o json"*) v="STUB_NS_$var"; listing "$v" namespace ;;
   *" -n argocd get applications -o json"*) v="STUB_APPS_$var"; listing "$v" application ;;
-  *" get configmap bundle-state "*) v="STUB_STATE_$var"; printf '%s' "${!v:-}" ;;
+  *" get configmap bundle-state "*)
+    v="STUB_STATE_FAIL"; [[ " ${!v:-} " != *" $cluster "* ]] || { echo "error: the connection to the server was refused" >&2; exit 1; }
+    v="STUB_STATE_$var"; printf '%s' "${!v:-}" ;;
   *" -n apps-demo get configmap m8-marker "*)
     if [[ " ${STUB_MARKER:-} " == *" $cluster "* ]] && ! grep -qx -- "$cluster configmap m8-marker" "$STUB_DIR/deleted" 2>/dev/null; then echo configmap/m8-marker; fi ;;
   *" delete namespace "*) [[ -n "${STUB_STUCK:-}" ]] || echo "$cluster namespace $5" >>"$STUB_DIR/deleted" ;;
@@ -46,10 +49,16 @@ esac
 const m8RepairMise = `#!/usr/bin/env bash
 echo "mise $*" >>"$STUB_DIR/calls"
 case "$*" in
+  "run bundle -- get --target "*)
+    # STUB_GET_<cluster> is the last signed set of a target. STUB_GET_OPEN_<cluster>=n makes the first n reads print it, and every later read print a closed set.
+    v="STUB_GET_${6//-/_}"; [[ -n "${!v:-}" ]] || exit 1
+    n="$(cat "$STUB_DIR/gets-$6" 2>/dev/null || echo 0)"; echo $((n + 1)) >"$STUB_DIR/gets-$6"
+    a="STUB_GET_OPEN_${6//-/_}"
+    if [[ -n "${!a:-}" ]] && ((n >= ${!a})); then echo '{"opId":"op1","served":true,"result":{"outcome":"applied"}}'; else printf '%s\n' "${!v}"; fi ;;
   "run bundle -- repair --target "*) echo '{"repaired":true}' ;;
   "run bundle -- publish --target "*" --wait")
     target="$6"
-    [[ "$target" != "${STUB_PUBLISH_FAIL:-none}" ]] || { echo "error: the set of $target ended refused" >&2; exit 1; }
+    [[ "$target" != "${STUB_PUBLISH_FAIL:-none}" ]] || { echo "${STUB_PUBLISH_ERR:-error: the set of $target ended refused}" >&2; exit 1; }
     echo '{"outcome":"applied"}' ;;
   *) echo "unexpected mise call: $*" >&2; exit 2 ;;
 esac
@@ -134,7 +143,7 @@ func TestGateM8RepairDeletesProbes(t *testing.T) {
 			t.Errorf("the calls hold %q, which the script must not touch:\n%s", deny, calls)
 		}
 	}
-	if strings.Contains(calls, "mise ") {
+	if strings.Contains(calls, "bundle -- publish") || strings.Contains(calls, "bundle -- repair") {
 		t.Errorf("the script published or repaired with nothing to restore:\n%s", calls)
 	}
 }
@@ -154,7 +163,7 @@ func TestGateM8RepairRepairsBeforePublish(t *testing.T) {
 	if at(calls, "publish --target dev-cell-1 --wait") < 0 || at(calls, "repair --target dev-cell-1") >= 0 {
 		t.Errorf("dev-cell-1 (rolled_back with no rollback_unhealthy) must be published and not repaired:\n%s", calls)
 	}
-	if at(calls, "--target dev-cp") >= 0 {
+	if at(calls, "publish --target dev-cp") >= 0 {
 		t.Errorf("dev-cp is healthy and was not recorded, so it needs no publish:\n%s", calls)
 	}
 	// A repair of a target must come before the publish of any target, because a repair can change what the others read.
@@ -220,6 +229,9 @@ func TestGateM8CheckNamesRepair(t *testing.T) {
 		{name: "the marker ConfigMap", code: 1, env: []string{"STUB_MARKER=dev-cell-2"}, want: []string{"dev-cell-2 holds the ConfigMap apps-demo/m8-marker", repair}},
 		{name: "a target of an aborted run", code: 1, recorded: "dev-cell-2\n", want: []string{"dev-cell-2", "build/gate/m8-bundles", repair}},
 		{name: "another prefix and no label are no drift", env: []string{"STUB_NS_dev_cell_1=m7-aa:true m8-bb:false"}},
+		{name: "an open served set", code: 1, env: []string{"STUB_GET_dev_cell_1=" + m8OpenSet()}, want: []string{"dev-cell-1", "op1", "expires at", repair}},
+		{name: "a final set is no open set", env: []string{"STUB_GET_dev_cell_1=" + m8ClosedSet(), "STUB_GET_dev_cp=" + m8ExpiredSet()}},
+		{name: "an unreadable bundle state fails", code: 1, env: []string{"STUB_STATE_FAIL=dev-cell-2"}, want: []string{"could not read ConfigMap bundle-state of dev-cell-2"}},
 		{name: "kind fails", code: 1, env: []string{"STUB_KIND_FAIL=1"}, want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -232,7 +244,7 @@ func TestGateM8CheckNamesRepair(t *testing.T) {
 					t.Errorf("output %q lacks %q", out, w)
 				}
 			}
-			for _, mutating := range []string{" delete ", "mise "} {
+			for _, mutating := range []string{" delete ", "bundle -- publish", "bundle -- repair"} {
 				if strings.Contains(calls, mutating) {
 					t.Errorf("--check changed something (%q):\n%s", mutating, calls)
 				}
@@ -251,5 +263,59 @@ func TestGateM8RepairLeftovers(t *testing.T) {
 	out, _, _, code := m8RepairRun(t, "", []string{"STUB_NS_dev_cell_1=m8-aa:true", "STUB_STUCK=1"})
 	if code != 1 || !strings.Contains(out, "dev-cell-1 m8-aa") {
 		t.Errorf("exit %d and %q, want exit 1 that names dev-cell-1 m8-aa", code, out)
+	}
+}
+
+// m8OpenSet is the last signed set of a target that is served, has no result and expires in an hour. m8ClosedSet has a final result, and m8ExpiredSet is
+// past its expiry with no result.
+func m8OpenSet() string {
+	return `{"opId":"op1","served":true,"expiresAt":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `"}`
+}
+func m8ClosedSet() string {
+	return `{"opId":"op1","served":true,"result":{"outcome":"applied"},"expiresAt":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `"}`
+}
+func m8ExpiredSet() string {
+	return `{"opId":"op1","served":true,"expiresAt":"` + time.Now().Add(-time.Hour).UTC().Format(time.RFC3339) + `"}`
+}
+
+// TestGateM8RepairWaitsForOpenSet: mgmtd refuses a new served set while one is open, so the repair waits for the open set of a target before it publishes, with a
+// bound. A set that closes in time is followed by the publish. A set that stays open is an error with the op ID and the expiry, and no publish.
+func TestGateM8RepairWaitsForOpenSet(t *testing.T) {
+	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_GET_dev_cell_1=" + m8OpenSet(), "STUB_GET_OPEN_dev_cell_1=2", "GATE_M8_OPEN_WAIT=30"})
+	if code != 0 || at(calls, "publish --target dev-cell-1 --wait") < 0 {
+		t.Fatalf("a set that closes in time: exit %d\n%s\ncalls %s", code, out, calls)
+	}
+	out, calls, _, code = m8RepairRun(t, "", []string{"STUB_GET_dev_cell_1=" + m8OpenSet(), "GATE_M8_OPEN_WAIT=1"})
+	if code != 1 || !strings.Contains(out, "op1") || !strings.Contains(out, "dev-cell-1") || !strings.Contains(out, "open until") || strings.Contains(calls, "publish --target") {
+		t.Errorf("a set that stays open: exit %d, output %q, calls %s; want exit 1 with the op ID and the expiry, and no publish", code, out, calls)
+	}
+}
+
+// TestGateM8RepairBundleOpenHint: a publish that mgmtd refuses with bundle_open does not say to hydrate again. Any other failure keeps that hint.
+func TestGateM8RepairBundleOpenHint(t *testing.T) {
+	env := []string{"STUB_STATE_dev_cell_1=" + m8Healthy, "STUB_PUBLISH_FAIL=dev-cell-1"}
+	out, _, _, code := m8RepairRun(t, "dev-cell-1\n", append(env, "STUB_PUBLISH_ERR=error: mgmtd refused the set of dev-cell-1: bundle_open"))
+	if code != 1 || !strings.Contains(out, "bundle_open") || strings.Contains(out, "cell:hydrate") || !strings.Contains(out, "mise run gate:m8:repair") {
+		t.Errorf("bundle_open: exit %d, output %q, want exit 1, the reason, the repair command and no hydrate hint", code, out)
+	}
+	out, _, _, _ = m8RepairRun(t, "dev-cell-1\n", env)
+	if !strings.Contains(out, "cell:hydrate") {
+		t.Errorf("another failure: output %q, want the hydrate hint", out)
+	}
+}
+
+// TestGateM8RepairRefusesUnknownArguments: only --check is an argument. A typo must not run the repair.
+func TestGateM8RepairRefusesUnknownArguments(t *testing.T) {
+	out, calls, _, code := m8RepairRun(t, "dev-cell-1\n", []string{"STUB_STATE_dev_cell_1=" + m8Healthy, "STUB_NS_dev_cp=m8-aa:true"}, "--chek")
+	if code != 1 || !strings.Contains(out, "usage: gate-m8-repair.sh [--check]") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
+		t.Errorf("exit %d, output %q, calls %s; want exit 1 with the usage line and no change", code, out, calls)
+	}
+}
+
+// TestGateM8RepairUnreadableState: a bundle state that cannot be read is an error, never "nothing to repair". Nothing changes.
+func TestGateM8RepairUnreadableState(t *testing.T) {
+	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_STATE_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
+	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
+		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
 	}
 }

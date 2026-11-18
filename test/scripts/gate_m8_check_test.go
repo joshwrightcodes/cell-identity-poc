@@ -17,7 +17,16 @@ const m8RepairOK = "#!/usr/bin/env bash\necho \"m8 repair $*\" >>\"$STUB_LOG\"\n
 // the output, the calls that the stubs logged, the root and the error. The stub of go fails a call with -json when STUB_GO_FAIL is set.
 func runGateM8(t *testing.T, stale, m7Repair, m8Repair string, hit bool, env ...string) (out, calls, root string, err error) {
 	t.Helper()
+	return runGateM8Edit(t, nil, stale, m7Repair, m8Repair, hit, env...)
+}
+
+// runGateM8Edit is runGateM8 with a function that changes the root before the run, for example harness/versions.env.
+func runGateM8Edit(t *testing.T, edit func(root string), stale, m7Repair, m8Repair string, hit bool, env ...string) (out, calls, root string, err error) {
+	t.Helper()
 	root = newM5GateRoot(t, stale)
+	if edit != nil {
+		edit(root)
+	}
 	write := func(path, body string) {
 		p := filepath.Join(root, path)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -256,10 +265,12 @@ func TestTokenScanReadsStoreLogs(t *testing.T) {
 		name  string
 		logs  map[string]string
 		files map[string]string
-		code  int
-		want  []string
-		deny  []string
-		reads []string
+		// unreadable names a file of build/gate whose mode is set to 0 after it is written.
+		unreadable string
+		code       int
+		want       []string
+		deny       []string
+		reads      []string
 	}{
 		{name: "clean logs and files", logs: map[string]string{"log-bundle-store-0-store-proxy": "ok\n", "log-argocd-repo-server-0-store-token": "ok\n"},
 			files: map[string]string{"m8-bundles": "dev-cell-1\ndev-cp\n"}, reads: []string{"logs bundle-store-0 store-proxy", "logs argocd-repo-server-0 store-token"}},
@@ -271,6 +282,8 @@ func TestTokenScanReadsStoreLogs(t *testing.T) {
 			want: []string{"build/gate/m8-output line 2"}, deny: []string{jws, "m8-bundles line"}},
 		{name: "a private key in a file of gate:m8", files: map[string]string{"m8-key": "-----BEGIN PRIVATE KEY-----\n"}, code: 1,
 			want: []string{"build/gate/m8-key line 1"}, deny: []string{"BEGIN PRIVATE"}},
+		{name: "an unreadable file of gate:m8 fails", files: map[string]string{"m8-secret": jws + "\n"}, unreadable: "m8-secret", code: 1,
+			want: []string{"cannot read build/gate/m8-secret"}, deny: []string{jws}},
 		{name: "a file of another gate is not scanned", files: map[string]string{"m6-steps": jws + "\n"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -296,6 +309,13 @@ func TestTokenScanReadsStoreLogs(t *testing.T) {
 				if err := os.WriteFile(filepath.Join(build, "gate", name), []byte(body), 0o644); err != nil {
 					t.Fatal(err)
 				}
+			}
+			if tc.unreadable != "" {
+				p := filepath.Join(build, "gate", tc.unreadable)
+				if err := os.Chmod(p, 0); err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() { _ = os.Chmod(p, 0o644) })
 			}
 			script, err := filepath.Abs("../../scripts/gate-token-scan.sh")
 			if err != nil {
@@ -334,5 +354,49 @@ func TestTokenScanReadsStoreLogs(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGateM8RefusesEmptyBudget: the M8 waits are longer than the floor of the Go timeout, and a timeout skips every cleanup. So gate.sh m8 stops before any check and test
+// when GATE_M8_BUDGET_MINUTES or GATE_M8_TEST_TIMEOUT_MINUTES is empty, and names the variable.
+func TestGateM8RefusesEmptyBudget(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	for _, name := range []string{"GATE_M8_BUDGET_MINUTES", "GATE_M8_TEST_TIMEOUT_MINUTES"} {
+		t.Run(name, func(t *testing.T) {
+			edit := func(root string) {
+				p := filepath.Join(root, "harness", "versions.env")
+				b, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var lines []string
+				for _, l := range strings.Split(string(b), "\n") {
+					if strings.HasPrefix(l, name+"=") {
+						l = name + "= # <set in the live part>"
+					}
+					lines = append(lines, l)
+				}
+				if err := os.WriteFile(p, []byte(strings.Join(lines, "\n")), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			out, calls, _, err := runGateM8Edit(t, edit, "", m7RepairOK, m8RepairOK, false)
+			if err == nil || !strings.Contains(out, name+" is empty in harness/versions.env") || strings.Contains(calls, "-run ^TestM8") || strings.Contains(calls, "repair --check") {
+				t.Fatalf("err %v, output %s, calls %s; want a stop that names %s before every check and test", err, out, calls, name)
+			}
+		})
+	}
+}
+
+// TestGateM8Versions: harness/versions.env holds the provisional limits of M8, with the note that the live part sets them.
+func TestGateM8Versions(t *testing.T) {
+	b, err := os.ReadFile("../../harness/versions.env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"GATE_M8_BUDGET_MINUTES=150 # <set in the live part>", "GATE_M8_TEST_TIMEOUT_MINUTES=140 # <set in the live part>"} {
+		if !strings.Contains(string(b), want+"\n") {
+			t.Errorf("harness/versions.env lacks the line %q", want)
+		}
 	}
 }

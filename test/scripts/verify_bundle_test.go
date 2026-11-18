@@ -19,6 +19,8 @@ echo "kubectl $*" >>"$d/calls"
 case " $* " in
   *" get configmap bundle-state "*) [[ -f "$d/state.json" ]] && cat "$d/state.json"; exit 0 ;;
   *" diff --server-side "*) cat >"$d/diff.in"; cat "$d/diff.out"; exit "$(cat "$d/diff.rc")" ;;
+  *" get validatingadmissionpolicy "*) name="${*: -3:1}"; [[ -f "$d/live-policy-$name.json" ]] || { echo "NotFound" >&2; exit 1; }; cat "$d/live-policy-$name.json" ;;
+  *" get validatingadmissionpolicybinding "*) name="${*: -3:1}"; [[ -f "$d/live-binding-$name.json" ]] || { echo "NotFound" >&2; exit 1; }; cat "$d/live-binding-$name.json" ;;
   *" -n cell-system get statefulset/bundle-store -o json "*) cat "$d/store.json" ;;
   *" -n argocd get deployment/argocd-repo-server -o json "*) cat "$d/repo-server.json" ;;
   *" get networkpolicy "*)
@@ -101,25 +103,57 @@ func TestVerifyBundleChecks(t *testing.T) {
 	cpStatus := func(sha string) string {
 		return `{"cells":[],"planeBundleStatus":{"state":"healthy","allowSHA256":"` + sha + `"}}`
 	}
+	with2 := func(a, b map[string]string) map[string]string {
+		out := map[string]string{}
+		for k, v := range a {
+			out[k] = v
+		}
+		for k, v := range b {
+			out[k] = v
+		}
+		return out
+	}
+	// guardLive writes the live guards of a role as the render of bundle-guard.sh gives them, one file for each object.
+	guardLive := func(role string) map[string]string {
+		raw, err := exec.Command("bash", filepath.Join(root, "components", "lib", "bundle-guard.sh"), role).Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := map[string]string{}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if line == "" || line == "---" {
+				continue
+			}
+			kind, name := "policy", ""
+			if strings.Contains(line, `"kind":"ValidatingAdmissionPolicyBinding"`) {
+				kind = "binding"
+			}
+			i := strings.Index(line, `"name":"`)
+			name = line[i+len(`"name":"`):]
+			name = name[:strings.Index(name, `"`)]
+			files["live-"+kind+"-"+name+".json"] = line
+		}
+		return files
+	}
 	cellFiles := func() map[string]string {
-		return map[string]string{
+		return with2(guardLive("cell"), map[string]string{
 			"state.json": signedState, "verify.out": `{"target":"dev-cell-1"}`, "verify.rc": "0", "diff.out": "", "diff.rc": "0",
 			"store.json":        bundleStoreJSON("token", "--audience=bundle-store", "--reader=system:serviceaccount:argocd:argocd-repo-server", bundleWriter),
 			"repo-server.json":  repoServerJSON,
 			"policy-celld.json": policy("cell-identity"), "policy-argocd-agent.json": policy("argocd-agent"), "policy-otel-uplink.json": policy("otel-uplink"),
 			"policy-mesh-view.json": policy("mesh-view"), "policy-plane-celld-store.json": policy("cell-identity"),
 			"project-cell": allowA, "project-cell-app": allowA, "mgmt-status.json": cellStatus(allowA),
-		}
+		})
 	}
 	cpFiles := func() map[string]string {
-		return map[string]string{
+		return with2(guardLive("cp"), map[string]string{
 			"state.json": signedState, "verify.out": `{"target":"dev-cp"}`, "verify.rc": "0", "diff.out": "", "diff.rc": "0",
 			"store.json":       bundleStoreJSON("token", "--audience=bundle-store", "--reader=system:serviceaccount:argocd:argocd-repo-server", bundleWriterC),
 			"repo-server.json": repoServerJSON,
 			"policy-envd.json": policy("envd"), "policy-plane-envd-store.json": policy("envd"), "policy-plane-cells.json": policy("envd"),
 			"policy-plane-envd.json": policy("envd"), "policy-plane-workloads.json": policy("envd"), "policy-plane-upstream.json": policy("envd"),
 			"project-cell": allowA, "mgmt-status.json": cpStatus(allowA),
-		}
+		})
 	}
 	mgmtFiles := func() map[string]string {
 		return map[string]string{"store.json": bundleStoreJSON("token", "--audience=bundle-store", "--reader=system:serviceaccount:argocd:argocd-repo-server"),
@@ -141,6 +175,7 @@ func TestVerifyBundleChecks(t *testing.T) {
 		name, check, cell string
 		files             map[string]string
 		want              []string // substrings of the output; nil means the check passes
+		deny              []string // substrings that the output of a failed check does not hold
 		diff              []string // substrings of the guards that the check renders
 		noDiff            []string // substrings that the rendered guards do not hold
 	}{
@@ -148,22 +183,34 @@ func TestVerifyBundleChecks(t *testing.T) {
 		{name: "signed root ok in a cell", check: "check_signed_root", cell: "dev-cell-1", files: cellFiles()},
 		{name: "signed root ok in dev-cp", check: "check_signed_root", cell: "dev-cp", files: cpFiles()},
 		{name: "signed root: cosign does not verify the root", check: "check_signed_root", cell: "dev-cell-1",
-			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: cosign does not verify the root sha256:11 of dev-cell-1 against the current key of mgmtd (no matching signatures)"}),
-			want:  []string{"cosign does not verify the root", publish("dev-cell-1")}},
+			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: cosign does not verify the root sha256:11 of dev-cell-1 against the current key of mgmtd (no matching signatures), so it is not trusted. If the key rotated, run: mise run bundle -- cosign --target dev-cell-1"}),
+			want:  []string{"cosign does not verify the root", "bundle -- cosign"}, deny: []string{"bundle -- publish"}},
+		{name: "signed root: the mirror is unreachable", check: "check_signed_root", cell: "dev-cell-1",
+			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: could not read the address of the registry mirror"}),
+			want:  []string{"registry mirror", "Run: mise run harness:status"}, deny: []string{"bundle -- publish"}},
 		{name: "signed root: the state is a bootstrap state", check: "check_signed_root", cell: "dev-cp",
 			files: with(cpFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: the bundle state of dev-cp has source 'bootstrap', so its root is a bootstrap root that nobody signed"}),
 			want:  []string{"source 'bootstrap'", publish("dev-cp")}},
 		// check_bundle_guard
 		{name: "bundle guard ok in a cell: both guards", check: "check_bundle_guard", cell: "dev-cell-1", files: cellFiles(),
-			diff: []string{"bundles-spare-harness", "bundles-app-limits"}},
+			diff: []string{"bundles-spare-harness", "bundles-app-limits", "cell.poc.internal/harness: cell-identity"}, noDiff: []string{"harness: envd"}},
 		{name: "bundle guard ok in dev-cp: one guard", check: "check_bundle_guard", cell: "dev-cp", files: cpFiles(),
-			diff: []string{"bundles-spare-harness"}, noDiff: []string{"bundles-app-limits"}},
+			diff: []string{"bundles-spare-harness", "cell.poc.internal/harness: envd"}, noDiff: []string{"bundles-app-limits", "harness: cell-identity"}},
 		{name: "bundle guard: a guard differs from the render", check: "check_bundle_guard", cell: "dev-cell-1",
 			files: with(cellFiles(), map[string]string{"diff.rc": "1", "diff.out": "-  failurePolicy: Fail\n+  failurePolicy: Ignore"}),
 			want:  []string{"failurePolicy: Ignore", "bundles-spare-harness and bundles-app-limits", up("dev-cell-1")}},
 		{name: "bundle guard: a guard is absent in dev-cp", check: "check_bundle_guard", cell: "dev-cp",
 			files: with(cpFiles(), map[string]string{"diff.rc": "1", "diff.out": "+kind: ValidatingAdmissionPolicy"}),
 			want:  []string{"bundles-spare-harness", up("dev-cp")}},
+		{name: "bundle guard: a binding of a cell is narrowed by a namespace selector", check: "check_bundle_guard", cell: "dev-cell-1",
+			files: with(cellFiles(), map[string]string{"live-binding-bundles-spare-harness.json": `{"apiVersion":"admissionregistration.k8s.io/v1","kind":"ValidatingAdmissionPolicyBinding","metadata":{"name":"bundles-spare-harness"},"spec":{"policyName":"bundles-spare-harness","validationActions":["Deny"],"matchResources":{"namespaceSelector":{"matchLabels":{"a":"b"}}}}}`}),
+			want:  []string{"bundles-spare-harness", "narrows", up("dev-cell-1")}},
+		{name: "bundle guard: a policy has an extra match condition", check: "check_bundle_guard", cell: "dev-cp",
+			files: with(cpFiles(), map[string]string{"live-policy-bundles-spare-harness.json": strings.Replace(cpFiles()["live-policy-bundles-spare-harness.json"], `"matchConditions":[`, `"matchConditions":[{"name":"extra","expression":"false"},`, 1)}),
+			want:  []string{"bundles-spare-harness", "differs", up("dev-cp")}},
+		{name: "bundle guard: the binding is absent", check: "check_bundle_guard", cell: "dev-cell-1",
+			files: with(cellFiles(), map[string]string{"live-binding-bundles-app-limits.json": ""}),
+			want:  []string{"bundles-app-limits", "cannot read", up("dev-cell-1")}},
 		{name: "bundle guard: kubectl diff fails", check: "check_bundle_guard", cell: "dev-cell-1",
 			files: with(cellFiles(), map[string]string{"diff.rc": "2", "diff.out": "error: the server is down"}),
 			want:  []string{"kubectl diff failed", "the server is down"}},
@@ -234,7 +281,7 @@ func TestVerifyBundleChecks(t *testing.T) {
 				_ = os.Remove(e)
 			}
 			for k, v := range tc.files {
-				if v == "" && strings.HasPrefix(k, "policy-") {
+				if v == "" && (strings.HasPrefix(k, "policy-") || strings.HasPrefix(k, "live-")) {
 					continue
 				}
 				if err := os.WriteFile(filepath.Join(stub, k), []byte(v), 0o644); err != nil {
@@ -262,6 +309,11 @@ set +e; `+tc.check, "_", root)
 						t.Errorf("output %q lacks %q", out.String(), w)
 					}
 				}
+				for _, d := range tc.deny {
+					if strings.Contains(out.String(), d) {
+						t.Errorf("output %q holds %q", out.String(), d)
+					}
+				}
 			}
 			if tc.diff != nil || tc.noDiff != nil {
 				in, _ := os.ReadFile(filepath.Join(stub, "diff.in"))
@@ -280,21 +332,33 @@ set +e; `+tc.check, "_", root)
 	}
 }
 
-// TestVerifyRunsBundleChecks reads scripts/verify.sh: a cell and dev-cp run the five bundle checks, and management runs only the store proxy check.
+// TestVerifyRunsBundleChecks reads scripts/verify.sh: check_store_proxy runs for every role, and the other four checks run only in the branch of the roles cell and
+// cp, so management (role open) runs the store proxy check alone.
 func TestVerifyRunsBundleChecks(t *testing.T) {
 	raw, err := os.ReadFile("../../scripts/verify.sh")
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(raw)
-	for _, fn := range []string{"check_signed_root", "check_bundle_guard", "check_store_proxy", "check_plane_policies", "check_allow_list_version"} {
-		if !strings.Contains(text, " "+fn+"\n") {
-			t.Errorf("scripts/verify.sh does not run %s", fn)
+	start := strings.Index(text, `case "$(bundle_role)" in`)
+	end := strings.Index(text[start+1:], "\nesac")
+	if start < 0 || end < 0 {
+		t.Fatal("scripts/verify.sh has no case on the bundle role")
+	}
+	branch := text[start : start+1+end]
+	outside := text[:start] + text[start+1+end:]
+	if !strings.Contains(branch, "cell | cp)") {
+		t.Error("the branch of the roles cell and cp is missing")
+	}
+	for _, fn := range []string{"check_signed_root", "check_bundle_guard", "check_plane_policies", "check_allow_list_version"} {
+		if !strings.Contains(branch, " "+fn+"\n") {
+			t.Errorf("the branch of the roles cell and cp does not run %s", fn)
+		}
+		if strings.Contains(outside, " "+fn+"\n") {
+			t.Errorf("scripts/verify.sh runs %s outside the branch of the roles cell and cp, so management would run it", fn)
 		}
 	}
-	i := strings.Index(text, " check_store_proxy\n")
-	j := strings.Index(text, " check_signed_root\n")
-	if i < 0 || j < 0 || i > j {
-		t.Errorf("check_store_proxy must run before the checks of a signed role, so that management reaches it alone (store proxy at %d, signed root at %d)", i, j)
+	if !strings.Contains(outside, " check_store_proxy\n") || strings.Contains(branch, "check_store_proxy") {
+		t.Error("check_store_proxy must run for every role, before the branch")
 	}
 }

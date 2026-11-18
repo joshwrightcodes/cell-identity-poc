@@ -17,6 +17,12 @@ source "$(dirname "$0")/lib.sh"
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
 milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision|m7|m8 [go test arguments]}"
+# The waits of the M8 tests are longer than the floor of the Go timeout, and a timeout skips every cleanup, so the limits of M8 must be set.
+if [[ "$milestone" == m8 ]]; then
+  for _var in GATE_M8_BUDGET_MINUTES GATE_M8_TEST_TIMEOUT_MINUTES; do
+    [[ -n "${!_var:-}" ]] || die "$_var is empty in harness/versions.env, and the M8 tests need it: a Go timeout of the default floor would skip the cleanups of a test that waits for a rollback. Set it, then run the gate again"
+  done
+fi
 # The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
 gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift

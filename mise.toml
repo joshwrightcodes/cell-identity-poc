@@ -168,7 +168,7 @@ description = "Run bundlectl, which packs, pushes and composes bundle sets on th
 run = "go run ./cmd/bundlectl"
 
 [tasks.bundle]
-description = "Publish and repair signed bundle sets of a cell or dev-cp, with the arguments after --: publish --target <cluster>... [--wait] signs and pushes the hydrated set, get --target <cluster> prints the last signed set, cosign --target <cluster> attaches the Sigstore bundle that mgmtd holds now (after a key rotation), repair --target <cluster> is the break glass that applies the argocd and cell-system bundles of the last good set"
+description = "Publish and repair signed bundle sets of a cell or dev-cp, with the arguments after --: publish --target <cluster>... [--wait] signs and pushes the hydrated set, get --target <cluster> prints the last signed set, cosign --target <cluster> attaches the Sigstore bundle that mgmtd holds now (after a key rotation), verify --target <cluster> checks with cosign, offline, that mgmtd signed the root of the state, repair --target <cluster> is the break glass that applies the argocd and cell-system bundles of the last good set"
 run = "scripts/bundle.sh"
 
 [tasks."hostsvc:serve"]

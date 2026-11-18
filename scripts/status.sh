@@ -473,7 +473,7 @@ bundle_problems() {
       + (if $role == "cp" and ($m.planeBundle // null) != null and $m.planeBundle.served == true and ($m.planeBundle.result // null) == null
             and (($m.planeBundle.issuedAt // "") | ts) > 1000000000 and ($now - (($m.planeBundle.issuedAt // "") | ts)) > 300
             and ((($m.planeBundleStatus.state // "") | IN("applying", "rolling_back")) | not)
-          then ["envd reported the set \($m.planeBundle.opId // "") of \($c), and mgmtd has not closed its result for more than 5 minutes (issued at \($m.planeBundle.issuedAt)). Run: CELL=\($c) mise run cell:verify"]
+          then ["envd reported the set \($m.planeBundle.opId // "") of \($c), and mgmtd has not closed its result for more than 5 minutes (issued at \($m.planeBundle.issuedAt), expires at \($m.planeBundle.expiresAt // "an unknown time")). Run: mise run bundle -- get --target \($c)"]
           else [] end)' <<<"$state")" || { addp "$cluster" "the bundle state of $cluster could not be evaluated. Run: CELL=$cluster mise run cell:verify"; continue; }
     extra="$(jq -c --arg c "$cluster" --argjson add "$out" '. + [$add[] | {cluster: $c, problem: .}]' <<<"$extra")"
   done

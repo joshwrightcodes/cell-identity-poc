@@ -13,17 +13,25 @@
 #
 # Usage: gate-m8-repair.sh [--check]
 #   --check prints each trace of a run with the command that repairs it, and exits 1. It changes nothing. It exits 0 when it finds none.
-# GATE_M8_WAIT sets the seconds to wait for the deletions (default 180) and GATE_M8_POLL the seconds between two reads (default 5).
+# GATE_M8_WAIT sets the seconds to wait for the deletions (default 180), GATE_M8_OPEN_WAIT the seconds to wait for an open set of a target before its
+# publish (default 2100, as long as the e2e helper m8WaitNoOpen), and GATE_M8_POLL the seconds between two reads (default 5).
+# mgmtd refuses a new served set while one is open (bundle_open), so an interrupted run can leave a target that cannot take a publish for up to 30 minutes.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
 
 check=0
-[[ "${1:-}" == "--check" ]] && check=1
+case "${1:-}" in
+  "") ;;
+  --check) check=1 ;;
+  *) echo "usage: gate-m8-repair.sh [--check]" >&2; exit 1 ;;
+esac
+((${#} <= 1)) || { echo "usage: gate-m8-repair.sh [--check]" >&2; exit 1; }
 repair="mise run gate:m8:repair"
 test_label="cell.poc.internal/e2e"
 recorded="$BUILD_ROOT/gate/m8-bundles"
 marker_cm=m8-marker
 wait_seconds="${GATE_M8_WAIT:-180}"
+open_wait="${GATE_M8_OPEN_WAIT:-2100}"
 
 existing="$(existing_clusters)" || die "could not list the clusters. Run: mise run harness:status"
 
@@ -44,6 +52,15 @@ state_of() {
     || die "could not read ConfigMap bundle-state of $1"
 }
 
+# open_set <target> prints "<op ID> <expiry>" when the last signed set of the target is served, has no final result and has not expired, and nothing
+# otherwise. A target that has no set yet gives nothing.
+open_set() {
+  local got
+  got="$(mise run bundle -- get --target "$1" 2>/dev/null)" || return 0
+  jq -r --argjson now "$(date +%s)" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    select(.served == true and (.result // null) == null and ((.expiresAt // "") | ts) > $now) | "\(.opId) \(.expiresAt)"' <<<"$got" 2>/dev/null || true
+}
+
 # probes prints "<cluster> <name>" for each probe of M8: a namespace, and application/<name> for an Application.
 probes() {
   local cluster names name
@@ -62,7 +79,7 @@ probes() {
 # Each target gets a reason line "<target> <kind> <text>" for a sign that a test changed it, where kind is recorded, apps-sample, marker,
 # rolled_back or rollback_unhealthy. A target with more than one sign has more than one line.
 signs() {
-  local target state apps
+  local target state apps open
   for target in "${targets[@]}"; do
     if grep -qx -- "$target" "$recorded" 2>/dev/null; then
       printf '%s recorded is listed in build/gate/m8-bundles, so a test changed its signed set and did not restore it\n' "$target"
@@ -74,6 +91,10 @@ signs() {
     fi
     if [[ -n "$(kubectl --context "kind-$target" -n apps-demo get configmap "$marker_cm" --ignore-not-found -o name)" ]]; then
       printf '%s marker holds the ConfigMap apps-demo/%s\n' "$target" "$marker_cm"
+    fi
+    open="$(open_set "$target")"
+    if [[ -n "$open" ]]; then
+      printf '%s open holds the open set %s, which expires at %s and has no final result\n' "$target" "${open% *}" "${open#* }"
     fi
     state="$(state_of "$target")" || exit 1
     [[ -n "$state" ]] || continue
@@ -138,9 +159,19 @@ done <<<"$reasons"
 # 3. The hydrated set goes out again for each target that a test changed, dev-cp first (the order of targets).
 for target in "${targets[@]}"; do
   grep -q "^$target " <<<"$reasons" || continue
+  open_end=$((SECONDS + open_wait))
+  while open="$(open_set "$target")" && [[ -n "$open" ]]; do
+    ((SECONDS < open_end)) || die "the set ${open% *} of $target is open until ${open#* }, and mgmtd refuses a new set until it ends. Wait, then run: $repair"
+    log "waiting for the open set ${open% *} of $target (until ${open#* })"
+    sleep "${GATE_M8_POLL:-5}"
+  done
   log "publishing the hydrated set of $target again"
-  mise run bundle -- publish --target "$target" --wait >/dev/null \
-    || die "could not publish the hydrated set of $target. Run: CELL=$target mise run cell:hydrate, then mise run bundle -- publish --target $target --wait"
+  if ! err="$(mise run bundle -- publish --target "$target" --wait 2>&1 >/dev/null)"; then
+    if [[ "$err" == *bundle_open* ]]; then
+      die "mgmtd refused the set of $target because a set is still open (bundle_open): ${err##*$'\n'}. Wait for it to end, then run: $repair"
+    fi
+    die "could not publish the hydrated set of $target: ${err##*$'\n'}. Run: CELL=$target mise run cell:hydrate, then mise run bundle -- publish --target $target --wait"
+  fi
   if grep -q "^$target marker " <<<"$reasons"; then
     kubectl --context "kind-$target" -n apps-demo delete configmap "$marker_cm" --ignore-not-found >/dev/null \
       || die "could not delete the ConfigMap apps-demo/$marker_cm of $target"

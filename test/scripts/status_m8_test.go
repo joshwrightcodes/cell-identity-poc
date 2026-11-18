@@ -123,7 +123,7 @@ func TestStatusBundles(t *testing.T) {
 				want: []string{"has no cluster"}, deny: []string{"bundle state", "bundle --"}},
 			{name: "an envd plane result that mgmtd has not closed for 6 minutes", cluster: "dev-cp",
 				env:  func() []string { return []string{"STUB_MGMT_STATUS=" + planeOpen(6*time.Minute, nil)} },
-				want: []string{"dev-cp", "0123456789abcdef0123456789abcdef", "more than 5 minutes", "Run: CELL=dev-cp mise run cell:verify"}},
+				want: []string{"dev-cp", "0123456789abcdef0123456789abcdef", "more than 5 minutes", "expires at", "Run: mise run bundle -- get --target dev-cp"}, deny: []string{"cell:verify"}},
 			{name: "an envd plane result open for 4 minutes is a wait",
 				env: func() []string { return []string{"STUB_MGMT_STATUS=" + planeOpen(4*time.Minute, nil)} }},
 			{name: "an envd plane result that mgmtd closed",

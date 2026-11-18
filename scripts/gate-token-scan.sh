@@ -56,6 +56,11 @@ done
 # A file of a gate:m8 run lies in build/gate on this Mac.
 for file in "$BUILD_ROOT"/gate/m8-*; do
   [[ -f "$file" ]] || continue
+  if [[ ! -r "$file" ]]; then
+    echo "cannot read build/gate/${file##*/}, so the scan cannot tell whether it holds a token"
+    status=1
+    continue
+  fi
   lines="$(grep -nE "$shape" "$file" | cut -d: -f1 || true)"
   for n in $lines; do
     echo "a token or a key is in a gate file: build/gate/${file##*/} line $n"

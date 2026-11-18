@@ -696,8 +696,15 @@ check_signed_root() {
   local out reason
   if ! out="$(cd "$ROOT" && mise run bundle -- verify --target "$CELL_NAME" 2>&1)"; then
     reason="$(grep '^error:' <<<"$out" | tail -n 1 || true)"
-    printf '%s\n' "${reason:-$(tail -n 1 <<<"$out")}"
-    echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    reason="${reason:-$(tail -n 1 <<<"$out")}"
+    printf '%s\n' "$reason"
+    # A new set fixes a bootstrap state or a missing state. A root that fails cosign says its own command (after a key rotation, bundle -- cosign), and a
+    # mirror or mgmtd that does not answer needs the harness first: a publish needs both.
+    if [[ "$reason" == *"bootstrap root"* || "$reason" == *"no bundle state"* || "$reason" == *"no root digest"* ]]; then
+      echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    elif [[ "$reason" != *"cosign"* ]]; then
+      echo "Run: mise run harness:status"
+    fi
     return 1
   fi
 }
@@ -705,7 +712,7 @@ check_signed_root() {
 # check_bundle_guard succeeds when the admission policies that keep Argo CD away from the harness equal the render of components/lib/bundle-guard.sh
 # for the role: bundles-spare-harness and its binding in a cell and in dev-cp, and bundles-app-limits and its binding in a cell.
 check_bundle_guard() {
-  local role docs names comp out rc
+  local role docs names comp out rc doc kind name resource live problems
   role="$(bundle_role)" || return 1
   case "$role" in
     cell) names="bundles-spare-harness and bundles-app-limits" comp=cell-identity ;;
@@ -718,7 +725,7 @@ check_bundle_guard() {
   rc=0
   out="$(k diff --server-side --force-conflicts -f - <<<"$docs" 2>&1)" || rc=$?
   case "$rc" in
-    0) return 0 ;;
+    0) ;;
     1)
       printf '%s\n' "$out" | head -n 40
       echo "The guards $names of $CELL_NAME differ from the render of components/lib/bundle-guard.sh $role."
@@ -726,6 +733,36 @@ check_bundle_guard() {
       return 1 ;;
     *) echo "kubectl diff failed: $out"; return 1 ;;
   esac
+  # The diff shows a field of the render that differs, and not a field that another manager added. So read each live object too: its match conditions,
+  # its validations and its rules must equal the render, and its binding may carry no selector, parameter or extra rule that narrows the guard.
+  problems=()
+  while IFS= read -r doc; do
+    [[ -n "$doc" && "$doc" != --- ]] || continue
+    kind="$(jq -r .kind <<<"$doc")" name="$(jq -r .metadata.name <<<"$doc")"
+    case "$kind" in
+      ValidatingAdmissionPolicy) resource=validatingadmissionpolicy ;;
+      ValidatingAdmissionPolicyBinding) resource=validatingadmissionpolicybinding ;;
+      *) continue ;;
+    esac
+    if ! live="$(k get "$resource" "$name" -o json 2>&1)"; then
+      problems+=("cannot read $kind $name: $live")
+      continue
+    fi
+    jq -e --argjson r "$doc" '
+      def rules: [.spec.matchConstraints.resourceRules[]? | {apiGroups, operations, resources}];
+      def checks: [.spec.validations[]? | {expression, message}];
+      if .kind == "ValidatingAdmissionPolicy" then
+        (.spec.matchConditions // []) == ($r.spec.matchConditions // []) and checks == ($r | checks) and rules == ($r | rules)
+      else
+        .spec.policyName == $r.spec.policyName and .spec.validationActions == $r.spec.validationActions and (.spec.paramRef // null) == null
+        and ((.spec.matchResources // {}) | (.namespaceSelector // {}) == {} and (.objectSelector // {}) == {} and (.resourceRules // []) == [] and (.excludeResourceRules // []) == [])
+      end' >/dev/null <<<"$live" || problems+=("$kind $name differs from the render, or narrows its match (a selector, a parameter, an extra condition or another rule)")
+  done <<<"$("$ROOT/components/lib/bundle-guard.sh" "$role")"
+  if ((${#problems[@]} > 0)); then
+    printf '%s\n' "${problems[@]}"
+    echo "Run: CELL=$CELL_NAME mise run cell:up"
+    return 1
+  fi
 }
 
 # check_store_proxy succeeds when the proxy in front of the bundle store admits the one writer of the role and the reader that Argo CD uses (the
