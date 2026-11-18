@@ -754,6 +754,10 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 		good = nil
 		if len(s.Good) > 0 {
 			good = maps.Clone(s.Good[0].Components)
+			if good == nil {
+				good = map[string]string{}
+			}
+			good["root"] = s.Good[0].Root.Digest
 		}
 		s.Source, s.Version, s.ContentSHA256, s.KeySHA256 = sourceSigned, r.set.Version, r.content, r.keySHA
 		s.OpID, s.State, s.Failed = r.opID, stateApplying, ""
@@ -905,8 +909,8 @@ func (a *Applier) refresh(ctx context.Context) {
 
 // judge holds what the waits need to tell a sync of this tag move from an older one: the time just
 // before the move, and the Applications as they were then. restore is true for the rollback wait,
-// whose good root was applied before. good holds the component digests of good[0] at the start of the
-// apply.
+// whose good root was applied before. good holds the digests of good[0] at the start of the apply: its
+// components, and its root under the name root.
 type judge struct {
 	since   time.Time
 	before  map[string]appState
@@ -915,17 +919,18 @@ type judge struct {
 }
 
 // counts reports whether an Application that is Synced at digest has reached it for the wait. The
-// health wait needs judge.applied, apart from a component that keeps its digest of good[0]. That one,
-// and in the rollback wait every Application, also counts when it runs no operation: Argo CD starts no
-// sync for an Application whose live state already compares equal, for example after a sync of the
-// failed set that applied nothing, or after a change of the source that kept the content. root and a
-// changed component keep the strict rule in the health wait.
+// health wait needs judge.applied, apart from an Application that keeps its digest of good[0] (root
+// included, for a set with the components of good[0]). That one, and in the rollback wait every
+// Application, also counts when it runs no operation: Argo CD starts no sync for an Application whose
+// live state already compares equal, for example after a sync of the failed set that applied nothing,
+// after a repair, or after a change of the source that kept the content. A changed Application keeps
+// the strict rule in the health wait.
 func (j judge) counts(name, digest string, s appState) bool {
 	if j.applied(name, digest, s) {
 		return true
 	}
 	idle := !s.Operation && s.Op.Phase != phaseRunning && s.Op.Phase != phaseTerminating
-	kept := name != "root" && digest != "" && j.good[name] == digest
+	kept := digest != "" && j.good[name] == digest
 	return idle && (j.restore || kept)
 }
 

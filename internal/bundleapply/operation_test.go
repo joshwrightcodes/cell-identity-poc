@@ -79,6 +79,19 @@ func TestApplyCountsOnlyASyncAfterTheMove(t *testing.T) {
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:apps-sample:Synced/Healthy")
 		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
 	})
+	// A set that only drops a component changes the root and keeps every child, so only root can show
+	// that the set was not applied: a changed root still needs a sync after the move.
+	t.Run("changed root with no sync", func(t *testing.T) {
+		e, a, _ := twoSets(t)
+		b := e.set(2, []spec{{"apps-sample", "apps-demo", cmap("apps-demo", "app", "a")}})
+		if b.root.Digest == a.root.Digest || b.digests()["apps-sample"] != a.digests()["apps-sample"] {
+			t.Fatal("the test set must change the root and keep apps-sample")
+		}
+		e.clk.Advance(time.Hour)
+		e.sync = syncOf("root", b.root.Digest, func(time.Time) (string, time.Time) { return "", time.Time{} })
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:root:Synced/Healthy")
+		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+	})
 	t.Run("unchanged component", func(t *testing.T) {
 		e, a, _ := twoSets(t)
 		b := e.set(2, []spec{
@@ -435,6 +448,39 @@ func TestApplyUnchangedComponentWithoutASync(t *testing.T) {
 		e.ops["network-policy"].phase = "Running"
 		e.step()
 		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "timeout:network-policy:Synced/Healthy")
+	})
+	// After a repair, root is Synced and Healthy at the good root with a failed sync of it as its last
+	// operation and none running. A set with the components of good[0] has the same root, so Argo CD
+	// starts no root sync.
+	t.Run("root after a repair", func(t *testing.T) {
+		e := newEnv(t)
+		a := e.set(1, std("a"))
+		wantOutcome(t, e.apply("opA", a), op.OutcomeApplied, "", "")
+		e.clk.Advance(time.Hour)
+		e.ops["root"] = &simOp{"Error", a.root.Digest, e.clk.Now().Add(-30 * time.Minute)}
+		e.step()
+		again := e.set(2, std("a"))
+		if again.root.Digest != a.root.Digest {
+			t.Fatal("two sets with the same components give two roots")
+		}
+		wantOutcome(t, e.apply("opA2", again), op.OutcomeApplied, "", "")
+	})
+	// good[0] of the first signed set is the bootstrap entry that the apply records from the state.
+	t.Run("first set after the bootstrap", func(t *testing.T) {
+		e := newEnv(t)
+		if st := e.state(); len(st.Good) != 0 {
+			t.Fatalf("the bootstrap state has good %+v, want none", st.Good)
+		}
+		e.clk.Advance(time.Hour)
+		e.movedWithoutSync("network-policy", e.boot.digests()["network-policy"])
+		b := e.set(1, []spec{
+			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "v1")},
+			{"network-policy", "cell-system", cmap("cell-system", "np", "boot")},
+		})
+		if b.digests()["network-policy"] != e.boot.digests()["network-policy"] {
+			t.Fatal("the test set changes network-policy")
+		}
+		wantOutcome(t, e.apply("op1", b), op.OutcomeApplied, "", "")
 	})
 	// The digest that counts is the one of good[0], not the one that the tag held: after a rollback that
 	// could not move the tag, the tag still holds the failed set.
