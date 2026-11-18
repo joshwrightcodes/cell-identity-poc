@@ -111,6 +111,12 @@ type env struct {
 	// hook runs after each simulated poll. A non-nil error ends the wait.
 	hook  func(n int)
 	polls int
+	// lag is how long the simulated Argo CD keeps showing the root that it showed before the tag
+	// moved. shown is the root that it shows, and seenRoot and seenAt record the last tag move.
+	lag      time.Duration
+	shown    string
+	seenRoot string
+	seenAt   time.Time
 }
 
 // canonBody returns the canonical form of body.
@@ -296,9 +302,25 @@ func (e *env) currentRoot() string {
 	return ocitest.Digest(m)
 }
 
-// step is the simulated Argo CD: it points every Application at the set of the current root tag.
+// lagged makes the simulated Argo CD show each new root tag only d after the tag moved.
+func (e *env) lagged(d time.Duration) {
+	e.lag, e.shown, e.seenRoot, e.seenAt = d, e.currentRoot(), e.currentRoot(), e.clk.Now()
+}
+
+// step is the simulated Argo CD: it points every Application at the set of the current root tag, or
+// of the root that it showed before, while the lag lasts.
 func (e *env) step() {
 	cur := e.currentRoot()
+	if e.lag > 0 {
+		now := e.clk.Now()
+		if cur != e.seenRoot {
+			e.seenRoot, e.seenAt = cur, now
+		}
+		if now.Sub(e.seenAt) < e.lag {
+			cur = e.shown
+		}
+		e.shown = cur
+	}
 	comps, ok := e.roots[cur]
 	if !ok {
 		return
@@ -972,6 +994,38 @@ func TestApplyRollbackNeverDeletes(t *testing.T) {
 			t.Fatalf("clientset delete: %v", act)
 		}
 	}
+}
+
+// TestApplyDegradedCountsOnlyTheWantedRevision checks that an Application that is Degraded at another
+// revision does not end a wait early: Argo CD can need longer than the degraded grace to read a root.
+func TestApplyDegradedCountsOnlyTheWantedRevision(t *testing.T) {
+	t.Run("forward wait", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.health = func(root, app string) (string, string) {
+			if root == a.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		e.step()
+		e.lagged(90 * time.Second)
+		wantOutcome(t, e.apply("opB", b), op.OutcomeApplied, "", "")
+		if e.currentRoot() != b.root.Digest {
+			t.Fatal("the set that fixes the Degraded app was rolled back")
+		}
+	})
+	t.Run("rollback wait", func(t *testing.T) {
+		e, a, b := twoSets(t)
+		e.health = func(root, app string) (string, string) {
+			if root == b.root.Digest && app == "apps-sample" {
+				return "Synced", "Degraded"
+			}
+			return "Synced", "Healthy"
+		}
+		e.lagged(90 * time.Second)
+		wantOutcome(t, e.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+		e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+	})
 }
 
 func TestApplyRollbackWithoutGoodRoot(t *testing.T) {
