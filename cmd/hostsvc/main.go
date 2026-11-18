@@ -92,6 +92,7 @@ func (e *exitError) Unwrap() error { return e.err }
 var (
 	startTelemetry  = telemetry.Start
 	selfExecutable  = os.Executable
+	registryDocker  = hostsvc.DockerFunc(hostsvc.RunDocker)
 	nodeIPLookup    = func(cell string) (string, error) { return hostsvc.NewKindRuntime().NodeIP(cell) }
 	newService      = func(topo *topology.Topology) *hostsvc.Service { return hostsvc.New(hostsvc.NewKindRuntime(), topo) }
 	nofileSoftLimit = func() (uint64, error) {
@@ -106,7 +107,7 @@ var (
 // run runs one command. It writes data to out, and the logs of serve go to logOut.
 func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: hostsvc up|down [--only <name>] | create --cluster <cell> | facts --cluster <name> | bootstrap-digest [--root <dir>] | ctl steps|log|cancel|reset-journal | serve --listen <addr> --client-bundle <file> [--client-id <id>] [--journal-dir <dir>] | pin --addr <addr> [--expect-sha256 <hex>]  [--topology <file>]")
+		return fmt.Errorf("usage: hostsvc up|down [--only <name>] | create --cluster <cell> | facts --cluster <name>|--registry | bootstrap-digest [--root <dir>] | ctl steps|log|cancel|reset-journal | serve --listen <addr> --client-bundle <file> [--client-id <id>] [--journal-dir <dir>] | pin --addr <addr> [--expect-sha256 <hex>]  [--topology <file>]")
 	}
 	cmd := args[0]
 	var sub string
@@ -121,6 +122,7 @@ func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 	topoPath := fs.String("topology", "harness/topology.yaml", "topology file")
 	only := fs.String("only", "", "act on this cluster only (up, down)")
 	name := fs.String("cluster", "", "cluster name (facts)")
+	registry := fs.Bool("registry", false, "print the address of the registry mirror (facts)")
 	listen := fs.String("listen", defaultServeAddr, "loopback address to listen on (serve)")
 	bundlePath := fs.String("client-bundle", "", "PEM file with the roots of the management plane (serve)")
 	clientID := fs.String("client-id", defaultClientID, "SPIFFE ID that a client must carry (serve)")
@@ -163,6 +165,16 @@ func run(ctx context.Context, args []string, out, logOut io.Writer) error {
 		if sf.journalDir = os.Getenv("POC_JOURNAL_DIR"); sf.journalDir == "" {
 			sf.journalDir = defaultJournalDir
 		}
+	}
+	if cmd == "facts" && *registry {
+		if *name != "" {
+			return errors.New("facts takes --cluster or --registry, not both")
+		}
+		f, err := hostsvc.RegistryFactsOf(ctx, registryDocker)
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(out).Encode(f)
 	}
 	topo, err := topology.Load(*topoPath)
 	if err != nil {
