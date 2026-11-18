@@ -558,3 +558,34 @@ func TestEnvdMirrorPortCheck(t *testing.T) {
 		t.Errorf("err %v, stdout %d bytes, stderr %q; want a stop that names the port", r.err, len(r.stdout), r.stderr)
 	}
 }
+
+// TestEnvdNoWorkloadPolicyWithoutWorkloads: when envd is the only local workload, the render prints no plane-workloads policy,
+// because a rule with an empty peer list admits every source.
+func TestEnvdNoWorkloadPolicyWithoutWorkloads(t *testing.T) {
+	objs := envdObjects(t, "SPIRE_LOCAL_WORKLOADS=envd=envd-system/envd")
+	if objs["NetworkPolicy spire-system/plane-workloads"] != nil {
+		t.Error("the render prints plane-workloads with no peer")
+	}
+	if objs["NetworkPolicy spire-system/plane-envd"] == nil {
+		t.Error("the render lost plane-envd")
+	}
+}
+
+// TestSpireServerRoleLookup: the render needs CELL_NAME to find the bundle role, and a failed lookup stops it. A cluster of role
+// open keeps the workload policy.
+func TestSpireServerRoleLookup(t *testing.T) {
+	for _, tc := range []struct {
+		name, want string
+		env        []string
+	}{
+		{"no CELL_NAME", "CELL_NAME", []string{"CELL_NAME="}},
+		{"a cluster that the topology does not hold", "nosuch", []string{"CELL_NAME=nosuch"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := render(t, append([]string{"SPIRE_CELL_SUBJECTS=", "SPIRE_LOCAL_WORKLOADS=cp/otel=observability-system/otel-uplink"}, tc.env...)...)
+			if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
+				t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", r.err, len(r.stdout), r.stderr, tc.want)
+			}
+		})
+	}
+}

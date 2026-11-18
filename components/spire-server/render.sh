@@ -35,12 +35,12 @@
 # data volume, so a restart keeps the root.
 # Inputs come from cells/<cluster>.env: SPIRE_TRUST_DOMAIN, SPIRE_SVID_TTL, SPIRE_CA_TTL (default
 # 24h), SPIRE_UPSTREAM, SPIRE_AGENT_CELLS, SPIRE_CELL_SUBJECTS and SPIRE_LOCAL_WORKLOADS. POC_ENV
-# comes from cells/common.env, and the API server facts from build/<cluster>/facts.env. The
+# comes from cells/common.env, CELL_NAME names the cluster whose bundle role decides the workload policy, and the API server facts from build/<cluster>/facts.env. The
 # external-secrets bundle holds Namespace spire-system when it is the namespace of the operator,
 # EXTERNAL_SECRETS_NAMESPACE or SECRET_STORE_NAMESPACES. hydrate replaces @CELL_NAME@, the cluster
 # name of the k8s_psat config.
 set -euo pipefail
-: "${SPIRE_TRUST_DOMAIN:?}" "${SPIRE_SVID_TTL:?}" "${POC_ENV:?}"
+: "${SPIRE_TRUST_DOMAIN:?}" "${SPIRE_SVID_TTL:?}" "${POC_ENV:?}" "${CELL_NAME:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -249,7 +249,8 @@ if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
 fi
 eso_namespace="${EXTERNAL_SECRETS_NAMESPACE:-${SECRET_STORE_NAMESPACES:-}}"
 [[ "$eso_namespace" != "$namespace" ]] || drop_objects+=("Namespace/$namespace")
-if [[ -n "${CELL_NAME:-}" && "$(bundle_role_of "$CELL_NAME")" == cp ]]; then
+role="$(bundle_role_of "$CELL_NAME")" || die "could not read the bundle role of $CELL_NAME"
+if [[ "$role" == cp ]]; then
   drop_objects+=("NetworkPolicy/spire-server-workloads")
 fi
 for v in ${drop_volumes[@]+"${drop_volumes[@]}"}; do

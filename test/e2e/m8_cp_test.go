@@ -116,6 +116,18 @@ func TestM8CpAdmitStageSigned(t *testing.T) {
 		}
 	}
 
+	// A failure after the delete must not leave the harness without the cell: the cleanup recreates it when its cluster is absent.
+	t.Cleanup(func() {
+		if slices.Contains(kindClusters(t), cell) {
+			return
+		}
+		if _, err := portal(t, "recreate", "--cell", cell, "--wait"); err != nil {
+			t.Logf("FAILED to restore %s: %v. Run: mise run portal -- recreate --cell %s --wait", cell, err, cell)
+			return
+		}
+		waitValid(t, []string{cell}, 5*time.Minute)
+	})
+
 	// cell:down renders dev-cp again. The address of the deleted cell must leave both policies, so a later admit adds it back.
 	if out, err := miseRun(t, cellDownWait, []string{"CELL=" + cell}, "cell:down"); err != nil {
 		t.Fatalf("cell:down of %s: %v\n%s", cell, err, out)

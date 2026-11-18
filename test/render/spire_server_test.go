@@ -334,7 +334,7 @@ var serverFacts = []string{"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", 
 // workload. The env values override them.
 func render(t *testing.T, env ...string) result {
 	t.Helper()
-	defaults := []string{"SPIRE_SVID_TTL=1m", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal", "SPIRE_UPSTREAM=disk",
+	defaults := []string{"CELL_NAME=management", "SPIRE_SVID_TTL=1m", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal", "SPIRE_UPSTREAM=disk",
 		"SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld", "SECRET_STORE_NAMESPACES=spire-system"}
 	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append(append(defaults, serverFacts...), env...)...)
 }
