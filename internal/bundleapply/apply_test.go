@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,13 +24,15 @@ import (
 	"time"
 
 	netv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
@@ -121,6 +124,30 @@ type env struct {
 	shown    string
 	seenRoot string
 	seenAt   time.Time
+
+	// ops holds the last sync operation of each simulated Application, and written is the root whose
+	// child Applications the simulated root wrote last. rvs holds the resource version of each
+	// Application, and nextRV the next one.
+	ops     map[string]*simOp
+	written string
+	rvs     map[string]string
+	nextRV  int
+	// sync, when set, decides how the simulated Argo CD syncs app to rev while the tag holds root: the
+	// phase of the operation that it starts ("" for none) and its start time. A nil function starts a
+	// sync that succeeds at once.
+	sync func(root, app, rev string, now time.Time) (string, time.Time)
+	// terminated lists the Applications whose operation the engine terminated, in order, and
+	// terminateRVs the resource version that each terminate patch carried. conflicts makes that many
+	// terminate patches fail with a conflict.
+	terminated   []string
+	terminateRVs []string
+	conflicts    int
+}
+
+// simOp is a sync operation of the simulated Argo CD.
+type simOp struct {
+	phase, rev string
+	started    time.Time
 }
 
 // canonBody returns the canonical form of body.
@@ -142,7 +169,8 @@ func std(v string) []spec {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	e := &env{t: t, clk: &clock{t: time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)}, roots: map[string]map[string]string{}}
+	e := &env{t: t, clk: &clock{t: time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)}, roots: map[string]map[string]string{},
+		ops: map[string]*simOp{}, rvs: map[string]string{}}
 	e.mirrorReg = ocitest.NewRegistry(t)
 	e.storeReg = ocitest.NewRegistry(t)
 	mirror, err := ocistore.New(ocistore.Client{Base: e.mirrorReg.URL()})
@@ -158,6 +186,7 @@ func newEnv(t *testing.T) *env {
 	e.disc = e.cs.Discovery().(*fakediscovery.FakeDiscovery)
 	e.dyn = dynamicfake.NewSimpleDynamicClientWithCustomListKinds(runtime.NewScheme(),
 		map[schema.GroupVersionResource]string{applicationGVR: "ApplicationList"})
+	e.dyn.PrependReactor("patch", "applications", e.terminateReactor)
 	e.pub, e.priv, err = ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -250,9 +279,14 @@ func (e *env) seedBootstrap() {
 	e.mustWriteState(State{
 		Source: "bootstrap", State: "healthy", Root: Root{Digest: b.root.Digest, Manifest: b.root.Manifest}, Components: b.digests(),
 	})
+	// Argo CD synced the bootstrap set an hour before the tests start.
+	synced := e.clk.Now().Add(-time.Hour)
 	for name, d := range b.digests() {
+		e.ops[name] = &simOp{"Succeeded", d, synced}
 		e.putApp(name, appState{Sync: "Synced", Health: "Healthy", Revision: d})
 	}
+	e.ops["root"] = &simOp{"Succeeded", b.root.Digest, synced}
+	e.written = b.root.Digest
 	e.putApp("root", appState{Sync: "Synced", Health: "Healthy", Revision: b.root.Digest})
 }
 
@@ -276,25 +310,89 @@ func (e *env) state() State {
 	return st
 }
 
+// putApp writes the status of one simulated Application, with its last operation from e.ops, as Argo
+// CD shows it: status.operationState, and the field operation while the operation runs. Each write
+// gives the Application a new resource version.
 func (e *env) putApp(name string, s appState) {
 	e.t.Helper()
 	gvr := applicationGVR.GroupVersion().WithResource("applications")
 	ctx := context.Background()
-	u := application(name, map[string]any{
+	status := map[string]any{
 		"sync":   map[string]any{"status": s.Sync, "revision": s.Revision},
 		"health": map[string]any{"status": s.Health},
-	})
+	}
+	var operation map[string]any
+	if o := e.ops[name]; o != nil {
+		sync := map[string]any{"revision": o.rev}
+		status["operationState"] = map[string]any{
+			"phase": o.phase, "startedAt": o.started.UTC().Format(time.RFC3339),
+			"operation": map[string]any{"sync": sync}, "syncResult": map[string]any{"revision": o.rev},
+		}
+		if o.phase == "Running" || o.phase == "Terminating" {
+			operation = map[string]any{"sync": sync}
+		}
+	}
+	e.nextRV++
+	rv := strconv.Itoa(e.nextRV)
+	e.rvs[name] = rv
+	u := application(name, status)
 	cur, err := e.dyn.Resource(gvr).Namespace("argocd").Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
-		if _, err := e.dyn.Resource(gvr).Namespace("argocd").Create(ctx, u, metav1.CreateOptions{}); err != nil {
+		cur = u
+	}
+	cur.Object["status"] = status
+	delete(cur.Object, "operation")
+	if operation != nil {
+		cur.Object["operation"] = operation
+	}
+	cur.SetResourceVersion(rv)
+	if err != nil {
+		if _, err := e.dyn.Resource(gvr).Namespace("argocd").Create(ctx, cur, metav1.CreateOptions{}); err != nil {
 			e.t.Fatal(err)
 		}
 		return
 	}
-	_ = unstructured.SetNestedField(cur.Object, u.Object["status"], "status")
 	if _, err := e.dyn.Resource(gvr).Namespace("argocd").Update(ctx, cur, metav1.UpdateOptions{}); err != nil {
 		e.t.Fatal(err)
 	}
+}
+
+// terminateReactor is the API server and the controller of the simulated Argo CD for a patch that
+// sets status.operationState.phase: it refuses a patch whose resource version is not current with a
+// conflict, and marks the operation Terminating, which the next step ends as Failed. Other patches go
+// on to the default reactor.
+func (e *env) terminateReactor(action k8stesting.Action) (bool, runtime.Object, error) {
+	p, ok := action.(k8stesting.PatchAction)
+	if !ok {
+		return false, nil, nil
+	}
+	var body struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+		Status struct {
+			OperationState struct {
+				Phase string `json:"phase"`
+			} `json:"operationState"`
+		} `json:"status"`
+	}
+	if err := json.Unmarshal(p.GetPatch(), &body); err != nil || body.Status.OperationState.Phase == "" {
+		return false, nil, nil
+	}
+	name := p.GetName()
+	e.terminateRVs = append(e.terminateRVs, body.Metadata.ResourceVersion)
+	if p.GetPatchType() != types.MergePatchType || body.Status.OperationState.Phase != "Terminating" {
+		return true, nil, fmt.Errorf("unexpected patch of %s: %s %s", name, p.GetPatchType(), p.GetPatch())
+	}
+	if e.conflicts > 0 || body.Metadata.ResourceVersion != e.rvs[name] {
+		e.conflicts--
+		return true, nil, apierrors.NewConflict(applicationGVR.GroupResource(), name, errors.New("the object has been modified"))
+	}
+	e.terminated = append(e.terminated, name)
+	if o := e.ops[name]; o != nil && o.phase == "Running" {
+		o.phase = "Terminating"
+	}
+	return true, nil, nil
 }
 
 // currentRoot returns the digest that the tag current has in the store.
@@ -311,8 +409,11 @@ func (e *env) lagged(d time.Duration) {
 	e.lag, e.shown, e.seenRoot, e.seenAt = d, e.currentRoot(), e.currentRoot(), e.clk.Now()
 }
 
-// step is the simulated Argo CD: it points every Application at the set of the current root tag, or
-// of the root that it showed before, while the lag lasts.
+// step is the simulated Argo CD. The root Application reads the current root tag, or the root that it
+// showed before while the lag lasts, and each child Application reads its revision from the root that
+// the root Application synced last. An Application whose revision changed starts a sync (e.sync), as
+// automated sync does, but not while an operation runs: an operation that the engine terminated ends
+// Failed first. An Application keeps a sync that it attempted once for the same revision.
 func (e *env) step() {
 	cur := e.currentRoot()
 	if e.lag > 0 {
@@ -325,24 +426,45 @@ func (e *env) step() {
 		}
 		e.shown = cur
 	}
-	comps, ok := e.roots[cur]
-	if !ok {
+	if _, ok := e.roots[cur]; !ok {
 		return
 	}
-	state := func(app, rev string) appState {
+	now := e.clk.Now()
+	advance := func(app, rev string) {
+		o := e.ops[app]
+		if o != nil && o.phase == "Terminating" {
+			o.phase = "Failed"
+		}
+		if o != nil && (o.phase == "Running" || o.rev == rev) {
+			return
+		}
+		phase, started := "Succeeded", now
+		if e.sync != nil {
+			phase, started = e.sync(cur, app, rev, now)
+		}
+		if phase != "" {
+			e.ops[app] = &simOp{phase, rev, started}
+		}
+	}
+	advance("root", cur)
+	if o := e.ops["root"]; o != nil && (o.phase == "Succeeded" || o.phase == "Running") {
+		e.written = o.rev
+	}
+	state := func(root, app, rev string) appState {
 		s, h := "Synced", "Healthy"
 		if e.health != nil {
-			s, h = e.health(cur, app)
+			s, h = e.health(root, app)
 		}
 		if e.revision != nil {
-			rev = e.revision(cur, app, rev)
+			rev = e.revision(root, app, rev)
 		}
 		return appState{Sync: s, Health: h, Revision: rev}
 	}
-	for name, d := range comps {
-		e.putApp(name, state(name, d))
+	for name, d := range e.roots[e.written] {
+		advance(name, d)
+		e.putApp(name, state(e.written, name, d))
 	}
-	e.putApp("root", state("root", cur))
+	e.putApp("root", state(cur, "root", cur))
 }
 
 func (e *env) apply(id string, b built) Outcome {

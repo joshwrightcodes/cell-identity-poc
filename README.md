@@ -558,8 +558,13 @@ The applier works in these steps:
 2. It fetches each bundle from `registry-mirror` by digest, and checks every object against one policy.
 3. It pushes the bundles to the bundle store, and moves the tag `current` of the root.
 4. It waits for up to 5 minutes until each Application is Synced and Healthy at its digest.
-   An Application that is `Degraded` for 60 seconds while it is Synced at its digest ends the wait early.
-5. When the set does not turn healthy, it moves `current` to the last good root and waits for up to 5 minutes again.
+   Each Application also needs a sync operation that succeeded at its digest after the tag moved.
+   An Application whose digest did not change keeps the sync that applied it before.
+   A component that is `Degraded` for 60 seconds after such a sync ends the wait early.
+   `root` never ends the wait early, because its health is the health of its children.
+5. When the set does not turn healthy, it moves `current` to the last good root.
+   It terminates each sync of the failed set that still runs, in `root` and in the component Applications.
+   It asks for a hard refresh of `root`, and waits for up to 5 minutes again by the same rule.
    It then reports `rolled_back`.
 
 A rollback creates no version and deletes no resource.
@@ -665,7 +670,7 @@ Read it with `mise run harness:logs <cell> app.kubernetes.io/name=celld`, or wit
 | `policy_blocks_planes`, `<namespace>/<name>` | The bundle names a harness plane policy | Remove the object. The plane policies belong to the harness |
 | `policy_blocks_planes`, `mesh_injection` | A Namespace or a pod template in a guarded namespace sets mesh injection | Remove the label |
 | Outcome `rolled_back`, reason `unhealthy`, detail `<app>:<sync>/<health>` | An Application did not turn healthy. The applier restored the last good root | Fix the cause. Publish again |
-| Outcome `rolled_back`, reason `unhealthy`, detail `timeout:<app>:<sync>/<health>` | The set did not turn healthy in 5 minutes | See the next section |
+| Outcome `rolled_back`, reason `unhealthy`, detail `timeout:<app>:<sync>/<health>` | The set did not turn healthy in 5 minutes. With `Synced/Healthy`, Argo CD ran no successful sync of the set for that Application | See the next section. The log line `bundle health wait timed out` names the last operation of the Application |
 | Outcome `rolled_back`, reason `unhealthy`, detail `rollback_unhealthy` | The rollback also failed, because the set broke the path that reads the store | Run `mise run bundle -- repair --target <target>`. Then publish |
 | `bundle_open` | `mgmtd` already has a served set for the target with no final result | Wait for the result, or for the expiry. Then run `mise run ops -- close <id>` |
 | `not_bound` | The cell is not bound | Run `CELL=<cell> mise run cell:up` |
@@ -677,7 +682,8 @@ Four more cases:
 
 - `timeout` is the usual end of a bad Deployment.
   Argo CD marks a Deployment `Degraded` only after `progressDeadlineSeconds`, so the wait runs to its end.
-  `controller.sync.timeout.seconds` is 240, so a sync that waits on a later wave ends before the rollback needs it.
+  Argo CD fails a sync at once when a resource of an earlier wave turns `Degraded`, and retries the same revision for minutes.
+  The rollback terminates these syncs, so the good root does not wait for the retries.
   A set whose workloads need more than 5 minutes ends in a rollback.
   A bad `dev-cp` set can stop attestation and the relay for up to 5 minutes before the rollback.
 - A recreated cell fails the telemetry check for up to 5 minutes after it turns valid.

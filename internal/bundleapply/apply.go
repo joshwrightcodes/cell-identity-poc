@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
@@ -46,6 +47,14 @@ const (
 	lockSlack        = 2 * time.Minute
 	maxStateAttempts = 8
 	detailRollback   = "rollback_unhealthy"
+	// opSkew is how long before the tag move a sync operation may start and still count for the move.
+	// Argo CD writes operationState.startedAt in whole seconds, from the clock of its node, and the
+	// engine and the application controller run in one kind cluster, whose nodes share the clock of
+	// the host. So 10 s covers the rounding with a margin, and stays well below the degraded grace of
+	// 1 min, the shortest time that a failed set holds the tag.
+	opSkew = 10 * time.Second
+	// terminateAttempts bounds the terminate patches of one Application that fail with a conflict.
+	terminateAttempts = 3
 )
 
 // DetailTarget is the detail of a payload_invalid refusal for a set whose predicate names another
@@ -761,6 +770,11 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 	for _, c := range r.set.Components {
 		comps[c.Name] = c.Digest
 	}
+	before, err := listApps(ctx, cfg.Dynamic)
+	if err != nil {
+		return Outcome{}, err
+	}
+	moved := judge{since: cfg.Now(), before: before}
 	tctx, end := a.tel.step(ctx, spanTag)
 	err = a.tag(tctx, r, comps)
 	end(err)
@@ -769,7 +783,7 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 	}
 
 	wctx, end := a.tel.step(ctx, spanWait)
-	detail, err := a.wait(wctx, r.set, r.root.Digest, comps, cfg.HealthTimeout)
+	detail, err := a.wait(wctx, r.set, r.root.Digest, comps, moved, cfg.HealthTimeout)
 	end(err)
 	if err != nil {
 		return Outcome{}, err
@@ -884,14 +898,40 @@ func (a *Applier) refresh(ctx context.Context) {
 	}
 }
 
-// wait polls the Applications until the root and every component are Synced at their digest and
-// Healthy. It returns "" when they are. It returns <app>:<sync>/<health> for an Application that stays
-// Synced and Degraded at its digest for the grace period, and timeout:<app>:<sync>/<health> for the
-// first Application that is not healthy at the deadline. Argo CD sets the revision when it compares,
-// before the sync applies anything, so an Application that is Degraded while OutOfSync, or at another
-// revision, still shows the old resources, and only the deadline ends the wait for it. An error means
+// judge holds what the waits need to tell a sync of this tag move from an older one: the time just
+// before the move, and the Applications as they were then.
+type judge struct {
+	since  time.Time
+	before map[string]appState
+}
+
+// applied reports whether the last sync operation of an Application applied digest for this move: it
+// succeeded at digest and started after the move, less opSkew. Argo CD starts no sync for an
+// Application whose revision did not change, so a sync of digest that the Application had already
+// started before the move also counts, while it is still the last operation of the Application. Sync
+// status, health and the compared revision never count alone: after a sync that the harness guard
+// denies, Argo CD can report Synced at a revision that it never applied.
+func (j judge) applied(name, digest string, s appState) bool {
+	if s.Op.Phase != phaseSucceeded || s.Op.Revision != digest || s.Op.StartedAt.IsZero() {
+		return false
+	}
+	if !s.Op.StartedAt.Before(j.since.Add(-opSkew)) {
+		return true
+	}
+	b, ok := j.before[name]
+	return ok && b.Op.StartedAt.Equal(s.Op.StartedAt) && (b.Op.Revision == digest || b.Op.Target == digest)
+}
+
+// wait polls the Applications until the root and every component have applied their digest (see
+// judge.applied), are Synced at it and Healthy. It returns "" when they are. It returns
+// <app>:<sync>/<health> for a component that stays Synced and Degraded at its digest for the grace
+// period after it applied it, and timeout:<app>:<sync>/<health> for the first Application that is not
+// healthy at the deadline. Argo CD sets the revision when it compares, before the sync applies
+// anything, so a Degraded Application without a sync that counts still shows the old resources, and
+// only the deadline ends the wait for it. The root never ends the wait early, because its health is
+// the health of its children (argocd-cm): a child that is still syncing would end it. An error means
 // that ctx ended.
-func (a *Applier) wait(ctx context.Context, set bundle.Set, rootDigest string, comps map[string]string, timeout time.Duration) (string, error) {
+func (a *Applier) wait(ctx context.Context, set bundle.Set, rootDigest string, comps map[string]string, j judge, timeout time.Duration) (string, error) {
 	type want struct{ name, digest string }
 	var wants []want
 	for _, c := range set.Components {
@@ -904,10 +944,10 @@ func (a *Applier) wait(ctx context.Context, set bundle.Set, rootDigest string, c
 		for _, w := range wants {
 			yield(w.name, w.digest)
 		}
-	}, timeout)
+	}, j, timeout)
 }
 
-func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, digest string)), timeout time.Duration) (string, error) {
+func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, digest string)), j judge, timeout time.Duration) (string, error) {
 	cfg := a.cfg
 	deadline := cfg.Now().Add(timeout)
 	degraded := map[string]time.Time{}
@@ -921,12 +961,14 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 		}
 		now := cfg.Now()
 		var first, early string
+		var firstState appState
 		wants(func(name, digest string) {
 			s, ok := apps[name]
 			if !ok {
 				s = appState{Sync: unknownStatus, Health: unknownStatus}
 			}
-			if s.Health == statusDegraded && s.Sync == statusSynced && s.Revision == digest {
+			at := s.Sync == statusSynced && s.Revision == digest && j.applied(name, digest, s)
+			if at && s.Health == statusDegraded && name != "root" {
 				since, seen := degraded[name]
 				if !seen {
 					degraded[name] = now
@@ -936,8 +978,8 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 			} else {
 				delete(degraded, name)
 			}
-			if first == "" && !(s.Sync == statusSynced && s.Revision == digest && s.Health == statusHealthy) {
-				first = name + ":" + s.String()
+			if first == "" && !(at && s.Health == statusHealthy) {
+				first, firstState = name+":"+s.String(), s
 			}
 		})
 		switch {
@@ -946,6 +988,8 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 		case first == "":
 			return "", nil
 		case !now.Before(deadline):
+			a.log.Warn("bundle health wait timed out", "app", first, "revision", firstState.Revision,
+				"op_phase", firstState.Op.Phase, "op_revision", firstState.Op.Revision, "op_started", firstState.Op.StartedAt, "moved", j.since)
 			return "timeout:" + first, nil
 		}
 		if err := a.sleep(ctx, cfg.Poll); err != nil {
@@ -954,11 +998,49 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 	}
 }
 
+// terminate ends the running sync operation of root and of each Application in wants that runs one
+// for another revision than the one it wants, root first. Argo CD retries a failed sync of the
+// revision that it started with and starts no other sync while an operation runs, so a rollback that
+// only moves the tag waits for the whole retry backoff. before is the read of the Applications that
+// the caller made. A conflict reads the Application again, and a failure is logged: the rollback wait
+// decides.
+func (a *Applier) terminate(ctx context.Context, before map[string]appState, wants map[string]string) {
+	names := slices.Sorted(maps.Keys(wants))
+	if i := slices.Index(names, "root"); i > 0 {
+		names = append([]string{"root"}, slices.Delete(names, i, i+1)...)
+	}
+	apps := before
+	for _, name := range names {
+		for attempt := 1; ; attempt++ {
+			s, ok := apps[name]
+			if !ok || !s.Operation || s.Op.Phase != phaseRunning || s.Op.Target == wants[name] {
+				break
+			}
+			err := terminateOp(ctx, a.cfg.Dynamic, name, s.RV)
+			if err == nil {
+				a.log.Info("bundle rollback terminated a sync", "app", name, "revision", s.Op.Target)
+				break
+			}
+			if !apierrors.IsConflict(err) || attempt == terminateAttempts {
+				a.log.Warn("bundle rollback terminate failed", "app", name, "error", err)
+				break
+			}
+			fresh, lerr := listApps(ctx, a.cfg.Dynamic)
+			if lerr != nil {
+				a.log.Warn("bundle rollback terminate failed", "app", name, "error", lerr)
+				break
+			}
+			apps = fresh
+		}
+	}
+}
+
 // rollback points the tag back at the last good root, with the manifest bytes that the state holds,
-// and waits for that root to become healthy. It creates no version and deletes nothing. It first
-// writes the state rolling_back with the failed detail, so that a run that takes over after a crash
-// resumes the rollback and does not push the failed root again. The state names the good root only
-// when the tag holds it.
+// terminates the sync operations that still run for the failed set, asks for a hard refresh of root,
+// and waits for the good root to become healthy, judged by the syncs that started after the tag moved
+// back. It creates no version and deletes nothing. It first writes the state rolling_back with the
+// failed detail, so that a run that takes over after a crash resumes the rollback and does not push
+// the failed root again. The state names the good root only when the tag holds it.
 func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcome, err error) {
 	cfg := a.cfg
 	rctx, end := a.tel.step(ctx, spanRollback)
@@ -987,19 +1069,32 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcom
 	case good == nil || sha256Digest(good.Root.Manifest) != good.Root.Digest:
 		detail = detailRollback
 	default:
+		before, lerr := listApps(rctx, cfg.Dynamic)
+		if lerr != nil {
+			a.log.Warn("bundle rollback read failed", "error", lerr)
+		}
+		j := judge{since: cfg.Now(), before: before}
 		if _, err := cfg.Store.PushManifest(rctx, repoRoot, tagCurrent, bundle.MediaTypeManifest, good.Root.Manifest); err != nil {
 			a.log.Error("bundle rollback tag failed", "error", err)
 			detail = detailRollback
 			break
 		}
 		moved = true
+		ends := maps.Clone(good.Components)
+		for _, c := range r.set.Components {
+			if _, ok := ends[c.Name]; !ok {
+				ends[c.Name] = ""
+			}
+		}
+		ends["root"] = good.Root.Digest
+		a.terminate(rctx, before, ends)
 		a.refresh(rctx)
 		left, err := a.waitFor(rctx, func(yield func(name, digest string)) {
 			for _, name := range slices.Sorted(maps.Keys(good.Components)) {
 				yield(name, good.Components[name])
 			}
 			yield("root", good.Root.Digest)
-		}, cfg.RollbackTimeout)
+		}, j, cfg.RollbackTimeout)
 		if err != nil {
 			return Outcome{}, err
 		}

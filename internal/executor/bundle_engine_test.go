@@ -112,9 +112,11 @@ func (er *engineRig) signedSet(target string) (bundle.Set, bundle.Artifact, []by
 }
 
 // healthy makes the fake Argo CD report every Application of the set as Synced and Healthy at its
-// digest, so that the health wait of the engine ends at its first poll.
+// digest, through a sync that succeeded at the digest before the engine runs, so that the health wait
+// of the engine ends at its first poll.
 func (er *engineRig) healthy(set bundle.Set, root bundle.Artifact) {
 	er.t.Helper()
+	started := er.clock.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
 	put := func(name, rev string) {
 		u := &unstructured.Unstructured{Object: map[string]any{
 			"apiVersion": "argoproj.io/v1alpha1", "kind": "Application",
@@ -122,6 +124,11 @@ func (er *engineRig) healthy(set bundle.Set, root bundle.Artifact) {
 			"status": map[string]any{
 				"sync":   map[string]any{"status": "Synced", "revision": rev},
 				"health": map[string]any{"status": "Healthy"},
+				"operationState": map[string]any{
+					"phase": "Succeeded", "startedAt": started,
+					"operation":  map[string]any{"sync": map[string]any{"revision": rev}},
+					"syncResult": map[string]any{"revision": rev},
+				},
 			},
 		}}
 		if _, err := er.dyn.Resource(applications).Namespace("argocd").Create(context.Background(), u, metav1.CreateOptions{}); err != nil {
