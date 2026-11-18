@@ -45,6 +45,9 @@ const (
 	lockSlack        = 2 * time.Minute
 	maxStateAttempts = 8
 	detailRollback   = "rollback_unhealthy"
+	// maxSetLayerBytes limits the layer bytes that one apply reads and holds until the push: eight
+	// layers of the largest size, a quarter of the most that 32 components could hold.
+	maxSetLayerBytes = 8 * bundle.MaxLayerBytes
 )
 
 // ErrLockHeld means that another holder, or another Apply of this process, has the apply lock. The
@@ -90,6 +93,8 @@ type Applier struct {
 	// running is held while one Apply of this process works under the lock. The state lock names
 	// the holder only, so it cannot tell two runs of one process apart.
 	running sync.Mutex
+	// maxSetBytes limits the layer bytes that one apply reads from the mirror and holds.
+	maxSetBytes int
 }
 
 // New returns an Applier for cfg. Zero timers take the plan values: a poll of 5 s, a health
@@ -120,7 +125,7 @@ func New(cfg Config) *Applier {
 		log.Error("bundle telemetry", "error", err)
 		tel, _ = newTelemetry(nil, nil)
 	}
-	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep}
+	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep, maxSetBytes: maxSetLayerBytes}
 }
 
 func realSleep(ctx context.Context, d time.Duration) error {
@@ -489,6 +494,7 @@ func (a *Applier) prepare(ctx context.Context, r *run) (Outcome, error) {
 }
 
 func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (Outcome, error) {
+	held := 0
 	for _, c := range r.set.Components {
 		if checked[checkedKey(c.Name, c.Digest)] {
 			continue
@@ -503,6 +509,10 @@ func (a *Applier) fetch(ctx context.Context, r *run, checked map[string]bool) (O
 		}
 		if art.Digest != c.Digest {
 			return refused(op.ReasonDigestMismatch, c.Name), nil
+		}
+		if held += len(art.Layer); held > a.maxSetBytes {
+			a.log.Warn("bundle refused", "component", c.Name, "reason", op.ReasonComponentNotAllowed, "detail", "too_large", "set_bytes", held)
+			return refused(op.ReasonComponentNotAllowed, "too_large"), nil
 		}
 		body, err := bundle.UnpackComponent(art.Layer, bundle.MaxUnpackedBytes)
 		if err != nil {

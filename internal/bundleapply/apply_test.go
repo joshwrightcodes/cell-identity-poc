@@ -869,6 +869,24 @@ func TestApplyDigestMismatch(t *testing.T) {
 	})
 }
 
+// TestApplySetTooLarge checks the limit on the layer bytes that one apply reads and holds.
+func TestApplySetTooLarge(t *testing.T) {
+	if New(Config{}).maxSetBytes != 64<<20 {
+		t.Fatalf("default limit = %d, want 64 MiB", New(Config{}).maxSetBytes)
+	}
+	e := newEnv(t)
+	b := e.set(1, std("v1"))
+	total := 0
+	for _, art := range b.arts {
+		total += len(art.Layer)
+	}
+	e.a.maxSetBytes = total - 1
+	wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonComponentNotAllowed, "too_large")
+	e.assertUntouched(t)
+	e.a.maxSetBytes = total
+	wantOutcome(t, e.apply("op2", e.set(2, std("v2"))), op.OutcomeApplied, "", "")
+}
+
 func TestApplyMirrorUnavailable(t *testing.T) {
 	e := newEnv(t)
 	b := e.set(1, std("v1"))
