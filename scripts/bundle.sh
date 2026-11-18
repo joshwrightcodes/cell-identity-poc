@@ -69,20 +69,12 @@ attach_sigstore() {
   printf '%s' "$file"
 }
 
-_check() {
-  local role
-  role="$(bundle_role)" || exit 1
-  case "$role" in
-    cell | cp) ;;
-    *) die "$CELL_NAME has role $role, so it has no signed bundle sets. Publish its bundles with: CELL=$CELL_NAME mise run cell:publish" ;;
-  esac
-}
-
 # check_build_fresh stops the publish when a hydrated bundle is older than an input of its render, because bundlectl packs build/<t>/bundles as it is,
 # and a render change without a new hydrate would sign the old content. The rule is the one of ko_image for build/images.env: a file that is newer than the
-# bundle. The inputs of the bundle of a component are the files of components/<component> and components/lib, cells/common.env, cells/<t>.env,
-# internal/bundle/allow.json and build/images.env (IMAGES_ENV names another file). Live facts that a render reads are not files, so a change in them still
-# needs cell:hydrate.
+# bundle. The inputs of the bundle of a component are the files and directories of components/<component> and components/lib (a deleted file changes its
+# directory), vendor/, scripts/lib.sh, scripts/hydrate.sh, scripts/ko-image.sh, cells/common.env, cells/<t>.env, internal/bundle/allow.json,
+# build/<t>/facts.env and build/images.env (IMAGES_ENV names another file). Live facts that a render reads from a cluster are not files, so a change in
+# them still needs cell:hydrate. A find that fails stops the publish.
 check_build_fresh() {
   local entry c file i newer inputs
   for entry in "${COMPONENTS[@]}"; do
@@ -90,12 +82,26 @@ check_build_fresh() {
     file="$BUNDLES/$c/manifests.yaml"
     [[ -f "$file" ]] || die "no hydrated bundle $c for $CELL_NAME ($file). Run: CELL=$CELL_NAME mise run cell:hydrate"
     inputs=()
-    for i in "$ROOT/components/$c" "$ROOT/components/lib" "$ROOT/cells/common.env" "$ROOT/cells/$CELL_NAME.env" "$ROOT/internal/bundle/allow.json" "${IMAGES_ENV:-$ROOT/build/images.env}"; do
+    for i in "$ROOT/components/$c" "$ROOT/components/lib" "$ROOT/vendor" "$ROOT/scripts/lib.sh" "$ROOT/scripts/hydrate.sh" "$ROOT/scripts/ko-image.sh" \
+      "$ROOT/cells/common.env" "$ROOT/cells/$CELL_NAME.env" "$ROOT/internal/bundle/allow.json" "$BUILD/facts.env" "${IMAGES_ENV:-$ROOT/build/images.env}"; do
       [[ ! -e "$i" ]] || inputs+=("$i")
     done
-    newer="$(find "${inputs[@]}" -type f -newer "$file" -print -quit 2>/dev/null)"
+    newer="$(find "${inputs[@]}" -type f -newer "$file" -print -quit)" || die "could not check the inputs of the bundle $c against $file"
+    # A directory that is newer lost or gained a file after the render.
+    [[ -n "$newer" ]] || newer="$(find "${inputs[@]}" -type d -newer "$file" -print -quit)" || die "could not check the inputs of the bundle $c against $file"
     [[ -z "$newer" ]] || die "${newer#"$ROOT"/} is newer than the hydrated bundle $c ($file), so the bundle holds an old render. Run: CELL=$CELL_NAME mise run cell:hydrate"
   done
+}
+
+_check() {
+  local role
+  role="$(bundle_role)" || exit 1
+  case "$role" in
+    cell | cp) ;;
+    *) die "$CELL_NAME has role $role, so it has no signed bundle sets. Publish its bundles with: CELL=$CELL_NAME mise run cell:publish" ;;
+  esac
+  # A publish checks the build of every target before the first lock and the first signature.
+  [[ "${BUNDLE_CHECK_FRESH:-}" != 1 ]] || { [[ -d "$BUNDLES" ]] || die "no hydrated bundles for $CELL_NAME. Run: CELL=$CELL_NAME mise run cell:hydrate"; check_build_fresh; }
 }
 
 _publish() {
@@ -205,7 +211,7 @@ verify_signed_root() {
 }
 
 _verify() {
-  local state root
+  local state root want
   _check
   state="$(bundle_state_json)" || exit 1
   [[ -n "$state" ]] || die "$CELL_NAME has no bundle state, so it has no root to verify"
@@ -215,7 +221,10 @@ _verify() {
   MIRROR="$(mirror_host)" || exit 1
   work="$(mktemp -d)"
   trap 'rm -rf "$work"' EXIT
-  verify_signed_root "$root" "$work/statement.json" "$(jq -c '.version // null' <<<"$state")" 1
+  # A rollback keeps the version of the failed set in state.version and moves state.root back to the good root, which carries the version of its own
+  # good entry. So the wanted version is the one of the good entry for this root, and state.version only when no entry names it.
+  want="$(jq -c --arg r "$root" '([.good[]? | select(.root.digest == $r) | .version] | map(select(. != null)) | .[0]) // .version // null' <<<"$state")"
+  verify_signed_root "$root" "$work/statement.json" "$want" 1
   jq -c --arg target "$CELL_NAME" --arg root "$root" '{target: $target, root: $root, version: .predicate.version,
     subjects: [.subject[] | {name, digest: ("sha256:" + .digest.sha256)}]}' "$work/statement.json"
 }
@@ -364,7 +373,7 @@ for t in "${targets[@]}"; do
   [[ -f "$here/../cells/$t.env" ]] || fail "unknown cluster '$t'. $usage"
 done
 # Every target is checked before the first lock and the first signature, so a call with a wrong target changes nothing.
-for t in "${targets[@]}"; do run_for "$t" _check || exit 1; done
+for t in "${targets[@]}"; do BUNDLE_CHECK_FRESH="$([[ "$cmd" == publish ]] && echo 1 || echo 0)" run_for "$t" _check || exit 1; done
 if [[ "$cmd" == publish || "$cmd" == repair ]]; then
   # Publish and repair change a cluster, so they take its lock, as cell:up does. The locks go in sorted order, and the phases below inherit
   # them (POC_HELD_LOCKS). cosign reads mgmtd and writes a referrer on the mirror of this Mac, so it takes none.

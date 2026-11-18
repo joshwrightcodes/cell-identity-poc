@@ -987,6 +987,8 @@ store_upgrade() {
       jq -e '(.metadata.generation // 0) <= (.status.observedGeneration // 0)' >/dev/null <<<"$live" && break
       sleep 1
     done
+    jq -e '(.metadata.generation // 0) <= (.status.observedGeneration // 0)' >/dev/null <<<"$live" \
+      || die "the StatefulSet controller did not catch up with bundle-store: generation $(jq -r '.metadata.generation' <<<"$live"), observed $(jq -r '.status.observedGeneration // 0' <<<"$live"). Run CELL=$CELL_NAME mise run cell:up again when the controller works"
   fi
   # The pod check runs on every pass, so a rerun after an interrupted upgrade also replaces a pod that never became Ready. A pod of the current
   # revision may still be starting, so only a pod of an older revision goes.

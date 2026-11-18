@@ -477,3 +477,18 @@ func TestUpStoreUpgradeWaitsForTheController(t *testing.T) {
 		t.Errorf("the stuck pod of the bootstrap revision was not replaced after the controller caught up:\n%s", calls)
 	}
 }
+
+// TestUpStoreUpgradeSaysWhenTheControllerLags: when the controller does not catch up within the wait, cell:up stops with the two generations, and
+// does not compare the stuck pod with a stale update revision.
+func TestUpStoreUpgradeSaysWhenTheControllerLags(t *testing.T) {
+	lag := fmt.Sprintf(`{"kind":"StatefulSet","metadata":{"name":"bundle-store","generation":4,"annotations":{"argocd.argoproj.io/tracking-id":%q}}%s,"status":{"observedGeneration":3,"updateRevision":"bundle-store-rev1"}}`, trackSTS, strings.TrimSuffix(staleSTS, revSTS))
+	root, logFile := upRoot(t)
+	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(root, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"), "CELL=dev-cell-1", "CELL_UP_SKIP_LINK=1", "UP_WAIT=5",
+		"STORE_UPGRADE_WAIT=2", "POC_BUILD_ROOT="+filepath.Join(root, "build"), "STUB_LOG="+logFile, "STUB_CREATED="+filepath.Join(root, "created.json"), "STUB_APPLIED="+filepath.Join(root, "applied"),
+		"STUB_NP_JSON="+objJSON("NetworkPolicy", trackNP, ""), "STUB_STS_JSON="+lag, "STUB_POD_JSON="+podStuck)
+	out, err := cmd.CombinedOutput()
+	if err == nil || !strings.Contains(string(out), "generation 4") || !strings.Contains(string(out), "observed 3") {
+		t.Errorf("err %v, output %q, want a failure that names generation 4 and observed 3", err, out)
+	}
+}

@@ -5,6 +5,7 @@
 # With no argument, the script builds every image. With image names, it builds and pushes only those
 # images and replaces only their lines, so each other image keeps its digest, and the checks of the
 # deployed images stay green. It keeps the `# commit` line too, unless the names cover every image.
+# It replaces the file only when an image line changes, so the time of the file moves only with a digest.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -77,6 +78,14 @@ if ((named)); then
   done
 else
   for name in "${images[@]}"; do line_for "$name" >>"$tmp"; done
+fi
+# The render pins these lines, and bundle.sh publish refuses a build that is older than build/images.env. So the file keeps its time when no digest changed.
+# Only the image lines count: the note of the commit changes with every commit, and the old file keeps its note.
+if [[ -f "$out_file" ]] && [[ "$(grep -v '^#' "$out_file" | sed '/^$/d')" == "$(grep -v '^#' "$tmp" | sed '/^$/d')" ]]; then
+  rm -f "$tmp"
+  trap - EXIT
+  printf '==> %s is unchanged: no image digest changed\n' "$out_file" >&2
+  exit 0
 fi
 mv "$tmp" "$out_file"
 trap - EXIT

@@ -183,7 +183,7 @@ func (r *bundleRoot) age() {
 	r.t.Helper()
 	set := func(root string, at time.Time, only string) {
 		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-			if err == nil && !d.IsDir() && (only == "" || filepath.Base(path) == only) {
+			if err == nil && (only == "" || !d.IsDir() && filepath.Base(path) == only) {
 				_ = os.Chtimes(path, at, at)
 			}
 			return nil
@@ -785,6 +785,31 @@ func TestBundleRepairOrder(t *testing.T) {
 			}
 		}
 	})
+	// The version matches as a whole: the same counter in another epoch is another set.
+	t.Run("the same counter in another epoch", func(t *testing.T) {
+		for _, tc := range []struct {
+			versions string
+			record   string
+			ok       bool
+		}{
+			{`[{"epoch":1,"counter":3},{"epoch":2,"counter":3}]`, `{"epoch":2,"counter":3}`, true},
+			{`[{"epoch":2,"counter":3},{"epoch":1,"counter":3}]`, `{"epoch":2,"counter":3}`, true},
+			{`[{"epoch":1,"counter":3}]`, `{"epoch":2,"counter":3}`, false},
+		} {
+			r := newBundleRoot(t, "dev-cell-1")
+			f := newRepairFixture(t, r)
+			var rec map[string]any
+			_ = json.Unmarshal([]byte(tc.record), &rec)
+			record := map[string]any{"version": rec, "contentSHA256": "aa", "root": map[string]any{"digest": f.root, "manifest": base64.StdEncoding.EncodeToString(f.rootManifest)}}
+			_, errOut, log, err := r.run("bundle.sh", append(f.env(), "STUB_STATE_JSON="+f.state(record), "STUB_COSIGN_VERSIONS="+tc.versions), "repair", "--target", "dev-cell-1")
+			if (err == nil) != tc.ok {
+				t.Errorf("versions %s record %s: err %v, want ok=%v\n%s", tc.versions, tc.record, err, tc.ok, errOut)
+			}
+			if !tc.ok {
+				noChange(t, log)
+			}
+		}
+	})
 	t.Run("a failed pin stops the repair before the apply", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		f := newRepairFixture(t, r)
@@ -1294,6 +1319,33 @@ func TestBundleVerifyArgs(t *testing.T) {
 			t.Errorf("err %v, stdout %q, stderr %q, want a failure that names the version 1/2", err, out, errOut)
 		}
 	})
+	// A rollback keeps the version of the failed set in state.version, and moves state.root back to the good root, whose statements carry the good
+	// version. verify wants the version of the good entry for the root of the state.
+	t.Run("a rolled-back state", func(t *testing.T) {
+		rolled := `{"source":"signed","state":"rolled_back","version":{"epoch":1,"counter":7},"root":{"digest":"` + f.root + `"},` +
+			`"good":[{"version":{"epoch":1,"counter":6},"root":{"digest":"` + f.root + `"}},{"version":{"epoch":1,"counter":4},"root":{"digest":"sha256:` + strings.Repeat("5", 64) + `"}}]}`
+		r := newBundleRoot(t, "dev-cell-1")
+		out, errOut, _, err := r.run("bundle.sh", []string{"STUB_STATE_JSON=" + rolled, "STUB_COSIGN_SUBJECTS=" + f.subjects, `STUB_COSIGN_VERSIONS=[{"epoch":1,"counter":5},{"epoch":1,"counter":6}]`}, "verify", "--target", "dev-cell-1")
+		var res struct{ Version map[string]int }
+		if err != nil || json.Unmarshal([]byte(strings.TrimSpace(out)), &res) != nil || res.Version["counter"] != 6 {
+			t.Fatalf("err %v, output %q %q, want the version 1/6 of the good entry", err, out, errOut)
+		}
+		// With no good entry for the root, the version of the state is the fallback, and the set of 1/7 is not signed for this root.
+		bare := strings.Replace(rolled, `{"version":{"epoch":1,"counter":6},"root":{"digest":"`+f.root+`"}},`, "", 1)
+		r = newBundleRoot(t, "dev-cell-1")
+		if _, errOut, _, err := r.run("bundle.sh", []string{"STUB_STATE_JSON=" + bare, "STUB_COSIGN_SUBJECTS=" + f.subjects, `STUB_COSIGN_VERSIONS=[{"epoch":1,"counter":6}]`}, "verify", "--target", "dev-cell-1"); err == nil || !strings.Contains(errOut, "1/7") {
+			t.Errorf("err %v, stderr %q, want a failure that names the version 1/7 of the state", err, errOut)
+		}
+	})
+	t.Run("the same counter in another epoch", func(t *testing.T) {
+		st := `{"source":"signed","version":{"epoch":2,"counter":3},"root":{"digest":"` + f.root + `"},"good":[]}`
+		r := newBundleRoot(t, "dev-cell-1")
+		out, errOut, _, err := r.run("bundle.sh", []string{"STUB_STATE_JSON=" + st, "STUB_COSIGN_SUBJECTS=" + f.subjects, `STUB_COSIGN_VERSIONS=[{"epoch":1,"counter":3},{"epoch":2,"counter":3}]`}, "verify", "--target", "dev-cell-1")
+		var res struct{ Version map[string]int }
+		if err != nil || json.Unmarshal([]byte(strings.TrimSpace(out)), &res) != nil || res.Version["epoch"] != 2 {
+			t.Errorf("err %v, output %q %q, want the version 2/3", err, out, errOut)
+		}
+	})
 	t.Run("role open and a second target", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		if _, errOut, _, err := r.run("bundle.sh", env, "verify", "--target", "management"); err == nil || !strings.Contains(errOut, "role open") {
@@ -1359,6 +1411,50 @@ func TestBundlePublishRefusesStaleBuild(t *testing.T) {
 		_, errOut, _, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
 		if err == nil || !strings.Contains(errOut, "argocd") || !strings.Contains(errOut, "CELL=dev-cell-1 mise run cell:hydrate") {
 			t.Errorf("err %v, stderr %q", err, errOut)
+		}
+	})
+}
+
+// TestBundlePublishChecksEveryTargetFirst: a stale build of the last target stops the call before the first signature, as a wrong target does.
+func TestBundlePublishChecksEveryTargetFirst(t *testing.T) {
+	r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+	r.touch("cells/dev-cell-2.env")
+	_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2")
+	if err == nil || !strings.Contains(errOut, "CELL=dev-cell-2 mise run cell:hydrate") {
+		t.Fatalf("err %v, stderr %q", err, errOut)
+	}
+	if strings.Contains(log, "bundle sign") || strings.Contains(log, "bundlectl") || strings.Contains(log, "locks=dev-cell") {
+		t.Errorf("the first target was signed before the stale build of the second was found:\n%s", log)
+	}
+}
+
+// TestBundlePublishFreshnessInputs: the render inputs also include the scripts that hydrate runs, the vendored files, the facts file, and a
+// deleted input (the directory of a component changes). A find that fails is a failure, not a fresh build.
+func TestBundlePublishFreshnessInputs(t *testing.T) {
+	for _, rel := range []string{"scripts/lib.sh", "scripts/hydrate.sh", "scripts/ko-image.sh", "vendor/charts/x/values.yaml", "build/dev-cell-1/facts.env"} {
+		t.Run(rel, func(t *testing.T) {
+			r := newBundleRoot(t, "dev-cell-1")
+			if rel == "vendor/charts/x/values.yaml" || rel == "build/dev-cell-1/facts.env" {
+				r.touch(rel)
+				r.age()
+			}
+			r.touch(rel)
+			_, errOut, _, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
+			if err == nil || !strings.Contains(errOut, rel) {
+				t.Errorf("err %v, stderr %q, want a refusal that names %s", err, errOut, rel)
+			}
+		})
+	}
+	t.Run("a deleted input", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		r.touch("components/argocd/extra.yaml")
+		r.age()
+		if err := os.Remove(filepath.Join(r.dir, "components", "argocd", "extra.yaml")); err != nil {
+			t.Fatal(err)
+		}
+		_, errOut, _, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "components/argocd") {
+			t.Errorf("err %v, stderr %q, want a refusal that names components/argocd", err, errOut)
 		}
 	})
 }
