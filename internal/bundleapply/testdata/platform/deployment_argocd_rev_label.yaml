@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: demo, namespace: argocd}
+spec:
+  selector: {matchLabels: {app: demo}}
+  template:
+    metadata:
+      labels:
+        app: demo
+        istio.io/rev: default
+    spec:
+      containers: [{name: demo, image: "registry.invalid/demo:1"}]

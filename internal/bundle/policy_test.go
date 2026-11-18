@@ -17,8 +17,10 @@ var allowFile []byte
 
 var (
 	platformNS = []string{"argocd", "cell-system", "istio-system", "istio-egress", "observability-system", "apps-demo"}
-	clusterKs  = []string{"Namespace", "CustomResourceDefinition", "ClusterRole", "ClusterRoleBinding",
-		"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
+	clusterKs  = []string{"Namespace", "apiextensions.k8s.io/CustomResourceDefinition",
+		"rbac.authorization.k8s.io/ClusterRole", "rbac.authorization.k8s.io/ClusterRoleBinding",
+		"admissionregistration.k8s.io/ValidatingWebhookConfiguration", "admissionregistration.k8s.io/MutatingWebhookConfiguration",
+		"admissionregistration.k8s.io/ValidatingAdmissionPolicy", "admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding"}
 	cellComps = []string{"namespaces", "argocd", "cell-system", "network-policy", "istio-base", "istio-cni", "istiod",
 		"observability-system", "istio-egress", "mesh-policy", "apps-demo"}
 	cpExtra = []string{"external-secrets", "spire-server", "relay-system"}
@@ -69,6 +71,10 @@ func TestDefaultPolicy(t *testing.T) {
 			HarnessClusterObjects: append(slices.Clone(guard), bundle.ObjectRef{Kind: "ValidatingAdmissionPolicy", Name: "bundles-app-limits"}, bundle.ObjectRef{Kind: "ValidatingAdmissionPolicyBinding", Name: "bundles-app-limits"}),
 			MeshGuarded:           []string{"argocd", "cell-system", "observability-system"},
 			AppComponents:         []string{"apps-sample"},
+			AppProjects:           []string{"cell", "cell-app"},
+			PlanePolicies: []bundle.PolicyRef{{Namespace: "cell-identity-system", Name: "celld"}, {Namespace: "argocd", Name: "argocd-agent"},
+				{Namespace: "observability-system", Name: "otel-uplink"}, {Namespace: "mesh-view-system", Name: "mesh-view"},
+				{Namespace: "cell-system", Name: "plane-celld-store"}},
 		},
 		"cp": {
 			Components:            comps(catList(cellComps, cpExtra), "cp-platform"),
@@ -76,10 +82,15 @@ func TestDefaultPolicy(t *testing.T) {
 			HarnessClusterObjects: guard,
 			MeshGuarded:           []string{"argocd", "cell-system", "observability-system", "spire-system", "relay-system", "external-secrets"},
 			AppComponents:         []string{},
+			AppProjects:           []string{"cell"},
+			PlanePolicies: []bundle.PolicyRef{{Namespace: "envd-system", Name: "envd"}, {Namespace: "cell-system", Name: "plane-envd-store"},
+				{Namespace: "spire-system", Name: "plane-cells"}, {Namespace: "spire-system", Name: "plane-envd"},
+				{Namespace: "relay-system", Name: "plane-cells"}, {Namespace: "relay-system", Name: "plane-upstream"}},
 		},
 		"open": {
 			Components: map[string]string{}, HarnessNamespaces: []string{}, HarnessClusterObjects: []bundle.ObjectRef{},
 			MeshGuarded: []string{}, AppComponents: []string{},
+			AppProjects: []string{}, PlanePolicies: []bundle.PolicyRef{},
 		},
 	}
 	if !reflect.DeepEqual(p.Roles, wantRoles) {
@@ -116,6 +127,14 @@ func TestDefaultPolicy(t *testing.T) {
 			if slices.Contains(cl.ClusterKinds, k) || slices.Contains(cl.NamespacedKinds, k) {
 				t.Errorf("class %s lists %s", name, k)
 			}
+		}
+	}
+}
+
+func TestAppProjectsNeverDefault(t *testing.T) {
+	for role, r := range bundle.DefaultPolicy().Roles {
+		if slices.Contains(r.AppProjects, "default") {
+			t.Errorf("role %s allows the AppProject default", role)
 		}
 	}
 }
@@ -180,7 +199,7 @@ func TestAllowJSONShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	for role, r := range roles {
-		for _, k := range []string{"components", "harnessNamespaces", "harnessClusterObjects", "meshGuarded", "appComponents"} {
+		for _, k := range []string{"components", "harnessNamespaces", "harnessClusterObjects", "meshGuarded", "appComponents", "appProjects", "planePolicies"} {
 			if _, ok := r[k]; !ok {
 				t.Errorf("role %s has no %q", role, k)
 			}

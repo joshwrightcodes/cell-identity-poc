@@ -22,13 +22,13 @@
       ],
       "clusterKinds": [
         "Namespace",
-        "CustomResourceDefinition",
-        "ClusterRole",
-        "ClusterRoleBinding",
-        "ValidatingWebhookConfiguration",
-        "MutatingWebhookConfiguration",
-        "ValidatingAdmissionPolicy",
-        "ValidatingAdmissionPolicyBinding"
+        "apiextensions.k8s.io/CustomResourceDefinition",
+        "rbac.authorization.k8s.io/ClusterRole",
+        "rbac.authorization.k8s.io/ClusterRoleBinding",
+        "admissionregistration.k8s.io/ValidatingWebhookConfiguration",
+        "admissionregistration.k8s.io/MutatingWebhookConfiguration",
+        "admissionregistration.k8s.io/ValidatingAdmissionPolicy",
+        "admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding"
       ],
       "namespacedKinds": [
         "*"
@@ -61,13 +61,13 @@
       ],
       "clusterKinds": [
         "Namespace",
-        "CustomResourceDefinition",
-        "ClusterRole",
-        "ClusterRoleBinding",
-        "ValidatingWebhookConfiguration",
-        "MutatingWebhookConfiguration",
-        "ValidatingAdmissionPolicy",
-        "ValidatingAdmissionPolicyBinding"
+        "apiextensions.k8s.io/CustomResourceDefinition",
+        "rbac.authorization.k8s.io/ClusterRole",
+        "rbac.authorization.k8s.io/ClusterRoleBinding",
+        "admissionregistration.k8s.io/ValidatingWebhookConfiguration",
+        "admissionregistration.k8s.io/MutatingWebhookConfiguration",
+        "admissionregistration.k8s.io/ValidatingAdmissionPolicy",
+        "admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding"
       ],
       "namespacedKinds": [
         "*"
@@ -139,6 +139,32 @@
       ],
       "appComponents": [
         "apps-sample"
+      ],
+      "appProjects": [
+        "cell",
+        "cell-app"
+      ],
+      "planePolicies": [
+        {
+          "namespace": "cell-identity-system",
+          "name": "celld"
+        },
+        {
+          "namespace": "argocd",
+          "name": "argocd-agent"
+        },
+        {
+          "namespace": "observability-system",
+          "name": "otel-uplink"
+        },
+        {
+          "namespace": "mesh-view-system",
+          "name": "mesh-view"
+        },
+        {
+          "namespace": "cell-system",
+          "name": "plane-celld-store"
+        }
       ]
     },
     "cp": {
@@ -181,14 +207,45 @@
         "relay-system",
         "external-secrets"
       ],
-      "appComponents": []
+      "appComponents": [],
+      "appProjects": [
+        "cell"
+      ],
+      "planePolicies": [
+        {
+          "namespace": "envd-system",
+          "name": "envd"
+        },
+        {
+          "namespace": "cell-system",
+          "name": "plane-envd-store"
+        },
+        {
+          "namespace": "spire-system",
+          "name": "plane-cells"
+        },
+        {
+          "namespace": "spire-system",
+          "name": "plane-envd"
+        },
+        {
+          "namespace": "relay-system",
+          "name": "plane-cells"
+        },
+        {
+          "namespace": "relay-system",
+          "name": "plane-upstream"
+        }
+      ]
     },
     "open": {
       "components": {},
       "harnessNamespaces": [],
       "harnessClusterObjects": [],
       "meshGuarded": [],
-      "appComponents": []
+      "appComponents": [],
+      "appProjects": [],
+      "planePolicies": []
     }
   }
 }

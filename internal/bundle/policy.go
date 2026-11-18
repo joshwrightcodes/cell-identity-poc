@@ -31,6 +31,12 @@ type Class struct {
 	NoSidecarOptOut       bool     `json:"noSidecarOptOut,omitempty"`
 }
 
+// PolicyRef names one namespaced object.
+type PolicyRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
 // Role maps the components of a cluster role to classes and names the harness objects that no
 // bundle may touch.
 type Role struct {
@@ -39,6 +45,8 @@ type Role struct {
 	HarnessClusterObjects []ObjectRef       `json:"harnessClusterObjects"`
 	MeshGuarded           []string          `json:"meshGuarded"`
 	AppComponents         []string          `json:"appComponents"`
+	AppProjects           []string          `json:"appProjects"`
+	PlanePolicies         []PolicyRef       `json:"planePolicies"`
 }
 
 // Policy is the allow-list data. The Rego policy reads it as data.allow. The role open is the

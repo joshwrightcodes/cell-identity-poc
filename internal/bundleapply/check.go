@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/open-policy-agent/opa/v1/ast"
@@ -74,8 +75,10 @@ func layout(detail string) *Refusal {
 }
 
 // Decode reads the documents of manifests. A document of kind List gives a Refusal with detail
-// list, more than maxObjects objects give too_large, and a document that is not an object with
-// apiVersion, kind and a name gives layout.
+// list. Any other document with an items field gives items_list, because Argo CD expands every
+// object that has an items array and the policy checks only the outer object. More than maxObjects
+// objects give too_large, and a document that is not an object with apiVersion, kind and a name
+// gives layout.
 func Decode(manifests []byte, maxObjects int) ([]Object, error) {
 	rd := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(manifests)))
 	var objs []Object
@@ -96,6 +99,9 @@ func Decode(manifests []byte, maxObjects int) ([]Object, error) {
 		}
 		if k, _ := raw["kind"].(string); k == "List" {
 			return nil, layout("list")
+		}
+		if _, has := raw["items"]; has {
+			return nil, layout("items_list")
 		}
 		o, ok := toObject(raw)
 		if !ok {
@@ -124,10 +130,15 @@ func toObject(raw map[string]any) (Object, bool) {
 	if o.Name, ok = meta["name"].(string); !ok || o.Name == "" {
 		return Object{}, false
 	}
-	if v, present := meta["namespace"]; present && v != nil {
-		if o.Namespace, ok = v.(string); !ok {
+	if v, present := meta["namespace"]; present {
+		if v == nil {
+			delete(meta, "namespace")
+		} else if o.Namespace, ok = v.(string); !ok {
 			return Object{}, false
 		}
+	}
+	if strings.Count(o.APIVersion, "/") > 1 {
+		return Object{}, false
 	}
 	for _, field := range []string{"labels", "annotations"} {
 		v, present := meta[field]
@@ -182,6 +193,19 @@ type Checker struct {
 	store storage.Store
 	query rego.PreparedEvalQuery
 	mu    sync.Mutex
+	// extra holds the scope of custom kinds that the caller learned from other components of the set
+	// or from live discovery, as group/Kind.
+	extraCluster, extraNamespaced []string
+}
+
+// AddScopes records the scope of kinds that no object of the checked component declares, for
+// example the CRDs of other components of the set. Each kind is written group/Kind, and a kind of
+// the core group is written without a group.
+func (c *Checker) AddScopes(cluster, namespaced []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.extraCluster = append(c.extraCluster, cluster...)
+	c.extraNamespaced = append(c.extraNamespaced, namespaced...)
 }
 
 // NewChecker prepares the embedded policy once, with the limited builtins and strict builtin errors.
@@ -202,6 +226,7 @@ func newChecker(role string, p bundle.Policy, h HarnessRefs, module string) (*Ch
 		"allow":   allow,
 		"context": map[string]any{"role": role, "component": ""},
 		"harness": map[string]any{"networkPolicies": nps},
+		"scope":   map[string]any{"cluster": []any{}, "namespaced": []any{}},
 	})
 	q, err := rego.New(
 		rego.Module("bundle.rego", module),
@@ -209,6 +234,7 @@ func newChecker(role string, p bundle.Policy, h HarnessRefs, module string) (*Ch
 		rego.Store(st),
 		rego.Capabilities(capabilities()),
 		rego.StrictBuiltinErrors(true),
+		rego.Strict(true),
 	).PrepareForEval(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("bundleapply: prepare policy: %w", err)
@@ -228,24 +254,63 @@ func toData(p bundle.Policy) (map[string]any, error) {
 	return m, nil
 }
 
-// detailRank orders the denials of one object: the lowest rank is reported.
+// detailRank orders the denials of one object: the lowest rank is reported. A detail that is not
+// listed ranks last. A plane policy name (reason policy_blocks_planes with a namespace and name as
+// detail) has the rank of the key planePolicy.
 var detailRank = map[string]int{
-	"component_unknown": 0, "harness_object": 1, "harness_namespace": 2, "harness_label": 3,
-	"mesh_injection": 4, "kind": 6, "namespace_missing": 7, "namespace": 8,
-	"service_type": 9, "mesh_opt_out": 10,
+	"component_unknown": 0, "harness_object": 1, "planePolicy": 2, "harness_namespace": 3,
+	"harness_label": 4, "mesh_injection": 5, "kind": 6, "kind_unknown_scope": 7,
+	"cluster_kind_namespaced": 8, "namespace_missing": 9, "namespace": 10, "layout": 11,
+	"service_type": 12, "mesh_opt_out": 13,
 }
+
+const lastRank = 1 << 20
 
 type denial struct{ msg, reason, detail string }
 
 func rank(d denial) int {
+	key := d.detail
 	if d.reason == op.ReasonPolicyBlocksPlanes && d.detail != "mesh_injection" {
-		return 5
+		key = "planePolicy"
 	}
-	return detailRank[d.detail]
+	if r, ok := detailRank[key]; ok {
+		return r
+	}
+	return lastRank
+}
+
+func policyError(o Object) *Refusal {
+	return &Refusal{Reason: op.ReasonComponentNotAllowed, Detail: "policy_error", Object: o.ref()}
+}
+
+// crdKinds returns the group/Kind of each custom resource that the CRDs among objs define, by scope.
+func crdKinds(objs []Object) (cluster, namespaced []string) {
+	for _, o := range objs {
+		if o.Kind != "CustomResourceDefinition" || !strings.HasPrefix(o.APIVersion, "apiextensions.k8s.io/") {
+			continue
+		}
+		spec, _ := o.Raw["spec"].(map[string]any)
+		names, _ := spec["names"].(map[string]any)
+		group, _ := spec["group"].(string)
+		kind, _ := names["kind"].(string)
+		scope, _ := spec["scope"].(string)
+		if group == "" || kind == "" {
+			continue
+		}
+		switch scope {
+		case "Cluster":
+			cluster = append(cluster, group+"/"+kind)
+		case "Namespaced":
+			namespaced = append(namespaced, group+"/"+kind)
+		}
+	}
+	return cluster, namespaced
 }
 
 // Check evaluates the policy for each object of component and returns the first refusal in input
-// order, as a *Refusal. Of several denials for one object, the most specific one wins.
+// order, as a *Refusal. Of several denials for one object, the most specific one wins. An
+// evaluation error or an empty result gives the refusal policy_error. Only a fault of the store or
+// a canceled context gives a plain error.
 func (c *Checker) Check(ctx context.Context, component string, objs []Object) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -258,17 +323,37 @@ func (c *Checker) Check(ctx context.Context, component string, objs []Object) er
 		map[string]any{"role": c.role, "component": component}); err != nil {
 		return err
 	}
+	cl, ns := crdKinds(objs)
+	cl = append(cl, c.extraCluster...)
+	ns = append(ns, c.extraNamespaced...)
+	if err := c.store.Write(ctx, txn, storage.AddOp, storage.MustParsePath("/scope"),
+		map[string]any{"cluster": toAny(cl), "namespaced": toAny(ns)}); err != nil {
+		return err
+	}
 	if len(objs) == 0 {
-		objs = []Object{{}}
+		rs, err := c.query.Eval(ctx, rego.EvalTransaction(txn), rego.EvalInput(map[string]any{}))
+		if err != nil && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		ds, derr := denials(rs, err)
+		if derr != nil {
+			return policyError(Object{})
+		}
+		for _, d := range ds {
+			if d.detail == "component_unknown" {
+				return &Refusal{Reason: d.reason, Detail: d.detail}
+			}
+		}
+		return nil
 	}
 	for _, o := range objs {
 		rs, err := c.query.Eval(ctx, rego.EvalTransaction(txn), rego.EvalInput(o.Raw))
-		if err != nil {
-			return fmt.Errorf("bundleapply: evaluate policy: %w", err)
+		if err != nil && ctx.Err() != nil {
+			return ctx.Err()
 		}
-		ds, err := denials(rs)
-		if err != nil {
-			return err
+		ds, derr := denials(rs, err)
+		if derr != nil {
+			return policyError(o)
 		}
 		if len(ds) == 0 {
 			continue
@@ -284,19 +369,30 @@ func (c *Checker) Check(ctx context.Context, component string, objs []Object) er
 	return nil
 }
 
-func denials(rs rego.ResultSet) ([]denial, error) {
+func toAny(in []string) []any {
+	out := make([]any, 0, len(in))
+	for _, s := range in {
+		out = append(out, s)
+	}
+	return out
+}
+
+func denials(rs rego.ResultSet, evalErr error) ([]denial, error) {
+	if evalErr != nil {
+		return nil, evalErr
+	}
 	if len(rs) == 0 || len(rs[0].Expressions) == 0 {
-		return nil, nil
+		return nil, errors.New("empty result")
 	}
 	list, ok := rs[0].Expressions[0].Value.([]any)
 	if !ok {
-		return nil, errors.New("bundleapply: policy deny is not a set")
+		return nil, errors.New("deny is not a set")
 	}
 	out := make([]denial, 0, len(list))
 	for _, e := range list {
 		m, ok := e.(map[string]any)
 		if !ok {
-			return nil, errors.New("bundleapply: policy deny entry is not an object")
+			return nil, errors.New("deny entry is not an object")
 		}
 		d := denial{}
 		d.msg, _ = m["msg"].(string)

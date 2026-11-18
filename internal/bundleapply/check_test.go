@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -74,19 +76,27 @@ type tcase struct {
 	name      string
 	component string
 	want      want
+	with      []string // fixtures of the same directory that precede the object in the component
+	cluster   []string // extra cluster scoped kinds, as group/Kind
+	namespace []string // extra namespaced kinds, as group/Kind
 }
 
 func runCases(t *testing.T, role, dir, defComponent string, h HarnessRefs, cases []tcase) {
 	t.Helper()
-	c := newTestChecker(t, role, h)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			comp := tc.component
 			if comp == "" {
 				comp = defComponent
 			}
-			err := c.Check(context.Background(), comp, []Object{loadObject(t, dir, tc.name)})
-			expect(t, err, tc.want, "")
+			c := newTestChecker(t, role, h)
+			c.AddScopes(tc.cluster, tc.namespace)
+			var objs []Object
+			for _, w := range tc.with {
+				objs = append(objs, loadObject(t, dir, w))
+			}
+			objs = append(objs, loadObject(t, dir, tc.name))
+			expect(t, c.Check(context.Background(), comp, objs), tc.want, "")
 		})
 	}
 }
@@ -110,6 +120,14 @@ func TestPolicyApp(t *testing.T) {
 		{name: "inject_false_label", want: not("mesh_opt_out")},
 		{name: "inject_false_annotation", want: not("mesh_opt_out")},
 		{name: "harness_label", want: not("harness_label")},
+		{name: "deployment_template_metadata_string", want: not("layout")},
+		{name: "deployment_template_labels_string", want: not("layout")},
+		{name: "service_spec_string", want: not("layout")},
+		{name: "application", want: not("kind")},
+		{name: "unknown_kind", want: not("kind_unknown_scope")},
+		{name: "unknown_kind", want: not("kind"), namespace: []string{"widgets.example.invalid/Widget"}},
+		{name: "knative_service", want: not("kind_unknown_scope")},
+		{name: "knative_service", want: not("kind"), namespace: []string{"serving.knative.dev/Service"}},
 	})
 }
 
@@ -126,7 +144,36 @@ func TestPolicyPlatform(t *testing.T) {
 		{name: "persistentvolume", want: not("kind")},
 		{name: "adminnetworkpolicy", want: not("kind")},
 		{name: "adminnetworkpolicy_namespaced", want: not("kind")},
-		{name: "crd_with_namespace", want: not("namespace")},
+		{name: "crd_with_namespace", want: not("cluster_kind_namespaced")},
+		{name: "persistentvolume_namespaced", want: not("kind")},
+		{name: "apiservice_namespaced", want: not("kind")},
+		{name: "mutatingadmissionpolicy_namespaced", want: not("kind")},
+		{name: "storageclass", want: not("kind")},
+		{name: "widget", want: not("kind_unknown_scope")},
+		{name: "widget_cluster", want: not("kind_unknown_scope")},
+		{name: "widget", with: []string{"widget_crd_namespaced"}},
+		{name: "widget", with: []string{"widget_crd_cluster"}, want: not("kind")},
+		{name: "widget_cluster", with: []string{"widget_crd_cluster"}, want: not("kind")},
+		{name: "widget", namespace: []string{"widgets.example.invalid/Widget"}},
+		{name: "widget", cluster: []string{"widgets.example.invalid/Widget"}, want: not("kind")},
+		{name: "clusterrolebinding_foreign_group", want: not("kind_unknown_scope")},
+		{name: "clusterrolebinding_foreign_group", cluster: []string{"evil.example.invalid/ClusterRoleBinding"}, want: not("kind")},
+		{name: "crd_null_namespace"},
+		{name: "namespace_argocd_no_label", want: want{rPlane, "mesh_injection"}},
+		{name: "namespace_argocd_disabled"},
+		{name: "namespace_kube_system", want: not("namespace")},
+		{name: "deployment_argocd_inject_true", want: want{rPlane, "mesh_injection"}},
+		{name: "deployment_argocd_rev_label", want: want{rPlane, "mesh_injection"}},
+		{name: "cronjob_argocd_inject_true", want: want{rPlane, "mesh_injection"}},
+		{name: "deployment_istio_system_inject_true", component: "istiod"},
+		{name: "application", component: "argocd", want: not("kind")},
+		{name: "applicationset", component: "argocd", want: not("kind")},
+		{name: "application", component: "mesh-policy", want: not("kind")},
+		{name: "appproject_cell", component: "argocd"},
+		{name: "appproject_cell", component: "istiod", want: not("kind")},
+		{name: "appproject_default", component: "argocd", want: not("kind")},
+		{name: "appproject_other", component: "argocd", want: not("kind")},
+		{name: "deployment_harness_label_template", want: not("harness_label")},
 		{name: "unknown_component_object", component: "nope", want: not("component_unknown")},
 		{name: "namespace_argocd_injection", want: want{rPlane, "mesh_injection"}},
 		{name: "namespace_argocd_rev", want: want{rPlane, "mesh_injection"}},
@@ -173,10 +220,25 @@ func TestPolicyHarnessObjects(t *testing.T) {
 		err := c.Check(context.Background(), "namespaces", []Object{loadObject(t, "harness", "vap")})
 		expect(t, err, not("harness_object"), "")
 	})
-	t.Run("cp without live cells passes", func(t *testing.T) {
+	t.Run("cp without live cells refuses a reserved name", func(t *testing.T) {
 		c := newTestChecker(t, "cp", HarnessRefs{})
 		err := c.Check(context.Background(), "spire-server", []Object{loadObject(t, "harness", "np_plane_cells")})
-		expect(t, err, pass(), "")
+		expect(t, err, want{rPlane, "spire-system/plane-cells"}, "")
+	})
+	t.Run("every reserved plane policy is refused with no live list", func(t *testing.T) {
+		for role, r := range bundle.DefaultPolicy().Roles {
+			for _, ref := range r.PlanePolicies {
+				np := loadObject(t, "harness", "np_other")
+				np.Namespace, np.Name = ref.Namespace, ref.Name
+				m := np.Raw["metadata"].(map[string]any)
+				m["namespace"], m["name"] = ref.Namespace, ref.Name
+				err := newTestChecker(t, role, HarnessRefs{}).Check(context.Background(), "network-policy", []Object{np})
+				var rf *Refusal
+				if !errors.As(err, &rf) || rf.Reason != rPlane || rf.Detail != ref.Namespace+"/"+ref.Name {
+					t.Errorf("%s %s/%s: %v", role, ref.Namespace, ref.Name, err)
+				}
+			}
+		}
 	})
 	t.Run("bundles-app-limits belongs to role cell", func(t *testing.T) {
 		vap := loadObject(t, "harness", "vap")
@@ -227,6 +289,9 @@ func TestCheckFirstRefusalInInputOrder(t *testing.T) {
 	expect(t, err, not("service_type"), "Service/apps-demo/demo")
 	expect(t, c.Check(context.Background(), "apps-sample", objs[:1]), pass(), "")
 	expect(t, c.Check(context.Background(), "nope", nil), not("component_unknown"), "")
+	expect(t, c.Check(context.Background(), "apps-sample", nil), pass(), "")
+	expect(t, c.Check(context.Background(), "apps-sample", []Object{}), pass(), "")
+	expect(t, newTestChecker(t, "cell", HarnessRefs{}).Check(context.Background(), "argocd", nil), pass(), "")
 }
 
 func TestPolicyNoNetworkBuiltins(t *testing.T) {
@@ -348,6 +413,28 @@ func TestDecodeLimits(t *testing.T) {
 		t.Fatalf("list: %v", err)
 	}
 	for name, in := range map[string]string{
+		"configmap with items": "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: apps-demo}\n" +
+			"items:\n- apiVersion: rbac.authorization.k8s.io/v1\n  kind: ClusterRoleBinding\n  metadata: {name: x}\n",
+		"configmaplist":  "apiVersion: v1\nkind: ConfigMapList\nmetadata: {name: a}\nitems: []\n",
+		"items null":     "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a}\nitems: null\n",
+		"items scalar":   "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a}\nitems: 5\n",
+		"items in later": doc(1) + "---\napiVersion: v1\nkind: Secret\nmetadata: {name: a}\nitems: []\n",
+	} {
+		if _, err := Decode([]byte(in), 10); !errors.As(err, &r) || r.Reason != rNot || r.Detail != "items_list" {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	if _, err := Decode([]byte("apiVersion: a/b/c\nkind: ConfigMap\nmetadata: {name: a}\n"), 10); !errors.As(err, &r) || r.Detail != "layout" {
+		t.Fatalf("apiVersion with two slashes: %v", err)
+	}
+	objs, err = Decode([]byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: null}\n"), 10)
+	if err != nil || len(objs) != 1 || objs[0].Namespace != "" {
+		t.Fatalf("null namespace: %v %v", objs, err)
+	}
+	if _, has := objs[0].Raw["metadata"].(map[string]any)["namespace"]; has {
+		t.Fatal("a null namespace stays in Raw")
+	}
+	for name, in := range map[string]string{
 		"no kind":       "apiVersion: v1\nmetadata: {name: a}\n",
 		"no name":       "apiVersion: v1\nkind: ConfigMap\nmetadata: {}\n",
 		"scalar":        "just text\n",
@@ -364,35 +451,127 @@ func TestDecodeLimits(t *testing.T) {
 	}
 }
 
-func findRender(t *testing.T) string {
-	t.Helper()
-	if p := os.Getenv("M7_RENDER_ARGOCD"); p != "" {
-		return p
-	}
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	for d := dir; ; d = filepath.Dir(d) {
-		p := filepath.Join(d, "build", "bundles", "argocd", "manifests.yaml")
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-		if d == filepath.Dir(d) {
-			return ""
+func TestPolicyOptOutValues(t *testing.T) {
+	c := newTestChecker(t, "cell", HarnessRefs{})
+	for v, refused := range map[string]bool{
+		"false": true, "False": true, "FALSE": true, "n": true, "no": true, "No": true, "off": true, "OFF": true,
+		"true": false, "": false, "maybe": false, "disabled": false,
+	} {
+		o := loadObject(t, "app", "deployment")
+		tmpl := o.Raw["spec"].(map[string]any)["template"].(map[string]any)["metadata"].(map[string]any)
+		tmpl["annotations"] = map[string]any{"sidecar.istio.io/inject": v}
+		err := c.Check(context.Background(), "apps-sample", []Object{o})
+		if refused {
+			expect(t, err, not("mesh_opt_out"), "")
+		} else if err != nil {
+			t.Errorf("value %q: %v", v, err)
 		}
 	}
 }
 
-func TestCheckArgocdSize(t *testing.T) {
-	path := findRender(t)
-	if path == "" {
-		t.Skip("no M7 render of argocd: run the hydrate, or set M7_RENDER_ARGOCD")
+func TestPolicyNullNamespaceIsAbsent(t *testing.T) {
+	o := loadObject(t, "platform", "crd")
+	o.Raw["metadata"].(map[string]any)["namespace"] = nil
+	expect(t, newTestChecker(t, "cell", HarnessRefs{}).Check(context.Background(), "namespaces", []Object{o}), pass(), "")
+}
+
+func TestPolicyPlaneNameInHarnessNamespace(t *testing.T) {
+	for role, r := range bundle.DefaultPolicy().Roles {
+		for _, ref := range r.PlanePolicies {
+			if !slices.Contains(r.HarnessNamespaces, ref.Namespace) {
+				continue
+			}
+			np := loadObject(t, "harness", "np_other")
+			np.Raw["metadata"].(map[string]any)["namespace"] = ref.Namespace
+			np.Raw["metadata"].(map[string]any)["name"] = ref.Name
+			err := newTestChecker(t, role, HarnessRefs{}).Check(context.Background(), "network-policy", []Object{np})
+			expect(t, err, want{rPlane, ref.Namespace + "/" + ref.Name}, "")
+		}
 	}
-	data, err := os.ReadFile(path)
+}
+
+func TestEveryDenyDetailHasARank(t *testing.T) {
+	re := regexp.MustCompile(`entry\("(\w+)", "(\w+)"\)`)
+	ms := re.FindAllStringSubmatch(policySource, -1)
+	if len(ms) < 15 {
+		t.Fatalf("found %d static denials", len(ms))
+	}
+	for _, m := range ms {
+		if _, ok := detailRank[m[2]]; !ok {
+			t.Errorf("detail %s has no rank", m[2])
+		}
+	}
+	if _, ok := detailRank["planePolicy"]; !ok {
+		t.Error("the plane policy rank is missing")
+	}
+	if got := rank(denial{reason: rNot, detail: "unranked"}); got != lastRank {
+		t.Errorf("an unranked detail has rank %d", got)
+	}
+	if rank(denial{reason: rNot, detail: "component_unknown"}) >= rank(denial{reason: rNot, detail: "unranked"}) {
+		t.Error("component_unknown does not rank before an unranked detail")
+	}
+}
+
+func TestPolicyErrorsAreRefusals(t *testing.T) {
+	// A runtime type error in a builtin is a refusal when strict builtin errors are on.
+	module := policySource + "\ndeny contains entry(\"component_not_allowed\", \"zz\") if {\n\tx := object.get(input.kind, \"k\", 1)\n\tx == 1\n}\n"
+	c, err := newChecker("cell", bundle.DefaultPolicy(), HarnessRefs{}, module)
 	if err != nil {
 		t.Fatal(err)
 	}
+	err = c.Check(context.Background(), "apps-sample", []Object{loadObject(t, "app", "configmap")})
+	expect(t, err, not("policy_error"), "ConfigMap/apps-demo/demo")
+
+	// A query with no result is a refusal too.
+	c, err = newChecker("cell", bundle.DefaultPolicy(), HarnessRefs{}, "package bundle.allow\n\nother := 1\n")
+	if err != nil {
+		t.Skipf("an empty module does not prepare: %v", err)
+	}
+	err = c.Check(context.Background(), "apps-sample", []Object{loadObject(t, "app", "configmap")})
+	expect(t, err, not("policy_error"), "")
+}
+
+func TestPolicyCompilerIsStrict(t *testing.T) {
+	module := policySource + "\nunused_var_rule if {\n\tx := 1\n\ttrue\n}\n"
+	if _, err := newChecker("cell", bundle.DefaultPolicy(), HarnessRefs{}, module); err == nil {
+		t.Fatal("a policy with an unused variable prepared")
+	}
+}
+
+// generatedRender builds a manifest set that looks like the argocd render of M7: a few large CRDs,
+// and workloads, services, roles and policies of the namespace argocd.
+func generatedRender() []byte {
+	var sb strings.Builder
+	big := strings.Repeat("        field: {type: string, description: \"generated description of one field\"}\n", 5000)
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(&sb, "---\napiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\nmetadata: {name: w%d.argoproj.io}\n"+
+			"spec:\n  group: argoproj.io\n  scope: Namespaced\n  names: {kind: W%d, plural: w%ds}\n  versions:\n  - name: v1\n    schema:\n"+
+			"      openAPIV3Schema:\n        type: object\n        properties:\n%s", i, i, i, big)
+	}
+	kinds := []struct{ api, kind string }{
+		{"v1", "ConfigMap"}, {"v1", "Service"}, {"v1", "ServiceAccount"}, {"apps/v1", "Deployment"},
+		{"rbac.authorization.k8s.io/v1", "Role"}, {"rbac.authorization.k8s.io/v1", "RoleBinding"},
+		{"networking.k8s.io/v1", "NetworkPolicy"},
+	}
+	for i := 0; i < 33; i++ {
+		k := kinds[i%len(kinds)]
+		extra := ""
+		switch k.kind {
+		case "Deployment":
+			extra = "spec:\n  selector: {matchLabels: {app: a}}\n  template:\n    metadata: {labels: {app: a}}\n    spec:\n      containers: [{name: a, image: \"registry.invalid/a:1\"}]\n"
+		case "NetworkPolicy":
+			extra = "spec: {podSelector: {}}\n"
+		case "Service":
+			extra = "spec: {ports: [{port: 80}]}\n"
+		}
+		fmt.Fprintf(&sb, "---\napiVersion: %s\nkind: %s\nmetadata: {name: o%d, namespace: argocd}\n%s", k.api, k.kind, i, extra)
+	}
+	sb.WriteString("---\napiVersion: argoproj.io/v1alpha1\nkind: AppProject\nmetadata: {name: cell, namespace: argocd}\nspec: {description: base}\n")
+	return []byte(sb.String())
+}
+
+func measure(t *testing.T, label string, data []byte, component string, maxObjects int) {
+	t.Helper()
 	var peak uint64
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -412,23 +591,38 @@ func TestCheckArgocdSize(t *testing.T) {
 		}
 	}()
 	start := time.Now()
-	objs, err := Decode(data, 2000)
+	objs, err := Decode(data, maxObjects)
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := newTestChecker(t, "cell", HarnessRefs{})
-	err = c.Check(context.Background(), "argocd", objs)
+	err = newTestChecker(t, "cell", HarnessRefs{}).Check(context.Background(), component, objs)
 	elapsed := time.Since(start)
 	close(stop)
 	<-done
-	t.Logf("argocd render: %d bytes, %d objects, decode and check in %s, heap peak %d MiB", len(data), len(objs), elapsed, peak>>20)
+	t.Logf("%s: %d bytes, %d objects, decode and check in %s, heap peak %d MiB", label, len(data), len(objs), elapsed, peak>>20)
+	if err != nil {
+		t.Fatalf("%s: %v", label, err)
+	}
 	if elapsed > 10*time.Second {
-		t.Fatalf("check took %s", elapsed)
+		t.Fatalf("%s: check took %s", label, elapsed)
 	}
-	var r *Refusal
-	if errors.As(err, &r) {
-		t.Logf("first refusal of the render: %v", r)
-	} else if err != nil {
-		t.Fatal(err)
+}
+
+func TestCheckArgocdSize(t *testing.T) {
+	r := generatedRender()
+	objs, err := Decode(r, 2000)
+	if err != nil || len(objs) != 37 {
+		t.Fatalf("generated render: %d objects, %v", len(objs), err)
 	}
+	if len(r) < 1<<20 {
+		t.Fatalf("generated render has %d bytes", len(r))
+	}
+	measure(t, "argocd-like render", r, "argocd", 2000)
+
+	var sb strings.Builder
+	kinds := []string{"ConfigMap", "Secret", "ServiceAccount", "Service"}
+	for i := 0; i < 2000; i++ {
+		fmt.Fprintf(&sb, "---\napiVersion: v1\nkind: %s\nmetadata: {name: o%d, namespace: argocd}\n", kinds[i%len(kinds)], i)
+	}
+	measure(t, "2000 objects", []byte(sb.String()), "argocd", 2000)
 }
