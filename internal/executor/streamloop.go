@@ -22,8 +22,29 @@ type execOutcome struct {
 	leaseID string
 }
 
+// effectSlot holds the one effect of a StreamConfig. The effect outlives the stream that started it:
+// the next streams open, send status and claim nothing while it runs, and the stream that is open
+// when it ends reports its result. Only the goroutine of RunStream reads and sets busy.
+type effectSlot struct {
+	busy bool
+	out  chan execOutcome
+	wg   sync.WaitGroup
+}
+
+func newEffectSlot() *effectSlot { return &effectSlot{out: make(chan execOutcome, 1)} }
+
+// start runs one effect in its own goroutine. out holds one outcome, so the send never blocks.
+func (s *effectSlot) start(run func() execOutcome) {
+	s.busy = true
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.out <- run()
+	}()
+}
+
 // loop serves one open stream. It runs in one goroutine and writes every frame itself. A reader
-// goroutine passes the frames in, and an executor goroutine passes the result of each lease.
+// goroutine passes the frames in, and the effect slot passes the result of each lease.
 type loop struct {
 	cfg StreamConfig
 	ctx context.Context
@@ -31,7 +52,8 @@ type loop struct {
 	parent context.Context
 	w      io.Writer
 	wg     sync.WaitGroup
-	exec   chan execOutcome
+	// adopted is true while an effect that an earlier stream started runs.
+	adopted bool
 
 	frames  chan gwapi.Frame
 	readErr chan error
@@ -51,10 +73,14 @@ type loop struct {
 }
 
 func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Decoder) *loop {
-	l := &loop{cfg: cfg, ctx: ctx, w: w, exec: make(chan execOutcome, 1),
+	l := &loop{cfg: cfg, ctx: ctx, w: w,
 		frames: make(chan gwapi.Frame), readErr: make(chan error, 1), held: map[string]struct{}{}}
 	now := cfg.Now()
 	l.wantClaim = true
+	if cfg.effect.busy {
+		// The claim of the running effect stays in flight, so this stream claims nothing until it ends.
+		l.executing, l.claimInFlight, l.adopted = true, true, true
+	}
 	l.claimAt = now.Add(cfg.ClaimEvery)
 	// The deadline of the last stream carries over. A new stream sends a status at once when that deadline has passed.
 	if l.statusAt = cfg.status.get(); l.statusAt.IsZero() {
@@ -86,12 +112,9 @@ func (c StreamConfig) statusWait() time.Duration {
 	return time.Duration(float64(c.StatusEvery) * (1 - statusSpread + 2*statusSpread*c.Rand()))
 }
 
-// finish waits for the goroutines of the loop. The stream must be closed first.
+// finish waits for the reader goroutine of the loop. The stream must be closed first. A running
+// effect goes on, and the next stream takes its outcome.
 func (l *loop) finish() {
-	if l.executing {
-		<-l.exec
-		l.executing = false
-	}
 	l.wg.Wait()
 }
 
@@ -106,6 +129,16 @@ func (l *loop) run(parent context.Context) error {
 	l.parent = parent
 	timer := time.NewTimer(0)
 	defer timer.Stop()
+	if l.adopted {
+		// An effect that ended between streams reports with its lease before the first resend.
+		select {
+		case o := <-l.cfg.effect.out:
+			if err := l.done(o); err != nil {
+				return err
+			}
+		default:
+		}
+	}
 	for {
 		if err := l.fire(l.cfg.Now()); err != nil {
 			return err
@@ -122,10 +155,8 @@ func (l *loop) run(parent context.Context) error {
 			if err := l.handle(f); err != nil {
 				return err
 			}
-		case o := <-l.exec:
-			l.executing, l.claimInFlight = false, false
-			l.wantClaim = op.IsFinal(o.res.Outcome)
-			if err := l.reportLease(o); err != nil {
+		case o := <-l.cfg.effect.out:
+			if err := l.done(o); err != nil {
 				return err
 			}
 		case <-timer.C:
@@ -217,7 +248,9 @@ func (l *loop) handle(f gwapi.Frame) error {
 		if ectx == nil {
 			ectx = l.parent
 		}
-		go func() { l.exec <- execOutcome{res: c.Exec.Execute(ectx, f.Envelope, f.Fence), leaseID: f.LeaseID} }()
+		c.effect.start(func() execOutcome {
+			return execOutcome{res: c.Exec.Execute(ectx, f.Envelope, f.Fence), leaseID: f.LeaseID}
+		})
 	case gwapi.TypeNone:
 		l.claimInFlight = false
 		l.claimDue = time.Time{}
@@ -276,10 +309,21 @@ func (l *loop) handleFinal(f gwapi.Frame) {
 	c.resent.forget(f.OpID)
 }
 
+// done takes the outcome of the effect, frees the slot and reports the result.
+func (l *loop) done(o execOutcome) error {
+	adopted := l.adopted
+	l.cfg.effect.busy = false
+	l.executing, l.claimInFlight, l.adopted = false, false, false
+	l.wantClaim = op.IsFinal(o.res.Outcome)
+	return l.reportLease(o, adopted)
+}
+
 // reportLease sends the result of a lease when it is final. A local outcome stays in the log. At most
 // one result with an empty operation ID goes up in forgedEvery, because a forged envelope can come
-// any number of times and the executor already counts each one in ForgedSeen.
-func (l *loop) reportLease(o execOutcome) error {
+// any number of times and the executor already counts each one in ForgedSeen. The result of an
+// adopted effect goes through the resend log, because the first resend of the stream can already
+// have sent its applied record.
+func (l *loop) reportLease(o execOutcome, adopted bool) error {
 	res := o.res
 	if !op.IsFinal(res.Outcome) {
 		l.cfg.Log.WarnContext(l.ctx, "local outcome stays here", "op_id", res.OpID, "outcome", res.Outcome, "reason", res.Reason)
@@ -291,6 +335,9 @@ func (l *loop) reportLease(o execOutcome) error {
 			return nil
 		}
 		l.lastForged = now
+	}
+	if adopted && res.OpID != "" && !l.cfg.resent.allow(res.OpID, l.cfg.Now()) {
+		return nil
 	}
 	return l.sendResult(res, o.leaseID)
 }
