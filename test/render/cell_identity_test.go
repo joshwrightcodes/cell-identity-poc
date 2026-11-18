@@ -804,7 +804,7 @@ func checkHarnessGuard(t *testing.T, objs map[string]object, roleName, component
 		t.Errorf("matchConditions is %s, want %s", got, want)
 	}
 	wantExpr := []string{
-		"!(request.namespace in " + quotedList(role.HarnessNamespaces) + ")",
+		"!has(request.namespace) || !(request.namespace in " + quotedList(role.HarnessNamespaces) + ")",
 		"oldObject == null || !has(oldObject.metadata.labels) || !('" + harnessLabel + "' in oldObject.metadata.labels)",
 		"object == null || !has(object.metadata.labels) || !('" + harnessLabel + "' in object.metadata.labels)",
 	}
@@ -943,7 +943,7 @@ func TestBundleGuardScript(t *testing.T) {
 		t.Errorf("role cp prints %v", got)
 	}
 	cp := bundle.DefaultPolicy().Roles["cp"]
-	if got := get[string](t, get[[]any](t, objs["ValidatingAdmissionPolicy bundles-spare-harness"], "spec", "validations")[0], "expression"); got != "!(request.namespace in "+quotedList(cp.HarnessNamespaces)+")" {
+	if got := get[string](t, get[[]any](t, objs["ValidatingAdmissionPolicy bundles-spare-harness"], "spec", "validations")[0], "expression"); got != "!has(request.namespace) || !(request.namespace in "+quotedList(cp.HarnessNamespaces)+")" {
 		t.Errorf("role cp namespaces: %s", got)
 	}
 	out, errOut, err = run("cell")

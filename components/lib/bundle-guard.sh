@@ -43,7 +43,7 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
   | policy("bundles-spare-harness";
       {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE", "DELETE"], resources: ["*/*"], scope: "*"};
       [$ctl];
-      [{expression: "!(request.namespace in \($r.harnessNamespaces | celist))", message: "Argo CD may not change an object in a harness namespace"},
+      [{expression: "!has(request.namespace) || !(request.namespace in \($r.harnessNamespaces | celist))", message: "Argo CD may not change an object in a harness namespace"},
        {expression: "oldObject == null || !has(oldObject.metadata.labels) || !(\($label) in oldObject.metadata.labels)", message: "Argo CD may not change or delete an object that carries the harness label"},
        {expression: "object == null || !has(object.metadata.labels) || !(\($label) in object.metadata.labels)", message: "Argo CD may not give an object the harness label"}]),
     (if $role == "cell" then
