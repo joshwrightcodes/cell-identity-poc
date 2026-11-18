@@ -56,7 +56,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 
 func run(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
-		return errors.New("usage: netprobe scan|serve|get|http|tlsserve|dial")
+		return errors.New("usage: netprobe scan|serve|get|http|tlsserve|dial|tlsdial|flipforward|watch")
 	}
 	fs := flag.NewFlagSet(args[0], flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -152,6 +152,12 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			out.Error = err.Error()
 		}
 		return json.NewEncoder(stdout).Encode(out)
+	case "tlsdial":
+		return runTLSDial(ctx, fs, args[1:], stdout)
+	case "flipforward":
+		return runFlipForward(ctx, fs, args[1:])
+	case "watch":
+		return runWatch(ctx, fs, args[1:], stdout)
 	}
 	return fmt.Errorf("unknown command %q", args[0])
 }
@@ -303,7 +309,8 @@ func tlsServe(ctx context.Context, addr string) error {
 				return
 			}
 			slog.Info("handshake done", "remote", c.RemoteAddr().String(), "alpn", tc.ConnectionState().NegotiatedProtocol)
-			_, _ = io.Copy(io.Discard, c)
+			n, _ := io.Copy(io.Discard, c)
+			slog.Info("connection closed", "remote", c.RemoteAddr().String(), "bytes_after_handshake", n)
 		})
 	}
 }

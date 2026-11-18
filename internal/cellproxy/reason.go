@@ -1,8 +1,12 @@
 package cellproxy
 
 import (
+	"crypto/tls"
 	"errors"
+	"io"
+	"net"
 	"net/http"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 )
@@ -81,4 +85,57 @@ func ReasonOf(err error) Reason {
 		return pe.Reason
 	}
 	return ""
+}
+
+// TLSReason names why a client TLS dial failed. It returns the reason of a refused peer, which the
+// config of ClientTLS and ProbeTLS raises, handshake_failed for any other TLS failure, and "" for
+// an error that is not a TLS failure, such as a refused connection, a context end or a timeout
+// before any TLS byte.
+//
+// crypto/tls returns an alert over TCP as a net.OpError with the Op "remote error" or "local
+// error". A peer that answers a TLS dial with plain HTTP gives a tls.RecordHeaderError, or
+// http.ErrSchemeMismatch through an http.Client. Any other error that crypto/tls creates has
+// the text prefix "tls: ". An alert has the prefix "remote error: " or "local error: ", so the OpError case
+// must name it.
+func TLSReason(err error) Reason {
+	if r := ReasonOf(err); r != "" {
+		return r
+	}
+	var op *net.OpError
+	var hdr tls.RecordHeaderError
+	var alert tls.AlertError
+	switch {
+	case errors.As(err, &op) && (op.Op == "remote error" || op.Op == "local error"):
+		return HandshakeFailed
+	case errors.As(err, &hdr), errors.As(err, &alert), errors.Is(err, http.ErrSchemeMismatch):
+		return HandshakeFailed
+	}
+	// crypto/tls returns some failures as plain errors that start with "tls: ". A caller wraps them, so each error in the chain counts.
+	for e := err; e != nil; e = errors.Unwrap(e) {
+		if strings.HasPrefix(e.Error(), "tls: ") {
+			return HandshakeFailed
+		}
+	}
+	return ""
+}
+
+// HandshakeReason is TLSReason for a caller that knows the error came from the TLS handshake. An
+// end of stream there, which a relay that closes the connection causes, is also handshake_failed.
+func HandshakeReason(err error) Reason {
+	if r := TLSReason(err); r != "" {
+		return r
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return HandshakeFailed
+	}
+	return ""
+}
+
+// ReasonAttrs returns the log attributes of the TLS reason of err: "reason" and its name, or none
+// when err is not a TLS failure, so that a log query for a reason never matches an empty value.
+func ReasonAttrs(err error) []any {
+	if r := TLSReason(err); r != "" {
+		return []any{"reason", string(r)}
+	}
+	return nil
 }

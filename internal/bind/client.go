@@ -23,10 +23,10 @@ import (
 
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
-	"github.com/spiffe/go-spiffe/v2/spiffetls/tlsconfig"
 	"go.opentelemetry.io/otel/trace"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -64,10 +64,7 @@ func PodTokenFunc(c corev1client.ServiceAccountsGetter, namespace, serviceAccoun
 // expect and a certificate that chains to peer. The client sends no certificate. Only TLS 1.3 and
 // HTTP/2 are allowed.
 func ClientTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
-	cfg := tlsconfig.TLSClientConfig(peer, tlsconfig.AuthorizeID(expect))
-	cfg.MinVersion, cfg.MaxVersion = tls.VersionTLS13, tls.VersionTLS13
-	cfg.NextProtos = []string{"h2"}
-	return cfg
+	return cellproxy.ProbeTLS(peer, expect)
 }
 
 // Config holds the settings of Once and Run. A zero duration takes the default.
@@ -94,6 +91,10 @@ type Config struct {
 	// Tracer, when set, starts a span for each bind attempt, so the log lines of the attempt carry trace_id and
 	// the requests carry the traceparent header.
 	Tracer trace.Tracer
+
+	// LocalIP, when set, is the source address of each connection. The kernel refuses a dial when
+	// the host does not hold the address.
+	LocalIP net.IP
 
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
 }
@@ -173,6 +174,11 @@ type Client struct {
 func NewClient(cfg Config) *Client {
 	protos := new(http.Protocols)
 	protos.SetHTTP2(true)
+	dial := cfg.dial
+	if dial == nil && cfg.LocalIP != nil {
+		d := net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: &net.TCPAddr{IP: cfg.LocalIP}}
+		dial = d.DialContext
+	}
 	tr := &http.Transport{
 		TLSClientConfig:   cfg.TLS,
 		Protocols:         protos,
@@ -180,7 +186,7 @@ func NewClient(cfg Config) *Client {
 		// The limit is far below the default of 10 MiB, for a pod with a small memory limit.
 		MaxResponseHeaderBytes: maxHeaderBytes,
 		HTTP2:                  &http.HTTP2Config{SendPingTimeout: pingIdle, PingTimeout: pingTimeout},
-		DialContext:            cfg.dial,
+		DialContext:            dial,
 	}
 	return &Client{cell: cfg.Cell, base: "https://" + cfg.Upstream, tr: tr, http: &http.Client{
 		Transport: telemetry.Transport(tr),
@@ -426,7 +432,7 @@ func bindUntilDone(ctx context.Context, cfg Config) error {
 			wait = backoff(cfg, failures)
 		}
 		cfg.observe(ctx, result)
-		cfg.Log.WarnContext(actx, "bind failed", "cell", cfg.Cell, "result", result, "error", err.Error(), "retry_in", wait.String())
+		cfg.Log.WarnContext(actx, "bind failed", append([]any{"cell", cfg.Cell, "result", result, "error", err.Error()}, append(cellproxy.ReasonAttrs(err), "retry_in", wait.String())...)...)
 		if err := cfg.Sleep(ctx, wait); err != nil {
 			return err
 		}
@@ -450,7 +456,7 @@ func recheck(ctx context.Context, cfg Config) error {
 		case err != nil:
 			wait = backoff(cfg, failures)
 			failures++
-			cfg.Log.WarnContext(ctx, "bind recheck failed", "cell", cfg.Cell, "error", err.Error(), "retry_in", wait.String())
+			cfg.Log.WarnContext(ctx, "bind recheck failed", append([]any{"cell", cfg.Cell, "error", err.Error()}, append(cellproxy.ReasonAttrs(err), "retry_in", wait.String())...)...)
 		case !bound:
 			cfg.Log.WarnContext(ctx, "the management plane holds no record", "cell", cfg.Cell)
 			return nil

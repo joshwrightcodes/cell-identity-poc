@@ -10,6 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -27,6 +31,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
 const testNonce = "bm9uY2Utbm9uY2Utbm9uY2Utbm9uY2Utbm9uY2Utbm9u"
@@ -490,5 +495,68 @@ func TestParseNeedsEnv(t *testing.T) {
 	_, err := parse([]string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1"}, podEnv(nil))
 	if err == nil || !strings.Contains(err.Error(), "--env") {
 		t.Fatalf("err = %v, want an error that names --env", err)
+	}
+}
+
+func TestAttestprobeSourceParse(t *testing.T) {
+	base := []string{"--variant", "good", "--server", "172.18.0.3:30081", "--cell", "dev-cell-1", "--env", "dev"}
+	cfg, err := parse(append(slices.Clone(base), "--source", "172.18.0.9"), podEnv(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.source.Equal(net.ParseIP("172.18.0.9")) {
+		t.Fatalf("source = %v", cfg.source)
+	}
+	if _, err := parse(append(slices.Clone(base), "--source", "not-an-ip"), podEnv(nil)); err == nil || !strings.Contains(err.Error(), "--source") {
+		t.Fatalf("err = %v, want an error that names --source", err)
+	}
+}
+
+// TestAttestprobeSourceSpireDial calls the real dial with a listener that only counts connections. A
+// source address that the host holds reaches the listener, and one that it does not hold never does.
+func TestAttestprobeSourceSpireDial(t *testing.T) {
+	ca := spiffetest.NewCA(t, "dev.env.poc.internal")
+	pem, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	bundle := filepath.Join(t.TempDir(), "bundle.pem")
+	if err := os.WriteFile(bundle, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	accepted := make(chan struct{}, 8)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_ = c.Close()
+		}
+	}()
+	for _, tc := range []struct {
+		source string
+		reach  bool
+	}{{"127.0.0.1", true}, {"203.0.113.9", false}} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		_, closeConn, err := dial(ctx, config{server: ln.Addr().String(), trustDomain: "dev.env.poc.internal", bundlePath: bundle, source: net.ParseIP(tc.source)})
+		cancel()
+		if err == nil {
+			closeConn()
+			t.Fatalf("source %s: the dial to a listener that holds no TLS succeeded", tc.source)
+		}
+		reached := len(accepted) > 0
+		for len(accepted) > 0 {
+			<-accepted
+		}
+		if reached != tc.reach {
+			t.Errorf("source %s: listener reached %v, want %v (dial error %v)", tc.source, reached, tc.reach, err)
+		}
 	}
 }

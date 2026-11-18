@@ -1304,6 +1304,52 @@ M6 measured values come from the live part of Task 11. Each value below is a mar
 | `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | 25 and 40 minutes, 1.5 times the slower run, rounded up to 5 minutes |
 | `harness:size` after the runs | 2026-11-18: `management` 3.4 GiB, `dev-cp` 2.5 GiB, each cell 2.2 GiB, `rogue` 0.6 GiB, `registry-mirror` 77 MiB. The VM used 11.7 GB and held 23.6 GB in the file cache |
 
+M7 measured values come from the live part of M7. Each value below is a marker until that run writes it:
+
+| Value | Result |
+| --- | --- |
+| `gate:m7`, two runs | 731 seconds and 737 seconds (2026-11-18), both pass, 13 tests. The slowest test is `TestM7InterceptCellProxyHops`, about 5.4 minutes |
+| `GATE_M7_BUDGET_MINUTES` | 20 minutes, 1.5 times the slower run, rounded up to 5 minutes. The go test timeout is 40 minutes |
+| Longest policy window of a new pod in `dev-cell-1` | 807 ms to 1.1.1.1:443 and 801 ms to the SPIRE node port of `dev-cp` (2026-11-18, four runs) |
+
+## Malicious cell tests
+
+The M7 tests try to break each identity check of the PoC. A test points a client at an impostor server.
+For some hops the real client needs an SVID from its own pod, so a probe with the same TLS checks replaces it.
+Another test puts a forwarder between a client and the real server, and changes one byte.
+Most tests check the reason code of the rejection. The scan tests check the set of open ports.
+A client that verifies its peer sends nothing to an impostor. Each impostor test counts the bytes after the handshake.
+For the hops that use `tlsdial`, a control shows that a probe that does not verify its peer sends 32 bytes.
+
+Build the images, and then run the tests:
+
+```sh
+mise run images
+mise run gate:m7
+```
+
+`gate:m7` stops before the tests when `registry-mirror` runs with deletes on, because the registry test deletes a manifest.
+In that case, run `mise run hostsvc -- up`. The host service recreates the registry and keeps its volume.
+
+Each test runs in a namespace with the prefix `m7-` and the label `cell.poc.internal/e2e=true`.
+The registry delete test is an exception, and it runs in `rogue/default`.
+`TestM7PrincipalLoopbackOnly` is another exception. It adds an ephemeral container to the principal pod.
+The container stays in the pod spec until the pod restarts, and `gate:m7:repair` cannot remove it.
+A test that needs the host network makes its own `m7-` namespace with Pod Security `privileged`.
+No test changes the label of a namespace that a bundle owns.
+
+If a run stops early, repair the clusters:
+
+```sh
+mise run gate:m7:repair -- --check
+mise run gate:m7:repair
+```
+
+The first command lists each `m7-` namespace that is left.
+The second command deletes them in every cluster and waits until none is left.
+It also deletes the pods of the registry test in `rogue/default`.
+It is safe to run again.
+
 ## Side effects of gate:m2
 
 `gate:m2` changes the clusters while it runs, and it puts them back before it ends:
@@ -1451,6 +1497,21 @@ The bundle store keeps bundles on a persistent volume, so they survive a pod res
 A harness component, for example `cell-identity`, reaches a cell only through `CELL=<cell> mise run cell:up`.
 `cell:publish` does not push it. `cell:up` applies it with server-side apply and does not prune.
 An object that leaves the bundle therefore stays in the cluster until you delete it.
+
+A change under `internal/cellproxy` changes many images, because `cell-proxy`, `celld`, `envd` and the gateway use that package.
+After `mise run images`, roll out every cluster that runs a changed image.
+Run these commands in this order:
+
+```sh
+CELL=dev-cp mise run cell:up
+CELL=management mise run cell:link
+CELL=dev-cell-1 mise run cell:up
+CELL=dev-cell-2 mise run cell:up
+mise run harness:status
+```
+
+`harness:status` fails for each pod that runs an image other than the one in `build/images.env`.
+A collector export retry can fail it once, and it clears within 5 minutes.
 `cell:verify` compares the live objects with the bundle.
 It checks the field values, the objects of each kind that the bundle holds, and the field managers of those objects.
 It does not report an extra object of a kind that the bundle does not hold.

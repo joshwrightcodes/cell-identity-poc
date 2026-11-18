@@ -133,9 +133,15 @@ func cellCtlPod(t *testing.T) string {
 // service there.
 func hostsvcNodeAddress(t *testing.T) string {
 	t.Helper()
-	out, err := dockerExec(t, spireCluster+"-control-plane", "", "getent", "ahostsv4", "host.docker.internal")
+	return hostsvcAddressIn(t, spireCluster)
+}
+
+// hostsvcAddressIn returns the one address that host.docker.internal has in the node container of a cluster.
+func hostsvcAddressIn(t *testing.T, cluster string) string {
+	t.Helper()
+	out, err := dockerExec(t, cluster+"-control-plane", "", "getent", "ahostsv4", "host.docker.internal")
 	if err != nil {
-		t.Fatalf("resolve host.docker.internal in %s: %v", spireCluster, err)
+		t.Fatalf("resolve host.docker.internal in %s: %v", cluster, err)
 	}
 	seen := map[string]bool{}
 	for line := range strings.SplitSeq(out, "\n") {
@@ -144,7 +150,7 @@ func hostsvcNodeAddress(t *testing.T) string {
 		}
 	}
 	if len(seen) != 1 {
-		t.Fatalf("host.docker.internal has %d addresses in %s (%v), want one", len(seen), spireCluster, seen)
+		t.Fatalf("host.docker.internal has %d addresses in %s (%v), want one", len(seen), cluster, seen)
 	}
 	for a := range seen {
 		return a

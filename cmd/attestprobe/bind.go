@@ -100,7 +100,7 @@ func runBind(ctx context.Context, cfg config, d deps) (string, error) {
 		return "", fmt.Errorf("--expect-id: %w", err)
 	}
 	tlsCfg := bind.ClientTLS(bind.FileBundle(cfg.bind.trustBundle, id.TrustDomain()), id)
-	client := bind.NewClient(bind.Config{Cell: cfg.cell, Upstream: cfg.bind.upstream, TLS: tlsCfg})
+	client := bind.NewClient(bind.Config{Cell: cfg.cell, Upstream: cfg.bind.upstream, TLS: tlsCfg, LocalIP: cfg.source})
 	defer client.Close()
 
 	var lines []string

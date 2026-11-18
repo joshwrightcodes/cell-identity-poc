@@ -265,6 +265,14 @@ run = "scripts/gate.sh m6-provision"
 description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m6-repair.sh"
 
+[tasks."gate:m7"]
+description = "Run the M7 end-to-end tests: a malicious cell, interception at each hop and a relay that alters bytes, plus the go test arguments after --. It runs gate:m7:repair --check first, and checks the deployed images of mgmtd, envd, the cell controller, cellgw, the SPIRE server and celld. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m7"
+
+[tasks."gate:m7:repair"]
+description = "Delete the test namespaces m7-* of every cluster, and wait until they are gone. With --check, only report and fail with the repair command. Safe to run again"
+run = "scripts/gate-m7-repair.sh"
+
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"
 env = { CELL = "dev-cp" }

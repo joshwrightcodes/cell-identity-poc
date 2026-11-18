@@ -2,7 +2,7 @@
 // throwaway CSR and a token of one variant. The rejection tests of the cluster_jwt attestor run it
 // as a Job in a cell.
 //
-//	attestprobe --variant <name> --server <ip>:<port> --cell <cell> --env <env> [--token-file <path>]
+//	attestprobe --variant <name> --server <ip>:<port> --cell <cell> --env <env> [--token-file <path>] [--source <ip>]
 //
 // The probe sends the cell name, waits for the nonce, and answers with a token. It makes the token
 // through TokenRequest for the service account of its own pod. With --token-file it sends the token
@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"os"
 	"slices"
 	"strings"
@@ -232,6 +233,7 @@ type config struct {
 	cell        string
 	env         string
 	tokenFile   string
+	source      net.IP
 	timeout     time.Duration
 	pod         podIdentity
 }
@@ -317,6 +319,12 @@ func parse(args []string, lookupEnv func(string) (string, bool)) (config, error)
 	fs.StringVar(&cfg.trustDomain, "trust-domain", "dev.env.poc.internal", "trust domain of the SPIRE server")
 	fs.StringVar(&cfg.bundlePath, "bundle", "/run/spire/bundle/bundle.crt", "PEM trust bundle of the SPIRE server")
 	fs.StringVar(&cfg.tokenFile, "token-file", "", "send the token in this file instead of a new one; needs --variant good")
+	fs.Func("source", "local IP address to bind before each dial", func(v string) error {
+		if cfg.source = net.ParseIP(v); cfg.source == nil {
+			return fmt.Errorf("--source must be an IP address, got %q", v)
+		}
+		return nil
+	})
 	fs.DurationVar(&cfg.timeout, "timeout", defaultTimeout, "time limit of the whole attestation")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
@@ -391,7 +399,14 @@ func dial(ctx context.Context, cfg config) (attestStream, func(), error) {
 		return nil, nil, err
 	}
 	creds := credentials.NewTLS(tlsconfig.TLSClientConfig(bundle, tlsconfig.AuthorizeID(serverID)))
-	conn, err := grpc.NewClient(cfg.server, grpc.WithTransportCredentials(creds))
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(creds)}
+	if cfg.source != nil {
+		d := net.Dialer{LocalAddr: &net.TCPAddr{IP: cfg.source}}
+		opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
+			return d.DialContext(ctx, "tcp", addr)
+		}))
+	}
+	conn, err := grpc.NewClient(cfg.server, opts...)
 	if err != nil {
 		return nil, nil, err
 	}

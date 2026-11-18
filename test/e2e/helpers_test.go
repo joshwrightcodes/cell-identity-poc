@@ -146,6 +146,12 @@ const (
 // the restricted profile in each test namespace.
 func createNamespace(t *testing.T, cluster, ns string) {
 	t.Helper()
+	createNamespaceAt(t, cluster, ns, "restricted")
+}
+
+// createNamespaceAt is createNamespace with the named Pod Security level.
+func createNamespaceAt(t *testing.T, cluster, ns, level string) {
+	t.Helper()
 	deleteNamespace := func() error {
 		_, err := kubectl(t, cluster, "", "delete", "namespace", ns, "--ignore-not-found", "--wait=true", "--timeout=180s")
 		return err
@@ -164,8 +170,8 @@ func createNamespace(t *testing.T, cluster, ns string) {
 	default:
 		t.Fatalf("namespace %s exists in %s without the label %s=true, so it is not a test namespace", ns, cluster, testNamespaceLabel)
 	}
-	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true", %q: "restricted"}}}`,
-		ns, testNamespaceLabel, podSecurityLabel)
+	manifest := fmt.Sprintf(`{"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": %q, "labels": {%q: "true", %q: %q}}}`,
+		ns, testNamespaceLabel, podSecurityLabel, level)
 	if _, err := kubectl(t, cluster, manifest, "create", "-f", "-"); err != nil {
 		t.Fatal(err)
 	}
@@ -227,10 +233,19 @@ func restrictedOverridesWithPull(name string, args []string, pullPolicy string) 
 // runPod runs the probe image with args to completion in a cluster and returns its standard output.
 func runPod(t *testing.T, cluster, ns string, args []string) string {
 	t.Helper()
+	return runPodLabeled(t, cluster, ns, "", args)
+}
+
+// runPodLabeled is runPod with a label, as key=value, on the pod. An empty label sets none.
+func runPodLabeled(t *testing.T, cluster, ns, label string, args []string) string {
+	t.Helper()
 	needProbeImage(t)
 	name := fmt.Sprintf("probe-%d", podCounter.Add(1))
 	runArgs := []string{"-n", ns, "run", name, "--image", probeImage, "--restart=Never",
 		"--overrides", restrictedOverrides(name, args)}
+	if label != "" {
+		runArgs = append(runArgs, "--labels", label)
+	}
 	if _, err := kubectl(t, cluster, "", runArgs...); err != nil {
 		t.Fatal(err)
 	}
@@ -262,10 +277,19 @@ func runPod(t *testing.T, cluster, ns string, args []string) string {
 // the pod is Running or Succeeded. It returns an error that describes the pod when the wait ends.
 func startPod(t *testing.T, cluster, ns string, args []string) error {
 	t.Helper()
+	return startPodLabeled(t, cluster, ns, "", args)
+}
+
+// startPodLabeled is startPod with a label, as key=value, on the pod. An empty label sets none.
+func startPodLabeled(t *testing.T, cluster, ns, label string, args []string) error {
+	t.Helper()
 	needProbeImage(t)
 	name := fmt.Sprintf("probe-%d", podCounter.Add(1))
 	runArgs := []string{"-n", ns, "run", name, "--image", probeImage, "--restart=Never",
 		"--overrides", restrictedOverridesWithPull(name, args, "Always")}
+	if label != "" {
+		runArgs = append(runArgs, "--labels", label)
+	}
 	if _, err := kubectl(t, cluster, "", runArgs...); err != nil {
 		return err
 	}

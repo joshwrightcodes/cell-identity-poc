@@ -20,8 +20,8 @@ func ClientTLS(svids x509svid.Source, peer x509bundle.Source, expect spiffeid.ID
 	return pin(tlsconfig.MTLSClientConfig(svids, peer, exactID(expect)))
 }
 
-// probeTLS is ClientTLS with no client certificate.
-func probeTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
+// ProbeTLS is ClientTLS with no client certificate.
+func ProbeTLS(peer x509bundle.Source, expect spiffeid.ID) *tls.Config {
 	return pin(tlsconfig.TLSClientConfig(peer, exactID(expect)))
 }
 

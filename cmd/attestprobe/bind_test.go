@@ -305,3 +305,17 @@ func TestAttestprobeBindRefusesUnknownStatus(t *testing.T) {
 		t.Fatalf("exit %d, output %q", code, out)
 	}
 }
+
+// TestAttestprobeSource checks that --source binds the local address before the dial. An address that
+// the host holds works, and the kernel refuses an address that it does not hold.
+func TestAttestprobeSource(t *testing.T) {
+	s := newBindServer(t)
+	td := newTestDeps(t)
+	if code, out := runProbe(t, td, s.args("--variant", "good", "--source", "127.0.0.1")); code != 0 || !strings.Contains(out, "bound:bound") {
+		t.Fatalf("with a local source: code %d, out %q", code, out)
+	}
+	code, out := runProbe(t, td, s.args("--variant", "good", "--source", "203.0.113.9", "--timeout", "5s"))
+	if code == 0 || strings.Contains(out, "bound") {
+		t.Fatalf("with a foreign source: code %d, out %q, want a failed dial", code, out)
+	}
+}
