@@ -1077,6 +1077,26 @@ func TestRuntimeObjectsBundleState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runtime_objects: %v\n%s", err, errOut)
 	}
+	checkBundleStateCases(t, out, "celld")
+	if !strings.Contains(out, "op-[0-9a-f]{32}") {
+		t.Errorf("the operation records are no runtime objects any more: %s", out)
+	}
+}
+
+// TestRuntimeObjectsBundleStateCp: in dev-cp, the bundle state lives in envd-system. envd writes it (marker envd) after the
+// harness wrote it first with kubectl create (marker bundle-bootstrap), so check_harness_objects of envd skips it in both forms.
+func TestRuntimeObjectsBundleStateCp(t *testing.T) {
+	out, errOut, err := libFunc(t, "dev-cp", "runtime_objects envd envd-system ConfigMap")
+	if err != nil {
+		t.Fatalf("runtime_objects: %v\n%s", err, errOut)
+	}
+	checkBundleStateCases(t, out, "envd")
+}
+
+// checkBundleStateCases checks that out holds exactly two runtime cases for bundle-state, one with the marker of the writer and
+// one with the marker bundle-bootstrap, and that no case names Argo CD as a manager.
+func checkBundleStateCases(t *testing.T, out, writer string) {
+	t.Helper()
 	var cases []struct {
 		Names    string   `json:"names"`
 		Managers []string `json:"managers"`
@@ -1097,11 +1117,8 @@ func TestRuntimeObjectsBundleState(t *testing.T) {
 			}
 		}
 	}
-	if !seen["celld"] || !seen["bundle-bootstrap"] || len(seen) != 2 {
-		t.Errorf("markers of bundle-state: %v, want celld and bundle-bootstrap\n%s", seen, out)
-	}
-	if !strings.Contains(out, "op-[0-9a-f]{32}") {
-		t.Errorf("the operation records are no runtime objects any more: %s", out)
+	if !seen[writer] || !seen["bundle-bootstrap"] || len(seen) != 2 {
+		t.Errorf("markers of bundle-state: %v, want %s and bundle-bootstrap\n%s", seen, writer, out)
 	}
 }
 

@@ -1181,7 +1181,8 @@ check_plane_pods() {
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
 # the check skips them, and prints no delete hint for them. The ConfigMap bundle-state is a runtime object too:
 # cell:up creates it with kubectl create and the marker poc.internal/made-by=bundle-bootstrap, and celld
-# updates it and changes the marker to celld.
+# updates it and changes the marker to celld. In dev-cp, the ConfigMap envd-system/bundle-state of envd follows the same rule,
+# with the field manager and marker envd.
 # The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
 # manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
@@ -1201,6 +1202,11 @@ runtime_objects() {
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
     jq -cn '[{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
       {names: "^bundle-state$", managers: ["celld", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
+    return
+  fi
+  if [[ "$1" == envd && "$2" == envd-system && "$3" == ConfigMap ]]; then
+    jq -cn '[{names: "^bundle-state$", managers: ["envd", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
       {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
     return
   fi
