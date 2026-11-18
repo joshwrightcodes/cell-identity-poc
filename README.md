@@ -222,7 +222,7 @@ An `mgmtd` image rollback after M6 needs `mise run mgmt -- reset-state`, then th
 An older `mgmtd` refuses a stored spec that holds steps, so the state must go.
 
 Rebuild a cell with the commands in [Rebuild one cluster](#rebuild-one-cluster). Rebuild `management` with `dependents_of management`, as the same section lists.
-The rebuild drill of `management` ran in the live part: <measured in the live part>.
+The rebuild drill of `management` ran on 2026-11-18 with the commands of `dependents_of management`. It took 23 minutes 35 seconds from `cell:down` to the first `harness:status` that exited 0, and the first `harness:status` failed only on collector export retries.
 
 ## Rebuild one cluster
 
@@ -301,6 +301,9 @@ mise run hostsvc:serve -- status
 mise run hostsvc:serve -- restart
 mise run hostsvc:serve -- stop
 ```
+
+After a change under `internal/hostsvc`, run `mise run images -- mgmtd` before `mise run hostsvc:serve -- restart`.
+Otherwise the link of `mgmt-api` in the restart stops with "no mgmtd image", because `build/images.env` is older than the source.
 
 `start` fetches the live root of `management` and writes it to `build/hostsvc/mgmt-root.crt`.
 It builds `build/bin/hostsvc` and runs it in the background.
@@ -1293,13 +1296,13 @@ M6 measured values come from the live part of Task 11. Each value below is a mar
 
 | Value | Result |
 | --- | --- |
-| `harness:up` from clean with the portal | <measured in the live part> |
-| `harness:up` run again, with both cells valid | <measured in the live part> |
-| Rebuild drill of `management` | <measured in the live part> |
-| `gate:m6`, two runs | <measured in the live part> |
-| `gate:m6:provision`, two runs | <measured in the live part> |
-| `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | <measured in the live part>, 1.5 times the slower run, rounded up to 5 minutes |
-| `harness:size` after the runs | <measured in the live part> |
+| `harness:up` from clean with the portal | 1674 seconds (27 minutes 54 seconds), 2026-11-18, with both cells built through the portal. The first `harness:status` failed only on collector export retries |
+| `harness:up` run again, with both cells valid | 181 seconds, 2026-11-18, then `harness:status` exited 0 |
+| Rebuild drill of `management` | 23 minutes 35 seconds, 2026-11-18: `cell:down` 3 s, `hostsvc -- up --only management` 27 s, `cell:up` of `management` 237 s, `mgmt-api` link 25 s, `cell:up` of `dev-cp` 81 s, `portal -- request` 1 s, `portal -- wait` 61 s, `cell:up` of each cell 57 s and 59 s, the last link 229 s, then `harness:status` |
+| `gate:m6`, two runs | 947.8 seconds and 964 seconds (2026-11-17 UTC), 14 tests, both pass |
+| `gate:m6:provision`, two runs | 1327.5 seconds and 1431.4 seconds (2026-11-17 UTC), both pass. In the second run both steps were done 15 minutes 6 seconds after the request |
+| `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | 25 and 40 minutes, 1.5 times the slower run, rounded up to 5 minutes |
+| `harness:size` after the runs | 2026-11-18: `management` 3.4 GiB, `dev-cp` 2.5 GiB, each cell 2.2 GiB, `rogue` 0.6 GiB, `registry-mirror` 77 MiB. The VM used 11.7 GB and held 23.6 GB in the file cache |
 
 ## Side effects of gate:m2
 

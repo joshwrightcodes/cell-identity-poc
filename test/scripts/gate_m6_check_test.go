@@ -285,7 +285,7 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 }
 
 // TestGateM6ProvisionGate: gate.sh m6-provision runs only TestProvisionFromPortal, with the go test timeout that gate_test_timeout derives from
-// the provisional budget of 90 minutes and the floor of 175 minutes in harness/versions.env: twice the budget, 180 minutes. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
+// the budget of 40 minutes and the floor of 175 minutes in harness/versions.env: the floor, 175 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
 // pattern of gate m6 does not match the provision test, because that test deletes both cells.
 func TestGateM6ProvisionGate(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
@@ -319,8 +319,8 @@ func TestGateM6ProvisionGate(t *testing.T) {
 				t.Errorf("the token scan did not run after the tests: calls %s", calls)
 			}
 			if tc.want == "" {
-				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 180m") || strings.Contains(string(calls), "-run M6") {
-					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 180m", err, ran, out, calls)
+				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 175m") || strings.Contains(string(calls), "-run M6") {
+					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 175m", err, ran, out, calls)
 				}
 				return
 			}
@@ -352,7 +352,7 @@ func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
 		}
 	}
 	out, err := exec.Command("bash", "-c", `source "$1"; printf '%s %s' "$GATE_M6_PROVISION_BUDGET_MINUTES" "$GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES"`, "bash", versions).Output()
-	if err != nil || string(out) != "90 175" {
-		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"90 175\"", out, err)
+	if err != nil || string(out) != "40 175" {
+		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"40 175\"", out, err)
 	}
 }
