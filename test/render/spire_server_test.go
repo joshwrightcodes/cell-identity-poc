@@ -237,6 +237,7 @@ const stubKind = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kind $*" >>"$STUB_LOG"
 [[ "$*" == "get clusters" ]] || exit 2
+[[ -z "${STUB_KIND_FAIL:-}" ]] || exit 1
 case "${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue}" in
   none) echo "No kind clusters found." >&2 ;;
   *) printf '%s\n' ${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue} ;;
@@ -629,14 +630,14 @@ func TestRenderSpireServer(t *testing.T) {
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
 	t.Run("k8s_psat admits the plane workloads cp/otel, envd, cp/gateway and cp/cell-controller", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"})
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"}, "envd-system/envd")
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
 		t.Fatalf("render left tokens %v", left)
 	}
-	if want := "run hostsvc -- facts --cluster dev-cell-1"; !strings.Contains(r.log, want) {
-		t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
+	if strings.Contains(r.log, "hostsvc -- facts --cluster dev-cell") {
+		t.Fatalf("render read the node address of a cell, which only the envd render needs; it ran:\n%s", r.log)
 	}
 
 	// The external-secrets bundle holds Namespace spire-system, because the Role of the operator
@@ -649,7 +650,7 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
-	t.Run("network policy admits only the agent nodes", func(t *testing.T) {
+	t.Run("the namespace denies by default and the bundle has no rule for the agent nodes", func(t *testing.T) {
 		deny := objs["NetworkPolicy/default-deny"]
 		if types := get[[]any](t, deny, "spec", "policyTypes"); len(types) != 2 || len(get[map[string]any](t, deny, "spec", "podSelector")) != 0 {
 			t.Fatalf("default-deny spec is %v", deny["spec"])
@@ -657,27 +658,8 @@ func TestRenderSpireServer(t *testing.T) {
 		if _, ok := lookup(deny, "spec", "ingress"); ok {
 			t.Fatal("default-deny has ingress rules")
 		}
-		np := objs["NetworkPolicy/spire-server-agents"]
-		rules := get[[]any](t, np, "spec", "ingress")
-		if len(rules) != 1 {
-			t.Fatalf("got %d ingress rules", len(rules))
-		}
-		var cidrs []string
-		for _, peer := range get[[]any](t, rules[0], "from") {
-			if len(peer.(map[string]any)) != 1 {
-				t.Fatalf("peer %v has more than an ipBlock", peer)
-			}
-			cidrs = append(cidrs, get[string](t, peer, "ipBlock", "cidr"))
-		}
-		if !slices.Equal(cidrs, []string{"10.9.0.1/32", "10.9.0.2/32"}) {
-			t.Fatalf("peers are %v", cidrs)
-		}
-		ports := get[[]any](t, rules[0], "ports")
-		if len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
-			t.Fatalf("ports are %v", ports)
-		}
-		if _, ok := lookup(np, "spec", "egress"); ok {
-			t.Fatal("the agent policy allows egress")
+		if _, ok := objs["NetworkPolicy/spire-server-agents"]; ok {
+			t.Fatal("the render has NetworkPolicy spire-server-agents, and the harness plane policy spire-system/plane-cells admits the agent nodes")
 		}
 	})
 
@@ -976,9 +958,6 @@ func TestRenderFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{"live cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "no host service facts for the live cell dev-cell-2"},
-		{"live cell without facts names the read command", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "Read them: mise run hostsvc -- facts --cluster dev-cell-2"},
-		{"live cell without node address", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_FACTS_NOIP=dev-cell-1"}, "node address of dev-cell-1"},
 		{"blank cells with subjects", []string{"SPIRE_AGENT_CELLS= "}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"cells without subjects", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS="}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"no cell and no local workload", []string{"SPIRE_AGENT_CELLS=", "SPIRE_CELL_SUBJECTS="}, "names no agent cell and no local workload"},
@@ -1071,6 +1050,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	// The per-subject aliases cell/<cell>/agents/<role> replace the M2 alias cell/<cell>/nodes, so the
 	// entries differ from M2. TestRenderSpireServer checks every entry.
+	delete(m2, "NetworkPolicy/spire-server-agents")
 	got["ConfigMap/spire-entries"]["data"] = map[string]any{}
 	m2["ConfigMap/spire-entries"]["data"] = map[string]any{}
 
@@ -1137,8 +1117,9 @@ func checkPrometheus(t *testing.T, text string) {
 
 // checkPSAT checks the k8s_psat path of a server render: the plugin config, the API access of the
 // server, the ingress rule for each local workload, and the alias and entry of each workload.
-// workloads maps each SPIFFE path to <namespace>/<service account>.
-func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloads map[string]string) {
+// workloads maps each SPIFFE path to <namespace>/<service account>. The accounts in planePeers have an entry and an alias, and
+// their ingress rule lives in a harness plane policy, so the workload policy has no peer for them.
+func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloads map[string]string, planePeers ...string) {
 	t.Helper()
 	text := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	// k8s_psat ignores unknown keys, so only this exact key gives each sidecar its own agent ID.
@@ -1236,7 +1217,9 @@ func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloa
 			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
 	}
 	for _, sub := range workloads {
-		wantPeers = append(wantPeers, sub)
+		if !slices.Contains(planePeers, sub) {
+			wantPeers = append(wantPeers, sub)
+		}
 	}
 	slices.Sort(peers)
 	slices.Sort(wantPeers)
@@ -1492,19 +1475,8 @@ func TestSpireServerHintConfig(t *testing.T) {
 // topology cells are live.
 func liveEnv(clusters string) string { return "STUB_KIND_CLUSTERS=" + clusters }
 
-// agentPolicyRules returns the ingress rules of NetworkPolicy spire-server-agents, or nil when the render has none.
-func agentPolicyRules(t *testing.T, objs map[string]object) []any {
-	t.Helper()
-	np, ok := objs["NetworkPolicy/spire-server-agents"]
-	if !ok {
-		return nil
-	}
-	return get[[]any](t, np, "spec", "ingress")
-}
-
 // TestSpireServerRenderNoLiveCells: dev-cp with a catalog of two cells and no cluster for either of them. The render
-// succeeds with no cell fact, drops the cluster_jwt section and the policy of the agent node port, and keeps the
-// ClusterStaticEntry pairs of both cells.
+// succeeds with no cell fact, drops the cluster_jwt section, and keeps the ClusterStaticEntry pairs of both cells.
 func TestSpireServerRenderNoLiveCells(t *testing.T) {
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
 	if r.err != nil {
@@ -1514,28 +1486,6 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) || strings.Contains(conf, "record_public_keys") {
 		t.Errorf("server.conf holds the cluster_jwt section with no live cell:\n%s", conf)
-	}
-	for _, rule := range agentPolicyRules(t, objs) {
-		t.Errorf("NetworkPolicy spire-server-agents has a rule with no live cell: %v", rule)
-	}
-	// No rule that names port 8081 may admit an ipBlock: only the local workloads reach the server.
-	for key, o := range objs {
-		if o["kind"] != "NetworkPolicy" {
-			continue
-		}
-		ingress, _ := lookupOr(o, "spec", "ingress").([]any)
-		for _, rule := range ingress {
-			ports, _ := lookup(rule, "ports")
-			from, _ := lookup(rule, "from")
-			if !strings.Contains(fmt.Sprint(ports), "port:8081") {
-				continue
-			}
-			for _, p := range from.([]any) {
-				if _, isBlock := lookup(p, "ipBlock"); isBlock {
-					t.Errorf("%s: a rule for port 8081 admits an ipBlock: %v", key, rule)
-				}
-			}
-		}
 	}
 	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
@@ -1552,29 +1502,22 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 			t.Errorf("the render ran %q with no live cell:\n%s", bad, r.log)
 		}
 	}
-	if _, ok := objs["ConfigMap/spire-entries"]; !ok {
-		t.Error("no ConfigMap spire-entries")
-	}
 }
 
-// TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The policy admits only the node of
-// dev-cell-1, the facts of dev-cell-2 are never read, and the entries of both cells stay.
+// TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The cluster_jwt section stays, and the
+// entries of both cells stay. The render reads no cell address.
 func TestSpireServerRenderOneLiveCell(t *testing.T) {
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue dev-cell-1"))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
-	rules := agentPolicyRules(t, objs)
-	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
-		t.Fatalf("agent policy rules %v, want one rule that admits 10.9.0.1/32", rules)
-	}
 	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	if !strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
 		t.Error("server.conf lacks the cluster_jwt section with one live cell")
 	}
-	if strings.Contains(r.log, "facts --cluster dev-cell-2") {
-		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
+	if strings.Contains(r.log, "facts --cluster dev-cell") {
+		t.Errorf("the render read the facts of a cell:\n%s", r.log)
 	}
 	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 	for _, name := range []string{"dev-cell-1-celld.yaml", "dev-cell-2-celld.yaml", "dev-cell-1-agents-celld.yaml", "dev-cell-2-agents-celld.yaml"} {
@@ -1585,14 +1528,14 @@ func TestSpireServerRenderOneLiveCell(t *testing.T) {
 }
 
 // TestSpireServerRenderNoNodeAddressIsNotLive: a cluster whose node container has no address on the network kind is
-// not live, so the render leaves it out and does not read its facts.
+// not live. With no other live cell, the cluster_jwt section is absent.
 func TestSpireServerRenderNoNodeAddressIsNotLive(t *testing.T) {
-	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-2")
+	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-1 dev-cell-2")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
-	rules := agentPolicyRules(t, docs(t, hydrated(r.stdout, "dev-cp")))
-	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
-		t.Fatalf("agent policy rules %v, want one rule that admits only dev-cell-1", rules)
+	conf := get[string](t, docs(t, hydrated(r.stdout, "dev-cp"))["ConfigMap/spire-server"], "data", "server.conf")
+	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
+		t.Error("server.conf holds the cluster_jwt section while no cell has a node address")
 	}
 }

@@ -645,7 +645,7 @@ var liveCellVariants = map[string]string{
 }
 
 // TestNoEmptyPeerList checks that every NetworkPolicy rule in every render names its peers. A rule
-// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay and cell-gateway in
+// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay, cell-gateway and envd in
 // dev-cp run again with no live cell and with one, because their cell rules lose the peers when a cell is absent, and
 // the rule must then go, not stay with an empty list.
 func TestNoEmptyPeerList(t *testing.T) {
@@ -681,7 +681,7 @@ func TestNoEmptyPeerList(t *testing.T) {
 	}
 	for label, kindEnv := range liveCellVariants {
 		for _, tc := range []struct{ component, binary string }{
-			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"},
+			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"}, {"envd", "/ko-app/stub"},
 		} {
 			t.Run(label+" "+tc.component, func(t *testing.T) {
 				script, err := filepath.Abs("../../components/" + tc.component + "/render.sh")

@@ -3,9 +3,10 @@
 #
 # Two attestation paths feed the server. Each loads only when its inputs are set.
 #   - cluster_jwt, for the SPIRE agent sidecars in cells: SPIRE_AGENT_CELLS (the catalog of cells) and
-#     SPIRE_CELL_SUBJECTS. For each live cell (live_cells in components/lib/live-cells.sh), the render reads the
-#     node address from the host service. The NetworkPolicy admits only those node addresses on the node
-#     port. With no live cell, the render drops the cluster_jwt section and the policy, and keeps the entries. The plugin trusts only records that the
+#     SPIRE_CELL_SUBJECTS. The render keeps the cluster_jwt section while a cell of the catalog is live (live_cells in
+#     components/lib/live-cells.sh), and checks the node of each live cell for traces of the M2 key rotation test. The harness
+#     plane policy spire-system/plane-cells, which the envd render prints, admits the node addresses of the live cells on the
+#     node port. With no live cell, the render drops the cluster_jwt section and keeps the entries. The plugin trusts only records that the
 #     management plane signs: record_public_keys holds the public key of mgmtd, from ConfigMap
 #     mgmt-signing-pub in management (components/lib/mgmt-key.sh). envd writes the signed records into
 #     ConfigMap spire-system/cell-records, which the pod mounts as an optional volume, and the plugin
@@ -26,6 +27,8 @@
 #   - Key hints: the cluster_jwt plugin patches ConfigMap spire-system/attest-hints on unknown_kid (hint_configmap in
 #     server.conf). It reaches the API through the same token as k8s_psat, so the hint line and Role spire-server-hints
 #     stay only when the cluster has both agent cells and local workloads.
+# The ingress of envd to the server API is the harness plane policy spire-system/plane-envd, so the workload policy has
+# a peer for every local workload except the account envd-system/envd, which keeps its alias and entry.
 # SPIRE_UPSTREAM=disk signs the server CA with the intermediate CA from Secret spire-upstream, and
 # the CA keys stay in memory. Without it, the CA is a self-signed root, and its key lives on the
 # data volume, so a restart keeps the root.
@@ -92,7 +95,6 @@ fi
 sections=()
 if [[ "$upstream" == disk ]]; then sections+=(keys_memory upstream_disk); else sections+=(keys_disk); fi
 
-peers='[]'
 entries='{}'
 mgmt_pub=""
 plugin_image=""
@@ -131,7 +133,7 @@ if ((${#cells[@]} > 0)); then
     done
   done
 
-  # Only a live cell has a node address to admit. A catalog cell with no cluster is not admitted.
+  # Only a live cell attests, so the cluster_jwt section follows the live cells of the catalog.
   live_all="$(live_cells)" || die "could not list the live cells"
   for cell in $live_all; do
     [[ " ${cells[*]} " != *" $cell "* ]] || live+=("$cell")
@@ -145,20 +147,11 @@ if ((${#live[@]} > 0)); then
   plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
   checksum="$(ko_binary_sha256 "$plugin_image" "$plugin_binary")" || die "no plugin checksum"
 
-  ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
   for cell in "${live[@]}"; do
-    # A live cell has a cluster, so its facts must read. A read error stops the render: a cell that the render left out
-    # because of a transient error would lose its place in the admit list.
-    if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$cell" 2>/dev/null)"; then
-      die "no host service facts for the live cell $cell: ${facts:-no output}. Read them: mise run hostsvc -- facts --cluster $cell"
-    fi
     # While the M2 key rotation test has changed the cell, its API server publishes the test key, so
     # the render stops until the node is repaired.
     traces="$(keytest_leftover "$cell")" || die "cannot check the node of $cell for the M2 key rotation test: $traces. Run: mise run gate:m2:repair"
     [[ -z "$traces" ]] || die "the node of $cell holds traces of the M2 key rotation test: ${traces//$'\n'/; }. Run: mise run gate:m2:repair"
-    ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
-    [[ "$ip" =~ $ipv4 ]] || die "node address of $cell is '$ip', not an IPv4 address"
-    peers="$(jq -c --arg cidr "$ip/32" '. + [{ipBlock: {cidr: $cidr}}]' <<<"$peers")"
   done
 fi
 
@@ -194,6 +187,8 @@ if ((${#local_workloads[@]} > 0)); then
           spec: {spiffeID: ("spiffe://" + $td + "/" + $path), parentID: $alias, selectors: ["unix:uid:" + $uid]}}
       }' <<<"$entries")"
     psat_accounts="$(jq -c --arg a "$wns:$wsa" '. + [$a] | unique' <<<"$psat_accounts")"
+    # The plane policy spire-system/plane-envd carries the flow of envd, so the workload policy has no peer for it.
+    [[ "$wns/$wsa" != envd-system/envd ]] || continue
     workload_peers="$(jq -c --arg ns "$wns" --arg sa "$wsa" '. + [{
       namespaceSelector: {matchLabels: {"kubernetes.io/metadata.name": $ns}},
       podSelector: {matchLabels: {"app.kubernetes.io/name": $sa}}}] | unique' <<<"$workload_peers")"
@@ -238,7 +233,6 @@ pod='select(.kind == "StatefulSet" and .metadata.name == "spire-server") | .spec
 service='select(.kind == "Service" and .metadata.name == "spire-server") | .spec'
 edits=""
 if ((${#live[@]} == 0)); then
-  drop_objects+=("NetworkPolicy/spire-server-agents")
   drop_volumes+=(plugins records)
   edits+=" | del($pod.initContainers) | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
 fi
@@ -255,6 +249,7 @@ if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
 fi
 eso_namespace="${EXTERNAL_SECRETS_NAMESPACE:-${SECRET_STORE_NAMESPACES:-}}"
 [[ "$eso_namespace" != "$namespace" ]] || drop_objects+=("Namespace/$namespace")
+[[ "$workload_peers" != "[]" ]] || drop_objects+=("NetworkPolicy/spire-server-workloads")
 for v in ${drop_volumes[@]+"${drop_volumes[@]}"}; do
   edits+=" | del($pod.volumes[] | select(.name == \"$v\")) | del($pod.containers[].volumeMounts[] | select(.name == \"$v\"))"
 done
@@ -264,9 +259,8 @@ for o in ${drop_objects[@]+"${drop_objects[@]}"}; do
 done
 
 # Each entry becomes one YAML file in the ConfigMap, as spire-controller-manager expects.
-PEERS="$peers" ENTRIES="$entries" WORKLOAD_PEERS="$workload_peers" API_PEERS="$api_peers" API_PORT="${API_SERVER_PORT:-0}" yq "
-  (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-agents\") | .spec.ingress[0].from) = (env(PEERS) | ... style=\"\")
-  | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-workloads\") | .spec.ingress[0].from) = (env(WORKLOAD_PEERS) | ... style=\"\")
+ENTRIES="$entries" WORKLOAD_PEERS="$workload_peers" API_PEERS="$api_peers" API_PORT="${API_SERVER_PORT:-0}" yq "
+  (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-workloads\") | .spec.ingress[0].from) = (env(WORKLOAD_PEERS) | ... style=\"\")
   | (select(.kind == \"NetworkPolicy\" and .metadata.name == \"spire-server-api\") | .spec.egress[0]) |= (.to = (env(API_PEERS) | ... style=\"\") | .ports[0].port = env(API_PORT))
   | (select(.kind == \"ConfigMap\" and .metadata.name == \"spire-entries\") | .data) = (env(ENTRIES) | ... style=\"\" | map_values(to_yaml) | .[] style=\"literal\")
   $edits

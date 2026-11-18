@@ -771,8 +771,14 @@ func quotedList(names []string) string {
 // has the harness label before or after the request. The lists come from allow.json, failurePolicy is Fail, and the binding
 // denies for every namespace. Both objects carry the harness label themselves.
 func TestHarnessGuardRender(t *testing.T) {
-	objs := cellObjects(t)
-	role := bundle.DefaultPolicy().Roles["cell"]
+	t.Run("cell", func(t *testing.T) { checkHarnessGuard(t, cellObjects(t), "cell", "cell-identity") })
+	t.Run("cp", func(t *testing.T) { checkHarnessGuard(t, envdObjects(t), "cp", "envd") })
+}
+
+// checkHarnessGuard checks the guard objects of a render for a role, and the harness label of the component that prints them.
+func checkHarnessGuard(t *testing.T, objs map[string]object, roleName, component string) {
+	t.Helper()
+	role := bundle.DefaultPolicy().Roles[roleName]
 	var names []string
 	for _, o := range role.HarnessClusterObjects {
 		if o.Name == "bundles-spare-harness" {
@@ -814,8 +820,12 @@ func TestHarnessGuardRender(t *testing.T) {
 			t.Errorf("validation %d is %v, want balanced text, reason Forbidden and a message", i, vals[i])
 		}
 	}
-	if !slices.Equal(role.HarnessNamespaces, []string{"cell-identity-system", "cell-ops-system", "mesh-view-system"}) {
-		t.Errorf("allow.json harness namespaces of role cell are %v", role.HarnessNamespaces)
+	wantNamespaces := map[string][]string{"cell": {"cell-identity-system", "cell-ops-system", "mesh-view-system"}, "cp": {"envd-system", "gateway-system", "cell-controller-system"}}[roleName]
+	if !slices.Equal(role.HarnessNamespaces, wantNamespaces) {
+		t.Errorf("allow.json harness namespaces of role %s are %v, want %v", roleName, role.HarnessNamespaces, wantNamespaces)
+	}
+	if roleName == "cp" && objs["ValidatingAdmissionPolicy bundles-app-limits"] != nil {
+		t.Error("the render of role cp prints bundles-app-limits, which only role cell has")
 	}
 	b := objs["ValidatingAdmissionPolicyBinding bundles-spare-harness"]
 	if b == nil {
@@ -825,8 +835,8 @@ func TestHarnessGuardRender(t *testing.T) {
 		t.Errorf("binding spec is %s, want %s", got, want)
 	}
 	for _, o := range []object{vap, b} {
-		if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != "cell-identity" {
-			t.Errorf("%s has harness label %v", objName(o), v)
+		if v, _ := lookup(o, "metadata", "labels", "cell.poc.internal/harness"); v != component {
+			t.Errorf("%s has harness label %v, want %s", objName(o), v, component)
 		}
 	}
 }

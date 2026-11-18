@@ -6,16 +6,15 @@
 # backlog cannot slow the view. Each route is <node port>:<container port>=<node port of RELAY_TARGET>.
 # A NodePort Service with the local traffic policy admits the routes on the node.
 #
-# The render reads these facts from the host service, as the M2 renders do:
-#   - the node address of RELAY_TARGET. The relay dials it, and the NetworkPolicy admits only it.
-#   - the node address of each live cell (live_cells in components/lib/live-cells.sh), among the cells of
-#     SPIRE_AGENT_CELLS. Only these addresses reach the routes. With no live cell, the render deletes the rule
-#     of the cells from each NetworkPolicy.
+# The render reads the node address of RELAY_TARGET from the host service. The relay dials it.
+# The NetworkPolicies of the relay hold the health port for the own nodes and the collector. The flows of the cells to the
+# routes and of the relay to RELAY_TARGET are the harness plane policies relay-system/plane-cells and
+# relay-system/plane-upstream, which the envd render prints.
 # The relay image is the one that `mise run images` built, by digest.
-# Inputs: RELAY_TARGET, RELAY_VIEW_ROUTES, RELAY_TELEMETRY_ROUTES and
-# SPIRE_AGENT_CELLS from cells/<cluster>.env, and NODE_IPS and DNS_SERVICE_IP from build/<cluster>/facts.env.
+# Inputs: RELAY_TARGET, RELAY_VIEW_ROUTES and RELAY_TELEMETRY_ROUTES from cells/<cluster>.env, and NODE_IPS and
+# DNS_SERVICE_IP from build/<cluster>/facts.env.
 set -euo pipefail
-: "${RELAY_TARGET:?}" "${RELAY_VIEW_ROUTES:?}" "${RELAY_TELEMETRY_ROUTES:?}" "${SPIRE_AGENT_CELLS:?}" "${NODE_IPS:?}" "${DNS_SERVICE_IP:?}"
+: "${RELAY_TARGET:?}" "${RELAY_VIEW_ROUTES:?}" "${RELAY_TELEMETRY_ROUTES:?}" "${NODE_IPS:?}" "${DNS_SERVICE_IP:?}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
@@ -25,7 +24,6 @@ die() { printf 'error: relay-system render: %s\n' "$*" >&2; exit 1; }
 
 source "$root/scripts/ko-image.sh"
 source "$root/components/lib/addresses.sh"
-source "$root/components/lib/live-cells.sh"
 
 ipv4='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 [[ "$DNS_SERVICE_IP" =~ $ipv4 ]] || die "DNS_SERVICE_IP '$DNS_SERVICE_IP' is not an IPv4 address"
@@ -43,22 +41,10 @@ node_ip() {
 }
 
 target_ip="$(node_ip "$RELAY_TARGET")"
-read -r -a catalog <<<"$SPIRE_AGENT_CELLS"
-((${#catalog[@]} > 0)) || die "SPIRE_AGENT_CELLS names no cell, so no cell could reach the relay"
-for cell in "${catalog[@]}"; do
-  [[ "$cell" != "$RELAY_TARGET" ]] || die "SPIRE_AGENT_CELLS names the relay target $RELAY_TARGET"
-done
-live_all="$(live_cells)" || die "could not list the live cells"
-cell_ips=()
-for cell in $live_all; do
-  [[ " ${catalog[*]} " != *" $cell "* ]] || cell_ips+=("$(node_ip "$cell")")
-done
 relay_image="$(ko_image relay)" || die "no relay image"
 
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }
-cell_peers="$(peers ${cell_ips[@]+"${cell_ips[@]}"})"
 node_peers="$(peers $node_ips)"
-target_peers="$(peers "$target_ip")"
 
 # check_routes <name> <routes> stops the render for a bad route. The node ports and container ports
 # must be unique across both Deployments.
@@ -85,7 +71,7 @@ check_routes relay-telemetry "$RELAY_TELEMETRY_ROUTES"
 # relay <name> <routes> prints the Deployment, the Service and the NetworkPolicy of one relay, for
 # routes that check_routes accepted.
 relay() {
-  local name="$1" routes route node container target args=() ports='[]' service='[]' route_ports='[]' target_ports='[]'
+  local name="$1" routes route node container target args=() ports='[]' service='[]'
   read -r -a routes <<<"$2"
   for route in "${routes[@]}"; do
     [[ "$route" =~ ^([0-9]{5}):([0-9]{1,5})=([0-9]{5})$ ]]
@@ -93,25 +79,18 @@ relay() {
     args+=("--route" "$container=$target_ip:$target")
     ports="$(jq -c --argjson p "$container" '. + [{name: ("route-" + ($p | tostring)), containerPort: $p}]' <<<"$ports")"
     service="$(jq -c --argjson p "$container" --argjson n "$node" '. + [{name: ("route-" + ($p | tostring)), port: $p, targetPort: $p, nodePort: $n}]' <<<"$service")"
-    route_ports="$(jq -c --argjson p "$container" '. + [{protocol: "TCP", port: $p}]' <<<"$route_ports")"
-    target_ports="$(jq -c --argjson p "$target" '. + [{protocol: "TCP", port: $p}] | unique' <<<"$target_ports")"
   done
   args+=("--health" ":8080")
   ports="$(jq -c '. + [{name: "health", containerPort: 8080}]' <<<"$ports")"
-  ARGS="$(printf '%s\n' "${args[@]}" | jq -Rcn '[inputs]')" PORTS="$ports" SERVICE="$service" ROUTE_PORTS="$route_ports" \
-    TARGET_PORTS="$target_ports" CELLS="$cell_peers" NODES="$node_peers" TARGET="$target_peers" NAME="$name" IMAGE="$relay_image" yq '
+  ARGS="$(printf '%s\n' "${args[@]}" | jq -Rcn '[inputs]')" PORTS="$ports" SERVICE="$service" \
+    NODES="$node_peers" NAME="$name" IMAGE="$relay_image" yq '
     select(.kind == "Deployment" or .kind == "Service" or .kind == "NetworkPolicy")
-    | with(select(.kind == "NetworkPolicy" and strenv(CELLS) == "[]"); del(.spec.ingress[] | select(.from == "@CELL_PEERS@")))
     | (.. | select(. == "@RELAY@")) = strenv(NAME)
     | (.. | select(. == "@RELAY_IMAGE@")) = strenv(IMAGE)
     | (.. | select(. == "@RELAY_ARGS@")) |= (env(ARGS) | ... style="")
     | (.. | select(. == "@RELAY_PORTS@")) |= (env(PORTS) | ... style="")
     | (.. | select(. == "@SERVICE_PORTS@")) |= (env(SERVICE) | ... style="")
-    | (.. | select(. == "@ROUTE_PORTS@")) |= (env(ROUTE_PORTS) | ... style="")
-    | (.. | select(. == "@TARGET_PORTS@")) |= (env(TARGET_PORTS) | ... style="")
-    | (.. | select(. == "@CELL_PEERS@")) |= (env(CELLS) | ... style="")
-    | (.. | select(. == "@NODE_PEERS@")) |= (env(NODES) | ... style="")
-    | (.. | select(. == "@TARGET_PEERS@")) |= (env(TARGET) | ... style="")' "$here/manifests.yaml"
+    | (.. | select(. == "@NODE_PEERS@")) |= (env(NODES) | ... style="")' "$here/manifests.yaml"
 }
 
 view="$(relay relay-view "$RELAY_VIEW_ROUTES")" || die "could not render relay-view"

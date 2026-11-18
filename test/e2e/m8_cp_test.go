@@ -1,0 +1,138 @@
+//go:build e2e
+
+package e2e
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+)
+
+// m8CpHydrated is the hydrated render of the apps-demo bundle of dev-cp, which cell:up leaves in the build directory.
+const m8CpHydrated = "../../build/dev-cp/bundles/apps-demo/manifests.yaml"
+
+// TestM8CpSignedBundleReachesArgoCD, in dev-cp: a bundle apps-demo that holds the hydrated objects and the ConfigMap
+// apps-demo/m8-marker with a random marker is pushed to the mirror, and mgmtd signs the last set of dev-cp with this entry. envd
+// applies it: the outcome is applied, the ConfigMap holds the marker, the Application spire-server is Synced at the digest of
+// its signed entry, the state holds the signed version, and root is at the root digest of the state.
+func TestM8CpSignedBundleReachesArgoCD(t *testing.T) {
+	const target = cpClusterName
+	m8RestoreTarget(t, target)
+	marker := randomHex(t, 8)
+	hydrated, err := os.ReadFile(filepath.FromSlash(m8CpHydrated))
+	if err != nil {
+		t.Fatalf("read the hydrated bundle apps-demo of %s: %v. Run: CELL=%s mise run cell:hydrate", target, err, target)
+	}
+	manifests := fmt.Sprintf("%s\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: m8-marker\n  namespace: apps-demo\n  labels:\n    cell.poc.internal/e2e: \"true\"\ndata:\n  marker: %q\n", strings.TrimRight(string(hydrated), "\n"), marker)
+	digest := m8PushBundle(t, target, "apps-demo", []byte(manifests))
+
+	last := m8LastSet(t, target)
+	if len(last.Components) == 0 {
+		t.Fatalf("%s has no signed set yet. Run: mise run bundle -- publish --target %s --wait", target, target)
+	}
+	var comps []bundle.Component
+	spireDigest := ""
+	found := false
+	for _, c := range last.Components {
+		if c.Name == "apps-demo" {
+			c.Digest = digest
+			found = true
+		}
+		if c.Name == "spire-server" {
+			spireDigest = c.Digest
+		}
+		comps = append(comps, c)
+	}
+	if !found || spireDigest == "" {
+		t.Fatalf("the last set of %s holds the components %v, want apps-demo and spire-server among them", target, last.Components)
+	}
+	signed := m8Sign(t, target, comps, true)
+	res := m8Wait(t, target, signed.OpID, 10*time.Minute)
+	if res.Result.Outcome != op.OutcomeApplied {
+		t.Fatalf("the outcome is %+v, want applied", *res.Result)
+	}
+
+	out, err := kubectl(t, target, "", "-n", "apps-demo", "get", "configmap", "m8-marker", "-o", "jsonpath={.data.marker}")
+	if err != nil || out != marker {
+		t.Errorf("ConfigMap m8-marker holds %q (%v), want %q", out, err, marker)
+	}
+	spire := m8Application(t, target, "spire-server")
+	if got := m8Field(spire, "status", "sync", "status"); got != "Synced" {
+		t.Errorf("spire-server is %s, want Synced", got)
+	}
+	if got := m8Field(spire, "status", "sync", "revision"); got != spireDigest {
+		t.Errorf("spire-server is at %s, want the signed digest %s", got, spireDigest)
+	}
+	st := m8State(t, target)
+	if st.Source != "signed" || st.State != "healthy" || st.Version != signed.Version {
+		t.Errorf("the state is %s/%s at %+v, want signed/healthy at %+v", st.Source, st.State, st.Version, signed.Version)
+	}
+	if st.Root.Digest != signed.RootDigest {
+		t.Errorf("the state holds the root %s, want the root subject %s", st.Root.Digest, signed.RootDigest)
+	}
+	if got := m8Field(m8Application(t, target, "root"), "status", "sync", "revision"); got != st.Root.Digest {
+		t.Errorf("root is at %s, want the root of the state %s", got, st.Root.Digest)
+	}
+}
+
+// TestM8CpAdmitStageSigned recreates dev-cell-2 through the portal. The admit stage renders dev-cp again, and on a signed cluster that
+// means a signed publish and then the render of envd. The log of the admit stage names bundle.sh publish --target dev-cp, the version
+// of dev-cp rises by at least 1, the policy spire-system/plane-cells admits the node address of dev-cell-2, and dev-cell-2 turns valid.
+func TestM8CpAdmitStageSigned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("the admit stage creates a step and takes several minutes")
+	}
+	const cell = "dev-cell-2"
+	if st := m8State(t, cpClusterName); st.Source != "signed" {
+		t.Fatalf("the bundle state of %s has the source %q, and the test needs signed", cpClusterName, st.Source)
+	}
+	before := m8Get(t, cpClusterName).Version
+
+	m, err := portal(t, "recreate", "--cell", cell, "--wait")
+	if err != nil {
+		t.Fatalf("recreate %s: %v", cell, err)
+	}
+	res := portalResult(t, m)
+	var id string
+	for _, s := range res.Steps {
+		if s.Cell == cell {
+			id = s.StepID
+		}
+	}
+	if !isStepID(id) {
+		t.Fatalf("the portal printed %v, want a step for %s", m, cell)
+	}
+
+	var admit []string
+	for _, s := range lastAttempts(stepLogSections(t, id)) {
+		if s.stage == "admitting" && s.cluster == cpClusterName {
+			admit = s.lines
+		}
+	}
+	if !strings.Contains(strings.Join(admit, "\n"), "bundle.sh publish --target dev-cp") {
+		t.Errorf("the admitting section of the step %s does not name bundle.sh publish --target dev-cp:\n%s", id, strings.Join(admit, "\n"))
+	}
+	after := m8Get(t, cpClusterName).Version
+	if after.Epoch != before.Epoch || after.Counter < before.Counter+1 {
+		t.Errorf("the version of %s is %+v after the admit stage, want at least one above %+v", cpClusterName, after, before)
+	}
+
+	ip := clusterFacts(t, cell).NodeIP
+	if ip == "" {
+		t.Fatalf("%s has no node address", cell)
+	}
+	for _, ns := range []string{"spire-system", "relay-system"} {
+		out, err := kubectl(t, cpClusterName, "", "-n", ns, "get", "networkpolicy", "plane-cells", "-o", "jsonpath={.spec.ingress[*].from[*].ipBlock.cidr}")
+		if err != nil || !slices.Contains(strings.Fields(out), ip+"/32") {
+			t.Errorf("%s/plane-cells admits %q (%v), want %s/32", ns, out, err, ip)
+		}
+	}
+	waitValid(t, []string{cell}, 5*time.Minute)
+}

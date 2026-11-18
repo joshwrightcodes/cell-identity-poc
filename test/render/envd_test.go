@@ -85,7 +85,9 @@ func TestEnvdRender(t *testing.T) {
 		wantArgs := []string{"run", "--upstream=10.9.0.10:31446", "--expect-id=spiffe://mgmt.poc.internal/api", "--peer-bundle=/run/envd/peer-root/root.crt",
 			"--peer-trust-domain=mgmt.poc.internal", "--spec-key-file=/run/envd/spec-key/spec.pub", "--env=dev", "--output-configmap=spire-system/cell-records",
 			"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints",
-			"--steps-configmap=cell-controller-system/cell-steps", "--step-status-configmap=cell-controller-system/step-status"}
+			"--steps-configmap=cell-controller-system/cell-steps", "--step-status-configmap=cell-controller-system/step-status",
+			"--cluster=dev-cp", "--bundle-mirror=172.18.0.7:5000", "--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
+			"--bundle-store-token=/var/run/secrets/bundle-store/token", "--bundle-state-configmap=envd-system/bundle-state", "--bundle-health-timeout=5m"}
 		if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != fmt.Sprint(wantArgs) {
 			t.Errorf("envd args are %s, want %v", got, wantArgs)
 		}
@@ -178,9 +180,10 @@ func TestEnvdRender(t *testing.T) {
 		if get[string](t, rb, "roleRef", "name") != "envd-records" || get[string](t, rb, "subjects", 0, "name") != "envd" || get[string](t, rb, "subjects", 0, "namespace") != "envd-system" || len(get[[]any](t, rb, "subjects")) != 1 {
 			t.Errorf("RoleBinding is %v", rb)
 		}
-		// Only the Role objects live outside envd-system.
+		// Outside envd-system, the render prints only these Roles, and the plane policies of the harness.
 		for key := range objs {
-			if strings.Contains(key, " spire-system/") && key != "Role spire-system/envd-records" && key != "RoleBinding spire-system/envd-records" {
+			if strings.Contains(key, " spire-system/") && key != "Role spire-system/envd-records" && key != "RoleBinding spire-system/envd-records" &&
+				key != "NetworkPolicy spire-system/plane-cells" && key != "NetworkPolicy spire-system/plane-envd" {
 				t.Errorf("the render prints %s in spire-system", key)
 			}
 		}
@@ -200,7 +203,8 @@ func TestEnvdRender(t *testing.T) {
 		for _, rule := range get[[]any](t, np, "spec", "egress") {
 			egress = append(egress, fmt.Sprintf("%s %v", peerList(t, rule, "to"), portList(t, rule)))
 		}
-		want := []string{"10.9.0.10/32 [31446]", "172.18.0.4/32 [6443]", "10.111.0.1/32 [443]", "spire-system/spire-server [8081]", "gateway-system/cell-gateway [8452]", "observability-system/otel-collector [4317]"}
+		want := []string{"10.9.0.10/32 [31446]", "172.18.0.4/32 [6443]", "10.111.0.1/32 [443]", "spire-system/spire-server [8081]", "gateway-system/cell-gateway [8452]", "observability-system/otel-collector [4317]",
+			"172.18.0.7/32 [5000]", "cell-system/bundle-store [5000]"}
 		if !slices.Equal(egress, want) {
 			t.Errorf("egress rules are %v, want %v", egress, want)
 		}
@@ -320,7 +324,7 @@ func TestEnvdRenderStepFlags(t *testing.T) {
 	for _, rule := range get[[]any](t, objs["NetworkPolicy envd-system/envd"], "spec", "egress") {
 		egress = append(egress, peerList(t, rule, "to"))
 	}
-	if len(egress) != 6 {
-		t.Errorf("the envd policy has the egress rules %v, want the six of M5 and none for the steps", egress)
+	if len(egress) != 8 {
+		t.Errorf("the envd policy has the egress rules %v, want the six of M5, the two of M8 and none for the steps", egress)
 	}
 }
