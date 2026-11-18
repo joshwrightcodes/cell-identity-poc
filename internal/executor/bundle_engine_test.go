@@ -213,3 +213,34 @@ func TestBundleEffectRealEngineTakeover(t *testing.T) {
 		t.Fatal("the store tag does not hold the root of the set")
 	}
 }
+
+// TestBundleEffectRealEngineExpiredInFlight checks that an operation that expires while the engine
+// state still names it in applying, after pod a died, is not reported expired: the cluster may run
+// its root. Pod b answers with a retryable result and does not apply the expired operation.
+func TestBundleEffectRealEngineExpiredInFlight(t *testing.T) {
+	er := newEngineRig(t)
+	set, root, att := er.signedSet("cell-1")
+	er.healthy(set, root)
+	o := er.operation(op.KindBundleApply, string(att))
+	env := er.sign(o)
+	er.state.limit.Store(2)
+	a := er.executor("uid-a", func(c *Config) { c.Bundle = er.engine("celld-uid-a") })
+	if res := a.Execute(ctx, env, fence(1, 1)); res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonEffectFailed {
+		t.Fatalf("pod a = %+v, want a retryable effect failure", res)
+	}
+	er.state.limit.Store(0)
+
+	er.clock.Advance(o.ExpiresAt.Sub(er.clock.Now()) + time.Second)
+	b := er.executor("uid-b", func(c *Config) { c.Bundle = er.engine("celld-uid-b") })
+	res := b.Execute(ctx, env, fence(1, 2))
+	if res.Outcome != op.OutcomeLeaseLost || res.Reason != ReasonEffectFailed || op.IsFinal(res.Outcome) {
+		t.Fatalf("pod b after the expiry = %+v, want a retryable result, not expired", res)
+	}
+	st, _, err := er.state.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.State != "applying" || st.OpID != o.ID || st.Holder != "celld-uid-a" {
+		t.Fatalf("engine state = %s op %s holder %s, want it untouched", st.State, st.OpID, st.Holder)
+	}
+}

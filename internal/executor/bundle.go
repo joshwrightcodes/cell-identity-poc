@@ -11,6 +11,7 @@ import (
 // bundleApplier is the part of bundleapply.Applier that the executor uses.
 type bundleApplier interface {
 	Apply(ctx context.Context, opID, opTarget string, attestation []byte) (bundleapply.Outcome, error)
+	Recorded(ctx context.Context, opID string) (bundleapply.Outcome, bool, error)
 	Status(ctx context.Context) (*op.BundleStatus, error)
 }
 

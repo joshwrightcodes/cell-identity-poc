@@ -87,6 +87,10 @@ func (s *slowStatus) Apply(context.Context, string, string, []byte) (bundleapply
 	return bundleapply.Outcome{}, nil
 }
 
+func (s *slowStatus) Recorded(context.Context, string) (bundleapply.Outcome, bool, error) {
+	return bundleapply.Outcome{}, false, nil
+}
+
 func (s *slowStatus) Status(ctx context.Context) (*op.BundleStatus, error) {
 	dl, ok := ctx.Deadline()
 	if !ok {

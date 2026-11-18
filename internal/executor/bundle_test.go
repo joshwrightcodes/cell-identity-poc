@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,11 @@ type fakeApplier struct {
 	calls   []applyCall
 	status  *op.BundleStatus
 	statErr error
+	// recorded holds the stored results that Recorded returns, recErr fails Recorded, and lookups
+	// lists the operations that Recorded was asked about.
+	recorded map[string]bundleapply.Outcome
+	recErr   error
+	lookups  []string
 }
 
 type fakeAnswer struct {
@@ -42,6 +48,17 @@ func (f *fakeApplier) Apply(_ context.Context, opID, target string, att []byte) 
 }
 
 func (f *fakeApplier) Status(context.Context) (*op.BundleStatus, error) { return f.status, f.statErr }
+
+func (f *fakeApplier) Recorded(_ context.Context, opID string) (bundleapply.Outcome, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lookups = append(f.lookups, opID)
+	if f.recErr != nil {
+		return bundleapply.Outcome{}, false, f.recErr
+	}
+	out, ok := f.recorded[opID]
+	return out, ok, nil
+}
 
 func (f *fakeApplier) called() []applyCall {
 	f.mu.Lock()
@@ -371,4 +388,61 @@ func TestCountsRolledBackAndAlreadyApplied(t *testing.T) {
 	if got["rolled_back/unhealthy"] != 1 || got["already_applied/"] != 1 || got["refused/wrong_target"] != 1 {
 		t.Errorf("metric = %v", got)
 	}
+}
+
+// TestBundleExpiredAsksTheEngine checks that an expired bundle.apply with no applied record of the
+// executor gets its answer from the engine: an operation that the engine still runs is not expired.
+func TestBundleExpiredAsksTheEngine(t *testing.T) {
+	expired := func(r *rig) op.Operation {
+		o := r.operation(op.KindBundleApply, attestation)
+		o.IssuedAt, o.ExpiresAt = r.clock.Now().Add(-time.Hour), r.clock.Now().Add(-time.Minute)
+		return o
+	}
+	cases := []struct {
+		name     string
+		recorded *bundleapply.Outcome
+		recErr   error
+		want     op.Result
+	}{
+		{name: "in flight", recErr: fmt.Errorf("look up: %w", bundleapply.ErrInFlight), want: op.Result{Outcome: op.OutcomeLeaseLost, Reason: ReasonEffectFailed}},
+		{name: "lookup fails", recErr: errors.New("state read refused"), want: op.Result{Outcome: op.OutcomeLeaseLost, Reason: ReasonStoreError}},
+		{name: "recorded rollback", recorded: &bundleapply.Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: "apps-sample:Synced/Degraded"},
+			want: op.Result{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: "apps-sample:Synced/Degraded"}},
+		{name: "recorded apply", recorded: &bundleapply.Outcome{Outcome: op.OutcomeApplied}, want: op.Result{Outcome: op.OutcomeApplied}},
+		{name: "no record", want: op.Result{Outcome: op.OutcomeExpired}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t)
+			f := &fakeApplier{answers: []fakeAnswer{{out: bundleapply.Outcome{Outcome: op.OutcomeApplied}}}, recErr: tc.recErr}
+			o := expired(r)
+			if tc.recorded != nil {
+				f.recorded = map[string]bundleapply.Outcome{o.ID: *tc.recorded}
+			}
+			e := r.bundleExecutor("uid-a", f)
+			res := e.Execute(ctx, r.sign(o), fence(1, 1))
+			if res.Outcome != tc.want.Outcome || res.Reason != tc.want.Reason || res.Detail != tc.want.Detail || res.OpID != o.ID {
+				t.Fatalf("result = %+v, want %s/%s/%s", res, tc.want.Outcome, tc.want.Reason, tc.want.Detail)
+			}
+			if n := len(f.called()); n != 0 {
+				t.Fatalf("the engine applied an expired operation %d times", n)
+			}
+			if len(f.lookups) != 1 || f.lookups[0] != o.ID {
+				t.Fatalf("lookups = %v", f.lookups)
+			}
+		})
+	}
+	t.Run("other kinds do not ask", func(t *testing.T) {
+		r := newRig(t)
+		f := &fakeApplier{answers: []fakeAnswer{{out: bundleapply.Outcome{Outcome: op.OutcomeApplied}}}, recErr: bundleapply.ErrInFlight}
+		e := r.bundleExecutor("uid-a", f)
+		o := r.operation(testKind, "{}")
+		o.IssuedAt, o.ExpiresAt = r.clock.Now().Add(-time.Hour), r.clock.Now().Add(-time.Minute)
+		if res := e.Execute(ctx, r.sign(o), fence(1, 1)); res.Outcome != op.OutcomeExpired {
+			t.Fatalf("result = %+v", res)
+		}
+		if len(f.lookups) != 0 {
+			t.Fatalf("lookups = %v", f.lookups)
+		}
+	})
 }
