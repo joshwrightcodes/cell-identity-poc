@@ -39,20 +39,22 @@ type Good struct {
 
 // State is the durable state of an applier.
 type State struct {
-	Source        string            `json:"source"`
-	Version       bundle.Version    `json:"version"`
-	ContentSHA256 string            `json:"contentSHA256"`
-	KeySHA256     string            `json:"keySHA256"`
-	OpID          string            `json:"opId"`
-	State         string            `json:"state"`
-	Holder        string            `json:"holder"`
-	Until         time.Time         `json:"until"`
-	Root          Root              `json:"root"`
-	Components    map[string]string `json:"components"`
-	Checked       []string          `json:"checked"`
-	CheckedBy     string            `json:"checkedBy"`
-	Good          []Good            `json:"good"`
-	Result        *op.Result        `json:"result,omitempty"`
+	Source        string         `json:"source"`
+	Version       bundle.Version `json:"version"`
+	ContentSHA256 string         `json:"contentSHA256"`
+	KeySHA256     string         `json:"keySHA256"`
+	OpID          string         `json:"opId"`
+	State         string         `json:"state"`
+	// Failed is the detail of the failed health wait while State is rolling_back.
+	Failed     string            `json:"failed,omitempty"`
+	Holder     string            `json:"holder"`
+	Until      time.Time         `json:"until"`
+	Root       Root              `json:"root"`
+	Components map[string]string `json:"components"`
+	Checked    []string          `json:"checked"`
+	CheckedBy  string            `json:"checkedBy"`
+	Good       []Good            `json:"good"`
+	Result     *op.Result        `json:"result,omitempty"`
 }
 
 // Store keeps the State.

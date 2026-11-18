@@ -1151,6 +1151,63 @@ func TestApplyResumeAfterRestart(t *testing.T) {
 	}
 }
 
+// TestApplyResumeRollbackAfterRestart checks that a process that takes over a rollback that a crash
+// stopped resumes the rollback: it does not push the failed root again.
+func TestApplyResumeRollbackAfterRestart(t *testing.T) {
+	for name, again := range map[string]string{"same operation": "opB", "another operation of the same set": "opB2"} {
+		t.Run(name, func(t *testing.T) {
+			e, a, b := twoSets(t)
+			before := e.state()
+			e.health = func(root, app string) (string, string) {
+				if root == b.root.Digest && app == "apps-sample" {
+					return "Synced", "Degraded"
+				}
+				return "Synced", "Healthy"
+			}
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			e.hook = func(int) {
+				if e.currentRoot() == a.root.Digest {
+					e.gate.fail.Store(true)
+					cancel()
+				}
+			}
+			if _, err := e.a.Apply(ctx, "opB", tTarget, b.att); err == nil {
+				t.Fatal("an apply with a canceled context succeeded")
+			}
+			e.gate.fail.Store(false)
+			e.hook = nil
+			st := e.state()
+			if st.State != "rolling_back" || st.Failed != "apps-sample:Synced/Degraded" || st.Holder != "pod-a" {
+				t.Fatalf("state after the crash = %s failed %q holder %s", st.State, st.Failed, st.Holder)
+			}
+
+			cfg := e.cfg
+			cfg.Holder = "pod-b"
+			second := e.applier(cfg)
+			e.clk.Advance(time.Hour)
+			tags := e.tagWrites()
+			var sawFailed bool
+			e.hook = func(int) { sawFailed = sawFailed || e.currentRoot() == b.root.Digest }
+			out, err := second.Apply(t.Context(), again, tTarget, b.att)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantOutcome(t, out, op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+			if n := e.tagWrites() - tags; n != 1 || sawFailed {
+				t.Fatalf("the resume wrote the tag %d times and showed the failed root: %v; want one write of the good root", n, sawFailed)
+			}
+			e.assertRolledBackTo(t, a, bundle.Version{Epoch: 1, Counter: 2})
+			if st := e.state(); st.Failed != "" || st.Result.OpID != again {
+				t.Fatalf("failed %q result %+v", st.Failed, st.Result)
+			}
+			if st := e.state(); st.CheckedBy != before.CheckedBy || fmt.Sprint(st.Checked) != fmt.Sprint(before.Checked) {
+				t.Fatalf("checked %v by %s, want the record of the good set %v by %s", st.Checked, st.CheckedBy, before.Checked, before.CheckedBy)
+			}
+		})
+	}
+}
+
 func TestApplyLockHeld(t *testing.T) {
 	t.Run("live lock", func(t *testing.T) {
 		e := newEnv(t)

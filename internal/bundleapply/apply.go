@@ -34,6 +34,7 @@ import (
 // The values of State.State and State.Source.
 const (
 	stateApplying    = "applying"
+	stateRollingBack = "rolling_back"
 	stateHealthy     = "healthy"
 	stateRolledBack  = "rolled_back"
 	sourceSigned     = "signed"
@@ -229,6 +230,10 @@ type run struct {
 	root      bundle.Artifact
 	// held is true while this process holds the lock and has not written a final state.
 	held bool
+	// rollingBack is true when the run resumes a rollback that another run started, and failed is
+	// the detail of the health wait that failed.
+	rollingBack bool
+	failed      string
 }
 
 type fetched struct {
@@ -275,6 +280,9 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 	}
 	r.held = true
 	defer a.release(r)
+	if r.rollingBack {
+		return a.rollback(ctx, r, r.failed)
+	}
 
 	out, err = a.prepare(ctx, r)
 	if err != nil || out != (Outcome{}) {
@@ -288,12 +296,14 @@ func (a *Applier) apply(ctx context.Context, opID, opTarget string, att []byte) 
 
 // admit takes the lock and decides from the state whether the set goes on: a repeated operation ID
 // gets its stored result, and the version rules refuse or accept the set. The mark moves later,
-// when the state enters applying.
+// when the state enters applying. A set that the state holds in applying or rolling_back resumes
+// from that phase, under any operation ID, so that a new operation for the same set can finish it.
 func (a *Applier) admit(ctx context.Context, r *run, trusted map[string]bool) (Outcome, bool, error) {
 	var out Outcome
 	var proceed, reset bool
 	err := a.update(ctx, func(s *State) error {
 		out, proceed, reset = Outcome{}, false, false
+		r.rollingBack, r.failed = false, ""
 		now := a.cfg.Now()
 		if s.Holder != "" && s.Holder != a.cfg.Holder && now.Before(s.Until) {
 			return ErrLockHeld
@@ -306,7 +316,11 @@ func (a *Applier) admit(ctx context.Context, r *run, trusted map[string]bool) (O
 		if s.KeySHA256 != "" && !trusted[s.KeySHA256] {
 			mark, reset = bundle.Version{}, true
 		}
-		resume := !reset && s.State == stateApplying && s.Version == r.set.Version && s.ContentSHA256 == r.content
+		same := !reset && s.Version == r.set.Version && s.ContentSHA256 == r.content
+		resume := same && (s.State == stateApplying || s.State == stateRollingBack)
+		if resume && s.State == stateRollingBack {
+			r.rollingBack, r.failed = true, s.Failed
+		}
 		if !resume {
 			switch cmp := r.set.Version.Compare(mark); {
 			case cmp < 0:
@@ -841,8 +855,10 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 }
 
 // rollback points the tag back at the last good root, with the manifest bytes that the state holds,
-// and waits for that root to become healthy. It creates no version and deletes nothing. The state
-// names the good root only when the tag holds it.
+// and waits for that root to become healthy. It creates no version and deletes nothing. It first
+// writes the state rolling_back with the failed detail, so that a run that takes over after a crash
+// resumes the rollback and does not push the failed root again. The state names the good root only
+// when the tag holds it.
 func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcome, err error) {
 	cfg := a.cfg
 	rctx, end := a.tel.step(ctx, spanRollback)
@@ -850,7 +866,16 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcom
 	var good *Good
 	// moved is true once the tag holds the good root again.
 	var moved bool
-	st, _, err := cfg.State.Read(rctx)
+	var st State
+	err = a.update(rctx, func(s *State) error {
+		if err := a.mine(s); err != nil {
+			return err
+		}
+		s.State, s.Failed = stateRollingBack, failed
+		s.Until = cfg.Now().Add(a.lockTTL())
+		st = *s
+		return nil
+	})
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -862,15 +887,6 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcom
 	case good == nil || sha256Digest(good.Root.Manifest) != good.Root.Digest:
 		detail = detailRollback
 	default:
-		if err := a.update(rctx, func(s *State) error {
-			if err := a.mine(s); err != nil {
-				return err
-			}
-			s.Until = cfg.Now().Add(a.lockTTL())
-			return nil
-		}); err != nil {
-			return Outcome{}, err
-		}
 		if _, err := cfg.Store.PushManifest(rctx, repoRoot, tagCurrent, bundle.MediaTypeManifest, good.Root.Manifest); err != nil {
 			a.log.Error("bundle rollback tag failed", "error", err)
 			detail = detailRollback
@@ -893,11 +909,15 @@ func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcom
 	}
 	out := Outcome{Outcome: op.OutcomeRolledBack, Reason: op.ReasonUnhealthy, Detail: detail}
 	err = a.finish(rctx, r, out, func(s *State) {
-		s.State = stateRolledBack
+		s.State, s.Failed = stateRolledBack, ""
 		if moved {
 			s.Root, s.Components = good.Root, maps.Clone(good.Components)
 		}
-		s.Checked, s.CheckedBy = a.boundChecked(s, r.checkedBy, nil), r.checkedBy
+		by := r.checkedBy
+		if r.rollingBack {
+			by = s.CheckedBy
+		}
+		s.Checked, s.CheckedBy = a.boundChecked(s, by, nil), by
 	})
 	return out, err
 }
