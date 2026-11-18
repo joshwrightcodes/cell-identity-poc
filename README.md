@@ -1304,6 +1304,43 @@ M6 measured values come from the live part of Task 11. Each value below is a mar
 | `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | 25 and 40 minutes, 1.5 times the slower run, rounded up to 5 minutes |
 | `harness:size` after the runs | 2026-11-18: `management` 3.4 GiB, `dev-cp` 2.5 GiB, each cell 2.2 GiB, `rogue` 0.6 GiB, `registry-mirror` 77 MiB. The VM used 11.7 GB and held 23.6 GB in the file cache |
 
+M7 measured values come from the live part of M7. Each value below is a marker until that run writes it:
+
+| Value | Result |
+| --- | --- |
+| `gate:m7`, two runs | <measured in the live part> |
+| `GATE_M7_BUDGET_MINUTES` | <set in the live part>, 1.5 times the slower run, rounded up to 5 minutes |
+| Longest policy window of a new pod in `dev-cell-1` | <measured in the live part> |
+
+## Malicious cell tests
+
+The M7 tests try to break each identity check of the PoC. A test points a real client binary at an impostor server.
+Another test puts a forwarder between a client and the real server, and changes one byte.
+Each test names the reason code that the client logs.
+Each impostor test also checks that the client sent no byte after the handshake.
+
+Build the images, and then run the tests:
+
+```sh
+mise run images
+mise run gate:m7
+```
+
+Every test runs in a namespace with the prefix `m7-` and the label `cell.poc.internal/e2e=true`.
+A test that needs the host network makes its own `m7-` namespace with Pod Security `privileged`.
+No test changes the label of a namespace that a bundle owns.
+
+If a run stops early, repair the clusters:
+
+```sh
+mise run gate:m7:repair -- --check
+mise run gate:m7:repair
+```
+
+The first command lists each `m7-` namespace that is left.
+The second command deletes them in every cluster and waits until none is left.
+It is safe to run again.
+
 ## Side effects of gate:m2
 
 `gate:m2` changes the clusters while it runs, and it puts them back before it ends:
