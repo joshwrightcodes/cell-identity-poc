@@ -70,21 +70,26 @@ func m8Mirror(t *testing.T) *ocistore.Store {
 // always give the same digest.
 func m8PushBundle(t *testing.T, target, component string, manifests []byte) string {
 	t.Helper()
+	return m8PushTo(t, m8Mirror(t), "bundles/"+target+"/"+component, manifests)
+}
+
+// m8PushTo packs the manifests as a bundle, pushes it to the repository of the store, and returns the digest of its manifest.
+func m8PushTo(t *testing.T, s *ocistore.Store, repo string, manifests []byte) string {
+	t.Helper()
 	objs, err := bundle.DecodeManifests(manifests, bundle.MaxObjects)
 	if err != nil {
-		t.Fatalf("decode the manifests of %s: %v", component, err)
+		t.Fatalf("decode the manifests of %s: %v", repo, err)
 	}
 	canon, err := bundle.Canonical(objs)
 	if err != nil {
-		t.Fatalf("canonical form of %s: %v", component, err)
+		t.Fatalf("canonical form of %s: %v", repo, err)
 	}
 	art, err := bundle.Pack(map[string][]byte{bundle.ManifestsFile: canon})
 	if err != nil {
-		t.Fatalf("pack %s: %v", component, err)
+		t.Fatalf("pack %s: %v", repo, err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	s, repo := m8Mirror(t), "bundles/"+target+"/"+component
 	if err := s.PushBlob(ctx, repo, art.ConfigDigest, art.Config); err != nil {
 		t.Fatalf("push the config of %s: %v", repo, err)
 	}
@@ -198,6 +203,23 @@ func m8State(t *testing.T, target string) bundleapply.State {
 // test when the restore does not end applied or already_applied.
 func m8RestoreTarget(t *testing.T, target string) {
 	t.Helper()
+	m8RecordTarget(t, target)
+	t.Cleanup(func() {
+		res, err := m8PublishHydrated(t, target)
+		if err != nil {
+			t.Errorf("restore the hydrated set of %s: %v", target, err)
+			return
+		}
+		if res["outcome"] != op.OutcomeApplied && res["outcome"] != op.OutcomeAlreadyApplied {
+			t.Errorf("restore of %s ended %v", target, res)
+		}
+	})
+}
+
+// m8RecordTarget adds the target to build/gate/m8-bundles, so that gate:m8:repair publishes its hydrated set again after an
+// aborted run.
+func m8RecordTarget(t *testing.T, target string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(m8BundlesFile), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -213,16 +235,6 @@ func m8RestoreTarget(t *testing.T, target string) {
 		}
 		f.Close()
 	}
-	t.Cleanup(func() {
-		res, err := m8PublishHydrated(t, target)
-		if err != nil {
-			t.Errorf("restore the hydrated set of %s: %v", target, err)
-			return
-		}
-		if res["outcome"] != op.OutcomeApplied && res["outcome"] != op.OutcomeAlreadyApplied {
-			t.Errorf("restore of %s ended %v", target, res)
-		}
-	})
 }
 
 // m8PublishHydrated runs mise run bundle -- publish --target <target> --wait, and returns the last JSON line that it printed (the
@@ -320,4 +332,33 @@ func m8Subject(t *testing.T, envelope json.RawMessage, name string) string {
 	}
 	t.Fatalf("the signed statement names no subject %s", name)
 	return ""
+}
+
+// m8PubKeyPEM writes the current public key of mgmtd as a PEM file in a temporary directory and returns its path. The key is public data.
+func m8PubKeyPEM(t *testing.T) string {
+	t.Helper()
+	line, err := m8Command(t, time.Minute, "", "run", "mgmt", "--", "pubkey")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, line)
+	}
+	pem, err := m8Command(t, time.Minute, m8LastLine(line), "run", "bundlectl", "--", "pubkey-pem")
+	if err != nil {
+		t.Fatalf("%v\n%s", err, pem)
+	}
+	path := filepath.Join(t.TempDir(), "mgmt.pub")
+	if err := os.WriteFile(path, []byte(pem+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// m8Cosign runs cosign through mise with an empty Docker configuration and no network option, and returns its combined output.
+func m8Cosign(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "mise", append([]string{"x", "--", "cosign"}, args...)...)
+	cmd.Env = append(os.Environ(), "DOCKER_CONFIG="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
