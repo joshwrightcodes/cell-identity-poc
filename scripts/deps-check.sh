@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Check the module rules of the Go binaries. Usage: deps-check.sh
-# For each platform in DEPS_CHECK_PLATFORMS (default "linux/arm64 darwin/arm64"), the script lists every package that each
-# binary in cmd/ compiles, and the direct imports of every package of the module, its tests and the e2e tests included. It
-# prints one line for each broken rule, binary or package and platform, and exits 1:
+# For each platform in DEPS_CHECK_PLATFORMS, the script lists every package that each binary in cmd/ compiles, and the direct
+# imports of every package of the module, its tests and the e2e tests included. The default platforms are the ko platforms
+# of KO_DEFAULTPLATFORMS (comma-separated, linux/arm64 when it is unset) and darwin/arm64, where hostsvc runs. It prints one
+# line for each broken rule, binary or package and platform, and exits 1:
 #   prometheus              a binary compiles a github.com/prometheus/ package
+#   prometheus_import       a package, its tests included, imports a github.com/prometheus/ package
 #   opa_forbidden           a package imports, or a binary compiles, opa/v1/sdk, opa/v1/plugins, opa/v1/runtime or opa/v1/storage/disk
 #   opa_outside_appliers    a binary other than celld and envd compiles an OPA package
 #   opa_outside_bundleapply a package outside internal/bundleapply imports an OPA package
@@ -15,7 +17,8 @@ module=github.com/joshwrightcodes/cell-identity-poc
 opa=github.com/open-policy-agent/opa
 forbidden=("$opa/v1/sdk" "$opa/v1/plugins" "$opa/v1/runtime" "$opa/v1/storage/disk")
 appliers=" celld envd "
-platforms="${DEPS_CHECK_PLATFORMS:-linux/arm64 darwin/arm64}"
+ko_platforms="${KO_DEFAULTPLATFORMS:-linux/arm64}"
+platforms="${DEPS_CHECK_PLATFORMS:-${ko_platforms//,/ } darwin/arm64}"
 failures=0
 nl=$'\n'
 
@@ -64,6 +67,9 @@ for platform in $platforms; do
   while read -r pkg pkgs; do
     [[ -n "$pkg" ]] || continue
     rel=${pkg#"$module"/}
+    if hit="$(first_match github.com/prometheus "$pkgs")"; then
+      fail "prometheus_import: $rel imports $hit ($platform)"
+    fi
     for f in "${forbidden[@]}"; do
       if hit="$(first_match "$f" "$pkgs")"; then
         fail "opa_forbidden: $rel imports $hit ($platform)"

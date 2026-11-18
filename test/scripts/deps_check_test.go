@@ -224,3 +224,48 @@ func TestDepsCheckGoListFails(t *testing.T) {
 		})
 	}
 }
+
+// TestDepsCheckPrometheusImport: a package of the module that imports a github.com/prometheus/ package fails, a test import
+// included, even when no binary compiles it.
+func TestDepsCheckPrometheusImport(t *testing.T) {
+	imports := append(cleanImports(), depsModule+"/test/e2e testing github.com/prometheus/client_golang/prometheus/testutil")
+	_, stderr, _, code := runDepsCheck(t, map[string][]string{"deps": cleanDeps(), "imports": imports})
+	if code != 1 {
+		t.Fatalf("exit %d, want 1:\n%s", code, stderr)
+	}
+	wantLines(t, stderr, []string{
+		"deps-check: prometheus_import: test/e2e imports github.com/prometheus/client_golang/prometheus/testutil (linux/arm64)",
+		"deps-check: prometheus_import: test/e2e imports github.com/prometheus/client_golang/prometheus/testutil (darwin/arm64)",
+		"deps-check: 2 rule failures",
+	}, []string{"prometheus: "})
+}
+
+// TestDepsCheckKoPlatforms: the linux platforms come from KO_DEFAULTPLATFORMS, a comma-separated list, and darwin/arm64
+// follows them. DEPS_CHECK_PLATFORMS replaces the whole list.
+func TestDepsCheckKoPlatforms(t *testing.T) {
+	files := map[string][]string{"deps": cleanDeps(), "imports": cleanImports()}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string
+		deny []string
+	}{
+		{"one ko platform", []string{"KO_DEFAULTPLATFORMS=linux/amd64"},
+			[]string{"./cmd/... GOOS=linux GOARCH=amd64 CGO_ENABLED=0", "./cmd/... GOOS=darwin GOARCH=arm64 CGO_ENABLED=1"},
+			[]string{"GOARCH=arm64 CGO_ENABLED=0"}},
+		{"two ko platforms", []string{"KO_DEFAULTPLATFORMS=linux/arm64,linux/amd64"},
+			[]string{"./cmd/... GOOS=linux GOARCH=arm64 CGO_ENABLED=0", "./cmd/... GOOS=linux GOARCH=amd64 CGO_ENABLED=0", "./cmd/... GOOS=darwin GOARCH=arm64 CGO_ENABLED=1"},
+			nil},
+		{"explicit list", []string{"KO_DEFAULTPLATFORMS=linux/amd64", "DEPS_CHECK_PLATFORMS=linux/riscv64"},
+			[]string{"./cmd/... GOOS=linux GOARCH=riscv64 CGO_ENABLED=0"},
+			[]string{"GOARCH=amd64", "GOOS=darwin"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, stderr, calls, code := runDepsCheck(t, files, tc.env...)
+			if code != 0 {
+				t.Fatalf("exit %d, want 0:\n%s", code, stderr)
+			}
+			wantLines(t, calls, tc.want, tc.deny)
+		})
+	}
+}
