@@ -843,10 +843,10 @@ func (a *Applier) waitFor(ctx context.Context, wants func(yield func(name, diges
 // rollback points the tag back at the last good root, with the manifest bytes that the state holds,
 // and waits for that root to become healthy. It creates no version and deletes nothing. The state
 // names the good root only when the tag holds it.
-func (a *Applier) rollback(ctx context.Context, r *run, failed string) (Outcome, error) {
+func (a *Applier) rollback(ctx context.Context, r *run, failed string) (_ Outcome, err error) {
 	cfg := a.cfg
 	rctx, end := a.tel.step(ctx, spanRollback)
-	defer func() { end(nil) }()
+	defer func() { end(err) }()
 	var good *Good
 	// moved is true once the tag holds the good root again.
 	var moved bool

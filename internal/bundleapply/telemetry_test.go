@@ -1,10 +1,12 @@
 package bundleapply
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -147,6 +149,41 @@ func TestApplyTelemetry(t *testing.T) {
 		wantOutcome(t, te.apply("op2", b), op.OutcomeRefused, op.ReasonVersionOld, "")
 		if n := te.counter(t, attrs("refused", "version_old")); n != 1 {
 			t.Fatalf("outcomes refused/version_old = %d", n)
+		}
+	})
+	t.Run("rollback ends with an error", func(t *testing.T) {
+		te := newTelemetryEnv(t)
+		a := te.set(1, std("a"))
+		wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+		b := te.set(2, std("b"))
+		te.health = func(root, app string) (string, string) {
+			if app == "apps-sample" {
+				return "Synced", "Progressing"
+			}
+			return "Synced", "Healthy"
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		te.hook = func(int) {
+			if te.currentRoot() == a.root.Digest {
+				cancel()
+			}
+		}
+		if _, err := te.a.Apply(ctx, "opB", tTarget, b.att); err == nil {
+			t.Fatal("a rollback with a canceled context succeeded")
+		}
+		var found bool
+		for _, s := range te.spans.Ended() {
+			if s.Name() != "rollback" {
+				continue
+			}
+			found = true
+			if s.Status().Code != codes.Error {
+				t.Fatalf("rollback span status = %v, want Error", s.Status())
+			}
+		}
+		if !found {
+			t.Fatal("no rollback span")
 		}
 	})
 	t.Run("lock held", func(t *testing.T) {
