@@ -3,27 +3,19 @@
 package bundleapply
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strings"
 	"sync"
-	"unicode"
-	"unicode/utf8"
 
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/rego"
 	"github.com/open-policy-agent/opa/v1/storage"
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
-	yamlv3 "go.yaml.in/yaml/v3"
-	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
-	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
@@ -77,50 +69,34 @@ func layout(detail string) *Refusal {
 	return &Refusal{Reason: op.ReasonComponentNotAllowed, Detail: detail}
 }
 
-// Decode reads the documents of manifests. A document of kind List gives a Refusal with detail
-// list. Any other document with an items field gives items_list, because Argo CD expands every
-// object that has an items array and the policy checks only the outer object. More than maxObjects
-// objects give too_large, and a document that is not an object with apiVersion, kind and a name
-// gives layout.
+// Decode reads the documents of manifests with bundle.DecodeManifests and returns the objects. Its
+// refusals are component_not_allowed with detail layout, list, items_list or too_large.
 func Decode(manifests []byte, maxObjects int) ([]Object, error) {
-	if !plainText(manifests) {
-		return nil, layout("layout")
+	raws, err := bundle.DecodeManifests(manifests, maxObjects)
+	if err != nil {
+		return nil, refusalOf(err)
 	}
-	rd := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(manifests)))
-	var objs []Object
-	for {
-		doc, err := rd.Read()
-		if errors.Is(err, io.EOF) {
-			return objs, nil
-		}
-		if err != nil {
-			return nil, layout("layout")
-		}
-		if !singlePlainDocument(doc) {
-			return nil, layout("layout")
-		}
-		var raw map[string]any
-		if err := yaml.Unmarshal(doc, &raw); err != nil {
-			return nil, layout("layout")
-		}
-		if len(raw) == 0 {
-			continue
-		}
-		if k, _ := raw["kind"].(string); k == "List" {
-			return nil, layout("list")
-		}
-		if _, has := raw["items"]; has {
-			return nil, layout("items_list")
-		}
+	return toObjects(raws)
+}
+
+func refusalOf(err error) error {
+	var me *bundle.ManifestError
+	if errors.As(err, &me) {
+		return layout(me.Detail)
+	}
+	return layout("layout")
+}
+
+func toObjects(raws []map[string]any) ([]Object, error) {
+	objs := make([]Object, 0, len(raws))
+	for _, raw := range raws {
 		o, ok := toObject(raw)
 		if !ok {
 			return nil, layout("layout")
 		}
-		if len(objs) >= maxObjects {
-			return nil, layout("too_large")
-		}
 		objs = append(objs, o)
 	}
+	return objs, nil
 }
 
 func toObject(raw map[string]any) (Object, bool) {
@@ -412,92 +388,12 @@ func denials(rs rego.ResultSet, evalErr error) ([]denial, error) {
 	return out, nil
 }
 
-// plainText reports whether the bytes hold only text that every YAML reader splits into lines in
-// the same way: valid UTF-8 with no byte order mark, no NUL byte, no lone carriage return, no
-// NEL, line separator or paragraph separator, and no line that starts a YAML document end marker.
-func plainText(b []byte) bool {
-	if !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 || bytes.Contains(b, []byte("\xef\xbb\xbf")) {
-		return false
-	}
-	for i := 0; i < len(b); i++ {
-		if b[i] == '\r' && (i+1 >= len(b) || b[i+1] != '\n') {
-			return false
-		}
-	}
-	for _, r := range string(b) {
-		if r == '\u0085' || r == '\u2028' || r == '\u2029' {
-			return false
-		}
-	}
-	for _, line := range bytes.Split(b, []byte("\n")) {
-		if bytes.HasPrefix(line, []byte("...")) && (len(line) == 3 || line[3] == ' ' || line[3] == '\t' || line[3] == '\r') {
-			return false
-		}
-	}
-	return true
-}
-
-// singlePlainDocument reports whether chunk is zero or one YAML document that starts with a block
-// construct and holds no anchor, alias, merge key, tag or duplicate key.
-func singlePlainDocument(chunk []byte) bool {
-	first := bytes.TrimLeftFunc(chunk, unicode.IsSpace)
-	if len(first) > 0 && (first[0] == '{' || first[0] == '[') {
-		return false
-	}
-	dec := yamlv3.NewDecoder(bytes.NewReader(chunk))
-	var n yamlv3.Node
-	if err := dec.Decode(&n); err != nil {
-		return errors.Is(err, io.EOF)
-	}
-	var again yamlv3.Node
-	if err := dec.Decode(&again); !errors.Is(err, io.EOF) {
-		return false
-	}
-	return plainNode(&n)
-}
-
-func plainNode(n *yamlv3.Node) bool {
-	if n.Anchor != "" || n.Kind == yamlv3.AliasNode || n.Style&yamlv3.TaggedStyle != 0 {
-		return false
-	}
-	if n.Kind == yamlv3.MappingNode {
-		seen := make(map[string]bool, len(n.Content)/2)
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			k := n.Content[i]
-			if k.Kind == yamlv3.ScalarNode {
-				if k.Tag == "!!merge" || seen[k.Value] {
-					return false
-				}
-				seen[k.Value] = true
-			}
-		}
-	}
-	for _, c := range n.Content {
-		if !plainNode(c) {
-			return false
-		}
-	}
-	return true
-}
-
-// DecodeCanonical decodes manifests and refuses them unless they are the canonical form of their own
-// objects (bundle.Canonical). Only that form reads the same in every YAML and JSON reader, so the
-// objects that the policy sees are the objects that Argo CD applies.
+// DecodeCanonical decodes manifests with bundle.DecodeCanonical, so the applier refuses the same
+// bytes as bundle.Pack. The detail not_canonical means that the bytes are not the canonical form.
 func DecodeCanonical(manifests []byte, maxObjects int) ([]Object, error) {
-	objs, err := Decode(manifests, maxObjects)
+	raws, err := bundle.DecodeCanonical(manifests, maxObjects)
 	if err != nil {
-		return nil, err
+		return nil, refusalOf(err)
 	}
-	raws := make([]map[string]any, len(objs))
-	for i, o := range objs {
-		raws[i] = o.Raw
-	}
-	canon, err := bundle.Canonical(raws)
-	if err != nil {
-		return nil, layout("layout")
-	}
-	if !bytes.Equal(canon, manifests) {
-		return nil, layout("not_canonical")
-	}
-	return objs, nil
+	return toObjects(raws)
 }

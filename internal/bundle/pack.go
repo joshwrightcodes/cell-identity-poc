@@ -86,13 +86,7 @@ func validFileName(name string) bool {
 // layer is one uncompressed tar in USTAR form with each file at the root, mode 0644, user and group 0, modification time 0, and the entries sorted by name.
 // The same files always give the same bytes, with no dependency on a compression library. A file
 // name holds no slash, and a file is not empty. A bundle holds 1 to MaxEntries files.
-func Pack(files map[string][]byte) (Artifact, error) { return pack(files, true) }
-
-// PackUnchecked is Pack without the canonical check of ManifestsFile. Tests use it to build a layer
-// that the applier must refuse. A publisher uses Pack.
-func PackUnchecked(files map[string][]byte) (Artifact, error) { return pack(files, false) }
-
-func pack(files map[string][]byte, checkManifests bool) (Artifact, error) {
+func Pack(files map[string][]byte) (Artifact, error) {
 	if len(files) == 0 || len(files) > MaxEntries {
 		return Artifact{}, fmt.Errorf("%w: %d files are outside 1 to %d", ErrLayout, len(files), MaxEntries)
 	}
@@ -105,7 +99,7 @@ func pack(files map[string][]byte, checkManifests bool) (Artifact, error) {
 		if len(body) == 0 {
 			return Artifact{}, fmt.Errorf("%w: file %q is empty", ErrLayout, name)
 		}
-		if checkManifests && name == ManifestsFile {
+		if name == ManifestsFile {
 			if err := CheckCanonical(body); err != nil {
 				return Artifact{}, fmt.Errorf("file %q: %w", name, err)
 			}

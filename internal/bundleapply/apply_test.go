@@ -1,10 +1,15 @@
 package bundleapply
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -623,7 +628,7 @@ func TestApplyComponentNotAllowed(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
-			art, err := bundle.PackUnchecked(map[string][]byte{"manifests.yaml": []byte(body)})
+			art, err := packRaw(map[string][]byte{"manifests.yaml": []byte(body)})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1128,4 +1133,60 @@ func TestApplyAppProjectSpec(t *testing.T) {
 		wantOutcome(t, e.apply("op1", e.set(1, []spec{{"argocd", "argocd", body}})), op.OutcomeRefused, op.ReasonComponentNotAllowed, "appproject_spec")
 		e.assertUntouched(t)
 	})
+}
+
+// packRaw builds a bundle artifact like bundle.Pack, without the canonical check of manifests.yaml,
+// for tests of a layer that the applier must refuse.
+func packRaw(files map[string][]byte) (bundle.Artifact, error) {
+	names := make([]string, 0, len(files))
+	for n := range files {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, n := range names {
+		hdr := &tar.Header{Typeflag: tar.TypeReg, Name: n, Mode: 0o644, Size: int64(len(files[n])), ModTime: time.Unix(0, 0), Format: tar.FormatUSTAR}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return bundle.Artifact{}, err
+		}
+		if _, err := tw.Write(files[n]); err != nil {
+			return bundle.Artifact{}, err
+		}
+	}
+	if err := tw.Close(); err != nil {
+		return bundle.Artifact{}, err
+	}
+	dg := func(b []byte) string { sum := sha256.Sum256(b); return "sha256:" + hex.EncodeToString(sum[:]) }
+	a := bundle.Artifact{Layer: buf.Bytes(), Config: []byte("{}")}
+	a.LayerDigest, a.ConfigDigest = dg(a.Layer), dg(a.Config)
+	type desc struct {
+		MediaType string `json:"mediaType"`
+		Digest    string `json:"digest"`
+		Size      int    `json:"size"`
+	}
+	m, err := json.Marshal(struct {
+		SchemaVersion int    `json:"schemaVersion"`
+		MediaType     string `json:"mediaType"`
+		Config        desc   `json:"config"`
+		Layers        []desc `json:"layers"`
+	}{2, bundle.MediaTypeManifest, desc{bundle.MediaTypeConfig, a.ConfigDigest, len(a.Config)},
+		[]desc{{bundle.MediaTypeLayer, a.LayerDigest, len(a.Layer)}}})
+	if err != nil {
+		return bundle.Artifact{}, err
+	}
+	a.Manifest, a.Digest = m, dg(m)
+	return a, nil
+}
+
+func TestPackRawMatchesPack(t *testing.T) {
+	files := map[string][]byte{bundle.ManifestsFile: canonBody(t, cmap("apps-demo", "x", "1"))}
+	a, err := bundle.Pack(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := packRaw(files)
+	if err != nil || a.Digest != b.Digest || a.LayerDigest != b.LayerDigest {
+		t.Fatalf("packRaw differs from Pack: %v", err)
+	}
 }

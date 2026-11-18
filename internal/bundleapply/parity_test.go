@@ -171,6 +171,45 @@ func parityCases() []pcase {
 		{"scalar", []byte("text\n")},
 		{"doc start inline", []byte("--- apiVersion: v1\n")},
 		{"yaml directive", []byte("%YAML 1.1\n---\n" + pGood)},
+		{"alias bomb", []byte("a: &a [x, x, x, x, x, x, x, x, x]\nb: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]\nc: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]\n")},
+		{"merge list of maps", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  <<: [{namespace: argocd}, {name: a}]\n")},
+		{"merge and explicit key", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  <<: {namespace: apps-demo}\n  namespace: argocd\n  name: a\n")},
+		{"merge tag", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  !!merge \"<<\": {namespace: argocd}\n  name: a\n")},
+		{"separator comment", []byte(pGood + "--- # c\n" + pNP)},
+		{"separator spaces", []byte(pGood + "---   \n" + pNP)},
+		{"separator tab", []byte(pGood + "---\t\n" + pNP)},
+		{"four dashes", []byte(pGood + "----\n" + pNP)},
+		{"indented separator", []byte(pGood + " ---\n" + pNP)},
+		{"separator with content", []byte(pGood + "--- " + pNP)},
+		{"dots in block scalar", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata:\n  k: |\n    x\n...\n" + pNP)},
+		{"separator in quoted scalar", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {k: \"x\n---\ny\"}\n")},
+		{"empty object", []byte("{}\n---\n" + pGood)},
+		{"tilde document", []byte("~\n---\n" + pGood)},
+		{"comment document", []byte("# c\n---\n" + pGood)},
+		{"top sequence", []byte("- a\n- b\n")},
+		{"top block scalar", []byte("|\n  apiVersion: v1\n  kind: ConfigMap\n  metadata: {name: a, namespace: argocd}\n")},
+		{"object text in value", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata:\n  k: |\n    apiVersion: v1\n    kind: Secret\n")},
+		{"json after 4096 spaces", []byte(strings.Repeat(" ", 4100) + pJSON + "\n" + pNP)},
+		{"vt before json", []byte("\v" + pJSON + "\n" + pNP)},
+		{"json duplicate key", []byte(`{"apiVersion":"v1","kind":"ConfigMap","kind":"Secret","metadata":{"name":"a"}}`)},
+		{"json escaped key", []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"argocd"},"it\u0065ms":[]}`)},
+		{"case differing keys", []byte("apiVersion: v1\nkind: ConfigMap\nKind: Secret\nmetadata: {name: a, namespace: argocd}\n")},
+		{"binary kind", []byte("apiVersion: v1\nkind: !!binary Q29uZmlnTWFw\nmetadata: {name: a, namespace: argocd}\n")},
+		{"int namespace", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: !!int 5}\n")},
+		{"yes label", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd, labels: {k: yes}}\n")},
+		{"null tag mismatch", []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: !!null x}\n")},
+		{"utf16 without bom", []byte("a\x00p\x00i\x00V\x00e\x00r\x00s\x00i\x00o\x00n\x00:\x00 \x00v\x001\x00\n\x00")},
+		{"json long key", []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"argocd"},"` + strings.Repeat("k", 1100) + `":1}`)},
+		{"json newline before colon", []byte("{\"apiVersion\"\n:\"v1\",\"kind\":\"ConfigMap\",\"metadata\":{\"name\":\"a\"}}\n")},
+		{"lower case kind", []byte("apiVersion: v1\nkind: configmap\nmetadata: {name: a, namespace: argocd}\n")},
+		{"Kind key only", []byte("apiVersion: v1\nKind: ConfigMap\nmetadata: {name: a, namespace: argocd}\n")},
+		{"kind List", []byte("apiVersion: v1\nkind: List\nitems:\n- {apiVersion: v1, kind: ConfigMap, metadata: {name: a, namespace: argocd}}\n")},
+		{"list with items", []byte("apiVersion: v1\nkind: ConfigMapList\nitems:\n- {apiVersion: v1, kind: ConfigMap, metadata: {name: a, namespace: argocd}}\n")},
+		{"items null", []byte("apiVersion: v1\nkind: ConfigMapList\nitems: null\n")},
+		{"items by escape", []byte(`{"apiVersion":"v1","kind":"ConfigMapList","it\u0065ms":[{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"a","namespace":"argocd"}}]}`)},
+		{"items by merge", []byte("apiVersion: v1\nkind: ConfigMapList\n<<: {items: [{apiVersion: v1, kind: ConfigMap, metadata: {name: a, namespace: argocd}}]}\n")},
+		{"crlf separator", []byte(pGood + "---\r\n" + pNP)},
+		{"comment json yaml", []byte("# c\n" + pJSON + "\n" + pNP)},
 	}
 }
 
@@ -228,6 +267,7 @@ func TestDecodeDefenceInDepth(t *testing.T) {
 		"custom tag":        "apiVersion: v1\nkind: !foo ConfigMap\nmetadata: {name: a, namespace: argocd}\n",
 		"str tag":           "apiVersion: v1\nkind: !!str ConfigMap\nmetadata: {name: a, namespace: argocd}\n",
 		"duplicate key":     "apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd, namespace: apps-demo}\n",
+		"comment json yaml": "# c\n" + pJSON + "\n" + pNP,
 		"duplicate top":     "apiVersion: v1\nkind: ConfigMap\nkind: Secret\nmetadata: {name: a}\n",
 	} {
 		var r *Refusal
@@ -245,27 +285,6 @@ func TestDecodeDefenceInDepth(t *testing.T) {
 	} {
 		if _, err := Decode([]byte(in), 10); err != nil {
 			t.Errorf("%s: %v", name, err)
-		}
-	}
-}
-
-func TestSinglePlainDocument(t *testing.T) {
-	for in, want := range map[string]bool{
-		"a: 1\n":             false,
-		"a: 1\n--- b: 2\n":   false,
-		"a: 1\n...\nb: 2\n":  false,
-		"a: 1\n---\nb: 2\n":  false,
-		"":                   true,
-		"# only a comment\n": true,
-		"a: {b: 1}\n":        true,
-		"a: [1, 2]\n":        true,
-	} {
-		got := singlePlainDocument([]byte(in))
-		if in == "a: 1\n" {
-			want = true
-		}
-		if got != want {
-			t.Errorf("%q: got %v, want %v", in, got, want)
 		}
 	}
 }
@@ -339,6 +358,83 @@ func TestCanonicalIsStable(t *testing.T) {
 	if got, _ := argoRender(c1); len(got) != 37 {
 		t.Fatalf("Argo CD reads %d objects of the canonical render", len(got))
 	}
+}
+
+// canonicalSeeds are canonical sets that must give the same objects in both readers, one by one.
+func canonicalSeeds(t testing.TB) [][]byte {
+	seeds := [][]byte{
+		canonicalOf(t, []byte(pGood+"---\n"+pNP)),
+		canonicalOf(t, generatedRender()),
+		canonicalOf(t, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd}\ndata: {\"21\": a, 2B22: b, 9YAC: c, \"on\": \"yes\", n: \"1.0\", e: \"\", t: \"~\"}\n")),
+		canonicalOf(t, []byte("apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: argocd, labels: {k: v}}\ndata:\n  k: |\n    multi\n    line: text\n  long: "+strings.Repeat("word ", 60)+"\n")),
+	}
+	for _, c := range parityCases() {
+		objs, err := Decode(c.in, 2000)
+		if err != nil || len(objs) == 0 {
+			continue
+		}
+		raws := make([]map[string]any, len(objs))
+		for i, o := range objs {
+			raws[i] = o.Raw
+		}
+		b, err := bundle.Canonical(raws)
+		if err != nil {
+			t.Logf("class %q has no canonical form: %v", c.name, err)
+			continue
+		}
+		seeds = append(seeds, b)
+	}
+	return seeds
+}
+
+func TestCanonicalSeedsReadTheSameInArgoCD(t *testing.T) {
+	seeds := canonicalSeeds(t)
+	t.Logf("%d canonical seeds, %d parity classes", len(seeds), len(parityCases()))
+	for i, in := range seeds {
+		objs, err := DecodeCanonical(in, 2000)
+		if err != nil {
+			t.Fatalf("seed %d: %v", i, err)
+		}
+		argo, msg := argoRender(in)
+		if msg != "" || len(argo) != len(objs) {
+			t.Fatalf("seed %d: Argo CD gives %d objects (%s), decode gives %d", i, len(argo), msg, len(objs))
+		}
+		for j := range objs {
+			if normal(objs[j].Raw) != normal(argo[j]) {
+				t.Fatalf("seed %d object %d differs", i, j)
+			}
+		}
+	}
+}
+
+// FuzzCanonicalParity maps each input that Decode accepts to its canonical form, and compares that
+// form with the Argo CD read path object by object.
+func FuzzCanonicalParity(f *testing.F) {
+	for _, c := range parityCases() {
+		f.Add(c.in)
+	}
+	f.Fuzz(func(t *testing.T, in []byte) {
+		if len(in) > 1<<16 {
+			return
+		}
+		objs, err := Decode(in, 2000)
+		if err != nil {
+			return
+		}
+		raws := make([]map[string]any, len(objs))
+		for i, o := range objs {
+			raws[i] = o.Raw
+		}
+		canon, err := bundle.Canonical(raws)
+		if err != nil {
+			return
+		}
+		got, err := DecodeCanonical(canon, 2000)
+		if err != nil {
+			t.Fatalf("the canonical form is refused: %v\n%q", err, canon)
+		}
+		parity(t, "canonical", canon, func(b []byte) ([]Object, error) { return got, nil })
+	})
 }
 
 func FuzzDecodeParity(f *testing.F) {

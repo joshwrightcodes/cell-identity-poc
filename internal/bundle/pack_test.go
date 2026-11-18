@@ -152,17 +152,18 @@ func TestPackUnpackRoundTrip(t *testing.T) {
 }
 
 func TestUnpackComponent(t *testing.T) {
-	a, err := bundle.Pack(map[string][]byte{"manifests.yaml": []byte("kind: ConfigMap\n")})
+	valid := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n"
+	a, err := bundle.Pack(map[string][]byte{"manifests.yaml": []byte(valid)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, err := bundle.UnpackComponent(a.Layer, 1<<20)
-	if err != nil || string(got) != "kind: ConfigMap\n" {
+	if err != nil || string(got) != valid {
 		t.Fatalf("got %q, %v", got, err)
 	}
 	for name, files := range map[string]map[string][]byte{
 		"other_name":   {"other.yaml": []byte("x")},
-		"extra_file":   {"manifests.yaml": []byte("kind: X\n"), "extra.yaml": []byte("y")},
+		"extra_file":   {"manifests.yaml": []byte("apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: a\n"), "extra.yaml": []byte("y")},
 		"only_a_wrong": {"manifest.yaml": []byte("x")},
 	} {
 		b, err := bundle.Pack(files)
