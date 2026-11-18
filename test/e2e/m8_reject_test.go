@@ -14,15 +14,20 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
-// m8Refusal is one set that a cell must refuse. The bundle of the component holds the manifests, and the set is the last signed
-// set of the target with that bundle in place of the bundle of the component. A component that the last set lacks is added with the
-// wave and the namespace.
+// m8Refusal is one set that a cell must refuse. The bundle of the component holds the live objects of the component and the probe, and
+// the set is the live set of the target with that bundle in place of the live bundle. A component that the target does not run is added
+// with the wave and the namespace, and its bundle holds the probe only. A set that the engine accepts by mistake then changes one object
+// and prunes nothing.
 type m8Refusal struct {
 	name      string
 	component string
 	wave      int
 	namespace string
+	// manifests holds the probe objects that the bundle gets in addition to the live objects of the component. edit changes a live object
+	// in place and returns it. Each object that a case adds or changes carries an annotation with a random value, so that the digest of the
+	// bundle differs in every run.
 	manifests []byte
+	edit      func(t *testing.T, objs []map[string]any) map[string]any
 	reason    string
 	detail    string
 }
@@ -30,11 +35,29 @@ type m8Refusal struct {
 // m8RunRefusals signs and serves each set in turn. Each must end refused with the reason and the detail, leave the bundle state and every
 // Application as they were, and leave the digest of its bundle out of the store that Argo CD reads. storeAddr is the address of the
 // loopback registry of the store of the target, which takes no token. Each set is the live set with one bundle replaced.
+// The bundle holds the live objects of the component and the probe.
 func m8RunRefusals(t *testing.T, target, storeAddr string, live []bundle.Component, cases []m8Refusal) {
 	t.Helper()
+	run := randomHex(t, 6)
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			digest := m8PushBundle(t, target, c.component, c.manifests)
+			liveDigest := m8LiveDigest(live, c.component)
+			var objs, changed []map[string]any
+			if liveDigest != "" {
+				objs = m8Objects(t, m8LiveManifests(t, target, c.component, liveDigest))
+			}
+			if c.edit != nil {
+				changed = append(changed, c.edit(t, objs))
+			}
+			if len(c.manifests) > 0 {
+				added := m8Objects(t, c.manifests)
+				objs = append(objs, added...)
+				changed = append(changed, added...)
+			}
+			for _, o := range changed {
+				m8Annotate(o, "cell.poc.internal/e2e-run", run+"-"+c.name)
+			}
+			digest := m8PushBundle(t, target, c.component, m8Render(t, objs))
 			comps := m8WithDigest(live, c.component, c.wave, c.namespace, digest)
 			before := m8Snapshot(t, target)
 			signed, tb := m8Offer(t, target, comps, m8RefusalWait)
@@ -42,6 +65,12 @@ func m8RunRefusals(t *testing.T, target, storeAddr string, live []bundle.Compone
 			m8RequireSame(t, before, m8Snapshot(t, target))
 			if got := m8StoreHead(t, storeAddr, "bundles/"+c.component, digest); got != 404 {
 				t.Errorf("HEAD of %s in the store of %s gives %d, want 404, after the refusal of %s", digest, target, got, signed.OpID)
+			}
+			// A HEAD of the live digest must find it, or the 404 above could come from a wrong repository path.
+			if liveDigest != "" {
+				if got := m8StoreHead(t, storeAddr, "bundles/"+c.component, liveDigest); got != 200 {
+					t.Errorf("HEAD of the live digest %s in the store of %s gives %d, want 200", liveDigest, target, got)
+				}
 			}
 		})
 	}
@@ -99,13 +128,13 @@ func TestM8CpSetRefusedInCell(t *testing.T) {
 	signed := m8Sign(t, cpClusterName, last.Components, false)
 	envelope := m8OperationEnvelope(t, signed.OpID)
 	before := m8Snapshot(t, cell)
+	seen := cellStatusOf(t, cell).ForgedSeen
 	since := time.Now().Add(-logMargin)
 	enqueueSigned(t, cell, envelope, true)
 	waitCelldSaw(t, cell, since, signed.OpID, op.OutcomeRefused, op.ReasonWrongTarget, m8RefusalWait)
+	waitForgedSeen(t, cell, seen, m8RefusalWait)
+	requireOpOpen(t, signed.OpID)
 	m8RequireSame(t, before, m8Snapshot(t, cell))
-	if v := opGet(t, signed.OpID); v.Final != "" {
-		t.Errorf("mgmtd shows the set of %s as final %q after the refusal in %s", cpClusterName, v.Final, cell)
-	}
 }
 
 // m8AppCases are the sets of an app bundle that the policy refuses, each with the detail of its denial. The bundle is apps-sample.
@@ -200,12 +229,12 @@ func TestM8CpBundleOutsideAllowList(t *testing.T) {
 			reason: op.ReasonComponentNotAllowed, detail: "harness_namespace"},
 	})
 	t.Run("apps_sample_in_cp", func(t *testing.T) {
-		digest := m8PushBundle(t, target, "apps-sample", []byte(m8Marker("m8-probe", "x")))
+		digest := m8PushBundle(t, target, "apps-sample", []byte(m8Marker("m8-probe", randomHex(t, 8))))
 		comps := m8WithDigest(live, "apps-sample", m8AppWave, "apps-demo", digest)
 		before := m8Snapshot(t, target)
 		out, err := signRefused(t, target, comps)
-		if err == nil || !strings.Contains(out+err.Error(), "payload_invalid") {
-			t.Fatalf("signing a set with the component apps-sample for %s gave %v and %q, want a refusal payload_invalid from mgmtd", target, err, out)
+		if err == nil || !payloadInvalidSet.MatchString(out+err.Error()) {
+			t.Fatalf("signing a set with the component apps-sample for %s gave %v and %q, want the refusal payload_invalid with the detail set from mgmtd", target, err, out)
 		}
 		m8RequireSame(t, before, m8Snapshot(t, target))
 		if got := m8StoreHead(t, addr, "bundles/apps-sample", digest); got != 404 {
@@ -213,6 +242,8 @@ func TestM8CpBundleOutsideAllowList(t *testing.T) {
 		}
 	})
 }
+
+var payloadInvalidSet = regexp.MustCompile(`payload_invalid\W+set\b`)
 
 // signRefused asks mgmtd to sign the components, and returns the error of the call. The call must not change the target.
 func signRefused(t *testing.T, target string, comps []bundle.Component) (string, error) {
@@ -308,14 +339,23 @@ spec:
 	m8RunRefusals(t, cell, addr, m8LiveSet(t, cell), []m8Refusal{
 		blocked("agent_policy_replaced", "network-policy", "argocd/argocd-agent", policy("argocd", "argocd-agent")),
 		blocked("store_policy_replaced", "network-policy", "cell-system/plane-celld-store", policy("cell-system", "plane-celld-store")),
-		blocked("mesh_injection_argocd", "namespaces", "mesh_injection", []byte(`apiVersion: v1
-kind: Namespace
-metadata:
-  name: argocd
-  labels:
-    cell.poc.internal/e2e: "true"
-    istio-injection: enabled
-`)),
+		{name: "mesh_injection_argocd", component: "namespaces", reason: op.ReasonPolicyBlocksPlanes, detail: "mesh_injection",
+			edit: func(t *testing.T, objs []map[string]any) map[string]any {
+				for _, o := range objs {
+					meta, _ := o["metadata"].(map[string]any)
+					if o["kind"] == "Namespace" && meta["name"] == "argocd" {
+						labels, _ := meta["labels"].(map[string]any)
+						if labels == nil {
+							labels = map[string]any{}
+							meta["labels"] = labels
+						}
+						labels["istio-injection"] = "enabled"
+						return o
+					}
+				}
+				t.Fatal("the live bundle namespaces has no Namespace argocd")
+				return nil
+			}},
 	})
 }
 
@@ -340,15 +380,23 @@ spec:
 `, name, ns))
 	}
 	live := m8LiveSet(t, target)
+	label, err := kubectl(t, target, "", "-n", "gateway-system", "get", "networkpolicy", "default-deny", "-o", `jsonpath={.metadata.labels.cell\.poc\.internal/harness}`)
+	if err != nil || strings.TrimSpace(label) == "" {
+		t.Fatalf("NetworkPolicy gateway-system/default-deny of %s has the harness label %q (%v), and the test needs it", target, label, err)
+	}
 	m8RunRefusals(t, target, addr, live, []m8Refusal{
 		{name: "spire_names_plane_cells", component: "spire-server", manifests: policy("spire-system", "plane-cells"),
 			reason: op.ReasonPolicyBlocksPlanes, detail: "spire-system/plane-cells"},
 		{name: "relay_names_plane_upstream", component: "relay-system", manifests: policy("relay-system", "plane-upstream"),
 			reason: op.ReasonPolicyBlocksPlanes, detail: "relay-system/plane-upstream"},
+		// default-deny of gateway-system carries the harness label and no list names it, so only the match against the live harness
+		// policies refuses it. Without that match the refusal is harness_namespace.
+		{name: "harness_policy_not_listed", component: "network-policy", manifests: policy("gateway-system", "default-deny"),
+			reason: op.ReasonPolicyBlocksPlanes, detail: "gateway-system/default-deny"},
 	})
 	t.Run("spire_drops_own_rules_passes", func(t *testing.T) {
 		var kept []map[string]any
-		for _, o := range m8Objects(t, m8Hydrated(t, target, "spire-server")) {
+		for _, o := range m8Objects(t, m8LiveManifests(t, target, "spire-server", m8LiveDigest(live, "spire-server"))) {
 			if o["kind"] != "NetworkPolicy" {
 				kept = append(kept, o)
 			}

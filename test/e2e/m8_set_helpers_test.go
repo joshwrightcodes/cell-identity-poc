@@ -30,8 +30,9 @@ const (
 	// m8SetWait bounds the wait for the final result of a set that the cell applies, or rolls back. The health wait takes 5 min and the
 	// rollback wait takes 5 min more.
 	m8SetWait = 15 * time.Minute
-	// m8RefusalWait bounds the wait for the refusal of a set. The engine refuses before it pushes anything.
-	m8RefusalWait = 5 * time.Minute
+	// m8RefusalWait bounds the wait for the final result of a set that the engine must refuse. A refusal takes seconds. A set that is
+	// accepted by mistake takes the health wait and the rollback wait, and the test must see its result before the next set.
+	m8RefusalWait = m8SetWait
 	// m8StoreRegistryPort is the port of the registry in the pod bundle-store-0. It listens on the loopback address of the pod and
 	// takes no token. m8StoreProxyPort is the port of the store proxy, which the Service bundle-store exposes.
 	m8StoreRegistryPort = 5001
@@ -154,8 +155,36 @@ func m8DeleteProbeDeployment(t *testing.T, cluster, name string) {
 	})
 }
 
+// m8WaitNoOpen waits until the last served set of the target has a final result or is past its lifetime. mgmtd refuses to serve a set
+// while one is open (bundle_open), and a set that the engine accepted by mistake takes the health wait and the rollback wait to end.
+func m8WaitNoOpen(t *testing.T, target string) {
+	t.Helper()
+	end := time.Now().Add(35 * time.Minute)
+	for {
+		tb := m8Get(t, target)
+		if tb.Result != nil || !tb.Served || time.Now().After(tb.ExpiresAt) {
+			return
+		}
+		if time.Now().After(end) {
+			t.Errorf("operation %s of %s is still open after 35 min", tb.OpID, target)
+			return
+		}
+		time.Sleep(10 * time.Second)
+	}
+}
+
+// m8DeleteProbeObjects deletes the ConfigMaps, Deployments and Services of apps-demo that M8 tests made. A root deletes the Application of
+// a probe bundle and leaves its objects.
+func m8DeleteProbeObjects(t *testing.T, cluster string) {
+	t.Helper()
+	if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "configmap,deployment,service", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
+		t.Errorf("delete the probe objects of apps-demo in %s: %v", cluster, err)
+	}
+}
+
 // m8RestoreOnFailure records the target, and publishes its hydrated set again when the test, or one of its subtests, failed. A
 // test that never lets a set reach the cell uses it, so that a failed run leaves the target healthy and a passing run costs no publish.
+// The restore waits until no set is open.
 func m8RestoreOnFailure(t *testing.T, target string) {
 	t.Helper()
 	m8RecordTarget(t, target)
@@ -163,6 +192,7 @@ func m8RestoreOnFailure(t *testing.T, target string) {
 		if !t.Failed() {
 			return
 		}
+		m8WaitNoOpen(t, target)
 		res, err := m8PublishHydrated(t, target)
 		if err != nil {
 			t.Errorf("restore the hydrated set of %s: %v", target, err)
@@ -171,18 +201,70 @@ func m8RestoreOnFailure(t *testing.T, target string) {
 		if res["outcome"] != op.OutcomeApplied && res["outcome"] != op.OutcomeAlreadyApplied {
 			t.Errorf("restore of %s ended %v", target, res)
 		}
+		m8DeleteProbeObjects(t, target)
 	})
 }
 
-// m8LiveSet returns the components of the last signed set of the target. A set that a test refuses or rolls back stays the last signed
-// set, so a test that serves several sets takes this once and builds each set from it. It fails the test when the target has no set.
+// m8LiveSet returns the components that the target runs now. The names, waves and namespaces come from the last signed set of mgmtd,
+// and each digest comes from the bundle state of the cell, because a set that was refused or rolled back stays the last signed set and
+// names bundles that never ran. A component that the state lacks is left out. A test that serves several sets takes this once and builds
+// each set from it. It fails the test when nothing is live.
 func m8LiveSet(t *testing.T, target string) []bundle.Component {
 	t.Helper()
 	last := m8LastSet(t, target)
-	if len(last.Components) == 0 {
-		t.Fatalf("%s has no signed set yet. Run: mise run bundle -- publish --target %s --wait", target, target)
+	st := m8State(t, target)
+	var comps []bundle.Component
+	for _, c := range last.Components {
+		if d, ok := st.Components[c.Name]; ok {
+			c.Digest = d
+			comps = append(comps, c)
+		}
 	}
-	return last.Components
+	if len(comps) == 0 {
+		t.Fatalf("%s runs no signed set yet. Run: mise run bundle -- publish --target %s --wait", target, target)
+	}
+	return comps
+}
+
+// m8LiveDigest returns the digest of the component in comps, or "".
+func m8LiveDigest(comps []bundle.Component, name string) string {
+	for _, c := range comps {
+		if c.Name == name {
+			return c.Digest
+		}
+	}
+	return ""
+}
+
+// m8LiveManifests reads the manifests of a live bundle of the target from the mirror, where every signed set of the target is kept.
+func m8LiveManifests(t *testing.T, target, component, digest string) []byte {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	art, err := ocistore.Fetch(ctx, m8Mirror(t), "bundles/"+target+"/"+component, digest)
+	if err != nil {
+		t.Fatalf("read the live bundle %s@%s of %s from the mirror: %v", component, digest, target, err)
+	}
+	manifests, err := bundle.UnpackComponent(art.Layer, bundle.MaxUnpackedBytes)
+	if err != nil {
+		t.Fatalf("unpack the live bundle %s of %s: %v", component, target, err)
+	}
+	return manifests
+}
+
+// m8Annotate sets an annotation on an object, so that its bundle differs from every bundle of an earlier run.
+func m8Annotate(obj map[string]any, key, value string) {
+	meta, _ := obj["metadata"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+		obj["metadata"] = meta
+	}
+	ann, _ := meta["annotations"].(map[string]any)
+	if ann == nil {
+		ann = map[string]any{}
+		meta["annotations"] = ann
+	}
+	ann[key] = value
 }
 
 // m8WithDigest returns a copy of the components with the digest of the component name replaced. A component that the set lacks is added
@@ -446,7 +528,8 @@ func m8StoreRequest(t *testing.T, addr, method, path, token string) (int, string
 }
 
 // m8CreateApplication applies an Application of the cluster that reads the bundle digest from the repository bundles/<repo> of the
-// in-cluster store, and deletes it when the test ends. The Application syncs by itself.
+// in-cluster store, and deletes it when the test ends. The Application has no finalizer and the delete orphans its objects, so that a
+// probe that Argo CD applied by mistake over an object of the harness is never pruned with it. The Application syncs by itself.
 func m8CreateApplication(t *testing.T, cluster, name, project, repo, digest, destNamespace string) {
 	t.Helper()
 	app := map[string]any{
@@ -454,8 +537,7 @@ func m8CreateApplication(t *testing.T, cluster, name, project, repo, digest, des
 		"kind":       "Application",
 		"metadata": map[string]any{
 			"name": name, "namespace": "argocd",
-			"labels":     map[string]any{testNamespaceLabel: "true"},
-			"finalizers": []any{"resources-finalizer.argocd.argoproj.io"},
+			"labels": map[string]any{testNamespaceLabel: "true"},
 		},
 		"spec": map[string]any{
 			"project": project,
@@ -479,7 +561,7 @@ func m8CreateApplication(t *testing.T, cluster, name, project, repo, digest, des
 		t.Fatalf("the Application %s exists in %s already (%v). The test needs the name for itself", name, cluster, err)
 	}
 	t.Cleanup(func() {
-		if _, err := kubectl(t, cluster, "", "-n", "argocd", "delete", "application", name, "--ignore-not-found", "--wait=true", "--timeout=180s"); err != nil {
+		if _, err := kubectl(t, cluster, "", "-n", "argocd", "delete", "application", name, "--cascade=orphan", "--ignore-not-found", "--wait=true", "--timeout=180s"); err != nil {
 			t.Errorf("delete the Application %s of %s: %v", name, cluster, err)
 		}
 	})

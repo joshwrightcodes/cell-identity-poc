@@ -205,6 +205,7 @@ func m8RestoreTarget(t *testing.T, target string) {
 	t.Helper()
 	m8RecordTarget(t, target)
 	t.Cleanup(func() {
+		m8WaitNoOpen(t, target)
 		res, err := m8PublishHydrated(t, target)
 		if err != nil {
 			t.Errorf("restore the hydrated set of %s: %v", target, err)
@@ -213,6 +214,7 @@ func m8RestoreTarget(t *testing.T, target string) {
 		if res["outcome"] != op.OutcomeApplied && res["outcome"] != op.OutcomeAlreadyApplied {
 			t.Errorf("restore of %s ended %v", target, res)
 		}
+		m8DeleteProbeObjects(t, target)
 	})
 }
 
@@ -352,7 +354,7 @@ func m8PubKeyPEM(t *testing.T) string {
 	return path
 }
 
-// m8Cosign runs cosign through mise with an empty Docker configuration and no network option, and returns its combined output.
+// m8Cosign runs cosign through mise with an empty Docker configuration, and returns its combined output.
 func m8Cosign(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

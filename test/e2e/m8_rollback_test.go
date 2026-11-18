@@ -165,11 +165,13 @@ func TestM8RollbackPastStuckWave(t *testing.T) {
 }
 
 // m8GuardVAP is a ValidatingAdmissionPolicy with the name. It matches no resource that exists, and no binding names it.
-func m8GuardVAP(name string) string {
+func m8GuardVAP(name, run string) string {
 	return fmt.Sprintf(`apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
   name: %s
+  annotations:
+    cell.poc.internal/e2e-run: %q
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -182,7 +184,7 @@ spec:
         resources: ["m8-never-exists"]
   validations:
     - expression: "true"
-`, name)
+`, name, run)
 }
 
 // TestM8HarnessObjectSpared, in dev-cell-2: a bundle cannot take over an object of the harness. mgmt_root: a mesh-policy bundle that holds
@@ -199,21 +201,36 @@ func TestM8HarnessObjectSpared(t *testing.T) {
 	live := m8LiveSet(t, cell)
 
 	t.Run("mgmt_root", func(t *testing.T) {
-		objs := m8Objects(t, m8Hydrated(t, cell, "mesh-policy"))
-		objs = append(objs, m8Objects(t, []byte(m8MarkerIn("argocd", "mgmt-root", "taken-"+randomHex(t, 4))))...)
+		objs := m8Objects(t, m8LiveManifests(t, cell, "mesh-policy", m8LiveDigest(live, "mesh-policy")))
+		probe := m8Objects(t, []byte(m8MarkerIn("argocd", "mgmt-root", "taken-"+randomHex(t, 4))))[0]
+		// Argo CD must not prune or delete the object if the guard lets it take the object over.
+		m8Annotate(probe, "argocd.argoproj.io/sync-options", "Prune=false,Delete=false")
+		objs = append(objs, probe)
 		digest := m8PushBundle(t, cell, "mesh-policy", m8Render(t, objs))
 		comps := m8WithDigest(live, "mesh-policy", 0, "istio-system", digest)
 		rv := m8ResourceVersion(t, cell, "argocd", "configmap", "mgmt-root")
-		label := func() string {
-			out, err := kubectl(t, cell, "", "-n", "argocd", "get", "configmap", "mgmt-root", "-o", `jsonpath={.metadata.labels.cell\.poc\.internal/harness}`)
+		jsonpath := func(field string) string {
+			out, err := kubectl(t, cell, "", "-n", "argocd", "get", "configmap", "mgmt-root", "-o", "jsonpath={.metadata."+field+"}")
 			if err != nil {
 				t.Fatal(err)
 			}
 			return strings.TrimSpace(out)
 		}
+		label := func() string { return jsonpath(`labels.cell\.poc\.internal/harness`) }
+		tracking := func() string { return jsonpath(`annotations.argocd\.argoproj\.io/tracking-id`) }
 		if rv == "" || label() == "" {
 			t.Fatalf("ConfigMap argocd/mgmt-root of %s has the resource version %q and the harness label %q, want both", cell, rv, label())
 		}
+		// A restore after a guard that failed must not prune the trust root of the agent, so the tracking annotation of Argo CD goes first.
+		t.Cleanup(func() {
+			if tracking() == "" {
+				return
+			}
+			t.Errorf("Argo CD took over ConfigMap argocd/mgmt-root of %s", cell)
+			if _, err := kubectl(t, cell, "", "-n", "argocd", "annotate", "configmap", "mgmt-root", "argocd.argoproj.io/tracking-id-"); err != nil {
+				t.Errorf("remove the tracking annotation of argocd/mgmt-root: %v", err)
+			}
+		})
 		signed := m8Sign(t, cell, comps, true)
 		seen := false
 		tb := m8WaitEach(t, cell, signed.OpID, m8SetWait, func() {
@@ -222,14 +239,14 @@ func TestM8HarnessObjectSpared(t *testing.T) {
 			}
 		})
 		m8WantResult(t, tb.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "*")
-		if tb.Result != nil && tb.Result.Detail == "rollback_unhealthy" {
-			t.Errorf("the rollback of %s did not finish: %s", cell, tb.Result.Detail)
+		if tb.Result != nil && !strings.HasPrefix(tb.Result.Detail, "timeout:mesh-policy:") {
+			t.Errorf("the detail of the rollback is %q, want one that starts with timeout:mesh-policy: (a failed sync does not turn the Application Degraded)", tb.Result.Detail)
 		}
 		if !seen {
 			t.Errorf("Argo CD never reported a sync error that names bundles-spare-harness for mesh-policy")
 		}
 		if got := m8ResourceVersion(t, cell, "argocd", "configmap", "mgmt-root"); got != rv {
-			t.Errorf("ConfigMap argocd/mgmt-root has the resource version %s, want %s", got, rv)
+			t.Errorf("ConfigMap argocd/mgmt-root has the resource version %s, want %s. Apply the harness again: CELL=%s mise run cell:up", got, rv, cell)
 		}
 		if got := label(); got == "" {
 			t.Error("ConfigMap argocd/mgmt-root lost its harness label")
@@ -243,7 +260,8 @@ func TestM8HarnessObjectSpared(t *testing.T) {
 		if rv == "" {
 			t.Fatalf("%s has no ValidatingAdmissionPolicy bundles-spare-harness", cell)
 		}
-		digest := m8PushBundle(t, cell, "argocd", []byte(m8GuardVAP("bundles-spare-harness")))
+		vap := m8Objects(t, []byte(m8GuardVAP("bundles-spare-harness", randomHex(t, 8))))
+		digest := m8PushBundle(t, cell, "argocd", m8Render(t, append(m8Objects(t, m8LiveManifests(t, cell, "argocd", m8LiveDigest(live, "argocd"))), vap...)))
 		before := m8Snapshot(t, cell)
 		_, tb := m8Offer(t, cell, m8WithDigest(live, "argocd", 0, "argocd", digest), m8RefusalWait)
 		m8WantResult(t, tb.Result, op.OutcomeRefused, op.ReasonComponentNotAllowed, "harness_object")
@@ -260,8 +278,18 @@ func TestM8HarnessObjectSpared(t *testing.T) {
 			t.Fatalf("%s has no ValidatingAdmissionPolicy bundles-spare-harness", cell)
 		}
 		_, store := m8ForwardStore(t, cell)
-		guarded := m8PushTo(t, store, "bundles/m8-guard-probe", []byte(m8GuardVAP("bundles-spare-harness")))
-		control := m8PushTo(t, store, "bundles/m8-guard-control", []byte(m8GuardVAP("m8-guard-control")))
+		run := randomHex(t, 8)
+		guarded := m8PushTo(t, store, "bundles/m8-guard-probe", []byte(m8GuardVAP("bundles-spare-harness", run)))
+		control := m8PushTo(t, store, "bundles/m8-guard-control", []byte(m8GuardVAP("m8-guard-control", run)))
+		// The Applications have no finalizer, so the deletes remove no object. This policy is the only one that the probe makes.
+		t.Cleanup(func() {
+			if _, err := kubectl(t, cell, "", "delete", "validatingadmissionpolicy", "m8-guard-control", "--ignore-not-found"); err != nil {
+				t.Errorf("delete the control policy of %s: %v", cell, err)
+			}
+			if got := m8ClusterResourceVersion(t, cell, guard, "bundles-spare-harness"); got != rv {
+				t.Errorf("the policy bundles-spare-harness of %s has the resource version %s, want %s. Apply the harness again: CELL=%s mise run cell:up", cell, got, rv, cell)
+			}
+		})
 		m8CreateApplication(t, cell, "m8-guard-control", "cell", "m8-guard-control", control, "default")
 		m8CreateApplication(t, cell, "m8-guard-probe", "cell", "m8-guard-probe", guarded, "default")
 		m8WaitApplicationText(t, cell, "m8-guard-probe", "not permitted in project", 3*time.Minute)
@@ -291,11 +319,11 @@ func m8jsonpath(t *testing.T, cluster, app, path string) string {
 	return out
 }
 
-// m8BadStoreTokenBundle returns the hydrated argocd bundle of the cluster with the upstream of the container store-token of the repo
-// server on port 5999, where nothing listens. The repo server then cannot read the store.
-func m8BadStoreTokenBundle(t *testing.T, cluster string) []byte {
+// m8BadStoreTokenBundle returns the manifests of the argocd bundle with the upstream of the container store-token of the repo server on
+// port 5999, where nothing listens. The repo server then cannot read the store.
+func m8BadStoreTokenBundle(t *testing.T, cluster string, manifests []byte) []byte {
 	t.Helper()
-	objs := m8Objects(t, m8Hydrated(t, cluster, "argocd"))
+	objs := m8Objects(t, manifests)
 	found := false
 	for _, o := range objs {
 		meta, _ := o["metadata"].(map[string]any)
@@ -350,29 +378,61 @@ func m8MiseOutput(limit time.Duration, args ...string) (string, int) {
 func TestM8BadArgocdSetNeedsRepair(t *testing.T) {
 	const cell = "dev-cell-2"
 	m8RestoreTarget(t, cell)
+	m8DeleteProbeDeployment(t, cell, "m8-repair-probe")
+	var hydratedRoot string
+	// The cleanup handles both outcomes of the bad set, and never leaves the cell on the bad root. A set that the cell rolled back is
+	// repaired with the command under test. A set that the cell applied by mistake has the bad root as good[0], so the hydrated argocd
+	// bundle goes back by hand, and the restore publish that follows finds a repo server that can read the store.
 	t.Cleanup(func() {
-		if !t.Failed() || m8State(t, cell).State == "healthy" {
+		if hydratedRoot == "" || !m8RepoServerBroken(t, cell) {
 			return
 		}
-		out, err := m8Command(t, 25*time.Minute, "", "run", "bundle", "--", "repair", "--target", cell)
-		if err != nil {
-			t.Errorf("repair %s after a failure: %v\n%s", cell, err, out)
+		if st := m8State(t, cell); len(st.Good) > 0 && st.Good[0].Root.Digest == hydratedRoot {
+			if out, err := m8Command(t, 25*time.Minute, "", "run", "bundle", "--", "repair", "--target", cell); err != nil {
+				t.Errorf("repair %s after a failure: %v\n%s", cell, err, out)
+			}
+			return
+		}
+		applyArgs := []string{"apply", "--server-side", "--force-conflicts", "-f", "-"}
+		if _, err := kubectl(t, cell, string(m8Hydrated(t, cell, "argocd")), applyArgs...); err != nil {
+			t.Errorf("apply the hydrated argocd bundle of %s: %v", cell, err)
+			return
+		}
+		if _, err := kubectl(t, cell, "", "-n", "argocd", "rollout", "status", "deployment/argocd-repo-server", "--timeout=300s"); err != nil {
+			t.Errorf("the repo server of %s did not roll out after the hydrated bundle: %v", cell, err)
 		}
 	})
 
 	if res, err := m8PublishHydrated(t, cell); err != nil || res["outcome"] != op.OutcomeApplied {
 		t.Fatalf("the hydrated set of %s ended %v (%v), want applied before the bad set", cell, res, err)
 	}
-	good := m8State(t, cell).Good
-	if len(good) == 0 {
-		t.Fatalf("the bundle state of %s holds no good root after the publish", cell)
+	st := m8State(t, cell)
+	if len(st.Good) == 0 || st.Good[0].Root.Digest != st.Root.Digest {
+		t.Fatalf("good[0] of %s is %+v after the publish, want the root %s", cell, st.Good, st.Root.Digest)
 	}
-	digest := m8PushBundle(t, cell, "argocd", m8BadStoreTokenBundle(t, cell))
+	hydratedRoot = st.Root.Digest
+	// Repair trusts only a root that cosign verifies against the key of mgmtd. The publish attached the Sigstore bundle of this root.
+	if out, err := m8Command(t, 5*time.Minute, "", "run", "bundle", "--", "verify", "--target", cell); err != nil {
+		t.Fatalf("the root %s of %s does not verify, so repair could not trust it: %v\n%s", hydratedRoot, cell, err, out)
+	}
+
+	live := m8LiveSet(t, cell)
+	badArgocd := m8PushBundle(t, cell, "argocd", m8BadStoreTokenBundle(t, cell, m8LiveManifests(t, cell, "argocd", m8LiveDigest(live, "argocd"))))
+	// The cache of Argo CD can hide a broken repo server, so the set also holds a new bundle that never becomes healthy: the health wait
+	// and the rollback must then read the store through the broken token client.
+	probe := m8PushBundle(t, cell, "apps-sample", []byte(m8FailingDeployment(t, "m8-repair-probe", "")))
+	comps := m8WithDigest(m8WithDigest(live, "argocd", 0, "argocd", badArgocd), "apps-sample", m8AppWave, "apps-demo", probe)
 	start := time.Now()
-	_, tb := m8Offer(t, cell, m8SetWithDigest(t, cell, "argocd", 0, "argocd", digest), 30*time.Minute)
+	_, tb := m8Offer(t, cell, comps, 30*time.Minute)
 	t.Logf("the bad argocd set of %s ended %v after %s", cell, *tb.Result, time.Since(start).Round(time.Second))
+	if tb.Result.Outcome == op.OutcomeApplied {
+		t.Fatalf("the bad argocd set of %s ended applied, so it did not fail health and the test has nothing to repair. The cleanup puts the hydrated argocd bundle back", cell)
+	}
 	m8WantResult(t, tb.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "rollback_unhealthy")
 	good0 := m8State(t, cell).Good[0]
+	if good0.Root.Digest != hydratedRoot {
+		t.Fatalf("good[0] of %s holds the root %s, want the hydrated root %s", cell, good0.Root.Digest, hydratedRoot)
+	}
 
 	statusOut, code := m8MiseOutput(30*time.Minute, "run", "harness:status")
 	if code != 1 {
@@ -394,12 +454,12 @@ func TestM8BadArgocdSetNeedsRepair(t *testing.T) {
 	if err := json.Unmarshal([]byte(m8LastLine(out)), &res); err != nil || res.Target != cell || res.Root != good0.Root.Digest {
 		t.Errorf("repair printed %q, want a line for %s with the root %s of good[0] (%v)", out, cell, good0.Root.Digest, err)
 	}
-	var comps []bundle.Component
+	var good []bundle.Component
 	for name, d := range good0.Components {
-		comps = append(comps, bundle.Component{Name: name, Digest: d})
+		good = append(good, bundle.Component{Name: name, Digest: d})
 	}
 	waitFor(t, "every Application of "+cell+" to be at good[0]", 15*time.Minute, func() (bool, string) {
-		p := m8AtSetProblems(t, cell, comps, good0.Root.Digest)
+		p := m8AtSetProblems(t, cell, good, good0.Root.Digest)
 		return len(p) == 0, strings.Join(p, "; ")
 	})
 	t.Logf("the repair of %s took %s", cell, time.Since(repaired).Round(time.Second))
@@ -411,4 +471,16 @@ func TestM8BadArgocdSetNeedsRepair(t *testing.T) {
 	if res2["outcome"] != op.OutcomeApplied {
 		t.Errorf("the hydrated set of %s ended %v after the repair, want applied", cell, res2)
 	}
+}
+
+// m8RepoServerBroken reports whether the repo server of the cluster still points its store token client at port 5999.
+func m8RepoServerBroken(t *testing.T, cluster string) bool {
+	t.Helper()
+	out, err := kubectl(t, cluster, "", "-n", "argocd", "get", "deployment", "argocd-repo-server", "-o",
+		`jsonpath={.spec.template.spec.containers[?(@.name=="store-token")].args}`)
+	if err != nil {
+		t.Errorf("read the repo server of %s: %v", cluster, err)
+		return false
+	}
+	return strings.Contains(out, ":5999")
 }
