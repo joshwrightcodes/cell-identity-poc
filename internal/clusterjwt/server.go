@@ -25,6 +25,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -65,18 +66,20 @@ type pluginConfig struct {
 	TrustDomain      string   `hcl:"trust_domain"`
 	RecordsDir       string   `hcl:"records_dir"`
 	RecordPublicKeys []string `hcl:"record_public_keys"`
-	PerCellRate      float64  `hcl:"per_cell_rate"`
-	PerCellBurst     int      `hcl:"per_cell_burst"`
-	PerCellInflight  int      `hcl:"per_cell_inflight"`
-	ChallengeTimeout string   `hcl:"challenge_timeout"`
-	ReloadInterval   string   `hcl:"reload_interval"`
-	MarksFile        string   `hcl:"marks_file"`
-	HintConfigMap    string   `hcl:"hint_configmap"`
-	HintMinInterval  string   `hcl:"hint_min_interval"`
+	// OperatorPublicKeys pins the keys that sign local revocations: none, one, or two during a rotation.
+	OperatorPublicKeys []string `hcl:"operator_public_keys"`
+	PerCellRate        float64  `hcl:"per_cell_rate"`
+	PerCellBurst       int      `hcl:"per_cell_burst"`
+	PerCellInflight    int      `hcl:"per_cell_inflight"`
+	ChallengeTimeout   string   `hcl:"challenge_timeout"`
+	ReloadInterval     string   `hcl:"reload_interval"`
+	MarksFile          string   `hcl:"marks_file"`
+	HintConfigMap      string   `hcl:"hint_configmap"`
+	HintMinInterval    string   `hcl:"hint_min_interval"`
 }
 
 var configKeys = map[string]bool{
-	"env": true, "trust_domain": true, "records_dir": true, "record_public_keys": true,
+	"env": true, "trust_domain": true, "records_dir": true, "record_public_keys": true, "operator_public_keys": true,
 	"per_cell_rate": true, "per_cell_burst": true, "per_cell_inflight": true, "challenge_timeout": true,
 	"reload_interval": true, "marks_file": true, "hint_configmap": true, "hint_min_interval": true,
 }
@@ -90,16 +93,21 @@ type state struct {
 	// spec is the revision of the spec that the load read, or zero when there was none.
 	spec envspec.Revision
 	// digests holds the digest of the signed payload of each record.
-	digests     map[string]string
-	dir         string
-	keys        []ed25519.PublicKey
-	reloadEvery time.Duration
-	marksFile   string
-	rate        float64
-	burst       int
-	maxInflight int
-	limit       *limiter
-	gate        *gate
+	digests map[string]string
+	dir     string
+	keys    []ed25519.PublicKey
+	// operatorKeys verify the local revocations. With none, the overlay stays empty.
+	operatorKeys []ed25519.PublicKey
+	// overlay holds the verified local revocations by cell. It only refuses cells that have a record.
+	overlay        revoke.Held
+	overlayRefused int
+	reloadEvery    time.Duration
+	marksFile      string
+	rate           float64
+	burst          int
+	maxInflight    int
+	limit          *limiter
+	gate           *gate
 	// hintCM is the ConfigMap that receives hints, or empty when hints are off.
 	hintCM    string
 	hintEvery time.Duration
@@ -228,7 +236,7 @@ func (p *Plugin) Configure(_ context.Context, req *configv1.ConfigureRequest) (*
 	}
 	p.applyInterval(st.reloadEvery)
 	p.startHints(st)
-	p.log.Info("configured", "env", st.env, "records", len(st.records), "spec_epoch", st.spec.Epoch, "spec_counter", st.spec.Counter, "reload_interval", st.reloadEvery.String(), "hint_configmap", st.hintCM, "hint_min_interval", st.hintEvery.String())
+	p.log.Info("configured", "env", st.env, "records", len(st.records), "spec_epoch", st.spec.Epoch, "spec_counter", st.spec.Counter, "overlay", len(st.overlay), "overlay_refused", st.overlayRefused, "reload_interval", st.reloadEvery.String(), "hint_configmap", st.hintCM, "hint_min_interval", st.hintEvery.String())
 	return &configv1.ConfigureResponse{}, nil
 }
 
@@ -248,6 +256,7 @@ func (p *Plugin) build(text, coreTrustDomain string, commit bool, old *state) (*
 		return nil, err
 	}
 	st.records, st.digests, st.spec = snap.records, snap.digests, snap.spec
+	st.overlay, st.overlayRefused = snap.overlay, snap.overlayRefused
 	return st, nil
 }
 
@@ -296,6 +305,13 @@ func (p *Plugin) parse(text, coreTrustDomain string) (*state, error) {
 	if err != nil {
 		return nil, err
 	}
+	var opKeys []ed25519.PublicKey
+	if len(cfg.OperatorPublicKeys) > 0 {
+		opKeys, err = revoke.ParseKeys([]byte(strings.Join(cfg.OperatorPublicKeys, "\n")))
+		if err != nil {
+			return nil, fmt.Errorf("operator_public_keys: %w", err)
+		}
+	}
 	if _, _, err := parseHintConfigMap(cfg.HintConfigMap); err != nil {
 		return nil, err
 	}
@@ -306,7 +322,7 @@ func (p *Plugin) parse(text, coreTrustDomain string) (*state, error) {
 	return &state{
 		hintCM: cfg.HintConfigMap, hintEvery: hintEvery,
 		env: cfg.Env, trustDomain: cfg.TrustDomain, timeout: timeout,
-		dir: cfg.RecordsDir, keys: keys, reloadEvery: every, marksFile: cfg.MarksFile,
+		dir: cfg.RecordsDir, keys: keys, operatorKeys: opKeys, reloadEvery: every, marksFile: cfg.MarksFile,
 		rate: cfg.PerCellRate, burst: cfg.PerCellBurst, maxInflight: cfg.PerCellInflight,
 		limit: newLimiter(cfg.PerCellRate, cfg.PerCellBurst, p.now),
 		gate:  newGate(cfg.PerCellInflight),
@@ -350,7 +366,10 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		return p.deny(logCell(payload.Cell), "", UnknownCell)
 	}
 	if rec.Revoked {
-		return p.deny(rec.Name, "", Revoked)
+		return p.deny(rec.Name, "", Revoked, "source", SourceRecord)
+	}
+	if _, held := st.overlay[rec.Name]; held {
+		return p.deny(rec.Name, "", Revoked, "source", SourceOverlay)
 	}
 	if !st.gate.acquire(rec.Name) {
 		return p.deny(rec.Name, "", TooManyPending)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	envspec "github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -29,6 +30,12 @@ type snapshot struct {
 	records map[string]record.Cell
 	digests map[string]string
 	spec    envspec.Revision
+	// retired holds the cells that the marks and the accepted spec retire.
+	retired map[string]bool
+	// overlay holds the verified local revocations by cell. overlayRefused counts the entries that the
+	// load skipped.
+	overlay        revoke.Held
+	overlayRefused int
 }
 
 func emptySnapshot() *snapshot {
@@ -160,11 +167,12 @@ func (p *Plugin) reload() {
 		if p.afterLoad != nil {
 			p.afterLoad()
 		}
-		if maps.Equal(snap.digests, cur.digests) {
+		if maps.Equal(snap.digests, cur.digests) && overlayEqual(snap.overlay, cur.overlay) && snap.overlayRefused == cur.overlayRefused {
 			return
 		}
 		next := *cur
 		next.records, next.digests = snap.records, snap.digests
+		next.overlay, next.overlayRefused = snap.overlay, snap.overlayRefused
 		if p.st.CompareAndSwap(cur, &next) {
 			p.logReloaded(cur, snap)
 			return
@@ -231,6 +239,9 @@ type rawLoad struct {
 	specAbsent bool
 	spec       []byte
 	files      []rawFile
+	// overlay is the content of the overlay file. overlayErr is set when the file exists and cannot be read.
+	overlay    []byte
+	overlayErr error
 }
 
 // readVersion reads the spec and every record file from one version of the directory. It holds no
@@ -254,6 +265,12 @@ func (p *Plugin) readVersion(dir string) (*rawLoad, error) {
 	} else if raw.spec, err = readSmall(specPath); err != nil {
 		return nil, fmt.Errorf("read %s: %w", specFile, err)
 	}
+	overlayPath := filepath.Join(dir, overlayFile)
+	if _, err := os.Lstat(overlayPath); err == nil {
+		raw.overlay, raw.overlayErr = readSmall(overlayPath)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		raw.overlayErr = err
+	}
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), recordSuffix) {
 			continue
@@ -275,7 +292,7 @@ func (p *Plugin) readVersion(dir string) (*rawLoad, error) {
 // share a revision with another record or a retired mark. A cell that the spec indexes and that has no
 // accepted record keeps its record from base only while that record is not below the entry. A cell
 // that the spec no longer indexes drops out. An unreadable marks file gives no record.
-func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
+func (p *Plugin) load(cfg, base *state, commit bool) (snap *snapshot, err error) {
 	raw, err := p.readVersion(cfg.dir)
 	if err != nil {
 		return nil, err
@@ -302,6 +319,12 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 		}
 	}
 
+	// The overlay is independent of the spec. It only matters for a cell that has a record.
+	defer func() {
+		if err == nil {
+			snap.overlay, snap.overlayRefused = p.loadOverlay(raw, cfg, base, note)
+		}
+	}()
 	if commit && !p.ensureMarks(cfg, note) {
 		return emptySnapshot(), nil
 	}
@@ -343,6 +366,7 @@ func (p *Plugin) load(cfg, base *state, commit bool) (*snapshot, error) {
 
 	out := emptySnapshot()
 	out.spec = sp.Revision
+	out.retired = retired
 	for _, f := range raw.files {
 		name := f.name
 		if f.err != nil {
