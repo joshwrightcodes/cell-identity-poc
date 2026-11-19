@@ -189,6 +189,10 @@ func (h *BindHandler) failed(w http.ResponseWriter, r *http.Request, what string
 }
 
 func (h *BindHandler) nonce(w http.ResponseWriter, r *http.Request, cell string, _ netip.Addr) {
+	if gone, _ := h.st.Overlaid(r.Context(), cell); gone {
+		h.deny(w, r, cell, gwapi.ReasonCellRevoked, "overlay")
+		return
+	}
 	latest, _, ok, err := h.st.CellInfo(r.Context(), cell)
 	if err != nil {
 		h.failed(w, r, "cell_info", err)
@@ -226,6 +230,10 @@ func (h *BindHandler) bind(w http.ResponseWriter, r *http.Request, cell string, 
 	}
 	if bad != "" {
 		h.deny(w, r, cell, reasonBadRequest, bad)
+		return
+	}
+	if gone, _ := h.st.Overlaid(r.Context(), cell); gone {
+		h.deny(w, r, cell, gwapi.ReasonCellRevoked, "overlay")
 		return
 	}
 	latest, previous, ok, err := h.st.CellInfo(r.Context(), cell)

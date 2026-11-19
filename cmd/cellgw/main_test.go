@@ -391,3 +391,56 @@ func TestCellgwServesWithZeroCells(t *testing.T) {
 		t.Fatalf("no bind_denied line with request_id %s and reason source_mismatch: %s", firstID, r.out.String())
 	}
 }
+
+func countLogs(out, msg string) int {
+	n := 0
+	for _, l := range strings.Split(out, "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == msg {
+			n++
+		}
+	}
+	return n
+}
+
+func TestCellgwOperatorKeyFlag(t *testing.T) {
+	t.Run("without_flag_logs_once", func(t *testing.T) {
+		r := startServe(t)
+		if n := countLogs(r.out.String(), "revocation_overlay_off"); n != 1 {
+			t.Fatalf("revocation_overlay_off logged %d times: %s", n, r.out.String())
+		}
+	})
+	t.Run("with_key_serves", func(t *testing.T) {
+		r := startServeWith(t, func(dir, key string) []string {
+			pub, _, _ := ed25519.GenerateKey(rand.Reader)
+			op := filepath.Join(dir, "operator.pub")
+			if err := os.WriteFile(op, []byte(base64.StdEncoding.EncodeToString(pub)+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return serveArgs(dir, key, "--operator-key-file", op)
+		})
+		if n := countLogs(r.out.String(), "revocation_overlay_off"); n != 0 {
+			t.Fatalf("the overlay is off with a key file: %s", r.out.String())
+		}
+	})
+	dir := shortDir(t)
+	key, _ := keyFile(t, dir)
+	for name, content := range map[string]*string{"missing_file": nil, "bad_base64": ptr("not base64!\n"), "empty": ptr("")} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, "op-"+name)
+			if content != nil {
+				if err := os.WriteFile(path, []byte(*content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var out bytes.Buffer
+			code := execute(context.Background(), serveArgs(dir, key, "--operator-key-file", path), strings.NewReader(""), &out, testDeps(t))
+			m := oneJSONLine(t, out.String())
+			if code != 2 || !strings.Contains(m["error"].(string), "--operator-key-file") {
+				t.Fatalf("exit %d, output %s", code, out.String())
+			}
+		})
+	}
+}
+
+func ptr(s string) *string { return &s }

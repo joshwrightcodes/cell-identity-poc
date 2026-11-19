@@ -52,6 +52,7 @@ type Store struct {
 	// raiseMu keeps the commit of a raise and the store of the atomic copy in one order.
 	raiseMu sync.Mutex
 	storeID string
+	ov      overlay
 
 	// failure is the last store failure that a handler noted. Stats reports it once and clears it.
 	failMu  sync.Mutex

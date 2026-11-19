@@ -60,7 +60,14 @@ func WithEnv(env string) EnvdOption {
 	return func(h *envdHandler) { h.env = env }
 }
 
+// WithOperatorKeys sets the keys that verify signed local revocations. Without them the handler
+// ignores the revocations of a sync.
+func WithOperatorKeys(keys []ed25519.PublicKey) EnvdOption {
+	return func(h *envdHandler) { h.opKeys = keys }
+}
+
 type envdHandler struct {
+	opKeys       []ed25519.PublicKey
 	env          string
 	st           *Store
 	keys         []ed25519.PublicKey
@@ -201,6 +208,12 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 	if len(req.Cells) > 0 {
 		if err := h.st.SetCells(ctx, req.Cells); err != nil {
 			h.storeFailed(ctx, w, "set_cells", err)
+			return
+		}
+	}
+	if len(h.opKeys) > 0 {
+		if err := h.st.SetRevocations(ctx, req.Revocations, h.opKeys, h.env); err != nil {
+			h.storeFailed(ctx, w, "set_revocations", err)
 			return
 		}
 	}
