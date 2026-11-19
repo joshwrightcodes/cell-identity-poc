@@ -806,7 +806,8 @@ The image check also covers `cell-proxy` in `bundle-store-0` and in `argocd-repo
 Then it runs the tests that match `^TestM8`, with `-short`.
 `GATE_M8_LONG=1 mise run gate:m8` drops `-short`.
 `harness/versions.env` holds `GATE_M8_BUDGET_MINUTES` and `GATE_M8_TEST_TIMEOUT_MINUTES`.
-The file marks both as set in the live part. The gate stops at once when one of them is empty.
+The budget is 105 minutes, 1.5 times the slower of two clean runs, rounded up to 5 minutes. The go test timeout is twice the budget.
+The gate stops at once when one of them is empty.
 A run whose tests pass removes the record `build/gate/m8-bundles`. A failed run keeps it.
 The token scan also reads the logs of `store-proxy` and `store-token`, and the files `build/gate/m8-*`.
 

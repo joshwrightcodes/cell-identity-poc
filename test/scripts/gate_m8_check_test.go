@@ -388,15 +388,19 @@ func TestGateM8RefusesEmptyBudget(t *testing.T) {
 	}
 }
 
-// TestGateM8Versions: harness/versions.env holds the provisional limits of M8, with the note that the live part sets them.
+// TestGateM8Versions: harness/versions.env holds the limits of M8 that the live runs set. The budget is 1.5 times the slower of two clean
+// runs (4007 s), rounded up to 5 minutes, and the Go test timeout is twice the budget. No line keeps the provisional mark.
 func TestGateM8Versions(t *testing.T) {
 	b, err := os.ReadFile("../../harness/versions.env")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"GATE_M8_BUDGET_MINUTES=150 # <set in the live part>", "GATE_M8_TEST_TIMEOUT_MINUTES=140 # <set in the live part>"} {
-		if !strings.Contains(string(b), want+"\n") {
+	for _, want := range []string{"GATE_M8_BUDGET_MINUTES=105", "GATE_M8_TEST_TIMEOUT_MINUTES=210"} {
+		if !strings.Contains(string(b), "\n"+want+"\n") {
 			t.Errorf("harness/versions.env lacks the line %q", want)
 		}
+	}
+	if strings.Contains(string(b), "<set in the live part>") {
+		t.Error("harness/versions.env still marks a limit as set in the live part")
 	}
 }
