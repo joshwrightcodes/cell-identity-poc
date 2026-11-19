@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Scan the logs of the M5 and M6 components for a token. Usage: gate-token-scan.sh <start time, RFC 3339 UTC>
+# Scan the logs of the M5, M6 and M8 components for a token. Usage: gate-token-scan.sh <start time, RFC 3339 UTC>
 # In each cluster with components, it reads the log of every container that runs the image cellgw, envd, mgmtd, celld, cell-proxy or
 # cell-controller since the start time, and the previous log of a container that restarted. It reads each step log of the host service
 # (build/hostsvc/steps/*.log, or the files in HOSTSVC_STEPS_DIR) in full, because a stage prints the output of a harness task. A line that
 # holds a compact JWS (eyJ..., a dot, eyJ..., a dot) or the text PRIVATE KEY----- is a token or a key: the script prints the cluster, the
-# pod, the container and the line number, or the step log and the line number, never the line, and exits 1. The standard
+# pod, the container and the line number, or the step log and the line number, never the line, and exits 1.
+# It also reads each container named store-proxy or store-token, whatever its image, because they carry the bundle store tokens of M8, and each file
+# build/gate/m8-* that a gate:m8 run leaves. The standard
 # base64 of any JSON object starts with eyJ, so a bare eyJ is no token. The logs of a pod that a test deleted are gone, and so is the log of a middle
 # instance of a container that restarted twice. The scan cannot read either.
 source "$(dirname "$0")/lib.sh"
@@ -19,7 +21,7 @@ existing="$(existing_clusters)" || die "could not list the clusters"
 for cluster in $(yq -r '.clusters[] | select(.components | length > 0) | .name' "$ROOT/harness/topology.yaml"); do
   grep -qx -- "$cluster" <<<"$existing" || continue
   targets="$(kubectl --context "kind-$cluster" get pods -A -o json | jq -r '.items[] | . as $p
-    | $p.spec.containers[] | select(.image | test("/(cellgw|envd|mgmtd|celld|cell-proxy|cell-controller)(@|:|$)")) | .name as $c
+    | $p.spec.containers[] | select((.image | test("/(cellgw|envd|mgmtd|celld|cell-proxy|cell-controller)(@|:|$)")) or .name == "store-proxy" or .name == "store-token") | .name as $c
     | "\($p.metadata.namespace) \($p.metadata.name) \($c) \(([$p.status.containerStatuses[]? | select(.name == $c) | .restartCount] | first) // 0)"')" \
     || die "could not list the pods of $cluster"
   while read -r ns pod container restarts; do
@@ -47,6 +49,21 @@ for file in "$steps"/*.log; do
   lines="$(grep -nE "$shape" "$file" | cut -d: -f1 || true)"
   for n in $lines; do
     echo "a token or a key is in a step log: $file line $n"
+    status=1
+  done
+done
+
+# A file of a gate:m8 run lies in build/gate on this Mac.
+for file in "$BUILD_ROOT"/gate/m8-*; do
+  [[ -f "$file" ]] || continue
+  if [[ ! -r "$file" ]]; then
+    echo "cannot read build/gate/${file##*/}, so the scan cannot tell whether it holds a token"
+    status=1
+    continue
+  fi
+  lines="$(grep -nE "$shape" "$file" | cut -d: -f1 || true)"
+  for n in $lines; do
+    echo "a token or a key is in a gate file: build/gate/${file##*/} line $n"
     status=1
   done
 done

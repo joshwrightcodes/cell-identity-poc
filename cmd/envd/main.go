@@ -5,13 +5,20 @@
 //	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
 //	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
 //	  --steps-configmap <ns>/<name> --step-status-configmap <ns>/<name>
-//	  [--interval 10s] [--health-listen :8080]
+//	  [--interval 10s] [--health-listen :8080] [--cluster <name>]
+//	  [--bundle-mirror <host:port> --bundle-store <host:port> --bundle-store-token <file>
+//	   --bundle-state-configmap <ns>/<name> --bundle-health-timeout 5m]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
 // run takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET and trusts the management plane
 // only through --peer-bundle. It reaches the cell gateway with the same SVID, trusts the bundle of
 // its own trust domain from the Workload API, and accepts only the exact --gateway-id. Every log line is compact JSON on stdout, and logs, traces and metrics
 // also go out as OTLP through package internal/telemetry.
+//
+// With --bundle-mirror, run also applies the signed bundle set of --cluster (operation kind
+// bundle.apply) that the ops pull carries in planeBundle, and reports the result in its status. run
+// never forwards an operation for --cluster to the gateway. The plane path runs only after run accepts
+// a spec and only when a gateway is set, because the ops pull belongs to the relay legs.
 //
 // check reads one SpecBundle from standard input, loads the current state without writing it, and
 // prints one JSON line. It starts no telemetry. The exit status is 0 for accepted and unchanged, and
@@ -20,6 +27,7 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"crypto/tls"
 	"encoding/base64"
@@ -36,6 +44,7 @@ import (
 	"os/signal"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -43,13 +52,17 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"github.com/spiffe/go-spiffe/v2/workloadapi"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/envd"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
@@ -64,6 +77,8 @@ const (
 	loadTimeout = 15 * time.Second
 	// kubeTimeout bounds each request to the Kubernetes API.
 	kubeTimeout = 15 * time.Second
+	// defaultBundleHealthTimeout is the time that a new bundle set has to become healthy.
+	defaultBundleHealthTimeout = 5 * time.Minute
 	// exitConfig is the status of a configuration error.
 	exitConfig = 2
 )
@@ -73,6 +88,8 @@ type deps struct {
 	telemetry func(ctx context.Context, stdout io.Writer) (*telemetry.T, error)
 	kube      func() (kubernetes.Interface, error)
 	svids     func(ctx context.Context) (x509svid.Source, func(), error)
+	// dynamic serves the bundle applier, and runs only with --bundle-mirror.
+	dynamic func() (dynamic.Interface, error)
 }
 
 func realDeps() deps {
@@ -87,6 +104,14 @@ func realDeps() deps {
 			}
 			cfg.Timeout = kubeTimeout
 			return kubernetes.NewForConfig(cfg)
+		},
+		dynamic: func() (dynamic.Interface, error) {
+			cfg, err := rest.InClusterConfig()
+			if err != nil {
+				return nil, fmt.Errorf("in-cluster config: %w", err)
+			}
+			cfg.Timeout = kubeTimeout
+			return dynamic.NewForConfig(cfg)
 		},
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
 			sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
@@ -215,6 +240,16 @@ type runConfig struct {
 	stepsName    string
 	statusNS     string
 	statusName   string
+	// cluster is the name of the cluster of envd. The bundle fields go together, and only with
+	// bundleMirror does envd apply signed bundle sets for cluster.
+	cluster             string
+	keyFile             string
+	bundleMirror        string
+	bundleStore         string
+	bundleStoreToken    string
+	bundleNS            string
+	bundleName          string
+	bundleHealthTimeout time.Duration
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -233,6 +268,12 @@ func parseRun(args []string) (runConfig, error) {
 	hints := fs.String("hints-configmap", "", "ConfigMap that holds the key hints, as <namespace>/<name>")
 	steps := fs.String("steps-configmap", "", "ConfigMap that holds the signed steps for the cell controller, as <namespace>/<name>")
 	stepStatus := fs.String("step-status-configmap", "", "ConfigMap that holds the step status of the cell controller, as <namespace>/<name>")
+	cluster := fs.String("cluster", "", "name of the cluster of envd; the gateway never receives an operation for it")
+	mirror := fs.String("bundle-mirror", "", "address of the bundle mirror as <host>:<port>; turns on bundle.apply for --cluster")
+	store := fs.String("bundle-store", "", "address of the in-cluster bundle store as <host>:<port>")
+	storeToken := fs.String("bundle-store-token", "", "file with the projected token for the bundle store")
+	state := fs.String("bundle-state-configmap", "", "ConfigMap that holds the bundle state, as <namespace>/<name>")
+	healthTimeout := fs.Duration("bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
@@ -297,10 +338,43 @@ func parseRun(args []string) (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
-	return runConfig{upstream: *upstream, expect: id, peer: peer, key: key, env: *env, namespace: ns,
+	rc := runConfig{upstream: *upstream, expect: id, peer: peer, key: key, keyFile: *keyFile, env: *env, namespace: ns,
 		configMap: cm, interval: *interval, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
-		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname}, nil
+		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
+		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout}
+	if err := checkPlaneFlags(&rc, fs, *state); err != nil {
+		return runConfig{}, err
+	}
+	return rc, nil
+}
+
+// checkPlaneFlags checks the cluster and bundle flags. The bundle flags go together: with --bundle-mirror
+// they are all required, and without it none may be set.
+func checkPlaneFlags(rc *runConfig, fs *flag.FlagSet, state string) error {
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if rc.cluster != "" && !spec.ValidName(rc.cluster) {
+		return errors.New("--cluster must be a DNS label")
+	}
+	if rc.bundleMirror == "" {
+		for _, n := range []string{"bundle-store", "bundle-store-token", "bundle-state-configmap", "bundle-health-timeout"} {
+			if set[n] {
+				return fmt.Errorf("--%s needs --bundle-mirror", n)
+			}
+		}
+		return nil
+	}
+	if err := required(map[string]string{"cluster": rc.cluster, "bundle-store": rc.bundleStore,
+		"bundle-store-token": rc.bundleStoreToken, "bundle-state-configmap": state}); err != nil {
+		return err
+	}
+	if rc.bundleHealthTimeout <= 0 {
+		return errors.New("--bundle-health-timeout must be positive")
+	}
+	var err error
+	rc.bundleNS, rc.bundleName, err = configMapRef("bundle-state-configmap", state)
+	return err
 }
 
 func runCommand(ctx context.Context, cfg runConfig, stdout io.Writer, d deps) int {
@@ -340,7 +414,17 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	if err != nil {
 		return err
 	}
-	puller := envd.NewPuller(pullerConfig(cfg, kube, mgmtClient, gateway, tel))
+	pc := pullerConfig(cfg, kube, mgmtClient, gateway, tel)
+	if cfg.bundleMirror != "" {
+		dyn, err := d.dynamic()
+		if err != nil {
+			return err
+		}
+		if pc.Plane, err = newPlane(cfg, kube, dyn, tel, func(c bundleapply.Config) envd.BundleApplier { return bundleapply.New(c) }); err != nil {
+			return err
+		}
+	}
+	puller := envd.NewPuller(pc)
 
 	ln, err := net.Listen("tcp", cfg.healthListen)
 	if err != nil {
@@ -364,6 +448,7 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, gateway envd.GatewayClient, tel *telemetry.T) envd.PullerConfig {
 	keys := []ed25519.PublicKey{cfg.key}
 	return envd.PullerConfig{
+		Cluster:    cfg.cluster,
 		Client:     mgmt,
 		BaseURL:    "https://" + cfg.upstream,
 		Env:        cfg.env,
@@ -377,6 +462,80 @@ func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, g
 		Log:        tel.Log,
 		Meter:      tel.Meter,
 		Tracer:     tel.Tracer,
+	}
+}
+
+// newPlane builds the plane path: the engine of role cp, which reads sets from the mirror, writes
+// them to the in-cluster store with the projected token and keeps its state in the ConfigMap of
+// --bundle-state-configmap.
+func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T, build func(bundleapply.Config) envd.BundleApplier) (*envd.Plane, error) {
+	mirror, err := ocistore.New(ocistore.Client{Base: cfg.bundleMirror})
+	if err != nil {
+		return nil, fmt.Errorf("--bundle-mirror: %w", err)
+	}
+	store, err := ocistore.New(ocistore.Client{Base: cfg.bundleStore, Token: tokenFromFile(cfg.bundleStoreToken), WriteOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("--bundle-store: %w", err)
+	}
+	holder, err := os.Hostname()
+	if err != nil || holder == "" {
+		holder = name
+	}
+	keys := planeKeys(cfg.keyFile, cfg.key, tel.Log)
+	engine := build(bundleapply.Config{
+		Role: "cp", Env: cfg.env, Target: cfg.cluster, Holder: holder,
+		Mirror: mirror, Store: store, Dynamic: dyn, Client: kube,
+		Policy: bundle.DefaultPolicy(), Keys: engineKeys(cfg.keyFile),
+		State:         &bundleapply.ConfigMapStore{Client: kube, Namespace: cfg.bundleNS, Name: cfg.bundleName, MadeBy: name},
+		HealthTimeout: cfg.bundleHealthTimeout,
+		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
+	})
+	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, Log: tel.Log})
+}
+
+// planeKeys returns a function that reads the pinned key in path again on each call. A failed read
+// gives the last key that loaded, or seed (the key that envd read at startup) before any read works, so a rotation in progress does not stop an apply.
+func planeKeys(path string, seed ed25519.PublicKey, log *slog.Logger) func() []crypto.PublicKey {
+	var mu sync.Mutex
+	last := []crypto.PublicKey{seed}
+	return func() []crypto.PublicKey {
+		mu.Lock()
+		defer mu.Unlock()
+		key, err := readSpecKey(path)
+		if err != nil {
+			log.Warn("bundle key not reloaded", "error", err.Error())
+			return last
+		}
+		last = []crypto.PublicKey{key}
+		return last
+	}
+}
+
+// engineKeys returns a function that reads the pinned key in path again on each call, for the
+// engine. A failed read is an error, so the engine leaves the operation open and tries it again later.
+func engineKeys(path string) func() ([]crypto.PublicKey, error) {
+	return func() ([]crypto.PublicKey, error) {
+		key, err := readSpecKey(path)
+		if err != nil {
+			return nil, err
+		}
+		return []crypto.PublicKey{key}, nil
+	}
+}
+
+// tokenFromFile returns a function that reads the token in path each time it runs, so that a token
+// that the kubelet rotates takes effect at once.
+func tokenFromFile(path string) func() (string, error) {
+	return func() (string, error) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read the bundle store token: %w", err)
+		}
+		tok := strings.TrimSpace(string(raw))
+		if tok == "" {
+			return "", errors.New("the bundle store token file is empty")
+		}
+		return tok, nil
 	}
 }
 

@@ -67,6 +67,11 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 			if store == nil {
 				t.Fatal("no policy bundle-store")
 			}
+			// The whole ingress list: one rule, the repo server of argocd on 5000. A second rule, even one that
+			// admits no more than it says, is a change that this test must show.
+			if in := peerRules(t, store, "ingress"); len(in) != 1 || in[0].String() != "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:argocd]] podSelector:map[matchLabels:map[app.kubernetes.io/name:argocd-repo-server]]]] 5000" {
+				t.Errorf("the bundle store ingress is %v, want only argocd-repo-server of argocd on 5000", in)
+			}
 			from := get[[]any](t, get[[]any](t, store, "spec", "ingress")[0], "from")
 			if len(from) != 1 || fmt.Sprint(lookupOr(from[0], "podSelector", "matchLabels")) != "map[app.kubernetes.io/name:argocd-repo-server]" ||
 				fmt.Sprint(lookupOr(from[0], "namespaceSelector", "matchLabels")) != "map[kubernetes.io/metadata.name:argocd]" {

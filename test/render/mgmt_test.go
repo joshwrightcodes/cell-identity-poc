@@ -491,9 +491,15 @@ func TestMgmtAPIRenderNoBindListener(t *testing.T) {
 			text.Write(b)
 		}
 	}
-	for _, bad := range []string{"mgmt-bind", "8447", "31447", `"name":"bind"`} {
+	for _, bad := range []string{"mgmt-bind", `"name":"bind"`} {
 		if strings.Contains(text.String(), bad) {
 			t.Errorf("the render of mgmt-api mentions %q", bad)
+		}
+	}
+	// The port numbers count only as whole numbers: a hex digest in an annotation can hold the same digits.
+	for _, port := range []string{"8447", "31447"} {
+		if regexp.MustCompile(`(^|[^0-9a-fA-F])` + port + `($|[^0-9a-fA-F])`).MatchString(text.String()) {
+			t.Errorf("the render of mgmt-api mentions the port %s", port)
 		}
 	}
 	if objs["Service mgmt-system/mgmt-api"] == nil {

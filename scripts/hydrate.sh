@@ -6,6 +6,8 @@
 # LATE_HARNESS read the SPIRE server of their own cluster: CELL_UP_SKIP_LATE=1 skips them, and
 # HYDRATE_ONLY=late renders only them. LINK_ONLY=<component> narrows HYDRATE_ONLY=link to that one
 # link component, and an unknown name fails.
+# The tokens @CELL_PROXY_IMAGE@ and @BUNDLE_STORE_WRITER@ get the pinned cell-proxy image and the bundle store writer
+# of the role (hydrate_store_tokens in scripts/lib.sh).
 # HARNESS_ONLY=<component> renders only that harness component, for cell:up with HARNESS_ONLY, and an unknown
 # name fails. It cannot go with HYDRATE_ONLY.
 source "$(dirname "$0")/lib.sh"
@@ -54,9 +56,11 @@ for entry in ${entries[@]+"${entries[@]}"}; do
   else
     kustomize build --enable-helm --load-restrictor LoadRestrictionsNone "$dir" >"$tmp/raw.yaml"
   fi
+  # A component that runs cell-proxy (cell-system, argocd) holds @CELL_PROXY_IMAGE@, and the bundle store holds
+  # @BUNDLE_STORE_WRITER@. hydrate_store_tokens replaces them from build/images.env and the bundle role.
   sed -e "s|@CELL_NAME@|$CELL_NAME|g" \
     -e "s|@CELL_MESH_TRUST_DOMAIN@|$CELL_MESH_TRUST_DOMAIN|g" \
-    "$tmp/raw.yaml" >"$tmp/manifests.yaml"
+    "$tmp/raw.yaml" | hydrate_store_tokens >"$tmp/manifests.yaml"
   rm "$tmp/raw.yaml"
   if grep -n '@[A-Z_]*@' "$tmp/manifests.yaml"; then
     die "$c has a token that hydrate does not replace"

@@ -7,6 +7,8 @@
 //	cell-proxy spiffe-server ... --proof-subject <role>=<namespace>/<service account> [--proof-subject ...] [--registry-reload 10s]
 //	cell-proxy tunnel --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td> [--proof]
 //	cell-proxy promql-proxy --listen <addr> --upstream <url>
+//	cell-proxy token --listen <addr> --upstream <host:port> --audience <aud> --reader <user> [--reader ...] [--writer <user> ...] [--health <addr>]
+//	cell-proxy token-client --listen <loopback addr> --upstream <host:port> --token-file <file> [--health <addr>]
 //	cell-proxy probe --upstream <host:port> --expect-id <id> --peer-bundle <file> --peer-trust-domain <td>
 //	cell-proxy whoami
 //
@@ -41,6 +43,14 @@
 // tunnel is the cell side: it dials one exact server ID with its SVID, and serves the allowed
 // Kubernetes reads on the dialed connection with the token of its pod. promql-proxy passes only
 // the Prometheus reads of Kiali to --upstream, and has no SVID.
+//
+// token fronts the in-cluster bundle store. It asks the TokenReview API who owns the bearer token of
+// each request, and passes a read (GET, HEAD) only for a --reader and a write (POST, PUT, PATCH)
+// only for a --writer. It refuses every other request with 403 and counts it in store_proxy.denials.
+// Its --health route answers 200 only while GET /v2/ on --upstream answers 200 or 401 within 2 s, and 503 otherwise.
+// With no --writer, it refuses every write. token-client listens on a loopback address only, and
+// sends each request to --upstream with the token that --token-file holds, which it reads again for
+// every request. Neither mode has an SVID.
 package main
 
 import (
@@ -109,7 +119,7 @@ func main() {
 // execute runs one mode and returns the exit status.
 func execute(ctx context.Context, args []string, stdout io.Writer) int {
 	if len(args) == 0 {
-		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, tunnel, tunnel-status, promql-proxy, probe or whoami"))
+		cli.Fail(stdout, name, errors.New("give a mode: spiffe-client, spiffe-server, tunnel, tunnel-status, promql-proxy, token, token-client, probe or whoami"))
 		return exitConfig
 	}
 	switch args[0] {
@@ -123,6 +133,10 @@ func execute(ctx context.Context, args []string, stdout io.Writer) int {
 		return runTunnelStatus(ctx, args[1:], stdout)
 	case "promql-proxy":
 		return runPromProxy(ctx, args[1:], stdout)
+	case "token":
+		return runToken(ctx, args[1:], stdout)
+	case "token-client":
+		return runTokenClient(ctx, args[1:], stdout)
 	case "probe":
 		cfg, err := parseProbe(args[1:])
 		if err != nil {

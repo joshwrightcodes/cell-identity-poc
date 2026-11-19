@@ -87,26 +87,24 @@ func TestM2EntriesReconcile(t *testing.T) {
 	rootRef := store + "/bundles/root"
 	spireRef := store + "/bundles/" + spireApp
 	origRoot := orasResolve(t, rootRef+":current")
-	origSpireTag := orasResolve(t, spireRef+":current")
-	// The restore goes back to these tags. A run that stopped before its cleanup can leave test
-	// bundles on them, so they must be the bundles that the last cell:publish pushed.
+	// The restore goes back to the root tag. A run that stopped before its cleanup can leave a test bundle there, so it must be the
+	// root that the last publish pushed. Component bundles have no tag, so the Application pin is the digest of the spire-server bundle.
 	published := publishedDigests(t, spireCluster)
-	if origRoot != published["root"] || origSpireTag != published[spireApp] {
-		t.Fatalf("root:current is %s and %s:current is %s, but build/%s/published.env has %s and %s. Run: mise run gate:m2:repair",
-			origRoot, spireApp, origSpireTag, spireCluster, published["root"], published[spireApp])
-	}
 	origSpire := appTargetRevision(t, spireApp)
+	if origRoot != published["root"] || origSpire != published[spireApp] {
+		t.Fatalf("root:current is %s and %s pins %s, but build/%s/published.env has %s and %s. Run: mise run gate:m2:repair",
+			origRoot, spireApp, origSpire, spireCluster, published["root"], published[spireApp])
+	}
 	if !strings.HasPrefix(origSpire, "sha256:") {
 		t.Fatalf("Application %s: want a targetRevision that pins a digest, got %q", spireApp, origSpire)
 	}
-	t.Logf("original root bundle %s, spire-server bundle %s (tag current %s)", origRoot, origSpire, origSpireTag)
+	t.Logf("original root bundle %s, spire-server bundle %s", origRoot, origSpire)
 
 	restored := false
 	restore := func(t *testing.T) {
 		t.Helper()
 		if !restored {
 			orasTag(t, rootRef+"@"+origRoot, "current")
-			orasTag(t, spireRef+"@"+origSpireTag, "current")
 			refreshRoot(t)
 			restored = true
 		}
@@ -142,7 +140,7 @@ spec:
 	if out := runTool(t, nil, "yq", selectEntries+` | .data | keys | join(",")`, manifests); !strings.Contains(out, "m2-test-entry.yaml") {
 		t.Fatalf("edited spire-server bundle: want key m2-test-entry.yaml in ConfigMap spire-entries, got keys %q", out)
 	}
-	testSpire := orasPush(t, spireDir, spireRef+":current")
+	testSpire := orasPush(t, spireDir, spireRef+":m2-test")
 
 	// A root bundle that pins the test spire-server bundle.
 	rootDir := orasPull(t, rootRef+"@"+origRoot)

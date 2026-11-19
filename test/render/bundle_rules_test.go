@@ -30,6 +30,8 @@ type component struct {
 	// kind is "bundle", "harness" or "link".
 	kind string
 	objs []object
+	// raw is the text of the render after hydrate replaced its tokens.
+	raw string
 }
 
 type clusterRender struct {
@@ -140,7 +142,24 @@ func renderComponent(t *testing.T, cluster string, c *component) (string, error)
 		}
 		out = cached
 	}
-	return strings.NewReplacer("@CELL_NAME@", cluster, "@CELL_MESH_TRUST_DOMAIN@", cluster+".mesh.poc.internal").Replace(out), nil
+	out = strings.NewReplacer("@CELL_NAME@", cluster, "@CELL_MESH_TRUST_DOMAIN@", cluster+".mesh.poc.internal").Replace(out)
+	return hydrateTokens(t, cluster, out), nil
+}
+
+// hydrateTokens replaces @CELL_PROXY_IMAGE@ and @BUNDLE_STORE_WRITER@ as scripts/hydrate.sh does, through
+// hydrate_store_tokens of scripts/lib.sh with the stub image list. A render with no token passes unchanged.
+func hydrateTokens(t *testing.T, cluster, text string) string {
+	t.Helper()
+	if !strings.Contains(text, "@CELL_PROXY_IMAGE@") && !strings.Contains(text, "@BUNDLE_STORE_WRITER@") {
+		return text
+	}
+	lib := filepath.Join(repoRoot(t), "scripts", "lib.sh")
+	r := runStubbed(t, "/ko-app/stub", text, []string{"bash", "-c", `source "$1"; hydrate_store_tokens`, "_", lib},
+		"CELL="+cluster, "POC_BUILD_ROOT="+t.TempDir())
+	if r.err != nil {
+		t.Fatalf("hydrate_store_tokens for %s: %v\n%s", cluster, r.err, r.stderr)
+	}
+	return r.stdout
 }
 
 // renderAll renders every component of every cluster with components in harness/topology.yaml.
@@ -168,6 +187,7 @@ func renderAll(t *testing.T) []*clusterRender {
 			if err != nil {
 				t.Fatal(err)
 			}
+			c.raw = out
 			if c.objs, err = parseDocs(out); err != nil {
 				t.Fatalf("%s/%s: %v", cluster, c.name, err)
 			}
@@ -625,7 +645,7 @@ var liveCellVariants = map[string]string{
 }
 
 // TestNoEmptyPeerList checks that every NetworkPolicy rule in every render names its peers. A rule
-// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay and cell-gateway in
+// with an empty or missing from or to list admits every peer. The renders of SPIRE server, relay, cell-gateway and envd in
 // dev-cp run again with no live cell and with one, because their cell rules lose the peers when a cell is absent, and
 // the rule must then go, not stay with an empty list.
 func TestNoEmptyPeerList(t *testing.T) {
@@ -661,7 +681,7 @@ func TestNoEmptyPeerList(t *testing.T) {
 	}
 	for label, kindEnv := range liveCellVariants {
 		for _, tc := range []struct{ component, binary string }{
-			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"},
+			{"spire-server", "/ko-app/cluster-jwt-server"}, {"relay-system", "/ko-app/stub"}, {"cell-gateway", "/ko-app/stub"}, {"envd", "/ko-app/stub"},
 		} {
 			t.Run(label+" "+tc.component, func(t *testing.T) {
 				script, err := filepath.Abs("../../components/" + tc.component + "/render.sh")

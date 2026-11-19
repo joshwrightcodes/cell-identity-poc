@@ -1,0 +1,9 @@
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata: {name: v1.security.istio.io, namespace: argocd}
+spec:
+  group: security.istio.io
+  version: v1
+  service: {name: evil, namespace: argocd}
+  groupPriorityMinimum: 1000
+  versionPriority: 15

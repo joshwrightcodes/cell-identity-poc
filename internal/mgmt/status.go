@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -42,6 +43,11 @@ type Status struct {
 	DroppedAt      time.Time              `json:"droppedAt,omitzero"`
 	EpochChangedAt time.Time              `json:"epochChangedAt,omitzero"`
 	StagedKey      string                 `json:"stagedKey,omitempty"`
+
+	// PlaneBundle is the last served set of the control plane, and PlaneBundleStatus the bundle state
+	// that envd reported for it.
+	PlaneBundle       *mgmtapi.TargetBundle `json:"planeBundle,omitempty"`
+	PlaneBundleStatus *op.BundleStatus      `json:"planeBundleStatus,omitempty"`
 
 	// HostSpecPushedAt and HostSpecPushError describe the last spec push to the host service, from
 	// Config.SpecPushState.
@@ -82,6 +88,10 @@ type CellStatus struct {
 	HintAt             time.Time    `json:"hintAt,omitzero"`
 	LastHintCheck      string       `json:"lastHintCheck,omitempty"`
 
+	// Bundle is the last signed set of the cell, and BundleStatus the state that its applier reported.
+	Bundle       *mgmtapi.TargetBundle `json:"bundle,omitempty"`
+	BundleStatus *op.BundleStatus      `json:"bundleStatus,omitempty"`
+
 	Requested    bool      `json:"requested"`
 	RequestedAt  time.Time `json:"requestedAt,omitzero"`
 	RequestID    string    `json:"requestId,omitempty"`
@@ -99,6 +109,8 @@ type reports struct {
 	refusal      *mgmtapi.Refusal
 	storeError   string
 	behindLogged bool
+
+	planeBundle *op.BundleStatus
 
 	gateway        *mgmtapi.GatewayStatus
 	gatewayAt      time.Time
@@ -162,6 +174,11 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		p.noteGateway(r.Gateway, now)
 		hints = append(hints, r.Gateway.KeyHints...)
 	}
+	p.rep.planeBundle = nil
+	if r.PlaneBundleStatus != nil {
+		b := *r.PlaneBundleStatus
+		p.rep.planeBundle = &b
+	}
 	p.noteSteps(st, r.Steps)
 	p.lagLocked(st, now)
 	logBehind := behind && !p.rep.behindLogged
@@ -174,6 +191,7 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 	for _, h := range hints {
 		p.queueHint(h.Cell)
 	}
+	p.planeResult(r.PlaneBundle)
 	if len(st.PendingDrops) > 0 && r.Applied == st.Last {
 		if err := p.dropNext(r.Applied); err != nil && ReasonOf(err) != mgmtapi.ReasonRestoreActive {
 			p.logLimited(context.Background(), slog.LevelError, "drop_failed", "drop_failed", "error", err.Error())
@@ -266,6 +284,10 @@ func (p *Plane) Status() Status {
 		Gateway:            rep.gateway, GatewayAt: rep.gatewayAt, DroppedAt: rep.droppedAt, EpochChangedAt: rep.epochChangedAt,
 		StagedKey: st.StagedKeySHA256,
 	}
+	if tb, ok := st.Bundles[p.cfg.Intent.ControlPlaneName()].shown(); ok {
+		s.PlaneBundle = &tb
+	}
+	s.PlaneBundleStatus = rep.planeBundle
 	if p.cfg.SpecPushState != nil {
 		s.HostSpecPushedAt, s.HostSpecPushError = p.cfg.SpecPushState()
 	}

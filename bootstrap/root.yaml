@@ -12,7 +12,7 @@ metadata:
 spec:
   project: cell
   source:
-    repoURL: oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/root
+    repoURL: oci://127.0.0.1:5000/bundles/root
     targetRevision: current
     path: .
   destination:

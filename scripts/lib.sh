@@ -213,7 +213,96 @@ done
 # The bootstrap set. Bootstrap applies these bundles once, before Argo CD takes over.
 BOOTSTRAP=(namespaces argocd cell-system)
 
-BUNDLE_STORE_HOST="bundle-store.cell-system.svc.cluster.local:5000"
+# Argo CD reads bundles from BUNDLE_STORE_HOST, which is the token client in the repo server pod. The token client
+# sends each request to BUNDLE_STORE_SERVICE, the service of the bundle store, with the token of the pod.
+BUNDLE_STORE_HOST="127.0.0.1:5000"
+BUNDLE_STORE_SERVICE="bundle-store.cell-system.svc.cluster.local:5000"
+
+source "$ROOT/components/lib/bundle-role.sh"
+
+# bundle_role prints the bundle role of $CELL: cell, cp or open (components/lib/bundle-role.sh).
+bundle_role() { bundle_role_of "$CELL_NAME"; }
+
+# bundle_state_ns <role> prints the namespace of ConfigMap bundle-state: cell-ops-system for role cell, envd-system for role cp,
+# and nothing for role open, which has no bundle state.
+bundle_state_ns() {
+  case "$1" in
+    cell) echo cell-ops-system ;;
+    cp) echo envd-system ;;
+    open) ;;
+    *) die "unknown bundle role '$1'" ;;
+  esac
+}
+
+# bundle_state_json prints state.json of ConfigMap bundle-state in the cluster CELL, and nothing when the ConfigMap is absent or
+# the role has none. A read that fails returns 1, so a caller never takes an unreadable state for an absent one.
+bundle_state_json() {
+  local role ns raw
+  role="$(bundle_role)" || return 1
+  ns="$(bundle_state_ns "$role")" || return 1
+  [[ -n "$ns" ]] || return 0
+  raw="$(k -n "$ns" get configmap bundle-state --ignore-not-found -o 'jsonpath={.data.state\.json}')" \
+    || { echo "error: could not read ConfigMap bundle-state in $ns of $CELL_NAME" >&2; return 1; }
+  printf '%s' "$raw"
+}
+
+# bundle_state_source prints the source of the bundle state (bootstrap or signed), and nothing when there is no state.
+bundle_state_source() {
+  local state
+  state="$(bundle_state_json)" || return 1
+  [[ -z "$state" ]] || jq -r '.source // ""' <<<"$state"
+}
+
+# bundle_state_bootstrap writes the bootstrap state of the cluster CELL when the role has a state and none exists: ConfigMap
+# bundle-state with the label poc.internal/made-by=bundle-bootstrap, from build/<cluster>/root.json (the result of publish.sh).
+# The state holds the root that publish.sh pushed as its first good root, state healthy and no version, so the first signed set
+# of any version is newer. The write is a create, so a state that celld wrote first stays.
+bundle_state_bootstrap() {
+  local role ns state doc
+  role="$(bundle_role)" || return 1
+  ns="$(bundle_state_ns "$role")" || return 1
+  [[ -n "$ns" ]] || return 0
+  state="$(bundle_state_json)" || return 1
+  [[ -z "$state" ]] || return 0
+  [[ -f "$BUILD/root.json" ]] || die "no $BUILD/root.json, so there is no bootstrap root to record. Run: CELL=$CELL_NAME mise run cell:publish"
+  doc="$(jq -c --arg ns "$ns" '{
+      apiVersion: "v1", kind: "ConfigMap",
+      metadata: {name: "bundle-state", namespace: $ns, labels: {"poc.internal/made-by": "bundle-bootstrap"}},
+      data: {"state.json": ({source: "bootstrap", version: {epoch: 0, counter: 0}, contentSHA256: "", keySHA256: "", opId: "",
+        state: "healthy", holder: "", until: "0001-01-01T00:00:00Z", root: {digest: .digest, manifest: .manifest},
+        components: .components, checked: [], checkedBy: "", good: []} | tojson)}}' "$BUILD/root.json")" \
+    || die "could not read the root of $BUILD/root.json"
+  if ! k -n "$ns" create -f - >/dev/null <<<"$doc"; then
+    state="$(bundle_state_json)" || return 1
+    [[ -n "$state" ]] || die "could not create ConfigMap bundle-state in $ns of $CELL_NAME"
+    return 0
+  fi
+  log "wrote the bootstrap bundle state of $CELL_NAME to $ns/bundle-state"
+}
+
+# hydrate_store_tokens replaces @CELL_PROXY_IMAGE@ and @BUNDLE_STORE_WRITER@ in the render on standard input and
+# prints the result. The image is the pinned reference from build/images.env. The writer is the account of the applier
+# of the role of $CELL, and a role with no writer drops the line with the token, so the proxy refuses every write. A
+# render without a token passes unchanged, and needs no image.
+hydrate_store_tokens() {
+  local text image="" writer="" role
+  text="$(cat; echo x)"; text="${text%x}"
+  if [[ "$text" == *@CELL_PROXY_IMAGE@* ]]; then
+    source "$ROOT/scripts/ko-image.sh"
+    image="$(ko_image cell-proxy)" || return 1
+    text="${text//@CELL_PROXY_IMAGE@/$image}"
+  fi
+  if [[ "$text" == *@BUNDLE_STORE_WRITER@* ]]; then
+    role="$(bundle_role)" || return 1
+    writer="$(bundle_store_writer_of "$role")" || return 1
+    if [[ -n "$writer" ]]; then
+      text="${text//@BUNDLE_STORE_WRITER@/$writer}"
+    else
+      text="$(grep -v '@BUNDLE_STORE_WRITER@' <<<"$text"; echo x)"; text="${text%x}"
+    fi
+  fi
+  printf '%s' "$text"
+}
 
 k() { kubectl --context "kind-$CELL_NAME" "$@"; }
 
@@ -227,13 +316,15 @@ wait_for() {
   done
 }
 
-# Start a port-forward to the bundle store. Sets BUNDLE_BUNDLE_STORE_PF_PID.
+# Start a port-forward to the registry of the bundle store. Sets BUNDLE_STORE_PF_PID. The registry listens on the
+# loopback address of the pod (port 5001), behind the token proxy, so the forward goes to the pod and no token is
+# needed. Only a person on this Mac reaches it, through kubectl. This is the path of the bootstrap publish and of the repair.
 bundle_store_forward() {
   if curl -fsS "http://127.0.0.1:${CELL_BUNDLE_STORE_PORT}/v2/" >/dev/null 2>&1; then
     die "port ${CELL_BUNDLE_STORE_PORT} already serves a bundle store, probably from an old port-forward. Find its process with: lsof -nP -iTCP:${CELL_BUNDLE_STORE_PORT} -sTCP:LISTEN. Stop that process, then run the command again."
   fi
   # Call kubectl directly, not through k, so $! is the kubectl process that the trap kills.
-  kubectl --context "kind-$CELL_NAME" -n cell-system port-forward svc/bundle-store "${CELL_BUNDLE_STORE_PORT}:5000" \
+  kubectl --context "kind-$CELL_NAME" -n cell-system port-forward pod/bundle-store-0 "${CELL_BUNDLE_STORE_PORT}:5001" \
     >/dev/null 2>&1 &
   BUNDLE_STORE_PF_PID=$!
   trap 'kill "$BUNDLE_STORE_PF_PID" 2>/dev/null || true' EXIT
@@ -296,7 +387,7 @@ cluster_lock_holder() {
   pid="$(tr -d '[:space:]' <"$dir/pid" 2>/dev/null)" || return 0
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
   # The system can give the pid of an ended run to another process, so the command line must show a harness script.
-  [[ "$(ps -ww -p "$pid" -o command= 2>/dev/null)" =~ (^|[[:space:]/])(up|down|link|restart)\.sh([[:space:]]|$) ]] || return 0
+  [[ "$(ps -ww -p "$pid" -o command= 2>/dev/null)" =~ (^|[[:space:]/])(up|down|link|restart|bundle)\.sh([[:space:]]|$) ]] || return 0
   step="$(cat "$dir/step" 2>/dev/null || true)"
   printf '%s|%s\n' "$pid" "$step"
 }
@@ -483,14 +574,19 @@ check_apps_namespace() {
   k -n argocd get application root >/dev/null 2>&1 || { echo "argocd has no root Application. Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
 }
 
-# check_argocd_projects succeeds when argocd holds exactly the AppProjects cell and default, and
-# default allows no source, no destination and no kind. The server of argocd admin dashboard
-# creates a permissive default when none exists.
+# check_argocd_projects succeeds when argocd holds exactly the AppProjects of the role of the cluster and default, and
+# default allows no source, no destination and no kind. The role gives cell and cell-app in a cell, and cell in every other
+# cluster. The server of argocd admin dashboard creates a permissive default when none exists.
 check_argocd_projects() {
-  local json
+  local json role want
   json="$(k -n argocd get appprojects -o json)" || return 1
-  jq -e '(.items | map(.metadata.name) | sort) == ["cell", "default"]' >/dev/null <<<"$json" \
-    || { echo "AppProjects in argocd: $(jq -r '[.items[].metadata.name] | join(" ")' <<<"$json"), want cell and default. Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
+  role="$(bundle_role)" || return 1
+  case "$role" in
+    cell) want='["cell", "cell-app", "default"]' ;;
+    *) want='["cell", "default"]' ;;
+  esac
+  jq -e --argjson want "$want" '(.items | map(.metadata.name) | sort) == $want' >/dev/null <<<"$json" \
+    || { echo "AppProjects in argocd: $(jq -r '[.items[].metadata.name] | join(" ")' <<<"$json"), want $(jq -r 'join(", ")' <<<"$want"). Run: CELL=$CELL_NAME mise run cell:ui:clean"; return 1; }
   jq -e '.items[] | select(.metadata.name == "default") | .spec
     | ((.sourceRepos // []) | length) == 0 and ((.destinations // []) | length) == 0
       and ((.clusterResourceWhitelist // []) | length) == 0 and ((.namespaceResourceWhitelist // []) | length) == 0' >/dev/null <<<"$json" \
@@ -586,11 +682,10 @@ check_agent_grants() {
 }
 
 # The relay copies the node address of RELAY_TARGET into its routes and its egress policy, and the
-# node addresses of the live cells into its ingress policy. Docker can give a rebuilt node a new
+# node addresses of the live cells into the harness plane policies of dev-cp. Docker can give a rebuilt node a new
 # address, and the relay then sends the streams of the cells to the wrong node. With no live cell, the
-# render deletes the cell ingress rule. Each rule is selected by its ports, never by its index: the rule
-# of the cells has the route ports, the rule of the nodes has the health port 8080, and the egress rule of
-# the target has the target node ports, from 30000.
+# render of envd leaves out plane-cells. The egress rule of the target is selected by its ports, never by its
+# index: the target node ports start at 30000.
 # check_relay_current needs the function node_ip <cluster>, which verify.sh defines.
 check_relay_current() {
   local target cell ip name json hosts cidrs want_cells stale=() cell_cidrs=() live cells_text
@@ -606,12 +701,16 @@ check_relay_current() {
     json="$(k -n relay-system get deployment "$name" -o json)" || { echo "cannot read Deployment relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
     hosts="$(jq -r '.spec.template.spec.containers[0].args as $a | [range(0; $a | length) | select($a[.] == "--route") | $a[. + 1] | split("=")[1] | split(":")[0]] | unique | join(" ")' <<<"$json")"
     [[ "$hosts" == "$target" ]] || stale+=("$name routes to '$hosts', but the node of $RELAY_TARGET is $target")
-    json="$(k -n relay-system get networkpolicy "$name" -o json)" || { echo "cannot read NetworkPolicy relay-system/$name"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
-    cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy of $name admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
-    cidrs="$(jq -r '[.spec.ingress[] | select(any(.ports[]?; .port != 8080)) | .from[].ipBlock.cidr] | sort | join(" ")' <<<"$json")"
-    [[ "$cidrs" == "$want_cells" ]] || stale+=("the ingress policy of $name admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   done
+  # The harness plane policies of dev-cp hold both lists: relay-system/plane-upstream (the relays to the target node) and relay-system/plane-cells
+  # (the cells to the route ports, absent while no cell is live).
+  json="$(k -n relay-system get networkpolicy plane-upstream -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-upstream"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  cidrs="$(jq -r '[.spec.egress[] | select(any(.ports[]?; .port >= 30000)) | .to[] | select(.ipBlock != null) | .ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+  [[ "$cidrs" == "$target/32" ]] || stale+=("the egress policy plane-upstream admits '$cidrs', but the node of $RELAY_TARGET is $target/32")
+  json="$(k -n relay-system get networkpolicy plane-cells --ignore-not-found -o json)" || { echo "cannot read NetworkPolicy relay-system/plane-cells"; echo "Run: CELL=$CELL_NAME mise run cell:up"; return 1; }
+  cidrs=""
+  [[ -z "$json" ]] || cidrs="$(jq -r '[.spec.ingress[]? | .from[]?.ipBlock.cidr] | sort | join(" ")' <<<"$json")"
+  [[ "$cidrs" == "$want_cells" ]] || stale+=("the plane policy relay-system/plane-cells admits '$cidrs' on its route ports, but the nodes of the live cells (${cells_text:-none}) are '$want_cells'")
   if ((${#stale[@]} > 0)); then
     printf '%s\n' "${stale[@]}"
     echo "Run: CELL=$CELL_NAME mise run cell:up"
@@ -849,6 +948,61 @@ apply_bundle() {
   log "applied bundle $1"
 }
 
+# apply_store_object <kind> <rendered file> <live object as JSON> applies the object bundle-store of kind <kind> from the rendered file with the field
+# manager argocd-controller, as an Argo CD sync does, and keeps the live tracking annotation, so the apply leaves one owner and no field of Argo CD behind.
+apply_store_object() {
+  local kind="$1" file="$2" live="$3" obj tid
+  obj="$(KIND="$kind" yq 'select(.kind == strenv(KIND) and .metadata.name == "bundle-store" and .metadata.namespace == "cell-system")' "$file")" \
+    || die "could not read $kind bundle-store in $file"
+  [[ -n "$obj" ]] || return 0
+  tid="$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")"
+  [[ -z "$tid" ]] || obj="$(TID="$tid" yq '.metadata.annotations["argocd.argoproj.io/tracking-id"] = strenv(TID)' <<<"$obj")"
+  k apply --server-side --field-manager=argocd-controller --force-conflicts -f - >/dev/null <<<"$obj" \
+    || die "could not apply $kind bundle-store as argocd-controller"
+  log "applied $kind bundle-store from the render, as an Argo CD sync does"
+}
+
+# store_upgrade moves the bundle store of a cluster from M7 to M8 after the bootstrap apply. It changes nothing in a new cluster or in an upgraded one.
+#   - The M7 registry has a readiness probe and a port that Argo CD owns (field manager argocd-controller). The bootstrap apply runs as kubectl and cannot
+#     remove them, and the new port 5000 is the store proxy, so the probe never passes and Argo CD cannot read the store to remove them. A StatefulSet
+#     that has such a field gets the rendered object with the manager argocd-controller, and a pod that never became Ready is deleted, because a StatefulSet
+#     does not replace a pod of the current revision.
+#   - The store proxy reviews tokens through the API server, and the egress for that lives in the network-policy bundle, which Argo CD syncs after it reads
+#     the store. A live policy bundle-store that Argo CD manages gets the rendered policy first.
+store_upgrade() {
+  local live stale tid pod ready rev hash i
+  live="$(k -n cell-system get networkpolicy bundle-store --ignore-not-found -o json)" || die "could not read NetworkPolicy bundle-store in cell-system"
+  if [[ -n "$live" && -f "$BUNDLES/network-policy/manifests.yaml" ]] \
+    && [[ -n "$(jq -r '.metadata.annotations["argocd.argoproj.io/tracking-id"] // ""' <<<"$live")" ]]; then
+    apply_store_object NetworkPolicy "$BUNDLES/network-policy/manifests.yaml" "$live"
+  fi
+  live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+  [[ -n "$live" ]] || return 0
+  stale="$(jq -r '[.spec.template.spec.containers[]? | select(.name == "bundle-store") | (.readinessProbe != null) or ((.ports // []) | length > 0)] | any' <<<"$live")"
+  if [[ "$stale" == true && -f "$BUNDLES/cell-system/manifests.yaml" ]]; then
+    apply_store_object StatefulSet "$BUNDLES/cell-system/manifests.yaml" "$live"
+    # status.updateRevision moves only when the controller has seen the new generation. Until then, the stuck pod still looks current.
+    for ((i = 0; i < ${STORE_UPGRADE_WAIT:-60}; i++)); do
+      live="$(k -n cell-system get statefulset bundle-store --ignore-not-found -o json)" || die "could not read StatefulSet bundle-store in cell-system"
+      jq -e '(.metadata.generation // 0) <= (.status.observedGeneration // 0)' >/dev/null <<<"$live" && break
+      sleep 1
+    done
+    jq -e '(.metadata.generation // 0) <= (.status.observedGeneration // 0)' >/dev/null <<<"$live" \
+      || die "the StatefulSet controller did not catch up with bundle-store: generation $(jq -r '.metadata.generation' <<<"$live"), observed $(jq -r '.status.observedGeneration // 0' <<<"$live"). Run CELL=$CELL_NAME mise run cell:up again when the controller works"
+  fi
+  # The pod check runs on every pass, so a rerun after an interrupted upgrade also replaces a pod that never became Ready. A pod of the current
+  # revision may still be starting, so only a pod of an older revision goes.
+  rev="$(jq -r '.status.updateRevision // ""' <<<"$live")"
+  pod="$(k -n cell-system get pod bundle-store-0 --ignore-not-found -o json)" || die "could not read pod bundle-store-0"
+  [[ -n "$pod" && -n "$rev" ]] || return 0
+  ready="$(jq -r '[.status.conditions[]? | select(.type == "Ready") | .status][0] // "False"' <<<"$pod")"
+  hash="$(jq -r '.metadata.labels["controller-revision-hash"] // ""' <<<"$pod")"
+  if [[ "$ready" != True && "$hash" != "$rev" ]]; then
+    k -n cell-system delete pod bundle-store-0 --wait=true --timeout=120s >/dev/null || die "could not delete the pod bundle-store-0, which never became Ready"
+    log "deleted the pod bundle-store-0, which never became Ready at revision $hash"
+  fi
+}
+
 # release_from_argocd <bundle> removes what Argo CD left on the objects of a bundle that an Argo CD
 # Application managed before: the tracking annotation and the argocd-controller field manager.
 # The harness apply then owns every field. Objects without these leftovers stay unchanged.
@@ -1025,7 +1179,10 @@ check_plane_pods() {
 # harness label and the marker label poc.internal/made-by=mgmtd.
 # The fourth case: celld writes the ConfigMaps op-<id> (an operation record) and demo-log in cell-ops-system
 # with the field manager celld and the marker label poc.internal/made-by=celld. The bundle holds neither, so
-# the check skips them, and prints no delete hint for them.
+# the check skips them, and prints no delete hint for them. The ConfigMap bundle-state is a runtime object too:
+# cell:up creates it with kubectl create and the marker poc.internal/made-by=bundle-bootstrap, and celld
+# updates it and changes the marker to celld. In dev-cp, the ConfigMap envd-system/bundle-state of envd follows the same rule,
+# with the field manager and marker envd.
 # The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
 # manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
@@ -1043,7 +1200,14 @@ runtime_objects() {
     return
   fi
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
-    jq -cn '{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}}'
+    jq -cn '[{names: "^(op-[0-9a-f]{32}|demo-log)$", managers: ["celld"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
+      {names: "^bundle-state$", managers: ["celld", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "celld"}},
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
+    return
+  fi
+  if [[ "$1" == envd && "$2" == envd-system && "$3" == ConfigMap ]]; then
+    jq -cn '[{names: "^bundle-state$", managers: ["envd", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
     return
   fi
   if [[ "$1:$2" =~ ^(central-view:central-view-system|telemetry-gateway:observability-system|mesh-view-hub:mesh-view-system)$ && "$3" == ConfigMap ]]; then
@@ -1153,6 +1317,11 @@ check_no_last_applied_secret() {
   }
 }
 
+# sha256 prints the hex SHA-256 of standard input, with sha256sum on Linux and shasum on the Mac.
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
 # pem_der_sha256 reads PEM certificates on standard input and prints the SHA-256 of their DER bytes, in
 # file order, one after the other. hostsvc prints the same value as root_sha256 for its client roots.
 pem_der_sha256() {
@@ -1160,13 +1329,14 @@ pem_der_sha256() {
   printf 'AA==' | base64 -d >/dev/null 2>&1 || decode=-D
   awk '/-----BEGIN CERTIFICATE-----/ { b = ""; next } /-----END CERTIFICATE-----/ { print b; next } { b = b $0 }' \
     | while read -r line; do printf '%s' "$line" | base64 "$decode"; done \
-    | if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+    | sha256
 }
 
 # dependents_of <name> prints the commands that bring the copies of a change up to date, one command on each
 # line, in the order to run them. The name is a cluster that was rebuilt (management, dev-cp or a cell),
-# hostsvc for a restart of the host service, gateway-nodes for a gateway that holds old cell node addresses, or
-# gateway-store for a store of the gateway that is lost, corrupt or full. The cell:up of dev-cp renders the
+# hostsvc for a restart of the host service, gateway-nodes for a gateway that holds old cell node addresses,
+# gateway-store for a store of the gateway that is lost, corrupt or full, mirror for a registry mirror with a new address, or
+# store-tokens for new projected store tokens. The cell:up of dev-cp renders the
 # cell gateway again, so the rows of a rebuilt cell and of dev-cp cover it. The README section
 # "Rebuild one cluster" holds the same table.
 # A cell exists only through a signed step, so the rows of a cell and of management go through the portal. The
@@ -1205,6 +1375,12 @@ dependents_of() {
       for cell in $live; do echo "CELL=$cell mise run cell:up"; done
       for cell in $live; do echo "CELL=$cell mise run cell:restart"; done
       echo "CELL=management mise run cell:link" ;;
+    # A new address of the registry mirror changes rules N45 in the render of celld. New store tokens need new pods.
+    mirror | store-tokens)
+      live="$(live_cells)" || return 1
+      for cell in $live; do
+        if [[ "$1" == mirror ]]; then echo "CELL=$cell HARNESS_ONLY=cell-identity mise run cell:up"; else echo "CELL=$cell STORE_TOKENS=1 mise run cell:restart"; fi
+      done ;;
     *)
       for cell in $catalog; do
         [[ "$cell" == "$1" ]] || continue
@@ -1215,7 +1391,7 @@ dependents_of() {
         echo "CELL=management mise run cell:link"
         return
       done
-      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store and $catalog, not '$1'" ;;
+      die "dependents_of knows management, dev-cp, hostsvc, gateway-nodes, gateway-store, mirror, store-tokens and $catalog, not '$1'" ;;
   esac
 }
 

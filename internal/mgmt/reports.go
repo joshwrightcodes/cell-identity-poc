@@ -83,6 +83,7 @@ type cellRuntime struct {
 	hintAt             time.Time
 	lastHintCheck      string
 	invalidSince       time.Time
+	bundle             *op.BundleStatus
 }
 
 type liveState struct {
@@ -116,6 +117,10 @@ func (l *liveState) snapshot() map[string]cellRuntime {
 
 // fill adds the report fields of a cell to its status.
 func (cs *CellStatus) fill(live cellRuntime, st *State, now time.Time) {
+	if tb, ok := st.Bundles[cs.Name].shown(); ok {
+		cs.Bundle = &tb
+	}
+	cs.BundleStatus = live.bundle
 	cs.LastStatusAt, cs.LastStatusPod = live.lastStatusAt, live.lastStatusPod
 	cs.Unreported, cs.OldestUnreportedAt, cs.Records = live.unreported, live.oldestUnreportedAt, live.records
 	cs.LastRefusal, cs.ForgedSeen = live.refusal, live.forgedTotal
@@ -226,6 +231,7 @@ func (p *Plane) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.Repo
 	}
 
 	outcomes := make([]string, len(pending))
+	refusedDetail := make([]string, len(pending))
 	err := p.commit(func(t *txn) error {
 		for j, pr := range pending {
 			x := t.st.Ops[pr.res.OpID]
@@ -238,11 +244,11 @@ func (p *Plane) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.Repo
 				outcomes[j] = mgmtapi.OutcomeForgedSeen
 			case x.Final != "":
 				outcomes[j] = mgmtapi.OutcomeDuplicate
+			case pr.res.Outcome == op.OutcomeRolledBack && opKind(x) != op.KindBundleApply:
+				outcomes[j], refusedDetail[j] = mgmtapi.OutcomeRefused, "outcome"
 			default:
-				res := pr.res
-				x.Result, x.ResultAt, x.Final = &res, t.now, res.Outcome
+				t.finishOp(pr.res.OpID, x, pr.res)
 				outcomes[j] = mgmtapi.OutcomeAccepted
-				t.dirty = true
 			}
 		}
 		return nil
@@ -255,6 +261,8 @@ func (p *Plane) Reports(ctx context.Context, b mgmtapi.ReportBatch) mgmtapi.Repo
 			o = mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeRetry, Reason: mgmtapi.ReasonStore}
 		case o.Outcome == mgmtapi.OutcomeForgedSeen:
 			p.noteForged(ctx, pr.cell, pr.res)
+		case o.Outcome == mgmtapi.OutcomeRefused:
+			o.Reason, o.Detail = mgmtapi.ReasonPayloadInvalid, refusedDetail[j]
 		}
 		out[pr.i] = p.noteItem(ctx, it, o)
 	}
@@ -325,6 +333,10 @@ func decodeResult(it mgmtapi.ReportItem, claims clusterjwt.Claims) (op.Result, *
 		return bad("outcome")
 	case res.Pod != "" && res.Pod != claims.PodName:
 		return bad("pod")
+	case res.Reason != "" && !op.ValidDetail(res.Reason):
+		return bad("reason")
+	case res.Detail != "" && !op.ValidDetail(res.Detail):
+		return bad("detail")
 	}
 	return res, nil
 }
@@ -370,6 +382,11 @@ func (p *Plane) reportStatus(it mgmtapi.ReportItem, claims clusterjwt.Claims, no
 	pod.name, pod.seq, pod.at = s.Pod, s.Seq, s.At
 	c.lastStatusAt, c.lastStatusPod = s.At, s.Pod
 	c.unreported, c.oldestUnreportedAt, c.records = s.Unreported, s.OldestUnreportedAt, s.Records
+	c.bundle = nil
+	if s.Bundle != nil {
+		b := *s.Bundle
+		c.bundle = &b
+	}
 	return mgmtapi.ItemOutcome{ID: it.ID, OpID: it.OpID, Outcome: mgmtapi.OutcomeAccepted}
 }
 

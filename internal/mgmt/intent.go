@@ -30,6 +30,20 @@ type Intent struct {
 	Env         string         `json:"env"`
 	BindSubject record.Subject `json:"bindSubject"`
 	Cells       []IntentCell   `json:"cells"`
+	// ControlPlane is the name of the environment control plane as a bundle target. Empty means
+	// DefaultControlPlane.
+	ControlPlane string `json:"controlPlane,omitempty"`
+}
+
+// DefaultControlPlane is the name of the control plane when the intent names none.
+const DefaultControlPlane = "dev-cp"
+
+// ControlPlaneName returns the name of the control plane as a bundle target.
+func (in Intent) ControlPlaneName() string {
+	if in.ControlPlane == "" {
+		return DefaultControlPlane
+	}
+	return in.ControlPlane
 }
 
 // IntentCell is one cell of the catalog. Cluster describes the cluster that a step creates.
@@ -70,6 +84,9 @@ func (in Intent) validate() error {
 	if in.BindSubject.Namespace == "" || in.BindSubject.ServiceAccount == "" {
 		return errors.New("bindSubject needs a namespace and a service account")
 	}
+	if in.ControlPlane != "" && !spec.ValidName(in.ControlPlane) {
+		return fmt.Errorf("controlPlane %q is not a DNS label of at most %d characters", in.ControlPlane, spec.MaxNameLength)
+	}
 	seen := map[string]bool{}
 	_, probe, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -85,6 +102,9 @@ func (in Intent) validate() error {
 			return fmt.Errorf("cell %q appears twice", c.Name)
 		}
 		seen[c.Name] = true
+		if c.Name == in.ControlPlaneName() {
+			return fmt.Errorf("cell name %q is the control plane", c.Name)
+		}
 		if c.Cluster == (step.ClusterRef{}) {
 			return fmt.Errorf("cell %q has no cluster", c.Name)
 		}

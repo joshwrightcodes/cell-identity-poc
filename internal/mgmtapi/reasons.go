@@ -37,6 +37,8 @@ const (
 	ReasonStale             = "stale"
 	ReasonStore             = "store"
 	ReasonInternal          = "internal"
+	// ReasonBundleOpen means a served bundle.apply of the target has no final result yet.
+	ReasonBundleOpen = "bundle_open"
 )
 
 // The values of ItemOutcome.Outcome. The reason of an item outcome reuses the detail reasons above.

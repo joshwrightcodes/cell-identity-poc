@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision|m7 [go test arguments]
+# Run the end-to-end tests of one milestone. Usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision|m7|m8 [go test arguments]
 # m4-rotate runs the one test that rotates the signing key of mgmtd, with the checks of m4.
 # m5-soak runs the one test that applies an operation each minute for 30 minutes on the open streams.
 # m5-drill runs the one test that loses the gateway volume with work in flight, and recovers it with gw:reset.
@@ -7,13 +7,22 @@
 # m6-provision runs the one test that deletes both cells and creates them again through the portal, after the same checks. It is not
 # part of m6, because it deletes the cells. An interrupted run leaves build/gate/m6-provision, and mise run gate:m6:repair restores the cells.
 # m7 runs gate-m6-repair.sh --check, gate-m7-repair.sh --check and the image check of m6 with celld added, because M7 tests run the celld bind client and the cell-proxy images.
-# After the tests, m5, m5-soak, m5-drill, m6, m6-provision and m7 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
+# m8 runs gate-m6-repair.sh --check, gate-m7-repair.sh --check, gate-m8-repair.sh --check and the image check of m7, with cell-proxy of bundle-store-0 and argocd-repo-server in
+# dev-cp and in each live cell added, then the tests with -short, which skips the long tests, unless GATE_M8_LONG=1. A run whose tests pass removes
+# build/gate/m8-bundles, the record of the targets that a test changed. A failed run keeps it, and gate-m8-repair.sh --check then fails.
+# After the tests, m5, m5-soak, m5-drill, m6, m6-provision, m7 and m8 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
-milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision|m7 [go test arguments]}"
+milestone="${1:?usage: gate.sh m1|m2|m3|m4|m4-rotate|m5|m5-soak|m5-drill|m6|m6-provision|m7|m8 [go test arguments]}"
+# The waits of the M8 tests are longer than the floor of the Go timeout, and a timeout skips every cleanup, so the limits of M8 must be set.
+if [[ "$milestone" == m8 ]]; then
+  for _var in GATE_M8_BUDGET_MINUTES GATE_M8_TEST_TIMEOUT_MINUTES; do
+    [[ -n "${!_var:-}" ]] || die "$_var is empty in harness/versions.env, and the M8 tests need it: a Go timeout of the default floor would skip the cleanups of a test that waits for a rollback. Set it, then run the gate again"
+  done
+fi
 # The kubelet compares --since-time with the clock of the VM, so the start time of the token scan comes from a node, not from the Mac.
 gate_started="$(docker exec dev-cp-control-plane date -u +%Y-%m-%dT%H:%M:%SZ)" || die "cannot read the time of the node dev-cp-control-plane. Run: mise run harness:status"
 shift
@@ -25,6 +34,7 @@ timeout_var="GATE_${pattern//-/_}_TEST_TIMEOUT_MINUTES"
 [[ "$milestone" != m5-drill ]] || pattern="^TestGatewayVolumeLostDrill$"
 [[ "$milestone" != m6-provision ]] || pattern="^TestProvisionFromPortal$"
 [[ "$milestone" != m7 ]] || pattern="^TestM7"
+[[ "$milestone" != m8 ]] || pattern="^TestM8"
 budget_minutes="${!budget_var:-}"
 
 # The live gates need the build output of the checkout that set up the clusters: build/images.env, and build/<cluster>/ with
@@ -143,10 +153,13 @@ fi
 # run old code, and a step does not end with bootstrap_mismatch because the images changed. gate-m6-repair.sh --check runs
 # gate-m5-repair.sh, which runs the M4 and M2 repairs once. The provision gate checks the same, and the check fails while the marker
 # of an earlier provision run exists.
-if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]]; then
+if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 || "$milestone" == m8 ]]; then
   "$ROOT/scripts/gate-m6-repair.sh" --check || exit 1
-  if [[ "$milestone" == m7 ]]; then
+  if [[ "$milestone" == m7 || "$milestone" == m8 ]]; then
     "$ROOT/scripts/gate-m7-repair.sh" --check || exit 1
+    [[ "$milestone" != m8 ]] || "$ROOT/scripts/gate-m8-repair.sh" --check || exit 1
+  fi
+  if [[ "$milestone" == m7 ]]; then
     # TestM7RegistryRefusesDelete sends a manifest delete. A mirror that still runs with deletes on would lose the image of netprobe.
     registry_env="$(docker inspect -f '{{json .Config.Env}}' registry-mirror)" \
       || die "could not read the container registry-mirror. Run: mise run harness:status"
@@ -159,10 +172,17 @@ if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]
     "dev-cp:cell-controller-system:deployment/cell-controller:mise run images -- cell-controller, then CELL=dev-cp mise run cell:up"
     "dev-cp:gateway-system:statefulset/cell-gateway:mise run images -- cellgw, then CELL=dev-cp mise run cell:up"
     "dev-cp:spire-system:statefulset/spire-server:mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up")
-  if [[ "$milestone" == m7 ]]; then
+  if [[ "$milestone" == m7 || "$milestone" == m8 ]]; then
     cells="$(live_cells)" || die "$cells"
     for cluster in $cells; do
       targets+=("$cluster:cell-identity-system:deployment/celld:mise run images -- celld cluster-jwt-agent, then CELL=$cluster mise run cell:up")
+    done
+  fi
+  # The bundle store proxy and the token client of the repo server run cell-proxy in dev-cp and in each live cell.
+  if [[ "$milestone" == m8 ]]; then
+    for cluster in dev-cp $cells; do
+      targets+=("$cluster:cell-system:statefulset/bundle-store:mise run images -- cell-proxy, then CELL=$cluster mise run cell:up"
+        "$cluster:argocd:deployment/argocd-repo-server:mise run images -- cell-proxy, then CELL=$cluster mise run cell:up")
     done
   fi
   for target in "${targets[@]}"; do
@@ -183,12 +203,16 @@ status=0
 # The test timeout is twice the budget, with a floor of 30 minutes or GATE_<MILESTONE>_TEST_TIMEOUT_MINUTES, so the budget check
 # reports a slow run and the Go timeout never ends the run first.
 test_timeout="$(gate_test_timeout "$budget_minutes" "${!timeout_var:-}")"
+# The long tests of M8 run only with GATE_M8_LONG=1.
+[[ "$milestone" != m8 || "${GATE_M8_LONG:-}" == 1 ]] || set -- -short "$@"
 go test -tags e2e -count=1 -timeout "${test_timeout}m" -json ./test/e2e/ -run "$pattern" "$@" \
   | tee "$events" | jq -Rrj 'fromjson? | select(.Output != null) | .Output' || status=$?
 elapsed=$((SECONDS - start))
 log "gate $milestone tests took ${elapsed}s"
+# Each test of M8 restored the targets that it changed, so a passing run leaves no record.
+[[ "$milestone" != m8 || "$status" -ne 0 ]] || rm -f "$BUILD_ROOT/gate/m8-bundles"
 # No token may reach a log of the M5 components. A hit fails the gate, like a failed test.
-if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill || "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 ]]; then
+if [[ "$milestone" == m5 || "$milestone" == m5-soak || "$milestone" == m5-drill || "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 || "$milestone" == m8 ]]; then
   "$ROOT/scripts/gate-token-scan.sh" "$gate_started" || { printf 'FAIL: gate %s found a token in a log\n' "$milestone" >&2; status=1; }
 fi
 # The duration of each top-level test, slowest first.

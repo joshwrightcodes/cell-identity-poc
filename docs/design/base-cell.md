@@ -61,7 +61,7 @@ plaintext. Strict mTLS on the collector would reject them.
 
 - Argo CD runs as a core install, with no UI and no API server.
 - Argo CD has no remote cluster secrets. The only destination is `https://kubernetes.default.svc`.
-- The only source is the in-cluster bundle store, under `oci://bundle-store.cell-system.svc.cluster.local:5000/bundles/`.
+- The only source is the in-cluster bundle store. Argo CD reads `oci://127.0.0.1:5000/bundles/` in the repo server pod. There the container `store-token` adds a token and forwards each request to `bundle-store.cell-system.svc.cluster.local:5000`.
 - A root Application follows the `current` tag of the root bundle.
 - Bootstrap applies the root Application once. It is the only object that Argo CD does not manage, because a self-managed root waits on itself.
 - Each child Application pins its bundle by digest.
@@ -92,10 +92,11 @@ The Redis proxy of the agent still serves the cached resource tree and managed r
 ### Bundles
 
 - `scripts/hydrate.sh` renders each component into plain YAML.
-- `scripts/publish.sh` pushes each bundle as a single-layer OCI artifact and records its digest.
-- The publish script stands in for the worker, which publishes bundles in a later milestone.
+- `scripts/publish.sh` pushes each bundle as a single-layer OCI artifact and records its digest. It writes the first root of a cluster, and it is the break glass after that.
+- Once a cluster holds a signed state, the applier pushes each bundle that the management plane signs. The applier is `celld` in a cell and envd in `dev-cp`. `mise run bundle -- publish` starts that path.
 - The bundle store keeps bundles on a 1Gi volume from the default StorageClass, so a pod restart keeps them.
-- The bundle store accepts plain HTTP for now. The SVID proxy replaces it when SPIRE arrives.
+- The registry in the store pod listens on the loopback address only. The container `store-proxy` listens on port 5000 and checks a service account token. It admits a read from the repo server and a write from the applier.
+- The bundle store accepts plain HTTP inside the pod network. The audience and the short life of the token limit a replay.
 
 ### Mesh
 
@@ -112,7 +113,7 @@ The Redis proxy of the agent still serves the cached resource tree and managed r
 - Every owned namespace denies all ingress and egress by default.
 - Each namespace then allows only DNS, traffic from the node addresses, and its own listed peers.
 - Only the egress gateway reaches the internet, on port 443, and never a private address range.
-- Only Argo CD reaches the bundle store.
+- Only the repo server of Argo CD reads the bundle store, and only the applier writes to it.
 - NetworkPolicy is the containment control. A pod with no mesh proxy bypasses Istio egress rules, but not NetworkPolicy.
 
 ### Telemetry
@@ -141,7 +142,7 @@ The Redis proxy of the agent still serves the cached resource tree and managed r
 | `client` reaches `example.com` through the egress gateway | Egress path |
 | `client` cannot reach `example.org` | Registered hosts only |
 | `plaintext` cannot reach the internet | NetworkPolicy containment |
-| No workload reaches the bundle store | Only Argo CD reads bundles |
+| No workload reaches the bundle store | Only the repo server of Argo CD reads bundles |
 | A privileged pod is rejected in `apps-demo` | Pod Security level |
 | The collector receives telemetry for `echo` | OTLP telemetry |
 

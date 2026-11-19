@@ -36,17 +36,23 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	tracenoop "go.opentelemetry.io/otel/trace/noop"
 	"google.golang.org/grpc"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/dynamic"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bind"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
@@ -162,8 +168,13 @@ func testEnv(name string) (string, bool) {
 	return v, ok
 }
 
+func fakeDynamicClient() (dynamic.Interface, error) {
+	return dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), nil
+}
+
 func testDeps(start telemetryStarter) deps {
-	return deps{start: start, lookupEnv: testEnv, kubeClient: fakeKubeClient, bindRun: blockingBind, streamRun: blockingStream}
+	return deps{start: start, lookupEnv: testEnv, kubeClient: fakeKubeClient, dynamicClient: fakeDynamicClient,
+		bindRun: blockingBind, streamRun: blockingStream}
 }
 
 func bundleFile(t *testing.T) string {
@@ -934,5 +945,165 @@ func TestEffectContextOutlivesTheSignalBriefly(t *testing.T) {
 	}
 	if !closedAfterGrace.Load() {
 		t.Fatal("the effect context did not end after the grace period")
+	}
+}
+
+func bundleArgs(t *testing.T, extra ...string) []string {
+	t.Helper()
+	return append(validArgs(t), extra...)
+}
+
+var bundleFlags = []string{
+	"--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "bundle-store.cell-system.svc.cluster.local:5000",
+	"--bundle-store-token", "/var/run/secrets/bundle-store/token", "--bundle-health-timeout", "4m",
+}
+
+// celldStatus runs celld with args until the stream starts, and returns its first status.
+func celldStatus(t *testing.T, args []string) op.Status {
+	t.Helper()
+	var mu sync.Mutex
+	var got executor.StreamConfig
+	d := testDeps(testTelemetry(discard()))
+	d.streamRun = func(ctx context.Context, cfg executor.StreamConfig) error {
+		mu.Lock()
+		got = cfg
+		mu.Unlock()
+		return blockingStream(ctx, cfg)
+	}
+	_, addr := serveWorkloadAPI(t)
+	t.Setenv("SPIFFE_ENDPOINT_SOCKET", addr)
+	ctx, cancel := context.WithCancel(t.Context())
+	out := &syncBuffer{}
+	done := make(chan int, 1)
+	go func() { done <- execute(ctx, args, out, d) }()
+	waitForLines(t, out, "watching the workload api", 1)
+	cancel()
+	<-done
+	mu.Lock()
+	defer mu.Unlock()
+	return got.Status()
+}
+
+func TestCelldBundleFlags(t *testing.T) {
+	if st := celldStatus(t, validArgs(t)); st.Bundle != nil {
+		t.Fatalf("status has a bundle without --bundle-mirror: %+v", st.Bundle)
+	}
+	st := celldStatus(t, bundleArgs(t, bundleFlags...))
+	if st.Bundle == nil || st.Bundle.AllowSHA256 != bundle.AllowSHA256() {
+		t.Fatalf("status bundle = %+v, want the allow-list hash", st.Bundle)
+	}
+
+	without := func(flag string) []string {
+		var out []string
+		for i := 0; i < len(bundleFlags); i += 2 {
+			if bundleFlags[i] != flag {
+				out = append(out, bundleFlags[i], bundleFlags[i+1])
+			}
+		}
+		return bundleArgs(t, out...)
+	}
+	cases := map[string][]string{
+		"mirror without a store":      without("--bundle-store"),
+		"mirror without a token file": without("--bundle-store-token"),
+		"store without a mirror":      bundleArgs(t, "--bundle-store", "s:5000"),
+		"token file without a mirror": bundleArgs(t, "--bundle-store-token", "/t"),
+		"mirror is not an address":    bundleArgs(t, "--bundle-mirror", "not an address", "--bundle-store", "s:5000", "--bundle-store-token", "/t"),
+		"timeout is not a duration":   bundleArgs(t, append(slices.Clone(bundleFlags), "--bundle-health-timeout", "soon")...),
+		"timeout is not positive":     bundleArgs(t, append(slices.Clone(bundleFlags), "--bundle-health-timeout", "0s")...),
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := execute(t.Context(), args, &out, testDeps(testTelemetry(discard()))); code != 1 {
+				t.Fatalf("exit code %d, want 1; output %s", code, out.String())
+			}
+			lines := jsonLines(t, out.String())
+			if len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["error"] == nil {
+				t.Fatalf("output = %s", out.String())
+			}
+		})
+	}
+}
+
+func TestBundleStoreTokenReadsTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	f := tokenFromFile(path)
+	if _, err := f(); err == nil {
+		t.Fatal("a missing file gave a token")
+	}
+	if err := os.WriteFile(path, []byte("abc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := f(); err != nil || got != "abc" {
+		t.Fatalf("token = %q, %v", got, err)
+	}
+	if err := os.WriteFile(path, []byte("def\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := f(); got != "def" {
+		t.Fatalf("token after a change = %q", got)
+	}
+	if err := os.WriteFile(path, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f(); err == nil {
+		t.Fatal("an empty file gave a token")
+	}
+}
+
+func TestOpKeysReloadForBundles(t *testing.T) {
+	dir := opKeyDir(t)
+	keys := bundleKeys(dir)
+	if got, err := keys(); err != nil || len(got) != 2 {
+		t.Fatalf("%d keys, err %v", len(got), err)
+	}
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+	if err := os.WriteFile(filepath.Join(dir, "third.pub"), []byte(base64.StdEncoding.EncodeToString(pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := keys(); err != nil || len(got) != 3 {
+		t.Fatalf("%d keys after a new file, err %v", len(got), err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	// A failed read is an error, so the engine leaves the operation open for a retry and records no
+	// signature refusal with keys that may be stale.
+	if got, err := keys(); err == nil || len(got) != 0 {
+		t.Fatalf("after the directory went: %d keys, err %v; want an error and no keys", len(got), err)
+	}
+}
+
+func TestBundleFlagsReachTheEngineConfig(t *testing.T) {
+	parse := func(extra ...string) options {
+		t.Helper()
+		o, err := parseOptions(bundleArgs(t, extra...), testEnv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return o
+	}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Tracer: tracenoop.NewTracerProvider().Tracer("t"), Meter: noop.NewMeterProvider().Meter("t")}
+	build := func(o options) bundleapply.Config {
+		t.Helper()
+		cfg, err := bundleConfig(o, fake.NewClientset(), dynamicfake.NewSimpleDynamicClient(runtime.NewScheme()), tel)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cfg
+	}
+	def := parse("--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "s:5000", "--bundle-store-token", "/t")
+	if def.bundleHealthTimeout != 5*time.Minute || build(def).HealthTimeout != 5*time.Minute {
+		t.Errorf("default health timeout = %s, engine %s", def.bundleHealthTimeout, build(def).HealthTimeout)
+	}
+	cfg := build(parse(bundleFlags...))
+	if cfg.HealthTimeout != 4*time.Minute {
+		t.Errorf("engine health timeout = %s, want 4m", cfg.HealthTimeout)
+	}
+	if cfg.Role != "cell" || cfg.Target != "dev-cell-1" || cfg.Env != "dev" || cfg.Holder != "celld-abc" {
+		t.Errorf("engine config = role %q target %q env %q holder %q", cfg.Role, cfg.Target, cfg.Env, cfg.Holder)
+	}
+	if st, ok := cfg.State.(*bundleapply.ConfigMapStore); !ok || st.Namespace != "cell-ops-system" || st.Name != "bundle-state" {
+		t.Errorf("state = %+v", cfg.State)
 	}
 }

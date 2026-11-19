@@ -1479,3 +1479,345 @@ has no CI run. The first CI run of Task 1 must record it here.
 - The driver reads the DSN of the queue as intended. `TestQueueDSNPragmas` in `internal/gwapi` opens a
   file with `_pragma=journal_mode(WAL)`, `_pragma=synchronous(FULL)`, `_pragma=busy_timeout(5000)` and
   `_txlock=immediate`, and reads back `wal`, `2` and `5000`.
+
+## containerd v2.4.2 registry resolver (2026-11-18)
+
+`internal/ocistore` wraps the resolver in `github.com/containerd/containerd/v2/core/remotes/docker`. The review cloned the tag
+into a scratch directory, with a scratch module cache, and read every package that the resolver compiles. Nothing ran during
+the review. The module cache copy matches the clone file for file. The clone also holds the nested modules, `vendor/` and one
+symbolic link, which a module archive leaves out. `go mod verify` passes.
+
+| Item | Value |
+| --- | --- |
+| Tag | `v2.4.2`, an annotated tag on commit `b7a25261e029d68978bbf290df0a62fc819b3c51` |
+| Release | 2026-10-13, the newest v2.4 release as of 2026-11-18 |
+| Licence | Apache 2.0. The modules below use Apache 2.0, MIT or BSD licences |
+| Build | 115 third-party packages from 27 modules, for linux/arm64 with the versions of this module |
+| Size | A stripped linux/arm64 probe that calls `docker.NewResolver` is 8.26 MB. A probe with only `net/http` is 3.34 MB |
+| Prometheus | No `github.com/prometheus/` package compiles (verify row 14) |
+
+The resolver compiles these 27 modules. The dates come from the Go module proxy, read on 2026-11-18.
+
+| Module | Version | Date | Status |
+| --- | --- | --- | --- |
+| `github.com/cespare/xxhash/v2` | v2.3.0 | 2024-04-04 | in the build before M8 |
+| `github.com/containerd/containerd/v2` | v2.4.2 | 2026-10-13 | new |
+| `github.com/containerd/errdefs` | v1.0.0 | 2024-10-08 | new |
+| `github.com/containerd/log` | v0.2.0 | 2026-08-28 | new |
+| `github.com/containerd/log/otel` | v0.1.0 | 2026-08-28 | new |
+| `github.com/containerd/platforms` | v1.0.0-rc.5 | 2026-06-02 | new |
+| `github.com/containerd/ttrpc` | v1.2.9 | 2026-06-09 | new |
+| `github.com/containerd/typeurl/v2` | v2.3.0 | 2024-11-07 | new |
+| `github.com/felixge/httpsnoop` | v1.1.0 | 2026-06-11 | new |
+| `github.com/go-logr/logr` | v1.4.4 | 2026-07-20 | in the build before M8 |
+| `github.com/go-logr/stdr` | v1.2.2 | 2021-12-14 | in the build before M8 |
+| `github.com/klauspost/compress` | v1.20.2 | 2026-10-12 | new |
+| `github.com/moby/locker` | v1.0.1 | 2020-09-10 | new |
+| `github.com/opencontainers/go-digest` | v1.0.0 | 2020-05-14 | new |
+| `github.com/opencontainers/image-spec` | v1.1.1 | 2025-02-24 | new |
+| `github.com/sirupsen/logrus` | v1.10.2 | 2026-08-25 | new |
+| `go.opentelemetry.io/auto/sdk` | v1.2.1 | 2025-09-15 | in the build before M8 |
+| `go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp` | v0.71.0 | 2026-08-26 | new |
+| `go.opentelemetry.io/otel` | v1.47.0 | 2026-10-02 | in the build before M8 |
+| `go.opentelemetry.io/otel/log` | v1.47.0 | 2026-10-02 | in the build before M8 |
+| `go.opentelemetry.io/otel/metric` | v1.47.0 | 2026-10-02 | in the build before M8 |
+| `go.opentelemetry.io/otel/trace` | v1.47.0 | 2026-10-02 | in the build before M8 |
+| `golang.org/x/sync` | v0.24.0 | 2026-09-23 | new |
+| `golang.org/x/sys` | v0.49.0 | 2026-10-06 | in the build before M8 |
+| `google.golang.org/genproto/googleapis/rpc` | v0.0.0-20260928230214-8a89bd6388cc | 2026-09-28 | in the build before M8 |
+| `google.golang.org/grpc` | v1.84.0 | 2026-09-17 | in the build before M8 |
+| `google.golang.org/protobuf` | v1.36.12 | 2026-08-10 | in the build before M8 |
+
+Apart from containerd itself, 15 modules come from outside the Go, gRPC, protobuf and OpenTelemetry projects. The plan says
+"about 15" for its v2.2.0 probe. The package list of that probe, read again on 2026-11-18, holds 13. v2.4.2 adds `ttrpc`, `log/otel`, `xxhash` and gRPC, because `pkg/namespaces` sets gRPC and ttrpc
+metadata. It drops `gogo/protobuf`.
+
+What the review checked, over the 554 non-test files that compile in a scratch probe for linux/arm64, linux/amd64 and
+darwin/arm64:
+
+- Hidden Unicode: none. A script read each file and found no bidirectional control, zero-width or other format
+  character. The only non-ASCII code is the Greek letter `Δ` as a variable name in `klauspost/compress/compressible.go`.
+  The no-break spaces in two `protobuf` error strings are deliberate, so that callers do not compare error text.
+- Obfuscation: no long encoded string. The assembly of `klauspost/compress` and `xxhash` holds no system call
+  instruction. The assembly files say that a generator wrote them. The review did not run that generator.
+- Calls at start-up: 14 `init` functions build tables, register a type or parse a protobuf descriptor. None opens a file,
+  reads the environment, starts a goroutine or calls the network.
+- Network: the resolver sends each request through the `http.Client` of its host options. `http.DefaultClient` is the
+  fallback in the authorizer, and `DefaultHTTPTransport` reads the proxy variables. The plan gives `internal/ocistore` its own
+  client.
+- Network fact for Task 5: `dockerFetcher.Fetch` first tries each URL in the `URLs` field of a descriptor. It uses
+  `http.DefaultClient` for these URLs, not the client of the host (`core/remotes/docker/fetcher.go`). A manifest can name
+  such URLs.
+  The fetcher drops the `Authorization` header for another host, but the request bypasses the client of the wrapper and its
+  redirect check. `internal/ocistore` must clear `URLs` on each descriptor before a fetch, and refuse a manifest that sets it.
+- Compression: the fetcher sends `Accept-Encoding: zstd;q=1.0, gzip;q=0.8, deflate;q=0.5` and decodes the answer.
+  `klauspost/compress` v1.20.0, which containerd v2.4.2 requires, has the high advisory GHSA-fpmh-frq8-7rj8
+  (CVE-2026-116591, published 2026-10-12): a crafted zstd frame makes the decoder panic. `go.mod` raises the module to
+  v1.20.2 (2026-10-12), which fixes it. Task 5 must send `Accept-Encoding: identity` from its `RoundTripper`. It must also
+  refuse a response with a `Content-Encoding`. Then no data from the registry reaches the zstd decoder or its assembly.
+- Process starts: `pkg/archive/compression` can run `igzip` or `unpigz` from `PATH`. Only the diff ID helpers of `core/images`
+  call it, and no package of `core/remotes` calls those helpers.
+- Telemetry: OpenTelemetry only. Each request wraps the transport in `otelhttp`, so the resolver makes client spans and
+  metrics through the global providers and sends a `traceparent` header. `containerd/log` writes text lines through `logrus`
+  to standard error, so Task 5 must give the resolver a context logger.
+- `github.com/sirupsen/logrus/hooks/slog` v1.10.2 compiles into `internal/ocistore`, which uses it to send logrus entries to
+  `slog`. The Task 5 review read `slog.go`, `handler.go` and `level.go` (320 lines) on 2026-11-18. The files import no `os`,
+  `net`, `os/exec` or `syscall` package and read no environment variable. The package is benign.
+- Environment: `logrus` reads `CLICOLOR` and `CLICOLOR_FORCE`. `pkg/namespaces` reads `CONTAINERD_NAMESPACE` only in a
+  helper that the resolver does not call.
+- `sudo`, `setuid`, persistence and credentials: none. Credentials come only from the callback of the caller. The packages
+  read no Docker configuration and no credential store. `containerd/platforms` reads `/proc/cpuinfo` on Linux for the CPU variant.
+
+### Raised modules of the M8 pins (2026-11-18)
+
+The two pins raise these modules in the module graph. The review read the diff of each pair in the module cache. It looked
+for process starts, network calls, file writes, environment reads, `init` changes, `unsafe` and hidden Unicode in the
+changed lines. Nothing ran.
+
+| Module | Change | Date | In the binaries | Result |
+| --- | --- | --- | --- | --- |
+| `golang.org/x/net` | v0.59.0 to v0.60.0 | 2026-10-08 | every binary | Benign. `http2` adds limits on flow control windows, a separate budget for trailers, checks on repeated `Content-Length` values, and it merges parallel dials to one host. The `http3` and `quic` changes compile in no binary |
+| `golang.org/x/time` | v0.15.0 to v0.16.0 | 2026-08-19 | the client-go users | Benign. Only `go.mod` changes |
+| `github.com/fxamacker/cbor/v2` | v2.9.1 to v2.9.4 | 2026-09-14 | the client-go users | Benign. Map keys get a stricter check for values that a map cannot hash, and the docs change |
+| `github.com/spf13/cobra` | v1.8.0 to v1.10.2 | 2025-12-03 | `hostsvc`, `cell-controller`, `mgmtd` | Benign. The changes cover completions, flag groups and doc generators. One new environment read selects completion options |
+| `github.com/fatih/color` | v1.15.0 to v1.18.0 | 2024-10-03 | the go-hclog users | Benign. It adds RGB colours and attribute reset codes |
+| `github.com/mattn/go-colorable` | v0.1.13 to v0.1.14 | 2025-01-10 | the go-hclog users | Benign. Windows files and build tags only |
+| `github.com/klauspost/compress` | v1.20.0 to v1.20.2 | 2026-10-12 | none yet | Advisory fix in `fse` and `huff0`. The diff adds 5,808 lines of generated amd64 and arm64 assembly in `huff0` and `zstd`. The review scanned them for system calls and calls, and did not read them line by line |
+| `github.com/Microsoft/go-winio` | v0.6.2 to v0.6.3-0.20251027160822-ad3df93bed29 | 2025-10-27 | none, Windows only | Not read |
+| `github.com/sirupsen/logrus` | v1.9.3 in the graph to v1.10.2 | 2026-08-25 | none yet | Read with the resolver packages above |
+
+`go.mod` lists the containerd module, OPA, `go-digest` and `image-spec` as direct requirements, which no package imports
+yet. Until Tasks 5 and 6 import them, `go.mod` is not tidy, and `go mod tidy` would remove the pins. No task before Task 5
+may run it. A scratch copy with those imports showed on 2026-11-18 that `go mod tidy` then changes nothing. A direct import
+of another module of the graph, for example `containerd/errdefs`, only moves its `// indirect` marker. Until Task 5, the
+binaries compile none of the new modules. `go.sum` also gains the go.mod and archive lines of test-only modules of OPA and
+containerd, for example `prometheus/client_golang`, `dgraph-io/badger` and `tetratelabs/wazero`. No binary compiles them.
+
+Result: low concern, under two conditions. `internal/ocistore` clears `URLs` on each descriptor and refuses a manifest
+that sets it. It sends `Accept-Encoding: identity` and refuses a response with a `Content-Encoding`.
+
+## OPA v1.22.0 `v1/rego` (2026-11-18)
+
+`internal/bundleapply` evaluates the bundle policy with `github.com/open-policy-agent/opa/v1/rego`. The review cloned the tag
+into a scratch directory, with a scratch module cache, and read every package that `v1/rego` compiles. Nothing ran during the
+review. The module cache copy matches the clone. The clone also holds the nested modules `build/` and `e2e/`.
+`go mod verify` passes.
+
+| Item | Value |
+| --- | --- |
+| Tag | `v1.22.0`, commit `d4c8d0c8812290c3e3715ca4cf958f75283f6ec4` |
+| Release | 2026-10-29. v1.22.1 to v1.22.4 came out from 2026-11-05 and are less than two weeks old |
+| Licence | Apache 2.0. The modules below use Apache 2.0, MIT or BSD licences |
+| Build | 168 third-party packages from 22 modules, for linux/arm64 with the versions of this module |
+| Size | A stripped linux/arm64 probe that calls `rego.New` is 19.40 MB, 16.06 MB more than the `net/http` probe |
+| Prometheus | No `github.com/prometheus/` package compiles. `v1/metrics` is an in-memory set of timers and counters |
+
+`v1/rego` compiles these 22 modules. The dates come from the Go module proxy, read on 2026-11-18.
+
+| Module | Version | Date | Status |
+| --- | --- | --- | --- |
+| `github.com/agnivade/levenshtein` | v1.2.1 | 2024-12-23 | new |
+| `github.com/cespare/xxhash/v2` | v2.3.0 | 2024-04-04 | in the build before M8 |
+| `github.com/gobwas/glob` | v1.0.0 | 2026-08-28 | new |
+| `github.com/google/uuid` | v1.6.0 | 2024-01-23 | in the build before M8 |
+| `github.com/lestrrat-go/blackmagic` | v1.0.4 | 2025-06-09 | new |
+| `github.com/lestrrat-go/dsig` | v1.4.0 | 2026-08-20 | new |
+| `github.com/lestrrat-go/httpcc` | v1.0.1 | 2022-03-29 | new |
+| `github.com/lestrrat-go/httprc/v3` | v3.0.6 | 2026-06-07 | new |
+| `github.com/lestrrat-go/jwx/v3` | v3.3.0 | 2026-09-08 | new |
+| `github.com/lestrrat-go/option/v2` | v2.0.0 | 2025-06-09 | new |
+| `github.com/open-policy-agent/opa` | v1.22.0 | 2026-10-29 | new |
+| `github.com/sirupsen/logrus` | v1.10.2 | 2026-08-25 | new |
+| `github.com/valyala/fastjson` | v1.6.10 | 2026-02-21 | new |
+| `github.com/vektah/gqlparser/v2` | v2.5.58 | 2026-09-23 | new |
+| `github.com/xeipuuv/gojsonpointer` | v0.0.0-20190905194746-02993c407bfb | 2019-09-05 | new |
+| `github.com/xeipuuv/gojsonreference` | v0.0.0-20180127040603-bd5ef7bd5415 | 2018-01-27 | new |
+| `github.com/yashtewari/glob-intersection` | v0.2.0 | 2023-06-22 | new |
+| `go.yaml.in/yaml/v3` | v3.0.5 | 2026-07-26 | in the build before M8 |
+| `golang.org/x/crypto` | v0.57.0 | 2026-09-08 | new |
+| `golang.org/x/sync` | v0.24.0 | 2026-09-23 | new |
+| `golang.org/x/sys` | v0.49.0 | 2026-10-06 | in the build before M8 |
+| `google.golang.org/protobuf` | v1.36.12 | 2026-08-10 | in the build before M8 |
+
+`gobwas/glob` v1.0.0 (2026-08-28) is a rewrite by the original owner after the v0.2.3 release of 2018. The review scanned its
+2,022 lines in the build. Its only `unsafe` use prints a slice address in a debug build. Each module date in the two
+tables is on or before 2026-10-29.
+
+`go.mod` also gains four indirect lines that no build compiles, for linux/arm64 or darwin/arm64: `decred/dcrd/dcrec/secp256k1/v4`
+v4.4.1 (2026-02-24), `goccy/go-json` v0.10.6 (2025-10-28), `segmentio/asm` v1.2.1 (2023-11-07) and
+`lestrrat-go/dsig-secp256k1` v1.0.0 (2025-08-18). The `go.mod` files of OPA v1.22.0 and `jwx` v3.3.0 require exactly these
+versions, and `jwx` compiles them only behind its build tags. The dates come from the Go module proxy.
+
+What the review checked, over the 946 non-test files that compile in a scratch probe for linux/arm64, linux/amd64 and
+darwin/arm64:
+
+- Hidden Unicode: none. The only result is a no-break space in a comment of `v1/util/performance.go`.
+- Obfuscation: no long encoded string in code. `internal/compiler/wasm/opa/opa.wasm` (432 KB) is a binary module for the
+  wasm target. No wasm runtime compiles, so nothing can run it. The review did not rebuild it from its C sources.
+- Calls at start-up: 96 `init` functions register built-in functions, key types, algorithms and GraphQL rules, and
+  `v1/version` reads the build information. None opens a file, reads the environment, starts a goroutine or calls the network.
+- Network: only built-in functions reach the network. `http.send` and `net.lookup_ip_addr` do so when a policy calls them.
+  `json.match_schema` and `json.verify_schema` fetch a remote `$ref` over HTTP to any host when `AllowNet` is nil. They also
+  read a `file://` reference from the local disk whatever `AllowNet` holds (`internal/gojsonschema/jsonLoader.go`).
+  The capability list of Task 6 must drop `http.send`, `net.lookup_ip_addr`, `opa.runtime`, `json.match_schema` and
+  `json.verify_schema`, and set `AllowNet` to an empty list.
+- Environment: `http.send` reads its TLS and timeout variables. The wasm compiler reads `EXPERIMENTAL_WASM_OPT`, and
+  `logrus` reads `CLICOLOR`.
+- Process starts: the wasm compiler runs `wasm-opt` only for the wasm target with `EXPERIMENTAL_WASM_OPT` set. The engine
+  uses the default Rego target.
+- Files: the loader, the capability file reader and the bundle reader open files only when a caller asks.
+  `internal/bundle.SaveBundleToDisk` writes files, and only `v1/plugins` calls it, which does not compile.
+- `sudo`, `setuid`, persistence and credentials: none. `internal/providers/aws` signs `http.send` requests with keys that the
+  request carries. It reads no environment variable, file or metadata service. No telemetry package or version check
+  compiles. Only `v1/runtime` and the `cmd` package call `internal/versioncheck`.
+
+Correctness facts for Task 6:
+
+- v1.22.1 fixes a rule indexer regression from v1.21.0: `input.x in {"a", input.y}` never matches. A `deny` rule with that
+  shape would never fire. The policy must not use a set literal with a reference on the right of `in`, or a test must pin it.
+- v1.22.2 and v1.22.3 fix type checker regressions that reject iteration over an empty collection, and constant keys of
+  empty collections in rules that `with` replaces. These reject a policy at compile time, so they cannot pass a bad object.
+
+Result: low concern, under two conditions. The capability list of Task 6 drops the network, runtime and schema built-ins
+above, with an empty `AllowNet`. The policy avoids the `in` shape above, or a test pins it.
+
+## conftest v0.71.1 (2026-11-18)
+
+mise installs conftest on the Mac. The render tests run it on the bundle policy. The review downloaded the release archives
+for darwin/arm64 and linux/x86_64 into a scratch directory, and cloned the tag. It ran nothing from either.
+
+| Item | Value |
+| --- | --- |
+| Tag | `v0.71.1`, commit `8f7ac015cb51d81992f2ffbe2b0c1451fd05d1c5` |
+| Release | 2026-10-06, the newest release as of 2026-11-18 |
+| Licence | Apache 2.0 |
+| Archives | `conftest_0.71.1_Darwin_arm64.tar.gz` `e1cc50d2590b6c5e3da6912666a71264bae82d60bdd62d7ae2b99971ccc8eedd` and `conftest_0.71.1_Linux_x86_64.tar.gz` `c3f6b2a753bd56e377a1e51a95ae3e057f926f2e9139f7d5b5dfbbaf810f7985` |
+| Binary | `conftest` in the darwin archive, `927afb80fdd63cb281ee686c7a859bffdeaf75d5ff661e5d51f816902b9ae050`, the same file that mise installed |
+
+- Provenance: both archives match `checksums.txt`. `gh attestation verify` accepted the GitHub artefact attestation of
+  each archive, with SLSA provenance v1 from `.github/workflows/release.yaml` at `refs/tags/v0.71.1` and the commit above.
+  `mise.lock` records the checksums and `provenance = "github-attestations"`.
+- Build: the build information of the binary shows Go 1.27.1, cgo off and a version flag. The release tool builds
+  `main.go` directly, so the binary carries no module path or commit.
+- OPA inside conftest is v1.21.1, not v1.22.0. It has the `in` regression above. `TestConftestMatchesEngine` must cover
+  each rule, because the two versions can differ.
+- Hidden Unicode: none in the 247 source, script and workflow files.
+- Process starts: only `plugin/plugin.go`, which runs a plugin when a person calls `conftest <plugin>`. At each start, conftest
+  lists the plugin directories under the XDG data directory and `~/.conftest/plugins`, and adds each plugin as a subcommand.
+- Network: `conftest test` reads local files only. `pull`, `push` and `test --update` download or upload policies through
+  `go-getter` or `oras-go`, with registry credentials from the Docker configuration. The render tests use none of them.
+- conftest evaluates with the default OPA capabilities, so a policy that it runs can call `http.send`. It runs only the
+  policy of this repository.
+- Telemetry: no telemetry code in conftest. The binary links the OpenTelemetry metric exporter for Google Cloud through the
+  Cloud Storage client, which only a `gcs::` download creates. The review did not check that exporter further.
+- `sudo`, persistence and credentials: none beyond the items above.
+- Not read: the 157 dependency modules of the binary.
+
+Result: medium concern. The review read the main module and checked the provenance, but not the 157 dependency modules.
+This depth is acceptable only under these run conditions:
+
+- conftest runs on the Mac only. CI does not install it.
+- It runs only `conftest test` on the policy and renders of this repository, with no plugin installed.
+- It runs no `pull`, `push` or `--update`, so no download code runs.
+
+Under these conditions, conftest reads local files and calls no network code path that the review found. The release
+provenance (checksums and the SLSA attestation) ties the binary to the reviewed tag.
+
+## cosign v3.1.4 (2026-11-18)
+
+mise installs cosign on the Mac. `mise run bundle -- verify` checks the signed bundle set with it. The review downloaded the
+binaries for darwin/arm64 and linux/amd64, their Sigstore bundles and `cosign_checksums.txt` into a scratch directory, and
+cloned the tag. It ran nothing from either.
+
+| Item | Value |
+| --- | --- |
+| Tag | `v3.1.4`, an annotated tag on commit `0e48502cf5ef34e2e60bbd3617aa19945712f705` |
+| Release | 2026-10-20, the newest release as of 2026-11-18 |
+| Licence | Apache 2.0 |
+| Binaries | `cosign-darwin-arm64` `9f9b8cd557cf2e5b3df3373a00baa005a86b02391e3e06dd0ce37b3a1533d3a4` and `cosign-linux-amd64` `424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa` |
+
+- Provenance: both binaries match `cosign_checksums.txt`. The checksums file and each binary have a Sigstore bundle v0.3.
+  `openssl` checked each signature with the key of its certificate. Each certificate names
+  `keyless@projectsigstore.iam.gserviceaccount.com` with the issuer `https://accounts.google.com`. The aqua registry entry
+  that mise uses expects the same identity. Each certificate chains to the Fulcio CA in `trusted_root.json` of the Sigstore
+  root repository. The review fetched that file from GitHub and did not check it through TUF. Each bundle holds a Rekor
+  entry. The review did not check the inclusion proofs or the signed entry timestamps: not verified.
+  A Fulcio certificate is valid for about 10 minutes. The chain check used `openssl verify -attime` with a time inside that
+  window, taken from the unsigned integrated time of the Rekor entry. No signed timestamp binds the signature to that
+  window, so the validity of the certificate at the time of the signature is not verified.
+- `mise.lock` records the checksums and `provenance = "cosign"`. The mise install of cosign 3.1.4 on this Mac predates this
+  review. It is from 2026-11-03, and its file has the SHA-256 of the reviewed darwin binary.
+- Build: the build information shows Go 1.27.3 and the module `github.com/sigstore/cosign/v3` v3.1.4. Its archive hash
+  matches the Go module proxy. The build used `-trimpath`, cgo and the tags `pivkey` and
+  `pkcs11key`. The binary links 259 modules and no Prometheus package.
+- Hidden Unicode: one no-break space in a comment of `cmd/cosign/cli/download/signature.go`, in 384 source, script and
+  workflow files.
+- Network: a default verify fetches the trusted root from `tuf-repo-cdn.sigstore.dev`, caches it in `~/.sigstore/root` and
+  calls Rekor. With `--key` and `--insecure-ignore-tlog=true`, and no signed timestamps, `verifyOfflineWithKey` is true. The
+  verify path then skips TUF and Rekor (`cmd/cosign/cli/verify/common.go`). The review read this path, and the spike below ran it.
+- Credentials: a command that reads a registry uses the default credential lookup of go-containerregistry. It reads
+  `~/.docker/config.json` and can run a `docker-credential-*` helper, which can read the OS credential
+  store. Task 16 must run cosign with `DOCKER_CONFIG` set to an empty temporary directory. The KMS providers of the cloud
+  vendors and other key services register at start-up, and so do the identity token providers. They read cloud
+  credentials only for a KMS URI or a keyless signature.
+- Process starts, `sudo`, persistence and telemetry: none in the main module. The only shell text is the completion help,
+  which tells a person to edit `~/.zshrc`.
+- Not read: the dependency modules, among them `sigstore/sigstore-go` v1.3.0 and go-containerregistry.
+
+Result: medium concern. The review read the main module and checked the provenance, but not the 259 dependency modules,
+where the network and registry code lives. This depth is acceptable only under these run conditions:
+
+- cosign runs on the Mac only. CI does not install it.
+- It verifies only with `--key` and `--insecure-ignore-tlog=true`, and with no signed timestamp option.
+- `DOCKER_CONFIG` points to an empty temporary directory, so no credential helper runs.
+- It signs nothing and uses no KMS URI.
+
+Under these conditions, the main module skips TUF, Rekor and every credential provider. Task 2 runs that path on the Mac,
+and it is the first check of the offline claim. The Sigstore identity of the release
+ties the binary to the release workflow of the project.
+
+### Spike: an Ed25519 attestation from `record.SignEnvelope` (2026-11-18)
+
+The spike ran cosign v3.1.4 (commit `0e48502c`, Go 1.27.3) through `mise x` on the Mac. Each run had `DOCKER_CONFIG` on an
+empty directory, `HOME` on a scratch directory and no `COSIGN_EXPERIMENTAL`. A `sandbox-exec` profile denied every outbound
+connection except to localhost. The registry was `registry-mirror` (`registry:3.1.2`) at `127.0.0.1:5001`, with test
+repositories under `m8-spike/`. Throwaway Go code outside the repository signed a bundle-set statement with a test Ed25519
+key through `record.SignEnvelope`. A copy of that logic signed the P-256 control: ASN.1 DER over the SHA-256 of the PAE.
+
+Result: cosign verifies the Ed25519 envelope of `record.SignEnvelope`. Verify row 11 passes, so Task 3 does not run.
+
+| Case | Command | Exit |
+| --- | --- | --- |
+| Ed25519, Sigstore bundle as a referrer | `cosign verify-attestation --key <pem> --insecure-ignore-tlog=true --allow-http-registry --type https://cell.poc.internal/bundle-set/v1 <repo>@sha256:<root>` | 0 |
+| Ed25519, bundle file | `cosign verify-blob-attestation --bundle <file> --key <pem> --insecure-ignore-tlog=true --type <type> --digest <root hex> --digestAlg sha256` | 0 |
+| Ed25519, envelope under the tag `sha256-<root>.att` | `cosign verify-attestation`, as in the first row | 0 |
+| P-256 control, the same three forms | as above | 0 |
+| P-256, signed by `cosign attest --key`, both storage forms | `cosign verify-attestation` | 0 |
+| Ed25519, signed by `cosign attest --key` | both verify commands | 1 |
+| Another key, one changed signature character, another root digest, or another `--type` | both verify commands | 1 |
+
+- Formats: the DSSE `payloadType` must be `application/vnd.in-toto+json`. A record or DSSE payload type fails with
+  `unsupported DSSE payload type`. cosign does not check the statement `_type`: `Statement/v1`, `v0.1` and an unknown value
+  all pass. `predicateType` must equal `--type`. One subject digest must equal the root manifest digest. cosign does not
+  check subject names. The Sigstore bundle is `{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json",
+  "verificationMaterial":{"publicKey":{"hint":<text>}},"dsseEnvelope":<envelope>}`, with no `tlogEntries` and no
+  timestamps. cosign does not check the hint. A hex key SHA-256, the cosign form and an empty hint all pass.
+- Ed25519 mode: cosign verifies DSSE with pure Ed25519 over the PAE, which `record.SignEnvelope` produces. `cosign attest`
+  signs Ed25519 keys with Ed25519ph by default (`pkg/cosign/keys.go`, `GetDefaultLoadOptions`), and its own verify refuses
+  those signatures. Do not use `cosign attest` to make reference vectors for Ed25519.
+- Storage: Distribution 3.1.2 has no referrers API. `GET /v2/<repo>/referrers/<digest>` answers `404 page not found`.
+  `oras attach` and `cosign attest` then write the fallback tag `sha256-<root hex>`, an image index of the referrers.
+  cosign reads the referrers API, gets 404, and then reads that tag. The tag moves with each attach, although deletes are
+  off. The `.att` tag form also verifies.
+- Referrer layout of `cosign attest`: manifest `application/vnd.oci.image.manifest.v1+json`, `artifactType`
+  `application/vnd.dev.sigstore.bundle.v0.3+json`, config `application/vnd.oci.empty.v1+json`, and one layer of the bundle
+  media type. The annotations are `dev.sigstore.bundle.content: dsse-envelope`, `dev.sigstore.bundle.predicateType` and
+  `org.opencontainers.image.created`. cosign requires only one layer whose media type starts with
+  `application/vnd.dev.sigstore.bundle`. An `oras attach` with no annotations also verifies.
+- Several referrers: cosign passes when any referrer of the root verifies, and it prints only the verified envelopes. A
+  root digest can carry the attestations of several versions, so the caller compares the printed version with the state.
+- Network: the verify commands above made requests only to the local registry. They wrote nothing under `HOME`. A
+  `verify-blob-attestation` without `--insecure-ignore-tlog=true` tried `tuf-repo-cdn.sigstore.dev`, and the sandbox
+  refused the connection. With `--allow-http-registry`, cosign tries HTTPS on `localhost:5001` first and then HTTP.
+- Signatures in the spike: `cosign attest` ran only with test keys, `--use-signing-config=false` and `--tlog-upload=false`.
+  No run used Fulcio, Rekor or a keyless flow.

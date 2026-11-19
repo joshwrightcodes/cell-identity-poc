@@ -168,7 +168,7 @@ $(namespace_peer argocd)
         - protocol: TCP
           port: 5000
   egress:
-    # N11: the bundle store sends OTLP over HTTP to the collector.
+    # N11: the registry sends OTLP over HTTP (4318) and the store proxy sends it over gRPC (4317) to the collector.
     - to:
 $(namespace_peer observability-system)
           podSelector:
@@ -176,7 +176,11 @@ $(namespace_peer observability-system)
               app.kubernetes.io/name: otel-collector
       ports:
         - protocol: TCP
+          port: 4317
+        - protocol: TCP
           port: 4318
+    # N47: the store proxy asks the API server which account owns a token.
+$(api_server_rule)
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

@@ -6,6 +6,11 @@
 //	celld --cell <name> --env <env> --gateway <host:port> --gateway-bind <host:port> \
 //	  --gateway-id <spiffe id> --trust-bundle <file> --op-key-dir <dir> --ops-namespace <namespace>
 //
+// With --bundle-mirror, celld also applies signed bundle sets (operation kind bundle.apply): it reads
+// them from the mirror at --bundle-mirror, writes them to the store at --bundle-store with the
+// token in --bundle-store-token, and waits up to --bundle-health-timeout for health. All three
+// address flags go together.
+//
 // The bind loop and the stream run in their own goroutines and never stop the SVID watch. The
 // environment names the pod: POD_NAME, POD_UID, POD_NAMESPACE and SERVICE_ACCOUNT. Each *.pub file
 // in --op-key-dir holds the standard base64 of one operation public key.
@@ -16,6 +21,7 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
@@ -40,12 +46,16 @@ import (
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bind"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
@@ -57,6 +67,10 @@ const (
 	effectGrace = 5 * time.Second
 	// shutdownTimeout bounds the whole flush. Each provider has its own shorter timeout inside it.
 	shutdownTimeout = 15 * time.Second
+
+	defaultBundleHealthTimeout = 5 * time.Minute
+	// bundleStateName names the ConfigMap of the bundle state in the operations namespace.
+	bundleStateName = "bundle-state"
 )
 
 func main() {
@@ -64,7 +78,7 @@ func main() {
 	// After the first signal, a second signal ends the process at once, also during the flush.
 	context.AfterFunc(ctx, stop)
 	code := execute(ctx, os.Args[1:], os.Stdout, deps{
-		start: startTelemetry, lookupEnv: os.LookupEnv, kubeClient: inClusterClient, bindRun: bind.Run,
+		start: startTelemetry, lookupEnv: os.LookupEnv, kubeClient: inClusterClient, dynamicClient: inClusterDynamic, bindRun: bind.Run,
 		streamRun: executor.RunStream,
 	})
 	stop()
@@ -78,8 +92,10 @@ type deps struct {
 	start      telemetryStarter
 	lookupEnv  func(string) (string, bool)
 	kubeClient func() (kubernetes.Interface, error)
-	bindRun    func(ctx context.Context, cfg bind.Config) error
-	streamRun  func(ctx context.Context, cfg executor.StreamConfig) error
+	// dynamicClient serves the bundle applier, and runs only when --bundle-mirror is set.
+	dynamicClient func() (dynamic.Interface, error)
+	bindRun       func(ctx context.Context, cfg bind.Config) error
+	streamRun     func(ctx context.Context, cfg executor.StreamConfig) error
 	// effectGrace is how long an effect may run after the first signal. Zero takes effectGrace.
 	effectGrace time.Duration
 }
@@ -88,6 +104,8 @@ type deps struct {
 type options struct {
 	cell, env, gateway, gatewayBind, trustBundle, opKeyDir, opsNamespace string
 	gatewayID                                                            spiffeid.ID
+	bundleMirror, bundleStore, bundleStoreToken                          string
+	bundleHealthTimeout                                                  time.Duration
 	pod                                                                  struct{ name, uid, namespace, serviceAccount string }
 }
 
@@ -104,11 +122,18 @@ func parseOptions(args []string, lookupEnv func(string) (string, bool)) (options
 	fs.StringVar(&o.trustBundle, "trust-bundle", "", "PEM trust bundle of the environment")
 	fs.StringVar(&o.opKeyDir, "op-key-dir", "", "directory with one *.pub file for each operation public key")
 	fs.StringVar(&o.opsNamespace, "ops-namespace", "", "namespace of the operation records")
+	fs.StringVar(&o.bundleMirror, "bundle-mirror", "", "address of the bundle mirror as <host>:<port>; turns on bundle.apply")
+	fs.StringVar(&o.bundleStore, "bundle-store", "", "address of the in-cluster bundle store as <host>:<port>")
+	fs.StringVar(&o.bundleStoreToken, "bundle-store-token", "", "file with the projected token for the bundle store")
+	fs.DurationVar(&o.bundleHealthTimeout, "bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+	}
+	if err := checkBundleFlags(o); err != nil {
+		return o, err
 	}
 	for _, f := range []struct{ name, value string }{
 		{"cell", o.cell}, {"env", o.env}, {"gateway", o.gateway}, {"gateway-bind", o.gatewayBind},
@@ -166,6 +191,86 @@ func loadOpKeys(dir string) ([]ed25519.PublicKey, error) {
 	return keys, nil
 }
 
+// checkBundleFlags makes sure that the bundle flags are all set or all unset, and that they hold values.
+func checkBundleFlags(o options) error {
+	if o.bundleMirror == "" {
+		if o.bundleStore != "" || o.bundleStoreToken != "" {
+			return errors.New("--bundle-store and --bundle-store-token need --bundle-mirror")
+		}
+		return nil
+	}
+	if o.bundleStore == "" || o.bundleStoreToken == "" {
+		return errors.New("--bundle-mirror needs --bundle-store and --bundle-store-token")
+	}
+	if o.bundleHealthTimeout <= 0 {
+		return errors.New("--bundle-health-timeout must be positive")
+	}
+	return nil
+}
+
+// tokenFromFile returns a function that reads the token in path each time it runs, so that a token
+// that the kubelet rotates takes effect at once.
+func tokenFromFile(path string) func() (string, error) {
+	return func() (string, error) {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read the bundle store token: %w", err)
+		}
+		tok := strings.TrimSpace(string(raw))
+		if tok == "" {
+			return "", errors.New("the bundle store token file is empty")
+		}
+		return tok, nil
+	}
+}
+
+// bundleKeys returns a function that reads the operation keys in dir again on each call. Bundle
+// attestations carry the signature of the management plane key, which also signs operations. A failed
+// read is an error, so the engine leaves the operation open and tries it again later.
+func bundleKeys(dir string) func() ([]crypto.PublicKey, error) {
+	return func() ([]crypto.PublicKey, error) {
+		keys, err := loadOpKeys(dir)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]crypto.PublicKey, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, k)
+		}
+		return out, nil
+	}
+}
+
+// newBundleApplier builds the applier of bundle.apply: it reads from the mirror, writes to the
+// in-cluster store with the projected token, and keeps its state in the operations namespace.
+func newBundleApplier(o options, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T) (*bundleapply.Applier, error) {
+	cfg, err := bundleConfig(o, kube, dyn, tel)
+	if err != nil {
+		return nil, err
+	}
+	return bundleapply.New(cfg), nil
+}
+
+// bundleConfig returns the engine configuration that the flags give.
+func bundleConfig(o options, kube kubernetes.Interface, dyn dynamic.Interface, tel *telemetry.T) (bundleapply.Config, error) {
+	mirror, err := ocistore.New(ocistore.Client{Base: o.bundleMirror})
+	if err != nil {
+		return bundleapply.Config{}, fmt.Errorf("--bundle-mirror: %w", err)
+	}
+	store, err := ocistore.New(ocistore.Client{Base: o.bundleStore, Token: tokenFromFile(o.bundleStoreToken), WriteOnly: true})
+	if err != nil {
+		return bundleapply.Config{}, fmt.Errorf("--bundle-store: %w", err)
+	}
+	return bundleapply.Config{
+		Role: "cell", Env: o.env, Target: o.cell, Holder: o.pod.name,
+		Mirror: mirror, Store: store, Dynamic: dyn, Client: kube,
+		Policy: bundle.DefaultPolicy(), Keys: bundleKeys(o.opKeyDir),
+		State:         &bundleapply.ConfigMapStore{Client: kube, Namespace: o.opsNamespace, Name: bundleStateName, MadeBy: "celld"},
+		HealthTimeout: o.bundleHealthTimeout,
+		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
+	}, nil
+}
+
 func buildVersion() string {
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
 		return info.Main.Version
@@ -179,6 +284,14 @@ func inClusterClient() (kubernetes.Interface, error) {
 		return nil, fmt.Errorf("load in-cluster configuration: %w", err)
 	}
 	return kubernetes.NewForConfig(rc)
+}
+
+func inClusterDynamic() (dynamic.Interface, error) {
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, fmt.Errorf("load in-cluster configuration: %w", err)
+	}
+	return dynamic.NewForConfig(rc)
 }
 
 // execute runs celld until ctx ends and returns the exit code. A failure is one JSON error line
@@ -225,10 +338,22 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		return 1
 	}
 	tokens := satoken.PodTokenFunc(kube.CoreV1(), opts.pod.namespace, opts.pod.serviceAccount, opts.pod.name, opts.pod.uid)
-	exec := executor.New(executor.Config{
+	execCfg := executor.Config{
 		Cell: opts.cell, Env: opts.env, Pod: opts.pod.name, PodUID: opts.pod.uid, Namespace: opts.opsNamespace,
 		Keys: keys, Client: kube, Log: tel.Log, Meter: tel.Meter,
-	})
+	}
+	if opts.bundleMirror != "" {
+		dyn, err := d.dynamicClient()
+		if err != nil {
+			tel.Log.Error("celld failed", "error", err.Error())
+			return 1
+		}
+		if execCfg.Bundle, err = newBundleApplier(opts, kube, dyn, tel); err != nil {
+			tel.Log.Error("celld failed", "error", err.Error())
+			return 1
+		}
+	}
+	exec := executor.New(execCfg)
 	bundle := bind.FileBundle(opts.trustBundle, opts.gatewayID.TrustDomain())
 
 	bgCtx, stopBackground := context.WithCancel(ctx)

@@ -20,6 +20,9 @@ kind = "0.33.0"
 argocd = "3.6.1"
 go = "1.27.3"
 ko = "0.19.1"
+# Mac-only tools. conftest runs the bundle policy over the renders, and cosign checks a signed bundle set.
+conftest = "0.71.1"
+cosign = "3.1.4"
 
 [env]
 # CELL picks the cluster. The default is dev-cell-1. An unknown name fails in scripts/lib.sh.
@@ -29,6 +32,8 @@ _.file = ["cells/common.env", "cells/{{get_env(name='CELL', default='dev-cell-1'
 GOFLAGS = "-mod=readonly"
 # Every Docker and kind command talks to the PoC VM, whatever the current Docker context is.
 DOCKER_HOST = "unix://{{env.HOME}}/.colima/poc/docker.sock"
+# ko builds images for this platform, and scripts/deps-check.sh checks the module rules for the same platform.
+KO_DEFAULTPLATFORMS = "linux/arm64"
 
 [tasks."vm:up"]
 description = "Start the Colima VM that runs the kind clusters"
@@ -52,7 +57,7 @@ description = "Render every component into build/<cluster>/bundles/<component>/m
 run = "scripts/hydrate.sh"
 
 [tasks."cell:publish"]
-description = "Push the hydrated bundles to the in-cluster store and point the root bundle at their digests"
+description = "Push the hydrated bundles to the in-cluster store and point the root bundle at their digests. A cluster whose bundle state has source signed refuses this task, unless BUNDLE_PUBLISH_UNSIGNED=1 (break glass); use bundle -- publish there"
 run = "scripts/publish.sh"
 
 [tasks."cell:verify"]
@@ -68,7 +73,7 @@ description = "Remove what the server of cell:ui wrote into argocd: the initial 
 run = "scripts/ui.sh --clean"
 
 [tasks."cell:restart"]
-description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. In dev-cp and management, restart the SPIRE server"
+description = "Restart the harness Deployments of the cluster CELL, so that each SPIRE agent attests again. STORE_TOKENS=1 also restarts bundle-store-0 and argocd-repo-server, which rotates the projected store tokens. In dev-cp and management, restart the SPIRE server"
 run = "scripts/restart.sh"
 
 [tasks."cell:restart-mesh"]
@@ -131,8 +136,8 @@ usage = 'arg "[packages]..." var=#true default="./..."'
 run = 'eval go test -timeout 20m ${usage_packages?}'
 
 [tasks.lint]
-description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag"
-run = ["go vet ./...", "go vet -tags e2e ./test/e2e/"]
+description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag. Then check the module rules of each binary in cmd/ with scripts/deps-check.sh"
+run = ["go vet ./...", "go vet -tags e2e ./test/e2e/", "scripts/deps-check.sh"]
 
 [tasks."vendor:fetch"]
 description = "Download the pinned Argo CD manifest, Istio charts and External Secrets Operator chart into vendor/ for review"
@@ -155,8 +160,16 @@ env = { CELL = "{{get_env(name='CELL', default='dev-cp')}}" }
 run = "scripts/pki-rotate-intermediate.sh"
 
 [tasks.hostsvc]
-description = "Run the host service: up, down or facts, with the arguments after --"
+description = "Run the host service: up, down or facts (facts --cluster <name>, or facts --registry for the address of the registry mirror), with the arguments after --"
 run = "go run ./cmd/hostsvc"
+
+[tasks.bundlectl]
+description = "Run bundlectl, which packs, pushes and composes bundle sets on this Mac: set, push, bootstrap, push-root, compose, attach, projects or pubkey-pem, with the arguments after --"
+run = "go run ./cmd/bundlectl"
+
+[tasks.bundle]
+description = "Publish and repair signed bundle sets of a cell or dev-cp, with the arguments after --: publish --target <cluster>... [--wait] signs and pushes the hydrated set, get --target <cluster> prints the last signed set, cosign --target <cluster> attaches the Sigstore bundle that mgmtd holds now (after a key rotation), verify --target <cluster> checks with cosign, offline, that mgmtd signed the root of the state, repair --target <cluster> is the break glass that applies the argocd and cell-system bundles of the last good set"
+run = "scripts/bundle.sh"
 
 [tasks."hostsvc:serve"]
 description = "Run the host service on this Mac, which answers the key requests and the spec pushes of mgmtd and the step requests of the cell controller on 127.0.0.1:17443. The argument is start, stop, restart (stop, start, then the link of mgmt-api), status, pin, sync (write the dev root and the keys after the cross-check with mgmtd), steps [--reset], log --step <id> [--follow] or cancel --cell <c> | --step <id>. start and restart refuse while a step runs a stage, unless --force"
@@ -169,7 +182,7 @@ env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
 [tasks."harness:up"]
-description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell"
+description = "Check the tool versions, create management, dev-cp and rogue through the host service, build the images, then run cell:up on each of them that has components. The two cells have no cell:up: the task asks for them with portal -- request, and waits with portal -- wait until both are valid. cell:up of dev-cp connects the secret store, or asks for secrets:connect in a second shell. The last step runs bundle -- publish --wait for dev-cp and both cells, so each of them applies a signed bundle set"
 depends = ["harness:preflight"]
 run = "scripts/harness.sh up"
 
@@ -198,7 +211,7 @@ run = "scripts/harness.sh down"
 description = "Build and push the in-cluster images to the local registry at localhost:5001, and record their digests in build/images.env"
 depends = ["vm:up"]
 # Without VCS stamps, a binary changes only when its sources change, so a commit alone gives no new digests.
-env = { KO_DOCKER_REPO = "localhost:5001", KO_DEFAULTPLATFORMS = "linux/arm64", GOFLAGS = "-mod=readonly -buildvcs=false" }
+env = { KO_DOCKER_REPO = "localhost:5001", GOFLAGS = "-mod=readonly -buildvcs=false" }
 run = "scripts/images.sh"
 
 [tasks."gate:m1"]
@@ -272,6 +285,14 @@ run = "scripts/gate.sh m7"
 [tasks."gate:m7:repair"]
 description = "Delete the test namespaces m7-* of every cluster, and wait until they are gone. With --check, only report and fail with the repair command. Safe to run again"
 run = "scripts/gate-m7-repair.sh"
+
+[tasks."gate:m8"]
+description = "Run the M8 end-to-end tests: signed bundle sets that reach Argo CD in each cell and in dev-cp, refusals outside the allow list, and rollbacks, plus the go test arguments after --. The tests run with -short, which skips the long tests, unless GATE_M8_LONG=1. It runs gate:m7:repair --check and gate:m8:repair --check first, and checks the deployed images of the M7 gate and of cell-proxy in the bundle store and the repo server. It scans the logs for a token afterwards. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m8"
+
+[tasks."gate:m8:repair"]
+description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap apps-demo/m8-marker, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m8-repair.sh"
 
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"

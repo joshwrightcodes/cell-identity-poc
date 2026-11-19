@@ -33,7 +33,8 @@ func renderRelay(t *testing.T, env ...string) result {
 
 // TestRenderRelaySystem renders the relay of dev-cp with cells/dev-cp.env. Each Deployment routes
 // its ports to the management node, each NodePort Service keeps the source address, and the
-// NetworkPolicy admits only the cell nodes on the routes and the own node on the health port.
+// NetworkPolicy admits the own node on the health port and reaches the collector. The harness plane policies of the envd
+// render carry the cell and management flows.
 func TestRenderRelaySystem(t *testing.T) {
 	r := renderRelay(t)
 	if r.err != nil {
@@ -78,21 +79,15 @@ func TestRenderRelaySystem(t *testing.T) {
 			}
 			np := objs["NetworkPolicy relay-system/"+name]
 			ingress := get[[]any](t, np, "spec", "ingress")
-			if len(ingress) != 2 {
-				t.Fatalf("ingress has %d rules, want the routes and the health port", len(ingress))
+			if len(ingress) != 1 {
+				t.Fatalf("ingress has %d rules, want the health port alone", len(ingress))
 			}
-			if peers := fmt.Sprint(get[[]any](t, ingress[0], "from")); peers != "[map[ipBlock:map[cidr:10.9.0.1/32]] map[ipBlock:map[cidr:10.9.0.2/32]]]" {
-				t.Errorf("the route rule admits %s, want the two cell nodes only", peers)
-			}
-			if ports := portList(t, ingress[0]); !slices.Equal(ports, w.ports) {
-				t.Errorf("the route rule opens %v, want %v", ports, w.ports)
-			}
-			if peers, ports := fmt.Sprint(get[[]any](t, ingress[1], "from")), portList(t, ingress[1]); peers != "[map[ipBlock:map[cidr:172.18.0.4/32]]]" || !slices.Equal(ports, []int{8080}) {
+			if peers, ports := fmt.Sprint(get[[]any](t, ingress[0], "from")), portList(t, ingress[0]); peers != "[map[ipBlock:map[cidr:172.18.0.4/32]]]" || !slices.Equal(ports, []int{8080}) {
 				t.Errorf("the probe rule admits %s on %v, want the own node on 8080", peers, ports)
 			}
 			egress := get[[]any](t, np, "spec", "egress")
-			if peers, ports := fmt.Sprint(get[[]any](t, egress[0], "to")), portList(t, egress[0]); peers != "[map[ipBlock:map[cidr:10.9.0.10/32]]]" || !slices.Equal(ports, w.targets) {
-				t.Errorf("the target rule reaches %s on %v, want the management node on %v", peers, ports, w.targets)
+			if len(egress) != 1 || peerList(t, egress[0], "to") != "observability-system/otel-collector" || !slices.Equal(portList(t, egress[0]), []int{4317}) {
+				t.Errorf("egress is %v, want the collector on 4317 alone", egress)
 			}
 		})
 	}
@@ -138,8 +133,6 @@ func TestRenderRelaySystemFailsClosed(t *testing.T) {
 		{"RELAY_TELEMETRY_ROUTES=30446:8443=31444", "the container port 8443 appears in two routes"},
 		{"RELAY_VIEW_ROUTES= ", "relay-view has no route"},
 		{"RELAY_TARGET=missing", "no host service facts for missing"},
-		{"STUB_FACTS_FAIL=dev-cell-2", "no host service facts for dev-cell-2"},
-		{"SPIRE_AGENT_CELLS=dev-cell-1 management", "names the relay target management"},
 		{"NODE_IPS= ", "NODE_IPS holds no address"},
 	} {
 		t.Run(tc.env, func(t *testing.T) {
@@ -371,32 +364,24 @@ func relayIngress(t *testing.T, objs map[string]object, name string) []string {
 	return out
 }
 
-// TestRenderRelaySystemNoLiveCells: with no cell cluster the render succeeds, reads no cell facts, and holds only the
-// node rule in each ingress policy.
-func TestRenderRelaySystemNoLiveCells(t *testing.T) {
-	r := renderRelay(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
-	if r.err != nil {
-		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
-	}
-	if strings.Contains(r.log, "facts --cluster dev-cell") {
-		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
-	}
-	objs := objectsIn(t, r.stdout)
-	for _, name := range []string{"relay-view", "relay-telemetry"} {
-		if got := relayIngress(t, objs, name); !slices.Equal(got, []string{"172.18.0.4/32 [8080]"}) {
-			t.Errorf("ingress rules of %s are %v, want the node rule only", name, got)
-		}
-	}
-}
-
-// TestRenderRelaySystemOneLiveCell: one live cell gives one address in the route rule.
-func TestRenderRelaySystemOneLiveCell(t *testing.T) {
-	r := renderRelay(t, "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-1")
-	if r.err != nil {
-		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
-	}
-	objs := objectsIn(t, r.stdout)
-	if got := relayIngress(t, objs, "relay-view"); !slices.Equal(got, []string{"10.9.0.1/32 [8443 8445]", "172.18.0.4/32 [8080]"}) {
-		t.Errorf("ingress rules of relay-view are %v", got)
+// TestRenderRelaySystemReadsNoCellFacts: whichever cells are live, the render reads no cell fact and holds the same
+// ingress rule in each policy: the own node on the health port.
+func TestRenderRelaySystemReadsNoCellFacts(t *testing.T) {
+	for label, kindEnv := range map[string]string{"no live cell": "STUB_KIND_CLUSTERS=management dev-cp rogue", "two live cells": "STUB_KIND_CLUSTERS=management dev-cp dev-cell-1 dev-cell-2"} {
+		t.Run(label, func(t *testing.T) {
+			r := renderRelay(t, kindEnv)
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			if strings.Contains(r.log, "facts --cluster dev-cell") || strings.Contains(r.log, "kind get clusters") {
+				t.Errorf("the render looked for a cell:\n%s", r.log)
+			}
+			objs := objectsIn(t, r.stdout)
+			for _, name := range []string{"relay-view", "relay-telemetry"} {
+				if got := relayIngress(t, objs, name); !slices.Equal(got, []string{"172.18.0.4/32 [8080]"}) {
+					t.Errorf("ingress rules of %s are %v, want the node rule only", name, got)
+				}
+			}
+		})
 	}
 }

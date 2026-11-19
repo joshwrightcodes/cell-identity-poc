@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: thief, namespace: apps-demo}
+spec:
+  selector: {matchLabels: {app: thief}}
+  template:
+    metadata:
+      labels: {app: thief}
+    spec:
+      serviceAccount: client
+      containers: [{name: thief, image: "registry.invalid/thief:1"}]

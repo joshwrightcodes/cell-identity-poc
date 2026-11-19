@@ -21,6 +21,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
@@ -62,6 +63,11 @@ type Config struct {
 	// SpecPushState returns the time and the error of the last spec push to the host service. A nil
 	// func leaves both empty in the status.
 	SpecPushState func() (time.Time, string)
+
+	// bundlePolicy is a test seam for the allow-list data that SignBundle checks a set against. The
+	// zero value takes bundle.DefaultPolicy. No flag sets it: mgmtd must sign against the list that
+	// the appliers embed.
+	bundlePolicy bundle.Policy
 
 	NonceTTL, CheckEvery, KeyUpdateGap, KeyCacheTTL, NonceKeyEvery time.Duration
 	HistoryLen                                                     int

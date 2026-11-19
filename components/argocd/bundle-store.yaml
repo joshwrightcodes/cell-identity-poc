@@ -1,5 +1,6 @@
-# Credential template for every bundle in the in-cluster store. It holds no credential:
-# it only tells Argo CD to use plain HTTP. The SVID proxy replaces plain HTTP in a later milestone.
+# Credential template for every bundle in the in-cluster store. It holds no credential: it only tells
+# Argo CD to use plain HTTP. The host is the token client in the repo server pod (container store-token),
+# which adds the token of the pod and sends the request to the bundle store.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -8,5 +9,5 @@ metadata:
     argocd.argoproj.io/secret-type: repo-creds
 stringData:
   type: oci
-  url: oci://bundle-store.cell-system.svc.cluster.local:5000/bundles
+  url: oci://127.0.0.1:5000/bundles
   insecureOCIForceHttp: "true"

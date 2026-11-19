@@ -13,9 +13,13 @@
 #     stream port 30450 and the bind port 30451 of the cell gateway on the node of SPIRE_SERVER_CLUSTER.
 #     The pod template carries the SHA-256 of the trust bundle and of the key, because celld loads both
 #     only at start, so a change restarts the pod.
+#   - the address of the registry mirror on the kind network, from the host service (facts --registry). celld reads the
+#     signed bundle sets from it (flow N45), and the NetworkPolicy of celld admits only that address on port 5000.
 #   - the plugin and celld images that `mise run images` built on this Mac, pinned by the digests
 #     in build/images.env. The agent config carries the SHA-256 of the plugin binary, so the agent
 #     checks the binary before it runs it.
+# components/lib/bundle-guard.sh adds the harness guard and the app limits of role cell, and components/lib/bundle-apps.sh
+# names the Applications that Role celld-argocd lets celld patch.
 # components/lib/spire-sidecar.sh adds the agent to the celld Deployment, with the M2 names of its
 # ConfigMaps and socket volume, so the deployed pod stays the same.
 # Inputs: SPIRE_SERVER_CLUSTER from cells/<cluster>.env, POC_ENV from cells/common.env, and the
@@ -34,6 +38,8 @@ source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/bundle-apps.sh"
+guard="$root/components/lib/bundle-guard.sh"
 
 celld_image="$(ko_image celld)" || die "no celld image"
 
@@ -43,6 +49,14 @@ if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$SPIRE_SERVER_C
 fi
 server_ip="$(jq -r '.nodeIP // ""' <<<"$facts")"
 [[ "$server_ip" =~ $ipv4 ]] || die "node address of $SPIRE_SERVER_CLUSTER is '$server_ip', not an IPv4 address"
+
+if ! registry="$(cd "$root" && mise run hostsvc -- facts --registry 2>/dev/null)"; then
+  die "no registry mirror address from the host service: ${registry:-no output}. Run: mise run harness:status"
+fi
+registry_ip="$(jq -r '.address // ""' <<<"$registry")"
+registry_port="$(jq -r '.port // 0' <<<"$registry")"
+[[ "$registry_ip" =~ $ipv4 ]] || die "no registry mirror address: the address of the mirror is '$registry_ip', not an IPv4 address"
+[[ "$registry_port" == 5000 ]] || die "the registry mirror port is '$registry_port', and the NetworkPolicy of celld admits port 5000"
 
 bundle="$(peer_root_pem "$SPIRE_SERVER_CLUSTER" "$trust_domain")" || exit 1
 bundle_sum="$(printf '%s' "$bundle" | sha256)"
@@ -61,14 +75,19 @@ api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 api_peers="$(for ip in $api_ips; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .)"
 [[ "$API_SERVER_PORT" =~ ^[0-9]+$ ]] || die "API_SERVER_PORT '$API_SERVER_PORT' is not a port number"
 
-manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" yq '
+argo_apps="$(bundle_argo_apps cell)" || die "no Applications of role cell in the allow list"
+
+manifests="$(PEERS="$api_peers" PORT="$API_SERVER_PORT" APPS="$argo_apps" yq '
   (select(.kind == "NetworkPolicy" and .metadata.name == "celld") | .spec.egress[] | select(.to == "@API_SERVER_PEERS@")) |= (
     .to = (env(PEERS) | ... style="") | .ports[0].port = env(PORT))
+  | (select(.kind == "Role" and .metadata.name == "celld-argocd") | .rules[] | select(.resourceNames == "@ARGOCD_APPS@")
+    | .resourceNames) = (env(APPS) | ... style="flow")
 ' "$here/manifests.yaml" \
   | sed -e "s|@CELLD_IMAGE@|$celld_image|" -e "s|@TRUST_BUNDLE_SHA256@|$bundle_sum|" -e "s|@OP_KEY_SHA256@|$op_sum|" \
     -e "s|@CELL_NAME@|$CELL_NAME|" -e "s|@POC_ENV@|$POC_ENV|" \
     -e "s|@GATEWAY_STREAM@|$server_ip:30450|" -e "s|@GATEWAY_BIND@|$server_ip:30451|" -e "s|@GATEWAY_ADDRESS@|$server_ip|" \
     -e "s|@SPIRE_SERVER_ADDRESS@|$server_ip|" \
+    -e "s|@REGISTRY_ADDRESS@|$registry_ip:$registry_port|" -e "s|@REGISTRY_IP@|$registry_ip|" \
     -e "s|@API_SERVICE_IP@|$API_SERVICE_IP|" \
     -e "s|@DNS_SERVICE_IP@|$DNS_SERVICE_IP|")"
 
@@ -78,6 +97,8 @@ celld="$(yq 'select(.kind == "Deployment" and .metadata.name == "celld")' <<<"$m
     SPIRE_SIDECAR_AGENT_CONFIGMAP=spire-agent SPIRE_SIDECAR_BUNDLE_CONFIGMAP=spire-trust-bundle SPIRE_SIDECAR_SOCKET_VOLUME=agent-socket \
     spire_sidecar celld cluster_jwt)" || die "the SPIRE sidecar of celld failed"
 
+guards="$("$guard" cell)" || die "the bundle guard failed"
+
 # Every object carries the harness label, so cell:verify can find the objects of the component.
 {
   yq 'select(.kind != "Deployment" or .metadata.name != "celld")' <<<"$manifests"
@@ -85,4 +106,6 @@ celld="$(yq 'select(.kind == "Deployment" and .metadata.name == "celld")' <<<"$m
   echo "$celld"
   echo "---"
   echo "$op_key"
+  echo "---"
+  echo "$guards"
 } | yq '.metadata.labels["cell.poc.internal/harness"] = "cell-identity"'

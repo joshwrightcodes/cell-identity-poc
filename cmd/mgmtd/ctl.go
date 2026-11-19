@@ -28,7 +28,8 @@ const (
 	ctlTimeout     = 60 * time.Second
 	maxCtlResponse = 16 << 20
 	maxStepInput   = 16 << 10
-	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign (the step as JSON on standard input)"
+	maxBundleInput = 256 << 10
+	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign (the step as JSON on standard input) | bundle sign --target <t> [--no-serve] [--ttl <d>] (the components as JSON on standard input) | bundle get --target <t> | bundle cosign --target <t>"
 )
 
 // Hooks that tests replace.
@@ -153,10 +154,12 @@ func ctlCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.W
 	ttl := sub.String("ttl", "", "op create, op sign: the lifetime of the operation, for example 10m")
 	kind := sub.String("kind", "demo.append", "op create, op sign: the kind of the operation")
 	id := sub.String("id", "", "op get, op close: the operation ID")
+	target := sub.String("target", "", "bundle sign, bundle get: the cell or the control plane")
+	noServe := sub.Bool("no-serve", false, "bundle sign: sign the set and never offer it")
 	digest := sub.String("bootstrap-sha256", "", "portal request, recreate, retry: the SHA-256 of the bootstrap bundle, as 64 lowercase hex characters")
 	subArgs := rest[1:]
 	opSub := ""
-	if verbs, ok := map[string]string{"op": "create, sign, get, list or close", "portal": "request, withdraw, recreate, retry or cancel", "step": "sign"}[rest[0]]; ok {
+	if verbs, ok := map[string]string{"op": "create, sign, get, list or close", "portal": "request, withdraw, recreate, retry or cancel", "step": "sign", "bundle": "sign, get or cosign"}[rest[0]]; ok {
 		if len(subArgs) == 0 {
 			cli.Fail(stdout, name, fmt.Errorf("%s needs %s; %s", rest[0], verbs, ctlUsage))
 			return exitConfig
@@ -265,6 +268,12 @@ func ctlCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.W
 			cli.Fail(stdout, name, err)
 			return exitConfig
 		}
+	case "bundle":
+		var err error
+		if method, path, body, err = bundleRequest(opSub, *target, *noServe, *ttl, stdin); err != nil {
+			cli.Fail(stdout, name, err)
+			return exitConfig
+		}
 	case "step":
 		if opSub != "sign" {
 			cli.Fail(stdout, name, fmt.Errorf("unknown step command %q; %s", opSub, ctlUsage))
@@ -349,6 +358,13 @@ func flagApplies(command, opSub, flagName string) bool {
 		case "withdraw", "cancel":
 			return flagName == "cell"
 		}
+	case "bundle":
+		switch opSub {
+		case "sign":
+			return flagName == "target" || flagName == "no-serve" || flagName == "ttl"
+		case "get", "cosign":
+			return flagName == "target"
+		}
 	case "op":
 		switch opSub {
 		case "create", "sign":
@@ -389,6 +405,50 @@ func portalRequest(sub string, cells []string, digest string) (method, path stri
 		return "", "", nil, err
 	}
 	return http.MethodPost, "/portal/" + sub, bytes.NewReader(req), nil
+}
+
+// bundleRequest returns the admin request of `ctl bundle <sub>`. sign reads the component list from
+// in, and the plane checks it. get asks for the set that the plane shows for the target. cosign asks
+// for the attestation and the cosign bundle that the plane holds now for it.
+func bundleRequest(sub, target string, noServe bool, ttl string, in io.Reader) (method, path string, body io.Reader, err error) {
+	if target == "" {
+		return "", "", nil, fmt.Errorf("bundle %s needs --target", sub)
+	}
+	switch sub {
+	case "sign":
+		comps, err := readBundleInput(in)
+		if err != nil {
+			return "", "", nil, err
+		}
+		q := url.Values{"target": {target}}
+		if noServe {
+			q.Set("serve", "0")
+		}
+		if ttl != "" {
+			q.Set("ttl", ttl)
+		}
+		return http.MethodPost, "/bundles?" + q.Encode(), bytes.NewReader(comps), nil
+	case "get":
+		return http.MethodGet, "/bundles?" + url.Values{"target": {target}}.Encode(), nil, nil
+	case "cosign":
+		return http.MethodGet, "/bundles/cosign?" + url.Values{"target": {target}}.Encode(), nil, nil
+	}
+	return "", "", nil, fmt.Errorf("unknown bundle command %q; %s", sub, ctlUsage)
+}
+
+// readBundleInput reads the component list of `ctl bundle sign` from in, at most maxBundleInput bytes.
+func readBundleInput(in io.Reader) ([]byte, error) {
+	if in == nil {
+		return nil, errors.New("bundle sign needs the components as JSON on standard input")
+	}
+	b, err := io.ReadAll(io.LimitReader(in, maxBundleInput+1))
+	if err != nil {
+		return nil, fmt.Errorf("read the components from standard input: %w", err)
+	}
+	if len(b) > maxBundleInput {
+		return nil, fmt.Errorf("the components on standard input are larger than %d bytes", maxBundleInput)
+	}
+	return b, nil
 }
 
 // readStepInput reads the step body of `ctl step sign` from in, at most maxStepInput bytes.

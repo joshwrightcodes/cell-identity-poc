@@ -3,6 +3,10 @@
 # ConfigMaps. The agent attests to the SPIRE server of the environment with the cluster_jwt
 # plugin, and celld gets its X.509 SVID from the agent.
 # The namespace stays out of the mesh, so identity does not depend on Istio.
+# celld also applies the signed bundle sets of its cell. It reads them from the registry mirror, writes them to the bundle store
+# with a projected token of the audience bundle-store, and asks Argo CD for the state of the Applications. Role celld-argocd
+# and ClusterRole celld-netpol-read give the rights that the apply engine needs. The guards bundles-spare-harness and
+# bundles-app-limits come from components/lib/bundle-guard.sh.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -62,8 +66,9 @@ spec:
           port: 53
 ---
 # The pod reaches only the SPIRE server node port, the stream and bind node ports of the cell gateway
-# (flow N41), all in the environment control plane, the API server, and the collector. It accepts no
-# connections: the probes run in the pod.
+# (flow N41), all in the environment control plane, the API server, and the collector. It also reads the
+# bundle sets from the registry mirror (flow N45) and writes them to the bundle store (flow N46). It accepts
+# no connections: the probes run in the pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -113,6 +118,47 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
+    - to:
+        - ipBlock:
+            cidr: "172.18.0.7/32"
+      ports:
+        - protocol: TCP
+          port: 5000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cell-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bundle-store
+      ports:
+        - protocol: TCP
+          port: 5000
+---
+# The bundle store admits celld on port 5000. This policy is a harness plane policy: every pod of cell-system is
+# selected, so a bundle cannot move the store out of the policy by a label, and the apply engine refuses a bundle
+# that names this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plane-celld-store
+  namespace: cell-system
+  labels:
+    cell.poc.internal/harness: cell-identity
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cell-identity-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: celld
+      ports:
+        - protocol: TCP
+          port: 5000
 ---
 # The operation records and the demo target of celld. The namespace holds no pod and stays out of the mesh.
 apiVersion: v1
@@ -159,6 +205,70 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: celld-ops
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system
+---
+# The apply engine of celld lists the Applications and asks Argo CD for a hard refresh of the Application root. On a
+# rollback it terminates the running sync operation of root and of the component Applications. The render puts root and
+# the components of the role in allow.json into resourceNames (components/lib/bundle-apps.sh). Nothing else in argocd.
+# The right to patch also covers the spec of these Applications. That is no more than patch on root already gives,
+# because root writes the spec of each component Application.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: celld-argocd
+  namespace: argocd
+  labels:
+    cell.poc.internal/harness: cell-identity
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [list]
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    resourceNames: [root, apps-demo, apps-sample, argocd, cell-system, istio-base, istio-cni, istio-egress, istiod, mesh-policy, namespaces, network-policy, observability-system]
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: celld-argocd
+  namespace: argocd
+  labels:
+    cell.poc.internal/harness: cell-identity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: celld-argocd
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system
+---
+# The engine reads the NetworkPolicies that carry the harness label in every namespace, so that no bundle blocks a plane flow.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: celld-netpol-read
+  labels:
+    cell.poc.internal/harness: cell-identity
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: celld-netpol-read
+  labels:
+    cell.poc.internal/harness: cell-identity
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: celld-netpol-read
 subjects:
   - kind: ServiceAccount
     name: celld
@@ -271,6 +381,10 @@ spec:
             - --trust-bundle=/run/celld/trust-bundle/bundle.crt
             - --op-key-dir=/run/celld/op-key
             - --ops-namespace=cell-ops-system
+            - --bundle-mirror=172.18.0.7:5000
+            - --bundle-store=bundle-store.cell-system.svc.cluster.local:5000
+            - --bundle-store-token=/var/run/secrets/bundle-store/token
+            - --bundle-health-timeout=5m
           env:
             - name: POD_NAME
               valueFrom:
@@ -306,7 +420,7 @@ spec:
               cpu: 10m
               memory: 16Mi
             limits:
-              memory: 64Mi
+              memory: 256Mi
           volumeMounts:
             - name: agent-socket
               mountPath: /run/spire/agent
@@ -320,6 +434,9 @@ spec:
             - name: celld-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            - name: bundle-store-token
+              mountPath: /var/run/secrets/bundle-store
+              readOnly: true
       volumes:
         - name: spire-trust-bundle
           configMap:
@@ -327,6 +444,14 @@ spec:
         - name: mgmt-op-key
           configMap:
             name: mgmt-op-key
+        # The bundle store accepts this token only for the audience bundle-store, and only from the account celld.
+        - name: bundle-store-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: bundle-store
+                  expirationSeconds: 600
         - name: celld-api-token
           projected:
             sources:
@@ -518,3 +643,11 @@ metadata:
     cell.poc.internal/harness: cell-identity
 data:
   op.pub: AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=
+---
+{"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "bundles-spare-harness", labels: {cell.poc.internal/harness: cell-identity}}, "spec": {"failurePolicy": "Fail", "matchConstraints": {"resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"], "operations": ["CREATE", "UPDATE", "DELETE"], "resources": ["*/*"], "scope": "*"}]}, "matchConditions": [{"name": "argocd-controller", "expression": "request.userInfo.username == 'system:serviceaccount:argocd:argocd-application-controller'"}], "validations": [{"expression": "!has(request.namespace) || !(request.namespace in ['cell-identity-system', 'cell-ops-system', 'mesh-view-system'])", "message": "Argo CD may not change an object in a harness namespace", "reason": "Forbidden"}, {"expression": "oldObject == null || !has(oldObject.metadata.labels) || !('cell.poc.internal/harness' in oldObject.metadata.labels)", "message": "Argo CD may not change or delete an object that carries the harness label", "reason": "Forbidden"}, {"expression": "object == null || !has(object.metadata.labels) || !('cell.poc.internal/harness' in object.metadata.labels)", "message": "Argo CD may not give an object the harness label", "reason": "Forbidden"}]}}
+---
+{"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding", "metadata": {"name": "bundles-spare-harness", labels: {cell.poc.internal/harness: cell-identity}}, "spec": {"policyName": "bundles-spare-harness", "validationActions": ["Deny"]}}
+---
+{"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy", "metadata": {"name": "bundles-app-limits", labels: {cell.poc.internal/harness: cell-identity}}, "spec": {"failurePolicy": "Fail", "matchConstraints": {"resourceRules": [{"apiGroups": ["*"], "apiVersions": ["*"], "operations": ["CREATE", "UPDATE"], "resources": ["*"], "scope": "*"}]}, "matchConditions": [{"name": "argocd-controller", "expression": "request.userInfo.username == 'system:serviceaccount:argocd:argocd-application-controller'"}, {"name": "app-component", "expression": "object != null && has(object.metadata.annotations) && 'argocd.argoproj.io/tracking-id' in object.metadata.annotations && (object.metadata.annotations['argocd.argoproj.io/tracking-id'].startsWith('apps-sample:'))"}], "validations": [{"expression": "object.kind != 'Service' || ((!has(object.spec.type) || object.spec.type == 'ClusterIP') && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))", "message": "An app component may create only a Service of type ClusterIP with no externalIPs", "reason": "Forbidden"}, {"expression": "object.kind != 'Deployment' || !(has(object.spec.template.metadata) && ((has(object.spec.template.metadata.labels) && 'sidecar.istio.io/inject' in object.spec.template.metadata.labels && object.spec.template.metadata.labels['sidecar.istio.io/inject'].lowerAscii() in ['false', 'n', 'no', 'off']) || (has(object.spec.template.metadata.annotations) && 'sidecar.istio.io/inject' in object.spec.template.metadata.annotations && object.spec.template.metadata.annotations['sidecar.istio.io/inject'].lowerAscii() in ['false', 'n', 'no', 'off'])))", "message": "An app component may not opt a Deployment out of the sidecar", "reason": "Forbidden"}, {"expression": "!has(object.metadata.labels) || !('cell.poc.internal/harness' in object.metadata.labels)", "message": "An app component may not create an object with the harness label", "reason": "Forbidden"}, {"expression": "object.kind != 'Secret' || !has(object.type) || object.type != 'kubernetes.io/service-account-token'", "message": "An app component may not create a ServiceAccount token Secret", "reason": "Forbidden"}]}}
+---
+{"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding", "metadata": {"name": "bundles-app-limits", labels: {cell.poc.internal/harness: cell-identity}}, "spec": {"policyName": "bundles-app-limits", "validationActions": ["Deny"]}}

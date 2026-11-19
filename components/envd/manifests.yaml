@@ -9,6 +9,11 @@
 # It also writes the signed spec and the signed steps to ConfigMap cell-controller-system/cell-steps for the cell
 # controller, and reads ConfigMap step-status there. The Role envd-steps, in the bundle of the cell controller, allows
 # both, so that bundle must be applied first.
+#
+# envd also applies the signed bundle sets of dev-cp. It reads them from the registry mirror, writes them to the bundle store
+# with a projected token of the audience bundle-store, keeps its state in ConfigMap envd-system/bundle-state, and asks
+# Argo CD for the state of the Applications. Role envd-argocd, ClusterRole envd-netpol-read and Role envd-bundle-state
+# give the rights that the apply engine needs. The guard bundles-spare-harness comes from components/lib/bundle-guard.sh.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -108,6 +113,12 @@ spec:
             - --hints-configmap=spire-system/attest-hints
             - --steps-configmap=cell-controller-system/cell-steps
             - --step-status-configmap=cell-controller-system/step-status
+            - --cluster=@CLUSTER@
+            - --bundle-mirror=@REGISTRY_ADDRESS@
+            - --bundle-store=bundle-store.cell-system.svc.cluster.local:5000
+            - --bundle-store-token=/var/run/secrets/bundle-store/token
+            - --bundle-state-configmap=envd-system/bundle-state
+            - --bundle-health-timeout=5m
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
@@ -143,7 +154,7 @@ spec:
               cpu: 10m
               memory: 32Mi
             limits:
-              memory: 128Mi
+              memory: 256Mi
           volumeMounts:
             - name: spire-agent-socket
               mountPath: /run/spire/agent
@@ -157,6 +168,9 @@ spec:
             - name: envd-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            - name: bundle-store-token
+              mountPath: /var/run/secrets/bundle-store
+              readOnly: true
       volumes:
         - name: peer-root
           configMap:
@@ -164,6 +178,14 @@ spec:
         - name: spec-key
           configMap:
             name: mgmt-spec-key
+        # The bundle store accepts this token only for the audience bundle-store, and only from the account envd.
+        - name: bundle-store-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: bundle-store
+                  expirationSeconds: 600
         - name: envd-api-token
           projected:
             sources:
@@ -180,3 +202,88 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
+---
+# The apply engine of envd lists the Applications and asks Argo CD for a hard refresh of the Application root. On a
+# rollback it terminates the running sync operation of root and of the component Applications. The render puts root and
+# the components of the role in allow.json into resourceNames (components/lib/bundle-apps.sh). Nothing else in argocd.
+# The right to patch also covers the spec of these Applications. That is no more than patch on root already gives,
+# because root writes the spec of each component Application.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-argocd
+  namespace: argocd
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [list]
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    resourceNames: "@ARGOCD_APPS@"
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-argocd
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: envd-argocd
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system
+---
+# The engine reads the NetworkPolicies that carry the harness label in every namespace, so that no bundle blocks a plane flow.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: envd-netpol-read
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: envd-netpol-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: envd-netpol-read
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system
+---
+# The engine keeps its state in ConfigMap bundle-state. Create cannot name the object, and get and update name only that one.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-bundle-state
+  namespace: envd-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [create]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [bundle-state]
+    verbs: [get, update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-bundle-state
+  namespace: envd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: envd-bundle-state
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system

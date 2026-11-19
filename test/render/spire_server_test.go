@@ -45,6 +45,14 @@ set -euo pipefail
 echo "$*" >>"$STUB_LOG"
 case "$2" in
   hostsvc)
+    # facts --registry answers the registry mirror: STUB_REGISTRY_IP sets its address, and STUB_REGISTRY_PORT sets its port, and STUB_REGISTRY_FAIL makes the call fail.
+    if [[ "${4:-}" == facts && "${5:-}" == --registry ]]; then
+      if [[ -n "${STUB_REGISTRY_FAIL:-}" ]]; then
+        echo '{"level":"ERROR","msg":"hostsvc failed","error":"registry-mirror has no address on the kind network"}'; exit 1
+      fi
+      printf '{"name":"registry-mirror","address":"%s","port":%s,"host":"127.0.0.1:5001"}\n' "${STUB_REGISTRY_IP:-172.18.0.7}" "${STUB_REGISTRY_PORT:-5000}"
+      exit 0
+    fi
     cell="$6"
     # STUB_FACTS_FAIL and STUB_FACTS_NOIP name cells (space separated) whose facts fail, or have no node address.
     if [[ " ${STUB_FACTS_FAIL:-} " == *" $cell "* ]]; then
@@ -92,6 +100,7 @@ case "$2" in
     echo "$out"
     ;;
   pki) shift 3; exec "$STUB_PKIGEN" "$@" ;;
+  bundlectl) shift 3; cd "$STUB_REPO" && exec go run ./cmd/bundlectl "$@" ;;
   *) exit 2 ;;
 esac
 `
@@ -228,6 +237,7 @@ const stubKind = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kind $*" >>"$STUB_LOG"
 [[ "$*" == "get clusters" ]] || exit 2
+[[ -z "${STUB_KIND_FAIL:-}" ]] || exit 1
 case "${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue}" in
   none) echo "No kind clusters found." >&2 ;;
   *) printf '%s\n' ${STUB_KIND_CLUSTERS:-management dev-cp dev-cell-1 dev-cell-2 rogue} ;;
@@ -324,7 +334,7 @@ var serverFacts = []string{"API_SERVER_IPS=172.18.0.4", "API_SERVER_PORT=6443", 
 // workload. The env values override them.
 func render(t *testing.T, env ...string) result {
 	t.Helper()
-	defaults := []string{"SPIRE_SVID_TTL=1m", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal", "SPIRE_UPSTREAM=disk",
+	defaults := []string{"CELL_NAME=management", "SPIRE_SVID_TTL=1m", "SPIRE_TRUST_DOMAIN=dev.env.poc.internal", "SPIRE_UPSTREAM=disk",
 		"SPIRE_CELL_SUBJECTS=cell-identity-system/celld=celld", "SECRET_STORE_NAMESPACES=spire-system"}
 	return renderScript(t, "spire-server", "/ko-app/cluster-jwt-server", append(append(defaults, serverFacts...), env...)...)
 }
@@ -413,12 +423,13 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 		fmt.Fprintf(&images, "IMAGE_%s=localhost:5001/%s@%s\n", strings.ToUpper(strings.ReplaceAll(repo, "-", "_")), repo, digest)
 	}
 	imagesFile := write("images.env", images.String(), 0o644)
+	stampFile := write("images.stamp", "", 0o644)
 	switch opts["STUB_IMAGES"] {
 	case "missing":
 		imagesFile = filepath.Join(dir, "no-images.env")
 	case "stale":
 		old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
-		if err := os.Chtimes(imagesFile, old, old); err != nil {
+		if err := os.Chtimes(stampFile, old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -459,7 +470,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"HOSTSVC_SERVE="+hostsvcServe, "STUB_PIN_FILE="+write("hostsvc.crt", caPEM(t, "host.docker.internal"), 0o644),
-		"POC_ENV="+commonEnv(t, "POC_ENV"))
+		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"))
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -469,6 +480,16 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	err := cmd.Run()
 	logData, _ := os.ReadFile(logFile)
 	return result{stdout.String(), stderr.String(), err, string(logData), digest, bundle}
+}
+
+// repoRoot returns the absolute path of the repository root.
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
 }
 
 func layerTarGz(t *testing.T, binary string) []byte {
@@ -506,8 +527,9 @@ var clusterScoped = []string{"Namespace", "CustomResourceDefinition", "ClusterRo
 	"ValidatingWebhookConfiguration", "MutatingWebhookConfiguration", "ValidatingAdmissionPolicy", "ValidatingAdmissionPolicyBinding"}
 
 // docsIn parses the render output by kind and name. Every namespaced object must be in ns, and no
-// Namespace other than ns may appear. The cell-identity render also holds the objects of namespace
-// cell-ops-system (TestCellOpsNamespace), and docsIn skips them for ns cell-identity-system.
+// Namespace other than ns may appear. The cell-identity render also holds the objects of the namespaces
+// cell-ops-system (TestCellOpsNamespace), argocd and cell-system (TestCelldRBACExact, TestCellStorePlanePolicy),
+// and docsIn skips them for ns cell-identity-system.
 func docsIn(t *testing.T, out, ns string) map[string]object {
 	t.Helper()
 	byKey := map[string]object{}
@@ -524,7 +546,8 @@ func docsIn(t *testing.T, out, ns string) map[string]object {
 		}
 		key := get[string](t, o, "kind") + "/" + get[string](t, o, "metadata", "name")
 		if ns == "cell-identity-system" {
-			if opsNS, _ := lookup(o, "metadata", "namespace"); opsNS == "cell-ops-system" || key == "Namespace/cell-ops-system" {
+			// The render also holds the objects that the celld account needs in cell-ops-system, argocd and cell-system.
+			if other, _ := lookup(o, "metadata", "namespace"); other == "cell-ops-system" || other == "argocd" || other == "cell-system" || key == "Namespace/cell-ops-system" {
 				continue
 			}
 		}
@@ -608,14 +631,15 @@ func TestRenderSpireServer(t *testing.T) {
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
 
 	t.Run("k8s_psat admits the plane workloads cp/otel, envd, cp/gateway and cp/cell-controller", func(t *testing.T) {
-		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"})
+		checkPSAT(t, objs, "dev-cp", "dev.env.poc.internal", map[string]string{"cp/otel": "observability-system/otel-uplink", "envd": "envd-system/envd", "cp/gateway": "gateway-system/cell-gateway", "cp/cell-controller": "cell-controller-system/cell-controller"},
+			"envd-system/envd", "observability-system/otel-uplink", "gateway-system/cell-gateway", "cell-controller-system/cell-controller")
 	})
 
 	if left := regexp.MustCompile(`@[A-Z_]+@`).FindAllString(r.stdout, -1); slices.ContainsFunc(left, func(s string) bool { return s != "@CELL_NAME@" }) {
 		t.Fatalf("render left tokens %v", left)
 	}
-	if want := "run hostsvc -- facts --cluster dev-cell-1"; !strings.Contains(r.log, want) {
-		t.Fatalf("render did not run mise %q; it ran:\n%s", want, r.log)
+	if strings.Contains(r.log, "hostsvc -- facts --cluster dev-cell") {
+		t.Fatalf("render read the node address of a cell, which only the envd render needs; it ran:\n%s", r.log)
 	}
 
 	// The external-secrets bundle holds Namespace spire-system, because the Role of the operator
@@ -628,7 +652,7 @@ func TestRenderSpireServer(t *testing.T) {
 		}
 	})
 
-	t.Run("network policy admits only the agent nodes", func(t *testing.T) {
+	t.Run("the namespace denies by default and the bundle has no rule for the agent nodes", func(t *testing.T) {
 		deny := objs["NetworkPolicy/default-deny"]
 		if types := get[[]any](t, deny, "spec", "policyTypes"); len(types) != 2 || len(get[map[string]any](t, deny, "spec", "podSelector")) != 0 {
 			t.Fatalf("default-deny spec is %v", deny["spec"])
@@ -636,27 +660,8 @@ func TestRenderSpireServer(t *testing.T) {
 		if _, ok := lookup(deny, "spec", "ingress"); ok {
 			t.Fatal("default-deny has ingress rules")
 		}
-		np := objs["NetworkPolicy/spire-server-agents"]
-		rules := get[[]any](t, np, "spec", "ingress")
-		if len(rules) != 1 {
-			t.Fatalf("got %d ingress rules", len(rules))
-		}
-		var cidrs []string
-		for _, peer := range get[[]any](t, rules[0], "from") {
-			if len(peer.(map[string]any)) != 1 {
-				t.Fatalf("peer %v has more than an ipBlock", peer)
-			}
-			cidrs = append(cidrs, get[string](t, peer, "ipBlock", "cidr"))
-		}
-		if !slices.Equal(cidrs, []string{"10.9.0.1/32", "10.9.0.2/32"}) {
-			t.Fatalf("peers are %v", cidrs)
-		}
-		ports := get[[]any](t, rules[0], "ports")
-		if len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
-			t.Fatalf("ports are %v", ports)
-		}
-		if _, ok := lookup(np, "spec", "egress"); ok {
-			t.Fatal("the agent policy allows egress")
+		if _, ok := objs["NetworkPolicy/spire-server-agents"]; ok {
+			t.Fatal("the render has NetworkPolicy spire-server-agents, and the harness plane policy spire-system/plane-cells admits the agent nodes")
 		}
 	})
 
@@ -955,9 +960,6 @@ func TestRenderFailsClosed(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{"live cell without facts", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "no host service facts for the live cell dev-cell-2"},
-		{"live cell without facts names the read command", []string{"SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "STUB_FACTS_FAIL=dev-cell-2"}, "Read them: mise run hostsvc -- facts --cluster dev-cell-2"},
-		{"live cell without node address", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "STUB_FACTS_NOIP=dev-cell-1"}, "node address of dev-cell-1"},
 		{"blank cells with subjects", []string{"SPIRE_AGENT_CELLS= "}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"cells without subjects", []string{"SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_CELL_SUBJECTS="}, "SPIRE_AGENT_CELLS and SPIRE_CELL_SUBJECTS must both be set or both be unset"},
 		{"no cell and no local workload", []string{"SPIRE_AGENT_CELLS=", "SPIRE_CELL_SUBJECTS="}, "names no agent cell and no local workload"},
@@ -1041,7 +1043,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
 	m2 := docs(t, string(want))
-	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-workloads", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
+	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
 		"Role/spire-server-hints", "RoleBinding/spire-server-hints"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("render has no %s", key)
@@ -1050,6 +1052,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	}
 	// The per-subject aliases cell/<cell>/agents/<role> replace the M2 alias cell/<cell>/nodes, so the
 	// entries differ from M2. TestRenderSpireServer checks every entry.
+	delete(m2, "NetworkPolicy/spire-server-agents")
 	got["ConfigMap/spire-entries"]["data"] = map[string]any{}
 	m2["ConfigMap/spire-entries"]["data"] = map[string]any{}
 
@@ -1116,8 +1119,9 @@ func checkPrometheus(t *testing.T, text string) {
 
 // checkPSAT checks the k8s_psat path of a server render: the plugin config, the API access of the
 // server, the ingress rule for each local workload, and the alias and entry of each workload.
-// workloads maps each SPIFFE path to <namespace>/<service account>.
-func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloads map[string]string) {
+// workloads maps each SPIFFE path to <namespace>/<service account>. The accounts in planePeers have an entry and an alias, and
+// their ingress rule lives in a harness plane policy, so the workload policy has no peer for them.
+func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloads map[string]string, planePeers ...string) {
 	t.Helper()
 	text := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	// k8s_psat ignores unknown keys, so only this exact key gives each sidecar its own agent ID.
@@ -1199,31 +1203,12 @@ func checkPSAT(t *testing.T, objs map[string]object, cluster, td string, workloa
 
 	// Flow N8: each local workload pod reaches the server API. Flow N9: the server reaches the API server.
 	np := objs["NetworkPolicy/spire-server-workloads"]
-	if get[string](t, np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
-		t.Fatalf("workload policy selects %v", get[map[string]any](t, np, "spec", "podSelector"))
-	}
-	ingress := get[[]any](t, np, "spec", "ingress")
-	if len(ingress) != 1 || !slices.Equal(get[[]any](t, np, "spec", "policyTypes"), []any{"Ingress"}) {
-		t.Fatalf("workload policy spec is %v", np["spec"])
-	}
-	var peers, wantPeers []string
-	for _, p := range get[[]any](t, ingress[0], "from") {
-		if len(p.(map[string]any)) != 2 {
-			t.Fatalf("peer %v needs exactly a namespace and a pod selector", p)
+	if len(planePeers) == len(workloads) {
+		if np != nil {
+			t.Fatalf("every workload has a harness plane policy, and the render prints NetworkPolicy spire-server-workloads: %v", np["spec"])
 		}
-		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+
-			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
-	}
-	for _, sub := range workloads {
-		wantPeers = append(wantPeers, sub)
-	}
-	slices.Sort(peers)
-	slices.Sort(wantPeers)
-	if !slices.Equal(peers, slices.Compact(wantPeers)) {
-		t.Fatalf("workload peers are %v, want %v", peers, wantPeers)
-	}
-	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
-		t.Fatalf("workload ports are %v", ports)
+	} else {
+		checkWorkloadPolicy(t, np, workloads, planePeers)
 	}
 	api := objs["NetworkPolicy/spire-server-api"]
 	if !slices.Equal(get[[]any](t, api, "spec", "policyTypes"), []any{"Egress"}) ||
@@ -1471,19 +1456,8 @@ func TestSpireServerHintConfig(t *testing.T) {
 // topology cells are live.
 func liveEnv(clusters string) string { return "STUB_KIND_CLUSTERS=" + clusters }
 
-// agentPolicyRules returns the ingress rules of NetworkPolicy spire-server-agents, or nil when the render has none.
-func agentPolicyRules(t *testing.T, objs map[string]object) []any {
-	t.Helper()
-	np, ok := objs["NetworkPolicy/spire-server-agents"]
-	if !ok {
-		return nil
-	}
-	return get[[]any](t, np, "spec", "ingress")
-}
-
 // TestSpireServerRenderNoLiveCells: dev-cp with a catalog of two cells and no cluster for either of them. The render
-// succeeds with no cell fact, drops the cluster_jwt section and the policy of the agent node port, and keeps the
-// ClusterStaticEntry pairs of both cells.
+// succeeds with no cell fact, drops the cluster_jwt section, and keeps the ClusterStaticEntry pairs of both cells.
 func TestSpireServerRenderNoLiveCells(t *testing.T) {
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
 	if r.err != nil {
@@ -1493,28 +1467,6 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) || strings.Contains(conf, "record_public_keys") {
 		t.Errorf("server.conf holds the cluster_jwt section with no live cell:\n%s", conf)
-	}
-	for _, rule := range agentPolicyRules(t, objs) {
-		t.Errorf("NetworkPolicy spire-server-agents has a rule with no live cell: %v", rule)
-	}
-	// No rule that names port 8081 may admit an ipBlock: only the local workloads reach the server.
-	for key, o := range objs {
-		if o["kind"] != "NetworkPolicy" {
-			continue
-		}
-		ingress, _ := lookupOr(o, "spec", "ingress").([]any)
-		for _, rule := range ingress {
-			ports, _ := lookup(rule, "ports")
-			from, _ := lookup(rule, "from")
-			if !strings.Contains(fmt.Sprint(ports), "port:8081") {
-				continue
-			}
-			for _, p := range from.([]any) {
-				if _, isBlock := lookup(p, "ipBlock"); isBlock {
-					t.Errorf("%s: a rule for port 8081 admits an ipBlock: %v", key, rule)
-				}
-			}
-		}
 	}
 	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
@@ -1531,29 +1483,22 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 			t.Errorf("the render ran %q with no live cell:\n%s", bad, r.log)
 		}
 	}
-	if _, ok := objs["ConfigMap/spire-entries"]; !ok {
-		t.Error("no ConfigMap spire-entries")
-	}
 }
 
-// TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The policy admits only the node of
-// dev-cell-1, the facts of dev-cell-2 are never read, and the entries of both cells stay.
+// TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The cluster_jwt section stays, and the
+// entries of both cells stay. The render reads no cell address.
 func TestSpireServerRenderOneLiveCell(t *testing.T) {
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue dev-cell-1"))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
 	objs := docs(t, hydrated(r.stdout, "dev-cp"))
-	rules := agentPolicyRules(t, objs)
-	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
-		t.Fatalf("agent policy rules %v, want one rule that admits 10.9.0.1/32", rules)
-	}
 	conf := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
 	if !strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
 		t.Error("server.conf lacks the cluster_jwt section with one live cell")
 	}
-	if strings.Contains(r.log, "facts --cluster dev-cell-2") {
-		t.Errorf("the render read the facts of a cell that has no cluster:\n%s", r.log)
+	if strings.Contains(r.log, "facts --cluster dev-cell") {
+		t.Errorf("the render read the facts of a cell:\n%s", r.log)
 	}
 	entries := get[map[string]any](t, objs["ConfigMap/spire-entries"], "data")
 	for _, name := range []string{"dev-cell-1-celld.yaml", "dev-cell-2-celld.yaml", "dev-cell-1-agents-celld.yaml", "dev-cell-2-agents-celld.yaml"} {
@@ -1564,14 +1509,48 @@ func TestSpireServerRenderOneLiveCell(t *testing.T) {
 }
 
 // TestSpireServerRenderNoNodeAddressIsNotLive: a cluster whose node container has no address on the network kind is
-// not live, so the render leaves it out and does not read its facts.
+// not live. With no other live cell, the cluster_jwt section is absent.
 func TestSpireServerRenderNoNodeAddressIsNotLive(t *testing.T) {
-	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-2")
+	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-1 dev-cell-2")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
 	}
-	rules := agentPolicyRules(t, docs(t, hydrated(r.stdout, "dev-cp")))
-	if len(rules) != 1 || peerList(t, rules[0], "from") != "10.9.0.1/32" {
-		t.Fatalf("agent policy rules %v, want one rule that admits only dev-cell-1", rules)
+	conf := get[string](t, docs(t, hydrated(r.stdout, "dev-cp"))["ConfigMap/spire-server"], "data", "server.conf")
+	if strings.Contains(conf, `NodeAttestor "cluster_jwt"`) {
+		t.Error("server.conf holds the cluster_jwt section while no cell has a node address")
+	}
+}
+
+// checkWorkloadPolicy checks the ingress policy of the local workloads: one rule, one peer for each workload that has no
+// harness plane policy, and port 8081.
+func checkWorkloadPolicy(t *testing.T, np object, workloads map[string]string, planePeers []string) {
+	t.Helper()
+	if get[string](t, np, "spec", "podSelector", "matchLabels", "app.kubernetes.io/name") != "spire-server" {
+		t.Fatalf("workload policy selects %v", get[map[string]any](t, np, "spec", "podSelector"))
+	}
+	ingress := get[[]any](t, np, "spec", "ingress")
+	if len(ingress) != 1 || !slices.Equal(get[[]any](t, np, "spec", "policyTypes"), []any{"Ingress"}) {
+		t.Fatalf("workload policy spec is %v", np["spec"])
+	}
+	var peers, wantPeers []string
+	for _, p := range get[[]any](t, ingress[0], "from") {
+		if len(p.(map[string]any)) != 2 {
+			t.Fatalf("peer %v needs exactly a namespace and a pod selector", p)
+		}
+		peers = append(peers, get[string](t, p, "namespaceSelector", "matchLabels", "kubernetes.io/metadata.name")+"/"+
+			get[string](t, p, "podSelector", "matchLabels", "app.kubernetes.io/name"))
+	}
+	for _, sub := range workloads {
+		if !slices.Contains(planePeers, sub) {
+			wantPeers = append(wantPeers, sub)
+		}
+	}
+	slices.Sort(peers)
+	slices.Sort(wantPeers)
+	if !slices.Equal(peers, slices.Compact(wantPeers)) {
+		t.Fatalf("workload peers are %v, want %v", peers, wantPeers)
+	}
+	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
+		t.Fatalf("workload ports are %v", ports)
 	}
 }

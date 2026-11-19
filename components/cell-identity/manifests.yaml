@@ -3,6 +3,10 @@
 # ConfigMaps. The agent attests to the SPIRE server of the environment with the cluster_jwt
 # plugin, and celld gets its X.509 SVID from the agent.
 # The namespace stays out of the mesh, so identity does not depend on Istio.
+# celld also applies the signed bundle sets of its cell. It reads them from the registry mirror, writes them to the bundle store
+# with a projected token of the audience bundle-store, and asks Argo CD for the state of the Applications. Role celld-argocd
+# and ClusterRole celld-netpol-read give the rights that the apply engine needs. The guards bundles-spare-harness and
+# bundles-app-limits come from components/lib/bundle-guard.sh.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -62,6 +66,10 @@ spec:
             - --trust-bundle=/run/celld/trust-bundle/bundle.crt
             - --op-key-dir=/run/celld/op-key
             - --ops-namespace=cell-ops-system
+            - --bundle-mirror=@REGISTRY_ADDRESS@
+            - --bundle-store=bundle-store.cell-system.svc.cluster.local:5000
+            - --bundle-store-token=/var/run/secrets/bundle-store/token
+            - --bundle-health-timeout=5m
           env:
             - name: POD_NAME
               valueFrom:
@@ -97,7 +105,7 @@ spec:
               cpu: 10m
               memory: 16Mi
             limits:
-              memory: 64Mi
+              memory: 256Mi
           volumeMounts:
             - name: agent-socket
               mountPath: /run/spire/agent
@@ -111,6 +119,9 @@ spec:
             - name: celld-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
+            - name: bundle-store-token
+              mountPath: /var/run/secrets/bundle-store
+              readOnly: true
       volumes:
         - name: spire-trust-bundle
           configMap:
@@ -118,6 +129,14 @@ spec:
         - name: mgmt-op-key
           configMap:
             name: mgmt-op-key
+        # The bundle store accepts this token only for the audience bundle-store, and only from the account celld.
+        - name: bundle-store-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  audience: bundle-store
+                  expirationSeconds: 600
         - name: celld-api-token
           projected:
             sources:
@@ -170,8 +189,9 @@ spec:
           port: 53
 ---
 # The pod reaches only the SPIRE server node port, the stream and bind node ports of the cell gateway
-# (flow N41), all in the environment control plane, the API server, and the collector. It accepts no
-# connections: the probes run in the pod.
+# (flow N41), all in the environment control plane, the API server, and the collector. It also reads the
+# bundle sets from the registry mirror (flow N45) and writes them to the bundle store (flow N46). It accepts
+# no connections: the probes run in the pod.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -217,6 +237,45 @@ spec:
       ports:
         - protocol: TCP
           port: 4317
+    - to:
+        - ipBlock:
+            cidr: "@REGISTRY_IP@/32"
+      ports:
+        - protocol: TCP
+          port: 5000
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cell-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: bundle-store
+      ports:
+        - protocol: TCP
+          port: 5000
+---
+# The bundle store admits celld on port 5000. This policy is a harness plane policy: every pod of cell-system is
+# selected, so a bundle cannot move the store out of the policy by a label, and the apply engine refuses a bundle
+# that names this policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: plane-celld-store
+  namespace: cell-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cell-identity-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: celld
+      ports:
+        - protocol: TCP
+          port: 5000
 ---
 # The operation records and the demo target of celld. The namespace holds no pod and stays out of the mesh.
 apiVersion: v1
@@ -256,6 +315,62 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: celld-ops
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system
+---
+# The apply engine of celld lists the Applications and asks Argo CD for a hard refresh of the Application root. On a
+# rollback it terminates the running sync operation of root and of the component Applications. The render puts root and
+# the components of the role in allow.json into resourceNames (components/lib/bundle-apps.sh). Nothing else in argocd.
+# The right to patch also covers the spec of these Applications. That is no more than patch on root already gives,
+# because root writes the spec of each component Application.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: celld-argocd
+  namespace: argocd
+rules:
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    verbs: [list]
+  - apiGroups: [argoproj.io]
+    resources: [applications]
+    resourceNames: "@ARGOCD_APPS@"
+    verbs: [patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: celld-argocd
+  namespace: argocd
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: celld-argocd
+subjects:
+  - kind: ServiceAccount
+    name: celld
+    namespace: cell-identity-system
+---
+# The engine reads the NetworkPolicies that carry the harness label in every namespace, so that no bundle blocks a plane flow.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: celld-netpol-read
+rules:
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: celld-netpol-read
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: celld-netpol-read
 subjects:
   - kind: ServiceAccount
     name: celld

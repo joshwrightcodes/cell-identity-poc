@@ -32,7 +32,8 @@
 | New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |
 | Report each hop of the telemetry path of one cluster, and the first failing hop (see README "Collectors and uplinks") | `mise run obs:uplink-status dev-cell-1` |
 | Render bundles only | `mise run cell:hydrate` |
-| Push bundles after a change | `mise run cell:hydrate && mise run cell:publish` |
+| Push bundles after a change to a cell or `dev-cp`, which take only signed sets | `CELL=<cluster> mise run cell:hydrate && mise run bundle -- publish --target <cluster> --wait` |
+| Push bundles to `management`, or break glass in a cluster with a signed state (name the cluster in `CELL`) | `CELL=management mise run cell:publish`, or `CELL=<cluster> BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish` |
 | Argo CD UI on localhost:8080 | `mise run cell:ui` |
 | Remove what the `cell:ui` server wrote into `argocd` | `mise run cell:ui:clean` |
 | Delete the cell | `mise run cell:down` |
@@ -65,6 +66,9 @@
 | Repair what `gate:m6` and `gate:m6:provision` leave: the key files, the replicas of the cell controller, recorded steps, test namespaces `m6-*`, and the cells after an interrupted provision run (`--check` only reports) | `mise run gate:m6:repair` |
 | Run the M7 end-to-end gate: a malicious cell, interception at each hop and a relay that alters bytes (build the images first) | `mise run gate:m7` |
 | Delete the test namespaces `m7-*` of every cluster and wait until they are gone (`--check` only reports) | `mise run gate:m7:repair` |
+| Publish and repair the signed bundle sets of a cell or `dev-cp` with `publish`, `get`, `verify`, `cosign` or `repair` (see README "Signed bundle sets") | `mise run bundle -- publish --target dev-cp --wait` |
+| Run the M8 end-to-end gate (build the images first; `GATE_M8_LONG=1` adds the long tests) | `mise run gate:m8` |
+| Repair what `gate:m8` leaves: test objects, and each target that a test changed. It repairs before it publishes, with `dev-cp` first (`--check` only reports) | `mise run gate:m8:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 

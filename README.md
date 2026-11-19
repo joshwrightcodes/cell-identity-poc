@@ -81,6 +81,7 @@ The two cells have no `cell:up` step. `harness:up` asks the portal for them, as 
 `harness:up` handles the clusters in topology order, so `dev-cp` is ready before the cells. The `cell-identity` render of each cell reads the trust bundle from the SPIRE server in `dev-cp`.
 `cell:up` applies the bootstrap set, publishes the bundles and waits until Argo CD reports every Application as Synced and Healthy at the published revision.
 In `dev-cp`, that wait also runs `secrets:connect` once, or prints the command above, while the secret store is not connected.
+In a cluster with a signed state, `cell:up` skips the bootstrap apply and the root apply, and runs `mise run bundle -- publish --target <cluster> --wait` for the cluster instead.
 Then `cell:up` applies the harness components, for example `cell-identity`, and waits for their rollout.
 Last, `cell:up` runs the link phase of a cluster with link components, as [Central Argo CD view](#central-argo-cd-view) describes.
 `harness:up` sets up `management` first with `CELL_UP_SKIP_LINK=1`.
@@ -240,6 +241,8 @@ The table also covers a new root that no one planned. For a planned change of th
 | `dev-cp` | `CELL=dev-cp mise run cell:up`, `CELL=management LINK_ONLY=mgmt-api mise run cell:link`, `cell:up` and `cell:restart` for each live cell, then `CELL=management mise run cell:link` | The cells and the link phase hold the node address of `dev-cp`. `mgmtd` admits `envd` by that address and by the root of `dev-cp`, so `mgmt-api` links before the cells. |
 | a cell | `CELL=<cell> mise run cell:down` while the cluster exists, `mise run portal -- recreate --cell <cell> --wait`, `CELL=management mise run cell:link` | A new cluster has a new node address and new keys. The step admits the address in `dev-cp`. The bind proves the new keys, and `mgmtd` publishes the record of the cell to the registries of the views. |
 | the host service restarts, or the root of `management` changes | `mise run hostsvc:serve -- restart` | The service makes a new TLS key at each start. It trusts only the root that it read at start. The command links `mgmt-api` again. Then it runs `CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up` when `dev-cp` exists, so the cell controller gets the new pin. It refuses while a step runs a stage, unless you add `--force`. |
+
+A cluster that ran the M7 bundle store needs `mise run images`, then `CELL=<cluster> mise run cell:up`. The command replaces the old store probe and the old store policy, and deletes a store pod that never became Ready.
 
 A restart of the SPIRE server in `management` keeps its root, because the CA key stays on the data volume. It needs none of these commands.
 A new data volume in `management` makes a new root, so treat it as a rebuild of `management`.
@@ -539,6 +542,286 @@ The outbox of the gateway holds at most 10,000 items and 64 MiB, and each cell a
 The gateway counts an item that it cannot keep in `dropped`, and `harness:status` fails for 15 minutes after the last drop.
 `celld` keeps each result until `mgmtd` reports it, and sends it again after a new stream, so a dropped result reaches `mgmtd` later.
 A lost or full store of the gateway needs `mise run gw:reset`, as the section on the cell gateway says.
+
+## Signed bundle sets
+
+A bundle set holds every component of one cluster and the root bundle that lists them.
+The management plane signs a set as an in-toto attestation in a DSSE envelope, with the Ed25519 key of `mgmtd`.
+An operation of the kind `bundle.apply` carries the attestation.
+In a cell, `celld` applies it. In `dev-cp`, `envd` applies it, and `mgmtd` hands it to `envd` in the ops pull, not through the gateway.
+`management` has no signed sets. It keeps `mise run cell:publish`.
+A cluster with a signed state takes bundles only from signed sets.
+
+The applier works in these steps:
+
+1. It checks the signature, the environment, the target, the expiry and the version.
+2. It fetches each bundle from `registry-mirror` by digest, and checks every object against one policy.
+3. It pushes the bundles to the bundle store, and moves the tag `current` of the root.
+4. It waits for up to 5 minutes until each Application is Synced and Healthy at its digest.
+   Each Application also needs a sync operation that succeeded at its digest after the tag moved.
+   An Application whose digest did not change keeps the sync that applied it before.
+   An Application that keeps its digest of the last good set also counts when it runs no sync and is Synced and Healthy at it.
+   This includes `root` for a set with the components of the last good set.
+   Argo CD starts no sync when the content compares equal, for example after a repair or a change of the repository URL.
+   A component that is `Degraded` for 60 seconds after such a sync ends the wait early.
+   `root` never ends the wait early, because its health is the health of its children.
+5. When the set does not turn healthy, it moves `current` to the last good root.
+   It terminates each sync of the failed set that still runs, in `root` and in the component Applications.
+   It asks for a hard refresh of `root`, and waits for up to 5 minutes again.
+   The good root was applied before, so an Application counts as restored when it is Synced and Healthy at that root and runs no sync.
+   It then reports `rolled_back`.
+
+A rollback creates no version and deletes no resource.
+It does delete each Application that only the failed set added, and it leaves the resources of that Application in the cluster.
+The next set gets a version above the failed one.
+
+### Bundle commands
+
+| Task | What it does |
+| --- | --- |
+| `mise run bundle -- publish --target dev-cp --target dev-cell-1 --wait` | Signs the hydrated set of each target, pushes it to `registry-mirror`, and starts the operation. With `--wait` it polls every 10 seconds for up to 15 minutes, and exits 1 unless the result is `applied` or `already_applied` |
+| `mise run bundle -- get --target dev-cell-1` | Prints the last signed set of the target with the result of its operation |
+| `mise run mgmt -- bundle get --target dev-cell-1` | Asks `mgmtd` for the same answer |
+| `mise run bundle -- verify --target dev-cell-1` | Checks on the Mac that `mgmtd` signed the root of the state. The next section describes it |
+| `mise run bundle -- cosign --target dev-cell-1` | Attaches the Sigstore bundle that `mgmtd` holds now to the last root on `registry-mirror` |
+| `mise run bundle -- repair --target dev-cell-1` | Break glass for a bad `argocd` or `cell-system` set. A later section describes it |
+
+A target is a cell name or `dev-cp`.
+`mise run bundle` refuses `management`, and prints the command for it, `CELL=management mise run cell:publish`.
+`mise run harness:up` ends with `bundle -- publish` for `dev-cp` and then for each live cell.
+`publish` and `repair` take the cluster lock of each target, as `cell:up` does.
+`mise run mgmt -- bundle sign --target <target> [--no-serve] [--ttl <duration>]` signs a set from a component list on standard input.
+The tests use it. An operator uses `bundle -- publish`.
+`bundle -- publish` refuses a set with more than 64 MiB of layers.
+`bundle -- publish` also refuses a stale build, before it takes a lock or signs anything.
+A hydrated bundle is stale when an input of its render is newer than `build/<target>/bundles/<component>/manifests.yaml`.
+The inputs are the files of `components/<component>` and `components/lib`, `vendor/`, `scripts/lib.sh`, `scripts/hydrate.sh`, `scripts/ko-image.sh`, `cells/common.env`, `cells/<target>.env`, `internal/bundle/allow.json`, `build/<target>/facts.env` and `build/images.env`.
+The error names the file and says to run `CELL=<target> mise run cell:hydrate`.
+A live fact that a render reads from a cluster is not a file, so a change in it also needs `cell:hydrate`.
+
+### After a change
+
+| Change | Then run | Because |
+| --- | --- | --- |
+| A render input of a cell or `dev-cp` bundle changes | `CELL=<cluster> mise run cell:up` | A cluster with a signed state takes bundles only from signed sets, and `cell:up` publishes one |
+| A target shows `rolled_back`, or has no signed root | Run `mise run mgmt -- bundle get --target <target>`. Fix the cause. Run `mise run bundle -- publish --target <target> --wait` | The next set gets a version above the failed one |
+| A target shows `rolled_back` with the detail `rollback_unhealthy` | Run `mise run bundle -- repair --target <target>` before the next set, because a sync that still retries holds its Application. Then follow the row above | A bad `argocd` or `cell-system` set stops the path that a rollback needs |
+| `internal/bundle/allow.json` or `internal/bundleapply/policy/bundle.rego` changes | Run `mise run images` with no image names. Roll each component whose digest changed: `CELL=management LINK_ONLY=mgmt-api mise run cell:link` for `mgmtd`, `CELL=<cell> HARNESS_ONLY=cell-identity mise run cell:up` for `celld` in each cell, and `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` for `envd`. Then run `CELL=<cluster> mise run cell:up` for each cluster | `mgmtd`, `celld` and `envd` embed both files, and the `argocd` bundle repeats the list in the AppProjects. Images come first, then the set. An old `mgmtd` refuses a set with a new component as `payload_invalid` with the detail `set`. An old applier refuses it as `component_unknown`. A change of the list moved six image digests in the live runs |
+| A person creates or deletes a cell | Follow the rows of [Provisioning](#provisioning). The admit stage and `cell:down` publish a signed `dev-cp` set and render `envd` again | The SPIRE cell subjects live in the signed `spire-server` bundle, and the cell rules live in the `envd` harness component |
+| You rotate the store tokens | `CELL=<cluster> STORE_TOKENS=1 mise run cell:restart` | New pods get new projected tokens |
+| `vm:up` runs, or the mirror has a new address | `CELL=<cell> HARNESS_ONLY=cell-identity mise run cell:up` for each cell, then `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` | The rules N45 and N48 admit the mirror by address |
+
+After the bootstrap apply, `cell:up` moves a store from M7 to M8.
+It applies the rendered store network policy and StatefulSet with the field manager of Argo CD, so that the old probe and port go.
+It also deletes a store pod of an older revision that never became Ready.
+The step changes nothing in a new cluster or in a cluster that already has the M8 store.
+
+### Check a set with cosign
+
+`mise run bundle -- verify --target <target>` runs `cosign verify-attestation` on the Mac, offline, with the public key that `mgmtd` serves now.
+It prints one JSON line with the signed version and the subjects of the statement: the root and each component.
+It changes nothing.
+The demo uses no transparency log and no certificate.
+It shows that the attestation verifies with the management key, and nothing more.
+`mgmtd` also prints the attestation as a Sigstore bundle of version v0.3 with a key hint, and `bundle -- publish` attaches it to the root on `registry-mirror`.
+`cell:verify` checks that `mgmtd` signed the root of the state. `harness:status` compares the live `root` Application with that root.
+
+### Key rotation and the option `--no-serve`
+
+`mise run mgmt -- rotate-signing-key` signs each open served `bundle.apply` operation again with the new key.
+A set that you sign with `--no-serve` stays as it was. A new signature over an old version would be input that an applier accepts after its mark reset.
+The `mgmtd` state keeps such a set apart from the last served one.
+`bundle -- get` and `mgmt -- status` show the last served set. When `mgmtd` holds no served set, they show the last set that no applier received.
+
+The Sigstore bundle on `registry-mirror` still carries the old key, and the referrer of the old key stays.
+After a rotation, run `mise run bundle -- cosign --target <target>` for each target.
+Run it before any repair, because the repair verifies the root against the current key.
+`bundle -- verify` and the repair pick the referrer whose key hint matches the current key.
+`cosign` prints one statement for each signed version of a root.
+`bundle -- verify` takes the statement whose version equals the version of the good root in the state, and fails when none matches.
+The repair takes the statement of the version that `good[0]` records. When none matches, it takes the highest version.
+
+The version mark of a target resets when the key that set it is no longer trusted.
+The applier logs `bundle_version_reset`.
+The next set carries the new epoch.
+`celld` reads the operation keys at start for the executor, and the engine reads the key directory again for each apply.
+After a key leaves the directory, run `CELL=<cell> mise run cell:restart`, so that both trust the same keys.
+An operation that the old key signed ends with `signature_invalid`.
+When the engine cannot read the keys, the operation stays open and the effect retries.
+
+### Runbook: bundle sets
+
+Read the result first: `mise run mgmt -- bundle get --target <target>` and `mise run ops -- trace <id>`.
+The result holds an outcome, a reason and a detail.
+The applier also logs `bundle refused` with the component, the reason, the detail and the object.
+Read it with `mise run harness:logs <cell> app.kubernetes.io/name=celld`, or with the selector `app.kubernetes.io/name=envd` in `dev-cp`.
+
+| Reason or outcome, then detail | What it means | What to do |
+| --- | --- | --- |
+| `version_old` | The set is below the version mark, or at the mark after a rollback | Run `mise run bundle -- publish --target <target> --wait`. `mgmtd` gives the next version |
+| `version_old`, `version_conflict` | A set repeats the version of the mark with other content | Do the same as for the row above |
+| `wrong_target` | The operation is for another cell, or an operation for `dev-cp` reached a cell | Check `--target`. A set for `dev-cp` goes only to `envd` |
+| `wrong_target`, `target` | The attestation names another target than the operation | Sign the set again with the right `--target` |
+| `payload_invalid`, `statement` or `subjects` | The envelope or the statement is wrong | Sign the set again. Do not edit the envelope |
+| `payload_invalid`, `version_given`, `set`, `too_large`, `target` or `ttl` | `mgmtd` refused to sign. A caller gave a version. Or the component list has the wrong shape or an unknown name, the set is too large, the target is unknown, or the lifetime is wrong | Fix the input of `publish` |
+| `signature_invalid` or `env_mismatch` | The key is not trusted, or the set is for another environment | Read the key rotation section above. Run `mise run mgmt -- keys --cell <cell>` |
+| `digest_mismatch`, a component or `root` | The mirror holds other bytes than the signed digest | Run `CELL=<cluster> mise run cell:up`, which hydrates and publishes again. Check the mirror for a push of another pod |
+| `component_not_allowed`, `component_unknown` | A hand-built set names a component outside the role of the target. `publish` refuses an unknown name earlier, at `mgmtd`, as `payload_invalid` with the detail `set` | Fix the name. A cell takes the platform components and `apps-sample`. `dev-cp` takes the platform components and the three of its own |
+| `component_not_allowed`, `kind`, `namespace`, `namespace_missing`, `cluster_kind_namespaced`, `kind_unknown_scope` or `items_list` | An object has a kind or a namespace that the class of the component does not allow, or the engine cannot place it | Remove the object, or move it to a component of the right class |
+| `component_not_allowed`, `harness_namespace`, `harness_label` or `harness_object` | A bundle names a harness namespace, carries the harness label, or names a guard policy | Remove the object. The harness owns these |
+| `component_not_allowed`, `service_type` or `mesh_opt_out` | An application bundle has a Service that is not `ClusterIP`. Or it has a pod that refuses the sidecar, or a label or annotation that changes or bypasses it. The only Istio key it may set is `sidecar.istio.io/inject`. The refused keys are the others under `sidecar.istio.io/`, `inject.istio.io/` and `traffic.sidecar.istio.io/`, and `istio.io/rev` and `proxy.istio.io/config` | Remove the Service type or the key |
+| `component_not_allowed`, `reserved_object` | An application bundle holds ConfigMap `kube-root-ca.crt`, ConfigMap `istio-ca-root-cert` or ServiceAccount `default`. The cluster creates these objects in every namespace, and no Application tracks them | Remove the object |
+| `component_not_allowed`, `service_account_token` | A bundle of any class holds a Secret of type `kubernetes.io/service-account-token`. The guard `bundles-app-limits` also refuses it in a cell | Remove the Secret |
+| `component_not_allowed`, `foreign_service_account` | A pod of an application bundle names a ServiceAccount that the same bundle does not declare, other than `default` | Declare the ServiceAccount in the bundle, or remove the name |
+| `component_not_allowed`, `appproject_spec`, `not_canonical`, `layout`, `list`, `too_large` or `policy_error` | An AppProject differs from the locked one. Or the bytes have no canonical form, the layout or the list is wrong, the set exceeds a limit, or the policy failed | Read the `bundle refused` log line for the object |
+| `policy_blocks_planes`, `<namespace>/<name>` | The bundle names a harness plane policy | Remove the object. The plane policies belong to the harness |
+| `policy_blocks_planes`, `mesh_injection` | A Namespace or a pod template in a guarded namespace sets mesh injection | Remove the label |
+| Outcome `rolled_back`, reason `unhealthy`, detail `<app>:<sync>/<health>` | An Application did not turn healthy. The applier restored the last good root | Fix the cause. Publish again |
+| Outcome `rolled_back`, reason `unhealthy`, detail `timeout:<app>:<sync>/<health>` | The set did not turn healthy in 5 minutes. With `Synced/Healthy`, Argo CD ran no successful sync of the set for that Application | See the next section. The log line `bundle health wait timed out` names the last operation of the Application |
+| Outcome `rolled_back`, reason `unhealthy`, detail `rollback_unhealthy` | The rollback also failed, because the set broke the path that reads the store | Run `mise run bundle -- repair --target <target>`. Then publish |
+| `bundle_open` | `mgmtd` already has a served set for the target with no final result | Wait for the result, or for the expiry. Then run `mise run ops -- close <id>` |
+| `not_bound` | The cell is not bound | Run `CELL=<cell> mise run cell:up` |
+| `query_invalid`, `bundle_key_retired` or `bundle_unknown` | An admin request has a bad query, names a key that left trust, or names an unknown set | Read the query, then `mise run mgmt -- keys --cell <cell>` |
+| `peer_not_allowed` in the log of `store-proxy`, `no_token`, `token_invalid`, `audience` or `subject` | A caller has no token, a bad token, a token for another audience, or the wrong service account | See the section on the store |
+| `request_not_allowed`, `method` or `path` | The proxy refused a method or a path | A caller outside the applier and the repo server asked the store |
+
+Four more cases:
+
+- `timeout` is the usual end of a bad Deployment.
+  Argo CD marks a Deployment `Degraded` only after `progressDeadlineSeconds`, so the wait runs to its end.
+  Argo CD fails a sync at once when a resource of an earlier wave turns `Degraded`.
+  It does not wait for `controller.sync.timeout.seconds`. It retries the same revision with a backoff of 10 seconds that doubles, five times, which holds the Application for about 6 minutes.
+  The rollback terminates these syncs, so the good root does not wait for the retries.
+  The forward path terminates nothing, so run the repair before the next set after `rollback_unhealthy`.
+  Argo CD does not sync a digest again when its last sync of that digest failed.
+  A set that sends that digest again times out and rolls back, unless someone syncs the Application by hand or the set changes its content.
+  A set whose workloads need more than 5 minutes ends in a rollback.
+  A bad `dev-cp` set can stop attestation and the relay for up to 5 minutes before the rollback.
+- A recreated cell fails the telemetry check for up to 5 minutes after it turns valid.
+  `harness:status` shows `telemetry` with `wait: true` in that time. Wait up to 5 minutes. Do not repair.
+- An operation that is in flight at its expiry gets its result when the engine finishes.
+  A new operation for the same set resumes it.
+- A pod that dies in the middle of an apply keeps the lock for about 12 minutes.
+  The new pod retries with the same operation ID, and resumes the apply after the lock ends.
+  `harness:status` fails when a state stays `applying` for more than 10 minutes after its `until` time.
+
+`bundle_open` means that a served set waits.
+The set lives 30 minutes by default.
+Wait for the expiry. Then run `mise run ops -- close <id>`.
+`gate:m8:repair` reports an open set and waits for it for up to 35 minutes, then stops with the command to run again.
+A set that you sign with `--no-serve` never counts, because no applier receives it.
+
+A repeated operation ID returns the stored result.
+When a later refusal overwrote that result, the answer comes from the state, and for a rolled back set it says `rolled_back` with no detail.
+`celld` also answers an older operation of the same set with `already_applied`.
+A forward resume under a new operation ID leaves the old operation with no record.
+
+### Repair a bad argocd or cell-system set
+
+A set that breaks the repo server, the token client or the store proxy can end `rolled_back` with `rollback_unhealthy`.
+Nothing then reads the restored tag, so the rollback cannot finish.
+`harness:status` names `mise run bundle -- repair --target <target>`.
+
+The repair verifies the signature of the root and runs the bundle policy on the bundles that it applies:
+
+- The root of `good[0]` is the bootstrap root that `build/<target>/root.json` names, or a root that `cosign` verifies offline against the current key of `mgmtd`.
+- The digests of `argocd` and `cell-system` come from the root layer, and the signed statement names the same digests.
+
+A signature proves that `mgmtd` signed the set, and not that the set was good.
+So the repair runs the bundle policy on the two bundles before it applies them, and refuses on any deny.
+
+Then the repair restores the verified root under `current` through a port-forward to the loopback registry of the store pod.
+It pins the Applications `cell-system` and `argocd` at the good digests.
+It applies the two bundles of `good[0]` with the administrator kubeconfig, and deletes the pod `bundle-store-0`.
+It refreshes the root and waits until every Application of the good root is Synced and Healthy.
+It prints one JSON line.
+The repair restores signed content, but no signature covers the act.
+
+The repair refuses a verified root whose signed version is lower than the version that the state records for `good[0]`.
+Add `--allow-older` for a deliberate rollback to older signed content: `mise run bundle -- repair --target <target> --allow-older`.
+The state ConfigMap `bundle-state` carries no signature.
+Its RBAC is the control, as the residual limits say.
+
+After a repair, run `mise run bundle -- publish --target <target> --wait`.
+`mise run gate:m8:repair` runs the repair first for a target in `rolled_back` with `rollback_unhealthy`, then publishes again.
+
+### Break glass and the store
+
+`CELL=<cluster> BUNDLE_PUBLISH_UNSIGNED=1 mise run cell:publish` publishes an unsigned root over the signed state of `<cluster>`.
+Name the cluster in the command, because `CELL` defaults to `dev-cell-1`.
+`cell:publish` refuses the break glass when `CELL` is not set in the environment.
+The check of the signed root in `cell:verify` then fails until a signed publish: `mise run bundle -- publish --target <target> --wait`.
+
+`CELL=<cluster> STORE_TOKENS=1 mise run cell:restart` rotates the projected tokens of the store.
+It restarts the applier, `bundle-store-0` and `argocd-repo-server`.
+
+The pod `bundle-store-0` has two containers.
+The registry listens on `127.0.0.1:5001`.
+The container `store-proxy` listens on port 5000 and checks each token with the TokenReview API of the cluster.
+A read admits only the repo server of `argocd`. A write admits only the applier of the cluster.
+The container `store-token` in `argocd-repo-server` adds the token for Argo CD.
+It sends the token over plain HTTP inside the cluster.
+The token has the audience `bundle-store` and lives 10 minutes.
+`store-proxy` logs only the requests that it denies, with the reason, the detail, the method, the subject and a request ID.
+It answers a denied request with HTTP 403 and no challenge, so a plain Docker or Argo CD client cannot talk to it.
+It keeps an accepted token for up to 30 seconds and never past its expiry, and a refused token for 10 seconds.
+A token of a deleted service account can therefore still read for up to 30 seconds.
+It runs at most 8 token reviews at once, and answers 503 with `overloaded` beyond that.
+The bootstrap publish and the repair bypass the proxy through the loopback port-forward.
+
+### What harness:status and cell:verify report
+
+`mise run harness:status` exits 1, with the next command, in these bundle cases:
+
+| Case | Command |
+| --- | --- |
+| A live cell or `dev-cp` has no signed bundle state | `mise run bundle -- publish --target <target> --wait` |
+| The state is `rolled_back` | `mise run bundle -- publish --target <target> --wait`. The problem names the detail |
+| The state is `rolled_back` with `rollback_unhealthy` | `mise run bundle -- repair --target <target>` |
+| The state is `applying` or `rolling_back`, and its `until` time is more than 10 minutes in the past | `mise run bundle -- publish --target <target> --wait` |
+| The Application `root` is at another digest than the root of a healthy state | `mise run bundle -- publish --target <target> --wait` |
+| An AppProject has no allow-list annotation, or one that differs from the digest that the applier reports | `mise run bundle -- publish --target <target> --wait` |
+| `mgmtd` holds a served `dev-cp` set with no result for more than 5 minutes after its issue time, and `envd` does not apply it | `mise run bundle -- get --target dev-cp` |
+
+A state that waits gives no problem: `applying` or `rolling_back` with an `until` time in the future, or less than 10 minutes in the past.
+`harness:status` takes the ages from the clock of a node.
+An allow-list mismatch can also mean that the running images of `celld` or `envd` are older than the checkout, because a build does not deploy.
+Run `mise run images`, roll `celld` and `envd` as the row for `allow.json` says, and publish again.
+
+`cell:verify` in a cell and in `dev-cp` makes these checks:
+
+- `mgmtd` signed the root in the bundle state. `cosign` verifies it offline on the Mac, as `bundle -- verify` does. A bootstrap state fails this check, and the output says to run `mise run bundle -- publish --target <target> --wait`.
+- The guards that keep Argo CD away from the harness equal their render. A cell has `bundles-spare-harness` and `bundles-app-limits`. `dev-cp` has `bundles-spare-harness`.
+- The store proxy admits the one writer of the role and the token client of the repo server, with the audience `bundle-store`.
+- Each harness plane policy of the role exists with its label. The policies `plane-cells` in `spire-system` and `relay-system` are not required while no cell is live, because the `envd` render leaves them out.
+- The allow-list digest that the applier reports equals the annotation of each AppProject.
+
+In `management`, it makes only the check of the store proxy, which has no writer.
+
+### Gate of M8
+
+`mise run gate:m8` runs the end-to-end tests of M8. Build the images first with `mise run images`.
+It first runs `gate:m6:repair`, `gate:m7:repair` and `gate:m8:repair` with `--check`, and the image check of M7.
+The image check also covers `cell-proxy` in `bundle-store-0` and in `argocd-repo-server`.
+Then it runs the tests that match `^TestM8`, with `-short`.
+`GATE_M8_LONG=1 mise run gate:m8` drops `-short`.
+`harness/versions.env` holds `GATE_M8_BUDGET_MINUTES` and `GATE_M8_TEST_TIMEOUT_MINUTES`.
+The budget is 105 minutes, 1.5 times the slower of two clean runs, rounded up to 5 minutes. The go test timeout is twice the budget.
+The gate stops at once when one of them is empty.
+A run whose tests pass removes the record `build/gate/m8-bundles`. A failed run keeps it.
+The token scan also reads the logs of `store-proxy` and `store-token`, and the files `build/gate/m8-*`.
+
+`mise run gate:m8:repair` repairs what a stopped run leaves, in this order:
+
+1. It deletes the namespaces `m8-*` and the test Applications `m8-*` that carry the label of the e2e tests, and waits until they are gone.
+2. For a target in `rolled_back` with `rollback_unhealthy`, it runs `mise run bundle -- repair --target <target>`.
+3. It publishes the hydrated set again for each target that a test changed, with `dev-cp` first.
+   A target counts when it is in `build/gate/m8-bundles`, holds the Application `apps-sample` or the ConfigMap `apps-demo/m8-marker`, is in `rolled_back`, or has an open set.
+   Before each publish it waits for an open set to end, for up to 35 minutes, because `mgmtd` refuses a new set with `bundle_open`.
+   After the publish it deletes the marker ConfigMap.
+
+`mise run gate:m8:repair -- --check` only reports each trace with the command that repairs it, and exits 1.
+It exits 0 when it finds none.
 
 ## Refused keys, signing key rotation and lost state
 
@@ -1312,6 +1595,20 @@ M7 measured values come from the live part of M7. Each value below is a marker u
 | `GATE_M7_BUDGET_MINUTES` | 20 minutes, 1.5 times the slower run, rounded up to 5 minutes. The go test timeout is 40 minutes |
 | Longest policy window of a new pod in `dev-cell-1` | 807 ms to 1.1.1.1:443 and 801 ms to the SPIRE node port of `dev-cp` (2026-11-18, four runs) |
 
+M8 measured values come from the live part of M8:
+
+| Value | Result |
+| --- | --- |
+| `harness:up` on a live harness | 213.64 seconds, 2026-11-19. Step 8 published a signed set to `dev-cp` and to each cell |
+| `gate:m8`, two runs from a clean harness | 3993 seconds and 4007 seconds (2026-11-19), both pass, 22 tests of which 1 is skipped with `-short`. The slowest test is `TestM8BadArgocdSetNeedsRepair`, about 16 to 17 minutes |
+| `GATE_M8_LONG=1 mise run gate:m8 -- -run TestM8CpAdmitStageSigned` | 531 seconds (2026-11-19), pass |
+| `GATE_M8_BUDGET_MINUTES` and `GATE_M8_TEST_TIMEOUT_MINUTES` | 105 and 210 minutes, 1.5 times the slower run rounded up to 5 minutes, and twice the budget |
+| `gate:m3` | 2682 seconds (2026-11-19). A first run failed 16 tests, and the second run passed |
+| `gate:m5` | 3008 seconds (2026-11-19), pass |
+| `gate:m6` | 942 seconds (2026-11-19), pass |
+| `gate:m6:provision` | 1385 seconds (2026-11-19), pass. Both steps were done 14 minutes 4 seconds after the request |
+| `gate:m7` | 734 seconds (2026-11-19), pass |
+
 ## Malicious cell tests
 
 The M7 tests try to break each identity check of the PoC. A test points a client at an impostor server.
@@ -1487,9 +1784,10 @@ A run of `CELL=dev-cp mise run cell:up` alone does not repair the policies of `m
 ## How a change reaches the cell
 
 1. Change a component under `components/`. After a change under `cmd/` or `internal/`, run `mise run images` first.
-   Renders fail while `build/images.env` is older than the Go sources.
+   Renders fail when the last image build is older than the Go sources.
 2. Run `mise run cell:hydrate` to render every component into `build/<cluster>/bundles/`.
-3. Run `mise run cell:publish` to push the bundles to the bundle store in the cluster.
+3. Run `CELL=<cluster> mise run cell:up` to publish the bundles. In a cluster with a signed state, this publishes a signed set, as [Signed bundle sets](#signed-bundle-sets) describes.
+   Run `mise run cell:publish` only for `management`, or for a cluster with no signed state.
 4. Argo CD syncs the changed bundles. Each Application pins its bundle by digest.
 
 The bundle store keeps bundles on a persistent volume, so they survive a pod restart.
@@ -1529,6 +1827,11 @@ Each image reaches its cluster through one command:
 | `envd` | Deployment `envd` in `envd-system` of `dev-cp` | `CELL=dev-cp mise run cell:up`, through the harness apply |
 
 `mise run images` builds every image and records their digests in `build/images.env`.
+It replaces that file only when an image digest changes, so the time of the file moves only with a digest.
+A run of every image that succeeds also touches `build/images.stamp`, and the Go source check compares the sources with that stamp.
+A run of some images does not touch the stamp.
+After an images build, roll out every component whose digest changed.
+A change of `internal/bundle/allow.json` moved six digests in the live runs, so run `cell:up` for each cluster that runs one of them.
 `cell:verify` fails when a running image differs from that file.
 `mise run images` builds without VCS stamps, so a digest changes only when the sources of that image change.
 A comment line in `build/images.env` records the commit of the build.
@@ -1548,6 +1851,9 @@ A signed spec can gain a member, for example `closed`. An older image of a reade
 2. Roll out every image that decodes the spec: `envd`, the cell controller, `cellgw` and `cluster-jwt-server`.
    Use `CELL=dev-cp mise run cell:up`, then `mise run hostsvc:serve -- restart` for the host service.
 3. Roll out `mgmtd` last, with `mise run images -- mgmtd` and `CELL=management LINK_ONLY=mgmt-api mise run cell:link`.
+
+`mise run hostsvc:serve -- restart` also restarts `mgmtd`, through the link `mgmt-api`, and renders the cell controller again.
+When `mgmtd` must roll last, restart the host service last too.
 
 After the first commit of the new `mgmtd`, an older `mgmtd` image cannot load its state. The way back is `mise run mgmt -- reset-state`.
 New image digests change the bootstrap digest. Each open step then fails with `bootstrap_mismatch`.

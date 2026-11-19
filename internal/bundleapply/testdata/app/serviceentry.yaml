@@ -1,0 +1,4 @@
+apiVersion: networking.istio.io/v1
+kind: ServiceEntry
+metadata: {name: demo, namespace: apps-demo}
+spec: {hosts: [example.invalid]}

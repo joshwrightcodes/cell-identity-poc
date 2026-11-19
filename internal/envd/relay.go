@@ -14,6 +14,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
 const (
@@ -136,10 +137,13 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 		ops = mgmtapi.OpsBundle{}
 		p.logLimited(ctx, "ops pull failed", "ops", "error", clip(opsErr.Error()))
 	}
+	if opsErr == nil && p.cfg.Plane != nil {
+		p.cfg.Plane.Offer(ctx, ops.PlaneBundle)
+	}
 	req := gwapi.SyncRequest{
 		SpecEnvelope: p.state.SpecEnvelope,
 		Records:      make(map[string]json.RawMessage, len(p.state.Records)),
-		Ops:          ops.Ops,
+		Ops:          p.gatewayOps(ctx, ops.Ops),
 		Cells:        ops.Cells,
 	}
 	for k, v := range p.state.Records {
@@ -165,6 +169,24 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 		p.relayItems(ctx, resp.Items)
 	}
 	return &resp.Status
+}
+
+// gatewayOps returns the operations that the gateway may queue. An operation whose target is the
+// cluster of envd belongs to the plane path and never reaches the gateway.
+func (p *Puller) gatewayOps(ctx context.Context, ops []json.RawMessage) []json.RawMessage {
+	if p.cfg.Cluster == "" {
+		return ops
+	}
+	var keep []json.RawMessage
+	for _, raw := range ops {
+		id, cell, _, err := op.Peek(raw)
+		if err == nil && cell == p.cfg.Cluster {
+			p.logLimited(ctx, "plane_op_not_forwarded", "plane-op-not-forwarded/"+id, "op", id, "cell", cell)
+			continue
+		}
+		keep = append(keep, raw)
+	}
+	return keep
 }
 
 func (p *Puller) getOps(ctx context.Context) (mgmtapi.OpsBundle, error) {

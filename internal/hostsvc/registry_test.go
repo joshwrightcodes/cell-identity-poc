@@ -282,3 +282,52 @@ func TestEnsureRegistryKeepsContainerItStarted(t *testing.T) {
 		t.Errorf("run -e values %v, want %v", d.ranEnv, registryEnv)
 	}
 }
+
+func facts(out string, err error) DockerFunc {
+	return func(_ context.Context, args ...string) ([]byte, error) {
+		if len(args) < 3 || args[0] != "container" || args[1] != "inspect" {
+			return nil, errors.New("unexpected call " + strings.Join(args, " "))
+		}
+		return []byte(out), err
+	}
+}
+
+func TestRegistryFacts(t *testing.T) {
+	f, err := RegistryFactsOf(context.Background(), facts("172.18.0.7\n", nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := RegistryFacts{Name: "registry-mirror", Address: "172.18.0.7", Port: 5000, Host: "127.0.0.1:5001"}
+	if f != want {
+		t.Fatalf("facts = %+v, want %+v", f, want)
+	}
+	b, _ := json.Marshal(f)
+	if string(b) != `{"name":"registry-mirror","address":"172.18.0.7","port":5000,"host":"127.0.0.1:5001"}` {
+		t.Fatalf("json = %s", b)
+	}
+}
+
+func TestRegistryFactsFailures(t *testing.T) {
+	for name, d := range map[string]DockerFunc{
+		"missing":      facts("Error: No such container: registry-mirror", errors.New("exit 1")),
+		"not attached": facts("\n", nil),
+		"not an IP":    facts("registry-mirror", nil),
+		"IPv6":         facts("fe80::1", nil),
+	} {
+		if f, err := RegistryFactsOf(context.Background(), d); err == nil {
+			t.Errorf("%s: facts = %+v, want an error", name, f)
+		}
+	}
+}
+
+// The fact reads the address on the kind network and nothing else.
+func TestRegistryFactsInspectArguments(t *testing.T) {
+	var got string
+	_, _ = RegistryFactsOf(context.Background(), func(_ context.Context, args ...string) ([]byte, error) {
+		got = strings.Join(args, " ")
+		return []byte("172.18.0.7"), nil
+	})
+	if !strings.HasPrefix(got, "container inspect -f ") || !strings.HasSuffix(got, " registry-mirror") || !strings.Contains(got, `"kind"`) {
+		t.Fatalf("docker call = %q", got)
+	}
+}

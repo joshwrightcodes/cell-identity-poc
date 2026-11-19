@@ -351,25 +351,6 @@ spec:
   podSelector: {}
   policyTypes: [Ingress, Egress]
 ---
-# Of the pod traffic, only the node addresses of the agent cells reach the server API. kindnet
-# accepts each packet of a root process on the dev-cp node before it checks a policy, so root
-# processes there, host network pods and the API server included, also reach it.
-apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: spire-server-agents
-  namespace: spire-system
-spec:
-  podSelector:
-    matchLabels:
-      app.kubernetes.io/name: spire-server
-  policyTypes: [Ingress]
-  ingress:
-    - from: "@SPIRE_AGENT_PEERS@"
-      ports:
-        - protocol: TCP
-          port: 8081
----
 # Flow N8: the SPIRE agent sidecar of each local plane workload reaches the server API. Each
 # workload pod carries the label app.kubernetes.io/name=<service account>.
 apiVersion: networking.k8s.io/v1

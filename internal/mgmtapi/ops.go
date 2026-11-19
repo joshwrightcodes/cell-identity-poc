@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -21,6 +23,9 @@ type CellInfo struct {
 type OpsBundle struct {
 	Ops   []json.RawMessage `json:"ops"`
 	Cells []CellInfo        `json:"cells"`
+	// PlaneBundle is the open served bundle.apply envelope whose target is the control plane. Ops
+	// never holds it.
+	PlaneBundle json.RawMessage `json:"planeBundle,omitempty"`
 }
 
 // ReportItem is one item that a cell sent up. Body holds the exact bytes that the proof audience
@@ -98,4 +103,30 @@ type GatewayStatus struct {
 	LastBindRefusal map[string]BindRefusal   `json:"lastBindRefusal"`
 	KeyHints        []KeyHint                `json:"keyHints"`
 	StoreError      string                   `json:"storeError"`
+}
+
+// BundleSignResult is what mgmtd returns for a signed bundle set: the operation, the version, the
+// content and root digests, the attestation envelope and the cosign bundle that wraps it. Both are
+// public data.
+type BundleSignResult struct {
+	OpID           string          `json:"opId"`
+	Version        bundle.Version  `json:"version"`
+	ContentSHA256  string          `json:"contentSHA256"`
+	RootDigest     string          `json:"rootDigest"`
+	Envelope       json.RawMessage `json:"envelope"`
+	SigstoreBundle json.RawMessage `json:"sigstoreBundle"`
+}
+
+// TargetBundle is the last signed set of one target, as the management plane reports it. Result is
+// the final result of the operation, and is absent while the operation is open.
+type TargetBundle struct {
+	OpID          string             `json:"opId"`
+	Version       bundle.Version     `json:"version"`
+	ContentSHA256 string             `json:"contentSHA256"`
+	RootDigest    string             `json:"rootDigest"`
+	Components    []bundle.Component `json:"components"`
+	IssuedAt      time.Time          `json:"issuedAt"`
+	ExpiresAt     time.Time          `json:"expiresAt"`
+	Served        bool               `json:"served"`
+	Result        *op.Result         `json:"result,omitempty"`
 }

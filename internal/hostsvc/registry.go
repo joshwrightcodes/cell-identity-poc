@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os/exec"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -16,8 +18,11 @@ import (
 const (
 	RegistryName   = "registry-mirror"
 	RegistryVolume = "registry-mirror-data"
-	registryUser   = "65534:65534"
-	RegistryImage  = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
+	// RegistryHost is the address of the registry on this Mac, and registryPort is its port inside the kind network.
+	RegistryHost  = "127.0.0.1:5001"
+	registryPort  = 5000
+	registryUser  = "65534:65534"
+	RegistryImage = "docker.io/library/registry:3.1.2@sha256:38907510915c3f1604c7e83d6ab602ab3020d092f73bdaed8696773693ff768c"
 	// HostsDir is the containerd registry configuration directory for localhost:5001 on a node.
 	HostsDir = "/etc/containerd/certs.d/localhost:5001"
 	certsDir = "/etc/containerd/certs.d"
@@ -87,6 +92,34 @@ func (s *Service) EnsureRegistry(ctx context.Context) error {
 	return nil
 }
 
+// RegistryFacts says where the registry is. Address and Port are what a pod in a kind cluster uses,
+// and Host is what a tool on this Mac uses.
+type RegistryFacts struct {
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+	Host    string `json:"host"`
+}
+
+// RegistryFactsOf reads the IPv4 address of the registry container on the kind network. A missing
+// container, a container that is not on the network and an address that is not IPv4 are errors.
+func RegistryFactsOf(ctx context.Context, docker DockerFunc) (RegistryFacts, error) {
+	out, err := docker(ctx, "container", "inspect", "-f",
+		`{{with index .NetworkSettings.Networks "`+kindNetwork+`"}}{{.IPAddress}}{{end}}`, RegistryName)
+	if err != nil {
+		return RegistryFacts{}, fmt.Errorf("inspect %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
+	}
+	text := strings.TrimSpace(string(out))
+	if text == "" {
+		return RegistryFacts{}, fmt.Errorf("%s has no address on the %s network", RegistryName, kindNetwork)
+	}
+	addr, err := netip.ParseAddr(text)
+	if err != nil || !addr.Is4() {
+		return RegistryFacts{}, fmt.Errorf("%s address %q is not an IPv4 address", RegistryName, text)
+	}
+	return RegistryFacts{Name: RegistryName, Address: addr.String(), Port: registryPort, Host: RegistryHost}, nil
+}
+
 // registryState parses the output of the inspect format. It reports whether the container runs,
 // and the first field that differs from the expected user or environment, or "" when none does.
 func registryState(out string) (running bool, drift string) {
@@ -124,7 +157,7 @@ func (s *Service) runRegistry(ctx context.Context) error {
 	for _, e := range registryEnv {
 		args = append(args, "-e", e)
 	}
-	args = append(args, "-p", "127.0.0.1:5001:5000", RegistryImage)
+	args = append(args, "-p", RegistryHost+":"+strconv.Itoa(registryPort), RegistryImage)
 	if out, err := s.Docker(ctx, args...); err != nil {
 		return fmt.Errorf("start %s: %w: %s", RegistryName, err, strings.TrimSpace(string(out)))
 	}

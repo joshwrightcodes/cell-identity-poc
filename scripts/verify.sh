@@ -754,7 +754,7 @@ log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
 check "No Application is outside argocd, except the mirrors of the central view" check_apps_namespace
-check "AppProject default in argocd allows nothing, and cell is the only other" check_argocd_projects
+check "AppProject default in argocd allows nothing, and the projects of the role are the only others" check_argocd_projects
 check "argocd holds no admin password" check_no_admin_credentials
 check "argocd holds only the allowed Secrets, and the agent can list them but not get or change them" check_argocd_secrets
 check "Argo CD has no remote clusters and reads only the local store" check_argocd_local_only
@@ -767,8 +767,8 @@ check "plaintext cannot reach echo, because mTLS is strict" expect_no_connection
 check "client reaches the allowed host through the egress gateway" check_egress_through_gateway
 check "client cannot reach a host that is not allowed" expect_no_connection client https://example.org/
 check "plaintext cannot reach the internet, because of NetworkPolicy" expect_no_connection plaintext https://example.com/
-check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_HOST/v2/"
-check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_HOST/v2/"
+check "client cannot reach the bundle store" expect_no_connection client "http://$BUNDLE_STORE_SERVICE/v2/"
+check "plaintext cannot reach the bundle store" expect_no_connection plaintext "http://$BUNDLE_STORE_SERVICE/v2/"
 check "Pod Security rejects a privileged pod in a workload namespace" check_psa_rejects_privileged
 if [[ -n "${COLLECTOR_STORE:-}" ]]; then
   check "lgtm runs as user 10001, and Grafana answers 401 to an anonymous read" check_lgtm_hardened
@@ -1189,6 +1189,17 @@ check_hub_tunnels() {
     sleep 3
   done
 }
+
+# The bundle store of every cluster, and the signed bundle sets of a cluster with the role cell or cp.
+check "The bundle store proxy admits the one writer of the role of $CELL_NAME, and the repo server reads through its token client" check_store_proxy
+case "$(bundle_role)" in
+  cell | cp)
+    check "The root in the bundle state of $CELL_NAME is signed by mgmtd (cosign, offline)" check_signed_root
+    check "The guards that keep Argo CD away from the harness equal the render of the role" check_bundle_guard
+    check "Each harness plane policy of the role exists with the harness label" check_plane_policies
+    check "The allow-list digest that the applier reports equals the annotation of each AppProject" check_allow_list_version
+    ;;
+esac
 
 # Link components: the objects of each namespace that the bundle holds, the cluster-scoped objects,
 # and the images of each workload. cell:link renders them again from the live facts.

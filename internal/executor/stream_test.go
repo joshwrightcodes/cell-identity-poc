@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -395,6 +396,321 @@ func TestStreamExecutionSurvivesSVIDUpdate(t *testing.T) {
 			return false
 		})
 	})
+}
+
+// slowKind gives the stream a kind test.slow whose effect blocks until release closes. It returns
+// the lease frame of one test.slow operation, its ID, and the channels of the effect.
+func slowKind(f *streamFixture, leaseID string, fe op.Fence, mod ...func(*Config)) (gwapi.Frame, string, chan struct{}, chan struct{}) {
+	started, release := make(chan struct{}), make(chan struct{})
+	kinds := f.rig.kinds()
+	kinds["test.slow"] = func(ctx context.Context, _ *Executor, _ op.Operation) error {
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f.exec = f.rig.executor("uid-1", append([]func(*Config){func(c *Config) { c.Kinds = kinds }}, mod...)...)
+	f.cfg.Exec = f.exec
+	o := f.rig.operation("test.slow", "{}")
+	return gwapi.Frame{Type: gwapi.TypeLease, LeaseID: leaseID, Envelope: f.rig.sign(o), Fence: fe}, o.ID, started, release
+}
+
+// resultsFor returns the result frames of one operation.
+func resultsFor(t *testing.T, f *streamFixture, opID string) []seenFrame {
+	var out []seenFrame
+	for _, r := range f.g.frames(gwapi.TypeResult) {
+		if resultOf(t, r.f).OpID == opID {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// A new SVID ends the stream about every 25 s, and a bundle.apply effect can run for minutes. While
+// the effect runs, each new stream opens at once, claims nothing and sends a status every interval.
+// The result goes up once, with its lease, on the stream that is open when the effect ends.
+func TestStreamStaysOpenWhileEffectRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		slow, id, started, release := slowKind(f, "s1.1", fence(1, 1))
+		quick, _ := f.lease("s1.2", fence(1, 2))
+		f.g.offer(slow, quick)
+		f.start()
+		<-started
+		effectStart := time.Now()
+		for i := range 6 {
+			time.Sleep(25 * time.Second)
+			select {
+			case f.updates <- struct{}{}:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("SVID update %d waited 5 s: the stream loop does not run while the effect runs", i+1)
+			}
+		}
+		time.Sleep(5 * time.Second)
+
+		if n := streamsStarted(f); n < 7 {
+			t.Fatalf("%d streams started while the effect ran, want one for each of the 6 SVID updates", n)
+		}
+		var during []seenFrame
+		for _, s := range f.g.frames(gwapi.TypeStatus) {
+			if s.at.After(effectStart) {
+				during = append(during, s)
+			}
+		}
+		if len(during) < 4 {
+			t.Fatalf("%d status frames in the %v of the effect, want one about every 30 s", len(during), time.Since(effectStart))
+		}
+		last := effectStart
+		for _, s := range during {
+			if gap := s.at.Sub(last); gap > 37*time.Second {
+				t.Fatalf("status gap %v while the effect ran, want at most 30 s plus 20%% spread plus a reconnect", gap)
+			}
+			last = s.at
+		}
+		if gap := time.Since(last); gap > 37*time.Second {
+			t.Fatalf("no status for %v at the end of the effect", gap)
+		}
+		for _, c := range f.g.frames(gwapi.TypeClaim) {
+			if c.stream > 1 {
+				t.Fatalf("stream %d sent a claim while the effect of stream 1 ran", c.stream)
+			}
+		}
+		if n := f.rig.cnt.count(); n != 0 {
+			t.Fatalf("%d other effects ran while the effect ran, want one effect at a time", n)
+		}
+		if n := len(f.g.frames(gwapi.TypeResult)); n != 0 {
+			t.Fatalf("%d result frames before the effect ended", n)
+		}
+
+		openAtEnd := streamsStarted(f)
+		close(release)
+		waitFor(t, 10*time.Second, "the result", func() bool { return len(resultsFor(t, f, id)) > 0 })
+		waitFor(t, 20*time.Second, "the next operation after the effect", func() bool { return f.rig.cnt.count() == 1 })
+		time.Sleep(5 * time.Second)
+		got := resultsFor(t, f, id)
+		if len(got) != 1 {
+			t.Fatalf("%d result frames for the operation, want 1", len(got))
+		}
+		r := got[0]
+		if r.stream != openAtEnd || r.f.LeaseID != "s1.1" || r.f.Fence != fence(1, 1) || resultOf(t, r.f).Outcome != op.OutcomeApplied {
+			t.Fatalf("result on stream %d with lease %q, fence %+v, outcome %q; want stream %d, lease s1.1, fence (1,1), applied",
+				r.stream, r.f.LeaseID, r.f.Fence, resultOf(t, r.f).Outcome, openAtEnd)
+		}
+	})
+}
+
+// The effect ends while no stream is open. The next stream sends its result once, with its lease.
+func TestStreamReportsEffectThatEndsBetweenStreams(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		slow, id, started, release := slowKind(f, "s1.1", fence(1, 1))
+		f.g.offer(slow)
+		var hold, inTLS atomic.Bool
+		gate := make(chan struct{})
+		defer func() {
+			select {
+			case <-gate:
+			default:
+				close(gate)
+			}
+		}()
+		tlsFn := f.cfg.TLS
+		f.cfg.TLS = func() (*tls.Config, error) {
+			if hold.Load() {
+				inTLS.Store(true)
+				<-gate
+			}
+			return tlsFn()
+		}
+		f.start()
+		<-started
+		hold.Store(true)
+		f.updates <- struct{}{}
+		waitFor(t, 10*time.Second, "the stream to end while the effect runs", inTLS.Load)
+		close(release)
+		waitFor(t, 10*time.Second, "the applied record", func() bool { return f.rig.record(id).State == stateApplied })
+		time.Sleep(time.Second)
+		close(gate)
+		waitFor(t, 10*time.Second, "the result", func() bool { return len(resultsFor(t, f, id)) > 0 })
+		time.Sleep(5 * time.Second)
+		got := resultsFor(t, f, id)
+		if len(got) != 1 {
+			t.Fatalf("%d result frames for the operation, want 1", len(got))
+		}
+		if r := got[0]; r.stream != 2 || r.f.LeaseID != "s1.1" {
+			t.Fatalf("result on stream %d with lease %q, want stream 2 and lease s1.1", r.stream, r.f.LeaseID)
+		}
+	})
+}
+
+// After an effect ends, the slot is free again: a stream that opens later claims and runs the next
+// operation.
+func TestStreamClaimsAfterEffectOnLaterStream(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		slow, id, started, release := slowKind(f, "s1.1", fence(1, 1))
+		f.g.offer(slow)
+		f.start()
+		<-started
+		close(release)
+		waitFor(t, 10*time.Second, "the result", func() bool { return len(resultsFor(t, f, id)) > 0 })
+		f.updates <- struct{}{}
+		waitFor(t, 10*time.Second, "stream 2", func() bool { return streamsStarted(f) >= 2 })
+		quick, _ := f.lease("s1.2", fence(1, 2))
+		f.g.offer(quick)
+		waitFor(t, 25*time.Second, "the next operation on stream 2", func() bool { return f.rig.cnt.count() == 1 })
+	})
+}
+
+// A stream that adopted a running effect ignores a lease, even one that no claim asked for, so no
+// second effect starts.
+func TestStreamAdoptedStreamIgnoresLease(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		slow, _, started, release := slowKind(f, "s1.1", fence(1, 1))
+		quick, _ := f.lease("s1.2", fence(1, 2))
+		f.g.offer(slow)
+		f.start()
+		<-started
+		f.g.mu.Lock()
+		f.g.handler = func(s *gwStream) {
+			_ = s.send(quick)
+			s.loop(nil)
+		}
+		f.g.mu.Unlock()
+		f.updates <- struct{}{}
+		waitFor(t, 10*time.Second, "stream 2", func() bool { return streamsStarted(f) >= 2 })
+		time.Sleep(5 * time.Second)
+		if n := f.rig.cnt.count(); n != 0 {
+			t.Fatalf("%d effects started on the adopted stream while the first effect ran", n)
+		}
+		close(release)
+	})
+}
+
+// gateHandler blocks the log call of one message until gate closes.
+type gateHandler struct {
+	msg  string
+	gate <-chan struct{}
+	hit  *atomic.Bool
+}
+
+func (h gateHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h gateHandler) WithAttrs([]slog.Attr) slog.Handler       { return h }
+func (h gateHandler) WithGroup(string) slog.Handler            { return h }
+func (h gateHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == h.msg {
+		h.hit.Store(true)
+		<-h.gate
+	}
+	return nil
+}
+
+// The effect has written its applied record, and its outcome has not reached the loop yet. A resend
+// in that window skips the operation, so the result goes up once, with its lease.
+func TestStreamResendSkipsTheRunningEffect(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := newFixture(t)
+		defer f.stop()
+		var hit atomic.Bool
+		gate := make(chan struct{})
+		defer func() {
+			select {
+			case <-gate:
+			default:
+				close(gate)
+			}
+		}()
+		slow, id, started, release := slowKind(f, "s1.1", fence(1, 1), func(c *Config) {
+			c.Log = slog.New(gateHandler{msg: "operation result", gate: gate, hit: &hit})
+		})
+		f.g.offer(slow)
+		f.start()
+		<-started
+		f.updates <- struct{}{}
+		waitFor(t, 10*time.Second, "stream 2", func() bool { return streamsStarted(f) >= 2 })
+		close(release)
+		waitFor(t, 10*time.Second, "the effect to write its record", hit.Load)
+		if st := f.rig.record(id).State; st != stateApplied {
+			t.Fatalf("record state %q, want applied", st)
+		}
+		_ = f.g.current().send(gwapi.Frame{Type: gwapi.TypeRetry, OpID: id})
+		time.Sleep(2 * time.Second)
+		close(gate)
+		waitFor(t, 10*time.Second, "the result", func() bool { return len(resultsFor(t, f, id)) > 0 })
+		time.Sleep(5 * time.Second)
+		got := resultsFor(t, f, id)
+		if len(got) != 1 {
+			t.Fatalf("%d result frames for the operation, want 1", len(got))
+		}
+		if r := got[0]; r.stream != 2 || r.f.LeaseID != "s1.1" {
+			t.Fatalf("result on stream %d with lease %q, want stream 2 and lease s1.1", r.stream, r.f.LeaseID)
+		}
+	})
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("the stream is gone") }
+
+// A resend that writes no frame leaves no mark in the resend log, so the next resend sends the
+// result at once.
+func TestResendMarksTheLogOnlyAfterTheWrite(t *testing.T) {
+	for _, name := range []string{"write fails", "token fails"} {
+		t.Run(name, func(t *testing.T) {
+			r := newRig(t)
+			e := r.executor("uid-1")
+			res := e.Execute(t.Context(), r.sign(r.operation(testKind, "{}")), fence(1, 1))
+			if res.Outcome != op.OutcomeApplied {
+				t.Fatalf("seed %+v", res)
+			}
+			var failToken atomic.Bool
+			failToken.Store(name == "token fails")
+			cfg, err := StreamConfig{
+				Cell: "cell-1", Upstream: "gw.test:8450", Exec: e,
+				TLS: func() (*tls.Config, error) { return nil, nil },
+				Tokens: func(_ context.Context, audience string) (string, error) {
+					if failToken.Load() {
+						return "", errors.New("no token")
+					}
+					return "t|" + audience, nil
+				},
+				Status: func() op.Status { return op.Status{} },
+			}.withDefaults()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			l := &loop{cfg: cfg, ctx: t.Context(), w: &buf, held: map[string]struct{}{}}
+			if name == "write fails" {
+				l.w = failWriter{}
+				if err := l.resendPending(""); err == nil {
+					t.Fatal("a failed write gave no error")
+				}
+			} else if err := l.resendPending(""); err != nil || buf.Len() != 0 {
+				t.Fatalf("resend without a token: error %v, %d bytes written", err, buf.Len())
+			}
+			failToken.Store(false)
+			l.w = &buf
+			if err := l.resendPending(""); err != nil {
+				t.Fatal(err)
+			}
+			fr, err := gwapi.NewDecoder(&buf).Decode()
+			if err != nil {
+				t.Fatalf("no result frame after the failed resend: %v", err)
+			}
+			if got := resultOf(t, fr); fr.Type != gwapi.TypeResult || got.OpID != res.OpID {
+				t.Fatalf("frame %+v with result %+v, want the result of %s", fr, got, res.OpID)
+			}
+		})
+	}
 }
 
 func TestStreamResendsUntilFinal(t *testing.T) {

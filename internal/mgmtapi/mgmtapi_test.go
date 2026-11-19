@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -242,5 +243,77 @@ func TestItemOutcomeStrings(t *testing.T) {
 	}
 	if len(outcomes) != 6 {
 		t.Errorf("two outcome constants share a string: %v", outcomes)
+	}
+}
+
+func TestOpsBundleNoPlaneKey(t *testing.T) {
+	raw, _ := json.Marshal(OpsBundle{Ops: []json.RawMessage{json.RawMessage(`{}`)}})
+	if strings.Contains(string(raw), "planeBundle") {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(OpsBundle{PlaneBundle: json.RawMessage(`{"payloadType":"x"}`)})
+	if !strings.Contains(string(raw), `"planeBundle":{"payloadType":"x"}`) {
+		t.Fatalf("got %s", raw)
+	}
+}
+
+func TestStatusReportNoPlaneKeys(t *testing.T) {
+	raw, _ := json.Marshal(StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 1}})
+	if strings.Contains(string(raw), "planeBundle") {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(StatusReport{
+		PlaneBundle:       &op.Result{Cell: "dev-cp", Outcome: op.OutcomeApplied},
+		PlaneBundleStatus: &op.BundleStatus{State: "healthy"},
+	})
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["planeBundle"]; !ok {
+		t.Errorf("no planeBundle in %s", raw)
+	}
+	if _, ok := m["planeBundleStatus"]; !ok {
+		t.Errorf("no planeBundleStatus in %s", raw)
+	}
+}
+
+func TestBundleWireNames(t *testing.T) {
+	at := time.Unix(1_800_000_000, 0).UTC()
+	for _, tc := range []struct {
+		v    any
+		keys []string
+	}{
+		{BundleSignResult{}, []string{"opId", "version", "contentSHA256", "rootDigest", "envelope", "sigstoreBundle"}},
+		{TargetBundle{IssuedAt: at, ExpiresAt: at}, []string{"opId", "version", "contentSHA256", "rootDigest", "components", "issuedAt", "expiresAt", "served"}},
+		{TargetBundle{IssuedAt: at, Result: &op.Result{}}, []string{"opId", "version", "contentSHA256", "rootDigest", "components", "issuedAt", "expiresAt", "served", "result"}},
+	} {
+		raw, _ := json.Marshal(tc.v)
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m) != len(tc.keys) {
+			t.Errorf("%T encodes %s", tc.v, raw)
+		}
+		for _, k := range tc.keys {
+			if _, ok := m[k]; !ok {
+				t.Errorf("%T lacks %q in %s", tc.v, k, raw)
+			}
+		}
+	}
+	res, err := json.Marshal(BundleSignResult{Envelope: json.RawMessage(`{"payloadType":"x"}`), SigstoreBundle: json.RawMessage(`{"mediaType":"y"}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj struct {
+		Envelope       map[string]string `json:"envelope"`
+		SigstoreBundle map[string]string `json:"sigstoreBundle"`
+	}
+	if err := json.Unmarshal(res, &obj); err != nil || obj.Envelope["payloadType"] != "x" || obj.SigstoreBundle["mediaType"] != "y" {
+		t.Errorf("envelope and sigstoreBundle must encode as JSON objects: %s, %v", res, err)
+	}
+	if ReasonBundleOpen != "bundle_open" {
+		t.Errorf("ReasonBundleOpen is %q", ReasonBundleOpen)
 	}
 }

@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -20,6 +22,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,9 +35,12 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/envd"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -684,5 +690,293 @@ func TestPullerConfigWiresStepConfigMaps(t *testing.T) {
 	got, _, err := pc.StepStatus.Read(t.Context())
 	if err != nil || len(got) != 1 || got[0].Cell != "d" {
 		t.Fatalf("step status %v %v", got, err)
+	}
+}
+
+// planeBase returns the flags of a complete run command.
+func planeBase(t *testing.T) []string {
+	t.Helper()
+	s := newSigner(t)
+	ca := spiffetest.NewCA(t, "mgmt.poc.internal")
+	pem, err := ca.Bundle().Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := filepath.Join(t.TempDir(), "peer.pem")
+	if err := os.WriteFile(peer, pem, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := []string{"--upstream", "x:1", "--expect-id", "spiffe://mgmt.poc.internal/api", "--peer-bundle", peer,
+		"--peer-trust-domain", "mgmt.poc.internal", "--spec-key-file", s.keyFile(), "--env", "dev", "--output-configmap", "a/b"}
+	return append(base, gatewayFlags()...)
+}
+
+func planeFlags() []string {
+	return []string{"--cluster", "dev-cp", "--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "bundle-store.cell-system.svc:5000",
+		"--bundle-store-token", "/var/run/secrets/store/token", "--bundle-state-configmap", "envd-system/bundle-state"}
+}
+
+func TestEnvdPlaneFlags(t *testing.T) {
+	base := planeBase(t)
+	plain, err := parseRun(base)
+	if err != nil {
+		t.Fatalf("without the plane flags: %v", err)
+	}
+	if plain.bundleMirror != "" || plain.cluster != "" {
+		t.Fatalf("plane is on without flags: %+v", plain)
+	}
+	cfg, err := parseRun(append(slices.Clone(base), planeFlags()...))
+	if err != nil {
+		t.Fatalf("full plane flags: %v", err)
+	}
+	if cfg.cluster != "dev-cp" || cfg.bundleMirror != "10.0.0.5:5000" || cfg.bundleStore != "bundle-store.cell-system.svc:5000" ||
+		cfg.bundleStoreToken != "/var/run/secrets/store/token" || cfg.bundleNS != "envd-system" || cfg.bundleName != "bundle-state" ||
+		cfg.bundleHealthTimeout != 5*time.Minute {
+		t.Fatalf("parsed %+v", cfg)
+	}
+	if cfg2, err := parseRun(append(slices.Clone(base), "--cluster", "dev-cp")); err != nil || cfg2.cluster != "dev-cp" || cfg2.bundleMirror != "" {
+		t.Fatalf("cluster alone: %+v %v", cfg2, err)
+	}
+	if cfg3, err := parseRun(append(append(slices.Clone(base), planeFlags()...), "--bundle-health-timeout", "90s")); err != nil || cfg3.bundleHealthTimeout != 90*time.Second {
+		t.Fatalf("health timeout: %+v %v", cfg3, err)
+	}
+	drop := func(args []string, flag string) []string {
+		var out []string
+		for i := 0; i < len(args); i++ {
+			if args[i] == flag {
+				i++
+				continue
+			}
+			out = append(out, args[i])
+		}
+		return out
+	}
+	for _, flag := range []string{"--cluster", "--bundle-store", "--bundle-store-token", "--bundle-state-configmap"} {
+		t.Run("missing"+flag, func(t *testing.T) {
+			_, err := parseRun(append(slices.Clone(base), drop(planeFlags(), flag)...))
+			if err == nil || !strings.Contains(err.Error(), flag) {
+				t.Fatalf("without %s: %v", flag, err)
+			}
+		})
+	}
+	for _, flag := range []string{"--bundle-store", "--bundle-store-token", "--bundle-state-configmap", "--bundle-health-timeout"} {
+		t.Run("needs_mirror"+flag, func(t *testing.T) {
+			v := "x/y"
+			if flag == "--bundle-health-timeout" {
+				v = "1m"
+			}
+			if _, err := parseRun(append(slices.Clone(base), flag, v)); err == nil || !strings.Contains(err.Error(), "--bundle-mirror") {
+				t.Fatalf("%s without the mirror: %v", flag, err)
+			}
+		})
+	}
+	for name, extra := range map[string][]string{
+		"timeout zero":        {"--bundle-health-timeout", "0s"},
+		"bad state":           {"--bundle-state-configmap", "nostate"},
+		"cluster not a label": {"--cluster", "Dev_CP"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseRun(append(append(slices.Clone(base), planeFlags()...), extra...)); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+}
+
+func TestPullerConfigWiresCluster(t *testing.T) {
+	s := newSigner(t)
+	cfg := runConfig{upstream: "x:1", env: "dev", key: s.pub, cluster: "dev-cp", namespace: "n", configMap: "c",
+		hintsNS: "n", hintsName: "h", stepsNS: "n", stepsName: "s", statusNS: "n", statusName: "t", interval: time.Second}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	if pc := pullerConfig(cfg, fake.NewClientset(), &http.Client{}, nil, tel); pc.Cluster != "dev-cp" {
+		t.Fatalf("cluster = %q", pc.Cluster)
+	}
+}
+
+func TestPlaneKeysReadTheFileEachCall(t *testing.T) {
+	a, b := newSigner(t), newSigner(t)
+	path := filepath.Join(t.TempDir(), "key")
+	write := func(s *signer) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(s.pub)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(a)
+	keys := planeKeys(path, a.pub, slog.New(slog.DiscardHandler))
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(a.pub) {
+		t.Fatalf("first read %v", got)
+	}
+	write(b)
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("second read %v", got)
+	}
+	if err := os.WriteFile(path, []byte("not a key"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("after a failed read %v", got)
+	}
+}
+
+func TestStoreTokenReadsTheFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("tok-1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	read := tokenFromFile(path)
+	if got, err := read(); err != nil || got != "tok-1" {
+		t.Fatalf("token %q %v", got, err)
+	}
+	if err := os.WriteFile(path, []byte("tok-2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := read(); got != "tok-2" {
+		t.Fatalf("rotated token %q", got)
+	}
+	if err := os.WriteFile(path, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := read(); err == nil {
+		t.Fatal("empty token accepted")
+	}
+}
+
+func TestPlaneKeysStartWithTheStartupKey(t *testing.T) {
+	a := newSigner(t)
+	keys := planeKeys(filepath.Join(t.TempDir(), "missing"), a.pub, slog.New(slog.DiscardHandler))
+	if got := keys(); len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(a.pub) {
+		t.Fatalf("keys after a failed first read: %v", got)
+	}
+}
+
+// TestEngineKeysReadFailureIsAnError checks that the engine gets an error, not the startup key, when
+// the key file cannot be read, so that the engine records no signature refusal with a stale key.
+func TestEngineKeysReadFailureIsAnError(t *testing.T) {
+	b := newSigner(t)
+	path := filepath.Join(t.TempDir(), "key")
+	keys := engineKeys(path)
+	if got, err := keys(); err == nil || len(got) != 0 {
+		t.Fatalf("missing file: %v, err %v; want an error and no keys", got, err)
+	}
+	if err := os.WriteFile(path, []byte(base64.StdEncoding.EncodeToString(b.pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := keys(); err != nil || len(got) != 1 || !got[0].(ed25519.PublicKey).Equal(b.pub) {
+		t.Fatalf("after the file appears: %v, err %v", got, err)
+	}
+}
+
+// capture holds the engine Config that newPlane built.
+type capture struct{ cfg bundleapply.Config }
+
+func (c *capture) build(cfg bundleapply.Config) envd.BundleApplier {
+	c.cfg = cfg
+	return bundleapply.New(cfg)
+}
+
+func TestNewPlaneBuildsTheEngine(t *testing.T) {
+	var mirrorHits, storeHits atomic.Int32
+	var storeAuth atomic.Value
+	mirror := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { mirrorHits.Add(1); http.NotFound(w, r) }))
+	defer mirror.Close()
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		storeHits.Add(1)
+		storeAuth.Store(r.Header.Get("Authorization"))
+		if r.URL.Path == "/v2/" {
+			return
+		}
+		http.Error(w, "no", http.StatusForbidden)
+	}))
+	defer store.Close()
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("tok-9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := newSigner(t)
+	keyPath := filepath.Join(t.TempDir(), "key")
+	if err := os.WriteFile(keyPath, []byte(base64.StdEncoding.EncodeToString(s.pub)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := runConfig{env: "dev", cluster: "dev-cp", key: s.pub, keyFile: keyPath, bundleMirror: strings.TrimPrefix(mirror.URL, "http://"),
+		bundleStore: strings.TrimPrefix(store.URL, "http://"), bundleStoreToken: tokenPath,
+		bundleNS: "envd-system", bundleName: "bundle-state", bundleHealthTimeout: 90 * time.Second}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	kube := fake.NewClientset()
+	dyn := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	var c capture
+	p, err := newPlane(cfg, kube, dyn, tel, c.build)
+	if err != nil || p == nil {
+		t.Fatalf("newPlane: %v %v", p, err)
+	}
+	got := c.cfg
+	t.Run("role", func(t *testing.T) {
+		if got.Role != "cp" {
+			t.Errorf("role %q", got.Role)
+		}
+	})
+	t.Run("env and target", func(t *testing.T) {
+		if got.Env != "dev" || got.Target != "dev-cp" {
+			t.Errorf("env %q target %q", got.Env, got.Target)
+		}
+	})
+	t.Run("health timeout", func(t *testing.T) {
+		if got.HealthTimeout != 90*time.Second {
+			t.Errorf("health timeout %v", got.HealthTimeout)
+		}
+	})
+	t.Run("holder", func(t *testing.T) {
+		if got.Holder == "" {
+			t.Error("no holder")
+		}
+	})
+	t.Run("state", func(t *testing.T) {
+		st, ok := got.State.(*bundleapply.ConfigMapStore)
+		if !ok || st.Namespace != "envd-system" || st.Name != "bundle-state" || st.MadeBy != "envd" || st.Client != kube {
+			t.Errorf("state %+v", got.State)
+		}
+	})
+	t.Run("clients", func(t *testing.T) {
+		if got.Client != kube || got.Dynamic != dyn {
+			t.Errorf("kube or dynamic client missing: %v %v", got.Client, got.Dynamic)
+		}
+	})
+	t.Run("keys", func(t *testing.T) {
+		if got.Keys == nil {
+			t.Fatal("no keys")
+		}
+		if ks, err := got.Keys(); err != nil || len(ks) != 1 || !ks[0].(ed25519.PublicKey).Equal(s.pub) {
+			t.Errorf("keys %v, err %v", ks, err)
+		}
+	})
+	t.Run("policy", func(t *testing.T) {
+		if len(got.Policy.Roles) == 0 {
+			t.Error("empty policy")
+		}
+	})
+	t.Run("mirror host", func(t *testing.T) {
+		_, _ = got.Mirror.Resolve(t.Context(), "bundles/root", "current")
+		if mirrorHits.Load() == 0 || storeHits.Load() != 0 {
+			t.Errorf("mirror %d, store %d", mirrorHits.Load(), storeHits.Load())
+		}
+	})
+	t.Run("store host and token", func(t *testing.T) {
+		before := mirrorHits.Load()
+		_ = got.Store.PushBlob(t.Context(), "bundles/root", fmt.Sprintf("sha256:%x", sha256.Sum256([]byte("x"))), []byte("x"))
+		if storeHits.Load() == 0 || mirrorHits.Load() != before {
+			t.Errorf("store %d, mirror %d", storeHits.Load(), mirrorHits.Load())
+		}
+		if a, _ := storeAuth.Load().(string); a != "Bearer tok-9" {
+			t.Errorf("authorization %q", a)
+		}
+	})
+	t.Run("store is write only", func(t *testing.T) {
+		if err := got.Store.Ping(t.Context()); err == nil {
+			t.Error("the store client can read")
+		}
+	})
+	cfg.bundleMirror = "not an address"
+	if _, err := newPlane(cfg, fake.NewClientset(), dyn, tel, c.build); err == nil {
+		t.Fatal("a bad mirror address was accepted")
 	}
 }

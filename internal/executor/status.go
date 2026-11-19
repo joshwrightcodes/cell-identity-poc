@@ -15,7 +15,7 @@ const statusReadTimeout = 10 * time.Second
 func NewStatus(cell, pod, podUID, version string, svidExpiry func() time.Time, e *Executor) func() op.Status {
 	var seq atomic.Uint64
 	return func() op.Status {
-		ctx, cancel := context.WithTimeout(context.Background(), statusReadTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), e.statusTimeout)
 		defer cancel()
 		c := e.Counts()
 		s := op.Status{
@@ -30,6 +30,11 @@ func NewStatus(cell, pod, podUID, version string, svidExpiry func() time.Time, e
 			s.Unreported = uint64(len(pending))
 			if len(pending) > 0 {
 				s.OldestUnreportedAt = pending[0].At
+			}
+		}
+		if e.bundle != nil {
+			if b, err := e.bundle.Status(ctx); err == nil {
+				s.Bundle = b
 			}
 		}
 		return s

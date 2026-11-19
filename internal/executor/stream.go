@@ -82,6 +82,8 @@ type StreamConfig struct {
 	Rand   func() float64
 
 	resent *resendLog
+	// effect holds the running effect across streams.
+	effect *effectSlot
 	// status holds the next status deadline across streams. A stream ends about every half life of the SVID, which can be shorter than
 	// StatusEvery, so a deadline that restarted with each stream would never fire.
 	status *statusClock
@@ -153,6 +155,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	if c.status == nil {
 		c.status = &statusClock{}
 	}
+	if c.effect == nil {
+		c.effect = newEffectSlot()
+	}
 	if c.resent == nil {
 		c.resent = &resendLog{last: map[string]time.Time{}}
 	}
@@ -188,6 +193,8 @@ func RunStream(ctx context.Context, cfg StreamConfig) error {
 	gc.Add(1)
 	go func() { defer gc.Done(); cfg.runGC(gcCtx) }()
 	defer func() { stopGC(); gc.Wait() }()
+	// An effect that runs when ctx ends finishes and writes its record before RunStream returns.
+	defer cfg.effect.wg.Wait()
 
 	for failures := 0; ; {
 		drain(cfg.SVIDUpdates)
@@ -400,14 +407,19 @@ type resendLog struct {
 	last map[string]time.Time
 }
 
-func (r *resendLog) allow(opID string, now time.Time) bool {
+// due reports whether opID may go up again at now.
+func (r *resendLog) due(opID string, now time.Time) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if t, ok := r.last[opID]; ok && now.Sub(t) < minResendGap {
-		return false
-	}
+	t, ok := r.last[opID]
+	return !ok || now.Sub(t) >= minResendGap
+}
+
+// mark records that a frame with the result of opID was written at now.
+func (r *resendLog) mark(opID string, now time.Time) {
+	r.mu.Lock()
 	r.last[opID] = now
-	return true
+	r.mu.Unlock()
 }
 
 func (r *resendLog) forget(opID string) {

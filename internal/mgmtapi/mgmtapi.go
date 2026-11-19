@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -56,6 +57,11 @@ type StatusReport struct {
 	// Steps is the status of the provisioning steps, as the cell controller wrote it at StepsAt.
 	Steps   []StepStatus `json:"steps,omitempty"`
 	StepsAt time.Time    `json:"stepsAt,omitzero"`
+	// PlaneBundle is the final result of the bundle.apply operation for the control plane that envd
+	// applied, until the management plane closes the operation.
+	PlaneBundle *op.Result `json:"planeBundle,omitempty"`
+	// PlaneBundleStatus is the bundle state of the control plane.
+	PlaneBundleStatus *op.BundleStatus `json:"planeBundleStatus,omitempty"`
 }
 
 // Refusal records the last spec that envd refused.

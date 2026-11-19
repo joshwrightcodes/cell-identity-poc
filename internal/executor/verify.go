@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundleapply"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 )
@@ -66,6 +67,11 @@ func (e *Executor) check(ctx context.Context, envelope []byte, f op.Fence, sha s
 		case recorded:
 			return refuse(op.OutcomeAlreadyApplied, "")
 		}
+		if o.Kind == op.KindBundleApply && e.bundle != nil {
+			if res := e.engineAnswer(ctx, o.ID, f, sha); res != nil {
+				return op.Operation{}, res
+			}
+		}
 		return refuse(op.OutcomeExpired, "")
 	}
 	if _, ok := e.cfg.Kinds[o.Kind]; !ok {
@@ -76,5 +82,36 @@ func (e *Executor) check(ctx context.Context, envelope []byte, f op.Fence, sha s
 			return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
 		}
 	}
+	if o.Kind == op.KindBundleApply && len(o.Args) > op.MaxBundleArgsBytes {
+		return refuse(op.OutcomeRefused, op.ReasonPayloadInvalid)
+	}
 	return o, nil
+}
+
+// engineAnswer asks the engine about an expired bundle.apply that the executor holds no applied record
+// for, because a pod can die after the engine moved the tag and before the executor wrote its result.
+// It returns the result that the engine recorded, a retryable result while the engine has the
+// operation in flight or the answer is not known, and nil when the engine knows nothing of it. The
+// engine never applies an expired operation.
+func (e *Executor) engineAnswer(ctx context.Context, id string, f op.Fence, sha string) *op.Result {
+	out, ok, err := e.bundle.Recorded(ctx, id)
+	var res op.Result
+	switch {
+	case errors.Is(err, bundleapply.ErrInFlight):
+		res = e.result(id, op.OutcomeLeaseLost, ReasonEffectFailed, f, sha)
+	case err != nil:
+		res = e.result(id, op.OutcomeLeaseLost, ReasonStoreError, f, sha)
+	case !ok:
+		return nil
+	default:
+		res = e.result(id, op.OutcomeApplied, "", f, sha)
+		var fin *Final
+		if errors.As(finalOf(out), &fin) {
+			res.Outcome, res.Reason = fin.Outcome, fin.Reason
+			if fin.Detail != "" && op.ValidDetail(fin.Detail) {
+				res.Detail = fin.Detail
+			}
+		}
+	}
+	return &res
 }

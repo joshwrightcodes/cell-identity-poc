@@ -32,7 +32,7 @@ spec:
         kubernetes.io/metadata.name: argocd
 ---
 # The central view mirrors the Applications of argocd. Each Application there uses the project
-# cell, for every user, so no Application can use a project with wider rights.
+# cell or the project cell-app, for every user, so no Application can use a project with wider rights.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -46,8 +46,8 @@ spec:
         operations: ["CREATE", "UPDATE"]
         resources: ["applications"]
   validations:
-    - expression: "object.spec.project == 'cell'"
-      message: An Application in argocd uses the project cell
+    - expression: "object.spec.project in ['cell', 'cell-app']"
+      message: An Application in argocd uses the project cell or cell-app
       reason: Forbidden
 ---
 apiVersion: admissionregistration.k8s.io/v1

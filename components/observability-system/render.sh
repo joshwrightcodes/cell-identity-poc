@@ -461,7 +461,7 @@ $(node_peers)
 ---
 # Flow N11 in: only the namespaces of COLLECTOR_SENDERS send OTLP on 4317, because a pod of any other
 # namespace could forge the signals of this cluster through the collector. The bundle store sends
-# OTLP over HTTP on 4318, and no other pod may use that port. Add a namespace to COLLECTOR_SENDERS
+# OTLP over gRPC on 4317 (the store proxy) and over HTTP on 4318 (the registry), and no other pod of its namespace may use them. Add a namespace to COLLECTOR_SENDERS
 # when a new workload sends OTLP. A node address reaches the probe port only (flow N23).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -489,6 +489,8 @@ $(uplink_ingress)
             matchLabels:
               app.kubernetes.io/name: bundle-store
       ports:
+        - protocol: TCP
+          port: 4317
         - protocol: TCP
           port: 4318
     - from:

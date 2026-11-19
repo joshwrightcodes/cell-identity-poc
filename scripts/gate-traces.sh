@@ -30,15 +30,16 @@ keytest_leftover() {
     true"
 }
 
-# store_forward_start <cluster> starts a port-forward to the bundle store of the cluster on a free
-# local port, and sets STORE_ADDR and STORE_PF_PID. store_forward_stop ends it.
+# store_forward_start <cluster> starts a port-forward to the registry of the bundle store of the cluster on a
+# free local port, and sets STORE_ADDR and STORE_PF_PID. store_forward_stop ends it. The registry listens on
+# the loopback address of the pod (port 5001), behind the token proxy on port 5000, so the forward goes to the pod.
 store_forward_start() {
   local out port="" i
   out="$(mktemp)"
-  kubectl --context "kind-$1" -n cell-system port-forward --address 127.0.0.1 svc/bundle-store :5000 >"$out" 2>&1 &
+  kubectl --context "kind-$1" -n cell-system port-forward --address 127.0.0.1 pod/bundle-store-0 :5001 >"$out" 2>&1 &
   STORE_PF_PID=$!
   for i in $(seq 1 60); do
-    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 5000$/\1/p' "$out" | head -n 1)"
+    port="$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 5001$/\1/p' "$out" | head -n 1)"
     [[ -n "$port" ]] && break
     sleep 0.5
   done
@@ -59,8 +60,8 @@ store_forward_stop() {
   wait "${STORE_PF_PID:-}" 2>/dev/null || true
 }
 
-# The entries test publishes test bundles of root and spire-server, and an entry under /m2-test/.
-BUNDLE_TEST_NAMES=(root spire-server)
+# The entries test publishes a test root bundle and a test spire-server bundle, and an entry under /m2-test/. Only root has a tag.
+BUNDLE_TEST_NAMES=(root)
 BUNDLE_TEST_PATH=/m2-test/
 
 # published_digest <cluster> <bundle> prints the digest that the last cell:publish pushed.
@@ -68,17 +69,17 @@ published_digest() {
   sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env" 2>/dev/null
 }
 
-# bundle_traces <cluster> prints each trace of the entries test in the cluster: a current tag or an
-# Application revision that differs from build/<cluster>/published.env, and a test entry.
+# bundle_traces <cluster> prints each trace of the entries test in the cluster: a root tag or an
+# Application revision that differs from build/<cluster>/published.env, and a test entry. Component
+# bundles are pushed by digest only, so a tag on a component bundle is no trace, and the Application
+# pin of spire-server is the check.
 bundle_traces() {
   local cluster="$1" name want got apps entries
   [[ -f "$BUILD_ROOT/$cluster/published.env" ]] || { echo "no build/$cluster/published.env. Run: CELL=$cluster mise run cell:up"; return 1; }
   store_forward_start "$cluster" || { echo "cannot reach the bundle store of $cluster"; return 1; }
-  for name in "${BUNDLE_TEST_NAMES[@]}"; do
-    want="$(published_digest "$cluster" "$name")"
-    got="$(oras resolve --plain-http "$STORE_ADDR/bundles/$name:current" 2>/dev/null)" || got="unreadable"
-    [[ -n "$want" && "$got" == "$want" ]] || echo "$name:current in the bundle store of $cluster is $got, and build/$cluster/published.env has '${want:-nothing}'"
-  done
+  want="$(published_digest "$cluster" root)"
+  got="$(oras resolve --plain-http "$STORE_ADDR/bundles/root:current" 2>/dev/null)" || got="unreadable"
+  [[ -n "$want" && "$got" == "$want" ]] || echo "root:current in the bundle store of $cluster is $got, and build/$cluster/published.env has '${want:-nothing}'"
   store_forward_stop
   apps="$(applications_json kubectl --context "kind-$cluster")" || {
     echo "cannot read the Applications of $cluster in argocd"; return 1; }
