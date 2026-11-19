@@ -32,8 +32,8 @@
 // registry whose signers.pub differs from that file, and keeps the last good registry on an error.
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
-// whoami prints the sorted IDs of the X.509 SVIDs of this process. Neither starts telemetry. A
-// configuration error is one JSON error line and exit status 2, as in the other modes. Any other
+// whoami prints the sorted IDs of the X.509 SVIDs of this process and expiresAt, the RFC 3339 NotAfter of
+// the first one. Neither starts telemetry. A configuration error is one JSON error line and exit status 2, as in the other modes. Any other
 // failure is one JSON error line and exit status 1. The probe error line carries a reason:
 // upstream_unavailable when the dial fails, peer_untrusted, peer_not_allowed or protocol_not_h2
 // for a refused server, and handshake_failed for any other handshake error.
@@ -457,8 +457,10 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 			return err
 		}
 		reg := cellproxy.WatchLoaded(ctx, cfg.registry, cfg.signerSHA256, cfg.registryDir, cfg.signer, cfg.reload, tel.Log)
-		scfg := serverProofConfig(cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log)}, cfg, reg)
-		return serveBackend(ctx, cellproxy.NewServer(scfg, backend, tel.Log), ln, backend)
+		scfg := serverProofConfig(cellproxy.ServerConfig{TLS: cellproxy.ServerTLS(svids, cfg.peer, cfg.allow, reg, tel.Log), Meter: tel.Meter}, cfg, reg)
+		srv := cellproxy.NewServer(scfg, backend, tel.Log)
+		reg.OnAdopt(func(r *cellproxy.Registry) { srv.CloseRevoked(r) })
+		return serveBackend(ctx, srv, ln, backend)
 	})
 }
 
@@ -588,9 +590,14 @@ func whoami(ctx context.Context, out io.Writer) error {
 		ids = append(ids, s.ID.String())
 	}
 	slices.Sort(ids)
+	var expires string
+	if len(svids) > 0 && len(svids[0].Certificates) > 0 {
+		expires = svids[0].Certificates[0].NotAfter.UTC().Format(time.RFC3339)
+	}
 	return json.NewEncoder(out).Encode(struct {
-		IDs []string `json:"ids"`
-	}{slices.Compact(ids)})
+		IDs       []string `json:"ids"`
+		ExpiresAt string   `json:"expiresAt"`
+	}{slices.Compact(ids), expires})
 }
 
 // serverProofConfig sets the proof check on every server, whatever the --allow-id pattern allows.
