@@ -1,7 +1,6 @@
 package revoke
 
 import (
-	"bytes"
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
@@ -39,12 +38,16 @@ type Refusal struct {
 }
 
 // Admit returns h with the entries of in that pass the admit rules, and one refusal for each
-// entry that fails. It leaves h unchanged. An entry must verify under keys (ReasonInvalid with
-// DetailSignature or DetailDecode), name env (DetailEnv), name a cell of records
-// (ReasonUnknownCell), and name a record revision at or above the revision of that record
-// (ReasonStale). The overlay holds at most MaxHeld entries (ReasonOverflow). An entry for a cell
-// that the overlay already holds changes nothing and is not refused, so the first entry stays.
-// The overlay keeps the compact form of each envelope.
+// entry that fails. It leaves h unchanged. The rules run in this order. An entry must verify under
+// keys (ReasonInvalid with DetailSignature or DetailDecode) and name env (DetailEnv). An entry for a
+// cell that the overlay already holds changes nothing and is not refused, so the first entry stays.
+// The entry must name a cell of records (ReasonUnknownCell). An entry for a cell whose record is
+// already revoked adds nothing, so it is skipped with no refusal. The entry must not be Stale
+// against the revision of that record (ReasonStale). The overlay holds at most MaxHeld entries
+// (ReasonOverflow). The overlay keeps each envelope in the form that Sign writes.
+//
+// The result depends on the order of in: the first entry for a cell wins, and the cap refuses the
+// last ones. A caller that reads an unordered source, such as the keys of a ConfigMap, sorts it first.
 func Admit(h Held, in [][]byte, keys []ed25519.PublicKey, env string, records map[string]record.Cell) (Held, []Refusal) {
 	out := make(Held, len(h)+len(in))
 	for cell, raw := range h {
@@ -52,45 +55,71 @@ func Admit(h Held, in [][]byte, keys []ed25519.PublicKey, env string, records ma
 	}
 	var refusals []Refusal
 	for _, raw := range in {
-		e, err := Verify(raw, keys)
-		if err != nil {
-			detail := DetailDecode
-			if errors.Is(err, record.ErrSignature) {
-				detail = DetailSignature
-			}
-			refusals = append(refusals, Refusal{Reason: ReasonInvalid, Detail: detail})
-			continue
-		}
-		refuse := func(reason, detail string) {
-			refusals = append(refusals, Refusal{Cell: e.Cell, ID: e.ID, Reason: reason, Detail: detail})
-		}
-		if e.Env != env {
-			refuse(ReasonInvalid, DetailEnv)
+		e, form, refusal, ok := check(raw, keys, env)
+		if !ok {
+			refusals = append(refusals, refusal)
 			continue
 		}
 		if _, held := out[e.Cell]; held {
 			continue
 		}
-		rec, ok := records[e.Cell]
+		refuse := func(reason string) {
+			refusals = append(refusals, Refusal{Cell: e.Cell, ID: e.ID, Reason: reason})
+		}
+		rec, known := records[e.Cell]
 		switch {
-		case !ok:
-			refuse(ReasonUnknownCell, "")
-			continue
-		case e.Record.Compare(spec.RecordRevision(rec)) < 0:
-			refuse(ReasonStale, "")
-			continue
+		case !known:
+			refuse(ReasonUnknownCell)
+		case rec.Revoked:
+		case Stale(e, spec.RecordRevision(rec)):
+			refuse(ReasonStale)
 		case len(out) >= MaxHeld:
-			refuse(ReasonOverflow, "")
-			continue
+			refuse(ReasonOverflow)
+		default:
+			out[e.Cell] = form
 		}
-		var compact bytes.Buffer
-		if err := json.Compact(&compact, raw); err != nil {
-			refuse(ReasonInvalid, DetailDecode)
-			continue
-		}
-		out[e.Cell] = compact.Bytes()
 	}
 	return out, refusals
+}
+
+// Load rebuilds the overlay from stored envelopes, for example after a restart. Each envelope must
+// verify under keys and name env, as in Admit, and the overlay keys each entry by its verified cell.
+// Load applies no stale rule and no unknown cell rule, because a held entry stays until Settle drops
+// it. The first entry for a cell wins, and the entries after the first MaxHeld cells are refused
+// with ReasonOverflow. Like Admit, the result depends on the order of envelopes.
+func Load(envelopes [][]byte, keys []ed25519.PublicKey, env string) (Held, []Refusal) {
+	out := make(Held, min(len(envelopes), MaxHeld))
+	var refusals []Refusal
+	for _, raw := range envelopes {
+		e, form, refusal, ok := check(raw, keys, env)
+		switch {
+		case !ok:
+			refusals = append(refusals, refusal)
+		case out[e.Cell] != nil:
+		case len(out) >= MaxHeld:
+			refusals = append(refusals, Refusal{Cell: e.Cell, ID: e.ID, Reason: ReasonOverflow})
+		default:
+			out[e.Cell] = form
+		}
+	}
+	return out, refusals
+}
+
+// check verifies raw and its env. It returns the entry and its envelope in the form that Sign
+// writes, or the refusal and false.
+func check(raw []byte, keys []ed25519.PublicKey, env string) (Entry, []byte, Refusal, bool) {
+	e, form, err := verify(raw, keys)
+	if err != nil {
+		detail := DetailDecode
+		if errors.Is(err, record.ErrSignature) {
+			detail = DetailSignature
+		}
+		return Entry{}, nil, Refusal{Reason: ReasonInvalid, Detail: detail}, false
+	}
+	if e.Env != env {
+		return Entry{}, nil, Refusal{Cell: e.Cell, ID: e.ID, Reason: ReasonInvalid, Detail: DetailEnv}, false
+	}
+	return e, form, Refusal{}, true
 }
 
 // Settle returns h without the entries whose cell an accepted spec holds revoked in its record, or

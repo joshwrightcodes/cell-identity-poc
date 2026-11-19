@@ -4,8 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -376,14 +381,80 @@ func TestRevocationReasons(t *testing.T) {
 		"revocation_invalid", "revocation_stale", "revocation_unknown_cell", "revocation_overflow",
 		"not_connected", "not_revoked", "overlay_held", "restore_past_revocation",
 	}
-	seen := map[string]bool{ReasonNotBound: true, ReasonStale: true, ReasonConflict: true, ReasonCellUnknown: true}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("constant %d = %q, want %q", i, got[i], want[i])
 		}
-		if seen[got[i]] {
-			t.Errorf("duplicate %q", got[i])
+	}
+	// Every other Reason constant of the package, from the source, must differ from the new ones.
+	fset := token.NewFileSet()
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]string{}
+	for _, f := range pkgs["mgmtapi"].Files {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range gd.Specs {
+				vs := spec.(*ast.ValueSpec)
+				for i, name := range vs.Names {
+					if !strings.HasPrefix(name.Name, "Reason") || i >= len(vs.Values) {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok {
+						continue
+					}
+					v, _ := strconv.Unquote(lit.Value)
+					if prev, dup := seen[v]; dup {
+						t.Errorf("%s and %s share %q", prev, name.Name, v)
+					}
+					seen[v] = name.Name
+				}
+			}
 		}
-		seen[got[i]] = true
+	}
+	if len(seen) < 50 {
+		t.Fatalf("found only %d reason constants", len(seen))
+	}
+	for _, r := range want[:4] {
+		if name, dup := seen[r]; dup {
+			t.Errorf("%s shares %q with a revocation reason", name, r)
+		}
+	}
+}
+
+func TestEntryUnrevoked(t *testing.T) {
+	rev := func(c uint64) spec.Revision { return spec.Revision{Epoch: 2, Counter: c} }
+	adopted := RevocationEvent{Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationRevoke, Source: RevocationSourceOperator, EntryID: "000000000000000a"}
+	undo := RevocationEvent{Cell: "dev-cell-2", Revision: rev(6), Kind: RevocationUnrevoke, Source: RevocationSourceAdmin}
+	for _, tc := range []struct {
+		name   string
+		events []RevocationEvent
+		cell   string
+		id     string
+		want   bool
+	}{
+		{"revoked_then_unrevoked", []RevocationEvent{adopted, undo}, "dev-cell-2", "000000000000000a", true},
+		{"unrevoke_listed_first", []RevocationEvent{undo, adopted}, "dev-cell-2", "000000000000000a", true},
+		{"revoked_only", []RevocationEvent{adopted}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_before_revoke", []RevocationEvent{adopted, {Cell: "dev-cell-2", Revision: rev(4), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_at_same_revision", []RevocationEvent{adopted, {Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_other_cell", []RevocationEvent{adopted, {Cell: "dev-cell-1", Revision: rev(6), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"other_id", []RevocationEvent{adopted, undo}, "dev-cell-2", "000000000000000b", false},
+		{"id_of_other_cell", []RevocationEvent{adopted, undo}, "dev-cell-1", "000000000000000a", false},
+		{"admin_revoke_has_no_id", []RevocationEvent{{Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationRevoke, Source: RevocationSourceAdmin}, undo}, "dev-cell-2", "", false},
+		{"unrevoke_with_the_id", []RevocationEvent{{Cell: "dev-cell-2", Revision: rev(6), Kind: RevocationUnrevoke, EntryID: "000000000000000a"}}, "dev-cell-2", "000000000000000a", false},
+		{"no_events", nil, "dev-cell-2", "000000000000000a", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EntryUnrevoked(tc.events, tc.cell, tc.id); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

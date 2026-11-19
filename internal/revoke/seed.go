@@ -31,6 +31,26 @@ func FormatSeed(k ed25519.PrivateKey) string {
 	return SeedPrefix + base64.StdEncoding.EncodeToString(k.Seed())
 }
 
+// WriteSeed writes the seed line of k and one line break to w, from a buffer that it clears
+// afterwards. Its error text never holds seed bytes.
+func WriteSeed(w io.Writer, k ed25519.PrivateKey) error {
+	if len(k) != ed25519.PrivateKeySize {
+		return errors.New("operator seed: key is not an Ed25519 private key")
+	}
+	seed := k.Seed()
+	defer clear(seed)
+	enc := base64.StdEncoding
+	line := make([]byte, 0, len(SeedPrefix)+enc.EncodedLen(len(seed))+1)
+	defer func() { clear(line[:cap(line)]) }()
+	line = append(line, SeedPrefix...)
+	line = enc.AppendEncode(line, seed)
+	line = append(line, '\n')
+	if _, err := w.Write(line); err != nil {
+		return errors.New("operator seed: write failed")
+	}
+	return nil
+}
+
 // The errors of ParseSeed. Their text is fixed, so no error carries a byte of the input.
 var (
 	errSeedRead   = errors.New("operator seed: read failed")
@@ -39,9 +59,9 @@ var (
 	errSeedLength = errors.New("operator seed: seed is not 32 bytes")
 )
 
-// ParseSeed reads one seed line from r, as FormatSeed writes it, with an optional line break at the
-// end. It reads at most 256 bytes. Its error text never holds input bytes, and it clears its copy
-// of the input before it returns.
+// ParseSeed reads one seed line from r, as FormatSeed writes it, with an optional "\n" or "\r\n"
+// at the end. It reads at most 256 bytes. Its error text never holds input bytes, and it clears its
+// copy of the input before it returns.
 func ParseSeed(r io.Reader) (ed25519.PrivateKey, error) {
 	buf := make([]byte, maxSeedRead)
 	defer clear(buf)
@@ -50,8 +70,9 @@ func ParseSeed(r io.Reader) (ed25519.PrivateKey, error) {
 		return nil, errSeedRead
 	}
 	line := buf[:n]
-	line = bytes.TrimSuffix(line, []byte("\n"))
-	line = bytes.TrimSuffix(line, []byte("\r"))
+	if l, ok := bytes.CutSuffix(line, []byte("\n")); ok {
+		line = bytes.TrimSuffix(l, []byte("\r"))
+	}
 	if n == maxSeedRead || bytes.ContainsAny(line, "\r\n") {
 		return nil, errSeedLines
 	}

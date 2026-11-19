@@ -77,6 +77,8 @@ func TestParseSeedErrorsCarryNoInput(t *testing.T) {
 		{"trailing_space", line + " \n"},
 		{"inner_space", SeedPrefix + " " + b64 + "\n"},
 		{"nul", line + "\x00\n"},
+		{"lone_cr", line + "\r"},
+		{"cr_cr_lf", line + "\r\r\n"},
 		{"too_long", line + "\n" + strings.Repeat("A", 400)},
 		{"too_long_one_line", line + strings.Repeat("A", 400)},
 	} {
@@ -193,3 +195,29 @@ func TestKeySHA256(t *testing.T) {
 		t.Error("two keys share a digest")
 	}
 }
+
+func TestWriteSeed(t *testing.T) {
+	key := testKey(t, 7)
+	var out bytes.Buffer
+	if err := WriteSeed(&out, key); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != FormatSeed(key)+"\n" {
+		t.Error("WriteSeed differs from the line of FormatSeed")
+	}
+	got, err := ParseSeed(&out)
+	if err != nil || !got.Equal(key) {
+		t.Errorf("ParseSeed of WriteSeed: %v", err)
+	}
+	var none bytes.Buffer
+	if err := WriteSeed(&none, key[:10]); err == nil || none.Len() != 0 {
+		t.Errorf("a short key: %v, wrote %d bytes", err, none.Len())
+	}
+	if err := WriteSeed(failWriter{}, key); err == nil || strings.Contains(err.Error(), base64.StdEncoding.EncodeToString(key.Seed())[:8]) {
+		t.Errorf("a write error: %v", err)
+	}
+}
+
+type failWriter struct{}
+
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("pipe closed") }

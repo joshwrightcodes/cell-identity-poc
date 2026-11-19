@@ -121,6 +121,49 @@ func TestEntryRules(t *testing.T) {
 			}
 			return append(env, bytes.Repeat([]byte(" "), MaxEntryBytes)...)
 		}},
+		{name: "keyid", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				m["signatures"].([]any)[0].(map[string]any)["keyid"] = strings.Repeat("k", 2000)
+			})
+		}},
+		{name: "keyid_empty", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				m["signatures"].([]any)[0].(map[string]any)["keyid"] = ""
+			})
+		}},
+		{name: "two_signatures", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				sigs := m["signatures"].([]any)
+				m["signatures"] = append(sigs, map[string]any{"sig": base64.StdEncoding.EncodeToString(make([]byte, 64))})
+			})
+		}},
+		{name: "same_signature_twice", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				sigs := m["signatures"].([]any)
+				m["signatures"] = append(sigs, sigs[0])
+			})
+		}},
+		{name: "noncanonical_payload", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				p := m["payload"].(string)
+				m["payload"] = p[:8] + "\n" + p[8:]
+			})
+		}},
+		{name: "noncanonical_payload_cr", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				p := m["payload"].(string)
+				m["payload"] = p + "\r\n"
+			})
+		}},
+		{name: "noncanonical_sig", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) {
+				s := m["signatures"].([]any)[0].(map[string]any)
+				s["sig"] = s["sig"].(string)[:8] + "\n" + s["sig"].(string)[8:]
+			})
+		}},
+		{name: "extra_member", env: func(t *testing.T) []byte {
+			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) { m["pad"] = strings.Repeat("p", 2000) })
+		}},
 		{name: "too_large_payload", body: `{"id":"0123456789abcdef","env":"dev","cell":"dev-cell-2","record":{"epoch":1,"counter":7},"issuedAt":"2026-11-20T03:04:05Z"` + strings.Repeat(" ", MaxEntryBytes) + `}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,4 +282,72 @@ func relabel(t *testing.T, env []byte, pt string) []byte {
 		t.Fatal(err)
 	}
 	return out
+}
+
+func mustSign(t *testing.T, e Entry, key ed25519.PrivateKey) []byte {
+	t.Helper()
+	env, err := Sign(e, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return env
+}
+
+// editEnvelope decodes env into generic JSON, lets edit change it, and encodes it again.
+func editEnvelope(t *testing.T, env []byte, edit func(map[string]any)) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(env, &m); err != nil {
+		t.Fatal(err)
+	}
+	edit(m)
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// TestVerifyCanonicalForm checks the forms that Verify accepts besides the bytes of Sign: other
+// whitespace and other member order. It also checks the size limit before any parse, and an
+// envelope with no signature.
+func TestVerifyCanonicalForm(t *testing.T) {
+	key := testKey(t, 1)
+	keys := []ed25519.PublicKey{pub(key)}
+	signed := mustSign(t, testEntry(), key)
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, signed, " ", "\t"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Verify(indented.Bytes(), keys); err != nil {
+		t.Errorf("indented envelope: %v", err)
+	}
+	reordered := editEnvelope(t, signed, func(map[string]any) {})
+	if _, err := Verify(reordered, keys); err != nil {
+		t.Errorf("reordered envelope: %v", err)
+	}
+	none := editEnvelope(t, signed, func(m map[string]any) { m["signatures"] = []any{} })
+	if _, err := Verify(none, keys); !errors.Is(err, record.ErrSignature) {
+		t.Errorf("no signature: %v, want ErrSignature", err)
+	}
+	big := bytes.Repeat([]byte("x"), MaxEntryBytes+1)
+	if _, err := Verify(big, keys); !errors.Is(err, ErrTooLarge) || !errors.Is(err, record.ErrDecode) {
+		t.Errorf("oversized input: %v, want ErrTooLarge and ErrDecode", err)
+	}
+	if _, err := Verify(bytes.Repeat([]byte("x"), MaxEntryBytes), keys); errors.Is(err, ErrTooLarge) {
+		t.Errorf("an input at the limit is too large: %v", err)
+	}
+}
+
+// TestEntryLargestEnvelope bounds the largest envelope that Sign can write, so a reader can size a
+// body that carries MaxHeld entries.
+func TestEntryLargestEnvelope(t *testing.T) {
+	e := testEntry()
+	e.Env, e.Cell = strings.Repeat("e", 63), strings.Repeat("c", 59)
+	e.Record = spec.Revision{Epoch: ^uint64(0), Counter: ^uint64(0)}
+	e.IssuedAt = time.Date(2026, 11, 20, 3, 4, 5, 999999999, time.FixedZone("x", -11*3600-59*60))
+	env := mustSign(t, e, testKey(t, 1))
+	if len(env) > MaxCanonicalBytes {
+		t.Errorf("largest envelope is %d bytes, above %d", len(env), MaxCanonicalBytes)
+	}
 }
