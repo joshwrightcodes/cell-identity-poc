@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"sync/atomic"
@@ -81,6 +82,11 @@ type PullerConfig struct {
 	Plane   *Plane
 	Now     func() time.Time
 	Sleep   func(context.Context, time.Duration) error
+	// OperatorKeys returns the pinned operator keys that verify local revocation entries, and
+	// Revocations is the input of those entries. A nil Revocations takes in no entry, and a nil
+	// OperatorKeys verifies none.
+	OperatorKeys func() []ed25519.PublicKey
+	Revocations  RevocationSource
 }
 
 // Puller pulls the bundle of one environment in rounds, accepts it, saves it and reports.
@@ -112,6 +118,13 @@ type Puller struct {
 	relaySkipped bool
 	// stepsWritten identifies the content that this process last wrote to the steps ConfigMap.
 	stepsWritten string
+	// pulled is true when the spec leg of the round accepted a spec.
+	pulled bool
+	// unconfirmed holds the cells of the held entries that the store gave at start, until a pull is
+	// accepted. Each one settles when it is stale against the record of its cell.
+	unconfirmed  map[string]bool
+	heldGauge    metric.Int64Gauge
+	refusedCount metric.Int64Counter
 }
 
 // NewPuller returns a Puller for cfg.
@@ -153,6 +166,10 @@ func NewPuller(cfg PullerConfig) *Puller {
 		metric.WithDescription("Report items that the management plane decided, by outcome"))
 	p.outbox, _ = cfg.Meter.Int64Gauge("envd.gateway.outbox",
 		metric.WithDescription("Items in the outbox of the gateway at the last sync"))
+	p.heldGauge, _ = cfg.Meter.Int64Gauge("envd.revocations.held",
+		metric.WithDescription("Local revocation entries that the overlay holds"))
+	p.refusedCount, _ = cfg.Meter.Int64Counter("envd.revocations.refused",
+		metric.WithDescription("Input local revocation entries that envd refused, counted in each round, by reason"))
 	return p
 }
 
@@ -196,6 +213,12 @@ func (p *Puller) Run(ctx context.Context) error {
 		cancel()
 		if err == nil {
 			p.state = st
+			for cell := range st.Revocations {
+				if p.unconfirmed == nil {
+					p.unconfirmed = map[string]bool{}
+				}
+				p.unconfirmed[cell] = true
+			}
 			p.setApplied(ctx, st.Revision)
 			p.ready.Store(true)
 			break
@@ -265,6 +288,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	defer cancel()
 	p.storeErr = ""
 	p.refusedNow = false
+	p.pulled = false
 	p.syncStore(rctx)
 
 	bundle, err := p.fetch(rctx)
@@ -275,6 +299,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	} else if p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
+	p.overlay(rctx, p.pulled)
 	if p.storeErr != "" {
 		failed = true
 	}
@@ -289,7 +314,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	hints := p.pendingHints(ctx, gw)
 	steps, stepsAt := p.stepStatus(ctx)
 	rep := mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
-		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt}
+		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt, LocalRevocations: p.overlayEnvelopes()}
 	if p.cfg.Plane != nil {
 		rep.PlaneBundle, rep.PlaneBundleStatus = p.cfg.Plane.Report()
 	}
@@ -329,6 +354,7 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
 		} else {
 			p.state = next
+			p.pulled = true
 			p.storeErr = ""
 			p.unverifiable = false
 			p.ready.Store(true)
@@ -346,6 +372,7 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
 		} else {
 			p.state = next
+			p.pulled = true
 		}
 		if !p.refusedNow {
 			p.refusal = nil
@@ -393,9 +420,10 @@ func (p *Puller) stepStatus(ctx context.Context) ([]mgmtapi.StepStatus, time.Tim
 	return steps, at
 }
 
-// sameContent reports whether two states hold the same signed spec and records.
+// sameContent reports whether two states hold the same signed spec, records and overlay.
 func sameContent(a, b *State) bool {
-	if a.SpecSHA256 != b.SpecSHA256 || !bytes.Equal(a.SpecEnvelope, b.SpecEnvelope) || len(a.Records) != len(b.Records) {
+	if a.SpecSHA256 != b.SpecSHA256 || !bytes.Equal(a.SpecEnvelope, b.SpecEnvelope) || len(a.Records) != len(b.Records) ||
+		!maps.EqualFunc(a.Revocations, b.Revocations, bytes.Equal) {
 		return false
 	}
 	for k, v := range a.Records {

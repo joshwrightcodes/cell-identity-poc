@@ -8,6 +8,7 @@
 //	  [--interval 10s] [--health-listen :8080] [--cluster <name>]
 //	  [--bundle-mirror <host:port> --bundle-store <host:port> --bundle-store-token <file>
 //	   --bundle-state-configmap <ns>/<name> --bundle-health-timeout 5m]
+//	  [--operator-key-file <file> --revocations-configmap <ns>/<name>]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
 // run takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET and trusts the management plane
@@ -19,6 +20,10 @@
 // bundle.apply) that the ops pull carries in planeBundle, and reports the result in its status. run
 // never forwards an operation for --cluster to the gateway. The plane path runs only after run accepts
 // a spec and only when a gateway is set, because the ops pull belongs to the relay legs.
+//
+// With --operator-key-file, run takes in the signed local revocation entries of
+// --revocations-configmap, holds the ones that verify under the pinned operator keys in its
+// ConfigMap, and passes them to the gateway and in each status report.
 //
 // check reads one SpecBundle from standard input, loads the current state without writing it, and
 // prints one JSON line. It starts no telemetry. The exit status is 0 for accepted and unchanged, and
@@ -63,6 +68,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/envd"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
@@ -250,6 +256,12 @@ type runConfig struct {
 	bundleNS            string
 	bundleName          string
 	bundleHealthTimeout time.Duration
+	// operatorKeyFile is the pin of the operator keys, and operatorKeys the keys that it held at
+	// startup. They go with revocationsNS and revocationsName, the input of the local revocations.
+	operatorKeyFile string
+	operatorKeys    []ed25519.PublicKey
+	revocationsNS   string
+	revocationsName string
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -274,6 +286,8 @@ func parseRun(args []string) (runConfig, error) {
 	storeToken := fs.String("bundle-store-token", "", "file with the projected token for the bundle store")
 	state := fs.String("bundle-state-configmap", "", "ConfigMap that holds the bundle state, as <namespace>/<name>")
 	healthTimeout := fs.Duration("bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
+	operatorKeyFile := fs.String("operator-key-file", "", "file with the pinned operator public keys, one standard base64 key on each line")
+	revocations := fs.String("revocations-configmap", "", "ConfigMap that holds the signed local revocation entries, as <namespace>/<name>")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
@@ -346,7 +360,65 @@ func parseRun(args []string) (runConfig, error) {
 	if err := checkPlaneFlags(&rc, fs, *state); err != nil {
 		return runConfig{}, err
 	}
+	if err := checkRevocationFlags(&rc, *operatorKeyFile, *revocations); err != nil {
+		return runConfig{}, err
+	}
 	return rc, nil
+}
+
+// checkRevocationFlags checks --operator-key-file and --revocations-configmap, which go together.
+func checkRevocationFlags(rc *runConfig, keyFile, revocations string) error {
+	if keyFile == "" && revocations == "" {
+		return nil
+	}
+	if err := required(map[string]string{"operator-key-file": keyFile, "revocations-configmap": revocations}); err != nil {
+		return err
+	}
+	keys, err := readOperatorKeys(keyFile)
+	if err != nil {
+		return err
+	}
+	ns, cm, err := configMapRef("revocations-configmap", revocations)
+	if err != nil {
+		return err
+	}
+	rc.operatorKeyFile, rc.operatorKeys, rc.revocationsNS, rc.revocationsName = keyFile, keys, ns, cm
+	return nil
+}
+
+// readOperatorKeys reads the pin of the operator keys, as in key keys.pub of ConfigMap operator-key.
+func readOperatorKeys(path string) ([]ed25519.PublicKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	keys, err := revoke.ParseKeys(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	return keys, nil
+}
+
+// operatorKeys returns a function that reads the pin in path again on each call, so that a key
+// rotation takes effect without a restart. A failed read gives the last keys that loaded, or seed
+// before any read works, and logs one line until a read works again.
+func operatorKeys(path string, seed []ed25519.PublicKey, log *slog.Logger) func() []ed25519.PublicKey {
+	var mu sync.Mutex
+	last, failing := seed, false
+	return func() []ed25519.PublicKey {
+		mu.Lock()
+		defer mu.Unlock()
+		keys, err := readOperatorKeys(path)
+		if err != nil {
+			if !failing {
+				log.Warn("operator keys not reloaded", "error", err.Error())
+			}
+			failing = true
+			return last
+		}
+		last, failing = keys, false
+		return last
+	}
 }
 
 // checkPlaneFlags checks the cluster and bundle flags. The bundle flags go together: with --bundle-mirror
@@ -447,21 +519,31 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 // pullerConfig wires the puller to the ConfigMaps that cfg names.
 func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, gateway envd.GatewayClient, tel *telemetry.T) envd.PullerConfig {
 	keys := []ed25519.PublicKey{cfg.key}
+	var opKeys func() []ed25519.PublicKey
+	var revocations envd.RevocationSource
+	var storeOpts []envd.StoreOption
+	if cfg.operatorKeyFile != "" {
+		opKeys = operatorKeys(cfg.operatorKeyFile, cfg.operatorKeys, tel.Log)
+		revocations = envd.ConfigMapRevocations{Client: kube, Namespace: cfg.revocationsNS, Name: cfg.revocationsName}
+		storeOpts = append(storeOpts, envd.WithOperatorKeys(opKeys))
+	}
 	return envd.PullerConfig{
-		Cluster:    cfg.cluster,
-		Client:     mgmt,
-		BaseURL:    "https://" + cfg.upstream,
-		Env:        cfg.env,
-		Keys:       keys,
-		Store:      envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
-		Gateway:    gateway,
-		Hints:      envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
-		Steps:      envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
-		StepStatus: envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
-		Interval:   cfg.interval,
-		Log:        tel.Log,
-		Meter:      tel.Meter,
-		Tracer:     tel.Tracer,
+		Cluster:      cfg.cluster,
+		Client:       mgmt,
+		BaseURL:      "https://" + cfg.upstream,
+		Env:          cfg.env,
+		Keys:         keys,
+		OperatorKeys: opKeys,
+		Revocations:  revocations,
+		Store:        envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log, storeOpts...),
+		Gateway:      gateway,
+		Hints:        envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
+		Steps:        envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
+		StepStatus:   envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
+		Interval:     cfg.interval,
+		Log:          tel.Log,
+		Meter:        tel.Meter,
+		Tracer:       tel.Tracer,
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -65,6 +66,9 @@ type State struct {
 	Steps map[string][]byte
 	// stepsVerified is true only when Accept filled Steps from a bundle that it checked.
 	stepsVerified bool
+	// Revocations is the held overlay: one signed local revocation entry for each revoked cell. A
+	// new spec keeps it, and the puller changes it after the spec leg of each round.
+	Revocations revoke.Held
 }
 
 // Empty returns the state of a first start.
@@ -241,5 +245,6 @@ func acceptRecordsCore(cur *State, b mgmtapi.SpecBundle, env string, keys []ed25
 		Records:      records,
 		Cells:        cells,
 		Marks:        marks,
+		Revocations:  cur.Revocations,
 	}, true, s, nil
 }

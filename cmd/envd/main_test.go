@@ -980,3 +980,110 @@ func TestNewPlaneBuildsTheEngine(t *testing.T) {
 		t.Fatal("a bad mirror address was accepted")
 	}
 }
+
+// operatorKeyFile writes the pin of the operator keys: one standard base64 key on each line.
+func operatorKeyFile(t *testing.T, keys ...ed25519.PublicKey) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "keys.pub")
+	writeOperatorKeys(t, p, keys...)
+	return p
+}
+
+func writeOperatorKeys(t *testing.T, path string, keys ...ed25519.PublicKey) {
+	t.Helper()
+	var b strings.Builder
+	for _, k := range keys {
+		b.WriteString(base64.StdEncoding.EncodeToString(k) + "\n")
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestEnvdRevocationFlags: --operator-key-file and --revocations-configmap go together. They wire
+// the operator keys, read again on each call, the input ConfigMap and the overlay of the store.
+func TestEnvdRevocationFlags(t *testing.T) {
+	base := planeBase(t)
+	a, b := newSigner(t), newSigner(t)
+	keyFile := operatorKeyFile(t, a.pub)
+	flags := []string{"--operator-key-file", keyFile, "--revocations-configmap", "envd-system/local-revocations"}
+
+	plain, err := parseRun(base)
+	if err != nil || plain.operatorKeyFile != "" {
+		t.Fatalf("without the flags: %+v %v", plain, err)
+	}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	if pc := pullerConfig(plain, fake.NewClientset(), &http.Client{}, nil, tel); pc.OperatorKeys != nil || pc.Revocations != nil {
+		t.Fatalf("overlay on without flags: %+v", pc)
+	}
+
+	cfg, err := parseRun(append(slices.Clone(base), flags...))
+	if err != nil {
+		t.Fatalf("with the flags: %v", err)
+	}
+	if cfg.operatorKeyFile != keyFile || cfg.revocationsNS != "envd-system" || cfg.revocationsName != "local-revocations" {
+		t.Fatalf("parsed %+v", cfg)
+	}
+	kube := fake.NewClientset()
+	pc := pullerConfig(cfg, kube, &http.Client{}, nil, tel)
+	src, ok := pc.Revocations.(envd.ConfigMapRevocations)
+	if !ok || src.Client != kube || src.Namespace != "envd-system" || src.Name != "local-revocations" {
+		t.Fatalf("revocation source %#v", pc.Revocations)
+	}
+	if got := pc.OperatorKeys(); len(got) != 1 || !got[0].Equal(a.pub) {
+		t.Fatalf("operator keys %v", got)
+	}
+	writeOperatorKeys(t, keyFile, a.pub, b.pub)
+	if got := pc.OperatorKeys(); len(got) != 2 || !got[1].Equal(b.pub) {
+		t.Fatalf("operator keys after a rotation %v", got)
+	}
+	if err := os.WriteFile(keyFile, []byte("not a key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := pc.OperatorKeys(); len(got) != 2 {
+		t.Fatalf("operator keys after a failed read %v, want the last keys that loaded", got)
+	}
+
+	// The store of the puller keeps the overlay key of its ConfigMap.
+	st, _, err := envd.Accept(envd.Empty(), a.bundle(1), "dev", []ed25519.PublicKey{a.pub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeOperatorKeys(t, keyFile, a.pub)
+	cfg.key = a.pub
+	pc = pullerConfig(cfg, kube, &http.Client{}, nil, tel)
+	if err := pc.Store.Save(t.Context(), st); err != nil {
+		t.Fatal(err)
+	}
+	cm, err := kube.CoreV1().ConfigMaps(cfg.namespace).Get(t.Context(), cfg.configMap, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm.Data[envd.RevocationsKey] = "[]"
+	if _, err := kube.CoreV1().ConfigMaps(cfg.namespace).Update(t.Context(), cm, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, clean, err := pc.Store.Peek(t.Context()); err != nil || clean {
+		t.Fatalf("an empty overlay key: clean %v, err %v, want not clean", clean, err)
+	}
+
+	for name, extra := range map[string][]string{
+		"key file alone":      {"--operator-key-file", keyFile},
+		"configmap alone":     {"--revocations-configmap", "envd-system/local-revocations"},
+		"missing key file":    {"--operator-key-file", filepath.Join(t.TempDir(), "absent"), "--revocations-configmap", "envd-system/local-revocations"},
+		"bad key file":        {"--operator-key-file", a.keyFile() + ".bad", "--revocations-configmap", "envd-system/local-revocations"},
+		"bad configmap":       {"--operator-key-file", keyFile, "--revocations-configmap", "local-revocations"},
+		"three keys in a pin": {"--operator-key-file", operatorKeyFile(t, a.pub, b.pub, newSigner(t).pub), "--revocations-configmap", "a/b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if name == "bad key file" {
+				if err := os.WriteFile(extra[1], []byte("not a key\n"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := parseRun(append(slices.Clone(base), extra...)); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+}

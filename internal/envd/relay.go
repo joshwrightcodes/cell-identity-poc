@@ -145,6 +145,7 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 		Records:      make(map[string]json.RawMessage, len(p.state.Records)),
 		Ops:          p.gatewayOps(ctx, ops.Ops),
 		Cells:        ops.Cells,
+		Revocations:  p.overlayEnvelopes(),
 	}
 	for k, v := range p.state.Records {
 		req.Records[k] = v
