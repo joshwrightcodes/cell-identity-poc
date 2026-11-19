@@ -346,14 +346,14 @@ func TestCellEndsTunnelAtOwnSVIDExpiry(t *testing.T) {
 	startCell(t, TunnelDialer(hub.addr, ClientTLS(src, h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog)), h.cellHandler(t))
 	findLog(t, h.cellLog, "tunnel_connected", nil, 5*time.Second)
 	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, time.Until(notAfter)+3*time.Second)
-	// Each tunnel, the renewals too, has the same leaf, so the cell ends each one at notAfter.
+	// Each tunnel, the renewals too, has the same leaf, so the cell ends each one at notAfter: not before it, and within 1 s after it.
 	deadline := time.Now().Add(3 * time.Second)
 	for {
 		accepted, ends := hub.result()
 		if accepted > 0 && len(ends) == accepted {
 			for _, end := range ends {
-				if end.Before(notAfter) {
-					t.Errorf("the cell ended a tunnel at %s, before the expiry of its leaf at %s", end.Format(time.RFC3339Nano), notAfter.Format(time.RFC3339Nano))
+				if end.Before(notAfter) || !end.Before(notAfter.Add(time.Second)) {
+					t.Errorf("the cell ended a tunnel at %s, and its leaf expires at %s", end.Format(time.RFC3339Nano), notAfter.Format(time.RFC3339Nano))
 				}
 			}
 			return
