@@ -526,9 +526,9 @@ func TestOverlaySurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestOverlayStaleAfterRestartDropped: a stored entry that a new puller loads is checked against
-// the record of its cell in the stored spec, and then in each pull until a pull is accepted. A stale
-// one settles. An entry that this check confirmed stays across a later newer record.
+// TestOverlayStaleAfterRestartDropped: a stored entry that a new puller loads is checked once,
+// against the record of its cell in the spec of the same store. A stale one settles. Afterwards the
+// loaded entry follows the settle rule, so a pulled newer record that is not revoked keeps it.
 func TestOverlayStaleAfterRestartDropped(t *testing.T) {
 	plant := func(r *ovRig, e []byte) {
 		r.editStored(func(cm *corev1.ConfigMap) { cm.Data[RevocationsKey] = list(e) })
@@ -581,15 +581,37 @@ func TestOverlayStaleAfterRestartDropped(t *testing.T) {
 		if !sameList(held1, e) {
 			t.Errorf("round 1 with the stored spec: gateway revocations %s", held1)
 		}
-		if len(p.state.Revocations) != 0 {
-			t.Errorf("held after the first pull %v", p.state.Revocations)
+		if p.state.Revision != rev(1, 6) || !bytes.Equal(p.state.Revocations["a"], e) {
+			t.Errorf("after the first pull: revision %v, held %v", p.state.Revision, p.state.Revocations)
 		}
-		if v, ok := r.stored(); ok {
-			t.Errorf("stored overlay %q", v)
+		if got, _ := r.stored(); got != list(e) {
+			t.Errorf("stored overlay %q", got)
 		}
-		settled := r.lines("revocation_settled")
-		if len(settled) != 1 || settled[0]["cause"] != "stale" {
-			t.Errorf("settled lines %v", settled)
+		if l := r.lines("revocation_settled"); len(l) != 0 {
+			t.Errorf("settled %v", l)
+		}
+	})
+
+	// rollback_residual: a writer of the records ConfigMap puts back an older signed spec with an
+	// old entry. The marks come from the stored spec itself, so the restart accepts the older spec,
+	// the entry is not stale against it, and the first pull keeps it. This is the T4 residual.
+	t.Run("rollback_residual", func(t *testing.T) {
+		r := newOvRig(t)
+		st, _, err := Accept(Empty(), newer(r), testEnv, r.f.keys())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.store().Save(t.Context(), st); err != nil {
+			t.Fatal(err)
+		}
+		older, _ := r.f.base()
+		writeOutside(t, r.client, older, KeyFingerprint(r.f.keys()))
+		e := r.entry("a", rev(1, 2))
+		plant(r, e)
+		r.up.set(newer(r))
+		p := r.run(2, nil)
+		if p.state.Revision != rev(1, 6) || !bytes.Equal(p.state.Revocations["a"], e) {
+			t.Errorf("revision %v, held %v", p.state.Revision, p.state.Revocations)
 		}
 	})
 
@@ -609,6 +631,49 @@ func TestOverlayStaleAfterRestartDropped(t *testing.T) {
 			t.Errorf("settled %v", l)
 		}
 	})
+}
+
+// TestOverlayRestartKeepsEntryAcrossUnrelatedRecord: envd holds an entry, restarts during an island
+// and then pulls a newer record of the cell that is not revoked. The entry stays held.
+func TestOverlayRestartKeepsEntryAcrossUnrelatedRecord(t *testing.T) {
+	r := newOvRig(t)
+	e := r.entry("a", rev(1, 2))
+	r.src.set(nil, e)
+	r.run(1, nil)
+	if got, _ := r.stored(); got != list(e) {
+		t.Fatalf("before the restart: stored overlay %q", got)
+	}
+
+	r.up.failGet.Store(true)
+	before := len(r.up.got())
+	p := r.run(3, func(round int) {
+		if round == 1 {
+			r.up.set(r.spec(rev(1, 6), r.f.cell("a", rev(1, 6), false)))
+			r.up.failGet.Store(false)
+		}
+	})
+	if p.state.Revision != rev(1, 6) {
+		t.Fatalf("the newer spec was not applied: %v", p.state.Revision)
+	}
+	if !bytes.Equal(p.state.Revocations["a"], e) || len(p.state.Revocations) != 1 {
+		t.Errorf("held %v", p.state.Revocations)
+	}
+	if got, _ := r.stored(); got != list(e) {
+		t.Errorf("stored overlay %q", got)
+	}
+	if s := r.gw.last(t); !sameList(s.Revocations, e) {
+		t.Errorf("gateway revocations %s", s.Revocations)
+	}
+	reps := r.up.got()[before:]
+	if len(reps) != 3 || !sameList(reps[2].LocalRevocations, e) {
+		t.Errorf("reports after the restart %+v", reps)
+	}
+	if l := r.lines("revocation_settled"); len(l) != 0 {
+		t.Errorf("settled %v", l)
+	}
+	if l := r.lines("revocation_refused"); len(l) != 0 {
+		t.Errorf("refused %v", l)
+	}
 }
 
 // TestOverlayStoreCanonical: the overlay key is part of the canonical form of the store. A stripped,

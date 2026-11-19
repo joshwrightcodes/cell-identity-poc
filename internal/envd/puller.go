@@ -118,11 +118,9 @@ type Puller struct {
 	relaySkipped bool
 	// stepsWritten identifies the content that this process last wrote to the steps ConfigMap.
 	stepsWritten string
-	// pulled is true when the spec leg of the round accepted a spec.
-	pulled bool
-	// unconfirmed holds the cells of the held entries that the store gave at start, until a pull is
-	// accepted. Each one settles when it is stale against the record of its cell.
-	unconfirmed  map[string]bool
+	// staleAtStart holds, by cell, each entry that the store gave at start and that is stale against
+	// the record of its cell in the spec of the same store. The first overlay leg drops them.
+	staleAtStart map[string][]byte
 	heldGauge    metric.Int64Gauge
 	refusedCount metric.Int64Counter
 }
@@ -213,12 +211,7 @@ func (p *Puller) Run(ctx context.Context) error {
 		cancel()
 		if err == nil {
 			p.state = st
-			for cell := range st.Revocations {
-				if p.unconfirmed == nil {
-					p.unconfirmed = map[string]bool{}
-				}
-				p.unconfirmed[cell] = true
-			}
+			p.staleAtStart = staleOnLoad(st)
 			p.setApplied(ctx, st.Revision)
 			p.ready.Store(true)
 			break
@@ -288,7 +281,6 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	defer cancel()
 	p.storeErr = ""
 	p.refusedNow = false
-	p.pulled = false
 	p.syncStore(rctx)
 
 	bundle, err := p.fetch(rctx)
@@ -299,7 +291,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	} else if p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
-	p.overlay(rctx, p.pulled)
+	p.overlay(rctx)
 	if p.storeErr != "" {
 		failed = true
 	}
@@ -354,7 +346,6 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
 		} else {
 			p.state = next
-			p.pulled = true
 			p.storeErr = ""
 			p.unverifiable = false
 			p.ready.Store(true)
@@ -372,7 +363,6 @@ func (p *Puller) accept(ctx, rctx context.Context, bundle mgmtapi.SpecBundle) (f
 			p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
 		} else {
 			p.state = next
-			p.pulled = true
 		}
 		if !p.refusedNow {
 			p.refusal = nil

@@ -117,21 +117,18 @@ func (p *Puller) operatorKeys() []ed25519.PublicKey {
 	return p.cfg.OperatorKeys()
 }
 
-// overlay runs after the spec leg of each round, also when the pull failed. It settles the held
-// entries against the accepted spec, drops each stale entry that the store gave at start, takes in
+// overlay runs after the spec leg of each round, also when the pull failed. It drops each stale
+// entry that the store gave at start, settles the held entries against the accepted spec, takes in
 // the input entries, and saves a changed overlay. It needs an accepted spec, so it does nothing
-// before the first one. pulled is true when the spec leg of this round accepted a spec.
-func (p *Puller) overlay(ctx context.Context, pulled bool) {
+// before the first one.
+func (p *Puller) overlay(ctx context.Context) {
 	if len(p.state.SpecEnvelope) == 0 {
 		return
 	}
 	ctx, span := p.cfg.Tracer.Start(ctx, "envd.overlay")
 	defer span.End()
-	held := p.settle(ctx, p.state.Revocations)
-	held = p.dropStale(ctx, held)
-	if pulled {
-		p.unconfirmed = nil
-	}
+	held := p.dropStale(ctx, p.state.Revocations)
+	held = p.settle(ctx, held)
 	held = p.intake(ctx, held)
 	p.heldGauge.Record(ctx, int64(len(held)))
 	if maps.EqualFunc(held, p.state.Revocations, bytes.Equal) {
@@ -177,29 +174,40 @@ func (p *Puller) settle(ctx context.Context, held revoke.Held) revoke.Held {
 	return out
 }
 
-// dropStale drops each entry that the store gave at start and that revoke.Stale reports against the
-// record of its cell in the accepted spec. Such an entry stays unconfirmed until a pull is accepted,
-// so the check runs on the stored spec at start and on each pull until then.
-func (p *Puller) dropStale(ctx context.Context, held revoke.Held) revoke.Held {
-	if len(p.unconfirmed) == 0 {
-		return held
-	}
-	out := maps.Clone(held)
-	for _, cell := range slices.Sorted(maps.Keys(p.unconfirmed)) {
-		raw, ok := held[cell]
-		if !ok {
-			delete(p.unconfirmed, cell)
-			continue
-		}
-		rec, known := p.state.Cells[cell]
+// staleOnLoad returns, by cell, each held entry of st that revoke.Stale reports against the record
+// of its cell in st. st is the state that the store gave at start, so each entry is checked against
+// the spec that it was held against. revoke.Load applies no stale rule, so this stops a writer of
+// the store from planting an old entry for a cell that was revoked and un-revoked since.
+func staleOnLoad(st *State) map[string][]byte {
+	var out map[string][]byte
+	for cell, raw := range st.Revocations {
+		rec, known := st.Cells[cell]
 		e, decoded := heldEntry(raw)
 		if !known || !decoded || !revoke.Stale(e, spec.RecordRevision(rec)) {
 			continue
 		}
-		delete(out, cell)
-		delete(p.unconfirmed, cell)
-		p.logSettled(ctx, cell, raw, settledStale)
+		if out == nil {
+			out = map[string][]byte{}
+		}
+		out[cell] = raw
 	}
+	return out
+}
+
+// dropStale drops the entries of staleOnLoad once, in the first overlay leg. Afterwards a loaded
+// entry follows the settle rule like an entry admitted in this run.
+func (p *Puller) dropStale(ctx context.Context, held revoke.Held) revoke.Held {
+	if len(p.staleAtStart) == 0 {
+		return held
+	}
+	out := maps.Clone(held)
+	for _, cell := range slices.Sorted(maps.Keys(p.staleAtStart)) {
+		if raw, ok := held[cell]; ok && bytes.Equal(raw, p.staleAtStart[cell]) {
+			delete(out, cell)
+			p.logSettled(ctx, cell, raw, settledStale)
+		}
+	}
+	p.staleAtStart = nil
 	return out
 }
 
