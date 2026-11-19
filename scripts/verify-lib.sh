@@ -795,11 +795,15 @@ check_store_proxy() {
 
 # check_plane_policies succeeds when each harness plane policy that the allow list names for the role exists with the label
 # cell.poc.internal/harness. The apply engine spares these policies, so a missing one is not restored by a bundle.
+# With no live cell, the envd render leaves out both plane-cells policies (components/envd/render.sh), so they are not required
+# then. check_admit_lists compares their lists with the live cells.
 check_plane_policies() {
-  local role ns name json problems=()
+  local role ns name json live problems=()
   role="$(bundle_role)" || return 1
+  live="$(live_cells)" || { echo "$live"; return 1; }
   while read -r ns name; do
     [[ -n "$name" ]] || continue
+    [[ "$name" != plane-cells || -n "$live" ]] || continue
     if ! json="$(k -n "$ns" get networkpolicy "$name" -o json 2>/dev/null)"; then
       problems+=("NetworkPolicy $ns/$name is absent")
     elif ! jq -e '(.metadata.labels["cell.poc.internal/harness"] // "") != ""' >/dev/null <<<"$json"; then

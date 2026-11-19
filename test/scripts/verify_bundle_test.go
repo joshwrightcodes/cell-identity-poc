@@ -174,6 +174,7 @@ func TestVerifyBundleChecks(t *testing.T) {
 	for _, tc := range []struct {
 		name, check, cell string
 		files             map[string]string
+		env               []string // more environment, for example the clusters that kind lists
 		want              []string // substrings of the output; nil means the check passes
 		deny              []string // substrings that the output of a failed check does not hold
 		diff              []string // substrings of the guards that the check renders
@@ -266,6 +267,11 @@ func TestVerifyBundleChecks(t *testing.T) {
 		{name: "plane policies: a policy of dev-cp is absent", check: "check_plane_policies", cell: "dev-cp",
 			files: with(cpFiles(), map[string]string{"policy-plane-upstream.json": ""}),
 			want:  []string{"NetworkPolicy relay-system/plane-upstream is absent", up("dev-cp")}},
+		{name: "plane policies ok in dev-cp with no live cell: the render leaves out plane-cells", check: "check_plane_policies", cell: "dev-cp",
+			files: with(cpFiles(), map[string]string{"policy-plane-cells.json": ""}), env: []string{"STUB_KIND=management dev-cp rogue"}},
+		{name: "plane policies: plane-cells is absent in dev-cp with live cells", check: "check_plane_policies", cell: "dev-cp",
+			files: with(cpFiles(), map[string]string{"policy-plane-cells.json": ""}),
+			want:  []string{"NetworkPolicy spire-system/plane-cells is absent", "NetworkPolicy relay-system/plane-cells is absent", up("dev-cp")}},
 		{name: "plane policies: a policy of dev-cp has no harness label", check: "check_plane_policies", cell: "dev-cp",
 			files: with(cpFiles(), map[string]string{"policy-envd.json": policy("")}),
 			want:  []string{"NetworkPolicy envd-system/envd has no label cell.poc.internal/harness", up("dev-cp")}},
@@ -308,6 +314,7 @@ source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"
 set +e; `+tc.check, "_", root)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=" + tc.cell,
 				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub}
+			cmd.Env = append(cmd.Env, tc.env...)
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err := cmd.Run()
