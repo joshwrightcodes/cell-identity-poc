@@ -3,6 +3,7 @@ package agentban
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -38,7 +39,12 @@ type spireFake struct {
 func newSpireFake(t *testing.T) (*spireFake, string) {
 	t.Helper()
 	f := &spireFake{evicted: map[string]bool{}, pageSize: 2}
-	sock := filepath.Join(t.TempDir(), "api.sock")
+	dir, err := os.MkdirTemp("", "ab")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "a.sock")
 	lis, err := net.Listen("unix", sock)
 	if err != nil {
 		t.Fatal(err)
@@ -58,6 +64,12 @@ func (f *spireFake) add(attest, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agents = append(f.agents, &fakeAgent{id: id, attest: attest})
+}
+
+func (f *spireFake) addBanned(attest, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agents = append(f.agents, &fakeAgent{id: id, attest: attest, banned: true})
 }
 
 func (f *spireFake) evict(id string) {
@@ -101,6 +113,9 @@ func (f *spireFake) ListAgents(_ context.Context, req *agentv1.ListAgentsRequest
 	var match []*fakeAgent
 	for _, a := range f.agents {
 		if t := req.GetFilter().GetByAttestationType(); t != "" && t != a.attest {
+			continue
+		}
+		if b := req.GetFilter().GetByBanned(); b != nil && b.GetValue() != a.banned {
 			continue
 		}
 		match = append(match, a)

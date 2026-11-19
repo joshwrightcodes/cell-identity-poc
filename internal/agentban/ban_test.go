@@ -146,8 +146,14 @@ func TestBanNotFoundIsDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Once: %v; NotFound must count as done", err)
 	}
-	if n != 2 {
-		t.Fatalf("Once = %d, want 2 (an evicted agent counts as done)", n)
+	if n != 1 {
+		t.Fatalf("Once = %d, want 1 (an evicted agent is done and not counted)", n)
+	}
+	if !strings.Contains(h.logs.String(), `"msg":"agent_gone"`) || strings.Contains(h.logs.String(), `"agent_id":"`+gone+`","source"`) {
+		t.Fatalf("an evicted agent must log agent_gone and not agent_banned: %s", h.logs)
+	}
+	if strings.Count(h.logs.String(), `"msg":"agent_banned"`) != 1 {
+		t.Fatalf("want one agent_banned line: %s", h.logs)
 	}
 	if got, want := h.fake.banned(), []string{agentID("dev-cell-2", "u3")}; !slices.Equal(got, want) {
 		t.Fatalf("banned %v, want %v", got, want)
@@ -161,5 +167,65 @@ func TestBanPagesThroughTheList(t *testing.T) {
 	}
 	if n, err := Once(context.Background(), h.cfg); err != nil || n != 5 {
 		t.Fatalf("Once = %d, %v; want 5", n, err)
+	}
+}
+
+func TestListAsksForUnbannedAgentsOnly(t *testing.T) {
+	h := newHarness(t, revoked("dev-cell-2"), nil)
+	h.fake.addBanned("cluster_jwt", agentID("dev-cell-2", "u1"))
+	h.fake.add("cluster_jwt", agentID("dev-cell-2", "u2"))
+	agents, err := h.cfg.API.List(context.Background())
+	if err != nil || len(agents) != 1 || agents[0].Banned {
+		t.Fatalf("List = %v, %v; want the one unbanned agent", agents, err)
+	}
+	for _, f := range h.fake.filters {
+		if b := f.GetByBanned(); b == nil || b.GetValue() {
+			t.Fatalf("list filter %v lacks by_banned=false", f)
+		}
+	}
+}
+
+type failingList struct{ API }
+
+func (failingList) List(context.Context) ([]Agent, error) { return nil, errors.New("socket closed") }
+
+func TestListRunsWithoutRevokedCells(t *testing.T) {
+	h := newHarness(t, revoked(), nil)
+	h.cfg.API = failingList{h.cfg.API}
+	if _, err := Once(context.Background(), h.cfg); err == nil {
+		t.Fatal("Once with an empty set and a failed list returned nil")
+	}
+}
+
+func TestCellOfSegments(t *testing.T) {
+	pre := "spiffe://" + testDomain + "/spire/agent/cluster_jwt/"
+	for _, tc := range []struct {
+		id   string
+		cell string
+		ok   bool
+	}{
+		{pre + "dev-cell-2/u1/h1", "dev-cell-2", true},
+		{pre + "dev-cell-2", "", false},
+		{pre + "dev-cell-2/u1", "", false},
+		{pre + "dev-cell-2/u1/h1/x", "", false},
+		{pre + "dev-cell-2//h1", "", false},
+		{pre + "/u1/h1", "", false},
+		{"spiffe://other.test/spire/agent/cluster_jwt/dev-cell-2/u1/h1", "", false},
+	} {
+		cell, ok := cellOf(testDomain, tc.id)
+		if cell != tc.cell || ok != tc.ok {
+			t.Errorf("cellOf(%q) = %q, %v; want %q, %v", tc.id, cell, ok, tc.cell, tc.ok)
+		}
+	}
+}
+
+func TestBanSkipsMalformedSegmentCounts(t *testing.T) {
+	h := newHarness(t, revoked("dev-cell-2"), nil)
+	pre := "spiffe://" + testDomain + "/spire/agent/cluster_jwt/"
+	for _, id := range []string{pre + "dev-cell-2", pre + "dev-cell-2/u1", pre + "dev-cell-2/u1/h1/x"} {
+		h.fake.add("cluster_jwt", id)
+	}
+	if n, err := Once(context.Background(), h.cfg); err != nil || n != 0 || h.fake.banCalls() != 0 {
+		t.Fatalf("Once = %d, %v, %d ban calls; want none", n, err, h.fake.banCalls())
 	}
 }

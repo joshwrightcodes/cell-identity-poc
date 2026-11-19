@@ -19,6 +19,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 )
@@ -33,9 +34,12 @@ type Agent struct {
 type API interface {
 	// List returns the agents that the cluster_jwt plugin attested.
 	List(ctx context.Context) ([]Agent, error)
-	// Ban bans one agent. An agent that the server no longer holds counts as banned.
+	// Ban bans one agent. It returns ErrGone when the server no longer holds the agent.
 	Ban(ctx context.Context, id string) error
 }
+
+// ErrGone means that the server no longer holds the agent. The agent cannot renew, so the ban is done.
+var ErrGone = errors.New("agent not found")
 
 // Config is the setting of the ban loop.
 type Config struct {
@@ -71,7 +75,10 @@ func (a *agentAPI) List(ctx context.Context) ([]Agent, error) {
 	for {
 		cctx, cancel := context.WithTimeout(ctx, callLimit)
 		resp, err := a.c.ListAgents(cctx, &agentv1.ListAgentsRequest{
-			Filter:    &agentv1.ListAgentsRequest_Filter{ByAttestationType: clusterjwt.PluginName},
+			Filter: &agentv1.ListAgentsRequest_Filter{
+				ByAttestationType: clusterjwt.PluginName,
+				ByBanned:          wrapperspb.Bool(false),
+			},
 			PageSize:  pageSize,
 			PageToken: token,
 		})
@@ -101,7 +108,7 @@ func (a *agentAPI) Ban(ctx context.Context, id string) error {
 	defer cancel()
 	_, err := a.c.BanAgent(cctx, &agentv1.BanAgentRequest{Id: &types.SPIFFEID{TrustDomain: td, Path: "/" + path}})
 	if status.Code(err) == codes.NotFound {
-		return nil
+		return ErrGone
 	}
 	return err
 }
@@ -121,23 +128,34 @@ func cellOf(trustDomain, id string) (string, bool) {
 	return parts[0], true
 }
 
+// newCounter creates the counter of bans.
+func newCounter(m metric.Meter) (metric.Int64Counter, error) {
+	c, err := m.Int64Counter("agentban.bans", metric.WithDescription("Agents banned because their cell is revoked or retired"))
+	if err != nil {
+		return nil, fmt.Errorf("counter: %w", err)
+	}
+	return c, nil
+}
+
 // Once reads the refused cells and bans every agent of those cells that is not yet banned. It returns
-// the number of agents that it banned. A failed read bans nothing.
+// the number of agents that it banned. A failed read bans nothing. It lists the agents on every pass,
+// also when no cell is refused, so that a broken API connection shows at once.
 func Once(ctx context.Context, cfg Config) (int, error) {
+	counter, err := newCounter(cfg.Meter)
+	if err != nil {
+		return 0, err
+	}
+	return once(ctx, cfg, counter)
+}
+
+func once(ctx context.Context, cfg Config, counter metric.Int64Counter) (int, error) {
 	set, err := cfg.Read()
 	if err != nil {
 		return 0, fmt.Errorf("read revoked cells: %w", err)
 	}
-	if len(set.Cells) == 0 {
-		return 0, nil
-	}
 	agents, err := cfg.API.List(ctx)
 	if err != nil {
 		return 0, err
-	}
-	counter, err := cfg.Meter.Int64Counter("agentban.bans", metric.WithDescription("Agents banned because their cell is revoked or retired"))
-	if err != nil {
-		return 0, fmt.Errorf("counter: %w", err)
 	}
 	banned := 0
 	var errs []error
@@ -150,13 +168,16 @@ func Once(ctx context.Context, cfg Config) (int, error) {
 		if !refused {
 			continue
 		}
-		if err := cfg.API.Ban(ctx, ag.ID); err != nil {
+		switch err := cfg.API.Ban(ctx, ag.ID); {
+		case errors.Is(err, ErrGone):
+			cfg.Log.InfoContext(ctx, "agent_gone", "cell", cell, "source", source, "agent_id", ag.ID)
+		case err != nil:
 			errs = append(errs, fmt.Errorf("ban %s: %w", ag.ID, err))
-			continue
+		default:
+			banned++
+			counter.Add(ctx, 1, metric.WithAttributes(attribute.String("cell", cell), attribute.String("source", source)))
+			cfg.Log.InfoContext(ctx, "agent_banned", "cell", cell, "source", source, "agent_id", ag.ID)
 		}
-		banned++
-		counter.Add(ctx, 1, metric.WithAttributes(attribute.String("cell", cell), attribute.String("source", source)))
-		cfg.Log.InfoContext(ctx, "agent_banned", "cell", cell, "source", source, "agent_id", ag.ID)
 	}
 	return banned, errors.Join(errs...)
 }
@@ -167,10 +188,14 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Every <= 0 {
 		return errors.New("agentban: Every must be positive")
 	}
+	counter, err := newCounter(cfg.Meter)
+	if err != nil {
+		return err
+	}
 	tick := time.NewTicker(cfg.Every)
 	defer tick.Stop()
 	for {
-		if _, err := Once(ctx, cfg); err != nil && ctx.Err() == nil {
+		if _, err := once(ctx, cfg, counter); err != nil && ctx.Err() == nil {
 			cfg.Log.ErrorContext(ctx, "agent_ban_failed", "error", err.Error())
 		}
 		select {

@@ -9,11 +9,13 @@
 // cells that the plugin refuses from the server configuration and bans their agents through the SPIRE
 // server API:
 //
-//	cluster-jwt-server ban-agents --trust-domain <td> [--config /run/spire/config/server.conf]
-//	  [--socket /run/spire/sockets/api.sock] [--every 5s] [--health-listen 127.0.0.1:8086]
+//	cluster-jwt-server ban-agents [--server-config /run/spire/config/server.conf]
+//	  [--socket /run/spire/sockets/api.sock] [--every 10s] [--health 127.0.0.1:8086]
 //
-// The marks file that the configuration names has to be readable at the same path in this container.
-// Without it the container reads the marks as absent, which narrows the ban and never widens it.
+// The trust domain comes from the server configuration. The marks file that the configuration names has
+// to be readable at the same path in this container. Without it the container does not apply the
+// rollback marks of the plugin: after a restore to an older spec it can ban a cell that the plugin
+// admits. The deployment mounts the data directory read-only.
 package main
 
 import (

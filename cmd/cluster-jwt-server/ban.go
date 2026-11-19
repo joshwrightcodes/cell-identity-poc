@@ -8,8 +8,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync/atomic"
 	"time"
+
+	"github.com/hashicorp/hcl"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/agentban"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
@@ -30,6 +33,10 @@ type banDeps struct {
 	telemetry func(ctx context.Context, stdout io.Writer) (*telemetry.T, error)
 	api       func(socket string) (agentban.API, func() error, error)
 	read      func(configPath string) (clusterjwt.RevokedSet, error)
+	// trustDomain returns the trust domain of the server configuration.
+	trustDomain func(configPath string) (string, error)
+	// window is how long a failure may last before health turns 503. Zero means the default.
+	window time.Duration
 }
 
 func realBanDeps() banDeps {
@@ -39,31 +46,52 @@ func realBanDeps() banDeps {
 		},
 		api:  agentban.NewAgentAPI,
 		read: clusterjwt.ReadRevoked,
+
+		trustDomain: readTrustDomain,
 	}
 }
 
+// readTrustDomain returns server.trust_domain of the SPIRE server configuration, the value that the
+// cluster_jwt plugin reads too.
+func readTrustDomain(path string) (string, error) {
+	text, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read server config: %w", err)
+	}
+	var doc map[string]any
+	if err := hcl.Decode(&doc, string(text)); err != nil {
+		return "", fmt.Errorf("parse server config: %w", err)
+	}
+	servers, _ := doc["server"].([]map[string]any)
+	if len(servers) != 1 {
+		return "", errors.New("server config needs exactly one server block")
+	}
+	td, _ := servers[0]["trust_domain"].(string)
+	if td == "" {
+		return "", errors.New("server config has no server.trust_domain")
+	}
+	return td, nil
+}
+
 type banConfig struct {
-	config, socket, trustDomain, health string
-	every                               time.Duration
+	config, socket, health string
+	every                  time.Duration
 }
 
 func parseBan(args []string) (banConfig, error) {
 	fs := flag.NewFlagSet(banMode, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var c banConfig
-	fs.StringVar(&c.config, "config", "/run/spire/config/server.conf", "SPIRE server configuration that holds the cluster_jwt settings")
+	fs.StringVar(&c.config, "server-config", "/run/spire/config/server.conf", "SPIRE server configuration with the trust domain and the cluster_jwt settings")
 	fs.StringVar(&c.socket, "socket", "/run/spire/sockets/api.sock", "SPIRE server API socket")
-	fs.StringVar(&c.trustDomain, "trust-domain", "", "trust domain of the SPIRE server")
-	fs.StringVar(&c.health, "health-listen", "127.0.0.1:8086", "address of the health endpoint")
-	fs.DurationVar(&c.every, "every", 5*time.Second, "time between passes")
+	fs.StringVar(&c.health, "health", "127.0.0.1:8086", "address of the health endpoint")
+	fs.DurationVar(&c.every, "every", 10*time.Second, "time between passes")
 	if err := fs.Parse(args); err != nil {
 		return c, err
 	}
 	switch {
 	case fs.NArg() != 0:
 		return c, fmt.Errorf("unexpected argument %q", fs.Arg(0))
-	case c.trustDomain == "":
-		return c, errors.New("--trust-domain is required")
 	case c.every <= 0:
 		return c, errors.New("--every must be positive")
 	}
@@ -87,6 +115,11 @@ func banAgents(ctx context.Context, args []string, stdout io.Writer, d banDeps) 
 		defer cancel()
 		_ = tel.Shutdown(fctx)
 	}()
+	trustDomain, err := d.trustDomain(cfg.config)
+	if err != nil {
+		cli.Fail(stdout, banName, err)
+		return 1
+	}
 	api, closeAPI, err := d.api(cfg.socket)
 	if err != nil {
 		cli.Fail(stdout, banName, err)
@@ -94,10 +127,15 @@ func banAgents(ctx context.Context, args []string, stdout io.Writer, d banDeps) 
 	}
 	defer func() { _ = closeAPI() }()
 
-	// The endpoint is healthy while reads of the revoked set keep succeeding.
-	var lastOK atomic.Int64
-	lastOK.Store(time.Now().UnixNano())
-	window := max(3*cfg.every, minHealthyFor)
+	// The endpoint is healthy while reads of the revoked set and lists of the agents keep succeeding.
+	var lastRead, lastList atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	lastList.Store(time.Now().UnixNano())
+	api = healthAPI{API: api, ok: &lastList}
+	window := d.window
+	if window == 0 {
+		window = max(3*cfg.every, minHealthyFor)
+	}
 	ln, err := net.Listen("tcp", cfg.health)
 	if err != nil {
 		cli.Fail(stdout, banName, fmt.Errorf("health listener: %w", err))
@@ -105,8 +143,8 @@ func banAgents(ctx context.Context, args []string, stdout io.Writer, d banDeps) 
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		if time.Since(time.Unix(0, lastOK.Load())) > window {
-			http.Error(w, "the revoked set is unreadable", http.StatusServiceUnavailable)
+		if time.Since(time.Unix(0, lastRead.Load())) > window || time.Since(time.Unix(0, lastList.Load())) > window {
+			http.Error(w, "the revoked set or the agent list is unreadable", http.StatusServiceUnavailable)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
@@ -116,13 +154,13 @@ func banAgents(ctx context.Context, args []string, stdout io.Writer, d banDeps) 
 	go func() { _ = srv.Serve(ln) }()
 	defer func() { _ = srv.Close() }()
 
-	tel.Log.Info("ban-agents started", "trust_domain", cfg.trustDomain, "health", ln.Addr().String())
+	tel.Log.Info("ban-agents started", "trust_domain", trustDomain, "health", ln.Addr().String())
 	err = agentban.Run(ctx, agentban.Config{
-		TrustDomain: cfg.trustDomain,
+		TrustDomain: trustDomain,
 		Read: func() (clusterjwt.RevokedSet, error) {
 			set, err := d.read(cfg.config)
 			if err == nil {
-				lastOK.Store(time.Now().UnixNano())
+				lastRead.Store(time.Now().UnixNano())
 			}
 			return set, err
 		},
@@ -136,4 +174,18 @@ func banAgents(ctx context.Context, args []string, stdout io.Writer, d banDeps) 
 		return 1
 	}
 	return 0
+}
+
+// healthAPI records the time of the last good list.
+type healthAPI struct {
+	agentban.API
+	ok *atomic.Int64
+}
+
+func (h healthAPI) List(ctx context.Context) ([]agentban.Agent, error) {
+	agents, err := h.API.List(ctx)
+	if err == nil {
+		h.ok.Store(time.Now().UnixNano())
+	}
+	return agents, err
 }
