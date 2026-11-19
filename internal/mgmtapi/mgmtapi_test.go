@@ -7,9 +7,9 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -388,19 +388,30 @@ func TestRevocationReasons(t *testing.T) {
 	}
 	// Every other Reason constant of the package, from the source, must differ from the new ones.
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)
+	dir, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
+	var files []*ast.File
+	for _, de := range dir {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".go") || strings.HasSuffix(de.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, de.Name(), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+	}
 	seen := map[string]string{}
-	for _, f := range pkgs["mgmtapi"].Files {
+	for _, f := range files {
 		for _, decl := range f.Decls {
 			gd, ok := decl.(*ast.GenDecl)
 			if !ok || gd.Tok != token.CONST {
 				continue
 			}
-			for _, spec := range gd.Specs {
-				vs := spec.(*ast.ValueSpec)
+			for _, sp := range gd.Specs {
+				vs := sp.(*ast.ValueSpec)
 				for i, name := range vs.Names {
 					if !strings.HasPrefix(name.Name, "Reason") || i >= len(vs.Values) {
 						continue

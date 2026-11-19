@@ -164,6 +164,7 @@ func TestEntryRules(t *testing.T) {
 		{name: "extra_member", env: func(t *testing.T) []byte {
 			return editEnvelope(t, mustSign(t, good, key), func(m map[string]any) { m["pad"] = strings.Repeat("p", 2000) })
 		}},
+		{name: "canonical_form_too_large", body: `{"id":"0123456789abcdef","env":"dev","cell":"dev-cell-2","record":{"epoch":1,"counter":7},"issuedAt":"2026-11-20T03:04:05Z"` + strings.Repeat(" ", 1500) + `}`},
 		{name: "too_large_payload", body: `{"id":"0123456789abcdef","env":"dev","cell":"dev-cell-2","record":{"epoch":1,"counter":7},"issuedAt":"2026-11-20T03:04:05Z"` + strings.Repeat(" ", MaxEntryBytes) + `}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -333,6 +334,13 @@ func TestVerifyCanonicalForm(t *testing.T) {
 	big := bytes.Repeat([]byte("x"), MaxEntryBytes+1)
 	if _, err := Verify(big, keys); !errors.Is(err, ErrTooLarge) || !errors.Is(err, record.ErrDecode) {
 		t.Errorf("oversized input: %v, want ErrTooLarge and ErrDecode", err)
+	}
+	padded := signBody(t, `{"id":"0123456789abcdef","env":"dev","cell":"dev-cell-2","record":{"epoch":1,"counter":7},"issuedAt":"2026-11-20T03:04:05Z"`+strings.Repeat(" ", 1500)+`}`, key)
+	if len(padded) <= MaxCanonicalBytes || len(padded) > MaxEntryBytes {
+		t.Fatalf("padded envelope of %d bytes is outside the gap between the limits", len(padded))
+	}
+	if _, err := Verify(padded, keys); !errors.Is(err, ErrTooLarge) || !errors.Is(err, record.ErrDecode) {
+		t.Errorf("a signed padded body: %v, want ErrTooLarge and ErrDecode", err)
 	}
 	if _, err := Verify(bytes.Repeat([]byte("x"), MaxEntryBytes), keys); errors.Is(err, ErrTooLarge) {
 		t.Errorf("an input at the limit is too large: %v", err)

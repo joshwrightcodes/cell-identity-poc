@@ -32,8 +32,8 @@ const (
 // maxEnvLength is the longest env that a spec accepts.
 const maxEnvLength = 63
 
-// ErrTooLarge means an envelope is longer than MaxEntryBytes. Verify checks it before any parse,
-// and the error also wraps record.ErrDecode.
+// ErrTooLarge means an envelope is longer than MaxEntryBytes, which Verify checks before any parse,
+// or that its canonical form is longer than MaxCanonicalBytes. The error also wraps record.ErrDecode.
 var ErrTooLarge = errors.New("entry envelope is too large")
 
 var (
@@ -101,12 +101,12 @@ type canonicalSig struct {
 }
 
 // Verify checks the envelope against the trusted keys, decodes the entry strictly and checks its
-// shape. It accepts only the form that Sign writes, with any JSON whitespace and member order:
-// at most MaxEntryBytes, checked before any parse, no member besides payloadType, payload and
-// signatures, exactly one signature with no keyid, and the canonical standard base64 of the payload
-// and of the signature. It does not check the env, the cell records or the clock: Admit does. The
-// error wraps record.ErrPayloadType, record.ErrSignature or record.ErrDecode, and ErrTooLarge for an
-// envelope above the limit.
+// shape. It accepts only the form that Sign writes, with any JSON whitespace and member order: at
+// most MaxEntryBytes, checked before any parse, at most MaxCanonicalBytes in the form that Sign
+// writes, no member besides payloadType, payload and signatures, exactly one signature with no
+// keyid, and the canonical standard base64 of the payload and of the signature. It does not check
+// the env, the cell records or the clock: Admit does. The error wraps record.ErrPayloadType,
+// record.ErrSignature or record.ErrDecode, and ErrTooLarge for an envelope above a limit.
 func Verify(envelope []byte, keys []ed25519.PublicKey) (Entry, error) {
 	e, _, err := verify(envelope, keys)
 	return e, err
@@ -137,6 +137,9 @@ func verify(envelope []byte, keys []ed25519.PublicKey) (Entry, []byte, error) {
 	form, err := json.Marshal(env)
 	if err != nil {
 		return Entry{}, nil, fmt.Errorf("encode entry envelope: %w", err)
+	}
+	if len(form) > MaxCanonicalBytes {
+		return Entry{}, nil, fmt.Errorf("%w entry: %w: canonical form of %d bytes, limit %d", record.ErrDecode, ErrTooLarge, len(form), MaxCanonicalBytes)
 	}
 	body, err := record.VerifyEnvelope(form, PayloadType, keys)
 	if err != nil {
