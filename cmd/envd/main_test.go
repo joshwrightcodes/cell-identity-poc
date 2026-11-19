@@ -1087,3 +1087,25 @@ func TestEnvdRevocationFlags(t *testing.T) {
 		})
 	}
 }
+
+func TestEnvdRefillFlag(t *testing.T) {
+	base := planeBase(t)
+	parse := func(extra ...string) (runConfig, error) {
+		return parseRun(append(append(slices.Clone(base), planeFlags()...), extra...))
+	}
+	if cfg, err := parse(); err != nil || cfg.bundleRefillEvery != time.Minute {
+		t.Fatalf("default = %s, %v", cfg.bundleRefillEvery, err)
+	}
+	if cfg, err := parse("--bundle-refill-every", "30s"); err != nil || cfg.bundleRefillEvery != 30*time.Second {
+		t.Fatalf("30s = %s, %v", cfg.bundleRefillEvery, err)
+	}
+	if cfg, err := parse("--bundle-refill-every", "0s"); err != nil || cfg.bundleRefillEvery != 0 {
+		t.Fatalf("0s = %s, %v", cfg.bundleRefillEvery, err)
+	}
+	if _, err := parse("--bundle-refill-every", "-1s"); err == nil || !strings.Contains(err.Error(), "--bundle-refill-every") {
+		t.Fatalf("negative: %v", err)
+	}
+	if _, err := parseRun(append(slices.Clone(base), "--bundle-refill-every", "30s")); err == nil || !strings.Contains(err.Error(), "--bundle-mirror") {
+		t.Fatalf("without the mirror: %v", err)
+	}
+}

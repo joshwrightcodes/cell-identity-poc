@@ -25,6 +25,7 @@ const (
 	metricOutcomes          = "bundle.apply.outcomes"
 	metricDuration          = "bundle.apply.duration"
 	metricTerminateFailures = "bundle.rollback.terminate.failures"
+	metricRefills           = "bundle.store.refills"
 )
 
 type telemetry struct {
@@ -32,6 +33,7 @@ type telemetry struct {
 	outcomes          metric.Int64Counter
 	duration          metric.Float64Histogram
 	terminateFailures metric.Int64Counter
+	refills           metric.Int64Counter
 }
 
 func newTelemetry(tr trace.Tracer, m metric.Meter) (telemetry, error) {
@@ -54,7 +56,11 @@ func newTelemetry(tr trace.Tracer, m metric.Meter) (telemetry, error) {
 	if err != nil {
 		return telemetry{}, err
 	}
-	return telemetry{tracer: tr, outcomes: outcomes, duration: duration, terminateFailures: terminateFailures}, nil
+	refills, err := m.Int64Counter(metricRefills, metric.WithDescription("Refills of the in-cluster bundle store, by outcome."))
+	if err != nil {
+		return telemetry{}, err
+	}
+	return telemetry{tracer: tr, outcomes: outcomes, duration: duration, terminateFailures: terminateFailures, refills: refills}, nil
 }
 
 // step starts a child span and returns the function that ends it. The function records err on the span.

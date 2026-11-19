@@ -9,6 +9,7 @@
 package ocistore
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -44,6 +45,8 @@ var (
 	ErrOffHost         = errors.New("request to another host refused")
 	ErrContentEncoding = errors.New("content encoding refused")
 	ErrWriteOnly       = errors.New("store is write-only")
+	// ErrBlobUnknown means that the registry refused a manifest because a blob that it names is absent.
+	ErrBlobUnknown = errors.New("manifest names a blob that the registry lacks")
 )
 
 const (
@@ -284,13 +287,15 @@ func mapErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	for _, sentinel := range []error{ErrDigestMismatch, ErrNotFound, ErrTooLarge, ErrDenied, ErrLayout, ErrOffHost, ErrContentEncoding} {
+	for _, sentinel := range []error{ErrDigestMismatch, ErrNotFound, ErrTooLarge, ErrDenied, ErrLayout, ErrOffHost, ErrContentEncoding, ErrBlobUnknown} {
 		if errors.Is(err, sentinel) {
 			return err
 		}
 	}
 	var status remoteerrors.ErrUnexpectedStatus
 	switch {
+	case errors.As(err, &status) && status.StatusCode == http.StatusBadRequest && bytes.Contains(status.Body, []byte("MANIFEST_BLOB_UNKNOWN")):
+		return fmt.Errorf("%w: %w", ErrBlobUnknown, err)
 	case errdefs.IsNotFound(err):
 		return fmt.Errorf("%w: %w", ErrNotFound, err)
 	case errors.Is(err, docker.ErrInvalidAuthorization):

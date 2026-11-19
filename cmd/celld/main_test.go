@@ -1107,3 +1107,31 @@ func TestBundleFlagsReachTheEngineConfig(t *testing.T) {
 		t.Errorf("state = %+v", cfg.State)
 	}
 }
+
+func TestCelldRefillFlag(t *testing.T) {
+	mirror := []string{"--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "s:5000", "--bundle-store-token", "/t"}
+	parse := func(extra ...string) (options, error) {
+		return parseOptions(bundleArgs(t, append(slices.Clone(mirror), extra...)...), testEnv)
+	}
+	if o, err := parse(); err != nil || o.bundleRefillEvery != time.Minute {
+		t.Fatalf("default = %s, %v", o.bundleRefillEvery, err)
+	}
+	if o, err := parse("--bundle-refill-every", "30s"); err != nil || o.bundleRefillEvery != 30*time.Second {
+		t.Fatalf("30s = %s, %v", o.bundleRefillEvery, err)
+	}
+	if o, err := parse("--bundle-refill-every", "0s"); err != nil || o.bundleRefillEvery != 0 {
+		t.Fatalf("0s = %s, %v", o.bundleRefillEvery, err)
+	}
+	if _, err := parse("--bundle-refill-every", "-1s"); err == nil || !strings.Contains(err.Error(), "--bundle-refill-every") {
+		t.Fatalf("negative: %v", err)
+	}
+	if _, err := parse("--bundle-refill-every", "often"); err == nil {
+		t.Fatal("a value that is not a duration was accepted")
+	}
+	if _, err := parseOptions(bundleArgs(t, "--bundle-refill-every", "30s"), testEnv); err == nil || !strings.Contains(err.Error(), "--bundle-mirror") {
+		t.Fatalf("without the mirror: %v", err)
+	}
+	if o, err := parseOptions(bundleArgs(t), testEnv); err != nil || o.bundleMirror != "" {
+		t.Fatalf("no bundle flags: %+v, %v", o, err)
+	}
+}

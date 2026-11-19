@@ -83,6 +83,8 @@ const (
 	loadTimeout = 15 * time.Second
 	// kubeTimeout bounds each request to the Kubernetes API.
 	kubeTimeout = 15 * time.Second
+	// defaultBundleRefillEvery is the time between probes of the bundle store.
+	defaultBundleRefillEvery = time.Minute
 	// defaultBundleHealthTimeout is the time that a new bundle set has to become healthy.
 	defaultBundleHealthTimeout = 5 * time.Minute
 	// exitConfig is the status of a configuration error.
@@ -258,10 +260,11 @@ type runConfig struct {
 	bundleHealthTimeout time.Duration
 	// operatorKeyFile is the pin of the operator keys, and operatorKeys the keys that it held at
 	// startup. They go with revocationsNS and revocationsName, the input of the local revocations.
-	operatorKeyFile string
-	operatorKeys    []ed25519.PublicKey
-	revocationsNS   string
-	revocationsName string
+	operatorKeyFile   string
+	operatorKeys      []ed25519.PublicKey
+	revocationsNS     string
+	revocationsName   string
+	bundleRefillEvery time.Duration
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -288,6 +291,7 @@ func parseRun(args []string) (runConfig, error) {
 	healthTimeout := fs.Duration("bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
 	operatorKeyFile := fs.String("operator-key-file", "", "file with the pinned operator public keys, one standard base64 key on each line")
 	revocations := fs.String("revocations-configmap", "", "ConfigMap that holds the signed local revocation entries, as <namespace>/<name>")
+	refillEvery := fs.Duration("bundle-refill-every", defaultBundleRefillEvery, "time between probes of the bundle store, which refills it after a loss; 0 turns the probe off")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
@@ -356,7 +360,7 @@ func parseRun(args []string) (runConfig, error) {
 		configMap: cm, interval: *interval, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
 		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
-		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout}
+		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout, bundleRefillEvery: *refillEvery}
 	if err := checkPlaneFlags(&rc, fs, *state); err != nil {
 		return runConfig{}, err
 	}
@@ -430,7 +434,7 @@ func checkPlaneFlags(rc *runConfig, fs *flag.FlagSet, state string) error {
 		return errors.New("--cluster must be a DNS label")
 	}
 	if rc.bundleMirror == "" {
-		for _, n := range []string{"bundle-store", "bundle-store-token", "bundle-state-configmap", "bundle-health-timeout"} {
+		for _, n := range []string{"bundle-store", "bundle-store-token", "bundle-state-configmap", "bundle-health-timeout", "bundle-refill-every"} {
 			if set[n] {
 				return fmt.Errorf("--%s needs --bundle-mirror", n)
 			}
@@ -443,6 +447,9 @@ func checkPlaneFlags(rc *runConfig, fs *flag.FlagSet, state string) error {
 	}
 	if rc.bundleHealthTimeout <= 0 {
 		return errors.New("--bundle-health-timeout must be positive")
+	}
+	if rc.bundleRefillEvery < 0 {
+		return errors.New("--bundle-refill-every must not be negative")
 	}
 	var err error
 	rc.bundleNS, rc.bundleName, err = configMapRef("bundle-state-configmap", state)
@@ -497,6 +504,12 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		}
 	}
 	puller := envd.NewPuller(pc)
+	if pc.Plane != nil {
+		var refill sync.WaitGroup
+		rctx, stopRefill := context.WithCancel(ctx)
+		defer func() { stopRefill(); refill.Wait() }()
+		refill.Go(func() { pc.Plane.RunRefill(rctx) })
+	}
 
 	ln, err := net.Listen("tcp", cfg.healthListen)
 	if err != nil {
@@ -572,7 +585,7 @@ func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, t
 		HealthTimeout: cfg.bundleHealthTimeout,
 		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
 	})
-	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, Log: tel.Log})
+	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, RefillEvery: cfg.bundleRefillEvery, Log: tel.Log})
 }
 
 // planeKeys returns a function that reads the pinned key in path again on each call. A failed read

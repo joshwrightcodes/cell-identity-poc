@@ -6,6 +6,7 @@ package ocitest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -184,6 +185,14 @@ func (r *Registry) SeedManifest(name, tag, mediaType string, data []byte) string
 	return d
 }
 
+// Lose drops every blob and every manifest of every repository, as a store that lost its volume.
+func (r *Registry) Lose() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.repos = map[string]*repo{}
+	r.uploadRepo = map[string]string{}
+}
+
 // Blob returns the stored blob of a repository.
 func (r *Registry) Blob(name, digest string) ([]byte, bool) {
 	r.mu.Lock()
@@ -334,6 +343,11 @@ func (r *Registry) manifest(w http.ResponseWriter, req *http.Request, name, ref 
 		m := manifest{mediaType: req.Header.Get("Content-Type"), data: data}
 		r.mu.Lock()
 		rp := r.repo(name)
+		if absent := missingBlob(rp, m); absent != "" {
+			r.mu.Unlock()
+			http.Error(w, `{"errors":[{"code":"MANIFEST_BLOB_UNKNOWN","message":"blob unknown to registry","detail":"`+absent+`"}]}`, http.StatusBadRequest)
+			return
+		}
 		rp.manifests[d] = m
 		rp.manifests[ref] = m
 		r.mu.Unlock()
@@ -404,4 +418,34 @@ func accepts(accept, mediaType string) bool {
 		}
 	}
 	return false
+}
+
+// missingBlob returns the digest of the first blob that an image manifest names and the repository
+// lacks, as Distribution 3.1.2 refuses such a manifest with MANIFEST_BLOB_UNKNOWN. An index and a
+// body that is not an image manifest pass.
+func missingBlob(rp *repo, m manifest) string {
+	if m.mediaType != "application/vnd.oci.image.manifest.v1+json" {
+		return ""
+	}
+	var body struct {
+		Config struct {
+			Digest string `json:"digest"`
+		} `json:"config"`
+		Layers []struct {
+			Digest string `json:"digest"`
+		} `json:"layers"`
+	}
+	if json.Unmarshal(m.data, &body) != nil {
+		return ""
+	}
+	want := []string{body.Config.Digest}
+	for _, l := range body.Layers {
+		want = append(want, l.Digest)
+	}
+	for _, d := range want {
+		if _, ok := rp.blobs[d]; !ok && digestRe.MatchString(d) {
+			return d
+		}
+	}
+	return ""
 }

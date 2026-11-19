@@ -856,27 +856,28 @@ func (a *Applier) boundChecked(s *State, by string, added []fetched) []string {
 
 func (a *Applier) push(ctx context.Context, r *run) error {
 	st := a.cfg.Store
-	one := func(repo string, art bundle.Artifact) error {
-		if err := st.PushBlob(ctx, repo, art.ConfigDigest, art.Config); err != nil {
-			return err
-		}
-		if err := st.PushBlob(ctx, repo, art.LayerDigest, art.Layer); err != nil {
-			return err
-		}
-		if _, err := st.PushManifest(ctx, repo, "", bundle.MediaTypeManifest, art.Manifest); err != nil {
-			return err
-		}
-		return nil
-	}
 	for _, f := range r.fetched {
-		if err := one("bundles/"+f.comp.Name, f.art); err != nil {
+		if err := pushArtifact(ctx, st, "bundles/"+f.comp.Name, f.art); err != nil {
 			return fmt.Errorf("push component %s: %w", f.comp.Name, err)
 		}
 	}
-	if err := one(repoRoot, r.root); err != nil {
+	if err := pushArtifact(ctx, st, repoRoot, r.root); err != nil {
 		return fmt.Errorf("push root: %w", err)
 	}
 	return nil
+}
+
+// pushArtifact writes the blobs of art, then its manifest by digest, so that the registry finds
+// every blob that the manifest names.
+func pushArtifact(ctx context.Context, st *ocistore.Store, repo string, art bundle.Artifact) error {
+	if err := st.PushBlob(ctx, repo, art.ConfigDigest, art.Config); err != nil {
+		return err
+	}
+	if err := st.PushBlob(ctx, repo, art.LayerDigest, art.Layer); err != nil {
+		return err
+	}
+	_, err := st.PushManifest(ctx, repo, "", bundle.MediaTypeManifest, art.Manifest)
+	return err
 }
 
 func (a *Applier) tag(ctx context.Context, r *run, comps map[string]string) error {
