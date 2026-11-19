@@ -306,6 +306,11 @@ func (p *Plugin) parse(text, coreTrustDomain string) (*state, error) {
 		return nil, err
 	}
 	var opKeys []ed25519.PublicKey
+	for i, k := range cfg.OperatorPublicKeys {
+		if k == "" || strings.Contains(k, "\n") {
+			return nil, fmt.Errorf("operator_public_keys[%d] is empty or holds a line break", i)
+		}
+	}
 	if len(cfg.OperatorPublicKeys) > 0 {
 		opKeys, err = revoke.ParseKeys([]byte(strings.Join(cfg.OperatorPublicKeys, "\n")))
 		if err != nil {

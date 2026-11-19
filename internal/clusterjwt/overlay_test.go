@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -107,6 +108,77 @@ func TestAttestOverlayRevoked(t *testing.T) {
 	f.reload()
 	f.wantRevoked("dev-cell-1", "overlay")
 	f.wantAttests("dev-cell-2")
+	f.wantLog(`"overlay":1`)
+}
+
+func TestConfigureAppliesOverlay(t *testing.T) {
+	pub, op := newOperatorKey(t)
+	f := newFixture(t, fixtureOptions{})
+	f.putOverlay(envelopes(t, signEntry(t, op, testEnv, "dev-cell-1")))
+	f.reconfigure(t, operatorHCL(pub))
+	f.wantRevoked("dev-cell-1", "overlay")
+	f.wantAttests("dev-cell-2")
+}
+
+func junkArray(n int) []byte {
+	return []byte("[" + strings.Repeat("0,", n-1) + "0]")
+}
+
+func TestOverlayJunkIsBounded(t *testing.T) {
+	cases := map[string][]byte{
+		"too many bytes": []byte(`["` + strings.Repeat("a", maxOverlayBytes) + `"]`),
+		"junk array":     junkArray(500_000),
+		"too many items": junkArray(maxOverlayItems + 1),
+		"null":           []byte("null"),
+		"trailing close": []byte("[]]"),
+		"trailing value": []byte("[] []"),
+		"object":         []byte("{}"),
+	}
+	for name, junk := range cases {
+		t.Run(name, func(t *testing.T) {
+			f, op := overlayFixture(t)
+			f.putOverlay(envelopes(t, signEntry(t, op, testEnv, "dev-cell-1")))
+			f.reload()
+			f.putOverlay(junk)
+			f.reload()
+			if _, held := f.plugin.st.Load().overlay["dev-cell-1"]; !held {
+				t.Fatal("a junk file dropped the held entry")
+			}
+			f.wantLog("overlay_unreadable")
+			if n := strings.Count(f.logs.String(), "overlay_"); n > 3 {
+				t.Fatalf("%d overlay log lines, want at most 3", n)
+			}
+		})
+	}
+}
+
+func TestOverlayRefusalsAreSummarised(t *testing.T) {
+	f, _ := overlayFixture(t)
+	f.putOverlay(junkArray(maxOverlayItems))
+	f.reload()
+	if n := strings.Count(f.logs.String(), "overlay_entries_refused"); n != 1 {
+		t.Fatalf("%d summary lines, want 1:\n%s", n, f.logs.String())
+	}
+	f.wantLog(fmt.Sprintf(`"count":%d`, maxOverlayItems))
+	if st := f.plugin.st.Load(); st.overlayRefused != maxOverlayItems {
+		t.Fatalf("refused = %d, want %d", st.overlayRefused, maxOverlayItems)
+	}
+}
+
+func TestReadRevokedHostileOverlayStaysSmall(t *testing.T) {
+	pub, _ := newOperatorKey(t)
+	f := newFixture(t, fixtureOptions{})
+	f.putOverlay(junkArray(500_000))
+	conf := writeServerConf(t, f, f.cm.root, operatorHCL(pub))
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	if _, err := ReadRevoked(conf); err != nil {
+		t.Fatal(err)
+	}
+	runtime.ReadMemStats(&after)
+	if used := after.TotalAlloc - before.TotalAlloc; used > 8<<20 {
+		t.Fatalf("ReadRevoked allocated %d bytes for a hostile file", used)
+	}
 }
 
 func TestOverlayUnsignedIgnored(t *testing.T) {
@@ -115,7 +187,7 @@ func TestOverlayUnsignedIgnored(t *testing.T) {
 	f.putOverlay(envelopes(t, signEntry(t, other, testEnv, "dev-cell-1")))
 	f.reload()
 	f.wantAttests("dev-cell-1")
-	f.wantLog("overlay_entry_refused")
+	f.wantLog("overlay_entries_refused")
 	f.wantLog(revoke.DetailSignature)
 	if st := f.plugin.st.Load(); st.overlayRefused != 1 || len(st.overlay) != 0 {
 		t.Fatalf("refused = %d, held = %d, want 1 and 0", st.overlayRefused, len(st.overlay))
@@ -164,6 +236,7 @@ func TestOverlayNeedsOperatorKeys(t *testing.T) {
 	f.putOverlay(envelopes(t, signEntry(t, op, testEnv, "dev-cell-1")))
 	f.reload()
 	f.wantAttests("dev-cell-1")
+	f.wantLog("overlay_ignored")
 }
 
 func TestConfigOperatorKeys(t *testing.T) {
@@ -181,6 +254,7 @@ func TestConfigOperatorKeys(t *testing.T) {
 	bad := map[string]string{
 		"three":     operatorHCL(a, b, c),
 		"duplicate": operatorHCL(a, a),
+		"empty key": `operator_public_keys = ["` + base64.StdEncoding.EncodeToString(a) + `", ""]` + "\n",
 		"not a key": `operator_public_keys = ["AAAA"]` + "\n",
 	}
 	for name, extra := range bad {

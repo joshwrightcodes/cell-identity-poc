@@ -198,7 +198,8 @@ func (p *Plugin) logReloaded(old *state, snap *snapshot) {
 	}
 	cells := slices.Sorted(maps.Keys(snap.digests))
 	p.log.Info("records reloaded", "spec_epoch", snap.spec.Epoch, "spec_counter", snap.spec.Counter,
-		"records", len(snap.records), "added", added, "changed", changed, "dropped", dropped, "cells", cells)
+		"records", len(snap.records), "added", added, "changed", changed, "dropped", dropped, "cells", cells,
+		"overlay", len(snap.overlay), "overlay_refused", snap.overlayRefused)
 }
 
 // resolveDir returns the directory that one load reads. A ConfigMap volume holds a ..data link to the

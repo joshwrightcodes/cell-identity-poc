@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"os"
 	"slices"
@@ -29,10 +30,52 @@ const (
 	SourceRetired = "retired"
 )
 
+// The bounds of the overlay file. A file that holds the most that envd writes, MaxHeld envelopes of at
+// most MaxEntryBytes each, stays below maxOverlayBytes. maxOverlayItems allows duplicates and junk
+// beside them.
+const (
+	maxOverlayBytes = revoke.MaxHeld*revoke.MaxEntryBytes + 4<<10
+	maxOverlayItems = 2 * revoke.MaxHeld
+)
+
+// errOverlayShape means the file is not one JSON array of at most maxOverlayItems values.
+var errOverlayShape = errors.New("the file is not one JSON array of a bounded size")
+
+// splitOverlay returns the items of the file, or an error when the file is above the bounds, is not
+// exactly one array, or is null.
+func splitOverlay(data []byte) ([]json.RawMessage, error) {
+	if len(data) > maxOverlayBytes {
+		return nil, errOverlayShape
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return nil, errOverlayShape
+	}
+	var items []json.RawMessage
+	for dec.More() {
+		if len(items) == maxOverlayItems {
+			return nil, errOverlayShape
+		}
+		var it json.RawMessage
+		if err := dec.Decode(&it); err != nil {
+			return nil, errOverlayShape
+		}
+		items = append(items, it)
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
+		return nil, errOverlayShape
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errOverlayShape
+	}
+	return items, nil
+}
+
 // loadOverlay returns the overlay of one load and the count of entries that the load skipped. An entry
 // that does not verify under the operator keys or names another environment is skipped, and it never
-// refuses a cell. A file that exists and cannot be read keeps the overlay of base, because dropping
-// held entries would admit cells that an operator revoked.
+// refuses a cell. A file that exists and cannot be read, or that is above the bounds, keeps the overlay
+// of base, because dropping held entries would admit cells that an operator revoked. The first load,
+// and a load after a change of the operator keys, has no base, so it holds nothing from an unreadable file.
 func (p *Plugin) loadOverlay(raw *rawLoad, cfg, base *state, note func(func(string, ...any), string, string, ...any)) (revoke.Held, int) {
 	var keep revoke.Held
 	if base != nil && keysEqual(base.operatorKeys, cfg.operatorKeys) {
@@ -45,21 +88,37 @@ func (p *Plugin) loadOverlay(raw *rawLoad, cfg, base *state, note func(func(stri
 	if raw.overlayErr != nil {
 		return fail("the file is not a small regular file")
 	}
-	if raw.overlay == nil || len(cfg.operatorKeys) == 0 {
+	if raw.overlay == nil {
 		return nil, 0
 	}
-	var items []json.RawMessage
-	dec := json.NewDecoder(bytes.NewReader(raw.overlay))
-	if err := dec.Decode(&items); err != nil || dec.More() {
-		return fail("the file is not a JSON array")
+	items, err := splitOverlay(raw.overlay)
+	if err != nil {
+		return fail(err.Error())
+	}
+	if len(cfg.operatorKeys) == 0 {
+		if len(items) > 0 {
+			note(p.log.Warn, "overlay_ignored", overlayFile, "reason", "no operator_public_keys", "entries", len(items))
+		}
+		return nil, 0
 	}
 	envelopes := make([][]byte, len(items))
 	for i, it := range items {
 		envelopes[i] = it
 	}
 	held, refusals := revoke.Load(envelopes, cfg.operatorKeys, cfg.env)
-	for i, r := range refusals {
-		note(p.log.Warn, "overlay_entry_refused", overlayFile, "reason", r.Reason, "detail", r.Detail, "cell", r.Cell, "id", r.ID, "entry", i)
+	type group struct{ reason, detail string }
+	counts := map[group]int{}
+	first := map[group]revoke.Refusal{}
+	for _, r := range refusals {
+		g := group{r.Reason, r.Detail}
+		if counts[g] == 0 {
+			first[g] = r
+		}
+		counts[g]++
+	}
+	for g, n := range counts {
+		note(p.log.Warn, "overlay_entries_refused", overlayFile, "reason", g.reason, "detail", g.detail, "count", n,
+			"first_cell", first[g].Cell, "first_id", first[g].ID)
 	}
 	return held, len(refusals)
 }
