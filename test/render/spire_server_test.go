@@ -389,6 +389,7 @@ func renderScript(t *testing.T, component, binary string, env ...string) result 
 // make images.env missing or older than the Go sources. STUB_TRUST_DOMAIN sets the trust domain of
 // the bundle that the stub server prints. STUB_CELL=<cluster> loads cells/common.env and
 // cells/<cluster>.env first, as hydrate does. The other values of env then override them.
+// STUB_SLOW_YQ=<text> slows each yq call whose arguments contain the text (testtool.SlowWrapper).
 func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string) result {
 	t.Helper()
 	testtool.Need(t, "yq", "jq", "tar", "bash", "go")
@@ -411,6 +412,9 @@ func runStubbed(t *testing.T, binary, stdin string, argv []string, env ...string
 	write("kubectl", stubKubectl, 0o755)
 	write("docker", stubDocker, 0o755)
 	write("kind", stubKind, 0o755)
+	if match := opts["STUB_SLOW_YQ"]; match != "" {
+		write("yq", testtool.SlowWrapper("yq", match), 0o755)
+	}
 	hostsvcServe := write("hostsvc-serve", stubHostsvcServe, 0o755)
 	layerBytes := layerTarGz(t, binary)
 	layer := write("layer.tar.gz", string(layerBytes), 0o644)

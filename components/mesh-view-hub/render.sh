@@ -181,8 +181,9 @@ rendered_strategy="$(yq -N 'select(.kind == "ConfigMap" and .metadata.name == "k
 [[ "$rendered_strategy" == anonymous ]] || die "the rendered Kiali config sets auth.strategy '$rendered_strategy', not anonymous, and the login signing key is predictable"
 kinds="$(yq -N '.kind' <<<"$kiali" | sort | paste -sd' ' -)"
 [[ "$kinds" == "ConfigMap Deployment Role RoleBinding Service ServiceAccount" ]] || die "the kiali-server chart renders '$kinds', and the hub expects ConfigMap Deployment Role RoleBinding Service ServiceAccount"
-! yq -N 'select(.kind == "Role") | .rules[].resources[]' <<<"$kiali" | grep -qx 'pods/portforward' \
-  || die "a rule of the kiali viewer Role still names pods/portforward"
+# The guard reads the whole list before it searches it: grep -q in a pipe can end yq with SIGPIPE, and pipefail would read that as no match.
+role_resources="$(yq -N 'select(.kind == "Role") | .rules[].resources[]' <<<"$kiali")" || die "could not read the rules of the kiali viewer Role"
+! grep -qx 'pods/portforward' <<<"$role_resources" || die "a rule of the kiali viewer Role still names pods/portforward"
 
 # The home cluster cache of Kiali watches each namespace of the list too, even with
 # ignore_home_cluster, and it stops when the API server refuses one. So the viewer Role and its
