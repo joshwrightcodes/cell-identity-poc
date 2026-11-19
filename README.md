@@ -793,7 +793,7 @@ Run `mise run images`, roll `celld` and `envd` as the row for `allow.json` says,
 - `mgmtd` signed the root in the bundle state. `cosign` verifies it offline on the Mac, as `bundle -- verify` does. A bootstrap state fails this check, and the output says to run `mise run bundle -- publish --target <target> --wait`.
 - The guards that keep Argo CD away from the harness equal their render. A cell has `bundles-spare-harness` and `bundles-app-limits`. `dev-cp` has `bundles-spare-harness`.
 - The store proxy admits the one writer of the role and the token client of the repo server, with the audience `bundle-store`.
-- Each harness plane policy of the role exists with its label.
+- Each harness plane policy of the role exists with its label. The policies `plane-cells` in `spire-system` and `relay-system` are not required while no cell is live, because the `envd` render leaves them out.
 - The allow-list digest that the applier reports equals the annotation of each AppProject.
 
 In `management`, it makes only the check of the store proxy, which has no writer.
@@ -1594,6 +1594,20 @@ M7 measured values come from the live part of M7. Each value below is a marker u
 | `gate:m7`, two runs | 731 seconds and 737 seconds (2026-11-18), both pass, 13 tests. The slowest test is `TestM7InterceptCellProxyHops`, about 5.4 minutes |
 | `GATE_M7_BUDGET_MINUTES` | 20 minutes, 1.5 times the slower run, rounded up to 5 minutes. The go test timeout is 40 minutes |
 | Longest policy window of a new pod in `dev-cell-1` | 807 ms to 1.1.1.1:443 and 801 ms to the SPIRE node port of `dev-cp` (2026-11-18, four runs) |
+
+M8 measured values come from the live part of M8:
+
+| Value | Result |
+| --- | --- |
+| `harness:up` on a live harness | 213.64 seconds, 2026-11-19. Step 8 published a signed set to `dev-cp` and to each cell |
+| `gate:m8`, two runs from a clean harness | 3993 seconds and 4007 seconds (2026-11-19), both pass, 22 tests of which 1 is skipped with `-short`. The slowest test is `TestM8BadArgocdSetNeedsRepair`, about 16 to 17 minutes |
+| `GATE_M8_LONG=1 mise run gate:m8 -- -run TestM8CpAdmitStageSigned` | 531 seconds (2026-11-19), pass |
+| `GATE_M8_BUDGET_MINUTES` and `GATE_M8_TEST_TIMEOUT_MINUTES` | 105 and 210 minutes, 1.5 times the slower run rounded up to 5 minutes, and twice the budget |
+| `gate:m3` | 2682 seconds (2026-11-19). A first run failed 16 tests, and the second run passed |
+| `gate:m5` | 3008 seconds (2026-11-19), pass |
+| `gate:m6` | 942 seconds (2026-11-19), pass |
+| `gate:m6:provision` | 1385 seconds (2026-11-19), pass. Both steps were done 14 minutes 4 seconds after the request |
+| `gate:m7` | 734 seconds (2026-11-19), pass |
 
 ## Malicious cell tests
 
