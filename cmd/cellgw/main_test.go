@@ -18,11 +18,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gateway"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
 
@@ -174,6 +179,11 @@ func startServeWith(t *testing.T, args func(dir, key string) []string) *running 
 	t.Helper()
 	dir := shortDir(t)
 	key, _ := keyFile(t, dir)
+	return startServeIn(t, dir, key, args)
+}
+
+func startServeIn(t *testing.T, dir, key string, args func(dir, key string) []string) *running {
+	t.Helper()
 	out := &lockedBuffer{}
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &running{out: out, cancel: cancel, done: make(chan int, 1), dir: dir}
@@ -444,3 +454,82 @@ func TestCellgwOperatorKeyFlag(t *testing.T) {
 }
 
 func ptr(s string) *string { return &s }
+
+// seedOverlay stores a verified revocation of dev-cell-1 in the data directory, the way a gateway
+// that ran before leaves it.
+func seedOverlay(t *testing.T, dir string, specPriv ed25519.PrivateKey, opPub ed25519.PublicKey, opPriv ed25519.PrivateKey) {
+	t.Helper()
+	ctx := context.Background()
+	if err := os.MkdirAll(filepath.Join(dir, "data"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	st, err := gateway.Open(ctx, filepath.Join(dir, "data", "queue.db"), nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	specPub := specPriv.Public().(ed25519.PublicKey)
+	cellPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	jwks, err := (jose.JSONWebKey{Key: cellPub, KeyID: "k1", Algorithm: "EdDSA", Use: "sig"}).MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwks, _ = json.Marshal(map[string]any{"keys": []json.RawMessage{jwks}})
+	c := record.Cell{Name: "dev-cell-1", Env: "dev", Issuer: "https://dev-cell-1.example", JWKS: jwks,
+		Subjects: []record.Subject{{Namespace: "ns", ServiceAccount: "sa"}}, Epoch: 1, Counter: 1}
+	renv, err := record.Sign(c, specPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, payload, err := record.VerifyWithPayload(renv, []ed25519.PublicKey{specPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1 := spec.Revision{Epoch: 1, Counter: 1}
+	senv, err := spec.Sign(spec.Spec{Env: "dev", Revision: r1, Retired: []spec.Retired{},
+		Cells: []spec.Entry{{Name: "dev-cell-1", Revision: r1, RecordSHA256: spec.RecordDigest(payload)}}}, specPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplySync(ctx, senv, map[string]json.RawMessage{"dev-cell-1": renv}, []ed25519.PublicKey{specPub}); err != nil {
+		t.Fatal(err)
+	}
+	entry, err := revoke.Sign(revoke.Entry{ID: "0123456789abcdef", Env: "dev", Cell: "dev-cell-1", Record: r1, IssuedAt: time.Now().UTC()}, opPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetRevocations(ctx, []json.RawMessage{entry}, []ed25519.PublicKey{opPub}, "dev"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// After a restart, the gateway refuses an overlaid cell before it gets any sync.
+func TestCellgwStartupReverifiesOverlay(t *testing.T) {
+	dir := shortDir(t)
+	key, specPriv := keyFile(t, dir)
+	opPub, opPriv, _ := ed25519.GenerateKey(rand.Reader)
+	opFile := filepath.Join(dir, "operator.pub")
+	if err := os.WriteFile(opFile, []byte(base64.StdEncoding.EncodeToString(opPub)+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedOverlay(t, dir, specPriv, opPub, opPriv)
+	r := startServeIn(t, dir, key, func(dir, key string) []string { return serveArgs(dir, key, "--operator-key-file", opFile) })
+	client := &http.Client{Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h2"}}, ForceAttemptHTTP2: true}}
+	defer client.CloseIdleConnections()
+	resp, err := client.Get("https://" + r.fields["bind"].(string) + gwapi.NoncePath("dev-cell-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("nonce of an overlaid cell: status %d", resp.StatusCode)
+	}
+	for _, l := range strings.Split(r.out.String(), "\n") {
+		var m map[string]any
+		if json.Unmarshal([]byte(l), &m) == nil && m["msg"] == "bind_denied" && m["reason"] == gwapi.ReasonCellRevoked {
+			return
+		}
+	}
+	t.Fatalf("no bind_denied with reason cell_revoked: %s", r.out.String())
+}

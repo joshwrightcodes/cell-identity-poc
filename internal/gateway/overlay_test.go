@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
@@ -142,30 +144,226 @@ func TestOverlayUnsignedIgnored(t *testing.T) {
 	if err := e.st.SetRevocations(context.Background(), list, good.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
-	if overlaid(t, e.st, cell1) || overlaid(t, e.st, cell2) {
-		t.Fatal("an unsigned or foreign entry holds a cell")
+	if overlaid(t, e.st, cell1) || overlaid(t, e.st, cell2) || e.st.OverlayCount() != 0 {
+		t.Fatalf("an unsigned, foreign or unknown-cell entry holds a cell: %d held", e.st.OverlayCount())
 	}
 	if !strings.Contains(e.logs.String(), "revocation_refused") {
 		t.Fatalf("no refusal logged: %s", e.logs.String())
 	}
 }
 
-func TestOverlayStaleNewEntryIgnored(t *testing.T) {
+// A stale entry that envd still lists stays. A stale entry that envd no longer lists goes.
+func TestOverlayStaleEntryFollowsEnvdList(t *testing.T) {
 	e := newGwEnv(t)
 	op := newOperator(t)
+	ctx := context.Background()
+	entry := op.entry(t, cell1, rev(1, 1))
 	e.applyRevoked(3, false)
-	if err := e.st.SetRevocations(context.Background(), []json.RawMessage{op.entry(t, cell1, rev(1, 2))}, op.keys(), "dev"); err != nil {
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{entry}, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if !overlaid(t, e.st, cell1) {
+		t.Fatal("an entry that envd lists was dropped as stale")
+	}
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{entry}, op.keys(), "dev"); err != nil || !overlaid(t, e.st, cell1) {
+		t.Fatalf("a second sync with the entry dropped it: %v", err)
+	}
+	if strings.Contains(e.logs.String(), "revocation_settled") {
+		t.Fatalf("an entry that envd lists was logged as settled: %s", e.logs.String())
+	}
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{}, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if overlaid(t, e.st, cell1) {
-		t.Fatal("a stale entry holds the cell")
+		t.Fatal("a stale entry that envd no longer lists stays")
+	}
+	if !strings.Contains(e.logs.String(), "revocation_settled") {
+		t.Fatalf("no revocation_settled line: %s", e.logs.String())
+	}
+}
+
+// The gateway misses the revoked revision, the owner unrevokes, and the next sync brings the new
+// record and an empty list.
+func TestOverlaySkippedRevokedRevisionClears(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	e.revoke(op, cell1)
+	e.applyRevoked(3, false)
+	if err := e.st.SetRevocations(context.Background(), []json.RawMessage{}, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if overlaid(t, e.st, cell1) {
+		t.Fatal("a cell that a newer verified record unrevoked stays overlaid")
+	}
+}
+
+// At startup the nil list drops an entry that is stale against the stored records.
+func TestOverlayStartupDropsStale(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	e.revoke(op, cell1, cell2)
+	e.applyRevoked(2, false)
+	if err := e.st.SetRevocations(context.Background(), nil, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if e.st.OverlayCount() != 0 {
+		t.Fatalf("%d stale entries survive the startup load", e.st.OverlayCount())
+	}
+}
+
+func TestOverlayUnknownCellRefused(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	if err := e.st.SetRevocations(context.Background(), []json.RawMessage{op.entry(t, "dev-cell-9", rev(1, 1))}, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if e.st.OverlayCount() != 0 || overlaid(t, e.st, "dev-cell-9") {
+		t.Fatal("an entry for a cell with no record is held")
+	}
+}
+
+func names16(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("dev-cell-%02d", i+1)
+	}
+	return out
+}
+
+// bundleOf signs a spec at revision sr with one record at rr for each name.
+func (g *signer) bundleOf(sr, rr spec.Revision, names []string) bundle {
+	g.t.Helper()
+	b := bundle{records: map[string]json.RawMessage{}}
+	sp := spec.Spec{Env: g.env, Revision: sr, Retired: []spec.Retired{}}
+	for _, name := range names {
+		c := record.Cell{Name: name, Env: g.env, Issuer: "https://" + name + ".example", JWKS: g.jwks,
+			Subjects: []record.Subject{{Namespace: "ns", ServiceAccount: "sa"}}, Epoch: rr.Epoch, Counter: rr.Counter}
+		env, err := record.Sign(c, g.priv)
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		_, payload, err := record.VerifyWithPayload(env, g.keys())
+		if err != nil {
+			g.t.Fatal(err)
+		}
+		b.records[name] = env
+		sp.Cells = append(sp.Cells, spec.Entry{Name: name, Revision: rr, RecordSHA256: spec.RecordDigest(payload)})
+	}
+	env, err := spec.Sign(sp, g.priv)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	b.spec = env
+	return b
+}
+
+// Orphan entries that envd let go do not starve new entries at the cap.
+func TestOverlayOrphansDoNotStarveNewEntries(t *testing.T) {
+	f := newFixture(t)
+	g := newSigner(t)
+	op := newOperator(t)
+	ctx := context.Background()
+	names := names16(revoke.MaxHeld + 1)
+	if err := f.apply(g, g.bundleOf(rev(1, 1), rev(1, 1), names)); err != nil {
+		t.Fatal(err)
+	}
+	var list []json.RawMessage
+	for _, n := range names[:revoke.MaxHeld] {
+		list = append(list, op.entry(t, n, rev(1, 1)))
+	}
+	if err := f.s.SetRevocations(ctx, list, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if f.s.OverlayCount() != revoke.MaxHeld {
+		t.Fatalf("held %d, want %d", f.s.OverlayCount(), revoke.MaxHeld)
+	}
+	if err := f.apply(g, g.bundleOf(rev(1, 3), rev(1, 3), names)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.SetRevocations(ctx, []json.RawMessage{op.entry(t, names[revoke.MaxHeld], rev(1, 3))}, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if !overlaid(t, f.s, names[revoke.MaxHeld]) || f.s.OverlayCount() != 1 {
+		t.Fatalf("orphans hold slots: %d held, new entry held %v", f.s.OverlayCount(), overlaid(t, f.s, names[revoke.MaxHeld]))
+	}
+}
+
+func TestOverlayInputCapped(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	valid := op.entry(t, cell1, rev(1, 1))
+	junk := json.RawMessage(`{}`)
+	var byCount []json.RawMessage
+	for range maxSyncEntries {
+		byCount = append(byCount, junk)
+	}
+	byCount = append(byCount, valid)
+	huge := json.RawMessage(`"` + strings.Repeat("x", maxSyncBytes) + `"`)
+	for name, list := range map[string][]json.RawMessage{"count": byCount, "bytes": {huge, valid}} {
+		if err := e.st.SetRevocations(context.Background(), list, op.keys(), "dev"); err != nil {
+			t.Fatal(name, err)
+		}
+		if overlaid(t, e.st, cell1) {
+			t.Fatalf("%s: an entry beyond the cap is held", name)
+		}
+	}
+	if !strings.Contains(e.logs.String(), "input_capped") {
+		t.Fatalf("no input_capped in the summary: %s", e.logs.String())
+	}
+}
+
+func TestOverlayRefusalSummaryLoggedOnChange(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	bad := []json.RawMessage{json.RawMessage(`{"payloadType":"x"}`)}
+	for range 50 {
+		if err := e.st.SetRevocations(context.Background(), bad, op.keys(), "dev"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(e.logs.String(), "revocation_refused"); n != 1 {
+		t.Fatalf("%d summary lines for 50 identical syncs", n)
+	}
+}
+
+func TestOverlayCorruptStoreStarts(t *testing.T) {
+	f := newFixture(t)
+	op := newOperator(t)
+	if _, err := f.s.db.Exec(`INSERT INTO meta (key, value) VALUES ('revocations', 'not json')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.SetRevocations(context.Background(), nil, op.keys(), "dev"); err != nil {
+		t.Fatalf("a corrupt stored value stops the gateway: %v", err)
+	}
+	if !strings.Contains(f.logs.String(), "revocation_store_corrupt") {
+		t.Fatalf("no log of the corrupt value: %s", f.logs.String())
+	}
+}
+
+func TestSyncRefusedSpecStillAppliesRevocations(t *testing.T) {
+	e := newGwEnv(t)
+	op := newOperator(t)
+	e.applyRevoked(2, false)
+	f := newEnvdFixture(t, e, envdSetup{}, WithOperatorKeys(op.keys()), WithEnv("dev"))
+	req := e.syncRequest(nil, nil) // revision 1.1 is below the stored 1.2
+	req.Revocations = []json.RawMessage{op.entry(t, cell1, rev(1, 2))}
+	code, _ := f.post(t, gwapi.SyncPath, req)
+	if code != http.StatusUnprocessableEntity {
+		t.Fatalf("status %d, want the spec refusal", code)
+	}
+	if !overlaid(t, e.st, cell1) {
+		t.Fatal("a refused spec held back a signed revocation")
 	}
 }
 
 func TestOverlaySurvivesRestart(t *testing.T) {
 	f := newFixture(t)
+	g := newSigner(t)
 	op := newOperator(t)
 	ctx := context.Background()
+	if err := f.apply(g, g.bundle(rev(1, 1), map[string]spec.Revision{cell1: rev(1, 1)})); err != nil {
+		t.Fatal(err)
+	}
 	if err := f.s.SetRevocations(ctx, []json.RawMessage{op.entry(t, cell1, rev(1, 1))}, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
@@ -201,9 +399,9 @@ func TestOverlaySettle(t *testing.T) {
 	if !overlaid(t, e.st, cell1) || !overlaid(t, e.st, cell2) {
 		t.Fatal("an empty list cleared the overlay")
 	}
-	// A newer record that is not revoked keeps the entry.
+	// A newer record that is not revoked keeps an entry that envd still lists.
 	e.applyRevoked(2, false)
-	if err := e.st.SetRevocations(ctx, nil, op.keys(), "dev"); err != nil {
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{op.entry(t, cell1, rev(1, 1)), op.entry(t, cell2, rev(1, 1))}, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if !overlaid(t, e.st, cell1) {
@@ -211,7 +409,7 @@ func TestOverlaySettle(t *testing.T) {
 	}
 	// A spec that revokes the cell clears it, and the other cell stays.
 	e.applyRevoked(3, true)
-	if err := e.st.SetRevocations(ctx, nil, op.keys(), "dev"); err != nil {
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{op.entry(t, cell2, rev(1, 1))}, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if overlaid(t, e.st, cell1) || !overlaid(t, e.st, cell2) {

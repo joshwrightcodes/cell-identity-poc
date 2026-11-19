@@ -6,6 +6,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"strings"
 	"sync"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
@@ -19,34 +23,64 @@ type overlay struct {
 	setMu sync.Mutex
 	mu    sync.RWMutex
 	held  revoke.Held
+	// lastSummary is the refusal summary that the last call logged. setMu guards it.
+	lastSummary string
 }
+
+// The bounds of the list that one sync passes to SetRevocations. envd holds at most revoke.MaxHeld
+// entries of at most revoke.MaxCanonicalBytes each, so a small multiple of that is generous.
+const (
+	maxSyncEntries = 4 * revoke.MaxHeld
+	maxSyncBytes   = 4 * revoke.MaxHeld * revoke.MaxCanonicalBytes
+)
+
+// capList returns the leading part of in that stays within maxSyncEntries and maxSyncBytes, and
+// whether it dropped anything.
+func capList(in []json.RawMessage) ([]json.RawMessage, bool) {
+	total := 0
+	for i, raw := range in {
+		total += len(raw)
+		if i >= maxSyncEntries || total > maxSyncBytes {
+			return in[:i], true
+		}
+	}
+	return in, false
+}
+
+type settled struct{ cell, id, why string }
 
 // SetRevocations verifies envelopes under keys for env and adds the entries to the overlay that
 // the store holds. The store keeps the verified envelopes, so that a restart verifies them again
-// when it calls SetRevocations with the keys. An entry leaves the overlay only when the stored
-// records say that its cell is revoked or retired, so an empty list clears nothing. A new entry
-// that names a record revision below the stored record of its cell is dropped as stale. An
-// envelope that fails verification is logged and ignored.
+// when it calls SetRevocations with the keys. The list is bounded in count and bytes before it is
+// read. A new entry for a cell with no stored record is refused, as envd refuses it.
+//
+// An entry leaves the overlay in two cases. The stored records revoke or retire its cell. Or the
+// entry is stale against the stored record of its cell and envd no longer lists it, because a newer
+// verified record outranks an entry that envd let go. An entry that envd still lists stays, even
+// when it is stale, and an empty list on its own clears nothing. The call logs each entry that
+// leaves as revocation_settled, and one summary line when the set of refusals changes.
 func (s *Store) SetRevocations(ctx context.Context, envelopes []json.RawMessage, keys []ed25519.PublicKey, env string) error {
 	s.ov.setMu.Lock()
 	defer s.ov.setMu.Unlock()
+	envelopes, capped := capList(envelopes)
 	var next revoke.Held
-	var refused []revoke.Refusal
+	var left []settled
+	refusals := map[string]int{}
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		stored, err := metaString(tx, "revocations")
+		storedText, err := metaString(tx, "revocations")
 		if err != nil {
 			return err
 		}
 		var kept []json.RawMessage
-		if stored != "" {
-			if err := json.Unmarshal([]byte(stored), &kept); err != nil {
-				return fmt.Errorf("read stored revocations: %w", err)
+		if storedText != "" {
+			if err := json.Unmarshal([]byte(storedText), &kept); err != nil {
+				s.log.ErrorContext(ctx, "revocation_store_corrupt", "error", err.Error())
+				s.NoteFailure("revocations", err)
+				kept = nil
 			}
 		}
 		known, _ := revoke.Load(toBytes(kept), keys, env)
-		all := append(append([]json.RawMessage{}, kept...), envelopes...)
-		held, refusals := revoke.Load(toBytes(all), keys, env)
-		refused = refusals
+		listed, _ := revoke.Load(toBytes(envelopes), keys, env)
 
 		records := map[string]record.Cell{}
 		retired := map[string]bool{}
@@ -77,36 +111,90 @@ func (s *Store) SetRevocations(ctx context.Context, envelopes []json.RawMessage,
 		}); err != nil {
 			return err
 		}
-		for cell, raw := range held {
-			if _, old := known[cell]; old {
-				continue
-			}
+		// An entry that is stale against its stored record and that envd no longer lists leaves
+		// before the cap applies, so that it holds no slot.
+		for cell, raw := range known {
 			e, err := revoke.Verify(raw, keys)
 			if err != nil {
-				delete(held, cell)
+				delete(known, cell)
 				continue
 			}
 			if rec, ok := records[cell]; ok && revoke.Stale(e, spec.RecordRevision(rec)) {
+				if _, still := listed[cell]; !still {
+					left = append(left, settled{cell, e.ID, "stale"})
+					delete(known, cell)
+				}
+			}
+		}
+		all := append(known.Envelopes(), envelopes...)
+		held, refused := revoke.Load(toBytes(all), keys, env)
+		for _, r := range refused {
+			key := r.Reason
+			if r.Detail != "" {
+				key += "/" + r.Detail
+			}
+			refusals[key]++
+		}
+		for cell := range held {
+			if _, wasHeld := known[cell]; wasHeld {
+				continue
+			}
+			if _, hasRec := records[cell]; !hasRec {
+				refusals[revoke.ReasonUnknownCell]++
 				delete(held, cell)
 			}
 		}
 		next = revoke.Settle(held, records, retired)
+		for cell := range held {
+			if _, ok := next[cell]; ok {
+				continue
+			}
+			if _, wasHeld := known[cell]; wasHeld {
+				left = append(left, settled{cell, "", "revoked_or_retired"})
+			}
+		}
 		body, err := json.Marshal(next.Envelopes())
 		if err != nil {
 			return err
+		}
+		if string(body) == storedText {
+			return nil
 		}
 		return setMeta(tx, "revocations", string(body))
 	})
 	if err != nil {
 		return fmt.Errorf("set revocations: %w", err)
 	}
-	if len(refused) > 0 {
-		s.log.WarnContext(ctx, "revocation_refused", "count", len(refused), "reason", refused[0].Reason, "detail", refused[0].Detail)
+	for _, l := range left {
+		s.log.InfoContext(ctx, "revocation_settled", "cell", l.cell, "id", l.id, "why", l.why)
 	}
+	if capped {
+		refusals["input_capped"]++
+	}
+	s.ov.summarise(ctx, s.log, refusals)
 	s.ov.mu.Lock()
 	s.ov.held = next
 	s.ov.mu.Unlock()
 	return nil
+}
+
+// summarise logs one line when the set of refusals differs from the last one that it logged.
+func (o *overlay) summarise(ctx context.Context, log *slog.Logger, refusals map[string]int) {
+	keys := slices.Sorted(maps.Keys(refusals))
+	parts := make([]string, len(keys))
+	attrs := make([]any, 0, 2*len(keys))
+	for i, k := range keys {
+		parts[i] = fmt.Sprintf("%s=%d", k, refusals[k])
+		attrs = append(attrs, k, refusals[k])
+	}
+	sum := strings.Join(parts, ",")
+	if sum == o.lastSummary {
+		return
+	}
+	o.lastSummary = sum
+	if sum != "" {
+		log.WarnContext(ctx, "revocation_refused", attrs...)
+	}
 }
 
 func toBytes(in []json.RawMessage) [][]byte {

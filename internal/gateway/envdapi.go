@@ -186,6 +186,7 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 	if h.env != "" {
 		if sp, _, err := spec.Verify(req.SpecEnvelope, h.keys); err == nil && sp.Env != h.env {
 			h.log.WarnContext(ctx, "sync_refused", "error", "spec env differs from the pinned env", "spec_env", sp.Env)
+			h.refusedRevocations(ctx, req.Revocations)
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": "spec env differs from the pinned env", "reason": mgmtapi.ReasonEnvMismatch})
 			return
 		}
@@ -193,6 +194,7 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 	if err := h.st.ApplySync(ctx, req.SpecEnvelope, req.Records, h.keys); err != nil {
 		if isRefusal(err) {
 			h.log.WarnContext(ctx, "sync_refused", "error", err.Error())
+			h.refusedRevocations(ctx, req.Revocations)
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "reason": refusalReason(err)})
 			return
 		}
@@ -211,11 +213,9 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if len(h.opKeys) > 0 {
-		if err := h.st.SetRevocations(ctx, req.Revocations, h.opKeys, h.env); err != nil {
-			h.storeFailed(ctx, w, "set_revocations", err)
-			return
-		}
+	if err := h.setRevocations(ctx, req.Revocations); err != nil {
+		h.storeFailed(ctx, w, "set_revocations", err)
+		return
 	}
 	if err := h.st.MarkSynced(ctx, time.Now()); err != nil {
 		h.storeFailed(ctx, w, "mark_synced", err)
@@ -248,6 +248,23 @@ func (h *envdHandler) sync(w http.ResponseWriter, r *http.Request) {
 		items = []gwapi.OutItem{}
 	}
 	writeJSON(w, http.StatusOK, gwapi.SyncResponse{Items: items, Status: status})
+}
+
+// setRevocations passes the revocations of a sync to the store when the handler holds operator keys.
+func (h *envdHandler) setRevocations(ctx context.Context, list []json.RawMessage) error {
+	if len(h.opKeys) == 0 {
+		return nil
+	}
+	return h.st.SetRevocations(ctx, list, h.opKeys, h.env)
+}
+
+// refusedRevocations applies the revocations of a sync whose spec the gateway refused. The entries
+// authenticate themselves through the operator key, so a refused spec does not hold them back.
+func (h *envdHandler) refusedRevocations(ctx context.Context, list []json.RawMessage) {
+	if err := h.setRevocations(ctx, list); err != nil {
+		h.log.ErrorContext(ctx, "sync_revocations_failed", "error", err.Error())
+		h.st.NoteFailure("set_revocations", err)
+	}
 }
 
 func refusalReason(err error) string {
