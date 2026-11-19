@@ -278,12 +278,13 @@ func BindResultFor(o mgmtapi.ItemOutcome) BindResult {
 }
 
 // SyncRequest is what envd sends the gateway: the signed spec, the signed records, the operation
-// envelopes and the cell nonces.
+// envelopes, the cell nonces and the local revocation entries that envd holds, sorted by cell.
 type SyncRequest struct {
 	SpecEnvelope json.RawMessage            `json:"specEnvelope"`
 	Records      map[string]json.RawMessage `json:"records"`
 	Ops          []json.RawMessage          `json:"ops"`
 	Cells        []mgmtapi.CellInfo         `json:"cells"`
+	Revocations  []json.RawMessage          `json:"revocations,omitempty"`
 }
 
 // SyncResponse is the answer of the gateway: the outbox items for the management plane and the

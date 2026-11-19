@@ -317,3 +317,73 @@ func TestBundleWireNames(t *testing.T) {
 		t.Errorf("ReasonBundleOpen is %q", ReasonBundleOpen)
 	}
 }
+
+func TestStatusReportNoRevocationKey(t *testing.T) {
+	raw, _ := json.Marshal(StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 1}})
+	if string(raw) != `{"applied":{"epoch":1,"counter":1}}` {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 1}, LocalRevocations: []json.RawMessage{}})
+	if strings.Contains(string(raw), "localRevocations") {
+		t.Fatalf("an empty list encodes: %s", raw)
+	}
+	raw, _ = json.Marshal(StatusReport{LocalRevocations: []json.RawMessage{json.RawMessage(`{"payloadType":"x"}`)}})
+	if !strings.Contains(string(raw), `"localRevocations":[{"payloadType":"x"}]`) {
+		t.Fatalf("got %s", raw)
+	}
+}
+
+func TestRevocationWireNames(t *testing.T) {
+	at := time.Unix(1_800_000_000, 0).UTC()
+	for _, tc := range []struct {
+		v    any
+		keys []string
+	}{
+		{RevocationEvent{Cell: "c", Revision: spec.Revision{Epoch: 1, Counter: 2}, Kind: RevocationRevoke, Source: RevocationSourceAdmin, At: at},
+			[]string{"cell", "revision", "kind", "source", "at"}},
+		{RevocationEvent{Cell: "c", Revision: spec.Revision{Epoch: 1, Counter: 2}, Kind: RevocationRevoke, Source: RevocationSourceOperator,
+			EntryID: "0123456789abcdef", OperatorKeySHA256: strings.Repeat("a", 64), At: at},
+			[]string{"cell", "revision", "kind", "source", "entryId", "operatorKeySHA256", "at"}},
+	} {
+		raw, err := json.Marshal(tc.v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m) != len(tc.keys) {
+			t.Errorf("%T encodes %s, want keys %v", tc.v, raw, tc.keys)
+		}
+		for _, k := range tc.keys {
+			if _, ok := m[k]; !ok {
+				t.Errorf("%T lacks key %q in %s", tc.v, k, raw)
+			}
+		}
+	}
+	if RevocationRevoke != "revoke" || RevocationUnrevoke != "unrevoke" || RevocationSourceAdmin != "admin" || RevocationSourceOperator != "operator" {
+		t.Error("revocation kinds or sources")
+	}
+}
+
+func TestRevocationReasons(t *testing.T) {
+	got := []string{
+		ReasonRevocationInvalid, ReasonRevocationStale, ReasonRevocationUnknownCell, ReasonRevocationOverflow,
+		ReasonNotConnected, ReasonNotRevoked, ReasonOverlayHeld, ReasonRestorePastRevocation,
+	}
+	want := []string{
+		"revocation_invalid", "revocation_stale", "revocation_unknown_cell", "revocation_overflow",
+		"not_connected", "not_revoked", "overlay_held", "restore_past_revocation",
+	}
+	seen := map[string]bool{ReasonNotBound: true, ReasonStale: true, ReasonConflict: true, ReasonCellUnknown: true}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("constant %d = %q, want %q", i, got[i], want[i])
+		}
+		if seen[got[i]] {
+			t.Errorf("duplicate %q", got[i])
+		}
+		seen[got[i]] = true
+	}
+}

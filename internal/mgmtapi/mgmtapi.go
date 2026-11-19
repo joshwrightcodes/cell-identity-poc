@@ -62,6 +62,34 @@ type StatusReport struct {
 	PlaneBundle *op.Result `json:"planeBundle,omitempty"`
 	// PlaneBundleStatus is the bundle state of the control plane.
 	PlaneBundleStatus *op.BundleStatus `json:"planeBundleStatus,omitempty"`
+	// LocalRevocations holds the envelope of each local revocation entry that envd holds, sorted by
+	// cell.
+	LocalRevocations []json.RawMessage `json:"localRevocations,omitempty"`
+}
+
+// The values of RevocationEvent.Kind.
+const (
+	RevocationRevoke   = "revoke"
+	RevocationUnrevoke = "unrevoke"
+)
+
+// The values of RevocationEvent.Source.
+const (
+	RevocationSourceAdmin    = "admin"
+	RevocationSourceOperator = "operator"
+)
+
+// RevocationEvent records one revoke or un-revoke of a cell that the management plane signed.
+// Revision is the revision of the signed cell record. EntryID and OperatorKeySHA256 name the
+// local revocation entry and the operator key of an event with source operator.
+type RevocationEvent struct {
+	Cell              string        `json:"cell"`
+	Revision          spec.Revision `json:"revision"`
+	Kind              string        `json:"kind"`
+	Source            string        `json:"source"`
+	EntryID           string        `json:"entryId,omitempty"`
+	OperatorKeySHA256 string        `json:"operatorKeySHA256,omitempty"`
+	At                time.Time     `json:"at"`
 }
 
 // Refusal records the last spec that envd refused.
