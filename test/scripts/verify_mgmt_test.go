@@ -45,6 +45,7 @@ esac
 `
 
 const verifyKind = `#!/usr/bin/env bash
+[[ "$(cat "$STUB_DIR/kind-clusters")" != FAIL ]] || { echo "ERROR: failed to list clusters" >&2; exit 1; }
 cat "$STUB_DIR/kind-clusters"
 `
 
@@ -136,6 +137,8 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 		{"env address: no dev-cp and no rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n",
 			"policy.json": `{"spec":{"ingress":[{"from":[{"ipBlock":{"cidr":"172.18.0.4/32"}}],"ports":[{"port":8080}]}],"egress":[]}}`}, nil},
 		{"env address: no dev-cp but a rule", "check_mgmt_env_address", map[string]string{"kind-clusters": "management\n"}, []string{"does not exist, but the API port admits", link}},
+		{"env address: kind does not answer", "check_mgmt_env_address", map[string]string{"kind-clusters": "FAIL"},
+			[]string{"kind get clusters failed", "ERROR: failed to list clusters", "cannot tell whether dev-cp exists"}},
 		{"peer root ok", "check_mgmt_peer_root", nil, nil},
 		{"peer root: dev-cp has a new root", "check_mgmt_peer_root", map[string]string{"cp-root.pem": otherRoot}, []string{"absent or holds other roots", link}},
 		{"peer root: a pod holds an old root", "check_mgmt_peer_root", map[string]string{"pods.json": pods(strings.Repeat("0", 64))}, []string{"carries the root digest", link}},
@@ -175,7 +178,7 @@ printf '%b' "$(cat "$STUB_DIR/getent")"
 			cmd := exec.Command("bash", "-c", `source "$1/scripts/lib.sh"; source "$1/components/lib/peer-root.sh"; source "$1/components/lib/hostsvc-pin.sh"
 source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"; set +e; `+tc.check, "_", root)
 			cmd.Env = []string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=management",
-				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub, "MGMT_KEY_ACCEPT_CHANGE=1", "REGISTRY_PUBLISHED_WAIT=0", "HOSTSVC_SERVE=" + filepath.Join(stub, "serve")}
+				"POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_DIR=" + stub, "MGMT_KEY_ACCEPT_CHANGE=1", "REGISTRY_PUBLISHED_WAIT=0", "HOSTSVC_SERVE=" + filepath.Join(stub, "serve"), "KIND_CLUSTERS_PAUSE=0"}
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err := cmd.Run()

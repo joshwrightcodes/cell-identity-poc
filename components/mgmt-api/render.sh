@@ -22,7 +22,8 @@
 #     ConfigMap peer-root. The render leaves it out only when VIEW_CONTROL_PLANE does not exist or its
 #     SPIRE server StatefulSet does not exist. When the StatefulSet exists, a failed read stops the
 #     render. The node address of VIEW_CONTROL_PLANE goes into the ingress rule of flow N26, and the
-#     render leaves that rule out while the cluster does not exist.
+#     render leaves that rule out while the cluster does not exist. When kind does not answer, the render
+#     stops, because it cannot tell whether the cluster exists.
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the mgmtd image that `mise run images` built, by digest.
@@ -50,6 +51,7 @@ source "$root/components/lib/addresses.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/hostsvc-pin.sh"
 source "$root/components/lib/spire-sidecar.sh"
+source "$root/components/lib/live-cells.sh"
 
 [[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 [[ "$SPIRE_TRUST_DOMAIN" == mgmt.poc.internal ]] || die "SPIRE_TRUST_DOMAIN '$SPIRE_TRUST_DOMAIN' is not mgmt.poc.internal, the domain of the mgmtd ID"
@@ -94,8 +96,8 @@ own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
 
 # The environment control plane: the peer root and the node address.
 peer_root="" peer_sum=absent env_ip=""
-kind_clusters="$(kind get clusters 2>/dev/null || true)"
-if grep -qx "$env_cluster" <<<"$kind_clusters"; then
+clusters="$(kind_clusters)" || die "kind does not answer, so the render cannot tell whether $env_cluster exists"
+if grep -qx "$env_cluster" <<<"$clusters"; then
   if ! facts="$(cd "$root" && mise run hostsvc -- facts --cluster "$env_cluster" 2>/dev/null)"; then
     die "no host service facts for $env_cluster: ${facts:-no output}. Run: CELL=$env_cluster mise run cell:up"
   fi

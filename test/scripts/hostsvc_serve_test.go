@@ -1023,6 +1023,23 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		}
 	})
 
+	t.Run("kind_down_keeps_files", func(t *testing.T) {
+		e := newServeEnv(t)
+		up := []string{"STUB_READY=True", "STUB_CM_PUB=" + keyGood, "STUB_LIVE_PUB=" + keyGood}
+		e.mustServe(t, "sync", up...)
+		before := hostFiles(e)
+		if len(before) != 2 {
+			t.Fatalf("files after the first sync: %v", before)
+		}
+		_, errOut, err := e.serve(t, "sync", append(up, "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")...)
+		if err == nil || !strings.Contains(errOut, "kind get clusters failed") || strings.Contains(errOut, "dev-cp does not exist") {
+			t.Fatalf("err %v, stderr %q; want exit 1 that names kind, never an absent dev-cp", err, errOut)
+		}
+		if after := hostFiles(e); !slices.Equal(after, before) {
+			t.Fatalf("files changed while kind did not answer: %v, was %v", after, before)
+		}
+	})
+
 	t.Run("spec_pub_differs", func(t *testing.T) {
 		e := newServeEnv(t)
 		_, errOut, err := e.serve(t, "sync", "STUB_READY=True", "STUB_CM_PUB="+keyGood, "STUB_LIVE_PUB="+keyOther)

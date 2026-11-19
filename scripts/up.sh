@@ -38,7 +38,8 @@ cluster_lock "$CELL_NAME"
 
 if [[ -n "${HARNESS_ONLY:-}" ]]; then
   entry="$(harness_only_entry)" || exit 1
-  kind get clusters 2>/dev/null | grep -qx -- "$CELL_NAME" \
+  clusters="$(kind_clusters)" || die "HARNESS_ONLY cannot tell whether the cluster $CELL_NAME exists, because kind does not answer. Check the Colima VM, then run the command again"
+  grep -qx -- "$CELL_NAME" <<<"$clusters" \
     || die "HARNESS_ONLY needs the cluster $CELL_NAME, and it does not exist. Run: CELL=$CELL_NAME mise run cell:up"
   log "applying only the harness component ${entry%%:*} of $CELL_NAME"
   "$ROOT/scripts/facts.sh"
@@ -51,8 +52,10 @@ fi
 
 # A cell of the catalog exists only through a signed step. cell:up of a cell that has no cluster says so, and it names the
 # portal command. A re-apply to an existing cluster stays allowed: repairs and rotations use it.
-if grep -qx -- "$CELL_NAME" <<<"$(catalog_cells)" && ! kind get clusters 2>/dev/null | grep -qx -- "$CELL_NAME"; then
-  die "cell_needs_step: cell $CELL_NAME has no cluster, and only a signed step creates it. Run: mise run portal -- request --cell $CELL_NAME --wait"
+if grep -qx -- "$CELL_NAME" <<<"$(catalog_cells)"; then
+  clusters="$(kind_clusters)" || die "cell:up cannot tell whether the cluster $CELL_NAME exists, because kind does not answer. Check the Colima VM, then run: CELL=$CELL_NAME mise run cell:up"
+  grep -qx -- "$CELL_NAME" <<<"$clusters" \
+    || die "cell_needs_step: cell $CELL_NAME has no cluster, and only a signed step creates it. Run: mise run portal -- request --cell $CELL_NAME --wait"
 fi
 # The link phase comes last, and it needs other clusters. Check them before the first step, so a
 # missing cluster stops cell:up in seconds and not after the base cell.

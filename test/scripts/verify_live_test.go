@@ -307,6 +307,8 @@ func TestCheckHostsvcRoots(t *testing.T) {
 		{name: "mgmtd does not answer", status: status(devSum, keysWant, rev), mgmtDown: true,
 			wanted: []string{"CELL=management LINK_ONLY=mgmt-api mise run cell:link"}},
 		{name: "the host service does not run", status: `{"running":false}`, wanted: []string{"Run: mise run hostsvc:serve -- start"}},
+		{name: "kind does not answer", status: status(devSum, keysWant, rev), env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"},
+			wanted: []string{"kind get clusters failed", "the dev root of the host service is unchecked"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

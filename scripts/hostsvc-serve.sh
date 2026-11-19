@@ -168,7 +168,7 @@ write_if_changed() {
 # do_sync writes the dev root and the keys of the service after the cross-check. Nothing is written unless every
 # value checks. It fails with the reason, and keeps the files, while mgmtd-0 is not Ready.
 do_sync() {
-  local ready dev_pem spec_pub next_pub changed=()
+  local ready clusters dev_pem spec_pub next_pub changed=()
   ready="$(kubectl --context kind-management -n mgmt-system get pod mgmtd-0 -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
   if [[ "$ready" != True ]]; then
     printf 'error: mgmtd-0 is not Ready, so the key files and the dev root of the host service stay as they are. Start mgmtd with: CELL=management LINK_ONLY=mgmt-api mise run cell:link\n' >&2
@@ -176,7 +176,11 @@ do_sync() {
   fi
   # The dev root exists only while dev-cp does. A cell controller handshake fails while the file is absent.
   dev_pem=""
-  if kind get clusters 2>/dev/null | grep -qx dev-cp; then
+  if ! clusters="$(kind_clusters)"; then
+    printf 'error: sync cannot tell whether dev-cp exists, so the key files and the dev root of the host service stay as they are. Check the Colima VM, then run: mise run hostsvc:serve -- sync\n' >&2
+    return 1
+  fi
+  if grep -qx dev-cp <<<"$clusters"; then
     dev_pem="$(peer_root_pem dev-cp "$SPIRE_TRUST_DOMAIN_DEV")" || return 1
   fi
   spec_pub="$(mgmt_signing_pub)" || return 1

@@ -44,7 +44,7 @@ node_ip() {
 # spec_revision must equal the signed revision. A mismatch prints mise run hostsvc:serve -- sync, and a mgmtd that does not
 # answer prints the link of mgmt-api.
 check_hostsvc_roots() {
-  local serve status mgmt pub staged live_dev want_keys flag problems=() link="CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  local serve status mgmt pub staged clusters live_dev want_keys flag problems=() link="CELL=management LINK_ONLY=mgmt-api mise run cell:link"
   serve="$(hostsvc_serve_script)"
   status="$("$serve" status)" || { echo "the host service status failed"; return 1; }
   [[ "$(jq -r '.running' <<<"$status")" == true ]] || { echo "the host service does not run."; echo "Run: mise run hostsvc:serve -- start"; return 1; }
@@ -55,7 +55,9 @@ check_hostsvc_roots() {
     echo "Run: $link"
     return 1
   fi
-  if kind get clusters 2>/dev/null | grep -qx dev-cp; then
+  if ! clusters="$(kind_clusters 2>&1)"; then
+    problems+=("$clusters, so the dev root of the host service is unchecked")
+  elif grep -qx dev-cp <<<"$clusters"; then
     live_dev="$(peer_root_pem dev-cp dev.env.poc.internal 2>/dev/null | pem_der_sha256)" || live_dev=""
     [[ -n "$live_dev" && "$(jq -r '.dev_root_sha256' <<<"$status")" == "$live_dev" ]] \
       || problems+=("the host service serves the dev root '$(jq -r '.dev_root_sha256' <<<"$status")', and the live root of dev-cp is '${live_dev:-unknown}'")
@@ -126,8 +128,10 @@ check_mgmt_hostsvc_address() {
 }
 
 check_mgmt_env_address() {
-  local want got port
-  if ! kind get clusters 2>/dev/null | grep -qx "$VIEW_CONTROL_PLANE"; then
+  local want got port clusters
+  clusters="$(kind_clusters 2>&1)" \
+    || { echo "$clusters, so the check cannot tell whether $VIEW_CONTROL_PLANE exists."; echo "Check the Colima VM, then run: CELL=management mise run cell:verify"; return 1; }
+  if ! grep -qx "$VIEW_CONTROL_PLANE" <<<"$clusters"; then
     got="$(k -n mgmt-system get networkpolicy mgmtd -o json | jq -r '[.spec.ingress[] | select(any(.ports[]; .port == 8446)) | .from[].ipBlock.cidr] | join(" ")')"
     [[ -z "$got" ]] || { echo "$VIEW_CONTROL_PLANE does not exist, but the API port admits '$got'."; echo "Run: $(fix_command mgmt-api)"; return 1; }
     return 0

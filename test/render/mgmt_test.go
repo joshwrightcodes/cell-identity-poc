@@ -285,6 +285,15 @@ func TestMgmtAPIRendersWithoutDevCP(t *testing.T) {
 	}
 }
 
+// When kind does not answer, the render cannot tell whether dev-cp exists. It stops with the error of kind, and never renders
+// mgmt-api as if dev-cp were absent, with no peer root and no rule for flow N26.
+func TestMgmtAPIRenderStopsWhenKindFails(t *testing.T) {
+	r := mgmtAPI(t, "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")
+	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "kind get clusters failed") {
+		t.Fatalf("err %v, stdout %d bytes, stderr %q; want a failed render that names kind", r.err, len(r.stdout), r.stderr)
+	}
+}
+
 // When the dev-cp SPIRE server StatefulSet exists and the server does not answer, a quiet render
 // would leave the API of mgmtd with no trust root. The render stops with the M3 hint instead.
 func TestMgmtAPIPeerRootRequiredWhenServerExists(t *testing.T) {
