@@ -396,7 +396,7 @@ case "${1:-}" in
     do_start --force
     (cd "$ROOT" && CELL=management LINK_ONLY=mgmt-api mise run cell:link)
     # The service has a new certificate. The cell controller of dev-cp pins it through its render.
-    clusters="$(kind get clusters 2>/dev/null)" || die "kind does not answer, so the cell controller of dev-cp keeps the old pin. Run: CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up"
+    clusters="$(kind_clusters)" || die "kind does not answer, so the cell controller of dev-cp keeps the old pin. Run: CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up"
     if grep -qx dev-cp <<<"$clusters"; then
       (cd "$ROOT" && CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up)
     fi

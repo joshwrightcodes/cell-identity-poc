@@ -295,6 +295,7 @@ func TestCheckHostsvcRoots(t *testing.T) {
 		env          []string
 		mgmtDown     bool
 		wanted       []string
+		unwanted     []string
 	}{
 		{name: "healthy without dev-cp", status: status("", keysWant, rev), env: []string{"STUB_KIND=management rogue"}},
 		{name: "healthy with the staged key and dev-cp", status: status(devSum, []string{rawSum(pub), staged}, rev), env: []string{"STUB_STAGED=" + staged}},
@@ -308,7 +309,9 @@ func TestCheckHostsvcRoots(t *testing.T) {
 			wanted: []string{"CELL=management LINK_ONLY=mgmt-api mise run cell:link"}},
 		{name: "the host service does not run", status: `{"running":false}`, wanted: []string{"Run: mise run hostsvc:serve -- start"}},
 		{name: "kind does not answer", status: status(devSum, keysWant, rev), env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"},
-			wanted: []string{"kind get clusters failed", "the dev root of the host service is unchecked"}},
+			wanted: []string{"kind get clusters failed", "the dev root of the host service is unchecked", "Check the Colima VM"}, unwanted: []string{"hostsvc:serve -- sync"}},
+		{name: "kind does not answer, and a key is missing", status: status(devSum, keysWant, rev), env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0", "STUB_STAGED=" + staged},
+			wanted: []string{"kind get clusters failed", "Check the Colima VM", "the host service trusts the keys", "mise run hostsvc:serve -- sync"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -356,6 +359,11 @@ set +e; check_hostsvc_roots`, "_", lib, root)
 			for _, w := range tc.wanted {
 				if !strings.Contains(out.String(), w) {
 					t.Errorf("output %q lacks %q", out.String(), w)
+				}
+			}
+			for _, w := range tc.unwanted {
+				if strings.Contains(out.String(), w) {
+					t.Errorf("output %q holds %q", out.String(), w)
 				}
 			}
 		})

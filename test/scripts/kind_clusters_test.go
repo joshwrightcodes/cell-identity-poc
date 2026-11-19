@@ -2,11 +2,13 @@ package scripts
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 )
@@ -57,22 +59,27 @@ func TestKindClusters(t *testing.T) {
 	}
 	run := func(t *testing.T, env ...string) (string, string, []string, error) {
 		t.Helper()
-		bin := t.TempDir()
-		writeLiveStubs(t, bin)
-		env = append(writeFlakyKind(t, bin), env...)
-		cmd := exec.Command("bash", "-c", `source "$1"; kind_clusters`, "_", lib)
-		cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=dev-cp",
-			"POC_BUILD_ROOT=" + t.TempDir()}, env...)
-		var out, errOut bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &out, &errOut
-		err := cmd.Run()
-		return out.String(), errOut.String(), env, err
+		return runLibFlaky(t, lib, "kind_clusters", env...)
 	}
 	const all = "dev-cell-1\ndev-cp\nmanagement\ndev-cell-2\nrogue\n"
 	t.Run("kind answers", func(t *testing.T) {
 		out, errOut, env, err := run(t)
 		if err != nil || out != all || kindCalls(t, env) != "1" {
 			t.Fatalf("err %v, stdout %q, stderr %q, calls %s; want the five clusters from one call", err, out, errOut, kindCalls(t, env))
+		}
+	})
+	for _, tries := range []string{"0", "-1", "abc", "2x"} {
+		t.Run("KIND_CLUSTERS_TRIES="+tries+" gives the default of 3 calls", func(t *testing.T) {
+			out, errOut, env, err := run(t, "STUB_KIND_FAILS=99", "KIND_CLUSTERS_TRIES="+tries)
+			if err == nil || out != "" || !strings.Contains(errOut, "kind get clusters failed 3 times") || kindCalls(t, env) != "3" {
+				t.Fatalf("err %v, stdout %q, stderr %q, calls %s; want 3 calls and a failure that names kind", err, out, errOut, kindCalls(t, env))
+			}
+		})
+	}
+	t.Run("KIND_CLUSTERS_TRIES=1 gives one call", func(t *testing.T) {
+		_, errOut, env, err := run(t, "STUB_KIND_FAILS=99", "KIND_CLUSTERS_TRIES=1")
+		if err == nil || !strings.Contains(errOut, "kind get clusters failed 1 times") || kindCalls(t, env) != "1" {
+			t.Fatalf("err %v, stderr %q, calls %s; want one call", err, errOut, kindCalls(t, env))
 		}
 	})
 	t.Run("kind fails once", func(t *testing.T) {
@@ -167,4 +174,73 @@ func runUpErr(t *testing.T, root, logFile string, env ...string) (string, string
 	out, err := cmd.CombinedOutput()
 	calls, _ := os.ReadFile(logFile)
 	return string(out), string(calls), err
+}
+
+// runLibFlaky sources scripts/lib.sh with the live stubs and stubKindFlaky on PATH, and runs call.
+func runLibFlaky(t *testing.T, lib, call string, env ...string) (string, string, []string, error) {
+	t.Helper()
+	bin := t.TempDir()
+	writeLiveStubs(t, bin)
+	env = append(writeFlakyKind(t, bin), env...)
+	cmd := exec.Command("bash", "-c", `source "$1"; `+call, "_", lib)
+	cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=dev-cp",
+		"POC_BUILD_ROOT=" + t.TempDir()}, env...)
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err := cmd.Run()
+	return out.String(), errOut.String(), env, err
+}
+
+// TestKindCallersRetry: live_cells and existing_clusters read kind through kind_clusters, so one failed call of kind is retried, and a
+// kind that keeps failing gives the error of kind and the reason of the caller.
+func TestKindCallersRetry(t *testing.T) {
+	testtool.Need(t, "yq", "bash")
+	lib, err := filepath.Abs("../../scripts/lib.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ call, want, reason string }{
+		{"live_cells", "dev-cell-1\ndev-cell-2\n", "the live cells are unknown"},
+		{"existing_clusters", "management\ndev-cp\ndev-cell-1\ndev-cell-2\nrogue\n", "the existing clusters are unknown"},
+	} {
+		t.Run(tc.call+": kind fails once", func(t *testing.T) {
+			out, errOut, env, err := runLibFlaky(t, lib, tc.call, "STUB_KIND_FAILS=1")
+			if err != nil || out != tc.want || kindCalls(t, env) != "2" {
+				t.Fatalf("err %v, stdout %q, stderr %q, calls %s; want %q from the second call", err, out, errOut, kindCalls(t, env), tc.want)
+			}
+		})
+		t.Run(tc.call+": kind keeps failing", func(t *testing.T) {
+			out, errOut, _, err := runLibFlaky(t, lib, tc.call, "STUB_KIND_FAILS=99")
+			if err == nil || out != "" || !strings.Contains(errOut, "kind get clusters failed 3 times") || !strings.Contains(errOut, tc.reason) {
+				t.Fatalf("err %v, stdout %q, stderr %q; want the error of kind and %q", err, out, errOut, tc.reason)
+			}
+		})
+	}
+}
+
+// TestVerifyRetriesKind: cell:verify of a cell with no cluster prints the skip line and passes. One failed call of kind does not turn
+// the absent cell into a run of every check.
+func TestVerifyRetriesKind(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	bin := t.TempDir()
+	writeLiveStubs(t, bin)
+	env := writeFlakyKind(t, bin)
+	for _, name := range []string{"kubectl", "mise", "curl", "oras", "helm"} {
+		if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/usr/bin/env bash\necho \"stub "+name+" $*\" >&2\nexit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verify, err := filepath.Abs("../../scripts/verify.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, verify)
+	cmd.Env = append([]string{"PATH=" + bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "CELL=dev-cell-1",
+		"POC_BUILD_ROOT=" + t.TempDir(), "STUB_KIND_FAILS=1", "STUB_KIND=management dev-cp dev-cell-2 rogue"}, env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(out), "skipped: cell dev-cell-1 has no cluster yet") || kindCalls(t, env) != "2" {
+		t.Fatalf("err %v, calls %s, output:\n%s\nwant the skip line after a second call of kind", err, kindCalls(t, env), out)
+	}
 }

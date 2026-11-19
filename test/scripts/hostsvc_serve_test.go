@@ -611,6 +611,17 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 		}
 	})
 
+	// One failed call of kind does not keep the old pin in the cell controller.
+	t.Run("restart retries kind", func(t *testing.T) {
+		e := newServeEnv(t)
+		e.mustServe(t, "start")
+		env := append(writeFlakyKind(t, filepath.Join(e.root, "bin")), "STUB_KIND_FAILS=1")
+		e.mustServe(t, "restart", env...)
+		if got := e.read("link.log"); got != "link CELL=management LINK_ONLY=mgmt-api\nup CELL=dev-cp HARNESS_ONLY=cell-controller\n" || kindCalls(t, env) != "2" {
+			t.Fatalf("calls %q, kind calls %s; want the render of the cell controller after a second call of kind", got, kindCalls(t, env))
+		}
+	})
+
 	t.Run("restart fails when the render of the cell controller fails", func(t *testing.T) {
 		e := newServeEnv(t)
 		e.mustServe(t, "start")
@@ -622,7 +633,7 @@ func TestHostsvcServeLifecycle(t *testing.T) {
 	t.Run("restart fails when kind does not answer", func(t *testing.T) {
 		e := newServeEnv(t)
 		e.mustServe(t, "start")
-		_, errOut, err := e.serve(t, "restart", "STUB_KIND_FAIL=1")
+		_, errOut, err := e.serve(t, "restart", "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")
 		if err == nil || strings.Contains(e.read("link.log"), "up CELL=dev-cp") {
 			t.Fatalf("err %v, stderr %q, calls %q; want a failure and no render", err, errOut, e.read("link.log"))
 		}

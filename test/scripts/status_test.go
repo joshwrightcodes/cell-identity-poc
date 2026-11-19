@@ -193,7 +193,7 @@ func TestLogsSkipsAnAbsentCell(t *testing.T) {
 	if m := jsonLines(t, out); code != 1 || len(m) != 1 || strings.Contains(m[0]["error"].(string), "portal") || !strings.Contains(m[0]["error"].(string), "Rebuild one cluster") {
 		t.Errorf("a missing management: exit %d, output %q, want the rebuild hint and no portal command", code, out)
 	}
-	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND_FAIL=1"}, "all", "app=x")
+	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"}, "all", "app=x")
 	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" {
 		t.Errorf("kind down: exit %d, output %q, want one JSON error line", code, out)
 	}

@@ -599,7 +599,7 @@ func TestRotateKeyOrder(t *testing.T) {
 
 	// A kind that does not answer must not drop a cell from the pass, so the script stops before it changes anything.
 	t.Run("kind that does not answer stops the run", func(t *testing.T) {
-		out, _, err := run("mgmt-rotate-key.sh", nil, "STUB_KIND_FAIL=1")
+		out, _, err := run("mgmt-rotate-key.sh", nil, "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")
 		var line map[string]any
 		if err == nil || json.Unmarshal([]byte(out), &line) != nil || line["level"] != "ERROR" || !strings.Contains(fmt.Sprint(line["error"]), "live cells") {
 			t.Fatalf("err %v, stdout %q; want one error line about the live cells", err, out)

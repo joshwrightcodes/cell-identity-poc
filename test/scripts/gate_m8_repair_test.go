@@ -237,7 +237,7 @@ func TestGateM8CheckNamesRepair(t *testing.T) {
 		{name: "a final set is no open set", env: []string{"STUB_GET_dev_cell_1=" + m8ClosedSet(), "STUB_GET_dev_cp=" + m8ExpiredSet()}},
 		{name: "an unreadable bundle state fails", code: 1, env: []string{"STUB_STATE_FAIL=dev-cell-2"}, want: []string{"could not read ConfigMap bundle-state of dev-cell-2"}},
 		{name: "a failed read of the last set is no absent set", code: 1, env: []string{"STUB_GET_FAIL=dev-cell-1"}, want: []string{"dev-cell-1", "could not read the last set"}},
-		{name: "kind fails", code: 1, env: []string{"STUB_KIND_FAIL=1"}, want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
+		{name: "kind fails", code: 1, env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"}, want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, calls, dir, code := m8RepairRun(t, tc.recorded, tc.env, "--check")

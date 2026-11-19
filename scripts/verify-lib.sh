@@ -42,9 +42,10 @@ node_ip() {
 # served dev_root_sha256 must equal the DER SHA-256 of the live dev root of dev-cp (while dev-cp exists), the served keys must
 # equal the SHA-256 of the key that `mise run mgmt -- pubkey` prints and of stagedKey of `mise run mgmt -- status`, and
 # spec_revision must equal the signed revision. A mismatch prints mise run hostsvc:serve -- sync, and a mgmtd that does not
-# answer prints the link of mgmt-api.
+# answer prints the link of mgmt-api. A kind that does not answer prints the error of kind and the Colima hint, because a sync would
+# fail for the same reason.
 check_hostsvc_roots() {
-  local serve status mgmt pub staged clusters live_dev want_keys flag problems=() link="CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  local serve status mgmt pub staged clusters kind_problem="" live_dev want_keys flag problems=() link="CELL=management LINK_ONLY=mgmt-api mise run cell:link"
   serve="$(hostsvc_serve_script)"
   status="$("$serve" status)" || { echo "the host service status failed"; return 1; }
   [[ "$(jq -r '.running' <<<"$status")" == true ]] || { echo "the host service does not run."; echo "Run: mise run hostsvc:serve -- start"; return 1; }
@@ -56,7 +57,7 @@ check_hostsvc_roots() {
     return 1
   fi
   if ! clusters="$(kind_clusters 2>&1)"; then
-    problems+=("$clusters, so the dev root of the host service is unchecked")
+    kind_problem="$clusters, so the dev root of the host service is unchecked"
   elif grep -qx dev-cp <<<"$clusters"; then
     live_dev="$(peer_root_pem dev-cp dev.env.poc.internal 2>/dev/null | pem_der_sha256)" || live_dev=""
     [[ -n "$live_dev" && "$(jq -r '.dev_root_sha256' <<<"$status")" == "$live_dev" ]] \
@@ -70,11 +71,16 @@ check_hostsvc_roots() {
     || problems+=("the host service trusts the keys $(jq -c '.keys' <<<"$status"), and mgmtd holds $want_keys (the signing key and the staged key)")
   [[ "$(jq -cS '.spec_revision' <<<"$status")" == "$(jq -cS '.signed' <<<"$mgmt")" ]] \
     || problems+=("the host service knows the spec revision $(jq -c '.spec_revision' <<<"$status"), and mgmtd signed $(jq -c '.signed' <<<"$mgmt")")
+  if [[ -n "$kind_problem" ]]; then
+    echo "$kind_problem"
+    echo "Check the Colima VM, then run: CELL=management mise run cell:verify"
+  fi
   if ((${#problems[@]} > 0)); then
     printf '%s\n' "${problems[@]}"
     echo "Run: mise run hostsvc:serve -- sync. If mgmtd pushes no spec, run: $link"
     return 1
   fi
+  [[ -z "$kind_problem" ]]
 }
 
 # mgmtd copies the certificate of the host service, the address of the host service, the node address of

@@ -377,7 +377,7 @@ func TestStatusJournalCorrupt(t *testing.T) {
 
 // TestStatusKindDown: with no answer from kind, the script prints one JSON error line and exits 1, because the live cells are unknown.
 func TestStatusKindDown(t *testing.T) {
-	out, _, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker, "kind": stubKind}, []string{"STUB_KIND_FAIL=1"})
+	out, _, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker, "kind": stubKind}, []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"})
 	lines := jsonLines(t, out)
 	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || !strings.Contains(lines[0]["error"].(string), "which cells are live") {
 		t.Errorf("exit %d and output %q, want one JSON error line", code, out)
