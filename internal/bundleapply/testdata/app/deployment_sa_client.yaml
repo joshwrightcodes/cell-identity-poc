@@ -1,6 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: thief, namespace: apps-demo}
+metadata: {name: thief, namespace: apps-sample}
 spec:
   selector: {matchLabels: {app: thief}}
   template:

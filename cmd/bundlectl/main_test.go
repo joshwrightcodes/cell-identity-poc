@@ -345,7 +345,7 @@ func TestSetAboveTheLayerLimit(t *testing.T) {
 			reg, host := newMirror(t)
 			build := render(t, t.TempDir(), "dev-cell-1", map[string]string{"apps-sample": cmA, "network-policy": cmB})
 			args := []string{cmd, "--target", "dev-cell-1", "--build", build, "--root", t.TempDir(), "--registry", host, "--role", "cell",
-				"apps-sample:0:apps-demo", "network-policy:0:cell-system"}
+				"apps-sample:0:apps-sample", "network-policy:0:cell-system"}
 			maxSetBytes = total - 1
 			code, out := runCLI(t, "", args...)
 			if code != 1 {
@@ -591,7 +591,7 @@ func TestProjectsByRole(t *testing.T) {
 		black    []entry
 		dests    map[string][]string
 	}{
-		{"cell", []string{"cell", "cell-app"}, cell, map[string][]string{"cell-app": {"apps-demo"}}},
+		{"cell", []string{"cell", "cell-app"}, cell, map[string][]string{"cell-app": {"apps-sample"}}},
 		{"cp", []string{"cell"}, vap("bundles-spare-harness"), map[string][]string{}},
 	}
 	for _, tc := range cases {

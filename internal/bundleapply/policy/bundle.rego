@@ -347,6 +347,16 @@ deny contains entry("component_not_allowed", "namespace") if {
 	not name_allowed
 }
 
+# A class that lists a namespace in namespaceKinds may place only those kinds there, whatever its
+# namespacedKinds say. The platform classes use it to reach the namespace of the app class.
+deny contains entry("component_not_allowed", "namespace") if {
+	class_name
+	not cluster_scoped
+	ns != ""
+	kinds := class.namespaceKinds[ns]
+	not kind_key in kinds
+}
+
 name_allowed if {
 	some n in class.objectNamespaces
 	n == name

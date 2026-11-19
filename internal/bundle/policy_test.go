@@ -19,8 +19,10 @@ import (
 var allowFile []byte
 
 var (
-	platformNS = []string{"argocd", "cell-system", "istio-system", "istio-egress", "observability-system", "apps-demo"}
-	clusterKs  = []string{"Namespace", "apiextensions.k8s.io/CustomResourceDefinition",
+	platformNS = []string{"argocd", "cell-system", "istio-system", "istio-egress", "observability-system", "apps-demo", "apps-sample"}
+	// platformAppsSample is what the platform classes may hold in the namespace of the app class: its Namespace and its NetworkPolicies.
+	platformAppsSample = map[string][]string{"apps-sample": {"networking.k8s.io/NetworkPolicy"}}
+	clusterKs          = []string{"Namespace", "apiextensions.k8s.io/CustomResourceDefinition",
 		"rbac.authorization.k8s.io/ClusterRole", "rbac.authorization.k8s.io/ClusterRoleBinding",
 		"admissionregistration.k8s.io/ValidatingWebhookConfiguration", "admissionregistration.k8s.io/MutatingWebhookConfiguration",
 		"admissionregistration.k8s.io/ValidatingAdmissionPolicy", "admissionregistration.k8s.io/ValidatingAdmissionPolicyBinding"}
@@ -40,16 +42,16 @@ func TestDefaultPolicy(t *testing.T) {
 		"platform": {
 			Project: "cell", ObjectNamespaces: platformNS,
 			DestinationNamespaces: catList(platformNS, []string{"default"}),
-			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"},
+			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"}, NamespaceKinds: platformAppsSample,
 		},
 		"cp-platform": {
 			Project:               "cell",
 			ObjectNamespaces:      catList(platformNS, []string{"external-secrets", "spire-system", "relay-system"}),
 			DestinationNamespaces: catList(platformNS, []string{"default", "external-secrets", "spire-system", "relay-system"}),
-			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"},
+			ClusterKinds:          clusterKs, NamespacedKinds: []string{"*"}, NamespaceKinds: platformAppsSample,
 		},
 		"app": {
-			Project: "cell-app", ObjectNamespaces: []string{"apps-demo"}, DestinationNamespaces: []string{"apps-demo"},
+			Project: "cell-app", ObjectNamespaces: []string{"apps-sample"}, DestinationNamespaces: []string{"apps-sample"},
 			ClusterKinds:         []string{},
 			NamespacedKinds:      []string{"ConfigMap", "Secret", "ServiceAccount", "Service", "apps/Deployment"},
 			ServiceClusterIPOnly: true, NoSidecarOptOut: true, OwnServiceAccountsOnly: true,
@@ -102,6 +104,23 @@ func TestDefaultPolicy(t *testing.T) {
 	}
 	if len(p.Roles["cell"].Components) != 12 || len(p.Roles["cp"].Components) != 14 {
 		t.Errorf("component counts %d %d", len(p.Roles["cell"].Components), len(p.Roles["cp"].Components))
+	}
+
+	// The app class owns apps-sample alone. The platform classes keep apps-demo and reach apps-sample only for its Namespace
+	// and its NetworkPolicies. No class other than the app class may place a workload object there.
+	if app := p.Classes["app"]; slices.Contains(app.ObjectNamespaces, "apps-demo") || slices.Contains(app.DestinationNamespaces, "apps-demo") {
+		t.Errorf("the app class still reaches apps-demo: %+v", app)
+	}
+	for name, cl := range p.Classes {
+		if name == "app" {
+			continue
+		}
+		if !slices.Contains(cl.ObjectNamespaces, "apps-demo") {
+			t.Errorf("class %s lost apps-demo", name)
+		}
+		if !reflect.DeepEqual(cl.NamespaceKinds, platformAppsSample) {
+			t.Errorf("class %s limits the kinds of apps-sample to %v, want %v", name, cl.NamespaceKinds, platformAppsSample)
+		}
 	}
 
 	// ClassOf follows the data. The role open has no class, so management has no signed root.

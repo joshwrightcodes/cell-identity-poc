@@ -84,8 +84,8 @@ func TestM8BundleVersionOld(t *testing.T) {
 	m8RestoreTarget(t, cell)
 	digestA := m8PushBundle(t, cell, "apps-sample", []byte(m8Marker("m8-marker", "a-"+randomHex(t, 8))))
 	digestB := m8PushBundle(t, cell, "apps-sample", []byte(m8Marker("m8-marker", "b-"+randomHex(t, 8))))
-	a := m8Sign(t, cell, m8SetWithDigest(t, cell, "apps-sample", m8AppWave, "apps-demo", digestA), false)
-	b := m8Sign(t, cell, m8SetWithDigest(t, cell, "apps-sample", m8AppWave, "apps-demo", digestB), false)
+	a := m8Sign(t, cell, m8SetWithDigest(t, cell, "apps-sample", m8AppWave, m8AppNS, digestA), false)
+	b := m8Sign(t, cell, m8SetWithDigest(t, cell, "apps-sample", m8AppWave, m8AppNS, digestB), false)
 	if b.Version.Compare(a.Version) <= 0 {
 		t.Fatalf("set B has the version %+v, want one above %+v of set A", b.Version, a.Version)
 	}
@@ -140,7 +140,7 @@ func TestM8CpSetRefusedInCell(t *testing.T) {
 // m8AppCases are the sets of an app bundle that the policy refuses, each with the detail of its denial. The bundle is apps-sample.
 func m8AppCases() []m8Refusal {
 	app := func(name, manifests, detail string) m8Refusal {
-		return m8Refusal{name: name, component: "apps-sample", wave: m8AppWave, namespace: "apps-demo", manifests: []byte(manifests),
+		return m8Refusal{name: name, component: "apps-sample", wave: m8AppWave, namespace: m8AppNS, manifests: []byte(manifests),
 			reason: op.ReasonComponentNotAllowed, detail: detail}
 	}
 	return []m8Refusal{
@@ -148,7 +148,7 @@ func m8AppCases() []m8Refusal {
 kind: NetworkPolicy
 metadata:
   name: m8-probe
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -159,18 +159,19 @@ spec:
 kind: AuthorizationPolicy
 metadata:
   name: m8-probe
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 spec:
   action: ALLOW
 `, "kind"),
 		app("namespace_argocd", m8MarkerIn("argocd", "m8-probe", "x"), "namespace"),
+		app("namespace_apps_demo", m8MarkerIn(m8PlatformNS, "m8-probe", "x"), "namespace"),
 		app("service_nodeport", `apiVersion: v1
 kind: Service
 metadata:
   name: m8-probe
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -184,7 +185,7 @@ spec:
 kind: Deployment
 metadata:
   name: m8-probe
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -205,7 +206,7 @@ spec:
 kind: Deployment
 metadata:
   name: m8-probe
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -225,126 +226,78 @@ spec:
 	}
 }
 
-// TestM8AppSharedNameRolledBack, in dev-cell-1 (row 18): an app bundle holds a Deployment with the name, the selector and the pod labels of
-// the Deployment echo of the platform component apps-demo, with another image, and a ConfigMap m8-shared-sibling. The policy accepts both,
-// and the API server would accept the new echo. Argo CD refuses the sync of apps-sample with the operation message "Shared resource found",
-// because the Application syncs with FailOnSharedResource=true and apps-demo already tracks echo. The set ends rolled_back with a timeout
-// of apps-sample. echo keeps its resource version and its tracking ID, and the sibling never exists. The test catches a component
-// Application without the option, which would take echo over, and a sync that applies its other objects before it fails.
-func TestM8AppSharedNameRolledBack(t *testing.T) {
+// TestM8AppClassOwnNamespace, in dev-cell-1 (row 18): an app bundle holds a Deployment echo with the pod label app: echo in the namespace
+// apps-sample, the namespace of the app class. The set applies. The Deployment echo of the platform component apps-demo keeps its resource
+// version and its tracking ID, and no endpoint slice of Service apps-demo/echo lists the pod of apps-sample, whose label matches the selector
+// of the Service. The test catches an app class that reaches apps-demo, where a pod with this label joined the platform Service.
+func TestM8AppClassOwnNamespace(t *testing.T) {
 	const cell = "dev-cell-1"
-	const sibling = "m8-shared-sibling"
 	m8RestoreTarget(t, cell)
 	live := m8LiveSet(t, cell)
-	var objs []map[string]any
-	if d := m8LiveDigest(live, "apps-sample"); d != "" {
-		objs = m8Objects(t, m8LiveManifests(t, cell, "apps-sample", d))
-	}
-	probe := m8Objects(t, []byte(`apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: echo
-  namespace: apps-demo
-  labels:
-    cell.poc.internal/e2e: "true"
-spec:
-  selector:
-    matchLabels:
-      app: echo
-  template:
-    metadata:
-      labels:
-        app: echo
-    spec:
-      containers:
-        - name: echo
-          image: registry.invalid/m8-probe
-`))[0]
-	// If Argo CD takes echo over by mistake, it must still never prune or delete it.
-	m8Annotate(probe, "argocd.argoproj.io/sync-options", "Prune=false,Delete=false")
-	added := append([]map[string]any{probe}, m8Objects(t, []byte(m8MarkerIn("apps-demo", sibling, "x")))...)
-	run := randomHex(t, 8)
-	for _, o := range added {
-		m8Annotate(o, "cell.poc.internal/e2e-run", run)
-	}
-	objs = append(objs, added...)
-
-	annotation := func(key string) string {
-		path := "jsonpath={.metadata.annotations." + strings.ReplaceAll(key, ".", `\.`) + "}"
-		out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "deployment", "echo", "-o", path)
+	const trackingKey = "argocd.argoproj.io/tracking-id"
+	platformEcho := func(path string) string {
+		out, err := kubectl(t, cell, "", "-n", m8PlatformNS, "get", "deployment", "echo", "-o", "jsonpath="+path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return strings.TrimSpace(out)
 	}
-	const trackingKey, optionsKey = "argocd.argoproj.io/tracking-id", "argocd.argoproj.io/sync-options"
-	rv := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo")
-	tracking, options := annotation(trackingKey), annotation(optionsKey)
-	if rv == "" || !strings.HasPrefix(tracking, "apps-demo:") {
+	rv := m8ResourceVersion(t, cell, m8PlatformNS, "deployment", "echo")
+	tracking := platformEcho("{.metadata.annotations." + strings.ReplaceAll(trackingKey, ".", `\.`) + "}")
+	if rv == "" || !strings.HasPrefix(tracking, m8PlatformNS+":") {
 		t.Fatalf("Deployment apps-demo/echo of %s has the resource version %q and the tracking ID %q, want both, with the Application apps-demo", cell, rv, tracking)
 	}
-	// This cleanup runs before the restore of the target. It never deletes echo. If the sync took echo over, it gives the tracking ID and
-	// the sync options back, so that the restore cannot prune echo and the self-heal of apps-demo writes its spec again.
-	t.Cleanup(func() {
-		if got := annotation(trackingKey); got != tracking {
-			t.Errorf("Argo CD took over Deployment apps-demo/echo of %s (tracking ID %q)", cell, got)
-			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "annotate", "--overwrite", "deployment", "echo", trackingKey+"="+tracking); err != nil {
-				t.Errorf("give the tracking ID of apps-demo/echo back: %v", err)
-			}
-		}
-		if got := annotation(optionsKey); got != options {
-			arg := optionsKey + "-"
-			if options != "" {
-				arg = optionsKey + "=" + options
-			}
-			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "annotate", "--overwrite", "deployment", "echo", arg); err != nil {
-				t.Errorf("give the sync options of apps-demo/echo back: %v", err)
-			}
-		}
-		if m8ResourceVersion(t, cell, "apps-demo", "configmap", sibling) != "" {
-			if _, err := kubectl(t, cell, "", "-n", "apps-demo", "delete", "configmap", sibling, "--ignore-not-found"); err != nil {
-				t.Errorf("delete the probe ConfigMap %s: %v", sibling, err)
-			}
-		}
-	})
+	m8DeleteProbeDeployment(t, cell, "echo-app-class")
 
+	var objs []map[string]any
+	if d := m8LiveDigest(live, "apps-sample"); d != "" {
+		objs = m8Objects(t, m8LiveManifests(t, cell, "apps-sample", d))
+	}
+	objs = append(objs, m8Objects(t, []byte(m8EchoDeployment(t, m8AppNS, "echo-app-class")))...)
 	digest := m8PushBundle(t, cell, "apps-sample", m8Render(t, objs))
-	signed := m8Sign(t, cell, m8WithDigest(live, "apps-sample", m8AppWave, "apps-demo", digest), true)
-	var message string
-	siblingSeen := false
-	tb := m8WaitEach(t, cell, signed.OpID, m8SetWait, func() {
-		// The Application apps-sample exists only while the set is applied, so a missing one is "not seen yet".
-		out, err := kubectl(t, cell, "", "-n", "argocd", "get", "application", "apps-sample", "--ignore-not-found",
-			"-o", "jsonpath={.status.operationState.message}")
+	signed := m8Sign(t, cell, m8WithDigest(live, "apps-sample", m8AppWave, m8AppNS, digest), true)
+	res := m8Wait(t, cell, signed.OpID, m8SetWait)
+	if res.Result == nil || res.Result.Outcome != op.OutcomeApplied {
+		t.Fatalf("the set with the app Deployment ended %+v, want applied", res.Result)
+	}
+
+	podList := func(ns, selector, path string) []string {
+		out, err := kubectl(t, cell, "", "-n", ns, "get", "pods", "-l", selector, "-o", "jsonpath="+path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if msg := strings.TrimSpace(out); message == "" && strings.Contains(msg, "Shared resource found") {
-			message = msg
+		return strings.Fields(out)
+	}
+	pods := podList(m8AppNS, "app=echo", "{.items[*].metadata.name}")
+	ips := podList(m8AppNS, "app=echo", "{.items[*].status.podIP}")
+	if len(pods) == 0 || len(ips) != len(pods) {
+		t.Fatalf("apps-sample of %s holds the pods %v with the addresses %v, want a pod of the app Deployment with an address", cell, pods, ips)
+	}
+	// The endpoint slices of the Service must never list the pod. The loop reads for 30 s, because a pod that joins does so within seconds.
+	for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(5 * time.Second) {
+		out, err := kubectl(t, cell, "", "-n", m8PlatformNS, "get", "endpointslices", "-l", "kubernetes.io/service-name=echo",
+			"-o", `jsonpath={range .items[*].endpoints[*]}{.targetRef.namespace}/{.targetRef.name} {.addresses[*]}{"\n"}{end}`)
+		if err != nil {
+			t.Fatal(err)
 		}
-		if m8ResourceVersion(t, cell, "apps-demo", "configmap", sibling) != "" {
-			siblingSeen = true
+		for _, line := range strings.Split(out, "\n") {
+			if strings.HasPrefix(line, m8AppNS+"/") {
+				t.Fatalf("an endpoint slice of Service apps-demo/echo lists %q, a pod of the namespace %s", line, m8AppNS)
+			}
+			for _, ip := range ips {
+				if strings.Contains(" "+line+" ", " "+ip+" ") {
+					t.Fatalf("an endpoint slice of Service apps-demo/echo lists the address %s of the pod %v of %s: %q", ip, pods, m8AppNS, line)
+				}
+			}
 		}
-	})
-	m8WantResult(t, tb.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "*")
-	if tb.Result != nil && !strings.HasPrefix(tb.Result.Detail, "timeout:apps-sample:") {
-		t.Errorf("the detail of the rollback is %q, want one that starts with timeout:apps-sample: (a failed sync does not turn the Application Degraded)", tb.Result.Detail)
 	}
-	if message == "" {
-		t.Error(`the operation of apps-sample never ended with the message "Shared resource found"`)
-	} else {
-		t.Logf("the operation of apps-sample ended with %q", message)
-	}
-	if siblingSeen {
-		t.Errorf("ConfigMap apps-demo/%s existed during the set, so the sync applied objects before it failed", sibling)
-	}
-	if got := m8ResourceVersion(t, cell, "apps-demo", "deployment", "echo"); got != rv {
+	if got := m8ResourceVersion(t, cell, m8PlatformNS, "deployment", "echo"); got != rv {
 		t.Errorf("Deployment apps-demo/echo has the resource version %s, want %s", got, rv)
 	}
-	if got := annotation(trackingKey); got != tracking {
+	if got := platformEcho("{.metadata.annotations." + strings.ReplaceAll(trackingKey, ".", `\.`) + "}"); got != tracking {
 		t.Errorf("Deployment apps-demo/echo has the tracking ID %q, want %q", got, tracking)
 	}
-	m8RequireAtSet(t, cell, live, "")
+	m8RequireAtSet(t, cell, m8WithDigest(live, "apps-sample", m8AppWave, m8AppNS, digest), signed.RootDigest)
 }
 
 // TestM8AppBundleOutsideAllowList, in dev-cell-1 (row 18, first layer): the engine refuses each app bundle that the class app does not
@@ -373,7 +326,7 @@ func TestM8CpBundleOutsideAllowList(t *testing.T) {
 	})
 	t.Run("apps_sample_in_cp", func(t *testing.T) {
 		digest := m8PushBundle(t, target, "apps-sample", []byte(m8Marker("m8-probe", randomHex(t, 8))))
-		comps := m8WithDigest(live, "apps-sample", m8AppWave, "apps-demo", digest)
+		comps := m8WithDigest(live, "apps-sample", m8AppWave, m8AppNS, digest)
 		before := m8Snapshot(t, target)
 		out, err := signRefused(t, target, comps)
 		if err == nil || !payloadInvalidSet.MatchString(out+err.Error()) {
@@ -400,7 +353,7 @@ func signRefused(t *testing.T, target string, comps []bundle.Component) (string,
 
 // TestM8AppProjectRefusesKind, in dev-cell-1 (row 18, second layer): a NetworkPolicy bundle that a hand pushes into the store through the
 // loopback port-forward, and that an Application in the project cell-app names, is refused by Argo CD with "not permitted in project".
-// No NetworkPolicy of that name reaches apps-demo. The test catches an AppProject that lets a kind through.
+// No NetworkPolicy of that name reaches apps-sample. The test catches an AppProject that lets a kind through.
 func TestM8AppProjectRefusesKind(t *testing.T) {
 	const cell = "dev-cell-1"
 	_, store := m8ForwardStore(t, cell)
@@ -409,7 +362,7 @@ func TestM8AppProjectRefusesKind(t *testing.T) {
 kind: NetworkPolicy
 metadata:
   name: %s
-  namespace: apps-demo
+  namespace: apps-sample
   annotations:
     cell.poc.internal/e2e-run: %q
   labels:
@@ -418,13 +371,13 @@ spec:
   podSelector: {}
   policyTypes: ["Ingress"]
 `, name, run)
-	m8DeleteIfRun(t, cell, "apps-demo", "networkpolicy", name, run)
+	m8DeleteIfRun(t, cell, m8AppNS, "networkpolicy", name, run)
 	digest := m8PushTo(t, store, "bundles/m8-project-probe", []byte(manifests))
-	m8CreateApplication(t, cell, "m8-project-probe", "cell-app", "m8-project-probe", digest, "apps-demo")
+	m8CreateApplication(t, cell, "m8-project-probe", "cell-app", "m8-project-probe", digest, m8AppNS)
 	m8WaitApplicationText(t, cell, "m8-project-probe", "not permitted in project", 2*time.Minute)
-	out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "networkpolicy", name, "--ignore-not-found", "-o", "name")
+	out, err := kubectl(t, cell, "", "-n", m8AppNS, "get", "networkpolicy", name, "--ignore-not-found", "-o", "name")
 	if err != nil || strings.TrimSpace(out) != "" {
-		t.Errorf("apps-demo holds the NetworkPolicy %s (%v): %q", name, err, out)
+		t.Errorf("apps-sample holds the NetworkPolicy %s (%v): %q", name, err, out)
 	}
 }
 
@@ -440,7 +393,7 @@ func TestM8AppLimitsPolicy(t *testing.T) {
 kind: Service
 metadata:
   name: %s
-  namespace: apps-demo
+  namespace: apps-sample
   annotations:
     cell.poc.internal/e2e-run: %q
   labels:
@@ -452,13 +405,13 @@ spec:
   ports:
     - port: 80
 `, name, run, name)
-	m8DeleteIfRun(t, cell, "apps-demo", "service", name, run)
+	m8DeleteIfRun(t, cell, m8AppNS, "service", name, run)
 	digest := m8PushTo(t, store, "bundles/m8-app-limits", []byte(manifests))
-	m8CreateApplication(t, cell, "apps-sample", "cell-app", "m8-app-limits", digest, "apps-demo")
+	m8CreateApplication(t, cell, "apps-sample", "cell-app", "m8-app-limits", digest, m8AppNS)
 	m8WaitApplicationText(t, cell, "apps-sample", "bundles-app-limits", 3*time.Minute)
-	out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "service", name, "--ignore-not-found", "-o", "name")
+	out, err := kubectl(t, cell, "", "-n", m8AppNS, "get", "service", name, "--ignore-not-found", "-o", "name")
 	if err != nil || strings.TrimSpace(out) != "" {
-		t.Errorf("apps-demo holds the Service %s (%v): %q", name, err, out)
+		t.Errorf("apps-sample holds the Service %s (%v): %q", name, err, out)
 	}
 }
 

@@ -1,6 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: demo, namespace: apps-demo}
+metadata: {name: demo, namespace: apps-sample}
 spec:
   selector: {matchLabels: {app: demo}}
   template:

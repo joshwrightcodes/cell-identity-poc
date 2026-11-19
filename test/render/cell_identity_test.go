@@ -936,12 +936,36 @@ func TestAppLimitsRender(t *testing.T) {
 	for _, a := range apps {
 		starts = append(starts, "object.metadata.annotations['"+track+"'].startsWith('"+a+":')")
 	}
-	wantApp := "object != null && has(object.metadata.annotations) && '" + track + "' in object.metadata.annotations && (" + strings.Join(starts, " || ") + ")"
+	// The condition holds for an object of an app namespace and for an object that an app component tracks. A request for a
+	// cluster scoped object has no request.namespace, so each use of it sits behind has(request.namespace).
+	var appNS []string
+	for _, a := range apps {
+		class, ok := bundle.DefaultPolicy().ClassOf("cell", a)
+		if !ok {
+			t.Fatalf("allow.json has no class for the app component %s", a)
+		}
+		for _, ns := range class.ObjectNamespaces {
+			appNS = append(appNS, "'"+ns+"'")
+		}
+	}
+	if !slices.Equal(appNS, []string{"'apps-sample'"}) {
+		t.Fatalf("the app namespaces are %v, want only apps-sample", appNS)
+	}
+	wantApp := "(has(request.namespace) && request.namespace in [" + strings.Join(appNS, ", ") + "]) || (object != null && has(object.metadata.annotations) && '" + track + "' in object.metadata.annotations && (" + strings.Join(starts, " || ") + "))"
 	if got := get[string](t, conds[1], "expression"); got != wantApp || get[string](t, conds[1], "name") != "app-component" || !celExprBalanced(wantApp) {
 		t.Errorf("the app component condition is %q, want %q", got, wantApp)
 	}
 	if n := strings.Count(wantApp, "startsWith("); n != len(apps) {
 		t.Errorf("%d matches for %d app components", n, len(apps))
+	}
+	// Every use of request.namespace is behind has(request.namespace), so a request with no namespace evaluates to false,
+	// not to a CEL error that failurePolicy Fail turns into a refusal of the whole request.
+	gotApp := get[string](t, conds[1], "expression")
+	if uses, guarded := strings.Count(gotApp, "request.namespace"), strings.Count(gotApp, "has(request.namespace) && request.namespace"); uses != 2*guarded || guarded == 0 {
+		t.Errorf("the app condition has %d uses of request.namespace and %d guarded uses: %q", uses, guarded, gotApp)
+	}
+	if !strings.HasPrefix(gotApp, "(has(request.namespace) && request.namespace in ['apps-sample'])") {
+		t.Errorf("the app condition %q does not start with the guarded namespace test", gotApp)
 	}
 	const inject = "sidecar.istio.io/inject"
 	optOut := func(field string) string {

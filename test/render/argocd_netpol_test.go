@@ -54,7 +54,7 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 			if policies["NetworkPolicy argocd/argocd"] == nil || policies["NetworkPolicy argocd/allow-from-nodes"] == nil {
 				t.Fatalf("the policies argocd and allow-from-nodes are missing in %s", cr.name)
 			}
-			for _, name := range []string{"cell-system", "istio-system", "apps-demo"} {
+			for _, name := range []string{"cell-system", "istio-system", "apps-demo", "apps-sample"} {
 				if p := policies["NetworkPolicy "+name+"/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != "map[]" {
 					t.Errorf("allow-from-nodes in %s changed: %v", name, p)
 				}

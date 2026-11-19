@@ -4,7 +4,7 @@
 # global.multiCluster.clusterName was set holds the default ID Kubernetes.
 #
 # The script deletes the pods of every Deployment in each namespace with istio-injection=enabled
-# (apps-demo and istio-egress), and waits for new Ready pods. Argo CD tracks these Deployments, and
+# (apps-demo, apps-sample and istio-egress), and waits for new Ready pods. Argo CD tracks these Deployments, and
 # kubectl rollout restart would write a pod template annotation that then differs from the bundle.
 # Last, it reads ISTIO_META_CLUSTER_ID from the istio-proxy container of every live pod in these
 # namespaces, and fails when one differs from the cluster name.

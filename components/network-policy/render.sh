@@ -12,7 +12,7 @@ source "$(cd "$(dirname "$0")/../lib" && pwd)/addresses.sh"
 node_ips="$(ipv4_list NODE_IPS)" || exit 1
 api_ips="$(ipv4_list API_SERVER_IPS)" || exit 1
 
-NAMESPACES=(argocd cell-system istio-system istio-egress apps-demo)
+NAMESPACES=(argocd cell-system istio-system istio-egress apps-demo apps-sample)
 # The policies of observability-system come from components/observability-system/render.sh.
 
 # Private and link-local ranges. The egress gateway may reach any public address on 443, but
@@ -292,4 +292,30 @@ $(namespace_peer observability-system)
           port: 4317
         - protocol: TCP
           port: 4318
+EOF
+
+# apps-sample is the namespace of the app class. Its pods reach each other, DNS, the kubelet probes and
+# istiod, which each sidecar needs. Every other flow stays closed, so a pod of the app class cannot reach a
+# platform workload.
+cat <<EOF
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: workloads
+  namespace: apps-sample
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to:
+        - podSelector: {}
+    - to:
+$(namespace_peer istio-system)
+      ports:
+        - protocol: TCP
+          port: 15012
 EOF

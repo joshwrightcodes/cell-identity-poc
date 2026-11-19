@@ -1,4 +1,4 @@
 apiVersion: security.istio.io/v1
 kind: AuthorizationPolicy
-metadata: {name: demo, namespace: apps-demo}
+metadata: {name: demo, namespace: apps-sample}
 spec: {action: ALLOW}

@@ -81,8 +81,14 @@ func m8Docs(docs ...string) []byte {
 	return []byte(strings.Join(docs, "---\n"))
 }
 
-// m8Marker is a ConfigMap of apps-demo that holds a marker. A bundle that holds it differs from every other bundle.
-func m8Marker(name, marker string) string { return m8MarkerIn("apps-demo", name, marker) }
+// m8AppNS is the namespace of the app class. m8PlatformNS is the namespace of the platform workloads.
+const (
+	m8AppNS      = "apps-sample"
+	m8PlatformNS = "apps-demo"
+)
+
+// m8Marker is a ConfigMap of apps-sample that holds a marker. A bundle that holds it differs from every other bundle.
+func m8Marker(name, marker string) string { return m8MarkerIn(m8AppNS, name, marker) }
 
 // m8MarkerIn is m8Marker in another namespace.
 func m8MarkerIn(namespace, name, marker string) string {
@@ -98,9 +104,9 @@ data:
 `, name, namespace, marker)
 }
 
-// m8FailingDeployment is a Deployment of apps-demo that never becomes ready. Its readiness probe asks a closed port, and its
+// m8FailingDeployment is a Deployment of the namespace ns that never becomes ready. Its readiness probe asks a closed port, and its
 // progress deadline of 30 s makes Argo CD report it Degraded soon after the rollout starts. A wave other than "" sets the sync wave.
-func m8FailingDeployment(t *testing.T, name, wave string) string {
+func m8FailingDeployment(t *testing.T, ns, name, wave string) string {
 	t.Helper()
 	needProbeImage(t)
 	annotations := ""
@@ -111,7 +117,7 @@ func m8FailingDeployment(t *testing.T, name, wave string) string {
 kind: Deployment
 metadata:
   name: %[1]s
-  namespace: apps-demo
+  namespace: %[4]s
 %[3]s  labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -141,16 +147,59 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-`, name, probeImage, annotations)
+`, name, probeImage, annotations, ns)
 }
 
-// m8DeleteProbeDeployment deletes a probe Deployment of apps-demo when the test ends. A rollback prunes it, and this covers a run
+// m8EchoDeployment is a Deployment of the namespace ns that becomes ready. Its pods carry the label app: echo, the label that the selector
+// of Service apps-demo/echo matches. It follows Pod Security restricted, as the Deployment of m8FailingDeployment does.
+func m8EchoDeployment(t *testing.T, ns, name string) string {
+	t.Helper()
+	needProbeImage(t)
+	return fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s
+  namespace: %[3]s
+  labels:
+    cell.poc.internal/e2e: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: %[2]s
+          args: ["serve", "--addr=:8080"]
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+`, name, probeImage, ns)
+}
+
+// m8DeleteProbeDeployment deletes a probe Deployment of apps-sample or apps-demo when the test ends. A rollback prunes it, and this covers a run
 // that fails before the rollback.
 func m8DeleteProbeDeployment(t *testing.T, cluster, name string) {
 	t.Helper()
 	t.Cleanup(func() {
-		if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "deployment", name, "--ignore-not-found", "--wait=false"); err != nil {
-			t.Errorf("delete the probe Deployment %s of %s: %v", name, cluster, err)
+		for _, ns := range []string{m8AppNS, m8PlatformNS} {
+			if _, err := kubectl(t, cluster, "", "-n", ns, "delete", "deployment", name, "--ignore-not-found", "--wait=false"); err != nil {
+				t.Errorf("delete the probe Deployment %s of %s in %s: %v", name, cluster, ns, err)
+			}
 		}
 	})
 }
@@ -173,12 +222,14 @@ func m8WaitNoOpen(t *testing.T, target string) {
 	}
 }
 
-// m8DeleteProbeObjects deletes the ConfigMaps, Deployments and Services of apps-demo that M8 tests made. A root deletes the Application of
+// m8DeleteProbeObjects deletes the ConfigMaps, Deployments and Services of apps-sample and apps-demo that M8 tests made. A root deletes the Application of
 // a probe bundle and leaves its objects.
 func m8DeleteProbeObjects(t *testing.T, cluster string) {
 	t.Helper()
-	if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "configmap,deployment,service,networkpolicy", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
-		t.Errorf("delete the probe objects of apps-demo in %s: %v", cluster, err)
+	for _, ns := range []string{m8AppNS, m8PlatformNS} {
+		if _, err := kubectl(t, cluster, "", "-n", ns, "delete", "configmap,deployment,service,networkpolicy", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
+			t.Errorf("delete the probe objects of %s in %s: %v", ns, cluster, err)
+		}
 	}
 }
 

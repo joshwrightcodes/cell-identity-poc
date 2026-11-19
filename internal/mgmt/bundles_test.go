@@ -26,7 +26,7 @@ func digestOf(c byte) string { return "sha256:" + strings.Repeat(string(c), 64) 
 
 func cellComps() []bundle.Component {
 	return []bundle.Component{
-		{Name: "apps-sample", Wave: 10, Namespace: "apps-demo", Digest: digestOf('b')},
+		{Name: "apps-sample", Wave: 10, Namespace: "apps-sample", Digest: digestOf('b')},
 		{Name: "argocd", Wave: -5, Namespace: "argocd", Digest: digestOf('a')},
 		{Name: "namespaces", Wave: -10, Namespace: "default", Digest: digestOf('c')},
 	}

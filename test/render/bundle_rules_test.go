@@ -785,3 +785,59 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 		}
 	}
 }
+
+// TestNetworkPolicyAppsSample checks, in every cluster, the policies of the namespace of the app class. The namespace denies
+// all traffic by default, with one policy that has no rule. The other policies admit DNS, the node addresses for the probes
+// of the kubelet, and the pods of the namespace itself, plus the one flow to istiod that a sidecar needs. No policy admits
+// a pod of apps-demo, so a pod of the app class has no path to the platform workloads.
+func TestNetworkPolicyAppsSample(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			policies := map[string]object{}
+			for _, c := range cr.components {
+				if c.name != "network-policy" {
+					continue
+				}
+				for _, o := range c.objs {
+					if o["kind"] == "NetworkPolicy" && lookupOr(o, "metadata", "namespace") == "apps-sample" {
+						policies[fmt.Sprint(lookupOr(o, "metadata", "name"))] = o
+					}
+				}
+			}
+			if got, want := slices.Sorted(mapKeys(policies)), []string{"allow-dns", "allow-from-nodes", "default-deny", "workloads"}; !slices.Equal(got, want) {
+				t.Fatalf("apps-sample holds the policies %v in %s, want %v", got, cr.name, want)
+			}
+			deny := policies["default-deny"]
+			if got, want := jsonOf(t, get[any](t, deny, "spec")), `{"podSelector":{},"policyTypes":["Ingress","Egress"]}`; got != want {
+				t.Errorf("default-deny of apps-sample is %s, want %s", got, want)
+			}
+			if got := fmt.Sprint(lookupOr(policies["allow-from-nodes"], "spec", "podSelector")); got != "map[]" {
+				t.Errorf("allow-from-nodes of apps-sample selects %s, want every pod", got)
+			}
+			// No rule of the namespace names apps-demo, and the only namespace outside it that a rule names is istio-system.
+			for name, p := range policies {
+				text := jsonOf(t, get[any](t, p, "spec"))
+				if strings.Contains(text, "apps-demo") {
+					t.Errorf("the policy %s of apps-sample names apps-demo: %s", name, text)
+				}
+				if name == "workloads" {
+					continue
+				}
+				if strings.Contains(text, "istio-system") {
+					t.Errorf("the policy %s of apps-sample names istio-system, which only workloads may: %s", name, text)
+				}
+			}
+			workloads := jsonOf(t, get[any](t, policies["workloads"], "spec"))
+			for _, want := range []string{`"podSelector":{}`, `"kubernetes.io/metadata.name":"istio-system"`, `"port":15012`} {
+				if !strings.Contains(workloads, want) {
+					t.Errorf("workloads of apps-sample is %s, want it to hold %s", workloads, want)
+				}
+			}
+			for _, other := range []string{"istio-egress", "observability-system", "argocd", "cell-system"} {
+				if strings.Contains(workloads, other) {
+					t.Errorf("workloads of apps-sample names %s: %s", other, workloads)
+				}
+			}
+		})
+	}
+}

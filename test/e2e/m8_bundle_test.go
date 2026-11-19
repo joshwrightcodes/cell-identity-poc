@@ -19,10 +19,10 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
-// m8AppWave is the sync wave of the apps-sample component: after apps-demo, which has wave 5.
+// m8AppWave is the sync wave of the apps-sample component: after apps-demo, which has wave 5. It lives in the namespace apps-sample.
 const m8AppWave = 10
 
-// TestM8SignedBundleReachesArgoCD, in each live cell: a bundle apps-sample that holds the ConfigMap apps-demo/m8-marker with a random
+// TestM8SignedBundleReachesArgoCD, in each live cell: a bundle apps-sample that holds the ConfigMap apps-sample/m8-marker with a random
 // marker is pushed to the mirror, and mgmtd signs the last set of the cell with this entry. The cell applies it: the outcome is
 // applied, the Application apps-sample is Synced at the digest and Healthy, the ConfigMap holds the marker, the state holds the
 // signed version, and root is at the root digest of the state, which is the root subject of the signature.
@@ -35,7 +35,7 @@ func TestM8SignedBundleReachesArgoCD(t *testing.T) {
 kind: ConfigMap
 metadata:
   name: m8-marker
-  namespace: apps-demo
+  namespace: apps-sample
   labels:
     cell.poc.internal/e2e: "true"
 data:
@@ -53,7 +53,7 @@ data:
 			if len(comps) == 0 {
 				t.Fatalf("%s has no signed set yet. Run: mise run bundle -- publish --target %s --wait", cell, cell)
 			}
-			comps = append(comps, bundle.Component{Name: "apps-sample", Wave: m8AppWave, Namespace: "apps-demo", Digest: digest})
+			comps = append(comps, bundle.Component{Name: "apps-sample", Wave: m8AppWave, Namespace: "apps-sample", Digest: digest})
 			signed := m8Sign(t, cell, comps, true)
 			res := m8Wait(t, cell, signed.OpID, 10*time.Minute)
 			if res.Result.Outcome != op.OutcomeApplied {
@@ -70,7 +70,7 @@ data:
 			if got := m8Field(app, "status", "health", "status"); got != "Healthy" {
 				t.Errorf("apps-sample is %s, want Healthy", got)
 			}
-			out, err := kubectl(t, cell, "", "-n", "apps-demo", "get", "configmap", "m8-marker", "-o", "jsonpath={.data.marker}")
+			out, err := kubectl(t, cell, "", "-n", "apps-sample", "get", "configmap", "m8-marker", "-o", "jsonpath={.data.marker}")
 			if err != nil || out != marker {
 				t.Errorf("ConfigMap m8-marker holds %q (%v), want %q", out, err, marker)
 			}

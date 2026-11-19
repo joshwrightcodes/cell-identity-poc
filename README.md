@@ -667,7 +667,7 @@ Read it with `mise run harness:logs <cell> app.kubernetes.io/name=celld`, or wit
 | `signature_invalid` or `env_mismatch` | The key is not trusted, or the set is for another environment | Read the key rotation section above. Run `mise run mgmt -- keys --cell <cell>` |
 | `digest_mismatch`, a component or `root` | The mirror holds other bytes than the signed digest | Run `CELL=<cluster> mise run cell:up`, which hydrates and publishes again. Check the mirror for a push of another pod |
 | `component_not_allowed`, `component_unknown` | A hand-built set names a component outside the role of the target. `publish` refuses an unknown name earlier, at `mgmtd`, as `payload_invalid` with the detail `set` | Fix the name. A cell takes the platform components and `apps-sample`. `dev-cp` takes the platform components and the three of its own |
-| `component_not_allowed`, `kind`, `namespace`, `namespace_missing`, `cluster_kind_namespaced`, `kind_unknown_scope` or `items_list` | An object has a kind or a namespace that the class of the component does not allow, or the engine cannot place it | Remove the object, or move it to a component of the right class |
+| `component_not_allowed`, `kind`, `namespace`, `namespace_missing`, `cluster_kind_namespaced`, `kind_unknown_scope` or `items_list` | An object has a kind or a namespace that the class of the component does not allow, or the engine cannot place it | Remove the object, or move it to a component of the right class. An application bundle places objects in `apps-sample` only |
 | `component_not_allowed`, `harness_namespace`, `harness_label` or `harness_object` | A bundle names a harness namespace, carries the harness label, or names a guard policy | Remove the object. The harness owns these |
 | `component_not_allowed`, `service_type` or `mesh_opt_out` | An application bundle has a Service that is not `ClusterIP`. Or it has a pod that refuses the sidecar, or a label or annotation that changes or bypasses it. The only Istio key it may set is `sidecar.istio.io/inject`. The refused keys are the others under `sidecar.istio.io/`, `inject.istio.io/` and `traffic.sidecar.istio.io/`, and `istio.io/rev` and `proxy.istio.io/config` | Remove the Service type or the key |
 | `component_not_allowed`, `reserved_object` | An application bundle holds ConfigMap `kube-root-ca.crt`, ConfigMap `istio-ca-root-cert` or ServiceAccount `default`. The cluster creates these objects in every namespace, and no Application tracks them | Remove the object |
@@ -816,7 +816,7 @@ The token scan also reads the logs of `store-proxy` and `store-token`, and the f
 1. It deletes the namespaces `m8-*` and the test Applications `m8-*` that carry the label of the e2e tests, and waits until they are gone.
 2. For a target in `rolled_back` with `rollback_unhealthy`, it runs `mise run bundle -- repair --target <target>`.
 3. It publishes the hydrated set again for each target that a test changed, with `dev-cp` first.
-   A target counts when it is in `build/gate/m8-bundles`, holds the Application `apps-sample` or the ConfigMap `apps-demo/m8-marker`, is in `rolled_back`, or has an open set.
+   A target counts when it is in `build/gate/m8-bundles`, holds the Application `apps-sample`, holds the ConfigMap `m8-marker` in `apps-sample` or `apps-demo`, is in `rolled_back`, or has an open set.
    Before each publish it waits for an open set to end, for up to 35 minutes, because `mgmtd` refuses a new set with `bundle_open`.
    After the publish it deletes the marker ConfigMap.
 

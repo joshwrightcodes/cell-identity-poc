@@ -724,7 +724,7 @@ func bundleCtl(t *testing.T) (func(stdin string, args ...string) (int, string), 
 	}, plane
 }
 
-const bundleComponents = `[{"name":"apps-sample","wave":10,"namespace":"apps-demo","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
+const bundleComponents = `[{"name":"apps-sample","wave":10,"namespace":"apps-sample","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
 
 func jsonLine(t *testing.T, out string) map[string]any {
 	t.Helper()

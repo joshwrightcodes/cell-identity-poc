@@ -39,7 +39,7 @@ func TestExpectedAppProjectSpec(t *testing.T) {
 	}
 	b, _ := json.Marshal(app)
 	for _, frag := range []string{
-		`"namespace":"apps-demo"`, `"kind":"Deployment"`, `"group":"apps"`, `"kind":"ConfigMap"`,
+		`"namespace":"apps-sample"`, `"kind":"Deployment"`, `"group":"apps"`, `"kind":"ConfigMap"`,
 		`"name":"bundles-app-limits"`, `"name":"bundles-spare-harness"`, `oci://127.0.0.1:5000/bundles/*`,
 	} {
 		if !strings.Contains(string(b), frag) {

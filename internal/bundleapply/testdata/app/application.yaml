@@ -1,4 +1,4 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
-metadata: {name: demo, namespace: apps-demo}
+metadata: {name: demo, namespace: apps-sample}
 spec: {}

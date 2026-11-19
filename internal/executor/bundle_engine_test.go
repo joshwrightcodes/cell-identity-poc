@@ -81,7 +81,7 @@ func (er *engineRig) engine(holder string) *bundleapply.Applier {
 func (er *engineRig) signedSet(target string) (bundle.Set, bundle.Artifact, []byte) {
 	er.t.Helper()
 	set := bundle.Set{Version: bundle.Version{Epoch: 1, Counter: 1}}
-	for _, c := range []struct{ name, ns string }{{"apps-sample", "apps-demo"}, {"network-policy", "cell-system"}} {
+	for _, c := range []struct{ name, ns string }{{"apps-sample", "apps-sample"}, {"network-policy", "cell-system"}} {
 		body, err := bundle.Canonical([]map[string]any{{
 			"apiVersion": "v1", "kind": "ConfigMap",
 			"metadata": map[string]any{"name": c.name, "namespace": c.ns},
