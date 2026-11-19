@@ -561,7 +561,7 @@ func TestM3KeepaliveBlackhole(t *testing.T) {
 func mustUps(ups []int, _, _ map[int]bool) []int { return ups }
 
 // meshNamespaces are the namespaces that Kiali reads in each cell (MESH_VIEW_NAMESPACES, and its own).
-var meshNamespaces = []string{"apps-demo", "istio-egress", "istio-system", "mesh-view-system"}
+var meshNamespaces = []string{"apps-demo", "apps-sample", "istio-egress", "istio-system", "mesh-view-system"}
 
 // kialiForward starts a port-forward to Kiali and returns its address.
 func kialiForward(t *testing.T) string {

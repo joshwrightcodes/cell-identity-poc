@@ -1,0 +1,4 @@
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata: {name: deny-all, namespace: apps-sample}
+spec: {}

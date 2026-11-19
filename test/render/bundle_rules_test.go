@@ -833,10 +833,38 @@ func TestNetworkPolicyAppsSample(t *testing.T) {
 					t.Errorf("workloads of apps-sample is %s, want it to hold %s", workloads, want)
 				}
 			}
-			for _, other := range []string{"istio-egress", "observability-system", "argocd", "cell-system"} {
+			// The one flow with the collector is N15: its pod reads the Envoy metrics on 15090.
+			if got := jsonOf(t, get[any](t, policies["workloads"], "spec", "ingress")); !strings.Contains(got, `"app.kubernetes.io/name":"otel-collector"`) || !strings.Contains(got, `"port":15090`) {
+				t.Errorf("the ingress of workloads in apps-sample is %s, want the collector on 15090", got)
+			}
+			for _, other := range []string{"istio-egress", "argocd", "cell-system"} {
 				if strings.Contains(workloads, other) {
 					t.Errorf("workloads of apps-sample names %s: %s", other, workloads)
 				}
+			}
+		})
+	}
+}
+
+// TestMeshDenyAllAppsSample checks, in every cluster, that the mesh denies each request to a workload of apps-sample by default:
+// an AuthorizationPolicy with an empty spec, as in apps-demo, and no policy of the mesh component that allows a request there.
+func TestMeshDenyAllAppsSample(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			found := 0
+			for _, c := range cr.components {
+				for _, o := range c.objs {
+					if o["kind"] != "AuthorizationPolicy" || lookupOr(o, "metadata", "namespace") != "apps-sample" {
+						continue
+					}
+					found++
+					if name := lookupOr(o, "metadata", "name"); name != "deny-all" || c.name != "mesh-policy" || jsonOf(t, get[any](t, o, "spec")) != "{}" {
+						t.Errorf("apps-sample holds the AuthorizationPolicy %v of %s with the spec %s, want only deny-all of mesh-policy with an empty spec", name, c.name, jsonOf(t, get[any](t, o, "spec")))
+					}
+				}
+			}
+			if found != 1 {
+				t.Errorf("apps-sample holds %d AuthorizationPolicies in %s, want deny-all alone", found, cr.name)
 			}
 		})
 	}

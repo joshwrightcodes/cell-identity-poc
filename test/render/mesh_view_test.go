@@ -328,7 +328,7 @@ func TestKialiRender(t *testing.T) {
 		"deployment.image_name":                     "quay.io/kiali/kiali",
 		"deployment.version_label":                  "v2.34.1",
 		"deployment.discovery_selectors": map[string]any{"default": []any{map[string]any{"matchExpressions": []any{map[string]any{
-			"key": "kubernetes.io/metadata.name", "operator": "In", "values": []any{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"}}}}}},
+			"key": "kubernetes.io/metadata.name", "operator": "In", "values": []any{"apps-demo", "apps-sample", "istio-system", "istio-egress", "mesh-view-system"}}}}}},
 		"server.observability.metrics.enabled":           false,
 		"external_services.prometheus.health_check_url":  nil,
 		"external_services.prometheus.auth":              nil,
@@ -364,7 +364,7 @@ func TestKialiRender(t *testing.T) {
 		}
 	}
 	// The home manager does not cache ConfigMaps, so the Roles in management grant none.
-	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress"} {
+	for _, ns := range []string{"apps-demo", "apps-sample", "istio-system", "istio-egress"} {
 		for _, rule := range get[[]any](t, objs["Role "+ns+"/kiali-viewer"], "rules") {
 			if len(strList(t, lookupOr(rule, "resources"))) == 0 {
 				t.Errorf("the viewer Role in %s has a rule with no resource, which the API server refuses", ns)
@@ -380,7 +380,7 @@ func TestKialiRender(t *testing.T) {
 		t.Error("the Kiali config has no signing key, or the old fixed one")
 	}
 	// The home cluster cache of Kiali watches each namespace of the list, so each has the viewer Role.
-	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"} {
+	for _, ns := range []string{"apps-demo", "apps-sample", "istio-system", "istio-egress", "mesh-view-system"} {
 		r := objs["Role "+ns+"/kiali-viewer"]
 		b := objs["RoleBinding "+ns+"/kiali-viewer"]
 		if r == nil || b == nil {

@@ -30,3 +30,11 @@ metadata:
   name: deny-all
   namespace: apps-demo
 spec: {}
+---
+# apps-sample holds the pods of the app class. The empty spec denies every request to them, and no policy allows one.
+apiVersion: security.istio.io/v1
+kind: AuthorizationPolicy
+metadata:
+  name: deny-all
+  namespace: apps-sample
+spec: {}

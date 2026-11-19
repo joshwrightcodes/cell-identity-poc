@@ -37,7 +37,8 @@
       ],
       "namespaceKinds": {
         "apps-sample": [
-          "networking.k8s.io/NetworkPolicy"
+          "networking.k8s.io/NetworkPolicy",
+          "security.istio.io/AuthorizationPolicy"
         ]
       }
     },
@@ -83,7 +84,8 @@
       ],
       "namespaceKinds": {
         "apps-sample": [
-          "networking.k8s.io/NetworkPolicy"
+          "networking.k8s.io/NetworkPolicy",
+          "security.istio.io/AuthorizationPolicy"
         ]
       }
     },

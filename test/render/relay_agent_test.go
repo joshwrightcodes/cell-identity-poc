@@ -228,6 +228,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				"[] [configmaps] [get list watch]; [] [secrets] [list watch]",
 			"Role argocd/argocd-agent-token":      "[] [serviceaccounts/token] [create]",
 			"Role apps-demo/argocd-agent-read":    "[] [services] [get list watch]; [apps] [deployments] [get list watch]; [security.istio.io] [authorizationpolicies] [get list watch]",
+			"Role apps-sample/argocd-agent-read":  "[] [configmaps serviceaccounts services] [get list watch]; [apps] [deployments] [get list watch]",
 			"Role argocd/argocd-agent-read":       "[apps] [statefulsets] [get list watch]; [argoproj.io] [appprojects] [get list watch]",
 			"Role istio-system/argocd-agent-read": "[] [configmaps] [get list watch]",
 			"ClusterRole argocd-agent-read": "[] [namespaces] [get list watch]; [admissionregistration.k8s.io] [validatingwebhookconfigurations] [get list watch]; " +
@@ -264,7 +265,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				t.Errorf("the render reads the objects of the harness bundle: %s", key)
 			}
 		}
-		for _, key := range []string{"RoleBinding argocd/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
+		for _, key := range []string{"RoleBinding argocd/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "RoleBinding apps-sample/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
 			if fmt.Sprint(lookupOr(objs[key], "subjects")) != "[map[kind:ServiceAccount name:argocd-agent namespace:argocd]]" {
 				t.Errorf("%s binds %v, want argocd/argocd-agent only", key, lookupOr(objs[key], "subjects"))
 			}

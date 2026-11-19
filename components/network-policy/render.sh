@@ -295,7 +295,7 @@ $(namespace_peer observability-system)
 EOF
 
 # apps-sample is the namespace of the app class. Its pods reach each other, DNS, the kubelet probes and
-# istiod, which each sidecar needs. Every other flow stays closed, so a pod of the app class cannot reach a
+# istiod, which each sidecar needs. The collector reads their Envoy metrics. Every other flow stays closed, so a pod of the app class cannot reach a
 # platform workload.
 cat <<EOF
 ---
@@ -310,6 +310,12 @@ spec:
   ingress:
     - from:
         - podSelector: {}
+    # N15: the Envoy metrics.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15090
   egress:
     - to:
         - podSelector: {}

@@ -523,6 +523,21 @@ func TestCollectorPolicies(t *testing.T) {
 				if get[string](t, j, "job_name") == "envoy" && !strings.Contains(fmt.Sprint(get[[]any](t, j, "relabel_configs")[0]), "regex:istio-proxy;15090") {
 					t.Errorf("the envoy job keeps %v, want regex istio-proxy;15090", get[[]any](t, j, "relabel_configs")[0])
 				}
+				if get[string](t, j, "job_name") == "envoy" {
+					if got := fmt.Sprint(get[[]any](t, j, "kubernetes_sd_configs")[0]); !strings.Contains(got, "names:[apps-demo apps-sample istio-egress]") {
+						t.Errorf("the envoy job reads %s, want the namespaces apps-demo, apps-sample and istio-egress", got)
+					}
+				}
+			}
+			// The collector reaches Envoy on 15090 in apps-sample too.
+			envoyPeers := ""
+			for _, r := range out {
+				if strings.Join(r.ports, ",") == "15090" {
+					envoyPeers = r.peers
+				}
+			}
+			if !strings.Contains(envoyPeers, "apps-sample") {
+				t.Errorf("the collector egress on 15090 is %q, want it to name apps-sample", envoyPeers)
 			}
 			// The bundle store sends OTLP to the collector pod only.
 			store := clusterComponent(t, cl.name, "network-policy")["NetworkPolicy cell-system/bundle-store"]
@@ -551,7 +566,7 @@ func TestMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
 	type port struct{ component, policy, port string }
 	ports := map[string][]port{
 		"base": {{"network-policy", "NetworkPolicy argocd/argocd", "8082,8084"}, {"network-policy", "NetworkPolicy istio-system/istio-system", "15014"},
-			{"network-policy", "NetworkPolicy apps-demo/workloads", "15090"}, {"network-policy", "NetworkPolicy istio-egress/egress-gateway", "15090"}},
+			{"network-policy", "NetworkPolicy apps-demo/workloads", "15090"}, {"network-policy", "NetworkPolicy apps-sample/workloads", "15090"}, {"network-policy", "NetworkPolicy istio-egress/egress-gateway", "15090"}},
 		"dev-cell-1": {{"argocd-agent", "NetworkPolicy argocd/argocd-agent", "8181"}},
 		"dev-cp":     {{"spire-server", "NetworkPolicy spire-system/spire-server-metrics", "9988"}},
 		"management": {{"spire-server", "NetworkPolicy spire-system/spire-server-metrics", "9988"},

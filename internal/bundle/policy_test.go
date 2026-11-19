@@ -20,8 +20,8 @@ var allowFile []byte
 
 var (
 	platformNS = []string{"argocd", "cell-system", "istio-system", "istio-egress", "observability-system", "apps-demo", "apps-sample"}
-	// platformAppsSample is what the platform classes may hold in the namespace of the app class: its Namespace and its NetworkPolicies.
-	platformAppsSample = map[string][]string{"apps-sample": {"networking.k8s.io/NetworkPolicy"}}
+	// platformAppsSample is what the platform classes may hold in the namespace of the app class: its Namespace, its NetworkPolicies and its AuthorizationPolicies.
+	platformAppsSample = map[string][]string{"apps-sample": {"networking.k8s.io/NetworkPolicy", "security.istio.io/AuthorizationPolicy"}}
 	clusterKs          = []string{"Namespace", "apiextensions.k8s.io/CustomResourceDefinition",
 		"rbac.authorization.k8s.io/ClusterRole", "rbac.authorization.k8s.io/ClusterRoleBinding",
 		"admissionregistration.k8s.io/ValidatingWebhookConfiguration", "admissionregistration.k8s.io/MutatingWebhookConfiguration",

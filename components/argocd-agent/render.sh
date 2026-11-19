@@ -77,6 +77,11 @@ objects="$(yq -o=json -I=0 'select(.kind != null and (.metadata.labels["cell.poc
   | {"apiVersion": .apiVersion, "kind": .kind, "ns": (.metadata.namespace // ""),
      "crd": (if .kind == "CustomResourceDefinition" then {"group": .spec.group, "kind": .spec.names.kind, "plural": .spec.names.plural, "scope": .spec.scope} else null end)}' \
   "${files[@]}")" || die "could not read the bundles in $bundles"
+# The app class has no bundle in the build directory. Its kinds and namespaces come from allow.json, so the view reads them too.
+app_objects="$(jq -c '.classes[] | select(.project == "cell-app") | . as $c | $c.namespacedKinds[] as $k | $c.objectNamespaces[] as $n
+  | {"apiVersion": (if ($k | contains("/")) then ($k | split("/")[0]) + "/v1" else "v1" end), "kind": ($k | split("/")[-1]), "ns": $n, "crd": null}' \
+  "${BUNDLE_ALLOW_JSON:-$root/internal/bundle/allow.json}")" || die "could not read the app class of allow.json"
+objects+=$'\n'"$app_objects"
 # api-resources prints NAME, SHORTNAMES (may be empty), APIVERSION, NAMESPACED and KIND.
 if ! api="$(kubectl --context "kind-$CELL_NAME" api-resources --no-headers 2>/dev/null)"; then
   die "kubectl api-resources failed for kind-$CELL_NAME. Check that the cluster answers"
