@@ -1311,10 +1311,15 @@ func TestActorCountsStates(t *testing.T) {
 	ae.start()
 	ae.submit(s, env)
 	ae.waitState(s.ID, mgmtapi.StepFailed)
+	// The actor counts a state after the journal holds it, so Status can show failed before the count of failed. Each count
+	// comes from the run of the step, in order, so the count of failed comes last.
 	var rm metricdata.ResourceMetrics
-	if err := reader.Collect(context.Background(), &rm); err != nil {
-		t.Fatal(err)
-	}
+	waitUntil(t, "the count of state failed", 5*time.Second, func() bool {
+		if err := reader.Collect(context.Background(), &rm); err != nil {
+			t.Fatal(err)
+		}
+		return sumFor(t, rm, "hostsvc.steps", "state", mgmtapi.StepFailed) > 0
+	})
 	for state, want := range map[string]int64{"queued": 1, "creating": 1, "admitting": 1, "bootstrapping": 1, "failed": 1, "done": 0} {
 		if got := sumFor(t, rm, "hostsvc.steps", "state", state); got != want {
 			t.Errorf("hostsvc.steps{state=%s} = %d, want %d", state, got, want)
