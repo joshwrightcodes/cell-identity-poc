@@ -39,6 +39,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/spiffetest"
 )
@@ -986,5 +987,28 @@ func TestStatusShowsValidAndSteps(t *testing.T) {
 	})
 	if bytes.Equal(host.got()[len(first)], first[0]) {
 		t.Fatal("the push after the request is the old spec")
+	}
+}
+
+func TestServeOperatorKeyFile(t *testing.T) {
+	f := newFixture(t)
+	currentT = t
+	bad := filepath.Join(f.dir, "bad.pub")
+	must(t, os.WriteFile(bad, []byte("not a key\n"), 0o600))
+	for name, path := range map[string]string{"absent": filepath.Join(f.dir, "absent.pub"), "invalid": bad} {
+		var out bytes.Buffer
+		argv := append(f.argv(), "--operator-key-file", path)
+		if code := execute(t.Context(), argv, &out, f.deps()); code != 2 {
+			t.Errorf("%s: exit %d, want 2: %s", name, code, out.String())
+		}
+	}
+	pub, _, err := ed25519.GenerateKey(nil)
+	must(t, err)
+	good := filepath.Join(f.dir, "spec.pub")
+	must(t, os.WriteFile(good, []byte(base64.StdEncoding.EncodeToString(pub)+"\n"), 0o600))
+	f.args["operator-key-file"] = good
+	r := f.start(t)
+	if got := waitField(t, r.out, "operator_keys", "key_sha256"); got != revoke.KeySHA256(pub) {
+		t.Fatalf("operator_keys key_sha256 %q", got)
 	}
 }

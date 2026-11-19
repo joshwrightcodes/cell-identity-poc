@@ -99,6 +99,11 @@ type CellStatus struct {
 	Valid        bool      `json:"valid"`
 	ValidReason  string    `json:"validReason,omitempty"`
 	InvalidSince time.Time `json:"invalidSince,omitzero"`
+
+	// Revoked is true while the record of the cell is revoked. RevokedBy is the source of the revoke
+	// that the mirror holds for it: admin or operator.
+	Revoked   bool   `json:"revoked"`
+	RevokedBy string `json:"revokedBy,omitempty"`
 }
 
 type reports struct {
@@ -120,6 +125,9 @@ type reports struct {
 	// stepHost is the last host status of each open step, by step ID. It lives in memory, so a
 	// report never raises the state version.
 	stepHost map[string]mgmtapi.StepStatus
+
+	// overlay holds the cells of the local revocation entries in the last report.
+	overlay map[string]bool
 }
 
 // maxStepStatuses is the most step statuses that one report stores.
@@ -152,9 +160,10 @@ func (p *Plane) noteGateway(g *mgmtapi.GatewayStatus, now time.Time) {
 	}
 }
 
-// Report stores what envd reported. A report of the signed revision releases the next pending drop.
-// Each key hint, from the report or from the gateway, queues at most one background hint check for
-// its cell in 60 s, so Report returns at once.
+// Report stores what envd reported. It hands the local revocation entries to adopt. A report of the
+// signed revision then releases the next pending revoke or, with none, the next pending drop. Each
+// key hint, from the report or from the gateway, queues at most one background hint check for its
+// cell in 60 s, so Report returns at once.
 func (p *Plane) Report(r mgmtapi.StatusReport) {
 	now := p.cfg.Now()
 	p.rmu.Lock()
@@ -180,6 +189,7 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		p.rep.planeBundle = &b
 	}
 	p.noteSteps(st, r.Steps)
+	p.rep.overlay = overlayCells(r.LocalRevocations)
 	p.lagLocked(st, now)
 	logBehind := behind && !p.rep.behindLogged
 	p.rep.behindLogged = behind
@@ -192,6 +202,15 @@ func (p *Plane) Report(r mgmtapi.StatusReport) {
 		p.queueHint(h.Cell)
 	}
 	p.planeResult(r.PlaneBundle)
+	p.adopt(context.Background(), r.LocalRevocations, now)
+	// adopt can sign a revision, so the queues read the state again. A revoke goes before a drop.
+	st = p.snap.Load().st
+	if len(st.PendingRevokes) > 0 && r.Applied == st.Last {
+		if err := p.revokeNext(r.Applied); err != nil && ReasonOf(err) != mgmtapi.ReasonRestoreActive {
+			p.logLimited(context.Background(), slog.LevelError, "revoke_failed", "revoke_failed", "error", err.Error())
+		}
+		st = p.snap.Load().st
+	}
 	if len(st.PendingDrops) > 0 && r.Applied == st.Last {
 		if err := p.dropNext(r.Applied); err != nil && ReasonOf(err) != mgmtapi.ReasonRestoreActive {
 			p.logLimited(context.Background(), slog.LevelError, "drop_failed", "drop_failed", "error", err.Error())
@@ -319,6 +338,9 @@ func (p *Plane) Status() Status {
 				}
 			}
 		}
+		if c := st.Cells[name]; c != nil && c.Revoked {
+			cs.Revoked, cs.RevokedBy = true, revokedBy(st.Revocations, name)
+		}
 		cs.Valid, cs.ValidReason = p.validOf(st, name, live[name], rep.applied, now)
 		cs.InvalidSince = p.noteValid(name, cs.Valid, now)
 		s.Cells = append(s.Cells, cs)
@@ -340,4 +362,14 @@ func (p *Plane) logLimited(ctx context.Context, level slog.Level, key, msg strin
 		args = append(args, "suppressed", suppressed)
 	}
 	p.cfg.Log.Log(ctx, level, msg, args...)
+}
+
+// revokedBy returns the source of the newest revoke of cell in the mirror.
+func revokedBy(events []mgmtapi.RevocationEvent, cell string) string {
+	for i := len(events) - 1; i >= 0; i-- {
+		if ev := events[i]; ev.Cell == cell && ev.Kind == mgmtapi.RevocationRevoke {
+			return ev.Source
+		}
+	}
+	return ""
 }

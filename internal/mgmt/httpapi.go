@@ -280,6 +280,8 @@ func NewAdminHandler(p *Plane, publish func(context.Context, ed25519.PublicKey) 
 	mux.HandleFunc("GET /keys/{cell}", h.keys)
 	mux.HandleFunc("POST /keycheck/{cell}", h.keycheck)
 	mux.HandleFunc("POST /restore/{revision}", h.restore)
+	mux.HandleFunc("POST /revoke/{cell}", h.revoke)
+	mux.HandleFunc("POST /unrevoke/{cell}", h.unrevoke)
 	mux.HandleFunc("POST /rotate-key", h.rotate)
 	mux.HandleFunc("POST /ops", h.createOp)
 	mux.HandleFunc("GET /ops", h.listOps)
@@ -336,7 +338,8 @@ func refusalStatus(status int, out map[string]any, err error) (int, map[string]a
 	if reason := ReasonOf(err); reason != "" {
 		out["reason"] = reason
 		switch reason {
-		case mgmtapi.ReasonConflict, mgmtapi.ReasonBundleOpen:
+		case mgmtapi.ReasonConflict, mgmtapi.ReasonBundleOpen, mgmtapi.ReasonNotConnected, mgmtapi.ReasonNotRevoked,
+			mgmtapi.ReasonOverlayHeld, mgmtapi.ReasonRestorePastRevocation:
 			status = http.StatusConflict
 		case mgmtapi.ReasonCellUnknown:
 			status = http.StatusNotFound
@@ -439,6 +442,30 @@ func (h *adminHandler) restore(w http.ResponseWriter, r *http.Request) {
 	}
 	st := h.p.Status()
 	writeJSON(w, http.StatusOK, map[string]any{"served": st.Served, "restoreActive": st.RestoreActive, "seq": st.Seq})
+}
+
+// revoke answers POST /revoke/{cell}: 200 with the RevokeResult, also for a cell that is revoked or
+// queued already, and 404 not_bound for a cell with no record.
+func (h *adminHandler) revoke(w http.ResponseWriter, r *http.Request) {
+	h.revokeAnswer(w, r, h.p.Revoke)
+}
+
+// unrevoke answers POST /unrevoke/{cell}: 200 with the RevokeResult, 404 not_bound, and 409
+// not_revoked, not_connected or overlay_held.
+func (h *adminHandler) unrevoke(w http.ResponseWriter, r *http.Request) {
+	h.revokeAnswer(w, r, h.p.Unrevoke)
+}
+
+func (h *adminHandler) revokeAnswer(w http.ResponseWriter, r *http.Request, do func(context.Context, string) (RevokeResult, error)) {
+	res, err := do(r.Context(), r.PathValue("cell"))
+	switch {
+	case ReasonOf(err) == mgmtapi.ReasonNotBound:
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error(), "reason": mgmtapi.ReasonNotBound})
+	case err != nil:
+		adminError(w, err)
+	default:
+		writeJSON(w, http.StatusOK, res)
+	}
 }
 
 // rotateMode reads the queries stage and commit. Each takes the value 1, and the two exclude each

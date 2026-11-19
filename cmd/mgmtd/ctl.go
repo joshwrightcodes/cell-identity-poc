@@ -29,7 +29,7 @@ const (
 	maxCtlResponse = 16 << 20
 	maxStepInput   = 16 << 10
 	maxBundleInput = 256 << 10
-	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign (the step as JSON on standard input) | bundle sign --target <t> [--no-serve] [--ttl <d>] (the components as JSON on standard input) | bundle get --target <t> | bundle cosign --target <t>"
+	ctlUsage       = "usage: mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | revoke --cell <c> | unrevoke --cell <c> | rotate-key [--stage|--commit|--emergency] | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign (the step as JSON on standard input) | bundle sign --target <t> [--no-serve] [--ttl <d>] (the components as JSON on standard input) | bundle get --target <t> | bundle cosign --target <t>"
 )
 
 // Hooks that tests replace.
@@ -230,6 +230,12 @@ func ctlCommand(ctx context.Context, args []string, stdin io.Reader, stdout io.W
 			return exitConfig
 		}
 		method, path = http.MethodPost, "/keycheck/"+url.PathEscape(cell)+query
+	case "revoke", "unrevoke":
+		if cell == "" {
+			cli.Fail(stdout, name, fmt.Errorf("%s needs --cell", rest[0]))
+			return exitConfig
+		}
+		method, path = http.MethodPost, "/"+rest[0]+"/"+url.PathEscape(cell)
 	case "restore":
 		if *revision == "" {
 			cli.Fail(stdout, name, errors.New("restore needs --revision"))
@@ -345,7 +351,7 @@ func ctlRequest(ctx context.Context, socket, method, path string, body io.Reader
 // flagApplies reports whether the subcommand flag applies to the command (and the op subcommand).
 func flagApplies(command, opSub, flagName string) bool {
 	switch command {
-	case "keys", "keycheck":
+	case "keys", "keycheck", "revoke", "unrevoke":
 		return flagName == "cell"
 	case "restore":
 		return flagName == "revision"

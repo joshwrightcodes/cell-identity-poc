@@ -45,3 +45,8 @@ func keySourceError(err error) error {
 
 // ErrRevisionUnknown means that a restore named a counter that the plane does not hold.
 var ErrRevisionUnknown = errors.New("no stored revision")
+
+// ErrRestorePastRevocation means that a restore named a revision below the last signed revoke of
+// the epoch. Such a restore would serve a cell as not revoked again. ReasonOf gives
+// restore_past_revocation.
+var ErrRestorePastRevocation error = &Error{Reason: mgmtapi.ReasonRestorePastRevocation}
