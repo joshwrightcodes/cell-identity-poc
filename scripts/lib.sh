@@ -1317,6 +1317,11 @@ check_no_last_applied_secret() {
   }
 }
 
+# sha256 prints the hex SHA-256 of standard input, with sha256sum on Linux and shasum on the Mac.
+sha256() {
+  if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+}
+
 # pem_der_sha256 reads PEM certificates on standard input and prints the SHA-256 of their DER bytes, in
 # file order, one after the other. hostsvc prints the same value as root_sha256 for its client roots.
 pem_der_sha256() {
@@ -1324,7 +1329,7 @@ pem_der_sha256() {
   printf 'AA==' | base64 -d >/dev/null 2>&1 || decode=-D
   awk '/-----BEGIN CERTIFICATE-----/ { b = ""; next } /-----END CERTIFICATE-----/ { print b; next } { b = b $0 }' \
     | while read -r line; do printf '%s' "$line" | base64 "$decode"; done \
-    | if command -v sha256sum >/dev/null; then sha256sum | cut -d' ' -f1; else shasum -a 256 | cut -d' ' -f1; fi
+    | sha256
 }
 
 # dependents_of <name> prints the commands that bring the copies of a change up to date, one command on each
