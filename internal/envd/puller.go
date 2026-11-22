@@ -127,8 +127,8 @@ type Puller struct {
 	// tokens and tokensAt hold the token bucket of the report rate.
 	tokens   float64
 	tokensAt time.Time
-	// started is the time of NewPuller. lastPull is the Unix time in nanoseconds of the last good
-	// pull, or zero before the first one. The age gauge reads both on collection.
+	// started is the time of NewPuller. lastPull is the Unix time in nanoseconds of the last pull
+	// that returned a decodable spec, or zero before the first one. The age gauge reads both on collection.
 	started  time.Time
 	lastPull atomic.Int64
 }
@@ -181,11 +181,11 @@ func NewPuller(cfg PullerConfig) *Puller {
 		metric.WithDescription("Input local revocation entries that envd refused, counted in each round, by reason"))
 	p.throttled, _ = cfg.Meter.Int64Counter("envd.reports.throttled",
 		metric.WithDescription("Report items that the report rate held back for a later round"))
-	// The gauge reads the age from the start of the process until the first good pull, so an island
+	// The gauge reads the age from the start of the process until the first such pull, so an island
 	// that began before a restart does not read as fresh.
 	_, _ = cfg.Meter.Float64ObservableGauge("envd.upstream.age",
 		metric.WithUnit("s"),
-		metric.WithDescription("Seconds since the last good spec pull, or since the start of envd before the first one"),
+		metric.WithDescription("Seconds since the last pull that returned a decodable spec, or since the start of envd before the first one"),
 		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
 			o.Observe(p.upstreamAge())
 			return nil
@@ -193,7 +193,7 @@ func NewPuller(cfg PullerConfig) *Puller {
 	return p
 }
 
-// upstreamAge returns the seconds since the last good pull, or since the start before the first one.
+// upstreamAge returns the seconds since the last pull that returned a decodable spec, or since the start before the first one.
 func (p *Puller) upstreamAge() float64 {
 	ref := p.started
 	if n := p.lastPull.Load(); n != 0 {
@@ -314,11 +314,16 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	p.syncStore(rctx)
 
 	bundle, err := p.fetch(rctx)
+	if err == nil {
+		// A pull that returned a decodable spec counts, even when Accept refuses it, because the
+		// management plane answered. A refusal has its own signals.
+		p.lastPull.Store(p.cfg.Now().UnixNano())
+	}
 	if err != nil {
 		fail(span, err)
 		p.logLimited(ctx, "pull failed", "pull", "error", clip(err.Error()))
 		failed = true
-	} else if p.lastPull.Store(p.cfg.Now().UnixNano()); p.accept(ctx, rctx, bundle) {
+	} else if p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
 	p.overlay(ctx)

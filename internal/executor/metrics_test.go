@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"io"
@@ -111,5 +112,36 @@ func TestCelldUpstreamAge(t *testing.T) {
 	clk.advance(45 * time.Second)
 	if got := gaugeValue(t, reader, "celld.upstream.age"); got != 45 {
 		t.Fatalf("age %v, want 45 since the frame", got)
+	}
+}
+
+// The welcome counts as a frame from the gateway, and a refusal counts too.
+func TestCelldUpstreamAgeWelcome(t *testing.T) {
+	reader, meter := testMeter()
+	clk := &testClock{}
+	clk.ns.Store(time.Date(2026, 11, 20, 9, 0, 0, 0, time.UTC).UnixNano())
+	cfg, err := StreamConfig{
+		Cell: "cell-1", Upstream: "gw.test:8450", Meter: meter, Now: clk.Now,
+		Exec: &Executor{}, Status: func() op.Status { return op.Status{} },
+		TLS:    func() (*tls.Config, error) { return nil, nil },
+		Tokens: func(context.Context, string) (string, error) { return "", nil },
+	}.withDefaults()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clk.advance(2 * time.Minute)
+	var buf bytes.Buffer
+	if err := gwapi.Encode(&buf, gwapi.Frame{Type: gwapi.TypeWelcome}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfg.readWelcome(gwapi.NewDecoder(&buf)); err != nil {
+		t.Fatal(err)
+	}
+	if got := gaugeValue(t, reader, "celld.upstream.age"); got != 0 {
+		t.Fatalf("age %v right after the welcome, want 0", got)
+	}
+	clk.advance(30 * time.Second)
+	if got := gaugeValue(t, reader, "celld.upstream.age"); got != 30 {
+		t.Fatalf("age %v, want 30 since the welcome", got)
 	}
 }

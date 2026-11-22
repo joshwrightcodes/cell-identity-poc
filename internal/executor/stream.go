@@ -389,19 +389,11 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 		return fmt.Errorf("the gateway answered HTTP %d", resp.StatusCode)
 	}
 	dec := gwapi.NewDecoder(resp.Body)
-	welcome, err := dec.Decode()
+	welcome, err := c.readWelcome(dec)
 	if err != nil {
-		return fmt.Errorf("wait for the welcome: %w", err)
-	}
-	switch welcome.Type {
-	case gwapi.TypeWelcome:
-	case gwapi.TypeRefused:
-		return fmt.Errorf("the gateway refused the stream: %s", welcome.Reason)
-	default:
-		return fmt.Errorf("the gateway sent %q, want welcome", welcome.Type)
+		return err
 	}
 	welcomeTimer.Stop()
-	c.upstream.touch()
 	c.Log.InfoContext(ctx, "stream open", "cell", c.Cell, "pod", welcome.Pod, "cap", welcome.Cap)
 
 	l := newLoop(c, sctx, pw, dec)
@@ -411,6 +403,24 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 	_ = resp.Body.Close()
 	l.finish()
 	return err
+}
+
+// readWelcome reads the first frame of a stream, which counts as a frame from the gateway, and
+// accepts only a welcome.
+func (c StreamConfig) readWelcome(dec *gwapi.Decoder) (gwapi.Frame, error) {
+	welcome, err := dec.Decode()
+	if err != nil {
+		return welcome, fmt.Errorf("wait for the welcome: %w", err)
+	}
+	c.upstream.touch()
+	switch welcome.Type {
+	case gwapi.TypeWelcome:
+	case gwapi.TypeRefused:
+		return welcome, fmt.Errorf("the gateway refused the stream: %s", welcome.Reason)
+	default:
+		return welcome, fmt.Errorf("the gateway sent %q, want welcome", welcome.Type)
+	}
+	return welcome, nil
 }
 
 // resendLog keeps when each result went up again, so that no op goes more than once in minResendGap,

@@ -52,3 +52,19 @@ func TestEnvdUpstreamAgeResetsOnGoodPull(t *testing.T) {
 		t.Fatalf("age %v after a good pull, want %v (the last wait only)", got, want)
 	}
 }
+
+// A pull that returned a decodable spec counts, even when Accept refuses it, because the
+// management plane answered.
+func TestEnvdUpstreamAgeRefusedSpecIsReachable(t *testing.T) {
+	h := newHarnessWith(t, 3, func(f *fx) (mgmtapi.SpecBundle, *State) {
+		cur, _ := f.base()
+		return f.bundle(rev(1, 4), []item{f.item(f.cell("a", rev(1, 2), false))}, nil), cur
+	}, func(c *PullerConfig) { c.Interval = 10 * time.Second })
+	runRounds(t, h.p, h.clk)
+	if h.p.refusal == nil {
+		t.Fatal("the bundle was not refused")
+	}
+	if got := ageOf(t, h); got != 10*time.Second {
+		t.Fatalf("age %v after refused pulls, want 10s (the last wait only)", got)
+	}
+}
