@@ -92,6 +92,9 @@ esac
 //   - stub/held: the cells of the entries that envd holds, one each line, for the next stub/held-reads reads of cell-records (default all).
 //   - stub/inputs: the input entry IDs of envd-system/local-revocations, one each line.
 //   - stub/ns-<cluster>: the e2e namespaces of the cluster, as namespace/<name> lines. A delete removes the line.
+//   - stub/store-notready: the number of reads of the pod bundle-store-0 that still say not Ready. stub/apps: the Applications of argocd as
+//     "<name> <sync> <health>" lines (default root Synced Healthy); an annotate of an Application sets it Synced and Healthy unless
+//     stub/refresh-stuck exists.
 //   - stub/no-agent-ban: the StatefulSet spire-server of dev-cp has no container agent-ban. stub/stale: "<namespace> <workload> <cluster>" of
 //     a workload that runs another image.
 const m9Kubectl = `#!/usr/bin/env bash
@@ -146,6 +149,14 @@ case " $* " in
       grep -vx "namespace/$a" "$d/ns-$ctx" >"$d/ns-$ctx.new" || true
       mv "$d/ns-$ctx.new" "$d/ns-$ctx"
     done ;;
+  *" get pod bundle-store-0 "*)
+    n="$(cat "$d/store-notready" 2>/dev/null || echo 0)"
+    if ((n > 0)); then echo $((n - 1)) >"$d/store-notready"; printf False; else printf True; fi ;;
+  *" get applications -o json "*)
+    [[ -e "$d/apps" ]] || echo "root Synced Healthy" >"$d/apps"
+    jq -Rn '{items: [inputs | select(length > 0) | split(" ") | {metadata: {name: .[0]}, status: {sync: {status: .[1]}, health: {status: .[2]}}}]}' "$d/apps" ;;
+  *" annotate application "*)
+    if [[ ! -e "$d/refresh-stuck" ]]; then awk '{ print $1, "Synced", "Healthy" }' "$d/apps" >"$d/apps.new" && mv "$d/apps.new" "$d/apps"; fi ;;
   *" get node "*) case "$ctx" in dev-cell-1) echo 172.18.0.5 ;; dev-cell-2) echo 172.18.0.6 ;; *) echo 172.18.0.9 ;; esac ;;
   *" get statefulset/"*" -o json "*|*" get deployment/"*" -o json "*)
     w=""
@@ -216,6 +227,9 @@ case "$1 $2" in
     fails="$(cat "$d/status-fails" 2>/dev/null || echo 0)"
     if [[ -e "$d/status-fail" ]] || ((fails > 0)); then echo $((fails - 1)) >"$d/status-fails"; echo '{"cluster":"dev-cp","ok":false}'; exit 1; fi
     echo '{"cluster":"dev-cp","ok":true}' ;;
+  "run bundle")
+    [[ ! -e "$d/publish-fail" ]] || { echo '{"error":"publish failed"}'; exit 1; }
+    echo '{"outcome":"applied"}' ;;
   "run revoke") [[ "$4" == clean ]] || exit 2; : >"$d/inputs" ;;
   "run gate:"*)
     echo $(($(cat "$d/now") + ${STUB_GATE_SECONDS:-0})) >"$d/now"

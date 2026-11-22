@@ -34,22 +34,37 @@ const (
 	m9StoreSampleEvery = 10 * time.Second
 )
 
-// m9UIDs maps "<kind>/<namespace>/<name>" to the UID of every Application of argocd and every Deployment of the cluster, except the
-// objects that carry the e2e label.
+// m9UIDs maps "<kind>/<namespace>/<name>" to the UID of every Application of argocd and every Deployment of the bundle namespaces, except
+// the objects that carry the e2e label.
 type m9UIDs map[string]string
 
-// m9ReadUIDs reads the UIDs of the Applications and of the Deployments of the cell. It uses no t.Fatal, so the sampler can call it from its
+// m9BundleNamespaces returns the namespaces that the signed set of the cell deploys into, and cell-system, which holds the bundle store.
+func m9BundleNamespaces(t *testing.T, cluster string) []string {
+	t.Helper()
+	nss := []string{m8CellStoreNS}
+	for _, c := range m8LiveSet(t, cluster) {
+		if c.Namespace != "" && !slices.Contains(nss, c.Namespace) {
+			nss = append(nss, c.Namespace)
+		}
+	}
+	slices.Sort(nss)
+	return nss
+}
+
+// m9ReadUIDs reads the UIDs of the Applications and of the Deployments of the namespaces. It uses no t.Fatal, so the sampler can call it from its
 // own goroutine.
-func m9ReadUIDs(t *testing.T, cluster string) (m9UIDs, error) {
+func m9ReadUIDs(t *testing.T, cluster string, namespaces []string) (m9UIDs, error) {
 	t.Helper()
 	uids := m9UIDs{}
-	for _, q := range []struct {
+	type query struct {
 		kind string
 		args []string
-	}{
-		{"application", []string{"-n", "argocd", "get", "applications", "-o", "json"}},
-		{"deployment", []string{"get", "deployments", "-A", "-o", "json"}},
-	} {
+	}
+	queries := []query{{"application", []string{"-n", "argocd", "get", "applications", "-o", "json"}}}
+	for _, ns := range namespaces {
+		queries = append(queries, query{"deployment", []string{"-n", ns, "get", "deployments", "-o", "json"}})
+	}
+	for _, q := range queries {
 		out, err := kubectl(t, cluster, "", q.args...)
 		if err != nil {
 			return nil, err
@@ -102,7 +117,7 @@ type m9UIDSampler struct {
 	done    chan struct{}
 }
 
-func m9StartSampler(t *testing.T, cluster string, base m9UIDs) *m9UIDSampler {
+func m9StartSampler(t *testing.T, cluster string, namespaces []string, base m9UIDs) *m9UIDSampler {
 	s := &m9UIDSampler{changes: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
@@ -112,7 +127,7 @@ func m9StartSampler(t *testing.T, cluster string, base m9UIDs) *m9UIDSampler {
 				return
 			case <-time.After(m9StoreSampleEvery):
 			}
-			now, err := m9ReadUIDs(t, cluster)
+			now, err := m9ReadUIDs(t, cluster, namespaces)
 			if err != nil {
 				continue
 			}
@@ -239,11 +254,19 @@ const tagCurrentName = "current"
 func m9CelldRefillLine(t *testing.T, since time.Time, rootDigest string) (time.Time, string, bool) {
 	t.Helper()
 	for _, p := range celldPods(t, m9StoreCell) {
-		out, err := kubectl(t, m9StoreCell, "", "-n", celldNamespace, "logs", p.Metadata.Name, "-c", celldContainer, "--timestamps", "--since-time="+since.UTC().Format(time.RFC3339))
-		if err != nil {
-			continue
+		// A restarted container keeps the log of its last run under --previous, which holds a line that the restart cut off.
+		var lines []string
+		for _, previous := range []bool{false, true} {
+			args := []string{"-n", celldNamespace, "logs", p.Metadata.Name, "-c", celldContainer, "--timestamps", "--since-time=" + since.UTC().Format(time.RFC3339)}
+			if previous {
+				args = append(args, "--previous")
+			}
+			// A container that never restarted has no previous log, and kubectl fails: that is no error here.
+			if out, err := kubectl(t, m9StoreCell, "", args...); err == nil {
+				lines = append(lines, strings.Split(out, "\n")...)
+			}
 		}
-		for line := range strings.SplitSeq(out, "\n") {
+		for _, line := range lines {
 			if !strings.Contains(line, "store_refilled") || !strings.Contains(line, rootDigest) {
 				continue
 			}
@@ -378,7 +401,8 @@ func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
 // Argo CD must have compared root after that log line. It never waits for a sync operation.
 func TestM9StoreLostDuringCellIsland(t *testing.T) {
 	cell := m9StoreCell
-	base, err := m9ReadUIDs(t, cell)
+	bundleNS := m9BundleNamespaces(t, cell)
+	base, err := m9ReadUIDs(t, cell, bundleNS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +447,7 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 	var cut *linkCut
 	getCut := func() *linkCut { return cut }
 	t.Cleanup(func() { m9RestoreStore(t, getCut, wasGood) })
-	sampler := m9StartSampler(t, cell, base)
+	sampler := m9StartSampler(t, cell, bundleNS, base)
 	t.Cleanup(func() { sampler.Stop() })
 
 	cut = cutLink(t, cell, cpClusterName, "both", m9StoreHold)
@@ -478,7 +502,7 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		if len(changes) > 0 {
 			t.Errorf("during the island, an Application or a Deployment was replaced or removed: %v", changes)
 		}
-		now, err := m9ReadUIDs(t, cell)
+		now, err := m9ReadUIDs(t, cell, bundleNS)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -496,7 +520,7 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		if res.Result.Outcome != op.OutcomeApplied {
 			t.Fatalf("the next signed set of %s ended %+v, want applied", cell, *res.Result)
 		}
-		now, err := m9ReadUIDs(t, cell)
+		now, err := m9ReadUIDs(t, cell, bundleNS)
 		if err != nil {
 			t.Fatal(err)
 		}

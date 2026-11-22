@@ -500,7 +500,7 @@ func (r *m9Rig) traces() {
 }
 
 // mutations are the call log parts of a repair that changes something.
-var m9Mutations = []string{"partition heal", "delete namespace", "mgmt -- unrevoke", "svid-ttl", "mise run revoke", "m2 repair", "harness:status"}
+var m9Mutations = []string{"partition heal", "delete namespace", "mgmt -- unrevoke", "svid-ttl", "mise run revoke", "m2 repair", "harness:status", "mise run bundle", "annotate application"}
 
 // TestGateM9RepairOrder: gate-m9-repair.sh heals every cut, waits until connected, waits until envd holds no entry, runs revoke -- clean,
 // un-revokes each recorded cell, repairs the API server when the test key exists, restores the lifetime, deletes the m9- namespaces and runs
@@ -639,6 +639,7 @@ func TestGateM9RepairCheck(t *testing.T) {
 		{"the API server test key", "m2-test-sa", func(r *m9Rig) {
 			r.state("keytest", "the node holds /etc/kubernetes/pki/m2-test-sa.key\n")
 		}},
+		{"the store breadcrumb", "build/gate/m9-store-lost", func(r *m9Rig) { r.storeCrumb() }},
 		{"everything", "m9-ab12cd", func(r *m9Rig) { r.traces() }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -656,6 +657,95 @@ func TestGateM9RepairCheck(t *testing.T) {
 			}
 		})
 	}
+}
+
+// storeCrumb writes the breadcrumb of the bundle store test, which names the cluster on its first line.
+func (r *m9Rig) storeCrumb() {
+	r.t.Helper()
+	r.write("build/gate/m9-store-lost", "cluster dev-cell-1\nnamespace cell-system\n")
+}
+
+// TestGateM9RepairStore: with the breadcrumb of TestM9StoreLostDuringCellIsland, gate-m9-repair.sh waits until bundle-store-0 is Ready,
+// publishes the hydrated set, hard-refreshes each Application, waits until every one is Synced and Healthy, and only then removes the
+// breadcrumb, after the lifetime restore and before harness:status. Without the breadcrumb it touches no store or Application.
+func TestGateM9RepairStore(t *testing.T) {
+	t.Parallel()
+	t.Run("order", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("store-notready", "2\n")
+		r.state("apps", "root OutOfSync Healthy\ncell-system Synced Healthy\n")
+		_, errOut, code := r.run("gate-m9-repair.sh", nil)
+		calls := r.calls()
+		if code != 0 {
+			t.Fatalf("exit %d\nstderr %s\ncalls %s", code, errOut, calls)
+		}
+		restore := callAt(calls, "svid-ttl restore")
+		ready := lastCallAt(calls, "get pod bundle-store-0")
+		publish := callAt(calls, "mise run bundle -- publish --target dev-cell-1 --wait")
+		refresh := callAt(calls, "annotate application root")
+		apps := lastCallAt(calls, "get applications -o json")
+		status := callAt(calls, "mise run harness:status")
+		order := []int{restore, ready, publish, refresh, apps, status}
+		for i := range order {
+			if order[i] < 0 || (i > 0 && order[i] < order[i-1]) {
+				t.Fatalf("want restore, store Ready, publish, refresh, Application read, harness:status (%v):\n%s", order, calls)
+			}
+		}
+		if n := strings.Count(calls, "get pod bundle-store-0"); n < 3 {
+			t.Errorf("%d reads of the store pod, want it read again until Ready:\n%s", n, calls)
+		}
+		if r.exists("build/gate/m9-store-lost") {
+			t.Error("the breadcrumb is still there")
+		}
+		if _, errOut, code := r.run("gate-m9-repair.sh", nil, "--check"); code != 0 {
+			t.Errorf("--check after the repair: exit %d, stderr %s", code, errOut)
+		}
+	})
+	t.Run("no breadcrumb", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		if _, errOut, code := r.run("gate-m9-repair.sh", nil); code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		for _, m := range []string{"get pod bundle-store-0", "mise run bundle", "annotate application"} {
+			if strings.Contains(r.calls(), m) {
+				t.Errorf("with no breadcrumb the repair called %q:\n%s", m, r.calls())
+			}
+		}
+	})
+	t.Run("an Application stays bad", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("apps", "root Unknown Healthy\n")
+		r.state("refresh-stuck", "")
+		_, errOut, code := r.run("gate-m9-repair.sh", []string{"GATE_M9_WAIT=30", "GATE_M9_POLL=10"})
+		if code == 0 || !r.exists("build/gate/m9-store-lost") || !strings.Contains(errOut, "root") || !strings.Contains(errOut, "mise run gate:m9:repair") || strings.Contains(r.calls(), "harness:status") {
+			t.Fatalf("exit %d, breadcrumb %v, stderr %q; want a failure that names root and the repair, with the breadcrumb kept and no harness:status", code, r.exists("build/gate/m9-store-lost"), errOut)
+		}
+	})
+	t.Run("the publish fails", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("publish-fail", "")
+		_, errOut, code := r.run("gate-m9-repair.sh", nil)
+		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "annotate application") || !strings.Contains(errOut, "mise run gate:m9:repair") {
+			t.Fatalf("exit %d, breadcrumb %v, stderr %q; want a failure that keeps the breadcrumb and refreshes nothing", code, r.exists("build/gate/m9-store-lost"), errOut)
+		}
+	})
+	t.Run("the store pod never gets Ready", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("store-notready", "1000\n")
+		_, errOut, code := r.run("gate-m9-repair.sh", []string{"GATE_M9_WAIT=30", "GATE_M9_POLL=10"})
+		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "mise run bundle") || !strings.Contains(errOut, "bundle-store-0") {
+			t.Fatalf("exit %d, stderr %q; want a failure that names the pod, before the publish", code, errOut)
+		}
+	})
 }
 
 // TestPocGateFastOrder: poc-gate.sh fast runs gate:m1 to gate:m8, with gate:m6:provision after gate:m6, and stops at the first failure. The

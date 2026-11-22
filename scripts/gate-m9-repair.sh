@@ -12,6 +12,9 @@
 #   7. runs scripts/svid-ttl.sh restore, which removes build/gate/m9-svid-ttl and restarts dev-cp and each live cell, so that every agent,
 #      and each un-revoked cell, gets new SVIDs;
 #   8. deletes each namespace m9-<name> with the label cell.poc.internal/e2e=true in every existing cluster, and waits until none is left;
+#   8b. when the breadcrumb build/gate/m9-store-lost exists (the bundle store test writes it before it deletes the store of a cell), waits
+#      until bundle-store-0 of that cell is Ready, publishes the hydrated set of the cell, hard-refreshes each Application, waits until
+#      every Application is Synced and Healthy, and removes the breadcrumb;
 #   9. runs mise run harness:status until it passes, up to HARNESS_STATUS_WAIT seconds (default 600).
 # Steps 1 and 4 call the scripts of the partition tool and of the revoke command only when they exist. It never touches an object without
 # the label, and none with another prefix. It is safe to run again.
@@ -36,6 +39,7 @@ esac
 repair="mise run gate:m9:repair"
 test_label="cell.poc.internal/e2e"
 revoked="$BUILD_ROOT/gate/m9-revoked"
+store_crumb="$BUILD_ROOT/gate/m9-store-lost"
 wait_seconds="${GATE_M9_WAIT:-600}"
 poll="${GATE_M9_POLL:-10}"
 
@@ -91,6 +95,15 @@ api_key_traces() {
   keytest_leftover dev-cell-1
 }
 
+# store_cell prints the cell named on the first line of the breadcrumb of the bundle store test. A name that is no cluster stops the script.
+store_cell() {
+  local line cell
+  read -r line <"$store_crumb" || true
+  cell="${line#cluster }"
+  [[ "$line" == "cluster "* && "$cell" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "build/gate/m9-store-lost holds '$line' on its first line, want: cluster <cell>. Fix the file, then run: $repair"
+  printf '%s\n' "$cell"
+}
+
 # traces prints one line for each trace of a stopped slow tier, with the step that the repair runs for it.
 traces() {
   local line c ns live file out node tag cells
@@ -125,6 +138,9 @@ traces() {
   done
   out="$(api_key_traces)" || die "could not check the node of dev-cell-1 for the API server test key: $out"
   [[ -z "$out" ]] || printf '%s\n' "$out"
+  if [[ -e "$store_crumb" ]]; then
+    echo "build/gate/m9-store-lost exists, so the bundle store of $(store_cell) may be lost and an Application may not be Synced"
+  fi
 }
 
 if ((check)); then
@@ -208,6 +224,28 @@ no_namespaces() {
   done
 }
 wait_until "no test namespace m9-* is left" no_namespaces || die "a test namespace m9-* is still there after ${wait_seconds}s"
+
+# Step 8b: the bundle store of a cell that a test emptied.
+if [[ -e "$store_crumb" ]]; then
+  cell="$(store_cell)"
+  store_ready() { [[ "$(kubectl --context "kind-$cell" -n cell-system get pod bundle-store-0 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == True ]]; }
+  wait_until "bundle-store-0 of $cell is Ready" store_ready || die "bundle-store-0 of $cell is not Ready after ${wait_seconds}s"
+  # The publish pushes every component and the root into the store and moves the tag current.
+  mise run bundle -- publish --target "$cell" --wait || die "mise run bundle -- publish --target $cell --wait failed"
+  apps="$(kubectl --context "kind-$cell" -n argocd get applications -o json | jq -r '.items[].metadata.name')" || die "could not list the Applications of $cell"
+  for app in $apps; do
+    kubectl --context "kind-$cell" -n argocd annotate application "$app" argocd.argoproj.io/refresh=hard --overwrite >/dev/null || die "could not refresh the Application $app of $cell"
+  done
+  bad_apps() {
+    kubectl --context "kind-$cell" -n argocd get applications -o json \
+      | jq -r '.items[] | select(.status.sync.status != "Synced" or .status.health.status != "Healthy") | "\(.metadata.name) is \(.status.sync.status)/\(.status.health.status)"'
+  }
+  apps_good() { local out; out="$(bad_apps)" && [[ -z "$out" ]]; }
+  wait_until "every Application of $cell is Synced and Healthy" apps_good \
+    || die "after ${wait_seconds}s these Applications of $cell are not Synced and Healthy: $(bad_apps 2>&1 | paste -sd';' -)"
+  rm -f "$store_crumb"
+  log "the bundle store of $cell is repaired"
+fi
 
 # Step 9: harness:status, read again while telemetry retries clear after the restarts.
 harness_status_settled || die "harness:status reports a bad value after the repair. Read its problems"
