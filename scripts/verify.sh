@@ -135,7 +135,7 @@ check_proxy_cert_life() {
     while read -r name; do
       [[ -n "$name" ]] || continue
       found=$((found + 1))
-      metrics="$(k -n "$ns" exec "$name" -c istio-proxy -- sh -c 'curl -sf localhost:15020/stats/prometheus')" \
+      metrics="$(k -n "$ns" exec "$name" -c istio-proxy -- sh -c "curl -sf -m 3 -H 'X-Prometheus-Scrape-Timeout-Seconds: 2' localhost:15020/stats/prometheus")" \
         || { bad+="$ns/$name: could not read the metrics of istio-proxy"$'\n'; continue; }
       left="$(awk 'index($1, "istio_agent_cert_expiry_seconds{") == 1 && $1 ~ /resource_name="default"/ { print $2; exit }' <<<"$metrics")"
       if [[ -z "$left" ]]; then
@@ -149,7 +149,8 @@ check_proxy_cert_life() {
   ((found > 0)) || { echo "no running istio-proxy in apps-demo or istio-egress"; return 1; }
   if [[ -n "$bad" ]]; then
     printf '%s' "$bad"
-    echo "The agent missed its renewal. The liveness probe restarts the container within about 2 minutes of VM run time."
+    echo "The agent missed its renewal. The liveness probe of a sidecar restarts the container within about 2 minutes of VM run time."
+    echo "The egress gateway has no probe. Its repair is a pod replacement, which is allowed only outside an environment island."
     return 1
   fi
 }

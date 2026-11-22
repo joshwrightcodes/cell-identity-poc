@@ -77,6 +77,8 @@ func TestVerifyProxyCertLife(t *testing.T) {
 			map[string]string{"gw-1": certMetric("43000")}, []string{"echo-1", "could not read"}},
 		{"a pod that is not Running is skipped", podsJSON(nativePod("echo-1", "Running"), nativePod("echo-old", "Pending")), podsJSON(regularPod("gw-1")),
 			map[string]string{"echo-1": certMetric("43000"), "gw-1": certMetric("43000")}, nil},
+		{"a gauge line with another label before resource_name is read", podsJSON(nativePod("echo-1", "Running")), podsJSON(regularPod("gw-1")),
+			map[string]string{"echo-1": "istio_agent_cert_expiry_seconds{pod=\"x\",resource_name=\"default\"} 100\n", "gw-1": certMetric("43000")}, []string{"echo-1", "100 s left"}},
 		{"no proxy at all fails", podsJSON(noProxyPod("plaintext-1")), podsJSON(), nil, []string{"no running istio-proxy"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -115,6 +117,9 @@ func TestVerifyProxyCertLife(t *testing.T) {
 			}
 			calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
 			for _, line := range strings.Split(strings.TrimSpace(string(calls)), "\n") {
+				if strings.Contains(line, " exec ") && (!strings.Contains(line, "curl -sf -m 3 ") || !strings.Contains(line, "X-Prometheus-Scrape-Timeout-Seconds: 2")) {
+					t.Errorf("the exec has no time limit on curl: %s", line)
+				}
 				if line != "" && !strings.Contains(line, " get pods ") && !strings.Contains(line, " exec ") {
 					t.Errorf("the check made a call that is neither get nor exec: %s", line)
 				}

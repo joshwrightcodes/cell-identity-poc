@@ -2,6 +2,7 @@ package render
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"text/template"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
@@ -59,7 +61,7 @@ func injectorConfigs(t *testing.T) map[string]injectorConfig {
 
 // applyCertTemplate runs the template as the injector does for one default template: it renders the text with the pod data and merges
 // the result into the pod with a strategic merge patch against corev1.Pod (pkg/kube/inject applyOverlayYAML).
-func applyCertTemplate(t *testing.T, text string, native bool, base corev1.Pod) corev1.Pod {
+func applyCertTemplate(t *testing.T, text string, native bool, annotations map[string]string, base corev1.Pod) corev1.Pod {
 	t.Helper()
 	tpl, err := template.New("inject").Funcs(template.FuncMap{
 		"default": func(def, v any) any {
@@ -73,7 +75,7 @@ func applyCertTemplate(t *testing.T, text string, native bool, base corev1.Pod) 
 		t.Fatalf("the template does not parse: %v", err)
 	}
 	var buf bytes.Buffer
-	data := map[string]any{"ObjectMeta": map[string]any{"Annotations": map[string]string{}}, "NativeSidecars": native}
+	data := map[string]any{"ObjectMeta": map[string]any{"Annotations": annotations}, "NativeSidecars": native}
 	if err := tpl.Execute(&buf, data); err != nil {
 		t.Fatalf("the template does not run: %v", err)
 	}
@@ -135,7 +137,7 @@ func TestSidecarCertLivenessProbe(t *testing.T) {
 				func(p corev1.Pod) (corev1.Container, bool) { return findContainer(p.Spec.Containers, "istio-proxy") }},
 		}
 		for _, f := range forms {
-			pod := applyCertTemplate(t, text, f.native, f.base)
+			pod := applyCertTemplate(t, text, f.native, nil, f.base)
 			c, ok := f.find(pod)
 			if !ok {
 				t.Errorf("%s, %s: istio-proxy is missing after the merge", cluster, f.name)
@@ -168,6 +170,42 @@ func TestSidecarCertLivenessProbe(t *testing.T) {
 	}
 }
 
+// TestSidecarCertLivenessFollowsTheNativeAnnotation: the annotation sidecar.istio.io/nativeSidecar takes precedence over the global
+// setting, as in the sidecar template. The probe goes to the list that holds istio-proxy.
+func TestSidecarCertLivenessFollowsTheNativeAnnotation(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "helm", "kustomize", "bash", "tar", "go")
+	for cluster, cfg := range injectorConfigs(t) {
+		text := cfg.Templates[certProbeTemplate]
+		always := corev1.ContainerRestartPolicyAlways
+		for _, tc := range []struct {
+			name        string
+			global      bool
+			annotations map[string]string
+			wantNative  bool
+		}{
+			{"the global setting is native and the annotation is false", true, map[string]string{"sidecar.istio.io/nativeSidecar": "false"}, false},
+			{"the global setting is regular and the annotation is true", false, map[string]string{"sidecar.istio.io/nativeSidecar": "true"}, true},
+		} {
+			base := corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "a"}, {Name: "istio-proxy", Image: "p"}}}}
+			if tc.wantNative {
+				base = corev1.Pod{Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "a"}},
+					InitContainers: []corev1.Container{{Name: "istio-proxy", Image: "p", RestartPolicy: &always}}}}
+			}
+			pod := applyCertTemplate(t, text, tc.global, tc.annotations, base)
+			if got := len(pod.Spec.InitContainers) + len(pod.Spec.Containers); got != len(base.Spec.InitContainers)+len(base.Spec.Containers) {
+				t.Errorf("%s, %s: the merge added a container, so the probe went to the wrong list", cluster, tc.name)
+			}
+			list := pod.Spec.Containers
+			if tc.wantNative {
+				list = pod.Spec.InitContainers
+			}
+			if c, ok := findContainer(list, "istio-proxy"); !ok || c.LivenessProbe == nil {
+				t.Errorf("%s, %s: istio-proxy has no probe in its own list", cluster, tc.name)
+			}
+		}
+	}
+}
+
 func findContainer(list []corev1.Container, name string) (corev1.Container, bool) {
 	for _, c := range list {
 		if c.Name == name {
@@ -179,53 +217,102 @@ func findContainer(list []corev1.Container, name string) (corev1.Container, bool
 
 // TestSidecarCertLivenessCommand runs the probe command with a stub curl that prints agent metrics. It fails only with a certificate that has
 // less than the minimum left, and it passes when the agent shows no metric yet or does not answer, so start-up and an island with istiod down
-// never restart the container.
+// never restart the container. A curl that hangs must end inside the probe timeout and count as no answer.
 func TestSidecarCertLivenessCommand(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "helm", "kustomize", "bash", "tar", "go", "sh", "awk")
 	var command []string
+	var timeout int32
 	for _, cfg := range injectorConfigs(t) {
-		pod := applyCertTemplate(t, cfg.Templates[certProbeTemplate], true, corev1.Pod{Spec: corev1.PodSpec{
+		pod := applyCertTemplate(t, cfg.Templates[certProbeTemplate], true, nil, corev1.Pod{Spec: corev1.PodSpec{
 			InitContainers: []corev1.Container{{Name: "istio-proxy", Image: "i"}}}})
 		if len(pod.Spec.InitContainers) == 1 && pod.Spec.InitContainers[0].LivenessProbe != nil && pod.Spec.InitContainers[0].LivenessProbe.Exec != nil {
 			command = pod.Spec.InitContainers[0].LivenessProbe.Exec.Command
+			timeout = pod.Spec.InitContainers[0].LivenessProbe.TimeoutSeconds
 		}
 		break
 	}
 	if len(command) == 0 {
 		t.Fatal("the template sets no exec probe command")
 	}
-	dir := t.TempDir()
-	stub := "#!/bin/sh\n[ \"$STUB_CURL_FAIL\" = 1 ] && exit 7\nprintf '%s' \"$STUB_METRICS\"\n"
+	dir, noAwk := t.TempDir(), t.TempDir()
+	// The stub records its arguments. With STUB_CURL_HANG=1 it never answers: it sleeps for the -m limit and exits 28 as curl does, and for 30 s when
+	// the command sets no limit.
+	stub := `#!/bin/sh
+echo "$*" >"$STUB_ARGS"
+[ "$STUB_CURL_FAIL" = 1 ] && exit 7
+if [ "$STUB_CURL_HANG" = 1 ]; then
+  limit=30
+  while [ $# -gt 0 ]; do [ "$1" = -m ] && limit="$2"; shift; done
+  sleep "$limit"; exit 28
+fi
+printf '%s' "$STUB_METRICS"
+`
 	if err := os.WriteFile(filepath.Join(dir, "curl"), []byte(stub), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// noAwk holds sh, sleep and the curl stub, and no awk.
+	for _, name := range []string{"sh", "sleep"} {
+		if err := os.Symlink("/bin/"+name, filepath.Join(noAwk, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "curl"), filepath.Join(noAwk, "curl")); err != nil {
+		t.Fatal(err)
+	}
 	other := "# TYPE istio_agent_cert_expiry_seconds gauge\nistio_agent_cert_expiry_seconds{resource_name=\"ROOTCA\"} 10\nistio_agent_process_start_time 1\n"
+	gauge := func(v string) string { return "istio_agent_cert_expiry_seconds{resource_name=\"default\"} " + v + "\n" }
 	for _, tc := range []struct {
 		name, metrics string
-		curlFail      bool
+		mode          string // "", "fail" (curl exits 7) or "hang"
 		env           []string
+		path          string
 		wantOK        bool
 	}{
-		{"a fresh certificate", other + "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 82989.6\n", false, nil, true},
-		{"a value in scientific notation", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 8.29896e+04\n", false, nil, true},
-		{"1 hour left", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 3600\n", false, nil, false},
-		{"just under 2 hours", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 7199\n", false, nil, false},
-		{"just over 2 hours", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 7201\n", false, nil, true},
-		{"an expired certificate", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} -19000.5\n", false, nil, false},
-		{"no default metric yet, as at start-up", other, false, nil, true},
-		{"the agent does not answer", "", true, nil, true},
-		{"a lower minimum from the environment", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 3600\n", false, []string{"CERT_MIN_SECONDS=600"}, true},
-		{"a higher minimum from the environment", "istio_agent_cert_expiry_seconds{resource_name=\"default\"} 82989\n", false, []string{"CERT_MIN_SECONDS=90000"}, false},
+		{"a fresh certificate", other + gauge("82989.6"), "", nil, "", true},
+		{"a value in scientific notation", gauge("8.29896e+04"), "", nil, "", true},
+		{"1 hour left", gauge("3600"), "", nil, "", false},
+		{"just under 2 hours", gauge("7199"), "", nil, "", false},
+		{"just over 2 hours", gauge("7201"), "", nil, "", true},
+		{"an expired certificate", gauge("-19000.5"), "", nil, "", false},
+		{"a gauge line with another label before resource_name", "istio_agent_cert_expiry_seconds{pod=\"x\",resource_name=\"default\"} 100\n", "", nil, "", false},
+		{"no default metric yet, as at start-up", other, "", nil, "", true},
+		{"the agent refuses the connection", "", "fail", nil, "", true},
+		{"the agent accepts and never answers", "", "hang", nil, "", true},
+		{"a lower minimum from the environment", gauge("3600"), "", []string{"CERT_MIN_SECONDS=600"}, "", true},
+		{"a higher minimum from the environment", gauge("82989"), "", []string{"CERT_MIN_SECONDS=90000"}, "", false},
+		{"awk is missing", gauge("100"), "", nil, noAwk, true},
 	} {
-		cmd := exec.Command(command[0], command[1:]...)
-		fail := "0"
-		if tc.curlFail {
-			fail = "1"
-		}
-		cmd.Env = append([]string{"PATH=" + dir + string(os.PathListSeparator) + "/usr/bin:/bin", "STUB_METRICS=" + tc.metrics, "STUB_CURL_FAIL=" + fail}, tc.env...)
-		out, err := cmd.CombinedOutput()
-		if (err == nil) != tc.wantOK {
-			t.Errorf("%s: probe ok=%v (%v), want %v\n%s", tc.name, err == nil, err, tc.wantOK, out)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+			cmd.WaitDelay = time.Second
+			args := filepath.Join(t.TempDir(), "args")
+			path := tc.path
+			if path == "" {
+				path = dir + string(os.PathListSeparator) + "/usr/bin:/bin"
+			}
+			cmd.Env = append([]string{"PATH=" + path, "STUB_METRICS=" + tc.metrics, "STUB_ARGS=" + args,
+				"STUB_CURL_FAIL=" + map[bool]string{true: "1", false: "0"}[tc.mode == "fail"],
+				"STUB_CURL_HANG=" + map[bool]string{true: "1", false: "0"}[tc.mode == "hang"]}, tc.env...)
+			out, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("the probe ran past its own timeout of %d s, so the kubelet counts a failure: %s", timeout, out)
+			}
+			if (err == nil) != tc.wantOK {
+				t.Errorf("probe ok=%v (%v), want %v\n%s", err == nil, err, tc.wantOK, out)
+			}
+			if tc.path == "" {
+				got, _ := os.ReadFile(args)
+				for _, want := range []string{"-m 3", "X-Prometheus-Scrape-Timeout-Seconds: 2", "localhost:15020/stats/prometheus"} {
+					if !strings.Contains(string(got), want) {
+						t.Errorf("curl ran with %q, want it to contain %q", got, want)
+					}
+				}
+			}
+		})
+	}
+	if timeout <= 3 {
+		t.Errorf("the probe timeout is %d s, want it above the 3 s limit of curl", timeout)
 	}
 }

@@ -18,9 +18,13 @@ global:
 # The Colima VM clock stops while the Mac sleeps. istio-agent schedules its certificate renewal on the monotonic clock, so after a
 # long pause it can serve an expired workload certificate. The cert-liveness template adds a liveness probe to istio-proxy. The probe
 # reads the wall-clock gauge of the agent and fails when less than CERT_MIN_SECONDS (default 7200) remain. The kubelet then restarts
-# the container, and the new agent fetches a certificate. The pod stays. The probe passes when the gauge is absent or the agent does
-# not answer, so it never depends on istiod. The template follows the sidecar form: istio-proxy is an init container with a native
-# sidecar and a regular container otherwise. A pod that sets inject.istio.io/templates replaces this list and has no probe.
+# the container, and the new agent fetches a certificate. The pod stays. CERT_MIN_SECONDS must stay well below the certificate life,
+# or a fresh certificate fails the probe and the container restarts in a loop. The probe passes when the gauge is absent, when the
+# agent refuses the connection, when it does not answer within 3 s (curl -m 3, and the scrape timeout header bounds the agent call to
+# Envoy), and when awk is missing. It never depends on istiod. The template follows the sidecar form: istio-proxy is an init container
+# with a native sidecar and a regular container otherwise. A pod that sets inject.istio.io/templates replaces this list and has no
+# probe, as the egress gateway does with its gateway template. Do not add cert-liveness to the gateway annotation: the template would
+# move the gateway istio-proxy into initContainers.
 sidecarInjectorWebhook:
   defaultTemplates: [sidecar, cert-liveness]
   templates:
@@ -39,9 +43,10 @@ sidecarInjectorWebhook:
               - sh
               - -c
               - >-
-                curl -sf localhost:15020/stats/prometheus |
+                command -v awk >/dev/null || exit 0;
+                curl -sf -m 3 -H 'X-Prometheus-Scrape-Timeout-Seconds: 2' localhost:15020/stats/prometheus |
                 awk -v min="${CERT_MIN_SECONDS:-7200}"
-                '/^istio_agent_cert_expiry_seconds\{resource_name="default"\} / { seen = 1; ok = ($2 > min) }
+                '/^istio_agent_cert_expiry_seconds\{.*resource_name="default".*\} / { seen = 1; ok = ($2 > min) }
                 END { exit !(seen == 0 || ok) }'
             periodSeconds: 60
             timeoutSeconds: 5
