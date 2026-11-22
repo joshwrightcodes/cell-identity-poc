@@ -80,8 +80,11 @@ type PullerConfig struct {
 	// whose target is Cluster. A non-nil Plane applies the bundle set for Cluster.
 	Cluster string
 	Plane   *Plane
-	Now     func() time.Time
-	Sleep   func(context.Context, time.Duration) error
+	// ReportRate is the number of report items per second that envd posts to the management plane,
+	// with a burst of MaxReportItems. A value of zero or less takes DefaultReportRate.
+	ReportRate float64
+	Now        func() time.Time
+	Sleep      func(context.Context, time.Duration) error
 	// OperatorKeys returns the pinned operator keys that verify local revocation entries, and
 	// Revocations is the input of those entries. A nil Revocations takes in no entry, and a nil
 	// OperatorKeys verifies none.
@@ -120,6 +123,10 @@ type Puller struct {
 	stepsWritten string
 	heldGauge    metric.Int64Gauge
 	refusedCount metric.Int64Counter
+	throttled    metric.Int64Counter
+	// tokens and tokensAt hold the token bucket of the report rate.
+	tokens   float64
+	tokensAt time.Time
 }
 
 // NewPuller returns a Puller for cfg.
@@ -145,6 +152,9 @@ func NewPuller(cfg PullerConfig) *Puller {
 	if cfg.Tracer == nil {
 		cfg.Tracer = nooptrace.NewTracerProvider().Tracer("envd")
 	}
+	if cfg.ReportRate <= 0 {
+		cfg.ReportRate = DefaultReportRate
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -165,6 +175,8 @@ func NewPuller(cfg PullerConfig) *Puller {
 		metric.WithDescription("Local revocation entries that the overlay holds"))
 	p.refusedCount, _ = cfg.Meter.Int64Counter("envd.revocations.refused",
 		metric.WithDescription("Input local revocation entries that envd refused, counted in each round, by reason"))
+	p.throttled, _ = cfg.Meter.Int64Counter("envd.reports.throttled",
+		metric.WithDescription("Report items that the report rate held back for a later round"))
 	return p
 }
 

@@ -1109,3 +1109,24 @@ func TestEnvdRefillFlag(t *testing.T) {
 		t.Fatalf("without the mirror: %v", err)
 	}
 }
+
+func TestEnvdReportRateFlag(t *testing.T) {
+	base := planeBase(t)
+	cfg, err := parseRun(base)
+	if err != nil || cfg.reportRate != 5 {
+		t.Fatalf("default: %+v %v", cfg, err)
+	}
+	tel := &telemetry.T{Log: slog.New(slog.DiscardHandler), Meter: noop.NewMeterProvider().Meter("t")}
+	cfg, err = parseRun(append(slices.Clone(base), "--report-rate", "2.5"))
+	if err != nil || cfg.reportRate != 2.5 {
+		t.Fatalf("set: %+v %v", cfg, err)
+	}
+	if pc := pullerConfig(cfg, fake.NewClientset(), &http.Client{}, nil, tel); pc.ReportRate != 2.5 {
+		t.Fatalf("puller rate %v", pc.ReportRate)
+	}
+	for _, bad := range []string{"0", "-1", "NaN"} {
+		if _, err := parseRun(append(slices.Clone(base), "--report-rate", bad)); err == nil || !strings.Contains(err.Error(), "--report-rate") {
+			t.Errorf("--report-rate %s: err %v", bad, err)
+		}
+	}
+}

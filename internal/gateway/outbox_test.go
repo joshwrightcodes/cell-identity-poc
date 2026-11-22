@@ -44,7 +44,7 @@ func TestOutboxCapDropsStatusFirst(t *testing.T) {
 	// The oldest item is a status; the next arrival in arrival order would be the result r1.
 	r3 := f.appendItem(item(gwapi.KindResult, cell1, opID(3), 1))
 	got, _ := f.s.Peek(ctx, 100, 1<<20)
-	want := []gwapi.ItemID{r1, s2, r2, r3}
+	want := []gwapi.ItemID{r1, r2, r3, s2}
 	if len(got) != len(want) {
 		t.Fatalf("outbox holds %d items, want %d", len(got), len(want))
 	}
@@ -290,7 +290,7 @@ func TestOutboxStatusDropStaysInCell(t *testing.T) {
 	}
 	f.appendItem(item(gwapi.KindResult, cell1, opID(1), 1))
 	got, _ := f.s.Peek(ctx, 10, 1<<20)
-	if len(got) != 3 || got[2].Kind != gwapi.KindResult {
+	if len(got) != 3 || got[0].Kind != gwapi.KindResult {
 		t.Fatalf("outbox after a result of cell 1: %+v", got)
 	}
 }
@@ -305,10 +305,62 @@ func TestOutboxRefusalRollsBackDrops(t *testing.T) {
 		t.Fatalf("a result that needs more than the status item frees: %v", err)
 	}
 	got, _ := f.s.Peek(ctx, 10, 1<<20)
-	if len(got) != 2 || got[0].ID != s1 || got[1].ID != r1 {
+	if len(got) != 2 || got[0].ID != r1 || got[1].ID != s1 {
 		t.Fatalf("outbox %+v: the refusal must not keep the drop", got)
 	}
 	if st, _ := f.s.Stats(ctx); st.Dropped != 0 {
 		t.Fatalf("dropped %d, want 0", st.Dropped)
+	}
+}
+
+func TestPeekOrder(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	s1 := f.appendItem(item(gwapi.KindStatus, cell1, "", 1))
+	t1 := f.appendItem(item(gwapi.KindStatus, cell2, "", 1))
+	r1 := f.appendItem(item(gwapi.KindResult, cell1, opID(1), 1))
+	s2 := f.appendItem(item(gwapi.KindStatus, cell1, "", 1))
+	b1 := f.appendItem(item(gwapi.KindBind, cell2, "", 1))
+	s3 := f.appendItem(item(gwapi.KindStatus, cell1, "", 1))
+	r2 := f.appendItem(item(gwapi.KindResult, cell2, opID(2), 1))
+	// The newest status of each cell is s3 and t1. The rest follow by seq.
+	want := []gwapi.ItemID{b1, r1, r2, t1, s3, s1, s2}
+	got, err := f.s.Peek(ctx, 100, 1<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Peek gave %d items, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i].ID != want[i] {
+			t.Fatalf("item %d is %s %s, want %s", i, got[i].Kind, got[i].ID, want[i])
+		}
+	}
+}
+
+func TestPeekOrderKeepsLimits(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	for n := range 120 {
+		f.appendItem(item(gwapi.KindStatus, cell1, "", 1))
+		f.appendItem(item(gwapi.KindResult, cell2, opID(n+1), 1))
+	}
+	got, err := f.s.Peek(ctx, 1000, 10<<20)
+	if err != nil || len(got) != MaxPeekItems {
+		t.Fatalf("Peek gave %d items, err %v", len(got), err)
+	}
+	for _, it := range got {
+		if it.Kind != gwapi.KindResult {
+			t.Fatalf("a %s item came before the results", it.Kind)
+		}
+	}
+	small, err := f.s.Peek(ctx, 3, 10<<20)
+	if err != nil || len(small) != 3 {
+		t.Fatalf("Peek(3) gave %d items, err %v", len(small), err)
+	}
+	one, err := f.s.Peek(ctx, 5, 10)
+	if err != nil || len(one) != 1 || one[0].Kind != gwapi.KindResult {
+		t.Fatalf("byte budget: %+v, %v", one, err)
 	}
 }

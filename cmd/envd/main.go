@@ -5,7 +5,7 @@
 //	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
 //	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
 //	  --steps-configmap <ns>/<name> --step-status-configmap <ns>/<name>
-//	  [--interval 10s] [--health-listen :8080] [--cluster <name>]
+//	  [--interval 10s] [--report-rate 5] [--health-listen :8080] [--cluster <name>]
 //	  [--bundle-mirror <host:port> --bundle-store <host:port> --bundle-store-token <file>
 //	   --bundle-state-configmap <ns>/<name> --bundle-health-timeout 5m]
 //	  [--operator-key-file <file> --revocations-configmap <ns>/<name>]
@@ -42,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -239,6 +240,7 @@ type runConfig struct {
 	namespace    string
 	configMap    string
 	interval     time.Duration
+	reportRate   float64
 	healthListen string
 	gateway      string
 	gatewayID    spiffeid.ID
@@ -277,6 +279,7 @@ func parseRun(args []string) (runConfig, error) {
 	env := fs.String("env", "", "environment name")
 	out := fs.String("output-configmap", "", "ConfigMap that holds the records, as <namespace>/<name>")
 	interval := fs.Duration("interval", 10*time.Second, "time between pulls")
+	reportRate := fs.Float64("report-rate", envd.DefaultReportRate, "report items per second that envd posts to the management plane")
 	health := fs.String("health-listen", ":8080", "address of the health endpoint")
 	gateway := fs.String("gateway", "", "base URL of the cell gateway, https://<host>:<port>")
 	gatewayID := fs.String("gateway-id", "", "the exact SPIFFE ID of the cell gateway")
@@ -305,6 +308,9 @@ func parseRun(args []string) (runConfig, error) {
 	}
 	if *interval <= 0 {
 		return runConfig{}, errors.New("--interval must be positive")
+	}
+	if !(*reportRate > 0) || math.IsInf(*reportRate, 0) {
+		return runConfig{}, errors.New("--report-rate must be positive")
 	}
 	if err := checkEnv(*env); err != nil {
 		return runConfig{}, err
@@ -357,7 +363,7 @@ func parseRun(args []string) (runConfig, error) {
 		return runConfig{}, err
 	}
 	rc := runConfig{upstream: *upstream, expect: id, peer: peer, key: key, keyFile: *keyFile, env: *env, namespace: ns,
-		configMap: cm, interval: *interval, healthListen: *health,
+		configMap: cm, interval: *interval, reportRate: *reportRate, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
 		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
 		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout, bundleRefillEvery: *refillEvery}
@@ -554,6 +560,7 @@ func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, g
 		Steps:        envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
 		StepStatus:   envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
 		Interval:     cfg.interval,
+		ReportRate:   cfg.reportRate,
 		Log:          tel.Log,
 		Meter:        tel.Meter,
 		Tracer:       tel.Tracer,

@@ -999,3 +999,72 @@ func TestHintsFromGatewayKeptWhenTheStatusPostFails(t *testing.T) {
 		t.Errorf("report 2 repeats a hint that report 1 carried: %v", reps[2].KeyHints)
 	}
 }
+
+func TestRelayDrainRate(t *testing.T) {
+	r := newRig(t, 6)
+	var items []gwapi.OutItem
+	for i := range 3 {
+		items = append(items, outItem(hexID(i+1), gwapi.KindResult, "a", `{}`))
+	}
+	for i := range 720 {
+		items = append(items, outItem(hexID(i+10), gwapi.KindStatus, "a", `{}`))
+	}
+	r.gw.set(func(g *fakeGateway) { g.items = items })
+	r.mgmt.set(func(m *fakeMgmt) { m.decide = accepted })
+	r.run()
+	bodies := r.mgmt.bodies()
+	if len(bodies) != 6 {
+		t.Fatalf("%d report posts, want 6", len(bodies))
+	}
+	var first mgmtapi.ReportBatch
+	if err := json.Unmarshal(bodies[0], &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Items) != MaxReportItems {
+		t.Fatalf("first round sent %d items, want %d", len(first.Items), MaxReportItems)
+	}
+	for i := range 3 {
+		if first.Items[i].Kind != gwapi.KindResult {
+			t.Fatalf("item %d of the first batch is %s, want a result", i, first.Items[i].Kind)
+		}
+	}
+	// The rounds are 10 s apart: 50 items each at 5 items per second.
+	for i, body := range bodies[1:] {
+		var b mgmtapi.ReportBatch
+		if err := json.Unmarshal(body, &b); err != nil {
+			t.Fatal(err)
+		}
+		if len(b.Items) > 50 || len(b.Items) < 45 {
+			t.Fatalf("round %d sent %d items, want at most 50", i+2, len(b.Items))
+		}
+	}
+	if n := r.gw.syncTotal(); n != 6 {
+		t.Fatalf("the gateway saw %d syncs, want 6: the rate must not delay the sync", n)
+	}
+	switch d := r.metric("envd.reports.throttled").(type) {
+	case metricdata.Sum[int64]:
+		if len(d.DataPoints) == 0 || d.DataPoints[0].Value == 0 {
+			t.Fatalf("throttled counter %+v", d)
+		}
+	default:
+		t.Fatalf("throttled counter missing: %T", d)
+	}
+}
+
+func TestRelayRateDefault(t *testing.T) {
+	r := newRig(t, 1)
+	r.cfg.ReportRate = 0
+	if got := NewPuller(r.cfg).cfg.ReportRate; got != 5 {
+		t.Fatalf("default report rate %v, want 5", got)
+	}
+	r.cfg.ReportRate = 2
+	if got := NewPuller(r.cfg).cfg.ReportRate; got != 2 {
+		t.Fatalf("report rate %v, want 2", got)
+	}
+}
+
+func (g *fakeGateway) syncTotal() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.syncs)
+}
