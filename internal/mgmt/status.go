@@ -20,20 +20,25 @@ const logWindow = 5 * time.Minute
 
 // Status is what `ctl status` shows.
 type Status struct {
-	Env                string           `json:"env"`
-	Seq                uint64           `json:"seq"`
-	Signed             spec.Revision    `json:"signed"`
-	Served             spec.Revision    `json:"served"`
-	RestoreActive      bool             `json:"restoreActive"`
-	Applied            spec.Revision    `json:"applied"`
-	AppliedAt          time.Time        `json:"appliedAt,omitzero"`
-	LagSince           time.Time        `json:"lagSince,omitzero"`
-	LastReportAt       time.Time        `json:"lastReportAt,omitzero"`
-	LastRefusal        *mgmtapi.Refusal `json:"lastRefusal,omitempty"`
-	StoreError         string           `json:"storeError,omitempty"`
-	PendingDrops       []string         `json:"pendingDrops"`
-	StateBehindApplied bool             `json:"stateBehindApplied"`
-	Cells              []CellStatus     `json:"cells"`
+	Env           string           `json:"env"`
+	Seq           uint64           `json:"seq"`
+	Signed        spec.Revision    `json:"signed"`
+	Served        spec.Revision    `json:"served"`
+	RestoreActive bool             `json:"restoreActive"`
+	Applied       spec.Revision    `json:"applied"`
+	AppliedAt     time.Time        `json:"appliedAt,omitzero"`
+	LagSince      time.Time        `json:"lagSince,omitzero"`
+	LastReportAt  time.Time        `json:"lastReportAt,omitzero"`
+	LastRefusal   *mgmtapi.Refusal `json:"lastRefusal,omitempty"`
+	StoreError    string           `json:"storeError,omitempty"`
+	PendingDrops  []string         `json:"pendingDrops"`
+	// PendingRevokes holds the revokes that wait for their revision, oldest first, and Revocations
+	// the mirror: each revoke and un-revoke that the plane signed, with its source, entry ID and
+	// operator key SHA-256.
+	PendingRevokes     []PendingRevoke           `json:"pendingRevokes"`
+	Revocations        []mgmtapi.RevocationEvent `json:"revocations"`
+	StateBehindApplied bool                      `json:"stateBehindApplied"`
+	Cells              []CellStatus              `json:"cells"`
 
 	// Gateway is the last gateway status that envd reported. DroppedAt is the time that the dropped
 	// count last rose, and EpochChangedAt the time that the queue epoch last changed. StagedKey is
@@ -100,10 +105,13 @@ type CellStatus struct {
 	ValidReason  string    `json:"validReason,omitempty"`
 	InvalidSince time.Time `json:"invalidSince,omitzero"`
 
-	// Revoked is true while the record of the cell is revoked. RevokedBy is the source of the revoke
-	// that the mirror holds for it: admin or operator.
-	Revoked   bool   `json:"revoked"`
-	RevokedBy string `json:"revokedBy,omitempty"`
+	// Revoked is true while the record of the cell is revoked. RevokedBy, RevokedEntryID and
+	// RevokedKeySHA256 come from the newest revoke of the cell in the mirror: its source (admin or
+	// operator), and the entry ID and operator key SHA-256 of an adopted entry.
+	Revoked          bool   `json:"revoked"`
+	RevokedBy        string `json:"revokedBy,omitempty"`
+	RevokedEntryID   string `json:"revokedEntryId,omitempty"`
+	RevokedKeySHA256 string `json:"revokedKeySha256,omitempty"`
 }
 
 type reports struct {
@@ -298,6 +306,8 @@ func (p *Plane) Status() Status {
 		Applied: rep.applied, AppliedAt: rep.appliedAt, LagSince: rep.lagSince, LastReportAt: rep.lastReportAt,
 		LastRefusal: rep.refusal, StoreError: rep.storeError,
 		PendingDrops:       append([]string{}, st.PendingDrops...),
+		PendingRevokes:     append([]PendingRevoke{}, st.PendingRevokes...),
+		Revocations:        append([]mgmtapi.RevocationEvent{}, st.Revocations...),
 		StateBehindApplied: rep.applied.Compare(st.Last) > 0,
 		Cells:              []CellStatus{},
 		Gateway:            rep.gateway, GatewayAt: rep.gatewayAt, DroppedAt: rep.droppedAt, EpochChangedAt: rep.epochChangedAt,
@@ -339,7 +349,10 @@ func (p *Plane) Status() Status {
 			}
 		}
 		if c := st.Cells[name]; c != nil && c.Revoked {
-			cs.Revoked, cs.RevokedBy = true, revokedBy(st.Revocations, name)
+			cs.Revoked = true
+			if ev, ok := newestEvent(st.Revocations, name, mgmtapi.RevocationRevoke); ok {
+				cs.RevokedBy, cs.RevokedEntryID, cs.RevokedKeySHA256 = ev.Source, ev.EntryID, ev.OperatorKeySHA256
+			}
 		}
 		cs.Valid, cs.ValidReason = p.validOf(st, name, live[name], rep.applied, now)
 		cs.InvalidSince = p.noteValid(name, cs.Valid, now)
@@ -364,12 +377,15 @@ func (p *Plane) logLimited(ctx context.Context, level slog.Level, key, msg strin
 	p.cfg.Log.Log(ctx, level, msg, args...)
 }
 
-// revokedBy returns the source of the newest revoke of cell in the mirror.
-func revokedBy(events []mgmtapi.RevocationEvent, cell string) string {
-	for i := len(events) - 1; i >= 0; i-- {
-		if ev := events[i]; ev.Cell == cell && ev.Kind == mgmtapi.RevocationRevoke {
-			return ev.Source
+// newestEvent returns the event of kind for cell with the highest revision in the mirror. An empty
+// kind matches both kinds.
+func newestEvent(events []mgmtapi.RevocationEvent, cell, kind string) (mgmtapi.RevocationEvent, bool) {
+	var out mgmtapi.RevocationEvent
+	found := false
+	for _, ev := range events {
+		if ev.Cell == cell && (kind == "" || ev.Kind == kind) && (!found || ev.Revision.Compare(out.Revision) > 0) {
+			out, found = ev, true
 		}
 	}
-	return ""
+	return out, found
 }

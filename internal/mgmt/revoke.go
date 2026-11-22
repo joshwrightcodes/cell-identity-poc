@@ -254,8 +254,11 @@ func claimedEntry(raw []byte) (revoke.Entry, bool) {
 // adopt verifies each local revocation entry that envd reports against Config.OperatorKeys, and
 // queues a revoke with source operator for each entry that passes. An entry passes when a pinned
 // key verifies it, it names this environment and a bound cell, the mirror holds no un-revoke of
-// its ID (mgmtapi.EntryUnrevoked), and it is not stale against the current record of its cell
-// (revoke.Stale). A refused entry logs adoption_refused, rate limited, and is never queued. An
+// its ID (mgmtapi.EntryUnrevoked), and its record revision is not below the newest un-revoke of its
+// cell (revoke.Stale against that revision). A re-sign that does not un-revoke, such as a key
+// update or a key rotation, leaves an entry valid, because the entry only narrows trust. A replay
+// after an un-revoke names a record below the un-revoke. A refused entry logs adoption_refused,
+// rate limited, and is never queued. An
 // entry for a cell that is revoked or queued already changes nothing. With no pinned key, adopt
 // logs operator_keys_absent once and adopts nothing. It reads at most revoke.MaxHeld envelopes.
 func (p *Plane) adopt(ctx context.Context, envelopes []json.RawMessage, now time.Time) {
@@ -284,11 +287,11 @@ func (p *Plane) adopt(ctx context.Context, envelopes []json.RawMessage, now time
 			continue
 		}
 		pr := PendingRevoke{Cell: e.Cell, Source: mgmtapi.RevocationSourceOperator, EntryID: e.ID, OperatorKeySHA256: keySHA, QueuedAt: now}
-		_, err := p.queueRevoke(ctx, pr, func(st *State, cs *CellState) string {
-			switch {
-			case mgmtapi.EntryUnrevoked(st.Revocations, e.Cell, e.ID):
+		_, err := p.queueRevoke(ctx, pr, func(st *State, _ *CellState) string {
+			if mgmtapi.EntryUnrevoked(st.Revocations, e.Cell, e.ID) {
 				return reasonEntryUnrevoked
-			case revoke.Stale(e, cs.Record):
+			}
+			if un, ok := newestEvent(st.Revocations, e.Cell, mgmtapi.RevocationUnrevoke); ok && revoke.Stale(e, un.Revision) {
 				return revoke.ReasonStale
 			}
 			return ""

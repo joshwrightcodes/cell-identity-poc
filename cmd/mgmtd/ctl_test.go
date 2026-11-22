@@ -904,6 +904,12 @@ func TestCtlRevoke(t *testing.T) {
 	if m := ctlLine(t, ctl, "revoke", "--cell", "dev-cell-1"); m["already"] != true || revisionOf(t, m) != got {
 		t.Fatalf("revoke again: %v", m)
 	}
+	st := ctlLine(t, ctl, "status")
+	mirror, _ := st["revocations"].([]any)
+	pending, _ := st["pendingRevokes"].([]any)
+	if len(mirror) != 1 || mirror[0].(map[string]any)["source"] != "admin" || pending == nil || len(pending) != 0 {
+		t.Fatalf("status revocations %v, pending %v", st["revocations"], st["pendingRevokes"])
+	}
 	code, out := ctl("revoke", "--cell", "dev-cell-9")
 	if lines := jsonLines(t, out); code != 1 || len(lines) != 1 || lines[0]["reason"] != "not_bound" {
 		t.Fatalf("revoke of an unknown cell: %d %q", code, out)

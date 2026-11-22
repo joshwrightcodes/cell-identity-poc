@@ -473,23 +473,234 @@ func TestAdoptIdempotent(t *testing.T) {
 	}
 }
 
+// An entry below the newest un-revoke of its cell is a replay, even with an ID that the mirror
+// does not hold.
 func TestAdoptRefusesStale(t *testing.T) {
 	k := newOpKey(t)
 	r := revokeRig(t, withKeys(k), cell1, cell2)
-	signed := r.status().Signed
-	cur := r.recRev(cell2)
-	stale := r.entry(k, "6666666666666666", "dev", cell2, rev(cur.Epoch, cur.Counter-1))
-	r.report(signed, stale)
-	if r.verifyRecord(cell2).Revoked || len(r.state().PendingRevokes) != 0 || r.status().Signed != signed {
-		t.Fatal("a stale entry was adopted")
+	revoked := next(r.status().Signed)
+	r.mustRevoke(cell2, RevokeResult{Cell: cell2, Revision: revoked})
+	r.report(revoked)
+	if _, err := r.plane.Unrevoke(t.Context(), cell2); err != nil {
+		t.Fatal(err)
+	}
+	unrevoked := r.status().Signed
+	r.report(unrevoked)
+	seq := r.status().Seq
+
+	stale := r.entry(k, "6666666666666666", "dev", cell2, revoked)
+	r.report(unrevoked, stale)
+	if r.verifyRecord(cell2).Revoked || len(r.state().PendingRevokes) != 0 || r.status().Seq != seq {
+		t.Fatal("an entry below the un-revoke was adopted")
 	}
 	if !r.refusedWith("6666666666666666", mgmtapi.ReasonRevocationStale) {
 		t.Fatalf("no adoption_refused line with revocation_stale: %v", r.logLines("adoption_refused"))
 	}
-	// An entry at the current record revision is adopted.
-	r.report(signed, r.entry(k, "6666666666666667", "dev", cell2, cur))
+	// An entry at the record of the un-revoke is adopted.
+	r.report(unrevoked, r.entry(k, "6666666666666667", "dev", cell2, unrevoked))
 	if !r.verifyRecord(cell2).Revoked {
-		t.Fatal("a current entry was not adopted")
+		t.Fatal("an entry at the un-revoke was not adopted")
+	}
+}
+
+// A re-sign that does not un-revoke, such as a subject change or a key rotation, does not make an
+// entry stale.
+func TestAdoptAcceptsEntryOutdatedByResign(t *testing.T) {
+	k := newOpKey(t)
+	r := revokeRig(t, withKeys(k), cell1, cell2, cell3)
+	held1, held2 := r.recRev(cell1), r.recRev(cell2)
+	r.restart(func(in *Intent) { in.Cells[0].Subjects = []record.Subject{celld} })
+	if r.recRev(cell1) == held1 {
+		t.Fatal("setup: the subject change did not re-sign the cell")
+	}
+	if _, err := r.plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if r.recRev(cell2).Epoch != 2 {
+		t.Fatal("setup: the rotation did not re-sign the cell")
+	}
+	r.report(r.status().Signed, r.entry(k, "999999999999999a", "dev", cell1, held1))
+	if !r.verifyRecord(cell1).Revoked {
+		t.Fatalf("an entry outdated by a subject change and a rotation was refused: %v", r.logLines("adoption_refused"))
+	}
+	r.report(r.status().Signed, r.entry(k, "999999999999999b", "dev", cell2, held2))
+	if !r.verifyRecord(cell2).Revoked {
+		t.Fatalf("an entry outdated by a rotation was refused: %v", r.logLines("adoption_refused"))
+	}
+}
+
+// An admin revoke and an adopted revoke wait in the queue across restarts, and each signs once.
+func TestRevokeQueueSurvivesRestart(t *testing.T) {
+	k := newOpKey(t)
+	r := revokeRig(t, withKeys(k), cell1, cell2, cell3)
+	signed := r.status().Signed
+	behind := rev(signed.Epoch, signed.Counter-1)
+	r.report(behind)
+	r.mustRevoke(cell1, RevokeResult{Cell: cell1, Queued: true})
+	const id = "8888888888888888"
+	r.report(behind, r.entry(k, id, "dev", cell2, r.recRev(cell2)))
+	r.restart(nil)
+
+	got := r.state().PendingRevokes
+	if len(got) != 2 {
+		t.Fatalf("pending after a restart: %+v", got)
+	}
+	if p := got[0]; p.Cell != cell1 || p.Source != mgmtapi.RevocationSourceAdmin || p.EntryID != "" || p.OperatorKeySHA256 != "" || p.QueuedAt.IsZero() {
+		t.Fatalf("first pending %+v", p)
+	}
+	if p := got[1]; p.Cell != cell2 || p.Source != mgmtapi.RevocationSourceOperator || p.EntryID != id || p.OperatorKeySHA256 != revoke.KeySHA256(k.pub) || p.QueuedAt.IsZero() {
+		t.Fatalf("second pending %+v", p)
+	}
+	if r.status().Signed != signed {
+		t.Fatal("a restart signed a queued revoke")
+	}
+
+	r.report(signed)
+	first := next(signed)
+	if r.status().Signed != first || !r.verifyRecord(cell1).Revoked || r.verifyRecord(cell2).Revoked {
+		t.Fatalf("after the report of %v: signed %v", signed, r.status().Signed)
+	}
+	if st := r.state(); len(st.Revocations) != 1 || len(st.PendingRevokes) != 1 {
+		t.Fatalf("mirror %+v, pending %+v", st.Revocations, st.PendingRevokes)
+	}
+	r.restart(nil)
+	if st := r.state(); st.Last != first || len(st.Revocations) != 1 || len(st.PendingRevokes) != 1 || st.PendingRevokes[0].Cell != cell2 {
+		t.Fatalf("after a second restart: last %v, mirror %+v, pending %+v", st.Last, st.Revocations, st.PendingRevokes)
+	}
+	r.report(first)
+	second := next(first)
+	if !r.verifyRecord(cell2).Revoked || r.status().Signed != second {
+		t.Fatalf("after the report of %v: signed %v", first, r.status().Signed)
+	}
+	r.restart(nil)
+	r.report(second)
+	st := r.state()
+	if st.Last != second || len(st.PendingRevokes) != 0 || len(st.Revocations) != 2 {
+		t.Fatalf("after a third restart: last %v, mirror %+v, pending %+v", st.Last, st.Revocations, st.PendingRevokes)
+	}
+	if a, b := st.Revocations[0], st.Revocations[1]; a.Cell != cell1 || a.Source != mgmtapi.RevocationSourceAdmin || a.Revision != first ||
+		b.Cell != cell2 || b.Source != mgmtapi.RevocationSourceOperator || b.EntryID != id || b.OperatorKeySHA256 != revoke.KeySHA256(k.pub) || b.Revision != second {
+		t.Fatalf("mirror %+v", st.Revocations)
+	}
+}
+
+// An adopted entry waits in the queue during a restore, and signs after it.
+func TestAdoptQueuesDuringRestore(t *testing.T) {
+	k := newOpKey(t)
+	r := revokeRig(t, withKeys(k), cell1, cell2)
+	signed := r.status().Signed
+	e := r.entry(k, "abababababababab", "dev", cell2, r.recRev(cell2))
+	if err := r.plane.Restore(signed.Counter - 1); err != nil {
+		t.Fatal(err)
+	}
+	r.report(signed, e)
+	st := r.state()
+	if st.Last != signed || len(st.PendingRevokes) != 1 || st.PendingRevokes[0].EntryID != "abababababababab" {
+		t.Fatalf("during a restore: last %v, pending %+v", st.Last, st.PendingRevokes)
+	}
+	if err := r.plane.Restore(0); err != nil {
+		t.Fatal(err)
+	}
+	r.report(signed, e)
+	if c := r.verifyRecord(cell2); !c.Revoked || spec.RecordRevision(c) != next(signed) {
+		t.Fatalf("after the restore: %+v", c)
+	}
+}
+
+// The restore guard holds only in the epoch of the last revoke: after a key rotation every
+// revision of the new epoch holds the revoke.
+func TestRestoreGuardSameEpochOnly(t *testing.T) {
+	r := revokeRig(t, nil, cell1, cell2, cell3)
+	revoked := next(r.status().Signed)
+	r.mustRevoke(cell1, RevokeResult{Cell: cell1, Revision: revoked})
+	if _, err := r.plane.RotateKey(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	r.restart(func(in *Intent) { in.Cells[1].Subjects = []record.Subject{celld} })
+	r.restart(func(in *Intent) { in.Cells[2].Subjects = []record.Subject{celld} })
+	if got := r.status().Signed; got != rev(2, 3) || revoked.Counter <= 2 {
+		t.Fatalf("setup: signed %v, revoke at %v", got, revoked)
+	}
+	if err := r.plane.Restore(2); err != nil {
+		t.Fatalf("restore to counter 2 of the new epoch: %v", err)
+	}
+	if s := r.verifySpec(); s.Revision != rev(2, 2) || !r.verifyRecord(cell1).Revoked {
+		t.Fatalf("served %v", s.Revision)
+	}
+	if err := r.plane.Restore(0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The status shows the queue and the mirror, and for each revoked cell the source, entry ID and
+// key SHA-256 of its revoke.
+func TestStatusShowsRevocations(t *testing.T) {
+	k := newOpKey(t)
+	r := revokeRig(t, withKeys(k), cell1, cell2, cell3)
+	if b := marshal(t, r.status()); !strings.Contains(b, `"pendingRevokes":[]`) || !strings.Contains(b, `"revocations":[]`) {
+		t.Fatalf("status of a plane with no revoke: %s", b)
+	}
+	signed := r.status().Signed
+	r.mustRevoke(cell1, RevokeResult{Cell: cell1, Revision: next(signed)})
+	const id = "cdcdcdcdcdcdcdcd"
+	r.report(signed, r.entry(k, id, "dev", cell2, r.recRev(cell2)))
+	r.mustRevoke(cell3, RevokeResult{Cell: cell3, Queued: true})
+
+	st := r.status()
+	if len(st.PendingRevokes) != 2 || st.PendingRevokes[0].Cell != cell2 || st.PendingRevokes[0].EntryID != id ||
+		st.PendingRevokes[0].OperatorKeySHA256 != revoke.KeySHA256(k.pub) || st.PendingRevokes[1].Cell != cell3 ||
+		st.PendingRevokes[1].Source != mgmtapi.RevocationSourceAdmin {
+		t.Fatalf("pending %+v", st.PendingRevokes)
+	}
+	if len(st.Revocations) != 1 || st.Revocations[0].Cell != cell1 {
+		t.Fatalf("mirror %+v", st.Revocations)
+	}
+	if cs := cellStatus(st, cell1); !cs.Revoked || cs.RevokedBy != mgmtapi.RevocationSourceAdmin || cs.RevokedEntryID != "" || cs.RevokedKeySHA256 != "" {
+		t.Fatalf("status of %s: %+v", cell1, cs)
+	}
+	r.report(next(signed))
+	st = r.status()
+	cs := cellStatus(st, cell2)
+	if !cs.Revoked || cs.RevokedBy != mgmtapi.RevocationSourceOperator || cs.RevokedEntryID != id || cs.RevokedKeySHA256 != revoke.KeySHA256(k.pub) {
+		t.Fatalf("status of %s: %+v", cell2, cs)
+	}
+	if ev := st.Revocations[len(st.Revocations)-1]; len(st.Revocations) != 2 || ev.EntryID != id || ev.OperatorKeySHA256 != revoke.KeySHA256(k.pub) {
+		t.Fatalf("mirror %+v", st.Revocations)
+	}
+	b := marshal(t, st)
+	for _, want := range []string{`"revokedEntryId":"` + id + `"`, `"revokedKeySha256":"` + revoke.KeySHA256(k.pub) + `"`, `"entryId":"` + id + `"`} {
+		if !strings.Contains(b, want) {
+			t.Errorf("status JSON has no %s: %s", want, b)
+		}
+	}
+}
+
+// A revoked cell that leaves the intent and comes back stays revoked until an un-revoke.
+func TestRevokedCellStaysRevokedAfterReturn(t *testing.T) {
+	r := revokeRig(t, nil, cell1, cell2)
+	revoked := next(r.status().Signed)
+	r.mustRevoke(cell2, RevokeResult{Cell: cell2, Revision: revoked})
+	r.report(revoked)
+	r.restart(func(in *Intent) { in.Cells = in.Cells[:1] })
+	r.release()
+	if s := r.verifySpec(); len(s.Retired) != 1 || s.Retired[0].Name != cell2 {
+		t.Fatalf("setup: spec %+v", s)
+	}
+	r.restart(func(in *Intent) { *in = testIntent(cell1, cell2) })
+	r.request(cell2)
+	r.mustBind(cell2, r.signers[cell2], mgmtapi.StatusBound)
+	if !r.verifyRecord(cell2).Revoked {
+		t.Fatal("the returned cell is not revoked")
+	}
+	if cs := cellStatus(r.status(), cell2); !cs.Revoked || cs.RevokedBy != mgmtapi.RevocationSourceAdmin {
+		t.Fatalf("status of the returned cell: %+v", cs)
+	}
+	r.release()
+	if _, err := r.plane.Unrevoke(t.Context(), cell2); err != nil {
+		t.Fatal(err)
+	}
+	if r.verifyRecord(cell2).Revoked {
+		t.Fatal("the un-revoke did not clear the revoke")
 	}
 }
 

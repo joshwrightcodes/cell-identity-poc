@@ -131,7 +131,9 @@ func (p *Plane) Bind(ctx context.Context, cell string, req mgmtapi.BindRequest) 
 				return refuse(mgmtapi.ReasonRateLimited, "key_update_gap")
 			}
 		} else {
-			cur = &CellState{BoundAt: t.now}
+			// A cell that left the intent while revoked comes back revoked, until an un-revoke.
+			ev, ok := newestEvent(t.st.Revocations, cell, "")
+			cur = &CellState{BoundAt: t.now, Revoked: ok && ev.Kind == mgmtapi.RevocationRevoke}
 			t.st.Cells[cell] = cur
 			delete(t.st.Retired, cell)
 		}
