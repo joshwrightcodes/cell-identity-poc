@@ -1,10 +1,17 @@
 package bundleapply
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -264,4 +271,144 @@ func TestRunRefillStopsWithContext(t *testing.T) {
 		t.Fatal("the first refill did not run at once")
 	}
 	e.a.RunRefill(t.Context(), 0)
+}
+
+// hooked returns an Applier like e.a whose mirror reads go through a proxy. before runs once, ahead
+// of the first read of a manifest from the mirror, as another process would act during the refill.
+func (e *env) hooked(before func()) *Applier {
+	e.t.Helper()
+	target, err := url.Parse("http://" + e.mirrorReg.URL())
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	var once sync.Once
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/manifests/") {
+			once.Do(before)
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	e.t.Cleanup(srv.Close)
+	mirror, err := ocistore.New(ocistore.Client{Base: strings.TrimPrefix(srv.URL, "http://")})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	cfg := e.cfg
+	cfg.Mirror = mirror
+	return e.applier(cfg)
+}
+
+func TestRefillStateMovesDuringRead(t *testing.T) {
+	for _, what := range []string{"lease lost", "root moved"} {
+		t.Run(what, func(t *testing.T) {
+			e := newEnv(t)
+			old := e.applied(1)
+			next := e.set(2, std("v2"))
+			e.storeReg.Lose()
+			a := e.hooked(func() {
+				st := e.state()
+				if what == "lease lost" {
+					st.Holder, st.Until = "pod-b", e.clk.Now().Add(time.Minute)
+				} else {
+					st.Root, st.Components = Root{Digest: next.root.Digest, Manifest: next.root.Manifest}, next.digests()
+				}
+				e.mustWriteState(st)
+				e.storeReg.SeedManifest("bundles/root", "current", bundle.MediaTypeManifest, next.root.Manifest)
+			})
+			res, err := a.Refill(t.Context())
+			if err != nil || res.Outcome != RefillSkipped {
+				t.Fatalf("result = %+v, error = %v", res, err)
+			}
+			if e.currentRoot() != next.root.Digest {
+				t.Errorf("tag current = %q, want %q: the refill moved it back to %q", e.currentRoot(), next.root.Digest, old.root.Digest)
+			}
+		})
+	}
+}
+
+func TestRefillHoldsLease(t *testing.T) {
+	e := newEnv(t)
+	b := e.applied(1)
+	e.storeReg.Lose()
+	var during State
+	a := e.hooked(func() { during = e.state() })
+	if res, err := a.Refill(t.Context()); err != nil || res.Outcome != RefillRefilled || res.Root != b.root.Digest {
+		t.Fatalf("result = %+v, error = %v", res, err)
+	}
+	if during.Holder != "pod-a" || !during.Until.After(e.clk.Now()) {
+		t.Errorf("during the read: holder %q until %v, want pod-a with a live lease", during.Holder, during.Until)
+	}
+	if st := e.state(); st.Holder != "" || !st.Until.IsZero() {
+		t.Errorf("after the refill: holder %q until %v, want the lease released", st.Holder, st.Until)
+	}
+}
+
+func TestRefillStateManifestHash(t *testing.T) {
+	e := newEnv(t)
+	e.applied(1)
+	e.storeReg.Lose()
+	st := e.state()
+	st.Root.Manifest = append(bytes.Clone(st.Root.Manifest), ' ')
+	e.mustWriteState(st)
+	store := len(e.storeReg.Requests())
+	res, err := e.a.Refill(t.Context())
+	if res.Outcome != RefillFailed || err == nil {
+		t.Fatalf("result = %+v, error = %v", res, err)
+	}
+	if got := writesOf(e.storeReg, store); len(got) != 0 || e.currentRoot() != "" {
+		t.Fatalf("store requests = %v, tag current = %q", got, e.currentRoot())
+	}
+}
+
+func TestRefillLogsPersistentFailureOnce(t *testing.T) {
+	e := newEnv(t)
+	e.applied(1)
+	e.storeReg.Lose()
+	e.mirrorReg.Lose()
+	var buf bytes.Buffer
+	cfg := e.cfg
+	cfg.Log = slog.New(slog.NewTextHandler(&buf, nil))
+	a := e.applier(cfg)
+	for range 3 {
+		if _, err := a.Refill(t.Context()); err == nil {
+			t.Fatal("refill succeeded with a mirror that lost its content")
+		}
+	}
+	if n := strings.Count(buf.String(), "store_refill_failed"); n != 1 {
+		t.Fatalf("store_refill_failed logged %d times, want 1:\n%s", n, buf.String())
+	}
+}
+
+// raced is a state store that runs before on its nth read.
+type raced struct {
+	Store
+	n, at  int
+	before func()
+}
+
+func (r *raced) Read(ctx context.Context) (State, string, error) {
+	if r.n++; r.n == r.at {
+		r.before()
+	}
+	return r.Store.Read(ctx)
+}
+
+func TestRefillLeaseTakenByAnotherHolder(t *testing.T) {
+	e := newEnv(t)
+	e.applied(1)
+	e.storeReg.Lose()
+	cfg := e.cfg
+	cfg.State = &raced{Store: e.gate, at: 2, before: func() {
+		st := e.state()
+		st.Holder, st.Until = "pod-b", e.clk.Now().Add(time.Minute)
+		e.mustWriteState(st)
+	}}
+	res, err := e.applier(cfg).Refill(t.Context())
+	if err != nil || res.Outcome != RefillSkipped || res.Pushed != 0 || e.currentRoot() != "" {
+		t.Fatalf("result = %+v, error = %v, current = %q", res, err, e.currentRoot())
+	}
+	if st := e.state(); st.Holder != "pod-b" {
+		t.Errorf("holder = %q, want pod-b", st.Holder)
+	}
 }

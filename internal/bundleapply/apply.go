@@ -108,6 +108,10 @@ type Applier struct {
 	// running is held while one Apply of this process works under the lock. The state lock names
 	// the holder only, so it cannot tell two runs of one process apart.
 	running sync.Mutex
+	// refillErr is the text of the error of the latest refill, which keeps a persistent failure from
+	// being logged at every tick.
+	refillMu  sync.Mutex
+	refillErr string
 	// maxSetBytes limits the layer bytes that one apply reads from the mirror and holds.
 	maxSetBytes int
 }
