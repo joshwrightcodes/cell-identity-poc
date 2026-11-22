@@ -873,11 +873,13 @@ partition_peer_ip() {
 # that tag. No other rule is printed, so a caller that runs each line in the node cannot touch another rule. It fails when the node does
 # not answer.
 partition_rules() {
-  local node="$1" tag="${2:-gate-m9-cut-}" tool chain out
+  local node="$1" tag="${2:-gate-m9-cut-}" end="" tool chain out
+  # A tag ends at a space or a quote, so the tag of 8 hex digits does not match a longer token.
+  [[ -z "${2:-}" ]] || end='\( \|"\|$\)'
   for tool in iptables ip6tables; do
     for chain in FORWARD INPUT OUTPUT; do
       out="$(docker exec "$node" "$tool" -S "$chain")" || return 1
-      grep -- "^-A .*--comment \"\{0,1\}$tag" <<<"$out" | sed "s/^-A /$tool -D /" || true
+      grep -- "^-A .* -m comment --comment \"\{0,1\}$tag$end" <<<"$out" | sed "s/^-A /$tool -D /" || true
     done
   done
 }

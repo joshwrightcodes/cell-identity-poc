@@ -19,7 +19,8 @@ import (
 // the exit codes of the real tools. A rule that -I adds is the line "-A <chain> <spec>", as -S prints it. The stub answers the node clock
 // with STUB_NOW. It writes each timer command of sh -c to $STUB_DIR/timers and does not run it. docker inspect reads the addresses from
 // $STUB_DIR/addr/<container>.4 and .6, and fails for a container with neither file. A node with the file $STUB_DIR/down-<node> does
-// not answer. Every call goes to $STUB_DIR/calls, in order.
+// not answer. With the file stuck-<node>, -D succeeds and keeps the rule. fail-insert-after and fail-timer-after hold a number n: the
+// call after the n-th -I or timer fails. A timer must come from docker exec -d. Every call goes to $STUB_DIR/calls, in order.
 const partitionDocker = `#!/usr/bin/env bash
 set -uo pipefail
 d="$STUB_DIR"
@@ -34,11 +35,20 @@ case "$1" in
   exec) ;;
   *) echo "unexpected docker call: $*" >&2; exit 2 ;;
 esac
+detached=0
+[[ "$2" != -d ]] || { detached=1; shift; }
 node="$2"; shift 2
 [[ ! -e "$d/down-$node" ]] || { echo "Error response from daemon: container $node is not running" >&2; exit 1; }
 case "$1" in
   date) [[ "$*" == "date +%s" ]] || exit 2; echo "${STUB_NOW:-1700000000}"; exit 0 ;;
-  sh) [[ "$2" == -c ]] || exit 2; echo "$node|$3" >>"$d/timers"; exit 0 ;;
+  sh)
+    [[ "$2" == -c ]] || exit 2
+    [[ "$detached" == 1 ]] || { echo "a timer must start with docker exec -d, or it ends with the exec session" >&2; exit 2; }
+    if [[ -e "$d/fail-timer-after" ]]; then
+      n=$(($(cat "$d/timer-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$d/timer-count"
+      ((n <= $(cat "$d/fail-timer-after"))) || { echo "exec failed" >&2; exit 1; }
+    fi
+    echo "$node|$3" >>"$d/timers"; exit 0 ;;
   iptables | ip6tables) ;;
   *) echo "unexpected docker exec: $*" >&2; exit 2 ;;
 esac
@@ -56,12 +66,17 @@ case "$op" in
   -I)
     chain="$3"; pos="$4"
     [[ "$pos" == 1 ]] || { echo "the stub models only position 1, got $pos" >&2; exit 2; }
+    if [[ -e "$d/fail-insert-after" ]]; then
+      n=$(($(cat "$d/insert-count" 2>/dev/null || echo 0) + 1)); echo "$n" >"$d/insert-count"
+      ((n <= $(cat "$d/fail-insert-after"))) || { echo "exec failed" >&2; exit 1; }
+    fi
     { printf '%s\n' "-A $chain ${*:5}"; cat "$f"; } >"$f.new"; mv "$f.new" "$f" ;;
   -C)
     grep -Fxq -- "-A $3 ${*:4}" "$f" || { echo "$tool: Bad rule (does a matching rule exist in that chain?)." >&2; exit 1; } ;;
   -D)
     line="-A $3 ${*:4}"
     grep -Fxq -- "$line" "$f" || { echo "$tool: Bad rule (does a matching rule exist in that chain?)." >&2; exit 1; }
+    [[ ! -e "$d/stuck-$node" ]] || exit 0
     awk -v l="$line" '$0 == l && !done { done = 1; next } { print }' "$f" >"$f.new"; mv "$f.new" "$f" ;;
   *) echo "unexpected $tool call: $*" >&2; exit 2 ;;
 esac
@@ -193,10 +208,10 @@ func parseCut(t *testing.T, out string) cutResult {
 var tagForm = regexp.MustCompile(`^gate-m9-cut-[0-9a-f]{8}$`)
 
 // timerRules returns the node and the rule line of each timer that the stub recorded, and fails when a timer is not of the form that the
-// plan fixes: nohup sh -c 'sleep <s>; <tool> -C <rule> && <tool> -D <rule>' in the background.
+// plan fixes: docker exec -d <node> sh -c 'sleep <s>; <tool> -C <rule> && <tool> -D <rule>'.
 func (e *partitionEnv) timers(seconds int) map[string]string {
 	e.t.Helper()
-	re := regexp.MustCompile(`^(\S+)\|nohup sh -c 'sleep (\d+); (ip6?tables) -C (\S+) (.+) && (ip6?tables) -D (\S+) (.+)' >/dev/null 2>&1 &$`)
+	re := regexp.MustCompile(`^(\S+)\|sleep (\d+); (ip6?tables) -C (\S+) (.+) && (ip6?tables) -D (\S+) (.+)$`)
 	got := map[string]string{}
 	for _, l := range strings.Split(strings.TrimSpace(e.read("timers")), "\n") {
 		if l == "" {
@@ -589,5 +604,134 @@ func TestVerifyCallsCheckNoPartition(t *testing.T) {
 	re := regexp.MustCompile(`(?m)^check "[^"]*" check_no_partition$`)
 	if !re.Match(b) {
 		t.Errorf("verify.sh has no unconditional call of check_no_partition at the top level")
+	}
+}
+
+// downFirstNode is the node of the first cluster in topology order.
+const downFirstNode = "down-management-control-plane"
+
+// TestPartitionHealReachesEveryNode: when the first node does not answer, heal --all and heal --tag still delete the rules of the nodes
+// after it, then fail and name the node that failed.
+func TestPartitionHealReachesEveryNode(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []string{"all", "tag"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			e := newPartitionEnv(t, allClusters, partitionAddrs)
+			res := parseCut(t, e.mustRun("cut", "--from", "dev-cell-2", "--to", "dev-cp", "--hold", "5", "--tag", "gate-m9-cut-aaaaaaaa"))
+			e.write(downFirstNode, "")
+			args := []string{"heal", "--all"}
+			if mode == "tag" {
+				args = []string{"heal", "--tag", res.Tag}
+			}
+			out, errOut, err := e.run(args...)
+			if err == nil || !strings.Contains(errOut, "management-control-plane") {
+				t.Errorf("want a failure that names management-control-plane, got %v\n%s", err, errOut)
+			}
+			for _, tool := range []string{"iptables", "ip6tables"} {
+				if got := e.rules("dev-cell-2", tool); len(got) != 0 {
+					t.Errorf("%s of dev-cell-2 still holds %v after the heal", tool, got)
+				}
+			}
+			if !strings.Contains(out, `"healed":8`) {
+				t.Errorf("the JSON line does not report the 8 deleted rules: %q", out)
+			}
+		})
+	}
+}
+
+// TestPartitionHealChecksTheDelete: a -D that succeeds but keeps the rule is a failure, and the message names the node.
+func TestPartitionHealChecksTheDelete(t *testing.T) {
+	t.Parallel()
+	e := newPartitionEnv(t, allClusters, partitionAddrs)
+	e.mustRun("cut", "--from", "dev-cell-2", "--to", "dev-cp", "--hold", "5")
+	e.write("stuck-dev-cell-2-control-plane", "")
+	_, errOut, err := e.run("heal", "--all")
+	if err == nil || !strings.Contains(errOut, "dev-cell-2-control-plane") || !strings.Contains(errOut, "still holds") {
+		t.Errorf("want a failure that says the node still holds rules, got %v\n%s", err, errOut)
+	}
+}
+
+// TestPartitionCutHealsAfterFailure: a cut whose timer arm or insert fails midway heals its tag. The message says that the rules are
+// deleted only when the heal worked, and otherwise names the heal command.
+func TestPartitionCutHealsAfterFailure(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, flag string
+		after      int
+		stuck      bool
+		want       string
+	}{
+		{"insert fails", "fail-insert-after", 3, false, "are deleted"},
+		{"insert fails and the heal fails", "fail-insert-after", 3, true, "the heal of gate-m9-cut-0a1b2c3d failed"},
+		{"timer fails", "fail-timer-after", 2, false, "removal timer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			e := newPartitionEnv(t, allClusters, partitionAddrs)
+			e.write(tc.flag, fmt.Sprint(tc.after))
+			if tc.stuck {
+				e.write("stuck-dev-cell-2-control-plane", "")
+			}
+			_, errOut, err := e.run("cut", "--from", "dev-cell-2", "--to", "dev-cp", "--hold", "5", "--tag", "gate-m9-cut-0a1b2c3d")
+			if err == nil || !strings.Contains(errOut, tc.want) {
+				t.Fatalf("want a failure with %q, got %v\n%s", tc.want, err, errOut)
+			}
+			if tc.stuck {
+				if strings.Contains(errOut, "are deleted") {
+					t.Errorf("the message says deleted although the heal failed:\n%s", errOut)
+				}
+				if !strings.Contains(errOut, "heal --all") {
+					t.Errorf("the message lacks the heal command:\n%s", errOut)
+				}
+				return
+			}
+			for _, tool := range []string{"iptables", "ip6tables"} {
+				if got := e.rules("dev-cell-2", tool); len(got) != 0 {
+					t.Errorf("%s still holds %v after the failed cut", tool, got)
+				}
+			}
+			if !strings.Contains(e.read("calls"), " -D ") && tc.flag == "fail-insert-after" {
+				t.Errorf("no delete call after the failed insert")
+			}
+		})
+	}
+}
+
+// TestPartitionRefusesUnknownCluster: --from and --to must be clusters that kind lists, so the rogue cluster of a harness without it, or
+// any other container name, is refused with no call that changes a node.
+func TestPartitionRefusesUnknownCluster(t *testing.T) {
+	t.Parallel()
+	e := newPartitionEnv(t, "management dev-cp dev-cell-1 dev-cell-2", partitionAddrs)
+	for _, args := range [][]string{
+		{"cut", "--from", "rogue", "--to", "dev-cp", "--hold", "5"},
+		{"cut", "--from", "dev-cp", "--to", "rogue", "--hold", "5"},
+		{"cut", "--from", "registry-mirror", "--to", "dev-cp", "--hold", "5"},
+	} {
+		_, errOut, err := e.run(args...)
+		if err == nil || !strings.Contains(errOut, "cluster") {
+			t.Errorf("%v: want a refusal that names the cluster, got %v %q", args, err, errOut)
+		}
+	}
+	if strings.Contains(e.read("calls"), " -I ") || e.read("timers") != "" {
+		t.Errorf("a refused cut changed a node:\n%s", e.read("calls"))
+	}
+}
+
+// TestPartitionRulesMatchesTheCommentToken: a foreign rule whose comment only contains the text of a tag is not a rule of the tool, and a tag matches only the whole token.
+func TestPartitionRulesMatchesTheCommentToken(t *testing.T) {
+	t.Parallel()
+	e := newPartitionEnv(t, allClusters, partitionAddrs)
+	e.write("rules/dev-cp-control-plane.iptables",
+		`-A FORWARD -m comment --comment "see --comment gate-m9-cut-aaaaaaaa here" -j DROP`+"\n"+
+			`-A INPUT -m comment --comment gate-m9-cut-aaaaaaaa1 -j DROP`+"\n")
+	if out := e.mustRun("list"); strings.Count(out, "\n") != 1 || strings.Contains(out, "see --comment") {
+		t.Errorf("list must show only the rule with the comment token gate-m9-cut-aaaaaaaa1: %s", out)
+	}
+	if _, _, err := e.run("heal", "--tag", "gate-m9-cut-aaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.rules("dev-cp", "iptables"); len(got) != 2 {
+		t.Errorf("heal changed a foreign rule: %v", got)
 	}
 }
