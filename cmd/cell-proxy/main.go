@@ -33,7 +33,7 @@
 //
 // probe makes one handshake with no client certificate, and prints the verified server ID.
 // whoami prints the sorted IDs of the X.509 SVIDs of this process and expiresAt, the RFC 3339 NotAfter of
-// the first one. Neither starts telemetry. A configuration error is one JSON error line and exit status 2, as in the other modes. Any other
+// the first SVID in the order of the Workload API, which is not always the first ID printed. Neither starts telemetry. A configuration error is one JSON error line and exit status 2, as in the other modes. Any other
 // failure is one JSON error line and exit status 1. The probe error line carries a reason:
 // upstream_unavailable when the dial fails, peer_untrusted, peer_not_allowed or protocol_not_h2
 // for a refused server, and handshake_failed for any other handshake error.

@@ -429,7 +429,7 @@ func TestProbeReasons(t *testing.T) {
 	}
 }
 
-func TestWhoamiPrintsOnlyIDs(t *testing.T) {
+func TestWhoamiPrintsIDsAndExpiry(t *testing.T) {
 	ca := newCA(t, "dev.env.poc.internal")
 	serveWorkloadAPI(t, ca, "spiffe://dev.env.poc.internal/cell/dev-cell-1/otel", "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent")
 	var out bytes.Buffer

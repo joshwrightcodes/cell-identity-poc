@@ -101,13 +101,13 @@ func NewServer(cfg ServerConfig, b Backend, log *slog.Logger) *Server {
 
 // CloseRevoked closes each live connection of a cell source that reg does not allow, because the
 // cell is revoked or has no record. Environment sources stay open. It returns the number of
-// connections that it closed. Each one logs "connection closed" with the reason cell_revoked.
+// connections that it closed, and it never waits on a peer. Each one logs "connection closed" with the reason cell_revoked.
 func (s *Server) CloseRevoked(reg *Registry) int {
 	s.mu.Lock()
 	s.adopted = reg
 	var doomed []*liveConn
 	for lc := range s.live {
-		if refused(reg, lc.src) {
+		if !lc.revoked && refused(reg, lc.src) {
 			lc.revoked = true
 			doomed = append(doomed, lc)
 		}
@@ -115,15 +115,19 @@ func (s *Server) CloseRevoked(reg *Registry) int {
 	s.mu.Unlock()
 	for _, lc := range doomed {
 		s.countClosed(lc.src)
-		_ = lc.conn.Close()
+		dropConn(lc.conn)
 	}
 	return len(doomed)
 }
 
+// dropConn closes the transport of conn without a close_notify alert. A revoked peer needs no
+// alert, and the alert write waits up to 5 seconds on a peer that does not read.
+func dropConn(conn *tls.Conn) { _ = conn.NetConn().Close() }
+
 func refused(reg *Registry, src Source) bool { return src.Plane == PlaneCell && !reg.Allows(src) }
 
 func (s *Server) countClosed(src Source) {
-	s.closed.Add(context.Background(), 1, metric.WithAttributes(attribute.String("cell", src.Cell)))
+	s.closed.Add(context.Background(), 1, metric.WithAttributes(attribute.String("plane", src.Plane)))
 }
 
 // track registers conn as live. When the last adopted registry refuses src, it closes conn at once.
@@ -138,7 +142,7 @@ func (s *Server) track(conn *tls.Conn, src Source) (*liveConn, func()) {
 	s.mu.Unlock()
 	if late {
 		s.countClosed(src)
-		_ = conn.Close()
+		dropConn(conn)
 	}
 	return lc, func() {
 		s.mu.Lock()
@@ -221,13 +225,21 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 	defer release()
 	lc, untrack := s.track(conn, src)
 	defer untrack()
+	log := s.log.With("spiffe_id", id, "remote", remote)
+	if s.wasRevoked(lc) {
+		log.Info("connection closed", "reason", "cell_revoked", "cell", src.Cell)
+		return
+	}
 	if s.cfg.Proof != nil && src.Plane == PlaneCell {
 		if err := s.cfg.Proof.check(conn, src, id); err != nil {
+			if s.wasRevoked(lc) {
+				log.Info("connection closed", "reason", "cell_revoked", "cell", src.Cell)
+				return
+			}
 			s.refusals.write("proof refused", ReasonOf(err), remote, id, err)
 			return
 		}
 	}
-	log := s.log.With("spiffe_id", id, "remote", remote)
 	log.Info("peer accepted")
 	if err := s.backend.Serve(withIdleTimeout(ctx, s.cfg.IdleTimeout), conn, src); err != nil {
 		log.Warn("backend failed", "error", err.Error())
