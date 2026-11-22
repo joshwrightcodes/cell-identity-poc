@@ -369,6 +369,7 @@ func m9StoreRestore(t *testing.T, cut func() *linkCut, wasGood []string) {
 		t.Logf("the store still lacks %v after the refill window. Signing the live set of %s to fill it", missing, m9StoreCell)
 		waitValid(t, []string{m9StoreCell}, 10*time.Minute)
 		signed := m8Sign(t, m9StoreCell, m8LiveSet(t, m9StoreCell), true)
+		m9StoreCosign(t, m9StoreCell)
 		if res := m8Wait(t, m9StoreCell, signed.OpID, m8SetWait); res.Result == nil || (res.Result.Outcome != op.OutcomeApplied && res.Result.Outcome != op.OutcomeAlreadyApplied) {
 			t.Errorf("the repair set of %s ended %+v, want applied", m9StoreCell, res.Result)
 		}
@@ -539,6 +540,7 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		cut.Heal(t)
 		waitValid(t, []string{cell}, 10*time.Minute)
 		signed := m8Sign(t, cell, m8LiveSet(t, cell), true)
+		m9StoreCosign(t, cell)
 		res := m8Wait(t, cell, signed.OpID, m8SetWait)
 		if res.Result.Outcome != op.OutcomeApplied {
 			t.Fatalf("the next signed set of %s ended %+v, want applied", cell, *res.Result)
@@ -556,4 +558,13 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 			t.Errorf("the store of %s lacks %v after the signed set", cell, missing)
 		}
 	})
+}
+
+// m9StoreCosign attaches the Sigstore bundle of the root of the target to the mirror. bundle -- sign serves a set but attaches nothing, and a set with the
+// same root as an older one then has no signed statement of its version, so the strict bundle -- verify and cell:verify fail after the test.
+func m9StoreCosign(t *testing.T, target string) {
+	t.Helper()
+	if out, err := m8Command(t, 5*time.Minute, "", "run", "bundle", "--", "cosign", "--target", target); err != nil {
+		t.Fatalf("attach the Sigstore bundle of %s: %v\n%s", target, err, out)
+	}
 }

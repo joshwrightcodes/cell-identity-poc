@@ -710,10 +710,12 @@ check_signed_root() {
     reason="$(grep '^error:' <<<"$out" | tail -n 1 || true)"
     reason="${reason:-$(tail -n 1 <<<"$out")}"
     printf '%s\n' "$reason"
-    # A new set fixes a bootstrap state or a missing state. A root that fails cosign says its own command (after a key rotation, bundle -- cosign), and a
+    # A new set fixes a bootstrap state or a missing state. A root that fails cosign says its own command (after a key rotation, bundle -- cosign), a set that was signed but never attached needs bundle -- cosign too, and a
     # mirror or mgmtd that does not answer needs the harness first: a publish needs both.
     if [[ "$reason" == *"bootstrap root"* || "$reason" == *"no bundle state"* || "$reason" == *"no root digest"* ]]; then
       echo "Run: mise run bundle -- publish --target $CELL_NAME --wait"
+    elif [[ "$reason" == *"no signed statement"* ]]; then
+      echo "Run: mise run bundle -- cosign --target $CELL_NAME"
     elif [[ "$reason" != *"cosign"* ]]; then
       echo "Run: mise run harness:status"
     fi
