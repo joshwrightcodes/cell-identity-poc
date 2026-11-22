@@ -21,8 +21,9 @@
 # rotate  It refuses while not connected, while a cut of the partition tool or the slow-tier marker exists, and while envd holds
 #         a local revocation entry. It checks all of these before it reads the secret manager. The default is the overlap. A new
 #         key goes to next.pub, the renders pin both keys, and cell:verify runs. Then the new key replaces the old one, the renders
-#         pin it alone, and cell:verify runs again. --emergency replaces the old key at once. Use it for a lost or leaked key, or
-#         to finish a rotation that stopped. The old seed stays in the secret manager. Delete it there by hand.
+#         pin it alone, and cell:verify runs again. --emergency replaces the old key at once. Use it for a lost or leaked key, to
+#         finish a rotation that stopped, or when operator-pub is absent or holds no valid key. It needs no old key. The old seed
+#         stays in the secret manager. Delete it there by hand.
 #
 # The owner creates the key once:
 #   1. Add this line to .envrc.local: export POC_OPERATOR_KEY='<remote key prefix for the operator key>'
@@ -247,7 +248,9 @@ set_next() {
 }
 
 switch_key() {
-  PUB_CM="$(write_operator_pub replace "$NEW_PUB" "$new_name")" \
+  local verb=replace
+  [[ -n "$PUB_CM" ]] || verb=create
+  PUB_CM="$(write_operator_pub "$verb" "$NEW_PUB" "$new_name")" \
     || { STEP_REASON="ConfigMap mgmt-system/operator-pub could not take the new key, or changed since the rotation wrote it"; return 1; }
   switched=true
   write_key_env "$new_name" "$new_sha" || { STEP_REASON="build/operator/key.env could not be written. The commands read spec.name of operator-pub instead"; return 1; }
@@ -281,14 +284,25 @@ cmd_rotate() {
   need_settings POC_SECRET_READ_CMD POC_SECRET_WRITE_CMD POC_OPERATOR_KEY
   [[ "$POC_OPERATOR_KEY" =~ ^[^[:space:]]*[^[:space:]/]$ ]] || fail "POC_OPERATOR_KEY must be one word with no slash at the end"
   read_operator_pub
-  [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management, so there is no key to rotate. The owner creates it with: mise run operator:create-key"
-  old_pub="$(pub_field spec.pub)"
-  old_name="$(pub_field spec.name)"
-  operator_key_valid "$old_pub" || fail "key spec.pub of operator-pub is not the standard base64 of 32 bytes. Replace the key with: mise run operator:rotate-key -- --emergency"
-  if [[ "$mode" == overlap && -n "$(pub_field next.pub)" ]]; then
-    fail "operator-pub holds next.pub, so an earlier rotation stopped. Finish it with a new key: mise run operator:rotate-key -- --emergency"
+  if [[ "$mode" == overlap ]]; then
+    [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management, so the overlap has no old key. The owner creates the key with: mise run operator:create-key, or replaces it with: mise run operator:rotate-key -- --emergency"
+    old_pub="$(pub_field spec.pub)"
+    old_name="$(pub_field spec.name)"
+    operator_key_valid "$old_pub" || fail "key spec.pub of operator-pub is not the standard base64 of 32 bytes. Replace the key with: mise run operator:rotate-key -- --emergency"
+    [[ -z "$(pub_field next.pub)" ]] \
+      || fail "operator-pub holds next.pub, so an earlier rotation stopped. Finish it with a new key: mise run operator:rotate-key -- --emergency"
+    old_sha="$(sha_of_pub "$old_pub")"
+  else
+    # The break-glass path pins the new key alone, so a writer of operator-pub must not block it. An absent ConfigMap or a spec.pub
+    # that is no key means no old key. The old name comes from key.env first, because operator-pub can be wrong.
+    old_pub="$(pub_field spec.pub)"
+    old_sha=""
+    ! operator_key_valid "$old_pub" || old_sha="$(sha_of_pub "$old_pub")"
+    old_name=""
+    [[ ! -f "$key_env" ]] || old_name="$(key_env_value OPERATOR_KEY_NAME)"
+    [[ -n "$old_name" ]] || old_name="$(pub_field spec.name)"
+    [[ -n "$old_sha" ]] || log "operator-pub holds no valid old key, so the emergency rotation writes the new key alone"
   fi
-  old_sha="$(sha_of_pub "$old_pub")"
   refuse_rotation "$mode"
 
   new_name="$(key_name_now)"
@@ -312,7 +326,7 @@ cmd_rotate() {
     # shellcheck disable=SC2086
     ${funcs[i]} || stop "$i" "${STEP_REASON:-${names[i]} failed}"
   done
-  log "rotated the operator key from $old_sha to $new_sha. Delete the old seed at the remote key $old_name by hand"
+  log "rotated the operator key from ${old_sha:-no valid old key} to $new_sha. Delete the old seed at the remote key ${old_name:-that key.env or operator-pub named} by hand"
   jq -nc --arg mode "$mode" --arg old "$old_sha" --arg new "$new_sha" --arg oldName "$old_name" --arg newName "$new_name" \
     --argjson seconds "$((SECONDS - started))" \
     '{rotated: true, mode: $mode, oldKeyName: $oldName, oldKeySHA256: $old, newKeyName: $newName, newKeySHA256: $new, seconds: $seconds}'

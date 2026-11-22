@@ -888,6 +888,11 @@ var rotateRefusals = []struct {
 	{"no_operator_pub", func(r *opRig) {
 		os.Remove(filepath.Join(r.stub, "k", "kind-management", "mgmt-system", "operator-pub.json"))
 	}, nil, "operator:create-key"},
+	{"bad_spec_pub", func(r *opRig) {
+		d := r.data("kind-management", "mgmt-system", "operator-pub")
+		d["spec.pub"] = "not-a-key"
+		r.put("kind-management", "mgmt-system", "operator-pub", d)
+	}, nil, "spec.pub of operator-pub is not the standard base64"},
 	{"next_pending", func(r *opRig) {
 		d := r.data("kind-management", "mgmt-system", "operator-pub")
 		d["next.pub"] = opPub(opNewKey(r.t))
@@ -911,8 +916,9 @@ var rotateRefusals = []struct {
 }
 
 // overlapOnly names the refusals of the default mode alone. A pending next.pub is the case that --emergency finishes. The other rows
-// check the old key, which the overlap pins again and --emergency drops.
-var overlapOnly = map[string]bool{"next_pending": true, "spec_swapped": true, "pin_differs": true, "pin_absent": true, "key_env_stale": true}
+// check the old key, which the overlap pins again and --emergency drops, so --emergency also runs with no valid old key.
+var overlapOnly = map[string]bool{"next_pending": true, "spec_swapped": true, "pin_differs": true, "pin_absent": true, "key_env_stale": true,
+	"no_operator_pub": true, "bad_spec_pub": true}
 
 func runRotateRefusal(t *testing.T, name string, args ...string) {
 	t.Helper()
@@ -1000,6 +1006,53 @@ func TestRotateEmergencyDropsSwappedKey(t *testing.T) {
 	}
 	if got := r.data("kind-dev-cp", "envd-system", "operator-key")["keys.pub"]; got != opPub(k)+"\n" {
 		t.Fatalf("envd pins %q, want the new key alone", got)
+	}
+}
+
+// TestRotateEmergencyWithoutOldKey: --emergency is the break-glass action, so a writer of operator-pub cannot block it. With a spec.pub
+// that is no key, or with operator-pub deleted, it writes the new key alone, pins only that key, and reports no old key SHA-256.
+// The default mode refuses both cases (rows bad_spec_pub and no_operator_pub of rotateRefusals).
+func TestRotateEmergencyWithoutOldKey(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		setup func(r *opRig)
+	}{
+		{"spec_not_a_key", func(r *opRig) {
+			d := r.data("kind-management", "mgmt-system", "operator-pub")
+			d["spec.pub"] = "not-a-key"
+			r.put("kind-management", "mgmt-system", "operator-pub", d)
+		}},
+		{"operator_pub_deleted", func(r *opRig) {
+			os.Remove(filepath.Join(r.stub, "k", "kind-management", "mgmt-system", "operator-pub.json"))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, _, oldName := rotateRig(t)
+			tc.setup(r)
+			out, errOut, code := r.run(nil, "rotate", "--emergency")
+			if code != 0 {
+				t.Fatalf("rotate --emergency: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+			}
+			res := oneJSON(t, out)
+			newName, _ := res["newKeyName"].(string)
+			k := newRotatedKey(t, r, newName)
+			if res["rotated"] != true || res["mode"] != "emergency" || res["newKeySHA256"] != opSHA(k) || res["oldKeySHA256"] != "" || res["oldKeyName"] != oldName {
+				t.Fatalf("rotate printed %v, want the new key, no old SHA-256 and the old name of key.env", res)
+			}
+			if d := r.data("kind-management", "mgmt-system", "operator-pub"); fmt.Sprint(d) != fmt.Sprint(map[string]string{"spec.pub": opPub(k), "spec.name": newName}) {
+				t.Fatalf("operator-pub holds %v, want the new key alone", d)
+			}
+			for _, c := range r.calls() {
+				if strings.HasPrefix(c, "render ") && c != "render dev-cp pins="+opPub(k) {
+					t.Fatalf("calls %q: render %q, want the new key alone", r.calls(), c)
+				}
+			}
+			if d := r.data("kind-dev-cp", "envd-system", "operator-key"); d["keys.pub"] != opPub(k)+"\n" {
+				t.Fatalf("envd pins %q, want the new key alone", d["keys.pub"])
+			}
+		})
 	}
 }
 
