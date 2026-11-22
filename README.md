@@ -608,6 +608,9 @@ A live fact that a render reads from a cluster is not a file, so a change in it 
 | A target shows `rolled_back` with the detail `rollback_unhealthy` | Run `mise run bundle -- repair --target <target>` before the next set, because a sync that still retries holds its Application. Then follow the row above | A bad `argocd` or `cell-system` set stops the path that a rollback needs |
 | `internal/bundle/allow.json` or `internal/bundleapply/policy/bundle.rego` changes | Run `mise run images` with no image names. Roll each component whose digest changed: `CELL=management LINK_ONLY=mgmt-api mise run cell:link` for `mgmtd`, `CELL=<cell> HARNESS_ONLY=cell-identity mise run cell:up` for `celld` in each cell, and `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` for `envd`. Then run `CELL=<cluster> mise run cell:up` for each cluster | `mgmtd`, `celld` and `envd` embed both files, and the `argocd` bundle repeats the list in the AppProjects. Images come first, then the set. An old `mgmtd` refuses a set with a new component as `payload_invalid` with the detail `set`. An old applier refuses it as `component_unknown`. A change of the list moved six image digests in the live runs |
 | A person creates or deletes a cell | Follow the rows of [Provisioning](#provisioning). The admit stage and `cell:down` publish a signed `dev-cp` set and render `envd` again | The SPIRE cell subjects live in the signed `spire-server` bundle, and the cell rules live in the `envd` harness component |
+| A new image of `mgmtd`, the cell gateway or `envd` rolls, and `envd` holds a local revocation entry | Roll `mgmtd` first with `CELL=management LINK_ONLY=mgmt-api mise run cell:link`. Then run `CELL=dev-cp HARNESS_ONLY=cell-gateway mise run cell:up`, and `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` last | `mgmtd` and the cell gateway decode the posts of `envd` strictly. The render order rolls `envd` first, so it cannot do this |
+| A cell needs a new `celld` pod, `cell-identity` or the mirror rules | Run a full `CELL=<cell> mise run cell:up`, not `HARNESS_ONLY=cell-identity` | A long-lived pod no longer holds the SPIRE server log line that the narrow run waits for |
+| The operator key pins change | `mise run operator:check-key`, then `CELL=dev-cp mise run cell:up` and `CELL=management LINK_ONLY=mgmt-api mise run cell:link` | The pins sit in `envd`, the cell gateway, the SPIRE server of `dev-cp` and `mgmtd`. `operator:rotate-key` runs these steps itself |
 | You rotate the store tokens | `CELL=<cluster> STORE_TOKENS=1 mise run cell:restart` | New pods get new projected tokens |
 | `vm:up` runs, or the mirror has a new address | `CELL=<cell> HARNESS_ONLY=cell-identity mise run cell:up` for each cell, then `CELL=dev-cp HARNESS_ONLY=envd mise run cell:up` | The rules N45 and N48 admit the mirror by address |
 
@@ -822,6 +825,208 @@ The token scan also reads the logs of `store-proxy` and `store-token`, and the f
 
 `mise run gate:m8:repair -- --check` only reports each trace with the command that repairs it, and exits 1.
 It exits 0 when it finds none.
+
+## Island mode and revocation
+
+An island is a part of the PoC that lost its upstream link. M9 covers two levels.
+In an environment island, `dev-cp` cannot reach `management`.
+In a cell island, a cell cannot reach `dev-cp`.
+A revocation makes the PoC refuse a cell. An operator revokes a cell through `mgmtd`, or on the Mac while `dev-cp` is an island.
+
+### Island mode
+
+Each level has its own expected behaviour.
+
+- In an environment island, `dev-cp` and the cells stay connected to the SPIRE server of `dev-cp`. Every SVID renews, and no container restarts.
+  `envd` and `celld` keep their queues. The outbox of `envd` grows, and it drains after the heal. In the run of 2026-11-22, the outbox grew to 18 items in 4 minutes and drained in 19 seconds.
+- In a cell island, the cell cannot renew its agent SVIDs. About one SVID lifetime into the island, the agent sidecars of the cell restart in place.
+  Their restart counts rise, and they attest again after the island. No pod is replaced, and customer traffic continues.
+  In the run of 2026-11-22, the agents exited 5 to 39 seconds after their SVIDs expired.
+  Each agent was Ready within 18 seconds of the heal.
+- Workload API clients take a new SVID about 11 seconds after their agent returns. The stream retry of `celld` stops at 5 seconds.
+- An operation expires 1 hour after its signature. Work that was queued before a longer island never applies, and a bundle set is an operation too.
+- A cell island longer than an SVID lifetime makes every agent of the cell attest again. The attestation limits of the SPIRE server then slow its recovery.
+- The island signals are `envd.upstream.age`, `celld.upstream.age` and `celld.svid.remaining`, and the fields `island`, `overlay`, `bans` and `svidTTL` of `harness:status`. No alert evaluator reads them.
+
+`harness:status` reports collector export retries for 5 to 10 minutes after a cell restart or a heal. They clear by themselves.
+
+### Cut and heal a link
+
+`mise run partition` cuts and heals the traffic between two kind clusters with tagged firewall rules.
+A cut covers the IPv4 and the IPv6 address of the peer, in the chains `FORWARD`, `INPUT` and `OUTPUT` of one node.
+`--hold` is the number of minutes, from 1 to 600.
+A timer in the node removes each rule after the hold plus 15 minutes, even if the tool does not run again.
+
+```sh
+mise run partition -- cut --from dev-cell-2 --to dev-cp --direction both --hold 10   # a cell island
+mise run partition -- cut --from dev-cp --to management --direction both --hold 10   # an environment island
+mise run partition -- list
+mise run partition -- heal --tag <tag>
+mise run partition -- heal --all
+```
+
+Each `cut` prints one JSON line with the tag. A heal takes about 4 seconds, and the `celld` stream returns about 10 seconds later.
+The mirror, `host.docker.internal` and the API ports stay reachable during a cut.
+
+### Revoke a cell
+
+While `dev-cp` is connected to `management`, ask `mgmtd` to revoke a cell, and to undo it:
+
+```sh
+mise run mgmt -- revoke --cell dev-cell-2
+mise run mgmt -- unrevoke --cell dev-cell-2
+CELL=dev-cell-2 mise run cell:restart
+```
+
+A revoke of a cell that is already revoked prints `"already":true`.
+`unrevoke` works only while `dev-cp` is connected, and only when `envd` holds no entry for the cell.
+`mgmt -- restore --revision <n>` refuses a revision below the last revocation, with `restore_past_revocation`.
+
+A revocation reaches these points:
+
+| Point | Effect | Time |
+| --- | --- | --- |
+| Plugin of the SPIRE server | Refuses new attestations, with the reason `revoked` | About 60 seconds, because of the ConfigMap sync and the reload of the plugin every 10 seconds |
+| Cell gateway | Refuses hello, claim and bind with `cell_revoked`, and closes the live streams | Within its 1 second tick |
+| Container `agent-ban` | Bans the agents of the cell | Within 10 seconds of the record in the pod, and about 4 seconds to take effect |
+| `cell-proxy` servers of `management` | Close the connections of the cell | Within 5 seconds after the log line `registry reloaded`, which follows the revocation by up to 81 seconds |
+
+A ban alone does not keep a cell out. The restart of a banned agent attests as a new agent within 1 second.
+The plugin and the gateway keep the cell out.
+
+While `dev-cp` is an island, revoke on the Mac with the operator key.
+The entry names the cell and the record revision that `envd` holds.
+`envd` and the gateway hold the cell revoked, and `mgmtd` adopts the entry when the environment reconnects.
+
+```sh
+mise run revoke -- local --cell dev-cell-2
+mise run revoke -- list
+mise run revoke -- reapply
+mise run revoke -- clean
+```
+
+- `local` signs an entry with the operator key and writes it to `envd-system/local-revocations`. It prints one JSON line with `id`, `cell` and `record`.
+- `list` prints each entry with its state: `held`, `pending`, `stale`, `settled` or `invalid`.
+- `reapply` writes the entries of `build/operator/revocations.log` back, after you lose `dev-cp`.
+- `clean` deletes only stale and settled entries. A key that does not verify needs a manual delete, and `list` prints the command.
+
+### Operator key
+
+The operator key is an Ed25519 key. Its seed stays in your secret manager and moves only through pipes.
+Add these lines to `.envrc.local`, as `.envrc.local.example` shows:
+
+```sh
+export POC_SECRET_READ_CMD='<your secret CLI> read "$1"'
+export POC_SECRET_WRITE_CMD='<your secret CLI> write "$1"'
+export POC_OPERATOR_KEY='<remote key prefix for the operator key>'
+```
+
+Create the key once:
+
+```sh
+mise run operator:create-key
+CELL=dev-cp mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
+mise run operator:check-key
+```
+
+`operator:check-key` must print `"match":true`. It compares the key in the secret manager with each public pin in the PoC.
+A pin that differs shows in the output, because the Mac administrator can change a pin.
+
+Rotate the key with an overlap of two keys, and then with the new key alone:
+
+```sh
+mise run operator:rotate-key
+mise run operator:rotate-key -- --emergency
+```
+
+The option `--emergency` replaces the old key at once. Use it for a lost or leaked key, or to finish a rotation that stopped. It needs no old key.
+The rotation refuses during a cut, while `dev-cp` is not connected, during a slow tier, and while `envd` holds an entry.
+It checks this before it reads the secret manager, and its message names the cut or "not connected".
+`mgmtd` learns a key change from the host service on the Mac, and it checks every 15 minutes, whether or not `dev-cp` is connected.
+While the secret manager is unreachable, an operator cannot revoke a cell locally.
+Before each slow-tier run, the owner unlocks the secret CLI.
+
+### Runbook: island mode and revocation
+
+| Case | What to do |
+| --- | --- |
+| A refusal with `revoked`, with the field `source` set to `record` or `overlay` | The plugin refuses the cell. `record` means the signed record revokes it, and `overlay` means `envd` holds a local entry |
+| A refusal with `cell_revoked` | The gateway or a `cell-proxy` server refuses the cell. Run `mise run mgmt -- status` to see if the revocation is adopted |
+| `revocation_invalid` in the `envd` log | The entry fails the check of its signature, its form or its environment. Run `mise run operator:check-key`, then sign the entry again |
+| `revocation_stale` | The record of the cell is newer than the entry. Run `mise run revoke -- clean` |
+| `revocation_unknown_cell` | The cell has no record. Run `mise run revoke -- list` and check the cell name |
+| `revocation_overflow` | `envd` holds the maximum of 16 entries. Run `mise run revoke -- clean` |
+| `mgmtd` answers `not_bound` (404) | The cell is not bound to `mgmtd`. Check the name, and run `mise run mgmt -- records` |
+| `mgmtd` answers `not_connected` (409) | `dev-cp` is not connected. Heal the cut, or use `mise run revoke -- local` |
+| `mgmtd` answers `not_revoked` (409) | The cell is not revoked, so `unrevoke` has nothing to undo |
+| `mgmtd` answers `overlay_held` (409) | `envd` holds an entry for the cell. Wait for the next revision to settle it, then run `mise run revoke -- clean` |
+| An adopted overlay entry stays in `revoke -- list` | The next signed revision settles it. Run `mise run revoke -- clean` to delete a stale or settled entry |
+| You revoked a cell by mistake | Run `mise run mgmt -- unrevoke --cell <cell>`, then `CELL=<cell> mise run cell:restart`, so that the agents attest again |
+| `envd` holds an entry that `mgmtd` refuses | `harness:status` fails after 10 minutes while `dev-cp` is connected. Render the pins again with `CELL=dev-cp mise run cell:up`. Then run `mise run mgmt -- revoke --cell <cell>` and `mise run mgmt -- unrevoke --cell <cell>`, so that a signed revision settles the entry |
+| A writer replayed an old signed entry, and the cell stays revoked | Run `mise run mgmt -- revoke --cell <cell>`, and then `mise run mgmt -- unrevoke --cell <cell>`. The un-revoke rule of `mgmtd` refuses to adopt the old entry again |
+| The gateway store is corrupt | The gateway holds no overlay until the next sync of `envd`. This takes about 10 seconds while `envd` runs |
+| A cell lost its bundle store | The applier refills the store from its state and the mirror, once each minute. If it does not, run `mise run bundle -- publish --target <cell> --wait` |
+| You lost `dev-cp` | After the rebuild, run `mise run revoke -- reapply` |
+
+The overlay of the gateway and `envd` counts a hold of more than 10 minutes from `issuedAt`, because `envd` records no admit time.
+`mgmtd` keeps a mirror of revocation events with no bound. Only an admin action or a signed entry adds an event.
+The container `agent-ban` has no probe. A configuration error makes it exit before any ban, and it shows as restarts.
+`cell:up` with `HARNESS_ONLY=cell-identity` waits for a SPIRE server log line that a long-lived pod no longer holds. Run a full `cell:up` instead.
+
+### Gate of M9
+
+`mise run gate:m9` runs the slow tier overnight. Build the images first with `mise run images`.
+The tier uses SVIDs of 1 hour, so each island holds for three lifetimes. A full run takes about 5 hours 30 minutes.
+The lifetime comes from `GATE_M9_SVID_TTL` in `harness/versions.env`. A value in the environment wins, and the run is then not a record.
+`GATE_M9_SVID_TTL=1m` makes the tier take about 1.5 hours.
+
+The gate runs in phases:
+
+1. Phase 0 runs the repair checks of M6 to M9 and the image checks. It keeps the Mac awake, and it refuses battery power unless `GATE_ALLOW_BATTERY=1`.
+   It then switches the SVID lifetime of `dev-cp` and waits until every SVID has it.
+2. Each M9 test runs in its own `go test` invocation, in this order: `TestM9LocalRevocationDuringIsland`, `TestM9ConnectedRevocation`, `TestM9OneWayPartitions`, `TestM9KeyRotatedDuringEnvironmentIsland`, `TestM9StoreLostDuringCellIsland` and `TestM9IslandsHold`.
+   The run stops at the first failure.
+3. Phase 7 scans the logs for a token, restores the lifetime and runs `harness:status`. It also runs after a failure.
+
+`mise run gate:m9 -- -run '^<test>$'` runs one test with Phases 0 and 7 around it. That run is not a record.
+`GATE_M9_BUDGET_MINUTES` bounds the whole tier, and `GATE_M9_TEST_TIMEOUT_MINUTES` is the timeout of each `go test` invocation.
+A Go timeout skips every cleanup, so run `gate:m9:repair` after a timeout.
+
+`mise run poc:gate -- fast` runs `gate:m1` to `gate:m8`, with `gate:m6:provision`, and stops at the first failure.
+`mise run poc:gate -- slow` runs `gate:m9`, and `mise run poc:gate -- all` runs both. A full run takes about 10 hours.
+The manual drills `gate:m4:rotate`, `gate:m5:soak` and `gate:m5:drill` do not run.
+
+The slow tier needs these conditions for its whole run:
+
+- The Mac runs on AC power, with the lid open or an external display connected.
+- The keep-awake runs. `gate:m9` and `poc:gate` start it themselves, but macOS still sleeps when the lid closes on battery power.
+- The owner unlocked the secret CLI.
+
+The Colima VM clocks stop while the Mac sleeps, and `istio-agent` renews on the monotonic clock.
+After a long sleep, a sidecar keeps an expired certificate. The `istio-proxy` liveness probe restarts only that container when its certificate has 2 hours or less left.
+The egress gateway has no such probe, and `cell:verify` reports its certificate.
+Do not run `cell:restart-mesh` in an island, because it deletes pods. Use it outside an island only.
+A sleep fails the run with `mac_slept`, when two samples lie more than 2 minutes apart.
+
+#### A failed overnight run
+
+1. Read the end of `build/gate/m9-samples.jsonl` and the test text in `build/gate-m9-<test>.json`. They name the phase, the last good sample and a sleep gap.
+2. Run `mise run gate:m9:repair -- --check`. It lists each cut, the marker, the revoked test cells, the held entries, the `m9-` namespaces and the API server test key.
+3. Run `mise run gate:m9:repair`. It heals every cut and waits until `dev-cp` is connected.
+   It waits until `envd` holds no entry, runs `revoke -- clean`, and un-revokes the test cells.
+   It repairs the API server of a key rotation test.
+   It restores the SVID lifetime, and restarts `dev-cp` and each live cell.
+   It deletes the `m9-` namespaces, and refills the bundle store of a cell that the store test emptied.
+   It ends with `harness:status`.
+4. To repeat one failed test at 1 hour, run `mise run gate:m9 -- -run '^<test>$'`.
+5. Run `mise run svid-ttl -- show` to read the lifetimes of the file, the marker and the live server.
+
+`mise run svid-ttl` switches the lifetime by hand.
+`set <ttl>` writes the marker `build/gate/m9-svid-ttl` and runs `cell:up` of `dev-cp`.
+`restore` removes the marker and restarts `dev-cp` and each live cell.
+Both need `dev-cp` connected to `management`. The switch to 1 hour settles in about 3 minutes, and the restore in under 5 minutes.
+Every other gate refuses while the marker exists.
 
 ## Refused keys, signing key rotation and lost state
 
@@ -1608,6 +1813,8 @@ M8 measured values come from the live part of M8:
 | `gate:m6` | 942 seconds (2026-11-19), pass |
 | `gate:m6:provision` | 1385 seconds (2026-11-19), pass. Both steps were done 14 minutes 4 seconds after the request |
 | `gate:m7` | 734 seconds (2026-11-19), pass |
+| `GATE_M9_BUDGET_MINUTES` and `GATE_M9_TEST_TIMEOUT_MINUTES` | 495 and 270 minutes. The values are provisional until the full runs set them |
+| `gate:m9` | `<measured in the live part>` |
 
 ## Malicious cell tests
 
@@ -1736,12 +1943,13 @@ In normal operation this prints nothing.
 
 `SPIRE_SVID_TTL` in `cells/dev-cp.env` sets the lifetime of agent and workload SVIDs.
 The value is `1m`, so a gate sees two renewals in about a minute.
+The slow tier of M9 runs with `1h`. `mise run svid-ttl -- set 1h` switches `dev-cp`, and `mise run svid-ttl -- restore` switches it back, as [Gate of M9](#gate-of-m9) describes.
 For an environment that stays up without gates, change the value to `1h` in `cells/dev-cp.env`, and run `CELL=dev-cp mise run cell:up`.
 A value in the shell environment has no effect, because mise and `scripts/lib.sh` load `cells/dev-cp.env` after the shell.
 The render accepts values from `1m` to `4h`, which is `ca_ttl` divided by 6.
 `cell:verify` in `dev-cp` checks that the server runs the value of `SPIRE_SVID_TTL`.
 
-With `1m`, a sleep of the Mac longer than about half a minute lets agent SVIDs expire.
+With `1m`, a sleep of the Mac longer than about half a minute lets agent SVIDs expire. With `1h`, the limit is about half an hour.
 An agent with an expired SVID exits, and its new container attests as a new agent.
 The Mac must stay awake for the whole gate, so run a keep-awake tool while the gate runs.
 macOS still sleeps when you close the lid on battery power, whatever tool runs.
