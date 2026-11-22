@@ -294,6 +294,10 @@ run = "scripts/gate.sh m8"
 description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap m8-marker in apps-sample or apps-demo, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m8-repair.sh"
 
+[tasks.partition]
+description = "Cut and heal the traffic between two kind clusters with tagged firewall rules, with the arguments after --: cut --from <cluster> --to <cluster> [--direction both|out|in] --hold <minutes> [--tag <tag>], heal --tag <tag>, heal --all (every gate-m9-cut- rule on every existing cluster) or list. A cut covers the IPv4 and the IPv6 address of the peer, and a timer in the node removes each rule after the hold plus 15 minutes. It prints one JSON line"
+run = "scripts/partition.sh"
+
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"
 env = { CELL = "dev-cp" }

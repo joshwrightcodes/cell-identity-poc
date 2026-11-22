@@ -750,6 +750,14 @@ check_no_blackhole() {
   [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//-D /}"; echo "Run: mise run gate:m3:repair"; return 1; }
 }
 
+# The partition tool cuts the traffic between two nodes with firewall rules in both address families. A run that stopped
+# early can leave them, and they cut a cell from its control plane, or an environment from management.
+check_no_partition() {
+  local found
+  found="$(partition_rules "$CELL_NAME-control-plane")" || { echo "the node of $CELL_NAME does not answer"; return 1; }
+  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the cut rules: ${found//$'\n'/; }"; echo "Run: mise run partition -- heal --all"; return 1; }
+}
+
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
@@ -891,6 +899,8 @@ fi
 if [[ -n "${RELAY_TARGET:-}" ]]; then
   check "The node of $CELL_NAME holds no firewall rule of a gate test between the relay and the hub" check_no_blackhole
 fi
+
+check "The node of $CELL_NAME holds no cut rule of the partition tool, in iptables or ip6tables" check_no_partition
 
 if has_harness mesh-view; then
   check "The mesh-view objects match the bundle" check_harness_drift mesh-view

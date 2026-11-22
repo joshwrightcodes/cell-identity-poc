@@ -854,6 +854,34 @@ blackhole_present() {
   grep -- '--comment "\{0,1\}gate-m3-blackhole-' <<<"$rules" | sed 's/^-A /-D /' || true
 }
 
+# partition_peer_ip <node container> 4|6 prints the address of the container on the network kind, for the family 4 or 6. It
+# prints nothing when the container has no address of that family, and fails when docker cannot inspect the container.
+partition_peer_ip() {
+  local fmt out
+  case "$2" in
+    4) fmt='{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' ;;
+    6) fmt='{{with index .NetworkSettings.Networks "kind"}}{{.GlobalIPv6Address}}{{end}}' ;;
+    *) echo "partition_peer_ip: the family is 4 or 6, not '$2'" >&2; return 2 ;;
+  esac
+  out="$(docker inspect -f "$fmt" "$1" 2>&1)" || { echo "docker inspect of $1 failed: $out" >&2; return 1; }
+  printf '%s\n' "${out//[[:space:]]/}"
+}
+
+# partition_rules <node container> [tag] prints each rule of the partition tool in the chains FORWARD, INPUT and OUTPUT of the node,
+# as the tool that holds it and its arguments for -D, for example "ip6tables -D FORWARD -d fc00::3/128 -m comment --comment
+# gate-m9-cut-0a1b2c3d -j DROP". A rule is a rule of the tool when its comment starts with gate-m9-cut-. With a tag, only the rules of
+# that tag. No other rule is printed, so a caller that runs each line in the node cannot touch another rule. It fails when the node does
+# not answer.
+partition_rules() {
+  local node="$1" tag="${2:-gate-m9-cut-}" tool chain out
+  for tool in iptables ip6tables; do
+    for chain in FORWARD INPUT OUTPUT; do
+      out="$(docker exec "$node" "$tool" -S "$chain")" || return 1
+      grep -- "^-A .*--comment \"\{0,1\}$tag" <<<"$out" | sed "s/^-A /$tool -D /" || true
+    done
+  done
+}
+
 # hub_cell_up <cell> reads the log of the hub on standard input and succeeds when the hub holds an open
 # tunnel of the cell. A tunnel is open when its tunnel_up line has no tunnel_down line with the same
 # conn_id. The test works on conn_id, because the new tunnel of a cell can log tunnel_up before the older
