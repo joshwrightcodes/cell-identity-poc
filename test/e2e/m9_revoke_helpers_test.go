@@ -222,7 +222,7 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 			s, err := m9Status()
 			if err == nil {
 				queued := slices.ContainsFunc(s.PendingRevokes, func(p mgmt.PendingRevoke) bool { return p.Cell == cell })
-				held := local && (m9EntryState(t, cell, "held") || m9EntryState(t, cell, "pending"))
+				held := local && m9EntryHasState(t, cell, "held", "pending")
 				if !queued && !held {
 					_, reason, uerr := m9UnrevokeErr(cell)
 					if uerr == nil || reason == "not_revoked" {
@@ -278,8 +278,9 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 	})
 }
 
-// m9EntryState reports whether revoke -- list shows an entry of the cell in the state.
-func m9EntryState(t *testing.T, cell, state string) bool {
+// m9EntryHasState reports whether one read of revoke -- list shows an entry of the cell in one of the states. It does not fail the
+// test, so a cleanup can use it.
+func m9EntryHasState(t *testing.T, cell string, states ...string) bool {
 	out, err := miseRun(t, 2*time.Minute, nil, "revoke", "--", "list")
 	if err != nil {
 		return false
@@ -289,7 +290,7 @@ func m9EntryState(t *testing.T, cell, state string) bool {
 			Cell  string `json:"cell"`
 			State string `json:"state"`
 		}
-		if json.Unmarshal([]byte(l), &e) == nil && e.Cell == cell && e.State == state {
+		if json.Unmarshal([]byte(l), &e) == nil && e.Cell == cell && slices.Contains(states, e.State) {
 			return true
 		}
 	}
@@ -446,26 +447,34 @@ func m9PluginRefuses(t *testing.T, cell, source string, since time.Time, wait ti
 	})
 }
 
-// m9GatewayHelloRefused waits until a new hello of the cell, made in the test, gets a refused frame cell_revoked, and until the
-// gateway log holds a stream_refused line with no pod for it. It returns the time of the answer on the clock of the node.
+// m9GatewayHelloRefused waits until a new hello of the cell, made in the test (m9GatewayHelloDialer), gets a refused frame
+// cell_revoked, and until the gateway log holds a stream_refused cell_revoked line with no pod. The log line cannot name the dialer,
+// because the gateway logs only the cell and the reason before it reads the hello. The frame is the direct proof. The poll runs in a
+// subtest, so its port-forward ends with the poll. It returns the time of the answer on the clock of the node.
 func m9GatewayHelloRefused(t *testing.T, cell string, since time.Time, wait time.Duration) time.Time {
 	t.Helper()
 	var at time.Time
-	waitFor(t, "the gateway to answer a new hello of "+cell+" with a refused frame cell_revoked", wait, func() (bool, string) {
-		reason, err := m9GatewayHello(t, cell)
-		if err != nil || reason != "cell_revoked" {
-			return false, fmt.Sprintf("reason %q, error %v", reason, err)
-		}
-		at = m9Now(t)
-		logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
-		n := len(matching(logs, func(l logLine) bool {
-			_, withPod := l["pod"]
-			return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && !withPod
-		}))
-		return n > 0, "the frame was cell_revoked, and the gateway log holds no stream_refused line without a pod"
+	t.Run("hello_"+cell, func(t *testing.T) {
+		dial := m9GatewayHelloDialer(t, cell)
+		waitFor(t, "the gateway to answer a new hello of "+cell+" with a refused frame cell_revoked", wait, func() (bool, string) {
+			reason, err := dial()
+			if err != nil || reason != "cell_revoked" {
+				return false, fmt.Sprintf("reason %q, error %v", reason, err)
+			}
+			at = m9Now(t)
+			logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
+			n := len(matching(logs, func(l logLine) bool {
+				_, withPod := l["pod"]
+				return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && !withPod
+			}))
+			return n > 0, "the frame was cell_revoked, and the gateway log holds no stream_refused line without a pod"
+		})
 	})
 	return at
 }
+
+// m9Until is time.Until for a time on the clock of the node (m9Now).
+func m9Until(t *testing.T, at time.Time) time.Duration { return at.Sub(m9Now(t)) }
 
 // m9Agent is one agent that the SPIRE server lists.
 type m9Agent struct {
@@ -522,7 +531,7 @@ func m9AgentsBanned(t *testing.T, cell, other, source string, recordAt time.Time
 	if len(m9AgentsOf(t, cell)) == 0 {
 		t.Fatalf("the SPIRE server lists no cluster_jwt agent of %s, so the ban has nothing to show", cell)
 	}
-	wait := max(time.Until(recordAt.Add(m9BanBound)), 20*time.Second)
+	wait := max(m9Until(t, recordAt.Add(m9BanBound)), 20*time.Second)
 	waitFor(t, "every cluster_jwt agent of "+cell+" to be banned", wait, func() (bool, string) {
 		var open []string
 		for _, a := range m9AgentsOf(t, cell) {
@@ -672,18 +681,31 @@ func m9RequireNoEntries(t *testing.T) {
 	}
 }
 
-// m9GatewayHello makes a new hello of the cell in the test, not through celld: it mints a celld SVID of the cell in dev-cp, opens
-// the stream through a port-forward of svc/cell-gateway-stream, and reads the first frame. The gateway checks the record and the
-// overlay before it reads the hello, so a revoked cell gets a refused frame with no token. A celld of a banned cell holds no valid
-// SVID after one lifetime, and the gateway then fails the handshake without a log line, so the test cannot use celld here. It returns
-// the reason of the refused frame, or the type of another frame.
-func m9GatewayHello(t *testing.T, cell string) (string, error) {
+// m9GatewayHelloDialer prepares new hellos of the cell, made in the test, not through celld. It reads the roots and opens the
+// port-forward of svc/cell-gateway-stream once (the forward ends with t), and mints the celld SVID of the cell in dev-cp, which it
+// mints again after 8 of its 10 minutes. The returned function opens the stream and reads the first frame. The gateway checks the
+// record and the overlay before it reads the hello, so a revoked cell gets a refused frame with no token. A celld of a banned cell
+// holds no valid SVID after one lifetime, and the gateway then fails the handshake without a log line, so the test cannot use celld
+// here. The function returns the reason of the refused frame, or the type of another frame.
+func m9GatewayHelloDialer(t *testing.T, cell string) func() (string, error) {
 	t.Helper()
-	cert := senderCert(t, "spiffe://"+envTrustDomain+"/cell/"+cell+"/"+gateway.CelldRole)
 	roots := x509.NewCertPool()
 	for _, c := range bundleRoots(t, envCluster) {
 		roots.AddCert(c)
 	}
+	addr := portForward(t, envCluster, gatewayNamespace, "svc/cell-gateway-stream", 8450)
+	var cert tls.Certificate
+	var mintedAt time.Time
+	return func() (string, error) {
+		if time.Since(mintedAt) > 8*time.Minute {
+			cert = senderCert(t, "spiffe://"+envTrustDomain+"/cell/"+cell+"/"+gateway.CelldRole)
+			mintedAt = time.Now()
+		}
+		return m9HelloOnce(addr, cell, cert, roots)
+	}
+}
+
+func m9HelloOnce(addr, cell string, cert tls.Certificate, roots *x509.CertPool) (string, error) {
 	conf := &tls.Config{
 		MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true,
 		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
@@ -703,7 +725,6 @@ func m9GatewayHello(t *testing.T, cell string) (string, error) {
 			return err
 		},
 	}
-	addr := portForward(t, envCluster, gatewayNamespace, "svc/cell-gateway-stream", 8450)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: conf, ForceAttemptHTTP2: true}, Timeout: 30 * time.Second}
 	defer client.CloseIdleConnections()
 	pr, pw := io.Pipe()

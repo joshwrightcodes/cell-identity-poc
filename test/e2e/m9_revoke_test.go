@@ -62,7 +62,7 @@ func TestM9ConnectedRevocation(t *testing.T) {
 	}
 
 	t.Run("gateway_refuses", func(t *testing.T) {
-		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(time.Until(start.Add(m9GatewayBound)), 30*time.Second))
+		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(m9Until(t, start.Add(m9GatewayBound)), 30*time.Second))
 		t.Logf("GATEWAY_STREAM_ENDED_SECONDS=%.0f GATEWAY_HELLO_REFUSED_SECONDS=%.0f", ended.Sub(start).Seconds(), hello.Sub(start).Seconds())
 		for what, at := range map[string]time.Time{"ended the open stream": ended, "refused a new hello": hello} {
 			if d := at.Sub(start); d > m9GatewayBound {
@@ -75,7 +75,7 @@ func TestM9ConnectedRevocation(t *testing.T) {
 		if d := inPod(t).Sub(start); d > m9PluginBound {
 			t.Errorf("the record reached the pod of the SPIRE server %s after the revocation, want at most %s", d.Round(time.Second), m9PluginBound)
 		}
-		m9PluginRefuses(t, m9Cell, clusterjwt.SourceRecord, start, max(time.Until(start.Add(m9PluginBound)), 30*time.Second))
+		m9PluginRefuses(t, m9Cell, clusterjwt.SourceRecord, start, max(m9Until(t, start.Add(m9PluginBound)), 30*time.Second))
 	})
 
 	t.Run("agents_banned", func(t *testing.T) {
@@ -102,6 +102,15 @@ func TestM9ConnectedRevocation(t *testing.T) {
 		// The plugin pod sees cell-records after the kubelet sync, so wait until it shows the new revision before the probe.
 		after := m9PluginAtRevision(t, s1.Signed, m9RecordBound)
 		m9PluginRefuses(t, m9Cell, clusterjwt.SourceRecord, after, m9PluginBound)
+		// The gateway reports the revision of each record that it holds. Wait for the new record of the witness before the dial.
+		waitFor(t, fmt.Sprintf("mgmt -- status to show the gateway at the record revision %v of %s", s1.Signed, m9Witness), 2*time.Minute, func() (bool, string) {
+			s, err := m9Status()
+			if err != nil || s.Gateway == nil {
+				return false, fmt.Sprintf("no gateway status (%v)", err)
+			}
+			got := s.Gateway.Records[m9Witness]
+			return got.Compare(s1.Signed) >= 0, fmt.Sprintf("the gateway holds %v for %s", got, m9Witness)
+		})
 		m9GatewayHelloRefused(t, m9Cell, after, m9GatewayBound)
 	})
 
@@ -381,11 +390,11 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 		if st := m9EntryOf(t, id); st != "held" {
 			t.Errorf("revoke -- list shows the entry %s as %q, want held", id, st)
 		}
-		t.Logf("HELD_SECONDS=%.0f", time.Since(start).Seconds())
+		t.Logf("HELD_SECONDS=%.0f", m9Now(t).Sub(start).Seconds())
 	})
 
 	t.Run("gateway_refuses", func(t *testing.T) {
-		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(time.Until(start.Add(m9IslandRefuseBound)), 30*time.Second))
+		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(m9Until(t, start.Add(m9IslandRefuseBound)), 30*time.Second))
 		t.Logf("GATEWAY_STREAM_ENDED_SECONDS=%.0f GATEWAY_HELLO_REFUSED_SECONDS=%.0f", ended.Sub(start).Seconds(), hello.Sub(start).Seconds())
 		for what, at := range map[string]time.Time{"ended the open stream": ended, "refused a new hello": hello} {
 			if d := at.Sub(start); d > m9IslandRefuseBound {
@@ -398,7 +407,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 		if d := inPod(t).Sub(start); d > m9IslandRefuseBound {
 			t.Errorf("the overlay reached the pod of the SPIRE server %s after revoke -- local, want at most %s (verify row 8)", d.Round(time.Second), m9IslandRefuseBound)
 		}
-		m9PluginRefuses(t, m9Cell, clusterjwt.SourceOverlay, start, max(time.Until(start.Add(m9IslandRefuseBound)), 30*time.Second))
+		m9PluginRefuses(t, m9Cell, clusterjwt.SourceOverlay, start, max(m9Until(t, start.Add(m9IslandRefuseBound)), 30*time.Second))
 	})
 
 	t.Run("agents_banned", func(t *testing.T) {
@@ -512,7 +521,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 			}
 			return cells[m9Cell].Revoked, fmt.Sprintf("revoked %v", cells[m9Cell].Revoked)
 		})
-		t.Logf("ADOPTED_SECONDS=%.0f after the heal", time.Since(healedAt).Seconds())
+		t.Logf("ADOPTED_SECONDS=%.0f after the heal", m9Now(t).Sub(healedAt).Seconds())
 	})
 	adoptedAt := m9Now(t)
 
