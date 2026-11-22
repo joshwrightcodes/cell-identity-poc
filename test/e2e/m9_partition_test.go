@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
@@ -102,8 +104,11 @@ func m9ptSnapshot(t *testing.T) (map[string]m9ptPod, error) {
 				Metadata struct {
 					Name, Namespace, UID string
 					Labels               map[string]string
+					DeletionTimestamp    *string                 `json:"deletionTimestamp"`
+					OwnerReferences      []struct{ Kind string } `json:"ownerReferences"`
 				} `json:"metadata"`
 				Status struct {
+					Phase                 string   `json:"phase"`
 					ContainerStatuses     []status `json:"containerStatuses"`
 					InitContainerStatuses []status `json:"initContainerStatuses"`
 				} `json:"status"`
@@ -114,6 +119,10 @@ func m9ptSnapshot(t *testing.T) (map[string]m9ptPod, error) {
 		}
 		for _, it := range list.Items {
 			if _, ok := it.Metadata.Labels[testNamespaceLabel]; ok || testNS[it.Metadata.Namespace] {
+				continue
+			}
+			if it.Metadata.DeletionTimestamp != nil || it.Status.Phase == "Succeeded" || it.Status.Phase == "Failed" ||
+				slices.ContainsFunc(it.Metadata.OwnerReferences, func(o struct{ Kind string }) bool { return o.Kind == "Job" }) {
 				continue
 			}
 			p := m9ptPod{Cluster: c, Namespace: it.Metadata.Namespace, Name: it.Metadata.Name, UID: it.Metadata.UID, Restarts: map[string]int{}}
@@ -182,6 +191,13 @@ func m9ptStartWatch(t *testing.T, base map[string]m9ptPod) *m9ptWatch {
 func (w *m9ptWatch) Stop() {
 	w.once.Do(func() { close(w.stop) })
 	<-w.done
+}
+
+// Errors returns the number of samples that failed.
+func (w *m9ptWatch) Errors() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.errors
 }
 
 func (w *m9ptWatch) firstRise(key, container string) time.Time {
@@ -308,7 +324,9 @@ func m9ptPassRule(base, final map[string]m9ptPod, w *m9ptWatch, cutCell string, 
 			case cutEnd.Sub(cutStart) <= exp.Sub(cutStart):
 				violations = append(violations, fmt.Sprintf("%s: spire-agent restarted, although the cut of %s is not longer than the %s that its SVID had left at the cut",
 					key, cutEnd.Sub(cutStart).Round(time.Second), exp.Sub(cutStart).Round(time.Second)))
-			case !first.IsZero() && first.Before(exp.Add(-m9ptSkew)):
+			case first.IsZero():
+				violations = append(violations, fmt.Sprintf("%s: spire-agent restarted, and the watch sampled no restart time, so the check against the SVID expiry %s is not possible", key, exp.Format(time.RFC3339)))
+			case first.Before(exp.Add(-m9ptSkew)):
 				violations = append(violations, fmt.Sprintf("%s: spire-agent restarted at %s, before its SVID expired at %s (skew %s)",
 					key, first.Format(time.RFC3339), exp.Format(time.RFC3339), m9ptSkew))
 			}
@@ -394,14 +412,16 @@ func m9ptSettled(t *testing.T, cell string) {
 
 // m9ptDrops counts the packets that the DROP rules of a cut hold in each chain of the node of a cluster, and the rules in each chain, for
 // both IP families. The rules of one tag sit in FORWARD and OUTPUT for the direction out, and in FORWARD and INPUT for in.
-func m9ptDrops(t *testing.T, cluster, tag string) (packets, rules map[string]int, err error) {
+//
+// The third result holds, for each chain, the source and destination column of each rule as "source>destination".
+func m9ptDrops(t *testing.T, cluster, tag string) (packets, rules map[string]int, ends map[string][]string, err error) {
 	t.Helper()
-	packets, rules = map[string]int{}, map[string]int{}
+	packets, rules, ends = map[string]int{}, map[string]int{}, map[string][]string{}
 	for _, tool := range []string{"iptables", "ip6tables"} {
 		for _, chain := range []string{"FORWARD", "INPUT", "OUTPUT"} {
 			out, err := dockerExec(t, cluster+"-control-plane", "", tool, "-nvxL", chain)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			for line := range strings.SplitSeq(out, "\n") {
 				if !strings.Contains(line, tag) {
@@ -409,15 +429,16 @@ func m9ptDrops(t *testing.T, cluster, tag string) (packets, rules map[string]int
 				}
 				f := strings.Fields(line)
 				n, perr := strconv.Atoi(f[0])
-				if perr != nil {
-					return nil, nil, fmt.Errorf("the rule %q has no packet count", line)
+				if perr != nil || len(f) < 9 {
+					return nil, nil, nil, fmt.Errorf("the rule %q has no packet count or no address columns", line)
 				}
+				ends[chain] = append(ends[chain], f[7]+">"+f[8])
 				packets[chain] += n
 				rules[chain]++
 			}
 		}
 	}
-	return packets, rules, nil
+	return packets, rules, ends, nil
 }
 
 // TestM9OneWayPartitions cuts one direction of the link between dev-cell-1 and dev-cp for 3 minutes, first out (packets from the cell to
@@ -432,14 +453,35 @@ func m9ptDrops(t *testing.T, cluster, tag string) (packets, rules map[string]int
 //
 // After the heal: celld holds a stream at the gateway within 90 s when the cut is shorter than half the SVID lifetime (1h), else within
 // the re-attestation bound of 10 minutes (1m, where the agents of the cell lose their SVIDs). The gateway log of the window holds no
-// replica_cap refusal. The pass rule holds over each subtest: at 1h no pod restarts, and at 1m only the spire-agent containers of the cut
+// replica_cap refusal. The pass rule holds over each subtest and over the test (UIDs and containers other than spire-agent): at 1h no pod restarts, and at 1m only the spire-agent containers of the cut
 // cell restart, after their SVIDs expired.
 func TestM9OneWayPartitions(t *testing.T) {
 	const cell = rejectCell
 	ttl := m9ptLiveTTL(t)
 	t.Logf("the live SVID lifetime of dev-cp is %s", ttl)
+	m9ptSettled(t, cell)
+	start := m9ptMustSnapshot(t)
 	for _, dir := range []string{"out", "in"} {
 		t.Run(dir, func(t *testing.T) { m9ptOneWay(t, cell, dir, ttl) })
+	}
+	t.Run("rotation_refused_in_cell_cut", m9ptCellCutRefusal)
+	// The pass rule over the whole test: no pod of the start is replaced, and no container other than spire-agent restarts, also between
+	// the windows of the two subtests. The restarts of spire-agent are judged per window, with its cut.
+	final := m9ptMustSnapshot(t)
+	for key, b := range start {
+		f, ok := final[key]
+		switch {
+		case !ok:
+			t.Errorf("pass rule over the test: %s is gone, it had the UID %s", key, b.UID)
+		case f.UID != b.UID:
+			t.Errorf("pass rule over the test: %s has the UID %s, it had %s", key, f.UID, b.UID)
+		default:
+			for container, n := range f.Restarts {
+				if container != "spire-agent" && n > b.Restarts[container] {
+					t.Errorf("pass rule over the test: %s: the container %s restarted %d times", key, container, n-b.Restarts[container])
+				}
+			}
+		}
 	}
 }
 
@@ -467,7 +509,7 @@ func m9ptOneWay(t *testing.T, cell, dir string, ttl time.Duration) {
 	// The rules of the direction, and only those.
 	wantChains := map[string][]string{"out": {"FORWARD", "OUTPUT"}, "in": {"FORWARD", "INPUT"}}[dir]
 	otherChain := map[string]string{"out": "INPUT", "in": "OUTPUT"}[dir]
-	_, rules, err := m9ptDrops(t, cell, cut.Tag)
+	_, rules, ends, err := m9ptDrops(t, cell, cut.Tag)
 	if err != nil {
 		t.Fatalf("%s: read the rules of the cut: %v", what, err)
 	}
@@ -480,25 +522,44 @@ func m9ptOneWay(t *testing.T, cell, dir string, ttl time.Duration) {
 		t.Errorf("%s: the chain %s of %s holds %d rules of the cut %s, and a one-way cut must not put a rule there", what, otherChain, cut.Node, rules[otherChain], cut.Tag)
 	}
 
+	// The address of dev-cp is the destination of each rule for out, and the source for in.
+	v4, v6 := nodeAddrs(t, spireCluster)
+	for _, c := range wantChains {
+		for _, e := range ends[c] {
+			src, dst, _ := strings.Cut(e, ">")
+			peer := dst
+			if dir == "in" {
+				peer = src
+			}
+			if peer != v4 && peer != v6 {
+				t.Errorf("%s: a rule of the cut %s in %s matches %s, want the address of %s (%s or %s) as the %s", what, cut.Tag, c, e, spireCluster, v4, v6,
+					map[string]string{"out": "destination", "in": "source"}[dir])
+			}
+		}
+	}
 	// Detection on the side of the cell: celld ends its stream.
 	waitFor(t, "celld in "+cell+" to log 'stream ended' after the cut of "+what, m9ptDetectWait, func() (bool, string) {
 		logs, err := m9ptCelldLog(t, cell, since)
 		if err != nil {
 			return false, err.Error()
 		}
-		n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "stream ended" }))
+		n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "stream ended" && !lineTime(l).Before(cutStart) }))
 		return n > 0, lastLines(logs, 2)
 	})
+	t.Logf("%s: DETECT_CELL_SECONDS=%.0f", what, time.Since(cutStart).Seconds())
 	// Detection on the side of the gateway: it closes the stream of the cell.
 	waitFor(t, "the gateway in "+spireCluster+" to log stream_closed of "+cell+" after the cut of "+what, m9ptDetectWait, func() (bool, string) {
 		logs, err := m9ptGatewayLog(t, since)
 		if err != nil {
 			return false, err.Error()
 		}
-		n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "stream_closed" && l.str("cell") == cell }))
+		n := len(matching(logs, func(l logLine) bool {
+			return l.str("msg") == "stream_closed" && l.str("cell") == cell && !lineTime(l).Before(cutStart)
+		}))
 		return n > 0, fmt.Sprintf("streams %v", m9ptStreams(t))
 	})
-	packets, _, err := m9ptDrops(t, cell, cut.Tag)
+	t.Logf("%s: DETECT_GATEWAY_SECONDS=%.0f", what, time.Since(cutStart).Seconds())
+	packets, _, _, err := m9ptDrops(t, cell, cut.Tag)
 	if err != nil {
 		t.Fatalf("%s: read the counters of the cut: %v", what, err)
 	}
@@ -512,7 +573,7 @@ func m9ptOneWay(t *testing.T, cell, dir string, ttl time.Duration) {
 	t.Logf("%s: the rules dropped %d packets (%v)", what, dropped, packets)
 
 	// A rotation of the operator key must refuse while the cut stands, and must read nothing from the secret manager.
-	m9ptRotationRefused(t, "the cut of "+what, "a cut of the partition tool is in place", "needs a connected environment")
+	m9ptRotationRefused(t, "the cut of "+what, "a cut of the partition tool is in place")
 
 	// Hold the cut for its full length.
 	if wait := m9ptCut - time.Since(cutStart); wait > 0 {
@@ -544,7 +605,7 @@ func m9ptOneWay(t *testing.T, cell, dir string, ttl time.Duration) {
 		s := gwStatus(t)
 		return !reopenedAt.IsZero() && s.Streams[cell] >= 1, fmt.Sprintf("streams %v", s.Streams)
 	})
-	t.Logf("%s: STREAM_BACK_SECONDS=%.0f after the heal", what, time.Since(healedAt).Seconds())
+	t.Logf("%s: STREAM_BACK_SECONDS=%.0f after the heal", what, reopenedAt.Sub(healedAt).Seconds())
 
 	logs, err := m9ptGatewayLog(t, since)
 	if err != nil {
@@ -563,6 +624,9 @@ func m9ptOneWay(t *testing.T, cell, dir string, ttl time.Duration) {
 	// The pass rule over the window, after the cell is quiet again.
 	m9ptSettled(t, cell)
 	watch.Stop()
+	if n := watch.Errors(); n > 0 {
+		t.Logf("%s: %d samples of the restart watch failed", what, n)
+	}
 	violations, restarts := m9ptPassRule(base, m9ptMustSnapshot(t), watch, cell, cutStart, healedAt, expiry)
 	for _, r := range restarts {
 		t.Logf("%s: RESTART %s", what, r)
@@ -629,10 +693,11 @@ func m9ptRotationRefused(t *testing.T, why string, want ...string) string {
 	return out
 }
 
-// TestM9OperatorRotationRefusedDuringCut: a rotation of the operator key refuses while a cut of the partition tool exists, before it reads
+// m9ptCellCutRefusal: a rotation of the operator key refuses while a cut of the partition tool exists, before it reads
 // the secret manager. The cut is between dev-cell-1 and dev-cell-2, which carries no flow of the control plane, so the environment stays
 // connected and the cut is the only reason. Canary commands stand in for the secret manager, and a marker file shows any call.
-func TestM9OperatorRotationRefusedDuringCut(t *testing.T) {
+func m9ptCellCutRefusal(t *testing.T) {
+	t.Helper()
 	cutLink(t, "dev-cell-1", "dev-cell-2", "both", 5*time.Minute)
 	out := m9ptRotationRefused(t, "a cut of the partition tool", "a cut of the partition tool is in place")
 	t.Logf("refused: %s", m9ptLastLine(out))
@@ -673,17 +738,22 @@ func m9ptWhoami(t *testing.T, cell string) (ids []string, expires time.Time, uid
 }
 
 // TestM9KeyRotatedDuringEnvironmentIsland cuts dev-cp from management (the environment island), then rotates the service account key of
-// dev-cell-1 with rotateAPIKey. mgmtd cannot learn the new key, so the record that envd holds lists the old key only.
+// dev-cell-1 with rotateAPIKey. The island cuts only the link from dev-cp to management, and mgmtd reads the keys of a cell through the host
+// service on the Mac, so mgmtd can still learn the new key (its periodic key check runs every 15 minutes, connected or not). The record
+// that envd holds in dev-cp lists the old key only until the island ends.
 //   - new_pods_wait: an attestprobe gets unknown_kid, and still gets it at the end of the island.
 //   - running_keep_ids: the celld agent keeps its agent ID and its pod, and the expiry of its SVID in spire-server agent list moves forward
 //     after the key change, and so does the expiresAt of the SVID of the mesh-view tunnel. The wait is at most half the lifetime plus 5
 //     minutes, and the island holds until then. The agent renews about every half lifetime, so at 1m it renews more than once in that
 //     wait. The test requires at least one renewal, and no step back.
 //   - operator_rotation_refused: with mgmtd no longer connected, a rotation of the operator key refuses before any secret read.
-//   - confirmed_on_reconnect: after the heal, the hint path updates the record, and the probe attests within 5 minutes.
+//   - confirmed_on_reconnect: mgmtd has updated the record, inside the island through its periodic check (at 1h the island lasts longer
+//     than the 15 minutes of the check) or after the heal through the hint path. After the heal envd and the gateway hold the new
+//     record, and the probe attests, within 5 minutes of the heal.
 //
 // The cleanup repairAPIServer replaces the pods that carry a token of the test key, so the test claims no pass rule. The heal of the
-// island runs before that repair, because the repair needs a connected environment.
+// island is deferred right after the cut, so it runs before every cleanup, also after a t.Fatal, and so before the repair, which needs a
+// connected environment.
 func TestM9KeyRotatedDuringEnvironmentIsland(t *testing.T) {
 	const cell = rejectCell
 	ttl := m9ptLiveTTL(t)
@@ -710,16 +780,26 @@ func TestM9KeyRotatedDuringEnvironmentIsland(t *testing.T) {
 	waitRegistryAtCleanup(t)
 
 	island := cutLink(t, spireCluster, mgmtCluster, "both", wait+m9ptIslandMargin)
-	islandStart := time.Now()
+	defer island.Heal(t)
 	since := time.Now().Add(-logMargin)
 	t.Logf("the environment island %s is in place until %s", island.Tag, island.Until.Format(time.RFC3339))
 	waitUpdateGap(t, checked)
 
 	oldKID, newKID := rotateAPIKey(t, cell)
 	rotatedAt := time.Now()
-	// The heal runs first in the cleanup: t.Cleanup runs the last registered function first, and the repair that rotateAPIKey registered
-	// needs a connected environment.
-	t.Cleanup(func() { island.Heal(t) })
+	// The baselines of the renewal checks are read at the key change, before the first subtest.
+	tunnelIDs0, tunnelExpiry0, _, err := m9ptWhoami(t, cell)
+	if err != nil {
+		t.Fatalf("cell-proxy whoami in the tunnel pod of %s: %v", cell, err)
+	}
+	agentExpiry0, err := m9ptAgentExpiry(t)
+	if err != nil {
+		t.Fatalf("list the agents: %v", err)
+	}
+	a0 := agentExpiry0[celldUID]
+	if a0.IsZero() {
+		t.Fatalf("the SPIRE server lists no SVID expiry for the celld pod %s", celldUID)
+	}
 	t.Logf("the API server of %s signs with %s and verifies %s too", cell, newKID, oldKID)
 
 	t.Run("new_pods_wait", func(t *testing.T) {
@@ -728,41 +808,44 @@ func TestM9KeyRotatedDuringEnvironmentIsland(t *testing.T) {
 	})
 
 	t.Run("running_keep_ids", func(t *testing.T) {
-		_, tunnelExpiry0, _, err := m9ptWhoami(t, cell)
-		if err != nil {
-			t.Fatalf("cell-proxy whoami in the tunnel pod of %s: %v", cell, err)
-		}
-		agentExpiry0, err := m9ptAgentExpiry(t)
-		if err != nil {
-			t.Fatalf("list the agents: %v", err)
-		}
-		a0 := agentExpiry0[celldUID]
-		if a0.IsZero() {
-			t.Fatalf("the SPIRE server lists no SVID expiry for the celld pod %s", celldUID)
-		}
 		var agentMoved, tunnelMoved bool
+		var stepBack []string
 		agentLast, tunnelLast := a0, tunnelExpiry0
 		waitFor(t, "the SVID expiry of the celld agent and of the tunnel to move forward after the key change, with the island held", max(time.Until(rotatedAt.Add(wait)), 30*time.Second), func() (bool, string) {
 			all, err := m9ptAgentExpiry(t)
 			if err != nil {
 				return false, err.Error()
 			}
-			if got := all[celldUID]; got.Before(agentLast) {
-				t.Errorf("the SVID expiry of the celld agent moved back, from %s to %s", agentLast, got)
+			got, listed := all[celldUID]
+			if !listed {
+				return false, "the SPIRE server lists no live agent for the celld pod " + celldUID
+			}
+			if got.Before(agentLast) {
+				if len(stepBack) == 0 {
+					stepBack = append(stepBack, fmt.Sprintf("the SVID expiry of the celld agent moved back, from %s to %s", agentLast, got))
+				}
 			} else if got.After(a0) {
 				agentMoved, agentLast = true, got
 			}
-			_, tunnelNow, _, err := m9ptWhoami(t, cell)
+			ids, tunnelNow, _, err := m9ptWhoami(t, cell)
 			if err != nil {
 				return false, err.Error()
 			}
+			if !slices.Equal(ids, tunnelIDs0) {
+				return false, fmt.Sprintf("the tunnel IDs are %v, were %v", ids, tunnelIDs0)
+			}
 			if tunnelNow.Before(tunnelLast) {
-				t.Errorf("the expiresAt of the tunnel SVID moved back, from %s to %s", tunnelLast, tunnelNow)
+				if len(stepBack) < 2 {
+					stepBack = append(stepBack, fmt.Sprintf("the expiresAt of the tunnel SVID moved back, from %s to %s", tunnelLast, tunnelNow))
+				}
 			} else if tunnelNow.After(tunnelExpiry0) {
 				tunnelMoved, tunnelLast = true, tunnelNow
 			}
 			return agentMoved && tunnelMoved, fmt.Sprintf("agent expiry %s (was %s), tunnel expiry %s (was %s)", agentLast, a0, tunnelLast, tunnelExpiry0)
 		})
+		for _, m := range stepBack {
+			t.Error(m)
+		}
 		t.Logf("RENEWED_SECONDS=%.0f after the key change", time.Since(rotatedAt).Seconds())
 		ids, err := m9ptAgentIDs(t, celldUID)
 		if err != nil {
@@ -789,9 +872,8 @@ func TestM9KeyRotatedDuringEnvironmentIsland(t *testing.T) {
 	})
 
 	t.Run("new_pods_still_wait", func(t *testing.T) {
-		// The island has held for the whole wait, so the record still lists the old key only.
-		if age := time.Since(islandStart); age < ttl/2 {
-			t.Logf("the island is %s old", age.Round(time.Second))
+		if out, err := miseRun(t, m9CutBound, nil, "partition", "--", "list"); err != nil || !strings.Contains(out, island.Tag) {
+			t.Fatalf("the environment island %s is not in place any more (error %v):\n%s", island.Tag, err, out)
 		}
 		res := runAttestProbe(t, probe{cell: cell, namespace: celldNamespace, account: celldAccount, variant: "good"})
 		expectRefusal(t, res, cell, "unknown_kid", []string{newKID})
@@ -815,35 +897,73 @@ func TestM9KeyRotatedDuringEnvironmentIsland(t *testing.T) {
 	})
 
 	t.Run("confirmed_on_reconnect", func(t *testing.T) {
+		// mgmtd may have updated the record already: its periodic key check ignores the connection of the environment.
+		inIsland, _, err := keysUpdatedLines(t, since, cell)
+		if err != nil {
+			t.Fatalf("read the mgmtd log: %v", err)
+		}
 		island.Heal(t)
 		if !island.healed {
 			t.Fatalf("the environment island %s is not healed. Run: mise run partition -- heal --all", island.Tag)
 		}
 		healedAt := time.Now()
+		deadline := healedAt.Add(healWait)
 		var updated logLine
-		waitFor(t, "the mgmtd log to hold a key update of "+cell+" after the heal of the island", healWait, func() (bool, string) {
-			lines, _, err := keysUpdatedLines(t, healedAt.Add(-logMargin), cell)
-			if err != nil {
-				return false, err.Error()
+		for _, l := range inIsland {
+			if updated == nil || lineTime(l).Before(lineTime(updated)) {
+				updated = l
 			}
-			if len(lines) == 0 {
-				return false, "no keys_updated line yet"
+		}
+		if updated != nil && lineTime(updated).Before(healedAt) {
+			if via := updated.str("via"); via != "periodic" {
+				t.Errorf("mgmtd updated the record of %s inside the island through %q, want the periodic check, because the hint path needs dev-cp", cell, via)
 			}
-			updated = lines[0]
-			return true, ""
-		})
+		} else {
+			waitFor(t, "the mgmtd log to hold a key update of "+cell+" after the heal of the island", max(time.Until(deadline), 30*time.Second), func() (bool, string) {
+				lines, _, err := keysUpdatedLines(t, since, cell)
+				if err != nil {
+					return false, err.Error()
+				}
+				if len(lines) == 0 {
+					return false, "no keys_updated line yet"
+				}
+				updated = lines[0]
+				return true, ""
+			})
+		}
 		path := updated.str("msg")
 		if via := updated.str("via"); via != "" {
 			path += "/" + via
 		}
-		t.Logf("KEYS_UPDATED_BY=%s, %.0f s after the heal", path, lineTime(updated).Sub(healedAt).Seconds())
-		if updated.str("via") == "periodic" || updated.str("via") == "manual" {
-			t.Errorf("the record of %s was updated through %s, want the hint path (key_check with via hint, or the bind)", cell, path)
-		}
+		t.Logf("KEYS_UPDATED_BY=%s, %.0f s after the heal (negative: inside the island)", path, lineTime(updated).Sub(healedAt).Seconds())
 		after := cellStatusOf(t, cell)
 		if !slices.Contains(after.Kids, oldKID) || !slices.Contains(after.Kids, newKID) || !afterRevision(after.Record, before.Record) {
-			t.Errorf("the record of %s lists %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
+			t.Errorf("mgmtd holds the record of %s with the key IDs %v at %+v, want %s and %s at a revision after %+v", cell, after.Kids, after.Record, oldKID, newKID, before.Record)
 		}
-		waitIssued(t, cell, healWait)
+		// The dev-cp side takes the record: envd holds it, and the gateway holds its revision.
+		waitFor(t, "envd and the gateway in dev-cp to hold the new record of "+cell+" within 5 minutes of the heal", max(time.Until(deadline), 30*time.Second), func() (bool, string) {
+			_, cells, err := readLiveRecords(t)
+			if err != nil {
+				return false, err.Error()
+			}
+			c, ok := cells[cell]
+			if !ok {
+				return false, "cell-records holds no record of " + cell
+			}
+			kids, err := jwksKIDs(c.JWKS)
+			if err != nil {
+				return false, err.Error()
+			}
+			if !slices.Contains(kids, oldKID) || !slices.Contains(kids, newKID) {
+				return false, fmt.Sprintf("envd holds the key IDs %v", kids)
+			}
+			want := spec.Revision{Epoch: c.Epoch, Counter: c.Counter}
+			s := gwStatus(t)
+			if got := s.Records[cell]; got != want {
+				return false, fmt.Sprintf("the gateway holds %+v, envd holds %+v", got, want)
+			}
+			return true, ""
+		})
+		waitIssued(t, cell, max(time.Until(deadline), 30*time.Second))
 	})
 }
