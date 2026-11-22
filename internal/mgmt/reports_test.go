@@ -927,9 +927,39 @@ func TestKeyCheckClearsOlderHintFailure(t *testing.T) {
 			if res, err := r.plane.KeyCheckVia(t.Context(), cell1, via); err != nil || res != CheckUnchanged {
 				t.Fatalf("key check: %v, %v", res, err)
 			}
-			if got := cellStatus(r.status(), cell1).LastHintCheck; got == string(CheckIssuerUnavailable) {
+			if got := cellStatus(r.status(), cell1).LastHintCheck; got != "" {
 				t.Fatalf("hint check %q survived a later successful key check", got)
 			}
 		})
+	}
+}
+
+func TestKeyCheckKeepsHintFailureOfAnotherCell(t *testing.T) {
+	r, _ := boundRig(t, cell1, cell2)
+	r.clk.Advance(61 * time.Second)
+	r.keys.fail(cell2, errors.New("api server restarting"))
+	r.plane.Report(mgmtapi.StatusReport{KeyHints: []mgmtapi.KeyHint{{Cell: cell2}}})
+	r.plane.Wait()
+	r.clk.Advance(61 * time.Second)
+	if res, err := r.plane.KeyCheckVia(t.Context(), cell1, ViaManual); err != nil || res != CheckUnchanged {
+		t.Fatalf("key check: %v, %v", res, err)
+	}
+	if got := cellStatus(r.status(), cell2).LastHintCheck; got != string(CheckIssuerUnavailable) {
+		t.Fatalf("hint check of the other cell %q, want %q", got, CheckIssuerUnavailable)
+	}
+}
+
+func TestKeyCheckKeepsNewerHintFailure(t *testing.T) {
+	r, _ := boundRig(t)
+	r.clk.Advance(61 * time.Second)
+	r.plane.rmu.Lock()
+	c := r.plane.rt.cell(cell1)
+	c.lastHintCheck, c.lastHintDoneAt = string(CheckIssuerUnavailable), r.clk.Now().Add(time.Hour)
+	r.plane.rmu.Unlock()
+	if res, err := r.plane.KeyCheckVia(t.Context(), cell1, ViaManual); err != nil || res != CheckUnchanged {
+		t.Fatalf("key check: %v, %v", res, err)
+	}
+	if got := cellStatus(r.status(), cell1).LastHintCheck; got != string(CheckIssuerUnavailable) {
+		t.Fatalf("a hint result newer than the key check was cleared: %q", got)
 	}
 }

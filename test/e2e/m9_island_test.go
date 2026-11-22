@@ -585,9 +585,9 @@ func (r *m9Run) minuteChecks() {
 			bad = append(bad, "read the gateway status: "+m9Short(err.Error()))
 		} else {
 			r.mu.Lock()
-			applied := len(r.ops) - r.baseGwOps
+			signed := len(r.ops) - r.baseGwOps
 			r.mu.Unlock()
-			if f := m9GwChange(r.baseGwRecs, got, applied); f != "" {
+			if f := m9GwChange(r.baseGwRecs, got, signed); f != "" {
 				bad = append(bad, f)
 			}
 		}
