@@ -1239,7 +1239,7 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 	readLine := regexp.MustCompile(`^\s*.*bash -c "\$POC_SECRET_READ_CMD" _ "\$[a-z_]+" \| mise run operatorctl -- (pub|sign)\b`)
 	keygenLine := regexp.MustCompile(`^\s*(if ! )?mise run operatorctl -- keygen --public-file "\$[a-z_]+" \| bash -c "\$POC_SECRET_WRITE_CMD" _ "\$[a-z_]+"`)
 	settingsLine := regexp.MustCompile(`^\s*(load_local_settings|need_settings) `)
-	for _, f := range []string{"../../scripts/operator-key.sh", "../../components/lib/operator-key.sh"} {
+	for _, f := range []string{"../../scripts/operator-key.sh", "../../scripts/operator-seed.sh", "../../scripts/revoke.sh", "../../components/lib/operator-key.sh"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatal(err)
@@ -1268,7 +1268,7 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 			}
 		}
 		if strings.Contains(f, "components") && strings.Contains(string(b), "POC_SECRET") {
-			t.Errorf("%s reaches the secret manager; only scripts/operator-key.sh may", f)
+			t.Errorf("%s reaches the secret manager; only the scripts of scripts/ may", f)
 		}
 	}
 
@@ -1289,6 +1289,15 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 	}
 	if n := len(r.seeds()); n != 4 {
 		t.Fatalf("the secret manager holds %d values, want the other seed and three keys", n)
+	}
+
+	// revoke.sh local runs under xtrace too. runRevoke checks standard output, standard error and every file under the run directory.
+	rr := newRevokeRig(t)
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		out, errOut, code := rr.runRevoke([]string{trace}, "local", "--cell", cell)
+		if code != 0 || !strings.Contains(errOut, "+ ") {
+			t.Fatalf("revoke local %s under xtrace: exit %d, traced %v\nstdout %s\nstderr %s", cell, code, strings.Contains(errOut, "+ "), out, errOut)
+		}
 	}
 }
 

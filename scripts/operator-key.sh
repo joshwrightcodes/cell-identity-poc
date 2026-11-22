@@ -36,6 +36,7 @@
 export CELL=management
 source "$(dirname "$0")/lib.sh"
 source "$ROOT/components/lib/operator-key.sh"
+source "$ROOT/scripts/operator-seed.sh"
 cd "$ROOT"
 
 key_dir="$BUILD_ROOT/operator"
@@ -108,7 +109,7 @@ new_key() {
     STEP_REASON="keygen wrote no public key. Delete the value at the remote key $name by hand"
     return 1
   fi
-  if ! got="$(operator_seed_pipe "$name" pub)"; then
+  if ! got="$(operator_seed_pub "$name")"; then
     STEP_REASON="the read back of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$got" | jq -r '.error // empty' 2>/dev/null || true)). Delete the value at $name by hand"
     return 1
   fi
@@ -153,7 +154,7 @@ cmd_check() {
   spec_name="$(pub_field spec.name)"
   name="$(operator_key_name "$PUB_CM")" || name=""
   [[ -n "$name" ]] || fail "neither build/operator/key.env nor spec.name of operator-pub names the remote key"
-  derived="$(operator_seed_pipe "$name" pub)" \
+  derived="$(operator_seed_pub "$name")" \
     || fail "the read of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$derived" | jq -r '.error // empty' 2>/dev/null || true))"
   sha="$(sha_of_pub "$derived")"
 

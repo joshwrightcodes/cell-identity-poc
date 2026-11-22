@@ -37,6 +37,13 @@ func statusHeld(envelopes ...string) string {
 	return string(b)
 }
 
+// statusHeldRaw is ConfigMap cell-records with one held entry whose issuedAt text is as given.
+func statusHeldRaw(id, cell, issuedAt string) string {
+	payload, _ := json.Marshal(map[string]any{"id": id, "env": "dev", "cell": cell, "record": map[string]any{"epoch": 2, "counter": 5}, "issuedAt": issuedAt})
+	env, _ := json.Marshal(map[string]any{"payloadType": "x", "payload": base64.StdEncoding.EncodeToString(payload), "signatures": []any{map[string]any{"sig": "good"}}})
+	return statusHeld(string(env))
+}
+
 func statusPod(ready bool, restarts int) string {
 	b, _ := json.Marshal(map[string]any{"status": map[string]any{"containerStatuses": []any{
 		map[string]any{"name": "spire-server", "ready": true, "restartCount": 0},
@@ -129,7 +136,7 @@ func TestStatusM9Conditions(t *testing.T) {
 		}},
 		{name: "an entry that does not verify", env: func() []string {
 			return []string{"STUB_LOCAL_REVOCATIONS=" + statusInputs(id+".json", statusEntry(id, "dev-cell-2", time.Now(), "bad"))}
-		}, want: []string{id + ".json", "envd refuses it", "mise run revoke -- list"}},
+		}, want: []string{id + ".json", "envd refuses it", "patch configmap local-revocations", id + ".json", "mise run revoke -- local --cell <cell>"}},
 		{name: "an entry under another key than its id", env: func() []string {
 			return []string{"STUB_LOCAL_REVOCATIONS=" + statusInputs("other.json", statusEntry(id, "dev-cell-2", time.Now(), "good"))}
 		}, want: []string{"other.json", "not <id>.json"}},
@@ -150,6 +157,21 @@ func TestStatusM9Conditions(t *testing.T) {
 		{name: "a cell held in the overlay for 11 minutes while connected", env: func() []string {
 			return []string{"STUB_CELL_RECORDS=" + statusHeld(statusEntry(id, "dev-cell-2", time.Now().Add(-11*time.Minute), "good"))}
 		}, want: []string{"holds the entry " + id + " for dev-cell-2", "more than 10 minutes", "mise run mgmt -- status"}},
+		{name: "a held entry whose cell has a revoke queued at mgmtd is no problem", env: func() []string {
+			return []string{"STUB_CELL_RECORDS=" + statusHeld(statusEntry(id, "dev-cell-2", time.Now().Add(-11*time.Minute), "good")),
+				"STUB_MGMT_STATUS=" + healthyPlane(func(m map[string]any) {
+					m["pendingRevokes"] = []any{map[string]any{"cell": "dev-cell-2", "source": "operator"}}
+				})}
+		}, deny: []string{"holds the entry"}},
+		{name: "a held entry whose cell has no queued revoke while another has one", env: func() []string {
+			return []string{"STUB_CELL_RECORDS=" + statusHeld(statusEntry(id, "dev-cell-2", time.Now().Add(-11*time.Minute), "good")),
+				"STUB_MGMT_STATUS=" + healthyPlane(func(m map[string]any) {
+					m["pendingRevokes"] = []any{map[string]any{"cell": "dev-cell-1", "source": "operator"}}
+				})}
+		}, want: []string{"holds the entry " + id + " for dev-cell-2"}},
+		{name: "a held entry with an issuedAt that is no UTC time", env: func() []string {
+			return []string{"STUB_CELL_RECORDS=" + statusHeldRaw(id, "dev-cell-2", "2026-11-22T10:00:00+02:00")}
+		}, want: []string{"issuedAt that is no UTC time"}},
 		{name: "a cell held in the overlay for 5 minutes", env: func() []string {
 			return []string{"STUB_CELL_RECORDS=" + statusHeld(statusEntry(id, "dev-cell-2", time.Now().Add(-5*time.Minute), "good"))}
 		}},

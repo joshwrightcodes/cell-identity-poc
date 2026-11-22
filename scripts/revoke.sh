@@ -13,17 +13,21 @@
 #                      the state that envd reports. held: envd holds the entry. pending: envd has not admitted it yet. stale: the
 #                      record of the cell is newer than the entry. settled: the record is revoked, or the cell has no record. invalid:
 #                      the key holds no readable entry.
-# reapply              Write every entry of build/operator/revocations.log back to the ConfigMap. Use it after a lost dev-cp.
+# reapply              Write the entries of build/operator/revocations.log that envd can still take in (held or pending) back to the
+#                      ConfigMap, and refuse when the ConfigMap would pass 64 keys. Use it after a lost dev-cp.
 # clean                Delete the keys of the entries that are stale or settled. A key that is held, pending or invalid stays.
 #
 # Settings in .envrc.local, as in .envrc.local.example: POC_SECRET_READ_CMD for local. A failure prints one JSON error line.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
 source "$ROOT/components/lib/operator-key.sh"
+source "$ROOT/scripts/operator-seed.sh"
 cd "$ROOT"
 
 log_file="$BUILD_ROOT/operator/revocations.log"
 inputs_cm=local-revocations
+# max_inputs is the bound of envd on the keys of the inputs: 4 times the 16 entries that it holds (internal/envd/overlay.go).
+max_inputs=64
 
 usage() { awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; }
 
@@ -49,19 +53,20 @@ read_inputs() {
 put_inputs() {
   read_inputs
   if [[ "$INPUTS" == null ]]; then
-    dev_cp -n envd-system create --field-manager=operator -f - >/dev/null <<<'{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"local-revocations","namespace":"envd-system"}}' \
+    printf '%s' '{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"local-revocations","namespace":"envd-system"}}' \
+      | dev_cp -n envd-system create --field-manager=operator -f - >/dev/null \
       || fail "could not create ConfigMap envd-system/local-revocations in dev-cp. Run: mise run harness:status"
   fi
   dev_cp -n envd-system patch configmap "$inputs_cm" --type=merge --field-manager=operator -p "$1" >/dev/null \
     || fail "could not write ConfigMap envd-system/local-revocations in dev-cp. Run: mise run harness:status"
 }
 
-# entry_states prints one JSON line for each key of the inputs, with the state that envd reports. It decodes the payload with no
-# signature check, because envd verifies each entry and the status checks do too.
-entry_states() {
-  read_inputs
-  read_records
-  jq -nc --argjson cm "$INPUTS" --argjson records "$RECORDS" '
+# states_of <inputs ConfigMap JSON> <cell-records ConfigMap JSON> prints one JSON line for each key of the inputs, with the state that envd
+# reports. It decodes the payload with no signature check, because envd verifies each entry. The order of the tests follows the settle
+# rule of envd: an entry that envd holds stays in force until an accepted spec holds its cell revoked or retires the cell. A newer
+# record that is not revoked keeps it. So held comes first, and only an entry that envd does not hold is stale or settled.
+states_of() {
+  jq -nc --argjson cm "$1" --argjson records "$2" '
     ($records.data // {}) as $d
     | (try ($d["local-revocations.json"] // "[]" | fromjson | map(.payload | @base64d | fromjson | .id)) catch []) as $held
     | def rec($cell): try ($d[$cell + ".dsse.json"] | fromjson | .payload | @base64d | fromjson) catch null;
@@ -72,11 +77,18 @@ entry_states() {
     | if $e == null or ($e.id | type) != "string" or ($e.cell | type) != "string" then {key: $key, state: "invalid"}
       else rec($e.cell) as $r
         | {key: $key} + $e + {state:
-            (if $r == null or $r.revoked == true then "settled"
+            (if ($held | index($e.id)) != null then "held"
+             elif $r == null or $r.revoked == true then "settled"
              elif older($e.record; $r) then "stale"
-             elif ($held | index($e.id)) != null then "held"
              else "pending" end)}
       end'
+}
+
+# entry_states prints the states of the keys of ConfigMap envd-system/local-revocations in dev-cp.
+entry_states() {
+  read_inputs
+  read_records
+  states_of "$INPUTS" "$RECORDS"
 }
 
 cmd_local() {
@@ -84,11 +96,13 @@ cmd_local() {
   local cell="$2" name state rev envelope id
   [[ "$cell" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || fail "the cell name is not a DNS label"
   load_local_settings POC_SECRET_READ_CMD
-  [[ -n "${POC_SECRET_READ_CMD:-}" ]] \
-    || fail "POC_SECRET_READ_CMD is not set. Copy it from .envrc.local.example to .envrc.local and complete it. direnv loads .envrc.local after you run direnv allow"
+  for name in POC_SECRET_READ_CMD; do
+    [[ -n "${!name:-}" ]] \
+      || fail "$name is not set. Copy it from .envrc.local.example to .envrc.local and complete it. direnv loads .envrc.local after you run direnv allow"
+  done
   read_records
-  state="$(jq -r --arg key "$cell.dsse.json" 'try (.data[$key] | fromjson | .payload | @base64d | fromjson
-    | if .revoked == true then "revoked" else "\(.epoch).\(.counter)" end) catch "absent"' <<<"$RECORDS")" \
+  state="$(printf '%s' "$RECORDS" | jq -r --arg key "$cell.dsse.json" 'try (.data[$key] | fromjson | .payload | @base64d | fromjson
+    | if .revoked == true then "revoked" else "\(.epoch).\(.counter)" end) catch "absent"')" \
     || fail "ConfigMap spire-system/cell-records in dev-cp holds no readable record of $cell"
   case "$state" in
     absent) fail "ConfigMap spire-system/cell-records in dev-cp holds no record of $cell, so envd would refuse the entry as revocation_unknown_cell" ;;
@@ -98,9 +112,9 @@ cmd_local() {
   name="$(operator_key_name)" \
     || fail "neither build/operator/key.env nor spec.name of operator-pub names the remote key. The owner creates the operator key once with: mise run operator:create-key"
   # The envelope is public data. Error text never quotes the output of the read command.
-  envelope="$(operator_seed_pipe "$name" sign --env "$POC_ENV" --cell "$cell" --record "$rev")" \
+  envelope="$(operator_seed_sign "$name" --env "$POC_ENV" --cell "$cell" --record "$rev")" \
     || fail "the read of the remote key $name through POC_SECRET_READ_CMD and operatorctl sign failed. Nothing was written"
-  id="$(jq -er 'select(type == "object") | .payload | @base64d | fromjson | .id' <<<"$envelope" 2>/dev/null)" \
+  id="$(printf '%s' "$envelope" | jq -er 'select(type == "object") | .payload | @base64d | fromjson | .id' 2>/dev/null)" \
     || fail "operatorctl sign printed no envelope. Nothing was written"
   [[ "$id" =~ ^[0-9a-f]{16}$ ]] || fail "operatorctl sign printed an entry with no valid id. Nothing was written"
   put_inputs "$(jq -nc --arg key "$id.json" --arg env "$envelope" '{data: {($key): $env}}')"
@@ -118,24 +132,33 @@ cmd_list() {
 cmd_reapply() {
   (($# == 0)) || fail "reapply takes no argument"
   [[ -s "$log_file" ]] || fail "build/operator/revocations.log is absent or empty, so there is nothing to apply"
-  local patch n
-  patch="$(jq -Rsc 'split("\n") | map(select(length > 0))
-    | map({key: ((fromjson | .payload | @base64d | fromjson | .id | select(test("^[0-9a-f]{16}$"))) + ".json"), value: .}) | from_entries | {data: .}' "$log_file" 2>/dev/null)" \
-    || fail "a line of build/operator/revocations.log is no entry envelope. Nothing was written"
-  n="$(jq '.data | length' <<<"$patch")"
-  put_inputs "$patch"
+  local logged states patch n total
+  logged="$(jq -Rsc 'split("\n") | map(select(length > 0))
+    | map({key: ((fromjson | .payload | @base64d | fromjson | .id | if type == "string" and test("^[0-9a-f]{16}$") then . else error("id") end) + ".json"), value: .}) | from_entries | {data: .}' "$log_file" 2>/dev/null)" \
+    || fail "a line of build/operator/revocations.log is no entry envelope with a 16 hex id. Nothing was written"
+  read_inputs
+  read_records
+  # Write only the entries that envd can still take in: held or pending. A stale, settled or invalid entry would only add a refusal.
+  states="$(states_of "$logged" "$RECORDS")"
+  patch="$(printf '%s\n' "$states" | jq -sc --argjson logged "$logged" '[.[] | select(.state == "held" or .state == "pending") | .key]
+    | map({key: ., value: $logged.data[.]}) | from_entries | {data: .}')"
+  n="$(printf '%s' "$patch" | jq '.data | length')"
+  total="$(printf '%s' "$INPUTS" | jq --argjson patch "$patch" '[((.data // {}) | keys[]), ($patch.data | keys[])] | unique | length')"
+  ((total <= max_inputs)) \
+    || fail "the write would leave $total keys in ConfigMap envd-system/local-revocations, and envd takes in at most $max_inputs. Run: mise run revoke -- clean. Nothing was written"
+  if ((n > 0)); then put_inputs "$patch"; fi
   log "wrote $n entries of the log to ConfigMap envd-system/local-revocations"
-  jq -nc --argjson n "$n" '{reapplied: $n}'
+  jq -nc --argjson n "$n" --argjson skipped "$(printf '%s' "$logged" | jq --argjson n "$n" '(.data | length) - $n')" '{reapplied: $n, skipped: $skipped}'
 }
 
 cmd_clean() {
   (($# == 0)) || fail "clean takes no argument"
   local states patch ids
   states="$(entry_states)"
-  patch="$(jq -sc '[.[] | select(.state == "stale" or .state == "settled") | .key] | map({key: ., value: null}) | from_entries | {data: .}' <<<"$states")"
-  ids="$(jq -sc '[.[] | select(.state == "stale" or .state == "settled") | .key | sub("\\.json$"; "")]' <<<"$states")"
-  if [[ "$(jq '.data | length' <<<"$patch")" != 0 ]]; then put_inputs "$patch"; fi
-  jq -nc --argjson removed "$ids" --argjson kept "$(jq -sc 'map(select(.state != "stale" and .state != "settled")) | length' <<<"$states")" '{removed: $removed, kept: $kept}'
+  patch="$(printf '%s\n' "$states" | jq -sc '[.[] | select(.state == "stale" or .state == "settled") | .key] | map({key: ., value: null}) | from_entries | {data: .}')"
+  ids="$(printf '%s\n' "$states" | jq -sc '[.[] | select(.state == "stale" or .state == "settled") | .key | sub("\\.json$"; "")]')"
+  if [[ "$(printf '%s' "$patch" | jq '.data | length')" != 0 ]]; then put_inputs "$patch"; fi
+  jq -nc --argjson removed "$ids" --argjson kept "$(printf '%s\n' "$states" | jq -sc 'map(select(.state != "stale" and .state != "settled")) | length')" '{removed: $removed, kept: $kept}'
 }
 
 case "${1:-}" in

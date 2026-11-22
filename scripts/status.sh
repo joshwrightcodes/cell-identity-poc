@@ -230,7 +230,7 @@ gateway_plane() {
   if ((mrc == 0)) && jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$mg"; then
     up=true
     bound="$(jq -c '[.cells[]? | select(.bound) | .name]' <<<"$mg")"
-    report="$(jq -c '{lastReportAt, applied, signed}' <<<"$mg")"
+    report="$(jq -c '{lastReportAt, applied, signed, pendingRevokes: [.pendingRevokes[]? | .cell]}' <<<"$mg")"
   fi
   jq -c --argjson up "$up" --argjson bound "$bound" --argjson report "$report" '{gateway: {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt,
     recordOld, recordOldAt, queued, streams, mostClaimed, lastBindRefusal, storeError}, mgmt_up: $up, mgmt: $report, bound: $bound}' <<<"$gw"
@@ -291,9 +291,12 @@ overlay_plane() {
        overlay: {held: $held, inputs: $in},
        bans: (if $ban == null then null else {ready: $ban.ready, restarts: $ban.restartCount} end),
        problems: ($problems
-         + [($in // [])[] | select(.ok | not) | "ConfigMap envd-system/local-revocations in dev-cp holds the key \(.key), and envd refuses it: \(.reason). Run: mise run revoke -- list"]
-         + (if $connected then [($held // [])[] | select(($now - (.issuedAt | ts)) > 600)
-             | "the overlay of envd holds the entry \(.id) for \(.cell) since \(.issuedAt), more than 10 minutes ago, while mgmtd is connected. Read mgmtd with: mise run mgmt -- status, then list the entries with: mise run revoke -- list"] else [] end)
+         + [($in // [])[] | select(.ok | not) | "ConfigMap envd-system/local-revocations in dev-cp holds the key \(.key), and envd refuses it: \(.reason). Delete the key with: mise x -- kubectl --context kind-dev-cp -n envd-system patch configmap local-revocations --type=merge -p '"'"'{\"data\":{\"\(.key)\":null}}'"'"'. Then sign the revocation again with: mise run revoke -- local --cell <cell>"]
+         + (if $connected then [($held // [])[] | . as $h | select((($plane.mgmt.pendingRevokes // []) | index($h.cell)) == null)
+             | ($h.issuedAt | ts) as $t
+             | if $t == null then "the overlay of envd holds the entry \($h.id) for \($h.cell) with an issuedAt that is no UTC time. Read mgmtd with: mise run mgmt -- status"
+               elif ($now - $t) > 600 then "the overlay of envd holds the entry \($h.id) for \($h.cell) since \($h.issuedAt), more than 10 minutes ago, while mgmtd is connected and has no revoke queued for it. Read mgmtd with: mise run mgmt -- status, then list the entries with: mise run revoke -- list"
+               else empty end] else [] end)
          + (if $pod != "" and ($ban == null or $ban.ready != true) then ["the container agent-ban in spire-server-0 of dev-cp is not Ready, so no agent of a revoked cell is banned. Run: CELL=dev-cp mise run cell:restart"] else [] end)
          )}'
 }

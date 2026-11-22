@@ -62,15 +62,6 @@ operator_key_name() {
   printf '%s\n' "$name"
 }
 
-# operator_seed_pipe <remote key name> <operatorctl argument...> runs operatorctl with the seed on its standard input. The read
-# command POC_SECRET_READ_CMD pipes the seed straight into it, so no file, variable or argument holds the seed. The caller sets
-# pipefail, so a failed read fails the pipe.
-operator_seed_pipe() {
-  local name="$1"
-  shift
-  bash -c "$POC_SECRET_READ_CMD" _ "$name" | (cd "$OPERATOR_KEY_ROOT" && mise run operatorctl -- "$@")
-}
-
 # operator_pin_name <cluster> <envd|gateway|server|mgmtd> prints the name of one pin, as the operator scripts report it.
 operator_pin_name() {
   case "$2" in

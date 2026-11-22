@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -365,16 +366,21 @@ func TestRevokeClean(t *testing.T) {
 	if len(map[string]bool{idHeld: true, idPending: true, idStale: true, idSettled: true, idGone: true}) != 5 {
 		t.Fatal("the ids of the fixtures collide")
 	}
-	r.setRecords([]string{held}, map[string]cellRecord{"dev-cell-1": {1, 4, false}, "dev-cell-2": {2, 5, false}, "dev-cell-3": {3, 2, false}, "dev-cell-4x": {1, 1, true}})
+	// envd holds two more entries that Settle keeps: one whose cell has a newer record that is not revoked, and one whose cell has no record.
+	idHeldNewer, heldNewer := r.sign("dev-cell-6", 1, 1, now)
+	idHeldGone, heldGone := r.sign("dev-cell-7", 1, 1, now)
+	r.setRecords([]string{held, heldNewer, heldGone}, map[string]cellRecord{"dev-cell-1": {1, 4, false}, "dev-cell-2": {2, 5, false}, "dev-cell-3": {3, 2, false},
+		"dev-cell-4x": {1, 1, true}, "dev-cell-6": {1, 6, false}})
 	r.put("kind-dev-cp", "envd-system", "local-revocations", map[string]string{
 		idHeld + ".json": held, idPending + ".json": pending, idStale + ".json": stale, idSettled + ".json": settled, idGone + ".json": gone, "junk.json": "{",
+		idHeldNewer + ".json": heldNewer, idHeldGone + ".json": heldGone,
 	})
 	out, stderr, code := r.runRevoke(nil, "list")
 	if code != 0 {
 		t.Fatalf("list: exit %d\n%s\n%s", code, out, stderr)
 	}
 	want := map[string]string{idHeld + ".json": "held", idPending + ".json": "pending", idStale + ".json": "stale", idSettled + ".json": "settled",
-		idGone + ".json": "settled", "junk.json": "invalid"}
+		idGone + ".json": "settled", "junk.json": "invalid", idHeldNewer + ".json": "held", idHeldGone + ".json": "held"}
 	got := listed(t, out)
 	for k, v := range want {
 		if got[k] != v {
@@ -395,12 +401,12 @@ func TestRevokeClean(t *testing.T) {
 	slices.Sort(res.Removed)
 	wantRemoved := []string{idStale, idSettled, idGone}
 	slices.Sort(wantRemoved)
-	if !slices.Equal(res.Removed, wantRemoved) || res.Kept != 3 {
-		t.Errorf("clean removed %v and kept %d, want %v and 3", res.Removed, res.Kept, wantRemoved)
+	if !slices.Equal(res.Removed, wantRemoved) || res.Kept != 5 {
+		t.Errorf("clean removed %v and kept %d, want %v and 5", res.Removed, res.Kept, wantRemoved)
 	}
 	left := r.inputs()
-	if len(left) != 3 || left[idHeld+".json"] == "" || left[idPending+".json"] == "" || left["junk.json"] == "" {
-		t.Errorf("ConfigMap holds %v, want the held, the pending and the invalid key", left)
+	if len(left) != 5 || left[idHeld+".json"] == "" || left[idPending+".json"] == "" || left["junk.json"] == "" || left[idHeldNewer+".json"] == "" || left[idHeldGone+".json"] == "" {
+		t.Errorf("ConfigMap holds %v, want the held (also with a newer record or no record), the pending and the invalid key", left)
 	}
 	// With no ConfigMap, clean removes nothing and writes nothing.
 	r2 := newRevokeRig(t)
@@ -417,5 +423,53 @@ func TestRotateCutRefusalNamesHealAll(t *testing.T) {
 	out, _, code := r.run([]string{"STUB_CUT=dev-cp-control-plane:iptables"}, "rotate")
 	if code != 1 || !strings.Contains(out, "mise run partition -- heal --all") {
 		t.Errorf("exit %d, output %q, want exit 1 and the command partition -- heal --all", code, out)
+	}
+}
+
+// TestRevokeReapplyWritesLiveEntriesOnly: reapply skips the entries that envd would refuse (stale, settled, no record), writes the
+// pending ones, refuses a log line with no 16 hex id, and refuses a write that would pass the 64 keys that envd takes in.
+func TestRevokeReapplyWritesLiveEntriesOnly(t *testing.T) {
+	t.Parallel()
+	r := newRevokeRig(t)
+	now := time.Now()
+	idLive, live := r.sign("dev-cell-2", 2, 5, now)
+	_, stale := r.sign("dev-cell-3", 3, 1, now)
+	_, settled := r.sign("dev-cell-4x", 1, 1, now)
+	_, gone := r.sign("dev-cell-55555", 1, 1, now)
+	r.setRecords(nil, map[string]cellRecord{"dev-cell-2": {2, 5, false}, "dev-cell-3": {3, 2, false}, "dev-cell-4x": {1, 1, true}})
+	logPath := filepath.Join(r.build, "operator", "revocations.log")
+	if err := os.WriteFile(logPath, []byte(strings.Join([]string{live, stale, settled, gone}, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, stderr, code := r.runRevoke(nil, "reapply")
+	if code != 0 || !strings.Contains(out, `"reapplied":1`) || !strings.Contains(out, `"skipped":3`) {
+		t.Fatalf("exit %d, output %q\n%s", code, out, stderr)
+	}
+	if got := r.inputs(); len(got) != 1 || got[idLive+".json"] != live {
+		t.Errorf("ConfigMap holds %v, want the live entry alone", got)
+	}
+	// A line whose id is not 16 hex characters stops the run.
+	payload, _ := json.Marshal(map[string]any{"id": "short", "cell": "dev-cell-2"})
+	bad, _ := json.Marshal(map[string]any{"payloadType": "x", "payload": base64.StdEncoding.EncodeToString(payload), "signatures": []any{}})
+	r2 := newRevokeRig(t)
+	if err := os.WriteFile(filepath.Join(r2.build, "operator", "revocations.log"), []byte(live+"\n"+string(bad)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, _, code := r2.runRevoke(nil, "reapply"); code != 1 || !strings.Contains(out, "16 hex id") || r2.inputs() != nil {
+		t.Errorf("a bad id: exit %d, output %q, inputs %v", code, out, r2.inputs())
+	}
+	// The ConfigMap holds 64 keys already: a new entry would make 65.
+	r3 := newRevokeRig(t)
+	_, e := r3.sign("dev-cell-2", 2, 5, now)
+	if err := os.WriteFile(filepath.Join(r3.build, "operator", "revocations.log"), []byte(e+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	full := map[string]string{}
+	for i := range 64 {
+		full[fmt.Sprintf("k%02d.json", i)] = "{"
+	}
+	r3.put("kind-dev-cp", "envd-system", "local-revocations", full)
+	if out, _, code := r3.runRevoke(nil, "reapply"); code != 1 || !strings.Contains(out, "at most 64") || len(r3.inputs()) != 64 {
+		t.Errorf("65 keys: exit %d, output %q, keys %d", code, out, len(r3.inputs()))
 	}
 }
