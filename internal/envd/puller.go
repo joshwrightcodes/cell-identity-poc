@@ -118,9 +118,6 @@ type Puller struct {
 	relaySkipped bool
 	// stepsWritten identifies the content that this process last wrote to the steps ConfigMap.
 	stepsWritten string
-	// staleAtStart holds, by cell, each entry that the store gave at start and that is stale against
-	// the record of its cell in the spec of the same store. The first overlay leg drops them.
-	staleAtStart map[string][]byte
 	heldGauge    metric.Int64Gauge
 	refusedCount metric.Int64Counter
 }
@@ -211,7 +208,6 @@ func (p *Puller) Run(ctx context.Context) error {
 		cancel()
 		if err == nil {
 			p.state = st
-			p.staleAtStart = staleOnLoad(st)
 			p.setApplied(ctx, st.Revision)
 			p.ready.Store(true)
 			break
@@ -291,7 +287,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	} else if p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
-	p.overlay(rctx)
+	p.overlay(ctx)
 	if p.storeErr != "" {
 		failed = true
 	}

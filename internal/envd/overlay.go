@@ -19,7 +19,6 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
-	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 // The bounds of the revocation input. envd checks them before it reads any entry, so a hostile
@@ -50,7 +49,6 @@ func checkInputSize(n, size int) error {
 const (
 	settledRevoked = "revoked"
 	settledRetired = "retired"
-	settledStale   = "stale"
 )
 
 // RevocationSource gives envd the signed local revocation entries that the operator wrote.
@@ -117,18 +115,18 @@ func (p *Puller) operatorKeys() []ed25519.PublicKey {
 	return p.cfg.OperatorKeys()
 }
 
-// overlay runs after the spec leg of each round, also when the pull failed. It drops each stale
-// entry that the store gave at start, settles the held entries against the accepted spec, takes in
-// the input entries, and saves a changed overlay. It needs an accepted spec, so it does nothing
-// before the first one.
+// overlay runs after the spec leg of each round, also when the pull failed. It settles the held
+// entries against the accepted spec, takes in the input entries, and saves a changed overlay. An
+// entry that the store gave at start follows the same settle rule. The input read and the save
+// each have a deadline of their own, so a pull that used up the round deadline does not stop
+// them. The leg needs an accepted spec, so it does nothing before the first one.
 func (p *Puller) overlay(ctx context.Context) {
 	if len(p.state.SpecEnvelope) == 0 {
 		return
 	}
 	ctx, span := p.cfg.Tracer.Start(ctx, "envd.overlay")
 	defer span.End()
-	held := p.dropStale(ctx, p.state.Revocations)
-	held = p.settle(ctx, held)
+	held := p.settle(ctx, p.state.Revocations)
 	held = p.intake(ctx, held)
 	p.heldGauge.Record(ctx, int64(len(held)))
 	if maps.EqualFunc(held, p.state.Revocations, bytes.Equal) {
@@ -142,7 +140,9 @@ func (p *Puller) overlay(ctx context.Context) {
 	// The new overlay is in force before the save, so the gateway and the report get it even when
 	// the save fails. The next round writes the store again.
 	p.state = &next
-	if err := p.cfg.Store.Save(ctx, &next); err != nil {
+	sctx, cancel := context.WithTimeout(ctx, p.cfg.RoundTimeout)
+	defer cancel()
+	if err := p.cfg.Store.Save(sctx, &next); err != nil {
 		fail(span, err)
 		p.storeErr = mgmtapi.ReasonStoreFailed
 		p.logLimited(ctx, "save failed", "save", "error", clip(err.Error()))
@@ -171,43 +171,6 @@ func (p *Puller) settle(ctx context.Context, held revoke.Held) revoke.Held {
 		}
 		p.logSettled(ctx, cell, held[cell], cause)
 	}
-	return out
-}
-
-// staleOnLoad returns, by cell, each held entry of st that revoke.Stale reports against the record
-// of its cell in st. st is the state that the store gave at start, so each entry is checked against
-// the spec that it was held against. revoke.Load applies no stale rule, so this stops a writer of
-// the store from planting an old entry for a cell that was revoked and un-revoked since.
-func staleOnLoad(st *State) map[string][]byte {
-	var out map[string][]byte
-	for cell, raw := range st.Revocations {
-		rec, known := st.Cells[cell]
-		e, decoded := heldEntry(raw)
-		if !known || !decoded || !revoke.Stale(e, spec.RecordRevision(rec)) {
-			continue
-		}
-		if out == nil {
-			out = map[string][]byte{}
-		}
-		out[cell] = raw
-	}
-	return out
-}
-
-// dropStale drops the entries of staleOnLoad once, in the first overlay leg. Afterwards a loaded
-// entry follows the settle rule like an entry admitted in this run.
-func (p *Puller) dropStale(ctx context.Context, held revoke.Held) revoke.Held {
-	if len(p.staleAtStart) == 0 {
-		return held
-	}
-	out := maps.Clone(held)
-	for _, cell := range slices.Sorted(maps.Keys(p.staleAtStart)) {
-		if raw, ok := held[cell]; ok && bytes.Equal(raw, p.staleAtStart[cell]) {
-			delete(out, cell)
-			p.logSettled(ctx, cell, raw, settledStale)
-		}
-	}
-	p.staleAtStart = nil
 	return out
 }
 

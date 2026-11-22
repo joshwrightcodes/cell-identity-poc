@@ -76,6 +76,8 @@ type ovRig struct {
 	src    *memSource
 	logs   *syncBuffer
 	read   *sdkmetric.ManualReader
+	// tune, when set, changes the config of each puller that run starts.
+	tune func(c *PullerConfig)
 }
 
 // newOvRig saves the base state of f in the store, and the management plane serves the same spec.
@@ -144,7 +146,7 @@ func (r *ovRig) run(rounds int, after func(round int)) *Puller {
 	r.t.Helper()
 	clk := newClock(rounds)
 	n := 0
-	p := NewPuller(PullerConfig{Client: r.up.client, BaseURL: r.up.url, Env: testEnv, Keys: r.f.keys(), Store: r.store(),
+	cfg := PullerConfig{Client: r.up.client, BaseURL: r.up.url, Env: testEnv, Keys: r.f.keys(), Store: r.store(),
 		Gateway: r.gw, OperatorKeys: r.operatorKeys, Revocations: r.src,
 		Log: newLog(r.logs), Meter: sdkmetric.NewMeterProvider(sdkmetric.WithReader(r.read)).Meter("test"),
 		Now: clk.Now, Sleep: func(ctx context.Context, d time.Duration) error {
@@ -153,7 +155,11 @@ func (r *ovRig) run(rounds int, after func(round int)) *Puller {
 				after(n)
 			}
 			return clk.Sleep(ctx, d)
-		}})
+		}}
+	if r.tune != nil {
+		r.tune(&cfg)
+	}
+	p := NewPuller(cfg)
 	runRounds(r.t, p, clk)
 	return p
 }
@@ -308,12 +314,23 @@ func TestOverlayRefusedUnsigned(t *testing.T) {
 	env["signatures"] = []any{}
 	unsigned, _ := json.Marshal(env)
 	_, otherKey, _ := ed25519.GenerateKey(rand.Reader)
+	// Two entries carry attacker text that the error of revoke.Verify quotes: a payload type and an
+	// unknown member. No log line may hold it.
+	const marker = "attacker-text-marker"
+	env["signatures"] = []any{map[string]any{"sig": "AAAA"}}
+	env["payloadType"] = marker
+	badType, _ := json.Marshal(env)
+	env["payloadType"] = revoke.PayloadType
+	env[marker] = 1
+	extraMember, _ := json.Marshal(env)
 	in := [][]byte{
 		unsigned,
 		signEntry(t, otherKey, testEnv, "a", rev(1, 2)),
 		[]byte("not an envelope"),
 		signEntry(t, r.opPriv, "prod", "a", rev(1, 2)),
 		r.entry("zz", rev(1, 2)),
+		badType,
+		extraMember,
 	}
 	r.src.set(nil, in...)
 	const rounds = 3
@@ -333,8 +350,8 @@ func TestOverlayRefusedUnsigned(t *testing.T) {
 			t.Errorf("report %+v", rep)
 		}
 	}
-	if n := r.refusedCount(revoke.ReasonInvalid); n != 4*rounds {
-		t.Errorf("refused invalid %d, want %d", n, 4*rounds)
+	if n := r.refusedCount(revoke.ReasonInvalid); n != 6*rounds {
+		t.Errorf("refused invalid %d, want %d", n, 6*rounds)
 	}
 	if n := r.refusedCount(revoke.ReasonUnknownCell); n != rounds {
 		t.Errorf("refused unknown cell %d, want %d", n, rounds)
@@ -351,6 +368,11 @@ func TestOverlayRefusedUnsigned(t *testing.T) {
 	}
 	if len(lines) > 4 {
 		t.Errorf("%d revocation_refused lines in %d rounds, want the limit of one for each kind", len(lines), rounds)
+	}
+	for _, l := range r.logs.lines() {
+		if strings.Contains(fmt.Sprint(l), marker) {
+			t.Errorf("a log line quotes attacker text: %v", l)
+		}
 	}
 	if n := r.heldGauge(); n != 0 {
 		t.Errorf("held gauge %d", n)
@@ -526,16 +548,57 @@ func TestOverlaySurvivesRestart(t *testing.T) {
 	}
 }
 
-// TestOverlayStaleAfterRestartDropped: a stored entry that a new puller loads is checked once,
-// against the record of its cell in the spec of the same store. A stale one settles. Afterwards the
-// loaded entry follows the settle rule, so a pulled newer record that is not revoked keeps it.
-func TestOverlayStaleAfterRestartDropped(t *testing.T) {
+// TestOverlayHeldAcrossRestartAfterUnrelatedRecord: envd holds an entry across a newer record of
+// the cell that is not revoked, saves both, and restarts. A loaded entry follows only the settle
+// rule, so it stays held although the stored record is newer than the record that it names. The
+// same holds for an entry that a writer of the records ConfigMap plants, with or without an older
+// signed spec: that is the T4 residual, which a revoke and an un-revoke clear.
+func TestOverlayHeldAcrossRestartAfterUnrelatedRecord(t *testing.T) {
 	plant := func(r *ovRig, e []byte) {
 		r.editStored(func(cm *corev1.ConfigMap) { cm.Data[RevocationsKey] = list(e) })
 	}
 	newer := func(r *ovRig) mgmtapi.SpecBundle { return r.spec(rev(1, 6), r.f.cell("a", rev(1, 6), false)) }
+	check := func(t *testing.T, r *ovRig, p *Puller, e []byte) {
+		t.Helper()
+		if p.state.Revision != rev(1, 6) || len(p.state.Revocations) != 1 || !bytes.Equal(p.state.Revocations["a"], e) {
+			t.Errorf("after the restart: revision %v, held %v", p.state.Revision, p.state.Revocations)
+		}
+		if got, _ := r.stored(); got != list(e) {
+			t.Errorf("stored overlay %q", got)
+		}
+		if s := r.gw.last(t); !sameList(s.Revocations, e) {
+			t.Errorf("gateway revocations %s", s.Revocations)
+		}
+		if l := r.lines("revocation_settled"); len(l) != 0 {
+			t.Errorf("settled %v", l)
+		}
+		if l := r.lines("revocation_refused"); len(l) != 0 {
+			t.Errorf("refused %v", l)
+		}
+	}
 
-	t.Run("stored_spec", func(t *testing.T) {
+	t.Run("held_then_newer_record", func(t *testing.T) {
+		r := newOvRig(t)
+		e := r.entry("a", rev(1, 2))
+		r.src.set(nil, e)
+		r.run(2, func(round int) {
+			if round == 1 {
+				r.up.set(newer(r))
+			}
+		})
+		if got, _ := r.stored(); got != list(e) {
+			t.Fatalf("before the restart: stored overlay %q", got)
+		}
+		r.up.failGet.Store(true)
+		before := len(r.up.got())
+		p := r.run(2, nil)
+		check(t, r, p, e)
+		if reps := r.up.got()[before:]; len(reps) != 2 || !sameList(reps[1].LocalRevocations, e) {
+			t.Errorf("reports after the restart %+v", reps)
+		}
+	})
+
+	t.Run("planted_beside_newer_record", func(t *testing.T) {
 		r := newOvRig(t)
 		st, _, err := Accept(Empty(), newer(r), testEnv, r.f.keys())
 		if err != nil {
@@ -544,57 +607,12 @@ func TestOverlayStaleAfterRestartDropped(t *testing.T) {
 		if err := r.store().Save(t.Context(), st); err != nil {
 			t.Fatal(err)
 		}
-		plant(r, r.entry("a", rev(1, 2)))
-		r.up.failGet.Store(true)
-		p := r.run(1, nil)
-		if len(p.state.Revocations) != 0 {
-			t.Errorf("held %v", p.state.Revocations)
-		}
-		if v, ok := r.stored(); ok {
-			t.Errorf("stored overlay %q", v)
-		}
-		if s := r.gw.last(t); len(s.Revocations) != 0 {
-			t.Errorf("gateway revocations %s", s.Revocations)
-		}
-		if reps := r.up.got(); len(reps) != 1 || len(reps[0].LocalRevocations) != 0 {
-			t.Errorf("reports %+v", reps)
-		}
-		settled := r.lines("revocation_settled")
-		if len(settled) != 1 || settled[0]["cell"] != "a" || settled[0]["cause"] != "stale" {
-			t.Errorf("settled lines %v", settled)
-		}
-	})
-
-	t.Run("first_pull", func(t *testing.T) {
-		r := newOvRig(t)
 		e := r.entry("a", rev(1, 2))
 		plant(r, e)
-		r.up.set(newer(r))
 		r.up.failGet.Store(true)
-		var held1 []json.RawMessage
-		p := r.run(2, func(round int) {
-			if round == 1 {
-				held1 = r.gw.last(t).Revocations
-				r.up.failGet.Store(false)
-			}
-		})
-		if !sameList(held1, e) {
-			t.Errorf("round 1 with the stored spec: gateway revocations %s", held1)
-		}
-		if p.state.Revision != rev(1, 6) || !bytes.Equal(p.state.Revocations["a"], e) {
-			t.Errorf("after the first pull: revision %v, held %v", p.state.Revision, p.state.Revocations)
-		}
-		if got, _ := r.stored(); got != list(e) {
-			t.Errorf("stored overlay %q", got)
-		}
-		if l := r.lines("revocation_settled"); len(l) != 0 {
-			t.Errorf("settled %v", l)
-		}
+		check(t, r, r.run(1, nil), e)
 	})
 
-	// rollback_residual: a writer of the records ConfigMap puts back an older signed spec with an
-	// old entry. The marks come from the stored spec itself, so the restart accepts the older spec,
-	// the entry is not stale against it, and the first pull keeps it. This is the T4 residual.
 	t.Run("rollback_residual", func(t *testing.T) {
 		r := newOvRig(t)
 		st, _, err := Accept(Empty(), newer(r), testEnv, r.f.keys())
@@ -609,28 +627,83 @@ func TestOverlayStaleAfterRestartDropped(t *testing.T) {
 		e := r.entry("a", rev(1, 2))
 		plant(r, e)
 		r.up.set(newer(r))
-		p := r.run(2, nil)
-		if p.state.Revision != rev(1, 6) || !bytes.Equal(p.state.Revocations["a"], e) {
-			t.Errorf("revision %v, held %v", p.state.Revision, p.state.Revocations)
-		}
+		check(t, r, r.run(2, nil), e)
 	})
+}
 
-	t.Run("confirmed_by_pull", func(t *testing.T) {
-		r := newOvRig(t)
-		e := r.entry("a", rev(1, 2))
-		plant(r, e)
-		p := r.run(3, func(round int) {
-			if round == 1 {
-				r.up.set(newer(r))
-			}
-		})
-		if p.state.Revision != rev(1, 6) || !bytes.Equal(p.state.Revocations["a"], e) {
-			t.Errorf("revision %v, held %v", p.state.Revision, p.state.Revocations)
+// ctxSource is a RevocationSource that, like client-go, fails once its context is done.
+type ctxSource struct{ in [][]byte }
+
+func (s ctxSource) Read(ctx context.Context) ([][]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.in, nil
+}
+
+// TestOverlayHeldDuringHangingPull: in an island with DROP rules the pull hangs until the round
+// deadline. The overlay leg has its own deadlines, so envd still takes in and saves the entry.
+func TestOverlayHeldDuringHangingPull(t *testing.T) {
+	r := newOvRig(t)
+	e := r.entry("a", rev(1, 2))
+	r.tune = func(c *PullerConfig) {
+		c.RoundTimeout = 200 * time.Millisecond
+		c.Revocations = ctxSource{in: [][]byte{e}}
+	}
+	r.up.delay.Store(int64(600 * time.Millisecond))
+	p := r.run(2, nil)
+	if len(p.state.Revocations) != 1 || !bytes.Equal(p.state.Revocations["a"], e) {
+		t.Errorf("held %v, read failures %v", p.state.Revocations, r.lines("revocation input read failed"))
+	}
+	if got, _ := r.stored(); got != list(e) {
+		t.Errorf("stored overlay %q", got)
+	}
+	if s := r.gw.last(t); !sameList(s.Revocations, e) {
+		t.Errorf("gateway revocations %s", s.Revocations)
+	}
+}
+
+// TestOverlaySaveFailureKeepsEntry: a failed save of a changed overlay keeps the entry in force. The
+// gateway and the report get it, the report names store_failed, and the next round writes the store.
+func TestOverlaySaveFailureKeepsEntry(t *testing.T) {
+	r := newOvRig(t)
+	e := r.entry("a", rev(1, 2))
+	r.src.set(nil, e)
+	left := 1
+	r.client.PrependReactor("update", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
+		if left > 0 {
+			left--
+			return true, nil, errors.New("apiserver unavailable")
 		}
-		if l := r.lines("revocation_settled"); len(l) != 0 {
-			t.Errorf("settled %v", l)
+		return false, nil, nil
+	})
+	var stored1 bool
+	var gw1 []json.RawMessage
+	p := r.run(2, func(round int) {
+		if round == 1 {
+			_, stored1 = r.stored()
+			gw1 = r.gw.last(t).Revocations
 		}
 	})
+	if left != 0 || stored1 {
+		t.Fatalf("the first save did not fail: failures left %d, stored after round 1 %v", left, stored1)
+	}
+	if !sameList(gw1, e) {
+		t.Errorf("round 1: gateway revocations %s", gw1)
+	}
+	reps := r.up.got()
+	if len(reps) != 2 || reps[0].StoreError != mgmtapi.ReasonStoreFailed || !sameList(reps[0].LocalRevocations, e) {
+		t.Fatalf("reports %+v", reps)
+	}
+	if reps[1].StoreError != "" || !sameList(reps[1].LocalRevocations, e) {
+		t.Errorf("round 2 report %+v", reps[1])
+	}
+	if got, _ := r.stored(); got != list(e) {
+		t.Errorf("stored overlay after round 2 %q", got)
+	}
+	if !bytes.Equal(p.state.Revocations["a"], e) {
+		t.Errorf("held %v", p.state.Revocations)
+	}
 }
 
 // TestOverlayRestartKeepsEntryAcrossUnrelatedRecord: envd holds an entry, restarts during an island
@@ -769,15 +842,28 @@ func TestConfigMapRevocationsRead(t *testing.T) {
 	if in, err := src.Read(t.Context()); err != nil || len(in) != 0 {
 		t.Fatalf("absent: %q %v", in, err)
 	}
+	// Sixteen keys and twenty reads: a read in map order gives the key order every time with a
+	// negligible chance.
+	data := map[string]string{}
+	var want []string
+	for i := range 16 {
+		data[fmt.Sprintf("%016x.json", i)] = fmt.Sprintf("v%02d", i)
+		want = append(want, fmt.Sprintf("v%02d", i))
+	}
 	if _, err := c.CoreV1().ConfigMaps("envd-system").Create(t.Context(), &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "local-revocations", Namespace: "envd-system"},
-		Data:       map[string]string{"00000000000000b2.json": "two", "00000000000000a1.json": "one"},
+		ObjectMeta: metav1.ObjectMeta{Name: "local-revocations", Namespace: "envd-system"}, Data: data,
 	}, metav1.CreateOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	in, err := src.Read(t.Context())
-	if err != nil || len(in) != 2 || string(in[0]) != "one" || string(in[1]) != "two" {
-		t.Fatalf("read %q %v", in, err)
+	for range 20 {
+		in, err := src.Read(t.Context())
+		var got []string
+		for _, v := range in {
+			got = append(got, string(v))
+		}
+		if err != nil || !slices.Equal(got, want) {
+			t.Fatalf("read %q %v, want the values in key order", got, err)
+		}
 	}
 	c.PrependReactor("get", "configmaps", func(k8stesting.Action) (bool, runtime.Object, error) {
 		return true, nil, errors.New("apiserver unavailable")
