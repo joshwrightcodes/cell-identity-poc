@@ -127,6 +127,10 @@ type Puller struct {
 	// tokens and tokensAt hold the token bucket of the report rate.
 	tokens   float64
 	tokensAt time.Time
+	// started is the time of NewPuller. lastPull is the Unix time in nanoseconds of the last good
+	// pull, or zero before the first one. The age gauge reads both on collection.
+	started  time.Time
+	lastPull atomic.Int64
 }
 
 // NewPuller returns a Puller for cfg.
@@ -161,7 +165,7 @@ func NewPuller(cfg PullerConfig) *Puller {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
 	}
-	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}}
+	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}, started: cfg.Now()}
 	// The instrument names are valid, so creation cannot fail. A failure leaves a no-op instrument.
 	p.counter, _ = cfg.Meter.Int64Gauge("envd.spec.counter",
 		metric.WithDescription("Counter of the last saved spec revision"))
@@ -177,7 +181,25 @@ func NewPuller(cfg PullerConfig) *Puller {
 		metric.WithDescription("Input local revocation entries that envd refused, counted in each round, by reason"))
 	p.throttled, _ = cfg.Meter.Int64Counter("envd.reports.throttled",
 		metric.WithDescription("Report items that the report rate held back for a later round"))
+	// The gauge reads the age from the start of the process until the first good pull, so an island
+	// that began before a restart does not read as fresh.
+	_, _ = cfg.Meter.Float64ObservableGauge("envd.upstream.age",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds since the last good spec pull, or since the start of envd before the first one"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(p.upstreamAge())
+			return nil
+		}))
 	return p
+}
+
+// upstreamAge returns the seconds since the last good pull, or since the start before the first one.
+func (p *Puller) upstreamAge() float64 {
+	ref := p.started
+	if n := p.lastPull.Load(); n != 0 {
+		ref = time.Unix(0, n)
+	}
+	return max(0, p.cfg.Now().Sub(ref).Seconds())
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -296,7 +318,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 		fail(span, err)
 		p.logLimited(ctx, "pull failed", "pull", "error", clip(err.Error()))
 		failed = true
-	} else if p.accept(ctx, rctx, bundle) {
+	} else if p.lastPull.Store(p.cfg.Now().UnixNano()); p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
 	p.overlay(ctx)

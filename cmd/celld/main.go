@@ -404,8 +404,8 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		defer background.Done()
 		cfg := executor.StreamConfig{
 			Cell: opts.cell, Upstream: opts.gateway, Log: tel.Log, Tracer: tel.Tracer,
-			TLS:         executor.StreamTLS(w, bundle, opts.gatewayID),
-			SVIDUpdates: w.signal, Tokens: tokens, Exec: exec, EffectCtx: effectCtx,
+			TLS:   executor.StreamTLS(w, bundle, opts.gatewayID),
+			Meter: tel.Meter, SVIDUpdates: w.signal, Tokens: tokens, Exec: exec, EffectCtx: effectCtx,
 			Status: executor.NewStatus(opts.cell, opts.pod.name, opts.pod.uid, buildVersion(), w.expiry, exec),
 		}
 		if err := d.streamRun(bgCtx, cfg); err != nil && bgCtx.Err() == nil {
@@ -436,6 +436,7 @@ type svidWatcher struct {
 	current *x509svid.SVID
 	// signal gets one value for each new SVID. A value that nobody has read yet is not repeated.
 	signal chan struct{}
+	now    func() time.Time
 }
 
 func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
@@ -444,7 +445,28 @@ func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create counter: %w", err)
 	}
-	return &svidWatcher{tel: tel, counter: counter, signal: make(chan struct{}, 1)}, nil
+	w := &svidWatcher{tel: tel, counter: counter, signal: make(chan struct{}, 1), now: time.Now}
+	_, err = tel.Meter.Float64ObservableGauge("celld.svid.remaining",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds until the current X.509 SVID expires, 0 after expiry or while celld holds none"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(w.remaining())
+			return nil
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("create gauge: %w", err)
+	}
+	return w, nil
+}
+
+// remaining returns the seconds until the current SVID expires. It is 0 after expiry and while
+// celld holds no SVID, and never negative.
+func (w *svidWatcher) remaining() float64 {
+	exp := w.expiry()
+	if exp.IsZero() {
+		return 0
+	}
+	return max(0, exp.Sub(w.now()).Seconds())
 }
 
 func (w *svidWatcher) OnX509ContextUpdate(c *workloadapi.X509Context) {

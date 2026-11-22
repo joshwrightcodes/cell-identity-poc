@@ -18,6 +18,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 	"golang.org/x/net/http2"
@@ -77,11 +79,15 @@ type StreamConfig struct {
 
 	Log    *slog.Logger
 	Tracer trace.Tracer
-	Now    func() time.Time
-	Sleep  func(context.Context, time.Duration) error
-	Rand   func() float64
+	// Meter holds the celld.upstream.age gauge. A nil Meter records nothing.
+	Meter metric.Meter
+	Now   func() time.Time
+	Sleep func(context.Context, time.Duration) error
+	Rand  func() float64
 
 	resent *resendLog
+	// upstream holds the time of the last frame from the gateway across streams.
+	upstream *upstreamClock
 	// effect holds the running effect across streams.
 	effect *effectSlot
 	// status holds the next status deadline across streams. A stream ends about every half life of the SVID, which can be shorter than
@@ -146,6 +152,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
+	if c.Meter == nil {
+		c.Meter = metricnoop.NewMeterProvider().Meter("celld")
+	}
 	if c.Sleep == nil {
 		c.Sleep = sleepTimer
 	}
@@ -154,6 +163,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	}
 	if c.status == nil {
 		c.status = &statusClock{}
+	}
+	if c.upstream == nil {
+		c.upstream = newUpstreamClock(c.Meter, c.Now)
 	}
 	if c.effect == nil {
 		c.effect = newEffectSlot()
@@ -389,6 +401,7 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 		return fmt.Errorf("the gateway sent %q, want welcome", welcome.Type)
 	}
 	welcomeTimer.Stop()
+	c.upstream.touch()
 	c.Log.InfoContext(ctx, "stream open", "cell", c.Cell, "pod", welcome.Pod, "cap", welcome.Cap)
 
 	l := newLoop(c, sctx, pw, dec)
@@ -445,4 +458,36 @@ func (s *statusClock) set(t time.Time) {
 	s.mu.Lock()
 	s.next = t
 	s.mu.Unlock()
+}
+
+// upstreamClock keeps the time of the last frame from the gateway for all streams of one
+// StreamConfig, and reports its age as the celld.upstream.age gauge. Before the first frame the age
+// counts from the start, so an island that began before a restart does not read as fresh.
+type upstreamClock struct {
+	now     func() time.Time
+	started time.Time
+	last    atomic.Int64
+}
+
+func newUpstreamClock(m metric.Meter, now func() time.Time) *upstreamClock {
+	u := &upstreamClock{now: now, started: now()}
+	_, _ = m.Float64ObservableGauge("celld.upstream.age",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds since the last frame from the gateway, or since the start of celld before the first one"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(u.age())
+			return nil
+		}))
+	return u
+}
+
+// touch records that a frame arrived now.
+func (u *upstreamClock) touch() { u.last.Store(u.now().UnixNano()) }
+
+func (u *upstreamClock) age() float64 {
+	ref := u.started
+	if n := u.last.Load(); n != 0 {
+		ref = time.Unix(0, n)
+	}
+	return max(0, u.now().Sub(ref).Seconds())
 }
