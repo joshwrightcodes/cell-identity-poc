@@ -585,11 +585,12 @@ func TestCelldBundleFlags(t *testing.T) {
 		"--bundle-mirror=172.18.0.7:5000",
 		"--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
 		"--bundle-store-token=/var/run/secrets/bundle-store/token",
-		"--bundle-health-timeout=5m"}); got != want {
+		"--bundle-health-timeout=5m",
+		"--bundle-refill-every=60s"}); got != want {
 		t.Errorf("the bundle flags are %s, want %s", got, want)
 	}
-	if len(args) != 12 {
-		t.Errorf("celld has %d args, want 12", len(args))
+	if len(args) != 13 {
+		t.Errorf("celld has %d args, want 13", len(args))
 	}
 	other := cellObjects(t, "STUB_REGISTRY_IP=172.18.0.99")
 	otherArgs := get[[]any](t, named(t, get[[]any](t, get[map[string]any](t, other["Deployment cell-identity-system/celld"], "spec", "template", "spec"), "containers"), "celld"), "args")
@@ -1048,5 +1049,21 @@ func TestBundleGuardScript(t *testing.T) {
 		if out, _, err := run(args...); err == nil || out != "" {
 			t.Errorf("run %v: err %v, stdout %q, want a failure with no output", args, err, out)
 		}
+	}
+}
+
+// TestCelldRefillFlag: celld probes the bundle store every 60 s and refills it from the mirror after a loss (Shared names
+// "Refill"). The render passes --bundle-refill-every=60s once, explicitly, with the other bundle flags that it needs.
+func TestCelldRefillFlag(t *testing.T) {
+	objs := cellObjects(t)
+	celld := named(t, get[[]any](t, get[map[string]any](t, objs["Deployment cell-identity-system/celld"], "spec", "template", "spec"), "containers"), "celld")
+	var refill []string
+	for _, a := range get[[]any](t, celld, "args") {
+		if strings.HasPrefix(a.(string), "--bundle-refill-every") {
+			refill = append(refill, a.(string))
+		}
+	}
+	if !slices.Equal(refill, []string{"--bundle-refill-every=60s"}) {
+		t.Errorf("celld has the refill flags %v, want --bundle-refill-every=60s once", refill)
 	}
 }

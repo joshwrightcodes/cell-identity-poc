@@ -74,7 +74,8 @@ func TestMeshViewCellRender(t *testing.T) {
 			if env := envOf(t, ctr); env["OTEL_SERVICE_NAME"] != "cell-proxy-mesh-tunnel" || env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME)" {
 				t.Errorf("env %v, want OTEL_SERVICE_NAME cell-proxy-mesh-tunnel and the pod name as instance", env)
 			}
-			for _, p := range []string{"startupProbe", "readinessProbe", "livenessProbe"} {
+			// TestTunnelLivenessNoWorkloadAPI checks the liveness probe.
+			for _, p := range []string{"startupProbe", "readinessProbe"} {
 				if cmd := fmt.Sprint(get[[]any](t, ctr, p, "exec", "command")); cmd != "[/ko-app/cell-proxy whoami]" {
 					t.Errorf("%s runs %s, want cell-proxy whoami", p, cmd)
 				}
@@ -643,5 +644,29 @@ func TestRenderMeshViewHubGuardStopsPortForward(t *testing.T) {
 	r := runStubbed(t, "/ko-app/stub", "", []string{script}, env...)
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "a rule of the kiali viewer Role still names pods/portforward") {
 		t.Fatalf("err %v, stdout %d bytes, stderr %q; want the guard to stop the render", r.err, len(r.stdout), r.stderr)
+	}
+}
+
+// TestTunnelLivenessNoWorkloadAPI: the liveness probe of the mesh-view tunnel runs cell-proxy tunnel-status, which answers
+// from the local status listener with or without a tunnel and reads no Workload API (Controller call 5). So a SPIRE agent
+// that is down in a cell island restarts no cell-proxy container. The startup and readiness probes keep whoami.
+func TestTunnelLivenessNoWorkloadAPI(t *testing.T) {
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		t.Run(cell, func(t *testing.T) {
+			objs := clusterComponent(t, cell, "mesh-view")
+			ctr := named(t, get[[]any](t, objs["Deployment mesh-view-system/mesh-view"], "spec", "template", "spec", "containers"), "cell-proxy")
+			want := map[string]string{"startupProbe": "[/ko-app/cell-proxy whoami]", "readinessProbe": "[/ko-app/cell-proxy whoami]",
+				"livenessProbe": "[/ko-app/cell-proxy tunnel-status]"}
+			for p, cmd := range want {
+				if got := fmt.Sprint(get[[]any](t, ctr, p, "exec", "command")); got != cmd {
+					t.Errorf("%s runs %s, want %s", p, got, cmd)
+				}
+			}
+			for _, a := range argsOf(t, ctr) {
+				if strings.HasPrefix(a, "--status-listen") {
+					t.Errorf("the tunnel sets %s, and tunnel-status reads the default address", a)
+				}
+			}
+		})
 	}
 }

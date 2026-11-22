@@ -36,10 +36,11 @@ func TestEnvdBundleFlags(t *testing.T) {
 	pod := get[map[string]any](t, objs["Deployment envd-system/envd"], "spec", "template", "spec")
 	envd := envdContainer(t, objs)
 	args := get[[]any](t, envd, "args")
-	if len(args) != 19 {
-		t.Fatalf("envd has %d args, want 19: %v", len(args), args)
+	// The four flags of M9 follow the bundle flags (TestEnvdOperatorPin).
+	if len(args) != 23 {
+		t.Fatalf("envd has %d args, want 23: %v", len(args), args)
 	}
-	if got, want := fmt.Sprint(args[13:]), fmt.Sprint([]string{
+	if got, want := fmt.Sprint(args[13:19]), fmt.Sprint([]string{
 		"--cluster=dev-cp",
 		"--bundle-mirror=172.18.0.7:5000",
 		"--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
@@ -97,8 +98,9 @@ func TestEnvdBundleFlags(t *testing.T) {
 // TestEnvdRBACExact checks every right that the apply engine needs, and no other: Role envd-argocd in argocd (list
 // Applications, and patch only root and the Application of each component of role cp), ClusterRole envd-netpol-read
 // (list NetworkPolicies), Role
-// envd-bundle-state in envd-system (create ConfigMaps, and get and update only bundle-state), the earlier Role envd-records, and a
-// binding of each to the envd account of envd-system. Every object carries the harness label.
+// envd-bundle-state in envd-system (create ConfigMaps, and get and update only bundle-state), the earlier Role envd-records, Role
+// envd-revocations of M9 (TestEnvdRevocationsRole), and a binding of each to the envd account of envd-system. Every object
+// carries the harness label.
 func TestEnvdRBACExact(t *testing.T) {
 	objs := envdObjects(t)
 	role := objs["Role argocd/envd-argocd"]
@@ -129,6 +131,7 @@ func TestEnvdRBACExact(t *testing.T) {
 		"RoleBinding argocd/envd-argocd":            "Role envd-argocd",
 		"ClusterRoleBinding envd-netpol-read":       "ClusterRole envd-netpol-read",
 		"RoleBinding envd-system/envd-bundle-state": "Role envd-bundle-state",
+		"RoleBinding envd-system/envd-revocations":  "Role envd-revocations",
 		"RoleBinding spire-system/envd-records":     "Role envd-records",
 	} {
 		b := objs[key]
@@ -156,10 +159,10 @@ func TestEnvdRBACExact(t *testing.T) {
 	}
 	slices.Sort(rights)
 	slices.Sort(bindings)
-	if want := []string{"ClusterRole envd-netpol-read", "Role argocd/envd-argocd", "Role envd-system/envd-bundle-state", "Role spire-system/envd-records"}; !slices.Equal(rights, want) {
+	if want := []string{"ClusterRole envd-netpol-read", "Role argocd/envd-argocd", "Role envd-system/envd-bundle-state", "Role envd-system/envd-revocations", "Role spire-system/envd-records"}; !slices.Equal(rights, want) {
 		t.Errorf("the render prints the roles %v, want %v", rights, want)
 	}
-	if len(bindings) != 4 {
+	if len(bindings) != 5 {
 		t.Errorf("the render prints the bindings %v, want one for each right", bindings)
 	}
 }

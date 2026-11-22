@@ -70,6 +70,7 @@ spec:
             - --bundle-store=bundle-store.cell-system.svc.cluster.local:5000
             - --bundle-store-token=/var/run/secrets/bundle-store/token
             - --bundle-health-timeout=5m
+            - --bundle-refill-every=60s
           env:
             - name: POD_NAME
               valueFrom:

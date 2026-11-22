@@ -36,6 +36,14 @@ const stubBinary = "stub plugin binary"
 // stubMgmtKey is the public key of mgmtd that the stub ConfigMap mgmt-signing-pub holds: the bytes 1 to 32.
 const stubMgmtKey = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 
+// stubOperatorKey is the operator key that spec.pub of the stub ConfigMap operator-pub holds: the bytes 33 to 64.
+// stubOperatorNext (the bytes 65 to 96) and stubOperatorOther (the bytes 97 to 128) are two more keys.
+const (
+	stubOperatorKey   = "ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A="
+	stubOperatorNext  = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2A="
+	stubOperatorOther = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4A="
+)
+
 // stubMise answers "mise run hostsvc -- facts" for the cells below, "mise run mgmt -- records" with
 // the records of dev-cell-1 and dev-cell-2, and runs the real pkigen for "mise run pki". The cell
 // bad-facts fails the way hostsvc fails, and no-ip has no node address. STUB_RANDOM_SIG gives each
@@ -76,9 +84,14 @@ case "$2" in
     case "$4" in
       pubkey) printf '{"spec.pub":"%s"}\n' "${STUB_MGMT_KEY:-AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=}"; exit 0 ;;
       status)
+        # STUB_CONNECTED=1 adds a fresh envd report that applied the signed revision, so the environment is connected.
         staged="${STUB_STAGED_KEY:-}"
         if [[ -z "$staged" && -n "${STUB_NEXT_PUB:-}" ]]; then staged="$(printf '%s' "$STUB_NEXT_PUB" | base64 -d | shasum -a 256 | cut -d' ' -f1)"; fi
-        printf '{"signed":{"epoch":1,"counter":1},"stagedKey":"%s"}\n' "$staged"
+        if [[ -n "${STUB_CONNECTED:-}" ]]; then
+          printf '{"signed":{"epoch":1,"counter":1},"applied":{"epoch":1,"counter":1},"lastReportAt":"%s","stagedKey":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$staged"
+        else
+          printf '{"signed":{"epoch":1,"counter":1},"stagedKey":"%s"}\n' "$staged"
+        fi
         exit 0 ;;
     esac
     [[ "$4" == records ]] || exit 2
@@ -138,9 +151,36 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 // that is not PEM. It answers "get statefulset spire-server" with the name, or with nothing under
 // STUB_NO_STS, whatever STUB_NO_SERVER says. STUB_NO_SERVER_IN=<cluster> makes it fail the way
 // STUB_NO_SERVER does, but only in that cluster.
+//
+// It answers "get configmap operator-pub" with spec.pub stubOperatorKey (STUB_OPERATOR_KEY replaces it) and next.pub
+// STUB_OPERATOR_NEXT when that is set. STUB_NO_OPERATOR_PUB makes the ConfigMap absent, and STUB_OPERATOR_PUB_FAIL makes the
+// read fail. The live pins of the cluster are absent unless STUB_LIVE_PIN_ENVD, STUB_LIVE_PIN_GATEWAY or STUB_LIVE_PIN_SERVER
+// sets their keys, joined with commas: keys.pub of envd-system/operator-key and gateway-system/operator-key, and
+// operator_public_keys in server.conf of spire-system/spire-server.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
+if [[ " $* " == *" get configmap operator-pub "* ]]; then
+  [[ -z "${STUB_OPERATOR_PUB_FAIL:-}" ]] || { echo 'error: the server is currently unable to handle the request' >&2; exit 1; }
+  [[ -z "${STUB_NO_OPERATOR_PUB:-}" ]] || exit 0
+  jq -cn --arg spec "${STUB_OPERATOR_KEY:-ISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0A=}" --arg next "${STUB_OPERATOR_NEXT:-}" \
+    '{data: ({"spec.pub": $spec, "spec.name": "poc/operator/20261120T093000Z"} + (if $next == "" then {} else {"next.pub": $next} end))}'
+  exit 0
+fi
+if [[ " $* " == *" get configmap operator-key "* ]]; then
+  pin=""
+  case " $* " in
+    *" -n envd-system "*) pin="${STUB_LIVE_PIN_ENVD:-}" ;;
+    *" -n gateway-system "*) pin="${STUB_LIVE_PIN_GATEWAY:-}" ;;
+  esac
+  [[ -z "$pin" ]] || jq -cn --arg p "$pin" '{data: {"keys.pub": (($p | gsub(","; "\n")) + "\n")}}'
+  exit 0
+fi
+if [[ " $* " == *" get configmap spire-server "* ]]; then
+  [[ -z "${STUB_LIVE_PIN_SERVER:-}" ]] || jq -cn --arg p "$STUB_LIVE_PIN_SERVER" \
+    '{data: {"server.conf": ("plugins {\n  operator_public_keys = [" + ($p | split(",") | map("\"" + . + "\"") | join(", ")) + "]\n}\n")}}'
+  exit 0
+fi
 if [[ " $* " == *" get configmap mgmt-signing-pub "* ]]; then
   if [[ -n "${STUB_NO_MGMT_KEY:-}" ]]; then
     echo 'Error from server (NotFound): configmaps "mgmt-signing-pub" not found' >&2
@@ -222,6 +262,11 @@ case "$1" in
     if [[ " $* " == *" getent ahostsv4 host.docker.internal "* ]]; then
       # STUB_GETENT replaces the answer. The default is one address in three socket types.
       printf '%b' "${STUB_GETENT:-192.168.5.2 STREAM host.docker.internal\\n192.168.5.2 DGRAM\\n192.168.5.2 RAW\\n}"
+      exit 0
+    fi
+    # The clock of a node, which the operator key helper compares with the time of the newest envd report.
+    if [[ " $* " == *" date +%s "* ]]; then
+      date +%s
       exit 0
     fi
     if [[ "$2" == "${STUB_KEYTEST_TRACE:-none}-control-plane" ]]; then
@@ -688,8 +733,8 @@ func TestRenderSpireServer(t *testing.T) {
 			t.Fatalf("pod securityContext is %v", sc)
 		}
 		containers := append(get[[]any](t, pod, "initContainers"), get[[]any](t, pod, "containers")...)
-		if len(containers) != 3 {
-			t.Fatalf("got %d containers", len(containers))
+		if len(containers) != 4 {
+			t.Fatalf("got %d containers, want install-plugin, spire-server, spire-controller-manager and agent-ban", len(containers))
 		}
 		for _, c := range containers {
 			name := get[string](t, c, "name")
@@ -1064,7 +1109,10 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	if n := len(psatOnly.FindAllString(conf, -1)); n != 2 {
 		t.Fatalf("server.conf has %d k8s_psat or telemetry blocks, want 2:\n%s", n, conf)
 	}
-	gotLines := configLines(psatOnly.ReplaceAllString(conf, ""))
+	// M9 adds the operator keys to the cluster_jwt plugin_data. TestSpireServerOperatorKeys checks the line.
+	gotLines := slices.DeleteFunc(configLines(psatOnly.ReplaceAllString(conf, "")), func(l string) bool {
+		return strings.HasPrefix(strings.TrimSpace(l), "operator_public_keys = ")
+	})
 	wantLines := configLines(get[string](t, m2["ConfigMap/spire-server"], "data", "server.conf"))
 	if !slices.Equal(gotLines, wantLines) {
 		t.Errorf("server.conf without the k8s_psat and telemetry blocks differs from M2.\ngot:\n%s\nwant:\n%s", strings.Join(gotLines, "\n"), strings.Join(wantLines, "\n"))
@@ -1074,6 +1122,8 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 
 	pod := get[map[string]any](t, got["StatefulSet/spire-server"], "spec", "template", "spec")
 	pod["volumes"] = slices.DeleteFunc(get[[]any](t, pod, "volumes"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
+	// M9 adds the ban container. TestAgentBanContainer checks it.
+	pod["containers"] = slices.DeleteFunc(get[[]any](t, pod, "containers"), func(c any) bool { return get[string](t, c, "name") == "agent-ban" })
 	server := named(t, get[[]any](t, pod, "containers"), "spire-server")
 	server["volumeMounts"] = slices.DeleteFunc(get[[]any](t, server, "volumeMounts"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
 	for _, o := range []object{got["StatefulSet/spire-server"], m2["StatefulSet/spire-server"]} {
@@ -1482,7 +1532,7 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 			}
 		}
 	}
-	for _, bad := range []string{"hostsvc -- facts --cluster dev-cell", "spire-server bundle show", "get configmap mgmt-signing-pub"} {
+	for _, bad := range []string{"hostsvc -- facts --cluster dev-cell", "spire-server bundle show", "get configmap mgmt-signing-pub", "get configmap operator-pub"} {
 		if strings.Contains(r.log, bad) {
 			t.Errorf("the render ran %q with no live cell:\n%s", bad, r.log)
 		}
@@ -1557,4 +1607,117 @@ func checkWorkloadPolicy(t *testing.T, np object, workloads map[string]string, p
 	if ports := get[[]any](t, ingress[0], "ports"); len(ports) != 1 || get[float64](t, ports[0], "port") != 8081 {
 		t.Fatalf("workload ports are %v", ports)
 	}
+}
+
+// TestSpireServerOperatorKeys: with a live cell, the cluster_jwt plugin_data of server.conf holds operator_public_keys on one
+// line, in the shape of record_public_keys, so that operator_pin of components/lib/operator-key.sh reads it. During a
+// rotation the line holds next.pub too. A change of the keys changes the config checksum, so the server restarts.
+func TestSpireServerOperatorKeys(t *testing.T) {
+	sums := map[string]string{}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want []string
+	}{
+		{"one key", nil, []string{stubOperatorKey}},
+		{"a rotation", []string{"STUB_OPERATOR_NEXT=" + stubOperatorNext}, []string{stubOperatorKey, stubOperatorNext}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renderCell(t, "dev-cp", tc.env...)
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			objs := docs(t, hydrated(r.stdout, "dev-cp"))
+			text := get[string](t, objs["ConfigMap/spire-server"], "data", "server.conf")
+			line := `operator_public_keys = ["` + strings.Join(tc.want, `", "`) + `"]`
+			var lines []string
+			for l := range strings.SplitSeq(text, "\n") {
+				if strings.Contains(l, "operator_public_keys") && !strings.HasPrefix(strings.TrimSpace(l), "#") {
+					lines = append(lines, strings.TrimSpace(l))
+				}
+			}
+			if !slices.Equal(lines, []string{line}) {
+				t.Errorf("server.conf has the operator key lines %q, want the one line %q", lines, line)
+			}
+			var conf map[string]any
+			if err := hcl.Decode(&conf, text); err != nil {
+				t.Fatalf("server.conf does not parse: %v", err)
+			}
+			data := hclAt(t, conf, "plugins", "NodeAttestor", "cluster_jwt", "plugin_data")
+			if got := fmt.Sprint(hclAt(t, data, "operator_public_keys")); got != fmt.Sprint(tc.want) {
+				t.Errorf("the cluster_jwt plugin_data holds operator_public_keys %s, want %v", got, tc.want)
+			}
+			sums[tc.name] = get[string](t, objs["StatefulSet/spire-server"], "spec", "template", "metadata", "annotations", "cell.poc.internal/config-checksum")
+		})
+	}
+	if sums["one key"] == sums["a rotation"] {
+		t.Error("a change of the operator keys leaves the config checksum as it was, so the server would keep the old keys")
+	}
+}
+
+// TestAgentBanContainer: with a live cell, the server pod holds container agent-ban from the plugin image, with the arguments
+// of the Ban row. It mounts the config, the data directory (for marks_file), the records and the sockets, each read-only and at
+// the path of the server container, and nothing else: no API token. It sets no user of its own, so it runs as the pod user
+// that owns the admin socket, and it sets requests and a memory limit. With no live cell, the pod has no ban container.
+func TestAgentBanContainer(t *testing.T) {
+	r := renderCell(t, "dev-cp")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	pod := get[map[string]any](t, docs(t, hydrated(r.stdout, "dev-cp"))["StatefulSet/spire-server"], "spec", "template", "spec")
+	ban := named(t, get[[]any](t, pod, "containers"), "agent-ban")
+	if got, want := get[string](t, ban, "image"), get[string](t, named(t, get[[]any](t, pod, "initContainers"), "install-plugin"), "image"); got != want || got != "localhost:5001/cluster-jwt-server@"+r.digest {
+		t.Errorf("agent-ban image is %q, want the plugin image %q by digest", got, want)
+	}
+	wantArgs := []string{"ban-agents", "--server-config", "/run/spire/config/server.conf", "--socket", "/run/spire/sockets/api.sock", "--every", "10s", "--health", "127.0.0.1:8086"}
+	if got := fmt.Sprint(get[[]any](t, ban, "args")); got != fmt.Sprint(wantArgs) {
+		t.Errorf("agent-ban args are %s, want %v", got, wantArgs)
+	}
+	if _, ok := ban["command"]; ok {
+		t.Errorf("agent-ban sets a command %v, want the entry point of the image", ban["command"])
+	}
+	wantMounts := []string{"config=/run/spire/config,true", "data=/run/spire/data,true", "records=/run/spire/records,true", "sockets=/run/spire/sockets,true"}
+	if got := mountList(t, ban); !slices.Equal(got, wantMounts) {
+		t.Errorf("agent-ban mounts %v, want %v", got, wantMounts)
+	}
+	server := named(t, get[[]any](t, pod, "containers"), "spire-server")
+	for _, m := range mountList(t, ban) {
+		name, rest, _ := strings.Cut(m, "=")
+		path, _, _ := strings.Cut(rest, ",")
+		if !slices.ContainsFunc(mountList(t, server), func(s string) bool { return strings.HasPrefix(s, name+"="+path+",") }) {
+			t.Errorf("agent-ban mounts %s at %s, and the server container mounts it elsewhere", name, path)
+		}
+	}
+	res := fmt.Sprint(lookupOr(ban, "resources"))
+	if res != "map[limits:map[memory:64Mi] requests:map[cpu:5m memory:16Mi]]" {
+		t.Errorf("agent-ban resources are %s, want requests 5m and 16Mi and a memory limit of 64Mi", res)
+	}
+	sc := get[map[string]any](t, ban, "securityContext")
+	for _, key := range []string{"runAsUser", "runAsGroup", "runAsNonRoot"} {
+		if _, ok := sc[key]; ok {
+			t.Errorf("agent-ban sets %s %v, want the user of the pod", key, sc[key])
+		}
+	}
+	if sc["allowPrivilegeEscalation"] != false || sc["readOnlyRootFilesystem"] != true || !slices.Equal(get[[]any](t, sc, "capabilities", "drop"), []any{"ALL"}) {
+		t.Errorf("agent-ban securityContext is %v", sc)
+	}
+	if _, ok := ban["ports"]; ok {
+		t.Errorf("agent-ban declares ports %v; its health listener stays on the loopback", ban["ports"])
+	}
+	if pod["automountServiceAccountToken"] != false {
+		t.Error("the pod mounts a ServiceAccount token")
+	}
+
+	t.Run("no live cell", func(t *testing.T) {
+		r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		pod := get[map[string]any](t, docs(t, hydrated(r.stdout, "dev-cp"))["StatefulSet/spire-server"], "spec", "template", "spec")
+		for _, c := range get[[]any](t, pod, "containers") {
+			if get[string](t, c, "name") == "agent-ban" {
+				t.Fatal("the pod holds agent-ban with no live cell, and server.conf has no cluster_jwt plugin for it to read")
+			}
+		}
+	})
 }

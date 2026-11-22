@@ -107,7 +107,7 @@ func TestMgmtAPIRender(t *testing.T) {
 	wantArgs := []string{"serve", "--intent=/etc/mgmtd/intent/intent.json", "--data-dir=/var/lib/mgmtd", "--peer-bundle=/etc/mgmtd/peer-root/root.crt",
 		"--peer-trust-domain=dev.env.poc.internal", "--allow-id=spiffe://dev.env.poc.internal/envd", "--hostsvc-addr=192.168.5.2:17443",
 		"--hostsvc-server-name=host.docker.internal", "--hostsvc-pin=/etc/mgmtd/hostsvc-pin/hostsvc.crt", "--public-configmap=mgmt-system/mgmt-signing-pub",
-		"--registry-namespaces=central-view-system,observability-system,mesh-view-system"}
+		"--registry-namespaces=central-view-system,observability-system,mesh-view-system", "--operator-key-file=/etc/mgmtd/operator-key/keys.pub"}
 	if got := containerArgs(t, mgmtd); !slices.Equal(got, wantArgs) {
 		t.Errorf("mgmtd args\n%v\nwant\n%v", got, wantArgs)
 	}
@@ -519,4 +519,93 @@ func TestMgmtAPIRenderNoBindListener(t *testing.T) {
 			t.Errorf("the render holds %s, and only Service mgmt-api may serve a port", key)
 		}
 	}
+}
+
+// TestMgmtdOperatorKeyFile: mgmtd has one --operator-key-file, and reads it at start only. The render copies spec.pub and,
+// during a rotation, next.pub of ConfigMap operator-pub into key keys.pub of ConfigMap mgmt-system/operator-key, one key on each
+// line, which only mgmtd mounts read-only. The pod template carries the SHA-256 of the file, so each change of the keys
+// restarts mgmtd. The render never prints operator-pub, which the operator script owns. With no operator-pub yet, mgmtd runs
+// with no operator key and adopts no local revocation. A failed read of operator-pub stops the render.
+func TestMgmtdOperatorKeyFile(t *testing.T) {
+	sums := map[string]string{}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"one key", nil, operatorKeysPub(stubOperatorKey)},
+		{"a rotation", []string{"STUB_OPERATOR_NEXT=" + stubOperatorNext}, operatorKeysPub(stubOperatorKey, stubOperatorNext)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			objs, r := mgmtObjects(t, tc.env...)
+			if !strings.Contains(r.log, "kubectl --context kind-management -n mgmt-system get configmap operator-pub") {
+				t.Errorf("the render did not read ConfigMap operator-pub; it ran:\n%s", r.log)
+			}
+			if objs["ConfigMap/operator-pub"] != nil {
+				t.Error("the render prints ConfigMap operator-pub, which only the operator script writes")
+			}
+			cm := objs["ConfigMap/operator-key"]
+			if cm == nil {
+				t.Fatalf("no ConfigMap mgmt-system/operator-key in %v", keysOfObjects(objs))
+			}
+			if data := get[map[string]any](t, cm, "data"); len(data) != 1 || data["keys.pub"] != tc.want {
+				t.Errorf("operator-key holds %q, want only keys.pub %q", data, tc.want)
+			}
+			sts := objs["StatefulSet/mgmtd"]
+			pod := get[map[string]any](t, sts, "spec", "template", "spec")
+			args := containerArgs(t, named(t, get[[]any](t, pod, "containers"), "mgmtd"))
+			if n := len(slices.DeleteFunc(slices.Clone(args), func(a string) bool { return a != "--operator-key-file=/etc/mgmtd/operator-key/keys.pub" })); n != 1 {
+				t.Errorf("mgmtd args %v hold --operator-key-file=/etc/mgmtd/operator-key/keys.pub %d times, want once", args, n)
+			}
+			if v := named(t, get[[]any](t, pod, "volumes"), "operator-key"); get[string](t, v, "configMap", "name") != "operator-key" {
+				t.Errorf("volume operator-key is %v, want ConfigMap operator-key", v)
+			}
+			for _, c := range get[[]any](t, pod, "containers") {
+				name := get[string](t, c, "name")
+				var got []string
+				for _, m := range mountList(t, c) {
+					if strings.HasPrefix(m, "operator-key=") {
+						got = append(got, m)
+					}
+				}
+				if want := map[bool][]string{true: {"operator-key=/etc/mgmtd/operator-key,true"}}[name == "mgmtd"]; !slices.Equal(got, want) {
+					t.Errorf("container %s mounts the keys as %v, want %v", name, got, want)
+				}
+			}
+			sum := fmt.Sprint(lookupOr(sts, "spec", "template", "metadata", "annotations", "poc.internal/operator-key-sha256"))
+			if sum != sha256Hex(tc.want) {
+				t.Errorf("the pod annotation poc.internal/operator-key-sha256 is %s, want the SHA-256 of keys.pub %s", sum, sha256Hex(tc.want))
+			}
+			sums[tc.name] = sum
+		})
+	}
+	if sums["one key"] == sums["a rotation"] {
+		t.Error("a rotation leaves the pod annotation as it was, so mgmtd would keep the old keys")
+	}
+
+	t.Run("no operator-pub yet", func(t *testing.T) {
+		objs, _ := mgmtObjects(t, "STUB_NO_OPERATOR_PUB=1")
+		if objs["ConfigMap/operator-key"] != nil {
+			t.Error("the render prints ConfigMap operator-key with no operator-pub")
+		}
+		sts := objs["StatefulSet/mgmtd"]
+		pod := get[map[string]any](t, sts, "spec", "template", "spec")
+		mgmtd := named(t, get[[]any](t, pod, "containers"), "mgmtd")
+		if args := containerArgs(t, mgmtd); slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--operator-key-file") }) {
+			t.Errorf("mgmtd args %v name an operator key file with no operator-pub", args)
+		}
+		if strings.Contains(fmt.Sprint(lookupOr(pod, "volumes"), mountList(t, mgmtd)), "operator-key") {
+			t.Error("the pod mounts an operator key with no operator-pub")
+		}
+		if got := lookupOr(sts, "spec", "template", "metadata", "annotations", "poc.internal/operator-key-sha256"); got != "absent" {
+			t.Errorf("the pod annotation poc.internal/operator-key-sha256 is %v, want absent", got)
+		}
+	})
+
+	t.Run("operator-pub unreadable", func(t *testing.T) {
+		r := mgmtAPI(t, "STUB_OPERATOR_PUB_FAIL=1")
+		if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "operator-pub") {
+			t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that names operator-pub", r.err, len(r.stdout), r.stderr)
+		}
+	})
 }

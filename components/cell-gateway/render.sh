@@ -3,7 +3,7 @@
 #
 # The bundle holds Namespace gateway-system, ServiceAccount cell-gateway, StatefulSet cell-gateway with
 # the k8s_psat SPIRE agent sidecar, Services cell-gateway-stream (node port 30450), cell-gateway-bind
-# (30451) and cell-gateway (8452), ConfigMap mgmt-spec-key, the objects of the sidecar, and the
+# (30451) and cell-gateway (8452), ConfigMaps mgmt-spec-key and operator-key, the objects of the sidecar, and the
 # NetworkPolicies default-deny, allow-dns and cell-gateway (flows N37 to N40, N8, N11 and N23). Every
 # object carries the harness label of the component.
 #
@@ -13,10 +13,14 @@
 #     With no live cell, the render passes no --cell-node and deletes both rules.
 #   - the public signing key of mgmtd, from ConfigMap mgmt-signing-pub in management, as ConfigMap
 #     mgmt-spec-key. envd and the SPIRE server of this cluster pin the same key.
+#   - the operator keys, from ConfigMap mgmt-system/operator-pub in management, as key keys.pub of ConfigMap operator-key,
+#     one key on each line, through the pin guard operator_pub_keys (components/lib/operator-key.sh). cellgw verifies the
+#     local revocations of envd reports with them. envd and the SPIRE server of this cluster pin the same keys.
 #   - the root of the environment trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the cellgw image that `mise run images` built, by digest.
-# The pod template carries the SHA-256 of the key, so a change restarts the pod.
+# The pod template carries the SHA-256 of the key and of the operator keys, so a change restarts the pod. Roll the gateway
+# before envd, because the gateway refuses a member of an envd report that it does not know.
 # Inputs: POC_ENV and SPIRE_TRUST_DOMAIN from the cell settings, and the cluster facts from
 # build/<cluster>/facts.env.
 set -euo pipefail
@@ -34,6 +38,7 @@ source "$root/scripts/ko-image.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/operator-key.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/live-cells.sh"
 
@@ -63,10 +68,15 @@ spec_key="$(NS="$namespace" PUB="$spec_pub" SUM="$spec_sum" yq -n '
   .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "mgmt-spec-key" | .metadata.namespace = strenv(NS)
   | .metadata.annotations["poc.internal/spec-key-sha256"] = strenv(SUM)
   | .data["spec.pub"] = strenv(PUB)')"
+operator_keys="$(operator_pub_keys "$CELL_NAME")" || exit 1
+operator_sum="$(printf '%s\n' "$operator_keys" | sha256)"
+operator_key="$(NS="$namespace" KEYS="$operator_keys" yq -n '
+  .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "operator-key" | .metadata.namespace = strenv(NS)
+  | .data["keys.pub"] = strenv(KEYS) + "\n" | .data["keys.pub"] style="literal"')"
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
 gateway_image="$(ko_image cellgw)" || die "no cellgw image"
 
-manifests="$(sed -e "s|@CELLGW_IMAGE@|$gateway_image|" -e "s|@SPEC_KEY_SHA256@|$spec_sum|" \
+manifests="$(sed -e "s|@CELLGW_IMAGE@|$gateway_image|" -e "s|@SPEC_KEY_SHA256@|$spec_sum|" -e "s|@OPERATOR_KEY_SHA256@|$operator_sum|" \
   -e "s|@SPIRE_TRUST_DOMAIN@|$SPIRE_TRUST_DOMAIN|g" -e "s|@POC_ENV@|$POC_ENV|" "$here/manifests.yaml" \
   | ARGS="$cell_args" awk '$0 == "@CELL_NODE_ARGS@" { if (ENVIRON["ARGS"] != "") print ENVIRON["ARGS"]; next } { print }')"
 grep -q '@[A-Z_]*@' <<<"$manifests" && die "the manifests keep a token that the render does not replace"
@@ -144,6 +154,8 @@ EOF2
   echo "$statefulset"
   echo "---"
   echo "$spec_key"
+  echo "---"
+  echo "$operator_key"
   echo "---"
   echo "$policy"
   echo "---"

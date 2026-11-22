@@ -3,7 +3,7 @@
 #
 # The bundle holds Namespace mgmt-system, ServiceAccount, Role and RoleBinding, StatefulSet mgmtd with
 # the k8s_psat SPIRE agent sidecar, Service mgmt-api (node port 31446), the
-# ConfigMaps mgmt-intent, hostsvc-pin and peer-root, the objects of the sidecar, and the
+# ConfigMaps mgmt-intent, hostsvc-pin, peer-root and operator-key, the objects of the sidecar, and the
 # NetworkPolicies default-deny, allow-dns and mgmtd (flows N26, N28, N29, N8, N11 and N23). Every
 # object carries the harness label of the component. mgmtd makes ConfigMap mgmt-signing-pub itself, and
 # ConfigMap cell-registry in the namespaces of the view servers (--registry-namespaces in manifests.yaml).
@@ -26,9 +26,15 @@
 #     stops, because it cannot tell whether the cluster exists.
 #   - the root of the management trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
+#   - the operator keys: spec.pub and, during a rotation, next.pub of ConfigMap mgmt-system/operator-pub, which the operator
+#     script writes (scripts/operator-key.sh). The render never prints operator-pub. It copies the keys into key keys.pub of
+#     ConfigMap operator-key, one key on each line, because mgmtd reads one file. With no operator-pub yet, the render leaves
+#     out the file and its flag, and mgmtd adopts no local revocation. A failed read of operator-pub stops the render.
 #   - the mgmtd image that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root (absent when it is left out), of the
-# host service certificate and of the intent, so a change restarts the pod.
+# host service certificate, of the intent and of the operator keys (absent when they are left out), so a change restarts the
+# pod. mgmtd reads the operator keys at start only, so each rotation step that changes them runs this render again. Roll mgmtd
+# before envd, because mgmtd refuses a member of an envd report that it does not know.
 # Inputs: POC_ENV, SPIRE_TRUST_DOMAIN, VIEW_CONTROL_PLANE and HOSTSVC_PORT from the cell settings, and
 # the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
@@ -52,6 +58,7 @@ source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/hostsvc-pin.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/live-cells.sh"
+source "$root/components/lib/operator-key.sh"
 
 [[ "$POC_ENV" =~ ^[a-z0-9][a-z0-9-]{0,30}$ ]] || die "POC_ENV '$POC_ENV' is not a short DNS label"
 [[ "$SPIRE_TRUST_DOMAIN" == mgmt.poc.internal ]] || die "SPIRE_TRUST_DOMAIN '$SPIRE_TRUST_DOMAIN' is not mgmt.poc.internal, the domain of the mgmtd ID"
@@ -112,11 +119,30 @@ if grep -qx "$env_cluster" <<<"$clusters"; then
   fi
 fi
 
+# The operator keys, when the owner has created the key.
+operator_key="" operator_sum=absent
+operator_pub="$(operator_pub_cm)" || die "ConfigMap mgmt-system/operator-pub could not be read. Run: mise run harness:status"
+if [[ -n "$operator_pub" ]]; then
+  operator_keys="$(operator_keys_of "$operator_pub")" || exit 1
+  operator_sum="$(printf '%s\n' "$operator_keys" | sha256)"
+  operator_key="$(NS="$namespace" KEYS="$operator_keys" yq -n '
+    .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "operator-key" | .metadata.namespace = strenv(NS)
+    | .data["keys.pub"] = strenv(KEYS) + "\n" | .data["keys.pub"] style="literal"')"
+else
+  printf 'mgmt-api render: ConfigMap mgmt-system/operator-pub is absent, so mgmtd adopts no local revocation. The owner creates the operator key once with: mise run operator:create-key\n' >&2
+fi
+
 mgmtd_image="$(ko_image mgmtd)" || die "no mgmtd image"
 
 peers() { for ip in "$@"; do printf '{"ipBlock":{"cidr":"%s/32"}}\n' "$ip"; done | jq -cs .; }
 manifests="$(sed -e "s|@MGMTD_IMAGE@|$mgmtd_image|" -e "s|@PEER_ROOT_SHA256@|$peer_sum|" -e "s|@HOSTSVC_PIN_SHA256@|$pin_sum|" \
-  -e "s|@INTENT_SHA256@|$intent_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|g" -e "s|@HOSTSVC_ADDR@|$host_ip:$HOSTSVC_PORT|" "$here/manifests.yaml")"
+  -e "s|@INTENT_SHA256@|$intent_sum|" -e "s|@OPERATOR_KEY_SHA256@|$operator_sum|" -e "s|@PEER_TRUST_DOMAIN@|$env_td|g" \
+  -e "s|@HOSTSVC_ADDR@|$host_ip:$HOSTSVC_PORT|" "$here/manifests.yaml")"
+if [[ -z "$operator_key" ]]; then
+  manifests="$(yq '(select(.kind == "StatefulSet") | .spec.template.spec) |= (
+      del(.volumes[] | select(.name == "operator-key"))
+      | (.containers[] | select(.name == "mgmtd")) |= (del(.args[] | select(test("^--operator-key-file="))) | del(.volumeMounts[] | select(.name == "operator-key"))))' <<<"$manifests")"
+fi
 grep -q '@[A-Z_]*@' <<<"$manifests" && die "the manifests keep a token that the render does not replace"
 
 statefulset="$(yq 'select(.kind == "StatefulSet")' <<<"$manifests" \
@@ -196,6 +222,10 @@ EOF2
   echo "$intent_cm"
   echo "---"
   echo "$pin"
+  if [[ -n "$operator_key" ]]; then
+    echo "---"
+    echo "$operator_key"
+  fi
   if [[ -n "$peer_root" ]]; then
     echo "---"
     echo "$peer_root"

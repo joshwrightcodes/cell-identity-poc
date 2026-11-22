@@ -19,7 +19,7 @@ import (
 // existed, and the changes that M4, M5 and M8 made on purpose to celld (the gateway flags, the pod fields, the
 // token, trust bundle and operation key mounts, ConfigMap mgmt-op-key, the gateway ports in the policy, the
 // namespace cell-ops-system, and for M8 the bundle flags, the store token, the rights to apply signed sets, the mirror
-// and store rules, the plane policy of the store and the two guards). Review the diff of the
+// and store rules, the plane policy of the store and the two guards, and for M9 the flag --bundle-refill-every). Review the diff of the
 // file by hand before each commit. The image
 // digest of the stub registry is replaced by stubDigest, so the file does not depend on the gzip
 // output of one Go version. UPDATE_GOLDEN=1 writes the file again from the current render.

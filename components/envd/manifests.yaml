@@ -6,6 +6,9 @@
 # management key, and writes them to ConfigMap spire-system/cell-records. The cluster_jwt plugin of the
 # SPIRE server reads that ConfigMap. Its SVID is spiffe://dev.env.poc.internal/envd.
 #
+# envd also holds the local revocations that the operator key signs: it reads ConfigMap envd-system/local-revocations
+# through Role envd-revocations and verifies each entry against the keys in ConfigMap envd-system/operator-key.
+#
 # It also writes the signed spec and the signed steps to ConfigMap cell-controller-system/cell-steps for the cell
 # controller, and reads ConfigMap step-status there. The Role envd-steps, in the bundle of the cell controller, allows
 # both, so that bundle must be applied first.
@@ -119,6 +122,12 @@ spec:
             - --bundle-store-token=/var/run/secrets/bundle-store/token
             - --bundle-state-configmap=envd-system/bundle-state
             - --bundle-health-timeout=5m
+            - --report-rate=5
+            - --bundle-refill-every=60s
+            # The operator keys and the input of the local revocations go together. envd reads the key file again on each
+            # use, so a rotation needs no restart.
+            - --operator-key-file=/run/envd/operator-key/keys.pub
+            - --revocations-configmap=envd-system/local-revocations
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
@@ -165,6 +174,9 @@ spec:
             - name: spec-key
               mountPath: /run/envd/spec-key
               readOnly: true
+            - name: operator-key
+              mountPath: /run/envd/operator-key
+              readOnly: true
             - name: envd-api-token
               mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               readOnly: true
@@ -178,6 +190,9 @@ spec:
         - name: spec-key
           configMap:
             name: mgmt-spec-key
+        - name: operator-key
+          configMap:
+            name: operator-key
         # The bundle store accepts this token only for the audience bundle-store, and only from the account envd.
         - name: bundle-store-token
           projected:
@@ -202,6 +217,33 @@ spec:
                     - path: namespace
                       fieldRef:
                         fieldPath: metadata.namespace
+---
+# envd reads the signed local revocation entries from ConfigMap local-revocations, which only the operator scripts on the Mac
+# write. Get names only that object, and envd needs no other verb on it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: envd-revocations
+  namespace: envd-system
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [local-revocations]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: envd-revocations
+  namespace: envd-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: envd-revocations
+subjects:
+  - kind: ServiceAccount
+    name: envd
+    namespace: envd-system
 ---
 # The apply engine of envd lists the Applications and asks Argo CD for a hard refresh of the Application root. On a
 # rollback it terminates the running sync operation of root and of the component Applications. The render puts root and

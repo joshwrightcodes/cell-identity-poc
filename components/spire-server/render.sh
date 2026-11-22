@@ -10,7 +10,10 @@
 #     management plane signs: record_public_keys holds the public key of mgmtd, from ConfigMap
 #     mgmt-signing-pub in management (components/lib/mgmt-key.sh). envd writes the signed records into
 #     ConfigMap spire-system/cell-records, which the pod mounts as an optional volume, and the plugin
-#     reloads them while the server runs. ConfigMap spire-entries gets two
+#     reloads them while the server runs. operator_public_keys holds the operator keys, from ConfigMap
+#     mgmt-system/operator-pub in management, through the pin guard operator_pub_keys (components/lib/operator-key.sh). They
+#     verify the local revocations that envd writes into the same ConfigMap. Container agent-ban of the server pod reads
+#     this server.conf and bans the agents of each cell that the plugin refuses. ConfigMap spire-entries gets two
 #     ClusterStaticEntry manifests for each subject of each cell: a node alias
 #     spiffe://<td>/cell/<cell>/agents/<role> that matches only the attested agents of that cell and
 #     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias, for each cell of the
@@ -55,6 +58,7 @@ source "$root/scripts/ko-image.sh"
 source "$root/scripts/gate-traces.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/operator-key.sh"
 source "$root/components/lib/live-cells.sh"
 source "$root/components/lib/bundle-role.sh"
 
@@ -99,6 +103,7 @@ if [[ "$upstream" == disk ]]; then sections+=(keys_memory upstream_disk); else s
 
 entries='{}'
 mgmt_pub=""
+operator_keys=""
 plugin_image=""
 checksum=""
 live=()
@@ -144,6 +149,7 @@ fi
 if ((${#live[@]} > 0)); then
   sections+=(cluster_jwt)
   mgmt_pub="$(mgmt_signing_pub)" || exit 1
+  operator_keys="$(operator_pub_keys "$CELL_NAME")" || exit 1
 
   # The plugin image and the checksum of the binary in it.
   plugin_image="$(ko_image cluster-jwt-server)" || die "no plugin image"
@@ -202,6 +208,8 @@ fi
 
 key_list="[]"
 [[ -z "$mgmt_pub" ]] || key_list="[\"$mgmt_pub\"]"
+# The operator keys go on one line, in the shape of record_public_keys.
+operator_list="$(jq -Rr -s 'split("\n") | map(select(length > 0) | "\"" + . + "\"") | "[" + join(", ") + "]"' <<<"$operator_keys")"
 account_list="$(jq -r 'map("\"" + . + "\"") | "[" + join(", ") + "]"' <<<"$psat_accounts")"
 # Each section of server.conf starts with "# section: <name>" and ends with "# end: <name>". The
 # render keeps the sections of this cluster without their marker lines.
@@ -210,7 +218,7 @@ server_conf="$(awk -v keep=" ${sections[*]} " '
     /^ *# end: / { drop = 0; next }
     !drop' "$here/server.conf" | cat -s \
   | sed -e "s|@SPIRE_TRUST_DOMAIN@|$td|g" -e "s|@SPIRE_CA_TTL@|$ca_ttl|" -e "s|@SPIRE_PLUGIN_CHECKSUM@|$checksum|" \
-    -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" -e "s|@SPIRE_PSAT_ACCOUNTS@|$account_list|" \
+    -e "s|@SPIRE_RECORD_PUBLIC_KEYS@|$key_list|" -e "s|@SPIRE_OPERATOR_PUBLIC_KEYS@|$operator_list|" -e "s|@SPIRE_PSAT_ACCOUNTS@|$account_list|" \
     -e "s|@SPIRE_SVID_TTL@|$SPIRE_SVID_TTL|g" -e "s|@POC_ENV@|$POC_ENV|g")"
 if ((${#live[@]} == 0 || ${#local_workloads[@]} == 0)); then
   server_conf="$(sed -e '/^ *hint_configmap = /d' <<<"$server_conf")"
@@ -234,7 +242,8 @@ service='select(.kind == "Service" and .metadata.name == "spire-server") | .spec
 edits=""
 if ((${#live[@]} == 0)); then
   drop_volumes+=(plugins records)
-  edits+=" | del($pod.initContainers) | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
+  edits+=" | del($pod.initContainers) | del($pod.containers[] | select(.name == \"agent-ban\"))"
+  edits+=" | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
 fi
 if [[ "$upstream" != disk ]]; then
   drop_objects+=("ExternalSecret/spire-upstream")
