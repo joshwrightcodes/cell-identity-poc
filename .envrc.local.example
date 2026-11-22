@@ -20,7 +20,8 @@ export POC_SECRET_STORE_PROVIDER='<provider block JSON for your secret manager>'
 # token.
 export POC_SECRET_READ_CMD='<your secret CLI> read "$1"'
 export POC_SECRET_WRITE_CMD='<your secret CLI> write "$1"'
-# operator:create-key, operator:check-key, operator:rotate-key and revoke only. The prefix of the remote keys that hold the operator key.
+# operator:create-key, operator:check-key, operator:rotate-key and revoke only. The prefix of the
+# remote keys that hold the operator key.
 export POC_OPERATOR_KEY='<remote key prefix for the operator key>'
 # The remote key of the root CA bundle.
 export POC_ROOT_CA_BUNDLE='<reference to the root CA bundle>'

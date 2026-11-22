@@ -48,14 +48,17 @@ func operatorctlBinary(t *testing.T) string {
 }
 
 // opSecretWrite stands in for the write command of the secret manager. It stores its standard input at the remote key "$1", in
-// $STUB_DIR/secrets, and records its arguments. STUB_WRITE_FAIL makes it read its input and fail.
+// $STUB_DIR/secrets, and records its arguments. Like a CLI that prints a receipt, it echoes the stored value on standard output, so a
+// script that lets that output through leaks the seed. STUB_WRITE_FAIL makes it read its input and fail.
 const opSecretWrite = `#!/usr/bin/env bash
 set -euo pipefail
 echo "secret-write $*" >>"$STUB_DIR/calls"
 (($# == 1)) || { echo "secret-write takes one remote key" >&2; exit 2; }
 if [[ -n "${STUB_WRITE_FAIL:-}" ]]; then cat >/dev/null; echo "the write was refused" >&2; exit 1; fi
 mkdir -p "$STUB_DIR/secrets"
-cat >"$STUB_DIR/secrets/$(printf '%s' "$1" | tr / _)"
+f="$STUB_DIR/secrets/$(printf '%s' "$1" | tr / _)"
+cat >"$f"
+printf '{"stored":"'; tr -d '\n' <"$f"; printf '"}\n'
 `
 
 // opSecretRead stands in for the read command of the secret manager. It prints the value of the remote key "$1" from
@@ -70,8 +73,10 @@ cat "$STUB_DIR/secrets/$(printf '%s' "$1" | tr / _)"
 `
 
 // opKubectl plays the ConfigMaps of management and dev-cp. Each one is the file $STUB_DIR/k/<context>/<namespace>/<name>.json. It
-// answers get, create -f - and replace -f -, records each call, and records each write with its data. STUB_DOWN names the contexts
-// whose API does not answer, and STUB_PIN_WRITE_FAIL fails every write.
+// answers get, create -f - and replace -f -, records each call, and records each write with its data. Each write raises
+// metadata.resourceVersion, and a replace whose body names another resourceVersion fails with a conflict, as the API server does. A
+// write with -o json prints the stored object. STUB_DOWN names the contexts whose API does not answer, and STUB_PIN_WRITE_FAIL fails
+// every write.
 const opKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_DIR/calls"
@@ -102,9 +107,15 @@ case "$1" in
     [[ "$1" != create || ! -f "$f" ]] || { echo "Error from server (AlreadyExists): configmaps \"$name\" already exists" >&2; exit 1; }
     [[ "$1" != replace || -f "$f" ]] || { echo "Error from server (NotFound): configmaps \"$name\" not found" >&2; exit 1; }
     [[ -z "${STUB_PIN_WRITE_FAIL:-}" ]] || { echo "Error from server (Forbidden)" >&2; exit 1; }
+    rv=0
+    [[ "$1" != replace ]] || rv="$(jq -r '.metadata.resourceVersion // "1"' "$f")"
+    want="$(printf '%s' "$body" | jq -r '.metadata.resourceVersion // ""')"
+    [[ -z "$want" || "$want" == "$rv" ]] \
+      || { echo "Error from server (Conflict): the object has been modified; please apply your changes to the latest version" >&2; exit 1; }
     mkdir -p "$(dirname "$f")"
-    printf '%s\n' "$body" >"$f"
-    echo "wrote $ctx $bns/$name $(printf '%s' "$body" | jq -c .data)" >>"$STUB_DIR/calls" ;;
+    printf '%s' "$body" | jq -c --arg rv "$((rv + 1))" '.metadata.resourceVersion = $rv' >"$f"
+    echo "wrote $ctx $bns/$name $(printf '%s' "$body" | jq -c .data)" >>"$STUB_DIR/calls"
+    [[ " $* " != *" -o json "* ]] || cat "$f" ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `
@@ -129,7 +140,8 @@ esac
 // opMise stands in for mise. operatorctl runs the real binary. mgmt -- status prints $STUB_DIR/mgmt-status.json, or an error line
 // under STUB_MGMT_DOWN. cell:up of dev-cp runs the pin helper of components/lib/operator-key.sh, as the renders do, and writes its
 // key lines into the three pins of dev-cp. cell:link and cell:verify record their call, and cell:verify records the pin of envd.
-// STUB_VERIFY_FAIL names the clusters whose verify fails.
+// STUB_VERIFY_FAIL names the clusters whose verify fails. STUB_TAMPER makes the first verify of dev-cp raise the resourceVersion of
+// operator-pub, as a writer during the rotation does.
 const opMise = `#!/usr/bin/env bash
 set -euo pipefail
 echo "mise $* CELL=${CELL:-} LINK_ONLY=${LINK_ONLY:-} ACCEPT=${OPERATOR_KEY_ACCEPT_CHANGE:-}" >>"$STUB_DIR/calls"
@@ -160,6 +172,11 @@ case "$task" in
   cell:verify)
     pins="$(jq -r '.data["keys.pub"]' "$STUB_DIR/k/kind-dev-cp/envd-system/operator-key.json" | paste -sd, -)"
     echo "verify $CELL pins=$pins" >>"$STUB_DIR/calls"
+    if [[ -n "${STUB_TAMPER:-}" && "$CELL" == dev-cp && ! -e "$STUB_DIR/tampered" ]]; then
+      : >"$STUB_DIR/tampered"
+      f="$STUB_DIR/k/kind-management/mgmt-system/operator-pub.json"
+      jq -c '.metadata.resourceVersion = ((.metadata.resourceVersion // "1" | tonumber) + 1 | tostring)' "$f" >"$f.new" && mv "$f.new" "$f"
+    fi
     [[ " ${STUB_VERIFY_FAIL:-} " != *" $CELL "* ]] || { echo "cell:verify of $CELL failed" >&2; exit 1; } ;;
   *) echo "unexpected mise task: $task" >&2; exit 2 ;;
 esac
@@ -214,10 +231,16 @@ func opSHA(k ed25519.PrivateKey) string { return revoke.KeySHA256(k.Public().(ed
 
 // setConnected writes the status of mgmtd: a report of envd 10 s ago with applied equal to signed, or a report of 10 minutes ago.
 func (r *opRig) setConnected(ok bool) {
-	at := time.Now().UTC().Add(-10 * time.Second)
+	age := 10 * time.Second
 	if !ok {
-		at = time.Now().UTC().Add(-10 * time.Minute)
+		age = 10 * time.Minute
 	}
+	r.setReportAge(age)
+}
+
+// setReportAge writes the status of mgmtd with applied equal to signed and the newest report of envd age ago.
+func (r *opRig) setReportAge(age time.Duration) {
+	at := time.Now().UTC().Add(-age)
 	r.writeStub("mgmt-status.json", fmt.Sprintf(`{"env":"dev","signed":{"epoch":2,"counter":9},"applied":{"epoch":2,"counter":9},"lastReportAt":%q}`,
 		at.Format("2006-01-02T15:04:05.123456789Z07:00")))
 }
@@ -232,7 +255,7 @@ func (r *opRig) writeStub(name, body string) {
 // put writes a ConfigMap of the stub cluster.
 func (r *opRig) put(ctx, ns, name string, data map[string]string) {
 	r.t.Helper()
-	b, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]string{"namespace": ns, "name": name}, "data": data})
+	b, err := json.Marshal(map[string]any{"apiVersion": "v1", "kind": "ConfigMap", "metadata": map[string]string{"namespace": ns, "name": name, "resourceVersion": "1"}, "data": data})
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -657,6 +680,16 @@ func TestCheckFindsSwappedPin(t *testing.T) {
 			r.put("kind-management", "mgmt-system", "operator-pub", d)
 		}},
 		{"operator_pub_next_added", "operatorPub", "management mgmt-system/operator-pub", func(r *opRig, o string) { r.setNext(o) }},
+		{"key_env_name", "keyEnv", "build/operator/key.env", func(r *opRig, _ string) {
+			// The same seed sits at another remote key, and key.env names that key with the right SHA-256.
+			b, err := os.ReadFile(filepath.Join(r.stub, "secrets", "poc_operator_20261120T093000Z"))
+			if err != nil {
+				r.t.Fatal(err)
+			}
+			os.WriteFile(filepath.Join(r.stub, "secrets", "poc_operator_other"), b, 0o600)
+			raw, _ := base64.StdEncoding.DecodeString(r.data("kind-management", "mgmt-system", "operator-pub")["spec.pub"])
+			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/other\nOPERATOR_KEY_SHA256="+revoke.KeySHA256(raw)+"\n"), 0o644)
+		}},
 		{"key_env", "keyEnv", "build/operator/key.env", func(r *opRig, _ string) {
 			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/20261120T093000Z\nOPERATOR_KEY_SHA256="+strings.Repeat("ab", 32)+"\n"), 0o644)
 		}},
@@ -838,6 +871,7 @@ var rotateRefusals = []struct {
 		r.writeStub("mgmt-status.json", fmt.Sprintf(`{"signed":{"epoch":2,"counter":10},"applied":{"epoch":2,"counter":9},"lastReportAt":%q}`, time.Now().UTC().Format(time.RFC3339Nano)))
 	}, nil, "not connected"},
 	{"mgmt_down", func(*opRig) {}, []string{"STUB_MGMT_DOWN=1"}, "not connected"},
+	{"report_3m", func(r *opRig) { r.setReportAge(3 * time.Minute) }, nil, "not connected"},
 	{"cut_v4", func(*opRig) {}, []string{"STUB_CUT=dev-cp-control-plane:iptables"}, "dev-cp-control-plane"},
 	{"cut_v6", func(*opRig) {}, []string{"STUB_CUT=dev-cell-2-control-plane:ip6tables"}, "dev-cell-2-control-plane"},
 	{"node_unreadable", func(*opRig) {}, []string{"STUB_DOCKER_FAIL=dev-cell-1-control-plane"}, "dev-cell-1-control-plane"},
@@ -859,7 +893,26 @@ var rotateRefusals = []struct {
 		d["next.pub"] = opPub(opNewKey(r.t))
 		r.put("kind-management", "mgmt-system", "operator-pub", d)
 	}, nil, "--emergency"},
+	// A writer of operator-pub swaps spec.pub for a key of its own. The pins in force and key.env keep the real key.
+	{"spec_swapped", func(r *opRig) {
+		d := r.data("kind-management", "mgmt-system", "operator-pub")
+		d["spec.pub"] = opPub(opNewKey(r.t))
+		r.put("kind-management", "mgmt-system", "operator-pub", d)
+	}, nil, "operator:check-key"},
+	{"pin_differs", func(r *opRig) {
+		r.put("kind-dev-cp", "gateway-system", "operator-key", map[string]string{"keys.pub": opPub(opNewKey(r.t)) + "\n"})
+	}, nil, "dev-cp gateway-system/operator-key"},
+	{"pin_absent", func(r *opRig) {
+		os.Remove(filepath.Join(r.stub, "k", "kind-dev-cp", "envd-system", "operator-key.json"))
+	}, nil, "dev-cp envd-system/operator-key"},
+	{"key_env_stale", func(r *opRig) {
+		os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/20260101T000000Z\nOPERATOR_KEY_SHA256="+strings.Repeat("ab", 32)+"\n"), 0o644)
+	}, nil, "build/operator/key.env"},
 }
+
+// overlapOnly names the refusals of the default mode alone. A pending next.pub is the case that --emergency finishes. The other rows
+// check the old key, which the overlap pins again and --emergency drops.
+var overlapOnly = map[string]bool{"next_pending": true, "spec_swapped": true, "pin_differs": true, "pin_absent": true, "key_env_stale": true}
 
 func runRotateRefusal(t *testing.T, name string, args ...string) {
 	t.Helper()
@@ -891,11 +944,11 @@ func runRotateRefusal(t *testing.T, name string, args ...string) {
 	t.Fatalf("no refusal %s", name)
 }
 
-// TestRotateRefusesNotConnected: rotate refuses while mgmtd has no recent report of envd, while envd has not applied the signed
-// revision, and while mgmtd does not answer.
+// TestRotateRefusesNotConnected: rotate refuses while the newest report of envd at mgmtd is older than 2 minutes, while envd has not
+// applied the signed revision, and while mgmtd does not answer.
 func TestRotateRefusesNotConnected(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"report_old", "applied_behind", "mgmt_down"} {
+	for _, name := range []string{"report_old", "report_3m", "applied_behind", "mgmt_down"} {
 		t.Run(name, func(t *testing.T) { t.Parallel(); runRotateRefusal(t, name) })
 	}
 }
@@ -917,13 +970,66 @@ func TestRotateRefusesHeldEntry(t *testing.T) {
 	}
 }
 
+// TestRotateRefusesSwappedPin: the overlap pins the old key again, so it refuses unless spec.pub of operator-pub is the only key of
+// every pin in force in dev-cp and matches the SHA-256 in key.env. A writer of operator-pub who swaps spec.pub gets no render.
+func TestRotateRefusesSwappedPin(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"spec_swapped", "pin_differs", "pin_absent", "key_env_stale"} {
+		t.Run(name, func(t *testing.T) { t.Parallel(); runRotateRefusal(t, name) })
+	}
+}
+
+// TestRotateEmergencyDropsSwappedKey: --emergency pins the new key alone, so it goes on when spec.pub was swapped, and never renders
+// the swapped key.
+func TestRotateEmergencyDropsSwappedKey(t *testing.T) {
+	t.Parallel()
+	r, _, _ := rotateRig(t)
+	bad := opPub(opNewKey(t))
+	d := r.data("kind-management", "mgmt-system", "operator-pub")
+	d["spec.pub"] = bad
+	r.put("kind-management", "mgmt-system", "operator-pub", d)
+	out, errOut, code := r.run(nil, "rotate", "--emergency")
+	if code != 0 {
+		t.Fatalf("rotate --emergency: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	k := newRotatedKey(t, r, oneJSON(t, out)["newKeyName"].(string))
+	for _, c := range r.calls() {
+		if strings.HasPrefix(c, "render ") && strings.Contains(c, bad) {
+			t.Fatalf("calls %q: a render pinned the swapped key", r.calls())
+		}
+	}
+	if got := r.data("kind-dev-cp", "envd-system", "operator-key")["keys.pub"]; got != opPub(k)+"\n" {
+		t.Fatalf("envd pins %q, want the new key alone", got)
+	}
+}
+
+// TestRotateKeepsResourceVersion: each write of operator-pub carries the resourceVersion of the write before it, from the first read
+// on. A change of operator-pub during the rotation fails the switch, and the error line names the step and the way out.
+func TestRotateKeepsResourceVersion(t *testing.T) {
+	t.Parallel()
+	r, old, oldName := rotateRig(t)
+	out, errOut, code := r.run([]string{"STUB_TAMPER=1"}, "rotate")
+	if code == 0 {
+		t.Fatalf("rotate: exit 0 after a change of operator-pub during the rotation\nstdout %s\nstderr %s", out, errOut)
+	}
+	res := oneJSON(t, out)
+	if res["step"] != "switch" || res["switched"] != false || !strings.Contains(fmt.Sprint(res["remaining"]), "--emergency") ||
+		!strings.Contains(fmt.Sprint(res["error"]), "unused key at poc/operator/") {
+		t.Fatalf("error line %v, want step switch, switched false, the unused remote key and --emergency", res)
+	}
+	d := r.data("kind-management", "mgmt-system", "operator-pub")
+	if d["spec.pub"] != opPub(old) || d["spec.name"] != oldName {
+		t.Fatalf("operator-pub holds %v, want the old key: the switch must not overwrite a change", d)
+	}
+}
+
 // TestRotateRefusesBeforeSecretRead: every refusal of rotate, in both modes, comes before keygen and before any read or write of the
 // secret manager, so a refused rotation never prompts.
 func TestRotateRefusesBeforeSecretRead(t *testing.T) {
 	t.Parallel()
 	for _, tc := range rotateRefusals {
 		for _, mode := range [][]string{nil, {"--emergency"}} {
-			if tc.name == "next_pending" && mode != nil {
+			if overlapOnly[tc.name] && mode != nil {
 				continue
 			}
 			t.Run(tc.name+strings.Join(mode, ""), func(t *testing.T) { t.Parallel(); runRotateRefusal(t, tc.name, mode...) })
@@ -972,6 +1078,8 @@ func TestPinGuardRefusesChange(t *testing.T) {
 		{"changed", func(r *opRig) { r.pinDevCP(b) }, nil, 1, "OPERATOR_KEY_ACCEPT_CHANGE"},
 		{"changed_accepted", func(r *opRig) { r.pinDevCP(b) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 0, a + "\n"},
 		{"changed_accepted_not_connected", func(r *opRig) { r.pinDevCP(b); r.setConnected(false) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 1, "not connected"},
+		{"changed_accepted_report_90s", func(r *opRig) { r.pinDevCP(b); r.setReportAge(90 * time.Second) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 0, a + "\n"},
+		{"changed_accepted_report_3m", func(r *opRig) { r.pinDevCP(b); r.setReportAge(3 * time.Minute) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 1, "not connected"},
 		{"changed_accepted_mgmt_down", func(r *opRig) { r.pinDevCP(b) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_MGMT_DOWN=1"}, 1, "not connected"},
 		{"next_added", func(r *opRig) { r.setNext(b); r.pinDevCP(a) }, nil, 1, "envd-system/operator-key"},
 		{"gateway_swapped", func(r *opRig) {
@@ -1074,5 +1182,28 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 	}
 	if n := len(r.seeds()); n != 4 {
 		t.Fatalf("the secret manager holds %d values, want the other seed and three keys", n)
+	}
+}
+
+// TestOperatorKeyOldBase64: on a macOS before 13, base64 decodes with -D only. check and the pin guard still work there.
+func TestOperatorKeyOldBase64(t *testing.T) {
+	t.Parallel()
+	real, err := exec.LookPath("base64")
+	if err != nil {
+		t.Skip("no base64 on PATH")
+	}
+	r := newOpRig(t)
+	stub := fmt.Sprintf("#!/usr/bin/env bash\ncase \"${1:-}\" in\n  -d) echo \"base64: invalid option -- d\" >&2; exit 64 ;;\n  -D) shift; exec %q -d \"$@\" ;;\n  *) exec %q \"$@\" ;;\nesac\n", real, real)
+	if err := os.WriteFile(filepath.Join(r.bin, "base64"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	k := opNewKey(t)
+	r.installKey(k, "poc/operator/20261120T093000Z")
+	out, errOut, code := r.run(nil, "check")
+	if code != 0 || oneJSON(t, out)["match"] != true || oneJSON(t, out)["keySHA256"] != opSHA(k) {
+		t.Fatalf("check with base64 -D: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	if out, errOut, code := r.guard(); code != 0 || out != opPub(k)+"\n" {
+		t.Fatalf("guard with base64 -D: exit %d\nstdout %s\nstderr %s", code, out, errOut)
 	}
 }

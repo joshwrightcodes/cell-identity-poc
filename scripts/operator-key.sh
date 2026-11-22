@@ -58,7 +58,7 @@ need_settings() {
 key_name_now() { printf '%s/%s\n' "$POC_OPERATOR_KEY" "$(date -u +%Y%m%dT%H%M%SZ)"; }
 
 # sha_of_pub <key> prints the lowercase hex SHA-256 of the 32 bytes of a public key, as revoke.KeySHA256 does.
-sha_of_pub() { printf '%s' "$1" | base64 -d | sha256; }
+sha_of_pub() { printf '%s' "$1" | operator_b64d | sha256; }
 
 # key_env_value <name> prints one value of key.env. The file holds public data, and the script never sources it.
 key_env_value() { sed -n "s/^$1=//p" "$key_env" | head -n 1; }
@@ -75,7 +75,8 @@ read_operator_pub() {
 pub_field() { printf '%s' "$PUB_CM" | jq -r --arg k "$1" '.data[$k] // ""'; }
 
 # write_operator_pub <create|replace> <spec.pub> <spec.name> [next.pub] writes ConfigMap mgmt-system/operator-pub with field manager
-# operator. create fails when the ConfigMap exists. replace keeps the resourceVersion of PUB_CM, so a change since that read fails it.
+# operator, and prints the stored object as JSON. create fails when the ConfigMap exists. replace carries the resourceVersion of
+# PUB_CM, so any change since that read or write fails it.
 write_operator_pub() {
   local verb="$1" base='{"metadata":{}}'
   [[ "$verb" == create ]] || base="$PUB_CM"
@@ -83,7 +84,7 @@ write_operator_pub() {
       metadata: ((.metadata // {} | with_entries(select(.key == "resourceVersion" or .key == "labels" or .key == "annotations")))
         + {name: "operator-pub", namespace: "mgmt-system"}),
       data: ({"spec.pub": $spec, "spec.name": $name} + (if $next == "" then {} else {"next.pub": $next} end))}' \
-    | kubectl --context kind-management -n mgmt-system "$verb" --field-manager=operator -f - >&2
+    | kubectl --context kind-management -n mgmt-system "$verb" --field-manager=operator -f - -o json
 }
 
 # new_key <name> makes a key at the remote key <name>. keygen pipes the seed into the write command and writes the public key to
@@ -94,7 +95,7 @@ new_key() {
   NEW_PUB=""
   mkdir -p "$key_dir" || { STEP_REASON="could not create $key_dir"; return 1; }
   rm -f "$pub_file"
-  if ! mise run operatorctl -- keygen --public-file "$pub_file" | bash -c "$POC_SECRET_WRITE_CMD" _ "$name" >&2; then
+  if ! mise run operatorctl -- keygen --public-file "$pub_file" | bash -c "$POC_SECRET_WRITE_CMD" _ "$name" >/dev/null; then
     rm -f "$pub_file"
     STEP_REASON="keygen or POC_SECRET_WRITE_CMD failed for the remote key $name. Delete any value there by hand"
     return 1
@@ -129,7 +130,7 @@ cmd_create() {
   name="$(key_name_now)"
   log "writing a new operator key to the remote key $name"
   new_key "$name" || fail "$STEP_REASON. No pin was written. Run: mise run operator:create-key"
-  write_operator_pub create "$NEW_PUB" "$name" \
+  write_operator_pub create "$NEW_PUB" "$name" >/dev/null \
     || fail "the secret manager holds the new key at $name, but ConfigMap mgmt-system/operator-pub could not be written. No pin was written. Delete the value at $name by hand, then run: mise run operator:create-key"
   sha="$(sha_of_pub "$NEW_PUB")"
   write_key_env "$name" "$sha" || fail "operator-pub holds the new key, but build/operator/key.env could not be written. The commands read spec.name of operator-pub instead"
@@ -184,10 +185,11 @@ cmd_check() {
   log "every pin holds the operator key $sha"
 }
 
-# refuse_rotation fails when the rotation must not start: while not connected, while a cut of the partition tool or the slow-tier
-# marker exists, or while envd holds a local revocation entry. It reads no secret.
+# refuse_rotation <mode> fails when the rotation must not start: while not connected, while a cut of the partition tool or the
+# slow-tier marker exists, or while envd holds a local revocation entry. The overlap pins spec.pub of operator-pub again, so in that
+# mode spec.pub must also be the only key of every pin of dev-cp and match the SHA-256 in key.env. It reads no secret.
 refuse_rotation() {
-  local reason clusters c tool rules records held
+  local mode="$1" reason clusters c tool rules records held which pinned env_sha
   reason="$(operator_connected 2>&1)" \
     || fail "the rotation needs a connected environment, and the check says: ${reason#error: }"
   clusters="$(existing_clusters)" || fail "kind does not answer, so a cut of the partition tool cannot be ruled out"
@@ -209,6 +211,17 @@ refuse_rotation() {
     || fail "key local-revocations.json of ConfigMap spire-system/cell-records in dev-cp is no JSON array, so the held entries are unknown"
   [[ -z "$held" ]] \
     || fail "envd holds local revocation entries for these cells: $held. A rotation would drop each held entry at its next verification. Settle them first: mise run mgmt -- status, then mise run revoke -- clean"
+  [[ "$mode" == overlap ]] || return 0
+  for which in envd gateway server; do
+    pinned="$(operator_pin dev-cp "$which")" || fail "could not read the pin $(operator_pin_name dev-cp "$which"). Run: mise run harness:status"
+    [[ "$pinned" == "$old_pub" ]] \
+      || fail "the pin $(operator_pin_name dev-cp "$which") does not hold spec.pub of operator-pub alone, and the overlap would pin spec.pub again. Compare every pin with the secret manager: mise run operator:check-key. To replace the key without the old one, run: mise run operator:rotate-key -- --emergency"
+  done
+  if [[ -f "$key_env" ]]; then
+    env_sha="$(key_env_value OPERATOR_KEY_SHA256)"
+    [[ "$env_sha" == "$old_sha" ]] \
+      || fail "build/operator/key.env names the key $env_sha, and spec.pub of operator-pub is $old_sha. Compare every pin with the secret manager: mise run operator:check-key. To replace the key without the old one, run: mise run operator:rotate-key -- --emergency"
+  fi
 }
 
 # The steps of a rotation after the new key exists. Each step has a name, the command that a person runs by hand, and its function.
@@ -226,14 +239,16 @@ add_renders() {
   add verify-management "CELL=management mise run cell:verify" "verify_cluster management"
 }
 
+# set_next and switch_key write over PUB_CM, the object of the first read or of the last write, so a change of operator-pub during the
+# rotation fails the write.
 set_next() {
-  read_operator_pub
-  write_operator_pub replace "$old_pub" "$old_name" "$NEW_PUB" || { STEP_REASON="ConfigMap mgmt-system/operator-pub could not take next.pub"; return 1; }
+  PUB_CM="$(write_operator_pub replace "$old_pub" "$old_name" "$NEW_PUB")" \
+    || { STEP_REASON="ConfigMap mgmt-system/operator-pub could not take next.pub, or changed since the rotation read it"; return 1; }
 }
 
 switch_key() {
-  read_operator_pub
-  write_operator_pub replace "$NEW_PUB" "$new_name" || { STEP_REASON="ConfigMap mgmt-system/operator-pub could not take the new key"; return 1; }
+  PUB_CM="$(write_operator_pub replace "$NEW_PUB" "$new_name")" \
+    || { STEP_REASON="ConfigMap mgmt-system/operator-pub could not take the new key, or changed since the rotation wrote it"; return 1; }
   switched=true
   write_key_env "$new_name" "$new_sha" || { STEP_REASON="build/operator/key.env could not be written. The commands read spec.name of operator-pub instead"; return 1; }
   log "operator-pub holds the new key $new_sha alone"
@@ -273,9 +288,9 @@ cmd_rotate() {
   if [[ "$mode" == overlap && -n "$(pub_field next.pub)" ]]; then
     fail "operator-pub holds next.pub, so an earlier rotation stopped. Finish it with a new key: mise run operator:rotate-key -- --emergency"
   fi
-  refuse_rotation
-
   old_sha="$(sha_of_pub "$old_pub")"
+  refuse_rotation "$mode"
+
   new_name="$(key_name_now)"
   if [[ "$new_name" == "$old_name" ]]; then
     sleep 1

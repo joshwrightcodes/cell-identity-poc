@@ -7,9 +7,16 @@
 
 OPERATOR_KEY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
+# operator_b64d decodes standard base64 from standard input. A macOS before 13 takes -D only, as pem_der_sha256 in scripts/lib.sh knows.
+operator_b64d() {
+  local decode=-d
+  printf 'AA==' | base64 -d >/dev/null 2>&1 || decode=-D
+  base64 "$decode"
+}
+
 # operator_key_valid <key> succeeds when the key is the standard base64 of 32 bytes.
 operator_key_valid() {
-  [[ "$1" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] && [[ "$(printf '%s' "$1" | base64 -d 2>/dev/null | wc -c | tr -d ' ')" == 32 ]]
+  [[ "$1" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ]] && [[ "$(printf '%s' "$1" | operator_b64d 2>/dev/null | wc -c | tr -d ' ')" == 32 ]]
 }
 
 # operator_pub_cm prints ConfigMap mgmt-system/operator-pub of management as JSON, and nothing when it is absent. A failed read
