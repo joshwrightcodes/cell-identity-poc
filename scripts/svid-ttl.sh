@@ -3,17 +3,22 @@
 #
 # Usage:
 #   svid-ttl.sh set <ttl>   write the lifetime to build/gate/m9-svid-ttl, run CELL=dev-cp mise run cell:up, and wait
-#   svid-ttl.sh restore     remove the marker, run CELL=dev-cp mise run cell:up, then cell:restart of dev-cp and of each live cell, and wait
+#   svid-ttl.sh restore     write build/gate/m9-svid-ttl.restoring, remove the marker, run CELL=dev-cp mise run cell:up, then cell:restart
+#                           of dev-cp and of each live cell, wait, and remove the stamp
 #   svid-ttl.sh show        print the lifetimes of cells/dev-cp.env, of the marker and of the live server config
 #
 # scripts/lib.sh reads the marker for CELL=dev-cp, so the render of cell:up takes the lifetime from it. The switch goes through the signed
 # path, so set and restore need dev-cp connected to management, as the Shared names value "Connected" of the M9 plan defines it. A lifetime
-# equal to SPIRE_SVID_TTL of cells/dev-cp.env skips the switch of set. The wait ends when the live agent_ttl is the new lifetime and every
+# equal to SPIRE_SVID_TTL of cells/dev-cp.env skips the switch of set. Any other lifetime must be 2.5 times that one or more, or 2.5 times less,
+# because the wait can tell two lifetimes apart only then. The wait ends when the live agent_ttl is the new lifetime and every
 # live agent has it (svid_ttl_settled in scripts/lib.sh). After a longer lifetime, set then waits one old lifetime, so that workload SVIDs
 # renew too. After a shorter one, the cell:restart of restore gives every agent and workload a new SVID.
-# SVID_TTL_WAIT bounds the wait in seconds. The default is half the longer of the two lifetimes plus 5 minutes, and at least 20 minutes,
-# because an agent that cell:restart does not reach renews only when half its old lifetime is left. SVID_TTL_POLL sets the seconds between
-# two checks (default 10). Each command prints one JSON line. A failed set keeps the marker, so mise run gate:m9:repair finds it.
+# SVID_TTL_WAIT bounds the wait in seconds. The default is half the longer of the two lifetimes plus 5 minutes, and at least 20 minutes:
+# an agent that cell:restart did not reach would renew only when half its old lifetime is left. Every agent of the SPIRE server of dev-cp
+# runs in a workload of dev-cp or of a cell, so restore restarts them all, and the bound is a margin. SVID_TTL_POLL sets the seconds between
+# two checks (default 10). Each command prints one JSON line. A failed set keeps the marker, and a failed restore keeps the stamp
+# build/gate/m9-svid-ttl.restoring, so every other gate refuses and mise run gate:m9:repair finds it. scripts/lib.sh does not read the stamp,
+# so a render takes the lifetime of cells/dev-cp.env, and scripts/bundle.sh counts it as an input of dev-cp.
 export CELL=dev-cp
 source "$(dirname "$0")/lib.sh"
 source "$ROOT/components/lib/operator-key.sh"
@@ -57,11 +62,17 @@ wait_settled() {
 }
 
 cmd_set() {
-  local ttl="${1:-}" file live have start
+  local ttl="${1:-}" file live have start small big
   (($# == 1)) || usage
   [[ "$ttl" =~ ^[1-9][0-9]*[smh]$ ]] && (($(ttl_seconds "$ttl") >= 60)) \
     || die "the lifetime '$ttl' is not of the form <n>s, <n>m or <n>h with 1m or more, such as 1h"
   file="$(svid_ttl_file)"
+  if [[ "$ttl" != "$file" ]]; then
+    small="$(ttl_seconds "$file")" big="$(ttl_seconds "$ttl")"
+    ((small < big)) || { small="$big" big="$(ttl_seconds "$file")"; }
+    ((big * 2 >= small * 5)) \
+      || die "the lifetime $ttl is less than 2.5 times apart from SPIRE_SVID_TTL=$file of cells/dev-cp.env, so the wait cannot tell the two apart. Take a lifetime of $(((small * 5 + 1) / 2))s or more"
+  fi
   if [[ -e "$SVID_TTL_MARKER" ]]; then
     have="$(tr -d '[:space:]' <"$SVID_TTL_MARKER")"
     [[ "$have" == "$ttl" ]] \
@@ -92,9 +103,10 @@ cmd_restore() {
   live="$(svid_ttl_live 2>/dev/null)" || live=""
   connected "the restore of the SVID lifetime"
   start="$(date +%s)"
-  # The marker leaves no file when it goes, so the stamp tells the stale-build rule of scripts/bundle.sh that the render of dev-cp changed.
+  # The stamp stays until every SVID has the lifetime of the file. A marker that goes leaves no file, so the stamp also tells the stale-build
+  # rule of scripts/bundle.sh that the render of dev-cp changed.
   mkdir -p "$(dirname "$SVID_TTL_MARKER")"
-  touch "$SVID_TTL_MARKER.restored"
+  touch "$SVID_TTL_MARKER.restoring"
   rm -f "$SVID_TTL_MARKER"
   log "the slow-tier marker is gone. Rendering dev-cp with SPIRE_SVID_TTL=$file of cells/dev-cp.env"
   CELL=dev-cp mise run cell:up || die "CELL=dev-cp mise run cell:up failed. Run: mise run svid-ttl -- restore"
@@ -104,6 +116,7 @@ cmd_restore() {
     CELL="$c" mise run cell:restart || die "CELL=$c mise run cell:restart failed. Run: mise run svid-ttl -- restore"
   done
   wait_settled "$file" "$live"
+  rm -f "$SVID_TTL_MARKER.restoring"
   jq -nc --arg ttl "$file" --arg from "$live" --argjson seconds "$(($(date +%s) - start))" '{ttl: $ttl, from: $from, restored: true, seconds: $seconds}'
 }
 

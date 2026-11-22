@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
@@ -83,9 +84,10 @@ esac
 
 // m9Kubectl stands in for kubectl against the clusters of the rig. The state:
 //   - stub/live-ttl: agent_ttl of the live server config of dev-cp (default 1m); stub/conf-fail makes the read fail.
-//   - stub/agents: the agents that the SPIRE server of dev-cp lists, one "<path> <lifetime seconds> <flag>" line each. The flag is live,
-//     banned, expired or gone (the pod of a cluster_jwt agent is gone, and its entry stays listed). An agent that is not expired expires
-//     three quarters of its lifetime after stub/now. The pods of a cluster are the pod UIDs of its cluster_jwt agents that are not gone.
+//   - stub/agents: the agents that the SPIRE server of dev-cp lists, one "<path> <lifetime seconds> <flag>" line each, with the paths of
+//     the real server: /spire/agent/cluster_jwt/<cell>/<pod uid>/<hash> and /spire/agent/k8s_psat/<cluster>/pod/<pod uid>. The flag is
+//     live, banned, expired or gone (the pod of the agent is gone, and its entry stays listed). An agent that is not expired expires
+//     three quarters of its lifetime after stub/now. The pods of a cluster are the pod UIDs of its agents that are not gone.
 //     stub/agents-fail makes the list fail.
 //   - stub/held: the cells of the entries that envd holds, one each line, for the next stub/held-reads reads of cell-records (default all).
 //   - stub/inputs: the input entry IDs of envd-system/local-revocations, one each line.
@@ -105,6 +107,12 @@ ref() { printf 'localhost:5001/%s@sha256:%s' "$1" "$(printf "$2%.0s" $(seq 64))"
 case " $* " in
   *" get configmap spire-server "*)
     [[ ! -e "$d/conf-fail" ]] || { echo "error: the server could not find the requested resource" >&2; exit 1; }
+    lag="$(cat "$d/conf-lag" 2>/dev/null || echo 0)"
+    if ((lag > 0)); then
+      echo $((lag - 1)) >"$d/conf-lag"
+      printf 'server {\n  agent_ttl = "%s"\n}\n' "$(cat "$d/live-ttl-old")"
+      exit 0
+    fi
     printf 'server {\n  default_x509_svid_ttl = "%s"\n  agent_ttl = "%s"\n}\n' "$(cat "$d/live-ttl" 2>/dev/null || echo 1m)" "$(cat "$d/live-ttl" 2>/dev/null || echo 1m)" ;;
   *"spire-server agent list "*)
     [[ ! -e "$d/agents-fail" ]] || { echo "error: connection refused" >&2; exit 1; }
@@ -118,7 +126,8 @@ case " $* " in
   *" get pods -A -o json "*)
     touch "$d/agents"
     jq -Rn --arg c "$ctx" '{items: [inputs | split(" ") | select(length == 3 and .[2] != "gone")
-      | (.[0] | capture("^/spire/agent/cluster_jwt/(?<cell>[^/]+)/(?<uid>[^/]+)/")) | select(.cell == $c) | {metadata: {uid: .uid}}]}' "$d/agents" ;;
+      | (.[0] | capture("^/spire/agent/(cluster_jwt/(?<cell>[^/]+)/(?<uid>[^/]+)/|k8s_psat/(?<pcell>[^/]+)/pod/(?<puid>[^/]+)$)"))
+      | select((.cell // .pcell) == $c) | {metadata: {uid: (.uid // .puid)}}] | unique}' "$d/agents" ;;
   *" get configmap cell-records "*)
     cells=""
     if [[ -s "$d/held" ]]; then
@@ -159,9 +168,11 @@ esac
 //     call fails and the number goes down by one. run mgmt -- unrevoke --cell <c> prints a result, and fails for a cell in stub/unrevoke-fail.
 //   - run cell:up (CELL=dev-cp): the render takes the lifetime of build/gate/m9-svid-ttl, else 1m, into stub/live-ttl. Each live agent with
 //     a shorter lifetime renews at once to the new one; a longer one keeps its SVID, as an agent does until half its lifetime. The call log
-//     names the marker that the render saw. stub/cellup-fail makes it fail.
-//   - run cell:restart (CELL=<c>): each live cluster_jwt agent of the cell gets a new pod with the live lifetime, and its old entry stays
-//     listed as gone. A k8s_psat agent of the cluster attests again with the same ID. stub/restart-keep-<c> keeps the old SVIDs.
+//     names the marker that the render saw. stub/cellup-fail makes it fail. With STUB_CONF_LAG=<n>, the next n reads of the server
+//     config still give the old lifetime, as the ConfigMap does before Argo CD syncs.
+//   - run cell:restart (CELL=<c>): each live agent of the cluster gets a new pod, so a new agent ID, with the live lifetime, and its old
+//     entry stays listed as gone, as the real server keeps it (use_pod_uid_for_agent_id for k8s_psat). stub/restart-keep-<c> keeps the
+//     old SVIDs.
 //   - run harness:status fails when stub/status-fail exists, and for as many runs as stub/status-fails holds. run revoke -- clean empties stub/inputs. run gate:<n> fails for a gate in
 //     STUB_FAIL_GATES and adds STUB_GATE_SECONDS to stub/now.
 const m9Mise = `#!/usr/bin/env bash
@@ -189,6 +200,7 @@ case "$1 $2" in
     [[ ! -e "$d/cellup-fail" ]] || exit 1
     ttl=1m
     [[ ! -e "$marker" ]] || ttl="$(cat "$marker")"
+    if [[ -n "${STUB_CONF_LAG:-}" ]]; then cat "$d/live-ttl" 2>/dev/null >"$d/live-ttl-old" || echo 1m >"$d/live-ttl-old"; echo "$STUB_CONF_LAG" >"$d/conf-lag"; fi
     echo "$ttl" >"$d/live-ttl"
     want="$(secs "$ttl")"
     awk -v w="$want" '$3 == "live" && $2 < w { $2 = w } { print }' "$d/agents" >"$d/agents.new" && mv "$d/agents.new" "$d/agents" ;;
@@ -198,7 +210,7 @@ case "$1 $2" in
     want="$(secs "$(cat "$d/live-ttl" 2>/dev/null || echo 1m)")"
     awk -v c="$c" -v w="$want" '
       $3 == "live" && index($1, "/spire/agent/cluster_jwt/" c "/") == 1 { print $1, $2, "gone"; n = split($1, p, "/"); print "/spire/agent/cluster_jwt/" c "/" p[6] "r/" p[7] "r", w, "live"; next }
-      $3 == "live" && index($1, "/spire/agent/k8s_psat/" c "/") == 1 { print $1, w, "live"; next }
+      $3 == "live" && index($1, "/spire/agent/k8s_psat/" c "/pod/") == 1 { print $1, $2, "gone"; print $1 "r", w, "live"; next }
       { print }' "$d/agents" >"$d/agents.new" && mv "$d/agents.new" "$d/agents" ;;
   "run harness:status")
     fails="$(cat "$d/status-fails" 2>/dev/null || echo 0)"
@@ -213,8 +225,9 @@ esac
 `
 
 // m9Go stands in for go. A build (no -json) passes. A test run logs its arguments, adds STUB_TEST_SECONDS to stub/now, prints the events of
-// the test that its -run pattern names (-run <p> or -run=<p>), and fails for a test in STUB_FAIL_TESTS. For a test in STUB_INTERRUPT_TESTS it sends SIGINT to the
-// gate, as Ctrl-C does, and ends with status 130.
+// the test that its -run pattern names (-run <p> or -run=<p>), and fails for a test in STUB_FAIL_TESTS. With STUB_WRITE_MARKER=1 it writes
+// the slow-tier marker, as a test that records a lifetime change does. For a test in STUB_INTERRUPT_TESTS it sends SIGINT to its process
+// group, as Ctrl-C does, so the signal ends the stub, tee and jq, and reaches the gate.
 const m9Go = `#!/usr/bin/env bash
 echo "go $*" >>"$STUB_DIR/calls"
 d="$STUB_DIR"
@@ -229,7 +242,8 @@ name="${pat#^}"
 name="${name%\$}"
 echo $(($(cat "$d/now") + ${STUB_TEST_SECONDS:-0})) >"$d/now"
 printf '{"Action":"run","Test":"%s"}\n{"Action":"output","Test":"%s","Output":"=== RUN   %s\\n"}\n' "$name" "$name" "$name"
-if [[ " ${STUB_INTERRUPT_TESTS:-} " == *" $name "* ]]; then kill -INT "$PPID"; exit 130; fi
+[[ "${STUB_WRITE_MARKER:-}" != 1 ]] || { mkdir -p "$POC_BUILD_ROOT/gate"; echo 1h >"$POC_BUILD_ROOT/gate/m9-svid-ttl"; }
+if [[ " ${STUB_INTERRUPT_TESTS:-} " == *" $name "* ]]; then trap - INT; kill -INT 0; sleep 5; exit 3; fi
 if [[ " ${STUB_FAIL_TESTS:-} " == *" $name "* ]]; then
   printf '{"Action":"output","Test":"%s","Output":"--- FAIL: %s\\n"}\n{"Action":"fail","Test":"%s","Elapsed":2}\n' "$name" "$name" "$name"
   exit 1
@@ -298,6 +312,8 @@ func (r *m9Rig) command(name string, env []string, args ...string) *exec.Cmd {
 	cmd := exec.Command(name, args...)
 	cmd.Env = append([]string{"PATH=" + r.bin + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"POC_BUILD_ROOT=" + r.build, "STUB_DIR=" + r.stub, "KIND_CLUSTERS_PAUSE=0"}, env...)
+	// Each run has its own process group, so a stub can send a signal to the group of the script, as Ctrl-C does, and not to the tests.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return cmd
 }
 
@@ -336,7 +352,7 @@ func (r *m9Rig) agents(lifetime int) {
 /spire/agent/cluster_jwt/dev-cell-1/u12/h12 %[1]d live
 /spire/agent/cluster_jwt/dev-cell-2/u21/h21 %[1]d live
 /spire/agent/cluster_jwt/dev-cell-2/u22/h22 %[1]d live
-/spire/agent/k8s_psat/dev-cp/n1 %[1]d live
+/spire/agent/k8s_psat/dev-cp/pod/n1 %[1]d live
 `, lifetime))
 }
 
@@ -401,12 +417,13 @@ func TestLibReadsSlowLifetimeForDevCpOnly(t *testing.T) {
 // TestSvidTtlSettled: svid_ttl_settled <ttl> passes when every live, current agent of the SPIRE server of dev-cp has a remaining lifetime that
 // fits the lifetime: between 0.4 and 1.1 times it, the renewal window of an agent (half its lifetime to all of it) with 10 percent of the
 // lifetime as margin. A banned agent, an expired entry, the entry of a pod that is gone and an agent of a cluster that does not exist do not
-// count. Among the entries of one pod, the one with the least time left counts.
+// count, for both attestors. Among the entries of one pod, the one with the least time left counts, and a pod that exists with entries
+// that are all expired is an agent that is down, which fails the check.
 func TestSvidTtlSettled(t *testing.T) {
 	t.Parallel()
 	const live = `/spire/agent/cluster_jwt/dev-cell-1/u11/h11 3600 live
 /spire/agent/cluster_jwt/dev-cell-2/u21/h21 3600 live
-/spire/agent/k8s_psat/dev-cp/n1 3600 live
+/spire/agent/k8s_psat/dev-cp/pod/n1 3600 live
 `
 	for _, tc := range []struct {
 		name, ttl, agents, kind, want string
@@ -415,11 +432,14 @@ func TestSvidTtlSettled(t *testing.T) {
 	}{
 		{name: "every agent at 1h", ttl: "1h", agents: live, ok: true},
 		{name: "one agent at 1m", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u22/h22 60 live\n", want: "dev-cell-2/u22"},
-		{name: "a k8s_psat agent at 1m", ttl: "1h", agents: strings.Replace(live, "n1 3600", "n1 60", 1), want: "k8s_psat/dev-cp/n1"},
+		{name: "a k8s_psat agent at 1m", ttl: "1h", agents: strings.Replace(live, "n1 3600", "n1 60", 1), want: "k8s_psat/dev-cp/pod/n1"},
+		{name: "the k8s_psat entry of a pod that is gone", ttl: "1m", agents: strings.ReplaceAll(live, "3600", "60") + "/spire/agent/k8s_psat/dev-cp/pod/n0 3600 gone\n", ok: true},
 		{name: "every agent at 1m for 1m", ttl: "1m", agents: strings.ReplaceAll(live, "3600", "60"), ok: true},
 		{name: "an agent at 1h for 1m", ttl: "1m", agents: strings.Replace(strings.ReplaceAll(live, "3600", "60"), "u11/h11 60", "u11/h11 3600", 1), want: "dev-cell-1/u11"},
 		{name: "a banned agent at 1m", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u23/h23 60 banned\n", ok: true},
-		{name: "an expired entry", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u23/h23 60 expired\n", ok: true},
+		{name: "an expired entry beside the live one", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u21/h20 60 expired\n", ok: true},
+		{name: "an agent that is down", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u23/h23 60 expired\n", want: "dev-cell-2/u23"},
+		{name: "a k8s_psat agent that is down", ttl: "1h", agents: live + "/spire/agent/k8s_psat/dev-cp/pod/n2 3600 expired\n", want: "k8s_psat/dev-cp/pod/n2"},
 		{name: "the entry of a pod that is gone", ttl: "1m", agents: strings.ReplaceAll(live, "3600", "60") + "/spire/agent/cluster_jwt/dev-cell-1/u19/h19 3600 gone\n", ok: true},
 		{name: "an older entry of the same pod", ttl: "1m", agents: strings.ReplaceAll(live, "3600", "60") + "/spire/agent/cluster_jwt/dev-cell-1/u11/h10 3600 live\n", ok: true},
 		{name: "an agent of a cluster that does not exist", ttl: "1h", agents: live + "/spire/agent/cluster_jwt/dev-cell-2/u22/h22 60 live\n", kind: "management dev-cp dev-cell-1", ok: true},
@@ -495,6 +515,19 @@ func TestSvidTtlSetWritesMarkerAndRenders(t *testing.T) {
 			t.Errorf("show: exit %d, %v; want file 1m, marker 1h and live 1h", code, s)
 		}
 	})
+	t.Run("the server config lags", func(t *testing.T) {
+		t.Parallel()
+		r := newM9Rig(t)
+		r.agents(60)
+		_, errOut, code := r.run("svid-ttl.sh", []string{"STUB_CONF_LAG=3"}, "set", "1h")
+		calls := r.calls()
+		if code != 0 {
+			t.Fatalf("exit %d, stderr %s", code, errOut)
+		}
+		if poll, wait := callAt(calls, "sleep 10"), callAt(calls, "sleep 60"); poll < 0 || wait < poll {
+			t.Errorf("the agents renewed before the live agent_ttl did, and the wait did not read the config again before it ended:\n%s", calls)
+		}
+	})
 	t.Run("an agent that does not renew", func(t *testing.T) {
 		t.Parallel()
 		r := newM9Rig(t)
@@ -515,6 +548,7 @@ func TestSvidTtlSetWritesMarkerAndRenders(t *testing.T) {
 		{name: "below 1m", ttl: "30s", want: "1m or more"},
 		{name: "no lifetime", ttl: "1d", want: "1m or more"},
 		{name: "another marker", ttl: "1h", marker: "2h", want: "mise run gate:m9:repair"},
+		{name: "close to the old lifetime", ttl: "2m", want: "2.5 times"},
 		{name: "not connected", ttl: "1h", files: []string{"mgmt-down"}, want: "connected"},
 	} {
 		t.Run("refuses "+tc.name, func(t *testing.T) {
@@ -587,8 +621,8 @@ func TestSvidTtlRestoreRestartsAndWaits(t *testing.T) {
 		if m := svidTTLLine(t, out); m["ttl"] != "1m" || m["from"] != "1h" || m["restored"] != true {
 			t.Errorf("result %v, want ttl 1m from 1h, restored", m)
 		}
-		if !r.exists("build/gate/m9-svid-ttl.restored") {
-			t.Error("restore left no stamp build/gate/m9-svid-ttl.restored for the stale-build rule of bundle.sh")
+		if r.exists("build/gate/m9-svid-ttl.restoring") {
+			t.Error("a restore that settled left the stamp build/gate/m9-svid-ttl.restoring")
 		}
 	})
 	t.Run("a cell keeps the old SVIDs", func(t *testing.T) {
@@ -601,6 +635,9 @@ func TestSvidTtlRestoreRestartsAndWaits(t *testing.T) {
 		_, errOut, code := r.run("svid-ttl.sh", []string{"SVID_TTL_WAIT=60", "SVID_TTL_POLL=10"}, "restore")
 		if code == 0 || !strings.Contains(errOut, "dev-cell-2/u2") {
 			t.Fatalf("exit %d, stderr %q; want a failure that names an agent of dev-cell-2", code, errOut)
+		}
+		if !r.exists("build/gate/m9-svid-ttl.restoring") {
+			t.Error("a restore that did not settle left no stamp build/gate/m9-svid-ttl.restoring, so no check can see it")
 		}
 	})
 	t.Run("not connected", func(t *testing.T) {
@@ -622,7 +659,7 @@ func TestSvidTtlRestoreRestartsAndWaits(t *testing.T) {
 // of dev-cp, and a publish of a cell goes on.
 func TestBundleStaleCountsMarker(t *testing.T) {
 	t.Parallel()
-	for _, rel := range []string{"build/gate/m9-svid-ttl", "build/gate/m9-svid-ttl.restored"} {
+	for _, rel := range []string{"build/gate/m9-svid-ttl", "build/gate/m9-svid-ttl.restoring"} {
 		t.Run(filepath.Base(rel), func(t *testing.T) {
 			t.Parallel()
 			r := newBundleRoot(t, "dev-cp", "dev-cell-1")

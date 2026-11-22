@@ -79,13 +79,18 @@ func TestFastGateRefusesSlowLifetime(t *testing.T) {
 		{name: "m2 with the marker", milestone: "m2", marker: "1h", live: "1h", want: "build/gate/m9-svid-ttl"},
 		{name: "m8 with the marker and the file lifetime live", milestone: "m8", marker: "1h", live: "1m", want: "build/gate/m9-svid-ttl"},
 		{name: "m8 with agent_ttl 1h and no marker", milestone: "m8", live: "1h", want: "agent_ttl '1h'"},
+		{name: "m8 after a restore that did not settle", milestone: "m8", marker: "restoring", live: "1m", want: "build/gate/m9-svid-ttl.restoring"},
 		{name: "m1 with agent_ttl 1h and no marker", milestone: "m1", live: "1h", want: "agent_ttl '1h'"},
 		{name: "m1 with the file lifetime", milestone: "m1", live: "1m"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			r := newGateM9Rig(t)
-			if tc.marker != "" {
+			switch tc.marker {
+			case "":
+			case "restoring":
+				r.write("build/gate/m9-svid-ttl.restoring", "")
+			default:
 				r.marker(tc.marker)
 			}
 			r.state("live-ttl", tc.live+"\n")
@@ -129,6 +134,9 @@ func TestGateM9Order(t *testing.T) {
 				t.Fatalf("step %d is out of order or missing (%v):\n%s", i, order, calls)
 			}
 		}
+		if scan := callAt(calls, "scan "); scan < order[4] || scan > order[5] {
+			t.Errorf("no token scan of Phase 0 between the switch and the first test:\n%s", calls)
+		}
 		runs := goRuns(calls)
 		if len(runs) != len(m9Tests) {
 			t.Fatalf("%d test runs, want %d:\n%s", len(runs), len(m9Tests), calls)
@@ -166,10 +174,10 @@ func TestGateM9Order(t *testing.T) {
 		runs  int
 		scans int
 	}{
-		{name: "a failure stops the run", env: []string{"STUB_FAIL_TESTS=TestM9OneWayPartitions"}, runs: 3, scans: 3},
-		{name: "a token stops the run", files: []string{"scan-hit"}, runs: 1, scans: 1},
-		{name: "an interrupt stops the run", env: []string{"STUB_INTERRUPT_TESTS=TestM9ConnectedRevocation"}, runs: 2, scans: 2},
-		{name: "a failed switch", files: []string{"svid-set-fail"}, runs: 0, scans: 0},
+		{name: "a failure stops the run", env: []string{"STUB_FAIL_TESTS=TestM9OneWayPartitions"}, runs: 3, scans: 4},
+		{name: "a token stops the run", files: []string{"scan-hit"}, runs: 0, scans: 1},
+		{name: "an interrupt stops the run", env: []string{"STUB_INTERRUPT_TESTS=TestM9ConnectedRevocation"}, runs: 2, scans: 3},
+		{name: "a failed switch", files: []string{"svid-set-fail"}, runs: 0, scans: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -177,10 +185,14 @@ func TestGateM9Order(t *testing.T) {
 			for _, f := range tc.files {
 				r.state(f, "")
 			}
+			r.write("build/gate-m9-TestM9IslandsHold.json", `{"Action":"pass","Test":"TestM9IslandsHold","Elapsed":1}`+"\n")
 			out, errOut, code := r.run("gate.sh", tc.env, "m9")
 			calls := r.calls()
-			if code == 0 {
-				t.Fatalf("exit 0, want a failure\nstdout %s\nstderr %s", out, errOut)
+			if code != 1 {
+				t.Fatalf("exit %d, want 1 after Phase 7\nstdout %s\nstderr %s", code, out, errOut)
+			}
+			if r.exists("build/gate-m9-TestM9IslandsHold.json") {
+				t.Error("the events file of an earlier run is still there, and it reads as a result of this run")
 			}
 			if n := len(goRuns(calls)); n != tc.runs {
 				t.Errorf("%d test runs, want %d:\n%s", n, tc.runs, calls)
@@ -280,6 +292,7 @@ func TestGateM9TtlFromEnvironment(t *testing.T) {
 		{name: "1m from the environment skips the switch", env: []string{"GATE_M9_SVID_TTL=1m"}},
 		{name: "30m from the environment", env: []string{"GATE_M9_SVID_TTL=30m"}, want: "svid-ttl set 30m"},
 		{name: "the file value", file: "2h", want: "svid-ttl set 2h", record: true},
+		{name: "1m with a marker that a test writes", env: []string{"GATE_M9_SVID_TTL=1m", "STUB_WRITE_MARKER=1"}, want: "svid-ttl restore"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -617,6 +630,7 @@ func TestGateM9RepairCheck(t *testing.T) {
 	}{
 		{"a cut", "gate-m9-cut-0a1b2c3d", func(r *m9Rig) { r.state("cuts", "dev-cp-control-plane gate-m9-cut-0a1b2c3d\n") }},
 		{"the marker", "build/gate/m9-svid-ttl", func(r *m9Rig) { r.marker("1h"); r.state("live-ttl", "1h\n") }},
+		{"a restore that did not settle", "build/gate/m9-svid-ttl.restoring", func(r *m9Rig) { r.write("build/gate/m9-svid-ttl.restoring", "") }},
 		{"a live lifetime with no marker", "agent_ttl '1h'", func(r *m9Rig) { r.state("live-ttl", "1h\n") }},
 		{"a revoked test cell", "dev-cell-2", func(r *m9Rig) { r.write("build/gate/m9-revoked", "dev-cell-2\n") }},
 		{"a held entry", "envd holds", func(r *m9Rig) { r.state("held", "dev-cell-1\n") }},

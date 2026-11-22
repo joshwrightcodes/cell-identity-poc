@@ -17,7 +17,8 @@
 # the label, and none with another prefix. It is safe to run again.
 #
 # Usage: gate-m9-repair.sh [--check]
-#   --check lists each cut, the marker, a live agent_ttl of dev-cp that differs from cells/dev-cp.env, the revoked test cells, the held and
+#   --check lists each cut, the marker, a restore that did not settle (build/gate/m9-svid-ttl.restoring), a live agent_ttl of dev-cp that
+#   differs from cells/dev-cp.env, the revoked test cells, the held and
 #   input local revocation entries, the m9- namespaces and the API server test key, and exits 1 with the repair command. It changes nothing.
 #   It exits 0 when it finds none.
 # GATE_M9_WAIT bounds each wait in seconds (default 600), and GATE_M9_POLL sets the seconds between two reads (default 10).
@@ -99,6 +100,8 @@ traces() {
   done <<<"$out"
   if [[ -e "$SVID_TTL_MARKER" ]]; then
     echo "the slow-tier marker build/gate/m9-svid-ttl holds $(tr -d '[:space:]' <"$SVID_TTL_MARKER"), so the SVID lifetime of dev-cp is not restored"
+  elif [[ -e "$SVID_TTL_MARKER.restoring" ]]; then
+    echo "build/gate/m9-svid-ttl.restoring exists, so a restore of the SVID lifetime of dev-cp did not settle"
   else
     live="$(svid_ttl_live)" || die "could not read agent_ttl of the SPIRE server config in dev-cp. Run: mise run harness:status"
     file="$(svid_ttl_file)"
@@ -161,7 +164,7 @@ wait_until "dev-cp is connected to management" is_connected \
 # Step 3: mgmtd adopts each held entry, and the next revision settles it.
 no_held() { local out; out="$(held_cells 2>/dev/null)" && [[ -z "$out" ]]; }
 wait_until "envd holds no local revocation entry" no_held \
-  || die "envd still holds local revocation entries for $(held_cells 2>/dev/null | paste -sd' ' -) after ${wait_seconds}s. Read the mirror with: mise run mgmt -- status"
+  || die "envd still holds local revocation entries for $(held_cells 2>/dev/null | paste -sd' ' -) after ${wait_seconds}s. Read the mirror with: mise run mgmt -- status. When mgmtd refuses an entry, the lifetime stays at the slow tier; restore it by hand with: mise run svid-ttl -- restore"
 
 # Step 4: the input entries.
 if [[ -x "$ROOT/scripts/revoke.sh" ]]; then

@@ -81,6 +81,9 @@ func TestKeepAwakeOnDarwinOnly(t *testing.T) {
 			if tc.caffeinate == 1 && !strings.Contains(calls, "caffeinate -ims bash "+filepath.Join(r.root, "scripts", "awake-probe.sh")+" a b") {
 				t.Errorf("caffeinate did not run the script with its arguments:\n%s", calls)
 			}
+			if tc.guard && !strings.Contains(errOut, "POC_KEEP_AWAKE=1") {
+				t.Errorf("stderr %q lacks the log line of a run that the guard skips", errOut)
+			}
 			if tc.uname != "Darwin" && !strings.Contains(errOut, "not macOS") {
 				t.Errorf("stderr %q lacks the log line of a host that is not macOS", errOut)
 			}
@@ -129,14 +132,16 @@ func TestBatteryRefused(t *testing.T) {
 	}
 }
 
-// TestMacOnlyToolsGuarded: no script calls caffeinate or pmset outside keep_awake and on_battery in scripts/lib.sh, and each of these two
-// functions checks uname -s and command -v before it calls its tool. A comment may name a tool.
+// TestMacOnlyToolsGuarded: no script, cell setting or mise task calls caffeinate or pmset outside keep_awake and on_battery in scripts/lib.sh,
+// and each of these two functions checks uname -s and command -v before it calls its tool. A comment may name a tool.
 func TestMacOnlyToolsGuarded(t *testing.T) {
 	t.Parallel()
 	tool := regexp.MustCompile(`\b(caffeinate|pmset)\b`)
 	files, _ := filepath.Glob("../../scripts/*.sh")
-	more, _ := filepath.Glob("../../components/*/*.sh")
-	files = append(files, more...)
+	for _, pattern := range []string{"../../components/*/*.sh", "../../harness/*", "../../cells/*.env", "../../mise.toml"} {
+		more, _ := filepath.Glob(pattern)
+		files = append(files, more...)
+	}
 	if len(files) < 10 {
 		t.Fatalf("found %d scripts", len(files))
 	}

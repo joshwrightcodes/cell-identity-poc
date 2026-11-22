@@ -1497,10 +1497,12 @@ svid_ttl_json() {
 # svid_ttl_settled <ttl> succeeds when every live, current agent of the SPIRE server of dev-cp has the lifetime <ttl>. The agent list of
 # spire-server gives the expiry of each agent SVID only (x509svid_expires_at, Unix seconds as a quoted string), so the check reads the time
 # that is left. An agent renews when about half its lifetime is left, so a live agent at <ttl> has 0.5 to 1 times <ttl> left. The check adds
-# 10 percent of <ttl> as margin at both ends: 0.4 to 1.1 times <ttl>. A banned agent and an expired entry do not count. The list keeps the
-# entry of a cluster_jwt agent after its pod is gone or its container restarted, so such an entry counts only while its pod exists in a
-# cluster that exists, and of the entries of one pod only the one with the least time left counts. An agent of another attestor keeps its ID
-# when it attests again. The present comes from the node dev-cp-control-plane. The check prints the reason on standard error when it fails.
+# 10 percent of <ttl> as margin at both ends: 0.4 to 1.1 times <ttl>, so it can tell two lifetimes apart only when one is 2.5 times the
+# other or more. A banned agent does not count. Both attestors take the agent ID from the pod UID (/spire/agent/cluster_jwt/<cell>/<pod
+# uid>/<hash>, and /spire/agent/k8s_psat/<cluster>/pod/<pod uid> with use_pod_uid_for_agent_id), and the list keeps the entry of an agent
+# after its pod is gone or its container restarted. So an entry counts only while its pod exists in a cluster that exists, and of the
+# entries of one pod only the live one with the least time left counts. A pod whose entries all expired holds an agent that is down, and
+# the check fails. The present comes from the node dev-cp-control-plane. The check prints the reason on standard error when it fails.
 svid_ttl_settled() {
   local ttl="${1:-}" want agents now clusters cells c pods uids='{}' verdict
   want="$(ttl_seconds "$ttl")" || { echo "'$ttl' is not a lifetime such as 1h" >&2; return 1; }
@@ -1512,7 +1514,7 @@ svid_ttl_settled() {
     return 1
   fi
   clusters="$(existing_clusters)" || { echo "could not list the clusters" >&2; return 1; }
-  cells="$(jq -r '[.agents[]? | .id.path // "" | capture("^/spire/agent/cluster_jwt/(?<cell>[a-z0-9][a-z0-9-]*)/").cell] | unique[]' <<<"$agents")" \
+  cells="$(jq -r '[.agents[]? | .id.path // "" | capture("^/spire/agent/(cluster_jwt|k8s_psat)/(?<cell>[a-z0-9][a-z0-9-]*)/").cell] | unique[]' <<<"$agents")" \
     || { echo "the agent list of the SPIRE server in dev-cp is no JSON" >&2; return 1; }
   for c in $cells; do
     grep -qx -- "$c" <<<"$clusters" || continue
@@ -1522,18 +1524,19 @@ svid_ttl_settled() {
   done
   verdict="$(jq -r --argjson now "$now" --argjson want "$want" --argjson uids "$uids" '
     def left: ((.x509svid_expires_at // 0) | tostring | tonumber) - $now;
-    [.agents[]? | select((.banned // false) | not) | left as $left | select($left > 0)
-      | (.id.path // "") as $p
-      | (($p | capture("^/spire/agent/cluster_jwt/(?<cell>[^/]+)/(?<uid>[^/]+)/")) // null) as $m
-      | if $m == null then {key: $p, left: $left}
-        elif any(($uids[$m.cell] // [])[]; . == $m.uid) then {key: "\($m.cell)/\($m.uid)", left: $left}
+    def pod: (capture("^/spire/agent/cluster_jwt/(?<cell>[^/]+)/(?<uid>[^/]+)/") | .key = "\(.cell)/\(.uid)")
+      // (capture("^/spire/agent/k8s_psat/(?<cell>[^/]+)/pod/(?<uid>[^/]+)$") | .key = "k8s_psat/\(.cell)/pod/\(.uid)") // null;
+    [.agents[]? | select((.banned // false) | not) | left as $left
+      | (.id.path // "") as $p | ($p | pod) as $m
+      | if $m == null then (select($left > 0) | {key: $p, left: $left})
+        elif any(($uids[$m.cell] // [])[]; . == $m.uid) then {key: $m.key, left: $left}
         else empty end]
-    | group_by(.key) | map(min_by(.left))
-    | map(select(.left > $want * 1.1 or .left < $want * 0.4)) as $bad
+    | group_by(.key) | map(if any(.[]; .left > 0) then (map(select(.left > 0)) | min_by(.left)) else {key: .[0].key, down: true} end)
+    | map(select(.down or .left > $want * 1.1 or .left < $want * 0.4)) as $bad
     | if length == 0 then "no live agent is listed by the SPIRE server in dev-cp"
       elif ($bad | length) == 0 then "ok"
       else "\($bad | length) of \(length) live agents have no SVID lifetime of \($want) s: "
-        + ($bad[:5] | map("\(.key) with \(.left) s left") | join(", ")) end' <<<"$agents")" \
+        + ($bad[:5] | map(if .down then "\(.key) with no SVID left, so its agent is down" else "\(.key) with \(.left) s left" end) | join(", ")) end' <<<"$agents")" \
     || { echo "the agent list of the SPIRE server in dev-cp is no JSON" >&2; return 1; }
   [[ "$verdict" != ok ]] || return 0
   echo "$verdict" >&2
@@ -1550,7 +1553,10 @@ keep_awake() {
     return 0
   fi
   command -v caffeinate >/dev/null 2>&1 || die "this Mac has no caffeinate on PATH, so it could sleep during the run. Put /usr/bin on PATH, then run the command again"
-  [[ "${POC_KEEP_AWAKE:-}" != 1 ]] || return 0
+  if [[ "${POC_KEEP_AWAKE:-}" == 1 ]]; then
+    log "POC_KEEP_AWAKE=1, so this run counts as one that keep_awake started. Unset it in the shell when no keep_awake started the run"
+    return 0
+  fi
   export POC_KEEP_AWAKE=1
   log "running $0 again under caffeinate, so the Mac stays awake. Keep the lid open"
   exec caffeinate -ims bash "$0" "$@"

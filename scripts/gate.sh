@@ -13,11 +13,11 @@
 # After the tests, m5, m5-soak, m5-drill, m6, m6-provision, m7 and m8 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: keep_awake, the battery check, gate-m6-repair.sh, gate-m7-repair.sh,
 # gate-m8-repair.sh and gate-m9-repair.sh with --check, the image check of m8 with agent-ban in spire-server-0 of dev-cp, cell-proxy of the
-# mesh-view tunnel in each cell and the three cell-proxy servers of management added, and svid-ttl.sh set at the slow-tier lifetime. Then each
-# M9 test in its own go test invocation with -failfast, its own events file build/gate-m9-<test>.json and a token scan from its own start. It
+# mesh-view tunnel in each cell and the three cell-proxy servers of management added, svid-ttl.sh set at the slow-tier lifetime, and a token
+# scan from the start of the gate. Then each M9 test in its own go test invocation with -failfast, its own events file build/gate-m9-<test>.json and a token scan from its own start. It
 # stops at the first failure. With -run in the go test arguments, it runs one invocation with that pattern (events in build/gate-m9-run.json).
-# Phase 7 runs from an EXIT trap, also after a failure or an interrupt: the token scan of an invocation that did not end, svid-ttl.sh restore
-# and harness:status. The lifetime is GATE_M9_SVID_TTL from the environment when set, else from harness/versions.env. A lifetime equal to
+# Phase 7 runs from an EXIT trap, also after a failure or an interrupt: the token scan of a step that did not end, svid-ttl.sh restore when the
+# switch ran or the marker or build/gate/m9-svid-ttl.restoring exists, and harness:status. The lifetime is GATE_M9_SVID_TTL from the environment when set, else from harness/versions.env. A lifetime equal to
 # cells/dev-cp.env skips the switch and the restore. A run with -run, or at a lifetime other than the one in harness/versions.env, prints
 # "not a slow-tier record". The -timeout of each invocation is GATE_M9_TEST_TIMEOUT_MINUTES as it stands, and the budget covers Phases 0 to 7.
 # Every other milestone refuses while build/gate/m9-svid-ttl exists, or while the live agent_ttl of dev-cp differs from cells/dev-cp.env.
@@ -73,10 +73,13 @@ if [[ "$milestone" != m1 ]]; then
 fi
 
 # A slow tier of gate:m9 sets a longer SVID lifetime in dev-cp. Every other gate needs the lifetime of cells/dev-cp.env, so it refuses while
-# the marker exists or while the live agent_ttl of dev-cp differs from that file.
+# the marker exists, while a restore has not settled (build/gate/m9-svid-ttl.restoring), or while the live agent_ttl of dev-cp differs from that
+# file.
 if [[ "$milestone" != m9 ]]; then
   [[ ! -e "$SVID_TTL_MARKER" ]] \
     || die "the slow-tier marker build/gate/m9-svid-ttl exists, so a slow tier runs or stopped early, and dev-cp has another SVID lifetime. Repair it with: mise run gate:m9:repair"
+  [[ ! -e "$SVID_TTL_MARKER.restoring" ]] \
+    || die "build/gate/m9-svid-ttl.restoring exists, so a restore of the SVID lifetime did not settle, and some SVIDs can still have the slow-tier lifetime. Repair it with: mise run gate:m9:repair"
   live_ttl="$(svid_ttl_live)" || die "could not read agent_ttl of the SPIRE server config in dev-cp. Run: mise run harness:status"
   file_ttl="$(svid_ttl_file)"
   [[ "$live_ttl" == "$file_ttl" ]] \
@@ -275,14 +278,17 @@ if [[ "$milestone" == m9 ]]; then
     if [[ -n "$m9_scan_from" ]]; then
       "$ROOT/scripts/gate-token-scan.sh" "$m9_scan_from" || { printf 'FAIL: gate m9 found a token in a log\n' >&2; m9_status=1; }
     fi
-    if ((switched)) || [[ -e "$SVID_TTL_MARKER" ]]; then
+    if ((switched)) || [[ -e "$SVID_TTL_MARKER" || -e "$SVID_TTL_MARKER.restoring" ]]; then
       "$ROOT/scripts/svid-ttl.sh" restore || { printf 'FAIL: gate m9 could not restore the SVID lifetime of dev-cp. Run: mise run gate:m9:repair\n' >&2; m9_status=1; }
     fi
     harness_status_settled || { printf 'FAIL: harness:status reports a bad value after gate m9. Read its problems, or run: mise run gate:m9:repair\n' >&2; m9_status=1; }
+    for _f in ${m9_events[@]+"${m9_events[@]}"}; do
+      [[ -f "$_f" ]] || log "the events file $_f is missing, so the durations leave out its test"
+    done
     if ((${#m9_events[@]} > 0)); then
       jq -Rrn '[inputs | fromjson? | select(.Test != null and (.Test | contains("/") | not) and (.Action == "pass" or .Action == "fail"))
         | {test: .Test, action: .Action, elapsed: .Elapsed}] | sort_by(-.elapsed)[] | "\(.elapsed)s \(.action) \(.test)"' "${m9_events[@]}" \
-        >"$BUILD_ROOT/gate-m9-durations.txt" 2>/dev/null
+        >"$BUILD_ROOT/gate-m9-durations.txt" 2>/dev/null || true
       log "the tests of gate m9 (every test is in $BUILD_ROOT/gate-m9-durations.txt):"
       cat "$BUILD_ROOT/gate-m9-durations.txt" >&2
     fi
@@ -313,13 +319,21 @@ if [[ "$milestone" == m9 ]]; then
     return 1
   }
 
+  # Bash runs a trap only after the foreground command ends. Ctrl-C reaches the whole process group, so go test ends at once. A signal to
+  # this process alone, for example kill -TERM <pid>, waits until the current go test invocation ends.
   trap m9_finish EXIT
   trap 'exit 130' INT TERM
+  # The events files of an earlier run would read as results of this run.
+  rm -f "$BUILD_ROOT"/gate-m9-*.json "$BUILD_ROOT/gate-m9-durations.txt"
+  # The token scan of Phase 0 covers the checks and the switch, which renders and rolls dev-cp. Phase 7 runs it when the switch fails.
+  m9_scan_from="$gate_started"
   if ((switched)); then
     "$ROOT/scripts/svid-ttl.sh" set "$svid_ttl" || die "the switch of the SVID lifetime of dev-cp to $svid_ttl failed"
   else
     log "the SVID lifetime $svid_ttl is the one of cells/dev-cp.env, so the switch is skipped"
   fi
+  "$ROOT/scripts/gate-token-scan.sh" "$m9_scan_from" || { m9_scan_from=""; die "gate m9 found a token in a log of Phase 0"; }
+  m9_scan_from=""
   if ((run_given)); then
     m9_invoke run "$@" || true
   else

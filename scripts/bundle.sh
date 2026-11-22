@@ -74,12 +74,12 @@ attach_sigstore() {
 # bundle. The inputs of the bundle of a component are the files and directories of components/<component> and components/lib (a deleted file changes its
 # directory), vendor/, scripts/lib.sh, scripts/hydrate.sh, scripts/ko-image.sh, cells/common.env, cells/<t>.env, internal/bundle/allow.json,
 # build/<t>/facts.env and build/images.env (IMAGES_ENV names another file). For dev-cp, the slow-tier marker build/gate/m9-svid-ttl and the stamp
-# build/gate/m9-svid-ttl.restored that svid-ttl.sh restore leaves count too, because the render of dev-cp reads the marker, and a marker that goes
+# build/gate/m9-svid-ttl.restoring of svid-ttl.sh restore count too, because the render of dev-cp reads the marker, and a marker that goes
 # leaves no file. Live facts that a render reads from a cluster are not files, so a change in them still needs cell:hydrate. A find that fails stops
 # the publish.
 check_build_fresh() {
   local entry c file i newer inputs slow=()
-  [[ "$CELL_NAME" != dev-cp ]] || slow=("$SVID_TTL_MARKER" "$SVID_TTL_MARKER.restored")
+  [[ "$CELL_NAME" != dev-cp ]] || slow=("$SVID_TTL_MARKER" "$SVID_TTL_MARKER.restoring")
   for entry in "${COMPONENTS[@]}"; do
     c="${entry%%:*}"
     file="$BUNDLES/$c/manifests.yaml"
