@@ -275,6 +275,7 @@ func (p *Puller) relayItems(ctx context.Context, items []gwapi.OutItem) {
 		res, err = p.postReports(lctx, b)
 		return err
 	}); err != nil {
+		p.tokens = min(MaxReportItems, p.tokens+float64(len(b.Items)))
 		p.logLimited(ctx, "report post failed", "reports", "error", clip(err.Error()))
 		return
 	}

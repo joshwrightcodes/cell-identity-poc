@@ -1068,3 +1068,68 @@ func (g *fakeGateway) syncTotal() int {
 	defer g.mu.Unlock()
 	return len(g.syncs)
 }
+
+func TestRelayThrottledItemsStayInTheOutbox(t *testing.T) {
+	r := newRig(t, 2)
+	var items []gwapi.OutItem
+	for i := range 100 {
+		items = append(items, outItem(hexID(i+1), gwapi.KindStatus, "a", `{}`))
+	}
+	r.gw.set(func(g *fakeGateway) { g.items = items })
+	r.mgmt.set(func(m *fakeMgmt) { m.decide = accepted })
+	r.run()
+	// Round 1 spends the burst. Round 2, 10 s later, holds 50 tokens for the same 100 items.
+	bodies := r.mgmt.bodies()
+	if len(bodies) != 2 {
+		t.Fatalf("%d report posts, want 2", len(bodies))
+	}
+	var b mgmtapi.ReportBatch
+	if err := json.Unmarshal(bodies[1], &b); err != nil {
+		t.Fatal(err)
+	}
+	_, acks := r.gw.seen()
+	if len(b.Items) != 50 || len(acks) != 2 || len(acks[1].Outcomes) != 50 {
+		t.Fatalf("round 2 sent %d items and acked %+v, want 50 of each", len(b.Items), acks)
+	}
+	held := map[string]bool{}
+	for _, it := range items[50:] {
+		held[string(it.ID)] = true
+	}
+	for _, it := range b.Items {
+		if held[it.ID] {
+			t.Fatalf("throttled item %s was sent", it.ID)
+		}
+	}
+	for _, o := range acks[1].Outcomes {
+		if held[o.ID] {
+			t.Fatalf("throttled item %s was acked, so the gateway would delete it", o.ID)
+		}
+	}
+}
+
+func TestRelayFailedPostReturnsTokens(t *testing.T) {
+	r := newRig(t, 2)
+	var items []gwapi.OutItem
+	for i := range 150 {
+		items = append(items, outItem(hexID(i+1), gwapi.KindStatus, "a", `{}`))
+	}
+	r.gw.set(func(g *fakeGateway) { g.items = items })
+	r.mgmt.set(func(m *fakeMgmt) { m.decide = accepted; m.repCode = 500 })
+	inner := r.cfg.Sleep
+	r.cfg.Sleep = func(ctx context.Context, d time.Duration) error {
+		r.mgmt.set(func(m *fakeMgmt) { m.repCode = 0 })
+		return inner(ctx, d)
+	}
+	r.run()
+	bodies := r.mgmt.bodies()
+	if len(bodies) == 0 {
+		t.Fatal("no report batch reached the management plane")
+	}
+	var b mgmtapi.ReportBatch
+	if err := json.Unmarshal(bodies[len(bodies)-1], &b); err != nil {
+		t.Fatal(err)
+	}
+	if len(b.Items) != MaxReportItems {
+		t.Fatalf("the round after a failed post sent %d items, want %d", len(b.Items), MaxReportItems)
+	}
+}

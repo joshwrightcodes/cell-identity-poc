@@ -109,9 +109,9 @@ const peekOrder = `CASE
 	ELSE 3
 END, seq`
 
-// Peek returns outbox items in the order of peekOrder, at most maxItems and about maxBytes of encoded items, and
-// never more than 100 items and 900 KiB. It always returns one item when the outbox has one. It
-// does not remove anything.
+// Peek returns outbox items in the order of peekOrder, at most maxItems and about maxBytes of
+// encoded items, and never more than 100 items and 900 KiB. It always returns one item when the
+// outbox has one. It does not remove anything.
 func (s *Store) Peek(ctx context.Context, maxItems, maxBytes int) ([]gwapi.OutItem, error) {
 	maxItems, maxBytes = min(maxItems, MaxPeekItems), min(maxBytes, MaxPeekBytes)
 	var out []gwapi.OutItem
