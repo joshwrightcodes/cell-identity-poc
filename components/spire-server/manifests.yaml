@@ -426,6 +426,45 @@ spec:
         - protocol: TCP
           port: 9988
 ---
+# The one flow of M9: container agent-ban sends OTLP to the collector of the cluster on 4317 (flow N11), and resolves the
+# Service name of the collector through the cluster DNS, because spire-system has no other DNS rule. The collector admits
+# spire-system through COLLECTOR_SENDERS. The render keeps this policy only with the ban container, so only with a live cell.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: spire-server-otlp
+  namespace: spire-system
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: spire-server
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: otel-collector
+      ports:
+        - protocol: TCP
+          port: 4317
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - ipBlock:
+            cidr: "@DNS_SERVICE_IP@/32"
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
 # Flow N9: the k8s_psat plugin reaches the API server for TokenReview and the pod and node reads.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

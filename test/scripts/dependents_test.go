@@ -883,3 +883,86 @@ func TestCheckHarnessObjectsAcceptsSigningPub(t *testing.T) {
 		})
 	}
 }
+
+// operatorObjectsKubectl serves the ConfigMaps of one namespace from $STUB_DIR/<namespace>.json, and the owned namespace of the
+// bundle with its harness label.
+const operatorObjectsKubectl = `#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+case "$args" in
+  *" get ConfigMap -o json --show-managed-fields "*)
+    ns="$(printf '%s\n' "$args" | sed -E 's/.* -n ([a-z-]+) .*/\1/')"
+    cat "$STUB_DIR/$ns.json" ;;
+  *" get Namespace -l cell.poc.internal/harness="*)
+    comp="${args##*harness=}"; comp="${comp%% *}"
+    echo "{\"items\":[{\"metadata\":{\"name\":\"$STUB_NS\",\"labels\":{\"cell.poc.internal/harness\":\"$comp\"},\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]}}]}" ;;
+  *" get namespace $STUB_NS -o json --show-managed-fields "*)
+    echo "{\"metadata\":{\"name\":\"$STUB_NS\",\"labels\":{\"cell.poc.internal/harness\":\"$STUB_COMP\"},\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]}}" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`
+
+// TestCheckHarnessObjectsAcceptsOperatorObjects: the operator script writes ConfigMap mgmt-system/operator-pub in management and
+// envd-system/local-revocations in dev-cp with the field manager operator and no harness label. check_harness_objects accepts each
+// as a runtime object of its component, and flags it when another manager wrote it. mgmt-system/operator-key is an object of the
+// mgmt-api bundle with the harness label, so it needs no runtime case.
+func TestCheckHarnessObjectsAcceptsOperatorObjects(t *testing.T) {
+	testtool.Need(t, "yq", "jq", "bash")
+	own := func(name, comp string) string {
+		return `{"metadata":{"name":"` + name + `","labels":{"cell.poc.internal/harness":"` + comp + `"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]}}`
+	}
+	written := func(name, manager string) string {
+		return `{"metadata":{"name":"` + name + `","managedFields":[{"manager":"` + manager + `","operation":"Update"}]}}`
+	}
+	for _, tc := range []struct {
+		name, cluster, comp, ns, object, manager, want string
+		bundled                                       []string
+	}{
+		{"operator-pub", "management", "mgmt-api", "mgmt-system", "operator-pub", "operator", "", []string{"mgmt-intent", "operator-key"}},
+		{"operator-pub of another manager", "management", "mgmt-api", "mgmt-system", "operator-pub", "kubectl-edit", "operator-pub", []string{"mgmt-intent", "operator-key"}},
+		{"local-revocations", "dev-cp", "envd", "envd-system", "local-revocations", "operator", "", []string{"operator-key"}},
+		{"local-revocations of another manager", "dev-cp", "envd", "envd-system", "local-revocations", "kubectl-edit", "local-revocations", []string{"operator-key"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(operatorObjectsKubectl), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			items := []string{written(tc.object, tc.manager)}
+			bundle := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + tc.ns + "\n"
+			for _, b := range tc.bundled {
+				items = append(items, own(b, tc.comp))
+				bundle += "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + b + "\n  namespace: " + tc.ns + "\n"
+			}
+			if err := os.WriteFile(filepath.Join(dir, tc.ns+".json"), []byte(`{"items":[`+strings.Join(items, ",")+`]}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			bdir := filepath.Join(dir, "build", tc.cluster, "bundles", tc.comp)
+			if err := os.MkdirAll(bdir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bdir, "manifests.yaml"), []byte(bundle), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lib, err := filepath.Abs("../../scripts/lib.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects "$2" "$3"`, "_", lib, tc.comp, tc.ns)
+			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+				"CELL=" + tc.cluster, "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_DIR=" + dir, "STUB_NS=" + tc.ns, "STUB_COMP=" + tc.comp}
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			err = cmd.Run()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("check failed: %v\n%s", err, out.String())
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("err %v, output %q; want a failure that names %s", err, out.String(), tc.want)
+			}
+		})
+	}
+}

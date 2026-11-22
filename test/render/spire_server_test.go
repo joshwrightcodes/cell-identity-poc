@@ -1093,7 +1093,7 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	got := docs(t, strings.ReplaceAll(r.stdout, r.digest, stubDigest))
 	m2 := docs(t, string(want))
 	for _, key := range []string{"ClusterRole/spire-server-psat", "ClusterRoleBinding/spire-server-psat", "NetworkPolicy/spire-server-api", "NetworkPolicy/spire-server-metrics",
-		"Role/spire-server-hints", "RoleBinding/spire-server-hints"} {
+		"Role/spire-server-hints", "RoleBinding/spire-server-hints", "NetworkPolicy/spire-server-otlp"} {
 		if _, ok := got[key]; !ok {
 			t.Fatalf("render has no %s", key)
 		}
@@ -1718,6 +1718,48 @@ func TestAgentBanContainer(t *testing.T) {
 			if get[string](t, c, "name") == "agent-ban" {
 				t.Fatal("the pod holds agent-ban with no live cell, and server.conf has no cluster_jwt plugin for it to read")
 			}
+		}
+	})
+}
+
+// TestSpireServerOTLPFlow: container agent-ban sends OTLP to the collector of its cluster, the one network flow that M9 adds. With a
+// live cell, NetworkPolicy spire-server-otlp lets the server pod reach the collector pod on TCP 4317, and the cluster DNS on 53,
+// because the endpoint is a Service name and spire-system has no other DNS rule. The collector of dev-cp admits spire-system as an
+// OTLP sender (COLLECTOR_SENDERS). With no live cell, the pod has no ban container and the render prints no such policy.
+func TestSpireServerOTLPFlow(t *testing.T) {
+	r := renderCell(t, "dev-cp")
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := docs(t, hydrated(r.stdout, "dev-cp"))
+	np := objs["NetworkPolicy/spire-server-otlp"]
+	if np == nil {
+		t.Fatalf("no NetworkPolicy spire-server-otlp in %v", keysOfObjects(objs))
+	}
+	if got := fmt.Sprint(lookupOr(np, "spec", "podSelector"), lookupOr(np, "spec", "policyTypes")); got != "map[matchLabels:map[app.kubernetes.io/name:spire-server]] [Egress]" {
+		t.Errorf("spire-server-otlp selects %s, want the server pod and egress only", got)
+	}
+	want := "[map[ports:[map[port:4317 protocol:TCP]] to:[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]] " +
+		"map[ports:[map[port:53 protocol:UDP] map[port:53 protocol:TCP]] to:[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:kube-system]] podSelector:map[matchLabels:map[k8s-app:kube-dns]]] map[ipBlock:map[cidr:10.111.0.10/32]]]]]"
+	if got := fmt.Sprint(lookupOr(np, "spec", "egress")); got != want {
+		t.Errorf("spire-server-otlp egress is\n%s\nwant\n%s", got, want)
+	}
+	pod := get[map[string]any](t, objs["StatefulSet/spire-server"], "spec", "template", "spec")
+	ban := named(t, get[[]any](t, pod, "containers"), "agent-ban")
+	if got := envOf(t, ban)["OTEL_EXPORTER_OTLP_ENDPOINT"]; got != "http://otel-collector.observability-system.svc.cluster.local:4317" {
+		t.Errorf("agent-ban sends OTLP to %q, want the collector Service on 4317", got)
+	}
+	if !slices.Contains(strings.Fields(cellEnv(t, "dev-cp", "COLLECTOR_SENDERS")), "spire-system") {
+		t.Errorf("COLLECTOR_SENDERS of dev-cp is %q, want spire-system, so the collector admits agent-ban", cellEnv(t, "dev-cp", "COLLECTOR_SENDERS"))
+	}
+
+	t.Run("no live cell", func(t *testing.T) {
+		r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		if _, ok := docs(t, hydrated(r.stdout, "dev-cp"))["NetworkPolicy/spire-server-otlp"]; ok {
+			t.Error("the render prints spire-server-otlp with no ban container")
 		}
 	})
 }

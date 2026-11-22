@@ -3,7 +3,8 @@
 #
 # ConfigMap mgmt-system/operator-pub in management is the source of every pin: key spec.pub, key next.pub during a rotation only,
 # and key spec.name. The pins in a cluster are key keys.pub of ConfigMaps envd-system/operator-key and gateway-system/operator-key,
-# one standard base64 key on each line, and operator_public_keys in server.conf of ConfigMap spire-system/spire-server.
+# one standard base64 key on each line, and operator_public_keys in server.conf of ConfigMap spire-system/spire-server. mgmtd reads
+# key keys.pub of ConfigMap mgmt-system/operator-key in management, the copy of operator-pub that the mgmt-api render writes.
 
 OPERATOR_KEY_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
@@ -47,21 +48,24 @@ operator_keys_of() {
   [[ -z "$next" ]] || printf '%s\n' "$next"
 }
 
-# operator_pin_name <cluster> <envd|gateway|server> prints the name of one pin, as the operator scripts report it.
+# operator_pin_name <cluster> <envd|gateway|server|mgmtd> prints the name of one pin, as the operator scripts report it.
 operator_pin_name() {
   case "$2" in
     envd | gateway) printf '%s %s-system/operator-key\n' "$1" "$2" ;;
+    mgmtd) printf '%s mgmt-system/operator-key\n' "$1" ;;
     server) printf '%s spire-system/spire-server operator_public_keys\n' "$1" ;;
   esac
 }
 
-# operator_pin <cluster> <envd|gateway|server> prints the keys of one pin in the cluster, sorted and joined with commas. It prints
-# nothing when the pin is absent. A failed read returns 1.
+# operator_pin <cluster> <envd|gateway|server|mgmtd> prints the keys of one pin in the cluster, sorted and joined with commas. It
+# prints nothing when the pin is absent. A failed read returns 1.
 operator_pin() {
-  local cm
+  local cm ns
   case "$2" in
-    envd | gateway)
-      cm="$(kubectl --context "kind-$1" -n "$2-system" get configmap operator-key --ignore-not-found -o json)" || return 1
+    envd | gateway | mgmtd)
+      ns="$2-system"
+      [[ "$2" != mgmtd ]] || ns=mgmt-system
+      cm="$(kubectl --context "kind-$1" -n "$ns" get configmap operator-key --ignore-not-found -o json)" || return 1
       printf '%s' "$cm" | jq -r '.data["keys.pub"] // "" | split("\n") | map(select(length > 0)) | sort | join(",")'
       ;;
     server)
@@ -71,6 +75,19 @@ operator_pin() {
       ;;
     *) return 1 ;;
   esac
+}
+
+# operator_server_pin <cluster> prints "none" when server.conf of ConfigMap spire-system/spire-server exists and holds no cluster_jwt
+# NodeAttestor. The render drops that section, and operator_public_keys with it, while no cell is live, so the server pins no key.
+# Otherwise it prints "pinned", also for an absent ConfigMap, which then counts as an absent pin. A failed read returns 1.
+operator_server_pin() {
+  local cm
+  cm="$(kubectl --context "kind-$1" -n spire-system get configmap spire-server --ignore-not-found -o json)" || return 1
+  if [[ -n "$cm" ]] && printf '%s' "$cm" | jq -e '.data["server.conf"] // "" | test("(?m)^[ \t]*NodeAttestor[ \t]+\"cluster_jwt\"") | not' >/dev/null; then
+    echo none
+  else
+    echo pinned
+  fi
 }
 
 # operator_connected succeeds when the environment is connected: mgmtd received a status report of envd within 2 minutes, by the

@@ -2,6 +2,7 @@ package render
 
 import (
 	"crypto/sha256"
+	"fmt"
 	"encoding/hex"
 	"os"
 	"path/filepath"
@@ -365,6 +366,51 @@ func TestPeerRootConfigMapFailsClosed(t *testing.T) {
 			r := peerRoot(t, tc.env)
 			if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
 				t.Fatalf("err %v, stdout %q, stderr %q; want a failure that says %q", r.err, r.stdout, r.stderr, tc.want)
+			}
+		})
+	}
+}
+
+// TestSpireAgentStartupProbe: after an island heals, a cluster_jwt agent attests again and its socket appears only after the
+// attestation (Task 2 live finding N2: the liveness probe killed bootstrapping agents 33 to 65 s after the start). The spire-agent
+// container of both modes has a startup probe on the same health check, which holds off the liveness and readiness probes for at
+// least 90 s. The liveness probe keeps its settings.
+func TestSpireAgentStartupProbe(t *testing.T) {
+	input := strings.NewReplacer("otel-uplink", "argocd-agent", "observability-system", "argocd").Replace(planeWorkload)
+	for _, tc := range []struct {
+		name string
+		r    func(t *testing.T) (result, string, string)
+	}{
+		{"cluster_jwt", func(t *testing.T) (result, string, string) {
+			return sidecar(t, "argocd-agent", "cluster_jwt", input,
+				"SPIRE_SIDECAR_SERVER_ADDRESS=10.9.0.9", "SPIRE_SIDECAR_SERVER_PORT=30091", "SPIRE_SIDECAR_TRUST_DOMAIN=test.env.poc.internal",
+				"SPIRE_SIDECAR_CELL=@CELL_NAME@", "SPIRE_SIDECAR_BUNDLE="+caPEM(t, "test.env.poc.internal"), "CELL_NAME=dev-cell-1"), "argocd", "Deployment/argocd-agent"
+		}},
+		{"k8s_psat", func(t *testing.T) (result, string, string) {
+			return sidecar(t, "otel-uplink", "k8s_psat", planeWorkload, append(slices.Clone(psatSidecarEnv), "SPIRE_SIDECAR_BUNDLE="+caPEM(t, "mgmt.poc.internal"))...),
+				"observability-system", "Deployment/otel-uplink"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ns, key := tc.r(t)
+			if r.err != nil {
+				t.Fatalf("helper failed: %v\n%s", r.err, r.stderr)
+			}
+			agent := named(t, get[[]any](t, docsIn(t, r.stdout, ns)[key], "spec", "template", "spec", "containers"), "spire-agent")
+			sp, ok := agent["startupProbe"].(map[string]any)
+			if !ok {
+				t.Fatalf("spire-agent has no startupProbe: %v", agent)
+			}
+			if got := fmt.Sprint(lookupOr(sp, "exec", "command")); got != "[/opt/spire/bin/spire-agent healthcheck -socketPath /run/spire/agent/agent.sock]" {
+				t.Errorf("the startup probe runs %s, want the health check of the Workload API socket", got)
+			}
+			period, _ := sp["periodSeconds"].(float64)
+			threshold, _ := sp["failureThreshold"].(float64)
+			if period*threshold < 90 {
+				t.Errorf("the startup probe allows %v s (period %v, threshold %v), want at least 90 s", period*threshold, period, threshold)
+			}
+			if got := fmt.Sprint(lookupOr(agent, "livenessProbe")); got != "map[exec:map[command:[/opt/spire/bin/spire-agent healthcheck -shallow -socketPath /run/spire/agent/agent.sock]] initialDelaySeconds:30 periodSeconds:30 timeoutSeconds:5]" {
+				t.Errorf("the liveness probe is %s, want its settings unchanged", got)
 			}
 		})
 	}

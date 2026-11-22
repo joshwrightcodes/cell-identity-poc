@@ -13,7 +13,8 @@
 #     reloads them while the server runs. operator_public_keys holds the operator keys, from ConfigMap
 #     mgmt-system/operator-pub in management, through the pin guard operator_pub_keys (components/lib/operator-key.sh). They
 #     verify the local revocations that envd writes into the same ConfigMap. Container agent-ban of the server pod reads
-#     this server.conf and bans the agents of each cell that the plugin refuses. ConfigMap spire-entries gets two
+#     this server.conf and bans the agents of each cell that the plugin refuses, and NetworkPolicy spire-server-otlp lets it send
+#     OTLP to the collector and resolve its name (DNS_SERVICE_IP from the cluster facts). ConfigMap spire-entries gets two
 #     ClusterStaticEntry manifests for each subject of each cell: a node alias
 #     spiffe://<td>/cell/<cell>/agents/<role> that matches only the attested agents of that cell and
 #     ServiceAccount, and the ID spiffe://<td>/cell/<cell>/<role> under that alias, for each cell of the
@@ -147,6 +148,8 @@ if ((${#cells[@]} > 0)); then
   done
 fi
 if ((${#live[@]} > 0)); then
+  : "${DNS_SERVICE_IP:?}"
+  [[ "$DNS_SERVICE_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "DNS_SERVICE_IP '$DNS_SERVICE_IP' is not an IPv4 address"
   sections+=(cluster_jwt)
   mgmt_pub="$(mgmt_signing_pub)" || exit 1
   operator_keys="$(operator_pub_keys "$CELL_NAME")" || exit 1
@@ -243,6 +246,7 @@ edits=""
 if ((${#live[@]} == 0)); then
   drop_volumes+=(plugins records)
   edits+=" | del($pod.initContainers) | del($pod.containers[] | select(.name == \"agent-ban\"))"
+  drop_objects+=("NetworkPolicy/spire-server-otlp")
   edits+=" | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
 fi
 if [[ "$upstream" != disk ]]; then
@@ -278,6 +282,6 @@ ENTRIES="$entries" WORKLOAD_PEERS="$workload_peers" API_PEERS="$api_peers" API_P
   $edits
 " "$here/manifests.yaml" \
   | yq "$keep_objects" \
-  | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_image|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|" -e "s|@API_SERVICE_IP@|${API_SERVICE_IP:-}|"
+  | sed -e "s|@SPIRE_PLUGIN_IMAGE@|$plugin_image|" -e "s|@SPIRE_CONFIG_CHECKSUM@|$config_checksum|" -e "s|@API_SERVICE_IP@|${API_SERVICE_IP:-}|" -e "s|@DNS_SERVICE_IP@|${DNS_SERVICE_IP:-}|"
 echo "---"
 echo "$config_maps"

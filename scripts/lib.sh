@@ -1216,6 +1216,9 @@ check_plane_pods() {
 # The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
 # manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
+# The sixth case: the operator script on this Mac (scripts/operator-key.sh) writes ConfigMap mgmt-system/operator-pub, and the
+# revoke tasks write ConfigMap envd-system/local-revocations in dev-cp, each with the field manager operator, no harness label and
+# no marker. The copy mgmt-system/operator-key is an object of the mgmt-api bundle, so it needs no case.
 # runtime_objects prints one case object, or a JSON list of cases when a namespace holds writers that differ. An object is a
 # runtime object when it fits one case.
 runtime_objects() {
@@ -1226,7 +1229,8 @@ runtime_objects() {
     return
   fi
   if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
-    jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
+    jq -cn '[{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}},
+      {names: "^operator-pub$", managers: ["operator"], labels: []}]'
     return
   fi
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
@@ -1237,7 +1241,8 @@ runtime_objects() {
   fi
   if [[ "$1" == envd && "$2" == envd-system && "$3" == ConfigMap ]]; then
     jq -cn '[{names: "^bundle-state$", managers: ["envd", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
-      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}},
+      {names: "^local-revocations$", managers: ["operator"], labels: []}]'
     return
   fi
   if [[ "$1:$2" =~ ^(central-view:central-view-system|telemetry-gateway:observability-system|mesh-view-hub:mesh-view-system)$ && "$3" == ConfigMap ]]; then
@@ -1372,6 +1377,11 @@ pem_der_sha256() {
 # A cell exists only through a signed step, so the rows of a cell and of management go through the portal. The
 # rows of management and dev-cp name the live cells: the cells whose cluster exists now. No step waits until every
 # cell is bound, except the portal wait that the rows name.
+# Roll order after an image change: mgmtd and the cell gateway refuse a member of an envd report that they do not know, so they
+# must run the new images before envd sends a new member. The row of dev-cp runs the cell:up of dev-cp, which rolls envd before the
+# cell gateway, and then the link of mgmt-api. That order is safe only while envd reports no new member, for example while it holds
+# no local revocation entry. Otherwise run CELL=management LINK_ONLY=mgmt-api mise run cell:link and
+# CELL=dev-cp HARNESS_ONLY=cell-gateway mise run cell:up first.
 dependents_of() {
   local cell catalog live args=""
   # The catalog is the list of cells that dev-cp admits.

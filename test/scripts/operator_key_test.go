@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -72,8 +74,8 @@ if [[ -n "${STUB_READ_OTHER:-}" ]]; then cat "$STUB_DIR/secrets/other"; exit 0; 
 cat "$STUB_DIR/secrets/$(printf '%s' "$1" | tr / _)"
 `
 
-// opKubectl plays the ConfigMaps of management and dev-cp. Each one is the file $STUB_DIR/k/<context>/<namespace>/<name>.json. It
-// answers get, create -f - and replace -f -, records each call, and records each write with its data. Each write raises
+// opKubectl plays the ConfigMaps of management and dev-cp. Each one is the file $STUB_DIR/k/<context>/<namespace>/<name>.json, and
+// a pod is the file pod-<name>.json there. It answers get, create -f - and replace -f -, records each call, and records each write with its data. Each write raises
 // metadata.resourceVersion, and a replace whose body names another resourceVersion fails with a conflict, as the API server does. A
 // write with -o json prints the stored object. STUB_DOWN names the contexts whose API does not answer, and STUB_PIN_WRITE_FAIL fails
 // every write.
@@ -93,8 +95,9 @@ done
 set -- "${rest[@]}"
 case "$1" in
   get)
-    [[ "$2" == configmap && " $* " == *" -o json "* ]] || { echo "unexpected kubectl get: $*" >&2; exit 2; }
+    [[ ("$2" == configmap || "$2" == pod) && " $* " == *" -o json "* ]] || { echo "unexpected kubectl get: $*" >&2; exit 2; }
     f="$STUB_DIR/k/$ctx/$ns/$3.json"
+    [[ "$2" != pod ]] || f="$STUB_DIR/k/$ctx/$ns/pod-$3.json"
     if [[ -f "$f" ]]; then cat "$f"
     elif [[ " $* " == *" --ignore-not-found "* ]]; then :
     else echo "Error from server (NotFound): configmaps \"$3\" not found" >&2; exit 1; fi ;;
@@ -139,7 +142,10 @@ esac
 
 // opMise stands in for mise. operatorctl runs the real binary. mgmt -- status prints $STUB_DIR/mgmt-status.json, or an error line
 // under STUB_MGMT_DOWN. cell:up of dev-cp runs the pin helper of components/lib/operator-key.sh, as the renders do, and writes its
-// key lines into the three pins of dev-cp. cell:link and cell:verify record their call, and cell:verify records the pin of envd.
+// key lines into the three pins of dev-cp. STUB_NO_LIVE_CELL makes that server.conf hold no cluster_jwt section, as the render does
+// with no live cell. cell:link of mgmt-api copies the keys of operator-pub into mgmt-system/operator-key, as the mgmt-api render
+// does, and sets the checksum annotation of the restarted pod mgmtd-0. STUB_LINK_NO_PIN skips the copy, and STUB_LINK_NO_RESTART
+// keeps the old pod. cell:verify records its call and the pin of envd.
 // STUB_VERIFY_FAIL names the clusters whose verify fails. STUB_TAMPER makes the first verify of dev-cp raise the resourceVersion of
 // operator-pub, as a writer during the rotation does.
 const opMise = `#!/usr/bin/env bash
@@ -166,9 +172,23 @@ case "$task" in
     kput kind-dev-cp envd-system operator-key "$(jq -nc --arg k "$lines" '{"keys.pub": ($k + "\n")}')"
     kput kind-dev-cp gateway-system operator-key "$(jq -nc --arg k "$lines" '{"keys.pub": ($k + "\n")}')"
     list="$(printf '%s\n' "$keys" | jq -Rr '"\"" + . + "\""' | paste -sd, - | sed 's/,/, /g')"
-    kput kind-dev-cp spire-system spire-server "$(jq -nc --arg l "$list" '{"server.conf": ("plugins {\n  NodeAttestor \"cluster_jwt\" {\n    plugin_data {\n      operator_public_keys = [" + $l + "]\n    }\n  }\n}\n")}')"
+    if [[ -n "${STUB_NO_LIVE_CELL:-}" ]]; then
+      kput kind-dev-cp spire-system spire-server '{"server.conf": "plugins {\n  NodeAttestor \"k8s_psat\" {\n    plugin_data {}\n  }\n}\n"}'
+    else
+      kput kind-dev-cp spire-system spire-server "$(jq -nc --arg l "$list" '{"server.conf": ("plugins {\n  NodeAttestor \"cluster_jwt\" {\n    plugin_data {\n      operator_public_keys = [" + $l + "]\n    }\n  }\n}\n")}')"
+    fi
     echo "render dev-cp pins=$(printf '%s\n' "$keys" | paste -sd, -)" >>"$STUB_DIR/calls" ;;
-  cell:link) [[ "$CELL $LINK_ONLY" == "management mgmt-api" ]] || { echo "unexpected cell:link: $CELL $LINK_ONLY" >&2; exit 2; } ;;
+  cell:link)
+    [[ "$CELL $LINK_ONLY" == "management mgmt-api" ]] || { echo "unexpected cell:link: $CELL $LINK_ONLY" >&2; exit 2; }
+    source "$STUB_REPO/components/lib/operator-key.sh"
+    keys="$(operator_keys_of "$(operator_pub_cm)")" || exit 1
+    lines="$(printf '%s\n' "$keys")"
+    [[ -n "${STUB_LINK_NO_PIN:-}" ]] || kput kind-management mgmt-system operator-key "$(jq -nc --arg k "$lines" '{"keys.pub": ($k + "\n")}')"
+    if [[ -z "${STUB_LINK_NO_RESTART:-}" ]]; then
+      sum="$(printf '%s\n' "$keys" | shasum -a 256 | cut -d' ' -f1)"
+      jq -nc --arg s "$sum" '{metadata: {name: "mgmtd-0", annotations: {"poc.internal/operator-key-sha256": $s}}}' >"$STUB_DIR/k/kind-management/mgmt-system/pod-mgmtd-0.json"
+    fi
+    echo "render management pins=$(printf '%s\n' "$keys" | paste -sd, -)" >>"$STUB_DIR/calls" ;;
   cell:verify)
     pins="$(jq -r '.data["keys.pub"]' "$STUB_DIR/k/kind-dev-cp/envd-system/operator-key.json" | paste -sd, -)"
     echo "verify $CELL pins=$pins" >>"$STUB_DIR/calls"
@@ -308,6 +328,20 @@ func (r *opRig) installKey(k ed25519.PrivateKey, name string) {
 		r.t.Fatal(err)
 	}
 	r.pinDevCP(opPub(k))
+	r.pinMgmtd(opPub(k))
+}
+
+// pinMgmtd writes the copy of the operator keys that mgmtd reads, ConfigMap mgmt-system/operator-key in management, and the
+// checksum annotation of the pod mgmtd-0 that runs with it.
+func (r *opRig) pinMgmtd(keys ...string) {
+	r.t.Helper()
+	lines := strings.Join(keys, "\n") + "\n"
+	r.put("kind-management", "mgmt-system", "operator-key", map[string]string{"keys.pub": lines})
+	sum := sha256.Sum256([]byte(lines))
+	b, _ := json.Marshal(map[string]any{"metadata": map[string]any{"name": "mgmtd-0", "annotations": map[string]string{"poc.internal/operator-key-sha256": hex.EncodeToString(sum[:])}}})
+	if err := os.WriteFile(filepath.Join(r.stub, "k", "kind-management", "mgmt-system", "pod-mgmtd-0.json"), b, 0o644); err != nil {
+		r.t.Fatal(err)
+	}
 }
 
 func (r *opRig) env(extra ...string) []string {
@@ -625,7 +659,7 @@ func TestCheckMatches(t *testing.T) {
 			}
 			res := oneJSON(t, out)
 			if res["match"] != true || res["keySHA256"] != opSHA(k) || res["keyName"] != "poc/operator/20261120T093000Z" ||
-				res["operatorPub"] != true || res["envd"] != true || res["gateway"] != true || res["serverConf"] != true {
+				res["operatorPub"] != true || res["envd"] != true || res["gateway"] != true || res["serverConf"] != true || res["mgmtd"] != true {
 				t.Fatalf("check printed %v, want match true with every pin true", res)
 			}
 			if withEnv && res["keyEnv"] != true {
@@ -674,6 +708,19 @@ func TestCheckFindsSwappedPin(t *testing.T) {
 		{"server_conf", "serverConf", "dev-cp spire-system/spire-server operator_public_keys", func(r *opRig, o string) {
 			r.put("kind-dev-cp", "spire-system", "spire-server", map[string]string{"server.conf": "plugins {\n  NodeAttestor \"cluster_jwt\" {\n    plugin_data {\n      operator_public_keys = [\"" + o + "\"]\n    }\n  }\n}\n"})
 		}},
+		{"server_conf_no_keys", "serverConf", "dev-cp spire-system/spire-server operator_public_keys", func(r *opRig, _ string) {
+			r.put("kind-dev-cp", "spire-system", "spire-server", map[string]string{"server.conf": "plugins {\n  NodeAttestor \"cluster_jwt\" {\n    plugin_data {}\n  }\n}\n"})
+		}},
+		{"mgmtd", "mgmtd", "management mgmt-system/operator-key", func(r *opRig, o string) {
+			r.put("kind-management", "mgmt-system", "operator-key", map[string]string{"keys.pub": o + "\n"})
+		}},
+		{"mgmtd_added_key", "mgmtd", "management mgmt-system/operator-key", func(r *opRig, o string) {
+			d := r.data("kind-management", "mgmt-system", "operator-key")
+			r.put("kind-management", "mgmt-system", "operator-key", map[string]string{"keys.pub": d["keys.pub"] + o + "\n"})
+		}},
+		{"mgmtd_absent", "mgmtd", "management mgmt-system/operator-key", func(r *opRig, _ string) {
+			os.Remove(filepath.Join(r.stub, "k", "kind-management", "mgmt-system", "operator-key.json"))
+		}},
 		{"operator_pub", "operatorPub", "management mgmt-system/operator-pub", func(r *opRig, o string) {
 			d := r.data("kind-management", "mgmt-system", "operator-pub")
 			d["spec.pub"] = o
@@ -708,7 +755,7 @@ func TestCheckFindsSwappedPin(t *testing.T) {
 			if res["match"] != false || res[tc.field] != false {
 				t.Fatalf("check printed %v, want match false and %s false", res, tc.field)
 			}
-			for _, f := range []string{"operatorPub", "envd", "gateway", "serverConf", "keyEnv"} {
+			for _, f := range []string{"operatorPub", "envd", "gateway", "serverConf", "mgmtd", "keyEnv"} {
 				if f != tc.field && res[f] != true {
 					t.Errorf("check printed %v, want %s true", res, f)
 				}
@@ -799,7 +846,8 @@ func TestRotateOverlapOrder(t *testing.T) {
 	both := opPub(old) + "," + opPub(k)
 	steps := []string{
 		"mise run cell:up CELL=dev-cp LINK_ONLY= ACCEPT=1", "render dev-cp pins=" + both,
-		"mise run cell:link CELL=management LINK_ONLY=mgmt-api ACCEPT=1",
+		"mise run cell:link CELL=management LINK_ONLY=mgmt-api ACCEPT=1", "render management pins=" + both,
+		"kubectl --context kind-management -n mgmt-system get pod mgmtd-0",
 		"verify dev-cp pins=" + both, "verify management pins=" + both,
 	}
 	at := idx[0]
@@ -810,7 +858,8 @@ func TestRotateOverlapOrder(t *testing.T) {
 	}
 	at = idx[1]
 	for _, s := range []string{"mise run cell:up CELL=dev-cp LINK_ONLY= ACCEPT=1", "render dev-cp pins=" + opPub(k),
-		"mise run cell:link CELL=management LINK_ONLY=mgmt-api ACCEPT=1", "verify dev-cp pins=" + opPub(k), "verify management pins=" + opPub(k)} {
+		"mise run cell:link CELL=management LINK_ONLY=mgmt-api ACCEPT=1", "render management pins=" + opPub(k),
+		"kubectl --context kind-management -n mgmt-system get pod mgmtd-0", "verify dev-cp pins=" + opPub(k), "verify management pins=" + opPub(k)} {
 		if at = opCallAt(calls, at, s); at < 0 {
 			t.Fatalf("calls %q: want %q after the switch", calls, s)
 		}
@@ -843,7 +892,7 @@ func TestRotateEmergencySingleKey(t *testing.T) {
 		t.Fatalf("operator-pub writes %v, want one write of the new key alone", data)
 	}
 	for _, c := range calls {
-		if strings.HasPrefix(c, "render ") && c != "render dev-cp pins="+opPub(k) {
+		if strings.HasPrefix(c, "render ") && c != "render dev-cp pins="+opPub(k) && c != "render management pins="+opPub(k) {
 			t.Fatalf("calls %q: render %q, want the new key alone", calls, c)
 		}
 	}
@@ -1045,7 +1094,7 @@ func TestRotateEmergencyWithoutOldKey(t *testing.T) {
 				t.Fatalf("operator-pub holds %v, want the new key alone", d)
 			}
 			for _, c := range r.calls() {
-				if strings.HasPrefix(c, "render ") && c != "render dev-cp pins="+opPub(k) {
+				if strings.HasPrefix(c, "render ") && c != "render dev-cp pins="+opPub(k) && c != "render management pins="+opPub(k) {
 					t.Fatalf("calls %q: render %q, want the new key alone", r.calls(), c)
 				}
 			}
@@ -1231,6 +1280,7 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 		}
 		if args[0] == "create" {
 			r.pinDevCP(r.data("kind-management", "mgmt-system", "operator-pub")["spec.pub"])
+			r.pinMgmtd(r.data("kind-management", "mgmt-system", "operator-pub")["spec.pub"])
 		}
 	}
 	if n := len(r.seeds()); n != 4 {
@@ -1258,5 +1308,69 @@ func TestOperatorKeyOldBase64(t *testing.T) {
 	}
 	if out, errOut, code := r.guard(); code != 0 || out != opPub(k)+"\n" {
 		t.Fatalf("guard with base64 -D: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+}
+
+// TestCheckServerConfNotApplicable: while dev-cp has no live cell, the render drops the cluster_jwt section of server.conf, and the
+// operator keys with it. check then reports serverConf as not_applicable and no mismatch. A cluster_jwt section with other keys, or
+// with no operator_public_keys, stays a mismatch (TestCheckFindsSwappedPin rows server_conf and server_conf_no_keys).
+func TestCheckServerConfNotApplicable(t *testing.T) {
+	t.Parallel()
+	r := newOpRig(t)
+	k := opNewKey(t)
+	r.installKey(k, "poc/operator/20261120T093000Z")
+	r.put("kind-dev-cp", "spire-system", "spire-server", map[string]string{"server.conf": "plugins {\n  NodeAttestor \"k8s_psat\" {\n    plugin_data {}\n  }\n}\n"})
+	out, errOut, code := r.run(nil, "check")
+	if code != 0 {
+		t.Fatalf("check: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	res := oneJSON(t, out)
+	if res["match"] != true || res["serverConf"] != "not_applicable" || fmt.Sprint(res["mismatch"]) != "[]" {
+		t.Fatalf("check printed %v, want match true, serverConf not_applicable and no mismatch", res)
+	}
+	for _, f := range []string{"operatorPub", "envd", "gateway", "mgmtd", "keyEnv"} {
+		if res[f] != true {
+			t.Errorf("check printed %v, want %s true", res, f)
+		}
+	}
+}
+
+// TestRotateWithoutLiveCell: with no live cell, server.conf holds no operator keys, so the overlap skips that pin as check does,
+// and the rotation runs to the new key alone in every pin, the copy of mgmtd included.
+func TestRotateWithoutLiveCell(t *testing.T) {
+	t.Parallel()
+	r, _, _ := rotateRig(t)
+	r.put("kind-dev-cp", "spire-system", "spire-server", map[string]string{"server.conf": "plugins {\n  NodeAttestor \"k8s_psat\" {\n    plugin_data {}\n  }\n}\n"})
+	out, errOut, code := r.run([]string{"STUB_NO_LIVE_CELL=1"}, "rotate")
+	if code != 0 {
+		t.Fatalf("rotate: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	k := newRotatedKey(t, r, fmt.Sprint(oneJSON(t, out)["newKeyName"]))
+	if d := r.data("kind-management", "mgmt-system", "operator-key"); d["keys.pub"] != opPub(k)+"\n" {
+		t.Fatalf("mgmtd pins %q, want the new key alone", d["keys.pub"])
+	}
+}
+
+// TestRotateChecksMgmtd: mgmtd reads its copy of the operator keys at start only. After each render of mgmt-api, the rotation checks
+// that mgmt-system/operator-key holds the keys of that step and that the pod mgmtd-0 carries their checksum, so mgmtd restarted.
+// Otherwise it stops at the step check-mgmtd, before the switch, and prints the commands that are left.
+func TestRotateChecksMgmtd(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, env, want string }{
+		{"pin_not_updated", "STUB_LINK_NO_PIN=1", "mgmt-system/operator-key"},
+		{"mgmtd_not_restarted", "STUB_LINK_NO_RESTART=1", "did not restart"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, _, _ := rotateRig(t)
+			out, errOut, code := r.run([]string{tc.env}, "rotate")
+			if code == 0 {
+				t.Fatalf("rotate: exit 0, want a stop\nstdout %s\nstderr %s", out, errOut)
+			}
+			res := oneJSON(t, out)
+			if res["step"] != "check-mgmtd" || res["switched"] != false || !strings.Contains(fmt.Sprint(res["error"]), tc.want) {
+				t.Fatalf("error line %v, want a stop at check-mgmtd before the switch that names %q", res, tc.want)
+			}
+		})
 	}
 }

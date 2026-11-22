@@ -6,7 +6,7 @@
 # and operatorctl. No file, shell variable, argument or log line holds it.
 # ConfigMap mgmt-system/operator-pub in management holds the public key (spec.pub), the remote key name (spec.name), and the next
 # public key during a rotation (next.pub). The renders pin its keys in envd, the cell gateway and the SPIRE server of dev-cp, and
-# mgmtd mounts it. build/operator/key.env holds the key name and the SHA-256 of the public key, both public. Without key.env, each
+# the mgmt-api render copies them into ConfigMap mgmt-system/operator-key, which mgmtd reads. build/operator/key.env holds the key name and the SHA-256 of the public key, both public. Without key.env, each
 # command reads the key name from spec.name of operator-pub.
 #
 # Settings in .envrc.local, as in .envrc.local.example: POC_SECRET_READ_CMD, POC_SECRET_WRITE_CMD and POC_OPERATOR_KEY.
@@ -16,12 +16,13 @@
 #         operator-pub and key.env. It prints one JSON line with keyName, keySHA256 and the next commands. A failed write or
 #         read-back writes no pin. Run create again after the fix. It writes a new remote key.
 # check   The read command pipes the seed into operatorctl pub. check compares that public key with operator-pub, each pin in
-#         dev-cp and key.env. It prints one JSON line with match, one field for each pin, and the names of the pins that differ.
-#         It exits 1 when a pin differs.
+#         dev-cp, the copy of mgmtd and key.env. It prints one JSON line with match, one field for each pin, and the names of the
+#         pins that differ. It exits 1 when a pin differs. While dev-cp has no live cell, server.conf pins no key, and the field
+#         serverConf is not_applicable.
 # rotate  It refuses while not connected, while a cut of the partition tool or the slow-tier marker exists, and while envd holds
 #         a local revocation entry. It checks all of these before it reads the secret manager. The default is the overlap. A new
 #         key goes to next.pub, the renders pin both keys, and cell:verify runs. Then the new key replaces the old one, the renders
-#         pin it alone, and cell:verify runs again. --emergency replaces the old key at once. Use it for a lost or leaked key, to
+#         pin it alone, and cell:verify runs again. After each render of mgmt-api, rotate checks that mgmtd restarted with the keys. --emergency replaces the old key at once. Use it for a lost or leaked key, to
 #         finish a rotation that stopped, or when operator-pub is absent or holds no valid key. It needs no old key. The old seed
 #         stays in the secret manager. Delete it there by hand.
 #
@@ -145,7 +146,7 @@ cmd_check() {
   need_settings POC_SECRET_READ_CMD
   read_operator_pub
   [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the key once with: mise run operator:create-key"
-  local spec next spec_name name derived sha which pinned env_name env_sha
+  local spec next spec_name name derived sha which cluster applies pinned env_name env_sha
   local -a names=() oks=() mismatch=()
   spec="$(pub_field spec.pub)"
   next="$(pub_field next.pub)"
@@ -157,13 +158,20 @@ cmd_check() {
     || fail "the read of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$derived" | jq -r '.error // empty' 2>/dev/null || true))"
   sha="$(sha_of_pub "$derived")"
 
-  # Each pin must hold the key of the secret manager alone. A next.pub outside a rotation is a mismatch of operator-pub.
+  # Each pin must hold the key of the secret manager alone. A next.pub outside a rotation is a mismatch of operator-pub. With no live
+  # cell, server.conf has no cluster_jwt section and pins no key, so serverConf is not_applicable and no mismatch.
   names+=(operatorPub)
   if [[ "$spec" == "$derived" && -z "$next" ]]; then oks+=(true); else oks+=(false); mismatch+=("management mgmt-system/operator-pub"); fi
-  for which in envd gateway server; do
-    pinned="$(operator_pin dev-cp "$which")" || fail "could not read the pin $(operator_pin_name dev-cp "$which"). Run: mise run harness:status"
+  for which in envd gateway server mgmtd; do
+    cluster=dev-cp
+    [[ "$which" != mgmtd ]] || cluster=management
     case "$which" in server) names+=(serverConf) ;; *) names+=("$which") ;; esac
-    if [[ "$pinned" == "$derived" ]]; then oks+=(true); else oks+=(false); mismatch+=("$(operator_pin_name dev-cp "$which")"); fi
+    if [[ "$which" == server ]]; then
+      applies="$(operator_server_pin dev-cp)" || fail "could not read the pin $(operator_pin_name dev-cp server). Run: mise run harness:status"
+      if [[ "$applies" == none ]]; then oks+=('"not_applicable"'); continue; fi
+    fi
+    pinned="$(operator_pin "$cluster" "$which")" || fail "could not read the pin $(operator_pin_name "$cluster" "$which"). Run: mise run harness:status"
+    if [[ "$pinned" == "$derived" ]]; then oks+=(true); else oks+=(false); mismatch+=("$(operator_pin_name "$cluster" "$which")"); fi
   done
   if [[ -f "$key_env" ]]; then
     env_name="$(key_env_value OPERATOR_KEY_NAME)"
@@ -190,7 +198,7 @@ cmd_check() {
 # slow-tier marker exists, or while envd holds a local revocation entry. The overlap pins spec.pub of operator-pub again, so in that
 # mode spec.pub must also be the only key of every pin of dev-cp and match the SHA-256 in key.env. It reads no secret.
 refuse_rotation() {
-  local mode="$1" reason clusters c tool rules records held which pinned env_sha
+  local mode="$1" reason clusters c tool rules records held which applies pinned env_sha
   reason="$(operator_connected 2>&1)" \
     || fail "the rotation needs a connected environment, and the check says: ${reason#error: }"
   clusters="$(existing_clusters)" || fail "kind does not answer, so a cut of the partition tool cannot be ruled out"
@@ -214,6 +222,10 @@ refuse_rotation() {
     || fail "envd holds local revocation entries for these cells: $held. A rotation would drop each held entry at its next verification. Settle them first: mise run mgmt -- status, then mise run revoke -- clean"
   [[ "$mode" == overlap ]] || return 0
   for which in envd gateway server; do
+    if [[ "$which" == server ]]; then
+      applies="$(operator_server_pin dev-cp)" || fail "could not read the pin $(operator_pin_name dev-cp server). Run: mise run harness:status"
+      [[ "$applies" != none ]] || continue
+    fi
     pinned="$(operator_pin dev-cp "$which")" || fail "could not read the pin $(operator_pin_name dev-cp "$which"). Run: mise run harness:status"
     [[ "$pinned" == "$old_pub" ]] \
       || fail "the pin $(operator_pin_name dev-cp "$which") does not hold spec.pub of operator-pub alone, and the overlap would pin spec.pub again. Compare every pin with the secret manager: mise run operator:check-key. To replace the key without the old one, run: mise run operator:rotate-key -- --emergency"
@@ -233,9 +245,26 @@ render_dev_cp() { OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=dev-cp mise run cell:up >&2;
 link_management() { OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link >&2; }
 verify_cluster() { CELL="$1" mise run cell:verify >&2; }
 
+# check_mgmtd <keys joined with commas, in the order of operator-pub> fails unless ConfigMap mgmt-system/operator-key holds these keys
+# and the pod mgmtd-0 carries their checksum, which the mgmt-api render sets. mgmtd reads the keys at start only, and cell:link waits
+# for the rollout, so the checksum shows that mgmtd restarted with them.
+check_mgmtd() {
+  local keys want pinned pod
+  keys="$(printf '%s\n' "$1" | tr , '\n')"
+  want="$(printf '%s\n' "$keys" | LC_ALL=C sort | paste -sd, -)"
+  pinned="$(operator_pin management mgmtd)" || { STEP_REASON="the pin management mgmt-system/operator-key could not be read"; return 1; }
+  [[ "$pinned" == "$want" ]] \
+    || { STEP_REASON="the pin management mgmt-system/operator-key holds ${pinned:-no key}, and the step pins $want"; return 1; }
+  pod="$(kubectl --context kind-management -n mgmt-system get pod mgmtd-0 -o json)" || { STEP_REASON="pod mgmtd-0 could not be read"; return 1; }
+  [[ "$(printf '%s' "$pod" | jq -r '.metadata.annotations["poc.internal/operator-key-sha256"] // ""')" == "$(printf '%s\n' "$keys" | sha256)" ]] \
+    || { STEP_REASON="pod mgmtd-0 runs with other operator keys than mgmt-system/operator-key, so mgmtd did not restart"; return 1; }
+}
+
+# add_renders <keys joined with commas> adds the renders of one step, the check of the copy of mgmtd, and the verifies.
 add_renders() {
   add render-dev-cp "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=dev-cp mise run cell:up" render_dev_cp
   add link-management "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link" link_management
+  add check-mgmtd "mise run operator:check-key" "check_mgmtd $1"
   add verify-dev-cp "CELL=dev-cp mise run cell:verify" "verify_cluster dev-cp"
   add verify-management "CELL=management mise run cell:verify" "verify_cluster management"
 }
@@ -316,10 +345,10 @@ cmd_rotate() {
   switched=false
   if [[ "$mode" == overlap ]]; then
     add next "write next.pub to ConfigMap mgmt-system/operator-pub" set_next
-    add_renders
+    add_renders "$old_pub,$NEW_PUB"
   fi
   add switch "write the new key alone to ConfigMap mgmt-system/operator-pub" switch_key
-  add_renders
+  add_renders "$NEW_PUB"
   local i
   for i in "${!funcs[@]}"; do
     STEP_REASON=""

@@ -306,6 +306,12 @@ spec:
         - name: spire-agent
           image: ghcr.io/spiffe/spire-agent:1.15.5@sha256:3652c732b0f0d36f4dd78394230a1b1cd0ddcc29548a46c67a996b1a78c14481
           args: ["-config", "/run/spire/config/agent.conf"]
+          startupProbe:
+            exec:
+              command: ["/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/agent/agent.sock"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
           readinessProbe:
             exec:
               command: ["/opt/spire/bin/spire-agent", "healthcheck", "-socketPath", "/run/spire/agent/agent.sock"]
