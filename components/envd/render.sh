@@ -48,7 +48,7 @@
 #   - the node address of each live cell, from the host service.
 #   - the envd image that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root and of the key, so a change restarts the pod. envd reads the operator
-# keys again on each use, so a rotation of them restarts no pod.
+# keys again on each use.
 # mgmtd and the cell gateway refuse a member of an envd report that they do not know. A new envd that holds a local
 # revocation entry reports it, so roll mgmtd and the cell gateway before envd each time.
 # Inputs: POC_ENV, SPIRE_TRUST_DOMAIN, RELAY_TARGET, SPIRE_AGENT_CELLS, RELAY_VIEW_ROUTES and RELAY_TELEMETRY_ROUTES from the

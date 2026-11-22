@@ -28,7 +28,8 @@
 #     trust bundle of the sidecar.
 #   - the operator keys: spec.pub and, during a rotation, next.pub of ConfigMap mgmt-system/operator-pub, which the operator
 #     script writes (scripts/operator-key.sh). The render never prints operator-pub. It copies the keys into key keys.pub of
-#     ConfigMap operator-key, one key on each line, because mgmtd reads one file. With no operator-pub yet, the render leaves
+#     ConfigMap operator-key, one key on each line, because mgmtd reads one file. The pin guard operator_pub_keys
+#     (components/lib/operator-key.sh) refuses a change of that live copy unless OPERATOR_KEY_ACCEPT_CHANGE=1. With no operator-pub yet, the render leaves
 #     out the file and its flag, and mgmtd adopts no local revocation. A failed read of operator-pub stops the render.
 #   - the mgmtd image that `mise run images` built, by digest.
 # The pod template carries the SHA-256 of the peer root (absent when it is left out), of the
@@ -123,7 +124,7 @@ fi
 operator_key="" operator_sum=absent
 operator_pub="$(operator_pub_cm)" || die "ConfigMap mgmt-system/operator-pub could not be read. Run: mise run harness:status"
 if [[ -n "$operator_pub" ]]; then
-  operator_keys="$(operator_keys_of "$operator_pub")" || exit 1
+  operator_keys="$(operator_pub_keys "$CELL_NAME" mgmtd)" || exit 1
   operator_sum="$(printf '%s\n' "$operator_keys" | sha256)"
   operator_key="$(NS="$namespace" KEYS="$operator_keys" yq -n '
     .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "operator-key" | .metadata.namespace = strenv(NS)

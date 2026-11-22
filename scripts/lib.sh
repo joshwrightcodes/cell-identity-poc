@@ -1218,7 +1218,7 @@ check_plane_pods() {
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
 # The sixth case: the operator script on this Mac (scripts/operator-key.sh) writes ConfigMap mgmt-system/operator-pub, and the
 # revoke tasks write ConfigMap envd-system/local-revocations in dev-cp, each with the field manager operator, no harness label and
-# no marker. The copy mgmt-system/operator-key is an object of the mgmt-api bundle, so it needs no case.
+# no marker.
 # runtime_objects prints one case object, or a JSON list of cases when a namespace holds writers that differ. An object is a
 # runtime object when it fits one case.
 runtime_objects() {

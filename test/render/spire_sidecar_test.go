@@ -372,7 +372,7 @@ func TestPeerRootConfigMapFailsClosed(t *testing.T) {
 }
 
 // TestSpireAgentStartupProbe: after an island heals, a cluster_jwt agent attests again and its socket appears only after the
-// attestation (Task 2 live finding N2: the liveness probe killed bootstrapping agents 33 to 65 s after the start). The spire-agent
+// attestation (Task 2 live finding N2: the liveness probe killed agents that still attested 33 to 65 s after the start). The spire-agent
 // container of both modes has a startup probe on the same health check, which holds off the liveness and readiness probes for at
 // least 90 s. The liveness probe keeps its settings.
 func TestSpireAgentStartupProbe(t *testing.T) {

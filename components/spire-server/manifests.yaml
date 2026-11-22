@@ -258,7 +258,7 @@ spec:
         # The ban container reads the cells that the cluster_jwt plugin refuses from server.conf, the records and the marks
         # file, and bans their agents through the admin socket every 10 s. It mounts each volume read-only at the path of
         # the server container, so the paths in server.conf resolve the same. It sets no user, so it runs as the pod user,
-        # who owns the admin socket. It needs no API token. Its health endpoint listens on the loopback only.
+        # who owns the admin socket. Its health endpoint listens on the loopback only.
         - name: agent-ban
           image: "@SPIRE_PLUGIN_IMAGE@"
           args: ["ban-agents", "--server-config", "/run/spire/config/server.conf", "--socket", "/run/spire/sockets/api.sock", "--every", "10s", "--health", "127.0.0.1:8086"]

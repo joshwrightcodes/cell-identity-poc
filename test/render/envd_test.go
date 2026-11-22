@@ -436,8 +436,8 @@ func TestEnvdRevocationsRole(t *testing.T) {
 	}
 }
 
-// TestRenderRefusesPinChange: each render of dev-cp that pins the operator keys runs the pin guard of
-// components/lib/operator-key.sh. A first pin and an unchanged pin render. A live pin with other keys, or a next.pub that a
+// TestRenderRefusesPinChange: each render that pins the operator keys runs the pin guard of components/lib/operator-key.sh: the
+// renders of dev-cp, and the mgmt-api render of management for the copy that mgmtd reads. A first pin and an unchanged pin render. A live pin with other keys, or a next.pub that a
 // writer added to operator-pub, stops the render unless OPERATOR_KEY_ACCEPT_CHANGE=1, and the flag works only while the
 // environment is connected.
 func TestRenderRefusesPinChange(t *testing.T) {
@@ -446,6 +446,7 @@ func TestRenderRefusesPinChange(t *testing.T) {
 		"envd":         renderEnvd,
 		"cell-gateway": renderGateway,
 		"spire-server": func(t *testing.T, env ...string) result { return renderCell(t, "dev-cp", env...) },
+		"mgmt-api":     mgmtAPI,
 	}
 	for _, tc := range []struct {
 		name, render string
@@ -461,6 +462,10 @@ func TestRenderRefusesPinChange(t *testing.T) {
 		{"accepted while connected", "envd", []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
 		{"accepted while connected, gateway", "cell-gateway", []string{"STUB_LIVE_PIN_GATEWAY=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
 		{"accepted while connected, server", "spire-server", []string{"STUB_LIVE_PIN_SERVER=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"mgmtd pin differs", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther}, "the pins management mgmt-system/operator-key hold other keys"},
+		{"mgmtd pin same", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorKey}, ""},
+		{"accepted while connected, mgmtd", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"accepted while not connected, mgmtd", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1"}, "refuses any change of the operator keys while not connected"},
 		{"accepted while not connected", "envd", []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1"}, "refuses any change of the operator keys while not connected"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

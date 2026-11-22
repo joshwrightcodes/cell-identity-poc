@@ -118,7 +118,7 @@ spire_sidecar() (
 
   # The agent image runs as root by default. The sidecar runs as user 1000. The image has no shell,
   # so the probes run the agent binary against the Workload API socket. The socket exists only after the
-  # attestation, so the startup probe gives a bootstrapping agent 120 s, for example after an island heals,
+  # attestation, so the startup probe gives an agent that attests 120 s, for example after an island heals,
   # before the liveness and readiness probes run.
   agent="$(cat <<EOF
 name: spire-agent

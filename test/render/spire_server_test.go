@@ -154,9 +154,9 @@ if [[ "$out" == - ]]; then cat "$src"; else cat "$src" >"$out"; fi
 //
 // It answers "get configmap operator-pub" with spec.pub stubOperatorKey (STUB_OPERATOR_KEY replaces it) and next.pub
 // STUB_OPERATOR_NEXT when that is set. STUB_NO_OPERATOR_PUB makes the ConfigMap absent, and STUB_OPERATOR_PUB_FAIL makes the
-// read fail. The live pins of the cluster are absent unless STUB_LIVE_PIN_ENVD, STUB_LIVE_PIN_GATEWAY or STUB_LIVE_PIN_SERVER
-// sets their keys, joined with commas: keys.pub of envd-system/operator-key and gateway-system/operator-key, and
-// operator_public_keys in server.conf of spire-system/spire-server.
+// read fail. The live pins of the cluster are absent unless STUB_LIVE_PIN_ENVD, STUB_LIVE_PIN_GATEWAY, STUB_LIVE_PIN_MGMTD or
+// STUB_LIVE_PIN_SERVER sets their keys, joined with commas: keys.pub of envd-system/operator-key, gateway-system/operator-key and
+// mgmt-system/operator-key, and operator_public_keys in server.conf of spire-system/spire-server.
 const stubKubectl = `#!/usr/bin/env bash
 set -euo pipefail
 echo "kubectl $*" >>"$STUB_LOG"
@@ -172,6 +172,7 @@ if [[ " $* " == *" get configmap operator-key "* ]]; then
   case " $* " in
     *" -n envd-system "*) pin="${STUB_LIVE_PIN_ENVD:-}" ;;
     *" -n gateway-system "*) pin="${STUB_LIVE_PIN_GATEWAY:-}" ;;
+    *" -n mgmt-system "*) pin="${STUB_LIVE_PIN_MGMTD:-}" ;;
   esac
   [[ -z "$pin" ]] || jq -cn --arg p "$pin" '{data: {"keys.pub": (($p | gsub(","; "\n")) + "\n")}}'
   exit 0

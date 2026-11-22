@@ -125,7 +125,7 @@ spec:
             - --report-rate=5
             - --bundle-refill-every=60s
             # The operator keys and the input of the local revocations go together. envd reads the key file again on each
-            # use, so a rotation needs no restart.
+            # use.
             - --operator-key-file=/run/envd/operator-key/keys.pub
             - --revocations-configmap=envd-system/local-revocations
           env:
@@ -219,7 +219,7 @@ spec:
                         fieldPath: metadata.namespace
 ---
 # envd reads the signed local revocation entries from ConfigMap local-revocations, which only the operator scripts on the Mac
-# write. Get names only that object, and envd needs no other verb on it.
+# write. Get names only that object.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

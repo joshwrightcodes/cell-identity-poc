@@ -904,8 +904,8 @@ esac
 
 // TestCheckHarnessObjectsAcceptsOperatorObjects: the operator script writes ConfigMap mgmt-system/operator-pub in management and
 // envd-system/local-revocations in dev-cp with the field manager operator and no harness label. check_harness_objects accepts each
-// as a runtime object of its component, and flags it when another manager wrote it. mgmt-system/operator-key is an object of the
-// mgmt-api bundle with the harness label, so it needs no runtime case.
+// as a runtime object of its component, and flags it when another manager wrote it. The bundle object mgmt-system/operator-key, with
+// the harness label, passes beside it.
 func TestCheckHarnessObjectsAcceptsOperatorObjects(t *testing.T) {
 	testtool.Need(t, "yq", "jq", "bash")
 	own := func(name, comp string) string {

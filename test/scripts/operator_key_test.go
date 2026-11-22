@@ -144,8 +144,8 @@ esac
 // under STUB_MGMT_DOWN. cell:up of dev-cp runs the pin helper of components/lib/operator-key.sh, as the renders do, and writes its
 // key lines into the three pins of dev-cp. STUB_NO_LIVE_CELL makes that server.conf hold no cluster_jwt section, as the render does
 // with no live cell. cell:link of mgmt-api copies the keys of operator-pub into mgmt-system/operator-key, as the mgmt-api render
-// does, and sets the checksum annotation of the restarted pod mgmtd-0. STUB_LINK_NO_PIN skips the copy, and STUB_LINK_NO_RESTART
-// keeps the old pod. cell:verify records its call and the pin of envd.
+// does through the pin guard, and sets the checksum annotation of the restarted pod mgmtd-0. STUB_LINK_NO_PIN skips the copy, and
+// STUB_LINK_NO_RESTART keeps the old pod; STUB_LINK_NO_RESTART=switch keeps it only for the single key after the switch. cell:verify records its call and the pin of envd.
 // STUB_VERIFY_FAIL names the clusters whose verify fails. STUB_TAMPER makes the first verify of dev-cp raise the resourceVersion of
 // operator-pub, as a writer during the rotation does.
 const opMise = `#!/usr/bin/env bash
@@ -181,10 +181,10 @@ case "$task" in
   cell:link)
     [[ "$CELL $LINK_ONLY" == "management mgmt-api" ]] || { echo "unexpected cell:link: $CELL $LINK_ONLY" >&2; exit 2; }
     source "$STUB_REPO/components/lib/operator-key.sh"
-    keys="$(operator_keys_of "$(operator_pub_cm)")" || exit 1
+    keys="$(operator_pub_keys management mgmtd)" || exit 1
     lines="$(printf '%s\n' "$keys")"
     [[ -n "${STUB_LINK_NO_PIN:-}" ]] || kput kind-management mgmt-system operator-key "$(jq -nc --arg k "$lines" '{"keys.pub": ($k + "\n")}')"
-    if [[ -z "${STUB_LINK_NO_RESTART:-}" ]]; then
+    if [[ -z "${STUB_LINK_NO_RESTART:-}" || ( "$STUB_LINK_NO_RESTART" == switch && "$keys" == *$'\n'* ) ]]; then
       sum="$(printf '%s\n' "$keys" | shasum -a 256 | cut -d' ' -f1)"
       jq -nc --arg s "$sum" '{metadata: {name: "mgmtd-0", annotations: {"poc.internal/operator-key-sha256": $s}}}' >"$STUB_DIR/k/kind-management/mgmt-system/pod-mgmtd-0.json"
     fi
@@ -956,6 +956,10 @@ var rotateRefusals = []struct {
 	{"pin_differs", func(r *opRig) {
 		r.put("kind-dev-cp", "gateway-system", "operator-key", map[string]string{"keys.pub": opPub(opNewKey(r.t)) + "\n"})
 	}, nil, "dev-cp gateway-system/operator-key"},
+	{"server_pin_differs", func(r *opRig) {
+		r.put("kind-dev-cp", "spire-system", "spire-server", map[string]string{"server.conf": "plugins {\n  NodeAttestor \"cluster_jwt\" {\n    plugin_data {\n      operator_public_keys = [\"" +
+			opPub(opNewKey(r.t)) + "\"]\n    }\n  }\n}\n"})
+	}, nil, "dev-cp spire-system/spire-server operator_public_keys"},
 	{"pin_absent", func(r *opRig) {
 		os.Remove(filepath.Join(r.stub, "k", "kind-dev-cp", "envd-system", "operator-key.json"))
 	}, nil, "dev-cp envd-system/operator-key"},
@@ -966,7 +970,7 @@ var rotateRefusals = []struct {
 
 // overlapOnly names the refusals of the default mode alone. A pending next.pub is the case that --emergency finishes. The other rows
 // check the old key, which the overlap pins again and --emergency drops, so --emergency also runs with no valid old key.
-var overlapOnly = map[string]bool{"next_pending": true, "spec_swapped": true, "pin_differs": true, "pin_absent": true, "key_env_stale": true,
+var overlapOnly = map[string]bool{"next_pending": true, "spec_swapped": true, "pin_differs": true, "server_pin_differs": true, "pin_absent": true, "key_env_stale": true,
 	"no_operator_pub": true, "bad_spec_pub": true}
 
 func runRotateRefusal(t *testing.T, name string, args ...string) {
@@ -1029,7 +1033,7 @@ func TestRotateRefusesHeldEntry(t *testing.T) {
 // every pin in force in dev-cp and matches the SHA-256 in key.env. A writer of operator-pub who swaps spec.pub gets no render.
 func TestRotateRefusesSwappedPin(t *testing.T) {
 	t.Parallel()
-	for _, name := range []string{"spec_swapped", "pin_differs", "pin_absent", "key_env_stale"} {
+	for _, name := range []string{"spec_swapped", "pin_differs", "server_pin_differs", "pin_absent", "key_env_stale"} {
 		t.Run(name, func(t *testing.T) { t.Parallel(); runRotateRefusal(t, name) })
 	}
 }
@@ -1353,7 +1357,8 @@ func TestRotateWithoutLiveCell(t *testing.T) {
 
 // TestRotateChecksMgmtd: mgmtd reads its copy of the operator keys at start only. After each render of mgmt-api, the rotation checks
 // that mgmt-system/operator-key holds the keys of that step and that the pod mgmtd-0 carries their checksum, so mgmtd restarted.
-// Otherwise it stops at the step check-mgmtd, before the switch, and prints the commands that are left.
+// Otherwise it stops at the step check-mgmtd and prints the commands that are left. After the switch, those start with the link of
+// mgmt-api, which restarts mgmtd, and then operator:check-key.
 func TestRotateChecksMgmtd(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct{ name, env, want string }{
@@ -1373,4 +1378,17 @@ func TestRotateChecksMgmtd(t *testing.T) {
 			}
 		})
 	}
+	t.Run("not_restarted_after_switch", func(t *testing.T) {
+		t.Parallel()
+		r, _, _ := rotateRig(t)
+		out, errOut, code := r.run([]string{"STUB_LINK_NO_RESTART=switch"}, "rotate")
+		if code == 0 {
+			t.Fatalf("rotate: exit 0, want a stop\nstdout %s\nstderr %s", out, errOut)
+		}
+		res := oneJSON(t, out)
+		want := "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link, then mise run operator:check-key; CELL=dev-cp mise run cell:verify; CELL=management mise run cell:verify"
+		if res["step"] != "check-mgmtd" || res["switched"] != true || res["remaining"] != want {
+			t.Fatalf("error line %v, want a stop at check-mgmtd after the switch with the remaining commands %q", res, want)
+		}
+	})
 }

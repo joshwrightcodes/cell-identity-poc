@@ -115,12 +115,15 @@ operator_connected() {
   return 1
 }
 
-# operator_pub_keys <cluster> prints the operator keys for a render of the cluster: spec.pub of operator-pub, then next.pub when a
-# rotation is in progress, one key on each line. A pin of the cluster that exists and holds another key set is a change. The helper
+# operator_pub_keys <cluster> [pin...] prints the operator keys for a render of the cluster: spec.pub of operator-pub, then next.pub
+# when a rotation is in progress, one key on each line. The pins default to envd, gateway and server, the pins of dev-cp. The
+# mgmt-api render names mgmtd. A named pin of the cluster that exists and holds another key set is a change. The helper
 # refuses a change unless OPERATOR_KEY_ACCEPT_CHANGE=1, and refuses any change while not connected. Only the operator scripts set
 # that variable. The helper fails with the reason on standard error.
 operator_pub_keys() {
-  local cluster="${1:?usage: operator_pub_keys <cluster>}" cm keys want which pinned changed=()
+  local cluster="${1:?usage: operator_pub_keys <cluster> [pin...]}" cm keys want which pinned changed=() pins=(envd gateway server)
+  shift
+  (($# == 0)) || pins=("$@")
   if ! cm="$(operator_pub_cm)"; then
     printf 'error: ConfigMap mgmt-system/operator-pub in management could not be read. Run: mise run harness:status\n' >&2
     return 1
@@ -131,7 +134,7 @@ operator_pub_keys() {
   fi
   keys="$(operator_keys_of "$cm")" || return 1
   want="$(printf '%s\n' "$keys" | LC_ALL=C sort | paste -sd, -)"
-  for which in envd gateway server; do
+  for which in "${pins[@]}"; do
     if ! pinned="$(operator_pin "$cluster" "$which")"; then
       printf 'error: the pin %s could not be read in %s, so the operator keys are unchecked. Run: mise run harness:status\n' "$(operator_pin_name "$cluster" "$which")" "$cluster" >&2
       return 1

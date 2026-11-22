@@ -264,7 +264,7 @@ check_mgmtd() {
 add_renders() {
   add render-dev-cp "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=dev-cp mise run cell:up" render_dev_cp
   add link-management "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link" link_management
-  add check-mgmtd "mise run operator:check-key" "check_mgmtd $1"
+  add check-mgmtd "OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link, then mise run operator:check-key" "check_mgmtd $1"
   add verify-dev-cp "CELL=dev-cp mise run cell:verify" "verify_cluster dev-cp"
   add verify-management "CELL=management mise run cell:verify" "verify_cluster management"
 }
