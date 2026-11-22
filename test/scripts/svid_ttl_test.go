@@ -189,6 +189,8 @@ esac
 //   - run cell:restart (CELL=<c>): each live agent of the cluster gets a new pod, so a new agent ID, with the live lifetime, and its old
 //     entry stays listed as gone, as the real server keeps it (use_pod_uid_for_agent_id for k8s_psat). stub/restart-keep-<c> keeps the
 //     old SVIDs.
+//   - run cell:hydrate (CELL=<c>) fails when stub/hydrate-fail exists. run bundle -- publish fails when stub/publish-fail exists, and prints
+//     the content of that file and a mise trailer to stderr when the file is not empty.
 //   - run harness:status fails when stub/status-fail exists, and for as many runs as stub/status-fails holds. run revoke -- clean empties stub/inputs. run gate:<n> fails for a gate in
 //     STUB_FAIL_GATES and adds STUB_GATE_SECONDS to stub/now.
 const m9Mise = `#!/usr/bin/env bash
@@ -232,7 +234,11 @@ case "$1 $2" in
     fails="$(cat "$d/status-fails" 2>/dev/null || echo 0)"
     if [[ -e "$d/status-fail" ]] || ((fails > 0)); then echo $((fails - 1)) >"$d/status-fails"; echo '{"cluster":"dev-cp","ok":false}'; exit 1; fi
     echo '{"cluster":"dev-cp","ok":true}' ;;
+  "run cell:hydrate")
+    [[ ! -e "$d/hydrate-fail" ]] || { echo "error: the hydrate failed" >&2; exit 1; }
+    echo '{"hydrated":true}' ;;
   "run bundle")
+    if [[ -s "$d/publish-fail" ]]; then cat "$d/publish-fail" >&2; echo "[bundle] ERROR task failed" >&2; exit 1; fi
     [[ ! -e "$d/publish-fail" ]] || { echo '{"error":"publish failed"}'; exit 1; }
     echo '{"outcome":"applied"}' ;;
   "run revoke") [[ "$4" == clean ]] || exit 2; : >"$d/inputs" ;;

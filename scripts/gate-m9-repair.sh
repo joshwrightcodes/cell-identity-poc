@@ -13,7 +13,7 @@
 #      and each un-revoked cell, gets new SVIDs;
 #   8. deletes each namespace m9-<name> with the label cell.poc.internal/e2e=true in every existing cluster, and waits until none is left;
 #   8b. when the breadcrumb build/gate/m9-store-lost exists (the bundle store test writes it before it deletes the store of a cell), waits
-#      until bundle-store-0 of that cell is Ready, publishes the hydrated set of the cell, hard-refreshes each Application, waits until
+#      until bundle-store-0 of that cell is Ready, hydrates the bundles of the cell again (CELL=<c> mise run cell:hydrate), publishes the hydrated set of the cell, hard-refreshes each Application, waits until
 #      every Application is Synced and Healthy, and removes the breadcrumb;
 #   9. runs mise run harness:status until it passes, up to HARNESS_STATUS_WAIT seconds (default 600).
 # Steps 1 and 4 call the scripts of the partition tool and of the revoke command only when they exist. It never touches an object without
@@ -243,12 +243,17 @@ if [[ -e "$store_crumb" ]]; then
   }
   wait_until "bundle-store-0 of $cell is Ready on a live claim" store_ready \
     || die "bundle-store-0 of $cell is not Ready on a live claim after ${wait_seconds}s (pod phase '$(kc get pod bundle-store-0 -o 'jsonpath={.status.phase}' 2>&1)', claim phase '$(kc get pvc data-bundle-store-0 -o 'jsonpath={.status.phase}' 2>&1)'). Read: kubectl --context kind-$cell -n cell-system describe pod bundle-store-0, and the StatefulSet bundle-store"
+  # The publish stops when build/images.env is newer than the hydrated bundles, so the cell is hydrated again first.
+  CELL="$cell" mise run cell:hydrate >/dev/null || die "could not hydrate the bundles of $cell. Run: CELL=$cell mise run cell:hydrate, then $repair"
   # The publish pushes every component and the root into the store and moves the tag current.
   if ! err="$(mise run bundle -- publish --target "$cell" --wait 2>&1 >/dev/null)"; then
+    # The last line is the trailer of mise. The cause is the last line that starts with error:.
+    cause="${err##*$'\n'}"
+    while IFS= read -r line; do if [[ "$line" == error:* ]]; then cause="$line"; fi; done <<<"$err"
     if [[ "$err" == *bundle_open* ]]; then
-      die "mgmtd refused the set of $cell because a set is still open (bundle_open): ${err##*$'\n'}. Wait for it to end, then run: $repair"
+      die "mgmtd refused the set of $cell because a set is still open (bundle_open): $cause. Wait for it to end, then run: $repair"
     fi
-    die "could not publish the hydrated set of $cell: ${err##*$'\n'}. Run: CELL=$cell mise run cell:hydrate, then mise run bundle -- publish --target $cell --wait"
+    die "could not publish the hydrated set of $cell: $cause. Run: CELL=$cell mise run cell:hydrate, then mise run bundle -- publish --target $cell --wait"
   fi
   apps="$(kubectl --context "kind-$cell" -n argocd get applications -o json | jq -r '.items[].metadata.name')" || die "could not list the Applications of $cell"
   for app in $apps; do

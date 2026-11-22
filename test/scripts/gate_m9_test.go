@@ -683,14 +683,15 @@ func TestGateM9RepairStore(t *testing.T) {
 		}
 		restore := callAt(calls, "svid-ttl restore")
 		ready := lastCallAt(calls, "get pod bundle-store-0")
+		hydrate := callAt(calls, "mise run cell:hydrate CELL=dev-cell-1")
 		publish := callAt(calls, "mise run bundle -- publish --target dev-cell-1 --wait")
 		refresh := callAt(calls, "annotate application root")
 		apps := lastCallAt(calls, "get applications -o json")
 		status := callAt(calls, "mise run harness:status")
-		order := []int{restore, ready, publish, refresh, apps, status}
+		order := []int{restore, ready, hydrate, publish, refresh, apps, status}
 		for i := range order {
 			if order[i] < 0 || (i > 0 && order[i] < order[i-1]) {
-				t.Fatalf("want restore, store Ready, publish, refresh, Application read, harness:status (%v):\n%s", order, calls)
+				t.Fatalf("want restore, store Ready, hydrate, publish, refresh, Application read, harness:status (%v):\n%s", order, calls)
 			}
 		}
 		for _, want := range []string{"kubectl --context kind-dev-cell-1 -n cell-system get pod bundle-store-0", "kubectl --context kind-dev-cell-1 -n argocd annotate application root", "kubectl --context kind-dev-cell-1 -n argocd get applications -o json"} {
@@ -739,6 +740,26 @@ func TestGateM9RepairStore(t *testing.T) {
 		_, errOut, code := r.run("gate-m9-repair.sh", nil)
 		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "annotate application") || !strings.Contains(errOut, "mise run gate:m9:repair") {
 			t.Fatalf("exit %d, breadcrumb %v, stderr %q; want a failure that keeps the breadcrumb and refreshes nothing", code, r.exists("build/gate/m9-store-lost"), errOut)
+		}
+	})
+	t.Run("the publish fails with an error line", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("publish-fail", "error: build/images.env is newer than the hydrated bundle namespaces\n")
+		_, errOut, code := r.run("gate-m9-repair.sh", nil)
+		if code == 0 || !strings.Contains(errOut, "error: build/images.env is newer than the hydrated bundle namespaces") || !r.exists("build/gate/m9-store-lost") {
+			t.Fatalf("exit %d, stderr %q; want the error line of the publish in the message, with the breadcrumb kept", code, errOut)
+		}
+	})
+	t.Run("the hydrate fails", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("hydrate-fail", "")
+		_, errOut, code := r.run("gate-m9-repair.sh", nil)
+		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "mise run bundle") || !strings.Contains(errOut, "cell:hydrate") {
+			t.Fatalf("exit %d, stderr %q; want a failure that names cell:hydrate, before the publish, with the breadcrumb kept", code, errOut)
 		}
 	})
 	t.Run("a Terminating claim", func(t *testing.T) {
