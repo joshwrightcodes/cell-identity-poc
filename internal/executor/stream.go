@@ -34,8 +34,8 @@ import (
 
 // Defaults of StreamConfig.
 const (
-	DefaultMinBackoff      = time.Second
-	DefaultMaxBackoff      = 30 * time.Second
+	DefaultMinBackoff      = 500 * time.Millisecond
+	DefaultMaxBackoff      = 5 * time.Second
 	DefaultClaimEvery      = 10 * time.Second
 	DefaultStatusEvery     = 30 * time.Second
 	DefaultResendEvery     = 60 * time.Second
@@ -51,7 +51,7 @@ const (
 	forgedEvery     = 10 * time.Second
 	gcEvery         = time.Hour
 	statusSpread    = 0.2
-	backoffSpread   = 0.5
+	backoffSpread   = 0.2
 	kubeTimeout     = 5 * time.Second
 	minResendGap    = 30 * time.Second
 	maxResendBurst  = 20
@@ -266,18 +266,16 @@ func (c StreamConfig) wait(ctx context.Context, d time.Duration) error {
 	return err
 }
 
-// backoff returns MinBackoff doubled for each earlier failure up to MaxBackoff, with jitter. Below
-// the cap the wait lies between d and 1.5 d. At the cap it lies between two thirds of MaxBackoff and
-// MaxBackoff, so a long outage keeps its jitter.
+// backoff returns MinBackoff doubled for each earlier failure, capped at MaxBackoff, plus jitter of up
+// to 20%. The cap applies first, so a wait never exceeds 1.2 MaxBackoff and a long outage keeps its
+// jitter. The first wait is at least MinBackoff, so the loop never spins.
 func (c StreamConfig) backoff(failures int) time.Duration {
 	d := c.MinBackoff
 	for i := 0; i < failures && d < c.MaxBackoff; i++ {
 		d *= 2
 	}
 	d = min(d, c.MaxBackoff)
-	high := min(time.Duration(float64(d)*(1+backoffSpread)), c.MaxBackoff)
-	low := min(d, high*2/3)
-	return low + time.Duration(c.Rand()*float64(high-low))
+	return d + time.Duration(c.Rand()*backoffSpread*float64(d))
 }
 
 func (c StreamConfig) runGC(ctx context.Context) {
