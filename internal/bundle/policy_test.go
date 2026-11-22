@@ -106,8 +106,8 @@ func TestDefaultPolicy(t *testing.T) {
 		t.Errorf("component counts %d %d", len(p.Roles["cell"].Components), len(p.Roles["cp"].Components))
 	}
 
-	// The app class owns apps-sample alone. The platform classes keep apps-demo and reach apps-sample only for its Namespace
-	// and its NetworkPolicies. No class other than the app class may place a workload object there.
+	// The app class owns apps-sample alone. The platform classes keep apps-demo and reach apps-sample only for its Namespace,
+	// its NetworkPolicies and its AuthorizationPolicies. No class other than the app class may place a workload object there.
 	if app := p.Classes["app"]; slices.Contains(app.ObjectNamespaces, "apps-demo") || slices.Contains(app.DestinationNamespaces, "apps-demo") {
 		t.Errorf("the app class still reaches apps-demo: %+v", app)
 	}

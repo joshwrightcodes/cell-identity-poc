@@ -58,4 +58,3 @@ metadata:
   labels:
     istio-injection: enabled
     pod-security.kubernetes.io/enforce: restricted
-    cell.poc.internal/workloads: "true"

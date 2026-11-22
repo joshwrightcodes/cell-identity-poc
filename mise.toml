@@ -291,7 +291,7 @@ description = "Run the M8 end-to-end tests: signed bundle sets that reach Argo C
 run = "scripts/gate.sh m8"
 
 [tasks."gate:m8:repair"]
-description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap apps-demo/m8-marker, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap m8-marker in apps-sample or apps-demo, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m8-repair.sh"
 
 [tasks.gw]

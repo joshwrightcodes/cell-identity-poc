@@ -10,7 +10,7 @@
 # ValidatingAdmissionPolicy bundles-app-limits (role cell only) denies, for an object in the namespace of an app class or
 # whose tracking ID starts with the name of an app component, a Service that is not ClusterIP or has externalIPs, a
 # Deployment with the sidecar opt-out, an object with the harness label, and a Secret of type
-# kubernetes.io/service-account-token. A request with no namespace, such as one for a cluster scoped object, goes to the tracking ID test.
+# kubernetes.io/service-account-token. A request for a cluster scoped object has no namespace and goes to the tracking ID test. A request for a Namespace object may carry the name of the namespace in that field, which does not change a validation.
 # The namespaces and the app components come from internal/bundle/allow.json, so the guards and the apply engine read one list.
 # BUNDLE_ALLOW_JSON names another allow-list file, for the tests.
 set -euo pipefail

@@ -807,44 +807,29 @@ func TestNetworkPolicyAppsSample(t *testing.T) {
 			if got, want := slices.Sorted(mapKeys(policies)), []string{"allow-dns", "allow-from-nodes", "default-deny", "workloads"}; !slices.Equal(got, want) {
 				t.Fatalf("apps-sample holds the policies %v in %s, want %v", got, cr.name, want)
 			}
-			deny := policies["default-deny"]
-			if got, want := jsonOf(t, get[any](t, deny, "spec")), `{"podSelector":{},"policyTypes":["Ingress","Egress"]}`; got != want {
-				t.Errorf("default-deny of apps-sample is %s, want %s", got, want)
-			}
-			if got := fmt.Sprint(lookupOr(policies["allow-from-nodes"], "spec", "podSelector")); got != "map[]" {
-				t.Errorf("allow-from-nodes of apps-sample selects %s, want every pod", got)
-			}
-			// No rule of the namespace names apps-demo, and the only namespace outside it that a rule names is istio-system.
-			for name, p := range policies {
-				text := jsonOf(t, get[any](t, p, "spec"))
-				if strings.Contains(text, "apps-demo") {
-					t.Errorf("the policy %s of apps-sample names apps-demo: %s", name, text)
-				}
-				if name == "workloads" {
-					continue
-				}
-				if strings.Contains(text, "istio-system") {
-					t.Errorf("the policy %s of apps-sample names istio-system, which only workloads may: %s", name, text)
-				}
-			}
-			workloads := jsonOf(t, get[any](t, policies["workloads"], "spec"))
-			for _, want := range []string{`"podSelector":{}`, `"kubernetes.io/metadata.name":"istio-system"`, `"port":15012`} {
-				if !strings.Contains(workloads, want) {
-					t.Errorf("workloads of apps-sample is %s, want it to hold %s", workloads, want)
-				}
-			}
-			// The one flow with the collector is N15: its pod reads the Envoy metrics on 15090.
-			if got := jsonOf(t, get[any](t, policies["workloads"], "spec", "ingress")); !strings.Contains(got, `"app.kubernetes.io/name":"otel-collector"`) || !strings.Contains(got, `"port":15090`) {
-				t.Errorf("the ingress of workloads in apps-sample is %s, want the collector on 15090", got)
-			}
-			for _, other := range []string{"istio-egress", "argocd", "cell-system"} {
-				if strings.Contains(workloads, other) {
-					t.Errorf("workloads of apps-sample names %s: %s", other, workloads)
+			// Each policy has a fixed spec. A rule that is added, such as an empty namespaceSelector or an ipBlock, fails the comparison.
+			for name, want := range appsSamplePolicySpecs {
+				// The /32 addresses of the DNS Service and the nodes differ between clusters, so the comparison masks them.
+				got := cidrMask.ReplaceAllString(jsonOf(t, get[any](t, policies[name], "spec")), `"cidr":"ADDR/32"`)
+				if got != want {
+					t.Errorf("the policy %s of apps-sample in %s has the spec\n%s\nwant\n%s", name, cr.name, got, want)
 				}
 			}
 		})
 	}
 }
+
+// appsSamplePolicySpecs are the specs of the NetworkPolicies of apps-sample. default-deny has no rule. allow-dns and
+// allow-from-nodes are the policies of every namespace. workloads admits the pods of the namespace, the collector on 15090
+// (flow N15) and, as egress, the pods of the namespace and istiod on 15012. No rule names apps-demo.
+var appsSamplePolicySpecs = map[string]string{
+	"default-deny":     `{"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
+	"allow-dns":        `{"egress":[{"ports":[{"port":53,"protocol":"UDP"},{"port":53,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}},{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Egress"]}`,
+	"allow-from-nodes": `{"ingress":[{"from":[{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Ingress"]}`,
+	"workloads":        `{"egress":[{"to":[{"podSelector":{}}]},{"ports":[{"port":15012,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"istio-system"}}}]}],"ingress":[{"from":[{"podSelector":{}}]},{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"observability-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"otel-collector"}}}],"ports":[{"port":15090,"protocol":"TCP"}]}],"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
+}
+
+var cidrMask = regexp.MustCompile(`"cidr":"[0-9.]+/32"`)
 
 // TestMeshDenyAllAppsSample checks, in every cluster, that the mesh denies each request to a workload of apps-sample by default:
 // an AuthorizationPolicy with an empty spec, as in apps-demo, and no policy of the mesh component that allows a request there.
@@ -865,6 +850,34 @@ func TestMeshDenyAllAppsSample(t *testing.T) {
 			}
 			if found != 1 {
 				t.Errorf("apps-sample holds %d AuthorizationPolicies in %s, want deny-all alone", found, cr.name)
+			}
+		})
+	}
+}
+
+// TestNamespaceAppsSample checks, in every cluster, the labels of Namespace apps-sample. Pod Security restricted refuses a
+// privileged or hostNetwork pod, which would bypass every NetworkPolicy. The mesh label gives each pod a sidecar. The label
+// cell.poc.internal/workloads stays off, because the policy of the egress gateway admits each namespace that carries it.
+func TestNamespaceAppsSample(t *testing.T) {
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			var ns object
+			for _, c := range cr.components {
+				if c.name != "namespaces" {
+					continue
+				}
+				for _, o := range c.objs {
+					if o["kind"] == "Namespace" && lookupOr(o, "metadata", "name") == "apps-sample" {
+						ns = o
+					}
+				}
+			}
+			if ns == nil {
+				t.Fatalf("the namespaces component of %s renders no Namespace apps-sample", cr.name)
+			}
+			want := `{"istio-injection":"enabled","pod-security.kubernetes.io/enforce":"restricted"}`
+			if got := jsonOf(t, get[any](t, ns, "metadata", "labels")); got != want {
+				t.Errorf("the labels of Namespace apps-sample in %s are %s, want %s", cr.name, got, want)
 			}
 		})
 	}
