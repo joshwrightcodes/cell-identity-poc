@@ -23,8 +23,8 @@ func TestStrategyJitterStaysInBounds(t *testing.T) {
 	b := Strategy{}.NewBackoff()
 	for i := 0; i < 200; i++ {
 		d := b.Next()
-		if d < InitialDelay || d > MaxDelay {
-			t.Fatalf("step %d: %v outside [%v, %v]", i, d, InitialDelay, MaxDelay)
+		if d < InitialDelay || d > MaxDelay*12/10 {
+			t.Fatalf("step %d: %v outside [%v, %v]", i, d, InitialDelay, MaxDelay*12/10)
 		}
 		if i%50 == 49 {
 			b.Reset()

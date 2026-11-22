@@ -45,8 +45,8 @@ func SourceOptions() workloadapi.X509SourceOption {
 	return workloadapi.WithClientOptions(ClientOptions()...)
 }
 
-// Strategy is an exponential back-off with jitter. Every delay lies between
-// InitialDelay and MaxDelay.
+// Strategy is an exponential back-off. The cap applies first, then jitter adds up
+// to 20%, so every delay lies between InitialDelay and 1.2 * MaxDelay.
 type Strategy struct {
 	// Rand returns a value in [0, 1). The zero value uses math/rand/v2.
 	Rand func() float64
@@ -72,8 +72,7 @@ func (b *backoff) Next() time.Duration {
 		d = min(InitialDelay<<b.n, MaxDelay)
 	}
 	b.n++
-	d = time.Duration(float64(d) * (1 + jitter*b.rand()))
-	return min(d, MaxDelay)
+	return time.Duration(float64(d) * (1 + jitter*b.rand()))
 }
 
 func (b *backoff) Reset() { b.n = 0 }
