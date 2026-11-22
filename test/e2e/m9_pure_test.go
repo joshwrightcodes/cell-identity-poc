@@ -21,8 +21,10 @@ const (
 	m9OpTTL = time.Hour
 	// m9ResultWait bounds the wait for the result of an operation in the outbox of the gateway.
 	m9ResultWait = 2 * time.Minute
-	// m9MaxSignLead is the longest time that may pass between signing the two held operations and the cell cut.
-	m9MaxSignLead = 3 * time.Minute
+	// m9MaxSignLead is the longest time that may pass between signing the two held operations and the cell cut. Signing takes seconds.
+	m9MaxSignLead = 90 * time.Second
+	// m9EnvCutAllowance is the time that the environment cut itself may take, bounded by the partition call.
+	m9EnvCutAllowance = 2 * time.Minute
 	// m9SleepGap is the longest gap between two samples that the run accepts.
 	m9SleepGap = 2 * time.Minute
 	// m9Skew is the clock skew that the pass rule allows between the expiry of an SVID and the restart of its agent.
@@ -76,9 +78,9 @@ func m9PlanFor(ttl time.Duration) m9Plan {
 // that it needs, and early enough for its result.
 func (p m9Plan) problems(signLead time.Duration) []string {
 	var bad []string
-	// The held operations were signed signLead before the cell cut, and enqueue time is measured from that cut or from the environment cut.
+	// The held operations were signed signLead before the cell cut. The environment cut starts EnvCutAfter later and can take m9EnvCutAllowance.
 	for name, after := range map[string]time.Duration{"first": p.FirstOpAfter, "second": p.SecondOpAfter} {
-		if age := signLead + p.EnvCutAfter + after; age >= m9OpTTL {
+		if age := signLead + p.EnvCutAfter + m9EnvCutAllowance + after; age >= m9OpTTL {
 			bad = append(bad, fmt.Sprintf("the %s held operation is %s old when it is enqueued, and its lifetime is %s", name, age, m9OpTTL))
 		}
 		if after+m9ResultWait > p.EnvHold {
@@ -113,11 +115,12 @@ func newSampler() *sampler {
 	return &sampler{stop: make(chan struct{}), done: make(chan struct{})}
 }
 
-// note records that a sample was taken at the time.
+// note records that a sample was taken at the time. It keeps the wall time only: on macOS the monotonic clock stops while the Mac sleeps, so a
+// gap of two monotonic readings would not show a sleep.
 func (s *sampler) note(at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.times = append(s.times, at)
+	s.times = append(s.times, at.Round(0))
 }
 
 // Gaps returns the time between each two consecutive samples, in order.
@@ -233,8 +236,8 @@ func parseM9Pods(cluster, raw string) ([]m9Pod, error) {
 	return pods, nil
 }
 
-// m9Agent is one entry of spire-server agent list.
-type m9Agent struct {
+// m9SpireAgent is one entry of spire-server agent list.
+type m9SpireAgent struct {
 	Path    string
 	Cluster string
 	UID     string
@@ -249,7 +252,7 @@ var (
 
 // parseM9Agents reads the JSON of spire-server agent list. It keeps the agents whose ID names a cluster and a pod UID. The server lists the
 // expiry of the agent SVID as x509svid_expires_at, in Unix seconds, as a quoted string.
-func parseM9Agents(raw string) ([]m9Agent, error) {
+func parseM9Agents(raw string) ([]m9SpireAgent, error) {
 	var res struct {
 		Agents []struct {
 			ID struct {
@@ -262,7 +265,7 @@ func parseM9Agents(raw string) ([]m9Agent, error) {
 	if err := json.Unmarshal([]byte(raw), &res); err != nil {
 		return nil, fmt.Errorf("the agent list is no JSON: %w", err)
 	}
-	var out []m9Agent
+	var out []m9SpireAgent
 	for _, a := range res.Agents {
 		var cluster, uid string
 		if m := m9JWTAgent.FindStringSubmatch(a.ID.Path); m != nil {
@@ -276,7 +279,7 @@ func parseM9Agents(raw string) ([]m9Agent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("the agent %s has the expiry %s, which is no Unix time", a.ID.Path, a.Expires)
 		}
-		out = append(out, m9Agent{Path: a.ID.Path, Cluster: cluster, UID: uid, Expires: time.Unix(secs, 0).UTC(), Banned: a.Banned})
+		out = append(out, m9SpireAgent{Path: a.ID.Path, Cluster: cluster, UID: uid, Expires: time.Unix(secs, 0).UTC(), Banned: a.Banned})
 	}
 	return out, nil
 }
@@ -290,7 +293,7 @@ type m9PodAgent struct {
 }
 
 // m9AgentsByPod maps each pod to its agent. An entry of a pod that no longer exists, and a banned entry, are left out.
-func m9AgentsByPod(entries []m9Agent, pods []m9Pod) map[string]m9PodAgent {
+func m9AgentsByPod(entries []m9SpireAgent, pods []m9Pod) map[string]m9PodAgent {
 	podOf := map[[2]string]string{}
 	for _, p := range pods {
 		podOf[[2]string{p.Cluster, p.UID}] = p.Key()
@@ -612,5 +615,28 @@ func TestM9Renewals(t *testing.T) {
 	}
 	if !m9RemainingOK(t0.Add(16*time.Second), t0, time.Minute) || m9RemainingOK(t0.Add(15*time.Second), t0, time.Minute) {
 		t.Error("the quarter of a 1 minute lifetime is 15 s, and the remaining time must be above it")
+	}
+}
+
+// TestSamplerKeepsWallTime: a stored sample time has no monotonic reading. On macOS the monotonic clock stops while the Mac sleeps, so a gap
+// from two monotonic readings would hide a sleep. Two wall times 20 minutes apart give a gap of 20 minutes.
+func TestSamplerKeepsWallTime(t *testing.T) {
+	s := newSampler()
+	now := time.Now()
+	if !strings.Contains(now.String(), " m=") {
+		t.Skip("this clock gives no monotonic reading, so there is nothing to strip")
+	}
+	s.note(now)
+	s.note(time.Unix(now.Unix()+20*60, 0))
+	for i, at := range s.times {
+		if strings.Contains(at.String(), " m=") {
+			t.Errorf("sample time %d is %s, with a monotonic reading", i, at)
+		}
+	}
+	if gaps := s.Gaps(); len(gaps) != 1 || gaps[0] < 19*time.Minute || gaps[0] > 21*time.Minute {
+		t.Errorf("Gaps() = %v, want one gap of about 20 minutes", gaps)
+	}
+	if err := m9SleepGapError(s.Gaps(), m9SleepGap); err == nil {
+		t.Error("a gap of 20 minutes passed the sleep check")
 	}
 }

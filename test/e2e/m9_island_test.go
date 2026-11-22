@@ -5,6 +5,8 @@ package e2e
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -15,9 +17,12 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
+	// m9OpsFile lists the IDs of the operations that the run signed, one on each line. The envelopes are not there. The IDs are not secret.
+	m9OpsFile         = "../../build/gate/m9-ops"
 	islandCell        = "dev-cell-2" // the cell island: dev-cell-2 cut from dev-cp
 	witnessCell       = "dev-cell-1" // stays connected, and is the witness of the environment island
 	m9RestartPoll     = 10 * time.Second
@@ -28,7 +33,7 @@ const (
 	m9ResultsWithin   = 10 * time.Minute
 	m9TelemetryWithin = 30 * time.Minute
 	// m9TelemetryFresh is the age that the newest sample of a cluster may have once telemetry flows again.
-	m9TelemetryFresh = "now-3m"
+	m9TelemetryFresh = 3 * time.Minute
 )
 
 // m9Finding is a problem that a goroutine of the run saw. The test reports it once, with the time of its first sight and its count.
@@ -95,6 +100,8 @@ type m9Run struct {
 type m9Trust struct {
 	Bundles map[string]string
 	Cells   map[string]string
+	// Pins holds the operator key pins and the signing key pin: the key sets that the cells verify against.
+	Pins map[string]string
 }
 
 func (r *m9Run) setPhase(p string) {
@@ -151,7 +158,11 @@ func (r *m9Run) since(at time.Time) string { return time.Since(at).Round(time.Se
 func TestM9IslandsHold(t *testing.T) {
 	r := &m9Run{t: t, stop: make(chan struct{}), envHealed: make(chan struct{}), phase: "setup",
 		restartLog: map[string]int{}, firstRst: map[string]time.Time{}}
-	defer r.stopBackground()
+	// The goroutines stop first, then each finding becomes a failure, also when a Fatal ends the test early.
+	defer func() {
+		r.stopBackground()
+		r.reportFindings()
+	}()
 	// The signed operations go final or closed even after a failure. Cleanups run last in, first out, and this one runs after the heals.
 	t.Cleanup(func() { r.closeOps() })
 	t.Cleanup(func() {
@@ -260,10 +271,17 @@ func TestM9IslandsHold(t *testing.T) {
 	})
 
 	// The environment island ends at its hold.
+	// The channel is read first, because the cell subtests can run past the hold and a select with two ready cases picks one at random.
 	select {
 	case <-r.envHealed:
-	case <-time.After(time.Until(r.envCutAt.Add(r.plan.EnvHold)) + 5*time.Minute):
-		t.Fatal("the environment island did not heal within 5 minutes of its hold")
+	default:
+		timer := time.NewTimer(max(0, time.Until(r.envCutAt.Add(r.plan.EnvHold))+5*time.Minute))
+		select {
+		case <-r.envHealed:
+			timer.Stop()
+		case <-timer.C:
+			t.Fatal("the environment island did not heal within 5 minutes of its hold")
+		}
 	}
 	r.mu.Lock()
 	healed := r.envHealedOK
@@ -292,8 +310,6 @@ func TestM9IslandsHold(t *testing.T) {
 	})
 	t.Run("telemetry_resumes", r.subTelemetry)
 
-	r.stopBackground()
-	r.reportFindings()
 	r.logQueues()
 }
 
@@ -302,6 +318,12 @@ func (r *m9Run) addOp(o m9Op) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ops = append(r.ops, o)
+	if err := os.MkdirAll(filepath.Dir(m9OpsFile), 0o755); err == nil {
+		if f, err := os.OpenFile(m9OpsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+			_, _ = f.WriteString(o.ID + "\n")
+			_ = f.Close()
+		}
+	}
 }
 
 // opID returns the ID of the operation with the name, or "".
@@ -316,7 +338,16 @@ func (r *m9Run) opID(name string) string {
 	return ""
 }
 
-// closeOps closes every operation of the run that mgmtd still holds open, so that none is left for the cell to apply later.
+// fromHeal returns the time that is left of a window of length d that started at the heal of the environment island, and at least 10 seconds, so
+// that a late subtest still looks once. One deadline from the heal bounds the reconnect subtests as a whole.
+func (r *m9Run) fromHeal(d time.Duration) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return max(10*time.Second, time.Until(r.envHealedAt.Add(d)))
+}
+
+// closeOps closes every operation of the run that mgmtd still holds open and that has expired. An open operation cannot be closed before its
+// lifetime ends, so the IDs also go to build/gate/m9-ops, and mise run ops -- close <id> closes them later.
 func (r *m9Run) closeOps() {
 	r.mu.Lock()
 	ops := slices.Clone(r.ops)
@@ -368,7 +399,15 @@ func (r *m9Run) readBaseline() {
 			t.Logf("collector queue of %s: %v", c, err)
 		}
 	}
-	var err error
+	agents, err := m9AgentList(t)
+	if err != nil {
+		t.Fatalf("read the agent list: %v", err)
+	}
+	for _, c := range []string{spireCluster, witnessCell} {
+		if len(m9AgentsByPod(agents, r.base[c])) == 0 {
+			t.Fatalf("spire-server agent list holds no agent of a pod of %s, so the renewal checks of row 749 would check nothing", c)
+		}
+	}
 	if r.baseRecs, err = m9RecordsCM(t); err != nil {
 		t.Fatalf("read the records ConfigMap: %v", err)
 	}
@@ -553,7 +592,7 @@ func (r *m9Run) minuteChecks() {
 // lifetime left, and each expiry moves forward at least once in half a lifetime plus 5 minutes.
 func (r *m9Run) renewalChecks() {
 	t := r.t
-	now := time.Now()
+	now := time.Now().Round(0)
 	agents, err := m9AgentList(t)
 	if err != nil {
 		r.find("read the agent list: " + m9Short(err.Error()))
@@ -566,13 +605,16 @@ func (r *m9Run) renewalChecks() {
 			continue
 		}
 		by := m9AgentsByPod(agents, pods)
+		if len(by) == 0 {
+			r.find(fmt.Sprintf("spire-server agent list holds no agent of a pod of %s, so row 749 checks nothing", c))
+		}
 		for _, key := range sortedKeys(by) {
 			a := by[key]
 			if !m9RemainingOK(a.Expires, now, r.ttl) {
 				r.find(fmt.Sprintf("the agent SVID of %s has %s left, not above a quarter of the lifetime %s (row 749)", key, a.Expires.Sub(now).Round(time.Second), r.ttl))
 			}
 			if p := r.renewals.observe("agent "+key, a.Expires, now); p != "" {
-				r.find("agent " + p + " (row 749)")
+				r.find(p + " (row 749)")
 			}
 		}
 	}
@@ -605,7 +647,7 @@ func (r *m9Run) recordIslandCell() {
 }
 
 // appProblems lists what is wrong with the Applications of a cluster at its bundle state. Each Application must be Synced and Healthy, and the
-// component Applications must sit at the digests of the state root. With strict false, it also compares with the baseline: the same UIDs, the
+// component Applications must sit at the digests of the state root. With baseline false, it also compares with the baseline: the same UIDs, the
 // same state root, and no Application that went away.
 func (r *m9Run) appProblems(cluster string, apps map[string]m9App, st bundleapply.State, baseline bool) []string {
 	var bad []string
@@ -728,7 +770,7 @@ func (r *m9Run) healEnvironmentAt(cut *linkCut) {
 		}
 	}
 	r.mu.Lock()
-	r.envHealedOK, r.envHealedAt, r.outboxAtHeal, r.outboxOldest = true, at, n, oldest
+	r.envHealedOK, r.envHealedAt, r.outboxAtHeal, r.outboxOldest = cut.healed, at, n, oldest
 	r.mu.Unlock()
 	r.t.Logf("healed the environment island after %s, with %d items in the outbox", r.since(r.envCutAt), n)
 }
@@ -767,6 +809,8 @@ func (r *m9Run) subSVIDsLapse(t *testing.T) {
 			if first.Before(expiry.Add(-m9Skew)) {
 				t.Errorf("%s restarted at %s, %s before its SVID expired at %s", key, first.UTC().Format(time.RFC3339), expiry.Sub(first).Round(time.Second), expiry.UTC().Format(time.RFC3339))
 			}
+		case count > 0:
+			t.Errorf("%s restarted %d times, and the run recorded no time for the first restart. Read the samples of build/gate/m9-samples.jsonl", key, count)
 		case hold > remaining:
 			t.Errorf("verify row 1 finding: the cell hold %s is above the remaining lifetime %s of the agent SVID of %s, and the agent did not restart. "+
 				"The agent kept running without a valid SVID, or renewed through another path", hold.Round(time.Second), remaining.Round(time.Second), key)
@@ -866,7 +910,7 @@ func (r *m9Run) subReattest(t *testing.T) {
 }
 
 func (r *m9Run) subCellsValid(t *testing.T) {
-	waitFor(t, "both cells to be valid at mgmtd", m9ValidWithin, func() (bool, string) {
+	waitFor(t, "both cells to be valid at mgmtd", r.fromHeal(m9ValidWithin), func() (bool, string) {
 		st, err := m9MgmtStatus()
 		if err != nil {
 			return false, err.Error()
@@ -891,7 +935,7 @@ func (r *m9Run) subDrain(t *testing.T) {
 	healedAt, atHeal, oldest := r.envHealedAt, r.outboxAtHeal, r.outboxOldest
 	r.mu.Unlock()
 	var items int
-	waitFor(t, "no outbox item older than the heal", m9DrainWithin, func() (bool, string) {
+	waitFor(t, "no outbox item older than the heal", r.fromHeal(m9DrainWithin), func() (bool, string) {
 		all, err := m9Outbox()
 		if err != nil {
 			return false, err.Error()
@@ -927,7 +971,7 @@ func (r *m9Run) subResultsRecorded(t *testing.T) {
 		t.Fatalf("the run signed %d operations, want 3 (two held for %s, one for %s)", len(ops), witnessCell, islandCell)
 	}
 	for _, o := range ops {
-		waitFor(t, "the operation "+o.Name+" ("+o.ID+") to be applied at mgmtd", m9ResultsWithin, func() (bool, string) {
+		waitFor(t, "the operation "+o.Name+" ("+o.ID+") to be applied at mgmtd", r.fromHeal(m9ResultsWithin), func() (bool, string) {
 			out, err := mgmtCtlErr("op", "get", o.ID)
 			if err != nil {
 				return false, err.Error()
@@ -952,6 +996,11 @@ func (r *m9Run) subNoTrustChange(t *testing.T) {
 	for _, k := range sortedKeys(r.baseTrust.Bundles) {
 		if got.Bundles[k] != r.baseTrust.Bundles[k] {
 			t.Errorf("the trust bundle of the SPIRE server of %s changed", k)
+		}
+	}
+	for _, k := range sortedKeys(r.baseTrust.Pins) {
+		if got.Pins[k] != r.baseTrust.Pins[k] {
+			t.Errorf("the key pin %s changed", k)
 		}
 	}
 	for _, k := range sortedKeys(r.baseTrust.Cells) {
@@ -991,9 +1040,12 @@ func (r *m9Run) subNoPodRestarts(t *testing.T) {
 
 func (r *m9Run) subTelemetry(t *testing.T) {
 	for _, c := range telemetryClusters {
-		waitFor(t, "a sample of "+c+" newer than 3 minutes in Prometheus", m9TelemetryWithin, func() (bool, string) {
-			s := promSamplesFrom(t, fmt.Sprintf(`up{k8s_cluster_name=%q}`, c), m9TelemetryFresh)
-			return len(s) > 0, fmt.Sprintf("%d series with a point in the last 3 minutes", len(s))
+		waitFor(t, "the newest sample of "+c+" in Prometheus to be younger than 3 minutes", r.fromHeal(m9TelemetryWithin), func() (bool, string) {
+			s := promSamples(t, fmt.Sprintf(`time() - max(timestamp(up{k8s_cluster_name=%q}))`, c))
+			if len(s) == 0 {
+				return false, "no sample"
+			}
+			return s[0].last < m9TelemetryFresh.Seconds(), fmt.Sprintf("the newest sample is %.0f s old", s[0].last)
 		})
 	}
 }
@@ -1081,7 +1133,7 @@ func m9RecordsCM(t *testing.T) (string, error) {
 	return kubectl(t, spireCluster, "", "-n", spireNamespace, "get", "configmap", "cell-records", "-o", "jsonpath={.data}")
 }
 
-// m9GatewayRecords returns the record revision of each cell at the gateway, as JSON. It is the spec revision that the gateway holds.
+// m9GatewayRecords returns the record revision of each cell at the gateway, as JSON. It is not the spec revision of the gateway, which Stats does not expose; a new spec at envd changes the records ConfigMap, which the run compares too. The epoch is included, so a reset of the gateway store shows.
 func m9GatewayRecords() (string, error) {
 	out, err := gwCtlErr("", "status")
 	if err != nil {
@@ -1091,20 +1143,42 @@ func m9GatewayRecords() (string, error) {
 	if err := json.Unmarshal([]byte(out), &s); err != nil {
 		return "", err
 	}
-	b, err := json.Marshal(s.Records)
+	b, err := json.Marshal(struct {
+		Epoch   uint64
+		Records map[string]spec.Revision
+	}{s.Epoch, s.Records})
 	return string(b), err
 }
 
 // m9SnapTrust reads the trust bundles of the SPIRE servers of dev-cp and management, and the issuer, keys and record of each cell at mgmtd.
 func m9SnapTrust(t *testing.T) (m9Trust, error) {
 	t.Helper()
-	tr := m9Trust{Bundles: map[string]string{}, Cells: map[string]string{}}
+	tr := m9Trust{Bundles: map[string]string{}, Cells: map[string]string{}, Pins: map[string]string{}}
 	for _, c := range []string{spireCluster, mgmtCluster} {
 		out, err := spireServerIn(t, c, "bundle", "show", "-socketPath", spireSocket, "-format", "pem")
 		if err != nil {
 			return tr, fmt.Errorf("spire-server bundle show in %s: %w", c, err)
 		}
 		tr.Bundles[c] = out
+	}
+	for _, p := range []struct{ cluster, ns, name string }{
+		{spireCluster, "envd-system", "operator-key"}, {spireCluster, "gateway-system", "operator-key"},
+		{mgmtCluster, mgmtNamespace, "operator-pub"}, {mgmtCluster, mgmtNamespace, "mgmt-signing-pub"},
+	} {
+		out, err := kubectl(t, p.cluster, "", "-n", p.ns, "get", "configmap", p.name, "--ignore-not-found", "-o", "jsonpath={.data}")
+		if err != nil {
+			return tr, err
+		}
+		tr.Pins[p.cluster+"/"+p.ns+"/"+p.name] = out
+	}
+	conf, err := kubectl(t, spireCluster, "", "-n", spireNamespace, "get", "configmap", "spire-server", "-o", `jsonpath={.data.server\.conf}`)
+	if err != nil {
+		return tr, err
+	}
+	for line := range strings.SplitSeq(conf, "\n") {
+		if strings.Contains(line, "operator_public_keys") {
+			tr.Pins["server.conf/operator_public_keys"] = strings.TrimSpace(line)
+		}
 	}
 	st, err := m9MgmtStatus()
 	if err != nil {

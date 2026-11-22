@@ -80,7 +80,7 @@ func startSampler(t *testing.T, phase func() string) *sampler {
 		defer f.Close()
 		next := time.Now()
 		for {
-			at := time.Now()
+			at := time.Now().Round(0)
 			s.note(at)
 			line := collectM9Sample(t, at, phase())
 			if b, err := json.Marshal(line); err == nil {
@@ -208,7 +208,7 @@ func m9ListPods(t *testing.T, cluster string) ([]m9Pod, error) {
 }
 
 // m9AgentList returns the agents that the SPIRE server of dev-cp lists.
-func m9AgentList(t *testing.T) ([]m9Agent, error) {
+func m9AgentList(t *testing.T) ([]m9SpireAgent, error) {
 	t.Helper()
 	out, err := spireServerIn(t, spireCluster, "agent", "list", "-socketPath", spireSocket, "-output", "json")
 	if err != nil {
