@@ -640,3 +640,51 @@ func TestSamplerKeepsWallTime(t *testing.T) {
 		t.Error("a gap of 20 minutes passed the sleep check")
 	}
 }
+
+// m9GwSnap is the part of the gateway status that the islands run compares. Records is the JSON of the record revision of each cell.
+type m9GwSnap struct {
+	Epoch   uint64
+	Records string
+}
+
+// m9GwChange returns the finding for a change of the gateway between base and got, or "". A change of the record revisions is a change of trust. The
+// gateway raises its fence epoch by design, on a hello after an applied operation, so the epoch may grow by at most one for each of the ops operations
+// that the run applied since the baseline. It may not fall.
+func m9GwChange(base, got m9GwSnap, ops int) string {
+	if got.Records != base.Records {
+		return fmt.Sprintf("the record revisions at the gateway changed from %s to %s", base.Records, got.Records)
+	}
+	if got.Epoch < base.Epoch {
+		return fmt.Sprintf("the fence epoch at the gateway fell from %d to %d", base.Epoch, got.Epoch)
+	}
+	if got.Epoch-base.Epoch > uint64(max(ops, 0)) {
+		return fmt.Sprintf("the fence epoch at the gateway grew from %d to %d, more than the %d operations that the run applied", base.Epoch, got.Epoch, ops)
+	}
+	return ""
+}
+
+func TestM9GwChange(t *testing.T) {
+	base := m9GwSnap{Epoch: 100, Records: `{"a":{"Epoch":1,"Seq":45}}`}
+	for _, c := range []struct {
+		name string
+		got  m9GwSnap
+		ops  int
+		bad  bool
+	}{
+		{"same", base, 0, false},
+		{"epoch raised once for an op", m9GwSnap{101, base.Records}, 1, false},
+		{"epoch raised three times for three ops", m9GwSnap{103, base.Records}, 3, false},
+		{"epoch raised with no op", m9GwSnap{101, base.Records}, 0, true},
+		{"epoch raised past the ops", m9GwSnap{104, base.Records}, 3, true},
+		{"epoch reset to a store time", m9GwSnap{1794952246, base.Records}, 3, true},
+		{"epoch fell", m9GwSnap{99, base.Records}, 3, true},
+		{"records changed", m9GwSnap{100, `{"a":{"Epoch":1,"Seq":46}}`}, 3, true},
+		{"records and epoch changed", m9GwSnap{101, `{}`}, 3, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := m9GwChange(base, c.got, c.ops); (got != "") != c.bad {
+				t.Fatalf("finding %q, want a finding: %v", got, c.bad)
+			}
+		})
+	}
+}

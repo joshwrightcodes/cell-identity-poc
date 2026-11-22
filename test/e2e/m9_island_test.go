@@ -83,7 +83,8 @@ type m9Run struct {
 	baseApps   map[string]map[string]m9App
 	baseState  map[string]bundleapply.State
 	baseRecs   string
-	baseGwRecs string
+	baseGwRecs m9GwSnap
+	baseGwOps  int
 	baseTrust  m9Trust
 	baseQueue  map[string]int
 
@@ -414,6 +415,9 @@ func (r *m9Run) readBaseline() {
 	if r.baseGwRecs, err = m9GatewayRecords(); err != nil {
 		t.Fatalf("read the gateway status: %v", err)
 	}
+	r.mu.Lock()
+	r.baseGwOps = len(r.ops)
+	r.mu.Unlock()
 	if r.baseTrust, err = m9SnapTrust(t); err != nil {
 		t.Fatalf("read the trust state: %v", err)
 	}
@@ -579,8 +583,13 @@ func (r *m9Run) minuteChecks() {
 		}
 		if got, err := m9GatewayRecords(); err != nil {
 			bad = append(bad, "read the gateway status: "+m9Short(err.Error()))
-		} else if got != r.baseGwRecs {
-			bad = append(bad, fmt.Sprintf("the record revisions at the gateway changed from %s to %s", r.baseGwRecs, got))
+		} else {
+			r.mu.Lock()
+			applied := len(r.ops) - r.baseGwOps
+			r.mu.Unlock()
+			if f := m9GwChange(r.baseGwRecs, got, applied); f != "" {
+				bad = append(bad, f)
+			}
 		}
 		return bad
 	})
@@ -1133,21 +1142,18 @@ func m9RecordsCM(t *testing.T) (string, error) {
 	return kubectl(t, spireCluster, "", "-n", spireNamespace, "get", "configmap", "cell-records", "-o", "jsonpath={.data}")
 }
 
-// m9GatewayRecords returns the record revision of each cell at the gateway, as JSON. It is not the spec revision of the gateway, which Stats does not expose; a new spec at envd changes the records ConfigMap, which the run compares too. The epoch is included, so a reset of the gateway store shows.
-func m9GatewayRecords() (string, error) {
+// m9GatewayRecords returns the record revision of each cell at the gateway, as JSON, and the fence epoch. It is not the spec revision of the gateway, which Stats does not expose; a new spec at envd changes the records ConfigMap, which the run compares too. The run compares the records for equality and bounds the epoch growth, because the gateway raises the epoch on a hello after an applied operation; m9GwChange does both.
+func m9GatewayRecords() (m9GwSnap, error) {
 	out, err := gwCtlErr("", "status")
 	if err != nil {
-		return "", fmt.Errorf("%w: %s", err, m9Short(out))
+		return m9GwSnap{}, fmt.Errorf("%w: %s", err, m9Short(out))
 	}
 	var s mgmtapi.GatewayStatus
 	if err := json.Unmarshal([]byte(out), &s); err != nil {
-		return "", err
+		return m9GwSnap{}, err
 	}
-	b, err := json.Marshal(struct {
-		Epoch   uint64
-		Records map[string]spec.Revision
-	}{s.Epoch, s.Records})
-	return string(b), err
+	b, err := json.Marshal(map[string]spec.Revision(s.Records))
+	return m9GwSnap{Epoch: s.Epoch, Records: string(b)}, err
 }
 
 // m9SnapTrust reads the trust bundles of the SPIRE servers of dev-cp and management, and the issuer, keys and record of each cell at mgmtd.
