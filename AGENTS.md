@@ -70,7 +70,7 @@
 | Run the M8 end-to-end gate (build the images first; `GATE_M8_LONG=1` adds the long tests) | `mise run gate:m8` |
 | Repair what `gate:m8` leaves: test objects, and each target that a test changed. It repairs before it publishes, with `dev-cp` first (`--check` only reports) | `mise run gate:m8:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
-| Run the M9 slow tier overnight, with the Mac on AC power and awake (see README "Gate of M9"; build the images first) | `mise run gate:m9` |
+| Run the M9 slow tier overnight (see README "Gate of M9"; build the images first) | `mise run gate:m9` |
 | Repair what `gate:m9` leaves: cuts, revoked test cells, held entries, the lifetime and `m9-*` namespaces (`--check` only reports) | `mise run gate:m9:repair` |
 | Run the gates as tiers: `fast` (M1 to M8), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
 | Cut and heal the traffic between two clusters: `cut`, `heal` or `list` (see README "Island mode and revocation") | `mise run partition -- cut --from dev-cell-2 --to dev-cp --hold 10` |

@@ -136,7 +136,7 @@ macOS still sleeps when the lid closes on battery power.
 - The identities `argocd/argocd-agent`, `observability-system/otel-uplink` and `mesh-view-system/mesh-view` follow the same rule as `celld`: any identity that can create a pod in the namespace can run it as that service account. The agent pod can request a token for its own service account, so it can attest as a node. The agent exposes `/debug/pprof` on its health port, and the pod admits no ingress to it. ConfigMap `mgmt-root` can be overwritten by a bundle that writes to `argocd`, and the new root applies at the next pod start.
 - The agent can list and watch every Secret of `argocd`, because it does not start without that access. The admission policy limits the Secret names and not their contents.
 - A revoked record stops new attestations. The plugin reloads the records every 10 seconds. A container beside the SPIRE server bans the agents of a revoked cell within 10 seconds.
-- A ban takes effect in about 4 seconds. The restart of a banned agent attests as a new agent within 1 second, so a ban alone does not keep a cell out. The overlay and the refusals of the record keep it out.
+- A ban takes effect in about 4 seconds. The restart of a banned agent attests as a new agent within 1 second, so a ban alone does not stop a cell. The overlay and the refusals of the record stop it.
 - A holder of the operator key can revoke any cell, and `mgmtd` adopts each revocation at once.
 - While the secret manager is unreachable, an operator cannot revoke a cell locally.
 - The Mac administrator can change every operator key pin, and `operator:check-key` detects the change.
@@ -144,15 +144,16 @@ macOS still sleeps when the lid closes on battery power.
 - A corrupt gateway store holds no overlay until the next sync of `envd`. This takes about 10 seconds while `envd` runs, and longer while `envd` is down.
 - `mgmtd` keeps an unbounded mirror of revocation events. Only an admin action or a signed entry adds an event.
 - The overlay of the gateway and `envd` counts a hold of more than 10 minutes from `issuedAt`, because `envd` records no admit time.
-- `revoke -- clean` deletes only stale and settled input keys. A key that does not verify needs a manual delete, and `revoke -- list` prints the command.
-- `mgmtd` learns key updates from the host service on the Mac. It checks every 15 minutes, whether or not `dev-cp` is connected.
+- `revoke -- clean` deletes only stale and settled input keys. A key that does not verify needs a manual delete, and `harness:status` prints the command.
+- `mgmtd` reads the cell keys from the host service on the Mac. It checks each bound cell every 15 minutes, whether or not `dev-cp` is connected.
 - `operator:rotate-key` refuses during a cut, or while `dev-cp` is not connected, before it reads the secret manager. The message names the cut or "not connected". The option `--emergency` needs no old key.
+- The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
 - The island signals have no alert evaluator.
 - The collector queue of `dev-cp` grows by `<measured in the live part>` in an environment island. This projects to `<measured in the live part>` in 24 hours, against a cap of 1.5 GiB.
 - An operation expires 1 hour after its signature, so work queued before a longer island never applies. A bundle set is an operation too.
 - The `celld` status carries no Argo CD health and no collector drops.
-- In a cell island, the agents of the cell exit 5 to 39 seconds after their SVIDs expire. Each container restarts in place and attests as a new agent after the heal. No pod is replaced. Every agent is Ready within 18 seconds of the heal.
-- Workload API clients take a new SVID about 11 seconds after their agent returns. The stream retry of `celld` stops at 5 seconds.
+- In the cell island of 2026-11-22, the agents of the cell exited 5 to 39 seconds after their SVIDs expired. Each container restarted in place and attested as a new agent after the heal. The cell kept every pod. Every agent was Ready within 18 seconds of the heal.
+- Workload API clients take a new SVID within about 11 seconds after their agent returns, by design. The retry caps give this bound, and the live value is `<measured in the live part>`. The stream retry of `celld` stops at 5 seconds.
 - An environment island restarts no container. In the run of 2026-11-22, the outbox grew to 18 items in 4 minutes and drained in 19 seconds.
 - The Colima VM clocks stop while the Mac sleeps, and `istio-agent` renews on the monotonic clock. After a long sleep, a sidecar keeps an expired certificate.
 - The `istio-proxy` liveness probe restarts only that container when its certificate has 2 hours or less left. The egress gateway has no such probe, and `cell:verify` reports its certificate.
