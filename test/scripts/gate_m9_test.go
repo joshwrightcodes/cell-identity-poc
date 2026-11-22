@@ -693,6 +693,11 @@ func TestGateM9RepairStore(t *testing.T) {
 				t.Fatalf("want restore, store Ready, publish, refresh, Application read, harness:status (%v):\n%s", order, calls)
 			}
 		}
+		for _, want := range []string{"kubectl --context kind-dev-cell-1 -n cell-system get pod bundle-store-0", "kubectl --context kind-dev-cell-1 -n argocd annotate application root", "kubectl --context kind-dev-cell-1 -n argocd get applications -o json"} {
+			if !strings.Contains(calls, want) {
+				t.Errorf("want the call %q:\n%s", want, calls)
+			}
+		}
 		if n := strings.Count(calls, "get pod bundle-store-0"); n < 3 {
 			t.Errorf("%d reads of the store pod, want it read again until Ready:\n%s", n, calls)
 		}
@@ -736,13 +741,25 @@ func TestGateM9RepairStore(t *testing.T) {
 			t.Fatalf("exit %d, breadcrumb %v, stderr %q; want a failure that keeps the breadcrumb and refreshes nothing", code, r.exists("build/gate/m9-store-lost"), errOut)
 		}
 	})
+	t.Run("a Terminating claim", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM9Rig(t)
+		r.storeCrumb()
+		r.state("claim-ending", "2\n")
+		_, errOut, code := r.run("gate-m9-repair.sh", nil)
+		calls := r.calls()
+		del, publish := callAt(calls, "delete pod bundle-store-0"), callAt(calls, "mise run bundle -- publish")
+		if code != 0 || del < 0 || publish < del {
+			t.Fatalf("exit %d, stderr %s; want the pod deleted by name before the publish:\n%s", code, errOut, calls)
+		}
+	})
 	t.Run("the store pod never gets Ready", func(t *testing.T) {
 		t.Parallel()
 		r := newRepairM9Rig(t)
 		r.storeCrumb()
 		r.state("store-notready", "1000\n")
 		_, errOut, code := r.run("gate-m9-repair.sh", []string{"GATE_M9_WAIT=30", "GATE_M9_POLL=10"})
-		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "mise run bundle") || !strings.Contains(errOut, "bundle-store-0") {
+		if code == 0 || !r.exists("build/gate/m9-store-lost") || strings.Contains(r.calls(), "mise run bundle") || !strings.Contains(errOut, "describe pod bundle-store-0") {
 			t.Fatalf("exit %d, stderr %q; want a failure that names the pod, before the publish", code, errOut)
 		}
 	})

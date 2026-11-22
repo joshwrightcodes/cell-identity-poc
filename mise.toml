@@ -299,7 +299,7 @@ description = "Run the slow tier of M9 overnight, plus the go test arguments aft
 run = "scripts/gate.sh m9"
 
 [tasks."gate:m9:repair"]
-description = "Repair what a slow tier of gate:m9 left when it stopped early: heal every cut, wait until connected and until envd holds no local revocation entry, run revoke -- clean, un-revoke the test cells, repair the API server of a key rotation test, restore the SVID lifetime of dev-cp with a restart of each cluster, delete the namespaces m9-* and run harness:status. With --check, only list the traces, and fail with the repair command. Safe to run again"
+description = "Repair what a slow tier of gate:m9 left when it stopped early: heal every cut, wait until connected and until envd holds no local revocation entry, run revoke -- clean, un-revoke the test cells, repair the API server of a key rotation test, restore the SVID lifetime of dev-cp with a restart of each cluster, delete the namespaces m9-*, refill the bundle store of a cell that the store test left empty, and run harness:status. With --check, only list the traces, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m9-repair.sh"
 
 [tasks."svid-ttl"]

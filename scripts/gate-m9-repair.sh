@@ -106,7 +106,7 @@ store_cell() {
 
 # traces prints one line for each trace of a stopped slow tier, with the step that the repair runs for it.
 traces() {
-  local line c ns live file out node tag cells
+  local line c ns live file out node tag cells sc
   out="$(cuts)" || exit 1
   while read -r node tag; do
     if [[ -n "$node" ]]; then echo "the node $node holds the cut $tag of the partition tool"; fi
@@ -139,7 +139,8 @@ traces() {
   out="$(api_key_traces)" || die "could not check the node of dev-cell-1 for the API server test key: $out"
   [[ -z "$out" ]] || printf '%s\n' "$out"
   if [[ -e "$store_crumb" ]]; then
-    echo "build/gate/m9-store-lost exists, so the bundle store of $(store_cell) may be lost and an Application may not be Synced"
+    sc="$(store_cell)" || exit 1
+    echo "build/gate/m9-store-lost exists, so the bundle store of $sc may be lost and an Application may not be Synced"
   fi
 }
 
@@ -228,10 +229,27 @@ wait_until "no test namespace m9-* is left" no_namespaces || die "a test namespa
 # Step 8b: the bundle store of a cell that a test emptied.
 if [[ -e "$store_crumb" ]]; then
   cell="$(store_cell)"
-  store_ready() { [[ "$(kubectl --context "kind-$cell" -n cell-system get pod bundle-store-0 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == True ]]; }
-  wait_until "bundle-store-0 of $cell is Ready" store_ready || die "bundle-store-0 of $cell is not Ready after ${wait_seconds}s"
+  kc() { kubectl --context "kind-$cell" -n cell-system "$@"; }
+  # A Ready pod on a claim that is being deleted is not repaired: the next restart of the pod loses the store. The pod is deleted by name,
+  # so that the StatefulSet makes the claim and the pod again.
+  store_ready() {
+    local claim_end
+    claim_end="$(kc get pvc data-bundle-store-0 --ignore-not-found -o 'jsonpath={.metadata.deletionTimestamp}' 2>/dev/null)" || return 1
+    if [[ -n "$claim_end" ]]; then
+      kc delete pod bundle-store-0 --wait=false >/dev/null 2>&1 || true
+      return 1
+    fi
+    [[ "$(kc get pod bundle-store-0 -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" == True ]]
+  }
+  wait_until "bundle-store-0 of $cell is Ready on a live claim" store_ready \
+    || die "bundle-store-0 of $cell is not Ready on a live claim after ${wait_seconds}s (pod phase '$(kc get pod bundle-store-0 -o 'jsonpath={.status.phase}' 2>&1)', claim phase '$(kc get pvc data-bundle-store-0 -o 'jsonpath={.status.phase}' 2>&1)'). Read: kubectl --context kind-$cell -n cell-system describe pod bundle-store-0, and the StatefulSet bundle-store"
   # The publish pushes every component and the root into the store and moves the tag current.
-  mise run bundle -- publish --target "$cell" --wait || die "mise run bundle -- publish --target $cell --wait failed"
+  if ! err="$(mise run bundle -- publish --target "$cell" --wait 2>&1 >/dev/null)"; then
+    if [[ "$err" == *bundle_open* ]]; then
+      die "mgmtd refused the set of $cell because a set is still open (bundle_open): ${err##*$'\n'}. Wait for it to end, then run: $repair"
+    fi
+    die "could not publish the hydrated set of $cell: ${err##*$'\n'}. Run: CELL=$cell mise run cell:hydrate, then mise run bundle -- publish --target $cell --wait"
+  fi
   apps="$(kubectl --context "kind-$cell" -n argocd get applications -o json | jq -r '.items[].metadata.name')" || die "could not list the Applications of $cell"
   for app in $apps; do
     kubectl --context "kind-$cell" -n argocd annotate application "$app" argocd.argoproj.io/refresh=hard --overwrite >/dev/null || die "could not refresh the Application $app of $cell"

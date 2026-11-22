@@ -95,6 +95,7 @@ esac
 //   - stub/store-notready: the number of reads of the pod bundle-store-0 that still say not Ready. stub/apps: the Applications of argocd as
 //     "<name> <sync> <health>" lines (default root Synced Healthy); an annotate of an Application sets it Synced and Healthy unless
 //     stub/refresh-stuck exists.
+//   - stub/claim-ending: the number of reads of the claim data-bundle-store-0 that show a deletionTimestamp.
 //   - stub/no-agent-ban: the StatefulSet spire-server of dev-cp has no container agent-ban. stub/stale: "<namespace> <workload> <cluster>" of
 //     a workload that runs another image.
 const m9Kubectl = `#!/usr/bin/env bash
@@ -149,6 +150,10 @@ case " $* " in
       grep -vx "namespace/$a" "$d/ns-$ctx" >"$d/ns-$ctx.new" || true
       mv "$d/ns-$ctx.new" "$d/ns-$ctx"
     done ;;
+  *" get pvc data-bundle-store-0 "*)
+    n="$(cat "$d/claim-ending" 2>/dev/null || echo 0)"
+    if ((n > 0)); then echo $((n - 1)) >"$d/claim-ending"; printf '2026-11-22T10:00:00Z'; fi ;;
+  *" delete pod bundle-store-0 "*) ;;
   *" get pod bundle-store-0 "*)
     n="$(cat "$d/store-notready" 2>/dev/null || echo 0)"
     if ((n > 0)); then echo $((n - 1)) >"$d/store-notready"; printf False; else printf True; fi ;;

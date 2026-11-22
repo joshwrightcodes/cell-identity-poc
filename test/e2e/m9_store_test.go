@@ -3,8 +3,10 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
@@ -23,8 +26,8 @@ const (
 	// m9StoreBreadcrumb tells gate:m9:repair that this test may have left the bundle store of m9StoreCell empty, or an Application not
 	// Synced. The test writes it before the first delete and removes it only after the cleanup saw the store and every Application back.
 	m9StoreBreadcrumb = "../../build/gate/m9-store-lost"
-	// m9StoreHold is the hold of the cell island. The timer of the partition tool removes the rules after the hold plus 15 minutes, and the
-	// test heals earlier. The island must outlast the loss, the new pod and the refill (three minutes after the pod is Ready).
+	// m9StoreHold only bounds the safety timer of the partition tool, which removes the rules after the hold plus 15 minutes. The test
+	// heals the cut itself in after_reconnect, and the island lasts for the loss, the new pod and the refill.
 	m9StoreHold = 15 * time.Minute
 	// m9StorePodWait bounds the wait for the new pod and the new volume.
 	m9StorePodWait = 5 * time.Minute
@@ -34,12 +37,12 @@ const (
 	m9StoreSampleEvery = 10 * time.Second
 )
 
-// m9UIDs maps "<kind>/<namespace>/<name>" to the UID of every Application of argocd and every Deployment of the bundle namespaces, except
+// m9StoreUIDs maps "<kind>/<namespace>/<name>" to the UID of every Application of argocd and every Deployment, StatefulSet and DaemonSet of the bundle namespaces, except
 // the objects that carry the e2e label.
-type m9UIDs map[string]string
+type m9StoreUIDs map[string]string
 
-// m9BundleNamespaces returns the namespaces that the signed set of the cell deploys into, and cell-system, which holds the bundle store.
-func m9BundleNamespaces(t *testing.T, cluster string) []string {
+// m9StoreBundleNamespaces returns the namespaces that the signed set of the cell deploys into, and cell-system, which holds the bundle store.
+func m9StoreBundleNamespaces(t *testing.T, cluster string) []string {
 	t.Helper()
 	nss := []string{m8CellStoreNS}
 	for _, c := range m8LiveSet(t, cluster) {
@@ -51,18 +54,20 @@ func m9BundleNamespaces(t *testing.T, cluster string) []string {
 	return nss
 }
 
-// m9ReadUIDs reads the UIDs of the Applications and of the Deployments of the namespaces. It uses no t.Fatal, so the sampler can call it from its
+// m9StoreReadUIDs reads the UIDs of the Applications and of the Deployments of the namespaces. It uses no t.Fatal, so the sampler can call it from its
 // own goroutine.
-func m9ReadUIDs(t *testing.T, cluster string, namespaces []string) (m9UIDs, error) {
+func m9StoreReadUIDs(t *testing.T, cluster string, namespaces []string) (m9StoreUIDs, error) {
 	t.Helper()
-	uids := m9UIDs{}
+	uids := m9StoreUIDs{}
 	type query struct {
 		kind string
 		args []string
 	}
 	queries := []query{{"application", []string{"-n", "argocd", "get", "applications", "-o", "json"}}}
 	for _, ns := range namespaces {
-		queries = append(queries, query{"deployment", []string{"-n", ns, "get", "deployments", "-o", "json"}})
+		for _, kind := range []string{"deployment", "statefulset", "daemonset"} {
+			queries = append(queries, query{kind, []string{"-n", ns, "get", kind + "s", "-o", "json"}})
+		}
 	}
 	for _, q := range queries {
 		out, err := kubectl(t, cluster, "", q.args...)
@@ -92,8 +97,8 @@ func m9ReadUIDs(t *testing.T, cluster string, namespaces []string) (m9UIDs, erro
 	return uids, nil
 }
 
-// m9UIDChanges lists each object of before that is gone or has another UID in after.
-func m9UIDChanges(before, after m9UIDs) []string {
+// m9StoreUIDChanges lists each object of before that is gone or has another UID in after.
+func m9StoreUIDChanges(before, after m9StoreUIDs) []string {
 	var out []string
 	for k, uid := range before {
 		switch got, ok := after[k]; {
@@ -107,9 +112,9 @@ func m9UIDChanges(before, after m9UIDs) []string {
 	return out
 }
 
-// m9UIDSampler reads the UIDs every m9StoreSampleEvery until stop is called, and keeps every change against the baseline. A read that
+// m9StoreUIDSampler reads the UIDs every m9StoreSampleEvery until stop is called, and keeps every change against the baseline. A read that
 // fails is not a change: the API of the cell stays reachable during the island, and the final read in the subtest has the last word.
-type m9UIDSampler struct {
+type m9StoreUIDSampler struct {
 	mu      sync.Mutex
 	changes map[string]bool
 	reads   int
@@ -117,8 +122,8 @@ type m9UIDSampler struct {
 	done    chan struct{}
 }
 
-func m9StartSampler(t *testing.T, cluster string, namespaces []string, base m9UIDs) *m9UIDSampler {
-	s := &m9UIDSampler{changes: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
+func m9StoreStartSampler(t *testing.T, cluster string, namespaces []string, base m9StoreUIDs) *m9StoreUIDSampler {
+	s := &m9StoreUIDSampler{changes: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
 		for {
@@ -127,13 +132,13 @@ func m9StartSampler(t *testing.T, cluster string, namespaces []string, base m9UI
 				return
 			case <-time.After(m9StoreSampleEvery):
 			}
-			now, err := m9ReadUIDs(t, cluster, namespaces)
+			now, err := m9StoreReadUIDs(t, cluster, namespaces)
 			if err != nil {
 				continue
 			}
 			s.mu.Lock()
 			s.reads++
-			for _, c := range m9UIDChanges(base, now) {
+			for _, c := range m9StoreUIDChanges(base, now) {
 				s.changes[c] = true
 			}
 			s.mu.Unlock()
@@ -143,7 +148,7 @@ func m9StartSampler(t *testing.T, cluster string, namespaces []string, base m9UI
 }
 
 // Stop ends the sampler and returns the number of reads and the sorted changes.
-func (s *m9UIDSampler) Stop() (int, []string) {
+func (s *m9StoreUIDSampler) Stop() (int, []string) {
 	select {
 	case <-s.stop:
 	default:
@@ -160,22 +165,22 @@ func (s *m9UIDSampler) Stop() (int, []string) {
 	return s.reads, ch
 }
 
-// m9Pod is what the test reads of the pod bundle-store-0.
-type m9Pod struct {
+// m9StorePodView is what the test reads of the pod bundle-store-0.
+type m9StorePodView struct {
 	UID      string
 	Ready    bool
 	Deleting bool
 	Claim    string
 }
 
-func m9ReadStorePod(t *testing.T) (m9Pod, bool, error) {
+func m9StoreReadPod(t *testing.T) (m9StorePodView, bool, error) {
 	t.Helper()
 	out, err := kubectl(t, m9StoreCell, "", "-n", m8CellStoreNS, "get", "pod", m9StorePod, "--ignore-not-found", "-o", "json")
 	if err != nil {
-		return m9Pod{}, false, err
+		return m9StorePodView{}, false, err
 	}
 	if strings.TrimSpace(out) == "" {
-		return m9Pod{}, false, nil
+		return m9StorePodView{}, false, nil
 	}
 	var p struct {
 		Metadata struct {
@@ -197,9 +202,9 @@ func m9ReadStorePod(t *testing.T) (m9Pod, bool, error) {
 		} `json:"status"`
 	}
 	if err := json.Unmarshal([]byte(out), &p); err != nil {
-		return m9Pod{}, false, err
+		return m9StorePodView{}, false, err
 	}
-	res := m9Pod{UID: p.Metadata.UID, Deleting: p.Metadata.DeletionTimestamp != nil}
+	res := m9StorePodView{UID: p.Metadata.UID, Deleting: p.Metadata.DeletionTimestamp != nil}
 	for _, c := range p.Status.Conditions {
 		if c.Type == "Ready" && c.Status == "True" {
 			res.Ready = true
@@ -213,8 +218,8 @@ func m9ReadStorePod(t *testing.T) (m9Pod, bool, error) {
 	return res, true, nil
 }
 
-// m9ReadStorePVC returns the UID of the claim and whether it is being deleted, or "" when it does not exist.
-func m9ReadStorePVC(t *testing.T) (uid string, deleting bool, err error) {
+// m9StoreReadPVC returns the UID of the claim and whether it is being deleted, or "" when it does not exist.
+func m9StoreReadPVC(t *testing.T) (uid string, deleting bool, err error) {
 	t.Helper()
 	out, err := kubectl(t, m9StoreCell, "", "-n", m8CellStoreNS, "get", "pvc", m9StorePVC, "--ignore-not-found", "-o", "jsonpath={.metadata.uid} {.metadata.deletionTimestamp}")
 	if err != nil {
@@ -227,6 +232,24 @@ func m9ReadStorePVC(t *testing.T) (uid string, deleting bool, err error) {
 	return f[0], len(f) > 1, nil
 }
 
+// m9StoreHeadDigest returns the status and the Docker-Content-Digest of a HEAD request for a manifest of the registry at addr.
+func m9StoreHeadDigest(t *testing.T, addr, repo, ref string) (int, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "http://"+addr+"/v2/"+repo+"/manifests/"+ref, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", bundle.MediaTypeManifest)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("HEAD %s:%s on %s: %v", repo, ref, addr, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode, resp.Header.Get("Docker-Content-Digest")
+}
+
 // m9StoreMissing reports what the in-cluster store lacks: the root manifest by digest and by the tag current, and each component manifest
 // by digest. It reads through a port-forward to the registry in the pod, which takes no token. An empty slice means the store holds all.
 func m9StoreMissing(t *testing.T, addr string, rootDigest string, comps map[string]string) []string {
@@ -235,8 +258,8 @@ func m9StoreMissing(t *testing.T, addr string, rootDigest string, comps map[stri
 	if s := m8StoreHead(t, addr, "bundles/root", rootDigest); s != 200 {
 		missing = append(missing, fmt.Sprintf("bundles/root@%s (%d)", rootDigest, s))
 	}
-	if s := m8StoreHead(t, addr, "bundles/root", tagCurrentName); s != 200 {
-		missing = append(missing, fmt.Sprintf("bundles/root:%s (%d)", tagCurrentName, s))
+	if s, d := m9StoreHeadDigest(t, addr, "bundles/root", m9StoreTagCurrent); s != 200 || d != rootDigest {
+		missing = append(missing, fmt.Sprintf("bundles/root:%s (%d, digest %q)", m9StoreTagCurrent, s, d))
 	}
 	for name, d := range comps {
 		if s := m8StoreHead(t, addr, "bundles/"+name, d); s != 200 {
@@ -247,11 +270,11 @@ func m9StoreMissing(t *testing.T, addr string, rootDigest string, comps map[stri
 	return missing
 }
 
-// tagCurrentName is the tag that the engine moves to the root manifest of the state, and that the Application root follows.
-const tagCurrentName = "current"
+// m9StoreTagCurrent is the tag that the engine moves to the root manifest of the state, and that the Application root follows.
+const m9StoreTagCurrent = "current"
 
-// m9CelldRefillLine returns the time of the first log line of celld that holds store_refilled and the root digest, at or after since.
-func m9CelldRefillLine(t *testing.T, since time.Time, rootDigest string) (time.Time, string, bool) {
+// m9StoreRefillLine returns the time of the first log line of celld that holds store_refilled and the root digest, at or after since.
+func m9StoreRefillLine(t *testing.T, since time.Time, rootDigest string) (time.Time, string, bool) {
 	t.Helper()
 	for _, p := range celldPods(t, m9StoreCell) {
 		// A restarted container keeps the log of its last run under --previous, which holds a line that the restart cut off.
@@ -281,8 +304,8 @@ func m9CelldRefillLine(t *testing.T, since time.Time, rootDigest string) (time.T
 	return time.Time{}, "", false
 }
 
-// m9AppView reports the sync status, the health and the comparison error of an Application, and the time of its last comparison.
-func m9AppView(t *testing.T, name string) (sync, health, revision string, reconciled time.Time, compErr bool) {
+// m9StoreAppView reports the sync status, the health and the comparison error of an Application, and the time of its last comparison.
+func m9StoreAppView(t *testing.T, name string) (sync, health, revision string, reconciled time.Time, compErr bool) {
 	t.Helper()
 	app := m8Application(t, m9StoreCell, name)
 	st, _ := app["status"].(map[string]any)
@@ -297,8 +320,8 @@ func m9AppView(t *testing.T, name string) (sync, health, revision string, reconc
 	return m8Field(app, "status", "sync", "status"), m8Field(app, "status", "health", "status"), m8Field(app, "status", "sync", "revision"), reconciled, compErr
 }
 
-// m9WriteStoreBreadcrumb records that the store of the cell may be lost, with the identity of the volume before the loss.
-func m9WriteStoreBreadcrumb(t *testing.T, pvcUID, podUID string) {
+// m9StoreWriteBreadcrumb records that the store of the cell may be lost, with the identity of the volume before the loss.
+func m9StoreWriteBreadcrumb(t *testing.T, pvcUID, podUID string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(m9StoreBreadcrumb), 0o755); err != nil {
 		t.Fatal(err)
@@ -310,25 +333,25 @@ func m9WriteStoreBreadcrumb(t *testing.T, pvcUID, podUID string) {
 	}
 }
 
-// m9RestoreStore is the cleanup of the test. It runs after the heal (t.Cleanup runs last in, first out, and the test registers it before
+// m9StoreRestore is the cleanup of the test. It runs after the heal (t.Cleanup runs last in, first out, and the test registers it before
 // the cut). It deletes only the pod and the claim that the test named, and only when the claim is still Terminating. It brings the pod
 // back, lets the refill fill the store for two minutes, signs the live set when the store is still short, hard-refreshes each Application
 // that is not Synced and Healthy, and waits until every Application that was Synced and Healthy before the loss is back. Each failure is
 // an error of the test, and the breadcrumb stays.
-func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
+func m9StoreRestore(t *testing.T, cut func() *linkCut, wasGood []string) {
 	t.Helper()
 	if c := cut(); c != nil {
 		c.Heal(t)
 	}
 	// A failure between the delete of the claim and the delete of the pod leaves the claim Terminating under a running pod.
-	if _, deleting, err := m9ReadStorePVC(t); err == nil && deleting {
+	if _, deleting, err := m9StoreReadPVC(t); err == nil && deleting {
 		if _, err := kubectl(t, m9StoreCell, "", "-n", m8CellStoreNS, "delete", "pod", m9StorePod, "--wait=false"); err != nil {
 			t.Errorf("delete %s to release the claim: %v", m9StorePod, err)
 		}
 	}
 	waitFor(t, m9StorePod+" Ready with an existing claim", m9StorePodWait, func() (bool, string) {
-		p, ok, err := m9ReadStorePod(t)
-		pvc, deleting, perr := m9ReadStorePVC(t)
+		p, ok, err := m9StoreReadPod(t)
+		pvc, deleting, perr := m9StoreReadPVC(t)
 		return err == nil && perr == nil && ok && p.Ready && !p.Deleting && pvc != "" && !deleting, fmt.Sprintf("pod %+v found %v, pvc %q deleting %v (%v, %v)", p, ok, pvc, deleting, err, perr)
 	})
 	st := m8State(t, m9StoreCell)
@@ -357,7 +380,7 @@ func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
 	// An Application that Argo CD has not compared since the source came back shows its old status. A hard refresh asks for a comparison
 	// and syncs nothing.
 	for _, name := range wasGood {
-		if sync, health, _, _, _ := m9AppView(t, name); sync == "Synced" && health == "Healthy" {
+		if sync, health, _, _, _ := m9StoreAppView(t, name); sync == "Synced" && health == "Healthy" {
 			continue
 		}
 		if out, err := kubectl(t, m9StoreCell, "", "-n", "argocd", "annotate", "application", name, "argocd.argoproj.io/refresh=hard", "--overwrite"); err != nil {
@@ -369,7 +392,7 @@ func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
 	for {
 		last = last[:0]
 		for _, name := range wasGood {
-			if sync, health, _, _, _ := m9AppView(t, name); sync != "Synced" || health != "Healthy" {
+			if sync, health, _, _, _ := m9StoreAppView(t, name); sync != "Synced" || health != "Healthy" {
 				last = append(last, fmt.Sprintf("%s is %s/%s", name, sync, health))
 			}
 		}
@@ -391,8 +414,7 @@ func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
 }
 
 // TestM9StoreLostDuringCellIsland (verify rows 3 and 12, plan row 756), on dev-cell-1: the cell is cut from dev-cp, the claim
-// data-bundle-store-0 and the pod bundle-store-0 are deleted, and the StatefulSet makes the pod again with an empty volume. Nothing is
-// scaled, because the Application of cell-system would undo a scale. The refill of celld, which runs from the mirror and needs no link to
+// data-bundle-store-0 and the pod bundle-store-0 are deleted, and the StatefulSet makes the pod again with an empty volume. The refill of celld, which runs from the mirror and needs no link to
 // dev-cp, puts the root, the components and the tag current back. No Application and no Deployment is replaced. After the heal the cell
 // is valid and the next signed set is applied.
 //
@@ -401,8 +423,8 @@ func m9RestoreStore(t *testing.T, cut func() *linkCut, wasGood []string) {
 // Argo CD must have compared root after that log line. It never waits for a sync operation.
 func TestM9StoreLostDuringCellIsland(t *testing.T) {
 	cell := m9StoreCell
-	bundleNS := m9BundleNamespaces(t, cell)
-	base, err := m9ReadUIDs(t, cell, bundleNS)
+	bundleNS := m9StoreBundleNamespaces(t, cell)
+	base, err := m9StoreReadUIDs(t, cell, bundleNS)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -419,7 +441,7 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if sync, health, _, _, _ := m9AppView(t, name); sync == "Synced" && health == "Healthy" {
+		if sync, health, _, _, _ := m9StoreAppView(t, name); sync == "Synced" && health == "Healthy" {
 			wasGood = append(wasGood, name)
 		}
 	}
@@ -427,11 +449,11 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 	if !slices.Contains(wasGood, "root") {
 		t.Fatalf("the Application root of %s is not Synced and Healthy before the test. Wait, or run: mise run cell:verify (CELL=%s)", cell, cell)
 	}
-	pod, ok, err := m9ReadStorePod(t)
+	pod, ok, err := m9StoreReadPod(t)
 	if err != nil || !ok || !pod.Ready || pod.Claim != m9StorePVC {
 		t.Fatalf("%s/%s of %s is %+v (found %v, error %v), want Ready with the claim %s", m8CellStoreNS, m9StorePod, cell, pod, ok, err, m9StorePVC)
 	}
-	pvcUID, deleting, err := m9ReadStorePVC(t)
+	pvcUID, deleting, err := m9StoreReadPVC(t)
 	if err != nil || pvcUID == "" || deleting {
 		t.Fatalf("the claim %s of %s has the UID %q, deleting %v (error %v), want a live claim", m9StorePVC, cell, pvcUID, deleting, err)
 	}
@@ -443,11 +465,11 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 
 	// The breadcrumb and the cleanup come before the cut and before the first delete. The cleanup heals the cut that cutLink registers
 	// later, because t.Cleanup runs last in, first out.
-	m9WriteStoreBreadcrumb(t, pvcUID, pod.UID)
+	m9StoreWriteBreadcrumb(t, pvcUID, pod.UID)
 	var cut *linkCut
 	getCut := func() *linkCut { return cut }
-	t.Cleanup(func() { m9RestoreStore(t, getCut, wasGood) })
-	sampler := m9StartSampler(t, cell, bundleNS, base)
+	t.Cleanup(func() { m9StoreRestore(t, getCut, wasGood) })
+	sampler := m9StoreStartSampler(t, cell, bundleNS, base)
 	t.Cleanup(func() { sampler.Stop() })
 
 	cut = cutLink(t, cell, cpClusterName, "both", m9StoreHold)
@@ -464,8 +486,8 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 	}
 	var readyAt time.Time
 	waitFor(t, m9StorePod+" Ready with a new claim UID", m9StorePodWait, func() (bool, string) {
-		p, found, err := m9ReadStorePod(t)
-		uid, del, perr := m9ReadStorePVC(t)
+		p, found, err := m9StoreReadPod(t)
+		uid, del, perr := m9StoreReadPVC(t)
 		good := err == nil && perr == nil && found && p.Ready && !p.Deleting && p.UID != pod.UID && p.Claim == m9StorePVC && uid != "" && uid != pvcUID && !del
 		return good, fmt.Sprintf("pod %+v found %v (old %s), claim %q deleting %v (old %s) (%v, %v)", p, found, pod.UID, uid, del, pvcUID, err, perr)
 	})
@@ -477,14 +499,15 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		deadline := readyAt.Add(m9StoreRefillWait)
 		var seen string
 		for {
-			refilledAt, line, found := m9CelldRefillLine(t, lostAt, st.Root.Digest)
+			refilledAt, line, found := m9StoreRefillLine(t, lostAt, st.Root.Digest)
 			missing := m9StoreMissing(t, addr, st.Root.Digest, st.Components)
-			sync, health, rev, reconciled, compErr := m9AppView(t, "root")
+			sync, health, rev, reconciled, compErr := m9StoreAppView(t, "root")
 			seen = fmt.Sprintf("log found %v, the store lacks %v, root is %s/%s at %s (comparison error %v, compared %s)", found, missing, sync, health, rev, compErr, reconciled.Format(time.RFC3339))
 			t.Log(seen)
-			// Synced inside the first 180 seconds is the old status and proves nothing. The comparison must follow the refill.
-			if found && len(missing) == 0 && sync == "Synced" && health == "Healthy" && rev == st.Root.Digest && !compErr && !reconciled.Before(refilledAt) {
-				t.Logf("celld logged store_refilled at %s: %s", refilledAt.Format(time.RFC3339), line)
+			// Synced inside the first 180 seconds is the old status and proves nothing. The comparison must follow the refill. reconciledAt has
+			// whole seconds and the log line has nanoseconds, so the log time is cut to the second before the comparison.
+			if found && len(missing) == 0 && sync == "Synced" && health == "Healthy" && rev == st.Root.Digest && !compErr && !reconciled.Before(refilledAt.Truncate(time.Second)) {
+				t.Logf("celld logged store_refilled at %s: %s. Argo CD compared root at %s", refilledAt.Format(time.RFC3339Nano), line, reconciled.Format(time.RFC3339))
 				return
 			}
 			if time.Now().After(deadline) {
@@ -502,11 +525,11 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		if len(changes) > 0 {
 			t.Errorf("during the island, an Application or a Deployment was replaced or removed: %v", changes)
 		}
-		now, err := m9ReadUIDs(t, cell, bundleNS)
+		now, err := m9StoreReadUIDs(t, cell, bundleNS)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ch := m9UIDChanges(base, now); len(ch) > 0 {
+		if ch := m9StoreUIDChanges(base, now); len(ch) > 0 {
 			t.Errorf("after the refill, an Application or a Deployment is not the one from before the loss: %v", ch)
 		}
 		t.Logf("%d reads of %d objects, no change", reads, len(base))
@@ -520,23 +543,17 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 		if res.Result.Outcome != op.OutcomeApplied {
 			t.Fatalf("the next signed set of %s ended %+v, want applied", cell, *res.Result)
 		}
-		now, err := m9ReadUIDs(t, cell, bundleNS)
+		now, err := m9StoreReadUIDs(t, cell, bundleNS)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if ch := m9UIDChanges(base, now); len(ch) > 0 {
+		if ch := m9StoreUIDChanges(base, now); len(ch) > 0 {
 			t.Errorf("after the reconnect, an Application or a Deployment is not the one from before the loss: %v", ch)
 		}
-		if missing := m9StoreMissing(t, addrOrForward(t, cell), m8State(t, cell).Root.Digest, m8State(t, cell).Components); len(missing) > 0 {
+		final := m8State(t, cell)
+		addrAfter, _ := m8ForwardStore(t, cell)
+		if missing := m9StoreMissing(t, addrAfter, final.Root.Digest, final.Components); len(missing) > 0 {
 			t.Errorf("the store of %s lacks %v after the signed set", cell, missing)
 		}
 	})
-}
-
-// addrOrForward opens a new port-forward to the registry of the current pod of the store of the cell. The pod of an earlier forward may
-// be a pod that was replaced.
-func addrOrForward(t *testing.T, cell string) string {
-	t.Helper()
-	addr, _ := m8ForwardStore(t, cell)
-	return addr
 }
