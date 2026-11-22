@@ -87,6 +87,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cli"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -469,7 +470,7 @@ func runServer(ctx context.Context, args []string, stdout io.Writer) int {
 func serve(ctx context.Context, stdout io.Writer, fn func(context.Context, *telemetry.T, *workloadapi.X509Source) error) int {
 	return serveTelemetry(ctx, stdout, func(ctx context.Context, tel *telemetry.T) error {
 		sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
-		svids, err := workloadapi.NewX509Source(sctx)
+		svids, err := workloadapi.NewX509Source(sctx, spireclient.SourceOptions())
 		cancel()
 		if err != nil {
 			return fmt.Errorf("x509 source from the workload api: %w", err)

@@ -38,6 +38,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -78,7 +79,7 @@ func realDeps() deps {
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
 			sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
 			defer cancel()
-			src, err := workloadapi.NewX509Source(sctx)
+			src, err := workloadapi.NewX509Source(sctx, spireclient.SourceOptions())
 			if err != nil {
 				return nil, nil, fmt.Errorf("x509 source from the workload api: %w", err)
 			}

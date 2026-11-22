@@ -57,6 +57,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -414,7 +415,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 	}()
 
 	tel.Log.Info("watching the workload api", "socket", os.Getenv("SPIFFE_ENDPOINT_SOCKET"))
-	if err := workloadapi.WatchX509Context(ctx, w); err != nil && ctx.Err() == nil {
+	if err := workloadapi.WatchX509Context(ctx, w, spireclient.ClientOptions()...); err != nil && ctx.Err() == nil {
 		tel.Log.Error("celld failed", "error", fmt.Sprintf("watch the workload api: %v", err))
 		return 1
 	}
