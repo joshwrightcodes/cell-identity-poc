@@ -334,3 +334,19 @@ run = "scripts/restart-check.sh"
 [tasks.pki]
 description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"
 run = "go run ./cmd/pkigen"
+
+[tasks.operatorctl]
+description = "Run operatorctl, the operator key tool of this Mac, with the arguments after --: keygen --public-file <path>, pub, sign --env <e> --cell <c> --record <epoch>.<counter> or verify --keys <file>. The seed moves only through standard input and standard output. See cmd/operatorctl"
+run = "go run ./cmd/operatorctl"
+
+[tasks."operator:create-key"]
+description = "Owner action, once: write a new operator key to the secret manager through POC_SECRET_WRITE_CMD, read it back, then write ConfigMap mgmt-system/operator-pub and build/operator/key.env. See scripts/operator-key.sh"
+run = "scripts/operator-key.sh create"
+
+[tasks."operator:check-key"]
+description = "Read the operator key through POC_SECRET_READ_CMD and compare its public key with operator-pub, each pin in dev-cp and build/operator/key.env. Prints one JSON line with match"
+run = "scripts/operator-key.sh check"
+
+[tasks."operator:rotate-key"]
+description = "Rotate the operator key, with the overlap of two keys, or at once with -- --emergency. Refuses while not connected, during a cut or a slow tier, and while envd holds a local revocation entry"
+run = "scripts/operator-key.sh rotate"

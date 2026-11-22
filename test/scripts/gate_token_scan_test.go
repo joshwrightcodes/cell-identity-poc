@@ -111,3 +111,35 @@ func TestGateTokenScan(t *testing.T) {
 		})
 	}
 }
+
+// TestTokenScanFindsSeed: a line that holds the operator seed prefix, in a container log, a step log or a gate file, fails the scan
+// with its place and line number, and the scan never prints the line or the seed.
+func TestTokenScanFindsSeed(t *testing.T) {
+	const seed = "OPERATOR-ED25519-SEED:q83vEjRWeJCrze8SNFZ4kKvN7xI0VniQq83vEjRWeJA="
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "log-cellgw-0"), []byte("ok\n"+seed+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	steps := t.TempDir()
+	if err := os.WriteFile(filepath.Join(steps, "eeee.log"), []byte("a\nb\nread "+seed+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stubs := map[string]string{"kubectl": tokenScanKubectl}
+	for name, body := range liveStubs {
+		stubs[name] = body
+	}
+	out, errOut, code := runScript(t, "gate-token-scan.sh", stubs, []string{"STUB_DIR=" + dir, "HOSTSVC_STEPS_DIR=" + steps}, "2026-11-15T01:02:03Z")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	for _, w := range []string{"dev-cp ns/cellgw-0 cellgw line 2", "eeee.log line 3"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("stdout %q lacks %q", out, w)
+		}
+	}
+	for _, d := range []string{"OPERATOR-ED25519-SEED", "q83vEjRW"} {
+		if strings.Contains(out+errOut, d) {
+			t.Errorf("the output holds %q", d)
+		}
+	}
+}
