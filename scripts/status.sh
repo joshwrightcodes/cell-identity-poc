@@ -24,6 +24,9 @@
 #   gateway       {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt, recordOld, recordOldAt,
 #                 queued, streams, mostClaimed, lastBindRefusal, storeError}: the status of the cell gateway. When it does not
 #                 answer, the object holds only error
+#   svidTTL       {file, marker, live}: the SVID lifetime of cells/dev-cp.env, of the slow-tier marker build/gate/m9-svid-ttl (null
+#                 when it is absent) and of the live server config (null with error when it cannot be read), as svid-ttl -- show
+#                 prints them. It is no problem by itself: cell:verify compares the live config with the lifetime in force
 # The object of management also holds:
 #   agents        {expected, connected, missing}: the Argo CD agents of VIEW_CELLS that the principal lists
 #   samples       the age in seconds of the last Prometheus sample for each k8s_cluster_name
@@ -507,7 +510,7 @@ collect() {
   fi
   if [[ "$cluster" == dev-cp ]]; then
     plane="$(gateway_plane)"
-    extras="$(jq -c '{gateway}' <<<"$plane")"
+    extras="$(jq -c --argjson ttl "$(svid_ttl_json)" '{gateway, svidTTL: $ttl}' <<<"$plane")"
     mp="$(gateway_problems <<<"$plane")"
   fi
   jq -nc --argjson mp "$mp" --arg cluster "$cluster" --arg env "$POC_ENV" --argjson apps "$apps" --argjson verify "$verify" --argjson telemetry "$telemetry" --argjson extras "$extras" '

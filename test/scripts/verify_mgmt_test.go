@@ -262,6 +262,7 @@ case " $* " in
   *" get deployment/envd "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"envd","image":"%s"}]}}}}\n' "$(img envd)" ;;
   *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
   *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
+  *" get configmap spire-server "*) printf 'server {\n  agent_ttl = "1m"\n}\n' ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `)

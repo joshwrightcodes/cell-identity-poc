@@ -11,8 +11,9 @@ import (
 // realPATH is PATH before the canaries. realTool uses it.
 var realPATH = os.Getenv("PATH")
 
-// canaryCommands are the commands that reach a cluster, the VM or the tools of the harness. A script test must never run the real one.
-var canaryCommands = []string{"kind", "docker", "colima", "ssh", "limactl", "kubectl", "mise"}
+// canaryCommands are the commands that reach a cluster, the VM or the tools of the harness, and the macOS tools that keep the Mac awake
+// or read its power source. A script test must never run the real one.
+var canaryCommands = []string{"kind", "docker", "colima", "ssh", "limactl", "kubectl", "mise", "caffeinate", "pmset"}
 
 // TestMain puts a canary for each command of canaryCommands at the front of PATH for every test of this package. A test puts its own stubs
 // before that PATH, so a stub wins. A command with no stub reaches the canary, which prints the command, its arguments and the name of this file, and

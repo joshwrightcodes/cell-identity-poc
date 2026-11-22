@@ -104,6 +104,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
 	  *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
 	  *" get deployment/argocd-agent-principal "*|*" get deployment/telemetry-gateway "*|*" get deployment/mesh-view-hub "*) one cell-proxy cell-proxy ;;
+	  *" get configmap spire-server "*) printf 'server {\n  agent_ttl = "1m"\n}\n' ;;
 	  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 	esac
 	`)

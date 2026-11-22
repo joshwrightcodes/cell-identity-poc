@@ -444,6 +444,9 @@ func TestStatusHealthyShape(t *testing.T) {
 	if got := keys(byName["management"]); !slices.Equal(got, []string{"agents", "applications", "cluster", "kiali", "management", "mesh", "ok", "problems", "samples", "stale_samples", "telemetry", "verify"}) {
 		t.Errorf("fields of the management object %v", got)
 	}
+	if ttl, ok := byName["dev-cp"]["svidTTL"].(map[string]any); !ok || ttl["file"] != "1m" {
+		t.Errorf("the dev-cp object holds svidTTL %v, want the lifetimes with file 1m", byName["dev-cp"]["svidTTL"])
+	}
 	m := byName["management"]
 	agents := m["agents"].(map[string]any)
 	if !slices.Equal(strs(agents["connected"]), []string{"dev-dev-cell-1", "dev-dev-cell-2"}) || len(agents["missing"].([]any)) != 0 {
