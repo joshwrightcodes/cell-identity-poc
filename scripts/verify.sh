@@ -125,6 +125,35 @@ check_trust_domain() {
   grep -qF "\"$want\"" <<<"$certs" || { echo "echo has no certificate for $want"; return 1; }
 }
 
+# Every istio-proxy must hold a workload certificate with more than 1 hour left on the wall clock of the pod. The agent renews on the
+# monotonic clock, which stops while the Mac sleeps, so a sidecar can serve an expired certificate. The liveness probe of the cert-liveness
+# injection template restarts the container below 2 hours. This check reads only.
+check_proxy_cert_life() {
+  local ns pods name metrics left found=0 bad=""
+  for ns in apps-demo istio-egress; do
+    pods="$(k -n "$ns" get pods -o json)" || { echo "could not list the pods in $ns"; return 1; }
+    while read -r name; do
+      [[ -n "$name" ]] || continue
+      found=$((found + 1))
+      metrics="$(k -n "$ns" exec "$name" -c istio-proxy -- sh -c 'curl -sf localhost:15020/stats/prometheus')" \
+        || { bad+="$ns/$name: could not read the metrics of istio-proxy"$'\n'; continue; }
+      left="$(awk 'index($1, "istio_agent_cert_expiry_seconds{") == 1 && $1 ~ /resource_name="default"/ { print $2; exit }' <<<"$metrics")"
+      if [[ -z "$left" ]]; then
+        bad+="$ns/$name: no istio_agent_cert_expiry_seconds for the default certificate"$'\n'
+      elif ! awk -v v="$left" 'BEGIN { exit !(v > 3600) }'; then
+        bad+="$ns/$name: the certificate has ${left%.*} s left, want more than 3600"$'\n'
+      fi
+    done < <(jq -r '.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)
+      | select([(.spec.initContainers // [])[], .spec.containers[] | .name] | index("istio-proxy") != null) | .metadata.name' <<<"$pods")
+  done
+  ((found > 0)) || { echo "no running istio-proxy in apps-demo or istio-egress"; return 1; }
+  if [[ -n "$bad" ]]; then
+    printf '%s' "$bad"
+    echo "The agent missed its renewal. The liveness probe restarts the container within about 2 minutes of VM run time."
+    return 1
+  fi
+}
+
 check_egress_through_gateway() {
   # Count upstream connections from the gateway to example.com. Istio trims most stats from
   # the stats endpoint, but /clusters keeps a cx_total counter for each upstream host.
@@ -769,6 +798,7 @@ check "Argo CD has no remote clusters and reads only the local store" check_argo
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh
 check "Mesh certificates use the cell trust domain" check_trust_domain
+check "Every istio-proxy certificate has more than 1 hour left" check_proxy_cert_life
 check "client reaches echo over mesh mTLS" expect_code client http://echo/hostname 200
 check "intruder is denied by AuthorizationPolicy" expect_code intruder http://echo/hostname 403
 check "plaintext cannot reach echo, because mTLS is strict" expect_no_connection plaintext http://echo/hostname

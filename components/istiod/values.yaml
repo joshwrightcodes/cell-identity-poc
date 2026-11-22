@@ -15,6 +15,37 @@ global:
       requests:
         cpu: 20m
         memory: 64Mi
+# The Colima VM clock stops while the Mac sleeps. istio-agent schedules its certificate renewal on the monotonic clock, so after a
+# long pause it can serve an expired workload certificate. The cert-liveness template adds a liveness probe to istio-proxy. The probe
+# reads the wall-clock gauge of the agent and fails when less than CERT_MIN_SECONDS (default 7200) remain. The kubelet then restarts
+# the container, and the new agent fetches a certificate. The pod stays. The probe passes when the gauge is absent or the agent does
+# not answer, so it never depends on istiod. The template follows the sidecar form: istio-proxy is an init container with a native
+# sidecar and a regular container otherwise. A pod that sets inject.istio.io/templates replaces this list and has no probe.
+sidecarInjectorWebhook:
+  defaultTemplates: [sidecar, cert-liveness]
+  templates:
+    cert-liveness: |
+      {{- $nativeSidecar := ne (index .ObjectMeta.Annotations `sidecar.istio.io/nativeSidecar` | default (printf "%t" .NativeSidecars)) "false" }}
+      spec:
+        {{- if $nativeSidecar }}
+        initContainers:
+        {{- else }}
+        containers:
+        {{- end }}
+        - name: istio-proxy
+          livenessProbe:
+            exec:
+              command:
+              - sh
+              - -c
+              - >-
+                curl -sf localhost:15020/stats/prometheus |
+                awk -v min="${CERT_MIN_SECONDS:-7200}"
+                '/^istio_agent_cert_expiry_seconds\{resource_name="default"\} / { seen = 1; ok = ($2 > min) }
+                END { exit !(seen == 0 || ok) }'
+            periodSeconds: 60
+            timeoutSeconds: 5
+            failureThreshold: 2
 meshConfig:
   trustDomain: "@CELL_MESH_TRUST_DOMAIN@"
   outboundTrafficPolicy:
