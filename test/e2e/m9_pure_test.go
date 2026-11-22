@@ -689,3 +689,39 @@ func TestM9GwChange(t *testing.T) {
 		})
 	}
 }
+
+// m9PluginCaughtUp decides whether the cleanup can stop waiting for the plugin. Envd must have applied the signed revision. Then the plugin
+// must show a "records reloaded" line at or after it, or show no such line at all, which means that it never changed its records.
+// Revisions are {epoch, counter}.
+func m9PluginCaughtUp(applied bool, signed, plugin [2]uint64, seen bool) bool {
+	if !applied {
+		return false
+	}
+	if !seen {
+		return true
+	}
+	return plugin[0] > signed[0] || (plugin[0] == signed[0] && plugin[1] >= signed[1])
+}
+
+func TestM9PluginCaughtUp(t *testing.T) {
+	for _, c := range []struct {
+		name            string
+		applied         bool
+		signed, plugin  [2]uint64
+		seen, wantReady bool
+	}{
+		{"no line in the log, applied", true, [2]uint64{1, 45}, [2]uint64{}, false, true},
+		{"no line in the log, not applied", false, [2]uint64{1, 45}, [2]uint64{}, false, false},
+		{"plugin at the signed revision", true, [2]uint64{1, 45}, [2]uint64{1, 45}, true, true},
+		{"plugin after the signed revision", true, [2]uint64{1, 45}, [2]uint64{2, 1}, true, true},
+		{"plugin behind in the counter", true, [2]uint64{1, 45}, [2]uint64{1, 44}, true, false},
+		{"plugin behind in the epoch", true, [2]uint64{2, 1}, [2]uint64{1, 99}, true, false},
+		{"plugin current, envd not applied", false, [2]uint64{1, 45}, [2]uint64{1, 45}, true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := m9PluginCaughtUp(c.applied, c.signed, c.plugin, c.seen); got != c.wantReady {
+				t.Fatalf("got %v, want %v", got, c.wantReady)
+			}
+		})
+	}
+}

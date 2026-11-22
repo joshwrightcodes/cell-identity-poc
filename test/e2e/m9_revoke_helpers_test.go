@@ -602,22 +602,30 @@ func base64Decode(s string) ([]byte, error) {
 }
 
 // m9PluginRevision returns the newest spec revision that the plugin log of the SPIRE server shows in "records reloaded". It does not
-// fail the test, so a cleanup can use it.
+// fail the test, so a cleanup can use it. It reads the whole log of the current pod, so a plugin that reloaded nothing in a long time
+// still shows its last line. seen is false when the log holds no such line.
 func m9PluginRevision() (epoch, counter uint64, err error) {
-	out, err := command("", "kubectl", "--context", "kind-"+spireCluster, "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=2h")
+	epoch, counter, _, err = m9PluginRevisionSeen()
+	return epoch, counter, err
+}
+
+func m9PluginRevisionSeen() (epoch, counter uint64, seen bool, err error) {
+	out, err := command("", "kubectl", "--context", "kind-"+spireCluster, "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server")
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	for _, l := range matching(out, func(l logLine) bool { return l.str("msg") == "records reloaded" }) {
 		e, c := uint64(number(l, "spec_epoch")), uint64(number(l, "spec_counter"))
+		seen = true
 		if e > epoch || (e == epoch && c > counter) {
 			epoch, counter = e, c
 		}
 	}
-	return epoch, counter, nil
+	return epoch, counter, seen, nil
 }
 
 // m9WaitPluginAtSigned waits, without failing the test, until envd applied the revision that mgmtd signed and the plugin holds it.
+// A plugin whose log has no "records reloaded" line never changed its records, so the wait ends once envd applied the signed revision.
 // A timeout is logged only, because the cleanup goes on with the restart.
 func m9WaitPluginAtSigned(t *testing.T, wait time.Duration) {
 	t.Helper()
@@ -625,9 +633,9 @@ func m9WaitPluginAtSigned(t *testing.T, wait time.Duration) {
 	last := ""
 	for time.Now().Before(end) {
 		if s, err := m9Status(); err == nil {
-			e, c, perr := m9PluginRevision()
-			last = fmt.Sprintf("signed %v, applied %v, plugin %d.%d (%v)", s.Signed, s.Applied, e, c, perr)
-			if s.Applied == s.Signed && perr == nil && (e > s.Signed.Epoch || (e == s.Signed.Epoch && c >= s.Signed.Counter)) {
+			e, c, seen, perr := m9PluginRevisionSeen()
+			last = fmt.Sprintf("signed %v, applied %v, plugin %d.%d seen %v (%v)", s.Signed, s.Applied, e, c, seen, perr)
+			if perr == nil && m9PluginCaughtUp(s.Signed == s.Applied, [2]uint64{s.Signed.Epoch, s.Signed.Counter}, [2]uint64{e, c}, seen) {
 				return
 			}
 		}
