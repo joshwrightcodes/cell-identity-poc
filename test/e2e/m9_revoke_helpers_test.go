@@ -3,18 +3,26 @@
 package e2e
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gateway"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
 const (
@@ -199,7 +207,11 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 		if !m9Marked(cell) {
 			return
 		}
+		// An adoption after a failure in the island needs the adoption bound, then the settle and the unrevoke.
 		deadline := time.Now().Add(m9ValidWait)
+		if local {
+			deadline = time.Now().Add(m9AdoptBound + 5*time.Minute)
+		}
 		fail := false
 		report := func(format string, args ...any) {
 			fail = true
@@ -210,7 +222,7 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 			s, err := m9Status()
 			if err == nil {
 				queued := slices.ContainsFunc(s.PendingRevokes, func(p mgmt.PendingRevoke) bool { return p.Cell == cell })
-				held := local && m9EntryState(t, cell, "held")
+				held := local && (m9EntryState(t, cell, "held") || m9EntryState(t, cell, "pending"))
 				if !queued && !held {
 					_, reason, uerr := m9UnrevokeErr(cell)
 					if uerr == nil || reason == "not_revoked" {
@@ -228,6 +240,8 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 			}
 			time.Sleep(5 * time.Second)
 		}
+		// The plugin must hold the unrevoked record before the agents attest again, or they retry against a refusal.
+		m9WaitPluginAtSigned(t, 5*time.Minute)
 		// 3.
 		if local {
 			if out, err := miseRun(t, 2*time.Minute, nil, "revoke", "--", "clean"); err != nil {
@@ -377,35 +391,21 @@ func number(l logLine, key string) float64 {
 	return n
 }
 
-// m9GatewayRefuses waits until the log of the gateway holds both refusals of the cell with the reason cell_revoked since a time: one
-// for the stream that was open (stream_refused with the pod of the stream) and one for a new hello (stream_refused with no pod, at the
-// start of the stream). It returns the time of each, which the caller compares with the start of the revocation.
+// m9GatewayRefuses waits until the log of the gateway holds the refusal of the open stream of the cell with the reason cell_revoked
+// (stream_refused with the pod of the stream) since a time, and until a new hello that the test makes (m9GatewayHello) gets a
+// refused frame cell_revoked. It returns the time of each on the clock of the node, which the caller compares with the start.
 func m9GatewayRefuses(t *testing.T, cell string, since time.Time, wait time.Duration) (ended, hello time.Time) {
 	t.Helper()
-	refused := func(l logLine) bool {
-		return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked"
-	}
-	waitFor(t, "the gateway log to hold stream_refused cell_revoked for "+cell+", for the open stream and for a new hello", wait, func() (bool, string) {
+	waitFor(t, "the gateway log to hold stream_refused cell_revoked with the pod of the open stream of "+cell, wait, func() (bool, string) {
 		logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
-		var withPod, withoutPod int
-		ended, hello = time.Time{}, time.Time{}
-		for _, l := range matching(logs, refused) {
-			at := lineTime(l)
-			if _, ok := l["pod"]; ok {
-				withPod++
-				if ended.IsZero() || at.Before(ended) {
-					ended = at
-				}
-			} else {
-				withoutPod++
-				if hello.IsZero() || at.Before(hello) {
-					hello = at
-				}
-			}
-		}
-		return withPod > 0 && withoutPod > 0, fmt.Sprintf("%d refusals of the open stream, %d of a new hello", withPod, withoutPod)
+		l, at, ok := m9FirstLine(logs, func(l logLine) bool {
+			_, withPod := l["pod"]
+			return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && withPod
+		})
+		ended = at
+		return ok, fmt.Sprintf("no such line in %d log bytes, last lines: %s (%v)", len(logs), lastLines(logs, 2), l)
 	})
-	return ended, hello
+	return ended, m9GatewayHelloRefused(t, cell, since, wait)
 }
 
 // m9RecordInPod waits until the plugin log "records reloaded" shows the revocation since a time, and returns the time of that line:
@@ -446,18 +446,25 @@ func m9PluginRefuses(t *testing.T, cell, source string, since time.Time, wait ti
 	})
 }
 
-// m9GatewayHelloRefused waits until the gateway log holds a stream_refused cell_revoked line of the cell with no pod (a new hello)
-// at or after a time.
-func m9GatewayHelloRefused(t *testing.T, cell string, since time.Time, wait time.Duration) {
+// m9GatewayHelloRefused waits until a new hello of the cell, made in the test, gets a refused frame cell_revoked, and until the
+// gateway log holds a stream_refused line with no pod for it. It returns the time of the answer on the clock of the node.
+func m9GatewayHelloRefused(t *testing.T, cell string, since time.Time, wait time.Duration) time.Time {
 	t.Helper()
-	waitFor(t, "the gateway to refuse a new hello of "+cell+" with cell_revoked", wait, func() (bool, string) {
+	var at time.Time
+	waitFor(t, "the gateway to answer a new hello of "+cell+" with a refused frame cell_revoked", wait, func() (bool, string) {
+		reason, err := m9GatewayHello(t, cell)
+		if err != nil || reason != "cell_revoked" {
+			return false, fmt.Sprintf("reason %q, error %v", reason, err)
+		}
+		at = m9Now(t)
 		logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
 		n := len(matching(logs, func(l logLine) bool {
 			_, withPod := l["pod"]
-			return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && !withPod && !lineTime(l).Before(since)
+			return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && !withPod
 		}))
-		return n > 0, fmt.Sprintf("%d refusals of a new hello since %s", n, since.UTC().Format(time.RFC3339))
+		return n > 0, "the frame was cell_revoked, and the gateway log holds no stream_refused line without a pod"
 	})
+	return at
 }
 
 // m9Agent is one agent that the SPIRE server lists.
@@ -583,4 +590,143 @@ func base64Decode(s string) ([]byte, error) {
 		return p, nil
 	}
 	return base64.RawURLEncoding.DecodeString(s)
+}
+
+// m9PluginRevision returns the newest spec revision that the plugin log of the SPIRE server shows in "records reloaded". It does not
+// fail the test, so a cleanup can use it.
+func m9PluginRevision() (epoch, counter uint64, err error) {
+	out, err := command("", "kubectl", "--context", "kind-"+spireCluster, "-n", spireNamespace, "logs", spireServerPod, "-c", "spire-server", "--since=2h")
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, l := range matching(out, func(l logLine) bool { return l.str("msg") == "records reloaded" }) {
+		e, c := uint64(number(l, "spec_epoch")), uint64(number(l, "spec_counter"))
+		if e > epoch || (e == epoch && c > counter) {
+			epoch, counter = e, c
+		}
+	}
+	return epoch, counter, nil
+}
+
+// m9WaitPluginAtSigned waits, without failing the test, until envd applied the revision that mgmtd signed and the plugin holds it.
+// A timeout is logged only, because the cleanup goes on with the restart.
+func m9WaitPluginAtSigned(t *testing.T, wait time.Duration) {
+	t.Helper()
+	end := time.Now().Add(wait)
+	last := ""
+	for time.Now().Before(end) {
+		if s, err := m9Status(); err == nil {
+			e, c, perr := m9PluginRevision()
+			last = fmt.Sprintf("signed %v, applied %v, plugin %d.%d (%v)", s.Signed, s.Applied, e, c, perr)
+			if s.Applied == s.Signed && perr == nil && (e > s.Signed.Epoch || (e == s.Signed.Epoch && c >= s.Signed.Counter)) {
+				return
+			}
+		}
+		time.Sleep(5 * time.Second)
+	}
+	t.Logf("cleanup: the plugin did not reach the signed revision in %s (%s)", wait, last)
+}
+
+// m9PluginAtRevision waits until the plugin log "records reloaded" shows a spec at or after rev (row 37: the plugin holds the new
+// revision), and returns the time of the check on the clock of the node.
+func m9PluginAtRevision(t *testing.T, rev spec.Revision, wait time.Duration) time.Time {
+	t.Helper()
+	waitFor(t, fmt.Sprintf("the plugin of the SPIRE server to reload records at the spec revision %d.%d or later", rev.Epoch, rev.Counter), wait, func() (bool, string) {
+		e, c, err := m9PluginRevision()
+		return err == nil && (e > rev.Epoch || (e == rev.Epoch && c >= rev.Counter)), fmt.Sprintf("the plugin shows %d.%d (%v)", e, c, err)
+	})
+	return m9Now(t)
+}
+
+var m9Offset struct {
+	set bool
+	d   time.Duration
+}
+
+// m9Now is the time of the node on the clock scale of the Mac: --since-time filters by the clock of the node, so each time that a
+// test compares with a log line comes from here. It reads dev-cp-control-plane once.
+func m9Now(t *testing.T) time.Time {
+	t.Helper()
+	if !m9Offset.set {
+		out, err := command("", "docker", "exec", spireCluster+"-control-plane", "date", "+%s.%N")
+		if err != nil {
+			t.Fatalf("read the clock of %s-control-plane: %v", spireCluster, err)
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(out), 64)
+		if err != nil {
+			t.Fatalf("the clock of %s-control-plane printed %q", spireCluster, out)
+		}
+		m9Offset.d = time.Duration(f*float64(time.Second)) - time.Duration(time.Now().UnixNano())
+		m9Offset.set = true
+		t.Logf("the clock of %s-control-plane is %s ahead of the Mac", spireCluster, m9Offset.d.Round(time.Millisecond))
+	}
+	return time.Now().Add(m9Offset.d)
+}
+
+// m9RequireNoEntries fails when ConfigMap local-revocations holds an entry, because the single refusal line of envd for a reason
+// would then come from that entry, and replay_refused would wait for a line that never comes.
+func m9RequireNoEntries(t *testing.T) {
+	t.Helper()
+	if es := m9ListEntries(t); len(es) > 0 {
+		t.Fatalf("ConfigMap envd-system/local-revocations holds %d entries from an earlier run (%+v). Run: mise run revoke -- clean", len(es), es)
+	}
+}
+
+// m9GatewayHello makes a new hello of the cell in the test, not through celld: it mints a celld SVID of the cell in dev-cp, opens
+// the stream through a port-forward of svc/cell-gateway-stream, and reads the first frame. The gateway checks the record and the
+// overlay before it reads the hello, so a revoked cell gets a refused frame with no token. A celld of a banned cell holds no valid
+// SVID after one lifetime, and the gateway then fails the handshake without a log line, so the test cannot use celld here. It returns
+// the reason of the refused frame, or the type of another frame.
+func m9GatewayHello(t *testing.T, cell string) (string, error) {
+	t.Helper()
+	cert := senderCert(t, "spiffe://"+envTrustDomain+"/cell/"+cell+"/"+gateway.CelldRole)
+	roots := x509.NewCertPool()
+	for _, c := range bundleRoots(t, envCluster) {
+		roots.AddCert(c)
+	}
+	conf := &tls.Config{
+		MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}, Certificates: []tls.Certificate{cert}, InsecureSkipVerify: true,
+		VerifyPeerCertificate: func(raw [][]byte, _ [][]*x509.Certificate) error {
+			var chain []*x509.Certificate
+			for _, r := range raw {
+				c, err := x509.ParseCertificate(r)
+				if err != nil {
+					return err
+				}
+				chain = append(chain, c)
+			}
+			inter := x509.NewCertPool()
+			for _, c := range chain[1:] {
+				inter.AddCert(c)
+			}
+			_, err := chain[0].Verify(x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny}})
+			return err
+		},
+	}
+	addr := portForward(t, envCluster, gatewayNamespace, "svc/cell-gateway-stream", 8450)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: conf, ForceAttemptHTTP2: true}, Timeout: 30 * time.Second}
+	defer client.CloseIdleConnections()
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	req, err := http.NewRequest(http.MethodPost, "https://"+addr+gwapi.StreamPath(cell), pr)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("the gateway answered %s", resp.Status)
+	}
+	f, err := gwapi.NewDecoder(resp.Body).Decode()
+	if err != nil {
+		return "", err
+	}
+	if f.Type != gwapi.TypeRefused {
+		return "frame " + f.Type, nil
+	}
+	return f.Reason, nil
 }

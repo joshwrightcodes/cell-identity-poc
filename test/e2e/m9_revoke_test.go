@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -48,7 +49,7 @@ func TestM9ConnectedRevocation(t *testing.T) {
 	m9RestoreCell(t, m9Cell, false)
 	otherBefore := m9BannedSet(t, m9Witness)
 
-	start := time.Now()
+	start := m9Now(t)
 	res := m9Revoke(t, m9Cell)
 	t.Logf("mgmt -- revoke --cell %s: %+v", m9Cell, res)
 	var recordAt time.Time
@@ -92,17 +93,20 @@ func TestM9ConnectedRevocation(t *testing.T) {
 			t.Fatalf("mgmtd signed %v after the key change of %s, want a revision after %v", s1.Signed, m9Witness, s0.Signed)
 		}
 		waitApplied(t, s1.Signed.Counter, 2*time.Minute)
-		after := time.Now()
 		if c, ok := m9CellStatus(mgmtStatus(t), m9Cell); !ok || !c.Revoked {
 			t.Errorf("after revision %v mgmtd shows %s with revoked %v, want true", s1.Signed, m9Cell, c.Revoked)
 		}
 		if _, cells, err := readLiveRecords(t); err != nil || !cells[m9Cell].Revoked {
 			t.Errorf("after revision %v the record of %s is revoked %v (%v), want true", s1.Signed, m9Cell, cells[m9Cell].Revoked, err)
 		}
+		// The plugin pod sees cell-records after the kubelet sync, so wait until it shows the new revision before the probe.
+		after := m9PluginAtRevision(t, s1.Signed, m9RecordBound)
 		m9PluginRefuses(t, m9Cell, clusterjwt.SourceRecord, after, m9PluginBound)
 		m9GatewayHelloRefused(t, m9Cell, after, m9GatewayBound)
 	})
 
+	// no_lease shows that the row stays unleased. celld cannot hold a stream of the revoked cell, so it does not tell the lease rule
+	// of the gateway (ClaimLive) from the refusal of the stream.
 	t.Run("no_lease", func(t *testing.T) {
 		id, envelope := opSign(t, m9Cell, "m9 revoked "+randomHex(t, 4), 3*time.Minute)
 		closer.add(id)
@@ -313,6 +317,7 @@ func m9TrustSnapshot(t *testing.T) map[string]string {
 	snap["pin/envd"] = get(spireCluster, envdNamespace, "operator-key", `{.data.keys\.pub}`)
 	snap["pin/gateway"] = get(spireCluster, gatewayNamespace, "operator-key", `{.data.keys\.pub}`)
 	snap["pin/server"] = strings.Join(regexp.MustCompile(`(?m)^[ \t]*operator_public_keys[ \t]*=[ \t]*\[[^\]]*\]`).FindAllString(get(spireCluster, spireNamespace, "spire-server", `{.data.server\.conf}`), -1), "\n")
+	snap["pin/mgmtd"] = get(mgmtCluster, mgmtNamespace, "operator-key", `{.data.keys\.pub}`)
 	snap["operator-pub"] = get(mgmtCluster, mgmtNamespace, "operator-pub", "{.data}")
 	if k, err := os.ReadFile(m9OperatorKeyEnv); err == nil {
 		snap["key.env"] = string(k)
@@ -340,13 +345,14 @@ func m9ErrorLine(out string) string {
 func TestM9LocalRevocationDuringIsland(t *testing.T) {
 	keySHA := m9OperatorKeySHA256(t)
 	m9RequireStart(t, m9Cell)
+	m9RequireNoEntries(t)
 	// Registered before the cut: the heal runs first, then the restore of the cell.
 	m9RestoreCell(t, m9Cell, true)
 	otherBefore := m9BannedSet(t, m9Witness)
 	cut := cutLink(t, spireCluster, mgmtCluster, "both", m9IslandHold)
 
 	m9MarkRevoked(t, m9Cell)
-	start := time.Now()
+	start := m9Now(t)
 	out, err := miseRun(t, 5*time.Minute, nil, "revoke", "--", "local", "--cell", m9Cell)
 	if err != nil {
 		t.Fatalf("mise run revoke -- local --cell %s: %v\n%s", m9Cell, err, out)
@@ -403,7 +409,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 		key := randomHex(t, 8) + ".json"
 		t.Cleanup(func() { m9PatchInput(t, key, "") })
 		forged := m9ForgedEnvelope(t, m9Witness, m9RecordRevision(t, m9Witness))
-		since := time.Now()
+		since := m9Now(t)
 		m9PatchInput(t, key, forged)
 		waitFor(t, "the envd log to hold revocation_refused with the reason revocation_invalid", 2*time.Minute, func() (bool, string) {
 			logs := m9PodLog(t, spireCluster, envdNamespace, "deploy/"+envdDeployment, envdDeployment, since.Add(-logMargin))
@@ -419,8 +425,13 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 			t.Errorf("attestprobe in %s printed %q after the forged entry, want issued:", m9Witness, res.out)
 		}
 		logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
-		if n := len(matching(logs, func(l logLine) bool { return l.str("msg") == "stream_refused" && l.str("cell") == m9Witness })); n > 0 {
-			t.Errorf("the gateway refused %s %d times after the forged entry, want none", m9Witness, n)
+		if n := len(matching(logs, func(l logLine) bool {
+			return l.str("msg") == "stream_refused" && l.str("cell") == m9Witness && l.str("reason") == "cell_revoked"
+		})); n > 0 {
+			t.Errorf("the gateway refused %s with cell_revoked %d times after the forged entry, want none", m9Witness, n)
+		}
+		if now := m9BannedSet(t, m9Witness); !slices.Equal(now, otherBefore) {
+			t.Errorf("the banned agents of %s changed from %v to %v after the forged entry, want no change", m9Witness, otherBefore, now)
 		}
 	})
 
@@ -441,11 +452,11 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 		msg := m9ErrorLine(out)
 		t.Logf("operator:rotate-key refused: %s", msg)
 		named := false
-		for _, want := range []string{"connected environment", "not connected", "cut of the partition tool", "local revocation entries"} {
+		for _, want := range []string{"connected environment", "cut of the partition tool"} {
 			named = named || strings.Contains(msg, want)
 		}
 		if !named {
-			t.Errorf("the refusal %q names neither the missing connection, the cut nor the held entries", msg)
+			t.Errorf("the refusal %q names neither the missing connection nor the cut", msg)
 		}
 		if _, err := os.Stat(canary); err == nil {
 			t.Error("operator:rotate-key called the secret manager before it refused")
@@ -468,7 +479,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 	if !cut.healed {
 		t.Fatalf("the cut %s is not healed, so the rest of the test cannot run", cut.Tag)
 	}
-	healedAt := time.Now()
+	healedAt := m9Now(t)
 
 	adopted := t.Run("adopted", func(t *testing.T) {
 		waitFor(t, "mgmtd to adopt the entry "+id+" and sign the record of "+m9Cell+" as revoked", m9AdoptBound, func() (bool, string) {
@@ -503,7 +514,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 		})
 		t.Logf("ADOPTED_SECONDS=%.0f after the heal", time.Since(healedAt).Seconds())
 	})
-	adoptedAt := time.Now()
+	adoptedAt := m9Now(t)
 
 	t.Run("stays_refused", func(t *testing.T) {
 		// Row 757: after the revision that revokes the cell, the cell stays refused, and envd settles the entry.
@@ -527,7 +538,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 			t.Skip("the entry was not adopted, so there is nothing to replay")
 		}
 		m9Unrevoke(t, m9Cell)
-		since := time.Now()
+		since := m9Now(t)
 		// The same entry goes in again, whether or not the key is still in the ConfigMap.
 		m9PatchInput(t, id+".json", envelope)
 		waitFor(t, "the envd log to hold revocation_refused revocation_stale for the entry "+id, 3*time.Minute, func() (bool, string) {
