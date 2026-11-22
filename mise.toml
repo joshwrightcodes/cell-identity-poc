@@ -359,6 +359,10 @@ run = "go run ./cmd/pkigen"
 description = "Run operatorctl, the operator key tool of this Mac, with the arguments after --: keygen --public-file <path>, pub, sign --env <e> --cell <c> --record <epoch>.<counter> or verify --keys <file>. The seed moves only through standard input and standard output. See cmd/operatorctl"
 run = "go run ./cmd/operatorctl"
 
+[tasks.revoke]
+description = "Revoke a cell with the operator key, with the arguments after --: local --cell <cell> (sign an entry for the record that envd holds and write it to envd-system/local-revocations), list (each entry with its envd state), reapply (write build/operator/revocations.log back) or clean (delete the stale and settled entries). Prints JSON lines. See scripts/revoke.sh"
+run = "scripts/revoke.sh"
+
 [tasks."operator:create-key"]
 description = "Owner action, once: write a new operator key to the secret manager through POC_SECRET_WRITE_CMD, read it back, then write ConfigMap mgmt-system/operator-pub and build/operator/key.env. See scripts/operator-key.sh"
 run = "scripts/operator-key.sh create"

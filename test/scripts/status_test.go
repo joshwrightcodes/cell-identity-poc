@@ -204,6 +204,10 @@ const statusKubectlStub = `#!/usr/bin/env bash
 ctx=""; prev=""
 for a in "$@"; do [[ "$prev" == --context ]] && ctx="$a"; prev="$a"; done
 args=" $* "
+default_pin='{"data":{"keys.pub":"KEYA\n"}}'
+default_records='{"data":{}}'
+default_conf='      agent_ttl = "1m"'
+default_pod='{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0},{"name":"agent-ban","ready":true,"restartCount":0}]}}'
 case "$args" in
   *" -n argocd get applications -o json "*)
     [[ "$ctx" == "kind-${STUB_APPS_GARBAGE:-none}" ]] && { echo "not json"; exit 0; }
@@ -230,6 +234,11 @@ case "$args" in
     var="STUB_ALLOW_ANN_${ctx#kind-}"; var="${var//-/_}"
     jq -nc --arg a "${!var-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" '(if $a == "" then {} else {"poc.internal/allow-sha256": $a} end) as $ann
       | {items: [{metadata: {name: "cell", annotations: $ann}}, {metadata: {name: "cell-app", annotations: $ann}}, {metadata: {name: "default"}}]}' ;;
+  *" -n envd-system get configmap local-revocations "*) printf '%s' "${STUB_LOCAL_REVOCATIONS-}" ;;
+  *" -n envd-system get configmap operator-key "*) printf '%s' "${STUB_ENVD_PIN-$default_pin}" ;;
+  *" -n spire-system get configmap cell-records "*) printf '%s' "${STUB_CELL_RECORDS-$default_records}" ;;
+  *" -n spire-system get configmap spire-server "*) printf '%s' "${STUB_SERVER_CONF-$default_conf}" ;;
+  *" -n spire-system get pod spire-server-0 "*) printf '%s' "${STUB_SPIRE_POD-$default_pod}" ;;
   *" get configmap hostsvc-pin "*) printf '%s' "${STUB_CM_PIN:-$STUB_PIN_PEM}" ;;
   *" get pod mgmtd-0 "*) printf '%s' "${STUB_POD_PIN:-}" ;;
   *" exec spire-server-0 "*) printf '%s\n' "${STUB_ROOT_PEM:-}" ;;
@@ -263,6 +272,10 @@ case "$*" in
   "run gw -- status")
     printf '%s\n' "${STUB_GW_STATUS:-}"
     exit "${STUB_GW_RC:-0}" ;;
+  "run operatorctl -- verify --keys "*)
+    # The stub accepts an envelope whose first signature is "good", and only when the keys file holds the pinned key KEYA.
+    keys="${6:-}"; grep -qx KEYA "$keys" || exit 1
+    jq -ce 'select(.signatures[0].sig == "good") | (.payload | @base64d | fromjson) + {keySHA256: "x"}' || exit 1 ;;
   "run pki -- trust-bundle "*) cat ;;
   "run mesh:status")
     printf 'hub    dev-cell-1: tunnel up\n'

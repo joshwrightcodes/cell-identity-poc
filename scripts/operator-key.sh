@@ -108,7 +108,7 @@ new_key() {
     STEP_REASON="keygen wrote no public key. Delete the value at the remote key $name by hand"
     return 1
   fi
-  if ! got="$(bash -c "$POC_SECRET_READ_CMD" _ "$name" | mise run operatorctl -- pub)"; then
+  if ! got="$(operator_seed_pipe "$name" pub)"; then
     STEP_REASON="the read back of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$got" | jq -r '.error // empty' 2>/dev/null || true)). Delete the value at $name by hand"
     return 1
   fi
@@ -151,10 +151,9 @@ cmd_check() {
   spec="$(pub_field spec.pub)"
   next="$(pub_field next.pub)"
   spec_name="$(pub_field spec.name)"
-  name="$spec_name"
-  [[ ! -f "$key_env" ]] || name="$(key_env_value OPERATOR_KEY_NAME)"
+  name="$(operator_key_name "$PUB_CM")" || name=""
   [[ -n "$name" ]] || fail "neither build/operator/key.env nor spec.name of operator-pub names the remote key"
-  derived="$(bash -c "$POC_SECRET_READ_CMD" _ "$name" | mise run operatorctl -- pub)" \
+  derived="$(operator_seed_pipe "$name" pub)" \
     || fail "the read of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$derived" | jq -r '.error // empty' 2>/dev/null || true))"
   sha="$(sha_of_pub "$derived")"
 
@@ -207,7 +206,7 @@ refuse_rotation() {
       rules="$(docker exec "$c-control-plane" "$tool" -S)" \
         || fail "could not read the $tool rules of $c-control-plane, so a cut cannot be ruled out. Run: mise run harness:status"
       [[ "$rules" != *gate-m9-cut-* ]] \
-        || fail "a cut of the partition tool is in place on $c-control-plane ($tool). List it with: mise run partition -- list. Heal it with: mise run partition -- heal"
+        || fail "a cut of the partition tool is in place on $c-control-plane ($tool). List it with: mise run partition -- list. Heal it with: mise run partition -- heal --all"
     done
   done
   [[ ! -e "$marker" ]] \

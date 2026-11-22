@@ -48,6 +48,29 @@ operator_keys_of() {
   [[ -z "$next" ]] || printf '%s\n' "$next"
 }
 
+# operator_key_name [<operator-pub JSON>] prints the remote key name of the operator key: OPERATOR_KEY_NAME of build/operator/key.env
+# first, then spec.name of operator-pub. It reads operator-pub itself when no JSON is given. It prints nothing and returns 1 when no
+# name exists.
+operator_key_name() {
+  local env_file="${BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}/operator/key.env" name="" cm
+  [[ ! -f "$env_file" ]] || name="$(sed -n '/^OPERATOR_KEY_NAME=/{s///p;q;}' "$env_file")"
+  if [[ -z "$name" ]]; then
+    if (($# > 0)); then cm="$1"; else cm="$(operator_pub_cm)" || return 1; fi
+    name="$(printf '%s' "$cm" | jq -r '.data["spec.name"] // ""')" || return 1
+  fi
+  [[ -n "$name" ]] || return 1
+  printf '%s\n' "$name"
+}
+
+# operator_seed_pipe <remote key name> <operatorctl argument...> runs operatorctl with the seed on its standard input. The read
+# command POC_SECRET_READ_CMD pipes the seed straight into it, so no file, variable or argument holds the seed. The caller sets
+# pipefail, so a failed read fails the pipe.
+operator_seed_pipe() {
+  local name="$1"
+  shift
+  bash -c "$POC_SECRET_READ_CMD" _ "$name" | (cd "$OPERATOR_KEY_ROOT" && mise run operatorctl -- "$@")
+}
+
 # operator_pin_name <cluster> <envd|gateway|server|mgmtd> prints the name of one pin, as the operator scripts report it.
 operator_pin_name() {
   case "$2" in

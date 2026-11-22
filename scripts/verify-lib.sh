@@ -1,6 +1,8 @@
 # Helpers of cell:verify that scripts/verify.sh sources, so the tests can source them too. Each check
 # function prints the reason and the repair command on standard output, and fails.
 # check_mgmt_* need scripts/lib.sh and the helpers of components/lib/hostsvc-pin.sh, peer-root.sh and mgmt-key.sh.
+# The operator checks need scripts/lib.sh. This file sources components/lib/operator-key.sh itself.
+source "$ROOT/components/lib/operator-key.sh"
 
 # pem_lines prints each PEM certificate on standard input as one line, sorted.
 pem_lines() {
@@ -860,4 +862,90 @@ check_allow_list_version() {
     echo "If the images of celld, envd and mgmtd are older than this checkout, run first: mise run images (a named run leaves the stamp unchanged), then roll the applier: CELL=$CELL_NAME HARNESS_ONLY=$([[ "$role" == cp ]] && echo envd || echo cell-identity) mise run cell:up, and mgmtd: CELL=management LINK_ONLY=mgmt-api mise run cell:link"
     return 1
   fi
+}
+
+# overlay_inputs prints one JSON line for each key of ConfigMap envd-system/local-revocations in dev-cp: {key, ok, reason} for an entry
+# that does not verify, and {key, ok, id, cell, record, issuedAt} for one that does. An entry verifies when one of the operator keys
+# that envd pins signed it, it names the env of the harness, and its key is <id>.json. The keys file holds public keys only. A
+# failed read prints the reason on standard error and returns 1. An absent ConfigMap prints nothing.
+overlay_inputs() {
+  local cm pinned dir item key value out
+  cm="$(kubectl --context kind-dev-cp -n envd-system get configmap local-revocations --ignore-not-found -o json)" \
+    || { echo "could not read ConfigMap envd-system/local-revocations in dev-cp. Run: mise run harness:status" >&2; return 1; }
+  [[ -n "$cm" ]] || return 0
+  pinned="$(operator_pin dev-cp envd)" \
+    || { echo "could not read the pin $(operator_pin_name dev-cp envd). Run: mise run harness:status" >&2; return 1; }
+  dir="$(mktemp -d)" || { echo "could not make a temporary directory" >&2; return 1; }
+  printf '%s\n' "$pinned" | tr , '\n' >"$dir/keys"
+  while IFS= read -r item; do
+    key="$(jq -r .key <<<"$item")"
+    value="$(jq -r .value <<<"$item")"
+    if [[ -z "$pinned" ]]; then
+      jq -nc --arg key "$key" '{key: $key, ok: false, reason: "envd pins no operator key"}'
+    elif ! out="$(printf '%s' "$value" | (cd "$ROOT" && mise run operatorctl -- verify --keys "$dir/keys") 2>/dev/null)"; then
+      jq -nc --arg key "$key" '{key: $key, ok: false, reason: "the entry does not verify against the pinned operator keys"}'
+    else
+      jq -c --arg key "$key" --arg env "${POC_ENV:-}" 'if .env != $env then {key: $key, ok: false, reason: "the entry names the env \(.env), and the harness is \($env)"}
+        elif $key != "\(.id).json" then {key: $key, ok: false, reason: "the key is not <id>.json of the entry"}
+        else {key: $key, ok: true, id, cell, record, issuedAt} end' <<<"$out"
+    fi
+  done < <(jq -c '(.data // {}) | to_entries[]' <<<"$cm")
+  rm -rf "$dir"
+}
+
+# check_overlay_inputs fails when a key of ConfigMap envd-system/local-revocations in dev-cp holds no entry that verifies against the
+# operator keys that envd pins. envd refuses such an entry and counts it.
+check_overlay_inputs() {
+  local lines bad
+  lines="$(overlay_inputs)" || return 1
+  bad="$(jq -r 'select(.ok | not) | "\(.key): \(.reason)"' <<<"$lines")" || { echo "could not read the entries of the overlay inputs"; return 1; }
+  [[ -z "$bad" ]] && return 0
+  echo "ConfigMap envd-system/local-revocations in dev-cp holds entries that envd refuses:"
+  echo "$bad"
+  echo "Delete each key with: mise x -- kubectl --context kind-dev-cp -n envd-system patch configmap local-revocations --type=merge -p '{\"data\":{\"<key>\":null}}'. Then sign the revocation again with: mise run revoke -- local --cell <cell>"
+  return 1
+}
+
+# check_operator_pins compares every operator key pin with ConfigMap mgmt-system/operator-pub of management: envd, the gateway and
+# the SPIRE server of dev-cp, and mgmtd in management. The server pin does not apply while no cell is live, because server.conf then
+# has no cluster_jwt section.
+check_operator_pins() {
+  local cm keys want which cluster pinned applies differ=() mgmtd_differs=false
+  cm="$(operator_pub_cm)" || { echo "could not read ConfigMap mgmt-system/operator-pub in management. Run: mise run harness:status"; return 1; }
+  [[ -n "$cm" ]] || { echo "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the operator key once with: mise run operator:create-key"; return 1; }
+  keys="$(operator_keys_of "$cm" 2>&1)" || { echo "$keys"; return 1; }
+  want="$(printf '%s\n' "$keys" | LC_ALL=C sort | paste -sd, -)"
+  for which in envd gateway server mgmtd; do
+    cluster=dev-cp
+    [[ "$which" != mgmtd ]] || cluster=management
+    if [[ "$which" == server ]]; then
+      applies="$(operator_server_pin dev-cp)" || { echo "could not read the pin $(operator_pin_name dev-cp server). Run: mise run harness:status"; return 1; }
+      [[ "$applies" != none ]] || continue
+    fi
+    pinned="$(operator_pin "$cluster" "$which")" || { echo "could not read the pin $(operator_pin_name "$cluster" "$which"). Run: mise run harness:status"; return 1; }
+    [[ "$pinned" != "$want" ]] || continue
+    if [[ -z "$pinned" ]]; then differ+=("$(operator_pin_name "$cluster" "$which") (absent)"); else differ+=("$(operator_pin_name "$cluster" "$which")"); fi
+    [[ "$which" != mgmtd ]] || mgmtd_differs=true
+  done
+  ((${#differ[@]} > 0)) || return 0
+  echo "these pins hold other keys than ConfigMap mgmt-system/operator-pub: $(printf '%s; ' "${differ[@]}" | sed 's/; $//')."
+  echo "Compare them with the secret manager: mise run operator:check-key. If operator-pub holds the right key, render the pins with: OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=dev-cp mise run cell:up"
+  [[ "$mgmtd_differs" != true ]] || echo "Then render the pin of mgmtd with: OPERATOR_KEY_ACCEPT_CHANGE=1 CELL=management LINK_ONLY=mgmt-api mise run cell:link"
+  return 1
+}
+
+# check_agent_ban fails unless the container agent-ban in pod spire-server-0 of dev-cp is Ready and has restart count 0. The
+# container has no probe of its own, so a stopped ban loop shows only here.
+check_agent_ban() {
+  local pod state
+  pod="$(kubectl --context kind-dev-cp -n spire-system get pod spire-server-0 -o json)" \
+    || { echo "could not read pod spire-server-0 in dev-cp. Run: mise run harness:status"; return 1; }
+  state="$(jq -r '[.status.containerStatuses[]? | select(.name == "agent-ban")][0] | if . == null then "absent" else "\(.ready) \(.restartCount)" end' <<<"$pod")" \
+    || { echo "pod spire-server-0 in dev-cp is no JSON object"; return 1; }
+  case "$state" in
+    "true 0") return 0 ;;
+    absent) echo "pod spire-server-0 in dev-cp has no container agent-ban, so nothing bans the agents of a revoked cell. Run: CELL=dev-cp mise run cell:up" ;;
+    *) echo "container agent-ban in spire-server-0 of dev-cp reports ready=${state% *} and restart count ${state#* }, and it has no probe of its own. Read its log: mise x -- kubectl --context kind-dev-cp -n spire-system logs spire-server-0 -c agent-ban. Then run: CELL=dev-cp mise run cell:restart" ;;
+  esac
+  return 1
 }
