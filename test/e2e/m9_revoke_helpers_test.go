@@ -392,19 +392,28 @@ func number(l logLine, key string) float64 {
 	return n
 }
 
-// m9GatewayRefuses waits until the log of the gateway holds the refusal of the open stream of the cell with the reason cell_revoked
-// (stream_refused with the pod of the stream) since a time, and until a new hello that the test makes (m9GatewayHello) gets a
-// refused frame cell_revoked. It returns the time of each on the clock of the node, which the caller compares with the start.
-func m9GatewayRefuses(t *testing.T, cell string, since time.Time, wait time.Duration) (ended, hello time.Time) {
+// m9OpenStreamPod returns the pod of the open stream of the cell: the pod of its last stream_open before a time. The test reads it
+// before the revocation, so that the check in m9GatewayRefuses can match the pod value.
+func m9OpenStreamPod(t *testing.T, cell string, before time.Time) string {
 	t.Helper()
-	waitFor(t, "the gateway log to hold stream_refused cell_revoked with the pod of the open stream of "+cell, wait, func() (bool, string) {
+	logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", time.Unix(0, 0))
+	pod := m9GwOpenPod(m9GwParse(logs), cell, before)
+	if pod == "" {
+		t.Fatalf("the gateway log holds no stream_open of %s before the revocation, so the test cannot tell which stream is open", cell)
+	}
+	return pod
+}
+
+// m9GatewayRefuses waits until the log of the gateway proves that the open stream of the cell (the stream of pod) ended because of the
+// revocation (m9GwEnded), and until a new hello that the test makes (m9GatewayHello) gets a refused frame cell_revoked. It returns the
+// time of each on the clock of the node, which the caller compares with the start.
+func m9GatewayRefuses(t *testing.T, cell, pod string, since time.Time, wait time.Duration) (ended, hello time.Time) {
+	t.Helper()
+	waitFor(t, "the gateway log to show that the open stream of "+cell+" (pod "+pod+") ended, by stream_refused cell_revoked with that pod or by a close and a refusal without a pod", wait, func() (bool, string) {
 		logs := m9PodLog(t, spireCluster, gatewayNamespace, gatewayPod, "cellgw", since.Add(-logMargin))
-		l, at, ok := m9FirstLine(logs, func(l logLine) bool {
-			_, withPod := l["pod"]
-			return l.str("msg") == "stream_refused" && l.str("cell") == cell && l.str("reason") == "cell_revoked" && withPod
-		})
+		at, why, ok := m9GwEnded(m9GwParse(logs), cell, pod, since.Add(-logMargin))
 		ended = at
-		return ok, fmt.Sprintf("no such line in %d log bytes, last lines: %s (%v)", len(logs), lastLines(logs, 2), l)
+		return ok, fmt.Sprintf("%s, in %d log bytes, last lines: %s", why, len(logs), lastLines(logs, 2))
 	})
 	return ended, m9GatewayHelloRefused(t, cell, since, wait)
 }

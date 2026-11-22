@@ -49,6 +49,7 @@ func TestM9ConnectedRevocation(t *testing.T) {
 	m9RestoreCell(t, m9Cell, false)
 	otherBefore := m9BannedSet(t, m9Witness)
 
+	openPod := m9OpenStreamPod(t, m9Cell, m9Now(t))
 	start := m9Now(t)
 	res := m9Revoke(t, m9Cell)
 	t.Logf("mgmt -- revoke --cell %s: %+v", m9Cell, res)
@@ -62,7 +63,7 @@ func TestM9ConnectedRevocation(t *testing.T) {
 	}
 
 	t.Run("gateway_refuses", func(t *testing.T) {
-		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(m9Until(t, start.Add(m9GatewayBound)), 30*time.Second))
+		ended, hello := m9GatewayRefuses(t, m9Cell, openPod, start, max(m9Until(t, start.Add(m9GatewayBound)), 30*time.Second))
 		t.Logf("GATEWAY_STREAM_ENDED_SECONDS=%.0f GATEWAY_HELLO_REFUSED_SECONDS=%.0f", ended.Sub(start).Seconds(), hello.Sub(start).Seconds())
 		for what, at := range map[string]time.Time{"ended the open stream": ended, "refused a new hello": hello} {
 			if d := at.Sub(start); d > m9GatewayBound {
@@ -361,6 +362,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 	cut := cutLink(t, spireCluster, mgmtCluster, "both", m9IslandHold)
 
 	m9MarkRevoked(t, m9Cell)
+	openPod := m9OpenStreamPod(t, m9Cell, m9Now(t))
 	start := m9Now(t)
 	out, err := miseRun(t, 5*time.Minute, nil, "revoke", "--", "local", "--cell", m9Cell)
 	if err != nil {
@@ -394,7 +396,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 	})
 
 	t.Run("gateway_refuses", func(t *testing.T) {
-		ended, hello := m9GatewayRefuses(t, m9Cell, start, max(m9Until(t, start.Add(m9IslandRefuseBound)), 30*time.Second))
+		ended, hello := m9GatewayRefuses(t, m9Cell, openPod, start, max(m9Until(t, start.Add(m9IslandRefuseBound)), 30*time.Second))
 		t.Logf("GATEWAY_STREAM_ENDED_SECONDS=%.0f GATEWAY_HELLO_REFUSED_SECONDS=%.0f", ended.Sub(start).Seconds(), hello.Sub(start).Seconds())
 		for what, at := range map[string]time.Time{"ended the open stream": ended, "refused a new hello": hello} {
 			if d := at.Sub(start); d > m9IslandRefuseBound {
