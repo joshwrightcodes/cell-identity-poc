@@ -120,34 +120,44 @@ type m9StoreUIDSampler struct {
 	reads   int
 	stop    chan struct{}
 	done    chan struct{}
+	read    func() (m9StoreUIDs, error)
+	final   bool
+	base    m9StoreUIDs
+}
+
+// sample takes one read and keeps its changes. A read that fails counts for nothing.
+func (s *m9StoreUIDSampler) sample() {
+	now, err := s.read()
+	if err != nil {
+		return
+	}
+	s.mu.Lock()
+	s.reads++
+	for _, c := range m9StoreUIDChanges(s.base, now) {
+		s.changes[c] = true
+	}
+	s.mu.Unlock()
 }
 
 func m9StoreStartSampler(t *testing.T, cluster string, namespaces []string, base m9StoreUIDs) *m9StoreUIDSampler {
-	s := &m9StoreUIDSampler{changes: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{})}
+	s := &m9StoreUIDSampler{changes: map[string]bool{}, stop: make(chan struct{}), done: make(chan struct{}), base: base,
+		read: func() (m9StoreUIDs, error) { return m9StoreReadUIDs(t, cluster, namespaces) }}
 	go func() {
 		defer close(s.done)
+		s.sample()
 		for {
 			select {
 			case <-s.stop:
 				return
 			case <-time.After(m9StoreSampleEvery):
 			}
-			now, err := m9StoreReadUIDs(t, cluster, namespaces)
-			if err != nil {
-				continue
-			}
-			s.mu.Lock()
-			s.reads++
-			for _, c := range m9StoreUIDChanges(base, now) {
-				s.changes[c] = true
-			}
-			s.mu.Unlock()
+			s.sample()
 		}
 	}()
 	return s
 }
 
-// Stop ends the sampler and returns the number of reads and the sorted changes.
+// Stop ends the sampler, takes one last read (once, however often Stop runs), and returns the number of reads and the sorted changes.
 func (s *m9StoreUIDSampler) Stop() (int, []string) {
 	select {
 	case <-s.stop:
@@ -155,6 +165,10 @@ func (s *m9StoreUIDSampler) Stop() (int, []string) {
 		close(s.stop)
 	}
 	<-s.done
+	if !s.final {
+		s.final = true
+		s.sample()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var ch []string
@@ -508,8 +522,8 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 			seen = fmt.Sprintf("log found %v, the store lacks %v, root is %s/%s at %s (comparison error %v, compared %s)", found, missing, sync, health, rev, compErr, reconciled.Format(time.RFC3339))
 			t.Log(seen)
 			// Synced inside the first 180 seconds is the old status and proves nothing. The comparison must follow the refill. reconciledAt has
-			// whole seconds and the log line has nanoseconds, so the log time is cut to the second before the comparison.
-			if found && len(missing) == 0 && sync == "Synced" && health == "Healthy" && rev == st.Root.Digest && !compErr && !reconciled.Before(refilledAt.Truncate(time.Second)) {
+			// whole seconds and the log line has nanoseconds, so the log time is cut up to the next second before the comparison.
+			if found && len(missing) == 0 && sync == "Synced" && health == "Healthy" && rev == st.Root.Digest && !compErr && m9StoreComparedAfter(reconciled, refilledAt) {
 				t.Logf("celld logged store_refilled at %s: %s. Argo CD compared root at %s", refilledAt.Format(time.RFC3339Nano), line, reconciled.Format(time.RFC3339))
 				return
 			}
@@ -522,8 +536,8 @@ func TestM9StoreLostDuringCellIsland(t *testing.T) {
 
 	t.Run("nothing_pruned", func(t *testing.T) {
 		reads, changes := sampler.Stop()
-		if reads == 0 {
-			t.Errorf("the sampler made no read during the island, so it proves nothing")
+		if !m9StoreReadsEnough(reads) {
+			t.Errorf("the sampler made %d reads during the island, want at least %d (one at the start, one at the stop), so it proves nothing", reads, m9StoreMinReads)
 		}
 		if len(changes) > 0 {
 			t.Errorf("during the island, an Application or a Deployment was replaced or removed: %v", changes)
