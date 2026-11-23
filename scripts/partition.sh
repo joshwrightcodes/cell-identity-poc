@@ -124,7 +124,7 @@ cmd_cut() {
   v4="$(partition_peer_ip "$peer" 4)" || die "could not read the address of $peer"
   v6="$(partition_peer_ip "$peer" 6)" || die "could not read the address of $peer"
   [[ "$v4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "$peer has no IPv4 address on the network kind"
-  [[ -z "$v6" || "$v6" == *:* ]] || die "$peer reports the IPv6 address '$v6'"
+  [[ -z "$v6" || "$v6" =~ ^[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,7}$ ]] || die "$peer reports the IPv6 address '$v6', which is no IPv6 address"
   now="$(docker exec "$node" date +%s)" || die "the node $node does not answer"
   [[ "$now" =~ ^[0-9]+$ ]] || die "the node $node reports the time '$now'"
   r="$(partition_rules "$node" "$tag")" || die "the node $node does not answer"

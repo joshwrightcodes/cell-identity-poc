@@ -735,3 +735,23 @@ func TestPartitionRulesMatchesTheCommentToken(t *testing.T) {
 		t.Errorf("heal changed a foreign rule: %v", got)
 	}
 }
+
+// TestPartitionRefusesBadIPv6: an IPv6 address of the peer that is not plain hex groups reaches no node. The timers run it in sh -c, so
+// a value with a command in it would run as root in the node.
+func TestPartitionRefusesBadIPv6(t *testing.T) {
+	t.Parallel()
+	for _, v6 := range []string{"fc00::3; touch /tmp/x", "fc00::3 && id", "fc00:f853:ccd:e793::$(id)", "::::::::::", "fc00:zzzz::3", "fc00"} {
+		t.Run(v6, func(t *testing.T) {
+			t.Parallel()
+			addrs := map[string][2]string{"dev-cp": {"172.18.0.3", v6}, "dev-cell-2": {"172.18.0.6", "fc00:f853:ccd:e793::6"}}
+			e := newPartitionEnv(t, allClusters, addrs)
+			_, errOut, err := e.run("cut", "--from", "dev-cell-2", "--to", "dev-cp", "--hold", "5")
+			if err == nil || !strings.Contains(errOut, "no IPv6 address") {
+				t.Fatalf("want a refusal of the address %q, got %v %q", v6, err, errOut)
+			}
+			if c := e.read("calls"); strings.Contains(c, "sh -c") || strings.Contains(c, "-I ") {
+				t.Errorf("a refused cut changed a node:\n%s", c)
+			}
+		})
+	}
+}
