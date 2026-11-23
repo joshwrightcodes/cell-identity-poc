@@ -174,7 +174,7 @@ func TestRepairRestoresCells(t *testing.T) {
 		{name: "a pending drop that stays", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`, code: 1, kept: true,
 			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status}, want: "pending drop", timed: true},
 		{name: "a cell that stays unbound keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: append(slices.Clone(restore[:6]), status, status)},
+			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: restore, timed: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
