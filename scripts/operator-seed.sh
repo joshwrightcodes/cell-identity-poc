@@ -7,6 +7,7 @@
 # operator_seed_pub <remote key name> prints the public key of the seed.
 operator_seed_pub() {
   local name="$1"
+  operator_key_name_valid "$name" || { echo "error: the remote key name is not valid, so no secret is read" >&2; return 1; }
   bash -c "$POC_SECRET_READ_CMD" _ "$name" | mise run operatorctl -- pub
 }
 
@@ -14,5 +15,6 @@ operator_seed_pub() {
 operator_seed_sign() {
   local name="$1"
   shift
+  operator_key_name_valid "$name" || { echo "error: the remote key name is not valid, so no secret is read" >&2; return 1; }
   bash -c "$POC_SECRET_READ_CMD" _ "$name" | mise run operatorctl -- sign "$@"
 }

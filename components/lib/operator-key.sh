@@ -48,9 +48,16 @@ operator_keys_of() {
   [[ -z "$next" ]] || printf '%s\n' "$next"
 }
 
+# operator_key_name_valid <name> succeeds when the name has the form that scripts/operator-key.sh creates: a prefix, a slash and a UTC
+# time yyyymmddThhmmssZ. The prefix starts with a letter, digit, dot, underscore, at sign, colon or plus, so a secret CLI never reads
+# the name as an option. It holds no white space and no quote.
+operator_key_name_valid() {
+  [[ "$1" =~ ^[A-Za-z0-9._@:+][A-Za-z0-9._@:+/-]*/[0-9]{8}T[0-9]{6}Z$ ]]
+}
+
 # operator_key_name [<operator-pub JSON>] prints the remote key name of the operator key: OPERATOR_KEY_NAME of build/operator/key.env
 # first, then spec.name of operator-pub. It reads operator-pub itself when no JSON is given. It prints nothing and returns 1 when no
-# name exists.
+# name exists, and when the name is not valid (operator_key_name_valid), with the reason on standard error.
 operator_key_name() {
   local env_file="${BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}/operator/key.env" name="" cm
   [[ ! -f "$env_file" ]] || name="$(sed -n '/^OPERATOR_KEY_NAME=/{s///p;q;}' "$env_file")"
@@ -59,6 +66,10 @@ operator_key_name() {
     name="$(printf '%s' "$cm" | jq -r '.data["spec.name"] // ""')" || return 1
   fi
   [[ -n "$name" ]] || return 1
+  if ! operator_key_name_valid "$name"; then
+    printf 'error: the remote key name of the operator key is not <prefix>/<UTC time yyyymmddThhmmssZ> with a safe prefix, so no secret is read. Compare build/operator/key.env and spec.name of ConfigMap mgmt-system/operator-pub\n' >&2
+    return 1
+  fi
   printf '%s\n' "$name"
 }
 
@@ -129,13 +140,20 @@ operator_connected() {
   return 1
 }
 
+# operator_pub_sha256 <key> prints the lowercase hex SHA-256 of the 32 bytes of a public key.
+operator_pub_sha256() {
+  local sum
+  if command -v sha256sum >/dev/null; then sum="$(printf '%s' "$1" | operator_b64d | sha256sum)"; else sum="$(printf '%s' "$1" | operator_b64d | shasum -a 256)"; fi
+  printf '%s\n' "${sum%% *}"
+}
+
 # operator_pub_keys <cluster> [pin...] prints the operator keys for a render of the cluster: spec.pub of operator-pub, then next.pub
 # when a rotation is in progress, one key on each line. The pins default to envd, gateway and server, the pins of dev-cp. The
 # mgmt-api render names mgmtd. A named pin of the cluster that exists and holds another key set is a change. The helper
 # refuses a change unless OPERATOR_KEY_ACCEPT_CHANGE=1, and refuses any change while not connected. Only the operator scripts set
 # that variable. The helper fails with the reason on standard error.
 operator_pub_keys() {
-  local cluster="${1:?usage: operator_pub_keys <cluster> [pin...]}" cm keys want which pinned changed=() pins=(envd gateway server)
+  local cluster="${1:?usage: operator_pub_keys <cluster> [pin...]}" cm keys want which pinned env_sha changed=() pins=(envd gateway server)
   shift
   (($# == 0)) || pins=("$@")
   if ! cm="$(operator_pub_cm)"; then
@@ -155,6 +173,11 @@ operator_pub_keys() {
     fi
     [[ -z "$pinned" || "$pinned" == "$want" ]] || changed+=("$(operator_pin_name "$cluster" "$which")")
   done
+  # build/operator/key.env holds the SHA-256 of the key that the owner created. Another spec.pub is a change, also while a pin is absent.
+  env_sha="$(sed -n '/^OPERATOR_KEY_SHA256=/{s///p;q;}' "${BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}/operator/key.env" 2>/dev/null || true)"
+  if [[ -n "$env_sha" && "$env_sha" != "$(operator_pub_sha256 "$(printf '%s\n' "$keys" | sed -n 1p)")" ]]; then
+    changed+=("build/operator/key.env")
+  fi
   if ((${#changed[@]} > 0)); then
     if [[ "${OPERATOR_KEY_ACCEPT_CHANGE:-}" != 1 ]]; then
       printf 'error: the pins %s hold other keys than ConfigMap mgmt-system/operator-pub. Compare them with the secret manager: mise run operator:check-key. To accept the keys of operator-pub, set OPERATOR_KEY_ACCEPT_CHANGE=1\n' "$(printf '%s; ' "${changed[@]}" | sed 's/; $//')" >&2

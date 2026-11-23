@@ -741,9 +741,9 @@ func TestCheckFindsSwappedPin(t *testing.T) {
 			if err != nil {
 				r.t.Fatal(err)
 			}
-			os.WriteFile(filepath.Join(r.stub, "secrets", "poc_operator_other"), b, 0o600)
+			os.WriteFile(filepath.Join(r.stub, "secrets", "poc_operator_20250101T000000Z"), b, 0o600)
 			raw, _ := base64.StdEncoding.DecodeString(r.data("kind-management", "mgmt-system", "operator-pub")["spec.pub"])
-			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/other\nOPERATOR_KEY_SHA256="+revoke.KeySHA256(raw)+"\n"), 0o644)
+			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/20250101T000000Z\nOPERATOR_KEY_SHA256="+revoke.KeySHA256(raw)+"\n"), 0o644)
 		}},
 		{"key_env", "keyEnv", "build/operator/key.env", func(r *opRig, _ string) {
 			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME=poc/operator/20261120T093000Z\nOPERATOR_KEY_SHA256="+strings.Repeat("ab", 32)+"\n"), 0o644)
@@ -1159,7 +1159,7 @@ func (r *opRig) guard(env ...string) (stdout, stderr string, code int) {
 		r.t.Fatal(err)
 	}
 	cmd := exec.Command("bash", "-c", `set -euo pipefail; source "$1"; operator_pub_keys dev-cp`, "_", lib)
-	cmd.Env = r.env(env...)
+	cmd.Env = r.env(append([]string{"BUILD_ROOT=" + r.build}, env...)...)
 	var out, errBuf bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errBuf
 	if err := cmd.Run(); err != nil {
@@ -1212,6 +1212,14 @@ func TestPinGuardRefusesChange(t *testing.T) {
 		}, nil, 1, "spec.pub"},
 		{"same_next", func(r *opRig) { r.setNext(a) }, nil, 1, "next.pub"},
 		{"dev_cp_down", func(r *opRig) { r.pinDevCP(a) }, []string{"STUB_DOWN=kind-dev-cp"}, 1, "dev-cp"},
+		// No pin exists, as before the first render or after a delete. A spec.pub that key.env does not name is a change.
+		{"key_env_matches_no_pins", func(r *opRig) { r.writeKeyEnv("poc/operator/20260101T000000Z", opSHAOf(a)) }, nil, 0, a + "\n"},
+		{"key_env_differs_no_pins", func(r *opRig) { r.writeKeyEnv("poc/operator/20260101T000000Z", strings.Repeat("ab", 32)) }, nil, 1, "build/operator/key.env"},
+		{"key_env_differs_accepted", func(r *opRig) { r.writeKeyEnv("poc/operator/20260101T000000Z", strings.Repeat("ab", 32)) }, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 0, a + "\n"},
+		{"key_env_differs_not_connected", func(r *opRig) {
+			r.writeKeyEnv("poc/operator/20260101T000000Z", strings.Repeat("ab", 32))
+			r.setConnected(false)
+		}, []string{"OPERATOR_KEY_ACCEPT_CHANGE=1"}, 1, "not connected"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1411,4 +1419,58 @@ func TestRotateChecksMgmtd(t *testing.T) {
 			t.Fatalf("error line %v, want a stop at check-mgmtd after the switch with the remaining commands %q", res, want)
 		}
 	})
+}
+
+// writeKeyEnv writes build/operator/key.env with a name and a SHA-256.
+func (r *opRig) writeKeyEnv(name, sha string) {
+	r.t.Helper()
+	if err := os.MkdirAll(filepath.Join(r.build, "operator"), 0o755); err != nil {
+		r.t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME="+name+"\nOPERATOR_KEY_SHA256="+sha+"\n"), 0o644); err != nil {
+		r.t.Fatal(err)
+	}
+}
+
+// opSHAOf returns the SHA-256 of the key bytes of a standard base64 public key, as key.env holds it.
+func opSHAOf(pub string) string {
+	raw, _ := base64.StdEncoding.DecodeString(pub)
+	return revoke.KeySHA256(raw)
+}
+
+// TestRemoteKeyNameIsValidated: a name that is not <prefix>/<UTC time> with a safe prefix reaches no secret read command, whether it
+// comes from key.env or from spec.name of operator-pub.
+func TestRemoteKeyNameIsValidated(t *testing.T) {
+	t.Parallel()
+	for _, name := range []string{"-o", "--output=/tmp/x/20261120T093000Z", "poc/operator/x", "poc/operator/20261120T093000Z extra", "poc operator/20261120T093000Z",
+		"poc/operator/20261120T093000Z\n-o", "$(id)/20261120T093000Z", "poc/operator/20261120T09300Z"} {
+		for _, via := range []string{"key_env", "spec_name"} {
+			if via == "key_env" && strings.Contains(name, "\n") {
+				continue // the reader of key.env takes the first line only
+			}
+			t.Run(via+"_"+strings.NewReplacer("/", "_", " ", "_", "$", "", "(", "", ")", "", "\n", "_n_", "-", "d").Replace(name), func(t *testing.T) {
+				t.Parallel()
+				r := newOpRig(t)
+				k := opNewKey(t)
+				r.installKey(k, "poc/operator/20261120T093000Z")
+				switch via {
+				case "key_env":
+					r.writeKeyEnv(name, opSHA(k))
+				default:
+					os.Remove(filepath.Join(r.build, "operator", "key.env"))
+					r.put("kind-management", "mgmt-system", "operator-pub", map[string]string{"spec.pub": opPub(k), "spec.name": name})
+				}
+				out, errOut, code := r.run(nil, "check")
+				if code == 0 {
+					t.Fatalf("check: exit 0 for the name %q\nstdout %s", name, out)
+				}
+				if calls := strings.Join(r.calls(), "\n"); strings.Contains(calls, "secret-read") {
+					t.Fatalf("the secret read command ran for the name %q:\n%s", name, calls)
+				}
+				if !strings.Contains(errOut+out, "remote key") {
+					t.Fatalf("no message about the remote key name:\n%s\n%s", out, errOut)
+				}
+			})
+		}
+	}
 }
