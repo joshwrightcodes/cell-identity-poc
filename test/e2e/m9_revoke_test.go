@@ -373,6 +373,7 @@ func TestM9LocalRevocationDuringIsland(t *testing.T) {
 	if local["cell"] != m9Cell || len(id) != 16 {
 		t.Fatalf("revoke -- local printed %v, want the cell %s and an entry ID of 16 hex characters", local, m9Cell)
 	}
+	m9NoteRevocation(t, m9Cell, "entry:"+id)
 	envelope := m9InputEnvelope(t, id)
 	t.Logf("entry %s signed for %s at the record %v", id, m9Cell, local["record"])
 	var recordAt time.Time

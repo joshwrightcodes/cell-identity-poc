@@ -26,8 +26,8 @@ import (
 )
 
 const (
-	// m9RevokedFile lists the cells that a test revoked, one cell on each line. A test writes the cell before it revokes it, so
-	// gate:m9:repair can run mgmt -- unrevoke for it after an aborted run.
+	// m9RevokedFile lists the cells that a test revoked, one cell on each line. A test writes the cell before it revokes it, and
+	// the identity of the revocation after it. gate:m9:repair runs mgmt -- unrevoke only for that revocation, after an aborted run.
 	m9RevokedFile = "../../build/gate/m9-revoked"
 	// m9OperatorKeyEnv holds OPERATOR_KEY_NAME and OPERATOR_KEY_SHA256 of the operator key. Both are public data.
 	m9OperatorKeyEnv = "../../build/operator/key.env"
@@ -53,28 +53,39 @@ const (
 // m9Marked reports whether build/gate/m9-revoked lists the cell.
 func m9Marked(cell string) bool {
 	data, err := os.ReadFile(m9RevokedFile)
-	return err == nil && slices.Contains(strings.Fields(string(data)), cell)
+	if err != nil {
+		return false
+	}
+	ok, _ := m9CrumbToken(string(data), cell)
+	return ok
 }
 
-// m9MarkRevoked writes the cell to build/gate/m9-revoked, once. Call it before the first command that can revoke the cell.
+// m9MarkRevoked writes the cell to build/gate/m9-revoked, once. Call it before the first command that can revoke the cell. The line
+// holds no identity until m9NoteRevocation adds it.
 func m9MarkRevoked(t *testing.T, cell string) {
 	t.Helper()
 	if m9Marked(cell) {
 		return
 	}
+	m9WriteCrumb(t, cell, "")
+}
+
+// m9NoteRevocation adds the identity of the revocation that the test made to the line of the cell: entry:<id> for a local entry, and
+// rev:<epoch>.<counter> for a revoke through mgmtd. gate:m9:repair and the cleanup un-revoke the cell only when its newest revoke event
+// has this identity.
+func m9NoteRevocation(t *testing.T, cell, token string) {
+	t.Helper()
+	m9WriteCrumb(t, cell, token)
+}
+
+func m9WriteCrumb(t *testing.T, cell, token string) {
+	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(m9RevokedFile), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.OpenFile(m9RevokedFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, werr := f.WriteString(cell + "\n")
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr != nil {
-		t.Fatalf("record %s in build/gate/m9-revoked: %v", cell, werr)
+	old, _ := os.ReadFile(m9RevokedFile)
+	if err := os.WriteFile(m9RevokedFile, []byte(m9CrumbWith(string(old), cell, token)), 0o644); err != nil {
+		t.Fatalf("record %s in build/gate/m9-revoked: %v", cell, err)
 	}
 }
 
@@ -84,16 +95,20 @@ func m9ClearRevoked(cell string) error {
 	if err != nil {
 		return nil
 	}
-	var rest []string
-	for _, c := range strings.Fields(string(data)) {
-		if c != cell {
-			rest = append(rest, c)
-		}
-	}
-	if len(rest) == 0 {
+	rest := m9CrumbWithout(string(data), cell)
+	if rest == "" {
 		return os.Remove(m9RevokedFile)
 	}
-	return os.WriteFile(m9RevokedFile, []byte(strings.Join(rest, "\n")+"\n"), 0o644)
+	return os.WriteFile(m9RevokedFile, []byte(rest), 0o644)
+}
+
+// m9Events converts the revocation events of a status.
+func m9Events(s mgmt.Status) []m9Event {
+	var out []m9Event
+	for _, ev := range s.Revocations {
+		out = append(out, m9Event{Cell: ev.Cell, Kind: ev.Kind, EntryID: ev.EntryID, Epoch: ev.Revision.Epoch, Counter: ev.Revision.Counter})
+	}
+	return out
 }
 
 // m9Revoke revokes the cell through mgmtd (mise run mgmt -- revoke), after it wrote the cell to build/gate/m9-revoked.
@@ -103,6 +118,22 @@ func m9Revoke(t *testing.T, cell string) mgmt.RevokeResult {
 	var res mgmt.RevokeResult
 	if err := json.Unmarshal([]byte(mgmtCtl(t, "revoke", "--cell", cell)), &res); err != nil || res.Cell != cell {
 		t.Fatalf("mgmt -- revoke --cell %s printed no result for the cell: %v", cell, err)
+	}
+	// A revoke that waits for its revision has no revision yet. The event of the revoke names it.
+	for deadline := time.Now().Add(m9RecordBound); ; time.Sleep(2 * time.Second) {
+		if res.Revision != (spec.Revision{}) {
+			m9NoteRevocation(t, cell, fmt.Sprintf("rev:%d.%d", res.Revision.Epoch, res.Revision.Counter))
+			break
+		}
+		if s, err := m9Status(); err == nil {
+			if tok := m9NewestRevoke(m9Events(s), cell); tok != "" {
+				m9NoteRevocation(t, cell, tok)
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("mgmt -- revoke --cell %s queued the revoke, and no revoke event of the cell appeared", cell)
+		}
 	}
 	return res
 }
@@ -192,7 +223,9 @@ func m9RequireStart(t *testing.T, cell string) {
 }
 
 // m9RestoreCell registers the cleanup of a test that revokes the cell. Register it before every other cleanup of the test (they run
-// in reverse order), and before the cut, so that the heal runs first. It acts only when build/gate/m9-revoked lists the cell. It
+// in reverse order), and before the cut, so that the heal runs first. It acts only when build/gate/m9-revoked lists the cell, and only on the
+// revocation that the test made: when the newest revoke event of the cell has another identity, it reports that and leaves the cell
+// revoked. It
 //  1. waits until mgmtd holds no queued revoke of the cell, and (local) until envd holds no entry for it, because mgmtd adopts each
 //     entry and un-revoke refuses an entry that is held;
 //  2. runs mgmt -- unrevoke, which a cell that is not revoked answers with not_revoked;
@@ -217,10 +250,17 @@ func m9RestoreCell(t *testing.T, cell string, local bool) {
 			fail = true
 			t.Errorf(format+". Run: mise run gate:m9:repair", args...)
 		}
+		crumb, _ := os.ReadFile(m9RevokedFile)
+		_, token := m9CrumbToken(string(crumb), cell)
 		// 1 and 2.
 		for {
 			s, err := m9Status()
 			if err == nil {
+				if c, ok := m9CellStatus(s, cell); ok && c.Revoked && !m9RevocationIsOurs(m9Events(s), cell, token) {
+					t.Errorf("cleanup: %s is revoked by %q, and the test recorded %q. The cleanup left it revoked. "+
+						"If that revocation is not wanted, run: mise run mgmt -- unrevoke --cell %s", cell, m9NewestRevoke(m9Events(s), cell), token, cell)
+					return
+				}
 				queued := slices.ContainsFunc(s.PendingRevokes, func(p mgmt.PendingRevoke) bool { return p.Cell == cell })
 				held := local && m9EntryHasState(t, cell, "held", "pending")
 				if !queued && !held {

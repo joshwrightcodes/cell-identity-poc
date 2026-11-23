@@ -491,12 +491,20 @@ func (r *m9Rig) traces() {
 	r.state("cuts", "dev-cp-control-plane gate-m9-cut-0a1b2c3d\n")
 	r.marker("1h")
 	r.state("live-ttl", "1h\n")
-	r.write("build/gate/m9-revoked", "dev-cell-2\n")
+	r.write("build/gate/m9-revoked", "dev-cell-2 rev:1.5\n")
+	r.revokedBy("dev-cell-2", `{"cell":"dev-cell-2","kind":"revoke","source":"admin","revision":{"epoch":1,"counter":5}}`)
 	r.state("held", "dev-cell-2\n")
 	r.state("held-reads", "2\n")
 	r.state("inputs", "0123456789abcdef\n")
 	r.state("ns-dev-cell-1", "namespace/m9-ab12cd\nnamespace/m8-keep\n")
 	r.state("keytest", "the node holds /etc/kubernetes/pki/m2-test-sa.key\n")
+}
+
+// revokedBy makes mgmt -- status show the cell as revoked, with the revoke events as JSON objects.
+func (r *m9Rig) revokedBy(cell string, events ...string) {
+	r.t.Helper()
+	r.state("status-cells", `[{"name":"`+cell+`","revoked":true}]`)
+	r.state("status-revocations", "["+strings.Join(events, ",")+"]")
 }
 
 // mutations are the call log parts of a repair that changes something.
@@ -517,7 +525,7 @@ func TestGateM9RepairOrder(t *testing.T) {
 		t.Fatalf("exit %d\nstderr %s\ncalls %s", code, errOut, calls)
 	}
 	heal := callAt(calls, "partition heal --all")
-	connected := lastCallAt(calls, "mise run mgmt -- status")
+	connected := lastCallAt(strings.Join(strings.Split(calls, "\n")[:callAt(calls, "mise run revoke -- clean")], "\n"), "mise run mgmt -- status")
 	settled := lastCallAt(calls, "get configmap cell-records")
 	clean := callAt(calls, "mise run revoke -- clean")
 	unrevoke := callAt(calls, "mise run mgmt -- unrevoke --cell dev-cell-2")
@@ -842,4 +850,50 @@ func TestPocGateFastOrder(t *testing.T) {
 			t.Errorf("exit %d, stderr %q; want the usage and no gate", code, errOut)
 		}
 	})
+}
+
+// TestGateM9RepairKeepsOtherRevocation: the repair un-revokes a cell only when the newest revoke event is the revocation that the test
+// recorded. Another revocation, or a breadcrumb with no identity, stays. The script names the manual step and exits 1, and it still
+// finishes the other steps.
+func TestGateM9RepairKeepsOtherRevocation(t *testing.T) {
+	t.Parallel()
+	mine := `{"cell":"dev-cell-2","kind":"revoke","source":"admin","revision":{"epoch":1,"counter":5}}`
+	theirs := `{"cell":"dev-cell-2","kind":"revoke","source":"admin","revision":{"epoch":1,"counter":6}}`
+	local := `{"cell":"dev-cell-2","kind":"revoke","source":"operator","entryId":"0123456789abcdef","revision":{"epoch":1,"counter":6}}`
+	for _, tc := range []struct {
+		name, crumb string
+		events      []string
+		unrevoke    bool
+	}{
+		{"the recorded revoke", "dev-cell-2 rev:1.5\n", []string{mine}, true},
+		{"the recorded local entry", "dev-cell-2 entry:0123456789abcdef\n", []string{mine, local}, true},
+		{"a newer revoke of an operator", "dev-cell-2 rev:1.5\n", []string{mine, theirs}, false},
+		{"another local entry", "dev-cell-2 entry:fedcba9876543210\n", []string{mine, local}, false},
+		{"no identity", "dev-cell-2\n", []string{mine}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := newRepairM9Rig(t)
+			r.write("build/gate/m9-revoked", tc.crumb)
+			r.revokedBy("dev-cell-2", tc.events...)
+			_, errOut, code := r.run("gate-m9-repair.sh", nil)
+			calls := r.calls()
+			did := strings.Contains(calls, "mise run mgmt -- unrevoke --cell dev-cell-2")
+			if did != tc.unrevoke {
+				t.Fatalf("un-revoke ran %v, want %v:\n%s", did, tc.unrevoke, calls)
+			}
+			if tc.unrevoke {
+				if code != 0 {
+					t.Fatalf("exit %d, stderr %s", code, errOut)
+				}
+				return
+			}
+			if code != 1 || !strings.Contains(errOut, "mise run mgmt -- unrevoke --cell dev-cell-2") || !strings.Contains(errOut, "left it revoked") {
+				t.Fatalf("exit %d, stderr %q; want exit 1 that names the manual un-revoke", code, errOut)
+			}
+			if !strings.Contains(calls, "svid-ttl restore") || !strings.Contains(calls, "mise run harness:status") {
+				t.Errorf("the other steps did not run:\n%s", calls)
+			}
+		})
+	}
 }

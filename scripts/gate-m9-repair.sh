@@ -7,7 +7,8 @@
 #   3. waits until envd holds no local revocation entry, because mgmtd adopts each one and the next revision settles it;
 #   4. runs mise run revoke -- clean, which deletes the input entries that envd reports stale or settled;
 #   5. runs mise run mgmt -- unrevoke --cell <c> for each cell in build/gate/m9-revoked (one cell on each line, which a test writes before it
-#      revokes the cell), and removes the file;
+#      revokes the cell, and then extends with the identity of its revocation), and removes the file. It un-revokes a cell only when the
+#      newest revoke event of the cell has that identity. Another revocation stays, and the script names the manual step and exits 1;
 #   6. runs scripts/gate-m2-repair.sh when the node of dev-cell-1 holds a trace of the API server key rotation test;
 #   7. runs scripts/svid-ttl.sh restore, which removes build/gate/m9-svid-ttl and restarts dev-cp and each live cell, so that every agent,
 #      and each un-revoked cell, gets new SVIDs;
@@ -69,15 +70,40 @@ input_entries() {
   [[ -z "$cm" ]] || jq -r '.data // {} | keys[]' <<<"$cm"
 }
 
-# revoked_cells prints the cells of build/gate/m9-revoked. A line that is not a cluster name stops the script.
+# crumb_line matches one line of build/gate/m9-revoked: a cell name and, after the revoke, the identity of the revocation that the test
+# made. The identity is rev:<epoch>.<counter> for a revoke through mgmtd, or entry:<16 hex characters> for a local entry.
+crumb_line='^([a-z0-9][a-z0-9-]*)( (rev:[0-9]+\.[0-9]+|entry:[0-9a-f]{16}))?$'
+
+# revoked_cells prints the cells of build/gate/m9-revoked. A line that does not match crumb_line stops the script.
 revoked_cells() {
   local line
   [[ -f "$revoked" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -n "$line" ]] || continue
-    [[ "$line" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "build/gate/m9-revoked holds '$line', which is no cell name. Fix the file, then run: $repair"
-    printf '%s\n' "$line"
+    [[ "$line" =~ $crumb_line ]] || die "build/gate/m9-revoked holds '$line', which is no cell name with an optional revocation identity. Fix the file, then run: $repair"
+    printf '%s\n' "${BASH_REMATCH[1]}"
   done <"$revoked"
+}
+
+# revoked_token <cell> prints the revocation identity that the test wrote for the cell. It prints nothing when the line has none.
+revoked_token() {
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ $crumb_line && "${BASH_REMATCH[1]}" == "$1" ]]; then printf '%s\n' "${BASH_REMATCH[3]}"; return 0; fi
+  done <"$revoked"
+}
+
+# current_revocation <status> <cell> prints none when the cell is not revoked, and unknown when mgmtd shows no revoke event for it.
+# Otherwise it prints the identity of the newest revoke event of the cell, in the form of the breadcrumb.
+current_revocation() {
+  jq -r --arg c "$2" '
+    ([.cells[]? | select(.name == $c)] | first // {}) as $cell
+    | if ($cell.revoked // false) | not then "none"
+      else ([.revocations[]? | select(.cell == $c and .kind == "revoke")] | sort_by([.revision.epoch, .revision.counter]) | last // null) as $ev
+        | if $ev == null then "unknown"
+          elif ($ev.entryId // "") != "" then "entry:\($ev.entryId)"
+          else "rev:\($ev.revision.epoch).\($ev.revision.counter)" end
+      end' <<<"$1"
 }
 
 # m9_namespaces <cluster> prints the namespaces m9-<name> with the test label in the cluster.
@@ -191,12 +217,25 @@ else
   log "scripts/revoke.sh does not exist, so no input entry is cleaned${inputs:+. ConfigMap envd-system/local-revocations still holds: $(paste -sd' ' - <<<"$inputs")}"
 fi
 
-# Step 5: un-revoke each test cell. A cell that is not revoked is done.
+# Step 5: un-revoke each test cell, but only the revocation that the test made. A cell that is not revoked is done. Another revocation of the
+# cell stays, and the script names the manual step at the end.
 cells="$(revoked_cells)" || exit 1
+manual=""
+if [[ -n "$cells" ]]; then
+  mgmt_status="$(mise run mgmt -- status)" || die "mise run mgmt -- status failed, so the revocation of each test cell is unknown"
+fi
 for c in $cells; do
-  out="$(mise run mgmt -- unrevoke --cell "$c" 2>&1)" || [[ "$out" == *not_revoked* ]] || die "mise run mgmt -- unrevoke --cell $c failed: $out"
-  log "un-revoked $c"
-  left="$(grep -vx -- "$c" "$revoked" || true)"
+  token="$(revoked_token "$c")"
+  now_revoked="$(current_revocation "$mgmt_status" "$c")" || die "mise run mgmt -- status printed no status object"
+  if [[ "$now_revoked" == none ]]; then
+    log "$c is not revoked"
+  elif [[ -n "$token" && "$now_revoked" == "$token" ]]; then
+    out="$(mise run mgmt -- unrevoke --cell "$c" 2>&1)" || [[ "$out" == *not_revoked* ]] || die "mise run mgmt -- unrevoke --cell $c failed: $out"
+    log "un-revoked $c"
+  else
+    manual+="$c is revoked by '$now_revoked', and the test recorded '${token:-no identity}'. The script left it revoked. If the revocation is not wanted, run: mise run mgmt -- unrevoke --cell $c"$'\n'
+  fi
+  left="$(grep -E -v -- "^$c( |\$)" "$revoked" || true)"
   if [[ -n "$left" ]]; then printf '%s\n' "$left" >"$revoked"; else rm -f "$revoked"; fi
 done
 
@@ -272,4 +311,8 @@ fi
 
 # Step 9: harness:status, read again while telemetry retries clear after the restarts.
 harness_status_settled || die "harness:status reports a bad value after the repair. Read its problems"
+if [[ -n "$manual" ]]; then
+  printf 'error: the repair is done except for this:\n%s' "$manual" >&2
+  exit 1
+fi
 log "every trace of a slow tier of gate:m9 is repaired"

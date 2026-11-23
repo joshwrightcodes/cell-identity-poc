@@ -208,7 +208,8 @@ case "$1 $2" in
       status)
         down="$(cat "$d/mgmt-down" 2>/dev/null || echo 0)"
         if ((down > 0)); then echo $((down - 1)) >"$d/mgmt-down"; echo '{"error":"mgmtd-0 is not Ready"}'; exit 1; fi
-        jq -nc --argjson n "$(cat "$d/now")" '{signed: {epoch: 1, counter: 7}, applied: {epoch: 1, counter: 7}, lastReportAt: ($n | todate), cells: []}' ;;
+        jq -nc --argjson n "$(cat "$d/now")" --argjson cells "$(cat "$d/status-cells" 2>/dev/null || echo '[]')" --argjson revs "$(cat "$d/status-revocations" 2>/dev/null || echo '[]')" \
+          '{signed: {epoch: 1, counter: 7}, applied: {epoch: 1, counter: 7}, lastReportAt: ($n | todate), cells: $cells, revocations: $revs}' ;;
       unrevoke)
         if grep -qx -- "$6" "$d/unrevoke-fail" 2>/dev/null; then echo '{"error":"not_connected"}'; exit 1; fi
         jq -nc --arg c "$6" '{cell: $c, revoked: false}' ;;
