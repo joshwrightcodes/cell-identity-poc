@@ -569,12 +569,15 @@ func TestSvidTtlSetWritesMarkerAndRenders(t *testing.T) {
 	for _, tc := range []struct {
 		name, ttl, marker, want string
 		files                   []string
+		restoring               bool
 	}{
 		{name: "below 1m", ttl: "30s", want: "1m or more"},
 		{name: "no lifetime", ttl: "1d", want: "1m or more"},
 		{name: "another marker", ttl: "1h", marker: "2h", want: "mise run gate:m9:repair"},
 		{name: "close to the old lifetime", ttl: "2m", want: "2.5 times"},
 		{name: "not connected", ttl: "1h", files: []string{"mgmt-down"}, want: "connected"},
+		{name: "an unfinished restore", ttl: "1h", restoring: true, want: "svid-ttl -- restore"},
+		{name: "an unfinished restore with the lifetime of the file", ttl: "1m", restoring: true, want: "svid-ttl -- restore"},
 	} {
 		t.Run("refuses "+tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -586,6 +589,9 @@ func TestSvidTtlSetWritesMarkerAndRenders(t *testing.T) {
 			for _, f := range tc.files {
 				r.state(f, "1\n")
 			}
+			if tc.restoring {
+				r.write("build/gate/m9-svid-ttl.restoring", "")
+			}
 			_, errOut, code := r.run("svid-ttl.sh", nil, "set", tc.ttl)
 			if code == 0 || !strings.Contains(errOut, tc.want) {
 				t.Fatalf("exit %d, stderr %q; want a refusal with %q", code, errOut, tc.want)
@@ -595,6 +601,9 @@ func TestSvidTtlSetWritesMarkerAndRenders(t *testing.T) {
 			}
 			if got := r.read("build/gate/m9-svid-ttl"); got != "" && got != tc.marker+"\n" {
 				t.Errorf("the marker holds %q after a refusal", got)
+			}
+			if tc.restoring && !r.exists("build/gate/m9-svid-ttl.restoring") {
+				t.Error("the refusal removed the stamp of the unfinished restore")
 			}
 		})
 	}

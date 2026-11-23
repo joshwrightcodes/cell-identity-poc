@@ -66,6 +66,8 @@ cmd_set() {
   (($# == 1)) || usage
   [[ "$ttl" =~ ^[1-9][0-9]*[smh]$ ]] && (($(ttl_seconds "$ttl") >= 60)) \
     || die "the lifetime '$ttl' is not of the form <n>s, <n>m or <n>h with 1m or more, such as 1h"
+  [[ ! -e "$SVID_TTL_MARKER.restoring" ]] \
+    || die "an earlier restore of the SVID lifetime did not finish, so build/gate/m9-svid-ttl.restoring exists and a new switch would hide it. Run: mise run svid-ttl -- restore"
   file="$(svid_ttl_file)"
   if [[ "$ttl" != "$file" ]]; then
     small="$(ttl_seconds "$file")" big="$(ttl_seconds "$ttl")"
