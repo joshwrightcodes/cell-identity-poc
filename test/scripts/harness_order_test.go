@@ -141,6 +141,9 @@ func TestRepairRestoresCells(t *testing.T) {
 		calls   []string
 		kept    bool
 		want    string
+		// timed marks a row whose wait ends by the clock. The script counts whole seconds, so the number of polls before the bound depends on
+		// where the first poll falls in a second, and the row accepts one poll or more.
+		timed bool
 	}{
 		{name: "two withdrawn cells", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, calls: restore},
 		{name: "one cell is requested already", marker: "dev-cell-1\ndev-cell-2\n", status: oneRequested, calls: []string{"serve sync", status,
@@ -169,7 +172,7 @@ func TestRepairRestoresCells(t *testing.T) {
 		{name: "a pending drop is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`,
 			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status}},
 		{name: "a pending drop that stays", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`, code: 1, kept: true,
-			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status, status}, want: "pending drop"},
+			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status}, want: "pending drop", timed: true},
 		{name: "a cell that stays unbound keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
 			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: append(slices.Clone(restore[:6]), status, status)},
 	} {
@@ -221,6 +224,9 @@ func TestRepairRestoresCells(t *testing.T) {
 					strings.HasPrefix(l, "repair-m5") || strings.HasPrefix(l, "serve sync") {
 					got = append(got, strings.TrimSpace(l))
 				}
+			}
+			if tc.timed {
+				got = slices.Compact(got)
 			}
 			if !slices.Equal(got, tc.calls) {
 				t.Fatalf("calls\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.calls, "\n"))
