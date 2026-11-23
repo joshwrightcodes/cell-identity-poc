@@ -1870,7 +1870,8 @@ It is safe to run again.
 
 `gate:m2` changes the clusters while it runs, and it puts them back before it ends:
 
-- It publishes test bundles of `root` and `spire-server` in `dev-cp`, with an entry under `/m2-test/`, for about two minutes.
+- It serves two signed sets of `dev-cp` through `mgmtd`: one with an entry under `/m2-test/`, for about two minutes, and then the live set again.
+  It needs `mgmtd` and the registry mirror, as `gate:m8` does.
 - It replaces the `celld` pod in each cell, so the SPIRE server keeps about six old agent entries until it prunes them, one hour after they expire.
 - It removes the `celld-token` RoleBinding of `dev-cell-2` for about a minute, and then applies it again from the harness bundle.
 - It edits the API server manifest of `dev-cell-1` on the node and signs tokens with a test key for two to three minutes.

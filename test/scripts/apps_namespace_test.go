@@ -440,11 +440,37 @@ func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
 	}
 }
 
-// Component bundles have no tag, so the M2 gate repair retags only root.
-func TestComponentBundlesHaveNoTestTag(t *testing.T) {
+// republish_bundles puts dev-cp back through the signed publish path: one call of the bundle task for the target, with --wait, and no
+// call that writes to the store or moves a tag.
+func TestRepublishBundlesUsesSignedPublish(t *testing.T) {
 	t.Parallel()
-	out, err := runLib(t, nil, `echo "${BUNDLE_TEST_NAMES[*]}"`)
-	if err != nil || strings.TrimSpace(out) != "root" {
-		t.Fatalf("err %v, BUNDLE_TEST_NAMES is %q, want root alone", err, out)
+	snippet := `mise() { echo "mise $*" >>"$STUB_LOG"; return "${STUB_MISE_RC:-0}"; }
+oras() { echo "oras $*" >>"$STUB_LOG"; }
+republish_bundles dev-cp`
+	log := filepath.Join(t.TempDir(), "log")
+	out, err := runLib(t, nil, snippet, "STUB_LOG="+log)
+	calls, _ := os.ReadFile(log)
+	if err != nil || strings.TrimSpace(string(calls)) != "mise run bundle -- publish --target dev-cp --wait" {
+		t.Fatalf("err %v, output %q, calls %q; want one signed publish of dev-cp with --wait", err, out, calls)
+	}
+	out, err = runLib(t, nil, snippet, "STUB_LOG="+log, "STUB_MISE_RC=3")
+	if err == nil {
+		t.Fatalf("output %q; want a failure when the publish fails", out)
+	}
+}
+
+// Step 1 of gate-m2-repair.sh publishes the hydrated set. It does not tag a bundle with oras.
+func TestM2RepairStepOneUsesSignedPublish(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../../scripts/gate-m2-repair.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	if strings.Contains(script, "oras ") {
+		t.Error("scripts/gate-m2-repair.sh still calls oras")
+	}
+	if !strings.Contains(script, "republish_bundles") {
+		t.Error("scripts/gate-m2-repair.sh does not call republish_bundles")
 	}
 }

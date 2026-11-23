@@ -7,8 +7,8 @@
 #   --check prints each trace and exits 1, or exits 0 when it finds none.
 #
 # The repair:
-#   1. dev-cp: tags root:current with the digest in
-#      build/dev-cp/published.env again (component bundles have no tag), refreshes root, waits for the Applications at those digests,
+#   1. dev-cp: when the root, the spire-server pin or a test entry differs from build/dev-cp/published.env, publishes the hydrated
+#      set again with mise run bundle -- publish --target dev-cp --wait, waits for the Applications at the digests of published.env,
 #      and waits until the SPIRE server holds no entry under /m2-test/;
 #   2. dev-cell-1: puts back the manifest that the key rotation test saved, or removes the two test
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes
@@ -136,22 +136,11 @@ no_test_entries() {
     /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" || return 1
   jq -e --arg p "$BUNDLE_TEST_PATH" '[.entries[] | select(.spiffe_id.path | startswith($p))] | length == 0' <<<"$entries"
 }
-retagged=0
-store_forward_start "$cp" || die "cannot reach the bundle store of $cp"
-for name in "${BUNDLE_TEST_NAMES[@]}"; do
-  want="$(published_digest "$cp" "$name")"
-  [[ "$want" == sha256:* ]] || { store_forward_stop; die "build/$cp/published.env has no digest for $name. Run: CELL=$cp mise run cell:up"; }
-  got="$(oras resolve --plain-http "$STORE_ADDR/bundles/$name:current" 2>/dev/null || true)"
-  if [[ "$got" != "$want" ]]; then
-    oras tag --plain-http "$STORE_ADDR/bundles/$name@$want" current >/dev/null \
-      || { store_forward_stop; die "could not tag $name@$want as current in the bundle store of $cp"; }
-    log "tagged $name@$want as current again, in place of ${got:-nothing}"
-    retagged=1
-  fi
-done
-store_forward_stop
-if ((retagged)) || ! apps_at_published >/dev/null 2>&1; then
-  kcp -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+# A trace means that the live root or the pin of spire-server differs from published.env, or that the SPIRE server holds a test entry.
+traces="$(bundle_traces "$cp")" || die "$traces"
+if [[ -n "$traces" ]] || ! apps_at_published >/dev/null 2>&1; then
+  log "publishing the hydrated set of $cp through the signed path"
+  republish_bundles "$cp" || die "could not publish the hydrated set of $cp. Run: CELL=$cp mise run cell:hydrate, then mise run bundle -- publish --target $cp --wait"
   wait_until 300 "the Applications of $cp are Synced and Healthy at the digests of build/$cp/published.env" apps_at_published
 fi
 wait_until 120 "the SPIRE server of $cp holds no entry under $BUNDLE_TEST_PATH" no_test_entries

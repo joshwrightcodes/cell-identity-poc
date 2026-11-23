@@ -316,8 +316,8 @@ check_live_images() {
   fi
 }
 
-# The entries test of gate:m2 publishes test bundles and adds an entry under /m2-test/. A run that
-# stops before its cleanup leaves them, and Argo CD still reports Synced and Healthy.
+# The entries test of gate:m2 serves a signed set with an entry under /m2-test/. A run that
+# stops before its cleanup leaves that set live, and Argo CD still reports Synced and Healthy.
 check_no_gate_bundles() {
   local traces
   if ! traces="$(bundle_traces "$CELL_NAME")" || [[ -n "$traces" ]]; then

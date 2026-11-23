@@ -60,9 +60,13 @@ store_forward_stop() {
   wait "${STORE_PF_PID:-}" 2>/dev/null || true
 }
 
-# The entries test publishes a test root bundle and a test spire-server bundle, and an entry under /m2-test/. Only root has a tag.
-BUNDLE_TEST_NAMES=(root)
+# The entries test publishes a signed set with a test entry under /m2-test/, and then the live set again. Only root has a tag.
 BUNDLE_TEST_PATH=/m2-test/
+
+# republish_bundles <cluster> publishes the hydrated set of the cluster through the signed path and waits for its result.
+republish_bundles() {
+  (cd "$ROOT" && mise run bundle -- publish --target "$1" --wait)
+}
 
 # published_digest <cluster> <bundle> prints the digest that the last cell:publish pushed.
 published_digest() {

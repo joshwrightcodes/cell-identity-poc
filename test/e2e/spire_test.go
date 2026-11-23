@@ -3,20 +3,19 @@
 package e2e
 
 import (
-	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
 const (
@@ -31,7 +30,6 @@ const (
 	spireEntryIDPrefix = "poc."
 	// No real entry uses this path. The test checks that before it adds an entry.
 	spireTestPath   = "/m2-test/"
-	argoSyncWait    = 4 * time.Minute
 	entryWait       = 4 * time.Minute
 	forwardWait     = 30 * time.Second
 	statefulsetWait = 3 * time.Minute
@@ -71,61 +69,37 @@ func TestM2ServerHealthy(t *testing.T) {
 	}
 }
 
-// TestM2EntriesReconcile adds a ClusterStaticEntry to ConfigMap spire-entries through the publish
-// path: a new spire-server bundle in the bundle store, and a new root bundle that pins it. It then
-// restores the original root bundle, which removes the entry again.
+// TestM2EntriesReconcile adds a ClusterStaticEntry to ConfigMap spire-entries through a signed bundle set of dev-cp: the live set with a
+// changed spire-server bundle. It checks that the entry reaches the SPIRE server, serves the live set again, and checks that the entry
+// is gone and that the state root is the original one.
 func TestM2EntriesReconcile(t *testing.T) {
-	store := forwardBundleStore(t)
 	run := randomHex(t, 6)
 	spiffeID := fmt.Sprintf("spiffe://%s%sentries-reconcile/%s", spireTD, spireTestPath, run)
 	parentID := fmt.Sprintf("spiffe://%s%sparent", spireTD, spireTestPath)
 
+	m8WaitNoOpen(t, spireCluster)
 	if used := entriesUnder(t, spireTestPath); len(used) > 0 {
-		t.Fatalf("want no entry under spiffe://%s%s before the test, got %v", spireTD, spireTestPath, used)
+		t.Fatalf("want no entry under spiffe://%s%s before the test, got %v. %s", spireTD, spireTestPath, used, repairHint)
 	}
-
-	rootRef := store + "/bundles/root"
-	spireRef := store + "/bundles/" + spireApp
-	origRoot := orasResolve(t, rootRef+":current")
-	// The restore goes back to the root tag. A run that stopped before its cleanup can leave a test bundle there, so it must be the
-	// root that the last publish pushed. Component bundles have no tag, so the Application pin is the digest of the spire-server bundle.
-	published := publishedDigests(t, spireCluster)
-	origSpire := appTargetRevision(t, spireApp)
-	if origRoot != published["root"] || origSpire != published[spireApp] {
-		t.Fatalf("root:current is %s and %s pins %s, but build/%s/published.env has %s and %s. Run: mise run gate:m2:repair",
-			origRoot, spireApp, origSpire, spireCluster, published["root"], published[spireApp])
+	if st := m8State(t, spireCluster); st.Source != "signed" {
+		t.Fatalf("the bundle state of %s has source %q, want signed", spireCluster, st.Source)
 	}
-	if !strings.HasPrefix(origSpire, "sha256:") {
-		t.Fatalf("Application %s: want a targetRevision that pins a digest, got %q", spireApp, origSpire)
-	}
-	t.Logf("original root bundle %s, spire-server bundle %s", origRoot, origSpire)
-
-	restored := false
-	restore := func(t *testing.T) {
-		t.Helper()
-		if !restored {
-			orasTag(t, rootRef+"@"+origRoot, "current")
-			refreshRoot(t)
-			restored = true
-		}
-		waitApps(t, origRoot, origSpire)
-	}
+	m8RestoreOnFailure(t, spireCluster)
 	t.Cleanup(func() {
-		failedBefore := t.Failed()
-		defer func() {
-			if t.Failed() && !failedBefore {
-				t.Logf("the restore of %s did not finish. %s", spireCluster, repairHint)
-			}
-		}()
-		restore(t)
 		if left := entriesUnder(t, spireTestPath); len(left) > 0 {
 			t.Errorf("want no entry under spiffe://%s%s after the test, got %v. %s", spireTD, spireTestPath, left, repairHint)
 		}
 	})
 
+	live := m8LiveSet(t, spireCluster)
+	origSpire := m8LiveDigest(live, spireApp)
+	if origSpire == "" {
+		t.Fatalf("the live set of %s has no component %s", spireCluster, spireApp)
+	}
+	origRoot := m8State(t, spireCluster).Root.Digest
+	t.Logf("original root bundle %s, spire-server bundle %s", origRoot, origSpire)
+
 	// A spire-server bundle whose ConfigMap spire-entries holds one test entry.
-	spireDir := orasPull(t, spireRef+"@"+origSpire)
-	manifests := filepath.Join(spireDir, "manifests.yaml")
 	entry := fmt.Sprintf(`apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterStaticEntry
 metadata:
@@ -135,24 +109,32 @@ spec:
   parentID: %s
   selectors: ["m2test:run:%s"]
 `, spiffeID, parentID, run)
-	selectEntries := `select(.kind == "ConfigMap" and .metadata.name == "spire-entries" and .metadata.namespace == "spire-system")`
-	runTool(t, []string{"ENTRY=" + entry}, "yq", "-i", "("+selectEntries+` | .data["m2-test-entry.yaml"]) = strenv(ENTRY)`, manifests)
-	if out := runTool(t, nil, "yq", selectEntries+` | .data | keys | join(",")`, manifests); !strings.Contains(out, "m2-test-entry.yaml") {
-		t.Fatalf("edited spire-server bundle: want key m2-test-entry.yaml in ConfigMap spire-entries, got keys %q", out)
+	objs := m8Objects(t, m8LiveManifests(t, spireCluster, spireApp, origSpire))
+	edited := false
+	for _, o := range objs {
+		meta, _ := o["metadata"].(map[string]any)
+		if o["kind"] != "ConfigMap" || meta["name"] != "spire-entries" || meta["namespace"] != spireNamespace {
+			continue
+		}
+		data, _ := o["data"].(map[string]any)
+		if data == nil {
+			data = map[string]any{}
+			o["data"] = data
+		}
+		data["m2-test-entry.yaml"] = entry
+		edited = true
 	}
-	testSpire := orasPush(t, spireDir, spireRef+":m2-test")
+	if !edited {
+		t.Fatalf("the live bundle %s of %s has no ConfigMap %s/spire-entries", spireApp, spireCluster, spireNamespace)
+	}
+	testSpire := m8PushBundle(t, spireCluster, spireApp, m8Render(t, objs))
+	if testSpire == origSpire {
+		t.Fatalf("the edited spire-server bundle has the digest %s of the live one", testSpire)
+	}
 
-	// A root bundle that pins the test spire-server bundle.
-	rootDir := orasPull(t, rootRef+"@"+origRoot)
-	app := filepath.Join(rootDir, spireApp+".yaml")
-	runTool(t, []string{"DIGEST=" + testSpire}, "yq", "-i", `.spec.source.targetRevision = strenv(DIGEST)`, app)
-	if out := strings.TrimSpace(runTool(t, nil, "yq", ".spec.source.targetRevision", app)); out != testSpire {
-		t.Fatalf("edited root bundle: want %s to pin %s, got %q", app, testSpire, out)
-	}
-	testRoot := orasPush(t, rootDir, rootRef+":current")
-	refreshRoot(t)
-	t.Logf("published test root bundle %s with spire-server bundle %s", testRoot, testSpire)
-	waitApps(t, testRoot, testSpire)
+	_, tb := m8Offer(t, spireCluster, m8WithDigest(live, spireApp, 0, spireNamespace, testSpire), m8SetWait)
+	m8WantResult(t, tb.Result, op.OutcomeApplied, "", "")
+	t.Logf("applied the set with spire-server bundle %s", testSpire)
 
 	var id string
 	waitFor(t, "entry "+spiffeID+" in spire-server entry show", entryWait, func() (bool, string) {
@@ -171,7 +153,8 @@ spec:
 	}
 	t.Logf("entry %s has ID %s", spiffeID, id)
 
-	restore(t)
+	_, tb = m8Offer(t, spireCluster, live, m8SetWait)
+	m8WantResult(t, tb.Result, op.OutcomeApplied, "", "")
 	waitFor(t, "no entry "+spiffeID+" in spire-server entry show after the restore", entryWait, func() (bool, string) {
 		entries, err := showEntries(t, spiffeID)
 		if err != nil {
@@ -179,6 +162,9 @@ spec:
 		}
 		return len(entries) == 0, fmt.Sprintf("%d entries: %v", len(entries), entries)
 	})
+	if got := m8State(t, spireCluster).Root.Digest; got != origRoot {
+		t.Errorf("the state root of %s is %s after the restore, want the original %s", spireCluster, got, origRoot)
+	}
 }
 
 type spireEntry struct {
@@ -253,155 +239,6 @@ func waitFor(t *testing.T, what string, timeout time.Duration, check func() (boo
 	}
 }
 
-type argoApp struct {
-	Metadata struct {
-		Name string `json:"name"`
-	} `json:"metadata"`
-	Spec struct {
-		Source struct {
-			TargetRevision string `json:"targetRevision"`
-		} `json:"source"`
-	} `json:"spec"`
-	Status struct {
-		Sync struct {
-			Status   string `json:"status"`
-			Revision string `json:"revision"`
-		} `json:"sync"`
-		Health struct {
-			Status string `json:"status"`
-		} `json:"health"`
-	} `json:"status"`
-}
-
-func (a argoApp) String() string {
-	return fmt.Sprintf("%s %s/%s at %s (target %s)", a.Metadata.Name, a.Status.Sync.Status, a.Status.Health.Status,
-		a.Status.Sync.Revision, a.Spec.Source.TargetRevision)
-}
-
-func argoApps(t *testing.T) ([]argoApp, error) {
-	t.Helper()
-	out, err := kubectl(t, spireCluster, "", "-n", "argocd", "get", "applications", "-o", "json")
-	if err != nil {
-		return nil, err
-	}
-	var list struct {
-		Items []argoApp `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		return nil, fmt.Errorf("decode Applications: %w", err)
-	}
-	return list.Items, nil
-}
-
-func appTargetRevision(t *testing.T, name string) string {
-	t.Helper()
-	out, err := kubectl(t, spireCluster, "", "-n", "argocd", "get", "application", name, "-o", "jsonpath={.spec.source.targetRevision}")
-	if err != nil {
-		t.Fatal(err)
-	}
-	return out
-}
-
-// waitApps waits until the root Application has synced root, the spire-server Application pins and
-// has synced spire, and every Application is Synced and Healthy.
-func waitApps(t *testing.T, root, spire string) {
-	t.Helper()
-	what := fmt.Sprintf("root at %s, %s at %s, and every Application Synced and Healthy", root, spireApp, spire)
-	waitFor(t, what, argoSyncWait, func() (bool, string) {
-		apps, err := argoApps(t)
-		if err != nil {
-			return false, err.Error()
-		}
-		var bad []string
-		for _, a := range apps {
-			want := ""
-			switch a.Metadata.Name {
-			case "root":
-				want = root
-			case spireApp:
-				want = spire
-			}
-			if a.Status.Sync.Status != "Synced" || a.Status.Health.Status != "Healthy" ||
-				(want != "" && a.Status.Sync.Revision != want) ||
-				(a.Metadata.Name == spireApp && a.Spec.Source.TargetRevision != spire) {
-				bad = append(bad, a.String())
-			}
-		}
-		if len(apps) == 0 {
-			bad = append(bad, "no Applications")
-		}
-		return len(bad) == 0, strings.Join(bad, "; ")
-	})
-}
-
-func refreshRoot(t *testing.T) {
-	t.Helper()
-	if _, err := kubectl(t, spireCluster, "", "-n", "argocd", "annotate", "application", "root",
-		"argocd.argoproj.io/refresh=hard", "--overwrite"); err != nil {
-		t.Fatal(err)
-	}
-}
-
-var forwardLine = regexp.MustCompile(`^Forwarding from 127\.0\.0\.1:(\d+) -> 5001$`)
-
-// forwardBundleStore starts a port-forward to the registry port of the bundle store pod of dev-cp, which needs no token, on a free
-// local port. It returns the store address and stops the forward when the test ends.
-func forwardBundleStore(t *testing.T) string {
-	t.Helper()
-	cmd := exec.Command("kubectl", "--context", "kind-"+spireCluster, "-n", "cell-system",
-		"port-forward", "--address", "127.0.0.1", "pod/bundle-store-0", ":5001")
-	// exec copies stderr in its own goroutine while the process runs, so reads take the lock.
-	var stderr lockedBuffer
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatalf("start the port-forward to the bundle store: %v", err)
-	}
-	// Wait closes the pipe, so it may run only after the reader has seen the end of the output.
-	readDone := make(chan struct{})
-	t.Cleanup(func() {
-		_ = cmd.Process.Kill()
-		select {
-		case <-readDone:
-		case <-time.After(forwardWait):
-			t.Logf("the port-forward output did not end within %s of the kill", forwardWait)
-		}
-		_ = cmd.Wait()
-	})
-	port := make(chan string, 1)
-	go func() {
-		defer close(readDone)
-		s := bufio.NewScanner(stdout)
-		for s.Scan() {
-			if m := forwardLine.FindStringSubmatch(s.Text()); m != nil {
-				port <- m[1]
-				break
-			}
-		}
-		for s.Scan() {
-		}
-	}()
-	var addr string
-	select {
-	case p := <-port:
-		addr = "127.0.0.1:" + p
-	case <-time.After(forwardWait):
-		t.Fatalf("waited %s for the port-forward to the bundle store to print its local port, stderr: %s", forwardWait, stderr.String())
-	}
-	waitFor(t, "HTTP 200 from http://"+addr+"/v2/", forwardWait, func() (bool, string) {
-		resp, err := http.Get("http://" + addr + "/v2/")
-		if err != nil {
-			return false, err.Error()
-		}
-		_ = resp.Body.Close()
-		return resp.StatusCode == http.StatusOK, resp.Status
-	})
-	return addr
-}
-
 // lockedBuffer is a buffer that one goroutine writes while another reads it.
 type lockedBuffer struct {
 	mu  sync.Mutex
@@ -448,47 +285,6 @@ func runTool(t *testing.T, env []string, name string, args ...string) string {
 		t.Fatalf("%s %s: %v: %s", name, strings.Join(args, " "), err, stderr.String())
 	}
 	return string(out)
-}
-
-func orasResolve(t *testing.T, ref string) string {
-	t.Helper()
-	d := strings.TrimSpace(runTool(t, nil, "oras", "resolve", "--plain-http", ref))
-	if !strings.HasPrefix(d, "sha256:") {
-		t.Fatalf("oras resolve %s: want a sha256 digest, got %q", ref, d)
-	}
-	return d
-}
-
-func orasPull(t *testing.T, ref string) string {
-	t.Helper()
-	dir := t.TempDir()
-	runTool(t, nil, "oras", "pull", "--plain-http", "--output", dir, ref)
-	return dir
-}
-
-// orasPush pushes dir as one bundle, the way scripts/publish.sh does, and returns its digest.
-func orasPush(t *testing.T, dir, ref string) string {
-	t.Helper()
-	cmd := exec.Command("oras", "push", "--plain-http", "--format", "json", ref, ".")
-	cmd.Dir = dir
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("oras push %s: %v: %s", ref, err, stderr.String())
-	}
-	var res struct {
-		Digest string `json:"digest"`
-	}
-	if err := json.Unmarshal(out, &res); err != nil || !strings.HasPrefix(res.Digest, "sha256:") {
-		t.Fatalf("oras push %s: want JSON with a sha256 digest, got %q: %v", ref, out, err)
-	}
-	return res.Digest
-}
-
-func orasTag(t *testing.T, ref, tag string) {
-	t.Helper()
-	runTool(t, nil, "oras", "tag", "--plain-http", ref, tag)
 }
 
 func randomHex(t *testing.T, n int) string {
