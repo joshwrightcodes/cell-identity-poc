@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
@@ -377,10 +378,43 @@ func m8AttachCosign(t *testing.T, target string) error {
 	return nil
 }
 
-// m8OfferCosigned is m8Offer with the Sigstore bundle attached after the set is signed and before the wait for its result.
+// m8PushRoot pushes the root of the components as bundles/<target>/root on the mirror, with bundlectl push-root as bundle -- publish does,
+// and returns the digest of the root. mgmtd signs a root and never pushes it, and bundle -- cosign attaches to a root that is already there.
+func m8PushRoot(t *testing.T, target string, comps []bundle.Component) string {
+	t.Helper()
+	role := "cell"
+	if target == cpClusterName {
+		role = "cp"
+	}
+	sorted := slices.Clone(comps)
+	slices.SortFunc(sorted, func(a, b bundle.Component) int { return strings.Compare(a.Name, b.Name) })
+	body, err := json.Marshal(sorted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := m8Command(t, 2*time.Minute, string(body), "run", "bundlectl", "--", "push-root", "--role", role, "--target", target,
+		"--set", "-", "--registry", hostsvc.RegistryHost)
+	if err != nil {
+		t.Fatalf("push the root of %s: %v\n%s", target, err, out)
+	}
+	var res struct {
+		Digest string `json:"digest"`
+	}
+	if err := json.Unmarshal([]byte(m8LastLine(out)), &res); err != nil || res.Digest == "" {
+		t.Fatalf("bundlectl push-root printed %q: %v", out, err)
+	}
+	return res.Digest
+}
+
+// m8OfferCosigned is m8Offer with the root of the set on the mirror and the Sigstore bundle attached after the set is signed and before the
+// wait for its result. The root goes first, so a failed push stops the test before a set is served.
 func m8OfferCosigned(t *testing.T, target string, comps []bundle.Component, d time.Duration) (mgmtapi.BundleSignResult, mgmtapi.TargetBundle) {
 	t.Helper()
+	pushed := m8PushRoot(t, target, comps)
 	signed := m8Sign(t, target, comps, true)
+	if pushed != signed.RootDigest {
+		t.Fatalf("the root that bundlectl pushed for %s (%s) differs from the root that mgmtd signed (%s)", target, pushed, signed.RootDigest)
+	}
 	if err := m8AttachCosign(t, target); err != nil {
 		t.Fatal(err)
 	}
