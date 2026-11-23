@@ -297,7 +297,7 @@ overlay_plane() {
              | if $t == null then "the overlay of envd holds the entry \($h.id) for \($h.cell) with an issuedAt that is no UTC time. Read mgmtd with: mise run mgmt -- status"
                elif ($now - $t) > 600 then "the overlay of envd holds the entry \($h.id) for \($h.cell) since \($h.issuedAt), more than 10 minutes ago, while mgmtd is connected and has no revoke queued for it. Read mgmtd with: mise run mgmt -- status, then list the entries with: mise run revoke -- list"
                else empty end] else [] end)
-         + (if $pod != "" and ($ban == null or $ban.ready != true) then ["the container agent-ban in spire-server-0 of dev-cp is not Ready, so no agent of a revoked cell is banned. Run: CELL=dev-cp mise run cell:restart"] else [] end)
+         + (if $pod != "" and (($ban == null and $live != "") or ($ban != null and $ban.ready != true)) then ["the container agent-ban in spire-server-0 of dev-cp is not Ready, so no agent of a revoked cell is banned. Run: CELL=dev-cp mise run cell:restart"] else [] end)
          )}'
 }
 

@@ -153,6 +153,12 @@ func TestStatusM9Conditions(t *testing.T) {
 		{name: "the ban container is absent", env: func() []string {
 			return []string{`STUB_SPIRE_POD={"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`}
 		}, want: []string{"agent-ban", "not Ready"}},
+		{name: "the ban container is absent with no live cell", env: func() []string {
+			return []string{`STUB_SPIRE_POD={"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, "STUB_KIND=management dev-cp rogue"}
+		}, deny: []string{"agent-ban"}},
+		{name: "the ban container is not Ready with no live cell", env: func() []string {
+			return []string{"STUB_SPIRE_POD=" + statusPod(false, 0), "STUB_KIND=management dev-cp rogue"}
+		}, want: []string{"agent-ban", "not Ready"}},
 		{name: "a ban container that restarted and is Ready is no status problem", env: func() []string { return []string{"STUB_SPIRE_POD=" + statusPod(true, 3)} }},
 		{name: "a cell held in the overlay for 11 minutes while connected", env: func() []string {
 			return []string{"STUB_CELL_RECORDS=" + statusHeld(statusEntry(id, "dev-cell-2", time.Now().Add(-11*time.Minute), "good"))}

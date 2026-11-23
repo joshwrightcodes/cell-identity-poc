@@ -976,6 +976,7 @@ Before each slow-tier run, the owner unlocks the secret CLI.
 The overlay of the gateway and `envd` counts a hold of more than 10 minutes from `issuedAt`, because `envd` records no admit time.
 `mgmtd` keeps a mirror of revocation events with no bound. Only an admin action or a signed entry adds an event.
 The container `agent-ban` has no probe. A configuration error makes it exit before any ban, and it shows as restarts.
+With no live cell, the server pod of `dev-cp` has no `agent-ban` container, and `cell:verify` and `harness:status` do not require it.
 `cell:up` with `HARNESS_ONLY=cell-identity` waits for a log line of the SPIRE server. A pod of the SPIRE server in `dev-cp` that has run for a long time no longer holds it. In that case run a full `cell:up`.
 
 ### Gate of M9

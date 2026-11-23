@@ -937,16 +937,19 @@ check_operator_pins() {
 }
 
 # check_agent_ban fails unless the container agent-ban in pod spire-server-0 of dev-cp is Ready and has restart count 0. The
-# container has no probe of its own, so a stopped ban loop shows only here.
+# container has no probe of its own, so a stopped ban loop shows only here. With no live cell the render leaves the container out,
+# so an absent container passes then, and a present container must still be Ready.
 check_agent_ban() {
-  local pod state
+  local pod state cells
+  cells="$(live_cells)" || { echo "$cells"; return 1; }
   pod="$(kubectl --context kind-dev-cp -n spire-system get pod spire-server-0 -o json)" \
     || { echo "could not read pod spire-server-0 in dev-cp. Run: mise run harness:status"; return 1; }
   state="$(jq -r '[.status.containerStatuses[]? | select(.name == "agent-ban")][0] | if . == null then "absent" else "\(.ready) \(.restartCount)" end' <<<"$pod")" \
     || { echo "pod spire-server-0 in dev-cp is no JSON object"; return 1; }
   case "$state" in
     "true 0") return 0 ;;
-    absent) echo "pod spire-server-0 in dev-cp has no container agent-ban, so nothing bans the agents of a revoked cell. Run: CELL=dev-cp mise run cell:up" ;;
+    absent) [[ -n "$cells" ]] || return 0
+      echo "pod spire-server-0 in dev-cp has no container agent-ban, so nothing bans the agents of a revoked cell. Run: CELL=dev-cp mise run cell:up" ;;
     *) echo "container agent-ban in spire-server-0 of dev-cp reports ready=${state% *} and restart count ${state#* }, and it has no probe of its own. Read its log: mise x -- kubectl --context kind-dev-cp -n spire-system logs spire-server-0 -c agent-ban. Then run: CELL=dev-cp mise run cell:restart" ;;
   esac
   return 1

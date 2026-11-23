@@ -143,18 +143,22 @@ func writePod(r *revokeRig, body string) {
 	}
 }
 
-// TestVerifyAgentBan: the container agent-ban in spire-server-0 of dev-cp must be Ready with restart count 0.
+// TestVerifyAgentBan: with a live cell, the container agent-ban in spire-server-0 of dev-cp must be present, Ready and at restart count 0. With
+// no live cell the render leaves the container out, and a present container must still be Ready.
 func TestVerifyAgentBan(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		pod  string // empty: no pod
+		env  []string
 		want []string
 	}{
 		{name: "ready with no restart", pod: statusPod(true, 0)},
 		{name: "not ready", pod: statusPod(false, 0), want: []string{"ready=false", "restart count 0", "logs spire-server-0 -c agent-ban"}},
 		{name: "ready after a restart", pod: statusPod(true, 2), want: []string{"ready=true", "restart count 2"}},
 		{name: "absent container", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, want: []string{"no container agent-ban", "CELL=dev-cp mise run cell:up"}},
+		{name: "absent container with no live cell", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, env: []string{"STUB_KIND=management dev-cp rogue"}},
+		{name: "not ready with no live cell", pod: statusPod(false, 0), env: []string{"STUB_KIND=management dev-cp rogue"}, want: []string{"ready=false", "restart count 0"}},
 		{name: "another container that restarted", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":4},{"name":"agent-ban","ready":true,"restartCount":0}]}}`},
 		{name: "no pod", want: []string{"could not read pod spire-server-0"}},
 	} {
@@ -164,7 +168,7 @@ func TestVerifyAgentBan(t *testing.T) {
 			if tc.pod != "" {
 				writePod(r, tc.pod)
 			}
-			out, code := r.runCheck("check_agent_ban")
+			out, code := r.runCheck("check_agent_ban", tc.env...)
 			if len(tc.want) == 0 {
 				if code != 0 {
 					t.Fatalf("the check fails: exit %d\n%s", code, out)
