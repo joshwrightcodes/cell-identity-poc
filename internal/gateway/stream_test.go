@@ -137,10 +137,10 @@ func (e *gwEnv) tlsConfig() *tls.Config {
 	return StreamServerTLS(e.ca.Source(e.t, gwSPIFFE), e.ca.Bundle(), e.gwID.TrustDomain())
 }
 
-func listenDual(t *testing.T) net.Listener {
+// listenLoopback listens on 127.0.0.1 only. A test that dials 127.0.0.1 uses it, because no other process can then bind the same address
+// and port and take the connection.
+func listenLoopback(t *testing.T) net.Listener {
 	t.Helper()
-	// The clients of the tests dial 127.0.0.1. A listener on that address takes the connection before a wildcard listener of another
-	// process on the same port can.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -148,14 +148,37 @@ func listenDual(t *testing.T) net.Listener {
 	return ln
 }
 
+// listenDual listens on [::]:0 for a test that dials both 127.0.0.1 and [::1], so that the two clients have two source addresses. The test
+// fails when this host has no IPv6 loopback, because the checks of the test would not run.
+func listenDual(t *testing.T) net.Listener {
+	t.Helper()
+	ln, err := net.Listen("tcp", "[::]:0")
+	if err != nil {
+		t.Fatalf("the dual-stack listener needs IPv6 on this host: %v", err)
+	}
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	probe, err := net.Dial("tcp", "[::1]:"+port)
+	if err != nil {
+		t.Fatalf("no IPv6 loopback on this host, and the test needs a client on [::1]: %v", err)
+	}
+	_ = probe.Close()
+	return ln
+}
+
 // serveStream starts the stream server and returns the handler and the address.
 func (e *gwEnv) serveStream(cfg StreamConfig) (*StreamHandler, string) {
+	e.t.Helper()
+	return e.serveStreamOn(cfg, listenLoopback)
+}
+
+// serveStreamOn is serveStream with the listener that listen makes.
+func (e *gwEnv) serveStreamOn(cfg StreamConfig, listen func(*testing.T) net.Listener) (*StreamHandler, string) {
 	e.t.Helper()
 	cfg.Subject, cfg.Notifier, cfg.Log = e.subject(), e.n, slog.New(slog.NewJSONHandler(e.logs, nil))
 	h := NewStreamHandler(e.st, cfg)
 	tlsCfg := e.tlsConfig()
 	srv := NewStreamServer(h, tlsCfg, nil)
-	ln := ListenStream(listenDual(e.t), tlsCfg)
+	ln := ListenStream(listen(e.t), tlsCfg)
 	go func() { _ = srv.Serve(ln) }()
 	e.t.Cleanup(func() { _ = srv.Close() })
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
@@ -231,10 +254,9 @@ func (e *gwEnv) open(addr, cell string, o openOpts) *cstream {
 			tc := tls.Client(stallConn{Conn: raw, stall: &c.stall}, cfg)
 			if err := tc.HandshakeContext(ctx); err != nil {
 				_ = raw.Close()
-				// The listener of the test binds [::]:port and the client dials 127.0.0.1:port. On macOS another process can bind 127.0.0.1 on
-				// the same port, and it then gets the connection. A server that is not the gateway shows a certificate with no SPIFFE ID, for
-				// example "certificate contains no URI SAN", so the error names the peer address.
-				return nil, fmt.Errorf("TLS handshake with %s (peer %s) failed, and a certificate with no URI SAN means that a foreign server answered on the port: %w", a, raw.RemoteAddr(), err)
+				// A test that listens on 127.0.0.1 gets no foreign server on its port. A certificate with no SPIFFE ID, for example
+				// "certificate contains no URI SAN", means that a process on another address of the port answered, so the error names the peer.
+				return nil, fmt.Errorf("TLS handshake with %s (peer %s) failed, and a certificate with no URI SAN means that another server answered: %w", a, raw.RemoteAddr(), err)
 			}
 			c.tc = tc
 			return tc, nil
@@ -1040,7 +1062,7 @@ func rawTLS(t *testing.T, e *gwEnv, addr string) (*tls.Conn, error) {
 
 func TestStreamListenerPerSourceCap(t *testing.T) {
 	e := newGwEnv(t)
-	_, addr := e.serveStream(StreamConfig{})
+	_, addr := e.serveStreamOn(StreamConfig{}, listenDual)
 	_, port, _ := net.SplitHostPort(addr)
 	var held []*tls.Conn
 	for i := 0; i < 4; i++ {
@@ -1059,11 +1081,6 @@ func TestStreamListenerPerSourceCap(t *testing.T) {
 		t.Fatalf("the fifth connection took %v to close", time.Since(start))
 	}
 	// A client from another source is served while the first four stay open.
-	probe, err := net.Dial("tcp", "[::1]:"+port)
-	if err != nil {
-		t.Skipf("no IPv6 loopback: %v", err)
-	}
-	_ = probe.Close()
 	start = time.Now()
 	c := e.open("[::1]:"+port, cell1, openOpts{pod: "uid-v6"})
 	c.hello(op.Fence{})
@@ -1166,7 +1183,7 @@ func TestStreamServerLogLineCarriesTraceID(t *testing.T) {
 	h := NewStreamHandler(e.st, StreamConfig{Subject: e.subject(), Log: log, HelloTimeout: 200 * time.Millisecond})
 	tlsCfg := e.tlsConfig()
 	srv := NewStreamServer(h, tlsCfg, sdktrace.NewTracerProvider().Tracer("test"))
-	ln := ListenStream(listenDual(t), tlsCfg)
+	ln := ListenStream(listenLoopback(t), tlsCfg)
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	_, port, _ := net.SplitHostPort(ln.Addr().String())

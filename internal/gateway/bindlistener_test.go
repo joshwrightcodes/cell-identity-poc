@@ -76,9 +76,6 @@ func newBindFx(t *testing.T, cfg BindConfig, tracer *sdktrace.TracerProvider, lo
 	t.Cleanup(func() { _ = tr.Close() })
 	_, b.port, _ = net.SplitHostPort(ln.Addr().String())
 	b.v4, b.v6 = b.client(), b.client()
-	if _, err := net.Dial("tcp", "[::1]:"+b.port); err != nil {
-		t.Skipf("no IPv6 loopback: %v", err)
-	}
 	b.setNonces("n1")
 	return b
 }
