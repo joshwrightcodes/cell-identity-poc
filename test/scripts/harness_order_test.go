@@ -131,8 +131,10 @@ func TestRepairRestoresCells(t *testing.T) {
 	const reqBoth = "mise run portal -- request --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cp"
 	const wait = "mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cp"
 	const link = "mise run cell:link | CELL=management"
+	const publish = "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait | CELL=dev-cp"
 	const openSteps1 = `{"steps":[{"id":"a","cell":"dev-cell-1","state":"creating"}]}`
-	restore := []string{"serve sync", status, reqBoth, wait, link, "repair-m5", status}
+	restoreBound := []string{"serve sync", status, reqBoth, wait, link, "repair-m5", status}
+	restore := append(slices.Clone(restoreBound), publish)
 	for _, tc := range []struct {
 		name    string
 		marker  string
@@ -150,37 +152,41 @@ func TestRepairRestoresCells(t *testing.T) {
 	}{
 		{name: "two withdrawn cells", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, calls: restore},
 		{name: "one cell is requested already", marker: "dev-cell-1\ndev-cell-2\n", status: oneRequested, calls: []string{"serve sync", status,
-			"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", wait, link, "repair-m5", status}},
+			"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		{name: "no marker", status: allGood, calls: []string{"repair-m5", "serve sync", status}},
 		{name: "no marker and a live cell that is not requested", status: oneRequested, code: 1, calls: []string{"repair-m5", "serve sync", status}, want: "dev-cell-2 has a cluster and is not requested"},
 		{name: "check with the marker", marker: "dev-cell-1\n", args: []string{"--check"}, status: bothWithdrawn, code: 1, kept: true,
 			calls: []string{"repair-m5 --check"}, want: "build/gate/m6-provision exists"},
 		{name: "check with no marker", args: []string{"--check"}, status: allGood, calls: []string{"repair-m5 --check", status}},
 		{name: "a wait that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_FAIL_ARGS=run portal -- wait"}, calls: restore[:4]},
+			env: []string{"STUB_FAIL_ARGS=run portal -- wait"}, calls: restoreBound[:4]},
 		{name: "a request that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_FAIL_ARGS=run portal -- request"}, calls: restore[:3]},
+			env: []string{"STUB_FAIL_ARGS=run portal -- request"}, calls: restoreBound[:3]},
 		{name: "a stream wait that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_M5_FAIL=1"}, calls: restore[:6]},
+			env: []string{"STUB_M5_FAIL=1"}, calls: restoreBound[:6]},
 		// An interrupt in the creating stage, before the node of the cell has an address: no cluster, an open step.
 		{name: "interrupt in creating", marker: "dev-cell-1\ndev-cell-2\n", status: bound(openCel, gone), env: []string{"STUB_STEPS=" + openSteps1, "STUB_KIND=management dev-cp rogue dev-cell-2"},
 			calls: []string{"mise run portal -- cancel --cell dev-cell-1 | CELL=dev-cp", "serve sync", status,
-				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status}},
+				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		// An interrupt after the node has an address: the half-built cluster is live, and cell:down deletes it before anything else.
 		{name: "interrupt after the node has an address", marker: "dev-cell-1\ndev-cell-2\n", status: bound(openCel, gone), env: []string{"STUB_STEPS=" + openSteps1},
 			calls: []string{"mise run portal -- cancel --cell dev-cell-1 | CELL=dev-cp", "mise run cell:down | CELL=dev-cell-1", "serve sync", status,
-				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status}},
+				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		{name: "a step of a cell that the marker does not name stays", marker: "dev-cell-2\n", status: bothWithdrawn, env: []string{"STUB_STEPS=" + openSteps1}, calls: restore},
 		// An interrupt between the withdraw and the staged drop: the repair waits for the drop before it requests.
 		{name: "a pending drop is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`,
-			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status}},
+			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status, publish}},
 		{name: "a pending drop that stays", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`, code: 1, kept: true,
 			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status}, want: "pending drop", timed: true},
 		// The bound wait retries: the first two reads after the link show an open step, and the third shows both cells bound.
 		{name: "a cell that becomes bound is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn,
-			env: []string{"STUB_UNBOUND_POLLS=2", "STUB_UNBOUND_STATUS=" + bound(openCel, okCell)}, calls: append(slices.Clone(restore), status, status)},
+			env: []string{"STUB_UNBOUND_POLLS=2", "STUB_UNBOUND_STATUS=" + bound(openCel, okCell)}, calls: append(slices.Clone(restoreBound), status, status, publish)},
 		{name: "a cell that stays unbound keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: restore, timed: true},
+			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: restoreBound, timed: true},
+		// A cell that the portal creates starts with a bootstrap bundle state. The signed publish comes after the bound wait and before the
+		// marker goes, and a failed publish keeps the marker.
+		{name: "a publish that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
+			env: []string{"STUB_FAIL_ARGS=run bundle -- publish"}, calls: restore, want: "could not publish a signed set to dev-cell-1 dev-cell-2"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -226,7 +232,7 @@ func TestRepairRestoresCells(t *testing.T) {
 			raw, _ := os.ReadFile(filepath.Join(dir, "calls"))
 			var got []string
 			for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-				if strings.HasPrefix(l, "mise run mgmt") || strings.HasPrefix(l, "mise run portal") || strings.HasPrefix(l, "mise run cell:") ||
+				if strings.HasPrefix(l, "mise run mgmt") || strings.HasPrefix(l, "mise run portal") || strings.HasPrefix(l, "mise run cell:") || strings.HasPrefix(l, "mise run bundle") ||
 					strings.HasPrefix(l, "repair-m5") || strings.HasPrefix(l, "serve sync") {
 					got = append(got, strings.TrimSpace(l))
 				}

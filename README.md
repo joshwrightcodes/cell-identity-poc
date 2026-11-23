@@ -137,8 +137,8 @@ The portal is not a security boundary, because the Mac user can still run `kind 
 
 A `gate:m6:provision` run deletes both cells and creates them again through one portal request. It writes the marker `build/gate/m6-provision`
 first. A run that stops early leaves the marker, and `gate:m6` then fails its check.
-Run `mise run gate:m6:repair` to restore the cells. It requests each cell that is not requested, waits until both are valid, links `management`
-and removes the marker. The repair takes about as long as the first creation. `gate:m6:repair` and `gate:m6:provision` change the cells,
+Run `mise run gate:m6:repair` to restore the cells. It requests each cell that is not requested, waits until both are valid, links `management`,
+signs one bundle set for each cell and removes the marker. The repair takes about as long as the first creation. `gate:m6:repair` and `gate:m6:provision` change the cells,
 so run them alone.
 
 ### Portal commands

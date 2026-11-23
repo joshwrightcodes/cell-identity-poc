@@ -275,7 +275,7 @@ description = "Run the test that deletes both cells and creates them again throu
 run = "scripts/gate.sh m6-provision"
 
 [tasks."gate:m6:repair"]
-description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
+description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management, signs one bundle set for each cell and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m6-repair.sh"
 
 [tasks."gate:m7"]

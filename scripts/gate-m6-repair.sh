@@ -14,7 +14,8 @@
 #      b. waits until mgmtd holds no pending drop of a catalog cell, runs one portal -- request for every catalog cell that is not
 #         requested, portal -- recreate for each cell of a, portal -- wait for every catalog cell, CELL=management mise run cell:link,
 #         then the M5 repair, which waits for the stream of each new cell;
-#      c. removes the marker last, after each cell is bound with no open step.
+#      c. runs bundle -- publish for every catalog cell, as harness:up does, so that no cell keeps the bundle state source bootstrap;
+#      d. removes the marker last, after each cell is bound with no open step and holds a signed set.
 # It is safe to run again.
 #
 # After the steps above, it reports each journal entry that runs a stage past its timeout plus 5 minutes (it cannot end the stage;
@@ -191,7 +192,7 @@ done
 # stays until the last one has succeeded. It first waits until mgmtd holds no pending drop of a catalog cell, because a request
 # before the drop leaves the old record in place and the step would never close (hint: wait, then run the repair again).
 restore_cells() {
-  local catalog status_json requested pending blocked missing=() margs=() cell args=() end poll="${GATE_M6_POLL:-5}"
+  local catalog status_json requested pending blocked missing=() margs=() cell args=() publish_args=() end poll="${GATE_M6_POLL:-5}"
   catalog="$(catalog_cells)" || die "could not read the cells of the topology"
   end=$((SECONDS + ${GATE_M6_DROP_WAIT:-300}))
   while :; do
@@ -234,6 +235,12 @@ restore_cells() {
     ((SECONDS < end)) || die "after ${GATE_M6_BOUND_WAIT:-120}s these cells are not bound, or have an open step: $(paste -sd' ' - <<<"$blocked"). Read: mise run mgmt -- status. Then run: mise run portal -- cancel --cell <cell> if its step is stale, and $repair"
     sleep "$poll"
   done
+  # A cell that the portal creates starts with the bundle state source bootstrap, which cell:verify fails. harness:up ends with the
+  # same signed publish.
+  for cell in $catalog; do publish_args+=(--target "$cell"); done
+  log "publishing a signed set to ${catalog//$'\n'/ }"
+  (cd "$ROOT" && mise run bundle -- publish "${publish_args[@]}" --wait) \
+    || die "could not publish a signed set to ${catalog//$'\n'/ }. Run: mise run bundle -- publish ${publish_args[*]} --wait, then $repair"
   rm -f "$marker" || die "could not remove $marker"
 }
 had_marker=0
