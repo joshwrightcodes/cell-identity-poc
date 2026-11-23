@@ -935,6 +935,7 @@ mise run operator:check-key
 ```
 
 `operator:check-key` prints `"match":true` when every pin matches. It compares the key in the secret manager with each public pin in the PoC.
+It reads the pin ConfigMaps and `server.conf`. It does not read the keys that the running processes loaded.
 A pin that differs shows in the output, because the Mac administrator can change a pin.
 
 Rotate the key with an overlap of two keys, and then with the new key alone:

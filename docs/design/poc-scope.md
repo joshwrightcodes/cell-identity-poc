@@ -135,11 +135,11 @@ macOS still sleeps when the lid closes on battery power.
 - Every pod of a cell that no NetworkPolicy limits reaches the relay node ports through the node address of its cell. In `dev-cp`, such a pod reaches `management` on 31443 directly. An address spoofed on the `kind` bridge reaches the same ports. Identity at cell-proxy is the control, as for the SPIRE node port.
 - The identities `argocd/argocd-agent`, `observability-system/otel-uplink` and `mesh-view-system/mesh-view` follow the same rule as `celld`: any identity that can create a pod in the namespace can run it as that service account. The agent pod can request a token for its own service account, so it can attest as a node. The agent exposes `/debug/pprof` on its health port, and the pod admits no ingress to it. ConfigMap `mgmt-root` can be overwritten by a bundle that writes to `argocd`, and the new root applies at the next pod start.
 - The agent can list and watch every Secret of `argocd`, because it does not start without that access. The admission policy limits the Secret names and not their contents.
-- A revoked record stops new attestations. The plugin reloads the records every 10 seconds. A container beside the SPIRE server bans the agents of a revoked cell within 10 seconds.
+- A revoked record stops new attestations. The kubelet syncs ConfigMap `cell-records` into the pod, which takes up to about a minute. After the pod holds the record, the plugin reloads it within 10 seconds, and a container beside the SPIRE server bans the agents of the cell within 10 seconds.
 - A ban takes effect in about 4 seconds. The restart of a banned agent attests as a new agent within 1 second, so a ban alone does not stop a cell. The overlay and the refusals of the record stop it.
 - A holder of the operator key can revoke any cell, and `mgmtd` adopts each revocation at once.
 - While the secret manager is unreachable, an operator cannot revoke a cell locally.
-- The Mac administrator can change every operator key pin, and `operator:check-key` detects the change.
+- The Mac administrator can change every operator key pin. `operator:check-key` compares the pin ConfigMaps and `server.conf` with the key in the secret manager. It does not read the keys that the running processes loaded. A writer in `dev-cp` can change a pin, restart the process, and restore the pin, and the check then reports a match.
 - A writer of `cell-records` can replay an old signed entry across a restart of `envd`, because `envd` keeps no spec marks elsewhere. The cell stays revoked until an operator runs a revoke and then an un-revoke. The un-revoke rule of `mgmtd` refuses to adopt the entry again.
 - A corrupt gateway store holds no overlay until the next sync of `envd`. This takes about 10 seconds while `envd` runs, and longer while `envd` is down.
 - `mgmtd` keeps an unbounded mirror of revocation events. Only an admin action or a signed entry adds an event.
@@ -147,7 +147,7 @@ macOS still sleeps when the lid closes on battery power.
 - `revoke -- clean` deletes only stale and settled input keys. A key that does not verify needs a manual delete, and `harness:status` prints the command.
 - `mgmtd` reads the cell keys from the host service on the Mac. It checks each bound cell every 15 minutes, whether or not `dev-cp` is connected.
 - `operator:rotate-key` refuses during a cut, or while `dev-cp` is not connected, before it reads the secret manager. The message names the cut or "not connected". The option `--emergency` needs no old key.
-- The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
+- The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. The DNS rule admits only the cluster DNS pods and the DNS Service address. CoreDNS can still forward names outside the cluster, so the server pod can send data out in DNS queries (not verified live). This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
 - The island signals have no alert evaluator.
 - The collector queue of `dev-cp` grows by `<measured in the live part>` in an environment island. This projects to `<measured in the live part>` in 24 hours, against a cap of 1.5 GiB.
 - An operation expires 1 hour after its signature, so work queued before a longer island never applies. A bundle set is an operation too.
