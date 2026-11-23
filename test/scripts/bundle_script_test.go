@@ -293,6 +293,7 @@ func calls(log, prefix string) []string {
 // the root with bundlectl attach, under the loopback mirror address. oras never attaches. A failure of the signature stops the publish
 // before any root or attach, and a root that differs from the signed root stops it before the attach.
 func TestBundleAttachesSigstore(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1")
 	out, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
 	if err != nil {
@@ -400,6 +401,7 @@ func TestBundleAttachesSigstore(t *testing.T) {
 // already_applied, and writes published.env (one name=digest line for each component, and root=<digest>). It exits 1 for rolled_back,
 // refused and expired, for another operation, and for a deadline, and then it writes no published.env.
 func TestBundleWaitOutcomes(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		outcomes string
@@ -469,6 +471,7 @@ func TestBundleWaitOutcomes(t *testing.T) {
 // TestBundleRefusesOpenRole: management has role open, and keeps the harness publish. bundle.sh stops at once, names mise run
 // cell:publish, and signs nothing. An unknown target stops too, and publish needs a target.
 func TestBundleRefusesOpenRole(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1")
 	for _, sub := range []string{"publish", "repair", "cosign"} {
 		out, errOut, log, err := r.run("bundle.sh", nil, sub, "--target", "management")
@@ -588,6 +591,7 @@ func (f repairFixture) env() []string {
 // cell-system at its good digest, apply argocd and cell-system server side with --force-conflicts, delete the pod of the store, refresh root,
 // and wait until every Application of the good root is Synced and Healthy at its digest.
 func TestBundleRepairOrder(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1")
 	f := newRepairFixture(t, r)
 	out, errOut, log, err := r.run("bundle.sh", f.env(), "repair", "--target", "dev-cell-1")
@@ -863,6 +867,7 @@ func publishVariant(t *testing.T, cell string, env ...string) (string, string, e
 // would overwrite a signed root. It names mise run bundle and the break glass. A bootstrap state, no state, a cluster with role open,
 // and a role that has no applier yet all go on. A state that cannot be read stops the publish too.
 func TestPublishRefusesSignedCluster(t *testing.T) {
+	t.Parallel()
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2", "dev-cp"} {
 		t.Run(cell, func(t *testing.T) {
 			out, log, err := publishVariant(t, cell, `STUB_STATE_JSON={"source":"signed","state":"healthy"}`)
@@ -906,6 +911,7 @@ func TestPublishRefusesSignedCluster(t *testing.T) {
 // TestPublishUnsignedBreakGlass: BUNDLE_PUBLISH_UNSIGNED=1 lets cell:publish go on in a signed cluster, and says in its output that the
 // root is no longer signed, and which command signs it again.
 func TestPublishUnsignedBreakGlass(t *testing.T) {
+	t.Parallel()
 	out, log, err := publishVariant(t, "dev-cell-1", `STUB_STATE_JSON={"source":"signed","state":"healthy"}`, "BUNDLE_PUBLISH_UNSIGNED=1")
 	if err != nil {
 		t.Fatalf("publish.sh failed with the break glass: %v\n%s\n%s", err, out, log)
@@ -931,6 +937,7 @@ const harnessUpPublish = "mise run bundle -- publish --target dev-cp --target de
 // them, after the full link of management. The cells attest through the plane policies that envd holds in dev-cp, so dev-cp comes first. A failed
 // publish prints itself in the hint list.
 func TestHarnessUpPublishesTargets(t *testing.T) {
+	t.Parallel()
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "up")
 	if err != nil {
@@ -954,6 +961,7 @@ func TestHarnessUpPublishesTargets(t *testing.T) {
 // TestRestartStoreTokens: STORE_TOKENS=1 cell:restart also restarts the pods of bundle-store-0 and argocd-repo-server, which hold
 // the projected store tokens, besides the harness workloads. Without the variable, it restarts only the harness workloads.
 func TestRestartStoreTokens(t *testing.T) {
+	t.Parallel()
 	setup := func(t *testing.T) (*bundleRoot, string) {
 		r := newBundleRoot(t)
 		dir := filepath.Join(r.dir, "build", "dev-cell-1", "bundles", "cell-identity")
@@ -1023,6 +1031,7 @@ exit 0
 // TestMgmtBundleSignReadsStdin: mgmt -- bundle sign reads the components as JSON on standard input, so the script runs kubectl exec with -i,
 // as it does for step sign. Any other command runs without it, because a stray -i would take the input of a shell loop.
 func TestMgmtBundleSignReadsStdin(t *testing.T) {
+	t.Parallel()
 	kubectl := `#!/usr/bin/env bash
 echo "kubectl $*" >>"$STUB_LOG"
 if [[ " $* " == *" get pod mgmtd-0 "* ]]; then printf True; exit 0; fi
@@ -1053,6 +1062,7 @@ echo '{}'
 // TestDependentsOfStoreChanges: a new address of the registry mirror needs the harness render of each live cell again, and new
 // store tokens need a restart of each live cell with STORE_TOKENS=1.
 func TestDependentsOfStoreChanges(t *testing.T) {
+	t.Parallel()
 	for name, want := range map[string]string{
 		"mirror":       "CELL=%s HARNESS_ONLY=cell-identity mise run cell:up",
 		"store-tokens": "CELL=%s STORE_TOKENS=1 mise run cell:restart",
@@ -1076,6 +1086,7 @@ func TestDependentsOfStoreChanges(t *testing.T) {
 // TestRuntimeObjectsBundleState: the bundle state in cell-ops-system is a runtime object that celld writes (marker celld) after
 // the harness wrote it first with kubectl create (marker bundle-bootstrap), so check_harness_objects skips it in both forms.
 func TestRuntimeObjectsBundleState(t *testing.T) {
+	t.Parallel()
 	out, errOut, err := libFunc(t, "dev-cell-1", "runtime_objects cell-identity cell-ops-system ConfigMap")
 	if err != nil {
 		t.Fatalf("runtime_objects: %v\n%s", err, errOut)
@@ -1089,6 +1100,7 @@ func TestRuntimeObjectsBundleState(t *testing.T) {
 // TestRuntimeObjectsBundleStateCp: in dev-cp, the bundle state lives in envd-system. envd writes it (marker envd) after the
 // harness wrote it first with kubectl create (marker bundle-bootstrap), so check_harness_objects of envd skips it in both forms.
 func TestRuntimeObjectsBundleStateCp(t *testing.T) {
+	t.Parallel()
 	out, errOut, err := libFunc(t, "dev-cp", "runtime_objects envd envd-system ConfigMap")
 	if err != nil {
 		t.Fatalf("runtime_objects: %v\n%s", err, errOut)
@@ -1156,6 +1168,7 @@ func bundleHolder(t *testing.T, r *bundleRoot, script, cluster string) int {
 // last wait ends, and release it. A live holder (a harness script, bundle.sh included) stops them at once. A nested call that inherits
 // POC_HELD_LOCKS (cell:up runs bundle.sh) passes. cosign and get change no cluster and take no lock.
 func TestBundleLocks(t *testing.T) {
+	t.Parallel()
 	both := "dev-cell-1.lock dev-cell-2.lock"
 	t.Run("both locks are held from the first signature to the last wait", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
@@ -1213,6 +1226,7 @@ func TestBundleLocks(t *testing.T) {
 
 // TestBundleWaitSharesOneDeadline: --wait has one bound for every target, so two targets that never settle fail after one bound and not two.
 func TestBundleWaitSharesOneDeadline(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
 	start := time.Now()
 	out, errOut, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=open", "BUNDLE_WAIT_SECONDS=3", "BUNDLE_WAIT_POLL=0.2"}, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2", "--wait")
@@ -1231,6 +1245,7 @@ func TestBundleWaitSharesOneDeadline(t *testing.T) {
 // TestBundlePublishWritesBootstrapState: a publish to a cluster with no bundle state writes the bootstrap state before it pushes anything,
 // and a cluster with a state gets none.
 func TestBundlePublishWritesBootstrapState(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1")
 	_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1")
 	if err != nil {
@@ -1255,6 +1270,7 @@ func TestBundlePublishWritesBootstrapState(t *testing.T) {
 // one JSON line with the signed version and the subjects. It changes no cluster and takes no lock. A state with no signed root, a root that
 // cosign does not verify, and a statement with no subject for the root fail with no output.
 func TestBundleVerifyArgs(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1")
 	f := newRepairFixture(t, r)
 	state := `{"source":"signed","state":"healthy","version":{"epoch":1,"counter":2},"root":{"digest":"` + f.root + `"},"good":[]}`
@@ -1383,6 +1399,7 @@ func TestBundleVerifyArgs(t *testing.T) {
 // components/<component> and components/lib, cells/common.env, cells/<t>.env, internal/bundle/allow.json and build/images.env. A missing bundle stops
 // it too. A fresh build, and a change outside these inputs, go on. Nothing is signed or pushed when it stops.
 func TestBundlePublishRefusesStaleBuild(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		touch string
@@ -1437,6 +1454,7 @@ func TestBundlePublishRefusesStaleBuild(t *testing.T) {
 
 // TestBundlePublishChecksEveryTargetFirst: a stale build of the last target stops the call before the first signature, as a wrong target does.
 func TestBundlePublishChecksEveryTargetFirst(t *testing.T) {
+	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
 	r.touch("cells/dev-cell-2.env")
 	_, errOut, log, err := r.run("bundle.sh", nil, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2")
@@ -1451,6 +1469,7 @@ func TestBundlePublishChecksEveryTargetFirst(t *testing.T) {
 // TestBundlePublishFreshnessInputs: the render inputs also include the scripts that hydrate runs, the vendored files, the facts file, and a
 // deleted input (the directory of a component changes). A find that fails is a failure, not a fresh build.
 func TestBundlePublishFreshnessInputs(t *testing.T) {
+	t.Parallel()
 	for _, rel := range []string{"scripts/lib.sh", "scripts/hydrate.sh", "scripts/ko-image.sh", "vendor/charts/x/values.yaml", "build/dev-cell-1/facts.env"} {
 		t.Run(rel, func(t *testing.T) {
 			r := newBundleRoot(t, "dev-cell-1")

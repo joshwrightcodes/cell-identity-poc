@@ -61,6 +61,7 @@ esac
 // TestVerifyMgmtChecks runs each of the six mgmt-api checks of cell:verify with fakes: once on a healthy state, and
 // once for each mismatch. A mismatch prints its reason and the repair command.
 func TestVerifyMgmtChecks(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64", "shasum")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
@@ -204,6 +205,7 @@ source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"; set +
 // mgmtd, envd, the SPIRE server of dev-cp (with its plugin) and celld in each cell (with the agent plugin). It stops
 // before the tests on a drift or on a stale image, and names the command that brings the workload up to date.
 func TestGateM4PreCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, stale string

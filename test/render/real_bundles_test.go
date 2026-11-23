@@ -169,6 +169,7 @@ func accountsOf(objs []map[string]any) []map[string]string {
 // scope of custom kinds comes from the CRDs of the same bundle, as the engine learns it. The test runs the
 // engine over the same objects too.
 func TestRealBundlesPassPolicy(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		role := roleOf[cr.name]
 		if role == "open" {
@@ -257,6 +258,7 @@ func engineVerdict(t *testing.T, checker *bundleapply.Checker, component string,
 //     the policy, so the policy alone accepts them. The applier and bundlectl decode first, so no render
 //     reaches conftest in that form.
 func TestConftestMatchesEngine(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "conftest")
 	fixtures, err := filepath.Glob("../../internal/bundleapply/testdata/*/*.yaml")
 	if err != nil || len(fixtures) < 50 {
@@ -418,6 +420,7 @@ func TestConftestMatchesEngine(t *testing.T) {
 // TestNoObjectInTwoBundles checks that no two bundles of one cluster render the same object. Every component
 // Application syncs with FailOnSharedResource=true, so Argo CD would refuse the sync of the second one.
 func TestNoObjectInTwoBundles(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			owner := map[string]string{}
@@ -447,6 +450,7 @@ func TestNoObjectInTwoBundles(t *testing.T) {
 // TestNoClusterNetworkPolicyKinds checks that no rendered object is an AdminNetworkPolicy, a
 // BaselineAdminNetworkPolicy or a ClusterNetworkPolicy, and that no class of allow.json lists them.
 func TestNoClusterNetworkPolicyKinds(t *testing.T) {
+	t.Parallel()
 	banned := []string{"AdminNetworkPolicy", "BaselineAdminNetworkPolicy", "ClusterNetworkPolicy"}
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
@@ -472,6 +476,7 @@ func TestNoClusterNetworkPolicyKinds(t *testing.T) {
 // locked AppProject default (one more source), and expects both conftest and the engine to refuse that bundle with
 // component_not_allowed:appproject_spec. The unchanged bundle passes (TestRealBundlesPassPolicy).
 func TestWidenedDefaultProjectRefused(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		role := roleOf[cr.name]
 		if role == "open" {

@@ -83,6 +83,7 @@ func problemsOf(m map[string]any) string { return strings.Join(strs(m["problems"
 // TestStatusProvisioning checks each condition of provisioning: the exit status is 1, the problem sits in the object of the cluster that it
 // names, and it ends with the command to run. A condition that is not met leaves the exit status at 0.
 func TestStatusProvisioning(t *testing.T) {
+	t.Parallel()
 	const id = "0123456789abcdef0123456789abcdef"
 	cells := func(a, b map[string]any) string {
 		return healthyPlane(func(m map[string]any) { m["cells"] = []any{a, b} })
@@ -257,6 +258,7 @@ func openStepPlane(id string) string {
 // TestStatusAbsentCell checks the object of a cell with no cluster: absent, and no read of a cluster that does not exist. It holds only the
 // problems of provisioning, and the M5 problem "is not bound" never names a cell that has no cluster.
 func TestStatusAbsentCell(t *testing.T) {
+	t.Parallel()
 	dir := writeJournal(t)
 	// The sources report what is true for a cell with no cluster: no agent, no sample, no Kiali cluster, a tunnel that is down and an API that does not answer.
 	absentSources := []string{"HOSTSVC_STEPS_DIR=" + dir, "STUB_KIND=management dev-cp dev-cell-1 rogue",
@@ -311,6 +313,7 @@ func TestStatusAbsentCell(t *testing.T) {
 
 // TestStatusMarkerNamesTheRepair: a cell that is neither requested nor live gives gate:m6:repair while the provision marker exists.
 func TestStatusMarkerNamesTheRepair(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "gate"), 0o755); err != nil {
 		t.Fatal(err)
@@ -331,6 +334,7 @@ func TestStatusMarkerNamesTheRepair(t *testing.T) {
 // Mac, a journal heartbeat that is 30 seconds old on the Mac passes, and a cell status that is 20 seconds old on the node passes. With a node
 // clock 10 minutes behind, a stage that began 40 minutes ago on the Mac is over its 35 minute limit, and the script says so.
 func TestStatusUsesTwoClocks(t *testing.T) {
+	t.Parallel()
 	const id = "0123456789abcdef0123456789abcdef"
 	plane := func(skew time.Duration) string {
 		// A time that is d old on the node is d - skew old on the Mac, where skew is how far the node runs ahead.
@@ -365,6 +369,7 @@ func TestStatusUsesTwoClocks(t *testing.T) {
 
 // TestStatusJournalCorrupt: a journal that does not parse gives one problem with the reset command, and the other objects stay readable.
 func TestStatusJournalCorrupt(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "journal.json"), []byte("{not json"), 0o644); err != nil {
 		t.Fatal(err)
@@ -377,6 +382,7 @@ func TestStatusJournalCorrupt(t *testing.T) {
 
 // TestStatusKindDown: with no answer from kind, the script prints one JSON error line and exits 1, because the live cells are unknown.
 func TestStatusKindDown(t *testing.T) {
+	t.Parallel()
 	out, _, code := runScript(t, "status.sh", map[string]string{"kubectl": statusKubectlStub, "mise": statusMiseStub, "docker": nodeClockDocker, "kind": stubKind}, []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"})
 	lines := jsonLines(t, out)
 	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || !strings.Contains(lines[0]["error"].(string), "which cells are live") {

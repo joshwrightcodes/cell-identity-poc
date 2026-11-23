@@ -53,6 +53,7 @@ func holder(t *testing.T, build, cluster, program, step string, seconds int) *ex
 
 // TestClusterLock: cluster_lock keeps one run for each cluster, and the lock directory lives outside build/<cluster>.
 func TestClusterLock(t *testing.T) {
+	t.Parallel()
 	t.Run("mkdir -p: the lock needs no build directory, and make none for the cluster", func(t *testing.T) {
 		build := filepath.Join(t.TempDir(), "build")
 		out, err := lockRun(t, build, `cluster_lock dev-cell-1; test -f "$BUILD_ROOT/locks/dev-cell-1.lock/pid" && echo held; echo "$POC_HELD_LOCKS"`)

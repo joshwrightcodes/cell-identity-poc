@@ -80,6 +80,7 @@ func jsonLines(t *testing.T, out string) []map[string]any {
 // cluster. A plain line and a JSON line that is no object get the field raw, and a field cluster of a log
 // line moves to source_cluster.
 func TestLogsMergesWithClusterField(t *testing.T) {
+	t.Parallel()
 	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl, "kind": stubKind}, nil, "all", "app=x")
 	lines := jsonLines(t, out)
 	if code != 0 || len(lines) != 16 {
@@ -124,6 +125,7 @@ func TestLogsMergesWithClusterField(t *testing.T) {
 // TestLogsReportsAnUnreadableCluster checks that the other clusters stay readable, that the unreadable one
 // gives one error line with its name, and that the exit status is 1. A wrong argument gives one JSON error.
 func TestLogsReportsAnUnreadableCluster(t *testing.T) {
+	t.Parallel()
 	out, _, code := runScript(t, "logs.sh", map[string]string{"kubectl": logsKubectl, "kind": stubKind}, []string{"STUB_FAIL_CLUSTER=dev-cp"}, "all", "app=x")
 	lines := jsonLines(t, out)
 	errs := 0
@@ -149,6 +151,7 @@ func TestLogsReportsAnUnreadableCluster(t *testing.T) {
 // TestLogsBoundsAndCluster checks that the call of kubectl logs carries the line bound and the age limit (the stub
 // refuses a call without them), and that a pattern as the cluster argument is no cluster and expands to nothing.
 func TestLogsBoundsAndCluster(t *testing.T) {
+	t.Parallel()
 	stubs := map[string]string{"kubectl": logsKubectl, "kind": stubKind}
 	out, _, code := runScript(t, "logs.sh", stubs, []string{"STUB_WANT_TAIL=7", "STUB_WANT_SINCE=10m", "LOGS_TAIL=7", "LOGS_SINCE=10m"}, "dev-cp", "app=x")
 	if lines := jsonLines(t, out); code != 0 || len(lines) != 4 {
@@ -165,6 +168,7 @@ func TestLogsBoundsAndCluster(t *testing.T) {
 // TestLogsSkipsAnAbsentCell checks that "all" reads only the clusters that exist: a cell with no cluster gives no error line, one line on
 // standard error, and the exit status stays 0. A cell that is named and has no cluster gives one JSON error line with the portal command.
 func TestLogsSkipsAnAbsentCell(t *testing.T) {
+	t.Parallel()
 	stubs := map[string]string{"kubectl": logsKubectl, "kind": stubKind}
 	env := []string{"STUB_KIND=management dev-cp dev-cell-1 rogue", "STUB_FAIL_CLUSTER=dev-cell-2"}
 	out, stderr, code := runScript(t, "logs.sh", stubs, env, "all", "app=x")
@@ -441,6 +445,7 @@ func strs(v any) []string {
 // TestStatusHealthyShape checks a healthy run: exit 0, one object for each cluster with components in
 // topology order, the documented fields and nothing on standard output but JSON. Progress goes to standard error.
 func TestStatusHealthyShape(t *testing.T) {
+	t.Parallel()
 	byName, lines, stderr, code := runStatus(t)
 	if code != 0 || len(lines) != 4 {
 		t.Fatalf("exit %d with %d objects, want exit 0 and 4:\n%v", code, len(lines), lines)
@@ -480,6 +485,7 @@ func TestStatusHealthyShape(t *testing.T) {
 // principal (the kubelet rotates the log after about 10 hours). An agent with no stream line counts as connected when the
 // principal received an event from it in the last 5 minutes. A closing line that is newer than the connect line still wins.
 func TestStatusAgentsSurviveLogRotation(t *testing.T) {
+	t.Parallel()
 	event := func(client string, ago time.Duration) string {
 		return fmt.Sprintf(`{"client":%q,"msg":"Event received: application spec-update","time":%q}`, client, time.Now().Add(-ago).UTC().Format("2006-01-02T15:04:05Z"))
 	}
@@ -512,6 +518,7 @@ func TestStatusAgentsSurviveLogRotation(t *testing.T) {
 }
 
 func TestStatusReportsEachBadValue(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		env     []string
@@ -572,6 +579,7 @@ func TestStatusReportsEachBadValue(t *testing.T) {
 // TestStatusNamesTheAbsentCellWhenKialiIsDown checks the state that follows a cell that is down: Kiali does not
 // start, so the object names the absent cell, the recovery time and the command.
 func TestStatusNamesTheAbsentCellWhenKialiIsDown(t *testing.T) {
+	t.Parallel()
 	byName, _, _, code := runStatus(t, "STUB_KIALI_READY=", "STUB_KIALI_CONF=", "STUB_CELL_DOWN=dev-cell-2",
 		`STUB_HUB={"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":false,"down_seconds":40}}}`)
 	m := byName["management"]
@@ -622,6 +630,7 @@ esac
 // TestViewPodsMustStartAfterTheViewKeys checks the drift check for an interrupted link run: a pod that started
 // before the newest view key Secret fails the check, and the output names the pod and the repair command.
 func TestViewPodsMustStartAfterTheViewKeys(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
@@ -664,6 +673,7 @@ func TestViewPodsMustStartAfterTheViewKeys(t *testing.T) {
 // TestStatusKialiNoteFollowsTheCause checks I1: a cell is absent only when its own API does not answer. A tunnel
 // that is down while the cell API answers does not blame the cell, and no cell command is offered for it.
 func TestStatusKialiNoteFollowsTheCause(t *testing.T) {
+	t.Parallel()
 	bothDown := `STUB_HUB={"cells":{"dev-cell-1":{"up":false},"dev-cell-2":{"up":false}}}`
 	oneDown := `STUB_HUB={"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":false}}}`
 	for _, tc := range []struct {
@@ -710,6 +720,7 @@ func TestStatusKialiNoteFollowsTheCause(t *testing.T) {
 // TestViewPodsTwoStalePodsEachGetTheirOwnTime checks S-M4: with two stale pods, each line names its own pod and the
 // newest key time.
 func TestViewPodsTwoStalePodsEachGetTheirOwnTime(t *testing.T) {
+	t.Parallel()
 	out, err := runVerifyFunctions(t, viewPodsKubectl, "check_view_pods_current", "management",
 		"STUB_SECRETS_AT=2026-11-12T10:00:00Z", "STUB_PRINCIPAL_AT=2026-11-12T09:59:59Z", "STUB_SERVER_AT=2026-11-12T09:00:00Z")
 	if err == nil {
@@ -761,6 +772,7 @@ esac
 // TestPeerRootCheckComparesThePodDigest checks S-M3: a ConfigMap that holds the live root is not enough. The running
 // pod must carry the digest of that ConfigMap, because it reads the file once at start.
 func TestPeerRootCheckComparesThePodDigest(t *testing.T) {
+	t.Parallel()
 	pem := "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----"
 	sum := fmt.Sprintf("%x", sha256.Sum256([]byte(pem)))
 	old := fmt.Sprintf("%x", sha256.Sum256([]byte("an older root")))
@@ -801,6 +813,7 @@ esac
 // TestMeshStatusNamesCellUpOnlyForAnAbsentCell checks the same rule as harness:status: a cell is absent only when its own API
 // does not answer. A tunnel that is down while the API answers has another cause, and cell:up of that cell does not fix it.
 func TestMeshStatusNamesCellUpOnlyForAnAbsentCell(t *testing.T) {
+	t.Parallel()
 	hub := `{"cells":{"dev-cell-1":{"up":false,"down_seconds":12},"dev-cell-2":{"up":true,"conn_id":1,"age_seconds":5}}}`
 	run := func(down string) string {
 		out, stderr, code := runScript(t, "mesh-status.sh", map[string]string{"kubectl": meshKubectlStub},
@@ -836,6 +849,7 @@ func TestMeshStatusNamesCellUpOnlyForAnAbsentCell(t *testing.T) {
 // report times, the cells and the host service in the field management of the management object. A healthy plane
 // exits 0. Each bad condition exits 1 with a problem that holds the next command, and no other cluster turns bad.
 func TestStatusReportsTheManagementPlane(t *testing.T) {
+	t.Parallel()
 	byName, _, _, code := runStatus(t)
 	if code != 0 {
 		t.Fatalf("exit %d on a healthy plane, want 0: %v", code, byName["management"]["problems"])
@@ -964,6 +978,7 @@ func TestStatusReportsTheManagementPlane(t *testing.T) {
 // work fields of each cell of the management object. A healthy run has none of them. Each case changes one value and
 // expects exit 1 with the problem on the object of the cluster that holds the value, and the command to run.
 func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
+	t.Parallel()
 	healthy, _, _, code := runStatus(t)
 	if code != 0 {
 		t.Fatalf("exit %d on a healthy run: %v", code, healthy["dev-cp"]["problems"])
@@ -1105,6 +1120,7 @@ func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
 // TestStatusAgesFollowTheNodeClock: the timestamps of mgmtd and the gateway come from the clock of the VM. With a VM clock 5 minutes behind the Mac, a
 // sync from 10 seconds ago on the VM clock is no problem, and a sync from 3 minutes ago on that clock still is.
 func TestStatusAgesFollowTheNodeClock(t *testing.T) {
+	t.Parallel()
 	const skew = 5 * time.Minute
 	vm := func(d time.Duration) string { return timeAgo(skew + d) }
 	env := func(syncedAgo time.Duration) []string {
@@ -1128,6 +1144,7 @@ func TestStatusAgesFollowTheNodeClock(t *testing.T) {
 // TestCheckGatewaySyncedUsesTheNodeClock: check_gateway_synced reads the present from a node. With a node clock 5 minutes behind the Mac, a sync from
 // 10 seconds ago on the node clock passes, and one from 3 minutes ago fails.
 func TestCheckGatewaySyncedUsesTheNodeClock(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	lib, _ := filepath.Abs("../../scripts/lib.sh")
 	verifyLib, _ := filepath.Abs("../../scripts/verify-lib.sh")
@@ -1155,6 +1172,7 @@ func TestCheckGatewaySyncedUsesTheNodeClock(t *testing.T) {
 // TestStatusReadsTheClockAfterTheVerifySteps: cell:verify can run for minutes before the age checks. A sync that is 110 seconds old when
 // the script starts, with a verify step of 15 seconds, is 125 seconds old at the check, and the script reports it.
 func TestStatusReadsTheClockAfterTheVerifySteps(t *testing.T) {
+	t.Parallel()
 	byName, _, stderr, code := runStatus(t, "STUB_VERIFY_SLEEP=15",
 		"STUB_GW_STATUS="+healthyGateway(func(m map[string]any) { m["syncedAt"] = timeAgo(110 * time.Second) }))
 	if code == 0 || !strings.Contains(strings.Join(strs(byName["dev-cp"]["problems"]), "\n"), "more than 2 minutes") {
@@ -1165,6 +1183,7 @@ func TestStatusReadsTheClockAfterTheVerifySteps(t *testing.T) {
 // TestStatusPrintsEveryClusterWhenTheNodeClockIsUnreadable: with no answer from the node dev-cp-control-plane, the script still prints one object for
 // each cluster. The clusters with time-based checks report a problem that names the cause.
 func TestStatusPrintsEveryClusterWhenTheNodeClockIsUnreadable(t *testing.T) {
+	t.Parallel()
 	byName, lines, stderr, code := runStatus(t, "STUB_CLOCK_FAIL=1")
 	if len(lines) != 4 {
 		t.Fatalf("got %d cluster objects, want 4\n%s", len(lines), stderr)

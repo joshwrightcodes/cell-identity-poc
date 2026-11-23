@@ -40,6 +40,7 @@ esac
 // start time, and the previous log of a restarted container. A compact JWS (eyJ, a dot, eyJ, a dot) fails the scan with the cluster, the
 // pod, the container and the line number, and never prints the line. A base64 JSON object with no JWS shape does not.
 func TestGateTokenScan(t *testing.T) {
+	t.Parallel()
 	const jws = "eyJhbGciOiJSUzI1NiIsImtpZCI6IngifQ.eyJhdWQiOlsibWdtdCJdfQ.c2ln"
 	for _, tc := range []struct {
 		name string
@@ -118,6 +119,7 @@ func TestGateTokenScan(t *testing.T) {
 // with its place and line number, and the scan never prints the line. The fixture is the prefix and a text that is no seed, so no
 // line of the repository parses as a key.
 func TestTokenScanFindsSeed(t *testing.T) {
+	t.Parallel()
 	const body = "fixture-not-a-seed"
 	seed := revoke.SeedPrefix + body
 	if _, err := revoke.ParseSeed(strings.NewReader(seed + "\n")); err == nil {

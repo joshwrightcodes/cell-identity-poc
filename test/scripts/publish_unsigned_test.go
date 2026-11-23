@@ -24,6 +24,7 @@ func publishNoCell(t *testing.T, env ...string) (string, string, error) {
 // glass without CELL would hit the wrong cluster. The script refuses it before it reads or changes anything, and prints the command with CELL=<cluster>.
 // With CELL set it goes on. The refusal of a signed cluster names the same command.
 func TestPublishUnsignedNeedsExplicitCell(t *testing.T) {
+	t.Parallel()
 	out, log, err := publishNoCell(t, "BUNDLE_PUBLISH_UNSIGNED=1")
 	if err == nil {
 		t.Fatalf("publish.sh passed with no CELL:\n%s\n%s", out, log)

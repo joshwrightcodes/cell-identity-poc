@@ -137,6 +137,7 @@ func withFiles(files map[string]string, change map[string]string) map[string]str
 // the gateway runs one --cell-node for each live cell. A stale address, a missing one, and an argument of a dead cell fail with
 // CELL=dev-cp mise run cell:up. While no cell is live, each cell rule is absent and the check passes; a rule that stays fails.
 func TestCheckAdmitLists(t *testing.T) {
+	t.Parallel()
 	healthy := admitFixture()
 	empty := map[string]string{
 		"policy-spire.json":   policyJSON(cidrRule(9999, "10.250.0.1/32")),
@@ -198,6 +199,7 @@ func TestCheckAdmitLists(t *testing.T) {
 // TestVerifySelectsRulesByPort: check_agent_cells_current, check_relay_current and check_gateway_cells read a rule by its ports. With a
 // rule in front of the cell rule, or no cell rule at all, they still read the right one.
 func TestVerifySelectsRulesByPort(t *testing.T) {
+	t.Parallel()
 	healthy := admitFixture()
 	t.Run("check_relay_current reads the plane policies, with the cell rule behind a decoy", func(t *testing.T) {
 		files := withFiles(healthy, map[string]string{
@@ -263,6 +265,7 @@ func cidrToRule(port int, cidrs ...string) string {
 // TestCheckHostsvcRoots: the host service serves the live dev root, the keys of mgmtd and the signed spec revision. A mismatch prints
 // mise run hostsvc:serve -- sync, and a mgmtd that does not answer prints the link of mgmt-api.
 func TestCheckHostsvcRoots(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64", "shasum")
 	pub := "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 	rawSum := func(b64 string) string {

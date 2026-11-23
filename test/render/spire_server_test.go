@@ -674,6 +674,7 @@ func named(t *testing.T, list []any, name string) map[string]any {
 // TestRenderSpireServer renders the environment server with cells/dev-cp.env. It keeps the M2
 // checks, and checks the k8s_psat path for the dev-cp plane workload cp/otel.
 func TestRenderSpireServer(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -992,6 +993,7 @@ func keysOf(m map[string]any) []string {
 
 // TestRenderSVIDLifetime renders the lifetime that a long-lived environment sets.
 func TestRenderSVIDLifetime(t *testing.T) {
+	t.Parallel()
 	r := render(t, "SPIRE_AGENT_CELLS=dev-cell-1", "SPIRE_SVID_TTL=1h")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1005,6 +1007,7 @@ func TestRenderSVIDLifetime(t *testing.T) {
 }
 
 func TestRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		env  []string
@@ -1083,6 +1086,7 @@ func configLines(text string) []string {
 // object with the M2 render, after it removes the k8s_psat additions: the plugin and telemetry
 // blocks, the cp/otel entries, the token volume and the objects that only k8s_psat needs.
 func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1330,6 +1334,7 @@ var managementWorkloads = map[string]string{
 // It has its own CA with no upstream authority, admits only its local workloads, and needs nothing
 // from a cell, the host service or the secret manager.
 func TestSpireServerRenderManagement(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "management")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1461,6 +1466,7 @@ func TestSpireServerRenderManagement(t *testing.T) {
 // else, with its RoleBinding for the server account. A server that has agent cells but no local workload has no API token,
 // so it gets no hint line and no Role. A server with no agent cell has no cluster_jwt plugin.
 func TestSpireServerHintConfig(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1514,6 +1520,7 @@ func liveEnv(clusters string) string { return "STUB_KIND_CLUSTERS=" + clusters }
 // TestSpireServerRenderNoLiveCells: dev-cp with a catalog of two cells and no cluster for either of them. The render
 // succeeds with no cell fact, drops the cluster_jwt section, and keeps the ClusterStaticEntry pairs of both cells.
 func TestSpireServerRenderNoLiveCells(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue"))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1543,6 +1550,7 @@ func TestSpireServerRenderNoLiveCells(t *testing.T) {
 // TestSpireServerRenderOneLiveCell: dev-cell-1 is live and dev-cell-2 is not. The cluster_jwt section stays, and the
 // entries of both cells stay. The render reads no cell address.
 func TestSpireServerRenderOneLiveCell(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp", liveEnv("management dev-cp rogue dev-cell-1"))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1566,6 +1574,7 @@ func TestSpireServerRenderOneLiveCell(t *testing.T) {
 // TestSpireServerRenderNoNodeAddressIsNotLive: a cluster whose node container has no address on the network kind is
 // not live. With no other live cell, the cluster_jwt section is absent.
 func TestSpireServerRenderNoNodeAddressIsNotLive(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp", "STUB_NO_NODE_IP=dev-cell-1 dev-cell-2")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1614,6 +1623,7 @@ func checkWorkloadPolicy(t *testing.T, np object, workloads map[string]string, p
 // line, in the shape of record_public_keys, so that operator_pin of components/lib/operator-key.sh reads it. During a
 // rotation the line holds next.pub too. A change of the keys changes the config checksum, so the server restarts.
 func TestSpireServerOperatorKeys(t *testing.T) {
+	t.Parallel()
 	sums := map[string]string{}
 	for _, tc := range []struct {
 		name string
@@ -1661,6 +1671,7 @@ func TestSpireServerOperatorKeys(t *testing.T) {
 // the path of the server container, and nothing else: no API token. It sets no user of its own, so it runs as the pod user
 // that owns the admin socket, and it sets requests and a memory limit. With no live cell, the pod has no ban container.
 func TestAgentBanContainer(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -1728,6 +1739,7 @@ func TestAgentBanContainer(t *testing.T) {
 // because the endpoint is a Service name and spire-system has no other DNS rule. The collector of dev-cp admits spire-system as an
 // OTLP sender (COLLECTOR_SENDERS). With no live cell, the pod has no ban container and the render prints no such policy.
 func TestSpireServerOTLPFlow(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)

@@ -13,6 +13,7 @@ import (
 // project cell or cell-app, the locked AppProject default, and the absence of the settings and the namespace
 // that older cells used for child Applications.
 func TestArgocdGuardsRender(t *testing.T) {
+	t.Parallel()
 	rootFile, err := os.ReadFile("../../bootstrap/root.yaml")
 	if err != nil {
 		t.Fatal(err)

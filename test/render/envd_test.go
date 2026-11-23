@@ -31,6 +31,7 @@ func peerList(t *testing.T, rule any, key string) string {
 // the bounds, the two checksum annotations, the token in the envd container only, the Role of cell-records,
 // the two ConfigMaps and the NetworkPolicies.
 func TestEnvdRender(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -218,6 +219,7 @@ func TestEnvdRender(t *testing.T) {
 
 // TestEnvdRenderFailsClosed gives the render a missing or wrong input. Each stops it with no output.
 func TestEnvdRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -245,6 +247,7 @@ func TestEnvdRenderFailsClosed(t *testing.T) {
 
 // TestEnvdRenderFollowsTheKey: a new signing key changes the key ConfigMap and the pod annotation, so the pod restarts.
 func TestEnvdRenderFollowsTheKey(t *testing.T) {
+	t.Parallel()
 	other := "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
 	a, b := renderEnvd(t), renderEnvd(t, "STUB_MGMT_KEY="+other)
 	if a.err != nil || b.err != nil {
@@ -261,6 +264,7 @@ func TestEnvdRenderFollowsTheKey(t *testing.T) {
 // TestEnvdRenderGatewayFlags checks the three gateway flags of envd, which an envd of Task 5 needs to start, the flow N39
 // rule to the gateway pod on 8452 and nothing else, and the Role rule that reads the hints ConfigMap by name.
 func TestEnvdRenderGatewayFlags(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -304,6 +308,7 @@ func TestEnvdRenderGatewayFlags(t *testing.T) {
 // render of the cell controller, so envd renders no object in that namespace, and its policy gets no rule for it: the
 // ConfigMaps go through flow N31, the API server.
 func TestEnvdRenderStepFlags(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -350,6 +355,7 @@ func mountList(t *testing.T, ctr any) []string {
 // --revocations-configmap come together, and the render passes --report-rate and --bundle-refill-every explicitly. During a
 // rotation the pin holds next.pub too. With no operator-pub, the render stops and names the owner action.
 func TestEnvdOperatorPin(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		env  []string
@@ -411,6 +417,7 @@ func TestEnvdOperatorPin(t *testing.T) {
 // exactly get on that name and nothing more, and its binding names the envd account alone. No other Role of the render names
 // the ConfigMap.
 func TestEnvdRevocationsRole(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -441,6 +448,7 @@ func TestEnvdRevocationsRole(t *testing.T) {
 // writer added to operator-pub, stops the render unless OPERATOR_KEY_ACCEPT_CHANGE=1, and the flag works only while the
 // environment is connected.
 func TestRenderRefusesPinChange(t *testing.T) {
+	t.Parallel()
 	same := []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorKey, "STUB_LIVE_PIN_GATEWAY=" + stubOperatorKey, "STUB_LIVE_PIN_SERVER=" + stubOperatorKey}
 	renders := map[string]func(*testing.T, ...string) result{
 		"envd":         renderEnvd,

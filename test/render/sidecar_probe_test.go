@@ -102,6 +102,7 @@ func applyCertTemplate(t *testing.T, text string, native bool, annotations map[s
 // istio-proxy both as a native sidecar (initContainers, restartPolicy Always) and as a regular container. The merge keeps the fields that
 // the sidecar template set.
 func TestSidecarCertLivenessProbe(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "helm", "kustomize", "bash", "tar", "go")
 	for cluster, cfg := range injectorConfigs(t) {
 		if got := strings.Join(cfg.DefaultTemplates, ","); got != "sidecar,"+certProbeTemplate {
@@ -173,6 +174,7 @@ func TestSidecarCertLivenessProbe(t *testing.T) {
 // TestSidecarCertLivenessFollowsTheNativeAnnotation: the annotation sidecar.istio.io/nativeSidecar takes precedence over the global
 // setting, as in the sidecar template. The probe goes to the list that holds istio-proxy.
 func TestSidecarCertLivenessFollowsTheNativeAnnotation(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "helm", "kustomize", "bash", "tar", "go")
 	for cluster, cfg := range injectorConfigs(t) {
 		text := cfg.Templates[certProbeTemplate]
@@ -219,6 +221,7 @@ func findContainer(list []corev1.Container, name string) (corev1.Container, bool
 // less than the minimum left, and it passes when the agent shows no metric yet or does not answer, so start-up and an island with istiod down
 // never restart the container. A curl that hangs must end inside the probe timeout and count as no answer.
 func TestSidecarCertLivenessCommand(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "helm", "kustomize", "bash", "tar", "go", "sh", "awk")
 	var command []string
 	var timeout int32

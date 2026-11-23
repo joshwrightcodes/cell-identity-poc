@@ -51,6 +51,7 @@ func certMetric(v string) string {
 // TestVerifyProxyCertLife: check_proxy_cert_life fails when any istio-proxy has a workload certificate with 1 hour or less left, or shows no
 // readable metric, and it reads only. It covers both sidecar forms, skips pods that are not Running or have no proxy, and fails when it finds no proxy.
 func TestVerifyProxyCertLife(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash", "awk")
 	lib, _ := filepath.Abs("../../scripts/lib.sh")
 	verify, _ := filepath.Abs("../../scripts/verify.sh")
@@ -135,6 +136,7 @@ func TestVerifyProxyCertLife(t *testing.T) {
 
 // TestVerifyRunsProxyCertCheck: scripts/verify.sh runs check_proxy_cert_life next to the trust domain check, and the function never deletes a pod.
 func TestVerifyRunsProxyCertCheck(t *testing.T) {
+	t.Parallel()
 	raw, err := os.ReadFile("../../scripts/verify.sh")
 	if err != nil {
 		t.Fatal(err)

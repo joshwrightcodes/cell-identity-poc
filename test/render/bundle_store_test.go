@@ -93,6 +93,7 @@ func noSharedNamespaces(t *testing.T, pod map[string]any) {
 // address of the pod only, the store proxy holds the exact arguments of its role, only the store proxy
 // mounts an API token, the Service sends port 5000 to the store proxy, and the account may review tokens.
 func TestBundleStoreTokenProxy(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			objs := clusterComponent(t, cr.name, "cell-system")
@@ -190,6 +191,7 @@ func TestBundleStoreTokenProxy(t *testing.T) {
 // arguments, a projected token of 600 s with the audience bundle-store that only this container mounts,
 // and the same resources.
 func TestRepoServerTokenSidecar(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			dep := clusterComponent(t, cr.name, "argocd")["Deployment argocd/argocd-repo-server"]
@@ -233,6 +235,7 @@ func TestRepoServerTokenSidecar(t *testing.T) {
 
 // TestArgocdSyncTimeout checks controller.sync.timeout.seconds in every cluster.
 func TestArgocdSyncTimeout(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			cm := clusterComponent(t, cr.name, "argocd")["ConfigMap argocd/argocd-cmd-params-cm"]
@@ -246,6 +249,7 @@ func TestArgocdSyncTimeout(t *testing.T) {
 // TestRepoCredsAndRootUseTheTokenClient checks that Argo CD reads from the token client on the loopback
 // address, in the repository credentials and in the root Application.
 func TestRepoCredsAndRootUseTheTokenClient(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			secret := clusterComponent(t, cr.name, "argocd")["Secret argocd/bundle-store"]

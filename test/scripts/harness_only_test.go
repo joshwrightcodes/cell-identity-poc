@@ -75,6 +75,7 @@ func runHarnessOnly(t *testing.T, root, calls, script string, env ...string) (st
 
 // TestHarnessOnly: cell:up and cell:restart with HARNESS_ONLY=<component> act on that one harness component of an existing cluster.
 func TestHarnessOnly(t *testing.T) {
+	t.Parallel()
 	t.Run("up renders, applies and waits for one component under the lock", func(t *testing.T) {
 		root, calls := harnessOnlyRoot(t)
 		out, log, err := runHarnessOnly(t, root, calls, "up.sh", "HARNESS_ONLY=envd")

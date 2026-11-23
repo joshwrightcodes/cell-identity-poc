@@ -129,6 +129,7 @@ func runUp(t *testing.T, root, logFile string, env ...string) (string, string) {
 // It runs bundle.sh publish --target <cluster> --wait instead, and then applies the harness components. A bootstrap state, or no state,
 // keeps the M6 order: the three applies, the root, publish.sh, and no bundle.sh.
 func TestUpSignedPathSkipsBootstrapApply(t *testing.T) {
+	t.Parallel()
 	applied := func(calls, component string) bool { return harnessApplyIndex(calls, component) >= 0 }
 	t.Run("signed", func(t *testing.T) {
 		root, logFile := upRoot(t)
@@ -195,6 +196,7 @@ exit 0
 // state that celld wrote first is never replaced. It holds the root digest, the root manifest and the component digests of root.json,
 // state healthy and no good root and no version. A cluster that has a state of any source, and a cluster of role open, get none.
 func TestUpBootstrapWritesState(t *testing.T) {
+	t.Parallel()
 	root, logFile := upRoot(t)
 	_, calls := runUp(t, root, logFile)
 	create := callIndex(calls, "kubectl --context kind-dev-cell-1 -n cell-ops-system create -f -")
@@ -302,6 +304,7 @@ func storeApplies(t *testing.T, root, calls string) (map[string]string, []string
 // tracking annotation, and deletes a store pod that never became Ready. A new cluster and an upgraded cluster get no StatefulSet apply and no
 // pod delete.
 func TestUpStoreUpgrade(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		env        []string
@@ -373,6 +376,7 @@ func TestUpStoreUpgrade(t *testing.T) {
 // carries those rules, so a cell:up of dev-cp that left envd as it was would leave the node address of a new cell out. up.sh logs the command
 // of the publish. A cell renders nothing between the publish and the wait, and the bootstrap path of dev-cp has no signed publish.
 func TestUpCpRerendersEnvdAfterPublish(t *testing.T) {
+	t.Parallel()
 	waitIndex := func(calls string, after int) int {
 		lines := strings.Split(calls, "\n")
 		for i := after + 1; i < len(lines); i++ {
@@ -430,6 +434,7 @@ func TestUpCpRerendersEnvdAfterPublish(t *testing.T) {
 // TestUpCpBootstrapWritesState: dev-cp keeps its bundle state in envd-system. A cluster with no state gets the bootstrap state there, after the
 // harness apply of envd, from build/dev-cp/root.json.
 func TestUpCpBootstrapWritesState(t *testing.T) {
+	t.Parallel()
 	root, logFile := upRoot(t)
 	_, calls := runUp(t, root, logFile, "CELL=dev-cp")
 	create := callIndex(calls, "kubectl --context kind-dev-cp -n envd-system create -f -")
@@ -465,6 +470,7 @@ func TestUpCpBootstrapWritesState(t *testing.T) {
 // bootstrap revision is "current" until then, so the upgrade waits until observedGeneration reaches the generation before it compares the pod
 // with the update revision. With the old read, the stuck pod would stay and the store wait would time out.
 func TestUpStoreUpgradeWaitsForTheController(t *testing.T) {
+	t.Parallel()
 	sts := func(generation, observed int, rev string) string {
 		spec := strings.TrimSuffix(staleSTS, revSTS)
 		return fmt.Sprintf(`{"kind":"StatefulSet","metadata":{"name":"bundle-store","generation":%d,"annotations":{"argocd.argoproj.io/tracking-id":%q}}%s,"status":{"observedGeneration":%d,"updateRevision":%q}}`,
@@ -481,6 +487,7 @@ func TestUpStoreUpgradeWaitsForTheController(t *testing.T) {
 // TestUpStoreUpgradeSaysWhenTheControllerLags: when the controller does not catch up within the wait, cell:up stops with the two generations, and
 // does not compare the stuck pod with a stale update revision.
 func TestUpStoreUpgradeSaysWhenTheControllerLags(t *testing.T) {
+	t.Parallel()
 	lag := fmt.Sprintf(`{"kind":"StatefulSet","metadata":{"name":"bundle-store","generation":4,"annotations":{"argocd.argoproj.io/tracking-id":%q}}%s,"status":{"observedGeneration":3,"updateRevision":"bundle-store-rev1"}}`, trackSTS, strings.TrimSuffix(staleSTS, revSTS))
 	root, logFile := upRoot(t)
 	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))

@@ -16,6 +16,7 @@ import (
 // command that brings the workload up to date. The cell-proxy clients are not in this check: a new image of the server
 // changes the digest of every user of cell-proxy, and the M3 check covers the clients.
 func TestGateM5ImageCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, stale, want string
@@ -114,6 +115,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 // TestGateM5TokenScan: after the tests, gate.sh m5, m5-soak and m5-drill run gate-token-scan.sh with the start time of the run. A
 // hit fails the gate with the lines of the scan, and a clean scan leaves the result of the tests. gate.sh m4 runs no scan.
 func TestGateM5TokenScan(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		milestone string

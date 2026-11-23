@@ -406,6 +406,7 @@ func alive(pid int) bool { return syscall.Kill(pid, 0) == nil }
 // management server. The shell computes the root digest, and the fake binary logs the digest that the
 // Go code gives, so a difference between the two makes start restart the service at each call.
 func TestHostsvcServeLifecycle(t *testing.T) {
+	t.Parallel()
 	t.Run("start twice gives one process", func(t *testing.T) {
 		e := newServeEnv(t)
 		e.mustServe(t, "start")
@@ -1085,6 +1086,7 @@ printf '{"spec.pub":"%s"}\n' "$STUB_LIVE_PUB"
 // base64 of 32 bytes. Whenever mgmtd-0 is Ready, the value must equal `mise run mgmt -- pubkey`. An absent
 // ConfigMap fails with the link command.
 func TestMgmtSigningPub(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash", "base64")
 	dir := t.TempDir()
 	for name, body := range map[string]string{"kubectl": fakeSigningKubectl, "mise": fakeMgmtMise} {
@@ -1139,6 +1141,7 @@ func TestMgmtSigningPub(t *testing.T) {
 // TestMgmtTaskNamesTheLinkCommand: mise run mgmt prints one JSON error line that names the link command when
 // mgmtd-0 is absent or not Ready, and runs mgmtd ctl in the pod otherwise.
 func TestMgmtTaskNamesTheLinkCommand(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "yq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

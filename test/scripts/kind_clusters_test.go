@@ -52,6 +52,7 @@ func kindCalls(t *testing.T, env []string) string {
 // TestKindClusters: kind_clusters prints the clusters that kind lists. It retries a failing kind, and when kind keeps failing, it
 // returns 1 with the error of kind on standard error, never an empty list.
 func TestKindClusters(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
@@ -109,6 +110,7 @@ func TestKindClusters(t *testing.T) {
 // absent cell. It retries a failing kind, and when kind keeps failing, it stops with the error of kind and not with cell_needs_step.
 // The same holds for the check of HARNESS_ONLY.
 func TestUpKindListing(t *testing.T) {
+	t.Parallel()
 	t.Run("kind writes the cell first and pauses", func(t *testing.T) {
 		root, logFile := upRoot(t)
 		env := append(writeFlakyKind(t, filepath.Join(root, "bin")), "STUB_KIND_PAUSE=0.2")
@@ -194,6 +196,7 @@ func runLibFlaky(t *testing.T, lib, call string, env ...string) (string, string,
 // TestKindCallersRetry: live_cells and existing_clusters read kind through kind_clusters, so one failed call of kind is retried, and a
 // kind that keeps failing gives the error of kind and the reason of the caller.
 func TestKindCallersRetry(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
@@ -221,6 +224,7 @@ func TestKindCallersRetry(t *testing.T) {
 // TestVerifyRetriesKind: cell:verify of a cell with no cluster prints the skip line and passes. One failed call of kind does not turn
 // the absent cell into a run of every check.
 func TestVerifyRetriesKind(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	bin := t.TempDir()
 	writeLiveStubs(t, bin)

@@ -225,6 +225,7 @@ func count(calls, verb string) int {
 }
 
 func TestRotateCARunsToTheEnd(t *testing.T) {
+	t.Parallel()
 	s := newRotateServer(t)
 	out, calls, err := s.run(t)
 	if err != nil {
@@ -245,6 +246,7 @@ func TestRotateCARunsToTheEnd(t *testing.T) {
 
 // A cell with no cluster holds no copy of the root, so the copy search skips it.
 func TestRotateCASkipsAnAbsentCell(t *testing.T) {
+	t.Parallel()
 	s := newRotateServer(t)
 	out, _, err := s.run(t, "STUB_GONE=dev-cell-2", "STUB_KIND=management dev-cp dev-cell-1 rogue")
 	if err != nil {
@@ -261,6 +263,7 @@ func TestRotateCASkipsAnAbsentCell(t *testing.T) {
 // A rotation that stopped goes on from the failed step when it runs again. It never prepares
 // while an old authority still needs its taint or revoke, because a prepare overwrites that slot.
 func TestRotateCAResumes(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		fail, wantStop string
 		// verbs that the second run must not call
@@ -298,6 +301,7 @@ func TestRotateCAResumes(t *testing.T) {
 // cell:up must apply each harness component through harness_apply, which refuses objects of
 // other owners. A bare apply_bundle after the root sync would take them.
 func TestUpAppliesHarnessThroughTheOwnerCheck(t *testing.T) {
+	t.Parallel()
 	data, err := os.ReadFile("../../scripts/up.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -321,6 +325,7 @@ done`
 // Both refresh steps restart the host service and wait until its root file equals the bundle. A service that
 // keeps an old root stops the run before the activate.
 func TestRotateCARestartsTheHostService(t *testing.T) {
+	t.Parallel()
 	s := newRotateServer(t)
 	out, _, err := s.run(t)
 	if err != nil {

@@ -33,6 +33,7 @@ func newRepairFixtureWith(t *testing.T, r *bundleRoot, argocdManifests string) r
 // it verified the root and before it changes anything. A good root that passes is repaired as before. A bundle that the policy denies is refused with the
 // denial printed, and repair neither tags, pins, applies, deletes nor refreshes.
 func TestBundleRepairPolicy(t *testing.T) {
+	t.Parallel()
 	t.Run("a clean good root passes the policy first", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		f := newRepairFixture(t, r)

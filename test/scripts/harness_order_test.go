@@ -41,6 +41,7 @@ func hintLines(t *testing.T, errOut string) []string {
 // cells (TestHarnessUpPublishesTargets). No cell gets cell:up.
 // The request runs on every call, even when both cells are requested already, because mgmtd answers alreadyRequested (ruling m6).
 func TestHarnessUpOrderM6(t *testing.T) {
+	t.Parallel()
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "up")
 	if err != nil {
@@ -112,6 +113,7 @@ exit 0
 // bound with no open step. With no marker it requests nothing. --check fails while the marker exists. A step of a cell that the marker
 // does not name is never cancelled.
 func TestRepairRestoresCells(t *testing.T) {
+	t.Parallel()
 	bound := func(c1, c2 string) string {
 		return `{"pendingDrops":[],"cells":[{"name":"dev-cell-1",` + c1 + `},{"name":"dev-cell-2",` + c2 + `}]}`
 	}

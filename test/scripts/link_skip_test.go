@@ -110,6 +110,7 @@ func runLinkScript(t *testing.T, root, logFile, script string, env ...string) (s
 // Without it, hydrate.sh renders the link component, and up.sh runs the link phase last. up.sh
 // always leaves the link components to link.sh, because their renders read live facts.
 func TestLinkSkippedWhenAsked(t *testing.T) {
+	t.Parallel()
 	root, logFile := linkRoot(t)
 
 	_, calls := runLinkScript(t, root, logFile, "hydrate.sh", "CELL_UP_SKIP_LINK=1")
@@ -139,6 +140,7 @@ func TestLinkSkippedWhenAsked(t *testing.T) {
 // Without CELL_UP_SKIP_LINK, cell:up and cell:link of management stop before any apply when the
 // environment control plane has no running SPIRE server, and name the commands that go on.
 func TestLinkPhaseNeedsTheOtherClusters(t *testing.T) {
+	t.Parallel()
 	root, logFile := linkRoot(t)
 	for _, script := range []string{"up.sh", "link.sh"} {
 		t.Run(script, func(t *testing.T) {
@@ -172,6 +174,7 @@ func TestLinkPhaseNeedsTheOtherClusters(t *testing.T) {
 
 // up.sh stops at UP_WAIT with the reason when argocd lacks the child Applications.
 func TestUpNamesWhyTheApplicationsAreNotReady(t *testing.T) {
+	t.Parallel()
 	root, logFile := linkRoot(t)
 	cmd := exec.Command(filepath.Join(root, "scripts", "up.sh"))
 	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"),
@@ -189,6 +192,7 @@ func TestUpNamesWhyTheApplicationsAreNotReady(t *testing.T) {
 
 // publish.sh writes every child Application into argocd.
 func TestPublishWritesTheApplicationsToArgocd(t *testing.T) {
+	t.Parallel()
 	root, logFile := linkRoot(t)
 	b, err := os.ReadFile("../../scripts/publish.sh")
 	if err != nil {
@@ -232,6 +236,7 @@ func TestPublishWritesTheApplicationsToArgocd(t *testing.T) {
 // server of dev-cp does not exist at the first hydrate. So up.sh skips the late harness components
 // in the first hydrate, and renders them after the waves.
 func TestLateHarnessComponentsRenderAfterTheWaves(t *testing.T) {
+	t.Parallel()
 	root, logFile := linkRoot(t)
 	for _, cell := range []string{"dev-cp", "dev-cell-1"} {
 		_, calls := runLinkScript(t, root, logFile, "hydrate.sh", "CELL="+cell)

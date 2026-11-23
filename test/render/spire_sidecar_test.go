@@ -66,6 +66,7 @@ func sameObjects(t *testing.T, got, want map[string]object) {
 // TestSpireSidecarClusterJWTMatchesCelld renders celld through the sidecar helper and compares
 // every object with the M2 render, so the helper keeps the deployed celld pod as it is.
 func TestSpireSidecarClusterJWTMatchesCelld(t *testing.T) {
+	t.Parallel()
 	r := renderCellIdentity(t, "STUB_BUNDLE_FILE="+devEnvCA(t))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -134,6 +135,7 @@ var psatSidecarEnv = []string{
 }
 
 func TestSpireSidecarK8sPSAT(t *testing.T) {
+	t.Parallel()
 	bundle := caPEM(t, "mgmt.poc.internal")
 	r := sidecar(t, "otel-uplink", "k8s_psat", planeWorkload, append(slices.Clone(psatSidecarEnv), "SPIRE_SIDECAR_BUNDLE="+bundle)...)
 	if r.err != nil {
@@ -259,6 +261,7 @@ func TestSpireSidecarK8sPSAT(t *testing.T) {
 // TestSpireSidecarClusterJWTDefaults renders a cell workload with the default names. The token
 // Role names only the ServiceAccount of the workload.
 func TestSpireSidecarClusterJWTDefaults(t *testing.T) {
+	t.Parallel()
 	input := strings.NewReplacer("otel-uplink", "argocd-agent", "observability-system", "argocd").Replace(planeWorkload)
 	r := sidecar(t, "argocd-agent", "cluster_jwt", input,
 		"SPIRE_SIDECAR_SERVER_ADDRESS=10.9.0.9", "SPIRE_SIDECAR_SERVER_PORT=30091", "SPIRE_SIDECAR_TRUST_DOMAIN=test.env.poc.internal",
@@ -292,6 +295,7 @@ func TestSpireSidecarClusterJWTDefaults(t *testing.T) {
 }
 
 func TestSpireSidecarFailsClosed(t *testing.T) {
+	t.Parallel()
 	bundle := "SPIRE_SIDECAR_BUNDLE=" + caPEM(t, "mgmt.poc.internal")
 	collide := strings.Replace(planeWorkload, "      containers:", "      volumes:\n        - name: data\n          emptyDir: {}\n      containers:", 1)
 	cases := []struct {
@@ -338,6 +342,7 @@ func peerRoot(t *testing.T, env ...string) result {
 }
 
 func TestPeerRootConfigMap(t *testing.T) {
+	t.Parallel()
 	r := peerRoot(t)
 	if r.err != nil {
 		t.Fatalf("peer_root_configmap failed: %v\n%s", r.err, r.stderr)
@@ -357,6 +362,7 @@ func TestPeerRootConfigMap(t *testing.T) {
 }
 
 func TestPeerRootConfigMapFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, env, want string }{
 		{"no server", "STUB_NO_SERVER=1", "Run CELL=dev-cp mise run cell:up first"},
 		{"other trust domain", "STUB_TRUST_DOMAIN=mgmt.poc.internal", "want spiffe://dev.env.poc.internal"},
@@ -376,6 +382,7 @@ func TestPeerRootConfigMapFailsClosed(t *testing.T) {
 // container of both modes has a startup probe on the same health check, which holds off the liveness and readiness probes for at
 // least 90 s. The liveness probe keeps its settings.
 func TestSpireAgentStartupProbe(t *testing.T) {
+	t.Parallel()
 	input := strings.NewReplacer("otel-uplink", "argocd-agent", "observability-system", "argocd").Replace(planeWorkload)
 	for _, tc := range []struct {
 		name string

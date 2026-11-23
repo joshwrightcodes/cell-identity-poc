@@ -26,6 +26,7 @@ func factsRun(t *testing.T, root, nodeIP string) string {
 // TestFactsEnvChangesOnlyWithAFact: facts.env is an input of the render, and the publish refuses a bundle that is older than its inputs, so a run
 // that reads the same facts must keep the file and its time. A changed fact replaces the file.
 func TestFactsEnvChangesOnlyWithAFact(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	root := t.TempDir()
 	copyFiles(t, root, "scripts")

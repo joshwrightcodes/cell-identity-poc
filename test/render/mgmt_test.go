@@ -72,6 +72,7 @@ func rulePorts(t *testing.T, rule any) []string {
 // annotations that restart the pod, the volume and the token mounts, the images by digest with their
 // limits, the NodePort Services, the Role, and the policies of the flows N26 to N29, N36, N8, N11 and N23.
 func TestMgmtAPIRender(t *testing.T) {
+	t.Parallel()
 	objs, r := mgmtObjects(t)
 	sts := objs["StatefulSet/mgmtd"]
 	if sts == nil {
@@ -256,6 +257,7 @@ func TestMgmtAPIRender(t *testing.T) {
 // With the dev-cp stub server down, or with no dev-cp cluster, no peer-root renders, and the annotation says
 // absent. A missing cluster leaves out the ingress rules of N26 and N27 too, because no node address exists.
 func TestMgmtAPIRendersWithoutDevCP(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name     string
 		env      []string
@@ -288,6 +290,7 @@ func TestMgmtAPIRendersWithoutDevCP(t *testing.T) {
 // When kind does not answer, the render cannot tell whether dev-cp exists. It stops with the error of kind, and never renders
 // mgmt-api as if dev-cp were absent, with no peer root and no rule for flow N26.
 func TestMgmtAPIRenderStopsWhenKindFails(t *testing.T) {
+	t.Parallel()
 	r := mgmtAPI(t, "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "kind get clusters failed") {
 		t.Fatalf("err %v, stdout %d bytes, stderr %q; want a failed render that names kind", r.err, len(r.stdout), r.stderr)
@@ -297,6 +300,7 @@ func TestMgmtAPIRenderStopsWhenKindFails(t *testing.T) {
 // When the dev-cp SPIRE server StatefulSet exists and the server does not answer, a quiet render
 // would leave the API of mgmtd with no trust root. The render stops with the M3 hint instead.
 func TestMgmtAPIPeerRootRequiredWhenServerExists(t *testing.T) {
+	t.Parallel()
 	r := mgmtAPI(t, "STUB_NO_SERVER_IN=dev-cp")
 	if r.err == nil || r.stdout != "" {
 		t.Fatalf("err %v, stdout %d bytes; want a failed render with no output", r.err, len(r.stdout))
@@ -308,6 +312,7 @@ func TestMgmtAPIPeerRootRequiredWhenServerExists(t *testing.T) {
 
 // The render stops when the host service does not serve, so no pod starts with an old pin.
 func TestMgmtAPIStopsWithoutHostService(t *testing.T) {
+	t.Parallel()
 	r := mgmtAPI(t, "STUB_HOSTSVC_FAIL=1")
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "mise run hostsvc:serve -- start") {
 		t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that names the start command", r.err, len(r.stdout), r.stderr)
@@ -320,6 +325,7 @@ func TestMgmtAPIStopsWithoutHostService(t *testing.T) {
 // cluster exists or not, so it holds both cells with no live cell. The bind subject comes from the shared table.
 // mgmt.LoadIntent must accept the file, which pins the shape that mgmtd reads.
 func TestMgmtIntentFromTopology(t *testing.T) {
+	t.Parallel()
 	objs, _ := mgmtObjects(t)
 	raw := get[string](t, objs["ConfigMap/mgmt-intent"], "data", "intent.json")
 	var intent struct {
@@ -410,6 +416,7 @@ func TestMgmtIntentFromTopology(t *testing.T) {
 
 // A render with no cell-identity cluster, or a subject list without the bind subject, stops.
 func TestMgmtIntentNeedsTheBindSubject(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	root := t.TempDir()
 	for _, d := range []string{"cells", "harness", "components/mgmt-api", "components/lib", "scripts"} {
@@ -446,6 +453,7 @@ func TestMgmtIntentNeedsTheBindSubject(t *testing.T) {
 // TestHostsvcAddressSingle: hostsvc_address prints the one address that getent gives, also when the
 // answer repeats it for each socket type. No address or two addresses fail.
 func TestHostsvcAddressSingle(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(stubDocker), 0o755); err != nil {
@@ -487,6 +495,7 @@ func TestHostsvcAddressSingle(t *testing.T) {
 // TestMgmtAPIRenderNoBindListener checks that the render of management has no bind path: no Service mgmt-bind, no port 8447
 // on the container, the Services or the policy, and no node port 31447.
 func TestMgmtAPIRenderNoBindListener(t *testing.T) {
+	t.Parallel()
 	r := renderScript(t, "mgmt-api", "/ko-app/stub", append([]string{"STUB_CELL=management"}, bundleFacts...)...)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -527,6 +536,7 @@ func TestMgmtAPIRenderNoBindListener(t *testing.T) {
 // restarts mgmtd. The render never prints operator-pub, which the operator script owns. With no operator-pub yet, mgmtd runs
 // with no operator key and adopts no local revocation. A failed read of operator-pub stops the render.
 func TestMgmtdOperatorKeyFile(t *testing.T) {
+	t.Parallel()
 	sums := map[string]string{}
 	for _, tc := range []struct {
 		name string

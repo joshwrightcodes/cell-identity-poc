@@ -177,6 +177,7 @@ func applies(r result) int {
 }
 
 func TestSecretsConnect(t *testing.T) {
+	t.Parallel()
 	r := run(t, both()...)
 	if r.err != nil {
 		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
@@ -259,6 +260,7 @@ func TestSecretsConnect(t *testing.T) {
 // A token reference in the form for a ClusterSecretStore names a namespace. A namespaced store
 // reads the Secret in its own namespace, so the script drops the field.
 func TestSecretsConnectDropsTheTokenNamespace(t *testing.T) {
+	t.Parallel()
 	r := run(t, "POC_SECRET_TOKEN_CMD=printf %s "+token, "POC_SECRET_STORE_PROVIDER="+providerWithNamespace)
 	if r.err != nil {
 		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
@@ -274,6 +276,7 @@ func TestSecretsConnectDropsTheTokenNamespace(t *testing.T) {
 
 // Without the two settings in the environment, the script reads .envrc.local itself.
 func TestSecretsConnectReadsEnvrcLocal(t *testing.T) {
+	t.Parallel()
 	file := filepath.Join(t.TempDir(), ".envrc.local")
 	content := "export POC_SECRET_TOKEN_CMD='printf %s " + token + "'\nexport POC_SECRET_STORE_PROVIDER='" + provider + "'\n"
 	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
@@ -290,6 +293,7 @@ func TestSecretsConnectReadsEnvrcLocal(t *testing.T) {
 }
 
 func TestSecretsConnectWithoutExternalSecrets(t *testing.T) {
+	t.Parallel()
 	r := run(t, append(both(), "STUB_NO_ES=1")...)
 	if r.err != nil {
 		t.Fatalf("secrets-connect failed: %v\n%s", r.err, r.stderr)
@@ -300,6 +304,7 @@ func TestSecretsConnectWithoutExternalSecrets(t *testing.T) {
 }
 
 func TestSecretsConnectFailsClosed(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		env  []string

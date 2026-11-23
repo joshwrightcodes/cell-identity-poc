@@ -50,6 +50,7 @@ done
 // file must keep its time when a run builds the same digests. Only the lines of images count: the note of the commit changes with every commit.
 // A changed digest replaces the file.
 func TestImagesEnvChangesOnlyWithADigest(t *testing.T) {
+	t.Parallel()
 	root := imagesRoot(t)
 	file := imagesRun(t, root, nil)
 	first, _ := os.ReadFile(file)
@@ -120,6 +121,7 @@ func koImageCheck(t *testing.T, root string) (string, string, error) {
 // images.env, which keeps its time when no digest changes. A Go edit that changes no digest must therefore stop ko_image until images.sh runs, and
 // one run must clear it, while images.env keeps its time for the bundle freshness rule.
 func TestImagesStampClearsKoImage(t *testing.T) {
+	t.Parallel()
 	root := imagesRoot(t)
 	src := filepath.Join(root, "internal", "x", "x.go")
 	if err := os.MkdirAll(filepath.Dir(src), 0o755); err != nil {
@@ -160,6 +162,7 @@ func TestImagesStampClearsKoImage(t *testing.T) {
 // TestImagesStampOnlyAfterAFullBuild: the stamp says that every image was built from the Go sources of that time. A run of named images, and a run
 // where ko fails, leave it as it is. A missing stamp stops ko_image.
 func TestImagesStampOnlyAfterAFullBuild(t *testing.T) {
+	t.Parallel()
 	// stampedRoot is a root with a full build, and a stamp that is two hours old.
 	stampedRoot := func(t *testing.T) (root, stamp string, past time.Time) {
 		t.Helper()

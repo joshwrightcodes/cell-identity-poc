@@ -70,6 +70,7 @@ const repoServerJSON = `{"spec":{"template":{"spec":{"containers":[{"name":"argo
 // TestVerifyBundleChecks runs each bundle check of cell:verify with fakes: once on a healthy cluster and once for each mismatch. A
 // mismatch prints its reason and the command to run.
 func TestVerifyBundleChecks(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib", "internal/bundle"} {
@@ -363,6 +364,7 @@ set +e; `+tc.check, "_", root)
 // TestVerifyRunsBundleChecks reads scripts/verify.sh: check_store_proxy runs for every role, and the other four checks run only in the branch of the roles cell and
 // cp, so management (role open) runs the store proxy check alone.
 func TestVerifyRunsBundleChecks(t *testing.T) {
+	t.Parallel()
 	raw, err := os.ReadFile("../../scripts/verify.sh")
 	if err != nil {
 		t.Fatal(err)

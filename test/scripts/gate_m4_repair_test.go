@@ -60,6 +60,7 @@ echo "harness-replicas $*" >>"$STUB_DIR/calls"
 // or serves another pin or another management root than the deployed ones, and it sets the replicas of mgmtd and
 // envd back to 1 through harness-replicas.sh. With --check it only reports each drift with the repair command.
 func TestGateM4Repair(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
@@ -148,6 +149,7 @@ func TestGateM4Repair(t *testing.T) {
 // labelled test namespaces m4-bind and m4-probe-* and the attestprobe objects, leaves other namespaces alone, and runs
 // the repair of gate:m2. With --check it only reports.
 func TestGateM4RepairTestState(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

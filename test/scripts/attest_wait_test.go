@@ -45,6 +45,7 @@ cat "$STUB_DIR/status.json"
 // the script prints the link command as a warning and exits 0 with no wait. A spire-agent in CrashLoopBackOff gets
 // its pod deleted once.
 func TestAttestWaitStages(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

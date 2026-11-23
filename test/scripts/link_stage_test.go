@@ -99,6 +99,7 @@ const hubLogBoth = `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}
 // The link phase applies the hub first, waits until the hub logs tunnel_up for each cell, and then
 // applies Kiali.
 func TestLinkAppliesKialiAfterTheTunnels(t *testing.T) {
+	t.Parallel()
 	root, calls := stageRoot(t)
 	out, log, err := runStage(t, root, calls, "STUB_HUB_LOG="+hubLogBoth)
 	if err != nil {
@@ -120,6 +121,7 @@ func TestLinkAppliesKialiAfterTheTunnels(t *testing.T) {
 // A cell with no tunnel fails the link phase after the wait, names that cell only, and applies no
 // Kiali. A cell whose last line is tunnel_down counts as missing.
 func TestLinkNamesTheCellsWithoutATunnel(t *testing.T) {
+	t.Parallel()
 	for name, hubLog := range map[string]string{
 		"no line":     `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}`,
 		"tunnel down": hubLogBoth + "\n" + `{"msg":"tunnel_down","cell":"dev-cell-2","conn_id":2}`,
@@ -143,6 +145,7 @@ func TestLinkNamesTheCellsWithoutATunnel(t *testing.T) {
 // The new tunnel of a cell logs tunnel_up before the replaced one logs tunnel_down, so the last line of the
 // cell is a tunnel_down. The cell has an open tunnel all the same, and the link phase goes on.
 func TestLinkCountsAReplacedTunnelAsUp(t *testing.T) {
+	t.Parallel()
 	root, calls := stageRoot(t)
 	log := `{"msg":"tunnel_up","cell":"dev-cell-1","conn_id":1}
 {"msg":"tunnel_up","cell":"dev-cell-2","conn_id":2}
@@ -156,6 +159,7 @@ func TestLinkCountsAReplacedTunnelAsUp(t *testing.T) {
 // The link phase reads the state that the hub process serves, and the log is only the fallback. A hub
 // that reports a cell down stops the link phase even when its log has a tunnel_up line for the cell.
 func TestLinkReadsTheStateOfTheHub(t *testing.T) {
+	t.Parallel()
 	both := `{"side":"hub","up":true,"cells":{"dev-cell-1":{"up":true},"dev-cell-2":{"up":true}}}`
 	root, calls := stageRoot(t)
 	if out, got, err := runStage(t, root, calls, "STUB_STATUS="+both); err != nil {

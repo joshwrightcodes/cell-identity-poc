@@ -70,6 +70,7 @@ func peerRules(t *testing.T, np object, dir string) []policyRule {
 // limits that the gateway needs, the source attributes of the row of the cluster, and the
 // NetworkPolicies of the flows N11, N10, N15, N16 and N19.
 func TestCollectorRender(t *testing.T) {
+	t.Parallel()
 	for _, cl := range collectorClusters {
 		t.Run(cl.name, func(t *testing.T) {
 			objs := clusterComponent(t, cl.name, "observability-system")
@@ -293,6 +294,7 @@ func TestCollectorRender(t *testing.T) {
 // to the series of the spoof alarm, and that no other collector has the filter. The gateway sends its own metrics
 // straight to the store, so it never passes this filter.
 func TestManagementCollectorDropsTheAlarmSeries(t *testing.T) {
+	t.Parallel()
 	for _, cl := range collectorClusters {
 		t.Run(cl.name, func(t *testing.T) {
 			conf := collectorConfig(t, clusterComponent(t, cl.name, "observability-system"))
@@ -430,6 +432,7 @@ func asciiUpper(s string) string {
 // the probe. The collector may reach its exporter target, the API server, and each scrape target of
 // its cluster on the port of the job.
 func TestCollectorPolicies(t *testing.T) {
+	t.Parallel()
 	for _, cl := range collectorClusters {
 		t.Run(cl.name, func(t *testing.T) {
 			objs := clusterComponent(t, cl.name, "observability-system")
@@ -562,6 +565,7 @@ func TestCollectorPolicies(t *testing.T) {
 // collector pod of observability-system, and no other pod, on that port. A node address may use only
 // the health port 8084 of the central repo server, which is also its metrics port.
 func TestMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
+	t.Parallel()
 	collectorPeer := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]"
 	type port struct{ component, policy, port string }
 	ports := map[string][]port{
@@ -610,6 +614,7 @@ func TestMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
 // in the sidecar values, so that source_cluster equals the cluster name and not the default
 // Kubernetes. It also checks that the Envoy metrics of Istio are on, because the collector scrapes them.
 func TestIstiodNamesTheCluster(t *testing.T) {
+	t.Parallel()
 	for _, cl := range collectorClusters {
 		t.Run(cl.name, func(t *testing.T) {
 			objs := clusterComponent(t, cl.name, "istiod")
@@ -660,6 +665,7 @@ func TestIstiodNamesTheCluster(t *testing.T) {
 // that a rule with no ports, which covers every port, admits only the pods of its own namespace or the
 // node address. Policies add up, so one open rule leaves the port open.
 func TestArgoCDMetricsPortsAdmitOnlyTheCollector(t *testing.T) {
+	t.Parallel()
 	collectorPeer := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]"
 	// ownNamespaceOrNode says whether peers are only the pods of the namespace or node addresses.
 	ownNamespaceOrNode := func(peers string) bool {

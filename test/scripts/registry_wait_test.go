@@ -84,6 +84,7 @@ func runWait(t *testing.T, snippet string, files map[string]string, env ...strin
 // ConfigMap that is absent, one without the marker, one with no record (an empty registry), and one that lacks a cell.
 // It also passes when the ConfigMap appears during the wait.
 func TestRegistryWait(t *testing.T) {
+	t.Parallel()
 	both := registryJSON("mgmtd", "dev-cell-1", "dev-cell-2")
 	for _, tc := range []struct {
 		name  string
@@ -132,6 +133,7 @@ func TestRegistryWait(t *testing.T) {
 // label, so a prune before the wait would delete it. When the registry never comes, the apply fails and the prune does not
 // run. Another component does not wait.
 func TestHarnessApplyWaitsForRegistryBeforePrune(t *testing.T) {
+	t.Parallel()
 	stubs := `harness_conflicts() { :; }; apply_bundle() { echo "STEP apply $1" >>"$STUB_LOG"; }; release_from_argocd() { :; }; `
 	// bundle copies the fixture bundle of central-view to the bundle of another component.
 	bundle := func(comp string) string {

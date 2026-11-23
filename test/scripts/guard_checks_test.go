@@ -58,6 +58,7 @@ func runGuardScript(t *testing.T, snippet string, env ...string) (string, string
 }
 
 func TestAgentServiceAccountMustBeUnmanaged(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, sa, key, want string
 	}{
@@ -80,6 +81,7 @@ func TestAgentServiceAccountMustBeUnmanaged(t *testing.T) {
 }
 
 func TestAgentGrantsMustMatchTheRender(t *testing.T) {
+	t.Parallel()
 	left := `{"items":[{"kind":"Role","metadata":{"name":"view-guard-test","namespace":"argocd"}},{"kind":"Namespace","metadata":{"name":"view-guard-test"}}]}`
 	for _, tc := range []struct {
 		name, left, bindings, want string
@@ -107,6 +109,7 @@ func TestAgentGrantsMustMatchTheRender(t *testing.T) {
 }
 
 func TestGateM3Repair(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	left := `{"items":[{"kind":"Role","metadata":{"name":"view-guard-test","namespace":"argocd"}},{"kind":"Namespace","metadata":{"name":"view-guard-test"}}]}`
 	script, err := filepath.Abs("../../scripts/gate-m3-repair.sh")

@@ -13,6 +13,7 @@ import (
 // TestGateTestTimeout pins the go test timeout that gate.sh derives from each budget: twice the budget,
 // with a floor of 30 minutes.
 func TestGateTestTimeout(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {
@@ -45,6 +46,7 @@ func TestGateTestTimeout(t *testing.T) {
 
 // TestGateScriptUsesDerivedTimeout makes sure gate.sh passes the derived value to go test.
 func TestGateScriptUsesDerivedTimeout(t *testing.T) {
+	t.Parallel()
 	b, err := os.ReadFile("../../scripts/gate.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -59,6 +61,7 @@ func TestGateScriptUsesDerivedTimeout(t *testing.T) {
 
 // A live gate fails at once, with the copy command, when the build output of another checkout is missing.
 func TestGateNeedsTheBuildOutput(t *testing.T) {
+	t.Parallel()
 	build := t.TempDir()
 	_, errOut, code := runScript(t, "gate.sh", withLive(nil), []string{"POC_BUILD_ROOT=" + build}, "m4")
 	if code != 1 || !strings.Contains(errOut, "images.env is missing") || !strings.Contains(errOut, "cp <that checkout>/build/images.env") {
@@ -76,6 +79,7 @@ func TestGateNeedsTheBuildOutput(t *testing.T) {
 // TestGateM2TimeoutCoversTheRepair: the cleanup of the key rotation test runs a repair that is bounded at 41 minutes, so the go test timeout of
 // gate:m2 must be above that bound plus the test bodies (5 minutes for the key rotation test and 8 for the others).
 func TestGateM2TimeoutCoversTheRepair(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	versions, _ := filepath.Abs("../../harness/versions.env")
 	lib, _ := filepath.Abs("../../scripts/lib.sh")

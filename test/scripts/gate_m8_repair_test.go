@@ -132,6 +132,7 @@ func at(calls, text string) int { return strings.Index(calls, text) }
 // run. The script deletes them in each cluster with a bundle role. It never touches an object without the label, another prefix, the
 // Application apps-sample, or a cluster without a bundle role.
 func TestGateM8RepairDeletesProbes(t *testing.T) {
+	t.Parallel()
 	_, calls, _, code := m8RepairRun(t, "", []string{
 		"STUB_NS_dev_cell_1=m8-aa:true m8-keep:false m7-bb:true default:false", "STUB_NS_dev_cp=m8-cc:true", "STUB_NS_rogue=m8-dd:true", "STUB_NS_management=m8-ee:true",
 		"STUB_APPS_dev_cell_2=m8-project-probe:true m8-nolabel:false root:false",
@@ -157,6 +158,7 @@ func TestGateM8RepairDeletesProbes(t *testing.T) {
 // TestGateM8RepairRepairsBeforePublish: a target in rolled_back with rollback_unhealthy gets mise run bundle -- repair --target <t> first, and then its set is
 // published again. A target in rolled_back with another detail is published and not repaired.
 func TestGateM8RepairRepairsBeforePublish(t *testing.T) {
+	t.Parallel()
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_STATE_dev_cell_2=" + m8RolledBack(true), "STUB_STATE_dev_cell_1=" + m8RolledBack(false),
 		"STUB_STATE_dev_cp=" + m8Healthy})
 	if code != 0 {
@@ -182,6 +184,7 @@ func TestGateM8RepairRepairsBeforePublish(t *testing.T) {
 // m8-marker (in apps-sample for a cell, in apps-demo for dev-cp), and each target in rolled_back gets mise run bundle -- publish --target <t> --wait, dev-cp first. The marker goes after the
 // publish. A target with none of the signs gets nothing, and the record of the run goes when every publish ended applied.
 func TestGateM8RepairRestoresMarkedTargets(t *testing.T) {
+	t.Parallel()
 	out, calls, dir, code := m8RepairRun(t, "dev-cell-1\ndev-cp\n", []string{"STUB_APPS_dev_cell_2=apps-sample:false", "STUB_MARKER=dev-cell-2", "STUB_MARKER_DEMO=dev-cp",
 		"STUB_STATE_dev_cell_1=" + m8Healthy, "STUB_STATE_dev_cell_2=" + m8Healthy, "STUB_STATE_dev_cp=" + m8Healthy})
 	if code != 0 {
@@ -217,6 +220,7 @@ func TestGateM8RepairRestoresMarkedTargets(t *testing.T) {
 // TestGateM8CheckNamesRepair: --check reports each trace of a gate:m8 run with the command that repairs it, exits 1, and changes nothing. A clean
 // harness gives exit 0.
 func TestGateM8CheckNamesRepair(t *testing.T) {
+	t.Parallel()
 	const repair = "Run: mise run gate:m8:repair"
 	for _, tc := range []struct {
 		name     string
@@ -268,6 +272,7 @@ func TestGateM8CheckNamesRepair(t *testing.T) {
 
 // TestGateM8RepairLeftovers: a probe namespace that stays after the deletion is an error that names it.
 func TestGateM8RepairLeftovers(t *testing.T) {
+	t.Parallel()
 	out, _, _, code := m8RepairRun(t, "", []string{"STUB_NS_dev_cell_1=m8-aa:true", "STUB_STUCK=1"})
 	if code != 1 || !strings.Contains(out, "dev-cell-1 m8-aa") {
 		t.Errorf("exit %d and %q, want exit 1 that names dev-cell-1 m8-aa", code, out)
@@ -289,6 +294,7 @@ func m8ExpiredSet() string {
 // TestGateM8RepairWaitsForOpenSet: mgmtd refuses a new served set while one is open, so the repair waits for the open set of a target before it publishes, with a
 // bound. A set that closes in time is followed by the publish. A set that stays open is an error with the op ID and the expiry, and no publish.
 func TestGateM8RepairWaitsForOpenSet(t *testing.T) {
+	t.Parallel()
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_GET_dev_cell_1=" + m8OpenSet(), "STUB_GET_OPEN_dev_cell_1=2", "GATE_M8_OPEN_WAIT=30"})
 	if code != 0 || at(calls, "publish --target dev-cell-1 --wait") < 0 {
 		t.Fatalf("a set that closes in time: exit %d\n%s\ncalls %s", code, out, calls)
@@ -301,6 +307,7 @@ func TestGateM8RepairWaitsForOpenSet(t *testing.T) {
 
 // TestGateM8RepairBundleOpenHint: a publish that mgmtd refuses with bundle_open does not say to hydrate again. Any other failure keeps that hint.
 func TestGateM8RepairBundleOpenHint(t *testing.T) {
+	t.Parallel()
 	env := []string{"STUB_STATE_dev_cell_1=" + m8Healthy, "STUB_PUBLISH_FAIL=dev-cell-1"}
 	out, _, _, code := m8RepairRun(t, "dev-cell-1\n", append(env, "STUB_PUBLISH_ERR=error: mgmtd refused the set of dev-cell-1: bundle_open"))
 	if code != 1 || !strings.Contains(out, "bundle_open") || strings.Contains(out, "cell:hydrate") || !strings.Contains(out, "mise run gate:m8:repair") {
@@ -314,6 +321,7 @@ func TestGateM8RepairBundleOpenHint(t *testing.T) {
 
 // TestGateM8RepairRefusesUnknownArguments: only --check is an argument. A typo must not run the repair.
 func TestGateM8RepairRefusesUnknownArguments(t *testing.T) {
+	t.Parallel()
 	out, calls, _, code := m8RepairRun(t, "dev-cell-1\n", []string{"STUB_STATE_dev_cell_1=" + m8Healthy, "STUB_NS_dev_cp=m8-aa:true"}, "--chek")
 	if code != 1 || !strings.Contains(out, "usage: gate-m8-repair.sh [--check]") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
 		t.Errorf("exit %d, output %q, calls %s; want exit 1 with the usage line and no change", code, out, calls)
@@ -322,6 +330,7 @@ func TestGateM8RepairRefusesUnknownArguments(t *testing.T) {
 
 // TestGateM8RepairUnreadableState: a bundle state that cannot be read is an error, never "nothing to repair". Nothing changes.
 func TestGateM8RepairUnreadableState(t *testing.T) {
+	t.Parallel()
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_STATE_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
 	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
 		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
@@ -331,6 +340,7 @@ func TestGateM8RepairUnreadableState(t *testing.T) {
 // TestGateM8RepairUnreadableSet: only the answer bundle_unknown means that a target has no set. Any other failure of the read stops the repair and names the target,
 // because the set can be open.
 func TestGateM8RepairUnreadableSet(t *testing.T) {
+	t.Parallel()
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_GET_FAIL=dev-cell-2", "STUB_NS_dev_cp=m8-aa:true"})
 	if code != 1 || !strings.Contains(out, "dev-cell-2") || strings.Contains(calls, " delete ") || strings.Contains(calls, "bundle -- publish") {
 		t.Errorf("exit %d, output %q, calls %s; want exit 1 that names dev-cell-2 and no change", code, out, calls)
@@ -346,6 +356,7 @@ func m8Ops(id, kind, state string, served bool) string {
 // the repair closes it with mise run mgmt -- op close. --check lists it and does not fail. A served operation, an operation that is not expired and an operation of
 // another kind are left alone.
 func TestGateM8RepairClosesUnservedExpiredOps(t *testing.T) {
+	t.Parallel()
 	const id = "0123456789abcdef0123456789abcdef"
 	out, calls, _, code := m8RepairRun(t, "", []string{"STUB_OPS=" + m8Ops(id, "bundle.apply", "expired", false)}, "--check")
 	if code != 0 || !strings.Contains(out, id) || strings.Contains(calls, "op close") {

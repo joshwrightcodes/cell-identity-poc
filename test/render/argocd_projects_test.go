@@ -59,6 +59,7 @@ var blacklistNames = map[string][]string{
 // the applier expects for its class, carries the blacklist names and the SHA-256 of the allow-list, and
 // that no other project except default exists. management keeps the project cell of M7.
 func TestAppProjectsRepeatAllowList(t *testing.T) {
+	t.Parallel()
 	policy := bundle.DefaultPolicy()
 	m7 := readObject(t, "../../components/argocd/project.yaml")
 	for _, cr := range renderAll(t) {
@@ -148,6 +149,7 @@ func sourceAllowed(repos []any, repoURL string) bool {
 // sourceRepos entry of the project of the Application allows, and a project that the cluster renders. The children of
 // role open come from scripts/publish.sh, and test/scripts checks them against the same project.
 func TestApplicationSourcesMatchProjects(t *testing.T) {
+	t.Parallel()
 	policy := bundle.DefaultPolicy()
 	root := readObject(t, "../../bootstrap/root.yaml")
 	for _, cr := range renderAll(t) {

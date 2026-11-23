@@ -3,7 +3,6 @@ package scripts
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -62,12 +61,16 @@ GOFLAGS=-mod=readonly exec go run ./cmd/pkigen "$@"
 // cluster of this Mac. The test must also point the program at its own fake, for example through KUBECONFIG and HOME.
 func useRealTool(t *testing.T, dir, name string) {
 	t.Helper()
-	old := os.Getenv("PATH")
-	os.Setenv("PATH", realPATH)
-	path, err := exec.LookPath(name)
-	os.Setenv("PATH", old)
-	if err != nil {
-		t.Skipf("%s is not installed: %v", name, err)
+	// The search reads realPATH and leaves the environment of the process alone, because tests run in parallel and read PATH.
+	var path string
+	for _, d := range filepath.SplitList(realPATH) {
+		if info, err := os.Stat(filepath.Join(d, name)); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			path = filepath.Join(d, name)
+			break
+		}
+	}
+	if path == "" {
+		t.Skipf("%s is not installed on PATH", name)
 	}
 	if err := os.Symlink(path, filepath.Join(dir, name)); err != nil {
 		t.Fatal(err)

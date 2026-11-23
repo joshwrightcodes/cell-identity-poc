@@ -17,6 +17,7 @@ func renderGateway(t *testing.T, env ...string) result {
 // the bounds, the volumes, the three Services, the key ConfigMap with its checksum, and one NetworkPolicy rule for each of
 // the flows N37 to N40, N8, N11 and N23.
 func TestCellGatewayRender(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -209,6 +210,7 @@ func TestCellGatewayRender(t *testing.T) {
 
 // TestCellGatewayRenderFailsClosed gives the render a missing or wrong input. Each stops it with no output.
 func TestCellGatewayRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -236,6 +238,7 @@ func TestCellGatewayRenderFailsClosed(t *testing.T) {
 // TestCellGatewayRenderNoLiveCells: with no cell cluster the render succeeds, passes no --cell-node, reads no cell
 // facts, and prints neither the N37 rule nor the N38 rule. The envd and kubelet rules stay.
 func TestCellGatewayRenderNoLiveCells(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -266,6 +269,7 @@ func TestCellGatewayRenderNoLiveCells(t *testing.T) {
 
 // TestCellGatewayRenderOneLiveCell: one live cell gives one --cell-node and one address in the N37 and N38 rules.
 func TestCellGatewayRenderOneLiveCell(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-2")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -283,6 +287,7 @@ func TestCellGatewayRenderOneLiveCell(t *testing.T) {
 // TestCellGatewayRenderLiveCellWithoutFacts: a live cell whose facts fail stops the render, so a read error never
 // removes a cell from the admit list.
 func TestCellGatewayRenderLiveCellWithoutFacts(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_FACTS_FAIL=dev-cell-2")
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "no host service facts for the live cell dev-cell-2") ||
 		!strings.Contains(r.stderr, "mise run hostsvc -- facts --cluster dev-cell-2") {
@@ -294,6 +299,7 @@ func TestCellGatewayRenderLiveCellWithoutFacts(t *testing.T) {
 // gateway-system/operator-key, and only cellgw mounts it read-only and reads it through --operator-key-file. cellgw reads the
 // file at start only, so the pod template carries the SHA-256 of the pin, and a rotation restarts the pod.
 func TestCellGatewayOperatorPin(t *testing.T) {
+	t.Parallel()
 	sums := map[string]string{}
 	for _, tc := range []struct {
 		name string

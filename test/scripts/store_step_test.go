@@ -74,6 +74,7 @@ func runStoreStep(t *testing.T, env ...string) (string, int, error) {
 }
 
 func TestStoreStepWithAConnectedStore(t *testing.T) {
+	t.Parallel()
 	out, runs, err := runStoreStep(t, "POC_SECRET_TOKEN_CMD=true")
 	if err != nil || runs != 0 || !strings.Contains(out, "store_done=1") || !strings.Contains(out, "is connected") {
 		t.Fatalf("err %v, %d runs, output %q; want no run of secrets:connect and store_done=1", err, runs, out)
@@ -81,6 +82,7 @@ func TestStoreStepWithAConnectedStore(t *testing.T) {
 }
 
 func TestStoreStepRunsSecretsConnectWithTheTokenCommand(t *testing.T) {
+	t.Parallel()
 	for _, gap := range []string{"STUB_SECRET_MISSING=1", "STUB_STORE_NOT_READY=1"} {
 		t.Run(gap, func(t *testing.T) {
 			out, runs, err := runStoreStep(t, gap, "POC_SECRET_TOKEN_CMD=true")
@@ -92,6 +94,7 @@ func TestStoreStepRunsSecretsConnectWithTheTokenCommand(t *testing.T) {
 }
 
 func TestStoreStepAsksForASecondShellWithoutTheTokenCommand(t *testing.T) {
+	t.Parallel()
 	out, runs, err := runStoreStep(t, "STUB_SECRET_MISSING=1")
 	if err != nil || runs != 0 || !strings.Contains(out, "store_done=0") ||
 		!strings.Contains(out, "Secret spire-system/spire-upstream is missing. Run in a second shell: CELL=dev-cp mise run secrets:connect") {
@@ -100,6 +103,7 @@ func TestStoreStepAsksForASecondShellWithoutTheTokenCommand(t *testing.T) {
 }
 
 func TestStoreStepStopsWhenSecretsConnectFails(t *testing.T) {
+	t.Parallel()
 	out, _, err := runStoreStep(t, "STUB_SECRET_MISSING=1", "POC_SECRET_TOKEN_CMD=true", "STUB_CONNECT_FAIL=1")
 	if err == nil || !strings.Contains(out, "secrets:connect failed. Fix the cause, then run: CELL=dev-cp mise run secrets:connect") {
 		t.Fatalf("err %v, output %q; want a failure that names secrets:connect", err, out)
@@ -110,6 +114,7 @@ func TestStoreStepStopsWhenSecretsConnectFails(t *testing.T) {
 // rolled out, the old controller can still serve. secrets:connect would then fail like a
 // credential problem, so the step waits.
 func TestStoreStepWaitsForTheScopedController(t *testing.T) {
+	t.Parallel()
 	for _, state := range []string{"STUB_APP_OLD=1", "STUB_OLD_CONTROLLER=1", "STUB_ROLLOUT=1"} {
 		t.Run(state, func(t *testing.T) {
 			out, runs, err := runStoreStep(t, state, "STUB_SECRET_MISSING=1", "POC_SECRET_TOKEN_CMD=true")

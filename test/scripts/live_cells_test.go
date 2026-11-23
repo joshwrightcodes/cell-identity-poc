@@ -83,6 +83,7 @@ func liveCellsRun(t *testing.T, env ...string) (string, string, error) {
 // TestLiveCells: live_cells prints the topology clusters with the cell-identity set whose kind cluster exists and whose node
 // container has an address on the network kind, in topology order.
 func TestLiveCells(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		env  []string

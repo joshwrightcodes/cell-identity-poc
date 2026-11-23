@@ -156,6 +156,7 @@ func portalJSON(t *testing.T, out string) map[string]any {
 // running stage unless --force; wait and --wait read the step by its ID; and each final state prints a hint that the plane accepts
 // in that state.
 func TestPortalScript(t *testing.T) {
+	t.Parallel()
 	newStep := strings.Repeat("n", 32)
 	oldStep := strings.Repeat("o", 32)
 

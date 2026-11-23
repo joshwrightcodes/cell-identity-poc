@@ -44,6 +44,7 @@ func envOf(t *testing.T, ctr map[string]any) map[string]string {
 // read-only root file system, the writable volumes, the environment, and the NetworkPolicy that
 // admits 4317 for the collector and the gateway only and gives the pod no egress.
 func TestLgtmRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "observability-store")
 	sts := objs["StatefulSet observability-system/lgtm"]
 	if sts == nil {
@@ -144,6 +145,7 @@ func TestLgtmRender(t *testing.T) {
 
 // TestLgtmConfigRender pins the Prometheus and Loki overrides, and the Grafana password objects.
 func TestLgtmConfigRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "observability-store")
 	cm := objs["ConfigMap observability-system/lgtm-config"]
 	if cm == nil {
@@ -254,6 +256,7 @@ func countOf(list []string, s string) int {
 // with the local traffic policy, the checksums that restart the pod, the harness label on each
 // object, the memory bounds, the probes, and the NetworkPolicy of the flows N2, N8, N10 and N11.
 func TestTelemetryGatewayRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "telemetry-gateway")
 	dep := objs["Deployment observability-system/telemetry-gateway"]
 	if dep == nil {

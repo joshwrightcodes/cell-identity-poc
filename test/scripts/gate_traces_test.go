@@ -30,6 +30,7 @@ func sourceLib(t *testing.T, dir, snippet string, args ...string) (string, error
 // TestRecordKidsTrace: gate:m2:repair --check reports a record whose key IDs differ from the API server, with the key check command.
 // It reports nothing for equal key IDs, and nothing when mgmtd does not answer.
 func TestRecordKidsTrace(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	dir := t.TempDir()
 	mise := "#!/usr/bin/env bash\n[[ \"$*\" == 'run mgmt -- status' ]] || exit 2\ncat \"" + dir + "/status\" 2>/dev/null || exit 1\n"
@@ -63,6 +64,7 @@ func TestRecordKidsTrace(t *testing.T) {
 // TestRepairOrderPods: the pods of kindnet, kube-proxy and istio-cni-node come before coredns and every other pod, and only the pods with a stale UID
 // are listed.
 func TestRepairOrderPods(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	pod := func(ns, name, uid, kind, owner string) string {
 		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
@@ -100,6 +102,7 @@ func TestRepairOrderPods(t *testing.T) {
 // sorts first. An app pod that waits for a certificate from an istiod with a token of the old key would otherwise stall the repair. The match uses
 // the label app.kubernetes.io/name. A SPIRE server pod gets no rank of its own.
 func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	pod := func(ns, name, uid, kind, owner, app string) string {
 		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","labels":{"app.kubernetes.io/name":"` + app + `"},"ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
@@ -167,6 +170,7 @@ func writeStubs(t *testing.T, dir string, files map[string]string) {
 // TestContainerStarted: the start of a container comes from the container runtime, in epoch seconds. A container that does not run gives status 1, and a failed runtime
 // call gives status 2, so that the repair can stop with an error and not treat the failure as "no container".
 func TestContainerStarted(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	dir := t.TempDir()
 	writeStubs(t, dir, map[string]string{"id-kube-apiserver": "abc\n", "inspect-abc.json": `{"status":{"state":"CONTAINER_RUNNING","startedAt":"2026-11-16T03:20:58.438809979Z"}}`})
@@ -189,6 +193,7 @@ func TestContainerStarted(t *testing.T) {
 // server, and holds a live Lease with the node as holder. For a container that the repair stopped, the Lease needs a new holder or an acquire
 // time at or after the stop: the old process renewed its Lease against the new API server before the stop, so a late renew time alone is no proof.
 func TestControlPlaneCurrent(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
 	node := "dev-cell-1-control-plane"
@@ -250,6 +255,7 @@ func TestControlPlaneCurrent(t *testing.T) {
 // started before the API server is stopped, and the stub then shows a new container. The step reads the Lease holder before the stop, so
 // the old process, which renewed its Lease after the API start, must not pass, and a Lease with a new holder or a later acquire time must.
 func TestSettleControlPlane(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
 	node := "dev-cell-1-control-plane"
