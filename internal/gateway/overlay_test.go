@@ -197,17 +197,24 @@ func TestOverlaySkippedRevokedRevisionClears(t *testing.T) {
 	}
 }
 
-// At startup the nil list drops an entry that is stale against the stored records.
-func TestOverlayStartupDropsStale(t *testing.T) {
+// A restart keeps an entry that is stale against the stored record. The next sync of envd decides.
+func TestOverlayRestoreKeepsStaleUntilEnvdSync(t *testing.T) {
 	e := newGwEnv(t)
 	op := newOperator(t)
+	ctx := context.Background()
 	e.revoke(op, cell1, cell2)
 	e.applyRevoked(2, false)
-	if err := e.st.SetRevocations(context.Background(), nil, op.keys(), "dev"); err != nil {
+	if err := e.st.RestoreRevocations(ctx, op.keys(), "dev"); err != nil {
+		t.Fatal(err)
+	}
+	if e.st.OverlayCount() != 2 {
+		t.Fatalf("%d entries after the restore, want 2", e.st.OverlayCount())
+	}
+	if err := e.st.SetRevocations(ctx, []json.RawMessage{}, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if e.st.OverlayCount() != 0 {
-		t.Fatalf("%d stale entries survive the startup load", e.st.OverlayCount())
+		t.Fatalf("%d stale entries survive an empty list of envd", e.st.OverlayCount())
 	}
 }
 
@@ -332,7 +339,7 @@ func TestOverlayCorruptStoreStarts(t *testing.T) {
 	if _, err := f.s.db.Exec(`INSERT INTO meta (key, value) VALUES ('revocations', 'not json')`); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.s.SetRevocations(context.Background(), nil, op.keys(), "dev"); err != nil {
+	if err := f.s.RestoreRevocations(context.Background(), op.keys(), "dev"); err != nil {
 		t.Fatalf("a corrupt stored value stops the gateway: %v", err)
 	}
 	if !strings.Contains(f.logs.String(), "revocation_store_corrupt") {
@@ -371,7 +378,7 @@ func TestOverlaySurvivesRestart(t *testing.T) {
 	if overlaid(t, f.s, cell1) {
 		t.Fatal("the overlay answers before its keys are known")
 	}
-	if err := f.s.SetRevocations(ctx, nil, op.keys(), "dev"); err != nil {
+	if err := f.s.RestoreRevocations(ctx, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if !overlaid(t, f.s, cell1) {
@@ -379,7 +386,7 @@ func TestOverlaySurvivesRestart(t *testing.T) {
 	}
 	// Other keys verify nothing, so the stored envelope does not hold the cell.
 	f.reopen()
-	if err := f.s.SetRevocations(ctx, nil, newOperator(t).keys(), "dev"); err != nil {
+	if err := f.s.RestoreRevocations(ctx, newOperator(t).keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if overlaid(t, f.s, cell1) {
@@ -434,7 +441,7 @@ func TestOverlayRetiredCellClears(t *testing.T) {
 	if err := f.apply(g, g.bundle(rev(1, 2), map[string]spec.Revision{cell2: rev(1, 1)}, spec.Retired{Name: cell1, Revision: rev(1, 1)})); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.s.SetRevocations(ctx, nil, op.keys(), "dev"); err != nil {
+	if err := f.s.RestoreRevocations(ctx, op.keys(), "dev"); err != nil {
 		t.Fatal(err)
 	}
 	if overlaid(t, f.s, cell1) {

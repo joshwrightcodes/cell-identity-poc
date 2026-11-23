@@ -60,6 +60,16 @@ type settled struct{ cell, id, why string }
 // when it is stale, and an empty list on its own clears nothing. The call logs each entry that
 // leaves as revocation_settled, and one summary line when the set of refusals changes.
 func (s *Store) SetRevocations(ctx context.Context, envelopes []json.RawMessage, keys []ed25519.PublicKey, env string) error {
+	return s.setRevocations(ctx, envelopes, keys, env, false)
+}
+
+// RestoreRevocations verifies the stored envelopes again under keys for env. It runs at start, when
+// no list of envd exists yet, so it drops no stale entry. The next sync decides that.
+func (s *Store) RestoreRevocations(ctx context.Context, keys []ed25519.PublicKey, env string) error {
+	return s.setRevocations(ctx, nil, keys, env, true)
+}
+
+func (s *Store) setRevocations(ctx context.Context, envelopes []json.RawMessage, keys []ed25519.PublicKey, env string, restore bool) error {
 	s.ov.setMu.Lock()
 	defer s.ov.setMu.Unlock()
 	envelopes, capped := capList(envelopes)
@@ -119,7 +129,7 @@ func (s *Store) SetRevocations(ctx context.Context, envelopes []json.RawMessage,
 				delete(known, cell)
 				continue
 			}
-			if rec, ok := records[cell]; ok && revoke.Stale(e, spec.RecordRevision(rec)) {
+			if rec, ok := records[cell]; ok && !restore && revoke.Stale(e, spec.RecordRevision(rec)) {
 				if _, still := listed[cell]; !still {
 					left = append(left, settled{cell, e.ID, "stale"})
 					delete(known, cell)

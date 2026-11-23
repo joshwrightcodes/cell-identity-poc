@@ -321,8 +321,8 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	}
 	defer st.Close()
 	if len(cfg.operatorKeys) > 0 {
-		// The stored envelopes verify again under the pinned keys, so the overlay survives a restart.
-		if err := st.SetRevocations(ctx, nil, cfg.operatorKeys, cfg.env); err != nil {
+		// The stored envelopes verify again under the pinned keys. A stale entry stays until the next sync of envd.
+		if err := st.RestoreRevocations(ctx, cfg.operatorKeys, cfg.env); err != nil {
 			return err
 		}
 	} else {
