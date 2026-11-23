@@ -38,9 +38,10 @@ shift
 exec "$@"
 `
 
-// m9Pmset answers pmset -g batt with the power source STUB_POWER (default AC Power).
+// m9Pmset answers pmset -g batt with the power source STUB_POWER (default AC Power), and pmset -g log with the file stub/pmset-log.
 const m9Pmset = `#!/usr/bin/env bash
 echo "pmset $*" >>"$STUB_DIR/calls"
+if [[ "$*" == "-g log" ]]; then cat "$STUB_DIR/pmset-log" 2>/dev/null; exit 0; fi
 [[ "$*" == "-g batt" ]] || { echo "unexpected pmset call: $*" >&2; exit 2; }
 printf "Now drawing from '%s'\n -InternalBattery-0 (id=4653155)\t81%%; charged; 0:00 remaining present: true\n" "${STUB_POWER:-AC Power}"
 `

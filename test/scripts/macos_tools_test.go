@@ -132,8 +132,8 @@ func TestBatteryRefused(t *testing.T) {
 	}
 }
 
-// TestMacOnlyToolsGuarded: no script, cell setting or mise task calls caffeinate or pmset outside keep_awake and on_battery in scripts/lib.sh,
-// and each of these two functions checks uname -s and command -v before it calls its tool. A comment may name a tool.
+// TestMacOnlyToolsGuarded: no script, cell setting or mise task calls caffeinate or pmset outside keep_awake, on_battery and sleep_report in scripts/lib.sh,
+// and each of these three functions checks uname -s and command -v before it calls its tool. A comment may name a tool.
 func TestMacOnlyToolsGuarded(t *testing.T) {
 	t.Parallel()
 	tool := regexp.MustCompile(`\b(caffeinate|pmset)\b`)
@@ -155,7 +155,7 @@ func TestMacOnlyToolsGuarded(t *testing.T) {
 		for i, line := range strings.Split(string(b), "\n") {
 			if filepath.Base(f) == "lib.sh" {
 				switch {
-				case line == "keep_awake() {" || line == "on_battery() {":
+				case line == "keep_awake() {" || line == "on_battery() {" || line == "sleep_report() {":
 					fn = strings.TrimSuffix(line, "() {")
 					continue
 				case fn != "" && line == "}":
@@ -167,11 +167,11 @@ func TestMacOnlyToolsGuarded(t *testing.T) {
 				}
 			}
 			if s := strings.TrimSpace(line); !strings.HasPrefix(s, "#") && tool.MatchString(s) {
-				t.Errorf("%s line %d calls a macOS tool outside keep_awake and on_battery of scripts/lib.sh: %s", filepath.Base(f), i+1, s)
+				t.Errorf("%s line %d calls a macOS tool outside keep_awake, on_battery and sleep_report of scripts/lib.sh: %s", filepath.Base(f), i+1, s)
 			}
 		}
 	}
-	for fn, name := range map[string]string{"keep_awake": "caffeinate", "on_battery": "pmset"} {
+	for fn, name := range map[string]string{"keep_awake": "caffeinate", "on_battery": "pmset", "sleep_report": "pmset"} {
 		body := bodies[fn]
 		if len(body) == 0 {
 			t.Errorf("scripts/lib.sh has no function %s", fn)
@@ -186,12 +186,97 @@ func TestMacOnlyToolsGuarded(t *testing.T) {
 				unameAt = i
 			case commandAt < 0 && strings.Contains(s, "command -v "+name):
 				commandAt = i
-			case useAt < 0 && regexp.MustCompile(`\b`+name+` -`).MatchString(s) && !strings.Contains(s, "log "):
+			case useAt < 0 && regexp.MustCompile(`\b`+name+` -`).MatchString(s) && !strings.HasPrefix(s, "log "):
 				useAt = i
 			}
 		}
 		if unameAt < 0 || commandAt < unameAt || useAt < commandAt {
 			t.Errorf("%s must check uname -s, then command -v %s, then call %s (lines %d, %d, %d)", fn, name, name, unameAt, commandAt, useAt)
 		}
+	}
+}
+
+// TestEveryGateKeepsAwakeAndRefusesBattery: gate.sh holds the keep-awake and refuses a start on battery power for a gate other than m9, before the
+// tests, unless GATE_ALLOW_BATTERY=1. A host that is not macOS runs the gate with no caffeinate.
+func TestEveryGateKeepsAwakeAndRefusesBattery(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, milestone, uname, power string
+		allow, refused                bool
+	}{
+		{name: "m1 on battery", milestone: "m1", uname: "Darwin", power: "Battery Power", refused: true},
+		{name: "m5 on battery", milestone: "m5", uname: "Darwin", power: "Battery Power", refused: true},
+		{name: "m1 on battery, allowed", milestone: "m1", uname: "Darwin", power: "Battery Power", allow: true},
+		{name: "m1 on AC power", milestone: "m1", uname: "Darwin", power: "AC Power"},
+		{name: "m1 on Linux", milestone: "m1", uname: "Linux", power: "Battery Power"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := newGateM9Rig(t)
+			env := []string{"STUB_UNAME=" + tc.uname, "STUB_POWER=" + tc.power}
+			if tc.allow {
+				env = append(env, "GATE_ALLOW_BATTERY=1")
+			}
+			_, errOut, code := r.run("gate.sh", env, tc.milestone)
+			calls := r.calls()
+			if strings.Count(calls, "caffeinate -ims bash ") != map[bool]int{true: 1}[tc.uname == "Darwin"] {
+				t.Errorf("caffeinate calls do not match the host %s:\n%s", tc.uname, calls)
+			}
+			if tc.refused {
+				if code == 0 || len(goRuns(calls)) != 0 || !strings.Contains(errOut, "GATE_ALLOW_BATTERY=1") {
+					t.Fatalf("exit %d, %d test runs, stderr %q; want a refusal before the tests", code, len(goRuns(calls)), errOut)
+				}
+				return
+			}
+			if code != 0 || len(goRuns(calls)) != 1 {
+				t.Fatalf("exit %d, %d test runs\nstderr %s", code, len(goRuns(calls)), errOut)
+			}
+		})
+	}
+}
+
+// TestGateReportsSleeps: at the end of a gate that passes, fails, or runs the m9 tier, gate.sh prints the Sleep and DarkWake lines that
+// pmset -g log recorded since the start, and leaves out the lines before the start and the other events. It says so when there is none.
+func TestGateReportsSleeps(t *testing.T) {
+	t.Parallel()
+	const pmLog = "2000-01-01 00:00:00 +0000 Sleep               \tEntering Sleep state due to 'Clamshell Sleep' OLD\n" +
+		"2999-01-01 00:00:00 +0000 Sleep               \tEntering Sleep state due to 'Clamshell Sleep' NEWSLEEP\n" +
+		"2999-01-01 00:19:00 +0000 DarkWake            \tDarkWake from Deep Idle NEWDARK\n" +
+		"2999-01-01 00:20:00 +0000 Assertions          \tPID 1 Created caffeinate NEWOTHER\n"
+	const oldOnly = "2000-01-01 00:00:00 +0000 Sleep               \tEntering Sleep state OLD\n"
+	for _, tc := range []struct {
+		name, milestone, uname, log string
+		fail, want, none            bool
+	}{
+		{name: "m1 passes", milestone: "m1", uname: "Darwin", log: pmLog, want: true},
+		{name: "m1 fails", milestone: "m1", uname: "Darwin", log: pmLog, fail: true, want: true},
+		{name: "m1 with no sleep", milestone: "m1", uname: "Darwin", log: oldOnly, none: true},
+		{name: "m9 passes", milestone: "m9", uname: "Darwin", log: pmLog, want: true},
+		{name: "m1 on Linux", milestone: "m1", uname: "Linux", log: pmLog},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r := newGateM9Rig(t)
+			r.state("pmset-log", tc.log)
+			env := []string{"STUB_UNAME=" + tc.uname}
+			if tc.fail {
+				env = append(env, "STUB_FAIL_TESTS=M1")
+			}
+			_, errOut, code := r.run("gate.sh", env, tc.milestone)
+			if (code != 0) != tc.fail {
+				t.Fatalf("exit %d, want a failure: %v\n%s", code, tc.fail, errOut)
+			}
+			if got := strings.Contains(errOut, "NEWSLEEP") && strings.Contains(errOut, "NEWDARK"); got != tc.want {
+				t.Errorf("sleep lines printed %v, want %v\n%s", got, tc.want, errOut)
+			}
+			for _, bad := range []string{"OLD", "NEWOTHER"} {
+				if strings.Contains(errOut, bad) {
+					t.Errorf("stderr prints %s, which is not a sleep since the start\n%s", bad, errOut)
+				}
+			}
+			if said := strings.Contains(errOut, "shows no sleep"); said != tc.none {
+				t.Errorf("stderr says no sleep: %v, want %v\n%s", said, tc.none, errOut)
+			}
+		})
 	}
 }

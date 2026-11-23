@@ -60,7 +60,7 @@ echo "scan $*" >>"$STUB_LOG"
 		h = "1"
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m7")
-	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + stale, "STUB_HIT=" + h,
 		"STUB_REGISTRY_ENV=" + registryEnv}
 	if registryEnv == "" {

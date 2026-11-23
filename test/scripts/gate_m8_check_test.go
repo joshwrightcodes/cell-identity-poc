@@ -59,7 +59,7 @@ echo "scan $*" >>"$STUB_LOG"
 		h = "1"
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m8")
-	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + stale, "STUB_HIT=" + h}, env...)
 	b, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -231,7 +231,7 @@ func runGateM8WithRecord(t *testing.T, env []string) (out, calls, root string, e
 		t.Fatal(err)
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m8")
-	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE="}, env...)
 	b, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(filepath.Join(root, "calls"))

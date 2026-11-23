@@ -1005,7 +1005,8 @@ The manual drills `gate:m4:rotate`, `gate:m5:soak` and `gate:m5:drill` do not ru
 The slow tier needs these conditions for its whole run:
 
 - The Mac runs on AC power, with the lid open or an external display connected.
-- The keep-awake runs. `gate:m9` and `poc:gate` start it themselves, but macOS still sleeps when the lid closes on battery power.
+- The keep-awake runs. Every `gate:*` task and `poc:gate` start it themselves, and macOS still sleeps when the lid closes on battery power.
+  At the end of each gate, pass or fail, the run prints the sleep and wake lines that the macOS power log recorded since the start, so a report shows a sleep.
 - The owner unlocked the secret CLI.
 
 The Colima VM clocks stop while the Mac sleeps, and `istio-agent` renews on the monotonic clock.

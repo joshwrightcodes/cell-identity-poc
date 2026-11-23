@@ -1544,8 +1544,8 @@ svid_ttl_settled() {
 }
 
 # keep_awake "$@" keeps a Mac awake for the rest of the script. On macOS it runs the script again, once, as caffeinate -ims bash "$0" "$@",
-# with POC_KEEP_AWAKE=1 exported as the guard, so the second run goes on at once and never runs it again. caffeinate holds no assertion
-# against a closed lid, so the lid stays open. On macOS without caffeinate it fails. On another system it logs and returns. Call it with the
+# with POC_KEEP_AWAKE=1 exported as the guard, so the second run goes on at once and never runs it again. On AC power, the -s flag keeps the
+# Mac awake with the lid closed. On battery power it does not, so refuse_battery stops a run there. On macOS without caffeinate it fails. On another system it logs and returns. Call it with the
 # arguments of the script, before the script changes its directory.
 keep_awake() {
   if [[ "$(uname -s)" != Darwin ]]; then
@@ -1570,6 +1570,21 @@ on_battery() {
   command -v pmset >/dev/null 2>&1 || return 1
   out="$(pmset -g batt 2>/dev/null)" || return 1
   [[ "$out" == *"'Battery Power'"* ]]
+}
+
+# sleep_report <since> prints the Sleep and DarkWake lines that pmset -g log recorded at or after <since>, a local time as YYYY-MM-DD HH:MM:SS,
+# and says when it found none. It prints to standard error, and it does nothing on another system, on macOS without pmset, and when pmset fails.
+sleep_report() {
+  local since="$1" out found
+  [[ "$(uname -s)" == Darwin ]] || return 0
+  command -v pmset >/dev/null 2>&1 || return 0
+  out="$(pmset -g log 2>/dev/null)" || return 0
+  found="$(awk -v since="$since" '($4 == "Sleep" || $4 == "DarkWake") && ($1 " " $2) >= since' <<<"$out")"
+  if [[ -n "$found" ]]; then
+    printf 'WARN: the Mac slept or woke during this run, so it is not a record. pmset -g log since %s:\n%s\n' "$since" "$found" >&2
+  else
+    log "pmset -g log shows no sleep since $since"
+  fi
 }
 
 # refuse_battery stops the script when the Mac runs on battery power, unless GATE_ALLOW_BATTERY=1. macOS sleeps when the lid closes on

@@ -63,14 +63,14 @@ func TestGateScriptUsesDerivedTimeout(t *testing.T) {
 func TestGateNeedsTheBuildOutput(t *testing.T) {
 	t.Parallel()
 	build := t.TempDir()
-	_, errOut, code := runScript(t, "gate.sh", withLive(nil), []string{"POC_BUILD_ROOT=" + build}, "m4")
+	_, errOut, code := runScript(t, "gate.sh", withLive(nil), []string{"POC_BUILD_ROOT=" + build, "POC_KEEP_AWAKE=1"}, "m4")
 	if code != 1 || !strings.Contains(errOut, "images.env is missing") || !strings.Contains(errOut, "cp <that checkout>/build/images.env") {
 		t.Fatalf("exit %d, stderr %q; want a failure that names build/images.env and the copy command", code, errOut)
 	}
 	if err := os.WriteFile(filepath.Join(build, "images.env"), []byte("# commit x\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, errOut, code = runScript(t, "gate.sh", withLive(nil), []string{"POC_BUILD_ROOT=" + build}, "m4")
+	_, errOut, code = runScript(t, "gate.sh", withLive(nil), []string{"POC_BUILD_ROOT=" + build, "POC_KEEP_AWAKE=1"}, "m4")
 	if code != 1 || !strings.Contains(errOut, "is missing. Copy it from the checkout") || !strings.Contains(errOut, "cp -R <that checkout>/build/") {
 		t.Fatalf("exit %d, stderr %q; want a failure that names the cluster directory", code, errOut)
 	}

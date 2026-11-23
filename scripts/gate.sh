@@ -11,7 +11,8 @@
 # dev-cp and in each live cell added, then the tests with -short, which skips the long tests, unless GATE_M8_LONG=1. A run whose tests pass removes
 # build/gate/m8-bundles, the record of the targets that a test changed. A failed run keeps it, and gate-m8-repair.sh --check then fails.
 # After the tests, m5, m5-soak, m5-drill, m6, m6-provision, m7 and m8 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
-# m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: keep_awake, the battery check, gate-m6-repair.sh, gate-m7-repair.sh,
+# Every gate runs under keep_awake, refuses battery power, and prints the Sleep and DarkWake lines of pmset -g log since its start.
+# m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: gate-m6-repair.sh, gate-m7-repair.sh,
 # gate-m8-repair.sh and gate-m9-repair.sh with --check, the image check of m8 with agent-ban in spire-server-0 of dev-cp, cell-proxy of the
 # mesh-view tunnel in each cell and the three cell-proxy servers of management added, svid-ttl.sh set at the slow-tier lifetime, and a token
 # scan from the start of the gate. Then each M9 test in its own go test invocation with -failfast, its own events file build/gate-m9-<test>.json and a token scan from its own start. It
@@ -24,11 +25,18 @@
 # The run fails when it takes longer than GATE_<MILESTONE>_BUDGET_MINUTES in harness/versions.env.
 source "$(dirname "$0")/lib.sh"
 
-# The slow tier runs overnight, so on macOS gate m9 runs again under keep_awake, and it does not start on battery power.
-if [[ "${1:-}" == m9 ]]; then
-  keep_awake "$@"
-  refuse_battery
-fi
+# On macOS every gate runs again under keep_awake, and it does not start on battery power. A sleep of the Mac stops the VM and every cluster.
+keep_awake "$@"
+refuse_battery
+gate_clock_start="$(date '+%Y-%m-%d %H:%M:%S')"
+# gate_sleep_exit prints the sleeps that pmset recorded since the start, after a pass and after a failure.
+gate_sleep_exit() {
+  local rc=$?
+  trap - EXIT
+  sleep_report "$gate_clock_start"
+  exit "$rc"
+}
+trap gate_sleep_exit EXIT
 
 cd "$ROOT"
 # A caller value of GATE_M9_SVID_TTL wins over harness/versions.env, and the value of the file stays the record value.
@@ -294,6 +302,7 @@ if [[ "$milestone" == m9 ]]; then
     fi
     elapsed=$(($(date +%s) - m9_start))
     log "gate m9 took ${elapsed}s, from Phase 0 to the end of Phase 7"
+    sleep_report "$gate_clock_start"
     [[ -z "$not_record" ]] || printf 'gate m9: not a slow-tier record: %s\n' "$not_record" >&2
     if ((elapsed > GATE_M9_BUDGET_MINUTES * 60)); then
       printf 'FAIL: gate m9 took %ss, over the budget of %s minutes\n' "$elapsed" "$GATE_M9_BUDGET_MINUTES" >&2
