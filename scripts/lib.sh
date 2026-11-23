@@ -1572,8 +1572,8 @@ on_battery() {
   [[ "$out" == *"'Battery Power'"* ]]
 }
 
-# sleep_report <since> prints the Sleep and DarkWake lines that pmset -g log recorded at or after <since>, a local time as YYYY-MM-DD HH:MM:SS,
-# and says when it found none. It prints to standard error.
+# sleep_report <since> prints the Sleep and DarkWake lines of `pmset -g log` from <since> on.
+# <since> is a local time in the form YYYY-MM-DD HH:MM:SS. The function prints to standard error and says when it finds no line.
 # It does nothing on another system, on macOS without pmset, and when pmset fails.
 sleep_report() {
   local since="$1" out found

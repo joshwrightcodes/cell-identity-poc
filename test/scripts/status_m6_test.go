@@ -150,7 +150,7 @@ func TestStatusProvisioning(t *testing.T) {
 			{name: "a heartbeat older than 2 minutes", cluster: "dev-cell-2",
 				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "creating", heartbeat: 3 * time.Minute, stage: 4 * time.Minute}},
 				env:  []string{"STUB_MGMT_STATUS=" + openStepPlane(id), stepStatusAt(20 * time.Second)},
-				want: []string{"step " + id + " of dev-cell-2 is in the stage creating", "heartbeat is 18", "Run: mise run hostsvc:serve -- restart --force"}},
+				want: []string{"step " + id + " of dev-cell-2 is in the stage creating", "seconds old, which is more than 2 minutes", "Run: mise run hostsvc:serve -- restart --force"}},
 			{name: "a stage past its timeout plus 5 minutes", cluster: "dev-cell-2",
 				rows: []journalRow{{id: id, cell: "dev-cell-2", state: "bootstrapping", heartbeat: 10 * time.Second, stage: 51 * time.Minute}},
 				env:  []string{"STUB_MGMT_STATUS=" + openStepPlane(id), stepStatusAt(20 * time.Second)},

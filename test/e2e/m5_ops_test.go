@@ -71,6 +71,12 @@ func enqueueSigned(t *testing.T, cell string, envelope []byte, replay bool) {
 // cannot excuse a record that was reported too early. It returns the states that it saw, in order.
 func waitOpReported(t *testing.T, cell, id string, timeout time.Duration) []string {
 	t.Helper()
+	return waitOpReportedAs(t, cell, id, timeout, op.OutcomeApplied)
+}
+
+// waitOpReportedAs is waitOpReported with the final results that a reported record accepts at mgmtd.
+func waitOpReportedAs(t *testing.T, cell, id string, timeout time.Duration, finals ...string) []string {
+	t.Helper()
 	var seen []string
 	waitFor(t, "the record op-"+id+" in "+cell+" to be reported", timeout, func() (bool, string) {
 		state := opRecordState(t, cell, id)
@@ -79,8 +85,8 @@ func waitOpReported(t *testing.T, cell, id string, timeout time.Duration) []stri
 		}
 		v := opGet(t, id)
 		if state == "reported" {
-			if v.Final != op.OutcomeApplied {
-				t.Fatalf("the record op-%s in %s is reported, and mgmtd shows the operation as state %q final %q, want applied", id, cell, v.State, v.Final)
+			if !slices.Contains(finals, v.Final) {
+				t.Fatalf("the record op-%s in %s is reported, and mgmtd shows the operation as state %q final %q, want one of %q", id, cell, v.State, v.Final, finals)
 			}
 			return true, ""
 		}
