@@ -1086,23 +1086,33 @@ func TestStatusReportsTheGatewayAndSignedWork(t *testing.T) {
 
 	for _, tc := range []struct {
 		name string
-		env  []string
+		env  func() []string
 	}{
-		{"envd synced 90 seconds ago is within 2 minutes", gw(func(m map[string]any) { m["syncedAt"] = timeAgo(90 * time.Second) })},
-		{"an outbox item of 1 minute is a wait", gw(func(m map[string]any) { m["outboxItems"] = 1; m["oldestOutboxAt"] = timeAgo(time.Minute) })},
-		{"a drop 20 minutes ago is history", gw(func(m map[string]any) { m["dropped"] = 1; m["droppedAt"] = timeAgo(20 * time.Minute) })},
-		{"a refused old record 20 minutes ago is history", gw(func(m map[string]any) { m["recordOld"] = 1; m["recordOldAt"] = timeAgo(20 * time.Minute) })},
-		{"three claims are no concern", gw(func(m map[string]any) {
-			m["mostClaimed"] = map[string]any{"dev-cell-1": map[string]any{"opId": "feedfacefeedfacefeedfacefeedface", "count": 3}}
-		})},
-		{"800 records are within the limit", plane(cellOf(map[string]any{"records": 800}))},
-		{"an unreported item of 4 minutes is a wait", plane(cellOf(map[string]any{"unreported": 1, "oldestUnreportedAt": timeAgo(4 * time.Minute)}))},
-		{"an operation that expired 20 minutes ago is history", append(plane(nil), op("expired", "", 20*time.Minute)...)},
-		{"an expired operation with a final result is closed", append(plane(nil), op("final", "refused", 5*time.Minute)...)},
-		{"an open operation is fine", append(plane(nil), op("open", "", 0)...)},
+		{"envd synced 90 seconds ago is within 2 minutes", func() []string { return gw(func(m map[string]any) { m["syncedAt"] = timeAgo(90 * time.Second) }) }},
+		{"an outbox item of 1 minute is a wait", func() []string {
+			return gw(func(m map[string]any) { m["outboxItems"] = 1; m["oldestOutboxAt"] = timeAgo(time.Minute) })
+		}},
+		{"a drop 20 minutes ago is history", func() []string {
+			return gw(func(m map[string]any) { m["dropped"] = 1; m["droppedAt"] = timeAgo(20 * time.Minute) })
+		}},
+		{"a refused old record 20 minutes ago is history", func() []string {
+			return gw(func(m map[string]any) { m["recordOld"] = 1; m["recordOldAt"] = timeAgo(20 * time.Minute) })
+		}},
+		{"three claims are no concern", func() []string {
+			return gw(func(m map[string]any) {
+				m["mostClaimed"] = map[string]any{"dev-cell-1": map[string]any{"opId": "feedfacefeedfacefeedfacefeedface", "count": 3}}
+			})
+		}},
+		{"800 records are within the limit", func() []string { return plane(cellOf(map[string]any{"records": 800})) }},
+		{"an unreported item of 4 minutes is a wait", func() []string {
+			return plane(cellOf(map[string]any{"unreported": 1, "oldestUnreportedAt": timeAgo(4 * time.Minute)}))
+		}},
+		{"an operation that expired 20 minutes ago is history", func() []string { return append(plane(nil), op("expired", "", 20*time.Minute)...) }},
+		{"an expired operation with a final result is closed", func() []string { return append(plane(nil), op("final", "refused", 5*time.Minute)...) }},
+		{"an open operation is fine", func() []string { return append(plane(nil), op("open", "", 0)...) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			byName, _, _, code := runStatus(t, tc.env...)
+			byName, _, _, code := runStatus(t, tc.env()...)
 			if code != 0 {
 				t.Errorf("exit %d, want 0: %v %v", code, byName["dev-cp"]["problems"], byName["management"]["problems"])
 			}
