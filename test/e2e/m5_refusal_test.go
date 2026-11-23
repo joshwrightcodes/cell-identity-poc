@@ -123,9 +123,10 @@ func (c *opCloser) run(t *testing.T) {
 	for _, d := range c.drains {
 		waitRowDone(t, d.cell, d.id)
 	}
+	// envd relays the result of celld to mgmtd every 10 s, so the result can make the operation final between the read and the close.
 	for _, id := range c.ids {
 		if opGet(t, id).State != "final" {
-			if out, err := mgmtCtlErr("op", "close", id); err != nil {
+			if out, err := mgmtCtlErr("op", "close", id); err != nil && opGet(t, id).State != "final" {
 				t.Errorf("could not close the operation %s: %v %s", id, err, out)
 			}
 		}
