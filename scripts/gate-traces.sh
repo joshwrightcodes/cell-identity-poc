@@ -63,9 +63,70 @@ store_forward_stop() {
 # The entries test publishes a signed set with a test entry under /m2-test/, and then the live set again. Only root has a tag.
 BUNDLE_TEST_PATH=/m2-test/
 
-# republish_bundles <cluster> publishes the hydrated set of the cluster through the signed path and waits for its result.
+# open_set <target> prints "<op ID> <expiry>" when the last signed set of the target is served, has no final result and has not expired, and nothing
+# otherwise. A target that has no set yet gives nothing.
+open_set() {
+  local got err
+  err="$(mktemp)"
+  if ! got="$(mise run bundle -- get --target "$1" 2>"$err")"; then
+    # Only the answer bundle_unknown means that the target has no set. Any other failure can hide an open set.
+    if grep -q bundle_unknown "$err" || grep -q bundle_unknown <<<"$got"; then rm -f "$err"; return 0; fi
+    echo "error: could not read the last set of $1: $(tail -n 1 "$err")" >&2
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  jq -r --argjson now "$(date +%s)" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
+    select(.served == true and (.result // null) == null and ((.expiresAt // "") | ts) > $now) | "\(.opId) \(.expiresAt)"' <<<"$got" 2>/dev/null || true
+}
+
+# wait_no_open_set <target> waits until mgmtd holds no open set of the target. GATE_OPEN_WAIT_SECONDS bounds the wait (default 2100).
+wait_no_open_set() {
+  local target="$1" end open
+  end=$((SECONDS + ${GATE_OPEN_WAIT_SECONDS:-2100}))
+  while :; do
+    open="$(open_set "$target")" || return 1
+    [[ -z "$open" ]] && return 0
+    if ((SECONDS >= end)); then
+      echo "the set ${open% *} of $target is open until ${open#* }, and mgmtd refuses a new set until it ends (bundle_open)" >&2
+      return 1
+    fi
+    log "waiting for the open set ${open% *} of $target (until ${open#* })"
+    sleep "${GATE_OPEN_POLL:-5}"
+  done
+}
+
+# republish_bundles <cluster> waits for an open set to end, then publishes the last hydrated set of the cluster through the signed
+# path and waits for its result.
 republish_bundles() {
+  wait_no_open_set "$1" || return 1
   (cd "$ROOT" && mise run bundle -- publish --target "$1" --wait)
+}
+
+# cp_apps_at_published <cluster> succeeds when every Application is Synced and Healthy, root synced the root of published.env, and
+# spire-server pins and synced the digest of published.env.
+cp_apps_at_published() {
+  local apps
+  apps="$(applications_json kubectl --context "kind-$1")" || return 1
+  jq -e --arg root "$(published_digest "$1" root)" --arg spire "$(published_digest "$1" spire-server)" '
+    (.items | length) > 0
+    and all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")
+    and any(.items[]; .metadata.name == "root" and .status.sync.revision == $root)
+    and any(.items[]; .metadata.name == "spire-server" and .spec.source.targetRevision == $spire and .status.sync.revision == $spire)' <<<"$apps"
+}
+
+# restore_bundles <cluster> acts on the state of the bundles of the cluster. A trace of the entries test (see bundle_traces) leads to a
+# signed publish of the last hydrated set. With no trace, Applications that are not Synced and Healthy get a hard refresh of root. With
+# no trace and good Applications it changes nothing.
+restore_bundles() {
+  local cluster="$1" traces
+  traces="$(bundle_traces "$cluster")" || { echo "$traces" >&2; return 1; }
+  if [[ -n "$traces" ]]; then
+    log "publishing the last hydrated set of $cluster through the signed path"
+    republish_bundles "$cluster" || return 1
+  elif ! cp_apps_at_published "$cluster" >/dev/null 2>&1; then
+    kubectl --context "kind-$cluster" -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null || return 1
+  fi
 }
 
 # published_digest <cluster> <bundle> prints the digest that the last cell:publish pushed.

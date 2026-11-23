@@ -444,7 +444,8 @@ func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
 // call that writes to the store or moves a tag.
 func TestRepublishBundlesUsesSignedPublish(t *testing.T) {
 	t.Parallel()
-	snippet := `mise() { echo "mise $*" >>"$STUB_LOG"; return "${STUB_MISE_RC:-0}"; }
+	snippet := `open_set() { :; }
+mise() { echo "mise $*" >>"$STUB_LOG"; return "${STUB_MISE_RC:-0}"; }
 oras() { echo "oras $*" >>"$STUB_LOG"; }
 republish_bundles dev-cp`
 	log := filepath.Join(t.TempDir(), "log")
@@ -470,7 +471,50 @@ func TestM2RepairStepOneUsesSignedPublish(t *testing.T) {
 	if strings.Contains(script, "oras ") {
 		t.Error("scripts/gate-m2-repair.sh still calls oras")
 	}
-	if !strings.Contains(script, "republish_bundles") {
-		t.Error("scripts/gate-m2-repair.sh does not call republish_bundles")
+	if !strings.Contains(script, "restore_bundles") {
+		t.Error("scripts/gate-m2-repair.sh does not call restore_bundles")
+	}
+}
+
+// restore_bundles decides step 1 of gate-m2-repair.sh: a trace leads to a signed publish, no trace with good Applications leads to no
+// change, and no trace with an Application that is not Synced and Healthy leads to a hard refresh of root and no publish.
+func TestRestoreBundlesDecision(t *testing.T) {
+	t.Parallel()
+	snippet := `bundle_traces() { printf '%s' "$STUB_TRACES"; }
+cp_apps_at_published() { return "${STUB_APPS_RC:-0}"; }
+republish_bundles() { echo "publish $1" >>"$STUB_LOG"; }
+kubectl() { echo "kubectl $*" >>"$STUB_LOG"; }
+restore_bundles dev-cp`
+	for _, tc := range []struct {
+		name, traces, appsRC, want string
+	}{
+		{"a trace and good Applications", "root:current differs", "0", "publish dev-cp\n"},
+		{"a trace and bad Applications", "a test entry", "1", "publish dev-cp\n"},
+		{"no trace and good Applications", "", "0", ""},
+		{"no trace and an Application not Healthy", "", "1", "kubectl --context kind-dev-cp -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite\n"},
+	} {
+		log := filepath.Join(t.TempDir(), "log")
+		out, err := runLib(t, nil, snippet, "STUB_LOG="+log, "STUB_TRACES="+tc.traces, "STUB_APPS_RC="+tc.appsRC)
+		calls, _ := os.ReadFile(log)
+		if err != nil || string(calls) != tc.want {
+			t.Errorf("%s: err %v, output %q, calls %q; want calls %q", tc.name, err, out, calls, tc.want)
+		}
+	}
+}
+
+// republish_bundles waits while a set is open, and fails with bundle_open when the set stays open.
+func TestRepublishBundlesWaitsForOpenSet(t *testing.T) {
+	t.Parallel()
+	snippet := `open_set() { echo x >>"$STUB_LOG.polls"; (($(wc -l <"$STUB_LOG.polls") < 3)) && echo "op1 later"; return 0; }
+mise() { echo "mise $*" >>"$STUB_LOG"; }
+republish_bundles dev-cp; echo "polls $(wc -l <"$STUB_LOG.polls" | tr -d " ")"`
+	log := filepath.Join(t.TempDir(), "log")
+	out, err := runLib(t, nil, snippet, "STUB_LOG="+log, "GATE_OPEN_POLL=0")
+	if err != nil || !strings.Contains(out, "polls 3") {
+		t.Fatalf("err %v, output %q; want three reads of the open set", err, out)
+	}
+	out, err = runLib(t, nil, `open_set() { echo "op1 later"; }; republish_bundles dev-cp`, "STUB_LOG="+log, "GATE_OPEN_POLL=0", "GATE_OPEN_WAIT_SECONDS=0")
+	if err == nil || !strings.Contains(out, "bundle_open") {
+		t.Fatalf("err %v, output %q; want a failure that names bundle_open", err, out)
 	}
 }

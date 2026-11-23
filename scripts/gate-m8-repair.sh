@@ -54,23 +54,6 @@ state_of() {
     || die "could not read ConfigMap bundle-state of $1"
 }
 
-# open_set <target> prints "<op ID> <expiry>" when the last signed set of the target is served, has no final result and has not expired, and nothing
-# otherwise. A target that has no set yet gives nothing.
-open_set() {
-  local got err
-  err="$(mktemp)"
-  if ! got="$(mise run bundle -- get --target "$1" 2>"$err")"; then
-    # Only the answer bundle_unknown means that the target has no set. Any other failure can hide an open set.
-    if grep -q bundle_unknown "$err" || grep -q bundle_unknown <<<"$got"; then rm -f "$err"; return 0; fi
-    echo "error: could not read the last set of $1: $(tail -n 1 "$err")" >&2
-    rm -f "$err"
-    return 1
-  fi
-  rm -f "$err"
-  jq -r --argjson now "$(date +%s)" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
-    select(.served == true and (.result // null) == null and ((.expiresAt // "") | ts) > $now) | "\(.opId) \(.expiresAt)"' <<<"$got" 2>/dev/null || true
-}
-
 # probes prints "<cluster> <name>" for each probe of M8: a namespace, and application/<name> for an Application.
 probes() {
   local cluster names name

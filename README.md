@@ -1872,6 +1872,7 @@ It is safe to run again.
 
 - It serves two signed sets of `dev-cp` through `mgmtd`: one with an entry under `/m2-test/`, for about two minutes, and then the live set again.
   It needs `mgmtd` and the registry mirror, as `gate:m8` does.
+  A passing run removes its line from `build/gate/m8-bundles`. A failed run leaves the line, and `gate:m8:repair` then publishes the set of `dev-cp` again.
 - It replaces the `celld` pod in each cell, so the SPIRE server keeps about six old agent entries until it prunes them, one hour after they expire.
 - It removes the `celld-token` RoleBinding of `dev-cell-2` for about a minute, and then applies it again from the harness bundle.
 - It edits the API server manifest of `dev-cell-1` on the node and signs tokens with a test key for two to three minutes.

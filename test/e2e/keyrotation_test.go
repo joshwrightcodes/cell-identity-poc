@@ -147,12 +147,12 @@ func addSigningKey(manifest string) (string, error) {
 // a projected token from the test key, and the controllers create those pods again.
 func repairAPIServer(t *testing.T) {
 	t.Helper()
-	// The bound is the fixed waits of the script plus the replaced pods. Fixed waits of gate-m2-repair.sh: 300 s (Applications), 120 s
+	// The bound is the fixed waits of the script plus the replaced pods. Fixed waits of gate-m2-repair.sh: 900 s (the signed publish of step 1, BUNDLE_WAIT_SECONDS; it runs only when step 1 finds a trace, and the wait for an open set is not counted), 300 s (Applications), 120 s
 	// (SPIRE entries), 240 s (one key), 240 s (API server restart), 330 s (control plane), 180 s (every workload) and 2 x 61 s (key
-	// check retries) are 1532 s. A pod replacement takes up to 183 s: 60 s for the delete, 3 s of sleep and 120 s until ready. Only the
-	// pods that started while the test key signed carry its token, so the bound allows five. 1532 s + 5 x 183 s = 2447 s, 41 minutes.
+	// check retries) are 2432 s. A pod replacement takes up to 183 s: 60 s for the delete, 3 s of sleep and 120 s until ready. Only the
+	// pods that started while the test key signed carry its token, so the bound allows five. 2432 s + 5 x 183 s = 3347 s, 56 minutes.
 	// On a timeout the whole process group ends, so no kubectl or docker child of the script stays behind.
-	const repairBound = (1532 + 5*183) * time.Second
+	const repairBound = (2432 + 5*183) * time.Second
 	// cmdrun.Run starts the repair in its own process group, forwards INT and TERM of the test process to it (so a Ctrl-C reaches the
 	// script and its EXIT trap frees the repair lock), and ends the group with TERM and then KILL at the bound.
 	res, err := cmdrun.Run(repairBound, "", nil, "bash", "../../scripts/gate-m2-repair.sh")

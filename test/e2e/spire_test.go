@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -81,15 +82,41 @@ func TestM2EntriesReconcile(t *testing.T) {
 	if used := entriesUnder(t, spireTestPath); len(used) > 0 {
 		t.Fatalf("want no entry under spiffe://%s%s before the test, got %v. %s", spireTD, spireTestPath, used, repairHint)
 	}
-	if st := m8State(t, spireCluster); st.Source != "signed" {
-		t.Fatalf("the bundle state of %s has source %q, want signed", spireCluster, st.Source)
+	if st := m8State(t, spireCluster); st.Source != "signed" || st.State != "healthy" {
+		t.Fatalf("the bundle state of %s has source %q and state %q, want signed and healthy. Run: mise run gate:m8:repair", spireCluster, st.Source, st.State)
 	}
-	m8RestoreOnFailure(t, spireCluster)
+	// This cleanup runs last. A passing run removes the record that m8RestoreOnFailure adds, because a pass leaves nothing to repair and
+	// the prechecks of gate:m8 refuse a listed target. A failed run keeps it.
+	known, _ := os.ReadFile(m8BundlesFile)
+	wasListed := slices.Contains(strings.Fields(string(known)), spireCluster)
 	t.Cleanup(func() {
-		if left := entriesUnder(t, spireTestPath); len(left) > 0 {
-			t.Errorf("want no entry under spiffe://%s%s after the test, got %v. %s", spireTD, spireTestPath, left, repairHint)
+		now, err := os.ReadFile(m8BundlesFile)
+		if err != nil {
+			return
+		}
+		if after := m2RecordAfter(string(now), spireCluster, wasListed, !t.Failed()); after != string(now) {
+			if err := os.WriteFile(m8BundlesFile, []byte(after), 0o644); err != nil {
+				t.Errorf("update %s: %v", m8BundlesFile, err)
+			}
 		}
 	})
+	// The entry check runs after the failure restore of m8RestoreOnFailure, which is registered below.
+	t.Cleanup(func() {
+		waitFor(t, "no entry under spiffe://"+spireTD+spireTestPath+" after the test. "+repairHint, entryWait, func() (bool, string) {
+			left, err := showEntries(t, "")
+			if err != nil {
+				return false, err.Error()
+			}
+			var under []spireEntry
+			for _, e := range left {
+				if e.SPIFFEID.TrustDomain == spireTD && strings.HasPrefix(e.SPIFFEID.Path, spireTestPath) {
+					under = append(under, e)
+				}
+			}
+			return len(under) == 0, fmt.Sprintf("%v", under)
+		})
+	})
+	m8RestoreOnFailure(t, spireCluster)
 
 	live := m8LiveSet(t, spireCluster)
 	origSpire := m8LiveDigest(live, spireApp)
