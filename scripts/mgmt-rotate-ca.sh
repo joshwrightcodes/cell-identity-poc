@@ -145,6 +145,17 @@ wait_for_copies() {
   done
 }
 
+# stale_copies <copies> prints the copies that hold a root which the live bundle does not hold.
+stale_copies() {
+  local want cluster ns name key got
+  want="$(bundle_blocks)" || die "could not read the bundle of $CELL_NAME"
+  while read -r cluster ns name key; do
+    [[ -n "$cluster" ]] || continue
+    got="$(kubectl --context "kind-$cluster" -n "$ns" get configmap "$name" -o json | jq -r --arg key "${key:-root.crt}" '.data[$key] // ""' | pem_blocks)"
+    [[ -z "$(comm -23 <(printf '%s\n' "$got") <(printf '%s\n' "$want"))" ]] || echo "$cluster $ns/$name"
+  done <<<"$1"
+}
+
 # manual <kind> <verb> <authority ID> prints the command that runs one authority step by hand.
 manual() {
   printf 'mise x -- kubectl --context kind-%s -n spire-system exec spire-server-0 -c spire-server -- /opt/spire/bin/spire-server localauthority %s %s -socketPath /run/spire/sockets/api.sock -authorityID %s' \
@@ -198,7 +209,14 @@ read_state
 # SPIRE prepares into the slot that holds the old authority, so a prepare before the old authority
 # is revoked would leave its root trusted until it expires. A run that stopped after the activate
 # goes on from the taint or the revoke, and prepares nothing.
-if [[ "$(old_status x509)" == *tainted || "$(old_status jwt)" == *tainted ]]; then
+resume_refresh=0
+if [[ -z "$(slot x509 prepared)" && -z "$(slot jwt prepared)" && "$(old_status x509)" != *tainted && "$(old_status jwt)" != *tainted ]]; then
+  stale="$(stale_copies "$holders")"
+  [[ -z "$stale" ]] || resume_refresh=1
+fi
+if ((resume_refresh)); then
+  log "the new authorities are active and the old ones are revoked, but these copies hold an old root: $(paste -sd, - <<<"$stale" | sed 's/,/, /g'). This run finishes step 5, the refresh of the copies, and prepares nothing"
+elif [[ "$(old_status x509)" == *tainted || "$(old_status jwt)" == *tainted ]]; then
   log "an earlier rotation left old authorities to revoke (X.509 $(old_status x509), JWT $(old_status jwt)). This run finishes that rotation, and prepares nothing"
 else
   for kind in x509 jwt; do
