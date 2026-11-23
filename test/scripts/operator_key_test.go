@@ -626,6 +626,9 @@ func TestCreateRefusesSecondKey(t *testing.T) {
 		{"management_down", func(*opRig) {}, []string{"STUB_DOWN=kind-management"}, "operator-pub"},
 		{"no_prefix", func(*opRig) {}, []string{"POC_OPERATOR_KEY="}, "POC_OPERATOR_KEY"},
 		{"no_write_command", func(*opRig) {}, []string{"POC_SECRET_WRITE_CMD="}, "POC_SECRET_WRITE_CMD"},
+		{"dash_prefix", func(*opRig) {}, []string{"POC_OPERATOR_KEY=-o"}, "POC_OPERATOR_KEY"},
+		{"hash_prefix", func(*opRig) {}, []string{"POC_OPERATOR_KEY=poc#operator"}, "POC_OPERATOR_KEY"},
+		{"quote_prefix", func(*opRig) {}, []string{`POC_OPERATOR_KEY=poc"operator`}, "POC_OPERATOR_KEY"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1470,6 +1473,27 @@ func TestRemoteKeyNameIsValidated(t *testing.T) {
 				if !strings.Contains(errOut+out, "remote key") {
 					t.Fatalf("no message about the remote key name:\n%s\n%s", out, errOut)
 				}
+			})
+		}
+	}
+}
+
+// TestRotateRefusesUnsafePrefix: rotate refuses a POC_OPERATOR_KEY that a later read refuses, before it reaches the secret manager.
+func TestRotateRefusesUnsafePrefix(t *testing.T) {
+	t.Parallel()
+	for _, prefix := range []string{"-o", "poc#operator", `poc"operator`} {
+		for _, mode := range [][]string{{"rotate"}, {"rotate", "--emergency"}} {
+			t.Run(prefix+strings.Join(mode[1:], ""), func(t *testing.T) {
+				t.Parallel()
+				r := newOpRig(t)
+				out, errOut, code := r.run([]string{"POC_OPERATOR_KEY=" + prefix}, mode...)
+				if code == 0 {
+					t.Fatalf("%v: exit 0, want a refusal\nstdout %s\nstderr %s", mode, out, errOut)
+				}
+				if !strings.Contains(out+errOut, "POC_OPERATOR_KEY") {
+					t.Fatalf("no message about POC_OPERATOR_KEY:\n%s\n%s", out, errOut)
+				}
+				noSecretAccess(t, r.calls())
 			})
 		}
 	}

@@ -51,7 +51,7 @@ type settled struct{ cell, id, why string }
 
 // SetRevocations verifies envelopes under keys for env and adds the entries to the overlay that
 // the store holds. The store keeps the verified envelopes, so that a restart verifies them again
-// when it calls SetRevocations with the keys. The list is bounded in count and bytes before it is
+// when it calls RestoreRevocations with the keys. The list is bounded in count and bytes before it is
 // read. A new entry for a cell with no stored record is refused, as envd refuses it.
 //
 // An entry leaves the overlay in two cases. The stored records revoke or retire its cell. Or the

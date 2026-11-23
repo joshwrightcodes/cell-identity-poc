@@ -168,11 +168,11 @@ func TestM3MgmtCARotation(t *testing.T) {
 		killGroup(cmd)
 		cmd.Env = append(env, "ROTATE_STATES="+filepath.Join(dir, "states-cleanup"), "ROTATE_DONE="+filepath.Join(dir, "done-cleanup"))
 		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Errorf("finish the second refresh of mgmt:rotate-ca: %v\n%s\nRun: CELL=%s mise run mgmt:rotate-ca", err, out, mgmtCluster)
+		if !rotateRefreshDone(err) {
+			t.Errorf("finish the second refresh of mgmt:rotate-ca: %v\n%s", err, out)
 			return
 		}
-		t.Logf("finished the second refresh after the rotation stopped:\n%s", strings.TrimSpace(string(out)))
+		t.Logf("finished the second refresh after the rotation stopped:\n%s", rotateRefreshLog(string(out)))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), rotateBudget(clusters, 2))
 	defer cancel()

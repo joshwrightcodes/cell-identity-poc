@@ -42,6 +42,18 @@ func m9NewestRevoke(events []m9Event, cell string) string {
 	return m9EventToken(best)
 }
 
+// m9NewestRevokeAbove returns the identity of the newest revoke event of the cell whose revision is above the floor, or "" when no
+// revoke event is above it. The floor is the signed revision that mgmtd had before the test revoked the cell.
+func m9NewestRevokeAbove(events []m9Event, cell string, epoch, counter uint64) string {
+	var above []m9Event
+	for _, ev := range events {
+		if ev.Epoch > epoch || (ev.Epoch == epoch && ev.Counter > counter) {
+			above = append(above, ev)
+		}
+	}
+	return m9NewestRevoke(above, cell)
+}
+
 // m9RevocationIsOurs reports whether the current revocation of the cell is the one that the breadcrumb token names. A token that is
 // empty never matches, and neither does a cell with no revoke event.
 func m9RevocationIsOurs(events []m9Event, cell, token string) bool {
@@ -142,5 +154,28 @@ func TestM9Crumb(t *testing.T) {
 	rest := m9CrumbWithout(data, "dev-cell-2")
 	if !slices.Equal(strings.Fields(rest), []string{"dev-cell-1", "entry:0123456789abcdef"}) {
 		t.Errorf("after the removal: %q", rest)
+	}
+}
+
+func TestM9NewestRevokeAbove(t *testing.T) {
+	old := m9Event{Cell: "dev-cell-2", Kind: "revoke", Epoch: 1, Counter: 5}
+	fresh := m9Event{Cell: "dev-cell-2", Kind: "revoke", Epoch: 1, Counter: 8}
+	un := m9Event{Cell: "dev-cell-2", Kind: "unrevoke", Epoch: 1, Counter: 9}
+	other := m9Event{Cell: "dev-cell-1", Kind: "revoke", Epoch: 1, Counter: 10}
+	for _, tc := range []struct {
+		name   string
+		events []m9Event
+		want   string
+	}{
+		{"only an earlier run", []m9Event{old}, ""},
+		{"an earlier run and a new revoke", []m9Event{old, fresh}, "rev:1.8"},
+		{"a revision equal to the floor", []m9Event{{Cell: "dev-cell-2", Kind: "revoke", Epoch: 1, Counter: 6}}, ""},
+		{"a later epoch", []m9Event{{Cell: "dev-cell-2", Kind: "revoke", Epoch: 2, Counter: 1}}, "rev:2.1"},
+		{"an unrevoke above the floor", []m9Event{old, un}, ""},
+		{"a revoke of another cell", []m9Event{old, other}, ""},
+	} {
+		if got := m9NewestRevokeAbove(tc.events, "dev-cell-2", 1, 6); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }

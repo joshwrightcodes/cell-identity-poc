@@ -111,13 +111,27 @@ func m9Events(s mgmt.Status) []m9Event {
 	return out
 }
 
-// m9Revoke revokes the cell through mgmtd (mise run mgmt -- revoke), after it wrote the cell to build/gate/m9-revoked.
+// m9Revoke revokes the cell through mgmtd (mise run mgmt -- revoke), after it wrote the cell to build/gate/m9-revoked. The test fails
+// when the cell is already revoked or queued, because that revocation belongs to someone else. A revoke that waits for its revision is
+// recorded only through a revoke event above the signed revision that mgmtd had before the call.
 func m9Revoke(t *testing.T, cell string) mgmt.RevokeResult {
 	t.Helper()
+	before, err := m9Status()
+	if err != nil {
+		t.Fatalf("read the status before the revoke of %s: %v", cell, err)
+	}
+	wasMarked := m9Marked(cell)
 	m9MarkRevoked(t, cell)
 	var res mgmt.RevokeResult
 	if err := json.Unmarshal([]byte(mgmtCtl(t, "revoke", "--cell", cell)), &res); err != nil || res.Cell != cell {
 		t.Fatalf("mgmt -- revoke --cell %s printed no result for the cell: %v", cell, err)
+	}
+	if res.Already {
+		if !wasMarked {
+			_ = m9ClearRevoked(cell)
+		}
+		t.Fatalf("mgmt -- revoke --cell %s returned already: another revocation holds the cell, and the test did not make one. "+
+			"Un-revoke it if it is not wanted: mise run mgmt -- unrevoke --cell %s", cell, cell)
 	}
 	// A revoke that waits for its revision has no revision yet. The event of the revoke names it.
 	for deadline := time.Now().Add(m9RecordBound); ; time.Sleep(2 * time.Second) {
@@ -126,13 +140,14 @@ func m9Revoke(t *testing.T, cell string) mgmt.RevokeResult {
 			break
 		}
 		if s, err := m9Status(); err == nil {
-			if tok := m9NewestRevoke(m9Events(s), cell); tok != "" {
+			if tok := m9NewestRevokeAbove(m9Events(s), cell, before.Signed.Epoch, before.Signed.Counter); tok != "" {
 				m9NoteRevocation(t, cell, tok)
 				break
 			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("mgmt -- revoke --cell %s queued the revoke, and no revoke event of the cell appeared", cell)
+			t.Fatalf("mgmt -- revoke --cell %s queued the revoke, and no revoke event of the cell above revision %d.%d appeared",
+				cell, before.Signed.Epoch, before.Signed.Counter)
 		}
 	}
 	return res
@@ -212,7 +227,8 @@ func m9RequireStart(t *testing.T, cell string) {
 	case !ok:
 		t.Fatalf("mgmtd shows no cell %s", cell)
 	case c.Revoked:
-		t.Fatalf("%s is revoked before the test. Run: mise run gate:m9:repair", cell)
+		t.Fatalf("%s is revoked before the test. If a failed run left it, run: mise run gate:m9:repair. "+
+			"If the repair leaves it revoked, another revocation holds it. Then run: mise run mgmt -- unrevoke --cell %s", cell, cell)
 	case !c.Valid:
 		t.Fatalf("%s is not valid before the test (%s)", cell, c.ValidReason)
 	}

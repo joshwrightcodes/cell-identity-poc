@@ -141,6 +141,8 @@ macOS still sleeps when the lid closes on battery power.
 - While the secret manager is unreachable, an operator cannot revoke a cell locally.
 - The Mac administrator can change every operator key pin. `operator:check-key` compares the pin ConfigMaps and `server.conf` with the key in the secret manager. It does not read the keys that the running processes loaded. A writer in `dev-cp` can change a pin, restart the process, and restore the pin, and the check then reports a match.
 - A writer of `cell-records` can replay an old signed entry across a restart of `envd`, because `envd` keeps no spec marks elsewhere. The cell stays revoked until an operator runs a revoke and then an un-revoke. The un-revoke rule of `mgmtd` refuses to adopt the entry again.
+- An operator revoke of a cell that the M9 test already holds revoked returns `already` and adds no event. The newest revoke event then still names the test, and `gate:m9:repair` and the cleanup un-revoke that cell. The test stops when its own revoke returns `already`, but not when an operator revokes later.
+- Without `build/operator/key.env`, for example in a new worktree, `operator_pub_keys` cannot compare a key that `mgmtd` created with the pins. A pin swap that matches no other pin then stays open there.
 - A corrupt gateway store holds no overlay until the next sync of `envd`. This takes about 10 seconds while `envd` runs, and longer while `envd` is down.
 - `mgmtd` keeps an unbounded mirror of revocation events. Only an admin action or a signed entry adds an event.
 - The overlay of the gateway and `envd` counts a hold of more than 10 minutes from `issuedAt`, because `envd` records no admit time.

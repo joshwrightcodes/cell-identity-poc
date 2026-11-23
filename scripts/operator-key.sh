@@ -124,6 +124,7 @@ cmd_create() {
   (($# == 0)) || fail "create takes no argument"
   need_settings POC_SECRET_READ_CMD POC_SECRET_WRITE_CMD POC_OPERATOR_KEY
   [[ "$POC_OPERATOR_KEY" =~ ^[^[:space:]]*[^[:space:]/]$ ]] || fail "POC_OPERATOR_KEY must be one word with no slash at the end"
+  operator_key_name_valid "$(key_name_now)" || fail "POC_OPERATOR_KEY must start with a letter, digit, dot, underscore, at sign, colon or plus, and hold no white space or quote, so that every later read accepts the name"
   [[ ! -e "$key_env" ]] \
     || fail "build/operator/key.env exists, so an operator key exists. Compare it with: mise run operator:check-key. Replace it with: mise run operator:rotate-key"
   read_operator_pub
@@ -312,6 +313,7 @@ cmd_rotate() {
   (($# <= 1)) || fail "usage: operator-key.sh rotate [--emergency]"
   need_settings POC_SECRET_READ_CMD POC_SECRET_WRITE_CMD POC_OPERATOR_KEY
   [[ "$POC_OPERATOR_KEY" =~ ^[^[:space:]]*[^[:space:]/]$ ]] || fail "POC_OPERATOR_KEY must be one word with no slash at the end"
+  operator_key_name_valid "$(key_name_now)" || fail "POC_OPERATOR_KEY must start with a letter, digit, dot, underscore, at sign, colon or plus, and hold no white space or quote, so that every later read accepts the name"
   read_operator_pub
   if [[ "$mode" == overlap ]]; then
     [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management, so the overlap has no old key. The owner creates the key with: mise run operator:create-key, or replaces it with: mise run operator:rotate-key -- --emergency"
