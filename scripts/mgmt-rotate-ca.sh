@@ -32,6 +32,8 @@
 # By default, a refresh runs cell:up once for each other cluster that holds a copy, and the link
 # phase (cell:link) of this cluster for its own copies, because each render reads the live bundle. MGMT_ROTATE_REFRESH names another command, for the tests. The
 # script runs it once for each copy, as <command> <cluster> <namespace> <name>.
+# Exit status: 0 after a rotation, 1 after a failure, and 3 after a run that only finished step 5 of an earlier rotation. Status 3
+# means that no new CA exists. Run the task again to rotate.
 # MGMT_ROTATE_WAIT bounds each wait for the copies in seconds (default 900). MGMT_ROTATE_TAINT_WAIT
 # is the time between taint and revoke in seconds (default 120).
 source "$(dirname "$0")/lib.sh"
@@ -277,4 +279,9 @@ log "the bundle holds $(grep -c '^x509 ' <<<"$bundle" || true) root(s)"
 
 refresh "$holders"
 wait_for_copies "$holders"
+if ((resume_refresh)); then
+  # Exit status 3 tells a caller that this run rotated nothing. Status 1 is a failure, and status 0 is a rotation.
+  log "step 5 is finished, and each copy holds only the roots of the bundle. NO NEW CA was prepared or activated: the CA of $CELL_NAME is still $(slot x509 active). To rotate the CA, run CELL=$CELL_NAME mise run mgmt:rotate-ca again"
+  exit 3
+fi
 log "the CA of $CELL_NAME is $(slot x509 active), and each copy holds only the roots of the bundle"

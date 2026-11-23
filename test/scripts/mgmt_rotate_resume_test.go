@@ -1,6 +1,7 @@
 package scripts
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,8 +89,12 @@ func TestRotateCAResumesTheRefreshAfterTheRevoke(t *testing.T) {
 			s := newRotateServer(t)
 			s.afterStep4(t, oldSlot)
 			out, calls, refreshes, own, err := s.resumeRun(t, 0, 1)
-			if err != nil {
-				t.Fatalf("resume failed: %v\n%s", err, out)
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) || ee.ExitCode() != 3 {
+				t.Fatalf("the resume exited with %v, want status 3, which says that nothing rotated\n%s", err, out)
+			}
+			if !strings.Contains(out, "NO NEW CA") {
+				t.Fatalf("the last line does not say that no rotation happened:\n%s", out)
 			}
 			for _, verb := range []string{"prepare", "activate", "taint", "revoke"} {
 				if n := count(calls, verb); n > 0 {

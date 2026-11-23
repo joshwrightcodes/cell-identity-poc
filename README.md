@@ -2250,6 +2250,8 @@ Do not roll back, because the old authorities are revoked.
 Fix the cause, then run `mise run mgmt:rotate-ca` again.
 The task sees the new root active, the old authorities revoked and a copy with an old root.
 It then runs only the refresh of step 5, and it prepares no new authority.
+The last line says "NO NEW CA", and the task exits with status 3, so that no one reads the run as a rotation.
+Run the task once more to rotate the CA.
 A run on a healthy `management`, where each copy equals the bundle, starts a new rotation.
 `cell:down` and `cell:up` of `management` remain the last resort, because they also delete the datastore.
 
