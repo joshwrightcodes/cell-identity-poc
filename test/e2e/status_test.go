@@ -14,8 +14,9 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
-// statusAttemptMax bounds one run of a mise task in this file. harness:status takes about 2 minutes.
-const statusAttemptMax = 6 * time.Minute
+// statusAttemptMax bounds one run of a mise task in this file. On the dev Mac, harness:status takes 5 to 6 minutes. The bound
+// covers the 900 s limit that scripts/status.sh sets for each cell:verify, plus the other reads.
+const statusAttemptMax = 16 * time.Minute
 
 // statusSampleMax is the age limit of a Prometheus sample in harness:status.
 const statusSampleMax = 5 * time.Minute
