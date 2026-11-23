@@ -232,7 +232,10 @@ func (e *gwEnv) open(addr, cell string, o openOpts) *cstream {
 			tc := tls.Client(stallConn{Conn: raw, stall: &c.stall}, cfg)
 			if err := tc.HandshakeContext(ctx); err != nil {
 				_ = raw.Close()
-				return nil, err
+				// The listener of the test binds [::]:port and the client dials 127.0.0.1:port. On macOS another process can bind 127.0.0.1 on
+				// the same port, and it then gets the connection. A server that is not the gateway shows a certificate with no SPIFFE ID, for
+				// example "certificate contains no URI SAN", so the error names the peer address.
+				return nil, fmt.Errorf("TLS handshake with %s (peer %s) failed, and a certificate with no URI SAN means that a foreign server answered on the port: %w", a, raw.RemoteAddr(), err)
 			}
 			c.tc = tc
 			return tc, nil
