@@ -928,7 +928,7 @@ func TestCheckHarnessObjectsAcceptsOperatorObjects(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, cluster, comp, ns, object, manager, want string
-		bundled                                       []string
+		bundled                                        []string
 	}{
 		{"operator-pub", "management", "mgmt-api", "mgmt-system", "operator-pub", "operator", "", []string{"mgmt-intent", "operator-key"}},
 		{"operator-pub of another manager", "management", "mgmt-api", "mgmt-system", "operator-pub", "kubectl-edit", "operator-pub", []string{"mgmt-intent", "operator-key"}},

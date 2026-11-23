@@ -2,8 +2,8 @@ package render
 
 import (
 	"crypto/sha256"
-	"fmt"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
