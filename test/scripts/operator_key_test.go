@@ -1230,7 +1230,8 @@ func (r *opRig) setNext(k string) {
 	r.put("kind-management", "mgmt-system", "operator-pub", d)
 }
 
-// TestOperatorScriptsKeepSeedInPipes: neither operator script has a here-string, a heredoc, mktemp, xtrace or a variable that holds
+// TestOperatorScriptsKeepSeedInPipes: neither operator script has a here-string, a heredoc, mktemp, xtrace, an indirect read (bash -c "${!name}"
+// or a variable set to the name of a setting) or a variable that holds
 // the seed. Each read of the secret manager pipes straight into operatorctl, and keygen pipes straight into the write command. Under
 // xtrace, which shows every assignment and command, a create, a check and a rotation print no seed on standard error, and leave no
 // seed under the build root, TMPDIR or the stub state.
@@ -1250,7 +1251,9 @@ func TestOperatorScriptsKeepSeedInPipes(t *testing.T) {
 				continue
 			}
 			for _, bad := range []*regexp.Regexp{regexp.MustCompile(`<<<`), regexp.MustCompile(`<<-?\s*['"]?[A-Za-z_]`), regexp.MustCompile(`\bmktemp\b`),
-				regexp.MustCompile(`\bset\s+-[a-wyz]*x`), regexp.MustCompile(`xtrace`), regexp.MustCompile(`\bBASH_XTRACEFD\b`)} {
+				regexp.MustCompile(`\bset\s+-[a-wyz]*x`), regexp.MustCompile(`xtrace`), regexp.MustCompile(`\bBASH_XTRACEFD\b`),
+				// The indirect read form: rc=POC_SECRET_READ_CMD; bash -c "${!rc}" runs the read command with no mention of $POC_SECRET_READ_CMD.
+				regexp.MustCompile(`bash\s+-c\s+["']?\$\{!`), regexp.MustCompile(`=\s*["']?\$?\{?POC_SECRET_(READ|WRITE)_CMD`)} {
 				if bad.MatchString(code) {
 					t.Errorf("%s line %d has %q: %s", filepath.Base(f), i+1, bad, line)
 				}
