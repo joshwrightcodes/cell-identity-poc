@@ -158,6 +158,7 @@ func TestVerifyAgentBan(t *testing.T) {
 		{name: "ready after a restart", pod: statusPod(true, 2), want: []string{"ready=true", "restart count 2"}},
 		{name: "absent container", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, want: []string{"no container agent-ban", "CELL=dev-cp mise run cell:up"}},
 		{name: "absent container with no live cell", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, env: []string{"STUB_KIND=management dev-cp rogue"}},
+		{name: "absent container when kind fails", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"}, want: []string{"cluster"}},
 		{name: "not ready with no live cell", pod: statusPod(false, 0), env: []string{"STUB_KIND=management dev-cp rogue"}, want: []string{"ready=false", "restart count 0"}},
 		{name: "another container that restarted", pod: `{"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":4},{"name":"agent-ban","ready":true,"restartCount":0}]}}`},
 		{name: "no pod", want: []string{"could not read pod spire-server-0"}},

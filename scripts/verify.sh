@@ -969,7 +969,7 @@ if has_harness envd; then
   check "ConfigMap spire-system/attest-hints exists, and the SPIRE server config sets hint_configmap to it" check_attest_hints_exists
   check "Every operator key pin of dev-cp and management holds the keys of operator-pub" check_operator_pins
   check "ConfigMap envd-system/local-revocations holds only entries that verify against the operator keys of envd" check_overlay_inputs
-  check "The container agent-ban in spire-server-0 is Ready and has not restarted" check_agent_ban
+  check "The container agent-ban in spire-server-0 is Ready and has not restarted, or is absent because no cell is live" check_agent_ban
 fi
 if has_harness cell-controller; then
   check "The cell-controller objects match the bundle" check_harness_drift cell-controller

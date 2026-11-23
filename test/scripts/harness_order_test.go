@@ -186,7 +186,7 @@ func TestRepairRestoresCells(t *testing.T) {
 		// A cell that the portal creates starts with a bootstrap bundle state. The signed publish comes after the bound wait and before the
 		// marker goes, and a failed publish keeps the marker.
 		{name: "a publish that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_FAIL_ARGS=run bundle -- publish"}, calls: restore, want: "could not publish a signed set to dev-cell-1 dev-cell-2"},
+			env: []string{"STUB_FAIL_ARGS=run bundle -- publish"}, calls: restore, want: "could not publish a signed set to dev-cell-1 dev-cell-2. Run: mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait, then mise run gate:m6:repair. If the publish stops on a stale build, run CELL=<cell> mise run cell:hydrate first"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

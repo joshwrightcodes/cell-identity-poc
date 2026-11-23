@@ -240,7 +240,7 @@ restore_cells() {
   for cell in $catalog; do publish_args+=(--target "$cell"); done
   log "publishing a signed set to ${catalog//$'\n'/ }"
   (cd "$ROOT" && mise run bundle -- publish "${publish_args[@]}" --wait) \
-    || die "could not publish a signed set to ${catalog//$'\n'/ }. Run: mise run bundle -- publish ${publish_args[*]} --wait, then $repair"
+    || die "could not publish a signed set to ${catalog//$'\n'/ }. Run: mise run bundle -- publish ${publish_args[*]} --wait, then $repair. If the publish stops on a stale build, run CELL=<cell> mise run cell:hydrate first"
   rm -f "$marker" || die "could not remove $marker"
 }
 had_marker=0

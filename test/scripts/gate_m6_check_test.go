@@ -289,7 +289,7 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 }
 
 // TestGateM6ProvisionGate: gate.sh m6-provision runs only TestProvisionFromPortal, with the go test timeout that gate_test_timeout derives from
-// the budget of 40 minutes and the floor of 175 minutes in harness/versions.env: the floor, 175 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
+// the budget of 40 minutes and the floor of 210 minutes in harness/versions.env: the floor, 210 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
 // pattern of gate m6 does not match the provision test, because that test deletes both cells.
 func TestGateM6ProvisionGate(t *testing.T) {
 	t.Parallel()
@@ -324,8 +324,8 @@ func TestGateM6ProvisionGate(t *testing.T) {
 				t.Errorf("the token scan did not run after the tests: calls %s", calls)
 			}
 			if tc.want == "" {
-				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 175m") || strings.Contains(string(calls), "-run M6") {
-					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 175m", err, ran, out, calls)
+				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 210m") || strings.Contains(string(calls), "-run M6") {
+					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 210m", err, ran, out, calls)
 				}
 				return
 			}
@@ -339,14 +339,14 @@ func TestGateM6ProvisionGate(t *testing.T) {
 	}
 }
 
-// TestGateM6ProvisionTimeoutFloor: the go test timeout of gate:m6:provision is never below 175 minutes, whatever budget Task 11 sets.
-// The floor is the worst case of the bounds in TestProvisionFromPortal, 174 minutes (the sum in harness/versions.env), rounded up to 5.
+// TestGateM6ProvisionTimeoutFloor: the go test timeout of gate:m6:provision is never below 210 minutes, whatever budget Task 11 sets.
+// The floor is the worst case of the bounds in TestProvisionFromPortal, 209 minutes (the sum in harness/versions.env), rounded up to 5.
 func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
 	t.Parallel()
 	testtool.Need(t, "bash")
 	versions, _ := filepath.Abs("../../harness/versions.env")
 	lib, _ := filepath.Abs("../../scripts/lib.sh")
-	for budget, want := range map[string]string{"": "175", "50": "175", "87": "175", "90": "180"} {
+	for budget, want := range map[string]string{"": "210", "50": "210", "87": "210", "105": "210", "110": "220"} {
 		cmd := exec.Command("bash", "-c", `source "$1"; source "$2"; gate_test_timeout "$3" "${GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES:-}"`, "bash", lib, versions, budget)
 		cmd.Env = append(os.Environ(), "CELL=dev-cell-1")
 		out, err := cmd.Output()
@@ -358,7 +358,7 @@ func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
 		}
 	}
 	out, err := exec.Command("bash", "-c", `source "$1"; printf '%s %s' "$GATE_M6_PROVISION_BUDGET_MINUTES" "$GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES"`, "bash", versions).Output()
-	if err != nil || string(out) != "40 175" {
-		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"40 175\"", out, err)
+	if err != nil || string(out) != "40 210" {
+		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"40 210\"", out, err)
 	}
 }

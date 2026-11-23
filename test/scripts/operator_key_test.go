@@ -123,8 +123,9 @@ case "$1" in
 esac
 `
 
-// opDocker answers docker inspect with a node address, the clock of a node and the rule lists of iptables and ip6tables. STUB_CUT names <node>:<tool> pairs whose list
-// holds a cut rule of the partition tool, and STUB_DOCKER_FAIL names nodes that do not answer.
+// opDocker answers docker inspect with a node address, the clock of a node and the rule lists of iptables and ip6tables.
+// STUB_CUT names <node>:<tool> pairs whose list holds a cut rule of the partition tool. STUB_DOCKER_FAIL names the node
+// containers whose exec fails and the cells whose inspect fails. STUB_NO_NODE_IP names the cells whose inspect prints no address.
 const opDocker = `#!/usr/bin/env bash
 set -euo pipefail
 echo "docker $*" >>"$STUB_DIR/calls"

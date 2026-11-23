@@ -130,6 +130,7 @@ func TestStatusM9Conditions(t *testing.T) {
 		env  func() []string
 		want []string // empty: the run passes
 		deny []string
+		noBan bool // dev-cp is in the output and its bans is null
 	}{
 		{name: "a valid entry in the inputs passes", env: func() []string {
 			return []string{"STUB_LOCAL_REVOCATIONS=" + statusInputs(id+".json", statusEntry(id, "dev-cell-2", time.Now(), "good"))}
@@ -155,7 +156,7 @@ func TestStatusM9Conditions(t *testing.T) {
 		}, want: []string{"agent-ban", "not Ready"}},
 		{name: "the ban container is absent with no live cell", env: func() []string {
 			return []string{`STUB_SPIRE_POD={"status":{"containerStatuses":[{"name":"spire-server","ready":true,"restartCount":0}]}}`, "STUB_KIND=management dev-cp rogue"}
-		}, deny: []string{"agent-ban"}},
+		}, deny: []string{"agent-ban"}, noBan: true},
 		{name: "the ban container is not Ready with no live cell", env: func() []string {
 			return []string{"STUB_SPIRE_POD=" + statusPod(false, 0), "STUB_KIND=management dev-cp rogue"}
 		}, want: []string{"agent-ban", "not Ready"}},
@@ -190,6 +191,15 @@ func TestStatusM9Conditions(t *testing.T) {
 			t.Parallel()
 			byName, _, _, code := runStatus(t, tc.env()...)
 			problems := problemsOf(byName["dev-cp"])
+			if tc.noBan {
+				obj, ok := byName["dev-cp"]
+				if !ok {
+					t.Fatalf("the output has no dev-cp object")
+				}
+				if bans, has := obj["bans"]; !has || bans != nil {
+					t.Errorf("bans of dev-cp is %v (present %v), want null", bans, has)
+				}
+			}
 			for _, d := range tc.deny {
 				if strings.Contains(problems, d) {
 					t.Errorf("the problems of dev-cp %q hold %q", problems, d)
