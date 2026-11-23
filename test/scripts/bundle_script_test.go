@@ -1225,17 +1225,25 @@ func TestBundleLocks(t *testing.T) {
 }
 
 // TestBundleWaitSharesOneDeadline: --wait has one bound for every target, so two targets that never settle fail after one bound and not two.
+// The publish of each target runs before the wait and has no bound, so a publish with no --wait of the same two targets gives the time that
+// belongs to the publish. The bound is measured on top of that time: a shared bound of 3 s adds about 3 s, and two separate bounds add about 6 s.
 func TestBundleWaitSharesOneDeadline(t *testing.T) {
 	t.Parallel()
 	r := newBundleRoot(t, "dev-cell-1", "dev-cell-2")
+	targets := []string{"publish", "--target", "dev-cell-1", "--target", "dev-cell-2"}
 	start := time.Now()
-	out, errOut, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=open", "BUNDLE_WAIT_SECONDS=3", "BUNDLE_WAIT_POLL=0.2"}, "publish", "--target", "dev-cell-1", "--target", "dev-cell-2", "--wait")
+	if _, errOut, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=open"}, targets...); err != nil {
+		t.Fatalf("the publish of the two targets failed: %v\n%s\n%s", err, errOut, log)
+	}
+	publish := time.Since(start)
+	start = time.Now()
+	out, errOut, log, err := r.run("bundle.sh", []string{"STUB_OUTCOMES=open", "BUNDLE_WAIT_SECONDS=3", "BUNDLE_WAIT_POLL=0.2"}, append(targets, "--wait")...)
 	took := time.Since(start)
 	if err == nil || !strings.Contains(out+errOut, "timeout") {
 		t.Fatalf("err %v, output %q", err, out+errOut)
 	}
-	if took > 5500*time.Millisecond {
-		t.Errorf("two targets waited %s with a bound of 3 s, so the bound is not shared", took)
+	if limit := publish + 4500*time.Millisecond; took > limit {
+		t.Errorf("two targets took %s with a publish of %s and a bound of 3 s (limit %s), so the bound is not shared", took, publish, limit)
 	}
 	if callIndex(log, "bundle get --target dev-cell-2") < 0 {
 		t.Errorf("the second target was never polled:\n%s", log)
