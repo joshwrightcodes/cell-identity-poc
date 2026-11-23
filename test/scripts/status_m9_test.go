@@ -126,10 +126,10 @@ func TestStatusM9Conditions(t *testing.T) {
 	t.Parallel()
 	const id = "0123456789abcdef"
 	for _, tc := range []struct {
-		name string
-		env  func() []string
-		want []string // empty: the run passes
-		deny []string
+		name  string
+		env   func() []string
+		want  []string // empty: the run passes
+		deny  []string
 		noBan bool // dev-cp is in the output and its bans is null
 	}{
 		{name: "a valid entry in the inputs passes", env: func() []string {
