@@ -342,14 +342,14 @@ func refreshRoot(t *testing.T) {
 	}
 }
 
-var forwardLine = regexp.MustCompile(`^Forwarding from 127\.0\.0\.1:(\d+) -> 5000$`)
+var forwardLine = regexp.MustCompile(`^Forwarding from 127\.0\.0\.1:(\d+) -> 5001$`)
 
-// forwardBundleStore starts a port-forward to the bundle store of dev-cp on a free local port. It
-// returns the store address and stops the forward when the test ends.
+// forwardBundleStore starts a port-forward to the registry port of the bundle store pod of dev-cp, which needs no token, on a free
+// local port. It returns the store address and stops the forward when the test ends.
 func forwardBundleStore(t *testing.T) string {
 	t.Helper()
 	cmd := exec.Command("kubectl", "--context", "kind-"+spireCluster, "-n", "cell-system",
-		"port-forward", "--address", "127.0.0.1", "svc/bundle-store", ":5000")
+		"port-forward", "--address", "127.0.0.1", "pod/bundle-store-0", ":5001")
 	// exec copies stderr in its own goroutine while the process runs, so reads take the lock.
 	var stderr lockedBuffer
 	cmd.Stderr = &stderr
