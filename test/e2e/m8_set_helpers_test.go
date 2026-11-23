@@ -367,6 +367,30 @@ func m8Offer(t *testing.T, target string, comps []bundle.Component, d time.Durat
 	return signed, tb
 }
 
+// m8AttachCosign attaches the Sigstore bundle of the root of the target to the mirror. bundle -- sign serves a set but attaches nothing, and a set with the
+// same root as an older one then has no signed statement of its version, so the strict bundle -- verify and cell:verify fail after the test.
+func m8AttachCosign(t *testing.T, target string) error {
+	t.Helper()
+	if out, err := m8Command(t, 5*time.Minute, "", "run", "bundle", "--", "cosign", "--target", target); err != nil {
+		return fmt.Errorf("attach the Sigstore bundle of %s: %w\n%s", target, err, out)
+	}
+	return nil
+}
+
+// m8OfferCosigned is m8Offer with the Sigstore bundle attached after the set is signed and before the wait for its result.
+func m8OfferCosigned(t *testing.T, target string, comps []bundle.Component, d time.Duration) (mgmtapi.BundleSignResult, mgmtapi.TargetBundle) {
+	t.Helper()
+	signed := m8Sign(t, target, comps, true)
+	if err := m8AttachCosign(t, target); err != nil {
+		t.Fatal(err)
+	}
+	tb := m8Wait(t, target, signed.OpID, d)
+	if tb.Result == nil {
+		t.Fatalf("operation %s of %s has no result", signed.OpID, target)
+	}
+	return signed, tb
+}
+
 // m8WantResult reports an error unless the result has the outcome, the reason and the detail. A detail of "*" accepts any.
 func m8WantResult(t *testing.T, res *op.Result, outcome, reason, detail string) {
 	t.Helper()

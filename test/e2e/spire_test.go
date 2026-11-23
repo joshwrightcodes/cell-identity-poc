@@ -159,7 +159,7 @@ spec:
 		t.Fatalf("the edited spire-server bundle has the digest %s of the live one", testSpire)
 	}
 
-	_, tb := m8Offer(t, spireCluster, m8WithDigest(live, spireApp, 0, spireNamespace, testSpire), m8SetWait)
+	_, tb := m8OfferCosigned(t, spireCluster, m8WithDigest(live, spireApp, 0, spireNamespace, testSpire), m8SetWait)
 	m8WantResult(t, tb.Result, op.OutcomeApplied, "", "")
 	t.Logf("applied the set with spire-server bundle %s", testSpire)
 
@@ -180,7 +180,7 @@ spec:
 	}
 	t.Logf("entry %s has ID %s", spiffeID, id)
 
-	_, tb = m8Offer(t, spireCluster, live, m8SetWait)
+	_, tb = m8OfferCosigned(t, spireCluster, live, m8SetWait)
 	m8WantResult(t, tb.Result, op.OutcomeApplied, "", "")
 	waitFor(t, "no entry "+spiffeID+" in spire-server entry show after the restore", entryWait, func() (bool, string) {
 		entries, err := showEntries(t, spiffeID)
