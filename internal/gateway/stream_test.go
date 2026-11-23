@@ -139,12 +139,11 @@ func (e *gwEnv) tlsConfig() *tls.Config {
 
 func listenDual(t *testing.T) net.Listener {
 	t.Helper()
-	ln, err := net.Listen("tcp", "[::]:0")
+	// The clients of the tests dial 127.0.0.1. A listener on that address takes the connection before a wildcard listener of another
+	// process on the same port can.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
+		t.Fatal(err)
 	}
 	return ln
 }
