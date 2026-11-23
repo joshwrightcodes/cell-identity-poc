@@ -1005,8 +1005,11 @@ The manual drills `gate:m4:rotate`, `gate:m5:soak` and `gate:m5:drill` do not ru
 The slow tier needs these conditions for its whole run:
 
 - The Mac runs on AC power, with the lid open or an external display connected.
-- The keep-awake runs. Every `gate:*` task and `poc:gate` start it themselves, and macOS still sleeps when the lid closes on battery power.
-  At the end of each gate, pass or fail, the run prints the sleep and wake lines that the macOS power log recorded since the start, so a report shows a sleep.
+  Every gate, `gate:m1` to `gate:m9` and `poc:gate`, refuses to start on battery power unless `GATE_ALLOW_BATTERY=1`.
+- The keep-awake runs. Every `gate:*` task except the `gate:mN:repair` tasks starts it, and so does `poc:gate`.
+  macOS still sleeps when the lid closes on battery power.
+  At the end of each gate, the run prints the sleep and wake lines that the macOS power log recorded since the start.
+  A report then shows a sleep.
 - The owner unlocked the secret CLI.
 
 The Colima VM clocks stop while the Mac sleeps, and `istio-agent` renews on the monotonic clock.
@@ -1766,7 +1769,7 @@ The rogue test waits 180 seconds on purpose. The fresh-namespace dial tests take
 `gate:m5` fails when the run takes longer than `GATE_M5_BUDGET_MINUTES`.
 The budget is 80 minutes. This is 1.5 times the slowest M5 run before the fixes, 3,096 seconds of tests on 2026-11-15 (UTC), rounded up to 5 minutes.
 The test timeout is 160 minutes, twice the budget.
-`gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has the floor of 30 minutes for its test timeout.
+`gate:m5:soak` has its own budget of 40 minutes, and `gate:m5:drill` has a test timeout of 60 minutes, set by `GATE_M5_DRILL_TEST_TIMEOUT_MINUTES`.
 All times of the next paragraph are wall time in seconds, measured on 2026-11-15 and 2026-11-16 (UTC).
 `gate:m1` took 108 seconds, `gate:m2` 490 and 453 seconds, `gate:m3` 2,693 seconds and `gate:m4` 791 seconds.
 The other gates took 592 seconds for `gate:m4:rotate` and 1,764 seconds for `gate:m5:soak`.

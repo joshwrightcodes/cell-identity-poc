@@ -1573,7 +1573,8 @@ on_battery() {
 }
 
 # sleep_report <since> prints the Sleep and DarkWake lines that pmset -g log recorded at or after <since>, a local time as YYYY-MM-DD HH:MM:SS,
-# and says when it found none. It prints to standard error, and it does nothing on another system, on macOS without pmset, and when pmset fails.
+# and says when it found none. It prints to standard error.
+# It does nothing on another system, on macOS without pmset, and when pmset fails.
 sleep_report() {
   local since="$1" out found
   [[ "$(uname -s)" == Darwin ]] || return 0

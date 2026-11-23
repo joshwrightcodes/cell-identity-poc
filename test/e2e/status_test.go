@@ -15,7 +15,7 @@ import (
 )
 
 // statusAttemptMax bounds one run of a mise task in this file. On the dev Mac, harness:status takes 5 to 6 minutes. The bound
-// covers the 900 s limit that scripts/status.sh sets for each cell:verify, plus the other reads.
+// covers the 900 s limit that scripts/status.sh sets for each cell:verify, plus about 1 minute for the other reads.
 const statusAttemptMax = 16 * time.Minute
 
 // statusSampleMax is the age limit of a Prometheus sample in harness:status.

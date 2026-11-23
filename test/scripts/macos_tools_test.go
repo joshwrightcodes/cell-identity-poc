@@ -226,6 +226,11 @@ func TestEveryGateKeepsAwakeAndRefusesBattery(t *testing.T) {
 				if code == 0 || len(goRuns(calls)) != 0 || !strings.Contains(errOut, "GATE_ALLOW_BATTERY=1") {
 					t.Fatalf("exit %d, %d test runs, stderr %q; want a refusal before the tests", code, len(goRuns(calls)), errOut)
 				}
+				for _, l := range strings.Split(calls, "\n") {
+					if strings.HasPrefix(l, "docker ") || strings.HasPrefix(l, "kubectl ") {
+						t.Fatalf("a live step ran before the refusal: %s\n%s", l, calls)
+					}
+				}
 				return
 			}
 			if code != 0 || len(goRuns(calls)) != 1 {
