@@ -2,7 +2,8 @@
 # Switch the SVID lifetime of dev-cp for the slow tier of gate:m9, and back.
 #
 # Usage:
-#   svid-ttl.sh set <ttl>   write the lifetime to build/gate/m9-svid-ttl, run CELL=dev-cp mise run cell:up, and wait
+#   svid-ttl.sh set <ttl>   write the lifetime to build/gate/m9-svid-ttl, run CELL=dev-cp mise run cell:up, and wait. It refuses while
+#                           build/gate/m9-svid-ttl.restoring exists
 #   svid-ttl.sh restore     write build/gate/m9-svid-ttl.restoring, remove the marker, run CELL=dev-cp mise run cell:up, then cell:restart
 #                           of dev-cp and of each live cell, wait, and remove the stamp
 #   svid-ttl.sh show        print the lifetimes of cells/dev-cp.env, of the marker and of the live server config

@@ -132,7 +132,7 @@ run = "scripts/down.sh"
 [tasks.test]
 description = "Run the Go unit tests, or the packages given after --"
 usage = 'arg "[packages]..." var=#true default="./..."'
-# The go test timeout is 32 minutes for each package. The tests run in parallel, so the time depends on -parallel (the number of cores by default). On 2026-11-23, with -count=1 on an 18-core Mac, test/scripts took 188 s and test/render 162 s. With -parallel 4, which stands for a small CI runner, test/scripts took 1255 s and test/render 408 s. The timeout is the longest of these, 1255 s, plus 50 percent. Before the tests ran in parallel, test/scripts took 2617 s and test/render 604 s on the same Mac. The CI job runs this task, so it has the same timeout.
+# The go test timeout is 32 minutes for each package. The tests run in parallel, so the time depends on -parallel (the number of cores by default). go test runs the packages at the same time. On 2026-11-23, with -count=1 on an 18-core Mac, test/scripts took 188 s and test/render 162 s. With -parallel 4, which stands for a small CI runner, test/scripts took 1255 s and test/render 408 s. The timeout is the longest of these, 1255 s, plus 50 percent. Before the tests ran in parallel, test/scripts took 2617 s and test/render 604 s on the same Mac. The CI job runs this task, so it has the same timeout.
 run = 'eval go test -timeout 32m ${usage_packages?}'
 
 [tasks.lint]

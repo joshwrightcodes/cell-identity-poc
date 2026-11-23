@@ -61,7 +61,7 @@ GOFLAGS=-mod=readonly exec go run ./cmd/pkigen "$@"
 // cluster of this Mac. The test must also point the program at its own fake, for example through KUBECONFIG and HOME.
 func useRealTool(t *testing.T, dir, name string) {
 	t.Helper()
-	// The search reads realPATH and leaves the environment of the process alone, because tests run in parallel and read PATH.
+	// The search reads realPATH, because exec.LookPath reads the PATH of the process, which TestMain changed and which parallel tests read.
 	var path string
 	for _, d := range filepath.SplitList(realPATH) {
 		if info, err := os.Stat(filepath.Join(d, name)); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
