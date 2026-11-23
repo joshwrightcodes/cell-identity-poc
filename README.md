@@ -2239,6 +2239,14 @@ The task then runs these steps:
 `MGMT_ROTATE_WAIT` bounds each wait for the copies in seconds. The default is 900.
 The old key stays in `keys.json` until SPIRE prepares a new authority in its place.
 No copy trusts its root after step 5.
+
+A run can stop in step 5, after the revoke, for example when a `cell:up` fails or a wait ends.
+Then the bundle holds only the new root, and a copy can still hold the old root. `cell:verify` and `harness:status` fail on that copy.
+Do not roll back, because the old authorities are revoked.
+Fix the cause, then run `mise run mgmt:rotate-ca` again.
+The task sees the new root active, the old authorities revoked and a copy with an old root.
+It then runs only the refresh of step 5, and it prepares no new authority.
+A run on a healthy `management`, where each copy equals the bundle, starts a new rotation.
 `cell:down` and `cell:up` of `management` remain the last resort, because they also delete the datastore.
 
 ### Keys of mgmtd and the host service
