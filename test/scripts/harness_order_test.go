@@ -92,14 +92,17 @@ func TestHarnessUpOrderM6(t *testing.T) {
 }
 
 // m6RestoreMise stands in for mise. It logs each call with the CELL of the step. mgmt -- status prints STUB_MGMT_STATUS, except for
-// the first STUB_PENDING_POLLS calls, which print STUB_MGMT_STATUS_PENDING, and except after the link, which prints STUB_BOUND_STATUS. A call that starts with STUB_FAIL_ARGS fails.
+// the first STUB_PENDING_POLLS calls, which print STUB_MGMT_STATUS_PENDING, and except after the link, which prints STUB_UNBOUND_STATUS for the first
+// STUB_UNBOUND_POLLS calls and STUB_BOUND_STATUS after that. A call that starts with STUB_FAIL_ARGS fails.
 const m6RestoreMise = `#!/usr/bin/env bash
 echo "mise $* | CELL=${CELL:-}" >>"$STUB_DIR/calls"
 [[ -z "${STUB_FAIL_ARGS:-}" || "$*" != "$STUB_FAIL_ARGS"* ]] || exit 1
 if [[ "$*" == "run mgmt -- status" ]]; then
   n=$(($(cat "$STUB_DIR/polls" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_DIR/polls"
   if ((n <= ${STUB_PENDING_POLLS:-0})); then printf '%s\n' "$STUB_MGMT_STATUS_PENDING"
-  elif grep -q '^mise run cell:link' "$STUB_DIR/calls"; then printf '%s\n' "$STUB_BOUND_STATUS"
+  elif grep -q '^mise run cell:link' "$STUB_DIR/calls"; then
+    m=$(($(cat "$STUB_DIR/bound-polls" 2>/dev/null || echo 0) + 1)); echo "$m" >"$STUB_DIR/bound-polls"
+    if ((m <= ${STUB_UNBOUND_POLLS:-0})); then printf '%s\n' "$STUB_UNBOUND_STATUS"; else printf '%s\n' "$STUB_BOUND_STATUS"; fi
   else printf '%s\n' "$STUB_MGMT_STATUS"; fi
 fi
 exit 0
@@ -173,6 +176,9 @@ func TestRepairRestoresCells(t *testing.T) {
 			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status}},
 		{name: "a pending drop that stays", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`, code: 1, kept: true,
 			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status}, want: "pending drop", timed: true},
+		// The bound wait retries: the first two reads after the link show an open step, and the third shows both cells bound.
+		{name: "a cell that becomes bound is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn,
+			env: []string{"STUB_UNBOUND_POLLS=2", "STUB_UNBOUND_STATUS=" + bound(openCel, okCell)}, calls: append(slices.Clone(restore), status, status)},
 		{name: "a cell that stays unbound keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
 			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: restore, timed: true},
 	} {
@@ -211,7 +217,7 @@ func TestRepairRestoresCells(t *testing.T) {
 				stubs[name] = body
 			}
 			env := append([]string{"STUB_DIR=" + dir, "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_MGMT_STATUS=" + tc.status, "STUB_MGMT_STATUS_PENDING=" + pending,
-				"STUB_STEPS=" + steps, "STUB_BOUND_STATUS=" + allGood, "GATE_M6_POLL=1", "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
+				"STUB_STEPS=" + steps, "STUB_BOUND_STATUS=" + allGood, "STUB_UNBOUND_STATUS=" + bothWithdrawn, "GATE_M6_POLL=1", "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
 				"HOSTSVC_SERVE=" + filepath.Join(dir, "serve")}, tc.env...)
 			out, errOut, code := runScript(t, "gate-m6-repair.sh", stubs, env, tc.args...)
 			if (code != 0) != (tc.code != 0) {
