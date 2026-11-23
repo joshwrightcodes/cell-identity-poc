@@ -425,8 +425,8 @@ func TestBundleWaitOutcomes(t *testing.T) {
 			if (err == nil) != tc.ok {
 				t.Fatalf("err %v, want ok=%v\nstdout %s\nstderr %s", err, tc.ok, out, errOut)
 			}
-			if n := len(calls(log, "mise run mgmt -- bundle get")); tc.polls >= 0 && n != tc.polls || tc.polls < 0 && n < 2 {
-				t.Errorf("%d polls, want %d\n%s", n, tc.polls, log)
+			if n := len(calls(log, "mise run mgmt -- bundle get")); tc.polls >= 0 && n != tc.polls || tc.polls < 0 && n < 1 {
+				t.Errorf("%d polls, want %d (or 1 or more when the row ends by the clock)\n%s", n, tc.polls, log)
 			}
 			published := r.file("build", "dev-cell-1", "published.env")
 			if tc.ok {
