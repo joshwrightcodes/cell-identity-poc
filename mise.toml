@@ -177,7 +177,7 @@ env = { CELL = "management" }
 run = "scripts/hostsvc-serve.sh"
 
 [tasks.mgmt]
-description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key, reset-state to start with a new state and a new signing key, or rotate-signing-key to rotate the signing key and render it"
+description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, revoke, unrevoke, restore or rotate-key, reset-state to start with a new state and a new signing key, or rotate-signing-key to rotate the signing key and render it"
 env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
