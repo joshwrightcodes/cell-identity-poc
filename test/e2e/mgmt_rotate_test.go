@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -21,22 +22,21 @@ import (
 // authority state of the management server, then renders the copy again with peer_root_configmap
 // and applies it, as a peer render does. Any other copy belongs to a real render. A copy in
 // management is the trust bundle of a link component sidecar, so the hook runs cell:link, which is
-// safe to run at each refresh. For a copy in another cluster the hook runs cell:up of that cluster
-// once for each content of the live bundle, as the refresh of mgmt:rotate-ca runs cell:up of a
-// cluster once in each pass.
+// safe to run at each refresh. For each cluster the hook runs cell:up, or cell:link for management,
+// once for each content of the live bundle, as the refresh of mgmt:rotate-ca does once in each pass.
 const rotateHook = `#!/usr/bin/env bash
 set -euo pipefail
 cluster="$1" ns="$2" name="$3"
-if [[ "$cluster" == management ]]; then
-  CELL=management "$ROTATE_ROOT/scripts/link.sh"
-  exit 0
-fi
-if [[ "$cluster" != "$ROTATE_TEST_CLUSTER" || "$ns" != "$ROTATE_TEST_NS" ]]; then
+if [[ "$cluster" == management || "$cluster" != "$ROTATE_TEST_CLUSTER" || "$ns" != "$ROTATE_TEST_NS" ]]; then
   pass="$(kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
     /opt/spire/bin/spire-server bundle show -socketPath /run/spire/sockets/api.sock -format pem | shasum -a 256 | cut -d' ' -f1)"
   grep -qxF "$cluster $pass" "$ROTATE_DONE" 2>/dev/null && exit 0
   echo "$cluster $pass" >>"$ROTATE_DONE"
-  CELL="$cluster" "$ROTATE_ROOT/scripts/up.sh"
+  if [[ "$cluster" == management ]]; then
+    CELL=management "$ROTATE_ROOT/scripts/link.sh"
+  else
+    CELL="$cluster" "$ROTATE_ROOT/scripts/up.sh"
+  fi
   exit 0
 fi
 kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-server -- \
@@ -44,6 +44,30 @@ kubectl --context kind-management -n spire-system exec spire-server-0 -c spire-s
 source "$ROTATE_ROOT/components/lib/peer-root.sh"
 peer_root_configmap "$name" "$ns" management mgmt.poc.internal | kubectl --context "kind-$cluster" apply -f - >/dev/null
 `
+
+// Bounds for the rotation. One refresh pass runs cell:up in each cluster with components, and
+// cell:link in management. The gate:m3 run of 2026-11-23 on a slow host took 163 s for the slowest
+// cell:up and 114 s for one link, so rotatePerCluster of 5 minutes gives each cluster the double of
+// that. The rotation has two refresh passes. rotatePadding covers the prepare, the activate, the
+// taint wait, the revoke and the two restarts of the host service.
+const (
+	rotatePerCluster = 5 * time.Minute
+	rotatePadding    = 10 * time.Minute
+	rotateWaitDelay  = 15 * time.Second
+)
+
+// rotateBudget returns the time for one rotation with passes refresh passes over n clusters.
+func rotateBudget(n, passes int) time.Duration {
+	return time.Duration(n*passes)*rotatePerCluster + rotatePadding
+}
+
+// killGroup makes cmd stop the process group that it leads, so a hook and the scripts below it
+// end with the script, and no orphan keeps the output pipe open.
+func killGroup(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
+	cmd.WaitDelay = rotateWaitDelay
+}
 
 // renderPeerCopy renders and applies the copy of the management root in a dev-cp test namespace.
 func renderPeerCopy(t *testing.T, root, ns string) {
@@ -121,18 +145,47 @@ func TestM3MgmtCARotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	states := filepath.Join(dir, "states")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", filepath.Join(root, "scripts/mgmt-rotate-ca.sh"))
-	cmd.Env = append(os.Environ(), "CELL="+mgmtCluster, "MGMT_ROTATE_REFRESH="+hook, "MGMT_ROTATE_TAINT_WAIT=10",
+	env := append(os.Environ(), "CELL="+mgmtCluster, "MGMT_ROTATE_REFRESH="+hook, "MGMT_ROTATE_TAINT_WAIT=10",
 		"ROTATE_TEST_CLUSTER="+spireCluster, "ROTATE_TEST_NS="+ns, "ROTATE_STATES="+states,
 		"ROTATE_DONE="+filepath.Join(dir, "done"), "ROTATE_ROOT="+root)
+	script := filepath.Join(root, "scripts/mgmt-rotate-ca.sh")
+	clusters := len(clustersWith(t, ""))
+	finished := false
+	// A rotation that stopped after the revoke leaves the bundle with the new root only, and the
+	// copies with two. It cannot roll back, so the cleanup runs the script again, which then runs
+	// only the second refresh. The hook makes the pass skip the clusters that it already refreshed.
+	t.Cleanup(func() {
+		if finished {
+			return
+		}
+		x509Now, _ := show()
+		if x509Now == oldX509 || len(bundleRoots(t, mgmtCluster)) != 1 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), rotateBudget(clusters, 1))
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "bash", script)
+		killGroup(cmd)
+		cmd.Env = append(env, "ROTATE_STATES="+filepath.Join(dir, "states-cleanup"), "ROTATE_DONE="+filepath.Join(dir, "done-cleanup"))
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Errorf("finish the second refresh of mgmt:rotate-ca: %v\n%s\nRun: CELL=%s mise run mgmt:rotate-ca", err, out, mgmtCluster)
+			return
+		}
+		t.Logf("finished the second refresh after the rotation stopped:\n%s", strings.TrimSpace(string(out)))
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), rotateBudget(clusters, 2))
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", script)
+	killGroup(cmd)
+	cmd.Env = env
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
-	t.Logf("running CELL=%s mise run mgmt:rotate-ca with the test copy %s/%s/peer-root", mgmtCluster, spireCluster, ns)
+	t.Logf("running CELL=%s mise run mgmt:rotate-ca with the test copy %s/%s/peer-root, bound %s", mgmtCluster, spireCluster, ns, rotateBudget(clusters, 2))
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("mgmt:rotate-ca: %v\n%s", err, out.String())
 	}
+	finished = true
 	t.Log(strings.TrimSpace(out.String()))
 
 	// The hook ran twice. At the first refresh the old CA was still active, and a new one was
