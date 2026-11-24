@@ -151,11 +151,11 @@ macOS still sleeps when the lid closes on battery power.
 - `operator:rotate-key` refuses during a cut, or while `dev-cp` is not connected, before it reads the secret manager. The message names the cut or "not connected". The option `--emergency` needs no old key.
 - The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. The DNS rule admits only the cluster DNS pods and the DNS Service address. CoreDNS can still forward names outside the cluster, so the server pod can send data out in DNS queries (not verified live). This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
 - The island signals have no alert evaluator.
-- The collector queue of `dev-cp` grows by `<measured in the live part>` in an environment island. This projects to `<measured in the live part>` in 24 hours, against a cap of 1.5 GiB.
+- The collector queue of `dev-cp` grows by 54 to 58 MiB per hour in an environment island, about 160 MiB in 3 hours 15 minutes. This projects to 1.3 to 1.4 GiB in 24 hours, against a cap of 1.5 GiB. Both slow runs project under 1.5 GiB, and the highest projection is 1.38 GiB.
 - An operation expires 1 hour after its signature, so work queued before a longer island never applies. A bundle set is an operation too.
 - The `celld` status carries no Argo CD health and no collector drops.
 - In the cell island of 2026-11-22, the agents of the cell exited 5 to 39 seconds after their SVIDs expired. Each container restarted in place and attested as a new agent after the heal. The cell kept every pod. Every agent was Ready within 18 seconds of the heal.
-- Workload API clients take a new SVID within about 11 seconds after their agent returns, by design. The retry caps give this bound, and the live value is `<measured in the live part>`. The stream retry of `celld` stops at 5 seconds.
+- Workload API clients take a new SVID within about 11 seconds after their agent returns, by design. The retry caps give this bound. In two slow runs, the new SVID came about 5 seconds after the agent returned, or 7 to 10 seconds after the heal. The stream retry of `celld` stops at 5 seconds.
 - An environment island restarts no container. In the run of 2026-11-22, the outbox grew to 18 items in 4 minutes and drained in 19 seconds.
 - The Colima VM clocks stop while the Mac sleeps, and `istio-agent` renews on the monotonic clock. After a long sleep, a sidecar keeps an expired certificate.
 - The `istio-proxy` liveness probe restarts only that container when its certificate has 2 hours or less left. The egress gateway has no such probe, and `cell:verify` reports its certificate.

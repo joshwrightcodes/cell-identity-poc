@@ -843,7 +843,7 @@ Each level has its own expected behaviour.
   Their restart counts rise, and they attest again after the island. No pod is replaced, and customer traffic continues.
   In the run of 2026-11-22, the agents exited 5 to 39 seconds after their SVIDs expired.
   Each agent was Ready within 18 seconds of the heal.
-- Workload API clients take a new SVID within about 11 seconds after their agent returns, by design. The retry caps give this bound, and the live value is `<measured in the live part>`.
+- Workload API clients take a new SVID within about 11 seconds after their agent returns, by design. The retry caps give this bound. In two slow runs, the new SVID came about 5 seconds after the agent returned, or 7 to 10 seconds after the heal.
 - The stream retry of `celld` stops at 5 seconds.
 - `mgmtd` reads the cell keys from the host service on the Mac. It checks each bound cell every 15 minutes, whether or not `dev-cp` is connected.
 - An operation expires 1 hour after its signature. Work that `mgmtd` queued before a longer island never applies, and a bundle set is an operation too.
@@ -890,7 +890,7 @@ A revocation reaches these points:
 
 | Point | Effect | Time |
 | --- | --- | --- |
-| Plugin of the SPIRE server | Refuses new attestations, with the reason `revoked` | Expected about 60 seconds after the revoke, from the ConfigMap sync and the reload every 10 seconds. The live value is `<measured in the live part>` |
+| Plugin of the SPIRE server | Refuses new attestations, with the reason `revoked` | Expected about 60 seconds after the revoke, from the ConfigMap sync and the reload every 10 seconds. The live value in two slow runs: the record reached the pod 26 and 50 seconds after the revoke, and the plugin refused by at most 32 and 57 seconds |
 | Cell gateway | Refuses hello, claim and bind with `cell_revoked`, and closes the live streams | Within 1 second after the gateway receives the record |
 | Container `agent-ban` | Bans the agents of the cell | Within 10 seconds after the pod holds the record, and about 4 seconds to take effect |
 | `cell-proxy` servers of `management` | Close the connections of the cell | Within 5 seconds after the log line `registry reloaded`, which follows the revocation by up to 81 seconds |
@@ -1752,7 +1752,7 @@ Many API server restarts in a short time raise that back-off, up to 5 minutes.
 Other runs took 312 to 471 seconds.
 The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it takes two to three minutes of that time.
 `gate:m3` fails when the run takes longer than `GATE_M3_BUDGET_MINUTES`.
-The budget is 66 minutes. This is 1.5 times the slower of two runs, 2,613 seconds on 2026-11-13, rounded up to the next minute.
+The budget is 115 minutes. This is 1.5 times the slower of two runs, 4,428 seconds on 2026-11-24, rounded up to 5 minutes.
 The test timeout of `go test` is twice the budget, with a floor of 30 minutes.
 Because of this, the budget check reports a slow run before the timeout ends it.
 This gives `gate:m1` and `gate:m2` 30 minutes, and `gate:m3` 132 minutes.
@@ -1801,7 +1801,9 @@ M6 measured values come from the live part of Task 11. Each value below is a mar
 | Rebuild drill of `management` | 23 minutes 35 seconds, 2026-11-18: `cell:down` 3 s, `hostsvc -- up --only management` 27 s, `cell:up` of `management` 237 s, `mgmt-api` link 25 s, `cell:up` of `dev-cp` 81 s, `portal -- request` 1 s, `portal -- wait` 61 s, `cell:up` of each cell 57 s and 59 s, the last link 229 s, then `harness:status` |
 | `gate:m6`, two runs | 947.8 seconds and 964 seconds (2026-11-17 UTC), 14 tests, both pass |
 | `gate:m6:provision`, two runs | 1327.5 seconds and 1431.4 seconds (2026-11-17 UTC), both pass. In the second run both steps were done 15 minutes 6 seconds after the request |
-| `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | 25 and 40 minutes, 1.5 times the slower run, rounded up to 5 minutes |
+| `gate:m6`, two runs again | 1549 seconds and 1583 seconds (2026-11-24 UTC), both pass |
+| `gate:m6:provision`, two runs again | 3276 seconds and 3046 seconds (2026-11-24 UTC), both pass |
+| `GATE_M6_BUDGET_MINUTES` and `GATE_M6_PROVISION_BUDGET_MINUTES` | 40 and 85 minutes, 1.5 times the slower run of 2026-11-24, rounded up to 5 minutes. The test timeout of `gate:m6:provision` stays at its floor of 210 minutes |
 | `harness:size` after the runs | 2026-11-18: `management` 3.4 GiB, `dev-cp` 2.5 GiB, each cell 2.2 GiB, `rogue` 0.6 GiB, `registry-mirror` 77 MiB. The VM used 11.7 GB and held 23.6 GB in the file cache |
 
 M7 measured values come from the live part of M7. Each value below is a marker until that run writes it:
@@ -1830,8 +1832,8 @@ M9 measured values come from the live part of M9:
 
 | Value | Result |
 | --- | --- |
-| `GATE_M9_BUDGET_MINUTES` and `GATE_M9_TEST_TIMEOUT_MINUTES` | 495 and 270 minutes. The values are provisional until the full runs set them |
-| `gate:m9` | `<measured in the live part>` |
+| `GATE_M9_BUDGET_MINUTES` and `GATE_M9_TEST_TIMEOUT_MINUTES` | 430 and 270 minutes. The budget is 1.5 times the slower run, rounded up to 5 minutes. `TestM9IslandsHold` took 199 minutes, under the timeout |
+| `gate:m9` | 17105 seconds and 16198 seconds (2026-11-24 UTC), from Phase 0 to the end of Phase 7, both pass with an SVID lifetime of 1 hour |
 
 ## Malicious cell tests
 

@@ -289,7 +289,7 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 }
 
 // TestGateM6ProvisionGate: gate.sh m6-provision runs only TestProvisionFromPortal, with the go test timeout that gate_test_timeout derives from
-// the budget of 40 minutes and the floor of 210 minutes in harness/versions.env: the floor, 210 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
+// the budget of 85 minutes and the floor of 210 minutes in harness/versions.env: the floor, 210 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
 // pattern of gate m6 does not match the provision test, because that test deletes both cells.
 func TestGateM6ProvisionGate(t *testing.T) {
 	t.Parallel()
@@ -358,7 +358,7 @@ func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
 		}
 	}
 	out, err := exec.Command("bash", "-c", `source "$1"; printf '%s %s' "$GATE_M6_PROVISION_BUDGET_MINUTES" "$GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES"`, "bash", versions).Output()
-	if err != nil || string(out) != "40 210" {
-		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"40 210\"", out, err)
+	if err != nil || string(out) != "85 210" {
+		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"85 210\"", out, err)
 	}
 }
