@@ -17,8 +17,8 @@
 #   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory, and kube-scheduler
 #      run a container that started after the API server container (read from the container runtime, not from the mirror pods)
 #      and hold a live Lease;
-#   4. replaces each pod with a projected token from another key, kindnet and kube-proxy first, then istio-cni-node, then istiod, then one pod at
-#      a time, and waits for every workload;
+#   4. replaces each pod with a projected token from another key, one at a time, in this order: kindnet and kube-proxy, istio-cni-node, istiod,
+#      then the other pods. It then waits for every workload;
 #   5. runs the key check of mgmtd for dev-cell-1, and repeats it after 61 s while the answer is rate_limited, up to
 #      three checks. The record of the cell must then list the key IDs that the API server publishes. A mgmtd
 #      that does not answer skips this step.

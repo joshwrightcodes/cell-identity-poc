@@ -890,7 +890,7 @@ A revocation reaches these points:
 
 | Point | Effect | Time |
 | --- | --- | --- |
-| Plugin of the SPIRE server | Refuses new attestations, with the reason `revoked` | Expected about 60 seconds after the revoke, from the ConfigMap sync and the reload every 10 seconds. The live value in two slow runs: the record reached the pod 26 and 50 seconds after the revoke, and the plugin refused by at most 32 and 57 seconds |
+| Plugin of the SPIRE server | Refuses new attestations, with the reason `revoked` | Expected about 60 seconds after the revoke, from the ConfigMap sync and the reload every 10 seconds. In two slow runs, the record reached the pod 26 and 50 seconds after the revoke. The plugin refused by at most 32 and 57 seconds |
 | Cell gateway | Refuses hello, claim and bind with `cell_revoked`, and closes the live streams | Within 1 second after the gateway receives the record |
 | Container `agent-ban` | Bans the agents of the cell | Within 10 seconds after the pod holds the record, and about 4 seconds to take effect |
 | `cell-proxy` servers of `management` | Close the connections of the cell | Within 5 seconds after the log line `registry reloaded`, which follows the revocation by up to 81 seconds |
@@ -983,7 +983,7 @@ With no live cell, the server pod of `dev-cp` has no `agent-ban` container, and 
 ### Gate of M9
 
 `mise run gate:m9` runs the slow tier overnight. Build the images first with `mise run images`.
-The tier uses SVIDs of 1 hour, so each island holds for three lifetimes. The estimate for a full run is about 5 hours 30 minutes.
+The tier uses SVIDs of 1 hour, so each island holds for three lifetimes. Two full runs took 4 hours 30 minutes and 4 hours 45 minutes.
 The lifetime comes from `GATE_M9_SVID_TTL` in `harness/versions.env`. A different value in the environment wins, and the run is then not a record.
 `GATE_M9_SVID_TTL=1m` makes the estimate about 1.5 hours.
 
@@ -1000,7 +1000,7 @@ The gate runs in phases:
 A Go timeout skips every cleanup, so run `gate:m9:repair` after a timeout.
 
 `mise run poc:gate -- fast` runs `gate:m1` to `gate:m8`, with `gate:m6:provision`, and stops at the first failure.
-`mise run poc:gate -- slow` runs `gate:m9`, and `mise run poc:gate -- all` runs both. The estimate for a full run is about 10 hours.
+`mise run poc:gate -- slow` runs `gate:m9`, and `mise run poc:gate -- all` runs both. The estimate for a run of both tiers is about 10 hours.
 The manual drills `gate:m4:rotate`, `gate:m5:soak` and `gate:m5:drill` do not run.
 
 The slow tier needs these conditions for its whole run:
@@ -1755,7 +1755,8 @@ The M2 key rotation test restarts the API server of `dev-cell-1` twice, and it t
 The budget is 115 minutes. This is 1.5 times the slower of two runs, 4,428 seconds on 2026-11-24, rounded up to 5 minutes.
 The test timeout of `go test` is twice the budget, with a floor of 30 minutes.
 Because of this, the budget check reports a slow run before the timeout ends it.
-This gives `gate:m1` and `gate:m2` 30 minutes, and `gate:m3` 132 minutes.
+This gives `gate:m1` 30 minutes and `gate:m3` 230 minutes. `gate:m2` has 60 minutes from `GATE_M2_TEST_TIMEOUT_MINUTES`.
+The budgets of `gate:m3`, `gate:m6`, `gate:m6:provision` and `gate:m9` come from runs of 2026-11-24. The host scripts ran 2.5 to 5 times slower in those runs than in the M8 runs.
 `TestM3StatusHealthy` takes about seven minutes. Earlier tests restart the SPIRE server of `management`, and `obs:uplink-status` counts exporter failures of the last five minutes. `TestM3VerifyDetectsPeerRootDrift` takes about 80 seconds.
 The tests of the mesh view add about ten minutes. The tests of the telemetry store add about two minutes. The collector tests add about eight minutes. The rogue telemetry test waits 3 minutes on purpose, and the check of every cluster waits for the signals to arrive. The probes of `TestM3LgtmHardened` and the three dial tests of `TestM3TelemetryNodePortAdmission` run in parallel, and the gateway exports metrics every 10 seconds, to keep that time short.
 `gate:m3` writes the events of `go test -json` to `build/gate-m3.json`, and the duration of each test, slowest first, to `build/gate-m3-durations.txt`.
