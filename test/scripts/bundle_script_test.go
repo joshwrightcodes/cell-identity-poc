@@ -379,6 +379,20 @@ func TestBundleAttachesSigstore(t *testing.T) {
 			}
 		}
 	})
+	t.Run("a failed attach after publish carries the error of bundlectl", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, errOut, _, err := r.run("bundle.sh", []string{"STUB_ATTACH_FAIL=1"}, "publish", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "could not attach the Sigstore bundle") || !strings.Contains(errOut, "attach failed") {
+			t.Errorf("err %v, stderr %q, want the die message with the error text of bundlectl attach", err, errOut)
+		}
+	})
+	t.Run("a failed attach after cosign carries the error of bundlectl", func(t *testing.T) {
+		r := newBundleRoot(t, "dev-cell-1")
+		_, errOut, _, err := r.run("bundle.sh", []string{"STUB_ATTACH_FAIL=1"}, "cosign", "--target", "dev-cell-1")
+		if err == nil || !strings.Contains(errOut, "could not attach the Sigstore bundle") || !strings.Contains(errOut, "attach failed") {
+			t.Errorf("err %v, stderr %q, want the die message with the error text of bundlectl attach", err, errOut)
+		}
+	})
 	t.Run("cosign attaches the bundle that mgmtd holds now, under the key of the plane", func(t *testing.T) {
 		r := newBundleRoot(t, "dev-cell-1")
 		out, errOut, log, err := r.run("bundle.sh", nil, "cosign", "--target", "dev-cell-1")

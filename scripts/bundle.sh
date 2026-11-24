@@ -58,14 +58,14 @@ mirror_host() {
 # attach_sigstore <answer of mgmtd> <mirror> writes the Sigstore bundle of the answer to build/<target>/sigstore-<counter>.json and
 # attaches it to the root of the set on the mirror. It prints the path of the file.
 attach_sigstore() {
-  local answer="$1" mirror="$2" root counter file
+  local answer="$1" mirror="$2" root counter file attached
   root="$(jq -er '.rootDigest' <<<"$answer")" || die "the answer of mgmtd has no root digest"
   counter="$(jq -er '.version.counter' <<<"$answer")" || die "the answer of mgmtd has no version"
   file="$BUILD/sigstore-$counter.json"
   mkdir -p "$BUILD"
   jq -ec '.sigstoreBundle' <<<"$answer" >"$file" || die "the answer of mgmtd has no Sigstore bundle"
-  mise run bundlectl -- attach --target "$CELL_NAME" --digest "$root" --bundle "$file" --registry "$mirror" --build "$BUILD_ROOT" >/dev/null \
-    || die "could not attach the Sigstore bundle $file to the root $root of $CELL_NAME on the mirror"
+  attached="$(mise run bundlectl -- attach --target "$CELL_NAME" --digest "$root" --bundle "$file" --registry "$mirror" --build "$BUILD_ROOT")" \
+    || die "could not attach the Sigstore bundle $file to the root $root of $CELL_NAME on the mirror: $attached"
   printf '%s' "$file"
 }
 
