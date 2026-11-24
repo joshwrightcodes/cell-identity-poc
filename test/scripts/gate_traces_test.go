@@ -61,40 +61,52 @@ func TestRecordKidsTrace(t *testing.T) {
 	}
 }
 
-// TestRepairOrderPods: the pods of kindnet, kube-proxy and istio-cni-node come before coredns and every other pod, and only the pods with a stale UID
-// are listed.
+// TestRepairOrderPods: the order is kindnet and kube-proxy, then istio-cni-node, then istiod, then every other pod. Only the pods with a stale UID are
+// listed. The input lists the istio-system pods first, as `kubectl get pods -A` does, so the order does not come from the list order.
 func TestRepairOrderPods(t *testing.T) {
 	t.Parallel()
 	testtool.Need(t, "jq", "bash")
-	pod := func(ns, name, uid, kind, owner string) string {
-		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
+	pod := func(ns, name, uid, kind, owner, app string) string {
+		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","labels":{"app.kubernetes.io/name":"` + app + `"},"ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
 	}
 	pods := `{"items":[` + strings.Join([]string{
-		pod("kube-system", "coredns-1", "u1", "ReplicaSet", "coredns-559f"),
-		pod("apps", "web-1", "u2", "ReplicaSet", "web-1a"),
-		pod("kube-system", "kube-proxy-x", "u3", "DaemonSet", "kube-proxy"),
-		pod("kube-system", "fresh", "u9", "ReplicaSet", "fresh-1"),
-		pod("kube-system", "kindnet-y", "u4", "DaemonSet", "kindnet"),
-		pod("local-path-storage", "provisioner", "u5", "ReplicaSet", "provisioner-1"),
-		pod("istio-system", "istio-cni-node-z", "u6", "DaemonSet", "istio-cni-node"),
+		pod("istio-system", "istio-cni-node-z", "u6", "DaemonSet", "istio-cni-node", "istio-cni"),
+		pod("istio-system", "istiod-7f", "u7", "ReplicaSet", "istiod-7f", "istiod"),
+		pod("apps", "web-1", "u2", "ReplicaSet", "web-1a", "web"),
+		pod("kube-system", "coredns-1", "u1", "ReplicaSet", "coredns-559f", "coredns"),
+		pod("kube-system", "fresh", "u9", "ReplicaSet", "fresh-1", "fresh"),
+		pod("kube-system", "kindnet-y", "u4", "DaemonSet", "kindnet", "kindnet"),
+		pod("kube-system", "kube-proxy-x", "u3", "DaemonSet", "kube-proxy", "kube-proxy"),
+		pod("local-path-storage", "provisioner", "u5", "ReplicaSet", "provisioner-1", "provisioner"),
 	}, ",") + `]}`
 	dir := t.TempDir()
-	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5","u6"]`, pods)
+	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5","u6","u7"]`, pods)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 6 {
-		t.Fatalf("got %d pods %q, want the 6 with a stale UID", len(lines), lines)
+	if len(lines) != 7 {
+		t.Fatalf("got %d pods %q, want the 7 with a stale UID", len(lines), lines)
 	}
-	first := map[string]bool{lines[0]: true, lines[1]: true, lines[2]: true}
-	if !first["kube-system kube-proxy-x DaemonSet kube-proxy"] || !first["kube-system kindnet-y DaemonSet kindnet"] || !first["istio-system istio-cni-node-z DaemonSet istio-cni-node"] {
-		t.Fatalf("the first three pods are %q, want kindnet, kube-proxy and istio-cni-node before coredns and the others", lines[:3])
+	pos := map[string]int{}
+	for i, l := range lines {
+		pos[strings.Fields(l)[1]] = i
 	}
-	for _, l := range lines[3:] {
-		if strings.Contains(l, "fresh") {
-			t.Errorf("the pod with a current UID is listed: %s", l)
+	if _, ok := pos["fresh"]; ok {
+		t.Errorf("the pod with a current UID is listed: %q", lines)
+	}
+	before := func(a, b string) {
+		t.Helper()
+		if pos[a] >= pos[b] {
+			t.Errorf("order %q puts %s at %d and %s at %d, want %s first", lines, a, pos[a], b, pos[b], a)
 		}
+	}
+	for _, node := range []string{"kindnet-y", "kube-proxy-x"} {
+		before(node, "istio-cni-node-z")
+	}
+	before("istio-cni-node-z", "istiod-7f")
+	for _, app := range []string{"web-1", "coredns-1", "provisioner"} {
+		before("istiod-7f", app)
 	}
 }
 

@@ -176,17 +176,20 @@ record_kids_trace() {
 }
 
 # repair_order_pods <stale pod UIDs as a JSON array> reads the output of `kubectl get pods -A -o json` on standard input and prints
-# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. Three ranks, in this order:
-#   0. kindnet, kube-proxy and istio-cni-node: kindnet enforces NetworkPolicy, kube-proxy routes the service addresses that other pods
-#      need to start, and no pod gets a sandbox while the token of istio-cni-node is signed by a key that the API server no longer verifies.
-#   1. istiod (label app.kubernetes.io/name): it reviews tokens through the API server and issues the certificates of other pods. An
+# "<namespace> <pod> <owner kind> <owner name>" for each pod with one of the UIDs. Four ranks, in this order:
+#   0. kindnet and kube-proxy: kindnet enforces NetworkPolicy. kube-proxy routes the service address of the API server, which
+#      istio-cni-node and every other pod client need. A kube-proxy with a token of the old key has no endpoint for the
+#      `kubernetes` Service, so pod-network clients time out on the API server.
+#   1. istio-cni-node: no pod gets a sandbox while its token is signed by a key that the API server no longer verifies.
+#   2. istiod (label app.kubernetes.io/name): it reviews tokens through the API server and issues the certificates of other pods. An
 #      app pod that waits for a certificate from an istiod with a token of the old key never gets one, so istiod comes before every
 #      app pod, whatever the namespace sorts like. The cells hold no SPIRE server, so no other issuer is in this rank.
-#   2. every other pod, in list order.
+#   3. every other pod, in list order.
 repair_order_pods() {
   jq -r --argjson uids "$1" '[.items[] | select(.metadata.uid as $u | $uids | index($u))]
-    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy", "istio-cni-node")) then 0
-        elif ((.metadata.labels["app.kubernetes.io/name"] // "") | IN("istiod")) then 1 else 2 end)
+    | sort_by(if ((.metadata.ownerReferences[0].name // "") | IN("kindnet", "kube-proxy")) then 0
+        elif ((.metadata.ownerReferences[0].name // "") == "istio-cni-node") then 1
+        elif ((.metadata.labels["app.kubernetes.io/name"] // "") == "istiod") then 2 else 3 end)
     | .[] | "\(.metadata.namespace) \(.metadata.name) \(.metadata.ownerReferences[0].kind // "none") \(.metadata.ownerReferences[0].name // "none")"'
 }
 

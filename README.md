@@ -1890,8 +1890,9 @@ It is safe to run again.
   Then it waits until each component runs a container that started after the API server and holds a live Lease.
   After a stop, the Lease needs a new holder, because the old process renews its Lease against the new API server before the stop.
 - It replaces each pod of `dev-cell-1` that received a token from the test key.
-  The repair replaces the pods one at a time, in three ranks.
-  The ranks are the node pods (`kindnet`, `kube-proxy` and `istio-cni-node`), `istiod`, and all other pods.
+  The repair replaces the pods one at a time, in four ranks.
+  The ranks are `kindnet` and `kube-proxy`, `istio-cni-node`, `istiod`, and all other pods.
+  `kube-proxy` routes the service address of the API server, so it comes before every pod that needs that address.
   An app pod waits for a certificate from `istiod`, so an `istiod` with a token of the old key goes before it.
   A Deployment outside the harness and outside Argo CD gets a rollout restart, so `coredns` keeps one ready pod.
   The other pods are deleted, and their controllers create them again.
