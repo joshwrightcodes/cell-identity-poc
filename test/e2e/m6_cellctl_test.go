@@ -421,12 +421,24 @@ func TestM6CancelReachesHostService(t *testing.T) {
 		t.Fatalf("the signed revision is %v after the cancel, and was %v before it, want a rise", cancelled, recreated)
 	}
 	waitHostSpecAtLeast(t, cancelled, 2*time.Minute)
-	a := putStepOnce(t, cert, id, envelope)
-	rid := a.denied()
-	if a.Code != http.StatusForbidden || rid == "" {
-		t.Fatalf("got %d %s (Retry-After %q), want 403 with the Denied body", a.Code, a.Body, a.RetryAfter)
+	// The host service logs a refusal with one reason at most once in each 10 s. A refusal of the cell controller can use the window
+	// of the test, so a PUT without a log line waits for a new window and goes out again.
+	const attempts = 3
+	var rid, line string
+	for attempt := 1; attempt <= attempts; attempt++ {
+		a := putStepOnce(t, cert, id, envelope)
+		rid = a.denied()
+		if a.Code != http.StatusForbidden || rid == "" {
+			t.Fatalf("attempt %d: got %d %s (Retry-After %q), want 403 with the Denied body", attempt, a.Code, a.Body, a.RetryAfter)
+		}
+		if line = hostLog(t, rid); line != "" {
+			break
+		}
+		if attempt == attempts {
+			t.Fatalf("the host service log has no line for request %s after %d attempts", rid, attempts)
+		}
+		time.Sleep(11 * time.Second)
 	}
-	line := hostLog(t, rid)
 	if !strings.Contains(line, `"reason":"`+step.DetailStepUnindexed+`"`) || strings.Contains(line, step.DetailBootstrapMismatch) {
 		t.Fatalf("the log of the host service for request %s is %q, want the reason step_unindexed and not bootstrap_mismatch", rid, line)
 	}
