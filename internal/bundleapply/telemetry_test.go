@@ -394,3 +394,63 @@ func TestSetAppliedFromState(t *testing.T) {
 	}
 	wantSeries(t, appliedFrom(t, reader), "1.1", rootChars(a), "healthy", at)
 }
+
+// TestSetAppliedRollingBack checks that the series reports the state rolling_back while the rollback waits.
+func TestSetAppliedRollingBack(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.health = func(root, app string) (string, string) {
+		if root == b.root.Digest && app == "apps-sample" {
+			return "Synced", "Degraded"
+		}
+		return "Synced", "Healthy"
+	}
+	var seen []appliedSeries
+	var at time.Time
+	te.hook = func(int) {
+		if te.state().State == stateRollingBack && seen == nil {
+			seen, at = te.applied(t), te.clk.Now()
+		}
+	}
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	if seen == nil {
+		t.Fatal("the rollback never waited")
+	}
+	// The series holds the time at which the state changed, which is before the first wait.
+	if len(seen) == 1 {
+		wantSeries(t, seen, "1.2", rootChars(b), "rolling_back", time.Unix(seen[0].value, 0))
+		if seen[0].value > at.Unix() {
+			t.Fatalf("value %d is after the first wait at %d", seen[0].value, at.Unix())
+		}
+	} else {
+		t.Fatalf("series = %v", seen)
+	}
+}
+
+// slowStore advances the clock at each write, so the tag move takes time.
+type slowStore struct {
+	Store
+	clk *clock
+}
+
+func (s slowStore) Write(ctx context.Context, st State, rv string) error {
+	s.clk.Advance(3 * time.Second)
+	return s.Store.Write(ctx, st, rv)
+}
+
+// TestSyncDelayStartsAtTagMove checks that the time of the tag step counts in the delay.
+func TestSyncDelayStartsAtTagMove(t *testing.T) {
+	te := newTelemetryEnv(t)
+	cfg := te.cfg
+	cfg.Poll = 7 * time.Second
+	cfg.Tracer, cfg.Meter = nil, te.meter
+	cfg.State = slowStore{Store: cfg.State, clk: te.clk}
+	te.a = te.applier(cfg)
+	wantOutcome(t, te.apply("opA", te.set(1, std("a"))), op.OutcomeApplied, "", "")
+	count, sum := te.syncDelays(t, "synced")
+	if count != 1 || sum < 10 || int64(sum-7)%3 != 0 {
+		t.Fatalf("sync delay count %d sum %v, want 1 and 7 plus whole 3 s writes of the tag step", count, sum)
+	}
+}
