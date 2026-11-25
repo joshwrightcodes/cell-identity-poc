@@ -20,7 +20,7 @@ node_peers="$(ipv4_list NODE_IPS | jq -Rcn '[inputs | {ipBlock: {cidr: (. + "/32
 cell_proxy_image="$(ko_image cell-proxy)" || { echo "error: observability-store render: no cell-proxy image" >&2; exit 1; }
 
 # Grafana reads the dashboards, the alert rules and the provider file from ConfigMaps. Each dashboard has its own ConfigMap
-# lgtm-dashboard-<file name>, and lgtm-grafana holds provider.yaml and rules.json. A ConfigMap stays below 256 KiB as a
+# lgtm-dashboard-<file name>, and lgtm-grafana holds provider.yaml and rules.json. The files of a ConfigMap stay below 256 KiB together, as a
 # margin, because Kubernetes limits an object to 1 MiB and the applications sync with server-side apply.
 grafana="$here/grafana"
 max_configmap=262144
@@ -29,10 +29,14 @@ for f in "$grafana"/dashboards/*.json; do
   [[ -f "$f" ]] || { echo "error: observability-store render: no dashboard in $grafana/dashboards" >&2; exit 1; }
   dashboards+=("$f")
 done
-for f in "${dashboards[@]}" "$grafana/provider.yaml" "$grafana/alerting/rules.json"; do
-  size="$(wc -c <"$f" | tr -d ' ')"
-  ((size <= max_configmap)) || { echo "error: observability-store render: $f has $size bytes, the limit is $max_configmap" >&2; exit 1; }
-done
+# check_size <file>... fails when the files of one ConfigMap add up to more than the limit.
+check_size() {
+  local total
+  total="$(cat "$@" | wc -c | tr -d ' ')"
+  ((total <= max_configmap)) || { echo "error: observability-store render: $* has $total bytes, the limit is $max_configmap" >&2; exit 1; }
+}
+for f in "${dashboards[@]}"; do check_size "$f"; done
+check_size "$grafana/provider.yaml" "$grafana/alerting/rules.json"
 
 sum="$(cat "$here/prometheus.yaml" "$here/loki.yaml" "${dashboards[@]}" "$grafana/provider.yaml" "$grafana/alerting/rules.json" | sha256)"
 sed "s|@LGTM_CONFIG_SHA256@|$sum|" "$here/lgtm.yaml" | DASHBOARDS="$(for f in "${dashboards[@]}"; do basename "$f" .json; done | jq -Rcn '[inputs]')" yq '
@@ -43,16 +47,16 @@ PROM="$(cat "$here/prometheus.yaml")" LOKI="$(cat "$here/loki.yaml")" yq -n '
   | .data["prometheus.yaml"] = strenv(PROM) | .data["loki.yaml"] = strenv(LOKI)
   | .data["prometheus.yaml"] style="literal" | .data["loki.yaml"] style="literal"'
 echo "---"
-PROVIDER="$(cat "$grafana/provider.yaml")" RULES="$(cat "$grafana/alerting/rules.json")" yq -n '
+PROVIDER="$grafana/provider.yaml" RULES="$grafana/alerting/rules.json" yq -n '
   .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "lgtm-grafana" | .metadata.namespace = "observability-system"
-  | .data["provider.yaml"] = strenv(PROVIDER) | .data["rules.json"] = strenv(RULES)
+  | .data["provider.yaml"] = load_str(strenv(PROVIDER)) | .data["rules.json"] = load_str(strenv(RULES))
   | .data["provider.yaml"] style="literal" | .data["rules.json"] style="literal"'
 echo "---"
 for f in "${dashboards[@]}"; do
   name="$(basename "$f" .json)"
-  NAME="lgtm-dashboard-$name" KEY="$name.json" BODY="$(cat "$f")" yq -n '
+  NAME="lgtm-dashboard-$name" KEY="$name.json" BODY="$f" yq -n '
     .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = strenv(NAME) | .metadata.namespace = "observability-system"
-    | .data[strenv(KEY)] = strenv(BODY) | .data[strenv(KEY)] style="literal"'
+    | .data[strenv(KEY)] = load_str(strenv(BODY)) | .data[strenv(KEY)] style="literal"'
   echo "---"
 done
 echo "---"

@@ -407,7 +407,7 @@ func TestLgtmGrafanaProvisioning(t *testing.T) {
 			continue
 		}
 		data := get[map[string]any](t, cm, "data")
-		if len(data) != 1 || data[name+".json"] != strings.TrimRight(string(want), "\n") {
+		if len(data) != 1 || data[name+".json"] != string(want) {
 			t.Errorf("ConfigMap lgtm-dashboard-%s has keys %v, want only %s.json with the file content", name, keysOf(data), name)
 		}
 		if len(want) > 256<<10 {
@@ -424,7 +424,7 @@ func TestLgtmGrafanaProvisioning(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := get[map[string]any](t, grafana, "data"); len(got) != 2 || got[key] != strings.TrimRight(string(want), "\n") {
+		if got := get[map[string]any](t, grafana, "data"); len(got) != 2 || got[key] != string(want) {
 			t.Errorf("ConfigMap lgtm-grafana key %s differs from %s, or the ConfigMap has keys %v", key, file, keysOf(got))
 		}
 	}
@@ -500,8 +500,23 @@ func TestLgtmGrafanaProvisioning(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := storeRender(t, root)
-		if r.err == nil || !strings.Contains(r.stderr, "mesh.json") {
+		if r.err == nil || !strings.Contains(r.stderr, "mesh.json") || !strings.Contains(r.stderr, "the limit is 262144") {
 			t.Errorf("render of a dashboard above 256 KiB gave %v and %q, want a failure that names the file", r.err, r.stderr)
+		}
+	})
+	t.Run("size cap of one ConfigMap", func(t *testing.T) {
+		t.Parallel()
+		root := storeTree(t)
+		dir := filepath.Join(root, "components", "observability-store", "grafana")
+		if err := os.WriteFile(filepath.Join(dir, "provider.yaml"), []byte(strings.Repeat("#", 130<<10)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "alerting", "rules.json"), []byte(strings.Repeat(" ", 130<<10)+"{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := storeRender(t, root)
+		if r.err == nil || !strings.Contains(r.stderr, "provider.yaml") || !strings.Contains(r.stderr, "the limit is 262144") {
+			t.Errorf("render of lgtm-grafana files above 256 KiB together gave %v and %q, want a failure that names the files", r.err, r.stderr)
 		}
 	})
 }
@@ -532,7 +547,10 @@ func TestCollectorIstioAgentJob(t *testing.T) {
 				t.Errorf("the job reads %s, want apps-demo, apps-sample and istio-egress", got)
 			}
 			relabel := fmt.Sprint(get[[]any](t, job, "relabel_configs"))
-			for _, want := range []string{"regex:istio-proxy;15090", "action:keep", "replacement:$$1:15020", "target_label:__address__", "target_label:pod", "target_label:namespace"} {
+			if want := "map[regex:(.+) replacement:$$1:15020 source_labels:[__meta_kubernetes_pod_ip] target_label:__address__]"; !strings.Contains(relabel, want) {
+				t.Errorf("relabel_configs %s lack the address rewrite %s", relabel, want)
+			}
+			for _, want := range []string{"regex:istio-proxy;15090", "action:keep", "target_label:pod", "target_label:namespace"} {
 				if !strings.Contains(relabel, want) {
 					t.Errorf("relabel_configs %s lack %s", relabel, want)
 				}
@@ -547,6 +565,11 @@ func TestCollectorIstioAgentJob(t *testing.T) {
 				t.Error("the replacement of the istio-agent job does not escape the dollar sign")
 			}
 			rule := ""
+			for _, r := range get[[]any](t, objs["NetworkPolicy observability-system/collector-egress"], "spec", "egress") {
+				if ports := fmt.Sprint(lookupOr(r, "ports")); strings.Contains(ports, "15020") && ports != "[map[port:15020 protocol:TCP]]" {
+					t.Errorf("the collector egress rule on 15020 has ports %s, want only TCP 15020", ports)
+				}
+			}
 			for _, r := range peerRules(t, objs["NetworkPolicy observability-system/collector-egress"], "egress") {
 				if strings.Join(r.ports, ",") == "15020" {
 					rule = r.peers
@@ -572,6 +595,11 @@ func TestNetworkPolicyIstioAgentPort(t *testing.T) {
 				if np == nil {
 					t.Errorf("no %s", name)
 					continue
+				}
+				for _, r := range get[[]any](t, np, "spec", "ingress") {
+					if ports := fmt.Sprint(lookupOr(r, "ports")); strings.Contains(ports, "15020") && ports != "[map[port:15020 protocol:TCP]]" {
+						t.Errorf("%s has an ingress rule with ports %s, want only TCP 15020", name, ports)
+					}
 				}
 				var on15090, on15020 []string
 				for _, r := range peerRules(t, np, "ingress") {
