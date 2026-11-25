@@ -367,6 +367,10 @@ run = "scripts/revoke.sh"
 description = "Owner action, once: write a new operator key to the secret manager through POC_SECRET_WRITE_CMD, read it back, then write ConfigMap mgmt-system/operator-pub and build/operator/key.env. See scripts/operator-key.sh"
 run = "scripts/operator-key.sh create"
 
+[tasks."operator:restore-key"]
+description = "Owner action, after a rebuild of the harness: read the operator key through POC_SECRET_READ_CMD, compare its SHA-256 with build/operator/key.env, then write ConfigMap mgmt-system/operator-pub. Refuses while operator-pub exists. See scripts/operator-key.sh"
+run = "scripts/operator-key.sh restore"
+
 [tasks."operator:check-key"]
 description = "Read the operator key through POC_SECRET_READ_CMD and compare its public key with operator-pub, each pin in dev-cp and build/operator/key.env. Prints one JSON line with match"
 run = "scripts/operator-key.sh check"

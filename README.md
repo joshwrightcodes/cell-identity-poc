@@ -947,6 +947,18 @@ CELL=management LINK_ONLY=mgmt-api mise run cell:link
 mise run operator:check-key
 ```
 
+After `harness:down` and `harness:up`, the new `management` cluster has no `operator-pub`, but `build/operator/key.env` and the key remain.
+`harness:up` then stops at the operator key. Restore the pin with the existing key, run the commands that it prints, and then rerun the remaining `harness:up` steps that the failed run printed:
+
+```sh
+mise run operator:restore-key
+CELL=dev-cp mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
+mise run operator:check-key
+```
+
+`operator:restore-key` refuses while `operator-pub` exists, and when `key.env` is absent. It writes nothing when the SHA-256 of the key differs from `key.env`.
+
 `operator:check-key` prints `"match":true` when every pin matches. It compares the key in the secret manager with each public pin in the PoC.
 It reads the pin ConfigMaps and `server.conf`. It does not read the keys that the running processes loaded.
 A pin that differs shows in the output, because the Mac administrator can change a pin.

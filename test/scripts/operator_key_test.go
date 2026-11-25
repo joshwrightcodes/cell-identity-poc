@@ -1498,3 +1498,171 @@ func TestRotateRefusesUnsafePrefix(t *testing.T) {
 		}
 	}
 }
+
+// restoreRig sets up a rebuilt harness: the key of installKey with operator-pub removed again, so key.env and the seed remain.
+func restoreRig(t *testing.T) (*opRig, ed25519.PrivateKey, string) {
+	t.Helper()
+	r := newOpRig(t)
+	name := "poc/operator/20260101T000000Z"
+	k := opNewKey(t)
+	r.installKey(k, name)
+	if err := os.Remove(filepath.Join(r.stub, "k", "kind-management", "mgmt-system", "operator-pub.json")); err != nil {
+		t.Fatal(err)
+	}
+	return r, k, name
+}
+
+// TestRestoreWritesOperatorPub: restore reads the seed through the read command into operatorctl pub, compares the SHA-256 with
+// key.env, writes operator-pub with the name of key.env, prints one JSON line, and leaves key.env and the secret manager as they were.
+func TestRestoreWritesOperatorPub(t *testing.T) {
+	t.Parallel()
+	r, k, name := restoreRig(t)
+	envBefore := r.keyEnv()
+	out, errOut, code := r.run(nil, "restore")
+	if code != 0 {
+		t.Fatalf("restore: exit %d\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	res := oneJSON(t, out)
+	if res["restored"] != true || res["keyName"] != name || res["keySHA256"] != opSHA(k) {
+		t.Fatalf("restore printed %v, want restored true, keyName %s and keySHA256 %s", res, name, opSHA(k))
+	}
+	next, _ := res["next"].([]any)
+	if len(next) != 3 || next[0] != "CELL=dev-cp mise run cell:up" || next[1] != "CELL=management LINK_ONLY=mgmt-api mise run cell:link" || next[2] != "mise run operator:check-key" {
+		t.Fatalf("next %v, want the three commands", next)
+	}
+	if d := r.data("kind-management", "mgmt-system", "operator-pub"); d["spec.pub"] != opPub(k) || d["spec.name"] != name || d["next.pub"] != "" {
+		t.Fatalf("operator-pub holds %v, want spec.pub %s and spec.name %s alone", d, opPub(k), name)
+	}
+	if r.keyEnv() != envBefore {
+		t.Fatalf("key.env changed: %q", r.keyEnv())
+	}
+	for _, c := range r.calls() {
+		if strings.HasPrefix(c, "secret-write") || strings.Contains(c, "keygen") {
+			t.Fatalf("restore made a new key: %q", c)
+		}
+	}
+	// check accepts the restored pin once the pins of dev-cp and mgmtd hold the key again.
+	if _, _, code := r.run(nil, "check"); code != 0 {
+		t.Fatalf("check after restore: exit %d, want 0", code)
+	}
+}
+
+// TestRestoreRefuses: restore refuses when operator-pub exists or when key.env is absent or incomplete, before it reaches the
+// secret manager, and it changes nothing.
+func TestRestoreRefuses(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, r *opRig, k ed25519.PrivateKey, name string)
+		want  string
+	}{
+		{"operator_pub_exists", func(_ *testing.T, r *opRig, k ed25519.PrivateKey, name string) {
+			r.put("kind-management", "mgmt-system", "operator-pub", map[string]string{"spec.pub": opPub(k), "spec.name": name})
+		}, "operator:check-key"},
+		{"no_key_env", func(t *testing.T, r *opRig, _ ed25519.PrivateKey, _ string) {
+			if err := os.Remove(filepath.Join(r.build, "operator", "key.env")); err != nil {
+				t.Fatal(err)
+			}
+		}, "operator:create-key"},
+		{"key_env_without_sha", func(_ *testing.T, r *opRig, _ ed25519.PrivateKey, name string) {
+			os.WriteFile(filepath.Join(r.build, "operator", "key.env"), []byte("OPERATOR_KEY_NAME="+name+"\n"), 0o644)
+		}, "operator:create-key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, k, name := restoreRig(t)
+			tc.setup(t, r, k, name)
+			before := fmt.Sprint(r.data("kind-management", "mgmt-system", "operator-pub"))
+			envBefore := r.keyEnv()
+			out, errOut, code := r.run(nil, "restore")
+			if code == 0 {
+				t.Fatalf("restore: exit 0, want a refusal\nstdout %s\nstderr %s", out, errOut)
+			}
+			if res := oneJSON(t, out); !strings.Contains(fmt.Sprint(res["error"]), tc.want) {
+				t.Fatalf("error line %v, want an error that names %q", res, tc.want)
+			}
+			noSecretAccess(t, r.calls())
+			if fmt.Sprint(r.data("kind-management", "mgmt-system", "operator-pub")) != before || r.keyEnv() != envBefore {
+				t.Fatal("a refused restore changed operator-pub or key.env")
+			}
+			for _, c := range r.calls() {
+				if strings.HasPrefix(c, "wrote ") {
+					t.Fatalf("a refused restore wrote: %q", c)
+				}
+			}
+		})
+	}
+}
+
+// TestRestoreRefusesShaMismatch: a seed whose public key has another SHA-256 than key.env writes nothing, and the error names both.
+func TestRestoreRefusesShaMismatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct{ name, knob string }{{"other_seed", "STUB_READ_OTHER=1"}, {"other_sha_in_key_env", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			r, k, name := restoreRig(t)
+			var env []string
+			want := opSHA(k)
+			if tc.knob != "" {
+				env = []string{tc.knob}
+			} else {
+				want = opSHAOf(opPub(opNewKey(t)))
+				r.writeKeyEnv(name, want)
+			}
+			out, errOut, code := r.run(env, "restore")
+			if code == 0 {
+				t.Fatalf("restore: exit 0, want a refusal\nstdout %s\nstderr %s", out, errOut)
+			}
+			if res := oneJSON(t, out); !strings.Contains(fmt.Sprint(res["error"]), "SHA-256") || !strings.Contains(fmt.Sprint(res["error"]), "Nothing was written") {
+				t.Fatalf("error line %v, want a SHA-256 mismatch and Nothing was written", res)
+			}
+			if r.data("kind-management", "mgmt-system", "operator-pub") != nil {
+				t.Fatal("operator-pub exists after a mismatch")
+			}
+			if !strings.Contains(r.keyEnv(), want) {
+				t.Fatalf("key.env changed to %q", r.keyEnv())
+			}
+			for _, c := range r.calls() {
+				if strings.HasPrefix(c, "wrote ") {
+					t.Fatalf("a mismatch wrote: %q", c)
+				}
+			}
+		})
+	}
+}
+
+// TestRestoreKeepsSeedInPipe: the read command output reaches only operatorctl pub. Under xtrace no seed shows in any output or
+// file, and the script passes the remote key name as the only argument of the read command.
+func TestRestoreKeepsSeedInPipe(t *testing.T) {
+	t.Parallel()
+	r, _, name := restoreRig(t)
+	out, errOut, code := r.run([]string{"SHELLOPTS=xtrace"}, "restore")
+	if code != 0 || !strings.Contains(errOut, "+ ") {
+		t.Fatalf("restore under xtrace: exit %d, traced %v\nstdout %s\nstderr %s", code, strings.Contains(errOut, "+ "), out, errOut)
+	}
+	reads := 0
+	for _, c := range r.calls() {
+		if strings.HasPrefix(c, "secret-read") {
+			reads++
+			if c != "secret-read "+name {
+				t.Fatalf("read call %q, want only the remote key name", c)
+			}
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("restore read the secret manager %d times, want 1", reads)
+	}
+	b, err := os.ReadFile("../../scripts/operator-key.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	i := strings.Index(body, "cmd_restore() {")
+	j := strings.Index(body, "cmd_check() {")
+	if strings.Contains(body[i:j], "POC_SECRET_READ_CMD\"") || strings.Contains(body[i:j], "$POC_SECRET_READ_CMD") && !strings.Contains(body[i:j], "need_settings POC_SECRET_READ_CMD") {
+		t.Fatal("cmd_restore runs the read command itself instead of operator_seed_pub")
+	}
+	if !strings.Contains(body[i:j], `operator_seed_pub "$name"`) {
+		t.Fatal("cmd_restore does not derive the key through operator_seed_pub")
+	}
+}
