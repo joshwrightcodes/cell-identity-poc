@@ -1,7 +1,7 @@
 package dashboards
 
 func argocdBoard() Dashboard {
-	b := newBoard("argocd-bundles.json", "poc-argocd-bundles", "Argo CD and bundle sets", "7d", clusterVar("Target"))
+	b := newBoard("argocd-bundles.json", "poc-argocd-bundles", "Argo CD and bundle sets", "48h", clusterVar("Target"))
 	s := func(i int, title, desc string, th *Thresholds, ts ...Target) {
 		x, w := col(i, 4)
 		b.add(stat(title, desc, x, 0, w, 4, "none", th, ts...))
@@ -13,8 +13,8 @@ func argocdBoard() Dashboard {
 		instant(apps(`sync_status="Synced"`)+" or 0 * "+apps(), "synced"), instant(apps(), "of"))
 	s(1, "Applications healthy", "Argo CD applications that are healthy, of all applications.", thresholds(colNeutral),
 		instant(apps(`health_status="Healthy"`)+" or 0 * "+apps(), "healthy"), instant(apps(), "of"))
-	s(2, "Rollbacks 7 days", "Bundle sets that the appliers rolled back in the last 7 days.", thresholds(colGood, step{1, colCrit}),
-		event(instant("sum("+Born(S("bundle_apply_outcomes_total", clusterRe, `outcome="rolled_back"`), "7d")+")", ""), false))
+	s(2, "Rollbacks 48 h", "Bundle sets that the appliers rolled back in the last 48 hours.", thresholds(colGood, step{1, colCrit}),
+		event(instant("sum("+Born(S("bundle_apply_outcomes_total", clusterRe, `outcome="rolled_back"`), "48h")+")", ""), false))
 	s(3, "Store denials", "Requests that the bundle store proxy refused in the time range.", thresholds(colGood, step{1, colWarning}),
 		event(instant("sum("+Born(S("store_proxy_denials_total", clusterRe), rng)+")", ""), false))
 

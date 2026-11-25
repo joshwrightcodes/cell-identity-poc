@@ -9,7 +9,7 @@
   "refresh": "30s",
   "schemaVersion": 41,
   "time": {
-    "from": "now-7d",
+    "from": "now-48h",
     "to": "now"
   },
   "timezone": "browser",
@@ -164,8 +164,8 @@
     {
       "id": 3,
       "type": "stat",
-      "title": "Rollbacks 7 days",
-      "description": "Bundle sets that the appliers rolled back in the last 7 days. Reads bundle_apply_outcomes_total.",
+      "title": "Rollbacks 48 h",
+      "description": "Bundle sets that the appliers rolled back in the last 48 hours. Reads bundle_apply_outcomes_total.",
       "gridPos": {
         "h": 4,
         "w": 6,
@@ -179,7 +179,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(((bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} unless bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} offset 7d) or increase(bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"}[7d])))) or vector(0)",
+          "expr": "(sum(((bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} unless bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} offset 48h) or increase(bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"}[48h])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }

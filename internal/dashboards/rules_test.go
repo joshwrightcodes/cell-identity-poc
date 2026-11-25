@@ -2,6 +2,8 @@ package dashboards
 
 import (
 	"encoding/json"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -194,8 +196,10 @@ func TestEventPanelsCountANewSeries(t *testing.T) {
 
 func TestRulesKeepSyntheticMarkerAndSVIDFloor(t *testing.T) {
 	for _, r := range Rules().Groups[0].Rules {
-		if !strings.Contains(ruleExpr(r), "service_name") {
-			t.Errorf("%s drops service_name", r.UID)
+		e := ruleExpr(r)
+		label := ruleGroupLabel[r.UID]
+		if !strings.HasPrefix(e, `label_replace(`) || !strings.HasSuffix(e, `, "synthetic", "true", "`+label+`", "m15-.+")`) || strings.Contains(e, "service_name") {
+			t.Errorf("%s has no marker on %s or splits by service_name: %s", r.UID, label, e)
 		}
 	}
 	if e := ruleExpr(ruleByUID(t, "poc-svid-low")); !strings.Contains(e, "clamp_min(celld_svid_lifetime_seconds") {
@@ -252,6 +256,29 @@ func TestRuleFieldsMatchGrafana(t *testing.T) {
 			if !refs[rm["condition"].(string)] {
 				t.Errorf("%v: condition names no refId", uid)
 			}
+		}
+	}
+}
+
+// TestNoRangeOverRetention checks that no dashboard or rule reads further back than Prometheus keeps its data.
+func TestNoRangeOverRetention(t *testing.T) {
+	const retention = 48 * time.Hour
+	dur := regexp.MustCompile(`\[(\d+[smhdw])(?::\d+[smhdw])?\]|offset (\d+[smhdw])`)
+	parse := func(s string) time.Duration {
+		n, _ := strconv.Atoi(s[:len(s)-1])
+		unit := map[byte]time.Duration{'s': time.Second, 'm': time.Minute, 'h': time.Hour, 'd': 24 * time.Hour, 'w': 7 * 24 * time.Hour}[s[len(s)-1]]
+		return time.Duration(n) * unit
+	}
+	for _, q := range promQueries(Boards(), Rules()) {
+		for _, m := range dur.FindAllStringSubmatch(q.Expr, -1) {
+			if d := parse(m[1] + m[2]); d > retention {
+				t.Errorf("%s: range %s is over 48h: %s", q.Where, m[0], q.Expr)
+			}
+		}
+	}
+	for _, b := range Boards() {
+		if d := parse(strings.TrimPrefix(b.Time.From, "now-")); d > retention {
+			t.Errorf("%s: default range %s is over 48h", b.UID, b.Time.From)
 		}
 	}
 }

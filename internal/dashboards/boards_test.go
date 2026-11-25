@@ -41,8 +41,8 @@ func TestBoardsMatchMockup(t *testing.T) {
 		{"spiffe.json", "poc-spiffe", "SPIFFE and SPIRE", "now-24h", []string{
 			"Attestations", "Refused attestations", "Agents per cell", "Intermediate CA expires", "Key checks", "Agent bans",
 			"Attestation refusals by reason", "SVIDs issued per 10 min", "unknown_kid hints per hour", "Trust anchors"}},
-		{"argocd-bundles.json", "poc-argocd-bundles", "Argo CD and bundle sets", "now-7d", []string{
-			"Applications synced", "Applications healthy", "Rollbacks 7 days", "Store denials", "Signed sets by target", "Sync time after a tag move", "Sync operations per hour"}},
+		{"argocd-bundles.json", "poc-argocd-bundles", "Argo CD and bundle sets", "now-48h", []string{
+			"Applications synced", "Applications healthy", "Rollbacks 48 h", "Store denials", "Signed sets by target", "Sync time after a tag move", "Sync operations per hour"}},
 		{"mesh.json", "poc-mesh", "Mesh and Kiali", "now-6h", []string{
 			"mTLS share of requests", "Request success", "Kiali tunnels up", "Shortest proxy cert life", "Requests per second by mesh", "Tunnel answers to Kiali"}},
 		{"islands.json", "poc-islands", "Islands and revocation", "now-24h", []string{
@@ -349,7 +349,7 @@ func TestEventCountersFallBackToZero(t *testing.T) {
 	want := map[string][]string{
 		"poc-cell-health":    {"Islands now", "Revoked cells"},
 		"poc-spiffe":         {"Attestations", "Refused attestations", "Agent bans", "Attestation refusals by reason", "unknown_kid hints per hour"},
-		"poc-argocd-bundles": {"Rollbacks 7 days", "Store denials"},
+		"poc-argocd-bundles": {"Rollbacks 48 h", "Store denials"},
 		"poc-islands":        {"Overlay entries", "Revoked streams closed"},
 		"poc-refusals":       {"Refusals by service"},
 		"poc-work":           {"Queue depth", "Claims 24 h", "Throttled reports", "Steps in flight", "Step stages, last provision"},
