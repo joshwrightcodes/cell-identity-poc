@@ -550,3 +550,32 @@ func TestSyncDelayStartsAtTagMove(t *testing.T) {
 		t.Fatalf("sync delay count %d sum %v, want 1 and 7 plus whole 3 s writes of the tag step", count, sum)
 	}
 }
+
+// TestSetSnapshotIdentity feeds states straight to the snapshot: a change of the version alone, or of the
+// digest beyond its 12-digit prefix alone, gives a new time, and the same state keeps the old one.
+func TestSetSnapshotIdentity(t *testing.T) {
+	t0 := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	state := func(counter uint64, digest string) State {
+		return State{State: stateApplying, Version: bundle.Version{Epoch: 1, Counter: counter}, Root: Root{Digest: digest}}
+	}
+	prefix := "sha256:" + strings.Repeat("a", rootDigestChars)
+	cases := []struct {
+		name string
+		next State
+		want time.Time
+	}{
+		{"same state", state(1, prefix+"1"), t0},
+		{"version only", state(2, prefix+"1"), t0.Add(time.Minute)},
+		{"digest beyond the prefix only", state(1, prefix+"2"), t0.Add(time.Minute)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var n setSnapshot
+			n.observeWrite(state(1, prefix+"1"), t0)
+			n.observeWrite(c.next, t0.Add(time.Minute))
+			if !n.at.Equal(c.want) {
+				t.Errorf("at = %s, want %s", n.at, c.want)
+			}
+		})
+	}
+}
