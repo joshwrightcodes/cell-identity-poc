@@ -173,11 +173,15 @@ func TestM15EventsShow(t *testing.T) {
 		})
 		c := cutLink(t, cell, spireCluster, "both", 4*time.Minute)
 		cutAt := time.Now()
-		// The proof of "within one minute" is the upstream age of the cell: it rises above 30 s within 60 s of the cut. The Stream column
-		// follows later, because the gateway ends a silent stream after 30 s and the panel keeps the last sample for 1 minute (ruling B2).
-		m15Within(t, "UPSTREAM_AGE_ABOVE_30S_SECONDS", `"Upstream age" of `+cell+" to rise above 30 s", cutAt, m15Show, func() (bool, string) {
-			v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "C"), "cluster", cell)
-			return ok && v > 30, fmt.Sprintf("age %v (found %v)", v, ok)
+		// The proof of "within one minute" is read on the connected side. A cut holds the telemetry of the cut cell in its own queue, so its
+		// upstream age cannot reach Grafana. The telemetry gateway in management exports cellproxy.gateway.last_export.time every 10 s
+		// (OTEL_METRIC_EXPORT_INTERVAL in components/telemetry-gateway/gateway.yaml), and the "Last telemetry" column of "Cells" shows the
+		// seconds since the last export of the sender. The value passes 30 s within 30 s of the cut, and the next gateway export, the store
+		// write and one poll add at most 20 s. The Stream column follows later, because the gateway ends a silent stream after 30 s and the
+		// panel keeps the last sample for 1 minute (ruling B2).
+		m15Within(t, "LAST_TELEMETRY_ABOVE_30S_SECONDS", `"Last telemetry" of `+cell+" to rise above 30 s", cutAt, m15Show, func() (bool, string) {
+			v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "H"), "cluster", cell)
+			return ok && v > 30, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
 		})
 		// A series that no longer reports leaves the panel, and a cell that mgmtd still lists reads 0, so absent and 0 both mean down.
 		m15Within(t, "STREAM_DOWN_SECONDS", `"Stream" of `+cell+" to read down", cutAt, 2*time.Minute, func() (bool, string) {
