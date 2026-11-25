@@ -59,6 +59,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/trustmetrics"
 )
 
 const (
@@ -346,6 +347,12 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		tel.Log.Error("celld failed", "error", err.Error())
 		return 1
 	}
+	if err := trustmetrics.Register(tel.Meter, func() []trustmetrics.Chain {
+		return append(w.chain(), trustmetrics.FileChain(opts.gatewayID.TrustDomain().String(), trustmetrics.SourceBundle, opts.trustBundle)...)
+	}); err != nil {
+		tel.Log.Error("celld failed", "error", err.Error())
+		return 1
+	}
 	tokens := satoken.PodTokenFunc(kube.CoreV1(), opts.pod.namespace, opts.pod.serviceAccount, opts.pod.name, opts.pod.uid)
 	execCfg := executor.Config{
 		Cell: opts.cell, Env: opts.env, Pod: opts.pod.name, PodUID: opts.pod.uid, Namespace: opts.opsNamespace,
@@ -457,7 +464,38 @@ func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create gauge: %w", err)
 	}
+	_, err = tel.Meter.Float64ObservableGauge("celld.svid.lifetime",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds between NotBefore and NotAfter of the current X.509 SVID, 0 while celld holds none"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(w.lifetime())
+			return nil
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("create gauge: %w", err)
+	}
 	return w, nil
+}
+
+// lifetime returns the seconds from NotBefore to NotAfter of the current SVID, or 0 while there is none.
+func (w *svidWatcher) lifetime() float64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.current == nil {
+		return 0
+	}
+	leaf := w.current.Certificates[0]
+	return leaf.NotAfter.Sub(leaf.NotBefore).Seconds()
+}
+
+// chain returns the certificate chain of the current SVID, or no chain while there is none.
+func (w *svidWatcher) chain() []trustmetrics.Chain {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.current == nil {
+		return nil
+	}
+	return trustmetrics.SVIDChain(w.current.ID.TrustDomain().String(), w.current.Certificates)
 }
 
 // remaining returns the seconds until the current SVID expires. It is 0 after expiry and while

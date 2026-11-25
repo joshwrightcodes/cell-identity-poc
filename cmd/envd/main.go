@@ -73,6 +73,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/trustmetrics"
 )
 
 const (
@@ -236,6 +237,7 @@ type runConfig struct {
 	upstream     string
 	expect       spiffeid.ID
 	peer         *x509bundle.Bundle
+	peerBundle   string
 	key          ed25519.PublicKey
 	env          string
 	namespace    string
@@ -363,7 +365,7 @@ func parseRun(args []string) (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
-	rc := runConfig{upstream: *upstream, expect: id, peer: peer, key: key, keyFile: *keyFile, env: *env, namespace: ns,
+	rc := runConfig{upstream: *upstream, expect: id, peer: peer, peerBundle: *bundle, key: key, keyFile: *keyFile, env: *env, namespace: ns,
 		configMap: cm, interval: *interval, reportRate: *reportRate, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
 		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
@@ -495,6 +497,17 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	defer closeSVIDs()
+
+	peerTD := cfg.expect.TrustDomain().String()
+	if err := trustmetrics.Register(tel.Meter, func() []trustmetrics.Chain {
+		var chains []trustmetrics.Chain
+		if own, err := svids.GetX509SVID(); err == nil {
+			chains = trustmetrics.SVIDChain(own.ID.TrustDomain().String(), own.Certificates)
+		}
+		return append(chains, trustmetrics.FileChain(peerTD, trustmetrics.SourceBundle, cfg.peerBundle)...)
+	}); err != nil {
+		return err
+	}
 
 	mgmtClient, gateway, err := newClients(svids, cfg)
 	if err != nil {

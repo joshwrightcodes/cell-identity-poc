@@ -101,6 +101,7 @@ var Catalogue = []Metric{
 
 	own("celld.bind.attempts", KindCounter, "", ClusterCell),
 	own("celld.ops.results", KindCounter, "", ClusterCell),
+	own("celld.svid.lifetime", KindGauge, "s", ClusterCell),
 	own("celld.svid.remaining", KindGauge, "s", ClusterCell),
 	own("celld.svid.updates", KindCounter, "", ClusterCell),
 	own("celld.upstream.age", KindGauge, "s", ClusterCell),
@@ -138,6 +139,8 @@ var Catalogue = []Metric{
 
 	own("relay.connections", KindCounter, "", ClusterControlPlane),
 	own("relay.connections.open", KindUpDownCounter, "", ClusterControlPlane),
+
+	own("trust.ca.not_after", KindGauge, "s", allClusters...),
 
 	// Third-party names. Task 1 of the M15 inventory read each name on the live harness, except where the origin says otherwise.
 	thirdParty("up", KindGauge, originProm, allClusters...),

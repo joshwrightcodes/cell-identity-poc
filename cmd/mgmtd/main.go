@@ -50,6 +50,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/trustmetrics"
 )
 
 const (
@@ -409,6 +410,18 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		return fmt.Errorf("start the plane: %w", err)
 	}
 	ready.Store(true)
+
+	if meter != nil {
+		if err := trustmetrics.Register(meter, func() []trustmetrics.Chain {
+			var chains []trustmetrics.Chain
+			if own, err := svids.GetX509SVID(); err == nil {
+				chains = trustmetrics.SVIDChain(own.ID.TrustDomain().String(), own.Certificates)
+			}
+			return append(chains, trustmetrics.FileChain(cfg.peerTD.String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
+		}); err != nil {
+			return err
+		}
+	}
 
 	apiTLS := mgmt.APIServerTLS(svids, mgmt.FileBundleSource(cfg.peerBundle, cfg.peerTD), cfg.allow)
 	apiSrv := mgmt.NewServers(
