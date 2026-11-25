@@ -213,6 +213,27 @@ func TestGateM15RepairCallsM9(t *testing.T) {
 			t.Fatalf("exit %d, stderr %q; want a stop before the deletes that names the repair", code, errOut)
 		}
 	})
+	t.Run("a marker of the rotation", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		r.write("build/gate/m15-intermediate-rotated", "2026-12-01T10:00:00Z\n")
+		_, errOut, code := r.run("gate-m15-repair.sh", nil)
+		calls := r.calls()
+		m9, rot := callAt(calls, "m9 repair"), callAt(calls, "mise run pki:rotate-intermediate CELL=dev-cp")
+		if code != 0 || m9 < 0 || rot < m9 || r.exists("build/gate/m15-intermediate-rotated") {
+			t.Fatalf("exit %d, stderr %q, calls %s; want the rotation after gate-m9-repair.sh and no marker", code, errOut, calls)
+		}
+	})
+	t.Run("a failed rotation keeps the marker", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		r.write("build/gate/m15-intermediate-rotated", "x\n")
+		r.state("rotate-fail", "")
+		_, errOut, code := r.run("gate-m15-repair.sh", nil)
+		if code == 0 || !r.exists("build/gate/m15-intermediate-rotated") || !strings.Contains(errOut, "pki:rotate-intermediate") {
+			t.Fatalf("exit %d, stderr %q; want a failure that keeps the marker", code, errOut)
+		}
+	})
 	t.Run("a namespace stays", func(t *testing.T) {
 		t.Parallel()
 		r := newRepairM15Rig(t)
@@ -243,6 +264,7 @@ func TestGateM15RepairCheck(t *testing.T) {
 		setup      func(r *m9Rig)
 	}{
 		{"a namespace", "m15-ab12cd", func(r *m9Rig) { r.state("ns-dev-cell-2", "namespace/m15-ab12cd\n") }},
+		{"a marker of the rotation", "m15-intermediate-rotated", func(r *m9Rig) { r.write("build/gate/m15-intermediate-rotated", "x\n") }},
 		{"a trace of M9", "a trace of m9", func(r *m9Rig) { r.state("m9-fail", "") }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

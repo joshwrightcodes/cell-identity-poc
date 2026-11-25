@@ -4,12 +4,14 @@
 #   1. runs scripts/gate-m9-repair.sh, which heals the gate-m9-cut- rules, un-revokes the cells of build/gate/m9-revoked and repairs the test
 #      key of the API server. gate-m9-repair.sh also deletes the m9- namespaces and runs svid-ttl.sh restore, which restarts dev-cp and each
 #      live cell. Then it waits for harness:status;
-#   2. deletes each namespace m15-<name> with the label cell.poc.internal/e2e=true in every existing cluster, and waits until none is left.
+#   2. when build/gate/m15-intermediate-rotated exists (the alert test writes it before it rotates the intermediate CA of dev-cp), runs
+#      CELL=dev-cp mise run pki:rotate-intermediate again, so that a rotation that stopped half way ends, and then removes the marker;
+#   3. deletes each namespace m15-<name> with the label cell.poc.internal/e2e=true in every existing cluster, and waits until none is left.
 # A synthetic series needs no repair. Its own step deletes only namespaces m15-<name> with the label. Each run repeats the restart of the
 # clusters, so a run takes several minutes. It is safe to run again.
 #
 # Usage: gate-m15-repair.sh [--check]
-#   --check runs gate-m9-repair.sh --check, lists the m15- namespaces, and exits 1 with the repair command when either finds a trace. It
+#   --check runs gate-m9-repair.sh --check, lists the marker and the m15- namespaces, and exits 1 with the repair command when either finds a trace. It
 #   changes nothing. It exits 0 when it finds none.
 # GATE_M15_WAIT bounds the wait for the deletions in seconds (default 180), and GATE_M15_POLL sets the seconds between two reads (default 5).
 export CELL=management
@@ -24,6 +26,7 @@ esac
 ((${#} <= 1)) || die "usage: gate-m15-repair.sh [--check]"
 repair="mise run gate:m15:repair"
 test_label="cell.poc.internal/e2e"
+rotated="$BUILD_ROOT/gate/m15-intermediate-rotated"
 wait_seconds="${GATE_M15_WAIT:-180}"
 poll="${GATE_M15_POLL:-5}"
 
@@ -39,6 +42,10 @@ m15_namespaces() {
 if ((check)); then
   found=0
   "$ROOT/scripts/gate-m9-repair.sh" --check || found=1
+  if [[ -e "$rotated" ]]; then
+    echo "the marker $rotated shows a rotation of the intermediate CA that may not have ended" >&2
+    found=1
+  fi
   for c in $existing; do
     out="$(m15_namespaces "$c")" || die "could not list the namespaces of $c"
     for ns in $out; do
@@ -54,6 +61,12 @@ fi
 die() { printf 'error: %s. Run: %s again\n' "$*" "$repair" >&2; exit 1; }
 
 "$ROOT/scripts/gate-m9-repair.sh" || die "scripts/gate-m9-repair.sh failed"
+
+if [[ -e "$rotated" ]]; then
+  log "the marker $rotated exists, so the rotation of the intermediate CA runs again"
+  (cd "$ROOT" && CELL=dev-cp mise run pki:rotate-intermediate) || die "CELL=dev-cp mise run pki:rotate-intermediate failed"
+  rm -f "$rotated"
+fi
 
 for c in $existing; do
   namespaces="$(m15_namespaces "$c")" || die "could not list the namespaces of $c"

@@ -243,6 +243,7 @@ case "$1 $2" in
     if [[ -s "$d/publish-fail" ]]; then cat "$d/publish-fail" >&2; echo "[bundle] ERROR task failed" >&2; exit 1; fi
     [[ ! -e "$d/publish-fail" ]] || { echo '{"error":"publish failed"}'; exit 1; }
     echo '{"outcome":"applied"}' ;;
+  "run pki:rotate-intermediate") [[ "${CELL:-}" == dev-cp && ! -e "$d/rotate-fail" ]] || exit 1 ;;
   "run revoke") [[ "$4" == clean ]] || exit 2; : >"$d/inputs" ;;
   "run gate:"*)
     echo $(($(cat "$d/now") + ${STUB_GATE_SECONDS:-0})) >"$d/now"
