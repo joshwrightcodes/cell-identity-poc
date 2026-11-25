@@ -12,7 +12,8 @@
 # build/gate/m8-bundles, the record of the targets that a test changed. A failed run keeps it, and gate-m8-repair.sh --check then fails.
 # After the tests, m5, m5-soak, m5-drill, m6, m6-provision, m7 and m8 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # Every gate runs under keep_awake, refuses battery power, and prints the Sleep and DarkWake lines of pmset -g log since its start.
-# m15 runs the checks of m6 to m9 (gate-m9-repair.sh --check last) and the image check of m8, which covers cluster-jwt-server in spire-server-0 of dev-cp.
+# m15 runs the checks of m6 to m8, gate-m15-repair.sh --check (which runs gate-m9-repair.sh --check first) and the image check of m8 with the
+# container agent-ban in spire-server-0 of dev-cp. The image check covers cluster-jwt-server.
 # It then runs the tests that match ^TestM15, and scans the logs of the M5 components for a token afterwards.
 # m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: gate-m6-repair.sh, gate-m7-repair.sh,
 # gate-m8-repair.sh and gate-m9-repair.sh with --check, the image check of m8 with agent-ban in spire-server-0 of dev-cp, cell-proxy of the
@@ -53,7 +54,7 @@ if [[ "$milestone" == m8 ]]; then
 fi
 if [[ "$milestone" == m15 ]]; then
   for _var in GATE_M15_BUDGET_MINUTES GATE_M15_TEST_TIMEOUT_MINUTES; do
-    [[ -n "${!_var:-}" ]] || die "$_var is empty in harness/versions.env, and the M15 tests need it: a Go timeout skips every cleanup of a test that cuts the API server. Set it, then run the gate again"
+    [[ -n "${!_var:-}" ]] || die "$_var is empty in harness/versions.env, and the M15 tests need it: a Go timeout skips every cleanup of a test that rotates the API server key. Set it, then run the gate again"
   done
 fi
 if [[ "$milestone" == m9 ]]; then
@@ -213,7 +214,8 @@ if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 |
   if [[ "$milestone" == m7 || "$milestone" == m8 || "$milestone" == m9 || "$milestone" == m15 ]]; then
     "$ROOT/scripts/gate-m7-repair.sh" --check || exit 1
     [[ "$milestone" != m8 && "$milestone" != m9 && "$milestone" != m15 ]] || "$ROOT/scripts/gate-m8-repair.sh" --check || exit 1
-    [[ "$milestone" != m9 && "$milestone" != m15 ]] || "$ROOT/scripts/gate-m9-repair.sh" --check || exit 1
+    [[ "$milestone" != m9 ]] || "$ROOT/scripts/gate-m9-repair.sh" --check || exit 1
+    [[ "$milestone" != m15 ]] || "$ROOT/scripts/gate-m15-repair.sh" --check || exit 1
   fi
   if [[ "$milestone" == m7 ]]; then
     # TestM7RegistryRefusesDelete sends a manifest delete. A mirror that still runs with deletes on would lose the image of netprobe.
@@ -250,6 +252,8 @@ if [[ "$milestone" == m6 || "$milestone" == m6-provision || "$milestone" == m7 |
     for cluster in $cells; do
       targets+=("$cluster:mesh-view-system:deployment/mesh-view:mise run images -- cell-proxy, then CELL=$cluster mise run cell:up")
     done
+  fi
+  if [[ "$milestone" == m9 || "$milestone" == m15 ]]; then
     server="$(kubectl --context kind-dev-cp -n spire-system get statefulset/spire-server -o json)" || die "could not read statefulset/spire-server in dev-cp"
     jq -e 'any(.spec.template.spec.containers[]; .name == "agent-ban")' >/dev/null <<<"$server" \
       || die "statefulset/spire-server in dev-cp has no container agent-ban, so a revoked cell keeps its agents. Run: mise run images -- cluster-jwt-server, then CELL=dev-cp mise run cell:up"

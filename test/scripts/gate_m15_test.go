@@ -2,6 +2,7 @@ package scripts
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -29,6 +30,9 @@ case " $* " in
 esac
 `
 
+// m9CalledBare matches the log line of gate-m9-repair.sh with no argument, which is a repair and not a check.
+var m9CalledBare = regexp.MustCompile(`(?m)^m9 repair $`)
+
 // newRepairM15Rig is an m9Rig with a stub of gate-m9-repair.sh that records its arguments. stub/m9-fail makes it fail.
 func newRepairM15Rig(t *testing.T) *m9Rig {
 	t.Helper()
@@ -39,26 +43,35 @@ func newRepairM15Rig(t *testing.T) *m9Rig {
 	return r
 }
 
-// TestGateM15Phases: gate.sh m15 runs the repair checks of M6 to M9 in order, then the image check of M8, then the tests that match
+// newGateM15Rig is a gate rig whose gate-m15-repair.sh is a stub that records its arguments. stub/m15-check-fail makes it fail.
+func newGateM15Rig(t *testing.T) *m9Rig {
+	t.Helper()
+	r := newGateM9Rig(t)
+	r.write("scripts/gate-m15-repair.sh", "#!/usr/bin/env bash\necho \"m15 repair $*\" >>\"$STUB_DIR/calls\"\n"+
+		"[[ ! -e \"$STUB_DIR/m15-check-fail\" ]] || { echo 'a trace of m15. Run: mise run gate:m15:repair'; exit 1; }\n")
+	return r
+}
+
+// TestGateM15Phases: gate.sh m15 runs the repair checks of M6 to M8 and of M15 in order, then the image check of M8, then the tests that match
 // ^TestM15 with the timeout of harness/versions.env, then the token scan. A failed check, a stale image or a token stops or fails the run.
 func TestGateM15Phases(t *testing.T) {
 	t.Parallel()
 	t.Run("order", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		_, errOut, code := r.run("gate.sh", nil, "m15")
 		calls := r.calls()
 		if code != 0 {
 			t.Fatalf("exit %d\nstderr %s\ncalls %s", code, errOut, calls)
 		}
-		m6, m7, m8, m9 := callAt(calls, "m6 repair --check"), callAt(calls, "m7 repair --check"), callAt(calls, "m8 repair --check"), callAt(calls, "m9 repair --check")
+		m6, m7, m8, m9 := callAt(calls, "m6 repair --check"), callAt(calls, "m7 repair --check"), callAt(calls, "m8 repair --check"), callAt(calls, "m15 repair --check")
 		image := callAt(calls, "kind-dev-cp -n spire-system get statefulset/spire-server")
 		run := callAt(calls, "go test", "-run ^TestM15", " -json ")
 		scan := callAt(calls, "scan ")
 		order := []int{m6, m7, m8, m9, image, run, scan}
 		for i := range order {
 			if order[i] < 0 || (i > 0 && order[i] < order[i-1]) {
-				t.Fatalf("want the checks of M6 to M9, the image check, the tests and the token scan in this order (%v):\n%s", order, calls)
+				t.Fatalf("want the checks of M6 to M8, the check of M15, the image check, the tests and the token scan in this order (%v):\n%s", order, calls)
 			}
 		}
 		runs := goRuns(calls)
@@ -74,8 +87,8 @@ func TestGateM15Phases(t *testing.T) {
 	})
 	t.Run("a failed check", func(t *testing.T) {
 		t.Parallel()
-		for _, m := range []string{"m6", "m7", "m8", "m9"} {
-			r := newGateM9Rig(t)
+		for _, m := range []string{"m6", "m7", "m8", "m15"} {
+			r := newGateM15Rig(t)
 			r.state(m+"-check-fail", "")
 			out, errOut, code := r.run("gate.sh", nil, "m15")
 			if code == 0 || len(goRuns(r.calls())) != 0 || !strings.Contains(out+errOut, "mise run gate:"+m+":repair") {
@@ -83,9 +96,18 @@ func TestGateM15Phases(t *testing.T) {
 			}
 		}
 	})
+	t.Run("no agent-ban", func(t *testing.T) {
+		t.Parallel()
+		r := newGateM15Rig(t)
+		r.state("no-agent-ban", "")
+		_, errOut, code := r.run("gate.sh", nil, "m15")
+		if code == 0 || len(goRuns(r.calls())) != 0 || !strings.Contains(errOut, "agent-ban") {
+			t.Fatalf("exit %d, stderr %q; want a stop before the tests that names agent-ban", code, errOut)
+		}
+	})
 	t.Run("a stale image", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		r.state("stale", "cell-system statefulset/bundle-store dev-cell-1")
 		_, errOut, code := r.run("gate.sh", nil, "m15")
 		if code == 0 || len(goRuns(r.calls())) != 0 || !strings.Contains(errOut, "CELL=dev-cell-1 mise run cell:up") {
@@ -94,7 +116,7 @@ func TestGateM15Phases(t *testing.T) {
 	})
 	t.Run("a token in a log", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		r.state("scan-hit", "")
 		_, errOut, code := r.run("gate.sh", nil, "m15")
 		if code == 0 || len(goRuns(r.calls())) != 1 || !strings.Contains(errOut, "found a token") {
@@ -103,7 +125,7 @@ func TestGateM15Phases(t *testing.T) {
 	})
 	t.Run("a failed test", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		_, _, code := r.run("gate.sh", []string{"STUB_FAIL_TESTS=TestM15"}, "m15")
 		if code == 0 || !strings.Contains(r.calls(), "scan ") {
 			t.Errorf("exit %d; want a failure, and the token scan after the tests:\n%s", code, r.calls())
@@ -111,7 +133,7 @@ func TestGateM15Phases(t *testing.T) {
 	})
 	t.Run("the slow lifetime", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		r.marker("1h")
 		_, errOut, code := r.run("gate.sh", nil, "m15")
 		if code == 0 || len(goRuns(r.calls())) != 0 || !strings.Contains(errOut, "mise run gate:m9:repair") {
@@ -136,7 +158,7 @@ func TestGateM15Budget(t *testing.T) {
 	for _, name := range []string{"GATE_M15_BUDGET_MINUTES", "GATE_M15_TEST_TIMEOUT_MINUTES"} {
 		t.Run("empty "+name, func(t *testing.T) {
 			t.Parallel()
-			r := newGateM9Rig(t)
+			r := newGateM15Rig(t)
 			r.setVersion(name, "")
 			_, errOut, code := r.run("gate.sh", nil, "m15")
 			if code == 0 || !strings.Contains(errOut, name+" is empty in harness/versions.env") || strings.Contains(r.calls(), "repair --check") || len(goRuns(r.calls())) != 0 {
@@ -146,7 +168,7 @@ func TestGateM15Budget(t *testing.T) {
 	}
 	t.Run("another timeout", func(t *testing.T) {
 		t.Parallel()
-		r := newGateM9Rig(t)
+		r := newGateM15Rig(t)
 		r.setVersion("GATE_M15_TEST_TIMEOUT_MINUTES", "260")
 		if _, errOut, code := r.run("gate.sh", nil, "m15"); code != 0 || !strings.Contains(strings.Join(goRuns(r.calls()), "\n"), " -timeout 260m ") {
 			t.Fatalf("exit %d, stderr %q, calls %s; want -timeout 260m", code, errOut, r.calls())
@@ -231,7 +253,7 @@ func TestGateM15RepairCheck(t *testing.T) {
 			if code != 1 || !strings.Contains(out+errOut, tc.want) || !strings.Contains(errOut, "Run: mise run gate:m15:repair") {
 				t.Fatalf("exit %d, output %q %q; want exit 1 with %q and the repair command", code, out, errOut, tc.want)
 			}
-			if strings.Contains(r.calls(), "delete namespace") || strings.Contains(r.calls(), "m9 repair\n") {
+			if strings.Contains(r.calls(), "delete namespace") || m9CalledBare.MatchString(r.calls()) {
 				t.Errorf("--check changed something:\n%s", r.calls())
 			}
 		})
