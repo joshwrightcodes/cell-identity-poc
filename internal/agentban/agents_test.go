@@ -21,13 +21,14 @@ type stubAPI struct {
 	agents  []Agent
 	listErr error
 	banned  []string
+	banErr  map[string]error
 }
 
 func (s *stubAPI) List(context.Context) ([]Agent, error) { return s.agents, s.listErr }
 
 func (s *stubAPI) Ban(_ context.Context, id string) error {
 	s.banned = append(s.banned, id)
-	return nil
+	return s.banErr[id]
 }
 
 type gaugeRig struct {
@@ -176,5 +177,59 @@ func TestAgentsClearOnReadError(t *testing.T) {
 	r.rerr = errors.New("no verified spec loaded")
 	if got := r.counts(t, o); len(got) != 0 {
 		t.Fatalf("after a failed read %v, want none", got)
+	}
+}
+
+func TestAgentsBanFailureAndGone(t *testing.T) {
+	r := newGaugeRig(t)
+	o := rigObserver(t, r)
+	r.set = revoked("dev-cell-2")
+	r.api.agents = []Agent{live("dev-cell-2", "u1"), live("dev-cell-2", "u2"), live("dev-cell-2", "u3")}
+	r.api.banErr = map[string]error{agentID("dev-cell-2", "u1"): ErrGone, agentID("dev-cell-2", "u2"): errors.New("denied")}
+	got := r.counts(t, o)
+	if len(got) != 1 || got["dev-cell-2"] != 1 {
+		t.Fatalf("counts %v, want only dev-cell-2=1 (the failed ban)", got)
+	}
+	if _, err := o.once(context.Background(), r.cfg); err == nil {
+		t.Fatal("once returned nil with a failed ban")
+	}
+}
+
+func TestOnceLeavesNoGaugeCallback(t *testing.T) {
+	r := newGaugeRig(t)
+	r.api.agents = []Agent{live("dev-cell-1", "u1"), live("dev-cell-2", "u2")}
+	if _, err := Once(context.Background(), r.cfg); err != nil {
+		t.Fatal(err)
+	}
+	r.api.agents = []Agent{live("dev-cell-1", "u1")}
+	if _, err := Once(context.Background(), r.cfg); err != nil {
+		t.Fatal(err)
+	}
+	var rm metricdata.ResourceMetrics
+	if err := r.reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if g, ok := m.Data.(metricdata.Gauge[int64]); ok && m.Name == "agentban.agents" && len(g.DataPoints) != 0 {
+				t.Fatalf("gauge still reports %v after Once returned", g.DataPoints)
+			}
+		}
+	}
+}
+
+func TestListMapsSvidExpiry(t *testing.T) {
+	h := newHarness(t, revoked(), nil)
+	h.fake.addExpiring("cluster_jwt", agentID("dev-cell-1", "u1"), 1795000000)
+	h.fake.addExpiring("cluster_jwt", agentID("dev-cell-1", "u2"), 0)
+	agents, err := h.cfg.API.List(context.Background())
+	if err != nil || len(agents) != 2 {
+		t.Fatalf("List = %v, %v", agents, err)
+	}
+	if want := time.Unix(1795000000, 0); !agents[0].ExpiresAt.Equal(want) {
+		t.Fatalf("ExpiresAt %v, want %v", agents[0].ExpiresAt, want)
+	}
+	if !agents[1].ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt %v, want the zero time", agents[1].ExpiresAt)
 	}
 }

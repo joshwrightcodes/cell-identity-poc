@@ -144,6 +144,7 @@ func cellOf(trustDomain, id string) (string, bool) {
 // observer holds the instruments of the ban loop and the agents of the last good round.
 type observer struct {
 	bans metric.Int64Counter
+	reg  metric.Registration
 	mu   sync.Mutex
 	// counts holds the live agents of each cell from the last good round. A failed round clears it.
 	counts map[string]int64
@@ -157,22 +158,28 @@ func newObserver(m metric.Meter) (*observer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("counter: %w", err)
 	}
-	_, err = m.Int64ObservableGauge("agentban.agents",
+	gauge, err := m.Int64ObservableGauge("agentban.agents",
 		metric.WithUnit("{agent}"),
-		metric.WithDescription("Unbanned cluster_jwt agents with a live SVID, by cell, from the last list round"),
-		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
-			o.mu.Lock()
-			defer o.mu.Unlock()
-			for cell, n := range o.counts {
-				obs.Observe(n, metric.WithAttributes(attribute.String("cell", cell)))
-			}
-			return nil
-		}))
+		metric.WithDescription("Unbanned cluster_jwt agents with a live SVID, by cell, from the last list round"))
 	if err != nil {
 		return nil, fmt.Errorf("gauge: %w", err)
 	}
+	o.reg, err = m.RegisterCallback(func(_ context.Context, obs metric.Observer) error {
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		for cell, n := range o.counts {
+			obs.ObserveInt64(gauge, n, metric.WithAttributes(attribute.String("cell", cell)))
+		}
+		return nil
+	}, gauge)
+	if err != nil {
+		return nil, fmt.Errorf("gauge callback: %w", err)
+	}
 	return o, nil
 }
+
+// close removes the gauge callback.
+func (o *observer) close() { _ = o.reg.Unregister() }
 
 func (o *observer) set(counts map[string]int64) {
 	o.mu.Lock()
@@ -188,6 +195,7 @@ func Once(ctx context.Context, cfg Config) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer o.close()
 	return o.once(ctx, cfg)
 }
 
@@ -250,6 +258,7 @@ func Run(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return err
 	}
+	defer o.close()
 	tick := time.NewTicker(cfg.Every)
 	defer tick.Stop()
 	for {

@@ -22,6 +22,8 @@ type fakeAgent struct {
 	id     string
 	attest string
 	banned bool
+	// expires is X509SvidExpiresAt in Unix seconds.
+	expires int64
 }
 
 // spireFake serves the Agent API of a SPIRE server on a unix socket. A banned ID stays banned. An
@@ -64,6 +66,12 @@ func (f *spireFake) add(attest, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agents = append(f.agents, &fakeAgent{id: id, attest: attest})
+}
+
+func (f *spireFake) addExpiring(attest, id string, expires int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agents = append(f.agents, &fakeAgent{id: id, attest: attest, expires: expires})
 }
 
 func (f *spireFake) addBanned(attest, id string) {
@@ -133,9 +141,10 @@ func (f *spireFake) ListAgents(_ context.Context, req *agentv1.ListAgentsRequest
 	for _, a := range match[start:end] {
 		td, path := splitID(a.id)
 		resp.Agents = append(resp.Agents, &types.Agent{
-			Id:              &types.SPIFFEID{TrustDomain: td, Path: path},
-			AttestationType: a.attest,
-			Banned:          a.banned,
+			Id:                &types.SPIFFEID{TrustDomain: td, Path: path},
+			AttestationType:   a.attest,
+			Banned:            a.banned,
+			X509SvidExpiresAt: a.expires,
 		})
 	}
 	if end < len(match) {
