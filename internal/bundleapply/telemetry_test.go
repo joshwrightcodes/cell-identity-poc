@@ -2,6 +2,7 @@ package bundleapply
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -375,57 +376,152 @@ func TestSetAppliedOneSeries(t *testing.T) {
 }
 
 func TestSetAppliedFromState(t *testing.T) {
-	te := newTelemetryEnv(t)
-	a := te.set(1, std("a"))
-	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
-	at := te.state().Good[0].At
-	te.clk.Advance(time.Hour)
+	for _, via := range []string{"Status", "Recorded"} {
+		t.Run(via, func(t *testing.T) {
+			te := newTelemetryEnv(t)
+			a := te.set(1, std("a"))
+			wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+			at := te.state().Good[0].At
+			te.clk.Advance(time.Hour)
+			fresh, reader := te.freshApplier(t, te.cfg.State)
+			if got := appliedFrom(t, reader); len(got) != 0 {
+				t.Fatalf("series before the first read = %v", got)
+			}
+			var err error
+			if via == "Status" {
+				_, err = fresh.Status(t.Context())
+			} else {
+				_, _, err = fresh.Recorded(t.Context(), "other")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantSeries(t, appliedFrom(t, reader), "1.1", rootChars(a), "healthy", at)
+		})
+	}
+}
+
+// freshApplier returns an applier on store with its own meter provider, as a restarted process has.
+func (te *telemetryEnv) freshApplier(t *testing.T, store Store) (*Applier, *sdkmetric.ManualReader) {
+	t.Helper()
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	t.Cleanup(func() { _ = mp.Shutdown(t.Context()) })
 	cfg := te.cfg
 	cfg.Meter = mp.Meter("fresh")
-	fresh := te.applier(cfg)
-	if got := appliedFrom(t, reader); len(got) != 0 {
-		t.Fatalf("series before the first read = %v", got)
-	}
-	if _, err := fresh.Status(t.Context()); err != nil {
-		t.Fatal(err)
-	}
-	wantSeries(t, appliedFrom(t, reader), "1.1", rootChars(a), "healthy", at)
+	cfg.State = store
+	return te.applier(cfg), reader
 }
 
-// TestSetAppliedRollingBack checks that the series reports the state rolling_back while the rollback waits.
-func TestSetAppliedRollingBack(t *testing.T) {
-	te := newTelemetryEnv(t)
-	a := te.set(1, std("a"))
-	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
-	b := te.set(2, std("b"))
+// writeStore calls fn before each write, with the state that the write stores.
+type writeStore struct {
+	Store
+	fn func(State)
+}
+
+func (s writeStore) Write(ctx context.Context, st State, rv string) error {
+	s.fn(st)
+	return s.Store.Write(ctx, st, rv)
+}
+
+// degraded makes the Application apps-sample of the set b Degraded, so that b rolls back.
+func (te *telemetryEnv) degraded(b built) {
 	te.health = func(root, app string) (string, string) {
 		if root == b.root.Digest && app == "apps-sample" {
 			return "Synced", "Degraded"
 		}
 		return "Synced", "Healthy"
 	}
-	var seen []appliedSeries
-	var at time.Time
-	te.hook = func(int) {
-		if te.state().State == stateRollingBack && seen == nil {
-			seen, at = te.applied(t), te.clk.Now()
+}
+
+// TestSetAppliedRollingBack checks that the series reports the state rolling_back from the time of
+// the write, and keeps that time while the rollback waits.
+func TestSetAppliedRollingBack(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.degraded(b)
+	var wrote time.Time
+	var reader *sdkmetric.ManualReader
+	te.a, reader = te.freshApplier(t, writeStore{Store: te.cfg.State, fn: func(st State) {
+		if st.State == stateRollingBack && wrote.IsZero() {
+			wrote = te.clk.Now()
 		}
+	}})
+	var seen int
+	te.hook = func(int) {
+		if te.state().State != stateRollingBack {
+			return
+		}
+		seen++
+		wantSeries(t, appliedFrom(t, reader), "1.2", rootChars(b), "rolling_back", wrote)
 	}
 	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
-	if seen == nil {
-		t.Fatal("the rollback never waited")
+	if seen == 0 || wrote.IsZero() {
+		t.Fatalf("the rollback never waited: %d reads, write at %v", seen, wrote)
 	}
-	// The series holds the time at which the state changed, which is before the first wait.
-	if len(seen) == 1 {
-		wantSeries(t, seen, "1.2", rootChars(b), "rolling_back", time.Unix(seen[0].value, 0))
-		if seen[0].value > at.Unix() {
-			t.Fatalf("value %d is after the first wait at %d", seen[0].value, at.Unix())
+}
+
+// TestSetAppliedRolledBack checks that a rolled_back series keeps the time of its write over later reads.
+func TestSetAppliedRolledBack(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.degraded(b)
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	st := te.state()
+	wrote := te.clk.Now()
+	want := te.applied(t)
+	wantSeries(t, want, fmt.Sprintf("%d.%d", st.Version.Epoch, st.Version.Counter), strings.TrimPrefix(st.Root.Digest, "sha256:")[:12], "rolled_back", wrote)
+	te.clk.Advance(time.Minute)
+	if _, err := te.a.Status(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := te.a.Recorded(t.Context(), "opB"); err != nil {
+		t.Fatal(err)
+	}
+	wantSeries(t, te.applied(t), fmt.Sprintf("%d.%d", st.Version.Epoch, st.Version.Counter), strings.TrimPrefix(st.Root.Digest, "sha256:")[:12], "rolled_back", wrote)
+}
+
+// raceStore runs after once, after the next read, as a write that overtakes that read would.
+type raceStore struct {
+	Store
+	after func()
+}
+
+func (s *raceStore) Read(ctx context.Context) (State, string, error) {
+	st, rv, err := s.Store.Read(ctx)
+	if f := s.after; f != nil && err == nil {
+		s.after = nil
+		f()
+	}
+	return st, rv, err
+}
+
+// TestSetAppliedStatusRace checks that a Status read does not overwrite the state of a newer write.
+func TestSetAppliedStatusRace(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	rs := &raceStore{Store: te.cfg.State}
+	fresh, reader := te.freshApplier(t, rs)
+	rs.after = func() {
+		err := fresh.update(t.Context(), func(s *State) error { s.State = stateApplying; return nil })
+		if err != nil {
+			t.Error(err)
 		}
-	} else {
-		t.Fatalf("series = %v", seen)
+	}
+	if _, err := fresh.Status(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got := appliedFrom(t, reader)
+	if len(got) != 1 {
+		t.Fatalf("series = %v", got)
+	}
+	if v, _ := got[0].attrs.Value("state"); v.AsString() != stateApplying {
+		t.Fatalf("the series shows the stale state %q", v.AsString())
 	}
 }
 

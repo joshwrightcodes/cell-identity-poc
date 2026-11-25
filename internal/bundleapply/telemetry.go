@@ -13,6 +13,8 @@ import (
 	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 	tracenoop "go.opentelemetry.io/otel/trace/noop"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
 )
 
 // The telemetry names of the applier. Every span of an apply is a child of spanApply.
@@ -49,30 +51,63 @@ const (
 // stores a time only in Good[].At. So the time of a set that is not the first good set is the time
 // of the first read of that root in that state, which a restart resets.
 type setSnapshot struct {
-	mu                   sync.Mutex
-	known                bool
-	version, root, state string
-	at                   time.Time
+	mu      sync.Mutex
+	known   bool
+	version bundle.Version
+	root    string
+	state   string
+	at      time.Time
+	// writes counts the observed writes, so that a read that a write overtook is dropped.
+	writes uint64
 }
 
-// observe refreshes the snapshot from st. now is the time of the read.
-func (n *setSnapshot) observe(st State, now time.Time) {
+// generation returns the count of writes. A reader takes it before it reads the store.
+func (n *setSnapshot) generation() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.writes
+}
+
+// observeWrite refreshes the snapshot from st, the state that the applier just wrote.
+func (n *setSnapshot) observeWrite(st State, now time.Time) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.writes++
+	n.set(st, now)
+}
+
+// observeRead refreshes the snapshot from st, which a read made after it took generation gen. A
+// write since then makes st stale, so the read changes nothing.
+func (n *setSnapshot) observeRead(st State, now time.Time, gen uint64) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.writes == gen {
+		n.set(st, now)
+	}
+}
+
+// set keeps the full digest and the version as the identity of the set. The caller holds mu.
+func (n *setSnapshot) set(st State, now time.Time) {
 	if st.State == "" {
 		return
 	}
-	root := strings.TrimPrefix(st.Root.Digest, "sha256:")
-	root = root[:min(len(root), rootDigestChars)]
-	n.mu.Lock()
-	defer n.mu.Unlock()
 	at := now
 	switch {
 	case st.State == stateHealthy && len(st.Good) > 0 && st.Good[0].Root.Digest == st.Root.Digest:
 		at = st.Good[0].At
-	case n.known && n.root == root && n.state == st.State:
+	case n.known && n.root == st.Root.Digest && n.version == st.Version && n.state == st.State:
 		at = n.at
 	}
-	n.known, n.root, n.state, n.at = true, root, st.State, at
-	n.version = fmt.Sprintf("%d.%d", st.Version.Epoch, st.Version.Counter)
+	n.known, n.root, n.version, n.state, n.at = true, st.Root.Digest, st.Version, st.State, at
+}
+
+// attrs returns the attributes of the series. Only the attribute shortens the digest.
+func (n *setSnapshot) attrs(role string) metric.MeasurementOption {
+	root := strings.TrimPrefix(n.root, "sha256:")
+	root = root[:min(len(root), rootDigestChars)]
+	return metric.WithAttributes(attribute.String("role", role),
+		attribute.String("version", fmt.Sprintf("%d.%d", n.version.Epoch, n.version.Counter)),
+		attribute.String("root.digest", root), attribute.String("state", n.state))
 }
 
 func syncResult(detail string) string {
@@ -132,9 +167,7 @@ func newTelemetry(role string, tr trace.Tracer, m metric.Meter) (telemetry, erro
 			snap.mu.Lock()
 			defer snap.mu.Unlock()
 			if snap.known {
-				o.Observe(snap.at.Unix(), metric.WithAttributes(
-					attribute.String("role", role), attribute.String("version", snap.version),
-					attribute.String("root.digest", snap.root), attribute.String("state", snap.state)))
+				o.Observe(snap.at.Unix(), snap.attrs(role))
 			}
 			return nil
 		}))

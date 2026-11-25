@@ -192,11 +192,12 @@ func (a *Applier) Apply(ctx context.Context, opID, opTarget string, attestation 
 
 // Status reports the state of the applier.
 func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
+	gen := a.tel.snap.generation()
 	st, _, err := a.cfg.State.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
-	a.tel.snap.observe(st, a.cfg.Now())
+	a.tel.snap.observeRead(st, a.cfg.Now(), gen)
 	return &op.BundleStatus{Version: st.Version, RootDigest: st.Root.Digest, State: st.State, AllowSHA256: bundle.AllowSHA256()}, nil
 }
 
@@ -207,11 +208,12 @@ func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
 // operation and has no final result for it yet, and any other error means that the answer is not
 // known.
 func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, error) {
+	gen := a.tel.snap.generation()
 	st, _, err := a.cfg.State.Read(ctx)
 	if err != nil {
 		return Outcome{}, false, err
 	}
-	a.tel.snap.observe(st, a.cfg.Now())
+	a.tel.snap.observeRead(st, a.cfg.Now(), gen)
 	if st.Result != nil && st.Result.OpID == opID {
 		return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
 	}
@@ -434,7 +436,7 @@ func (a *Applier) update(ctx context.Context, fn func(*State) error) error {
 			continue
 		}
 		if err == nil {
-			a.tel.snap.observe(st, a.cfg.Now())
+			a.tel.snap.observeWrite(st, a.cfg.Now())
 		}
 		return err
 	}
