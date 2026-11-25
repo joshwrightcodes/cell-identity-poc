@@ -77,6 +77,8 @@ var Catalogue = []Metric{
 
 	own("bundle.apply.duration", KindHistogram, "s", cpAndCell...),
 	own("bundle.apply.outcomes", KindCounter, "", cpAndCell...),
+	own("bundle.set.applied", KindGauge, "s", cpAndCell...),
+	own("bundle.sync.delay", KindHistogram, "s", cpAndCell...),
 	own("bundle.rollback.terminate.failures", KindCounter, "", cpAndCell...),
 	own("bundle.store.refills", KindCounter, "", cpAndCell...),
 

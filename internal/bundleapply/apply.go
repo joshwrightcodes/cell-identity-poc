@@ -139,10 +139,10 @@ func New(cfg Config) *Applier {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	tel, err := newTelemetry(cfg.Tracer, cfg.Meter)
+	tel, err := newTelemetry(cfg.Role, cfg.Tracer, cfg.Meter)
 	if err != nil {
 		log.Error("bundle telemetry", "error", err)
-		tel, _ = newTelemetry(nil, nil)
+		tel, _ = newTelemetry(cfg.Role, nil, nil)
 	}
 	return &Applier{cfg: cfg, tel: tel, log: log, sleep: realSleep, maxSetBytes: bundle.MaxSetLayerBytes}
 }
@@ -196,6 +196,7 @@ func (a *Applier) Status(ctx context.Context) (*op.BundleStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.tel.snap.observe(st, a.cfg.Now())
 	return &op.BundleStatus{Version: st.Version, RootDigest: st.Root.Digest, State: st.State, AllowSHA256: bundle.AllowSHA256()}, nil
 }
 
@@ -210,6 +211,7 @@ func (a *Applier) Recorded(ctx context.Context, opID string) (Outcome, bool, err
 	if err != nil {
 		return Outcome{}, false, err
 	}
+	a.tel.snap.observe(st, a.cfg.Now())
 	if st.Result != nil && st.Result.OpID == opID {
 		return Outcome{st.Result.Outcome, st.Result.Reason, st.Result.Detail}, true, nil
 	}
@@ -430,6 +432,9 @@ func (a *Applier) update(ctx context.Context, fn func(*State) error) error {
 		err = a.cfg.State.Write(ctx, st, rv)
 		if errors.Is(err, ErrConflict) {
 			continue
+		}
+		if err == nil {
+			a.tel.snap.observe(st, a.cfg.Now())
 		}
 		return err
 	}
@@ -801,6 +806,7 @@ func (a *Applier) deploy(ctx context.Context, r *run) (Outcome, error) {
 	if err != nil {
 		return Outcome{}, err
 	}
+	a.tel.recordSync(ctx, detail, cfg.Now().Sub(moved.since))
 	if detail == "" {
 		out := Outcome{Outcome: op.OutcomeApplied}
 		err = a.finish(ctx, r, out, func(s *State) {
