@@ -508,7 +508,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	cellKeys := cellEnvKeys(t)
 	var base []string
 	for _, e := range os.Environ() {
-		if k, _, _ := strings.Cut(e, "="); !cellKeys[k] {
+		if k, _, _ := strings.Cut(e, "="); !cellKeys[k] && k != "BUILD_ROOT" && k != "POC_BUILD_ROOT" {
 			base = append(base, e)
 		}
 	}
@@ -520,7 +520,9 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"HOSTSVC_SERVE="+hostsvcServe, "STUB_PIN_FILE="+write("hostsvc.crt", caPEM(t, "host.docker.internal"), 0o644),
-		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"))
+		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"),
+		// An empty build root keeps the operator key lookup away from build/operator/key.env of the checkout.
+		"POC_BUILD_ROOT="+t.TempDir())
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
