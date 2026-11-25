@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Repair what a gate:m15 run can leave behind. The M15 tests rotate the API server key, cut links, revoke cells and write synthetic series, and
 # they run probe objects in namespaces m15-<name>. The script
-#   1. runs scripts/gate-m9-repair.sh, which heals the gate-m9-cut- rules, un-revokes the cells of build/gate/m9-revoked and repairs the API
-#      server test key. It also runs svid-ttl.sh restore, which restarts dev-cp and each live cell, deletes the m9- namespaces and waits for
-#      harness:status;
+#   1. runs scripts/gate-m9-repair.sh, which heals the gate-m9-cut- rules, un-revokes the cells of build/gate/m9-revoked and repairs the test
+#      key of the API server. gate-m9-repair.sh also deletes the m9- namespaces and runs svid-ttl.sh restore, which restarts dev-cp and each
+#      live cell. Then it waits for harness:status;
 #   2. deletes each namespace m15-<name> with the label cell.poc.internal/e2e=true in every existing cluster, and waits until none is left.
 # A synthetic series needs no repair. Its own step deletes only namespaces m15-<name> with the label. Each run repeats the restart of the
 # clusters, so a run takes several minutes. It is safe to run again.

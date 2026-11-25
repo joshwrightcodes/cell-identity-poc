@@ -12,8 +12,8 @@
 # build/gate/m8-bundles, the record of the targets that a test changed. A failed run keeps it, and gate-m8-repair.sh --check then fails.
 # After the tests, m5, m5-soak, m5-drill, m6, m6-provision, m7 and m8 scan the logs of the M5 components since the start for a token (scripts/gate-token-scan.sh).
 # Every gate runs under keep_awake, refuses battery power, and prints the Sleep and DarkWake lines of pmset -g log since its start.
-# m15 runs the checks of m6 to m8, gate-m15-repair.sh --check (which runs gate-m9-repair.sh --check first) and the image check of m8 with the
-# container agent-ban in spire-server-0 of dev-cp. The image check covers cluster-jwt-server.
+# m15 runs the checks of m6 to m8, then gate-m15-repair.sh --check, which runs gate-m9-repair.sh --check first. Then it checks the container
+# agent-ban in spire-server-0 of dev-cp and runs the image check of m8, which covers cluster-jwt-server.
 # It then runs the tests that match ^TestM15, and scans the logs of the M5 components for a token afterwards.
 # m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: gate-m6-repair.sh, gate-m7-repair.sh,
 # gate-m8-repair.sh and gate-m9-repair.sh with --check, the image check of m8 with agent-ban in spire-server-0 of dev-cp, cell-proxy of the

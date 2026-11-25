@@ -315,7 +315,7 @@ description = "Run the M15 end-to-end tests: dashboards, alert rules and the che
 run = "scripts/gate.sh m15"
 
 [tasks."gate:m15:repair"]
-description = "Run gate:m9:repair, which heals the cuts, un-revokes the test cells, repairs the API server test key and restarts dev-cp and each live cell, then delete the namespaces m15-* that a gate:m15 run left. With --check, only report, and fail with the repair command. Each run repeats the restarts. Safe to run again"
+description = "Repair what a gate:m15 run left. It runs gate:m9:repair, which heals the cuts, un-revokes the test cells and deletes the namespaces m9-*. That repair also fixes the test key of the API server and restarts dev-cp and each live cell. The script then deletes the namespaces m15-*. With --check, it only reports, and it fails with the repair command. Each run repeats the restarts. Safe to run again"
 run = "scripts/gate-m15-repair.sh"
 
 [tasks."svid-ttl"]
