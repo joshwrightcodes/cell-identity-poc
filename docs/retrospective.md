@@ -21,38 +21,10 @@ The management plane decides, the environment control plane executes, and cells 
 Every connection goes up a layer. The management plane opens no connection into an environment
 or a cell.
 
-```mermaid
-flowchart BT
-  subgraph cells["dev-cell-1, dev-cell-2: SVIDs from dev.env.poc.internal, one mesh CA per cell"]
-    agent["spire-agent sidecar, non-reattestable"]
-    celld["celld"]
-    cproxy["cell-proxy: view, OTLP, tunnel"]
-    argo["Argo CD core and bundle store"]
-  end
-  subgraph cp["dev-cp: dev.env.poc.internal, intermediate from an offline root"]
-    spire["SPIRE server with the cluster_jwt plugin"]
-    gw["cell gateway: queue and outbox"]
-    relay["relays: TLS passthrough"]
-    envd["envd"]
-    ctl["cell controller"]
-  end
-  subgraph mgmt["management: mgmt.poc.internal, self-signed root"]
-    mgmtd["mgmtd: signs specs, work, steps and bundle sets"]
-    views["central views: Argo CD principal, telemetry gateway, Kiali hub"]
-  end
-  subgraph mac["Mac, in place of the cloud provider"]
-    host["host service: clusters, JWKS, steps"]
-    mirror["registry mirror"]
-  end
-  agent -- "attest: cell token against signed keys" --> spire
-  celld -- "mTLS stream and proof token" --> gw
-  cproxy -- "SVID mTLS and proof frame" --> relay
-  relay -- "view, telemetry, mesh tunnel" --> views
-  envd -- "pull signed spec and work, report with proof" --> mgmtd
-  mgmtd -. "JWKS over pinned TLS" .-> host
-  ctl -. "signed steps" .-> host
-  celld -. "bundle bytes by digest" .-> mirror
-```
+![Architecture of the PoC: cells and the control plane dial upward with SPIFFE identities, and the Mac plays the cloud provider](images/retrospective-architecture.svg)
+
+[`docs/architecture.yaml`](architecture.yaml) holds the same architecture in a form for tools and AI agents.
+It lists each cluster, trust domain, SPIFFE ID, connection and flow, with the source of each fact.
 
 Solid arrows carry SPIFFE identities, from the caller to the server.
 Dashed arrows go to the Mac, which plays the cloud provider.
