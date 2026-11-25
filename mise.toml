@@ -120,6 +120,14 @@ description = "Rotate the Grafana admin password of management through the Grafa
 env = { CELL = "management" }
 run = "scripts/obs-rotate-password.sh"
 
+[tasks."obs:dashboards"]
+description = "Write the Grafana dashboards, alert rules and provider file under components/observability-store/grafana from internal/dashboards"
+run = "go run ./cmd/dashgen --out components/observability-store/grafana"
+
+[tasks."obs:dashboards:check"]
+description = "Print each file under components/observability-store/grafana that differs from the generated output, and exit 1 when one differs. Writes nothing"
+run = "go run ./cmd/dashgen --check components/observability-store/grafana"
+
 [tasks."obs:uplink-status"]
 description = "Report each hop of the telemetry path of one cluster: its collector queue and failures, the uplink, the gateway counts for that sender, and the newest sample in the store. Prints one JSON object that names the first failing hop"
 usage = 'arg "<cluster>"'
