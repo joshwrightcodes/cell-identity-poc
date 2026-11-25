@@ -132,6 +132,7 @@ var Catalogue = []Metric{
 	host("hostsvc.steps", KindCounter, ""),
 
 	own("mgmtd.bind.results", KindCounter, "", ClusterManagement),
+	own("mgmtd.cell.state", KindGauge, "{cell}", ClusterManagement),
 	own("mgmtd.cells.valid", KindGauge, "", ClusterManagement),
 	own("mgmtd.hostsvc.spec_push_age", KindGauge, "s", ClusterManagement),
 	own("mgmtd.keycheck.results", KindCounter, "", ClusterManagement),

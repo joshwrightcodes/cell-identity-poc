@@ -135,6 +135,7 @@ type Plane struct {
 	keysAbsentLogged atomic.Bool
 
 	bindResults, checkResults, reportItems, retryUnknownKID metric.Int64Counter
+	cellsValid, cellState                                   metric.Int64ObservableGauge
 }
 
 // NewPlane loads the key and the state, signs the first spec of a fresh store, re-signs after a key
@@ -181,8 +182,15 @@ func NewPlane(cfg Config) (*Plane, error) {
 	if _, err := cfg.Meter.Int64ObservableGauge("mgmtd.spec.revision.lag", metric.WithInt64Callback(p.observeLag)); err != nil {
 		return nil, err
 	}
-	if _, err := cfg.Meter.Int64ObservableGauge("mgmtd.cells.valid", metric.WithInt64Callback(p.observeValid)); err != nil {
-		return nil, err
+	var gerr error
+	if p.cellsValid, gerr = cfg.Meter.Int64ObservableGauge("mgmtd.cells.valid"); gerr != nil {
+		return nil, gerr
+	}
+	if p.cellState, gerr = cfg.Meter.Int64ObservableGauge("mgmtd.cell.state", metric.WithUnit("{cell}")); gerr != nil {
+		return nil, gerr
+	}
+	if _, gerr = cfg.Meter.RegisterCallback(p.observeCells, p.cellsValid, p.cellState); gerr != nil {
+		return nil, gerr
 	}
 
 	pub := key.Public().(ed25519.PublicKey)

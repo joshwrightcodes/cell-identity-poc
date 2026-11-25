@@ -44,3 +44,29 @@ func collect(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	}
 	return out
 }
+
+// cellStates reads the series of mgmtd.cell.state as "cell/valid/revoked/reason" keys.
+func cellStates(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(context.Background(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok || m.Name != "mgmtd.cell.state" {
+				continue
+			}
+			for _, p := range g.DataPoints {
+				get := func(k string) string {
+					v, _ := p.Attributes.Value(attribute.Key(k))
+					return v.Emit()
+				}
+				out[get("cell")+"/"+get("valid")+"/"+get("revoked")+"/"+get("reason")] = p.Value
+			}
+		}
+	}
+	return out
+}
