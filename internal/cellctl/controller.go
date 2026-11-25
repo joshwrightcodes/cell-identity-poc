@@ -120,7 +120,7 @@ type entry struct {
 	lastErr *mgmtapi.HostErrorInfo
 	polled  time.Time
 	state   string // the last state that was counted
-	// stage is the stage that the last poll showed, and stageAt is the time of that poll.
+	// stage is the stage that the last poll showed, and stageAt is the time of the first poll that showed it.
 	stage   string
 	stageAt time.Time
 }
@@ -204,15 +204,20 @@ func (c *Controller) observeOpen(_ context.Context, o metric.Int64Observer) erro
 	return nil
 }
 
-// countOpen replaces the snapshot of open steps. A step is open when the host service has
-// answered for it, nothing refused it, and its state is not final.
+// countOpen replaces the snapshot of open steps. A step is open when its reported state is not
+// final or refused and its poll has not ended. A held step counts as queued.
 func (c *Controller) countOpen() {
 	open := map[stepKey]int64{}
 	for _, e := range c.entries {
-		if e.status == nil || e.final() || e.denied != nil || e.refusal != nil {
+		st, ok := e.report()
+		if !ok || e.ended {
 			continue
 		}
-		open[stepKey{e.status.State, e.status.Stage}]++
+		switch st.State {
+		case mgmtapi.StepDone, mgmtapi.StepFailedFinal, mgmtapi.StepCancelled, mgmtapi.StepRefused:
+			continue
+		}
+		open[stepKey{st.State, st.Stage}]++
 	}
 	c.openMu.Lock()
 	c.open = open
@@ -571,6 +576,7 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 			return
 		}
 		e.status, e.putEnv = nil, nil
+		e.stage, e.stageAt = "", time.Time{}
 		return
 	case he.Reason == mgmtapi.ReasonHostsvcDenied:
 		c.hostOK()

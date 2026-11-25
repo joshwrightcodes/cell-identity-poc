@@ -1187,9 +1187,18 @@ func TestStageDurationOnChange(t *testing.T) {
 	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
 	h.runFor(30 * time.Second)
 	h.setStage(a.s.ID, mgmtapi.StepAdmitting, mgmtapi.StageAdmitting)
+	h.runFor(50 * time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepBootstrapping, mgmtapi.StageBootstrapping)
+	// Each stage starts at the poll that first showed it, so the sum is the wait plus one poll.
+	want := map[string]float64{"creating": 40, "admitting": 60}
 	got := stageDurations(collect(t, reader))
-	if len(got) != 1 || got[0].stage != "creating" || got[0].result != "next" || got[0].count != 1 || got[0].sum < 30 || got[0].sum > 60 {
-		t.Errorf("durations %+v", got)
+	if len(got) != 2 {
+		t.Fatalf("durations %+v", got)
+	}
+	for _, d := range got {
+		if w, ok := want[d.stage]; !ok || d.result != "next" || d.count != 1 || d.sum != w {
+			t.Errorf("duration %+v, want sum %v", d, w)
+		}
 	}
 }
 
@@ -1201,7 +1210,7 @@ func TestStageDurationOnFinal(t *testing.T) {
 	h.setStage(a.s.ID, mgmtapi.StepDone, "")
 	h.runFor(time.Minute)
 	got := stageDurations(collect(t, reader))
-	if len(got) != 1 || got[0].stage != "bootstrapping" || got[0].result != "done" || got[0].count != 1 {
+	if len(got) != 1 || got[0].stage != "bootstrapping" || got[0].result != "done" || got[0].count != 1 || got[0].sum != 30 {
 		t.Errorf("durations %+v", got)
 	}
 }
@@ -1231,5 +1240,48 @@ func TestStepsOpenByState(t *testing.T) {
 	h.setStage(a.s.ID, mgmtapi.StepDone, "")
 	if got := openSteps(collect(t, reader)); len(got) != 0 {
 		t.Errorf("final step is open: %v", got)
+	}
+}
+
+func TestStepsOpenCountsHeldSteps(t *testing.T) {
+	w := newWorld(t)
+	a, b := w.item("dev-cell-1", 0), w.item("dev-cell-2", time.Second)
+	reader := metric.NewManualReader()
+	h := newHarness(t, w, func(c *Config) { c.Meter = metric.NewMeterProvider(metric.WithReader(reader)).Meter("t") })
+	h.setSteps(w.data(2, a, b))
+	h.runFor(time.Minute)
+	if got := openSteps(collect(t, reader)); got[gaugeKey{"queued", ""}] != 2 || len(got) != 1 {
+		t.Errorf("held step: %v", got)
+	}
+}
+
+func TestNoStageDurationWhenHostForgets(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
+	h.host.mu.Lock()
+	delete(h.host.steps, a.s.ID)
+	h.host.mu.Unlock()
+	h.runFor(time.Minute)
+	if got := stageDurations(collect(t, reader)); len(got) != 0 {
+		t.Errorf("durations after the host forgot the step: %+v", got)
+	}
+}
+
+func TestStepsOpenSkipsEndedSteps(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
+	h.setSteps(h.w.data(3))
+	h.host.mu.Lock()
+	delete(h.host.steps, a.s.ID)
+	h.host.mu.Unlock()
+	h.clk.now = h.clk.now.Add(time.Minute)
+	h.c.round(t.Context())
+	if e := h.c.entries[a.s.ID]; e == nil || !e.ended {
+		t.Fatalf("step did not end: %+v", e)
+	}
+	if got := openSteps(collect(t, reader)); len(got) != 0 {
+		t.Errorf("ended step is open: %v", got)
 	}
 }
