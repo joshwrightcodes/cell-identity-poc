@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Create, check and rotate the operator key: mise run operator:create-key, operator:check-key, operator:rotate-key [-- --emergency].
+# Create, restore, check and rotate the operator key: mise run operator:create-key, operator:restore-key, operator:check-key,
+# operator:rotate-key [-- --emergency].
 #
 # The operator key is an Ed25519 key that signs local revocations on this Mac. Its seed lives only in the secret manager, at the
 # remote key <POC_OPERATOR_KEY>/<UTC time yyyymmddThhmmssZ>. The seed moves only through pipes between the read or write command
@@ -15,6 +16,10 @@
 #         The read command pipes it back into operatorctl pub, and the two public keys must match. Only then does create write
 #         operator-pub and key.env. It prints one JSON line with keyName, keySHA256 and the next commands. A failed write or
 #         read-back writes no pin. Run create again after the fix. It writes a new remote key.
+# restore Owner action, after a rebuild of the harness with the same key. It refuses when operator-pub exists, and when key.env is
+#         absent or names no key. The read command pipes the seed into operatorctl pub, and the SHA-256 of that public key must
+#         equal the one in key.env. Only then does restore write operator-pub, and it writes nothing on a mismatch. It prints one
+#         JSON line with keyName, keySHA256 and the next commands. It writes no new remote key and does not touch key.env.
 # check   The read command pipes the seed into operatorctl pub. check compares that public key with operator-pub, each pin in
 #         dev-cp, the copy of mgmtd and key.env. It prints one JSON line with match, one field for each pin, and the names of the
 #         pins that differ. It exits 1 when a pin differs. While dev-cp has no live cell, server.conf pins no key, and the field
@@ -32,6 +37,8 @@
 #   3. Run: CELL=dev-cp mise run cell:up
 #   4. Run: CELL=management LINK_ONLY=mgmt-api mise run cell:link
 #   5. Run: mise run operator:check-key. Expected: "match":true.
+# After mise run harness:down and mise run harness:up, operator-pub is absent and key.env remains. Run mise run operator:restore-key
+# instead of step 2, then steps 3 to 5.
 # A failure prints one JSON error line on standard output. No error line holds the output of the read command.
 export CELL=management
 source "$(dirname "$0")/lib.sh"
@@ -143,11 +150,35 @@ cmd_create() {
     next: ["CELL=dev-cp mise run cell:up", "CELL=management LINK_ONLY=mgmt-api mise run cell:link", "mise run operator:check-key"]}'
 }
 
+cmd_restore() {
+  (($# == 0)) || fail "restore takes no argument"
+  need_settings POC_SECRET_READ_CMD
+  local name env_sha derived sha
+  [[ -f "$key_env" ]] || fail "build/operator/key.env is absent, so no earlier operator key is known. For a first setup, run: mise run operator:create-key"
+  name="$(key_env_value OPERATOR_KEY_NAME)"
+  env_sha="$(key_env_value OPERATOR_KEY_SHA256)"
+  [[ -n "$name" && -n "$env_sha" ]] || fail "build/operator/key.env names no key or no SHA-256. For a first setup, run: mise run operator:create-key"
+  read_operator_pub
+  [[ -z "$PUB_CM" ]] \
+    || fail "ConfigMap mgmt-system/operator-pub exists in management, so nothing is left to restore. Compare it with: mise run operator:check-key"
+  derived="$(operator_seed_pub "$name")" \
+    || fail "the read of the remote key $name through POC_SECRET_READ_CMD and operatorctl pub failed ($(printf '%s' "$derived" | jq -r '.error // empty' 2>/dev/null || true)). Nothing was written"
+  operator_key_valid "$derived" || fail "the read of the remote key $name gave no public key. Nothing was written"
+  sha="$(sha_of_pub "$derived")"
+  [[ "$sha" == "$env_sha" ]] \
+    || fail "the public key of the remote key $name has the SHA-256 $sha, and build/operator/key.env names $env_sha. Nothing was written. Check POC_SECRET_READ_CMD and the key.env of this Mac"
+  write_operator_pub create "$derived" "$name" >/dev/null \
+    || fail "ConfigMap mgmt-system/operator-pub could not be written. Nothing was written. Run: mise run operator:restore-key"
+  log "restored operator-pub with the operator key $sha. Run next: CELL=dev-cp mise run cell:up, then CELL=management LINK_ONLY=mgmt-api mise run cell:link, then mise run operator:check-key"
+  jq -nc --arg name "$name" --arg sha "$sha" '{restored: true, keyName: $name, keySHA256: $sha,
+    next: ["CELL=dev-cp mise run cell:up", "CELL=management LINK_ONLY=mgmt-api mise run cell:link", "mise run operator:check-key"]}'
+}
+
 cmd_check() {
   (($# == 0)) || fail "check takes no argument"
   need_settings POC_SECRET_READ_CMD
   read_operator_pub
-  [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the key once with: mise run operator:create-key"
+  [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the key once with: mise run operator:create-key. To rebuild with the existing key, run: mise run operator:restore-key"
   local spec next spec_name name derived sha which cluster applies pinned env_name env_sha
   local -a names=() oks=() mismatch=()
   spec="$(pub_field spec.pub)"
@@ -316,7 +347,7 @@ cmd_rotate() {
   operator_key_name_valid "$(key_name_now)" || fail "POC_OPERATOR_KEY must start with a letter, digit, dot, underscore, at sign, colon or plus, and hold no white space or quote, so that every later read accepts the name"
   read_operator_pub
   if [[ "$mode" == overlap ]]; then
-    [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management, so the overlap has no old key. The owner creates the key with: mise run operator:create-key, or replaces it with: mise run operator:rotate-key -- --emergency"
+    [[ -n "$PUB_CM" ]] || fail "ConfigMap mgmt-system/operator-pub is absent in management, so the overlap has no old key. The owner creates the key with: mise run operator:create-key, rebuilds with the existing key with: mise run operator:restore-key, or replaces it with: mise run operator:rotate-key -- --emergency"
     old_pub="$(pub_field spec.pub)"
     old_name="$(pub_field spec.name)"
     operator_key_valid "$old_pub" || fail "key spec.pub of operator-pub is not the standard base64 of 32 bytes. Replace the key with: mise run operator:rotate-key -- --emergency"
@@ -365,6 +396,7 @@ cmd_rotate() {
 
 case "${1:-}" in
   create) shift; cmd_create "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
   check) shift; cmd_check "$@" ;;
   rotate) shift; cmd_rotate "$@" ;;
   help | -h | --help) usage ;;

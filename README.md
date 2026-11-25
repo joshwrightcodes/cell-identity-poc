@@ -7,6 +7,8 @@ The first milestone is the base cell: one cluster with Argo CD, Istio, network p
 OpenTelemetry collector. Every later plane starts from this base.
 `docs/design/base-cell.md` describes it.
 
+New to the PoC? [Get started](docs/getting-started.md) takes a clean Mac to the web UIs.
+
 ## What the PoC shows
 
 ![The management cluster, dev-cp and three cells in a Colima VM, with a host service on the Mac](docs/images/poc-architecture.svg)
@@ -53,10 +55,20 @@ Follow these steps for the first setup:
 1. Run `mise trust` and `mise install` in the checkout.
 2. Create the keys and `.envrc.local`, as steps 1 to 4 of [Keys](#keys) describe.
    The SPIRE server in `dev-cp` cannot start without them.
-3. Create and check the clusters:
+3. Create the clusters:
 
    ```sh
    mise run harness:up
+   ```
+
+4. On a new `management` cluster, step 3 of `harness:up` stops, because `management` has no operator key.
+   On the first setup on this Mac, run `mise run operator:create-key`.
+   After a rebuild on this Mac, run `mise run operator:restore-key`.
+   Then run the commands that `harness:up` printed, in the same order.
+   Run `mise run operator:check-key` after the second `mgmt-api` link. [Operator key](#operator-key) describes the key.
+5. Check the clusters:
+
+   ```sh
    mise run harness:status
    ```
 
@@ -104,6 +116,7 @@ CELL=management LINK_ONLY=mgmt-api mise run cell:link
 mise run portal -- request --cell dev-cell-1 --cell dev-cell-2
 mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2
 CELL=management mise run cell:link
+mise run bundle -- publish --target dev-cp --target dev-cell-1 --target dev-cell-2 --wait
 ```
 
 `mgmtd` signs the records of the cells, and `envd` delivers them to `dev-cp`.
@@ -933,6 +946,18 @@ CELL=dev-cp mise run cell:up
 CELL=management LINK_ONLY=mgmt-api mise run cell:link
 mise run operator:check-key
 ```
+
+After `harness:down` and `harness:up`, the new `management` cluster has no `operator-pub`, but `build/operator/key.env` and the key remain.
+`harness:up` then stops at the operator key. Restore the pin with the existing key, run the commands that it prints, and then rerun the remaining `harness:up` steps that the failed run printed:
+
+```sh
+mise run operator:restore-key
+CELL=dev-cp mise run cell:up
+CELL=management LINK_ONLY=mgmt-api mise run cell:link
+mise run operator:check-key
+```
+
+`operator:restore-key` refuses while `operator-pub` exists, and when `key.env` is absent. It writes nothing when the SHA-256 of the key differs from `key.env`.
 
 `operator:check-key` prints `"match":true` when every pin matches. It compares the key in the secret manager with each public pin in the PoC.
 It reads the pin ConfigMaps and `server.conf`. It does not read the keys that the running processes loaded.

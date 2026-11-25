@@ -161,7 +161,7 @@ operator_pub_keys() {
     return 1
   fi
   if [[ -z "$cm" ]]; then
-    printf 'error: ConfigMap mgmt-system/operator-pub in management is absent. The owner creates the operator key once with: mise run operator:create-key\n' >&2
+    printf 'error: ConfigMap mgmt-system/operator-pub in management is absent. The owner creates the operator key once with: mise run operator:create-key. To rebuild with the existing key, run: mise run operator:restore-key\n' >&2
     return 1
   fi
   keys="$(operator_keys_of "$cm")" || return 1

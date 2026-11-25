@@ -914,7 +914,7 @@ check_overlay_inputs() {
 check_operator_pins() {
   local cm keys want which cluster pinned applies differ=() mgmtd_differs=false
   cm="$(operator_pub_cm)" || { echo "could not read ConfigMap mgmt-system/operator-pub in management. Run: mise run harness:status"; return 1; }
-  [[ -n "$cm" ]] || { echo "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the operator key once with: mise run operator:create-key"; return 1; }
+  [[ -n "$cm" ]] || { echo "ConfigMap mgmt-system/operator-pub is absent in management. The owner creates the operator key once with: mise run operator:create-key. To rebuild with the existing key, run: mise run operator:restore-key"; return 1; }
   keys="$(operator_keys_of "$cm" 2>&1)" || { echo "$keys"; return 1; }
   want="$(printf '%s\n' "$keys" | LC_ALL=C sort | paste -sd, -)"
   for which in envd gateway server mgmtd; do

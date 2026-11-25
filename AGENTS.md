@@ -77,7 +77,7 @@
 | Switch the SVID lifetime of `dev-cp` for the slow tier: `set <ttl>`, `restore` or `show` | `mise run svid-ttl -- show` |
 | Revoke a cell through `mgmtd`, or undo it, while `dev-cp` is connected | `mise run mgmt -- revoke --cell dev-cell-2`, `mise run mgmt -- unrevoke --cell dev-cell-2` |
 | Revoke a cell on the Mac with the operator key while `dev-cp` is an island: `local`, `list`, `reapply` or `clean` | `mise run revoke -- local --cell dev-cell-2` |
-| Create, check and rotate the operator key (`--emergency` replaces it at once; see README "Operator key") | `mise run operator:create-key`, `mise run operator:check-key`, `mise run operator:rotate-key` |
+| Create, restore, check and rotate the operator key (`--emergency` replaces it at once; see README "Operator key") | `mise run operator:create-key`, `mise run operator:restore-key`, `mise run operator:check-key`, `mise run operator:rotate-key` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References

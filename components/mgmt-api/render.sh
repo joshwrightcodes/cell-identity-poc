@@ -130,7 +130,7 @@ if [[ -n "$operator_pub" ]]; then
     .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "operator-key" | .metadata.namespace = strenv(NS)
     | .data["keys.pub"] = strenv(KEYS) + "\n" | .data["keys.pub"] style="literal"')"
 else
-  printf 'mgmt-api render: ConfigMap mgmt-system/operator-pub is absent, so mgmtd adopts no local revocation. The owner creates the operator key once with: mise run operator:create-key\n' >&2
+  printf 'mgmt-api render: ConfigMap mgmt-system/operator-pub is absent, so mgmtd adopts no local revocation. The owner creates the operator key once with: mise run operator:create-key. To rebuild with the existing key, run: mise run operator:restore-key\n' >&2
 fi
 
 mgmtd_image="$(ko_image mgmtd)" || die "no mgmtd image"
