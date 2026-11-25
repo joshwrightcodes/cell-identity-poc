@@ -163,56 +163,43 @@ func (f *fixture) sendMalformed() error {
 	return err
 }
 
-// blockingExporter never returns from Export until release closes.
-type blockingExporter struct {
-	release chan struct{}
-	entered chan struct{}
-}
-
-func (e *blockingExporter) Temporality(sdkmetric.InstrumentKind) metricdata.Temporality {
-	return metricdata.CumulativeTemporality
-}
-func (e *blockingExporter) Aggregation(k sdkmetric.InstrumentKind) sdkmetric.Aggregation {
-	return sdkmetric.DefaultAggregationSelector(k)
-}
-func (e *blockingExporter) Export(context.Context, *metricdata.ResourceMetrics) error {
-	select {
-	case e.entered <- struct{}{}:
-	default:
-	}
-	<-e.release
-	return nil
-}
-func (e *blockingExporter) ForceFlush(context.Context) error { return nil }
-func (e *blockingExporter) Shutdown(context.Context) error   { return nil }
-
-// The test guards against a future exporter that runs inside Attest. The SDK exports on its own goroutine today.
-func TestAttestDoesNotWaitOnExport(t *testing.T) {
-	f := newFixture(t, fixtureOptions{})
-	exp := &blockingExporter{release: make(chan struct{}), entered: make(chan struct{}, 1)}
-	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exp, sdkmetric.WithInterval(10*time.Millisecond))))
-	t.Cleanup(func() {
-		close(exp.release)
-		_ = mp.Shutdown(context.Background())
-	})
-	if err := f.plugin.SetMeter(mp.Meter("test")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.attest("dev-cell-1", f.goodToken); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-exp.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the exporter never started")
-	}
-	start := time.Now()
-	for i := 0; i < 3; i++ {
-		if _, err := f.attest("dev-cell-2", f.goodToken); err != nil {
-			t.Fatal(err)
+func TestAttestationsCountInflightCapAndAbandon(t *testing.T) {
+	f := newFixture(t, fixtureOptions{extraHCL: `challenge_timeout = "30s"`})
+	r := meterFixture(t, f)
+	var cancels []context.CancelFunc
+	for i := 0; i < 8; i++ {
+		_, cancel, err := f.openChallenge("dev-cell-1")
+		if err != nil {
+			t.Fatalf("challenge %d: %v", i+1, err)
 		}
+		cancels = append(cancels, cancel)
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("three attestations took %v while the exporter blocked", d)
+	_, _, err := f.openChallenge("dev-cell-1")
+	wantDenied(t, err, TooManyPending)
+	// Each cancelled challenge ends as abandoned.
+	for _, c := range cancels {
+		c()
 	}
+	waitIdle(t, f.plugin)
+	// A client that closes its side after the challenge is abandoned too.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := f.client.Attest(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(Payload{Cell: "dev-cell-1"})
+	_ = stream.Send(&nodeattestorv1.AttestRequest{Request: &nodeattestorv1.AttestRequest_Payload{Payload: payload}})
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = stream.Recv()
+	wantDenied(t, err, Abandoned)
+	waitCounts(t, r, map[attestKey]int64{
+		{"dev-cell-1", "refused", "too_many_pending"}:    1,
+		{"dev-cell-1", "refused", "challenge_abandoned"}: 9,
+	})
 }

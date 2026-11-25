@@ -294,14 +294,11 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
-// SPIRE starts the plugin with the handshake cookie and reads the first stdout line. Any other stdout
-// output, such as a telemetry log line, breaks the plugin load. The test refuses one attestation, so
-// that the plugin has a count to export to a closed port.
+// SPIRE starts the plugin with the handshake cookie and reads the first stdout line. Output before the
+// handshake breaks the plugin load, and the client drops output after it. The test refuses one
+// attestation, so that the plugin has a count to export to a closed port.
 func TestPluginStdoutHoldsOnlyHandshake(t *testing.T) {
-	bin := filepath.Join(t.TempDir(), "cluster-jwt-server")
-	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build: %v\n%s", err, out)
-	}
+	bin := buildPlugin(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
@@ -373,5 +370,105 @@ func TestPluginStdoutHoldsOnlyHandshake(t *testing.T) {
 	<-copied
 	if more := rest.String(); more != "" {
 		t.Fatalf("stdout holds more than the handshake: %q", more)
+	}
+}
+
+func buildPlugin(t *testing.T) string {
+	t.Helper()
+	bin := filepath.Join(t.TempDir(), "cluster-jwt-server")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	return bin
+}
+
+// A collector that accepts connections and never answers must not slow an attestation.
+func TestAttestDoesNotWaitOnCollector(t *testing.T) {
+	bin := buildPlugin(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	var held []net.Conn
+	var heldMu sync.Mutex
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			heldMu.Lock()
+			held = append(held, c)
+			heldMu.Unlock()
+		}
+	}()
+	defer func() {
+		heldMu.Lock()
+		defer heldMu.Unlock()
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Env = append(os.Environ(),
+		"NodeAttestor=NodeAttestor",
+		"OTEL_EXPORTER_OTLP_ENDPOINT=http://"+ln.Addr().String(),
+		"OTEL_EXPORTER_OTLP_INSECURE=true",
+		"OTEL_METRIC_EXPORT_INTERVAL=50",
+	)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { cancel(); _ = cmd.Wait() }()
+	reader := bufio.NewReader(out)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(strings.TrimSpace(line), "|")
+	if len(parts) != 6 {
+		t.Fatalf("handshake line = %q", line)
+	}
+	go func() { _, _ = io.Copy(io.Discard, reader) }()
+	conn, err := grpc.NewClient("unix://"+parts[3], grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := nodeattestorv1.NewNodeAttestorClient(conn)
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		actx, acancel := context.WithTimeout(ctx, 5*time.Second)
+		stream, err := client.Attest(actx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = stream.Send(&nodeattestorv1.AttestRequest{Request: &nodeattestorv1.AttestRequest_Payload{Payload: []byte(`{"cell":"x"}`)}})
+		_, err = stream.Recv()
+		acancel()
+		if status.Code(err) != codes.PermissionDenied {
+			t.Fatalf("attest %d error = %v, want PermissionDenied", i, err)
+		}
+		if i == 9 {
+			// Let the exporter open a connection and block on it.
+			time.Sleep(300 * time.Millisecond)
+			start = time.Now()
+		}
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Fatalf("ten attestations took %v while the collector hung", d)
+	}
+	heldMu.Lock()
+	n := len(held)
+	heldMu.Unlock()
+	if n == 0 {
+		t.Fatal("the plugin never connected to the collector, so the test proves nothing")
 	}
 }

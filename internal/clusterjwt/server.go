@@ -181,10 +181,10 @@ type Plugin struct {
 	loops     atomic.Int32
 	tickEvery atomic.Int64
 
-	// hintCh carries the cells that need a hint to the writing goroutine. hintMu guards hintStarted.
 	// attestations counts each finished Attest call. It stays nil until SetMeter.
 	attestations metric.Int64Counter
 
+	// hintCh carries the cells that need a hint to the writing goroutine. hintMu guards hintStarted.
 	hintCh      chan string
 	hintLim     *lograte.Limiter
 	hintMu      sync.Mutex
