@@ -20,6 +20,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -30,6 +31,7 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/install"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 const binaryName = "cluster-jwt-server"
@@ -45,6 +47,25 @@ func main() {
 		os.Exit(install.Run(binaryName, os.Args[1:], os.Stdout, os.Executable))
 	}
 	p := clusterjwt.New()
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
+		// Stdout carries the go-plugin handshake, so telemetry writes its own log lines to stderr.
+		tel, err := telemetry.Start(context.Background(), binaryName, os.Stderr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "cluster-jwt-server: start telemetry:", err)
+			os.Exit(1)
+		}
+		if err := p.SetMeter(tel.Meter); err != nil {
+			fmt.Fprintln(os.Stderr, "cluster-jwt-server:", err)
+			os.Exit(1)
+		}
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), flushTimeout)
+			defer cancel()
+			if err := tel.Shutdown(sctx); err != nil {
+				fmt.Fprintln(os.Stderr, "cluster-jwt-server: telemetry shutdown:", err)
+			}
+		}()
+	}
 	pluginmain.Serve(
 		nodeattestorv1.NodeAttestorPluginServer(p),
 		configv1.ConfigServiceServer(p),

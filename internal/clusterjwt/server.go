@@ -19,6 +19,8 @@ import (
 	"github.com/hashicorp/hcl"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
 	configv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/service/common/config/v1"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -40,6 +42,16 @@ const (
 	ChallengeTimeout Reason = "challenge_timeout"
 	Abandoned        Reason = "challenge_abandoned"
 	NotConfigured    Reason = "not_configured"
+	// Internal marks a failure of the server itself, such as a nonce that cannot be generated.
+	Internal Reason = "internal"
+)
+
+const (
+	attestationsName = "cluster_jwt.attestations"
+	cellUnknown      = "unknown"
+	resultAccepted   = "accepted"
+	resultRefused    = "refused"
+	reasonNone       = "none"
 )
 
 const (
@@ -170,6 +182,9 @@ type Plugin struct {
 	tickEvery atomic.Int64
 
 	// hintCh carries the cells that need a hint to the writing goroutine. hintMu guards hintStarted.
+	// attestations counts each finished Attest call. It stays nil until SetMeter.
+	attestations metric.Int64Counter
+
 	hintCh      chan string
 	hintLim     *lograte.Limiter
 	hintMu      sync.Mutex
@@ -197,6 +212,44 @@ func newWithTicker(tick <-chan time.Time, stop <-chan struct{}) *Plugin {
 
 // SetLogger receives the logger that SPIRE writes.
 func (p *Plugin) SetLogger(l hclog.Logger) { p.log = l }
+
+// SetMeter creates the attestation counter on the meter. Call it before the first attestation.
+func (p *Plugin) SetMeter(m metric.Meter) error {
+	c, err := m.Int64Counter(attestationsName,
+		metric.WithUnit("{attestation}"),
+		metric.WithDescription("Attestations that the cluster_jwt plugin finished, by cell, result and reason"))
+	if err != nil {
+		return fmt.Errorf("attestation counter: %w", err)
+	}
+	p.attestations = c
+	return nil
+}
+
+// outcome is what one Attest call adds to the counter. The cell stays "unknown" until a record matches.
+type outcome struct {
+	cell   string
+	reason Reason
+}
+
+// count adds one finished attestation. The cell label holds the name of a loaded record or "unknown".
+func (p *Plugin) count(o *outcome, err error) {
+	if p.attestations == nil {
+		return
+	}
+	result, reason := resultAccepted, reasonNone
+	if err != nil {
+		result, reason = resultRefused, string(o.reason)
+	}
+	cell := o.cell
+	if cell == "" {
+		cell = cellUnknown
+	}
+	p.attestations.Add(context.Background(), 1, metric.WithAttributes(
+		attribute.String("cell", cell),
+		attribute.String("result", result),
+		attribute.String("reason", reason),
+	))
+}
 
 // Validate checks a configuration without applying it.
 func (p *Plugin) Validate(_ context.Context, req *configv1.ValidateRequest) (*configv1.ValidateResponse, error) {
@@ -351,54 +404,63 @@ func parseKeys(in []string) ([]ed25519.PublicKey, error) {
 
 // Attest challenges the agent with a fresh nonce and checks the token that answers it.
 func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
+	var o outcome
+	err := p.attest(stream, &o)
+	p.count(&o, err)
+	return err
+}
+
+func (p *Plugin) attest(stream nodeattestorv1.NodeAttestor_AttestServer, o *outcome) error {
 	p.active.Add(1)
 	defer p.active.Add(-1)
 
 	st := p.st.Load()
 	if st == nil {
-		return p.deny("", "", NotConfigured)
+		return p.deny(o, "", "", NotConfigured)
 	}
 	first, err := stream.Recv()
 	if err != nil {
-		return p.deny("", "", Malformed)
+		return p.deny(o, "", "", Malformed)
 	}
 	var payload Payload
 	if err := decodeStrict(first.GetPayload(), &payload); err != nil {
-		return p.deny("", "", Malformed)
+		return p.deny(o, "", "", Malformed)
 	}
 	rec, ok := st.records[payload.Cell]
 	if !ok {
-		return p.deny(logCell(payload.Cell), "", UnknownCell)
+		return p.deny(o, logCell(payload.Cell), "", UnknownCell)
 	}
+	o.cell = rec.Name
 	if rec.Revoked {
-		return p.deny(rec.Name, "", Revoked, "source", SourceRecord)
+		return p.deny(o, rec.Name, "", Revoked, "source", SourceRecord)
 	}
 	if _, held := st.overlay[rec.Name]; held {
-		return p.deny(rec.Name, "", Revoked, "source", SourceOverlay)
+		return p.deny(o, rec.Name, "", Revoked, "source", SourceOverlay)
 	}
 	if !st.gate.acquire(rec.Name) {
-		return p.deny(rec.Name, "", TooManyPending)
+		return p.deny(o, rec.Name, "", TooManyPending)
 	}
 	defer st.gate.release(rec.Name)
 
 	nonce, err := newNonce()
 	if err != nil {
 		p.log.Error("nonce generation failed", "error", err.Error())
+		o.reason = Internal
 		return status.Error(codes.Internal, "cluster_jwt: internal")
 	}
 	if err := stream.Send(&nodeattestorv1.AttestResponse{Response: &nodeattestorv1.AttestResponse_Challenge{Challenge: []byte(nonce)}}); err != nil {
-		return p.deny(rec.Name, "", Abandoned)
+		return p.deny(o, rec.Name, "", Abandoned)
 	}
 	sent := time.Now()
 	reply, reason := recvWithin(stream, st.timeout)
 	if reason != "" {
-		return p.deny(rec.Name, "", reason)
+		return p.deny(o, rec.Name, "", reason)
 	}
 	// replyMS is the time from the challenge to the reply, which challenge_timeout bounds.
 	replyMS := time.Since(sent).Milliseconds()
 	var resp Response
 	if err := decodeStrict(reply.GetChallengeResponse(), &resp); err != nil {
-		return p.deny(rec.Name, "", Malformed, "challenge_reply_ms", replyMS)
+		return p.deny(o, rec.Name, "", Malformed, "challenge_reply_ms", replyMS)
 	}
 	kid := tokenKID(resp.Token)
 	claims, err := Validate(rec, resp.Token, st.env, nonce, p.now())
@@ -407,19 +469,19 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 		if reason == UnknownKID {
 			p.queueHint(st, rec.Name)
 		}
-		return p.deny(rec.Name, kid, reason, "challenge_reply_ms", replyMS)
+		return p.deny(o, rec.Name, kid, reason, "challenge_reply_ms", replyMS)
 	}
 	if !podUIDRE.MatchString(claims.PodUID) {
-		return p.deny(rec.Name, kid, Malformed, "challenge_reply_ms", replyMS)
+		return p.deny(o, rec.Name, kid, Malformed, "challenge_reply_ms", replyMS)
 	}
 	if !st.limit.allow(rec.Name) {
-		return p.deny(rec.Name, kid, RateLimited, "challenge_reply_ms", replyMS)
+		return p.deny(o, rec.Name, kid, RateLimited, "challenge_reply_ms", replyMS)
 	}
 
 	id := fmt.Sprintf("spiffe://%s/spire/agent/%s/%s/%s/%s", st.trustDomain, PluginName, rec.Name, claims.PodUID, nonceHash(nonce))
 	p.log.Info("attested", "cell", rec.Name, "kid", kid, "namespace", claims.Namespace, "service_account", claims.ServiceAccount,
 		"agent_id", id, "challenge_reply_ms", replyMS)
-	return stream.Send(&nodeattestorv1.AttestResponse{Response: &nodeattestorv1.AttestResponse_AgentAttributes{
+	err = stream.Send(&nodeattestorv1.AttestResponse{Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 		AgentAttributes: &nodeattestorv1.AgentAttributes{
 			SpiffeId: id,
 			SelectorValues: []string{
@@ -430,6 +492,10 @@ func (p *Plugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServer) error {
 			CanReattest: false,
 		},
 	}})
+	if err != nil {
+		o.reason = Abandoned
+	}
+	return err
 }
 
 // recvWithin reads the next request, or returns the reason it could not. The reading goroutine ends
@@ -469,7 +535,8 @@ func newNonce() (string, error) {
 
 // deny logs the refusal with any extra key and value pairs, and returns the gRPC error. It never
 // receives the token.
-func (p *Plugin) deny(cell, kid string, reason Reason, extra ...any) error {
+func (p *Plugin) deny(o *outcome, cell, kid string, reason Reason, extra ...any) error {
+	o.reason = reason
 	p.log.Warn("attestation refused", append([]any{"reason", string(reason), "cell", cell, "kid", kid}, extra...)...)
 	return status.Error(codes.PermissionDenied, "cluster_jwt: "+string(reason))
 }
