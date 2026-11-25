@@ -71,7 +71,7 @@ func TestSelectorsKeepMatchers(t *testing.T) {
 }
 
 func TestPlanQueriesParse(t *testing.T) {
-	// Forms from the panel table of the plan, which Task 9 writes.
+	// Forms from the panel table of the plan.
 	exprs := map[string]string{
 		`max(mgmtd_cells_valid{k8s_cluster_name="management"})`:                                                                                              "mgmtd_cells_valid",
 		`(min(trust_ca_not_after_seconds{trust_domain="dev.env.poc.internal", ca="intermediate"}) - time()) / 86400`:                                         "trust_ca_not_after_seconds",

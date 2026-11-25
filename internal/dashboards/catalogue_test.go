@@ -60,7 +60,9 @@ func TestCatalogueEntriesAreComplete(t *testing.T) {
 	}
 }
 
-// liveNames are names that the M15 inventory read from Prometheus of lgtm-0 on 2026-11-25.
+// The list holds the names of the M15 live inventory of 2026-11-25 (UTC). Most had series in Prometheus of lgtm-0 then.
+// Names of counters and observed gauges that had not yet seen an event are in the list too, because their code defines them.
+// istio_agent_cert_expiry_seconds was read on port 15020 only. The names that had series anchor the name translation.
 func TestCatalogueNamesMatchTheLiveHarness(t *testing.T) {
 	names := known()
 	for _, n := range strings.Fields(`

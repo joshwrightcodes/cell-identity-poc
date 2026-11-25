@@ -13,6 +13,8 @@ type Metric struct {
 	Origin     string
 	ThirdParty bool
 	Clusters   []string
+	// NotExported marks a metric that no binary exports today, so a panel or a rule that reads it stays empty.
+	NotExported bool
 }
 
 // Emitter values for Metric.Clusters.
@@ -41,6 +43,13 @@ func own(instrument, kind, unit string, clusters ...string) Metric {
 		Prom:       strings.TrimSuffix(PromName(instrument, kind, unit)[0], "_bucket"),
 		Instrument: instrument, Kind: kind, Unit: unit, Origin: originOwn, Clusters: clusters,
 	}
+}
+
+// host describes an instrument of the host service on the Mac, which exports no telemetry today.
+func host(instrument, kind, unit string) Metric {
+	m := own(instrument, kind, unit, ClusterHost)
+	m.NotExported = true
+	return m
 }
 
 // thirdParty describes a metric that a third-party component exposes and the collector scrapes.
@@ -109,12 +118,12 @@ var Catalogue = []Metric{
 	own("envd.spec.refusals", KindCounter, "", ClusterControlPlane),
 	own("envd.upstream.age", KindGauge, "s", ClusterControlPlane),
 
-	own("hostsvc.key.cache.hits", KindCounter, "", ClusterHost),
-	own("hostsvc.key.handshake.refusals", KindCounter, "", ClusterHost),
-	own("hostsvc.key.lookup.duration", KindHistogram, "s", ClusterHost),
-	own("hostsvc.key.lookups", KindCounter, "", ClusterHost),
-	own("hostsvc.key.requests", KindCounter, "", ClusterHost),
-	own("hostsvc.steps", KindCounter, "", ClusterHost),
+	host("hostsvc.key.cache.hits", KindCounter, ""),
+	host("hostsvc.key.handshake.refusals", KindCounter, ""),
+	host("hostsvc.key.lookup.duration", KindHistogram, "s"),
+	host("hostsvc.key.lookups", KindCounter, ""),
+	host("hostsvc.key.requests", KindCounter, ""),
+	host("hostsvc.steps", KindCounter, ""),
 
 	own("mgmtd.bind.results", KindCounter, "", ClusterManagement),
 	own("mgmtd.cells.valid", KindGauge, "", ClusterManagement),
@@ -127,7 +136,7 @@ var Catalogue = []Metric{
 	own("relay.connections", KindCounter, "", ClusterControlPlane),
 	own("relay.connections.open", KindUpDownCounter, "", ClusterControlPlane),
 
-	// Third-party names. Each one was read on the live harness in the M15 inventory of 2026-11-26.
+	// Third-party names. Task 1 of the M15 inventory read each name on the live harness, except where the origin says otherwise.
 	thirdParty("up", KindGauge, originProm, allClusters...),
 	thirdParty("argocd_app_info", KindGauge, originArgoCD, allClusters...),
 	thirdParty("argocd_app_sync_total", KindCounter, originArgoCD, allClusters...),

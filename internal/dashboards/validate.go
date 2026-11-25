@@ -12,17 +12,25 @@ import (
 // gridColumns is the width of the Grafana grid.
 const gridColumns = 24
 
-// Boards returns the dashboards. Task 9 fills the list.
+// Boards returns the dashboards that the generator writes.
 func Boards() []Dashboard { return nil }
 
-// Rules returns the alert rule file. Task 10 fills the list.
+// Rules returns the alert rule file that the generator writes.
 func Rules() RuleFile { return RuleFile{APIVersion: 1, Groups: []RuleGroup{}} }
 
 // promQuery is one PromQL expression with the place that holds it.
 type promQuery struct {
 	Where string
 	Expr  string
+	Kind  string
 }
+
+// Kinds of promQuery.
+const (
+	kindVariable = "variable"
+	kindPanel    = "panel"
+	kindRule     = "rule"
+)
 
 var labelValuesRE = regexp.MustCompile(`^label_values\((.*),\s*[A-Za-z_][A-Za-z0-9_]*\)$`)
 
@@ -37,7 +45,7 @@ func promQueries(boards []Dashboard, rules RuleFile) []promQuery {
 				if m := labelValuesRE.FindStringSubmatch(expr); m != nil {
 					expr = m[1]
 				}
-				out = append(out, promQuery{fmt.Sprintf("%s variable %s", b.UID, v.Name), expr})
+				out = append(out, promQuery{fmt.Sprintf("%s variable %s", b.UID, v.Name), expr, kindVariable})
 			}
 		}
 		for _, p := range b.Panels {
@@ -47,7 +55,7 @@ func promQueries(boards []Dashboard, rules RuleFile) []promQuery {
 					ds = p.Datasource
 				}
 				if ds != nil && ds.UID == DSPrometheus {
-					out = append(out, promQuery{fmt.Sprintf("%s panel %q target %s", b.UID, p.Title, t.RefID), t.Expr})
+					out = append(out, promQuery{fmt.Sprintf("%s panel %q target %s", b.UID, p.Title, t.RefID), t.Expr, kindPanel})
 				}
 			}
 		}
@@ -59,7 +67,7 @@ func promQueries(boards []Dashboard, rules RuleFile) []promQuery {
 					continue
 				}
 				expr, _ := q.Model["expr"].(string)
-				out = append(out, promQuery{fmt.Sprintf("rule %s query %s", r.UID, q.RefID), expr})
+				out = append(out, promQuery{fmt.Sprintf("rule %s query %s", r.UID, q.RefID), expr, kindRule})
 			}
 		}
 	}
@@ -90,6 +98,9 @@ func CheckLayout(boards []Dashboard) error {
 		files[b.File] = true
 		for _, v := range b.Templating.List {
 			okDS(b.UID+" variable "+v.Name, v.Datasource)
+			if v.Datasource == nil {
+				errs = append(errs, fmt.Errorf("%s variable %s: no data source", b.UID, v.Name))
+			}
 		}
 		ids := map[int]bool{}
 		for i, p := range b.Panels {
@@ -111,6 +122,9 @@ func CheckLayout(boards []Dashboard) error {
 			okDS(where, p.Datasource)
 			for _, t := range p.Targets {
 				okDS(where+" target "+t.RefID, t.Datasource)
+				if t.Datasource == nil && p.Datasource == nil {
+					errs = append(errs, fmt.Errorf("%s target %s: no data source on the target or the panel", where, t.RefID))
+				}
 			}
 		}
 	}
@@ -131,8 +145,11 @@ func CheckQueries(boards []Dashboard, rules RuleFile) error {
 			errs = append(errs, fmt.Errorf("%s: the expression names no metric", q.Where))
 		}
 		for _, n := range got {
-			if _, ok := names[n]; !ok {
+			m, ok := names[n]
+			if !ok {
 				errs = append(errs, fmt.Errorf("%s: metric %q is not in the catalogue", q.Where, n))
+			} else if m.NotExported {
+				errs = append(errs, fmt.Errorf("%s: metric %q is not exported by any binary today", q.Where, n))
 			}
 		}
 	}
@@ -156,20 +173,38 @@ func CheckSelectors(boards []Dashboard, rules RuleFile) error {
 				continue
 			}
 			pin := ""
+			scoped := false
 			for _, mt := range s.Matchers {
 				if mt.Label == "k8s_cluster_name" && mt.Op == "=" {
 					pin = mt.Value
 				}
+				if scopeLabels[mt.Label] && (strings.Contains(mt.Value, "$cluster") || strings.Contains(mt.Value, "$cell")) {
+					scoped = true
+				}
 			}
-			if pin != "" && !contains(m.Clusters, pin) {
+			if pin != "" && !emits(m, pin) {
 				errs = append(errs, fmt.Errorf("%s: %s pins k8s_cluster_name=%q, but the metric comes from %s", q.Where, s.Name, pin, strings.Join(m.Clusters, ", ")))
 			}
-			if pin == "" && len(m.Clusters) == 1 && m.Clusters[0] != ClusterCell && m.Clusters[0] != ClusterHost {
+			oneEmitter := len(m.Clusters) == 1 && m.Clusters[0] != ClusterCell && m.Clusters[0] != ClusterHost
+			if pin == "" && oneEmitter {
 				errs = append(errs, fmt.Errorf("%s: %s has no k8s_cluster_name=%q, which is the only emitter", q.Where, s.Name, m.Clusters[0]))
+			}
+			// A panel that reads a metric of many emitters must pin one emitter or follow a dashboard variable.
+			// Variable queries and rules cannot use the dashboard variables.
+			if q.Kind == kindPanel && !oneEmitter && pin == "" && !scoped {
+				errs = append(errs, fmt.Errorf("%s: %s comes from many clusters and its selector has neither a k8s_cluster_name pin nor a $cluster or $cell matcher", q.Where, s.Name))
 			}
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// scopeLabels are the labels whose matcher may follow the dashboard variables.
+var scopeLabels = map[string]bool{"k8s_cluster_name": true, "platform_cell": true, "cell": true, "sender_cluster": true}
+
+// emits reports whether the cluster is an emitter of the metric. A cell cluster is named dev-cell-<n>.
+func emits(m Metric, cluster string) bool {
+	return contains(m.Clusters, cluster) || (contains(m.Clusters, ClusterCell) && strings.HasPrefix(cluster, "dev-cell-"))
 }
 
 func contains(list []string, s string) bool {

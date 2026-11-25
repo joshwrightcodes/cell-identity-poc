@@ -40,15 +40,19 @@ func TestEveryDashboardParses(t *testing.T) {
 		boards []Dashboard
 		want   string
 	}{
-		"duplicate UID":                {append(mutate(func(*Dashboard) {}), func() Dashboard { b := goodBoard(); b.File = "other.json"; return b }()), `UID "poc-good" is not unique`},
-		"duplicate file":               {append(mutate(func(*Dashboard) {}), func() Dashboard { b := goodBoard(); b.UID = "poc-other"; return b }()), "is not unique"},
-		"panel past column 24":         {mutate(func(b *Dashboard) { b.Panels[0].GridPos = GridPos{H: 4, W: 8, X: 20, Y: 0} }), "outside the 24 columns"},
-		"zero width":                   {mutate(func(b *Dashboard) { b.Panels[0].GridPos.W = 0 }), "outside the 24 columns"},
-		"overlap":                      {mutate(func(b *Dashboard) { b.Panels[1].GridPos.X = 4 }), "overlaps panel"},
-		"duplicate panel ID":           {mutate(func(b *Dashboard) { b.Panels[1].ID = 1 }), "panel ID 1 is not unique"},
-		"unknown data source":          {mutate(func(b *Dashboard) { b.Panels[0].Datasource = &Datasource{Type: "tempo", UID: "tempo"} }), `data source UID "tempo"`},
-		"unknown target data source":   {mutate(func(b *Dashboard) { b.Panels[0].Targets[0].Datasource = &Datasource{Type: "x", UID: "other"} }), `data source UID "other"`},
-		"unknown variable data source": {mutate(func(b *Dashboard) { b.Templating.List[0].Datasource = &Datasource{Type: "x", UID: "other"} }), `variable cluster`},
+		"duplicate UID":              {append(mutate(func(*Dashboard) {}), func() Dashboard { b := goodBoard(); b.File = "other.json"; return b }()), `UID "poc-good" is not unique`},
+		"duplicate file":             {append(mutate(func(*Dashboard) {}), func() Dashboard { b := goodBoard(); b.UID = "poc-other"; return b }()), "is not unique"},
+		"panel past column 24":       {mutate(func(b *Dashboard) { b.Panels[0].GridPos = GridPos{H: 4, W: 8, X: 20, Y: 0} }), "outside the 24 columns"},
+		"zero width":                 {mutate(func(b *Dashboard) { b.Panels[0].GridPos.W = 0 }), "outside the 24 columns"},
+		"overlap":                    {mutate(func(b *Dashboard) { b.Panels[1].GridPos.X = 4 }), "overlaps panel"},
+		"duplicate panel ID":         {mutate(func(b *Dashboard) { b.Panels[1].ID = 1 }), "panel ID 1 is not unique"},
+		"unknown data source":        {mutate(func(b *Dashboard) { b.Panels[0].Datasource = &Datasource{Type: "tempo", UID: "tempo"} }), `data source UID "tempo"`},
+		"unknown target data source": {mutate(func(b *Dashboard) { b.Panels[0].Targets[0].Datasource = &Datasource{Type: "x", UID: "other"} }), `data source UID "other"`},
+		"panel and target without a data source": {mutate(func(b *Dashboard) {
+			b.Panels[0].Datasource = nil
+		}), "no data source on the target or the panel"},
+		"variable without a data source": {mutate(func(b *Dashboard) { b.Templating.List[0].Datasource = nil }), "variable cluster: no data source"},
+		"unknown variable data source":   {mutate(func(b *Dashboard) { b.Templating.List[0].Datasource = &Datasource{Type: "x", UID: "other"} }), `variable cluster`},
 	}
 	for name, tc := range bad {
 		t.Run("bad: "+name, func(t *testing.T) { wantError(t, CheckLayout(tc.boards), tc.want) })
@@ -121,6 +125,12 @@ func TestPanelQueriesNameKnownMetrics(t *testing.T) {
 		})
 		wantError(t, CheckQueries(boards, goodRules()), "Cells valid")
 	})
+	t.Run("bad: a metric that no binary exports", func(t *testing.T) {
+		boards := mutate(func(b *Dashboard) { b.Panels[0].Targets[0].Expr = `sum(increase(hostsvc_steps_total[$__range]))` })
+		wantError(t, CheckQueries(boards, goodRules()), `"hostsvc_steps_total" is not exported`)
+		rules := mutateRules(func(r *Rule) { r.Data[0].Model["expr"] = `sum(hostsvc_steps_total)` })
+		wantError(t, CheckQueries(nil, rules), "not exported")
+	})
 	t.Run("bad: an expression with no metric", func(t *testing.T) {
 		boards := mutate(func(b *Dashboard) { b.Panels[0].Targets[0].Expr = `vector(1)` })
 		wantError(t, CheckQueries(boards, goodRules()), "names no metric")
@@ -160,11 +170,35 @@ func TestSelectorsPinEmitter(t *testing.T) {
 		})
 		wantError(t, CheckSelectors(nil, rules), "poc-good-rule", "cell_proxy_tunnel_up pins")
 	})
+	t.Run("bad: a metric of many clusters with no pin and no variable", func(t *testing.T) {
+		for _, expr := range []string{
+			`sum(argocd_app_info)`,
+			`sum(argocd_app_info{job="argocd"})`,
+			`min(celld_upstream_age_seconds)`,
+			`min(istio_agent_cert_expiry_seconds{resource_name="default"})`,
+		} {
+			wantError(t, CheckSelectors(setExpr(expr), goodRules()), "comes from many clusters", "Cells valid")
+		}
+	})
+	t.Run("bad: a pin to a cluster that is not a cell", func(t *testing.T) {
+		wantError(t, CheckSelectors(setExpr(`celld_svid_remaining_seconds{k8s_cluster_name="dev-cp"}`), goodRules()), "pins")
+	})
+	t.Run("good: a rule and a variable query need no scope", func(t *testing.T) {
+		rules := mutateRules(func(r *Rule) { r.Data[0].Model["expr"] = `min(celld_upstream_age_seconds{platform_cell!=""})` })
+		boards := mutate(func(b *Dashboard) {
+			b.Templating.List[1].Query = `label_values(celld_upstream_age_seconds, platform_cell)`
+		})
+		if err := CheckSelectors(boards, rules); err != nil {
+			t.Fatal(err)
+		}
+	})
 	t.Run("good: a metric of many clusters takes the variable or a fixed emitter", func(t *testing.T) {
 		for _, expr := range []string{
 			`sum(argocd_app_info{k8s_cluster_name=~"$cluster"})`,
 			`sum(argocd_app_info{k8s_cluster_name="dev-cp"})`,
-			`sum(argocd_app_info)`,
+			`sum(celld_svid_remaining_seconds{k8s_cluster_name="dev-cell-1"})`,
+			`sum(cell_proxy_tunnel_up{k8s_cluster_name="dev-cell-2", side="cell"})`,
+			`sum(argocd_app_info{sender_cluster=~"$cluster"})`,
 			`max(cellproxy_gateway_slots_used{k8s_cluster_name="management", sender_cluster=~"$cluster"})`,
 		} {
 			if err := CheckSelectors(setExpr(expr), goodRules()); err != nil {

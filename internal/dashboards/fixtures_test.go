@@ -17,7 +17,7 @@ func panel(id int, title string, x, y, w, h int, exprs ...string) Panel {
 }
 
 // goodBoard is a board that passes every check. The checks of the real boards run on an empty list
-// until Task 9, so each check also runs on this board and on the bad boards that mutate it.
+// while no board exists yet, so each check also runs on this board and on the bad boards that mutate it.
 func goodBoard() Dashboard {
 	logs := panel(4, "Latest refusals", 0, 8, 24, 8)
 	logs.Type = "table"
