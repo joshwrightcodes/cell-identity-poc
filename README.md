@@ -1024,7 +1024,7 @@ The gate runs in phases:
 `GATE_M9_BUDGET_MINUTES` bounds the whole tier, and `GATE_M9_TEST_TIMEOUT_MINUTES` is the timeout of each `go test` invocation.
 A Go timeout skips every cleanup, so run `gate:m9:repair` after a timeout.
 
-`mise run poc:gate -- fast` runs `gate:m1` to `gate:m8`, with `gate:m6:provision`, and stops at the first failure.
+`mise run poc:gate -- fast` runs `gate:m1` to `gate:m8`, with `gate:m6:provision`, then `gate:m15`, and stops at the first failure.
 `mise run poc:gate -- slow` runs `gate:m9`, and `mise run poc:gate -- all` runs both. The estimate for a run of both tiers is about 10 hours.
 The manual drills `gate:m4:rotate`, `gate:m5:soak` and `gate:m5:drill` do not run.
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the gates of the PoC as tiers. Usage: poc-gate.sh fast|slow|all
-#   fast  gate:m1 to gate:m8, with gate:m6:provision after gate:m6. It stops at the first failure. GATE_FAST_BUDGET_MINUTES in
+#   fast  gate:m1 to gate:m8 and gate:m15, with gate:m6:provision after gate:m6. It stops at the first failure. GATE_FAST_BUDGET_MINUTES in
 #         harness/versions.env bounds the tier when it is set.
 #   slow  gate:m9, the slow tier at the SVID lifetime of GATE_M9_SVID_TTL, which takes the night.
 #   all   fast, then slow.
@@ -19,7 +19,7 @@ refuse_battery
 cd "$ROOT"
 source "$ROOT/harness/versions.env"
 
-fast=(gate:m1 gate:m2 gate:m3 gate:m4 gate:m5 gate:m6 gate:m6:provision gate:m7 gate:m8)
+fast=(gate:m1 gate:m2 gate:m3 gate:m4 gate:m5 gate:m6 gate:m6:provision gate:m7 gate:m8 gate:m15)
 passed=()
 start="$(date +%s)"
 

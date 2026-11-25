@@ -72,7 +72,9 @@
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Run the M9 slow tier overnight (see README "Gate of M9"; build the images first) | `mise run gate:m9` |
 | Repair what `gate:m9` leaves: cuts, revoked test cells, held entries, the lifetime and `m9-*` namespaces (`--check` only reports) | `mise run gate:m9:repair` |
-| Run the gates as tiers: `fast` (M1 to M8), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
+| Run the M15 end-to-end gate (build the images first) | `mise run gate:m15` |
+| Repair what `gate:m15` leaves: it runs `gate:m9:repair`, then deletes `m15-*` namespaces (`--check` only reports) | `mise run gate:m15:repair` |
+| Run the gates as tiers: `fast` (M1 to M8, then M15), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
 | Cut and heal the traffic between two clusters: `cut`, `heal` or `list` (see README "Island mode and revocation") | `mise run partition -- cut --from dev-cell-2 --to dev-cp --hold 10` |
 | Switch the SVID lifetime of `dev-cp` for the slow tier: `set <ttl>`, `restore` or `show` | `mise run svid-ttl -- show` |
 | Revoke a cell through `mgmtd`, or undo it, while `dev-cp` is connected | `mise run mgmt -- revoke --cell dev-cell-2`, `mise run mgmt -- unrevoke --cell dev-cell-2` |
