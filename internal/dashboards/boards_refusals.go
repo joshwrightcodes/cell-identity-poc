@@ -1,13 +1,11 @@
 package dashboards
 
-import "fmt"
-
 // refusalSource is one counter of refusals and the service that it names.
 type refusalSource struct{ service, expr string }
 
 func refusalSources() []refusalSource {
 	inc := func(name string, matchers ...string) string {
-		return fmt.Sprintf("sum(increase(%s[%s]))", S(name, matchers...), rng)
+		return "sum(" + Born(S(name, matchers...), rng) + ")"
 	}
 	return []refusalSource{
 		{"cellgw", inc("cellgw_refusals_total", pinCP)},

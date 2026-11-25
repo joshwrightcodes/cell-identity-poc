@@ -13,9 +13,9 @@ func workBoard() Dashboard {
 	s(0, "Queue depth", "Operations that the gateway holds in the queue of a cell. The gauge has no series while every queue is empty.", thresholds(colGood, step{1, colWarning}),
 		event(instant("sum("+fresh(S("cellgw_queue_depth", pinCP), freshFast)+")", ""), false))
 	s(1, "Claims 24 h", "Operations that the cells claimed in the last 24 hours.", thresholds(colNeutral),
-		event(instant("sum(increase("+S("cellgw_claims_total", pinCP)+"[24h]))", ""), false))
+		event(instant("sum("+Born(S("cellgw_claims_total", pinCP), "24h")+")", ""), false))
 	s(2, "Throttled reports", "Reports that envd throttled in the time range.", thresholds(colGood, step{1, colWarning}),
-		event(instant("sum(increase("+S("envd_reports_throttled_total", pinCP)+"["+rng+"]))", ""), false))
+		event(instant("sum("+Born(S("envd_reports_throttled_total", pinCP), rng)+")", ""), false))
 	s(3, "Steps in flight", "Steps that the cell controller tracks and that have no final state.", thresholds(colNeutral),
 		event(instant("sum("+fresh(S("cellctl_steps_open", pinCP, `state=~"$kind"`), freshSlow)+")", ""), false))
 

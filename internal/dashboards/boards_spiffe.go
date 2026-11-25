@@ -8,7 +8,7 @@ func spiffeBoard() Dashboard {
 		b.add(stat(title, desc, x, 0, w, 4, unit, th, ts...))
 	}
 	attest := func(result string) string {
-		return "sum(increase(" + S("cluster_jwt_attestations_total", pinCP, `result="`+result+`"`) + "[" + rng + "]))"
+		return "sum(" + Born(S("cluster_jwt_attestations_total", pinCP, `result="`+result+`"`), rng) + ")"
 	}
 	s(0, "Attestations", "Attestations that the cluster_jwt plugin accepted in the time range.", "none", thresholds(colNeutral),
 		event(instant(attest("accepted"), ""), false))
@@ -20,13 +20,13 @@ func spiffeBoard() Dashboard {
 		thresholds(colCrit, step{7, colWarning}, step{14, colGood}),
 		instant("(min("+fresh(S("trust_ca_not_after_seconds", clusterRe, `ca="intermediate"`, `trust_domain=~"$trust_domain"`), freshSlow)+") - time()) / 86400", ""))
 	s(4, "Key checks", "Key checks of mgmtd that found no change or updated the keys, of all key checks in the time range.", "none", thresholds(colNeutral),
-		instant("sum(increase("+S("mgmtd_keycheck_results_total", pinMgmt, `result=~"unchanged|keys_updated"`)+"["+rng+"]))", "ok"),
-		instant("sum(increase("+S("mgmtd_keycheck_results_total", pinMgmt)+"["+rng+"]))", "of"))
+		instant("sum("+Born(S("mgmtd_keycheck_results_total", pinMgmt, `result=~"unchanged|keys_updated"`), rng)+")", "ok"),
+		instant("sum("+Born(S("mgmtd_keycheck_results_total", pinMgmt), rng)+")", "of"))
 	s(5, "Agent bans", "Agents that the ban container banned in the time range.", "none", thresholds(colGood, step{1, colWarning}),
-		event(instant("sum(increase("+S("agentban_bans_total", pinCP)+"["+rng+"]))", ""), false))
+		event(instant("sum("+Born(S("agentban_bans_total", pinCP), rng)+")", ""), false))
 
 	refusals := barGauge("Attestation refusals by reason", "Refused attestations in the time range, by the reason of the plugin.", 0, 4, 10, 8, "none",
-		event(instant("sum by (reason) (increase("+S("cluster_jwt_attestations_total", pinCP, `result="refused"`)+"["+rng+"]))", "{{reason}}"), true))
+		event(instant("sum by (reason) ("+Born(S("cluster_jwt_attestations_total", pinCP, `result="refused"`), rng)+")", "{{reason}}"), true))
 	refusals.FieldConfig.Defaults.Color = map[string]any{"mode": "fixed", "fixedColor": colWarning}
 	b.add(refusals)
 	b.add(coloured(timeSeries("SVIDs issued per 10 min", "X.509 SVIDs that each SPIRE server signed in each 10 minutes.", 10, 4, 14, 8, "none",

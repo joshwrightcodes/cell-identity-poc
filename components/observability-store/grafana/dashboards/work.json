@@ -149,7 +149,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[24h]))) or vector(0)",
+          "expr": "(sum(((cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset 24h) or increase(cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[24h])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -205,7 +205,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }

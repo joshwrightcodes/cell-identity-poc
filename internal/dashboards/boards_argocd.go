@@ -14,9 +14,9 @@ func argocdBoard() Dashboard {
 	s(1, "Applications healthy", "Argo CD applications that are healthy, of all applications.", thresholds(colNeutral),
 		instant(apps(`health_status="Healthy"`)+" or 0 * "+apps(), "healthy"), instant(apps(), "of"))
 	s(2, "Rollbacks 7 days", "Bundle sets that the appliers rolled back in the last 7 days.", thresholds(colGood, step{1, colCrit}),
-		event(instant("sum(increase("+S("bundle_apply_outcomes_total", clusterRe, `outcome="rolled_back"`)+"[7d]))", ""), false))
+		event(instant("sum("+Born(S("bundle_apply_outcomes_total", clusterRe, `outcome="rolled_back"`), "7d")+")", ""), false))
 	s(3, "Store denials", "Requests that the bundle store proxy refused in the time range.", thresholds(colGood, step{1, colWarning}),
-		event(instant("sum(increase("+S("store_proxy_denials_total", clusterRe)+"["+rng+"]))", ""), false))
+		event(instant("sum("+Born(S("store_proxy_denials_total", clusterRe), rng)+")", ""), false))
 
 	sets := table("Signed sets by target", "The signed set of each applier, sorted by the numeric Applied time. Version 0.0 is the bootstrap state.", 0, 4, 14, 9,
 		"k8s_cluster_name", "Target", "Applied",

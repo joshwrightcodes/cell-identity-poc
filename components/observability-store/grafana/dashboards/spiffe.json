@@ -93,7 +93,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"accepted\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"accepted\", service_name!=\"m15-synthetic\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"accepted\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"accepted\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -149,7 +149,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -328,13 +328,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", result=~\"unchanged|keys_updated\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "expr": "sum(((mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", result=~\"unchanged|keys_updated\", service_name!=\"m15-synthetic\"} unless mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", result=~\"unchanged|keys_updated\", service_name!=\"m15-synthetic\"} offset $__range) or increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", result=~\"unchanged|keys_updated\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true,
           "legendFormat": "ok"
         },
         {
           "refId": "B",
-          "expr": "sum(increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "expr": "sum(((mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} unless mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} offset $__range) or increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true,
           "legendFormat": "of"
         }
@@ -390,7 +390,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(agentban_bans_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((agentban_bans_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless agentban_bans_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(agentban_bans_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -450,7 +450,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum by (reason) (increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range]))) or on() vector(0)",
+          "expr": "(sum by (reason) (((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range])))) or on() vector(0)",
           "instant": true,
           "legendFormat": "{{reason}}",
           "eventOnly": true

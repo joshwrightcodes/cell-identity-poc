@@ -313,7 +313,7 @@
         },
         {
           "refId": "B",
-          "expr": "(sum(increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "refused",
           "eventOnly": true
@@ -376,7 +376,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cellproxy_revoked_closed_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellproxy_revoked_closed_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_revoked_closed_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_revoked_closed_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }

@@ -431,13 +431,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (status) (increase(cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "expr": "sum by (status) (((cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true,
           "legendFormat": "{{status}}"
         },
         {
           "refId": "B",
-          "expr": "sum by (reason) (increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "expr": "sum by (reason) (((cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true,
           "legendFormat": "refused: {{reason}}"
         }

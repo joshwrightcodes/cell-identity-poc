@@ -55,7 +55,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) / (sum(increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) + (sum(increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) or vector(0)))",
+          "expr": "100 * sum(((cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) / (sum(((cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) + (sum(((cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)))",
           "instant": true
         }
       ],
@@ -118,7 +118,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -178,7 +178,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }

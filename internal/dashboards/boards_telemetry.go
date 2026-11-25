@@ -8,7 +8,7 @@ func telemetryBoard() Dashboard {
 		b.add(stat(title, desc, x, 0, w, 4, unit, th, ts...))
 	}
 	exports := func(name string, matchers ...string) string {
-		return "sum(increase(" + S(name, append([]string{pinMgmt, `sender_cluster=~"$cluster"`}, matchers...)...) + "[" + rng + "]))"
+		return "sum(" + Born(S(name, append([]string{pinMgmt, `sender_cluster=~"$cluster"`}, matchers...)...), rng) + ")"
 	}
 	accepted, denied := exports("cellproxy_gateway_exports_accepted_total"), exports("cellproxy_gateway_exports_denied_total")
 	s(0, "Exports accepted", "Share of export requests that the gateway accepted in the time range.", "percent", thresholds(colCrit, step{95, colWarning}, step{99, colGood}),
@@ -16,7 +16,7 @@ func telemetryBoard() Dashboard {
 	s(1, "Source tags overwritten", "Source attributes that the gateway replaced in the time range.", "none", thresholds(colGood, step{1, colCrit}),
 		event(instant(exports("cellproxy_gateway_attribute_overwrites_total"), ""), false))
 	s(2, "Upstream failures", "Exports that the gateway could not pass upstream in the time range.", "none", thresholds(colGood, step{1, colCrit}),
-		event(instant("sum(increase("+S("cellproxy_gateway_upstream_failures_total", pinMgmt)+"["+rng+"]))", ""), false))
+		event(instant("sum("+Born(S("cellproxy_gateway_upstream_failures_total", pinMgmt), rng)+")", ""), false))
 	s(3, "Relay slots used", "Connections that the relay holds open, of 256, and the call slots of the telemetry gateway.", "none", thresholds(colGood, step{205, colWarning}, step{243, colCrit}),
 		instant("sum("+S("relay_connections_open", pinCP)+")", "relay of 256"),
 		instant("sum("+S("cellproxy_gateway_slots_used", pinMgmt, `sender_cluster=~"$cluster"`)+")", "gateway of 16"))

@@ -26,9 +26,9 @@ func islandsBoard() Dashboard {
 	b.add(queue)
 	b.add(stat("Overlay entries", "Revocations that the overlay holds, the entries that it refused in the time range, and the overlay of the gateway.", 0, 16, 12, 4, "none", thresholds(colNeutral),
 		instant("sum("+S("envd_revocations_held", pinCP)+")", "held"),
-		event(instant("sum(increase("+S("envd_revocations_refused_total", pinCP)+"["+rng+"]))", "refused"), false),
+		event(instant("sum("+Born(S("envd_revocations_refused_total", pinCP), rng)+")", "refused"), false),
 		instant("max("+S("cellgw_revocations_overlay", pinCP)+")", "gateway overlay")))
 	b.add(stat("Revoked streams closed", "Open streams that the proxies closed because of a revoke, in the time range.", 12, 16, 12, 4, "none", thresholds(colNeutral),
-		event(instant("sum(increase("+S("cellproxy_revoked_closed_total", clusterRe)+"["+rng+"]))", ""), false)))
+		event(instant("sum("+Born(S("cellproxy_revoked_closed_total", clusterRe), rng)+")", ""), false)))
 	return b.d
 }

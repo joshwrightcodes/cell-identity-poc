@@ -179,7 +179,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"}[7d]))) or vector(0)",
+          "expr": "(sum(((bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} unless bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"} offset 7d) or increase(bundle_apply_outcomes_total{k8s_cluster_name=~\"$cluster\", outcome=\"rolled_back\", service_name!=\"m15-synthetic\"}[7d])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }
@@ -239,7 +239,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "eventOnly": true
         }

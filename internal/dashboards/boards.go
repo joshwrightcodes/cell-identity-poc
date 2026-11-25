@@ -51,6 +51,13 @@ func fresh(selector, window string) string {
 	return fmt.Sprintf("last_over_time(%s[%s])", selector, window)
 }
 
+// Born returns the increase of a counter in the window, and it counts a series that the window creates as its full value.
+// A counter has no series before its first event, and the first sample of a new series holds the count, so increase alone reads 0 for it.
+// A series that was absent at the start of the window comes first, because or keeps the left side.
+func Born(selector, window string) string {
+	return "((" + selector + " unless " + selector + " offset " + window + ") or increase(" + selector + "[" + window + "]))"
+}
+
 // gw is the last export time of the telemetry gateway for the metrics signal.
 func gw(extra ...string) string {
 	return S("cellproxy_gateway_last_export_time_seconds", append([]string{pinMgmt, `signal="metrics"`}, extra...)...)
@@ -59,6 +66,8 @@ func gw(extra ...string) string {
 // IslandScope narrows the layers of IslandAge. An empty field adds no matcher. Extra goes on every selector.
 type IslandScope struct {
 	Sender, Cell, Env, Extra string
+	// KeepService groups by service_name too, so an alert instance keeps the marker of a synthetic series.
+	KeepService bool
 }
 
 // IslandAge returns the upstream age in seconds of each layer, keyed by the label cluster.
@@ -76,7 +85,11 @@ func IslandAge(sc IslandScope) string {
 		}
 		return name + "{" + strings.Join(all, ", ") + "}"
 	}
-	return `max by (cluster) (` +
+	by := "cluster"
+	if sc.KeepService {
+		by += ", service_name"
+	}
+	return `max by (` + by + `) (` +
 		`label_replace(time() - ` + sel("cellproxy_gateway_last_export_time_seconds", pinMgmt, `signal="metrics"`, sc.Sender) + `, "cluster", "$1", "sender_cluster", "(.+)") or ` +
 		`label_replace(` + sel("celld_upstream_age_seconds", sc.Cell) + `, "cluster", "$1", "platform_cell", "(.+)") or ` +
 		`label_replace(` + sel("envd_upstream_age_seconds", pinCP, sc.Env) + `, "cluster", "$1", "k8s_cluster_name", "(.+)"))`

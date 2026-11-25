@@ -24,7 +24,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "min by (platform_cell) (celld_svid_remaining_seconds{platform_cell!=\"\"} / celld_svid_lifetime_seconds{platform_cell!=\"\"})",
+                "expr": "min by (platform_cell, service_name) (celld_svid_remaining_seconds{platform_cell!=\"\"} / clamp_min(celld_svid_lifetime_seconds{platform_cell!=\"\"}, 1))",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -82,7 +82,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "max by (cluster) (label_replace(time() - cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\"}, \"cluster\", \"$1\", \"sender_cluster\", \"(.+)\") or label_replace(celld_upstream_age_seconds{platform_cell!=\"\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\") or label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\"))",
+                "expr": "max by (cluster, service_name) (label_replace(time() - cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\"}, \"cluster\", \"$1\", \"sender_cluster\", \"(.+)\") or label_replace(celld_upstream_age_seconds{platform_cell!=\"\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\") or label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\"))",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -140,7 +140,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "min by (trust_domain) (last_over_time(trust_ca_not_after_seconds{ca=\"intermediate\", trust_domain!=\"\"}[2m])) - time()",
+                "expr": "min by (trust_domain, service_name) (last_over_time(trust_ca_not_after_seconds{ca=\"intermediate\", trust_domain!=\"\"}[2m])) - time()",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -198,7 +198,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "sum by (cell) (increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\"}[5m]))",
+                "expr": "sum by (cell, service_name) (((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\"} offset 5m) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\"}[5m])))",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -256,7 +256,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "count_over_time((count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", sync_status!=\"Synced\", k8s_cluster_name!=\"\"}))[10m:1m]) >= 10 or sum by (k8s_cluster_name) (increase(bundle_apply_outcomes_total{outcome=\"rolled_back\", k8s_cluster_name!=\"\"}[10m])) > 0",
+                "expr": "count_over_time((count by (k8s_cluster_name, service_name) (argocd_app_info{job=\"argocd\", sync_status!=\"Synced\", k8s_cluster_name!=\"\"}))[10m:1m]) >= 10 or sum by (k8s_cluster_name, service_name) (((bundle_apply_outcomes_total{outcome=\"rolled_back\", k8s_cluster_name!=\"\"} unless bundle_apply_outcomes_total{outcome=\"rolled_back\", k8s_cluster_name!=\"\"} offset 10m) or increase(bundle_apply_outcomes_total{outcome=\"rolled_back\", k8s_cluster_name!=\"\"}[10m]))) > 0",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -314,7 +314,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "max by (k8s_cluster_name, data_type) (otelcol_exporter_queue_size{k8s_cluster_name!=\"\"} / otelcol_exporter_queue_capacity{k8s_cluster_name!=\"\"})",
+                "expr": "max by (k8s_cluster_name, data_type, service_name) (otelcol_exporter_queue_size{k8s_cluster_name!=\"\"} / otelcol_exporter_queue_capacity{k8s_cluster_name!=\"\"})",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -372,7 +372,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "sum by (sender_cluster) (increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster!=\"\"}[5m]))",
+                "expr": "sum by (sender_cluster, service_name) (((cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster!=\"\"} unless cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster!=\"\"} offset 5m) or increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster!=\"\"}[5m])))",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,
@@ -430,7 +430,7 @@
                   "type": "prometheus",
                   "uid": "prometheus"
                 },
-                "expr": "min by (cell) (cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell!=\"\"})",
+                "expr": "min by (cell, service_name) (cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell!=\"\"})",
                 "instant": true,
                 "intervalMs": 1000,
                 "maxDataPoints": 43200,

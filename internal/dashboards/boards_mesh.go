@@ -23,8 +23,8 @@ func meshBoard() Dashboard {
 	b.add(coloured(timeSeries("Requests per second by mesh", "Requests per second that each mesh reports at the destination.", 0, 4, 16, 9, "reqps",
 		series("sum by (k8s_cluster_name) (rate("+S("istio_requests_total", clusterRe, `reporter="destination"`)+"["+rate+"]))", "{{k8s_cluster_name}}"))))
 	b.add(barGauge("Tunnel answers to Kiali", "Answers of each hub tunnel by status, and the requests that the tunnels refused by reason.", 16, 4, 8, 9, "none",
-		instant("sum by (status) (increase("+S("cell_proxy_tunnel_responses_total", pinMgmt, `side="hub"`, `cell=~"$cell"`)+"["+rng+"]))", "{{status}}"),
-		instant("sum by (reason) (increase("+S("cell_proxy_tunnel_refused_requests_total", clusterRe)+"["+rng+"]))", "refused: {{reason}}")))
+		instant("sum by (status) ("+Born(S("cell_proxy_tunnel_responses_total", pinMgmt, `side="hub"`, `cell=~"$cell"`), rng)+")", "{{status}}"),
+		instant("sum by (reason) ("+Born(S("cell_proxy_tunnel_refused_requests_total", clusterRe), rng)+")", "refused: {{reason}}")))
 	return b.d
 }
 

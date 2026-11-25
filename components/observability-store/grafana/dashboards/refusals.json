@@ -74,63 +74,63 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum(increase(cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "cellgw",
           "eventOnly": true
         },
         {
           "refId": "B",
-          "expr": "(sum(increase(envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "envd spec",
           "eventOnly": true
         },
         {
           "refId": "C",
-          "expr": "(sum(increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "envd revocations",
           "eventOnly": true
         },
         {
           "refId": "D",
-          "expr": "(sum(increase(cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "cellctl",
           "eventOnly": true
         },
         {
           "refId": "E",
-          "expr": "(sum(increase(store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "store proxy",
           "eventOnly": true
         },
         {
           "refId": "F",
-          "expr": "(sum(increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "cell proxy tunnel",
           "eventOnly": true
         },
         {
           "refId": "G",
-          "expr": "(sum(increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "telemetry gateway",
           "eventOnly": true
         },
         {
           "refId": "H",
-          "expr": "(sum(increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "cluster_jwt",
           "eventOnly": true
         },
         {
           "refId": "I",
-          "expr": "(sum(increase(relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "expr": "(sum(((relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"} unless relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"} offset $__range) or increase(relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
           "instant": true,
           "legendFormat": "relay",
           "eventOnly": true
