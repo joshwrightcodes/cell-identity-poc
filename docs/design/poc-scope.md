@@ -39,6 +39,7 @@ It also shows three properties that the owner set:
 | Bundles | `celld` in each cell and envd in `dev-cp` apply bundle sets that the management plane signs. Each applier pushes the bundles to the bundle store, and Argo CD applies them. A rollback points the root back at the last good root that the management plane signed | Bundles, Argo CD and safe updates |
 | Central view | Argo CD Agent in autonomous mode, with the principal in `management`. Agents connect through `cell-proxy` and a TLS passthrough relay in `dev-cp`. An admission policy in the cell blocks every write, every annotation except refresh, `.operation`, and exec | Central Argo CD view |
 | Observability | The `otel-lgtm` image in `management` runs Grafana, Loki, Tempo and Prometheus. Each cluster's collector scrapes local Prometheus endpoints and receives OTLP. It exports OTLP through `cell-proxy` and the telemetry relay to a gateway in `management` | Telemetry |
+| Dashboards and alerts | Grafana provisions the dashboards and alert rules from files in the store bundle. Grafana in `management` evaluates every rule, and no rule sends a notification | Telemetry |
 | Mesh view | Kiali in `management` reads mesh metrics from the stack. It reads each cell's mesh state through a tunnel that the cell's `cell-proxy` opens up to `management` | Mesh view |
 | Island mode | Both levels, with no trust change during an island | Island mode |
 | Revocation | The management plane revokes in a spec. During an island, an operator revokes locally, and the overlay holds until a spec from the management plane includes it | Revocation |
@@ -55,7 +56,7 @@ These stay in the target architecture, and come in later increments:
 | Restore with epochs, rebuild from empty, provider inventory and the sweeper | Disaster recovery work, once the core holds |
 | Relay hardening: outer mTLS, per-cell caps, revocation at the relay | The PoC relay only passes TLS through. The management plane enforces identity |
 | Watchdog and blue/green updates of `celld` and Argo CD | In the PoC, the harness updates `celld`, and a bundle updates Argo CD. The residual limits say what a bundle can still change |
-| HPA fan-out, cross-environment requests, alert evaluators, the personal-data canary test | Scale and operations work |
+| HPA fan-out, cross-environment requests, alert evaluators inside each cluster, alert notifications, the personal-data canary test | Scale and operations work |
 | EKS, ACK, the tailnet and AWS-specific network rules | The second environment target |
 | Integration tests in GitHub CI | Hosted runners for private repositories have 2 CPUs and 8 GB. CI runs unit and component tests only |
 
@@ -108,8 +109,9 @@ it exists.
 | M7 | Malicious cell and MITM | Check 4 passes. A rogue cluster, a rogue JWKS, TLS interception at each hop, and a relay that alters bytes all fail |
 | M8 | Bundles | Bundles that the management plane signs reach Argo CD in each cell and in `dev-cp`. A bundle outside its allow-list fails, and a rollback restores the last good root |
 | M9 | Island mode and revocation | Both island levels hold for three SVID lifetimes, with no pod restarts. Revocation works connected and locally |
+| M15 | Dashboards and alert rules | Grafana in `management` provisions eight dashboards and eight alert rules from files in the `observability-store` bundle. Each panel query returns data on a fresh harness. A revoke, a cut and a key rotation each show on their dashboard within one minute. Each alert rule fires and clears in `gate:m15` |
 
-The full gate runs on the Mac, with a fast tier for M1–M8 and a slow tier for M9. Each tier has a
+The full gate runs on the Mac, with a fast tier for M1–M8 and M15 and a slow tier for M9. Each tier has a
 time budget, set at M1. The Mac must stay awake for the whole gate, so a keep-awake tool must run.
 macOS still sleeps when the lid closes on battery power.
 
