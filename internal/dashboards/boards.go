@@ -2,6 +2,7 @@ package dashboards
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -247,10 +248,45 @@ type tableColumn struct {
 	LabelMap map[string]any
 }
 
+// nullAsNA shows an empty value as n/a. A mapping in an override replaces the default mappings, so each override adds it again.
+func nullAsNA() map[string]any {
+	return map[string]any{"type": "special", "options": map[string]any{"match": "null+nan", "result": map[string]any{"text": "n/a", "color": colNeutral, "index": 99}}}
+}
+
+// setOrder keeps only the columns with the titles, in that order.
+func setOrder(p Panel, titles ...string) Panel {
+	var rename map[string]string
+	for _, t := range p.Transformations {
+		if t["id"] == "organize" {
+			rename = t["options"].(map[string]any)["renameByName"].(map[string]string)
+		}
+	}
+	index := map[string]int{}
+	var keep []string
+	for source, title := range rename {
+		for i, want := range titles {
+			if title == want {
+				index[source] = i
+				keep = append(keep, source)
+			}
+		}
+	}
+	sort.Strings(keep)
+	for _, t := range p.Transformations {
+		switch t["id"] {
+		case "filterFieldsByName":
+			t["options"].(map[string]any)["include"] = map[string]any{"names": keep}
+		case "organize":
+			t["options"].(map[string]any)["indexByName"] = index
+		}
+	}
+	return p
+}
+
 func mappingOverride(name string, m map[string]any) Override {
 	return Override{
 		Matcher:    FieldMatcher{ID: "byName", Options: name},
-		Properties: []Property{{ID: "mappings", Value: []map[string]any{m}}},
+		Properties: []Property{{ID: "mappings", Value: []map[string]any{m, nullAsNA()}}},
 	}
 }
 
@@ -284,7 +320,7 @@ func table(title, desc string, x, y, w, h int, key, keyTitle, sortBy string, col
 			ov.Properties = append(ov.Properties, Property{ID: "unit", Value: c.Unit})
 		}
 		if c.Map != nil {
-			ov.Properties = append(ov.Properties, Property{ID: "mappings", Value: []map[string]any{c.Map}})
+			ov.Properties = append(ov.Properties, Property{ID: "mappings", Value: []map[string]any{c.Map, nullAsNA()}})
 		}
 		if len(ov.Properties) > 0 {
 			p.FieldConfig.Overrides = append(p.FieldConfig.Overrides, ov)
@@ -296,7 +332,7 @@ func table(title, desc string, x, y, w, h int, key, keyTitle, sortBy string, col
 	}
 	p.FieldConfig.Defaults = FieldDefaults{
 		Custom:   map[string]any{"align": "auto", "cellOptions": map[string]any{"type": "auto"}},
-		Mappings: []map[string]any{{"type": "special", "options": map[string]any{"match": "null+nan", "result": map[string]any{"text": "n/a", "color": colNeutral, "index": 99}}}},
+		Mappings: []map[string]any{nullAsNA()},
 	}
 	p.Options = map[string]any{"showHeader": true, "sortBy": []map[string]any{{"displayName": sortBy, "desc": false}}}
 	if key != "" {

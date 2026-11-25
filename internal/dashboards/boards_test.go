@@ -2,8 +2,11 @@ package dashboards
 
 import (
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 )
 
 func boardByUID(t *testing.T, uid string) Dashboard {
@@ -232,22 +235,26 @@ func TestNoSyntheticSeries(t *testing.T) {
 }
 
 func TestVanishingGaugesAreFresh(t *testing.T) {
-	gauges := []string{"cellgw_streams", "agentban_agents", "mgmtd_cell_state", "trust_ca_not_after_seconds", "bundle_set_applied_seconds", "cellctl_steps_open", "cellgw_queue_depth"}
+	// The 15 s exporters get 1m, the 60 s exporters 2m.
+	gauges := map[string]string{
+		"cellgw_streams": "1m", "agentban_agents": "1m", "mgmtd_cell_state": "1m", "cellgw_queue_depth": "1m",
+		"trust_ca_not_after_seconds": "2m", "bundle_set_applied_seconds": "2m", "cellctl_steps_open": "2m",
+	}
 	seen := map[string]int{}
 	for _, q := range promQueries(Boards(), RuleFile{}) {
-		for _, g := range gauges {
+		if q.Kind == kindVariable {
+			continue
+		}
+		for g, window := range gauges {
 			all := strings.Count(q.Expr, g+"{")
-			wrapped := len(regexp.MustCompile(`last_over_time\(`+g+`\{[^}]*\}\[[0-9]+[sm]\]\)`).FindAllString(q.Expr, -1))
-			if q.Kind == kindVariable {
-				continue
-			}
+			wrapped := len(regexp.MustCompile(`last_over_time\(`+g+`\{[^}]*\}\[`+window+`\]\)`).FindAllString(q.Expr, -1))
 			if all != wrapped {
-				t.Errorf("%s: %d reads of %s, %d with last_over_time", q.Where, all, g, wrapped)
+				t.Errorf("%s: %d reads of %s, %d with last_over_time over %s", q.Where, all, g, wrapped, window)
 			}
 			seen[g] += all
 		}
 	}
-	for _, g := range gauges {
+	for g := range gauges {
 		if seen[g] == 0 {
 			t.Errorf("no panel reads %s", g)
 		}
@@ -316,7 +323,7 @@ func TestSpecificPanels(t *testing.T) {
 	})
 	t.Run("islands now shares the expression of rule A2", func(t *testing.T) {
 		rule := IslandAge(IslandScope{Cell: `platform_cell!=""`})
-		if !strings.Contains(rule, `celld_upstream_age_seconds{platform_cell!=""}`) || strings.Contains(rule, "m15-synthetic") || strings.Contains(rule, "$") && !strings.Contains(rule, `"$1"`) {
+		if !strings.Contains(rule, `celld_upstream_age_seconds{platform_cell!=""}`) || strings.Contains(rule, "m15-synthetic") || regexp.MustCompile(`\$\{?(cell|cluster)`).MatchString(rule) {
 			t.Errorf("rule expression = %s", rule)
 		}
 		p := panelByTitle(t, boardByUID(t, "poc-cell-health"), "Islands now")
@@ -359,6 +366,99 @@ func TestEventCountersFallBackToZero(t *testing.T) {
 			if !any {
 				t.Errorf("%s %q has no EventOnly target", uid, title)
 			}
+		}
+	}
+}
+
+func TestQueueCapIsOneQueue(t *testing.T) {
+	p := panelByTitle(t, boardByUID(t, "poc-islands"), "dev-cp collector queue")
+	n := 0
+	for _, tg := range p.Targets {
+		if tg.LegendFormat == "cap" {
+			n++
+			if strings.Contains(tg.Expr, "sum(") || !strings.Contains(tg.Expr, "max(") {
+				t.Errorf("the cap adds the queues of the signals: %s", tg.Expr)
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d cap targets, want 1", n)
+	}
+}
+
+func TestStepsInFlightCoverEveryOpenState(t *testing.T) {
+	var kind Variable
+	for _, v := range boardByUID(t, "poc-work").Templating.List {
+		if v.Name == "kind" {
+			kind = v
+		}
+	}
+	got := strings.Split(kind.Query, ",")
+	open := []string{mgmtapi.StepQueued, mgmtapi.StepCreating, mgmtapi.StepAdmitting, mgmtapi.StepBootstrapping, mgmtapi.StepFailed}
+	sort.Strings(got)
+	sort.Strings(open)
+	if strings.Join(got, ",") != strings.Join(open, ",") {
+		t.Errorf("kind lists %v, the open states are %v", got, open)
+	}
+}
+
+func TestCellCountsCountEachCellOnce(t *testing.T) {
+	b := boardByUID(t, "poc-cell-health")
+	for _, title := range []string{"Cells valid", "Revoked cells"} {
+		for _, tg := range panelByTitle(t, b, title).Targets {
+			if strings.Contains(tg.Expr, "mgmtd_cell_state") && !strings.Contains(tg.Expr, "count by (cell)") {
+				t.Errorf("%s: %s counts series, not cells", title, tg.Expr)
+			}
+		}
+	}
+	for _, tg := range panelByTitle(t, b, "Revoked cells").Targets {
+		if tg.LegendFormat == "overlay held" && tg.EventOnly {
+			t.Error("overlay held is a live gauge and must not be EventOnly")
+		}
+	}
+}
+
+func TestTablesKeepNAAndMockupColumns(t *testing.T) {
+	cells := panelByTitle(t, boardByUID(t, "poc-cell-health"), "Cells")
+	for _, o := range cells.FieldConfig.Overrides {
+		for _, pr := range o.Properties {
+			if pr.ID != "mappings" {
+				continue
+			}
+			ms := pr.Value.([]map[string]any)
+			if ms[len(ms)-1]["type"] != "special" {
+				t.Errorf("override %s replaces the n/a mapping", o.Matcher.Options)
+			}
+		}
+	}
+	order := func(p Panel) []string {
+		var rename map[string]string
+		var index map[string]int
+		for _, tr := range p.Transformations {
+			if tr["id"] == "organize" {
+				rename = tr["options"].(map[string]any)["renameByName"].(map[string]string)
+				index = tr["options"].(map[string]any)["indexByName"].(map[string]int)
+			}
+		}
+		out := make([]string, len(index))
+		for src, i := range index {
+			out[i] = rename[src]
+		}
+		for len(out) > 0 && out[len(out)-1] == "" {
+			out = out[:len(out)-1]
+		}
+		return out
+	}
+	for _, c := range []struct {
+		board, title string
+		want         []string
+	}{
+		{"poc-spiffe", "Trust anchors", []string{"Trust domain", "CA", "Expires", "Root", "Pinned by"}},
+		{"poc-argocd-bundles", "Signed sets by target", []string{"Target", "Set", "Root digest", "Applied", "Apply time", "Result"}},
+	} {
+		got := order(panelByTitle(t, boardByUID(t, c.board), c.title))
+		if strings.Join(got, "|") != strings.Join(c.want, "|") {
+			t.Errorf("%s columns = %v, want %v", c.title, got, c.want)
 		}
 	}
 }

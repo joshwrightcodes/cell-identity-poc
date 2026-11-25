@@ -60,7 +60,7 @@
       "id": 1,
       "type": "stat",
       "title": "Cells valid",
-      "description": "Cells whose record is valid, of the cells in the intent. Reads mgmtd_cells_valid, mgmtd_cell_state.",
+      "description": "Cells whose record is valid and not revoked, of the cells in the intent. Each cell counts once. Reads mgmtd_cell_state.",
       "gridPos": {
         "h": 4,
         "w": 4,
@@ -74,13 +74,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(mgmtd_cells_valid{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}[1m]))) or 0 * count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m])))",
           "instant": true,
           "legendFormat": "valid"
         },
         {
           "refId": "B",
-          "expr": "count(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]))",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m])))",
           "instant": true,
           "legendFormat": "of"
         }
@@ -369,17 +369,16 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(count(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]))) or vector(0)",
+          "expr": "(count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m])))) or vector(0)",
           "instant": true,
           "legendFormat": "revoked",
           "eventOnly": true
         },
         {
           "refId": "B",
-          "expr": "(sum(envd_revocations_held{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})) or vector(0)",
+          "expr": "sum(envd_revocations_held{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
           "instant": true,
-          "legendFormat": "overlay held",
-          "eventOnly": true
+          "legendFormat": "overlay held"
         }
       ],
       "fieldConfig": {
@@ -443,25 +442,25 @@
         },
         {
           "refId": "B",
-          "expr": "label_replace(celld_svid_remaining_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\")",
+          "expr": "max by (cluster) (label_replace(celld_svid_remaining_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\"))",
           "instant": true,
           "format": "table"
         },
         {
           "refId": "C",
-          "expr": "label_replace(celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\") or label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "expr": "max by (cluster) (label_replace(celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\")) or max by (cluster) (label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\"))",
           "instant": true,
           "format": "table"
         },
         {
           "refId": "D",
-          "expr": "label_replace(sum by (cell) (last_over_time(cellgw_streams{k8s_cluster_name=\"dev-cp\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1m])), \"cluster\", \"$1\", \"cell\", \"(.+)\")",
+          "expr": "max by (cluster) (label_replace(sum by (cell) (last_over_time(cellgw_streams{k8s_cluster_name=\"dev-cp\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1m])), \"cluster\", \"$1\", \"cell\", \"(.+)\")) or max by (cluster) (label_replace(0 * last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]), \"cluster\", \"$1\", \"cell\", \"(.+)\"))",
           "instant": true,
           "format": "table"
         },
         {
           "refId": "E",
-          "expr": "label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", sync_status=\"Synced\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "expr": "label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", sync_status=\"Synced\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\") or 0 * label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
           "instant": true,
           "format": "table"
         },
@@ -485,7 +484,7 @@
         },
         {
           "refId": "I",
-          "expr": "label_replace(cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"cell\", \"(.+)\")",
+          "expr": "max by (cluster) (label_replace(cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"cell\", \"(.+)\"))",
           "instant": true,
           "format": "table"
         }
@@ -541,6 +540,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -588,6 +598,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -611,6 +632,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -663,6 +695,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }

@@ -55,7 +55,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", sync_status=\"Synced\", service_name!=\"m15-synthetic\"})",
+          "expr": "count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", sync_status=\"Synced\", service_name!=\"m15-synthetic\"}) or 0 * count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"})",
           "instant": true,
           "legendFormat": "synced"
         },
@@ -117,7 +117,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", health_status=\"Healthy\", service_name!=\"m15-synthetic\"})",
+          "expr": "count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", health_status=\"Healthy\", service_name!=\"m15-synthetic\"}) or 0 * count(argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"})",
           "instant": true,
           "legendFormat": "healthy"
         },
@@ -351,6 +351,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -374,6 +385,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -397,6 +419,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -420,6 +453,17 @@
                       }
                     },
                     "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
                   }
                 ]
               }
@@ -473,13 +517,12 @@
           "options": {
             "include": {
               "names": [
+                "Value #A",
+                "Value #B",
                 "k8s_cluster_name",
-                "role",
-                "version",
                 "root_digest",
                 "state",
-                "Value #A",
-                "Value #B"
+                "version"
               ]
             }
           }
@@ -489,13 +532,12 @@
           "options": {
             "excludeByName": {},
             "indexByName": {
-              "Value #A": 5,
-              "Value #B": 6,
+              "Value #A": 3,
+              "Value #B": 4,
               "k8s_cluster_name": 0,
-              "role": 1,
-              "root_digest": 3,
-              "state": 4,
-              "version": 2
+              "root_digest": 2,
+              "state": 5,
+              "version": 1
             },
             "renameByName": {
               "Value #A": "Applied",

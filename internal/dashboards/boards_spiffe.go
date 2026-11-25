@@ -39,10 +39,11 @@ func spiffeBoard() Dashboard {
 		fresh(S("trust_ca_not_after_seconds", clusterRe, `trust_domain=~"$trust_domain"`, `ca!="issuing"`), freshSlow) + `) - time())` +
 		` or label_replace(label_replace(label_replace(` + S("citadel_server_root_cert_expiry_timestamp", clusterRe) + ` - time(),` +
 		` "trust_domain", "$1.mesh", "k8s_cluster_name", "(.+)"), "ca", "mesh root", "", ""), "source", "istiod", "", "")`
-	b.add(table("Trust anchors", "CA certificates that the clusters report, and the mesh roots. Expires is the time left. Pinned by is the cluster that reports the row.",
+	trust := table("Trust anchors", "CA certificates that the clusters report, and the mesh roots. Expires is the time left. Pinned by is the cluster that reports the row.",
 		12, 12, 12, 8, "", "", "Pinned by",
 		tableColumn{Title: "Expires", Unit: "s", Expr: anchors, Labels: [][2]string{
-			{"trust_domain", "Trust domain"}, {"ca", "CA"}, {"sha256", "Root"}, {"source", "Source"}, {"k8s_cluster_name", "Pinned by"}}},
-	))
+			{"trust_domain", "Trust domain"}, {"ca", "CA"}, {"sha256", "Root"}, {"k8s_cluster_name", "Pinned by"}}},
+	)
+	b.add(setOrder(trust, "Trust domain", "CA", "Expires", "Root", "Pinned by"))
 	return b.d
 }

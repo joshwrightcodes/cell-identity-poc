@@ -19,9 +19,9 @@ func islandsBoard() Dashboard {
 	b.add(timeSeries("Outbox during the island", "Items that the gateway and the envd outbox hold while a link is down.", 0, 8, 12, 8, "none",
 		series("sum("+S("cellgw_outbox_items", pinCP)+")", "gateway outbox"),
 		series("max("+S("envd_gateway_outbox", pinCP)+")", "envd outbox")))
-	queue := timeSeries("dev-cp collector queue", "Exporter queue of the dev-cp collector. The dashed line is the cap.", 12, 8, 12, 8, "bytes",
+	queue := timeSeries("dev-cp collector queue", "Exporter queue of the dev-cp collector. Each signal has its own queue. The dashed line is the cap of one queue.", 12, 8, 12, 8, "bytes",
 		series("sum by (data_type) ("+S("otelcol_exporter_queue_size", pinCP)+")", "{{data_type}}"),
-		series("sum("+S("otelcol_exporter_queue_capacity", pinCP)+")", "cap"))
+		series("max("+S("otelcol_exporter_queue_capacity", pinCP)+")", "cap"))
 	queue.FieldConfig.Overrides = append(queue.FieldConfig.Overrides, dashed("cap", colCrit))
 	b.add(queue)
 	b.add(stat("Overlay entries", "Revocations that the overlay holds, the entries that it refused in the time range, and the overlay of the gateway.", 0, 16, 12, 4, "none", thresholds(colNeutral),

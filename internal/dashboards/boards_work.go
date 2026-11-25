@@ -2,7 +2,7 @@ package dashboards
 
 func workBoard() Dashboard {
 	kind := Variable{
-		Name: "kind", Label: "Step state", Type: "custom", Query: "admitting,bootstrapping,creating,queued", Definition: "admitting,bootstrapping,creating,queued",
+		Name: "kind", Label: "Step state", Type: "custom", Query: "admitting,bootstrapping,creating,failed,queued", Definition: "admitting,bootstrapping,creating,failed,queued",
 		Multi: true, IncludeAll: true, Sort: 1, Current: &Current{Text: "All", Value: "$__all"},
 	}
 	b := newBoard("work.json", "poc-work", "Work and provisioning steps", "24h", clusterVar("Cluster"), cellVar(), kind)

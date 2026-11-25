@@ -244,9 +244,9 @@
         },
         {
           "refId": "B",
-          "expr": "sum(cellproxy_gateway_slots_used{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})",
+          "expr": "sum(cellproxy_gateway_slots_used{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"})",
           "instant": true,
-          "legendFormat": "gateway"
+          "legendFormat": "gateway of 16"
         }
       ],
       "fieldConfig": {
@@ -273,7 +273,36 @@
             ]
           }
         },
-        "overrides": []
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gateway of 16"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#0ca30c",
+                      "value": null
+                    },
+                    {
+                      "color": "#fab219",
+                      "value": 12
+                    },
+                    {
+                      "color": "#d03b3b",
+                      "value": 16
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
       },
       "options": {
         "colorMode": "background",

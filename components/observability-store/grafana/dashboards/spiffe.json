@@ -705,13 +705,12 @@
           "options": {
             "include": {
               "names": [
-                "trust_domain",
-                "ca",
-                "sha256",
-                "source",
-                "k8s_cluster_name",
+                "Value",
                 "Value #A",
-                "Value"
+                "ca",
+                "k8s_cluster_name",
+                "sha256",
+                "trust_domain"
               ]
             }
           }
@@ -721,12 +720,11 @@
           "options": {
             "excludeByName": {},
             "indexByName": {
-              "Value": 5,
-              "Value #A": 5,
+              "Value": 2,
+              "Value #A": 2,
               "ca": 1,
               "k8s_cluster_name": 4,
-              "sha256": 2,
-              "source": 3,
+              "sha256": 3,
               "trust_domain": 0
             },
             "renameByName": {
@@ -735,7 +733,6 @@
               "ca": "CA",
               "k8s_cluster_name": "Pinned by",
               "sha256": "Root",
-              "source": "Source",
               "trust_domain": "Trust domain"
             }
           }

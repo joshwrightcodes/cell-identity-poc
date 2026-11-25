@@ -19,7 +19,14 @@ func telemetryBoard() Dashboard {
 		event(instant("sum(increase("+S("cellproxy_gateway_upstream_failures_total", pinMgmt)+"["+rng+"]))", ""), false))
 	s(3, "Relay slots used", "Connections that the relay holds open, of 256, and the call slots of the telemetry gateway.", "none", thresholds(colGood, step{205, colWarning}, step{243, colCrit}),
 		instant("sum("+S("relay_connections_open", pinCP)+")", "relay of 256"),
-		instant("sum("+S("cellproxy_gateway_slots_used", pinMgmt)+")", "gateway"))
+		instant("sum("+S("cellproxy_gateway_slots_used", pinMgmt, `sender_cluster=~"$cluster"`)+")", "gateway of 16"))
+
+	slots := b.d.Panels[3]
+	slots.FieldConfig.Overrides = append(slots.FieldConfig.Overrides, Override{
+		Matcher:    FieldMatcher{ID: "byName", Options: "gateway of 16"},
+		Properties: []Property{{ID: "thresholds", Value: thresholds(colGood, step{12, colWarning}, step{16, colCrit})}},
+	})
+	b.d.Panels[3] = slots
 
 	age := coloured(timeSeries("Seconds since the last export, by sender", "Seconds since the gateway last accepted a metrics export from each sender. The dashed line marks stale.", 0, 4, 24, 9, "s",
 		series("time() - max by (sender_cluster) ("+gw(`sender_cluster=~"$cluster"`)+")", "{{sender_cluster}}"),

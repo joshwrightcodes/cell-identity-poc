@@ -206,7 +206,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "dev-cp collector queue",
-      "description": "Exporter queue of the dev-cp collector. The dashed line is the cap. Reads otelcol_exporter_queue_size, otelcol_exporter_queue_capacity.",
+      "description": "Exporter queue of the dev-cp collector. Each signal has its own queue. The dashed line is the cap of one queue. Reads otelcol_exporter_queue_size, otelcol_exporter_queue_capacity.",
       "gridPos": {
         "h": 8,
         "w": 12,
@@ -226,7 +226,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum(otelcol_exporter_queue_capacity{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "expr": "max(otelcol_exporter_queue_capacity{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
           "range": true,
           "legendFormat": "cap"
         }
