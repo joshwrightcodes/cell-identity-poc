@@ -9,12 +9,16 @@ import (
 	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/spiffeid"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/attribute"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -102,7 +106,6 @@ func TestChainClasses(t *testing.T) {
 		{td, SourceSVID, []*x509.Certificate{leaf.cert, spire.cert, inter.cert}},
 		{"mgmt", SourceSVID, []*x509.Certificate{leaf.cert, spire.cert, inter.cert, root.cert}},
 		{td, SourceBundle, []*x509.Certificate{root.cert, inter.cert}},
-		{td, SourcePin, []*x509.Certificate{root.cert}},
 	}
 	got := collect(t, func() []Chain { return chains })
 	want := map[series]int64{
@@ -113,7 +116,6 @@ func TestChainClasses(t *testing.T) {
 		{"mgmt", "root", digest(root.cert), "svid"}:          root.cert.NotAfter.Unix(),
 		{td, "root", digest(root.cert), "bundle"}:            root.cert.NotAfter.Unix(),
 		{td, "root", digest(inter.cert), "bundle"}:           inter.cert.NotAfter.Unix(),
-		{td, "root", digest(root.cert), "pin"}:               root.cert.NotAfter.Unix(),
 	}
 	if len(got) != len(want) {
 		t.Fatalf("got %d series %v, want %d", len(got), got, len(want))
@@ -135,7 +137,6 @@ func TestRootDigestSameAcrossSources(t *testing.T) {
 	chains := []Chain{
 		{"td", SourceSVID, []*x509.Certificate{root.cert, root.cert}},
 		{"td", SourceBundle, []*x509.Certificate{root.cert}},
-		{"td", SourcePin, []*x509.Certificate{root.cert}},
 	}
 	got := collect(t, func() []Chain { return chains })
 	roots := map[string]bool{}
@@ -147,8 +148,8 @@ func TestRootDigestSameAcrossSources(t *testing.T) {
 			}
 		}
 	}
-	if len(roots) != 3 || len(got) != 3 {
-		t.Fatalf("want one root series for each of three sources, got %v", got)
+	if len(roots) != 2 || len(got) != 2 {
+		t.Fatalf("want one root series for each of two sources, got %v", got)
 	}
 }
 
@@ -173,6 +174,15 @@ func TestNoSeriesWithoutChain(t *testing.T) {
 	if c := FileChain("td", SourceBundle, bad); c != nil {
 		t.Fatalf("chain from a bad file: %v", c)
 	}
+	good := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: root.cert.Raw})
+	corrupt := append(good, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: []byte("junk")})...)
+	mixed := filepath.Join(dir, "mixed.pem")
+	if err := os.WriteFile(mixed, corrupt, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := FileChain("td", SourceBundle, mixed); c != nil {
+		t.Fatalf("chain from a file with a corrupt certificate: %v", c)
+	}
 	if c := SVIDChain("td", nil); c != nil {
 		t.Fatalf("chain from no certificates: %v", c)
 	}
@@ -195,3 +205,41 @@ func TestFileChain(t *testing.T) {
 		t.Fatalf("series %v", got)
 	}
 }
+
+type fakeSource struct {
+	svid    *x509svid.SVID
+	authors []*x509.Certificate
+}
+
+func (f fakeSource) GetX509SVID() (*x509svid.SVID, error) {
+	if f.svid == nil {
+		return nil, errors.New("no svid")
+	}
+	return f.svid, nil
+}
+
+func (f fakeSource) GetX509BundleForTrustDomain(td spiffeid.TrustDomain) (*x509bundle.Bundle, error) {
+	return x509bundle.FromX509Authorities(td, f.authors), nil
+}
+
+func TestSourceChains(t *testing.T) {
+	root := issue(t, "root", 1, time.Hour, nil)
+	leaf := issue(t, "leaf", 2, time.Hour, &root)
+	id := spiffeid.RequireFromString("spiffe://mgmt.poc.internal/mgmtd")
+	svid := &x509svid.SVID{ID: id, Certificates: []*x509.Certificate{leaf.cert}}
+	got := collect(t, func() []Chain { return SourceChains(fakeSource{svid, []*x509.Certificate{root.cert}}) })
+	want := map[series]int64{{"mgmt.poc.internal", "root", digest(root.cert), "bundle"}: root.cert.NotAfter.Unix()}
+	if len(got) != 1 || got[series{"mgmt.poc.internal", "root", digest(root.cert), "bundle"}] != want[series{"mgmt.poc.internal", "root", digest(root.cert), "bundle"}] {
+		t.Fatalf("series %v", got)
+	}
+	if c := SourceChains(fakeSource{}); c != nil {
+		t.Fatalf("chain with no SVID: %v", c)
+	}
+	if c := SourceChains(nilSource{}); c != nil {
+		t.Fatalf("chain from a nil SVID: %v", c)
+	}
+}
+
+type nilSource struct{}
+
+func (nilSource) GetX509SVID() (*x509svid.SVID, error) { return nil, nil }

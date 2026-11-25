@@ -498,13 +498,8 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 	}
 	defer closeSVIDs()
 
-	peerTD := cfg.expect.TrustDomain().String()
 	if err := trustmetrics.Register(tel.Meter, func() []trustmetrics.Chain {
-		var chains []trustmetrics.Chain
-		if own, err := svids.GetX509SVID(); err == nil {
-			chains = trustmetrics.SVIDChain(own.ID.TrustDomain().String(), own.Certificates)
-		}
-		return append(chains, trustmetrics.FileChain(peerTD, trustmetrics.SourceBundle, cfg.peerBundle)...)
+		return trustChains(svids, cfg)
 	}); err != nil {
 		return err
 	}
@@ -653,6 +648,11 @@ func tokenFromFile(path string) func() (string, error) {
 		}
 		return tok, nil
 	}
+}
+
+// trustChains returns the chain and the bundle of the envd SVID and the roots of the --peer-bundle file.
+func trustChains(svids x509svid.Source, cfg runConfig) []trustmetrics.Chain {
+	return append(trustmetrics.SourceChains(svids), trustmetrics.FileChain(cfg.expect.TrustDomain().String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
 }
 
 // newClients builds the client of the management plane and the client of the gateway. The gateway

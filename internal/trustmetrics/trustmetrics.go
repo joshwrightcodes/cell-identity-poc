@@ -2,7 +2,7 @@
 //
 // The gauge trust.ca.not_after has one series for each certificate, labelled by trust domain, CA
 // class, a short SHA-256 digest of the DER and the source of the certificate. One digest for each
-// trust domain across all sources means that every pin agrees.
+// trust domain across all sources means that every copy of a root agrees.
 package trustmetrics
 
 import (
@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/spiffe/go-spiffe/v2/bundle/x509bundle"
+	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
@@ -23,7 +25,6 @@ import (
 const (
 	SourceSVID   = "svid"
 	SourceBundle = "bundle"
-	SourcePin    = "pin"
 )
 
 // Classes of a CA certificate.
@@ -101,8 +102,9 @@ func selfSigned(c *x509.Certificate) bool {
 	return bytes.Equal(c.RawSubject, c.RawIssuer) && c.CheckSignatureFrom(c) == nil
 }
 
-// FileChain reads the PEM certificates of path. It returns no chain when the file is missing or
-// holds no certificate, so a bad file never fails a metric collection.
+// FileChain reads the PEM certificates of path. It returns no chain when the file is missing,
+// holds no certificate or holds a certificate that does not parse, as the binaries refuse such a
+// file. A bad file never fails a metric collection.
 func FileChain(trustDomain, source, path string) []Chain {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -118,9 +120,11 @@ func FileChain(trustDomain, source, path string) []Chain {
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		if cert, err := x509.ParseCertificate(block.Bytes); err == nil {
-			certs = append(certs, cert)
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil
 		}
+		certs = append(certs, cert)
 	}
 	if len(certs) == 0 {
 		return nil
@@ -134,4 +138,21 @@ func SVIDChain(trustDomain string, certs []*x509.Certificate) []Chain {
 		return nil
 	}
 	return []Chain{{TrustDomain: trustDomain, Source: SourceSVID, Certs: certs}}
+}
+
+// SourceChains returns the chain of the SVID in src and, when src also holds trust bundles, the
+// bundle of the trust domain of that SVID. It returns no chain while src holds no SVID.
+func SourceChains(src x509svid.Source) []Chain {
+	svid, err := src.GetX509SVID()
+	if err != nil || svid == nil {
+		return nil
+	}
+	td := svid.ID.TrustDomain()
+	chains := SVIDChain(td.String(), svid.Certificates)
+	if bs, ok := src.(x509bundle.Source); ok {
+		if b, err := bs.GetX509BundleForTrustDomain(td); err == nil && b != nil && len(b.X509Authorities()) > 0 {
+			chains = append(chains, Chain{TrustDomain: td.String(), Source: SourceBundle, Certs: b.X509Authorities()})
+		}
+	}
+	return chains
 }

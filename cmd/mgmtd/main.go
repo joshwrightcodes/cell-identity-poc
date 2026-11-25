@@ -278,6 +278,11 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
+// trustChains returns the chain and the bundle of the mgmtd SVID and the roots of the --peer-bundle file.
+func trustChains(svids x509svid.Source, cfg serveConfig) []trustmetrics.Chain {
+	return append(trustmetrics.SourceChains(svids), trustmetrics.FileChain(cfg.peerTD.String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
+}
+
 func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error {
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 	var meter metric.Meter
@@ -409,19 +414,14 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	if err != nil {
 		return fmt.Errorf("start the plane: %w", err)
 	}
-	ready.Store(true)
-
 	if meter != nil {
 		if err := trustmetrics.Register(meter, func() []trustmetrics.Chain {
-			var chains []trustmetrics.Chain
-			if own, err := svids.GetX509SVID(); err == nil {
-				chains = trustmetrics.SVIDChain(own.ID.TrustDomain().String(), own.Certificates)
-			}
-			return append(chains, trustmetrics.FileChain(cfg.peerTD.String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
+			return trustChains(svids, cfg)
 		}); err != nil {
 			return err
 		}
 	}
+	ready.Store(true)
 
 	apiTLS := mgmt.APIServerTLS(svids, mgmt.FileBundleSource(cfg.peerBundle, cfg.peerTD), cfg.allow)
 	apiSrv := mgmt.NewServers(

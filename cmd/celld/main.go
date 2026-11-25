@@ -348,7 +348,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		return 1
 	}
 	if err := trustmetrics.Register(tel.Meter, func() []trustmetrics.Chain {
-		return append(w.chain(), trustmetrics.FileChain(opts.gatewayID.TrustDomain().String(), trustmetrics.SourceBundle, opts.trustBundle)...)
+		return trustChains(w, opts)
 	}); err != nil {
 		tel.Log.Error("celld failed", "error", err.Error())
 		return 1
@@ -475,6 +475,11 @@ func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
 		return nil, fmt.Errorf("create gauge: %w", err)
 	}
 	return w, nil
+}
+
+// trustChains returns the chain of the current SVID and the roots of the --trust-bundle file.
+func trustChains(w *svidWatcher, opts options) []trustmetrics.Chain {
+	return append(w.chain(), trustmetrics.FileChain(opts.gatewayID.TrustDomain().String(), trustmetrics.SourceBundle, opts.trustBundle)...)
 }
 
 // lifetime returns the seconds from NotBefore to NotAfter of the current SVID, or 0 while there is none.
