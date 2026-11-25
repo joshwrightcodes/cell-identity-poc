@@ -3,11 +3,15 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -28,11 +32,54 @@ type m15Alert struct {
 	State  string            `json:"state"`
 }
 
+// m15Call is grafanaCall with an error in place of a failed test. It retries a failed call twice.
+func m15Call(creds, method, path, body string) (code int, resp []byte, err error) {
+	quote := func(s string) string { return strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) }
+	var cfg strings.Builder
+	fmt.Fprintf(&cfg, "user = \"%s\"\nrequest = \"%s\"\nurl = \"http://127.0.0.1:3000%s\"\n", quote(creds), method, path)
+	if body != "" {
+		fmt.Fprintf(&cfg, "header = \"Content-Type: application/json\"\ndata = \"%s\"\n", quote(body))
+	}
+	cfg.WriteString("silent\nshow-error\nmax-time = 30\nwrite-out = \"\\n%{http_code}\"\n")
+	for try := 0; try < 3; try++ {
+		if try > 0 {
+			time.Sleep(5 * time.Second)
+		}
+		var out string
+		out, err = kubectlNoT(cfg.String(), "-n", obsNamespace, "exec", "-i", lgtmPod, "-c", lgtmContainer, "--", "curl", "-K", "-")
+		if err != nil {
+			continue
+		}
+		i := strings.LastIndex(out, "\n")
+		code, err = strconv.Atoi(strings.TrimSpace(out[i+1:]))
+		if err != nil {
+			continue
+		}
+		return code, []byte(out[:i]), nil
+	}
+	return 0, nil, err
+}
+
+// kubectlNoT runs kubectl against management with a time limit and returns standard output. It never fails a test.
+func kubectlNoT(stdin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), kubectlTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "kubectl", append([]string{"--context", "kind-" + mgmtCluster}, args...)...)
+	cmd.Stdin = strings.NewReader(stdin)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return string(out), fmt.Errorf("kubectl: %w: %.200s", err, stderr.String())
+	}
+	return string(out), nil
+}
+
 func m15Alerts(t *testing.T, creds string) []m15Alert {
 	t.Helper()
-	code, body := grafanaCall(t, creds, "GET", "/api/prometheus/grafana/api/v1/alerts", "")
-	if code != 200 {
-		t.Fatalf("GET alerts: HTTP %d: %.300s", code, body)
+	code, body, err := m15Call(creds, "GET", "/api/prometheus/grafana/api/v1/alerts", "")
+	if err != nil || code != 200 {
+		t.Fatalf("GET alerts: HTTP %d: %v %.300s", code, err, body)
 	}
 	var r struct {
 		Data struct {
@@ -45,10 +92,11 @@ func m15Alerts(t *testing.T, creds string) []m15Alert {
 	return r.Data.Alerts
 }
 
-// m15Firing reports whether an alert of the rule title has the label value and the synthetic marker, in the state Alerting.
-func m15Firing(alerts []m15Alert, title, label, value string) bool {
+// m15Firing reports whether an alert of the rule title has the label value, in the state Alerting. A synthetic alert carries the label
+// synthetic=true. A real alert, such as the one that a cut makes, has no such label.
+func m15Firing(alerts []m15Alert, title, label, value string, synthetic bool) bool {
 	for _, a := range alerts {
-		if a.Labels["alertname"] == title && a.Labels[label] == value && a.Labels["synthetic"] == "true" &&
+		if a.Labels["alertname"] == title && a.Labels[label] == value && (a.Labels["synthetic"] == "true") == synthetic &&
 			(strings.EqualFold(a.State, "alerting") || strings.EqualFold(a.State, "firing")) {
 			return true
 		}
@@ -56,19 +104,35 @@ func m15Firing(alerts []m15Alert, title, label, value string) bool {
 	return false
 }
 
-// m15Push sends the series to the OTLP HTTP port of the collector in lgtm-0 with curl.
+// m15Push sends the series to the OTLP endpoint of Prometheus in lgtm-0 with curl, and it checks the status of the write. A failed call
+// is tried three times.
 func m15Push(t *testing.T, series []m15Synth, start time.Time) {
 	t.Helper()
-	body, err := m15Request(series, start, time.Now())
-	if err != nil {
+	if err := m15PushErr(series, start); err != nil {
 		t.Fatal(err)
 	}
-	out, err := kubectl(t, mgmtCluster, string(body), "-n", obsNamespace, "exec", "-i", lgtmPod, "-c", lgtmContainer, "--",
-		"curl", "-sS", "--max-time", "20", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
-		"-H", "Content-Type: application/x-protobuf", "--data-binary", "@-", "http://127.0.0.1:4318/v1/metrics")
-	if err != nil || strings.TrimSpace(out) != "200" {
-		t.Fatalf("push of %d synthetic series: HTTP %q, error %v", len(series), out, err)
+}
+
+func m15PushErr(series []m15Synth, start time.Time) error {
+	body, err := m15Request(series, start, time.Now())
+	if err != nil {
+		return err
 	}
+	var last error
+	for try := 0; try < 3; try++ {
+		if try > 0 {
+			time.Sleep(5 * time.Second)
+		}
+		out, err := kubectlNoT(string(body), "-n", obsNamespace, "exec", "-i", lgtmPod, "-c", lgtmContainer, "--",
+			"curl", "-sS", "--max-time", "20", "-w", "\n%{http_code}", "-X", "POST",
+			"-H", "Content-Type: application/x-protobuf", "--data-binary", "@-", "http://127.0.0.1:9090/api/v1/otlp/v1/metrics")
+		i := strings.LastIndex(out, "\n")
+		if err == nil && i >= 0 && strings.TrimSpace(out[i+1:]) == "200" {
+			return nil
+		}
+		last = fmt.Errorf("push of %d synthetic series: %v, answer %.300s", len(series), err, out)
+	}
+	return last
 }
 
 // m15Rule is one row of the table of the plan. fire and clear return the series for the value v, which is m15-<hex>.
@@ -108,7 +172,7 @@ func m15Rules() []m15Rule {
 		return func(v string) []m15Synth {
 			at := float64(time.Now().Add(time.Duration(days) * 24 * time.Hour).Unix())
 			return []m15Synth{{Instrument: "trust.ca.not_after", Value: at, Resource: map[string]string{"k8s.cluster.name": v},
-				Attrs: map[string]string{"ca": "intermediate", "trust.domain": v}}}
+				Attrs: map[string]string{"ca": "intermediate", "trust_domain": v}}}
 		}
 	}
 	queue := func(size float64) func(string) []m15Synth {
@@ -147,7 +211,8 @@ func m15Rules() []m15Rule {
 var m15RotateOnce sync.Once
 
 // m15RotateIntermediate rotates the intermediate CA of dev-cp when it has under 7 days left, because a real A3 alert would fire from then
-// on. It writes build/gate/m15-intermediate-rotated first, so that the repair knows the rotation ran. It rotates at most once.
+// on. It writes build/gate/m15-intermediate-rotated first, so that gate-m15-repair.sh finishes a rotation that stops half way, and it
+// removes the marker after a rotation that ends well. It rotates at most once.
 func m15RotateIntermediate(t *testing.T) {
 	t.Helper()
 	m15RotateOnce.Do(func() {
@@ -165,8 +230,10 @@ func m15RotateIntermediate(t *testing.T) {
 			return
 		}
 		if out, err := miseRun(t, m15RotateBound, []string{"CELL=dev-cp"}, "pki:rotate-intermediate"); err != nil {
-			t.Errorf("pki:rotate-intermediate: %v\n%s", err, out)
+			t.Errorf("pki:rotate-intermediate: %v\n%s. The marker stays, so mise run gate:m15:repair runs it again", err, lastLines(out, 6))
+			return
 		}
+		_ = os.Remove(m15RotatedMarker)
 	})
 }
 
@@ -176,6 +243,9 @@ func m15RotateIntermediate(t *testing.T) {
 // Born is tested. Their clear series keep the value, and the alert clears when the window passes.
 func TestM15AlertRulesFireAndClear(t *testing.T) {
 	creds := m15RequireGrafana(t)
+	// The rotation runs before any subtest, because a rotation of up to 40 minutes between the fire and the clear phase would let the
+	// alert of A3 end by itself and pass the clear check with no proof.
+	m15RotateIntermediate(t)
 	start := time.Now().Add(-time.Minute)
 	for _, r := range m15Rules() {
 		t.Run(r.id, func(t *testing.T) {
@@ -183,12 +253,7 @@ func TestM15AlertRulesFireAndClear(t *testing.T) {
 			v := "m15-" + randomHex(t, 4)
 			t.Cleanup(func() {
 				if r.id != "A4" && r.id != "A5" && r.id != "A7" {
-					body, err := m15Request(r.clear(v), start, time.Now())
-					if err == nil {
-						_, _ = kubectl(t, mgmtCluster, string(body), "-n", obsNamespace, "exec", "-i", lgtmPod, "-c", lgtmContainer, "--",
-							"curl", "-sS", "--max-time", "20", "-o", "/dev/null", "-X", "POST", "-H", "Content-Type: application/x-protobuf",
-							"--data-binary", "@-", "http://127.0.0.1:4318/v1/metrics")
-					}
+					_ = m15PushErr(r.clear(v), start)
 				}
 			})
 			phase := func(what string, series func(string) []m15Synth, bound time.Duration, done func([]m15Alert) bool) time.Duration {
@@ -204,12 +269,9 @@ func TestM15AlertRulesFireAndClear(t *testing.T) {
 					time.Sleep(m15PushEvery)
 				}
 			}
-			took := phase("fire", r.fire, r.fireWait, func(a []m15Alert) bool { return m15Firing(a, r.title, r.label, v) })
+			took := phase("fire", r.fire, r.fireWait, func(a []m15Alert) bool { return m15Firing(a, r.title, r.label, v, true) })
 			t.Logf("%s FIRE_SECONDS=%.0f", r.id, took.Seconds())
-			if r.id == "A3" {
-				m15RotateIntermediate(t)
-			}
-			took = phase("clear", r.clear, r.clearWait, func(a []m15Alert) bool { return !m15Firing(a, r.title, r.label, v) })
+			took = phase("clear", r.clear, r.clearWait, func(a []m15Alert) bool { return !m15Firing(a, r.title, r.label, v, true) })
 			t.Logf("%s CLEAR_SECONDS=%.0f", r.id, took.Seconds())
 		})
 	}
@@ -230,6 +292,7 @@ func TestM15AlertRulesFireAndClear(t *testing.T) {
 				Templating struct {
 					List []struct {
 						Name, Type, Query string
+						Datasource        *struct{ UID string } `json:"datasource"`
 					} `json:"list"`
 				} `json:"templating"`
 			}
@@ -245,7 +308,11 @@ func TestM15AlertRulesFireAndClear(t *testing.T) {
 					t.Errorf("%s variable %s has the query %q, which the test cannot run", d.UID, v.Name, v.Query)
 					continue
 				}
+				// The variable service of poc-refusals reads Loki, and the others read Prometheus.
 				path := "/api/datasources/uid/prometheus/resources/api/v1/label/" + m[2] + "/values"
+				if v.Datasource != nil && v.Datasource.UID == "loki" {
+					path = "/api/datasources/uid/loki/resources/label/" + m[2] + "/values"
+				}
 				if m[1] != "" {
 					path += "?match[]=" + url.QueryEscape(m[1])
 				}
@@ -270,6 +337,7 @@ func TestM15AlertRulesFireAndClear(t *testing.T) {
 			}
 			code, resp := grafanaCall(t, creds, "POST", "/api/ds/query", body)
 			if code != 200 {
+				t.Errorf("%s: HTTP %d: %.200s", tg.Name(), code, resp)
 				continue
 			}
 			if hit := leak.FindString(strings.ReplaceAll(string(resp), "m15-synthetic", "")); hit != "" {
