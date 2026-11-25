@@ -67,6 +67,22 @@ func TestEveryDashboardParses(t *testing.T) {
 	})
 }
 
+func TestVariablesNeedASourceOnlyWhenTheyQuery(t *testing.T) {
+	t.Run("good: a custom and an interval variable have no data source", func(t *testing.T) {
+		boards := mutate(func(b *Dashboard) {
+			b.Templating.List = append(b.Templating.List,
+				Variable{Name: "kind", Type: "custom", Query: "a,b"}, Variable{Name: "step", Type: "interval", Query: "1m,5m"})
+		})
+		if err := CheckLayout(boards); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("bad: a query variable with no data source", func(t *testing.T) {
+		boards := mutate(func(b *Dashboard) { b.Templating.List[0].Datasource = nil })
+		wantError(t, CheckLayout(boards), "poc-good variable cluster", "no data source")
+	})
+}
+
 func TestPanelQueriesNameKnownMetrics(t *testing.T) {
 	t.Run("generated boards and rules", func(t *testing.T) {
 		if err := CheckQueries(Boards(), Rules()); err != nil {
@@ -182,6 +198,25 @@ func TestSelectorsPinEmitter(t *testing.T) {
 	})
 	t.Run("bad: a pin to a cluster that is not a cell", func(t *testing.T) {
 		wantError(t, CheckSelectors(setExpr(`celld_svid_remaining_seconds{k8s_cluster_name="dev-cp"}`), goodRules()), "pins")
+	})
+	t.Run("good: a matcher in the form ${cell} or ${cluster} follows the variable", func(t *testing.T) {
+		for _, expr := range []string{
+			`celld_upstream_age_seconds{platform_cell=~"${cell}"}`,
+			`sum(argocd_app_info{k8s_cluster_name=~"${cluster}"})`,
+			`min(celld_upstream_age_seconds{platform_cell="$cell"})`,
+		} {
+			if err := CheckSelectors(setExpr(expr), goodRules()); err != nil {
+				t.Errorf("%s: %v", expr, err)
+			}
+		}
+	})
+	t.Run("bad: a negative matcher on the variable is no scope", func(t *testing.T) {
+		for _, expr := range []string{
+			`celld_upstream_age_seconds{platform_cell!~"$cell"}`,
+			`sum(argocd_app_info{k8s_cluster_name!="${cluster}"})`,
+		} {
+			wantError(t, CheckSelectors(setExpr(expr), goodRules()), "comes from many clusters")
+		}
 	})
 	t.Run("good: a rule and a variable query need no scope", func(t *testing.T) {
 		rules := mutateRules(func(r *Rule) { r.Data[0].Model["expr"] = `min(celld_upstream_age_seconds{platform_cell!=""})` })

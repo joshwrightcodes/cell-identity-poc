@@ -1,0 +1,418 @@
+{
+  "uid": "poc-islands",
+  "title": "Islands and revocation",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cell",
+        "label": "Cell",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "definition": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "state-timeline",
+      "title": "Link state by layer",
+      "description": "Each layer reads connected, or island when its upstream age is over 2 minutes. Reads cellproxy_gateway_last_export_time_seconds, celld_upstream_age_seconds, envd_upstream_age_seconds.",
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(time() - max by (sender_cluster) (cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"})) > bool 120",
+          "range": true,
+          "legendFormat": "{{sender_cluster}} gateway export"
+        },
+        {
+          "refId": "B",
+          "expr": "celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"} > bool 120",
+          "range": true,
+          "legendFormat": "{{platform_cell}} celld"
+        },
+        {
+          "refId": "C",
+          "expr": "envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} > bool 120",
+          "range": true,
+          "legendFormat": "dev-cp envd"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "options": {
+                "0": {
+                  "color": "#0ca30c",
+                  "index": 0,
+                  "text": "connected"
+                },
+                "1": {
+                  "color": "#fab219",
+                  "index": 1,
+                  "text": "island"
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "custom": {
+            "fillOpacity": 80,
+            "lineWidth": 0
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.9,
+        "showValue": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Outbox during the island",
+      "description": "Items that the gateway and the envd outbox hold while a link is down. Reads cellgw_outbox_items, envd_gateway_outbox.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(cellgw_outbox_items{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "gateway outbox"
+        },
+        {
+          "refId": "B",
+          "expr": "max(envd_gateway_outbox{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "envd outbox"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "dev-cp collector queue",
+      "description": "Exporter queue of the dev-cp collector. The dashed line is the cap. Reads otelcol_exporter_queue_size, otelcol_exporter_queue_capacity.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (data_type) (otelcol_exporter_queue_size{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "{{data_type}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(otelcol_exporter_queue_capacity{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "cap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "cap"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d03b3b",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Overlay entries",
+      "description": "Revocations that the overlay holds, the entries that it refused in the time range, and the overlay of the gateway. Reads envd_revocations_held, envd_revocations_refused_total, cellgw_revocations_overlay.",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(envd_revocations_held{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "held"
+        },
+        {
+          "refId": "B",
+          "expr": "(sum(increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "instant": true,
+          "legendFormat": "refused",
+          "eventOnly": true
+        },
+        {
+          "refId": "C",
+          "expr": "max(cellgw_revocations_overlay{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "gateway overlay"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Revoked streams closed",
+      "description": "Open streams that the proxies closed because of a revoke, in the time range. Reads cellproxy_revoked_closed_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(cellproxy_revoked_closed_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    }
+  ]
+}

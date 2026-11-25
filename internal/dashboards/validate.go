@@ -12,9 +12,6 @@ import (
 // gridColumns is the width of the Grafana grid.
 const gridColumns = 24
 
-// Boards returns the dashboards that the generator writes.
-func Boards() []Dashboard { return nil }
-
 // Rules returns the alert rule file that the generator writes.
 func Rules() RuleFile { return RuleFile{APIVersion: 1, Groups: []RuleGroup{}} }
 
@@ -98,7 +95,7 @@ func CheckLayout(boards []Dashboard) error {
 		files[b.File] = true
 		for _, v := range b.Templating.List {
 			okDS(b.UID+" variable "+v.Name, v.Datasource)
-			if v.Datasource == nil {
+			if v.Type == "query" && v.Datasource == nil {
 				errs = append(errs, fmt.Errorf("%s variable %s: no data source", b.UID, v.Name))
 			}
 		}
@@ -178,7 +175,7 @@ func CheckSelectors(boards []Dashboard, rules RuleFile) error {
 				if mt.Label == "k8s_cluster_name" && mt.Op == "=" {
 					pin = mt.Value
 				}
-				if scopeLabels[mt.Label] && (strings.Contains(mt.Value, "$cluster") || strings.Contains(mt.Value, "$cell")) {
+				if scopeLabels[mt.Label] && (mt.Op == "=" || mt.Op == "=~") && followsScope(mt.Value) {
 					scoped = true
 				}
 			}
@@ -197,6 +194,16 @@ func CheckSelectors(boards []Dashboard, rules RuleFile) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// followsScope reports whether a matcher value uses the variable cluster or cell, in the form $name or ${name}.
+func followsScope(value string) bool {
+	for _, name := range []string{"cluster", "cell"} {
+		if strings.Contains(value, "$"+name) || strings.Contains(value, "${"+name) {
+			return true
+		}
+	}
+	return false
 }
 
 // scopeLabels are the labels whose matcher may follow the dashboard variables.

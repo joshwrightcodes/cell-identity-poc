@@ -2,11 +2,6 @@ package dashboards
 
 import "math"
 
-var (
-	promDS = &Datasource{Type: "prometheus", UID: DSPrometheus}
-	lokiDS = &Datasource{Type: "loki", UID: DSLoki}
-)
-
 // panel builds a panel with one Prometheus target.
 func panel(id int, title string, x, y, w, h int, exprs ...string) Panel {
 	p := Panel{ID: id, Type: "stat", Title: title, GridPos: GridPos{H: h, W: w, X: x, Y: y}, Datasource: promDS}

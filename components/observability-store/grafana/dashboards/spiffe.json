@@ -1,0 +1,746 @@
+{
+  "uid": "poc-spiffe",
+  "title": "SPIFFE and SPIRE",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cell",
+        "label": "Cell",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "definition": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "trust_domain",
+        "label": "Trust domain",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(trust_ca_not_after_seconds{service_name!=\"m15-synthetic\"}, trust_domain)",
+        "definition": "label_values(trust_ca_not_after_seconds{service_name!=\"m15-synthetic\"}, trust_domain)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Attestations",
+      "description": "Attestations that the cluster_jwt plugin accepted in the time range. Reads cluster_jwt_attestations_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"accepted\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Refused attestations",
+      "description": "Attestations that the cluster_jwt plugin refused in the time range. Reads cluster_jwt_attestations_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Agents per cell",
+      "description": "Unbanned agents of each cell. A series that stops reporting leaves the panel within a minute. Reads agentban_agents.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (cell) (last_over_time(agentban_agents{k8s_cluster_name=\"dev-cp\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1m]))",
+          "instant": true,
+          "legendFormat": "{{cell}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Intermediate CA expires",
+      "description": "Days until the intermediate CA expires. Warning under 14 days, critical under 7 days. Reads trust_ca_not_after_seconds.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(min(last_over_time(trust_ca_not_after_seconds{k8s_cluster_name=~\"$cluster\", ca=\"intermediate\", trust_domain=~\"$trust_domain\", service_name!=\"m15-synthetic\"}[2m])) - time()) / 86400",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "d",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d03b3b",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 7
+              },
+              {
+                "color": "#0ca30c",
+                "value": 14
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Key checks",
+      "description": "Key checks of mgmtd that found no change or updated the keys, of all key checks in the time range. Reads mgmtd_keycheck_results_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", result=~\"unchanged|keys_updated\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "ok"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(increase(mgmtd_keycheck_results_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "of"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Agent bans",
+      "description": "Agents that the ban container banned in the time range. Reads agentban_bans_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(agentban_bans_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 7,
+      "type": "bargauge",
+      "title": "Attestation refusals by reason",
+      "description": "Refused attestations in the time range, by the reason of the plugin. Reads cluster_jwt_attestations_total.",
+      "gridPos": {
+        "h": 8,
+        "w": 10,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (reason) (increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range]))) or on() vector(0)",
+          "instant": true,
+          "legendFormat": "{{reason}}",
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "color": {
+            "fixedColor": "#fab219",
+            "mode": "fixed"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "SVIDs issued per 10 min",
+      "description": "X.509 SVIDs that each SPIRE server signed in each 10 minutes. Reads spire_server_server_ca_sign_x509_svid_total.",
+      "gridPos": {
+        "h": 8,
+        "w": 14,
+        "x": 10,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (k8s_cluster_name) (increase(spire_server_server_ca_sign_x509_svid_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[10m]))",
+          "range": true,
+          "legendFormat": "{{k8s_cluster_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "unknown_kid hints per hour",
+      "description": "Report items that mgmtd retried because the key id was unknown, in each hour. Reads mgmtd_report_retry_unknown_kid_total.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(increase(mgmtd_report_retry_unknown_kid_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1h]))) or vector(0)",
+          "range": true,
+          "legendFormat": "retries",
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 40,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Trust anchors",
+      "description": "CA certificates that the clusters report, and the mesh roots. Expires is the time left. Pinned by is the cluster that reports the row. Reads trust_ca_not_after_seconds, citadel_server_root_cert_expiry_timestamp.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(max by (trust_domain, ca, sha256, source, k8s_cluster_name) (last_over_time(trust_ca_not_after_seconds{k8s_cluster_name=~\"$cluster\", trust_domain=~\"$trust_domain\", ca!=\"issuing\", service_name!=\"m15-synthetic\"}[2m])) - time()) or label_replace(label_replace(label_replace(citadel_server_root_cert_expiry_timestamp{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} - time(), \"trust_domain\", \"$1.mesh\", \"k8s_cluster_name\", \"(.+)\"), \"ca\", \"mesh root\", \"\", \"\"), \"source\", \"istiod\", \"\", \"\")",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "color": "#6e7f96",
+                  "index": 99,
+                  "text": "n/a"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Expires"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": false,
+            "displayName": "Pinned by"
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "trust_domain",
+                "ca",
+                "sha256",
+                "source",
+                "k8s_cluster_name",
+                "Value #A",
+                "Value"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Value": 5,
+              "Value #A": 5,
+              "ca": 1,
+              "k8s_cluster_name": 4,
+              "sha256": 2,
+              "source": 3,
+              "trust_domain": 0
+            },
+            "renameByName": {
+              "Value": "Expires",
+              "Value #A": "Expires",
+              "ca": "CA",
+              "k8s_cluster_name": "Pinned by",
+              "sha256": "Root",
+              "source": "Source",
+              "trust_domain": "Trust domain"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

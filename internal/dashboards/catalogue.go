@@ -147,7 +147,7 @@ var Catalogue = []Metric{
 
 	own("trust.ca.not_after", KindGauge, "s", allClusters...),
 
-	// Third-party names. Task 1 of the M15 inventory read each name on the live harness, except where the origin says otherwise.
+	// Third-party names. The M15 inventory read each name on the live harness, except where the origin says otherwise.
 	thirdParty("up", KindGauge, originProm, allClusters...),
 	thirdParty("argocd_app_info", KindGauge, originArgoCD, allClusters...),
 	thirdParty("argocd_app_sync_total", KindCounter, originArgoCD, allClusters...),
