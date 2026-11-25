@@ -182,6 +182,13 @@ spec:
         - name: spire-server
           image: ghcr.io/spiffe/spire-server:1.15.5@sha256:584a9c5cc95b9457f5033e7e4488d603fffe5ec48a80c4dba14b05c5e1c2c384
           args: ["-config", "/run/spire/config/server.conf"]
+          # The cluster_jwt plugin inherits this environment and exports through the collector. The container sets no
+          # OTEL_SERVICE_NAME, so the plugin keeps its own service name.
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector.observability-system.svc.cluster.local:4317
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "15000"
           ports:
             - name: grpc
               containerPort: 8081
@@ -265,6 +272,8 @@ spec:
           env:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "15000"
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

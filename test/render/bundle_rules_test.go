@@ -829,13 +829,13 @@ func TestNetworkPolicyAppsSample(t *testing.T) {
 }
 
 // appsSamplePolicySpecs are the specs of the NetworkPolicies of apps-sample. default-deny has no rule. allow-dns and
-// allow-from-nodes are the policies of every namespace. workloads admits the pods of the namespace, the collector on 15090
+// allow-from-nodes are the policies of every namespace. workloads admits the pods of the namespace, the collector on 15090 and 15020
 // (flow N15) and, as egress, the pods of the namespace and istiod on 15012. No rule names apps-demo.
 var appsSamplePolicySpecs = map[string]string{
 	"default-deny":     `{"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
 	"allow-dns":        `{"egress":[{"ports":[{"port":53,"protocol":"UDP"},{"port":53,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}},{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Egress"]}`,
 	"allow-from-nodes": `{"ingress":[{"from":[{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Ingress"]}`,
-	"workloads":        `{"egress":[{"to":[{"podSelector":{}}]},{"ports":[{"port":15012,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"istio-system"}}}]}],"ingress":[{"from":[{"podSelector":{}}]},{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"observability-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"otel-collector"}}}],"ports":[{"port":15090,"protocol":"TCP"}]}],"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
+	"workloads":        `{"egress":[{"to":[{"podSelector":{}}]},{"ports":[{"port":15012,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"istio-system"}}}]}],"ingress":[{"from":[{"podSelector":{}}]},{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"observability-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"otel-collector"}}}],"ports":[{"port":15090,"protocol":"TCP"}]},{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"observability-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"otel-collector"}}}],"ports":[{"port":15020,"protocol":"TCP"}]}],"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
 }
 
 var cidrMask = regexp.MustCompile(`"cidr":"[0-9.]+/32"`)

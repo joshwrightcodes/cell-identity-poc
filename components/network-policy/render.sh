@@ -235,6 +235,12 @@ $(collector_peer)
       ports:
         - protocol: TCP
           port: 15090
+    # N15: the certificate expiry of the Istio agent.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15020
   egress:
     - to:
 $(namespace_peer istio-system)
@@ -272,6 +278,12 @@ $(collector_peer)
       ports:
         - protocol: TCP
           port: 15090
+    # N15: the certificate expiry of the Istio agent.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15020
   egress:
     - to:
         - podSelector: {}
@@ -316,6 +328,12 @@ $(collector_peer)
       ports:
         - protocol: TCP
           port: 15090
+    # N15: the certificate expiry of the Istio agent.
+    - from:
+$(collector_peer)
+      ports:
+        - protocol: TCP
+          port: 15020
   egress:
     - to:
         - podSelector: {}

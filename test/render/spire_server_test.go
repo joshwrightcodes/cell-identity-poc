@@ -1132,6 +1132,8 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	// M9 adds the ban container. TestAgentBanContainer checks it.
 	pod["containers"] = slices.DeleteFunc(get[[]any](t, pod, "containers"), func(c any) bool { return get[string](t, c, "name") == "agent-ban" })
 	server := named(t, get[[]any](t, pod, "containers"), "spire-server")
+	// M15 adds the telemetry environment. TestSpireServerPluginTelemetry checks it.
+	delete(server, "env")
 	server["volumeMounts"] = slices.DeleteFunc(get[[]any](t, server, "volumeMounts"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
 	for _, o := range []object{got["StatefulSet/spire-server"], m2["StatefulSet/spire-server"]} {
 		delete(get[map[string]any](t, o, "spec", "template", "metadata", "annotations"), "cell.poc.internal/config-checksum")
