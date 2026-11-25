@@ -98,6 +98,8 @@ var Catalogue = []Metric{
 
 	own("cellctl.refusals", KindCounter, "", ClusterControlPlane),
 	own("cellctl.steps", KindCounter, "", ClusterControlPlane),
+	own("cellctl.steps.open", KindGauge, "{step}", ClusterControlPlane),
+	own("cellctl.step.stage.duration", KindHistogram, "s", ClusterControlPlane),
 
 	own("cluster_jwt.attestations", KindCounter, "{attestation}", ClusterControlPlane),
 

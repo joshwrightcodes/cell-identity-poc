@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -80,6 +81,11 @@ type Controller struct {
 	ready  atomic.Bool
 	steps  metric.Int64Counter
 	refuse metric.Int64Counter
+	stages metric.Float64Histogram
+
+	// open is the snapshot that the cellctl.steps.open gauge reports. A round replaces it.
+	openMu sync.Mutex
+	open   map[stepKey]int64
 
 	// The revision mark and the last index live in memory only. After a restart the host service,
 	// with its own spec mark and index checks, is the backstop.
@@ -114,7 +120,13 @@ type entry struct {
 	lastErr *mgmtapi.HostErrorInfo
 	polled  time.Time
 	state   string // the last state that was counted
+	// stage is the stage that the last poll showed, and stageAt is the time of that poll.
+	stage   string
+	stageAt time.Time
 }
+
+// stepKey is the label set of the cellctl.steps.open gauge.
+type stepKey struct{ state, stage string }
 
 type denial struct {
 	envelope  []byte
@@ -165,10 +177,56 @@ func New(cfg Config) (*Controller, error) {
 	if err != nil {
 		return nil, fmt.Errorf("counter cellctl.refusals: %w", err)
 	}
-	return &Controller{
+	stages, err := cfg.Meter.Float64Histogram("cellctl.step.stage.duration", metric.WithUnit("s"),
+		metric.WithDescription("time from the first poll that showed a stage to the poll that showed the next stage or a final state"))
+	if err != nil {
+		return nil, fmt.Errorf("histogram cellctl.step.stage.duration: %w", err)
+	}
+	c := &Controller{
 		cfg: cfg, store: &statusStore{c: cfg.Client, namespace: cfg.Namespace, name: cfg.StatusName},
-		steps: steps, refuse: refuse, entries: map[string]*entry{}, lastIndex: map[string]string{}, logged: map[string]bool{},
-	}, nil
+		steps: steps, refuse: refuse, stages: stages, open: map[stepKey]int64{},
+		entries: map[string]*entry{}, lastIndex: map[string]string{}, logged: map[string]bool{},
+	}
+	if _, err := cfg.Meter.Int64ObservableGauge("cellctl.steps.open", metric.WithUnit("{step}"),
+		metric.WithDescription("steps that the cell controller tracks and that have no final state"),
+		metric.WithInt64Callback(c.observeOpen)); err != nil {
+		return nil, fmt.Errorf("gauge cellctl.steps.open: %w", err)
+	}
+	return c, nil
+}
+
+func (c *Controller) observeOpen(_ context.Context, o metric.Int64Observer) error {
+	c.openMu.Lock()
+	defer c.openMu.Unlock()
+	for k, n := range c.open {
+		o.Observe(n, metric.WithAttributes(attribute.String("state", k.state), attribute.String("stage", k.stage)))
+	}
+	return nil
+}
+
+// countOpen replaces the snapshot of open steps. A step is open when the host service has
+// answered for it, nothing refused it, and its state is not final.
+func (c *Controller) countOpen() {
+	open := map[stepKey]int64{}
+	for _, e := range c.entries {
+		if e.status == nil || e.final() || e.denied != nil || e.refusal != nil {
+			continue
+		}
+		open[stepKey{e.status.State, e.status.Stage}]++
+	}
+	c.openMu.Lock()
+	c.open = open
+	c.openMu.Unlock()
+}
+
+// endStage records the time of the stage that e showed, with the result "next" or the final state.
+// A step that showed no stage records nothing.
+func (c *Controller) endStage(e *entry, now time.Time, result string) {
+	if e.stage != "" {
+		c.stages.Record(context.Background(), now.Sub(e.stageAt).Seconds(),
+			metric.WithAttributes(attribute.String("stage", e.stage), attribute.String("result", result)))
+	}
+	e.stage, e.stageAt = "", now
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -203,6 +261,7 @@ func (c *Controller) round(ctx context.Context) {
 		c.nextRead = now.Add(c.cfg.Interval)
 	}
 	c.hostWork(ctx)
+	c.countOpen()
 	c.report(ctx)
 }
 
@@ -473,6 +532,13 @@ func (c *Controller) setStatus(e *entry, st mgmtapi.StepStatus) {
 	now := c.cfg.Now()
 	st.LastHostError = nil
 	e.status, e.polled = &st, now
+	switch {
+	case e.final() || st.State == mgmtapi.StepRefused:
+		c.endStage(e, now, st.State)
+	case e.stage != st.Stage:
+		c.endStage(e, now, "next")
+		e.stage = st.Stage
+	}
 	if e.state != st.State {
 		c.cfg.Log.Info("step state", "step", e.id, "cell", e.cell, "state", st.State, "stage", st.Stage, "detail", st.Detail)
 		c.steps.Add(context.Background(), 1, metric.WithAttributes(attribute.String("state", st.State)))
@@ -516,6 +582,7 @@ func (c *Controller) failed(e *entry, op string, env []byte, err error) {
 		e.polled = now
 		c.refuse.Add(context.Background(), 1, metric.WithAttributes(attribute.String("detail", mgmtapi.ReasonHostsvcDenied)))
 		c.steps.Add(context.Background(), 1, metric.WithAttributes(attribute.String("state", mgmtapi.StepRefused)))
+		c.endStage(e, now, mgmtapi.StepRefused)
 		return
 	}
 	for _, x := range c.entries {

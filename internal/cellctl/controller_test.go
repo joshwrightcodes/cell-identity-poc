@@ -1102,3 +1102,134 @@ func TestNewChecksConfig(t *testing.T) {
 		t.Errorf("defaults %+v", cfg)
 	}
 }
+
+type gaugeKey struct{ state, stage string }
+
+func collect(t *testing.T, reader *metric.ManualReader) metricdata.ResourceMetrics {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	return rm
+}
+
+func openSteps(rm metricdata.ResourceMetrics) map[gaugeKey]int64 {
+	got := map[gaugeKey]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok || m.Name != "cellctl.steps.open" {
+				continue
+			}
+			for _, dp := range g.DataPoints {
+				st, _ := dp.Attributes.Value("state")
+				sg, _ := dp.Attributes.Value("stage")
+				got[gaugeKey{st.AsString(), sg.AsString()}] += dp.Value
+			}
+		}
+	}
+	return got
+}
+
+type stageDP struct {
+	stage, result string
+	count         uint64
+	sum           float64
+}
+
+func stageDurations(rm metricdata.ResourceMetrics) []stageDP {
+	var got []stageDP
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok || m.Name != "cellctl.step.stage.duration" {
+				continue
+			}
+			for _, dp := range h.DataPoints {
+				sg, _ := dp.Attributes.Value("stage")
+				r, _ := dp.Attributes.Value("result")
+				got = append(got, stageDP{sg.AsString(), r.AsString(), dp.Count, dp.Sum})
+			}
+		}
+	}
+	return got
+}
+
+func stageHarness(t *testing.T) (*harness, *metric.ManualReader, item) {
+	t.Helper()
+	w := newWorld(t)
+	a := w.item("dev-cell-1", 0)
+	reader := metric.NewManualReader()
+	h := newHarness(t, w, func(c *Config) { c.Meter = metric.NewMeterProvider(metric.WithReader(reader)).Meter("t") })
+	h.setSteps(w.data(2, a))
+	return h, reader, a
+}
+
+// setStage moves the step at the host service and lets the controller poll it.
+func (h *harness) setStage(id, state, stage string) {
+	h.host.set(id, func(s *mgmtapi.StepStatus) { s.State, s.Stage = state, stage })
+	h.runFor(h.c.cfg.PollEvery)
+}
+
+func TestNoStageDurationForFirstPoll(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
+	if got := stageDurations(collect(t, reader)); len(got) != 0 {
+		t.Errorf("durations after the first poll of a stage: %+v", got)
+	}
+}
+
+func TestStageDurationOnChange(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
+	h.runFor(30 * time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepAdmitting, mgmtapi.StageAdmitting)
+	got := stageDurations(collect(t, reader))
+	if len(got) != 1 || got[0].stage != "creating" || got[0].result != "next" || got[0].count != 1 || got[0].sum < 30 || got[0].sum > 60 {
+		t.Errorf("durations %+v", got)
+	}
+}
+
+func TestStageDurationOnFinal(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepBootstrapping, mgmtapi.StageBootstrapping)
+	h.runFor(20 * time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepDone, "")
+	h.runFor(time.Minute)
+	got := stageDurations(collect(t, reader))
+	if len(got) != 1 || got[0].stage != "bootstrapping" || got[0].result != "done" || got[0].count != 1 {
+		t.Errorf("durations %+v", got)
+	}
+}
+
+func TestStageDurationOnRefused(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	h.setStage(a.s.ID, mgmtapi.StepCreating, mgmtapi.StageCreating)
+	h.host.getErr[a.s.ID] = &mgmtapi.HostError{Reason: mgmtapi.ReasonHostsvcDenied, Status: 403, RequestID: "0123456789abcdef"}
+	h.runFor(30 * time.Second)
+	got := stageDurations(collect(t, reader))
+	if len(got) != 1 || got[0].stage != "creating" || got[0].result != "refused" || got[0].count != 1 {
+		t.Errorf("durations %+v", got)
+	}
+}
+
+func TestStepsOpenByState(t *testing.T) {
+	h, reader, a := stageHarness(t)
+	h.runFor(time.Second)
+	if got := openSteps(collect(t, reader)); got[gaugeKey{"queued", ""}] != 1 || len(got) != 1 {
+		t.Errorf("queued: %v", got)
+	}
+	h.setStage(a.s.ID, mgmtapi.StepAdmitting, mgmtapi.StageAdmitting)
+	if got := openSteps(collect(t, reader)); got[gaugeKey{"admitting", "admitting"}] != 1 || len(got) != 1 {
+		t.Errorf("admitting: %v", got)
+	}
+	h.setStage(a.s.ID, mgmtapi.StepDone, "")
+	if got := openSteps(collect(t, reader)); len(got) != 0 {
+		t.Errorf("final step is open: %v", got)
+	}
+}
