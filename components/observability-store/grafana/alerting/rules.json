@@ -1,4 +1,477 @@
 {
   "apiVersion": 1,
-  "groups": []
+  "groups": [
+    {
+      "orgId": 1,
+      "name": "cell-identity",
+      "folder": "Cell identity PoC alerts",
+      "interval": "30s",
+      "rules": [
+        {
+          "uid": "poc-svid-low",
+          "title": "SVID under a quarter of its lifetime",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "min by (platform_cell) (celld_svid_remaining_seconds{platform_cell!=\"\"} / celld_svid_lifetime_seconds{platform_cell!=\"\"})",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        0.25
+                      ],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The SVID of cell {{ $labels.platform_cell }} has less than a quarter of its lifetime left."
+          }
+        },
+        {
+          "uid": "poc-island",
+          "title": "Island started",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "max by (cluster) (label_replace(time() - cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\"}, \"cluster\", \"$1\", \"sender_cluster\", \"(.+)\") or label_replace(celld_upstream_age_seconds{platform_cell!=\"\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\") or label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\"))",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        120
+                      ],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Layer {{ $labels.cluster }} has lost its upstream for more than 2 minutes."
+          }
+        },
+        {
+          "uid": "poc-intermediate-ca",
+          "title": "Intermediate CA under 7 days",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "min by (trust_domain) (last_over_time(trust_ca_not_after_seconds{ca=\"intermediate\", trust_domain!=\"\"}[2m])) - time()",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        604800
+                      ],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "The intermediate CA of trust domain {{ $labels.trust_domain }} expires within 7 days."
+          }
+        },
+        {
+          "uid": "poc-attest-refusals",
+          "title": "Attestation refusals over 10 in 5 minutes",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "sum by (cell) (increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\"}[5m]))",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        10
+                      ],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The control plane refused more than 10 attestations of cell {{ $labels.cell }} in 5 minutes."
+          }
+        },
+        {
+          "uid": "poc-set-not-applied",
+          "title": "Set not applied, or a rollback",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "count_over_time((count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", sync_status!=\"Synced\", k8s_cluster_name!=\"\"}))[10m:1m]) >= 10 or sum by (k8s_cluster_name) (increase(bundle_apply_outcomes_total{outcome=\"rolled_back\", k8s_cluster_name!=\"\"}[10m])) > 0",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        0
+                      ],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "Cluster {{ $labels.k8s_cluster_name }} has not applied the set for 10 minutes, or it rolled back."
+          }
+        },
+        {
+          "uid": "poc-collector-queue",
+          "title": "Collector queue over 80% of its cap",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "max by (k8s_cluster_name, data_type) (otelcol_exporter_queue_size{k8s_cluster_name!=\"\"} / otelcol_exporter_queue_capacity{k8s_cluster_name!=\"\"})",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        0.8
+                      ],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "1m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The exporter queue of the collector in {{ $labels.k8s_cluster_name }} is over 80% of its cap."
+          }
+        },
+        {
+          "uid": "poc-tag-overwrite",
+          "title": "Source tag overwritten",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "sum by (sender_cluster) (increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster!=\"\"}[5m]))",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        0
+                      ],
+                      "type": "gt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "0s",
+          "labels": {
+            "severity": "critical"
+          },
+          "annotations": {
+            "summary": "The telemetry gateway overwrote the source tag of sender {{ $labels.sender_cluster }}."
+          }
+        },
+        {
+          "uid": "poc-tunnel-down",
+          "title": "Kiali tunnel down",
+          "condition": "C",
+          "data": [
+            {
+              "refId": "A",
+              "relativeTimeRange": {
+                "from": 600,
+                "to": 0
+              },
+              "datasourceUid": "prometheus",
+              "model": {
+                "datasource": {
+                  "type": "prometheus",
+                  "uid": "prometheus"
+                },
+                "expr": "min by (cell) (cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell!=\"\"})",
+                "instant": true,
+                "intervalMs": 1000,
+                "maxDataPoints": 43200,
+                "refId": "A"
+              }
+            },
+            {
+              "refId": "C",
+              "datasourceUid": "__expr__",
+              "model": {
+                "conditions": [
+                  {
+                    "evaluator": {
+                      "params": [
+                        1
+                      ],
+                      "type": "lt"
+                    }
+                  }
+                ],
+                "datasource": {
+                  "type": "__expr__",
+                  "uid": "__expr__"
+                },
+                "expression": "A",
+                "refId": "C",
+                "type": "threshold"
+              }
+            }
+          ],
+          "noDataState": "OK",
+          "execErrState": "Error",
+          "for": "5m",
+          "labels": {
+            "severity": "warning"
+          },
+          "annotations": {
+            "summary": "The Kiali tunnel of cell {{ $labels.cell }} is down."
+          }
+        }
+      ]
+    }
+  ]
 }

@@ -12,9 +12,6 @@ import (
 // gridColumns is the width of the Grafana grid.
 const gridColumns = 24
 
-// Rules returns the alert rule file that the generator writes.
-func Rules() RuleFile { return RuleFile{APIVersion: 1, Groups: []RuleGroup{}} }
-
 // promQuery is one PromQL expression with the place that holds it.
 type promQuery struct {
 	Where string
