@@ -181,12 +181,19 @@ func TestLogsSkipsAnAbsentCell(t *testing.T) {
 	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" || !strings.Contains(m[0]["error"].(string), "Run: mise run portal -- recreate --cell dev-cell-2") {
 		t.Errorf("a named absent cell: exit %d, output %q, want one JSON error line with the portal command", code, out)
 	}
+	// The first cell of the catalog gets the portal command too. catalog_cells prints one line at a time here, so a search that pipes it
+	// into grep -q would end yq with SIGPIPE and fall back to the rebuild hint.
+	slow := map[string]string{"kubectl": logsKubectl, "kind": stubKind, "yq": testtool.SlowWrapper("yq", `select(.components[] == "cell-identity")`)}
+	out, _, code = runScript(t, "logs.sh", slow, []string{"STUB_KIND=management dev-cp dev-cell-2 rogue"}, "dev-cell-1", "app=x")
+	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" || !strings.Contains(m[0]["error"].(string), "Run: mise run portal -- recreate --cell dev-cell-1") {
+		t.Errorf("a named absent dev-cell-1: exit %d, output %q, want one JSON error line with the portal command", code, out)
+	}
 	// A cluster outside the catalog has no portal command: the hint names the rebuild.
 	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND=dev-cp dev-cell-1 dev-cell-2"}, "management", "app=x")
 	if m := jsonLines(t, out); code != 1 || len(m) != 1 || strings.Contains(m[0]["error"].(string), "portal") || !strings.Contains(m[0]["error"].(string), "Rebuild one cluster") {
 		t.Errorf("a missing management: exit %d, output %q, want the rebuild hint and no portal command", code, out)
 	}
-	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND_FAIL=1"}, "all", "app=x")
+	out, _, code = runScript(t, "logs.sh", stubs, []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"}, "all", "app=x")
 	if m := jsonLines(t, out); code != 1 || len(m) != 1 || m[0]["level"] != "ERROR" {
 		t.Errorf("kind down: exit %d, output %q, want one JSON error line", code, out)
 	}

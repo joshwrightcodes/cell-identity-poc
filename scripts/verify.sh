@@ -11,7 +11,7 @@ set +e
 # A cell exists only through a signed step. cell:verify of a cell with no cluster prints one line and passes, so harness:verify,
 # which runs every cluster of the topology, does not fail while a cell is absent.
 if grep -qx -- "$CELL_NAME" <<<"$(catalog_cells)"; then
-  existing_clusters="$(kind get clusters 2>/dev/null)" || existing_clusters="unknown"
+  existing_clusters="$(kind_clusters)" || existing_clusters="unknown"
   if [[ "$existing_clusters" != unknown ]] && ! grep -qx -- "$CELL_NAME" <<<"$existing_clusters"; then
     log "skipped: cell $CELL_NAME has no cluster yet. A signed step creates it: mise run portal -- request --cell $CELL_NAME --wait"
     exit 0

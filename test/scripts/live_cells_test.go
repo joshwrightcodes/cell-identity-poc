@@ -120,7 +120,7 @@ func TestLiveCells(t *testing.T) {
 		}
 	})
 	t.Run("kind does not answer", func(t *testing.T) {
-		out, errOut, err := liveCellsRun(t, "STUB_KIND_FAIL=1")
+		out, errOut, err := liveCellsRun(t, "STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0")
 		if err == nil || out != "" || !strings.Contains(errOut, "kind get clusters failed, so the live cells are unknown") {
 			t.Fatalf("err %v, stdout %q, stderr %q; want a failure, never an empty list", err, out, errOut)
 		}

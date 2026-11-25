@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
@@ -14,6 +15,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +27,7 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"golang.org/x/net/http2"
 )
 
 const anyCellRole = `^spiffe://dev\.env\.poc\.internal/cell/[a-z0-9-]+/[a-z0-9-]+$`
@@ -331,13 +335,122 @@ func TestCellEndsTunnelAtHubSVIDExpiry(t *testing.T) {
 	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1", "conn_id": 1}, 3*time.Second)
 }
 
-// A tunnel that ends with a short cell SVID does not push the next dial to the backoff cap.
+// The cell ends the tunnel at the expiry of its own leaf, also when the hub keeps the tunnel open. The hub closes a tunnel at
+// the expiry of the cell leaf too, at the same instant, so the test runs the cell against keepOpenHub, which never closes one.
 func TestCellEndsTunnelAtOwnSVIDExpiry(t *testing.T) {
 	h := newTunnelHarness(t, 5*time.Second)
-	src := &rotatingSource{svids: []*x509svid.SVID{h.env.svidUntil(t, meshViewID1, time.Now().Add(4*time.Second))}}
-	startCell(t, h.dialerWith(src), h.cellHandler(t))
-	h.waitTunnels(t, 1, 5*time.Second)
-	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, 5*time.Second)
+	svid := h.env.svidUntil(t, meshViewID1, time.Now().Add(4*time.Second))
+	notAfter := svid.Certificates[0].NotAfter
+	hub := newKeepOpenHub(t, h)
+	src := &rotatingSource{svids: []*x509svid.SVID{svid}}
+	startCell(t, TunnelDialer(hub.addr, ClientTLS(src, h.mgmt.bundle(), spiffeIDOf(kialiID)), jsonLog(h.cellLog)), h.cellHandler(t))
+	findLog(t, h.cellLog, "tunnel_connected", nil, 5*time.Second)
+	findLog(t, h.cellLog, "tunnel_expired", map[string]any{"side": "cell"}, time.Until(notAfter)+3*time.Second)
+	// Each tunnel, the renewals too, has the same leaf, so the cell ends each one at notAfter: not before it, and within 1 s after it.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		accepted, ends := hub.result()
+		if accepted > 0 && len(ends) == accepted {
+			for _, end := range ends {
+				if end.Before(notAfter) || !end.Before(notAfter.Add(time.Second)) {
+					t.Errorf("the cell ended a tunnel at %s, and its leaf expires at %s", end.Format(time.RFC3339Nano), notAfter.Format(time.RFC3339Nano))
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the cell ended %d of the %d tunnels that the hub accepted:\n%s", len(ends), accepted, h.cellLog.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// keepOpenHub stands in for a hub that never closes a tunnel. It accepts a tunnel with the TLS of the hub and starts HTTP/2 on
+// it, as the hub does, and it records when the cell ends each tunnel.
+type keepOpenHub struct {
+	addr     string
+	mu       sync.Mutex
+	accepted int
+	ends     []time.Time
+	conns    []net.Conn
+}
+
+func newKeepOpenHub(t *testing.T, h *tunnelHarness) *keepOpenHub {
+	t.Helper()
+	cfg := ServerTLS(source(h.mgmt.svid(t, kialiID)), h.env.bundle(), regexp.MustCompile(meshPattern), testRegistry(t), jsonLog(h.hubLog))
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := &keepOpenHub{addr: ln.Addr().String()}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			wg.Add(1)
+			go func() { defer wg.Done(); k.serve(c.(*tls.Conn)) }()
+		}
+	}()
+	t.Cleanup(func() {
+		_ = ln.Close()
+		k.mu.Lock()
+		for _, c := range k.conns {
+			_ = c.Close()
+		}
+		k.mu.Unlock()
+		wg.Wait()
+	})
+	return k
+}
+
+func (k *keepOpenHub) serve(c *tls.Conn) {
+	k.mu.Lock()
+	k.conns = append(k.conns, c)
+	k.mu.Unlock()
+	if err := c.Handshake(); err != nil {
+		_ = c.Close()
+		return
+	}
+	ended := make(chan struct{})
+	cc, err := (&http2.Transport{}).NewClientConn(&endConn{Conn: c, ended: ended})
+	if err != nil {
+		_ = c.Close()
+		return
+	}
+	k.mu.Lock()
+	k.accepted++
+	k.mu.Unlock()
+	<-ended
+	k.mu.Lock()
+	k.ends = append(k.ends, time.Now())
+	k.mu.Unlock()
+	_ = cc.Close()
+}
+
+func (k *keepOpenHub) result() (int, []time.Time) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.accepted, slices.Clone(k.ends)
+}
+
+// endConn closes ended at the first read error, which is the end of the tunnel by the cell.
+type endConn struct {
+	net.Conn
+	ended chan struct{}
+	once  sync.Once
+}
+
+func (c *endConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if err != nil {
+		c.once.Do(func() { close(c.ended) })
+	}
+	return n, err
 }
 
 func TestTunnelLogsHubAcceptance(t *testing.T) {

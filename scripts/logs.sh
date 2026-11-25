@@ -24,7 +24,7 @@ if [[ "$target" == all ]]; then
   done <<<"$clusters"
 elif grep -Fxq -- "$target" <<<"$clusters"; then
   if ! grep -Fxq -- "$target" <<<"$existing"; then
-    if catalog_cells | grep -Fxq -- "$target"; then
+    if grep -Fxq -- "$target" <<<"$(catalog_cells)"; then
       json_fail harness:logs "the cluster $target does not exist. Run: mise run portal -- recreate --cell $target"
     fi
     json_fail harness:logs "the cluster $target does not exist. Rebuild it with the commands in the README section Rebuild one cluster, or run: mise run harness:up"

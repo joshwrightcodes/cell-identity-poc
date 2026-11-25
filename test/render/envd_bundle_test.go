@@ -307,7 +307,7 @@ func TestEnvdRenderCellsFailClosed(t *testing.T) {
 		{"live cell without facts names the read command", "Read them: mise run hostsvc -- facts --cluster dev-cell-2", []string{"STUB_FACTS_FAIL=dev-cell-2"}},
 		{"live cell without node address", "node address of dev-cell-1", []string{"STUB_FACTS_NOIP=dev-cell-1"}},
 		{"a relay target in the catalog", "names the relay target management", []string{"SPIRE_AGENT_CELLS=dev-cell-1 management"}},
-		{"kind does not answer", "kind get clusters failed", []string{"STUB_KIND_FAIL=1"}},
+		{"kind does not answer", "kind get clusters failed", []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"}},
 		{"a bad route", "is not <node port>:<container port>=<target node port>", []string{"RELAY_VIEW_ROUTES=8443=31443"}},
 		{"no route", "has no route", []string{"RELAY_TELEMETRY_ROUTES= "}},
 	} {

@@ -58,7 +58,7 @@ func TestGateM7Repair(t *testing.T) {
 			calls: []string{"--context kind-rogue -n default delete pod/probe-1", "delete pod/probe-2"}},
 		{name: "repair: a registry test pod that stays is an error", code: 1, calls: []string{"delete pod/probe-1"}, env: []string{"STUB_REGISTRY_PODS=probe-1", "STUB_STUCK=1"},
 			want: []string{"still exist: rogue pod/probe-1"}},
-		{name: "check: kind fails", args: []string{"--check"}, code: 1, env: []string{"STUB_KIND_FAIL=1"},
+		{name: "check: kind fails", args: []string{"--check"}, code: 1, env: []string{"STUB_KIND_FAIL=1", "KIND_CLUSTERS_PAUSE=0"},
 			want: []string{"error: could not list the clusters. Run: mise run harness:status"}},
 		{name: "check: m7 namespaces in two clusters", args: []string{"--check"}, code: 1,
 			env: []string{"STUB_NS_dev_cell_1=m7-aa:true", "STUB_NS_rogue=m7-bb:true m7-cc:true"},

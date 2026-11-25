@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -11,6 +13,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/cellproxy"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/topology"
 )
 
@@ -587,5 +590,58 @@ func TestRenderMeshViewHubFailsClosed(t *testing.T) {
 				t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", r.err, len(r.stdout), r.stderr, tc.want)
 			}
 		})
+	}
+}
+
+// renderCopyWithout copies the render of a component into a new root, with the line strip removed, and returns the path of the copy.
+// Every other file of the repository is a symbolic link into the root of the copy, so the copy reads the same charts and libraries.
+func renderCopyWithout(t *testing.T, component, strip string) string {
+	t.Helper()
+	repo, root := repoRoot(t), t.TempDir()
+	for _, dir := range []string{"components", filepath.Join("components", component)} {
+		if err := os.Mkdir(filepath.Join(root, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for from, to := range map[string]string{repo: root, filepath.Join(repo, "components"): filepath.Join(root, "components"),
+		filepath.Join(repo, "components", component): filepath.Join(root, "components", component)} {
+		entries, err := os.ReadDir(from)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, e := range entries {
+			if p := filepath.Join(to, e.Name()); !slices.Contains([]string{filepath.Join(root, "components"), filepath.Join(root, "components", component),
+				filepath.Join(root, "components", component, "render.sh")}, p) {
+				if err := os.Symlink(filepath.Join(from, e.Name()), p); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	src, err := os.ReadFile(filepath.Join(repo, "components", component, "render.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := strings.Count(string(src), strip+"\n"); n != 1 {
+		t.Fatalf("the render of %s holds the line %q %d times, want once", component, strip, n)
+	}
+	script := filepath.Join(root, "components", component, "render.sh")
+	if err := os.WriteFile(script, []byte(strings.Replace(string(src), strip+"\n", "", 1)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+// The render removes pods/portforward from the Roles of the chart, and a guard stops the render when a Role still names it. The test
+// removes the strip from a copy of the render, so the Role keeps pods/portforward, and expects the guard to stop the render. The yq call
+// of the guard prints one line at a time with a pause, so a guard that pipes yq into grep -q would see SIGPIPE and let the Role through.
+func TestRenderMeshViewHubGuardStopsPortForward(t *testing.T) {
+	testtool.Need(t, "helm")
+	script := renderCopyWithout(t, "mesh-view-hub",
+		`    | (select(.kind == "Role" or .kind == "ClusterRole") | .rules) |= map(select((.resources // []) | contains(["pods/portforward"]) | not))`)
+	env := append([]string{"STUB_CELL=management", "CELL_NAME=management", "STUB_SLOW_YQ=.rules[].resources[]"}, bundleFacts...)
+	r := runStubbed(t, "/ko-app/stub", "", []string{script}, env...)
+	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "a rule of the kiali viewer Role still names pods/portforward") {
+		t.Fatalf("err %v, stdout %d bytes, stderr %q; want the guard to stop the render", r.err, len(r.stdout), r.stderr)
 	}
 }
