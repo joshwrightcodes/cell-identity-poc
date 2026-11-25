@@ -116,6 +116,7 @@ metadata:
 // with the label and a name or a kind that the bundle lacks fails the call for its namespace, in either namespace. An object
 // of another owner without the label does not count.
 func TestHarnessObjectsByNamespace(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, extra, unlabelled string
@@ -250,6 +251,7 @@ metadata:
 // delete hint. A record without the label, with another field manager or with another name still fails, so a person
 // cannot hide an object there.
 func TestHarnessObjectsIgnoresCelldRecords(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, record string
@@ -341,6 +343,7 @@ esac
 // name and prints no delete hint. An object that keeps the harness label of an old render, one without the marker, one
 // that another manager wrote, and one with another name are reported.
 func TestHarnessObjectsAcceptsPublishedRegistry(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	// telemetry-gateway shares observability-system with other bundles, so its bundle does not hold the Namespace.
 	for _, comp := range []struct {
@@ -519,6 +522,7 @@ func runControllerObjects(t *testing.T, steps, extra string) (string, error) {
 // delete hint. A ConfigMap with the right name and the marker or the manager of the other writer, one with no marker, one that
 // a person edited, one with the harness label of the bundle and one with another name are reported.
 func TestHarnessObjectsAcceptsStepConfigMaps(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, steps, want string
 	}{
@@ -550,6 +554,7 @@ func TestHarnessObjectsAcceptsStepConfigMaps(t *testing.T) {
 // the harness label of another component, such as a Role envd-steps rendered by the component envd, is an extra object, and the check
 // fails. The Role envd-steps of the bundle itself, with the label cell-controller, passes.
 func TestHarnessObjectsOwnedNamespaceRefusesOtherLabels(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, extra, want string
 	}{

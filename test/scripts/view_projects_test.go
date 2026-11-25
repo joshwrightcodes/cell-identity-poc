@@ -60,6 +60,7 @@ const principalManager = `{"manager":"foo","operation":"Update"},{"manager":"arg
 // management. Only an AppProject <agent>-<project> of an agent of VIEW_CELLS, with the principal as
 // its only field manager and no harness label, may stay outside the bundle.
 func TestHarnessObjectsSkipOnlyThePrincipalProjects(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, projects, configmaps, want string

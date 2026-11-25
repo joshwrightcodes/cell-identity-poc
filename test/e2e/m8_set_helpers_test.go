@@ -20,6 +20,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/bundle"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
@@ -81,8 +82,14 @@ func m8Docs(docs ...string) []byte {
 	return []byte(strings.Join(docs, "---\n"))
 }
 
-// m8Marker is a ConfigMap of apps-demo that holds a marker. A bundle that holds it differs from every other bundle.
-func m8Marker(name, marker string) string { return m8MarkerIn("apps-demo", name, marker) }
+// m8AppNS is the namespace of the app class. m8PlatformNS is the namespace of the platform workloads.
+const (
+	m8AppNS      = "apps-sample"
+	m8PlatformNS = "apps-demo"
+)
+
+// m8Marker is a ConfigMap of apps-sample that holds a marker. A bundle that holds it differs from every other bundle.
+func m8Marker(name, marker string) string { return m8MarkerIn(m8AppNS, name, marker) }
 
 // m8MarkerIn is m8Marker in another namespace.
 func m8MarkerIn(namespace, name, marker string) string {
@@ -98,9 +105,9 @@ data:
 `, name, namespace, marker)
 }
 
-// m8FailingDeployment is a Deployment of apps-demo that never becomes ready. Its readiness probe asks a closed port, and its
+// m8FailingDeployment is a Deployment of the namespace ns that never becomes ready. Its readiness probe asks a closed port, and its
 // progress deadline of 30 s makes Argo CD report it Degraded soon after the rollout starts. A wave other than "" sets the sync wave.
-func m8FailingDeployment(t *testing.T, name, wave string) string {
+func m8FailingDeployment(t *testing.T, ns, name, wave string) string {
 	t.Helper()
 	needProbeImage(t)
 	annotations := ""
@@ -111,7 +118,7 @@ func m8FailingDeployment(t *testing.T, name, wave string) string {
 kind: Deployment
 metadata:
   name: %[1]s
-  namespace: apps-demo
+  namespace: %[4]s
 %[3]s  labels:
     cell.poc.internal/e2e: "true"
 spec:
@@ -141,16 +148,59 @@ spec:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
-`, name, probeImage, annotations)
+`, name, probeImage, annotations, ns)
 }
 
-// m8DeleteProbeDeployment deletes a probe Deployment of apps-demo when the test ends. A rollback prunes it, and this covers a run
+// m8EchoDeployment is a Deployment of the namespace ns that becomes ready. Its pods carry the label app: echo, the label that the selector
+// of Service apps-demo/echo matches. It follows Pod Security restricted, as the Deployment of m8FailingDeployment does.
+func m8EchoDeployment(t *testing.T, ns, name string) string {
+	t.Helper()
+	needProbeImage(t)
+	return fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s
+  namespace: %[3]s
+  labels:
+    cell.poc.internal/e2e: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo
+  template:
+    metadata:
+      labels:
+        app: echo
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: %[2]s
+          args: ["serve", "--addr=:8080"]
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            periodSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+`, name, probeImage, ns)
+}
+
+// m8DeleteProbeDeployment deletes a probe Deployment of apps-sample or apps-demo when the test ends. A rollback prunes it, and this covers a run
 // that fails before the rollback.
 func m8DeleteProbeDeployment(t *testing.T, cluster, name string) {
 	t.Helper()
 	t.Cleanup(func() {
-		if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "deployment", name, "--ignore-not-found", "--wait=false"); err != nil {
-			t.Errorf("delete the probe Deployment %s of %s: %v", name, cluster, err)
+		for _, ns := range []string{m8AppNS, m8PlatformNS} {
+			if _, err := kubectl(t, cluster, "", "-n", ns, "delete", "deployment", name, "--ignore-not-found", "--wait=false"); err != nil {
+				t.Errorf("delete the probe Deployment %s of %s in %s: %v", name, cluster, ns, err)
+			}
 		}
 	})
 }
@@ -173,12 +223,14 @@ func m8WaitNoOpen(t *testing.T, target string) {
 	}
 }
 
-// m8DeleteProbeObjects deletes the ConfigMaps, Deployments and Services of apps-demo that M8 tests made. A root deletes the Application of
+// m8DeleteProbeObjects deletes the ConfigMaps, Deployments and Services of apps-sample and apps-demo that M8 tests made. A root deletes the Application of
 // a probe bundle and leaves its objects.
 func m8DeleteProbeObjects(t *testing.T, cluster string) {
 	t.Helper()
-	if _, err := kubectl(t, cluster, "", "-n", "apps-demo", "delete", "configmap,deployment,service,networkpolicy", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
-		t.Errorf("delete the probe objects of apps-demo in %s: %v", cluster, err)
+	for _, ns := range []string{m8AppNS, m8PlatformNS} {
+		if _, err := kubectl(t, cluster, "", "-n", ns, "delete", "configmap,deployment,service,networkpolicy", "-l", m8Label, "--ignore-not-found", "--wait=false"); err != nil {
+			t.Errorf("delete the probe objects of %s in %s: %v", ns, cluster, err)
+		}
 	}
 }
 
@@ -309,6 +361,63 @@ func m8SetWithDigest(t *testing.T, target, name string, wave int, namespace, dig
 func m8Offer(t *testing.T, target string, comps []bundle.Component, d time.Duration) (mgmtapi.BundleSignResult, mgmtapi.TargetBundle) {
 	t.Helper()
 	signed := m8Sign(t, target, comps, true)
+	tb := m8Wait(t, target, signed.OpID, d)
+	if tb.Result == nil {
+		t.Fatalf("operation %s of %s has no result", signed.OpID, target)
+	}
+	return signed, tb
+}
+
+// m8AttachCosign attaches the Sigstore bundle of the root of the target to the mirror. bundle -- sign serves a set but attaches nothing, and a set with the
+// same root as an older one then has no signed statement of its version, so the strict bundle -- verify and cell:verify fail after the test.
+func m8AttachCosign(t *testing.T, target string) error {
+	t.Helper()
+	if out, err := m8Command(t, 5*time.Minute, "", "run", "bundle", "--", "cosign", "--target", target); err != nil {
+		return fmt.Errorf("attach the Sigstore bundle of %s: %w\n%s", target, err, out)
+	}
+	return nil
+}
+
+// m8PushRoot pushes the root of the components as bundles/<target>/root on the mirror, with bundlectl push-root as bundle -- publish does,
+// and returns the digest of the root. mgmtd signs a root and never pushes it, and bundle -- cosign attaches to a root that is already there.
+func m8PushRoot(t *testing.T, target string, comps []bundle.Component) string {
+	t.Helper()
+	role := "cell"
+	if target == cpClusterName {
+		role = "cp"
+	}
+	sorted := slices.Clone(comps)
+	slices.SortFunc(sorted, func(a, b bundle.Component) int { return strings.Compare(a.Name, b.Name) })
+	body, err := json.Marshal(sorted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := m8Command(t, 2*time.Minute, string(body), "run", "bundlectl", "--", "push-root", "--role", role, "--target", target,
+		"--set", "-", "--registry", hostsvc.RegistryHost)
+	if err != nil {
+		t.Fatalf("push the root of %s: %v\n%s", target, err, out)
+	}
+	var res struct {
+		Digest string `json:"digest"`
+	}
+	if err := json.Unmarshal([]byte(m8LastLine(out)), &res); err != nil || res.Digest == "" {
+		t.Fatalf("bundlectl push-root printed %q: %v", out, err)
+	}
+	return res.Digest
+}
+
+// m8OfferCosigned is m8Offer with the root of the set on the mirror and the Sigstore bundle attached after the set is signed and before the
+// wait for its result. The root goes first, so a failed push stops the test before a set is served.
+func m8OfferCosigned(t *testing.T, target string, comps []bundle.Component, d time.Duration) (mgmtapi.BundleSignResult, mgmtapi.TargetBundle) {
+	t.Helper()
+	pushed := m8PushRoot(t, target, comps)
+	signed := m8Sign(t, target, comps, true)
+	if pushed != signed.RootDigest {
+		t.Fatalf("the root that bundlectl pushed for %s (%s) differs from the root that mgmtd signed (%s)", target, pushed, signed.RootDigest)
+	}
+	if err := m8AttachCosign(t, target); err != nil {
+		t.Fatal(err)
+	}
 	tb := m8Wait(t, target, signed.OpID, d)
 	if tb.Result == nil {
 		t.Fatalf("operation %s of %s has no result", signed.OpID, target)

@@ -83,7 +83,7 @@ func TestApplyCountsOnlyASyncAfterTheMove(t *testing.T) {
 	// that the set was not applied: a changed root still needs a sync after the move.
 	t.Run("changed root with no sync", func(t *testing.T) {
 		e, a, _ := twoSets(t)
-		b := e.set(2, []spec{{"apps-sample", "apps-demo", cmap("apps-demo", "app", "a")}})
+		b := e.set(2, []spec{{"apps-sample", "apps-sample", cmap("apps-sample", "app", "a")}})
 		if b.root.Digest == a.root.Digest || b.digests()["apps-sample"] != a.digests()["apps-sample"] {
 			t.Fatal("the test set must change the root and keep apps-sample")
 		}
@@ -95,7 +95,7 @@ func TestApplyCountsOnlyASyncAfterTheMove(t *testing.T) {
 	t.Run("unchanged component", func(t *testing.T) {
 		e, a, _ := twoSets(t)
 		b := e.set(2, []spec{
-			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "b")},
+			{"apps-sample", "apps-sample", cmap("apps-sample", "app", "b")},
 			{"network-policy", "cell-system", cmap("cell-system", "np", "a")},
 		})
 		if b.digests()["network-policy"] != a.digests()["network-policy"] {
@@ -355,7 +355,7 @@ func TestApplyReadBeforeTheMoveFails(t *testing.T) {
 func TestApplyRollbackKeepsASyncOfTheGoodRevision(t *testing.T) {
 	e, a, _ := twoSets(t)
 	b := e.set(2, []spec{
-		{"apps-sample", "apps-demo", cmap("apps-demo", "app", "a")},
+		{"apps-sample", "apps-sample", cmap("apps-sample", "app", "a")},
 		{"network-policy", "cell-system", cmap("cell-system", "np", "b")},
 	})
 	rev := a.digests()["apps-sample"]
@@ -422,7 +422,7 @@ func TestApplyUnchangedComponentWithoutASync(t *testing.T) {
 	// keepNP builds a set that changes apps-sample and keeps network-policy of set a.
 	keepNP := func(e *env, a built) built {
 		b := e.set(2, []spec{
-			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "b")},
+			{"apps-sample", "apps-sample", cmap("apps-sample", "app", "b")},
 			{"network-policy", "cell-system", cmap("cell-system", "np", "a")},
 		})
 		if b.digests()["network-policy"] != a.digests()["network-policy"] {
@@ -474,7 +474,7 @@ func TestApplyUnchangedComponentWithoutASync(t *testing.T) {
 		e.clk.Advance(time.Hour)
 		e.movedWithoutSync("network-policy", e.boot.digests()["network-policy"])
 		b := e.set(1, []spec{
-			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "v1")},
+			{"apps-sample", "apps-sample", cmap("apps-sample", "app", "v1")},
 			{"network-policy", "cell-system", cmap("cell-system", "np", "boot")},
 		})
 		if b.digests()["network-policy"] != e.boot.digests()["network-policy"] {
@@ -506,7 +506,7 @@ func TestApplyUnchangedComponentWithoutASync(t *testing.T) {
 		}
 		// Set c keeps apps-sample of the failed set b, whose sync Argo CD shows for another revision.
 		c := e.set(3, []spec{
-			{"apps-sample", "apps-demo", cmap("apps-demo", "app", "b")},
+			{"apps-sample", "apps-sample", cmap("apps-sample", "app", "b")},
 			{"network-policy", "cell-system", cmap("cell-system", "np", "c")},
 		})
 		e.clk.Advance(time.Hour)

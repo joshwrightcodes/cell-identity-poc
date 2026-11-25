@@ -65,6 +65,7 @@ func statusRun(t *testing.T, args []string, env ...string) (string, int) {
 // TestUplinkStatusNamesTheFirstFailingHop checks that the task reports a healthy path, and that each broken
 // hop gets its own verdict, in the order collector, uplink, gateway, collector export, store. A stale store names the collector log.
 func TestUplinkStatusNamesTheFirstFailingHop(t *testing.T) {
+	t.Parallel()
 	out, code := statusRun(t, []string{"dev-cell-1"})
 	if m := oneJSONLine(t, out); code != 0 || m["verdict"] != "every hop is healthy" {
 		t.Fatalf("exit %d, output %v, want a healthy path", code, m)
@@ -95,6 +96,7 @@ func TestUplinkStatusNamesTheFirstFailingHop(t *testing.T) {
 
 // TestUplinkStatusRefusesAnUnknownCluster checks that a wrong argument prints one JSON error line.
 func TestUplinkStatusRefusesAnUnknownCluster(t *testing.T) {
+	t.Parallel()
 	out, code := statusRun(t, []string{"rogue"})
 	if m := oneJSONLine(t, out); code != 1 || m["level"] != "ERROR" || !strings.Contains(m["error"].(string), "Usage: mise run obs:uplink-status <cluster>") {
 		t.Errorf("exit %d, output %v", code, m)

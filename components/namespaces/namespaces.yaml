@@ -50,3 +50,11 @@ metadata:
     istio-injection: enabled
     pod-security.kubernetes.io/enforce: restricted
     cell.poc.internal/workloads: "true"
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apps-sample
+  labels:
+    istio-injection: enabled
+    pod-security.kubernetes.io/enforce: restricted

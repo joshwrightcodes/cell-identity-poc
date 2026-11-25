@@ -56,6 +56,7 @@ func principalTemplate(t *testing.T, objs map[string]object) map[string]any {
 // ConfigMap, and get and update only cell-registry. ConfigMap registry-signer holds the key of mgmtd as
 // signers.pub holds it (the base64 and a newline), and its checksum is on the pod template of each server.
 func TestRegistryRoleForMgmtd(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ component, ns, deployment string }{
 		{"central-view", "central-view-system", "argocd-agent-principal"},
 		{"telemetry-gateway", "observability-system", "telemetry-gateway"},
@@ -108,6 +109,7 @@ func TestRegistryRoleForMgmtd(t *testing.T) {
 
 // The central view renders the principal with its exact settings, from VIEW_CELLS and POC_ENV.
 func TestRenderCentralView(t *testing.T) {
+	t.Parallel()
 	r := renderCentralView(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -246,6 +248,7 @@ func TestRenderCentralView(t *testing.T) {
 // VIEW_CELLS must name the clusters with the argocd-agent set in harness/topology.yaml, and each
 // of them must be in SPIRE_AGENT_CELLS of dev-cp.
 func TestViewCellsMatchTopology(t *testing.T) {
+	t.Parallel()
 	topo, err := topology.Load("../../harness/topology.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -273,6 +276,7 @@ func TestViewCellsMatchTopology(t *testing.T) {
 
 // The render refuses a reserved or long cell name, an unpinned agent image, and a missing input.
 func TestRenderCentralViewFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ env, want string }{
 		{"VIEW_CELLS=rogue", "reserved name rogue"},
 		{"VIEW_CELLS=" + strings.Repeat("a", 60), "at most 59 characters"},
@@ -300,6 +304,7 @@ func TestRenderCentralViewFailsClosed(t *testing.T) {
 // The vendored Argo CD Agent manifests match ARGOCD_AGENT_MANIFESTS_SHA256, computed as
 // scripts/vendor-fetch.sh computes it.
 func TestAgentManifestsPinned(t *testing.T) {
+	t.Parallel()
 	version := commonEnv(t, "ARGOCD_AGENT_VERSION")
 	dir := filepath.Join("../../vendor/argocd-agent", version)
 	var files []string

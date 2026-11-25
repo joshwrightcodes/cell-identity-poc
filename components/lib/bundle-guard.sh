@@ -7,9 +7,10 @@
 # ValidatingAdmissionPolicy bundles-spare-harness (role cell and role cp, resources and subresources) denies each request of the application
 # controller of Argo CD that creates, changes or deletes an object in a harness namespace of the role, that touches an
 # object whose old version carries the label cell.poc.internal/harness, or that gives an object the label.
-# ValidatingAdmissionPolicy bundles-app-limits (role cell only) denies, for an object whose tracking ID starts with the
-# name of an app component, a Service that is not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out,
-# an object with the harness label, and a Secret of type kubernetes.io/service-account-token.
+# ValidatingAdmissionPolicy bundles-app-limits (role cell only) denies, for an object in the namespace of an app class or
+# whose tracking ID starts with the name of an app component, a Service that is not ClusterIP or has externalIPs, a
+# Deployment with the sidecar opt-out, an object with the harness label, and a Secret of type
+# kubernetes.io/service-account-token. A request for a cluster scoped object has no namespace and goes to the tracking ID test. A request for a Namespace object may carry the name of the namespace in that field, which does not change a validation.
 # The namespaces and the app components come from internal/bundle/allow.json, so the guards and the apply engine read one list.
 # BUNDLE_ALLOW_JSON names another allow-list file, for the tests.
 set -euo pipefail
@@ -36,7 +37,9 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
   def optout($field):
     "object.spec.template.metadata.\($field)" as $m
     | "(has(\($m)) && \(s("sidecar.istio.io/inject")) in \($m) && \($m)[\(s("sidecar.istio.io/inject"))].lowerAscii() in \(["false", "n", "no", "off"] | celist))";
-  .roles[$role] as $r
+  . as $all
+  | .roles[$role] as $r
+  | ([$r.appComponents[] as $a | $all.classes[$r.components[$a]].objectNamespaces[]] | unique) as $appns
   | s("cell.poc.internal/harness") as $label
   | s("argocd.argoproj.io/tracking-id") as $track
   | {name: "argocd-controller", expression: "request.userInfo.username == \(s("system:serviceaccount:argocd:argocd-application-controller"))"} as $ctl
@@ -49,7 +52,7 @@ docs="$(jq -c --arg role "$role" --arg q "'" '
     (if $role == "cell" then
       policy("bundles-app-limits";
         {apiGroups: ["*"], apiVersions: ["*"], operations: ["CREATE", "UPDATE"], resources: ["*"], scope: "*"};
-        [$ctl, {name: "app-component", expression: "object != null && has(object.metadata.annotations) && \($track) in object.metadata.annotations && (\($r.appComponents | map("object.metadata.annotations[\($track)].startsWith(\(s(. + ":")))") | join(" || ")))"}];
+        [$ctl, {name: "app-component", expression: "(has(request.namespace) && request.namespace in \($appns | celist)) || (object != null && has(object.metadata.annotations) && \($track) in object.metadata.annotations && (\($r.appComponents | map("object.metadata.annotations[\($track)].startsWith(\(s(. + ":")))") | join(" || "))))"}];
         [{expression: "object.kind != \(s("Service")) || ((!has(object.spec.type) || object.spec.type == \(s("ClusterIP"))) && (!has(object.spec.externalIPs) || size(object.spec.externalIPs) == 0))", message: "An app component may create only a Service of type ClusterIP with no externalIPs"},
          {expression: "object.kind != \(s("Deployment")) || !(has(object.spec.template.metadata) && (\(optout("labels")) || \(optout("annotations"))))", message: "An app component may not opt a Deployment out of the sidecar"},
          {expression: "!has(object.metadata.labels) || !(\($label) in object.metadata.labels)", message: "An app component may not create an object with the harness label"},

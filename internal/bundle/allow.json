@@ -9,7 +9,8 @@
         "istio-system",
         "istio-egress",
         "observability-system",
-        "apps-demo"
+        "apps-demo",
+        "apps-sample"
       ],
       "destinationNamespaces": [
         "argocd",
@@ -18,6 +19,7 @@
         "istio-egress",
         "observability-system",
         "apps-demo",
+        "apps-sample",
         "default"
       ],
       "clusterKinds": [
@@ -32,7 +34,13 @@
       ],
       "namespacedKinds": [
         "*"
-      ]
+      ],
+      "namespaceKinds": {
+        "apps-sample": [
+          "networking.k8s.io/NetworkPolicy",
+          "security.istio.io/AuthorizationPolicy"
+        ]
+      }
     },
     "cp-platform": {
       "project": "cell",
@@ -43,6 +51,7 @@
         "istio-egress",
         "observability-system",
         "apps-demo",
+        "apps-sample",
         "external-secrets",
         "spire-system",
         "relay-system"
@@ -54,6 +63,7 @@
         "istio-egress",
         "observability-system",
         "apps-demo",
+        "apps-sample",
         "default",
         "external-secrets",
         "spire-system",
@@ -71,15 +81,21 @@
       ],
       "namespacedKinds": [
         "*"
-      ]
+      ],
+      "namespaceKinds": {
+        "apps-sample": [
+          "networking.k8s.io/NetworkPolicy",
+          "security.istio.io/AuthorizationPolicy"
+        ]
+      }
     },
     "app": {
       "project": "cell-app",
       "objectNamespaces": [
-        "apps-demo"
+        "apps-sample"
       ],
       "destinationNamespaces": [
-        "apps-demo"
+        "apps-sample"
       ],
       "clusterKinds": [],
       "namespacedKinds": [

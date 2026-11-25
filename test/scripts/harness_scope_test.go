@@ -177,6 +177,7 @@ func runHarnessScript(t *testing.T, owned bool, snippet string, env ...string) (
 // A harness component can share its namespace with Argo CD objects. Only its own labelled
 // workloads belong to it.
 func TestHarnessWorkloadsAreTheLabelledOnes(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runHarnessScript(t, false, `harness_workloads cell-identity shared`)
 	if err != nil || strings.TrimSpace(out) != "deployment.apps/celld" {
 		t.Fatalf("err %v, output %q, calls:\n%s; want only deployment.apps/celld", err, out, calls)
@@ -185,6 +186,7 @@ func TestHarnessWorkloadsAreTheLabelledOnes(t *testing.T) {
 
 // A lost label or a failed API call must stop cell:up and cell:restart, not turn them into no-ops.
 func TestHarnessWorkloadsFailClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ env, want string }{
 		{"STUB_NO_LABEL=1", "holds the workloads '' with the label cell.poc.internal/harness=cell-identity, and the bundle cell-identity renders 'deployment.apps/celld'"},
 		{"STUB_LIST_FAIL=1", "could not list the Deployments and StatefulSets of cell-identity in shared"},
@@ -204,6 +206,7 @@ func TestHarnessWorkloadsFailClosed(t *testing.T) {
 
 // cell:up waits only for the rollouts of the labelled workloads.
 func TestHarnessRolloutWaitSkipsOtherDeployments(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runHarnessScript(t, false, `harness_rollout_wait cell-identity shared`)
 	if err != nil {
 		t.Fatalf("err %v, output %q, calls:\n%s", err, out, calls)
@@ -216,6 +219,7 @@ func TestHarnessRolloutWaitSkipsOtherDeployments(t *testing.T) {
 // cell:restart restarts only the labelled workloads, never the objects that Argo CD owns, and it
 // stops when the labelled workloads differ from the bundle.
 func TestRestartSkipsDeploymentsOfOtherOwners(t *testing.T) {
+	t.Parallel()
 	script, err := filepath.Abs("../../scripts/restart.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -239,6 +243,7 @@ func TestRestartSkipsDeploymentsOfOtherOwners(t *testing.T) {
 // harness_apply refuses an object that another owner holds, before the apply. An object of an
 // Application that the current root no longer holds is the M2 migration case: the harness takes it.
 func TestHarnessApplyRefusesObjectsOfOtherOwners(t *testing.T) {
+	t.Parallel()
 	live := func(meta string) string {
 		return `{"kind":"List","items":[{"kind":"Deployment","metadata":{"name":"celld","namespace":"shared"}},{"kind":"ConfigMap","metadata":{"name":"spire-agent","namespace":"shared",` + meta + `}}]}`
 	}
@@ -274,6 +279,7 @@ func TestHarnessApplyRefusesObjectsOfOtherOwners(t *testing.T) {
 // A pod that runs as a plane ServiceAccount gets the plane SVID, so it must belong to the harness
 // component through its label and its controller.
 func TestPlanePodsMustBelongToTheHarness(t *testing.T) {
+	t.Parallel()
 	snippet := `HARNESS_COMPONENTS=("cell-identity:shared"); SPIRE_LOCAL_WORKLOADS="celld=shared/celld"; check_plane_pods`
 	out, calls, err := runHarnessScript(t, false, snippet)
 	if err != nil {
@@ -295,6 +301,7 @@ func TestPlanePodsMustBelongToTheHarness(t *testing.T) {
 // In a shared namespace, cell:verify compares only the objects with the harness label of the
 // component, and skips the field managers of the Namespace, which the component does not hold.
 func TestHarnessObjectsInASharedNamespace(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`)
 	if err != nil {
 		t.Fatalf("check failed in a shared namespace: %v\n%s\ncalls:\n%s", err, out, calls)
@@ -316,6 +323,7 @@ func TestHarnessObjectsInASharedNamespace(t *testing.T) {
 // In the namespace of the component, every object that another manager wrote is extra, and the
 // Namespace must have only the kubectl apply manager, as in M2.
 func TestHarnessObjectsInAnOwnedNamespace(t *testing.T) {
+	t.Parallel()
 	out, _, err := runHarnessScript(t, true, `check_harness_objects cell-identity shared`, "STUB_NS_MANAGER=kubectl")
 	if err == nil || !strings.Contains(out, "argocd-repo-server") || !strings.Contains(out, "argocd-cm") {
 		t.Fatalf("err %v, output %q; want a failure that names the Argo CD objects", err, out)
@@ -329,6 +337,7 @@ func TestHarnessObjectsInAnOwnedNamespace(t *testing.T) {
 // mgmt:rotate-ca refuses a server with an upstream authority, and a cluster with no server, before
 // it calls the cluster.
 func TestRotateCARefusesOtherServers(t *testing.T) {
+	t.Parallel()
 	script, err := filepath.Abs("../../scripts/mgmt-rotate-ca.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -351,6 +360,7 @@ func TestRotateCARefusesOtherServers(t *testing.T) {
 // cluster-scoped kind by the harness label, because a list of that kind holds the objects of every
 // owner, and it never lists a cluster-scoped kind in the namespace.
 func TestHarnessObjectsOfOtherNamespacesAndTheClusterScope(t *testing.T) {
+	t.Parallel()
 	extra := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: elsewhere\n  namespace: other\n---\n" +
 		"apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: celld-read\n"
 	for _, owned := range []bool{false, true} {
@@ -382,6 +392,7 @@ func TestHarnessObjectsOfOtherNamespacesAndTheClusterScope(t *testing.T) {
 // manager validatingadmissionpolicy-status. The check accepts that manager for the status of that
 // kind and no other write of it.
 func TestHarnessObjectsAcceptThePolicyStatusManager(t *testing.T) {
+	t.Parallel()
 	extra := "apiVersion: admissionregistration.k8s.io/v1\nkind: ValidatingAdmissionPolicy\nmetadata:\n  name: guard\n"
 	for _, tc := range []struct {
 		name, manager, want string
@@ -405,6 +416,7 @@ func TestHarnessObjectsAcceptThePolicyStatusManager(t *testing.T) {
 // The status manager of the admission policies is no excuse for another kind: a ConfigMap that it
 // wrote is an extra field manager.
 func TestHarnessObjectsRefuseThePolicyStatusManagerOnAnotherKind(t *testing.T) {
+	t.Parallel()
 	out, _, err := runHarnessScript(t, false, `check_harness_objects cell-identity shared`, "STUB_CM_VAP_STATUS=1")
 	if err == nil || !strings.Contains(out, "ConfigMap/spire-agent has the field manager validatingadmissionpolicy-status (Apply status)") {
 		t.Fatalf("err %v, output %q; want a failure that names the status manager on the ConfigMap", err, out)

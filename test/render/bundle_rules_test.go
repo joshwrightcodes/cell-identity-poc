@@ -266,6 +266,7 @@ func (cr *clusterRender) waveOf(name string) (int, bool) {
 // TestRootBundleWaveOrder checks that no bundle depends on a later wave, a harness component or a
 // link component, so a clean harness:up never waits for something that comes later.
 func TestRootBundleWaveOrder(t *testing.T) {
+	t.Parallel()
 	// The relay comes at wave 8 in dev-cp, after spire-server, and each cell runs the agent as a
 	// harness component, so the loop below checks both.
 	// The collector comes at wave 3 in every cluster. The uplink is a harness component in dev-cp (the
@@ -372,6 +373,7 @@ func TestRootBundleWaveOrder(t *testing.T) {
 // would stop with "namespace not found". The Role envd-steps lives in the namespace of the cell controller, so it belongs to
 // the component that creates that namespace, and that component comes first.
 func TestHarnessWritesOnlyIntoExistingNamespaces(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			creator := map[string]int{}
@@ -403,6 +405,7 @@ func TestHarnessWritesOnlyIntoExistingNamespaces(t *testing.T) {
 // TestCellControllerComesBeforeEnvd: the new envd needs the namespace cell-controller-system and the Role envd-steps at its first
 // round, and both come with the cell controller component. Without them each round ends with store_failed.
 func TestCellControllerComesBeforeEnvd(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		if cr.name != "dev-cp" {
 			continue
@@ -458,6 +461,7 @@ func requiredRecordsMounts(spec map[string]any) []string {
 // TestCellRecordsMountMustBeOptional pins the two rules that the wave test applies to a bundle pod: the mount
 // of cell-records must be optional, and a SPIRE agent sidecar of its own cluster stays refused.
 func TestCellRecordsMountMustBeOptional(t *testing.T) {
+	t.Parallel()
 	pod := func(volume string) map[string]any {
 		var spec map[string]any
 		if err := yaml.Unmarshal([]byte(volume), &spec); err != nil {
@@ -563,6 +567,7 @@ var (
 // TestRenderedPodsPinnedAndBounded checks every container of every render: its image is pinned by
 // digest, and it has CPU and memory requests and a memory limit.
 func TestRenderedPodsPinnedAndBounded(t *testing.T) {
+	t.Parallel()
 	seen := map[string]bool{}
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
@@ -649,6 +654,7 @@ var liveCellVariants = map[string]string{
 // dev-cp run again with no live cell and with one, because their cell rules lose the peers when a cell is absent, and
 // the rule must then go, not stay with an empty list.
 func TestNoEmptyPeerList(t *testing.T) {
+	t.Parallel()
 	// The collector policies and both forms of the uplink must be among the policies that the loop sees.
 	seen := map[string]bool{}
 	defer func() {
@@ -717,6 +723,7 @@ func TestNoEmptyPeerList(t *testing.T) {
 // the kind, namespace and name of a bundle object of the same cluster. cell:up would take such an
 // object from its Application, and Argo CD would take it back on each sync.
 func TestHarnessObjectsHaveOneOwner(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		bundleObjs := map[string]string{}
 		for _, c := range cr.components {
@@ -743,6 +750,7 @@ func TestHarnessObjectsHaveOneOwner(t *testing.T) {
 // from an address list of build/<cluster>/facts.env. A blank or malformed list must stop the
 // render, because a rule with no peers admits every peer.
 func TestRendersRefuseEmptyAddressLists(t *testing.T) {
+	t.Parallel()
 	type render func(t *testing.T, env ...string) (string, string, error)
 	script := func(component, cluster string) render {
 		return func(t *testing.T, env ...string) (string, string, error) {
@@ -783,5 +791,105 @@ func TestRendersRefuseEmptyAddressLists(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+// TestNetworkPolicyAppsSample checks, in every cluster, the policies of the namespace of the app class. The namespace denies
+// all traffic by default, with one policy that has no rule. The other policies admit DNS, the node addresses for the probes
+// of the kubelet, and the pods of the namespace itself, plus the one flow to istiod that a sidecar needs. No policy admits
+// a pod of apps-demo, so a pod of the app class has no path to the platform workloads.
+func TestNetworkPolicyAppsSample(t *testing.T) {
+	t.Parallel()
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			policies := map[string]object{}
+			for _, c := range cr.components {
+				if c.name != "network-policy" {
+					continue
+				}
+				for _, o := range c.objs {
+					if o["kind"] == "NetworkPolicy" && lookupOr(o, "metadata", "namespace") == "apps-sample" {
+						policies[fmt.Sprint(lookupOr(o, "metadata", "name"))] = o
+					}
+				}
+			}
+			if got, want := slices.Sorted(mapKeys(policies)), []string{"allow-dns", "allow-from-nodes", "default-deny", "workloads"}; !slices.Equal(got, want) {
+				t.Fatalf("apps-sample holds the policies %v in %s, want %v", got, cr.name, want)
+			}
+			// Each policy has a fixed spec. A rule that is added, such as an empty namespaceSelector or an ipBlock, fails the comparison.
+			for name, want := range appsSamplePolicySpecs {
+				// The /32 addresses of the DNS Service and the nodes differ between clusters, so the comparison masks them.
+				got := cidrMask.ReplaceAllString(jsonOf(t, get[any](t, policies[name], "spec")), `"cidr":"ADDR/32"`)
+				if got != want {
+					t.Errorf("the policy %s of apps-sample in %s has the spec\n%s\nwant\n%s", name, cr.name, got, want)
+				}
+			}
+		})
+	}
+}
+
+// appsSamplePolicySpecs are the specs of the NetworkPolicies of apps-sample. default-deny has no rule. allow-dns and
+// allow-from-nodes are the policies of every namespace. workloads admits the pods of the namespace, the collector on 15090
+// (flow N15) and, as egress, the pods of the namespace and istiod on 15012. No rule names apps-demo.
+var appsSamplePolicySpecs = map[string]string{
+	"default-deny":     `{"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
+	"allow-dns":        `{"egress":[{"ports":[{"port":53,"protocol":"UDP"},{"port":53,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"kube-system"}},"podSelector":{"matchLabels":{"k8s-app":"kube-dns"}}},{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Egress"]}`,
+	"allow-from-nodes": `{"ingress":[{"from":[{"ipBlock":{"cidr":"ADDR/32"}}]}],"podSelector":{},"policyTypes":["Ingress"]}`,
+	"workloads":        `{"egress":[{"to":[{"podSelector":{}}]},{"ports":[{"port":15012,"protocol":"TCP"}],"to":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"istio-system"}}}]}],"ingress":[{"from":[{"podSelector":{}}]},{"from":[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"observability-system"}},"podSelector":{"matchLabels":{"app.kubernetes.io/name":"otel-collector"}}}],"ports":[{"port":15090,"protocol":"TCP"}]}],"podSelector":{},"policyTypes":["Ingress","Egress"]}`,
+}
+
+var cidrMask = regexp.MustCompile(`"cidr":"[0-9.]+/32"`)
+
+// TestMeshDenyAllAppsSample checks, in every cluster, that the mesh denies each request to a workload of apps-sample by default:
+// an AuthorizationPolicy with an empty spec, as in apps-demo, and no policy of the mesh component that allows a request there.
+func TestMeshDenyAllAppsSample(t *testing.T) {
+	t.Parallel()
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			found := 0
+			for _, c := range cr.components {
+				for _, o := range c.objs {
+					if o["kind"] != "AuthorizationPolicy" || lookupOr(o, "metadata", "namespace") != "apps-sample" {
+						continue
+					}
+					found++
+					if name := lookupOr(o, "metadata", "name"); name != "deny-all" || c.name != "mesh-policy" || jsonOf(t, get[any](t, o, "spec")) != "{}" {
+						t.Errorf("apps-sample holds the AuthorizationPolicy %v of %s with the spec %s, want only deny-all of mesh-policy with an empty spec", name, c.name, jsonOf(t, get[any](t, o, "spec")))
+					}
+				}
+			}
+			if found != 1 {
+				t.Errorf("apps-sample holds %d AuthorizationPolicies in %s, want deny-all alone", found, cr.name)
+			}
+		})
+	}
+}
+
+// TestNamespaceAppsSample checks, in every cluster, the labels of Namespace apps-sample. Pod Security restricted refuses a
+// privileged or hostNetwork pod, which would bypass every NetworkPolicy. The mesh label gives each pod a sidecar. The label
+// cell.poc.internal/workloads stays off, because the policy of the egress gateway admits each namespace that carries it.
+func TestNamespaceAppsSample(t *testing.T) {
+	t.Parallel()
+	for _, cr := range renderAll(t) {
+		t.Run(cr.name, func(t *testing.T) {
+			var ns object
+			for _, c := range cr.components {
+				if c.name != "namespaces" {
+					continue
+				}
+				for _, o := range c.objs {
+					if o["kind"] == "Namespace" && lookupOr(o, "metadata", "name") == "apps-sample" {
+						ns = o
+					}
+				}
+			}
+			if ns == nil {
+				t.Fatalf("the namespaces component of %s renders no Namespace apps-sample", cr.name)
+			}
+			want := `{"istio-injection":"enabled","pod-security.kubernetes.io/enforce":"restricted"}`
+			if got := jsonOf(t, get[any](t, ns, "metadata", "labels")); got != want {
+				t.Errorf("the labels of Namespace apps-sample in %s are %s, want %s", cr.name, got, want)
+			}
+		})
 	}
 }

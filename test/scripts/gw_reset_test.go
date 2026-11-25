@@ -48,6 +48,7 @@ fi
 // TestGwReset: gw-reset.sh sets the replicas of cell-gateway to 0 and deletes the volume claim, in this order, then sets the replicas to 1
 // through harness-replicas.sh, and prints one JSON line with the old and the new epoch.
 func TestGwReset(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
@@ -130,6 +131,7 @@ func TestGwReset(t *testing.T) {
 // TestGwResetWaitsForThePodAndNeedsTheClaim: the volume claim goes only after the pod is gone, and a missing claim ends the script with
 // one JSON error line and no delete that looks like a success.
 func TestGwResetWaitsForThePodAndNeedsTheClaim(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

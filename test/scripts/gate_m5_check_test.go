@@ -16,6 +16,7 @@ import (
 // command that brings the workload up to date. The cell-proxy clients are not in this check: a new image of the server
 // changes the digest of every user of cell-proxy, and the M3 check covers the clients.
 func TestGateM5ImageCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, stale, want string
@@ -35,7 +36,7 @@ func TestGateM5ImageCheck(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := newM5GateRoot(t, tc.stale)
 			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m5")
-			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -104,6 +105,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 	  *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
 	  *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
 	  *" get deployment/argocd-agent-principal "*|*" get deployment/telemetry-gateway "*|*" get deployment/mesh-view-hub "*) one cell-proxy cell-proxy ;;
+	  *" get configmap spire-server "*) printf 'server {\n  agent_ttl = "1m"\n}\n' ;;
 	  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 	esac
 	`)
@@ -113,6 +115,7 @@ func newM5GateRoot(t *testing.T, stale string) string {
 // TestGateM5TokenScan: after the tests, gate.sh m5, m5-soak and m5-drill run gate-token-scan.sh with the start time of the run. A
 // hit fails the gate with the lines of the scan, and a clean scan leaves the result of the tests. gate.sh m4 runs no scan.
 func TestGateM5TokenScan(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		milestone string
@@ -146,7 +149,7 @@ echo "scan $*" >>"$STUB_LOG"
 			if tc.hit {
 				hit = "1"
 			}
-			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=", "STUB_HIT=" + hit}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))

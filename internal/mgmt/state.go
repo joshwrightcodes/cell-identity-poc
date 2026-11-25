@@ -33,6 +33,9 @@ type CellState struct {
 	CheckedAt     time.Time        `json:"checkedAt"`
 	KeysUpdatedAt time.Time        `json:"keysUpdatedAt"`
 	LastCheck     string           `json:"lastCheck"`
+	// Revoked marks a cell that the plane revoked. Every record that the plane signs for the cell
+	// carries it, until an un-revoke clears it.
+	Revoked bool `json:"revoked,omitempty"`
 }
 
 // Signed is one served revision: the spec and the records.
@@ -106,6 +109,24 @@ type State struct {
 	Requests map[string]*Request `json:"requests"`
 	// Bundles holds the bundle state of each target, by target name.
 	Bundles map[string]*BundleState `json:"bundles,omitempty"`
+	// Revocations is the mirror: one event for each revoke and un-revoke that the plane signed,
+	// oldest first. LastRevocation is the revision of the newest signed revoke, and no restore goes
+	// below it in the same epoch. PendingRevokes holds the revokes that wait for their revision,
+	// oldest first: one revoke commits for each revision that envd reports as applied.
+	Revocations    []mgmtapi.RevocationEvent `json:"revocations,omitempty"`
+	LastRevocation spec.Revision             `json:"lastRevocation,omitzero"`
+	PendingRevokes []PendingRevoke           `json:"pendingRevokes,omitempty"`
+}
+
+// PendingRevoke is a revoke that waits for its revision. Source is mgmtapi.RevocationSourceAdmin or
+// mgmtapi.RevocationSourceOperator. EntryID and OperatorKeySHA256 name the local revocation entry
+// and the operator key of an adopted entry.
+type PendingRevoke struct {
+	Cell              string    `json:"cell"`
+	Source            string    `json:"source"`
+	EntryID           string    `json:"entryId,omitempty"`
+	OperatorKeySHA256 string    `json:"operatorKeySHA256,omitempty"`
+	QueuedAt          time.Time `json:"queuedAt"`
 }
 
 func newState(keySHA string) *State {
@@ -126,6 +147,8 @@ func (s *State) clone() *State {
 		c.Retired = map[string]spec.Revision{}
 	}
 	c.PendingDrops = slices.Clone(s.PendingDrops)
+	c.Revocations = slices.Clone(s.Revocations)
+	c.PendingRevokes = slices.Clone(s.PendingRevokes)
 	c.History = slices.Clone(s.History)
 	c.Ops = make(map[string]*OpState, len(s.Ops))
 	for k, v := range s.Ops {

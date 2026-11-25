@@ -15,7 +15,7 @@ import (
 
 func composeSet() bundle.Set {
 	return bundle.Set{Version: bundle.Version{Epoch: 1, Counter: 1}, Components: []bundle.Component{
-		{Name: "apps-sample", Wave: 5, Namespace: "apps-demo", Digest: hexDigest('1')},
+		{Name: "apps-sample", Wave: 5, Namespace: "apps-sample", Digest: hexDigest('1')},
 		{Name: "argocd", Wave: -1, Namespace: "argocd", Digest: hexDigest('2')},
 		{Name: "istiod", Wave: 3, Namespace: "istio-system", Digest: hexDigest('3'),
 			IgnoreDifferences: json.RawMessage(`[{"group":"admissionregistration.k8s.io","kind":"ValidatingWebhookConfiguration","jqPathExpressions":[".webhooks[]?.failurePolicy",".webhooks[]?.clientConfig.caBundle"]},{"group":"admissionregistration.k8s.io","kind":"MutatingWebhookConfiguration","jqPathExpressions":[".webhooks[]?.clientConfig.caBundle"]}]`)},

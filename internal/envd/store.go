@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 )
 
@@ -27,7 +28,19 @@ const (
 	AnnotationEpoch   = "poc.internal/spec-epoch"
 	AnnotationCounter = "poc.internal/spec-counter"
 	AnnotationKeySHA  = "poc.internal/spec-key-sha256"
+	// RevocationsKey holds the held overlay: a JSON array of entry envelopes, sorted by cell. The
+	// key is present only while the overlay holds an entry.
+	RevocationsKey = "local-revocations.json"
 )
+
+// StoreOption changes a store that NewConfigMapStore returns.
+type StoreOption func(*configMapStore)
+
+// WithOperatorKeys makes the store read the held overlay of RevocationsKey: each envelope must verify
+// under the keys that keys returns and name the env of the store. Without it, the key is a stray key.
+func WithOperatorKeys(keys func() []ed25519.PublicKey) StoreOption {
+	return func(s *configMapStore) { s.operatorKeys = keys }
+}
 
 // ErrStateUnverifiable means the stored state carries the fingerprint of the pinned key but does
 // not verify. Load never replaces such a state with an empty one, because that would drop the marks.
@@ -65,6 +78,8 @@ type configMapStore struct {
 	keys      []ed25519.PublicKey
 	pin       string
 	log       *slog.Logger
+	// operatorKeys is nil when the store does not read the overlay.
+	operatorKeys func() []ed25519.PublicKey
 }
 
 // KeyFingerprint returns the lowercase hex SHA-256 of the pinned keys, joined in order.
@@ -80,8 +95,19 @@ func KeyFingerprint(keys []ed25519.PublicKey) string {
 // absent ConfigMap, and for one whose spec does not verify under the pinned keys and whose key
 // annotation differs from the pin. A stored spec that verifies is kept, whatever the annotation says.
 // A state that does not verify and carries the pin gives an error that wraps ErrStateUnverifiable.
-func NewConfigMapStore(c kubernetes.Interface, namespace, name, env string, keys []ed25519.PublicKey, log *slog.Logger) Store {
-	return &configMapStore{c: c, namespace: namespace, name: name, env: env, keys: keys, pin: KeyFingerprint(keys), log: log}
+func NewConfigMapStore(c kubernetes.Interface, namespace, name, env string, keys []ed25519.PublicKey, log *slog.Logger, opts ...StoreOption) Store {
+	s := &configMapStore{c: c, namespace: namespace, name: name, env: env, keys: keys, pin: KeyFingerprint(keys), log: log}
+	for _, o := range opts {
+		o(s)
+	}
+	return s
+}
+
+// overlayJSON returns the canonical form of the held overlay of RevocationsKey.
+func overlayJSON(h revoke.Held) string {
+	// A list of compact envelopes always encodes.
+	raw, _ := json.Marshal(h.Envelopes())
+	return string(raw)
 }
 
 func unverifiable(format string, args ...any) error {
@@ -111,11 +137,43 @@ func (s *configMapStore) decode(cm *corev1.ConfigMap) (st *State, clean bool, er
 	if err != nil {
 		return nil, false, unverifiable("configmap %s/%s: %v", s.namespace, s.name, err)
 	}
-	clean = len(cm.BinaryData) == 0 && len(cm.Data) == len(want) &&
+	overlayClean := true
+	if raw, ok := cm.Data[RevocationsKey]; ok && s.operatorKeys != nil {
+		want[RevocationsKey] = true
+		st.Revocations, overlayClean = s.decodeOverlay(raw)
+	}
+	clean = overlayClean && len(cm.BinaryData) == 0 && len(cm.Data) == len(want) &&
 		cm.Annotations[AnnotationKeySHA] == s.pin &&
 		cm.Annotations[AnnotationEpoch] == strconv.FormatUint(st.Revision.Epoch, 10) &&
 		cm.Annotations[AnnotationCounter] == strconv.FormatUint(st.Revision.Counter, 10)
 	return st, clean, nil
+}
+
+// maxStoredOverlayBytes bounds the stored overlay that decodeOverlay parses. The canonical form of
+// revoke.MaxHeld entries takes at most half of it.
+const maxStoredOverlayBytes = 2 * revoke.MaxHeld * revoke.MaxCanonicalBytes
+
+// decodeOverlay reads the stored overlay with revoke.Load, which applies no stale rule. It returns the
+// entries that verify, and whether raw is exactly the canonical form of a non-empty overlay. A value
+// above maxStoredOverlayBytes or a list of more than revoke.MaxHeld items gives no entries and is not
+// clean, so the puller writes back the overlay that it holds.
+func (s *configMapStore) decodeOverlay(raw string) (revoke.Held, bool) {
+	if len(raw) > maxStoredOverlayBytes {
+		return nil, false
+	}
+	var list []json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &list); err != nil || len(list) > revoke.MaxHeld {
+		return nil, false
+	}
+	envelopes := make([][]byte, 0, len(list))
+	for _, e := range list {
+		envelopes = append(envelopes, e)
+	}
+	held, refusals := revoke.Load(envelopes, s.operatorKeys(), s.env)
+	if len(held) == 0 {
+		return nil, false
+	}
+	return held, len(refusals) == 0 && raw == overlayJSON(held)
 }
 
 func (s *configMapStore) get(ctx context.Context) (*corev1.ConfigMap, error) {
@@ -173,6 +231,9 @@ func (s *configMapStore) write(ctx context.Context, st *State, guard bool) error
 	data[SpecKey] = string(st.SpecEnvelope)
 	for name, raw := range st.Records {
 		data[name+RecordSuffix] = string(raw)
+	}
+	if len(st.Revocations) > 0 {
+		data[RevocationsKey] = overlayJSON(st.Revocations)
 	}
 	annotations := map[string]string{
 		AnnotationEpoch:   strconv.FormatUint(st.Revision.Epoch, 10),

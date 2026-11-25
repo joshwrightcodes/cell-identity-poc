@@ -32,14 +32,16 @@ func envdContainer(t *testing.T, objs map[string]object) map[string]any {
 // 600 s, read only), and the memory limit of 256Mi, which is a hypothesis that the live part of M8 measures. No flag
 // names a list of cells: the plane policies carry the cell flows.
 func TestEnvdBundleFlags(t *testing.T) {
+	t.Parallel()
 	objs := envdObjects(t)
 	pod := get[map[string]any](t, objs["Deployment envd-system/envd"], "spec", "template", "spec")
 	envd := envdContainer(t, objs)
 	args := get[[]any](t, envd, "args")
-	if len(args) != 19 {
-		t.Fatalf("envd has %d args, want 19: %v", len(args), args)
+	// The four flags of M9 follow the bundle flags (TestEnvdOperatorPin).
+	if len(args) != 23 {
+		t.Fatalf("envd has %d args, want 23: %v", len(args), args)
 	}
-	if got, want := fmt.Sprint(args[13:]), fmt.Sprint([]string{
+	if got, want := fmt.Sprint(args[13:19]), fmt.Sprint([]string{
 		"--cluster=dev-cp",
 		"--bundle-mirror=172.18.0.7:5000",
 		"--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
@@ -97,9 +99,11 @@ func TestEnvdBundleFlags(t *testing.T) {
 // TestEnvdRBACExact checks every right that the apply engine needs, and no other: Role envd-argocd in argocd (list
 // Applications, and patch only root and the Application of each component of role cp), ClusterRole envd-netpol-read
 // (list NetworkPolicies), Role
-// envd-bundle-state in envd-system (create ConfigMaps, and get and update only bundle-state), the earlier Role envd-records, and a
-// binding of each to the envd account of envd-system. Every object carries the harness label.
+// envd-bundle-state in envd-system (create ConfigMaps, and get and update only bundle-state), the earlier Role envd-records, Role
+// envd-revocations of M9 (TestEnvdRevocationsRole), and a binding of each to the envd account of envd-system. Every object
+// carries the harness label.
 func TestEnvdRBACExact(t *testing.T) {
+	t.Parallel()
 	objs := envdObjects(t)
 	role := objs["Role argocd/envd-argocd"]
 	if role == nil {
@@ -129,6 +133,7 @@ func TestEnvdRBACExact(t *testing.T) {
 		"RoleBinding argocd/envd-argocd":            "Role envd-argocd",
 		"ClusterRoleBinding envd-netpol-read":       "ClusterRole envd-netpol-read",
 		"RoleBinding envd-system/envd-bundle-state": "Role envd-bundle-state",
+		"RoleBinding envd-system/envd-revocations":  "Role envd-revocations",
 		"RoleBinding spire-system/envd-records":     "Role envd-records",
 	} {
 		b := objs[key]
@@ -156,10 +161,10 @@ func TestEnvdRBACExact(t *testing.T) {
 	}
 	slices.Sort(rights)
 	slices.Sort(bindings)
-	if want := []string{"ClusterRole envd-netpol-read", "Role argocd/envd-argocd", "Role envd-system/envd-bundle-state", "Role spire-system/envd-records"}; !slices.Equal(rights, want) {
+	if want := []string{"ClusterRole envd-netpol-read", "Role argocd/envd-argocd", "Role envd-system/envd-bundle-state", "Role envd-system/envd-revocations", "Role spire-system/envd-records"}; !slices.Equal(rights, want) {
 		t.Errorf("the render prints the roles %v, want %v", rights, want)
 	}
-	if len(bindings) != 4 {
+	if len(bindings) != 5 {
 		t.Errorf("the render prints the bindings %v, want one for each right", bindings)
 	}
 }
@@ -168,6 +173,7 @@ func TestEnvdRBACExact(t *testing.T) {
 // pods of bundle-store, port 5000), as the last two egress rules of policy envd. The mirror address comes from the host
 // service.
 func TestEnvdMirrorRule(t *testing.T) {
+	t.Parallel()
 	for _, ip := range []string{"172.18.0.7", "172.18.0.99"} {
 		egress := get[[]any](t, envdObjects(t, "STUB_REGISTRY_IP="+ip)["NetworkPolicy envd-system/envd"], "spec", "egress")
 		if len(egress) != 8 {
@@ -207,6 +213,7 @@ const envdPeer = "envd-system/envd"
 // selector is {} so that a bundle cannot move a pod out of the policy by a label. The plane-cells policies are absent
 // while no cell is live. The set of policies equals the plane policies of role cp in allow.json.
 func TestCpPlanePolicies(t *testing.T) {
+	t.Parallel()
 	variants := []struct {
 		name, kind string
 		cells      []string
@@ -299,6 +306,7 @@ func TestCpPlanePolicies(t *testing.T) {
 // TestEnvdRenderCellsFailClosed gives the cell part of the render a wrong input. A live cell whose facts fail, or that has
 // no node address, stops the render, because a cell that the render left out would lose its place in the admit lists.
 func TestEnvdRenderCellsFailClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -323,6 +331,7 @@ func TestEnvdRenderCellsFailClosed(t *testing.T) {
 // TestEnvdRenderFollowsTheCells: a cell that goes away leaves the addresses of both plane-cells policies at the next render, as
 // the render that cell:down starts for dev-cp, and a cell that has no node address is not live.
 func TestEnvdRenderFollowsTheCells(t *testing.T) {
+	t.Parallel()
 	both := envdObjects(t)
 	for _, env := range [][]string{{"STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-1"}, {"STUB_NO_NODE_IP=dev-cell-2"}} {
 		one := envdObjects(t, env...)
@@ -342,6 +351,7 @@ func TestEnvdRenderFollowsTheCells(t *testing.T) {
 // while the cluster_jwt section and the entries of both live cells stay. The cell and envd flows live in harness plane
 // policies, which a bundle cannot take away.
 func TestSpireServerHasNoCellRules(t *testing.T) {
+	t.Parallel()
 	r := renderCell(t, "dev-cp")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -395,6 +405,7 @@ func TestSpireServerHasNoCellRules(t *testing.T) {
 // TestRelayHasNoCellRules checks that no rule of the relay bundle admits a cell address or reaches management, in any
 // policy, whichever cells are live.
 func TestRelayHasNoCellRules(t *testing.T) {
+	t.Parallel()
 	r := renderRelay(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -479,6 +490,7 @@ func admits(t *testing.T, objs map[string]object, ns, dir, peer string, port int
 // cell nodes to the SPIRE server (8081) and to the relay routes, the relay to the management routes, envd to the SPIRE
 // server, and the applier of each role to the bundle store (5000).
 func TestPlaneFlowsHarnessOnly(t *testing.T) {
+	t.Parallel()
 	cp := envdObjects(t)
 	for _, f := range []struct {
 		ns, dir, peer string
@@ -537,6 +549,7 @@ func TestPlaneFlowsHarnessOnly(t *testing.T) {
 // TestEnvdPlaneCellsFollowTheCatalog: a cell that is live but that SPIRE_AGENT_CELLS leaves out gets no address in either
 // plane-cells policy, and the render reads no facts of it.
 func TestEnvdPlaneCellsFollowTheCatalog(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t, "SPIRE_AGENT_CELLS=dev-cell-1")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -554,6 +567,7 @@ func TestEnvdPlaneCellsFollowTheCatalog(t *testing.T) {
 
 // TestEnvdMirrorPortCheck: a registry mirror on another port stops the render, because rule N48 admits port 5000 only.
 func TestEnvdMirrorPortCheck(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t, "STUB_REGISTRY_PORT=5001")
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "the registry mirror port is '5001'") {
 		t.Errorf("err %v, stdout %d bytes, stderr %q; want a stop that names the port", r.err, len(r.stdout), r.stderr)
@@ -563,6 +577,7 @@ func TestEnvdMirrorPortCheck(t *testing.T) {
 // TestEnvdNoWorkloadPolicyWithoutWorkloads: when envd is the only local workload, the render prints no plane-workloads policy,
 // because a rule with an empty peer list admits every source.
 func TestEnvdNoWorkloadPolicyWithoutWorkloads(t *testing.T) {
+	t.Parallel()
 	objs := envdObjects(t, "SPIRE_LOCAL_WORKLOADS=envd=envd-system/envd")
 	if objs["NetworkPolicy spire-system/plane-workloads"] != nil {
 		t.Error("the render prints plane-workloads with no peer")
@@ -575,6 +590,7 @@ func TestEnvdNoWorkloadPolicyWithoutWorkloads(t *testing.T) {
 // TestSpireServerRoleLookup: the render needs CELL_NAME to find the bundle role, and a failed lookup stops it. A cluster of role
 // open keeps the workload policy.
 func TestSpireServerRoleLookup(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string

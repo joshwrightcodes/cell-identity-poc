@@ -13,10 +13,12 @@ var sha256Call = regexp.MustCompile(`(^|[|(]\s*|\$\()sha256(\s|\)|$)`)
 
 var sha256Def = regexp.MustCompile(`(?m)^sha256\(\)\s*\{`)
 
-var sourcesLib = regexp.MustCompile(`(?m)source\s+"[^"]*lib\.sh"`)
+// sourcesLib matches `source "<path>/lib.sh"` and the form `source "$(dirname "$0")/lib.sh"` of most scripts, whose path holds quotes.
+var sourcesLib = regexp.MustCompile(`(?m)source\s+("[^"]*|"\$\(dirname "\$0"\))/?lib\.sh"`)
 
 // TestScriptsHashPortably: every script that calls sha256 gets the portable function, so the call works on Linux as well as on the Mac.
 func TestScriptsHashPortably(t *testing.T) {
+	t.Parallel()
 	lib, err := os.ReadFile("../../scripts/lib.sh")
 	if err != nil {
 		t.Fatal(err)

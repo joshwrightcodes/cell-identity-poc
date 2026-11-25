@@ -3,8 +3,9 @@
 # In each cluster with components, it reads the log of every container that runs the image cellgw, envd, mgmtd, celld, cell-proxy or
 # cell-controller since the start time, and the previous log of a container that restarted. It reads each step log of the host service
 # (build/hostsvc/steps/*.log, or the files in HOSTSVC_STEPS_DIR) in full, because a stage prints the output of a harness task. A line that
-# holds a compact JWS (eyJ..., a dot, eyJ..., a dot) or the text PRIVATE KEY----- is a token or a key: the script prints the cluster, the
-# pod, the container and the line number, or the step log and the line number, never the line, and exits 1.
+# holds a compact JWS (eyJ..., a dot, eyJ..., a dot), the text PRIVATE KEY----- or the operator seed prefix OPERATOR-ED25519-SEED: is a
+# token or a key: the script prints the cluster, the pod, the container and the line number, or the step log and the line number, never
+# the line, and exits 1.
 # It also reads each container named store-proxy or store-token, whatever its image, because they carry the bundle store tokens of M8, and each file
 # build/gate/m8-* that a gate:m8 run leaves. The standard
 # base64 of any JSON object starts with eyJ, so a bare eyJ is no token. The logs of a pod that a test deleted are gone, and so is the log of a middle
@@ -13,7 +14,7 @@ source "$(dirname "$0")/lib.sh"
 source "$ROOT/scripts/steps-lib.sh"
 
 since="${1:?usage: gate-token-scan.sh <start time, RFC 3339 UTC>}"
-shape='eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]*\.|PRIVATE KEY-----'
+shape='eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]*\.|PRIVATE KEY-----|OPERATOR-ED25519-SEED:'
 status=0
 
 # A cell has no cluster until its step creates it, so the scan reads the clusters that exist.

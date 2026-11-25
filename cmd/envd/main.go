@@ -5,9 +5,10 @@
 //	  --spec-key-file <file> --env <env> --output-configmap <ns>/<name>
 //	  --gateway <https-url> --gateway-id <id> --hints-configmap <ns>/<name>
 //	  --steps-configmap <ns>/<name> --step-status-configmap <ns>/<name>
-//	  [--interval 10s] [--health-listen :8080] [--cluster <name>]
+//	  [--interval 10s] [--report-rate 5] [--health-listen :8080] [--cluster <name>]
 //	  [--bundle-mirror <host:port> --bundle-store <host:port> --bundle-store-token <file>
 //	   --bundle-state-configmap <ns>/<name> --bundle-health-timeout 5m]
+//	  [--operator-key-file <file> --revocations-configmap <ns>/<name>]
 //	envd check --spec-key-file <file> --env <env> --current-configmap <ns>/<name>
 //
 // run takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET and trusts the management plane
@@ -19,6 +20,10 @@
 // bundle.apply) that the ops pull carries in planeBundle, and reports the result in its status. run
 // never forwards an operation for --cluster to the gateway. The plane path runs only after run accepts
 // a spec and only when a gateway is set, because the ops pull belongs to the relay legs.
+//
+// With --operator-key-file, run takes in the signed local revocation entries of
+// --revocations-configmap, holds the ones that verify under the pinned operator keys in its
+// ConfigMap, and passes them to the gateway and in each status report.
 //
 // check reads one SpecBundle from standard input, loads the current state without writing it, and
 // prints one JSON line. It starts no telemetry. The exit status is 0 for accepted and unchanged, and
@@ -37,6 +42,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -63,7 +69,9 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/envd"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -77,6 +85,8 @@ const (
 	loadTimeout = 15 * time.Second
 	// kubeTimeout bounds each request to the Kubernetes API.
 	kubeTimeout = 15 * time.Second
+	// defaultBundleRefillEvery is the time between probes of the bundle store.
+	defaultBundleRefillEvery = time.Minute
 	// defaultBundleHealthTimeout is the time that a new bundle set has to become healthy.
 	defaultBundleHealthTimeout = 5 * time.Minute
 	// exitConfig is the status of a configuration error.
@@ -116,7 +126,7 @@ func realDeps() deps {
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
 			sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
 			defer cancel()
-			src, err := workloadapi.NewX509Source(sctx)
+			src, err := workloadapi.NewX509Source(sctx, spireclient.SourceOptions())
 			if err != nil {
 				return nil, nil, fmt.Errorf("x509 source from the workload api: %w", err)
 			}
@@ -231,6 +241,7 @@ type runConfig struct {
 	namespace    string
 	configMap    string
 	interval     time.Duration
+	reportRate   float64
 	healthListen string
 	gateway      string
 	gatewayID    spiffeid.ID
@@ -250,6 +261,13 @@ type runConfig struct {
 	bundleNS            string
 	bundleName          string
 	bundleHealthTimeout time.Duration
+	// operatorKeyFile is the pin of the operator keys, and operatorKeys the keys that it held at
+	// startup. They go with revocationsNS and revocationsName, the input of the local revocations.
+	operatorKeyFile   string
+	operatorKeys      []ed25519.PublicKey
+	revocationsNS     string
+	revocationsName   string
+	bundleRefillEvery time.Duration
 }
 
 func parseRun(args []string) (runConfig, error) {
@@ -262,6 +280,7 @@ func parseRun(args []string) (runConfig, error) {
 	env := fs.String("env", "", "environment name")
 	out := fs.String("output-configmap", "", "ConfigMap that holds the records, as <namespace>/<name>")
 	interval := fs.Duration("interval", 10*time.Second, "time between pulls")
+	reportRate := fs.Float64("report-rate", envd.DefaultReportRate, "report items per second that envd posts to the management plane")
 	health := fs.String("health-listen", ":8080", "address of the health endpoint")
 	gateway := fs.String("gateway", "", "base URL of the cell gateway, https://<host>:<port>")
 	gatewayID := fs.String("gateway-id", "", "the exact SPIFFE ID of the cell gateway")
@@ -274,6 +293,9 @@ func parseRun(args []string) (runConfig, error) {
 	storeToken := fs.String("bundle-store-token", "", "file with the projected token for the bundle store")
 	state := fs.String("bundle-state-configmap", "", "ConfigMap that holds the bundle state, as <namespace>/<name>")
 	healthTimeout := fs.Duration("bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
+	operatorKeyFile := fs.String("operator-key-file", "", "file with the pinned operator public keys, one standard base64 key on each line")
+	revocations := fs.String("revocations-configmap", "", "ConfigMap that holds the signed local revocation entries, as <namespace>/<name>")
+	refillEvery := fs.Duration("bundle-refill-every", defaultBundleRefillEvery, "time between probes of the bundle store, which refills it after a loss; 0 turns the probe off")
 	if err := parseFlags(fs, args); err != nil {
 		return runConfig{}, err
 	}
@@ -287,6 +309,9 @@ func parseRun(args []string) (runConfig, error) {
 	}
 	if *interval <= 0 {
 		return runConfig{}, errors.New("--interval must be positive")
+	}
+	if !(*reportRate > 0) || math.IsInf(*reportRate, 0) {
+		return runConfig{}, errors.New("--report-rate must be positive")
 	}
 	if err := checkEnv(*env); err != nil {
 		return runConfig{}, err
@@ -339,14 +364,72 @@ func parseRun(args []string) (runConfig, error) {
 		return runConfig{}, err
 	}
 	rc := runConfig{upstream: *upstream, expect: id, peer: peer, key: key, keyFile: *keyFile, env: *env, namespace: ns,
-		configMap: cm, interval: *interval, healthListen: *health,
+		configMap: cm, interval: *interval, reportRate: *reportRate, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
 		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
-		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout}
+		bundleMirror: *mirror, bundleStore: *store, bundleStoreToken: *storeToken, bundleHealthTimeout: *healthTimeout, bundleRefillEvery: *refillEvery}
 	if err := checkPlaneFlags(&rc, fs, *state); err != nil {
 		return runConfig{}, err
 	}
+	if err := checkRevocationFlags(&rc, *operatorKeyFile, *revocations); err != nil {
+		return runConfig{}, err
+	}
 	return rc, nil
+}
+
+// checkRevocationFlags checks --operator-key-file and --revocations-configmap, which go together.
+func checkRevocationFlags(rc *runConfig, keyFile, revocations string) error {
+	if keyFile == "" && revocations == "" {
+		return nil
+	}
+	if err := required(map[string]string{"operator-key-file": keyFile, "revocations-configmap": revocations}); err != nil {
+		return err
+	}
+	keys, err := readOperatorKeys(keyFile)
+	if err != nil {
+		return err
+	}
+	ns, cm, err := configMapRef("revocations-configmap", revocations)
+	if err != nil {
+		return err
+	}
+	rc.operatorKeyFile, rc.operatorKeys, rc.revocationsNS, rc.revocationsName = keyFile, keys, ns, cm
+	return nil
+}
+
+// readOperatorKeys reads the pin of the operator keys, as in key keys.pub of ConfigMap operator-key.
+func readOperatorKeys(path string) ([]ed25519.PublicKey, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	keys, err := revoke.ParseKeys(raw)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	return keys, nil
+}
+
+// operatorKeys returns a function that reads the pin in path again on each call, so that a key
+// rotation takes effect without a restart. A failed read gives the last keys that loaded, or seed
+// before any read works, and logs one line until a read works again.
+func operatorKeys(path string, seed []ed25519.PublicKey, log *slog.Logger) func() []ed25519.PublicKey {
+	var mu sync.Mutex
+	last, failing := seed, false
+	return func() []ed25519.PublicKey {
+		mu.Lock()
+		defer mu.Unlock()
+		keys, err := readOperatorKeys(path)
+		if err != nil {
+			if !failing {
+				log.Warn("operator keys not reloaded", "error", err.Error())
+			}
+			failing = true
+			return last
+		}
+		last, failing = keys, false
+		return last
+	}
 }
 
 // checkPlaneFlags checks the cluster and bundle flags. The bundle flags go together: with --bundle-mirror
@@ -358,7 +441,7 @@ func checkPlaneFlags(rc *runConfig, fs *flag.FlagSet, state string) error {
 		return errors.New("--cluster must be a DNS label")
 	}
 	if rc.bundleMirror == "" {
-		for _, n := range []string{"bundle-store", "bundle-store-token", "bundle-state-configmap", "bundle-health-timeout"} {
+		for _, n := range []string{"bundle-store", "bundle-store-token", "bundle-state-configmap", "bundle-health-timeout", "bundle-refill-every"} {
 			if set[n] {
 				return fmt.Errorf("--%s needs --bundle-mirror", n)
 			}
@@ -371,6 +454,9 @@ func checkPlaneFlags(rc *runConfig, fs *flag.FlagSet, state string) error {
 	}
 	if rc.bundleHealthTimeout <= 0 {
 		return errors.New("--bundle-health-timeout must be positive")
+	}
+	if rc.bundleRefillEvery < 0 {
+		return errors.New("--bundle-refill-every must not be negative")
 	}
 	var err error
 	rc.bundleNS, rc.bundleName, err = configMapRef("bundle-state-configmap", state)
@@ -425,6 +511,12 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		}
 	}
 	puller := envd.NewPuller(pc)
+	if pc.Plane != nil {
+		var refill sync.WaitGroup
+		rctx, stopRefill := context.WithCancel(ctx)
+		defer func() { stopRefill(); refill.Wait() }()
+		refill.Go(func() { pc.Plane.RunRefill(rctx) })
+	}
 
 	ln, err := net.Listen("tcp", cfg.healthListen)
 	if err != nil {
@@ -447,21 +539,32 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 // pullerConfig wires the puller to the ConfigMaps that cfg names.
 func pullerConfig(cfg runConfig, kube kubernetes.Interface, mgmt *http.Client, gateway envd.GatewayClient, tel *telemetry.T) envd.PullerConfig {
 	keys := []ed25519.PublicKey{cfg.key}
+	var opKeys func() []ed25519.PublicKey
+	var revocations envd.RevocationSource
+	var storeOpts []envd.StoreOption
+	if cfg.operatorKeyFile != "" {
+		opKeys = operatorKeys(cfg.operatorKeyFile, cfg.operatorKeys, tel.Log)
+		revocations = envd.ConfigMapRevocations{Client: kube, Namespace: cfg.revocationsNS, Name: cfg.revocationsName}
+		storeOpts = append(storeOpts, envd.WithOperatorKeys(opKeys))
+	}
 	return envd.PullerConfig{
-		Cluster:    cfg.cluster,
-		Client:     mgmt,
-		BaseURL:    "https://" + cfg.upstream,
-		Env:        cfg.env,
-		Keys:       keys,
-		Store:      envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log),
-		Gateway:    gateway,
-		Hints:      envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
-		Steps:      envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
-		StepStatus: envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
-		Interval:   cfg.interval,
-		Log:        tel.Log,
-		Meter:      tel.Meter,
-		Tracer:     tel.Tracer,
+		Cluster:      cfg.cluster,
+		Client:       mgmt,
+		BaseURL:      "https://" + cfg.upstream,
+		Env:          cfg.env,
+		Keys:         keys,
+		OperatorKeys: opKeys,
+		Revocations:  revocations,
+		Store:        envd.NewConfigMapStore(kube, cfg.namespace, cfg.configMap, cfg.env, keys, tel.Log, storeOpts...),
+		Gateway:      gateway,
+		Hints:        envd.NewConfigMapHints(kube, cfg.hintsNS, cfg.hintsName, tel.Log),
+		Steps:        envd.NewStepStore(kube, cfg.stepsNS, cfg.stepsName, envd.KeyFingerprint(keys), tel.Log),
+		StepStatus:   envd.NewConfigMapStepStatus(kube, cfg.statusNS, cfg.statusName, tel.Log),
+		Interval:     cfg.interval,
+		ReportRate:   cfg.reportRate,
+		Log:          tel.Log,
+		Meter:        tel.Meter,
+		Tracer:       tel.Tracer,
 	}
 }
 
@@ -490,7 +593,7 @@ func newPlane(cfg runConfig, kube kubernetes.Interface, dyn dynamic.Interface, t
 		HealthTimeout: cfg.bundleHealthTimeout,
 		Log:           tel.Log, Tracer: tel.Tracer, Meter: tel.Meter,
 	})
-	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, Log: tel.Log})
+	return envd.NewPlane(envd.PlaneConfig{Env: cfg.env, Cluster: cfg.cluster, Keys: keys, Applier: engine, RefillEvery: cfg.bundleRefillEvery, Log: tel.Log})
 }
 
 // planeKeys returns a function that reads the pinned key in path again on each call. A failed read

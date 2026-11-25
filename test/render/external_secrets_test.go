@@ -112,6 +112,7 @@ func esoDocsIn(t *testing.T, out, scope string) map[string]object {
 }
 
 func TestRenderExternalSecrets(t *testing.T) {
+	t.Parallel()
 	out, stderr, err := renderExternalSecrets(t, esoFacts...)
 	if err != nil {
 		t.Fatalf("render failed: %v\n%s", err, stderr)
@@ -405,6 +406,7 @@ func TestRenderExternalSecrets(t *testing.T) {
 // SECRET_STORE_NAMESPACES, the store namespace of secrets:connect. A store outside the controller
 // namespace would never become Ready.
 func TestRenderExternalSecretsNeedsOneStoreNamespace(t *testing.T) {
+	t.Parallel()
 	for name, env := range map[string][]string{
 		"none":                         {"SECRET_STORE_NAMESPACES="},
 		"two":                          {"SECRET_STORE_NAMESPACES=spire-system other"},
@@ -443,6 +445,7 @@ func cellSetting(t *testing.T, cluster, name string) string {
 // so it gets no internet egress and no store Namespace. It works only in observability-system, which
 // the namespaces bundle holds, for the Password generator of Grafana.
 func TestRenderExternalSecretsWithoutStore(t *testing.T) {
+	t.Parallel()
 	scope := cellSetting(t, "management", "EXTERNAL_SECRETS_NAMESPACE")
 	if scope != "observability-system" || cellSetting(t, "management", "SECRET_STORE_NAMESPACES") != "" {
 		t.Fatalf("cells/management.env sets EXTERNAL_SECRETS_NAMESPACE %q and SECRET_STORE_NAMESPACES %q, want observability-system and none",
@@ -498,6 +501,7 @@ func TestRenderExternalSecretsWithoutStore(t *testing.T) {
 }
 
 func TestRenderExternalSecretsFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, missing := range []string{"API_SERVER_IPS", "API_SERVER_PORT", "API_SERVICE_IP", "DNS_SERVICE_IP"} {
 		t.Run(missing, func(t *testing.T) {
 			var env []string
@@ -527,6 +531,7 @@ const goldenESODevCP = "testdata/external-secrets-dev-cp.sha256"
 // TestRenderExternalSecretsDevCPUnchanged renders the operator with the store namespace of dev-cp,
 // with and without EXTERNAL_SECRETS_NAMESPACE. Both renders must equal the M2 render byte for byte.
 func TestRenderExternalSecretsDevCPUnchanged(t *testing.T) {
+	t.Parallel()
 	sum := func(s string) string {
 		h := sha256.Sum256([]byte(s))
 		return hex.EncodeToString(h[:])

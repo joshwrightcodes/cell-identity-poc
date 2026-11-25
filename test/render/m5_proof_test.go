@@ -36,6 +36,7 @@ func containerEnv(t *testing.T, ctr map[string]any) map[string]string {
 // of the pod mounts that volume. The Role of the sidecar already lets the account create a token for itself. The
 // uplink of dev-cp has an SVID of the cp path, so it sends no proof and mounts no token.
 func TestCellProxyClientsProve(t *testing.T) {
+	t.Parallel()
 	for _, c := range proofClients {
 		for _, cluster := range []string{"dev-cell-1", "dev-cell-2"} {
 			t.Run(c.component+"/"+cluster, func(t *testing.T) {
@@ -108,6 +109,7 @@ func TestCellProxyClientsProve(t *testing.T) {
 // is the key of mgmt-signing-pub. It mounts the registry as a whole volume of the ConfigMap that mgmtd publishes:
 // a mount with subPath never sees the update of a ConfigMap.
 func TestCellProxyServersRequireProof(t *testing.T) {
+	t.Parallel()
 	// SPIRE_CELL_SUBJECTS of cells/dev-cp.env lists "<namespace>/<account>=<role>" for each attested role. A server expects "<role>=<namespace>/<account>".
 	subjectOf := map[string]string{}
 	for _, e := range strings.Fields(cellEnv(t, "dev-cp", "SPIRE_CELL_SUBJECTS")) {
@@ -171,6 +173,7 @@ func TestCellProxyServersRequireProof(t *testing.T) {
 // TokenRequest may be the SPIRE audience, or mgmt-stream/<this cell>/<role>/<22 characters of binding>. The test
 // runs the patterns of the CEL expression against audiences that the proof package builds.
 func TestGuardAllowsStreamAudience(t *testing.T) {
+	t.Parallel()
 	binding := strings.Repeat("a", 21) + "_"
 	for _, tc := range []struct{ component, policy, role string }{
 		{"argocd-agent", "argocd-agent-read-only", "argocd-agent"},

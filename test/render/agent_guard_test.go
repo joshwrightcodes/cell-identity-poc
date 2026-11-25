@@ -20,6 +20,7 @@ func guardAudiencePattern(env string) string {
 // binding denies, and the audience pattern follows the environment and the nonce limit of the
 // plugin.
 func TestRenderAgentGuard(t *testing.T) {
+	t.Parallel()
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
 		t.Run(env, func(t *testing.T) {
 			r := renderAgent(t, "dev-cell-1", "POC_ENV="+env)
@@ -111,6 +112,7 @@ func TestRenderAgentGuard(t *testing.T) {
 // TestGuardPatternMatchesPluginAudience checks the pattern against the audience of the plugin, for
 // a nonce at the limit and one byte over it.
 func TestGuardPatternMatchesPluginAudience(t *testing.T) {
+	t.Parallel()
 	re := regexp.MustCompile(guardAudiencePattern("dev"))
 	for nonce, want := range map[string]bool{
 		"abc_DEF-123": true,

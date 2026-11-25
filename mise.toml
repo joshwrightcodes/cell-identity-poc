@@ -132,8 +132,8 @@ run = "scripts/down.sh"
 [tasks.test]
 description = "Run the Go unit tests, or the packages given after --"
 usage = 'arg "[packages]..." var=#true default="./..."'
-# The go test timeout is 20 minutes for each package. test/scripts took 541 s (559 s on a loaded run) on 2026-11-17, and the default of 10 minutes was too close. The CI job runs this task, so it has the same timeout.
-run = 'eval go test -timeout 20m ${usage_packages?}'
+# The go test timeout is 32 minutes for each package. The tests run in parallel, so the time depends on -parallel (the number of cores by default). go test runs the packages at the same time. On 2026-11-23, with -count=1 on an 18-core Mac, test/scripts took 188 s and test/render 162 s. With -parallel 4, which stands for a small CI runner, test/scripts took 1255 s and test/render 408 s. The timeout is the longest of these, 1255 s, plus 50 percent. Before the tests ran in parallel, test/scripts took 2617 s and test/render 604 s on the same Mac. The CI job runs this task, so it has the same timeout.
+run = 'eval go test -timeout 32m ${usage_packages?}'
 
 [tasks.lint]
 description = "Run go vet on every package, and on the end-to-end tests with the e2e build tag. Then check the module rules of each binary in cmd/ with scripts/deps-check.sh"
@@ -177,7 +177,7 @@ env = { CELL = "management" }
 run = "scripts/hostsvc-serve.sh"
 
 [tasks.mgmt]
-description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, restore or rotate-key, reset-state to start with a new state and a new signing key, or rotate-signing-key to rotate the signing key and render it"
+description = "Run mgmtd ctl in the pod mgmtd-0 of management, with the arguments after --: status, records, pubkey, keys, keycheck, revoke, unrevoke, restore or rotate-key, reset-state to start with a new state and a new signing key, or rotate-signing-key to rotate the signing key and render it"
 env = { CELL = "management" }
 run = "scripts/mgmt.sh"
 
@@ -275,7 +275,7 @@ description = "Run the test that deletes both cells and creates them again throu
 run = "scripts/gate.sh m6-provision"
 
 [tasks."gate:m6:repair"]
-description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
+description = "Run gate:m5:repair, run hostsvc:serve -- sync, cancel each open step that a gate test recorded in build/gate/m6-steps, and delete the test namespaces m6-* of every cluster. While build/gate/m6-provision exists, it also requests each cell that is not requested, waits until each cell is valid, links management, signs one bundle set for each cell and removes the marker. With --check, only report, also fail on an open step that no test recorded or on the marker, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m6-repair.sh"
 
 [tasks."gate:m7"]
@@ -291,8 +291,28 @@ description = "Run the M8 end-to-end tests: signed bundle sets that reach Argo C
 run = "scripts/gate.sh m8"
 
 [tasks."gate:m8:repair"]
-description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap apps-demo/m8-marker, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
+description = "Delete the namespaces m8-* and the Applications m8-* that a gate:m8 run left, run bundle -- repair for a target in rolled_back with rollback_unhealthy, and publish the hydrated set again for each target that a test changed (build/gate/m8-bundles, the Application apps-sample, the ConfigMap m8-marker in apps-sample or apps-demo, or the state rolled_back), dev-cp first. With --check, only report, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m8-repair.sh"
+
+[tasks."gate:m9"]
+description = "Run the slow tier of M9 overnight, plus the go test arguments after --. Phase 0 runs the repair checks of M6 to M9 and the image checks, keeps the Mac awake, refuses battery power unless GATE_ALLOW_BATTERY=1, and sets the SVID lifetime of dev-cp to GATE_M9_SVID_TTL. Then each M9 test runs in its own go test invocation, and the run stops at the first failure. Phase 7 restores the lifetime and runs harness:status, also after a failure. With -run, one invocation runs, and the run is not a record. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m9"
+
+[tasks."gate:m9:repair"]
+description = "Repair what a slow tier of gate:m9 left when it stopped early: heal every cut, wait until connected and until envd holds no local revocation entry, run revoke -- clean, un-revoke the test cells, repair the API server of a key rotation test, restore the SVID lifetime of dev-cp with a restart of each cluster, delete the namespaces m9-*, refill the bundle store of a cell that the store test left empty, and run harness:status. With --check, only list the traces, and fail with the repair command. Safe to run again"
+run = "scripts/gate-m9-repair.sh"
+
+[tasks."svid-ttl"]
+description = "Switch the SVID lifetime of dev-cp for the slow tier, with the arguments after --: set <ttl> writes build/gate/m9-svid-ttl, runs cell:up of dev-cp and waits until every SVID has the lifetime; restore removes the marker, runs cell:up of dev-cp and cell:restart of dev-cp and each live cell, and waits; show prints the lifetimes. Each prints one JSON line. set and restore need dev-cp connected to management"
+run = "scripts/svid-ttl.sh"
+
+[tasks."poc:gate"]
+description = "Run the gates as tiers, with the argument after --: fast runs gate:m1 to gate:m8 with gate:m6:provision and stops at the first failure, slow runs gate:m9, and all runs both. It keeps the Mac awake, and it refuses battery power unless GATE_ALLOW_BATTERY=1. The manual drills gate:m4:rotate, gate:m5:soak and gate:m5:drill do not run"
+run = "scripts/poc-gate.sh"
+
+[tasks.partition]
+description = "Cut and heal the traffic between two kind clusters with tagged firewall rules, with the arguments after --: cut --from <cluster> --to <cluster> [--direction both|out|in] --hold <minutes> [--tag <tag>], heal --tag <tag>, heal --all (every gate-m9-cut- rule on every existing cluster) or list. A cut covers the IPv4 and the IPv6 address of the peer, and a timer in the node removes each rule after the hold plus 15 minutes. It prints one JSON line"
+run = "scripts/partition.sh"
 
 [tasks.gw]
 description = "Run cellgw ctl in the pod cell-gateway-0 of dev-cp, with the arguments after --: status, queue --cell <c>, enqueue --cell <c> [--replay], inject or outbox. Standard input reaches enqueue and inject"
@@ -334,3 +354,23 @@ run = "scripts/restart-check.sh"
 [tasks.pki]
 description = "Print CA material: root, intermediate (root bundle on stdin), key or cert (bundle on stdin), trust-bundle (checks PEM certificates) or info (one certificate). See cmd/pkigen"
 run = "go run ./cmd/pkigen"
+
+[tasks.operatorctl]
+description = "Run operatorctl, the operator key tool of this Mac, with the arguments after --: keygen --public-file <path>, pub, sign --env <e> --cell <c> --record <epoch>.<counter> or verify --keys <file>. The seed moves only through standard input and standard output. See cmd/operatorctl"
+run = "go run ./cmd/operatorctl"
+
+[tasks.revoke]
+description = "Revoke a cell with the operator key, with the arguments after --: local --cell <cell> (sign an entry for the record that envd holds and write it to envd-system/local-revocations), list (each entry with its envd state), reapply (write build/operator/revocations.log back) or clean (delete the stale and settled entries). Prints JSON lines. See scripts/revoke.sh"
+run = "scripts/revoke.sh"
+
+[tasks."operator:create-key"]
+description = "Owner action, once: write a new operator key to the secret manager through POC_SECRET_WRITE_CMD, read it back, then write ConfigMap mgmt-system/operator-pub and build/operator/key.env. See scripts/operator-key.sh"
+run = "scripts/operator-key.sh create"
+
+[tasks."operator:check-key"]
+description = "Read the operator key through POC_SECRET_READ_CMD and compare its public key with operator-pub, each pin in dev-cp and build/operator/key.env. Prints one JSON line with match"
+run = "scripts/operator-key.sh check"
+
+[tasks."operator:rotate-key"]
+description = "Rotate the operator key, with the overlap of two keys, or at once with -- --emergency. Refuses while not connected, during a cut or a slow tier, and while envd holds a local revocation entry"
+run = "scripts/operator-key.sh rotate"

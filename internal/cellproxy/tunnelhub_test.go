@@ -709,3 +709,25 @@ func TestRenewalLogsAtInfo(t *testing.T) {
 		t.Fatalf("a renewal logged at %v, want INFO", line["level"])
 	}
 }
+
+// The hub holds each tunnel on the connection that the server accepted, so CloseRevoked ends it.
+func TestHubTunnelClosedOnRevoke(t *testing.T) {
+	pub, priv := signerKey(t)
+	reg, err := LoadRegistry(writeRegistry(t, []ed25519.PublicKey{pub}, priv, cell("dev-cell-1", false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := newTunnelHarnessWith(t, tunnelHarnessConfig{wait: 5 * time.Second, registry: reg})
+	done := h.serveFixed(t, h.dialer(t), textHandler("up"))
+	h.waitTunnels(t, 1, 5*time.Second)
+	if n := h.srv.CloseRevoked(registryOf(t, cell("dev-cell-1", true))); n != 1 {
+		t.Fatalf("CloseRevoked closed %d connections, want 1", n)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tunnel of the revoked cell stayed open")
+	}
+	findLog(t, h.hubLog, "tunnel_down", map[string]any{"cell": "dev-cell-1"}, 5*time.Second)
+	findLog(t, h.hubLog, "connection closed", map[string]any{"reason": "cell_revoked", "cell": "dev-cell-1"}, 5*time.Second)
+}

@@ -18,6 +18,8 @@ import (
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	metricnoop "go.opentelemetry.io/otel/metric/noop"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 	"golang.org/x/net/http2"
@@ -32,8 +34,8 @@ import (
 
 // Defaults of StreamConfig.
 const (
-	DefaultMinBackoff      = time.Second
-	DefaultMaxBackoff      = 30 * time.Second
+	DefaultMinBackoff      = 500 * time.Millisecond
+	DefaultMaxBackoff      = 5 * time.Second
 	DefaultClaimEvery      = 10 * time.Second
 	DefaultStatusEvery     = 30 * time.Second
 	DefaultResendEvery     = 60 * time.Second
@@ -49,7 +51,7 @@ const (
 	forgedEvery     = 10 * time.Second
 	gcEvery         = time.Hour
 	statusSpread    = 0.2
-	backoffSpread   = 0.5
+	backoffSpread   = 0.2
 	kubeTimeout     = 5 * time.Second
 	minResendGap    = 30 * time.Second
 	maxResendBurst  = 20
@@ -77,11 +79,15 @@ type StreamConfig struct {
 
 	Log    *slog.Logger
 	Tracer trace.Tracer
-	Now    func() time.Time
-	Sleep  func(context.Context, time.Duration) error
-	Rand   func() float64
+	// Meter holds the celld.upstream.age gauge. A nil Meter records nothing.
+	Meter metric.Meter
+	Now   func() time.Time
+	Sleep func(context.Context, time.Duration) error
+	Rand  func() float64
 
 	resent *resendLog
+	// upstream holds the time of the last frame from the gateway across streams.
+	upstream *upstreamClock
 	// effect holds the running effect across streams.
 	effect *effectSlot
 	// status holds the next status deadline across streams. A stream ends about every half life of the SVID, which can be shorter than
@@ -146,6 +152,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	if c.Now == nil {
 		c.Now = time.Now
 	}
+	if c.Meter == nil {
+		c.Meter = metricnoop.NewMeterProvider().Meter("celld")
+	}
 	if c.Sleep == nil {
 		c.Sleep = sleepTimer
 	}
@@ -154,6 +163,9 @@ func (c StreamConfig) withDefaults() (StreamConfig, error) {
 	}
 	if c.status == nil {
 		c.status = &statusClock{}
+	}
+	if c.upstream == nil {
+		c.upstream = newUpstreamClock(c.Meter, c.Now)
 	}
 	if c.effect == nil {
 		c.effect = newEffectSlot()
@@ -254,18 +266,16 @@ func (c StreamConfig) wait(ctx context.Context, d time.Duration) error {
 	return err
 }
 
-// backoff returns MinBackoff doubled for each earlier failure up to MaxBackoff, with jitter. Below
-// the cap the wait lies between d and 1.5 d. At the cap it lies between two thirds of MaxBackoff and
-// MaxBackoff, so a long outage keeps its jitter.
+// backoff returns MinBackoff doubled for each earlier failure, capped at MaxBackoff, plus jitter of up
+// to 20%. The cap applies first, so a wait never exceeds 1.2 MaxBackoff and a long outage keeps its
+// jitter. The first wait is at least MinBackoff, so the loop never spins.
 func (c StreamConfig) backoff(failures int) time.Duration {
 	d := c.MinBackoff
 	for i := 0; i < failures && d < c.MaxBackoff; i++ {
 		d *= 2
 	}
 	d = min(d, c.MaxBackoff)
-	high := min(time.Duration(float64(d)*(1+backoffSpread)), c.MaxBackoff)
-	low := min(d, high*2/3)
-	return low + time.Duration(c.Rand()*float64(high-low))
+	return d + time.Duration(c.Rand()*backoffSpread*float64(d))
 }
 
 func (c StreamConfig) runGC(ctx context.Context) {
@@ -377,16 +387,9 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 		return fmt.Errorf("the gateway answered HTTP %d", resp.StatusCode)
 	}
 	dec := gwapi.NewDecoder(resp.Body)
-	welcome, err := dec.Decode()
+	welcome, err := c.readWelcome(dec)
 	if err != nil {
-		return fmt.Errorf("wait for the welcome: %w", err)
-	}
-	switch welcome.Type {
-	case gwapi.TypeWelcome:
-	case gwapi.TypeRefused:
-		return fmt.Errorf("the gateway refused the stream: %s", welcome.Reason)
-	default:
-		return fmt.Errorf("the gateway sent %q, want welcome", welcome.Type)
+		return err
 	}
 	welcomeTimer.Stop()
 	c.Log.InfoContext(ctx, "stream open", "cell", c.Cell, "pod", welcome.Pod, "cap", welcome.Cap)
@@ -398,6 +401,24 @@ func (c StreamConfig) runOne(ctx context.Context) (err error) {
 	_ = resp.Body.Close()
 	l.finish()
 	return err
+}
+
+// readWelcome reads the first frame of a stream, which counts as a frame from the gateway, and
+// accepts only a welcome.
+func (c StreamConfig) readWelcome(dec *gwapi.Decoder) (gwapi.Frame, error) {
+	welcome, err := dec.Decode()
+	if err != nil {
+		return welcome, fmt.Errorf("wait for the welcome: %w", err)
+	}
+	c.upstream.touch()
+	switch welcome.Type {
+	case gwapi.TypeWelcome:
+	case gwapi.TypeRefused:
+		return welcome, fmt.Errorf("the gateway refused the stream: %s", welcome.Reason)
+	default:
+		return welcome, fmt.Errorf("the gateway sent %q, want welcome", welcome.Type)
+	}
+	return welcome, nil
 }
 
 // resendLog keeps when each result went up again, so that no op goes more than once in minResendGap,
@@ -445,4 +466,36 @@ func (s *statusClock) set(t time.Time) {
 	s.mu.Lock()
 	s.next = t
 	s.mu.Unlock()
+}
+
+// upstreamClock keeps the time of the last frame from the gateway for all streams of one
+// StreamConfig, and reports its age as the celld.upstream.age gauge. Before the first frame the age
+// counts from the start, so an island that began before a restart does not read as fresh.
+type upstreamClock struct {
+	now     func() time.Time
+	started time.Time
+	last    atomic.Int64
+}
+
+func newUpstreamClock(m metric.Meter, now func() time.Time) *upstreamClock {
+	u := &upstreamClock{now: now, started: now()}
+	_, _ = m.Float64ObservableGauge("celld.upstream.age",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds since the last frame from the gateway, or since the start of celld before the first one"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(u.age())
+			return nil
+		}))
+	return u
+}
+
+// touch records that a frame arrived now.
+func (u *upstreamClock) touch() { u.last.Store(u.now().UnixNano()) }
+
+func (u *upstreamClock) age() float64 {
+	ref := u.started
+	if n := u.last.Load(); n != 0 {
+		ref = time.Unix(0, n)
+	}
+	return max(0, u.now().Sub(ref).Seconds())
 }

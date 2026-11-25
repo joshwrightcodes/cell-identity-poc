@@ -25,6 +25,12 @@ type BundleApplier interface {
 	Status(ctx context.Context) (*op.BundleStatus, error)
 }
 
+// StoreRefiller is the part of bundleapply.Applier that refills the bundle store. An Applier that
+// has it gets the refill loop of Plane.RunRefill.
+type StoreRefiller interface {
+	RunRefill(ctx context.Context, every time.Duration)
+}
+
 // PlaneConfig holds what a Plane needs. Keys returns the keys that sign operations, read again for
 // each envelope. A nil Now uses the real clock and a nil Log uses the default logger.
 type PlaneConfig struct {
@@ -33,6 +39,8 @@ type PlaneConfig struct {
 	Applier      BundleApplier
 	Now          func() time.Time
 	Log          *slog.Logger
+	// RefillEvery is the time between probes of the bundle store. Zero turns the refill off.
+	RefillEvery time.Duration
 }
 
 // Plane applies the signed bundle set for the cluster of envd. The management plane hands the open
@@ -72,6 +80,17 @@ func NewPlane(cfg PlaneConfig) (*Plane, error) {
 		cfg.Log = slog.Default()
 	}
 	return &Plane{cfg: cfg, logs: lograte.New(logWindow, 16, cfg.Now)}, nil
+}
+
+// RunRefill probes the bundle store every RefillEvery and refills it after a loss, until ctx ends.
+// It returns at once when RefillEvery is zero or the Applier cannot refill. The refill runs apart
+// from the apply path and skips while an apply holds the engine lock.
+func (p *Plane) RunRefill(ctx context.Context) {
+	r, ok := p.cfg.Applier.(StoreRefiller)
+	if !ok || p.cfg.RefillEvery <= 0 {
+		return
+	}
+	r.RunRefill(ctx, p.cfg.RefillEvery)
 }
 
 // Offer hands the open plane envelope of the ops pull to the plane, or nil when the pull holds none.

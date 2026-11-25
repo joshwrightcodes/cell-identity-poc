@@ -166,7 +166,7 @@ EOF
 }
 scrape_jobs() {
   # Envoy of every pod with an istio-proxy container. The sidecar is an init container or a regular one.
-  scrape_head envoy /stats/prometheus apps-demo istio-egress
+  scrape_head envoy /stats/prometheus apps-demo apps-sample istio-egress
   cat <<'EOF'
             - source_labels: [__meta_kubernetes_pod_container_name, __meta_kubernetes_pod_container_port_number]
               regex: istio-proxy;15090
@@ -531,7 +531,7 @@ $(api_peers)
           port: 443
     - to:
         - namespaceSelector:
-$(namespace_in apps-demo istio-egress)
+$(namespace_in apps-demo apps-sample istio-egress)
       ports:
         - protocol: TCP
           port: 15090

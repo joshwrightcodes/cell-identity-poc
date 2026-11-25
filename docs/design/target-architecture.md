@@ -739,6 +739,14 @@ Rows 16 and 40d in the PoC form:
 - M8 gives row 40d the version rule of row 14 only. A set below the mark gets `version_old`, and no floor binds a set above the mark. A writer of the state ConfigMap can lower the mark.
 - The attestation envelope can carry approver signatures later, and the engine then checks them locally.
 
+Rows 28 and 37, and the two island rows of the survivability tests, in the PoC form:
+
+- The relay does not close the streams of a revoked cell. Each `cell-proxy` server of `management` closes the connections of the cell within 5 seconds after the log line `registry reloaded`. The cell gateway closes the streams of the cell within its 1 second tick. `TestM9ConnectedRevocation` checks both, in the subtests `gateway_refuses` and `streams_closed`.
+- The gateway refuses hello, claim and bind with `cell_revoked`. The plugin of the SPIRE server refuses new attestations with `revoked` and the field `source`, not with `cell_revoked`. The ban container bans the agents of the cell. `TestM9ConnectedRevocation` and `TestM9LocalRevocationDuringIsland` check them.
+- In a local revocation, a signed entry from the operator key holds the cell revoked in `envd` and in the gateway. `mgmtd` adopts the entry when the environment reconnects, and the next revision settles it.
+- M9 adds one network flow: the SPIRE server pod of `dev-cp` sends OTLP to the in-cluster collector on TCP 4317, and resolves DNS. The collector admits the namespace `spire-system`.
+- In a cell island, the cell keeps every pod. The `spire-agent` containers of the cell exit about one SVID lifetime in, restart in place, and attest as new agents after the heal. In an environment island, no container restarts.
+
 ## Survivability tests
 
 Tests are event-driven. A test profile shortens SVID and intermediate lifetimes, within
@@ -746,15 +754,15 @@ SPIRE's limits. The Mac gate has a fast tier and a slow tier.
 
 | Test | Pass when | Phase |
 | --- | --- | --- |
-| Kiln cut off from `dev-cp` | Queued operations continue. SVIDs renew. No trust changes | 1 |
-| A cell cut off from `dev-cp` for three SVID lifetimes | Customer traffic continues. Argo CD keeps the last good state. No pod restarts. Sidecars attest again on reconnect | 1 |
+| Kiln cut off from `dev-cp` (`TestM9IslandsHold`) | Queued operations continue. SVIDs renew. No trust changes | 1 |
+| A cell cut off from `dev-cp` for three SVID lifetimes (`TestM9IslandsHold`) | Customer traffic continues. Argo CD keeps the last good state. No pod restarts. Sidecars attest again on reconnect | 1 |
 | Sidecar restart within its token's lifetime | It attests again with the reused token | 1 |
-| Partition without a pod restart, one-way too | Streams recover, and the replica cap refuses no real replica | 1 |
+| Partition without a pod restart, one-way too (`TestM9OneWayPartitions`) | Streams recover, and the replica cap refuses no real replica | 1 |
 | Cell key rotated while connected | Attestation recovers within one immediate key check | 1 |
-| Cell key rotated during an environment island | Running workloads keep identities. New pods wait. Kiln confirms the key on reconnect | 1 |
+| Cell key rotated during an environment island (`TestM9KeyRotatedDuringEnvironmentIsland`) | Running workloads keep identities. New pods wait. Kiln confirms the key on reconnect | 1 |
 | Bad platform bundle, bad `celld`, bad Argo CD, each separately | Rolled back with no step in the cell | 1 |
-| Bundle store lost during an island | No Application is pruned, and the store refills after reconnect | 1 |
-| Local revocation in island mode | The cell stays refused after the next Kiln revision | 1 |
+| Bundle store lost during an island (`TestM9StoreLostDuringCellIsland`) | No Application is pruned, and the store refills after reconnect | 1 |
+| Local revocation in island mode (`TestM9LocalRevocationDuringIsland`) | The cell stays refused after the next Kiln revision | 1 |
 | Planned rotation of a Kiln signing key and the SPIRE intermediate, under load | No operation fails and no identity lapses | 1 |
 | Emergency removal of a Kiln key while one cell is an island | Connected cells refuse the key at once. The island cell applies the key set before any work on reconnect | 1 |
 | One recovery key replaced by three holders | Cells accept the new key, and refuse key sets signed by the old one | 2 |
@@ -877,6 +885,20 @@ this order, each with its own scope document:
 | A host network pod in `rogue` reaches exactly the residual ports of the `dev-cp` and `management` nodes. One in a cell also reaches the ports that admit its node address, and no others. Each mutual TLS port answers a handshake with no certificate with a TLS alert or a closed connection | M7 | None. Stop and report. Result 2026-11-18, `TestM7CellPodScansOtherCell`, `HostNetworkScan` and `PrincipalLoopbackOnly` passed in two clean runs |
 | A pod of `rogue` that sends no certificate, or a wrong one, to the host service gets a TLS alert. The host service logs `handshake refused` | M7 | None. Stop and report. Result 2026-11-18, `TestM7RogueHandshakeToHostService` passed in two clean runs |
 | A token that `rogue` signs fails at the attestor and at bind, and a client with another pin gets `issuer_untrusted`. `TestM2RejectRogueKey`, `TestM5BindRefusalsLive` and `TestM4HostServiceServesPinnedKeys` prove this in the gates of M2, M4 and M5 | M7 | None. Run those gates at the head of M7. Result: 2026-11-18, run alone at the head of M7 (61a0209): `TestM2RejectRogueKey` passed (15.4 s, 02:42 UTC), `TestM5BindRefusalsLive` passed (207 s, 02:43 UTC) and `TestM4HostServiceServesPinnedKeys` passed (0.8 s, 02:47 UTC) |
+| A `cluster_jwt` agent exits at the SVID expiry and not before, while its server is unreachable. It restarts in place and attests as a new agent after the heal | M9 | None. Report first. Result 2026-11-22, SPIRE v1.15.5, SVIDs of 1 minute: the agents exited 5 to 39 seconds after `NotAfter`, with no pod replaced. An attempt that failed 1 second before `NotAfter` only logged. The agent version has no option that changes this |
+| `BanAgent` on a non-reattestable agent stops its renewals, and a new attestation of the cell gets a new agent ID | M9 | `DeleteAgent`, with a residual line. Report first. Result 2026-11-22: the agent exited 3.9 seconds after the ban and deleted its SVID. Its restart attested as a new agent within 1 second, so the overlay and the record refusals stop the cell. `ListAgents` filters by attestation type, banned state and selector, and the admin socket needs no caller identity |
+| Argo CD v3.6.1 keeps every Application, and prunes nothing, while its OCI source answers not found. After the source returns, a refresh syncs the same digest again | M9 | The engine requests a sync of `root` after the refill. Report first. Result 2026-11-24, two slow runs: the 27 Applications and Deployments kept their UIDs over 12 and 13 reads, and the store refill pushed 12 bundles. Argo CD compared `root` 105 and 82 seconds after the refill, and `root` stayed Synced and Healthy at the same digest |
+| go-spiffe `X509Source` keeps the last SVID and retries while the Workload API is gone. `celld`, the `cell-proxy` clients and `otel-uplink` do not exit | M9 | None. Report first. Result 2026-11-22: no client restarted. The delay to a new SVID has a bound by design of about 11 seconds. The bound comes from the retry caps of the watch and of gRPC. Result 2026-11-24, two slow runs: the new SVID came about 5 seconds after the agent returned, which is 7 to 10 seconds after the heal. The `celld` stream retry stops at 5 seconds |
+| DROP rules in a kind node cut every flow to the peer. They cover the IPv4 and the IPv6 address, in `FORWARD`, `INPUT` and `OUTPUT` | M9 | None. Stop and report. Result 2026-11-22: every dial timed out in both directions, NodePorts included, and established flows ended. The mirror, `host.docker.internal` and the API ports stayed reachable. A heal takes about 4 seconds, and the `celld` stream returns about 10 seconds later |
+| The time from a heal to every `spire-agent` of the cell Ready | M9 | None. Report above 10 minutes. Result 2026-11-22, island of 4 minutes: at most 18 seconds. The restart counts were 2 to 3 for each agent |
+| The times from `mgmt -- revoke` to the gateway refusal, the plugin refusal, the ban and the `cell-proxy` close, and the close time from `registry reloaded` | M9 | None. Report above 5 seconds for the close. Result 2026-11-24, two slow runs: the gateway ended the stream 5 to 10 seconds and refused the hello 7 to 13 seconds after the revoke. The record reached the SPIRE server pod after 26 to 50 seconds, and the plugin refused by at most 32 to 57 seconds. The ban followed the record by 0 seconds. The `cell-proxy` close came 0.0 seconds after `registry reloaded` |
+| The time from `revoke -- local` to the gateway and plugin refusals with `management` cut | M9 | None. Report above 2 minutes. Result 2026-11-24, two slow runs: the gateway ended the stream 38 to 39 seconds and refused the hello 39 to 40 seconds after the revoke. The overlay reached the SPIRE server pod after 60 to 90 seconds, and the plugin refused by at most 64 to 96 seconds |
+| The outbox items, refusals and drain time after the environment island | M9 | None. Report above 10 minutes. Result 2026-11-22, island of 4 minutes: 18 items, drained in 19 seconds. Result 2026-11-24, two slow runs with an island of 3 hours 15 minutes: 643 and 644 items at the heal. They drained in 2 minutes 19 seconds and 2 minutes 22 seconds. The last refusal of each cell has the kind `status` and the reason `stale` |
+| The collector queue growth in the environment island, projected to 24 hours, against 1.5 GiB | M9 | None. Residual line. Result 2026-11-24, two slow runs: the `dev-cp` queue grew 54 to 58 MiB per hour after the growth started, 20 to 30 minutes into the island. It grew about 160 MiB in 3 hours 15 minutes. From the queue size before the island, the projection is 1.3 to 1.4 GiB in 24 hours. Both runs stay under 1.5 GiB, and the highest projection is 1.38 GiB |
+| The time from `svid-ttl -- set 1h` to every SVID at 1 hour, and from `restore` to every SVID at 1 minute | M9 | Wait one old lifetime plus 5 minutes. Report first. Result 2026-11-22: 174 seconds for the switch to 1 hour, and 283 seconds for the restore |
+| `registry:3.1.2` answers the PUT of a manifest whose layer blob is gone with 400 `MANIFEST_BLOB_UNKNOWN` | M9 | Probe with a PUT of the config blob. Report first. Result 2026-11-24: a separate container of the mirror image took the config blob with 201. The manifest PUT then got 400 `MANIFEST_BLOB_UNKNOWN` with the digest of the missing layer |
+| The two island levels in parallel give each level its own result | M9 | Run them in sequence, for 3 hours 15 minutes more. Report first. Result 2026-11-24, two slow runs: both levels held in parallel, for 3 hours 5 minutes and 3 hours 15 minutes. Each level had its own result |
+| A full slow tier on AC power, with the lid open, under `caffeinate -ims` shows no gap above 2 minutes between samples | M9 | None. Report. Result 2026-11-24, two slow runs: `TestM9IslandsHold` took 199 samples in each run, with a longest gap of 60 seconds. The sleep report of each gate run showed no sleep |
 
 ## Departures from the Kiln canon
 

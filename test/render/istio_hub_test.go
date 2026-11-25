@@ -15,6 +15,7 @@ var retiredIstioHubs = []string{"registry.istio.io/release", "gcr.io/istio-relea
 // The sidecar injector and the egress gateway take the hub from the istiod values, so the check
 // covers the injector ConfigMap too.
 func TestIstioImagesUseDockerHub(t *testing.T) {
+	t.Parallel()
 	images := map[string]string{}
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {

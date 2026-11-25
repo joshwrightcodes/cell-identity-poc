@@ -11,7 +11,7 @@ permissions:
 jobs:
   unit:
     runs-on: ubuntu-latest
-    # The tests take about 12 minutes in all (test/scripts 541 s and test/render 80 s, one after the other, on 2026-11-17), and each package has a go test timeout of 20 minutes in mise.toml.
+    # The tests take about 28 minutes in all on a small runner: with -parallel 4 on 2026-11-23, test/scripts took 1255 s and test/render 408 s, 1663 s if they ran one after the other, which is the worst case because go test runs the packages at the same time. A serial run before the parallel change took 355 s and 538 s for test/scripts on ubuntu-latest (runs of 2026-11-18 and 2026-11-19). The job allows the worst case plus 50 percent (42 minutes) and 3 minutes for the setup. Replace these numbers with the times of the first CI run of the parallel tests. Each package has a go test timeout of 32 minutes in mise.toml.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

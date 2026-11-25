@@ -6,8 +6,8 @@
 #   2. runs mise run bundle -- repair --target <t> for each target whose bundle state is rolled_back with the detail rollback_unhealthy, because
 #      such a cluster cannot read the store, and no new set would apply;
 #   3. runs mise run bundle -- publish --target <t> --wait for each target that a test changed: a target in build/gate/m8-bundles, a target with the
-#      Application apps-sample or the ConfigMap apps-demo/m8-marker, and a target in the state rolled_back. dev-cp goes first. It deletes the
-#      ConfigMap apps-demo/m8-marker of a target after its publish, and removes build/gate/m8-bundles after every publish ended applied.
+#      Application apps-sample or the ConfigMap m8-marker (in apps-sample for a cell, in apps-demo for dev-cp), and a target in the state
+#      rolled_back. dev-cp goes first. It deletes the ConfigMap m8-marker of a target after its publish, and removes build/gate/m8-bundles after every publish ended applied.
 # The tests record a target in build/gate/m8-bundles before they sign a set for it. It never touches an object without the label, and none with
 # another prefix. It is safe to run again.
 #
@@ -30,6 +30,8 @@ repair="mise run gate:m8:repair"
 test_label="cell.poc.internal/e2e"
 recorded="$BUILD_ROOT/gate/m8-bundles"
 marker_cm=m8-marker
+# The namespaces that can hold the marker: apps-sample for the app class of a cell, apps-demo for the platform component of dev-cp.
+marker_namespaces=(apps-sample apps-demo)
 wait_seconds="${GATE_M8_WAIT:-180}"
 open_wait="${GATE_M8_OPEN_WAIT:-2100}"
 
@@ -52,23 +54,6 @@ state_of() {
     || die "could not read ConfigMap bundle-state of $1"
 }
 
-# open_set <target> prints "<op ID> <expiry>" when the last signed set of the target is served, has no final result and has not expired, and nothing
-# otherwise. A target that has no set yet gives nothing.
-open_set() {
-  local got err
-  err="$(mktemp)"
-  if ! got="$(mise run bundle -- get --target "$1" 2>"$err")"; then
-    # Only the answer bundle_unknown means that the target has no set. Any other failure can hide an open set.
-    if grep -q bundle_unknown "$err" || grep -q bundle_unknown <<<"$got"; then rm -f "$err"; return 0; fi
-    echo "error: could not read the last set of $1: $(tail -n 1 "$err")" >&2
-    rm -f "$err"
-    return 1
-  fi
-  rm -f "$err"
-  jq -r --argjson now "$(date +%s)" 'def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0;
-    select(.served == true and (.result // null) == null and ((.expiresAt // "") | ts) > $now) | "\(.opId) \(.expiresAt)"' <<<"$got" 2>/dev/null || true
-}
-
 # probes prints "<cluster> <name>" for each probe of M8: a namespace, and application/<name> for an Application.
 probes() {
   local cluster names name
@@ -87,7 +72,7 @@ probes() {
 # Each target gets a reason line "<target> <kind> <text>" for a sign that a test changed it, where kind is recorded, apps-sample, marker,
 # rolled_back or rollback_unhealthy. A target with more than one sign has more than one line.
 signs() {
-  local target state apps open
+  local target state apps open ns
   for target in "${targets[@]}"; do
     if grep -qx -- "$target" "$recorded" 2>/dev/null; then
       printf '%s recorded is listed in build/gate/m8-bundles, so a test changed its signed set and did not restore it\n' "$target"
@@ -97,9 +82,11 @@ signs() {
     if grep -qx apps-sample <<<"$apps"; then
       printf '%s apps-sample holds the Application apps-sample\n' "$target"
     fi
-    if [[ -n "$(kubectl --context "kind-$target" -n apps-demo get configmap "$marker_cm" --ignore-not-found -o name)" ]]; then
-      printf '%s marker holds the ConfigMap apps-demo/%s\n' "$target" "$marker_cm"
-    fi
+    for ns in "${marker_namespaces[@]}"; do
+      if [[ -n "$(kubectl --context "kind-$target" -n "$ns" get configmap "$marker_cm" --ignore-not-found -o name)" ]]; then
+        printf '%s marker holds the ConfigMap %s/%s\n' "$target" "$ns" "$marker_cm"
+      fi
+    done
     open="$(open_set "$target")" || exit 1
     if [[ -n "$open" ]]; then
       printf '%s open holds the open set %s, which expires at %s and has no final result\n' "$target" "${open% *}" "${open#* }"
@@ -202,10 +189,12 @@ for target in "${targets[@]}"; do
     fi
     die "could not publish the hydrated set of $target: ${err##*$'\n'}. Run: CELL=$target mise run cell:hydrate, then mise run bundle -- publish --target $target --wait"
   fi
-  if grep -q "^$target marker " <<<"$reasons"; then
-    kubectl --context "kind-$target" -n apps-demo delete configmap "$marker_cm" --ignore-not-found >/dev/null \
-      || die "could not delete the ConfigMap apps-demo/$marker_cm of $target"
-  fi
+  for ns in "${marker_namespaces[@]}"; do
+    if grep -q "^$target marker holds the ConfigMap $ns/" <<<"$reasons"; then
+      kubectl --context "kind-$target" -n "$ns" delete configmap "$marker_cm" --ignore-not-found >/dev/null \
+        || die "could not delete the ConfigMap $ns/$marker_cm of $target"
+    fi
+  done
 done
 rm -f "$recorded"
 for id in $unserved; do

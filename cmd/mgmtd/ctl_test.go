@@ -20,6 +20,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/step"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/testtool/kubetoken"
 )
@@ -724,7 +725,7 @@ func bundleCtl(t *testing.T) (func(stdin string, args ...string) (int, string), 
 	}, plane
 }
 
-const bundleComponents = `[{"name":"apps-sample","wave":10,"namespace":"apps-demo","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
+const bundleComponents = `[{"name":"apps-sample","wave":10,"namespace":"apps-sample","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"name":"argocd","wave":-5,"namespace":"argocd","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]`
 
 func jsonLine(t *testing.T, out string) map[string]any {
 	t.Helper()
@@ -874,5 +875,79 @@ func TestCtlBundleCosign(t *testing.T) {
 		if code, out := ctl("", args...); code != 2 {
 			t.Errorf("%s: exit %d output %q", name, code, out)
 		}
+	}
+}
+
+// connect gives the plane the report of its signed revision, as envd sends it.
+func connect(plane *mgmt.Plane) {
+	plane.Report(mgmtapi.StatusReport{Applied: plane.Status().Signed})
+}
+
+func revisionOf(t *testing.T, m map[string]any) spec.Revision {
+	t.Helper()
+	b, err := json.Marshal(m["revision"])
+	must(t, err)
+	var r spec.Revision
+	must(t, json.Unmarshal(b, &r))
+	return r
+}
+
+func TestCtlRevoke(t *testing.T) {
+	ctl, plane := bindFixture(t, newFixture(t))
+	connect(plane)
+	before := plane.Status().Signed
+	m := ctlLine(t, ctl, "revoke", "--cell", "dev-cell-1")
+	got := revisionOf(t, m)
+	if m["cell"] != "dev-cell-1" || m["queued"] != false || m["already"] != false || got.Epoch != before.Epoch || got.Counter != before.Counter+1 {
+		t.Fatalf("revoke: %v", m)
+	}
+	if m := ctlLine(t, ctl, "revoke", "--cell", "dev-cell-1"); m["already"] != true || revisionOf(t, m) != got {
+		t.Fatalf("revoke again: %v", m)
+	}
+	st := ctlLine(t, ctl, "status")
+	mirror, _ := st["revocations"].([]any)
+	pending, _ := st["pendingRevokes"].([]any)
+	if len(mirror) != 1 || mirror[0].(map[string]any)["source"] != "admin" || pending == nil || len(pending) != 0 {
+		t.Fatalf("status revocations %v, pending %v", st["revocations"], st["pendingRevokes"])
+	}
+	code, out := ctl("revoke", "--cell", "dev-cell-9")
+	if lines := jsonLines(t, out); code != 1 || len(lines) != 1 || lines[0]["reason"] != "not_bound" {
+		t.Fatalf("revoke of an unknown cell: %d %q", code, out)
+	}
+	for name, args := range map[string][]string{
+		"no_cell": {"revoke"}, "two_cells": {"revoke", "--cell", "a", "--cell", "b"},
+		"other_flag": {"revoke", "--cell", "dev-cell-1", "--revision", "1"}, "expect_seq": {"--expect-seq", "1", "revoke", "--cell", "dev-cell-1"},
+	} {
+		if code, out := ctl(args...); code != 2 || len(jsonLines(t, out)) != 1 {
+			t.Errorf("%s: exit %d output %q", name, code, out)
+		}
+	}
+}
+
+func TestCtlUnrevoke(t *testing.T) {
+	ctl, plane := bindFixture(t, newFixture(t))
+	connect(plane)
+	code, out := ctl("unrevoke", "--cell", "dev-cell-1")
+	if lines := jsonLines(t, out); code != 1 || len(lines) != 1 || lines[0]["reason"] != "not_revoked" {
+		t.Fatalf("unrevoke of a cell that is not revoked: %d %q", code, out)
+	}
+	ctlLine(t, ctl, "revoke", "--cell", "dev-cell-1")
+	code, out = ctl("unrevoke", "--cell", "dev-cell-1")
+	if lines := jsonLines(t, out); code != 1 || len(lines) != 1 || lines[0]["reason"] != "not_connected" {
+		t.Fatalf("unrevoke before envd applied the revoke: %d %q", code, out)
+	}
+	connect(plane)
+	before := plane.Status().Signed
+	m := ctlLine(t, ctl, "unrevoke", "--cell", "dev-cell-1")
+	if got := revisionOf(t, m); m["cell"] != "dev-cell-1" || m["queued"] != false || got.Counter != before.Counter+1 {
+		t.Fatalf("unrevoke: %v", m)
+	}
+	for _, c := range plane.Status().Cells {
+		if c.Name == "dev-cell-1" && c.Revoked {
+			t.Fatal("the cell is still revoked")
+		}
+	}
+	if code, out := ctl("unrevoke"); code != 2 || len(jsonLines(t, out)) != 1 {
+		t.Fatalf("unrevoke without --cell: exit %d output %q", code, out)
 	}
 }

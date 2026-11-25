@@ -169,7 +169,7 @@ func cmap(ns, name, v string) string {
 
 func std(v string) []spec {
 	return []spec{
-		{"apps-sample", "apps-demo", cmap("apps-demo", "app", v)},
+		{"apps-sample", "apps-sample", cmap("apps-sample", "app", v)},
 		{"network-policy", "cell-system", cmap("cell-system", "np", v)},
 	}
 }
@@ -277,7 +277,7 @@ func (e *env) set(counter uint64, specs []spec) built {
 func (e *env) seedBootstrap() {
 	e.t.Helper()
 	b := e.build(tTarget, bundle.Version{}, []spec{
-		{"apps-sample", "apps-demo", cmap("apps-demo", "app", "boot")},
+		{"apps-sample", "apps-sample", cmap("apps-sample", "app", "boot")},
 		{"network-policy", "cell-system", cmap("cell-system", "np", "boot")},
 	})
 	e.boot = b
@@ -975,7 +975,7 @@ func TestApplyRootSubjectMismatch(t *testing.T) {
 }
 
 func badApp(body string) []spec {
-	return []spec{{"apps-sample", "apps-demo", body}}
+	return []spec{{"apps-sample", "apps-sample", body}}
 }
 
 func TestApplyComponentNotAllowed(t *testing.T) {
@@ -994,7 +994,7 @@ func TestApplyComponentNotAllowed(t *testing.T) {
 	})
 	t.Run("namespace of the component", func(t *testing.T) {
 		e := newEnv(t)
-		b := e.set(1, []spec{{"apps-sample", "argocd", cmap("apps-demo", "x", "1")}})
+		b := e.set(1, []spec{{"apps-sample", "argocd", cmap("apps-sample", "x", "1")}})
 		wantOutcome(t, e.apply("op1", b), op.OutcomeRefused, op.ReasonComponentNotAllowed, "namespace")
 		e.assertUntouched(t)
 	})

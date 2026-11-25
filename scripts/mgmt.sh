@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run mgmtd ctl in the pod mgmtd-0 of management: mise run mgmt -- status|records|pubkey|keys|keycheck|restore|rotate-key.
+# Run mgmtd ctl in the pod mgmtd-0 of management: mise run mgmt -- status|records|pubkey|keys|keycheck|revoke|unrevoke|restore|rotate-key.
 # The command reset-state runs scripts/mgmt-reset-state.sh: it moves a lost or invalid state aside and restarts mgmtd with a new key.
 # The command rotate-signing-key [--emergency | --step <name>] runs scripts/mgmt-rotate-key.sh: the overlap rotation, the render of the new key and the verify of both clusters.
 # The admin socket of mgmtd is a unix socket in the pod, so the command runs there. The binary prints

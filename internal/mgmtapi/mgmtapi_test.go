@@ -4,8 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -315,5 +320,152 @@ func TestBundleWireNames(t *testing.T) {
 	}
 	if ReasonBundleOpen != "bundle_open" {
 		t.Errorf("ReasonBundleOpen is %q", ReasonBundleOpen)
+	}
+}
+
+func TestStatusReportNoRevocationKey(t *testing.T) {
+	raw, _ := json.Marshal(StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 1}})
+	if string(raw) != `{"applied":{"epoch":1,"counter":1}}` {
+		t.Fatalf("got %s", raw)
+	}
+	raw, _ = json.Marshal(StatusReport{Applied: spec.Revision{Epoch: 1, Counter: 1}, LocalRevocations: []json.RawMessage{}})
+	if strings.Contains(string(raw), "localRevocations") {
+		t.Fatalf("an empty list encodes: %s", raw)
+	}
+	raw, _ = json.Marshal(StatusReport{LocalRevocations: []json.RawMessage{json.RawMessage(`{"payloadType":"x"}`)}})
+	if !strings.Contains(string(raw), `"localRevocations":[{"payloadType":"x"}]`) {
+		t.Fatalf("got %s", raw)
+	}
+}
+
+func TestRevocationWireNames(t *testing.T) {
+	at := time.Unix(1_800_000_000, 0).UTC()
+	for _, tc := range []struct {
+		v    any
+		keys []string
+	}{
+		{RevocationEvent{Cell: "c", Revision: spec.Revision{Epoch: 1, Counter: 2}, Kind: RevocationRevoke, Source: RevocationSourceAdmin, At: at},
+			[]string{"cell", "revision", "kind", "source", "at"}},
+		{RevocationEvent{Cell: "c", Revision: spec.Revision{Epoch: 1, Counter: 2}, Kind: RevocationRevoke, Source: RevocationSourceOperator,
+			EntryID: "0123456789abcdef", OperatorKeySHA256: strings.Repeat("a", 64), At: at},
+			[]string{"cell", "revision", "kind", "source", "entryId", "operatorKeySHA256", "at"}},
+	} {
+		raw, err := json.Marshal(tc.v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatal(err)
+		}
+		if len(m) != len(tc.keys) {
+			t.Errorf("%T encodes %s, want keys %v", tc.v, raw, tc.keys)
+		}
+		for _, k := range tc.keys {
+			if _, ok := m[k]; !ok {
+				t.Errorf("%T lacks key %q in %s", tc.v, k, raw)
+			}
+		}
+	}
+	if RevocationRevoke != "revoke" || RevocationUnrevoke != "unrevoke" || RevocationSourceAdmin != "admin" || RevocationSourceOperator != "operator" {
+		t.Error("revocation kinds or sources")
+	}
+}
+
+func TestRevocationReasons(t *testing.T) {
+	got := []string{
+		ReasonRevocationInvalid, ReasonRevocationStale, ReasonRevocationUnknownCell, ReasonRevocationOverflow,
+		ReasonNotConnected, ReasonNotRevoked, ReasonOverlayHeld, ReasonRestorePastRevocation,
+	}
+	want := []string{
+		"revocation_invalid", "revocation_stale", "revocation_unknown_cell", "revocation_overflow",
+		"not_connected", "not_revoked", "overlay_held", "restore_past_revocation",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("constant %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// Every other Reason constant of the package, from the source, must differ from the new ones.
+	fset := token.NewFileSet()
+	dir, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var files []*ast.File
+	for _, de := range dir {
+		if de.IsDir() || !strings.HasSuffix(de.Name(), ".go") || strings.HasSuffix(de.Name(), "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, de.Name(), nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, f)
+	}
+	seen := map[string]string{}
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			gd, ok := decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.CONST {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				vs := sp.(*ast.ValueSpec)
+				for i, name := range vs.Names {
+					if !strings.HasPrefix(name.Name, "Reason") || i >= len(vs.Values) {
+						continue
+					}
+					lit, ok := vs.Values[i].(*ast.BasicLit)
+					if !ok {
+						continue
+					}
+					v, _ := strconv.Unquote(lit.Value)
+					if prev, dup := seen[v]; dup {
+						t.Errorf("%s and %s share %q", prev, name.Name, v)
+					}
+					seen[v] = name.Name
+				}
+			}
+		}
+	}
+	if len(seen) < 50 {
+		t.Fatalf("found only %d reason constants", len(seen))
+	}
+	for _, r := range want[:4] {
+		if name, dup := seen[r]; dup {
+			t.Errorf("%s shares %q with a revocation reason", name, r)
+		}
+	}
+}
+
+func TestEntryUnrevoked(t *testing.T) {
+	rev := func(c uint64) spec.Revision { return spec.Revision{Epoch: 2, Counter: c} }
+	adopted := RevocationEvent{Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationRevoke, Source: RevocationSourceOperator, EntryID: "000000000000000a"}
+	undo := RevocationEvent{Cell: "dev-cell-2", Revision: rev(6), Kind: RevocationUnrevoke, Source: RevocationSourceAdmin}
+	for _, tc := range []struct {
+		name   string
+		events []RevocationEvent
+		cell   string
+		id     string
+		want   bool
+	}{
+		{"revoked_then_unrevoked", []RevocationEvent{adopted, undo}, "dev-cell-2", "000000000000000a", true},
+		{"unrevoke_listed_first", []RevocationEvent{undo, adopted}, "dev-cell-2", "000000000000000a", true},
+		{"revoked_only", []RevocationEvent{adopted}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_before_revoke", []RevocationEvent{adopted, {Cell: "dev-cell-2", Revision: rev(4), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_at_same_revision", []RevocationEvent{adopted, {Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"unrevoke_other_cell", []RevocationEvent{adopted, {Cell: "dev-cell-1", Revision: rev(6), Kind: RevocationUnrevoke}}, "dev-cell-2", "000000000000000a", false},
+		{"other_id", []RevocationEvent{adopted, undo}, "dev-cell-2", "000000000000000b", false},
+		{"id_of_other_cell", []RevocationEvent{adopted, undo}, "dev-cell-1", "000000000000000a", false},
+		{"admin_revoke_has_no_id", []RevocationEvent{{Cell: "dev-cell-2", Revision: rev(5), Kind: RevocationRevoke, Source: RevocationSourceAdmin}, undo}, "dev-cell-2", "", false},
+		{"unrevoke_with_the_id", []RevocationEvent{{Cell: "dev-cell-2", Revision: rev(6), Kind: RevocationUnrevoke, EntryID: "000000000000000a"}}, "dev-cell-2", "000000000000000a", false},
+		{"no_events", nil, "dev-cell-2", "000000000000000a", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EntryUnrevoked(tc.events, tc.cell, tc.id); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

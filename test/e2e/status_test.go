@@ -14,8 +14,9 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/op"
 )
 
-// statusAttemptMax bounds one run of a mise task in this file. harness:status takes about 2 minutes.
-const statusAttemptMax = 6 * time.Minute
+// statusAttemptMax bounds one run of a mise task in this file. On the dev Mac, harness:status takes 5 to 6 minutes. The bound
+// covers the 900 s limit that scripts/status.sh sets for each cell:verify, plus about 1 minute for the other reads.
+const statusAttemptMax = 16 * time.Minute
 
 // statusSampleMax is the age limit of a Prometheus sample in harness:status.
 const statusSampleMax = 5 * time.Minute
@@ -68,6 +69,24 @@ type statusObject struct {
 		Accessible []string `json:"accessible"`
 		Missing    []string `json:"missing"`
 	} `json:"kiali"`
+	// The M9 fields of the dev-cp object.
+	Island *struct {
+		Environment bool     `json:"environment"`
+		Cells       []string `json:"cells"`
+	} `json:"island"`
+	Overlay *struct {
+		Held   []json.RawMessage `json:"held"`
+		Inputs []json.RawMessage `json:"inputs"`
+	} `json:"overlay"`
+	Bans *struct {
+		Ready    bool `json:"ready"`
+		Restarts int  `json:"restarts"`
+	} `json:"bans"`
+	SVIDTTL *struct {
+		Live       string `json:"live"`
+		Configured string `json:"configured"`
+		Marker     bool   `json:"marker"`
+	} `json:"svidTTL"`
 }
 
 // statusOnce runs harness:status and returns the object of each cluster by name, and the exit status.
@@ -110,6 +129,11 @@ func TestM3StatusHealthy(t *testing.T) {
 		if !ok || !o.OK || !o.Verify.OK {
 			t.Errorf("object of %s is %+v (present %v), want ok with a passing cell:verify", cluster, o, ok)
 		}
+	}
+	if cp := objs["dev-cp"]; cp.Island == nil || cp.Overlay == nil || cp.Bans == nil || cp.SVIDTTL == nil {
+		t.Errorf("the dev-cp object lacks island, overlay, bans or svidTTL:\n%s", stdout)
+	} else if cp.Island.Environment || len(cp.Island.Cells) > 0 || !cp.Bans.Ready || cp.SVIDTTL.Live == "" {
+		t.Errorf("dev-cp island %+v, bans %+v, svidTTL %+v, want a connected environment, no cell without a stream, a Ready ban container and a live lifetime", *cp.Island, *cp.Bans, *cp.SVIDTTL)
 	}
 	mgmt := objs[mgmtCluster]
 	if mgmt.Agents == nil || mgmt.Kiali == nil {

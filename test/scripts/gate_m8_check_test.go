@@ -59,7 +59,7 @@ echo "scan $*" >>"$STUB_LOG"
 		h = "1"
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m8")
-	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + stale, "STUB_HIT=" + h}, env...)
 	b, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -69,6 +69,7 @@ echo "scan $*" >>"$STUB_LOG"
 // TestGateM8RunsChecksInOrder: gate.sh m8 runs gate-m6-repair.sh --check, gate-m7-repair.sh --check, gate-m8-repair.sh --check and the image check, and
 // then the tests. A failed check stops the run before the tests and before the later checks.
 func TestGateM8RunsChecksInOrder(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	_, calls, _, err := runGateM8(t, "", m7RepairOK, m8RepairOK, false)
 	if err != nil {
@@ -100,6 +101,7 @@ func TestGateM8RunsChecksInOrder(t *testing.T) {
 // TestGateM8Pattern: the tests run with the anchored pattern ^TestM8, so no other test that holds M8 in its name runs. They run with -short, which
 // skips the long tests, unless GATE_M8_LONG=1.
 func TestGateM8Pattern(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name  string
@@ -134,6 +136,7 @@ func TestGateM8Pattern(t *testing.T) {
 // TestGateM8ImageCheck: the image check of M7, and cell-proxy in bundle-store-0 and argocd-repo-server of dev-cp and of each live cell, stop the run before the tests and name
 // the command that updates the workload.
 func TestGateM8ImageCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct{ name, stale, want string }{
 		{name: "healthy"},
@@ -162,6 +165,7 @@ func TestGateM8ImageCheck(t *testing.T) {
 
 // TestGateM8TokenScan: after the tests, gate.sh m8 scans the logs with the start time of the run, and a hit fails the gate.
 func TestGateM8TokenScan(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, hit := range []bool{false, true} {
 		out, calls, _, err := runGateM8(t, "", m7RepairOK, m8RepairOK, hit)
@@ -180,6 +184,7 @@ func TestGateM8TokenScan(t *testing.T) {
 // TestGateM8Record: build/gate/m8-bundles lists the targets that a test changed. A run whose tests pass removes it, because each test restored its
 // target. A run whose tests fail keeps it, so that the next check names gate:m8:repair.
 func TestGateM8Record(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, fail := range []bool{false, true} {
 		root := ""
@@ -226,7 +231,7 @@ func runGateM8WithRecord(t *testing.T, env []string) (out, calls, root string, e
 		t.Fatal(err)
 	}
 	cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m8")
-	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+	cmd.Env = append([]string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 		"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE="}, env...)
 	b, err := cmd.CombinedOutput()
 	c, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -259,6 +264,7 @@ esac
 // TestTokenScanReadsStoreLogs: the scan reads the logs of the containers store-proxy (bundle-store-0) and store-token (argocd-repo-server) in each cluster, and
 // the files build/gate/m8-* that a gate:m8 run leaves. A compact JWS in any of them fails the scan with the place and the line number, and never prints the line.
 func TestTokenScanReadsStoreLogs(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	const jws = "eyJhbGciOiJSUzI1NiIsImtpZCI6IngifQ.eyJhdWQiOlsibWdtdCJdfQ.c2ln"
 	for _, tc := range []struct {
@@ -360,6 +366,7 @@ func TestTokenScanReadsStoreLogs(t *testing.T) {
 // TestGateM8RefusesEmptyBudget: the M8 waits are longer than the floor of the Go timeout, and a timeout skips every cleanup. So gate.sh m8 stops before any check and test
 // when GATE_M8_BUDGET_MINUTES or GATE_M8_TEST_TIMEOUT_MINUTES is empty, and names the variable.
 func TestGateM8RefusesEmptyBudget(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, name := range []string{"GATE_M8_BUDGET_MINUTES", "GATE_M8_TEST_TIMEOUT_MINUTES"} {
 		t.Run(name, func(t *testing.T) {
@@ -391,6 +398,7 @@ func TestGateM8RefusesEmptyBudget(t *testing.T) {
 // TestGateM8Versions: harness/versions.env holds the limits of M8 that the live runs set. The budget is 1.5 times the slower of two clean
 // runs (4007 s), rounded up to 5 minutes, and the Go test timeout is twice the budget. No line keeps the provisional mark.
 func TestGateM8Versions(t *testing.T) {
+	t.Parallel()
 	b, err := os.ReadFile("../../harness/versions.env")
 	if err != nil {
 		t.Fatal(err)

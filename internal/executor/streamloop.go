@@ -99,6 +99,7 @@ func newLoop(cfg StreamConfig, ctx context.Context, w io.Writer, dec *gwapi.Deco
 				l.readErr <- err
 				return
 			}
+			cfg.upstream.touch()
 			select {
 			case l.frames <- f:
 			case <-ctx.Done():

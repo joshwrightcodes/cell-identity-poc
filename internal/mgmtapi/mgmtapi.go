@@ -62,6 +62,60 @@ type StatusReport struct {
 	PlaneBundle *op.Result `json:"planeBundle,omitempty"`
 	// PlaneBundleStatus is the bundle state of the control plane.
 	PlaneBundleStatus *op.BundleStatus `json:"planeBundleStatus,omitempty"`
+	// LocalRevocations holds the envelope of each local revocation entry that envd holds, sorted by
+	// cell.
+	LocalRevocations []json.RawMessage `json:"localRevocations,omitempty"`
+}
+
+// The values of RevocationEvent.Kind.
+const (
+	RevocationRevoke   = "revoke"
+	RevocationUnrevoke = "unrevoke"
+)
+
+// The values of RevocationEvent.Source.
+const (
+	RevocationSourceAdmin    = "admin"
+	RevocationSourceOperator = "operator"
+)
+
+// RevocationEvent records one revoke or un-revoke of a cell that the management plane signed.
+// Revision is the revision of the signed cell record. EntryID and OperatorKeySHA256 name the
+// local revocation entry and the operator key of an event with source operator.
+type RevocationEvent struct {
+	Cell              string        `json:"cell"`
+	Revision          spec.Revision `json:"revision"`
+	Kind              string        `json:"kind"`
+	Source            string        `json:"source"`
+	EntryID           string        `json:"entryId,omitempty"`
+	OperatorKeySHA256 string        `json:"operatorKeySHA256,omitempty"`
+	At                time.Time     `json:"at"`
+}
+
+// EntryUnrevoked reports whether events hold a revoke of cell that adopted the local revocation
+// entry id, and an un-revoke of cell at a higher revision than that revoke. The order of events
+// does not matter. A reader that adopts entries refuses such an entry, so a replay of an old entry
+// does not revoke the cell again after an un-revoke.
+func EntryUnrevoked(events []RevocationEvent, cell, id string) bool {
+	if id == "" {
+		return false
+	}
+	var first spec.Revision
+	found := false
+	for _, ev := range events {
+		if ev.Kind == RevocationRevoke && ev.Cell == cell && ev.EntryID == id && (!found || ev.Revision.Compare(first) < 0) {
+			first, found = ev.Revision, true
+		}
+	}
+	if !found {
+		return false
+	}
+	for _, ev := range events {
+		if ev.Kind == RevocationUnrevoke && ev.Cell == cell && ev.Revision.Compare(first) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Refusal records the last spec that envd refused.

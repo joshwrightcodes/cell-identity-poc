@@ -185,6 +185,7 @@ func (l *trackListener) dropAll() {
 type tunnelHarness struct {
 	api      *fakeAPI
 	hub      *TunnelHub
+	srv      *Server
 	hubURL   string
 	hubURLs  map[string]string
 	server   string
@@ -260,6 +261,7 @@ func newTunnelHarnessWith(t *testing.T, cfg tunnelHarnessConfig) *tunnelHarness 
 		scfg.Proof = testProofCheck(cfg.registry)
 	}
 	srv := NewServer(scfg, NewTunnelBackend(h.hub), log)
+	h.srv = srv
 	ctx, cancel := context.WithCancel(context.Background())
 	h.stopServer, h.serverDone = cancel, make(chan struct{})
 	go func() { _ = srv.Serve(ctx, h.accepted); close(h.serverDone) }()

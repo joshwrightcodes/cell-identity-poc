@@ -23,17 +23,19 @@ type ObjectRef struct {
 // "*" stands for every namespaced kind, and a kind with a group is written group/Kind.
 // OwnServiceAccountsOnly lets a pod of the class run only as default or as a ServiceAccount that the
 // same component declares in the namespace of the pod. NoReservedObjects refuses the objects that
-// cluster controllers create in every namespace, which no Application tracks.
+// cluster controllers create in every namespace, which no Application tracks. NamespaceKinds limits a
+// namespace of ObjectNamespaces to the kinds that it lists for that namespace, as group/Kind.
 type Class struct {
-	Project                string   `json:"project"`
-	ObjectNamespaces       []string `json:"objectNamespaces"`
-	DestinationNamespaces  []string `json:"destinationNamespaces"`
-	ClusterKinds           []string `json:"clusterKinds"`
-	NamespacedKinds        []string `json:"namespacedKinds"`
-	ServiceClusterIPOnly   bool     `json:"serviceClusterIPOnly,omitempty"`
-	NoSidecarOptOut        bool     `json:"noSidecarOptOut,omitempty"`
-	OwnServiceAccountsOnly bool     `json:"ownServiceAccountsOnly,omitempty"`
-	NoReservedObjects      bool     `json:"noReservedObjects,omitempty"`
+	Project                string              `json:"project"`
+	ObjectNamespaces       []string            `json:"objectNamespaces"`
+	DestinationNamespaces  []string            `json:"destinationNamespaces"`
+	ClusterKinds           []string            `json:"clusterKinds"`
+	NamespacedKinds        []string            `json:"namespacedKinds"`
+	NamespaceKinds         map[string][]string `json:"namespaceKinds,omitempty"`
+	ServiceClusterIPOnly   bool                `json:"serviceClusterIPOnly,omitempty"`
+	NoSidecarOptOut        bool                `json:"noSidecarOptOut,omitempty"`
+	OwnServiceAccountsOnly bool                `json:"ownServiceAccountsOnly,omitempty"`
+	NoReservedObjects      bool                `json:"noReservedObjects,omitempty"`
 }
 
 // PolicyRef names one namespaced object.

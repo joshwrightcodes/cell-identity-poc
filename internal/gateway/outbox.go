@@ -99,16 +99,26 @@ func (s *Store) appendItem(tx *sql.Tx, it gwapi.Item) (gwapi.ItemID, error) {
 	return id, err
 }
 
-// Peek returns the oldest outbox items, at most maxItems and about maxBytes of encoded items, and
-// never more than 100 items and 900 KiB. It always returns one item when the outbox has one. It
-// does not remove anything.
+// peekOrder puts bind items first, then result items, then the newest status item of each cell,
+// then the rest. Each group goes by seq, so a fresh status reaches the management plane before the
+// stale status items that wait behind it.
+const peekOrder = `CASE
+	WHEN kind = 'bind' THEN 0
+	WHEN kind = 'result' THEN 1
+	WHEN kind = 'status' AND seq = (SELECT max(o.seq) FROM outbox o WHERE o.cell = outbox.cell AND o.kind = 'status') THEN 2
+	ELSE 3
+END, seq`
+
+// Peek returns outbox items in the order of peekOrder, at most maxItems and about maxBytes of
+// encoded items, and never more than 100 items and 900 KiB. It always returns one item when the
+// outbox has one. It does not remove anything.
 func (s *Store) Peek(ctx context.Context, maxItems, maxBytes int) ([]gwapi.OutItem, error) {
 	maxItems, maxBytes = min(maxItems, MaxPeekItems), min(maxBytes, MaxPeekBytes)
 	var out []gwapi.OutItem
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		out = nil
 		total, full := 0, false
-		return scanRows(tx, `SELECT id, cell, kind, op_id, body, token FROM outbox ORDER BY seq LIMIT ?`, func(r *sql.Rows) error {
+		return scanRows(tx, `SELECT id, cell, kind, op_id, body, token FROM outbox ORDER BY `+peekOrder+` LIMIT ?`, func(r *sql.Rows) error {
 			if full || len(out) >= maxItems {
 				return nil
 			}
@@ -194,7 +204,7 @@ func (s *Store) Outcome(ctx context.Context, cell string, id gwapi.ItemID) (mgmt
 // returned none). The stream keeps that cursor. It deletes nothing: after the stream has written
 // the frames, it calls ForgetRetries with the cursor.
 //
-// The cursor is the outbox row ID, which follows the order of Peek. Peek returns the oldest prefix,
+// The cursor is the outbox row ID. Peek returns result items by row ID, ahead of every status item,
 // one Ack stores the outcomes of a whole batch in one transaction, and the row ID is AUTOINCREMENT,
 // so a later batch has only higher IDs. An outcome below the cursor can appear only when a caller
 // breaks that order, for example with a partial ack, and the resend of the cell then heals it.

@@ -16,6 +16,7 @@ const notAgentSelector = "map[matchExpressions:[map[key:app.kubernetes.io/name o
 // leave out the pod of the Argo CD Agent, so that its own policy bounds it. Only the default deny
 // and the DNS rule select every pod. The bundle store admits only the repo server.
 func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			var policies map[string]object
@@ -54,7 +55,7 @@ func TestArgocdPoliciesExcludeTheAgent(t *testing.T) {
 			if policies["NetworkPolicy argocd/argocd"] == nil || policies["NetworkPolicy argocd/allow-from-nodes"] == nil {
 				t.Fatalf("the policies argocd and allow-from-nodes are missing in %s", cr.name)
 			}
-			for _, name := range []string{"cell-system", "istio-system", "apps-demo"} {
+			for _, name := range []string{"cell-system", "istio-system", "apps-demo", "apps-sample"} {
 				if p := policies["NetworkPolicy "+name+"/allow-from-nodes"]; p == nil || fmt.Sprint(lookupOr(p, "spec", "podSelector")) != "map[]" {
 					t.Errorf("allow-from-nodes in %s changed: %v", name, p)
 				}

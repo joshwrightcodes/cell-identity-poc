@@ -38,6 +38,7 @@ func copyFiles(t *testing.T, root, src string) {
 // so a new principal pod attests under the new root. Without a refresh the run stops before the
 // activate.
 func TestRotateCARefreshesTheSidecarBundle(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name    string
 		refresh bool

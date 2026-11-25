@@ -57,6 +57,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/executor"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/ocistore"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/satoken"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -69,6 +70,8 @@ const (
 	shutdownTimeout = 15 * time.Second
 
 	defaultBundleHealthTimeout = 5 * time.Minute
+	// defaultBundleRefillEvery is how often celld probes the in-cluster bundle store and refills it.
+	defaultBundleRefillEvery = time.Minute
 	// bundleStateName names the ConfigMap of the bundle state in the operations namespace.
 	bundleStateName = "bundle-state"
 )
@@ -105,7 +108,8 @@ type options struct {
 	cell, env, gateway, gatewayBind, trustBundle, opKeyDir, opsNamespace string
 	gatewayID                                                            spiffeid.ID
 	bundleMirror, bundleStore, bundleStoreToken                          string
-	bundleHealthTimeout                                                  time.Duration
+	bundleHealthTimeout, bundleRefillEvery                               time.Duration
+	bundleRefillSet                                                      bool
 	pod                                                                  struct{ name, uid, namespace, serviceAccount string }
 }
 
@@ -126,12 +130,14 @@ func parseOptions(args []string, lookupEnv func(string) (string, bool)) (options
 	fs.StringVar(&o.bundleStore, "bundle-store", "", "address of the in-cluster bundle store as <host>:<port>")
 	fs.StringVar(&o.bundleStoreToken, "bundle-store-token", "", "file with the projected token for the bundle store")
 	fs.DurationVar(&o.bundleHealthTimeout, "bundle-health-timeout", defaultBundleHealthTimeout, "time that a new bundle set has to become healthy")
+	fs.DurationVar(&o.bundleRefillEvery, "bundle-refill-every", defaultBundleRefillEvery, "time between probes of the bundle store, which refills it after a loss; 0 turns the probe off")
 	if err := fs.Parse(args); err != nil {
 		return o, err
 	}
 	if fs.NArg() > 0 {
 		return o, fmt.Errorf("unexpected argument %q", fs.Arg(0))
 	}
+	fs.Visit(func(f *flag.Flag) { o.bundleRefillSet = o.bundleRefillSet || f.Name == "bundle-refill-every" })
 	if err := checkBundleFlags(o); err != nil {
 		return o, err
 	}
@@ -194,8 +200,8 @@ func loadOpKeys(dir string) ([]ed25519.PublicKey, error) {
 // checkBundleFlags makes sure that the bundle flags are all set or all unset, and that they hold values.
 func checkBundleFlags(o options) error {
 	if o.bundleMirror == "" {
-		if o.bundleStore != "" || o.bundleStoreToken != "" {
-			return errors.New("--bundle-store and --bundle-store-token need --bundle-mirror")
+		if o.bundleStore != "" || o.bundleStoreToken != "" || o.bundleRefillSet {
+			return errors.New("--bundle-store, --bundle-store-token and --bundle-refill-every need --bundle-mirror")
 		}
 		return nil
 	}
@@ -204,6 +210,9 @@ func checkBundleFlags(o options) error {
 	}
 	if o.bundleHealthTimeout <= 0 {
 		return errors.New("--bundle-health-timeout must be positive")
+	}
+	if o.bundleRefillEvery < 0 {
+		return errors.New("--bundle-refill-every must not be negative")
 	}
 	return nil
 }
@@ -342,16 +351,18 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		Cell: opts.cell, Env: opts.env, Pod: opts.pod.name, PodUID: opts.pod.uid, Namespace: opts.opsNamespace,
 		Keys: keys, Client: kube, Log: tel.Log, Meter: tel.Meter,
 	}
+	var applier *bundleapply.Applier
 	if opts.bundleMirror != "" {
 		dyn, err := d.dynamicClient()
 		if err != nil {
 			tel.Log.Error("celld failed", "error", err.Error())
 			return 1
 		}
-		if execCfg.Bundle, err = newBundleApplier(opts, kube, dyn, tel); err != nil {
+		if applier, err = newBundleApplier(opts, kube, dyn, tel); err != nil {
 			tel.Log.Error("celld failed", "error", err.Error())
 			return 1
 		}
+		execCfg.Bundle = applier
 	}
 	exec := executor.New(execCfg)
 	bundle := bind.FileBundle(opts.trustBundle, opts.gatewayID.TrustDomain())
@@ -371,6 +382,9 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		stopGrace()
 		stopEffect()
 	}()
+	if applier != nil && opts.bundleRefillEvery > 0 {
+		background.Go(func() { applier.RunRefill(bgCtx, opts.bundleRefillEvery) })
+	}
 	background.Add(2)
 	go func() {
 		defer background.Done()
@@ -391,8 +405,8 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 		defer background.Done()
 		cfg := executor.StreamConfig{
 			Cell: opts.cell, Upstream: opts.gateway, Log: tel.Log, Tracer: tel.Tracer,
-			TLS:         executor.StreamTLS(w, bundle, opts.gatewayID),
-			SVIDUpdates: w.signal, Tokens: tokens, Exec: exec, EffectCtx: effectCtx,
+			TLS:   executor.StreamTLS(w, bundle, opts.gatewayID),
+			Meter: tel.Meter, SVIDUpdates: w.signal, Tokens: tokens, Exec: exec, EffectCtx: effectCtx,
 			Status: executor.NewStatus(opts.cell, opts.pod.name, opts.pod.uid, buildVersion(), w.expiry, exec),
 		}
 		if err := d.streamRun(bgCtx, cfg); err != nil && bgCtx.Err() == nil {
@@ -401,7 +415,7 @@ func execute(ctx context.Context, args []string, stdout io.Writer, d deps) int {
 	}()
 
 	tel.Log.Info("watching the workload api", "socket", os.Getenv("SPIFFE_ENDPOINT_SOCKET"))
-	if err := workloadapi.WatchX509Context(ctx, w); err != nil && ctx.Err() == nil {
+	if err := workloadapi.WatchX509Context(ctx, w, spireclient.ClientOptions()...); err != nil && ctx.Err() == nil {
 		tel.Log.Error("celld failed", "error", fmt.Sprintf("watch the workload api: %v", err))
 		return 1
 	}
@@ -423,6 +437,7 @@ type svidWatcher struct {
 	current *x509svid.SVID
 	// signal gets one value for each new SVID. A value that nobody has read yet is not repeated.
 	signal chan struct{}
+	now    func() time.Time
 }
 
 func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
@@ -431,7 +446,28 @@ func newSVIDWatcher(tel *telemetry.T) (*svidWatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create counter: %w", err)
 	}
-	return &svidWatcher{tel: tel, counter: counter, signal: make(chan struct{}, 1)}, nil
+	w := &svidWatcher{tel: tel, counter: counter, signal: make(chan struct{}, 1), now: time.Now}
+	_, err = tel.Meter.Float64ObservableGauge("celld.svid.remaining",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds until the current X.509 SVID expires, 0 after expiry or while celld holds none"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(w.remaining())
+			return nil
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("create gauge: %w", err)
+	}
+	return w, nil
+}
+
+// remaining returns the seconds until the current SVID expires. It is 0 after expiry and while
+// celld holds no SVID, and never negative.
+func (w *svidWatcher) remaining() float64 {
+	exp := w.expiry()
+	if exp.IsZero() {
+		return 0
+	}
+	return max(0, exp.Sub(w.now()).Seconds())
 }
 
 func (w *svidWatcher) OnX509ContextUpdate(c *workloadapi.X509Context) {

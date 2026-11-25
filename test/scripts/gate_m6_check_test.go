@@ -20,6 +20,7 @@ import (
 // with build/images.env. It stops before the tests on a stale image and names the command that brings the workload up to date.
 // The check runs after gate-m6-repair.sh --check, and a gate with every image current runs the tests with -run M6.
 func TestGateM6ImageCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, stale, want string
@@ -43,7 +44,7 @@ func TestGateM6ImageCheck(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m6")
-			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -92,6 +93,7 @@ if [[ -n "${STUB_MGMT_STATUS:-}" ]]; then printf '%s\n' "$STUB_MGMT_STATUS"; els
 // hold as requested, the script exits 1, with --check or without, and names the command. A live heartbeat over a long stage, a stage inside
 // its limit, and an entry that runs no stage pass. The journal times come from the clock of the Mac.
 func TestGateM6RepairChecksStuckStepsAndRequests(t *testing.T) {
+	t.Parallel()
 	const id = "0123456789abcdef0123456789abcdef"
 	requested := func(names ...string) string {
 		var cells []map[string]any
@@ -163,6 +165,7 @@ func TestGateM6RepairChecksStuckStepsAndRequests(t *testing.T) {
 // replicas. With --check the script names the Deployment and the repair command, and with no flag it sets the replicas back to 1
 // through harness-replicas.sh and waits for the rollout. One replica needs nothing, and an absent Deployment names cell:up.
 func TestGateM6RepairCellControllerReplicas(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		args  []string
@@ -223,6 +226,7 @@ func TestGateM6RepairCellControllerReplicas(t *testing.T) {
 // compares the SHA-256 of each envelope payload with the stepSHA256 of the spec in the same ConfigMap. --check names a key that differs
 // or that the spec does not index, and exits 1. A repair removes it with a merge patch. A key that matches stays.
 func TestGateM6RepairStraySteps(t *testing.T) {
+	t.Parallel()
 	b64 := base64.StdEncoding.EncodeToString
 	payload := `{"id":"` + strings.Repeat("a", 32) + `"}`
 	sum := fmt.Sprintf("%x", sha256.Sum256([]byte(payload)))
@@ -285,9 +289,10 @@ func TestGateM6RepairStraySteps(t *testing.T) {
 }
 
 // TestGateM6ProvisionGate: gate.sh m6-provision runs only TestProvisionFromPortal, with the go test timeout that gate_test_timeout derives from
-// the budget of 40 minutes and the floor of 175 minutes in harness/versions.env: the floor, 175 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
+// the budget of 85 minutes and the floor of 210 minutes in harness/versions.env: the floor, 210 minutes, because it is above twice the budget. It runs gate-m6-repair.sh --check and the image check of gate m6 first, and stops on a stale image. The
 // pattern of gate m6 does not match the provision test, because that test deletes both cells.
 func TestGateM6ProvisionGate(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, milestone, stale, want string
@@ -307,7 +312,7 @@ func TestGateM6ProvisionGate(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), tc.milestone)
-			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))
@@ -319,8 +324,8 @@ func TestGateM6ProvisionGate(t *testing.T) {
 				t.Errorf("the token scan did not run after the tests: calls %s", calls)
 			}
 			if tc.want == "" {
-				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 175m") || strings.Contains(string(calls), "-run M6") {
-					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 175m", err, ran, out, calls)
+				if err != nil || !ran || !strings.Contains(string(calls), "-timeout 210m") || strings.Contains(string(calls), "-run M6") {
+					t.Fatalf("err %v, ran %v, output %s\ncalls %s\nwant the provision test alone with a timeout of 210m", err, ran, out, calls)
 				}
 				return
 			}
@@ -334,13 +339,14 @@ func TestGateM6ProvisionGate(t *testing.T) {
 	}
 }
 
-// TestGateM6ProvisionTimeoutFloor: the go test timeout of gate:m6:provision is never below 175 minutes, whatever budget Task 11 sets.
-// The floor is the worst case of the bounds in TestProvisionFromPortal, 174 minutes (the sum in harness/versions.env), rounded up to 5.
+// TestGateM6ProvisionTimeoutFloor: the go test timeout of gate:m6:provision is never below 210 minutes, whatever budget Task 11 sets.
+// The floor is the worst case of the bounds in TestProvisionFromPortal, 209 minutes (the sum in harness/versions.env), rounded up to 5.
 func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash")
 	versions, _ := filepath.Abs("../../harness/versions.env")
 	lib, _ := filepath.Abs("../../scripts/lib.sh")
-	for budget, want := range map[string]string{"": "175", "50": "175", "87": "175", "90": "180"} {
+	for budget, want := range map[string]string{"": "210", "50": "210", "87": "210", "105": "210", "110": "220"} {
 		cmd := exec.Command("bash", "-c", `source "$1"; source "$2"; gate_test_timeout "$3" "${GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES:-}"`, "bash", lib, versions, budget)
 		cmd.Env = append(os.Environ(), "CELL=dev-cell-1")
 		out, err := cmd.Output()
@@ -352,7 +358,7 @@ func TestGateM6ProvisionTimeoutFloor(t *testing.T) {
 		}
 	}
 	out, err := exec.Command("bash", "-c", `source "$1"; printf '%s %s' "$GATE_M6_PROVISION_BUDGET_MINUTES" "$GATE_M6_PROVISION_TEST_TIMEOUT_MINUTES"`, "bash", versions).Output()
-	if err != nil || string(out) != "40 175" {
-		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"40 175\"", out, err)
+	if err != nil || string(out) != "85 210" {
+		t.Errorf("versions.env sets the provision budget and timeout %q (%v), want \"85 210\"", out, err)
 	}
 }

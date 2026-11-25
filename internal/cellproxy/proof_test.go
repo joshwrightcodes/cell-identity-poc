@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -400,15 +401,6 @@ func TestTunnelDialerSendsProof(t *testing.T) {
 func rewriteRegistry(t *testing.T, dir string, pubs []ed25519.PublicKey, priv ed25519.PrivateKey, cells ...record.Cell) {
 	t.Helper()
 	src := writeRegistry(t, pubs, priv, cells...)
-	old, err := filepath.Glob(filepath.Join(dir, "*"+recordSuffix))
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, f := range old {
-		if err := os.Remove(f); err != nil {
-			t.Fatal(err)
-		}
-	}
 	entries, err := os.ReadDir(src)
 	if err != nil {
 		t.Fatal(err)
@@ -424,6 +416,19 @@ func rewriteRegistry(t *testing.T, dir string, pubs []ed25519.PublicKey, priv ed
 		}
 		if err := os.Rename(tmp, filepath.Join(dir, e.Name())); err != nil {
 			t.Fatal(err)
+		}
+	}
+	// Each file is replaced at once and an old record goes only after the new ones are in place, so a
+	// reload never reads a directory with a record missing, as with the ConfigMap ..data swap.
+	old, err := filepath.Glob(filepath.Join(dir, "*"+recordSuffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range old {
+		if !slices.ContainsFunc(entries, func(e os.DirEntry) bool { return e.Name() == filepath.Base(f) }) {
+			if err := os.Remove(f); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 }

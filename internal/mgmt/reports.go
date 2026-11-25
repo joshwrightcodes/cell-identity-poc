@@ -82,6 +82,7 @@ type cellRuntime struct {
 	forged             []ForgedSeen
 	hintAt             time.Time
 	lastHintCheck      string
+	lastHintDoneAt     time.Time
 	invalidSince       time.Time
 	bundle             *op.BundleStatus
 }
@@ -182,7 +183,8 @@ func (p *Plane) queueHint(cell string) {
 			p.logLimited(ctx, slog.LevelWarn, "hint_check_failed/"+cell, "hint_check_failed", "cell", cell, "error", err.Error())
 		}
 		p.rmu.Lock()
-		p.rt.cell(cell).lastHintCheck = last
+		c := p.rt.cell(cell)
+		c.lastHintCheck, c.lastHintDoneAt = last, p.cfg.Now()
 		p.rmu.Unlock()
 	})
 }

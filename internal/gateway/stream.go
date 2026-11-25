@@ -327,6 +327,10 @@ func (h *StreamHandler) serve(w http.ResponseWriter, r *http.Request) {
 		refuse(gwapi.ReasonCellRevoked)
 		return
 	}
+	if gone, _ := h.st.Overlaid(ctx, cell); gone {
+		refuse(gwapi.ReasonCellRevoked)
+		return
+	}
 
 	frames := make(chan frameResult, 1)
 	go func() {
@@ -586,7 +590,8 @@ func (h *StreamHandler) handle(ctx context.Context, cell string, me *stream, o o
 	return errEndStream
 }
 
-// cellGone reports whether the record of cell is revoked or missing now. A store failure is not an
+// cellGone reports whether the record of cell is revoked or missing now, or a signed local
+// revocation holds the cell revoked. A store failure is not an
 // answer, so the stream goes on.
 func (h *StreamHandler) cellGone(ctx context.Context, cell string) bool {
 	rec, found, err := h.st.Cell(ctx, cell)
@@ -594,7 +599,11 @@ func (h *StreamHandler) cellGone(ctx context.Context, cell string) bool {
 		h.log.WarnContext(ctx, "stream_cell_check_failed", "cell", cell, "error", err.Error())
 		return false
 	}
-	return !found || rec.Revoked
+	if !found || rec.Revoked {
+		return true
+	}
+	gone, _ := h.st.Overlaid(ctx, cell)
+	return gone
 }
 
 // forward sends final or retry for each outcome after cursor, then forgets the retry outcomes that

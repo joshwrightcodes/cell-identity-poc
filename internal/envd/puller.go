@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"net/http"
 	"sync/atomic"
@@ -79,8 +80,16 @@ type PullerConfig struct {
 	// whose target is Cluster. A non-nil Plane applies the bundle set for Cluster.
 	Cluster string
 	Plane   *Plane
-	Now     func() time.Time
-	Sleep   func(context.Context, time.Duration) error
+	// ReportRate is the number of report items per second that envd posts to the management plane,
+	// with a burst of MaxReportItems. A value of zero or less takes DefaultReportRate.
+	ReportRate float64
+	Now        func() time.Time
+	Sleep      func(context.Context, time.Duration) error
+	// OperatorKeys returns the pinned operator keys that verify local revocation entries, and
+	// Revocations is the input of those entries. A nil Revocations takes in no entry, and a nil
+	// OperatorKeys verifies none.
+	OperatorKeys func() []ed25519.PublicKey
+	Revocations  RevocationSource
 }
 
 // Puller pulls the bundle of one environment in rounds, accepts it, saves it and reports.
@@ -112,6 +121,16 @@ type Puller struct {
 	relaySkipped bool
 	// stepsWritten identifies the content that this process last wrote to the steps ConfigMap.
 	stepsWritten string
+	heldGauge    metric.Int64Gauge
+	refusedCount metric.Int64Counter
+	throttled    metric.Int64Counter
+	// tokens and tokensAt hold the token bucket of the report rate.
+	tokens   float64
+	tokensAt time.Time
+	// started is the time of NewPuller. lastPull is the Unix time in nanoseconds of the last pull
+	// that returned a decodable spec, or zero before the first one. The age gauge reads both on collection.
+	started  time.Time
+	lastPull atomic.Int64
 }
 
 // NewPuller returns a Puller for cfg.
@@ -137,13 +156,16 @@ func NewPuller(cfg PullerConfig) *Puller {
 	if cfg.Tracer == nil {
 		cfg.Tracer = nooptrace.NewTracerProvider().Tracer("envd")
 	}
+	if cfg.ReportRate <= 0 {
+		cfg.ReportRate = DefaultReportRate
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleep
 	}
-	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}}
+	p := &Puller{cfg: cfg, logs: lograte.New(RefusalLogWindow, maxLogKeys, cfg.Now), hintMarks: map[string]time.Time{}, gwHints: map[string]time.Time{}, started: cfg.Now()}
 	// The instrument names are valid, so creation cannot fail. A failure leaves a no-op instrument.
 	p.counter, _ = cfg.Meter.Int64Gauge("envd.spec.counter",
 		metric.WithDescription("Counter of the last saved spec revision"))
@@ -153,7 +175,31 @@ func NewPuller(cfg PullerConfig) *Puller {
 		metric.WithDescription("Report items that the management plane decided, by outcome"))
 	p.outbox, _ = cfg.Meter.Int64Gauge("envd.gateway.outbox",
 		metric.WithDescription("Items in the outbox of the gateway at the last sync"))
+	p.heldGauge, _ = cfg.Meter.Int64Gauge("envd.revocations.held",
+		metric.WithDescription("Local revocation entries that the overlay holds"))
+	p.refusedCount, _ = cfg.Meter.Int64Counter("envd.revocations.refused",
+		metric.WithDescription("Input local revocation entries that envd refused, counted in each round, by reason"))
+	p.throttled, _ = cfg.Meter.Int64Counter("envd.reports.throttled",
+		metric.WithDescription("Report items that the report rate held back for a later round"))
+	// The gauge reads the age from the start of the process until the first such pull, so an island
+	// that began before a restart does not read as fresh.
+	_, _ = cfg.Meter.Float64ObservableGauge("envd.upstream.age",
+		metric.WithUnit("s"),
+		metric.WithDescription("Seconds since the last pull that returned a decodable spec, or since the start of envd before the first one"),
+		metric.WithFloat64Callback(func(_ context.Context, o metric.Float64Observer) error {
+			o.Observe(p.upstreamAge())
+			return nil
+		}))
 	return p
+}
+
+// upstreamAge returns the seconds since the last pull that returned a decodable spec, or since the start before the first one.
+func (p *Puller) upstreamAge() float64 {
+	ref := p.started
+	if n := p.lastPull.Load(); n != 0 {
+		ref = time.Unix(0, n)
+	}
+	return max(0, p.cfg.Now().Sub(ref).Seconds())
 }
 
 func sleep(ctx context.Context, d time.Duration) error {
@@ -268,6 +314,11 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	p.syncStore(rctx)
 
 	bundle, err := p.fetch(rctx)
+	if err == nil {
+		// A pull that returned a decodable spec counts, even when Accept refuses it, because the
+		// management plane answered. A refusal has its own signals.
+		p.lastPull.Store(p.cfg.Now().UnixNano())
+	}
 	if err != nil {
 		fail(span, err)
 		p.logLimited(ctx, "pull failed", "pull", "error", clip(err.Error()))
@@ -275,6 +326,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	} else if p.accept(ctx, rctx, bundle) {
 		failed = true
 	}
+	p.overlay(ctx)
 	if p.storeErr != "" {
 		failed = true
 	}
@@ -289,7 +341,7 @@ func (p *Puller) round(ctx context.Context) (failed bool) {
 	hints := p.pendingHints(ctx, gw)
 	steps, stepsAt := p.stepStatus(ctx)
 	rep := mgmtapi.StatusReport{Applied: p.applied, LastRefusal: p.refusal, StoreError: storeErr,
-		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt}
+		KeyHints: hints, Gateway: gw, Steps: steps, StepsAt: stepsAt, LocalRevocations: p.overlayEnvelopes()}
 	if p.cfg.Plane != nil {
 		rep.PlaneBundle, rep.PlaneBundleStatus = p.cfg.Plane.Report()
 	}
@@ -393,9 +445,10 @@ func (p *Puller) stepStatus(ctx context.Context) ([]mgmtapi.StepStatus, time.Tim
 	return steps, at
 }
 
-// sameContent reports whether two states hold the same signed spec and records.
+// sameContent reports whether two states hold the same signed spec, records and overlay.
 func sameContent(a, b *State) bool {
-	if a.SpecSHA256 != b.SpecSHA256 || !bytes.Equal(a.SpecEnvelope, b.SpecEnvelope) || len(a.Records) != len(b.Records) {
+	if a.SpecSHA256 != b.SpecSHA256 || !bytes.Equal(a.SpecEnvelope, b.SpecEnvelope) || len(a.Records) != len(b.Records) ||
+		!maps.EqualFunc(a.Revocations, b.Revocations, bytes.Equal) {
 		return false
 	}
 	for k, v := range a.Records {

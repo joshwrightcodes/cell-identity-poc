@@ -1107,3 +1107,82 @@ func TestBundleFlagsReachTheEngineConfig(t *testing.T) {
 		t.Errorf("state = %+v", cfg.State)
 	}
 }
+
+func TestCelldRefillFlag(t *testing.T) {
+	mirror := []string{"--bundle-mirror", "10.0.0.5:5000", "--bundle-store", "s:5000", "--bundle-store-token", "/t"}
+	parse := func(extra ...string) (options, error) {
+		return parseOptions(bundleArgs(t, append(slices.Clone(mirror), extra...)...), testEnv)
+	}
+	if o, err := parse(); err != nil || o.bundleRefillEvery != time.Minute {
+		t.Fatalf("default = %s, %v", o.bundleRefillEvery, err)
+	}
+	if o, err := parse("--bundle-refill-every", "30s"); err != nil || o.bundleRefillEvery != 30*time.Second {
+		t.Fatalf("30s = %s, %v", o.bundleRefillEvery, err)
+	}
+	if o, err := parse("--bundle-refill-every", "0s"); err != nil || o.bundleRefillEvery != 0 {
+		t.Fatalf("0s = %s, %v", o.bundleRefillEvery, err)
+	}
+	if _, err := parse("--bundle-refill-every", "-1s"); err == nil || !strings.Contains(err.Error(), "--bundle-refill-every") {
+		t.Fatalf("negative: %v", err)
+	}
+	if _, err := parse("--bundle-refill-every", "often"); err == nil {
+		t.Fatal("a value that is not a duration was accepted")
+	}
+	if _, err := parseOptions(bundleArgs(t, "--bundle-refill-every", "30s"), testEnv); err == nil || !strings.Contains(err.Error(), "--bundle-mirror") {
+		t.Fatalf("without the mirror: %v", err)
+	}
+	if o, err := parseOptions(bundleArgs(t), testEnv); err != nil || o.bundleMirror != "" {
+		t.Fatalf("no bundle flags: %+v, %v", o, err)
+	}
+}
+
+// The gauge reports the seconds until the SVID expires, 0 while there is none, and 0 and never
+// negative after expiry.
+func TestCelldSvidRemaining(t *testing.T) {
+	ca := newCA(t)
+	resp := ca.svid(t, 1).Svids[0]
+	svid, err := x509svid.ParseRaw(resp.X509Svid, resp.X509SvidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := sdkmetric.NewManualReader()
+	tel, err := testTelemetry(discard())(t.Context(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tel.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	w, err := newSVIDWatcher(tel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	notAfter := svid.Certificates[0].NotAfter
+	now := notAfter.Add(-90 * time.Second)
+	w.now = func() time.Time { return now }
+	read := func() float64 {
+		t.Helper()
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(t.Context(), &rm); err != nil {
+			t.Fatal(err)
+		}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name == "celld.svid.remaining" {
+					return m.Data.(metricdata.Gauge[float64]).DataPoints[0].Value
+				}
+			}
+		}
+		t.Fatal("no celld.svid.remaining metric")
+		return 0
+	}
+	if got := read(); got != 0 {
+		t.Fatalf("remaining %v with no SVID, want 0", got)
+	}
+	w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{svid}})
+	if got := read(); got != 90 {
+		t.Fatalf("remaining %v, want 90", got)
+	}
+	now = notAfter.Add(time.Minute)
+	if got := read(); got != 0 {
+		t.Fatalf("remaining %v after expiry, want 0", got)
+	}
+}

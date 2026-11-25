@@ -36,6 +36,7 @@ func renderRelay(t *testing.T, env ...string) result {
 // NetworkPolicy admits the own node on the health port and reaches the collector. The harness plane policies of the envd
 // render carry the cell and management flows.
 func TestRenderRelaySystem(t *testing.T) {
+	t.Parallel()
 	r := renderRelay(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -100,6 +101,7 @@ func TestRenderRelaySystem(t *testing.T) {
 // relay-bind Deployment, Service or NetworkPolicy, no route to 8447, and no node port 30447, even when the settings
 // still carry the old RELAY_BIND_ROUTES value.
 func TestRelayHasNoBindRoute(t *testing.T) {
+	t.Parallel()
 	for _, env := range [][]string{nil, {"RELAY_BIND_ROUTES=30447:8447=31447"}} {
 		r := renderRelay(t, env...)
 		if r.err != nil {
@@ -125,6 +127,7 @@ func TestRelayHasNoBindRoute(t *testing.T) {
 
 // TestRenderRelaySystemFailsClosed gives the relay bad routes and inputs. Each stops the render.
 func TestRenderRelaySystemFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ env, want string }{
 		{"RELAY_VIEW_ROUTES=8443=31443", "is not <node port>:<container port>=<target node port>"},
 		{"RELAY_VIEW_ROUTES=29999:8443=31443", "outside 30000 to 32767"},
@@ -153,6 +156,7 @@ func renderAgent(t *testing.T, cell string, env ...string) result {
 // agent and cell-proxy arguments, the RBAC limits, the copy of AppProject cell, the root pin and
 // the harness label.
 func TestRenderArgoCDAgent(t *testing.T) {
+	t.Parallel()
 	r := renderAgent(t, "dev-cell-1")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -228,6 +232,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				"[] [configmaps] [get list watch]; [] [secrets] [list watch]",
 			"Role argocd/argocd-agent-token":      "[] [serviceaccounts/token] [create]",
 			"Role apps-demo/argocd-agent-read":    "[] [services] [get list watch]; [apps] [deployments] [get list watch]; [security.istio.io] [authorizationpolicies] [get list watch]",
+			"Role apps-sample/argocd-agent-read":  "[] [configmaps serviceaccounts services] [get list watch]; [apps] [deployments] [get list watch]",
 			"Role argocd/argocd-agent-read":       "[apps] [statefulsets] [get list watch]; [argoproj.io] [appprojects] [get list watch]",
 			"Role istio-system/argocd-agent-read": "[] [configmaps] [get list watch]",
 			"ClusterRole argocd-agent-read": "[] [namespaces] [get list watch]; [admissionregistration.k8s.io] [validatingwebhookconfigurations] [get list watch]; " +
@@ -264,7 +269,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 				t.Errorf("the render reads the objects of the harness bundle: %s", key)
 			}
 		}
-		for _, key := range []string{"RoleBinding argocd/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
+		for _, key := range []string{"RoleBinding argocd/argocd-agent", "RoleBinding apps-demo/argocd-agent-read", "RoleBinding apps-sample/argocd-agent-read", "ClusterRoleBinding argocd-agent-read"} {
 			if fmt.Sprint(lookupOr(objs[key], "subjects")) != "[map[kind:ServiceAccount name:argocd-agent namespace:argocd]]" {
 				t.Errorf("%s binds %v, want argocd/argocd-agent only", key, lookupOr(objs[key], "subjects"))
 			}
@@ -312,6 +317,7 @@ func TestRenderArgoCDAgent(t *testing.T) {
 // TestRenderArgoCDAgentFailsClosed stops the render for a missing bundle directory, a failed
 // api-resources call, a kind with no resource, and an unpinned agent image.
 func TestRenderArgoCDAgentFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ env, want string }{
 		{"AGENT_BUNDLES=/nonexistent", "no bundles in /nonexistent"},
 		{"STUB_NO_API=1", "kubectl api-resources failed"},
@@ -367,6 +373,7 @@ func relayIngress(t *testing.T, objs map[string]object, name string) []string {
 // TestRenderRelaySystemReadsNoCellFacts: whichever cells are live, the render reads no cell fact and holds the same
 // ingress rule in each policy: the own node on the health port.
 func TestRenderRelaySystemReadsNoCellFacts(t *testing.T) {
+	t.Parallel()
 	for label, kindEnv := range map[string]string{"no live cell": "STUB_KIND_CLUSTERS=management dev-cp rogue", "two live cells": "STUB_KIND_CLUSTERS=management dev-cp dev-cell-1 dev-cell-2"} {
 		t.Run(label, func(t *testing.T) {
 			r := renderRelay(t, kindEnv)

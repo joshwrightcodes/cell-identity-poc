@@ -1,5 +1,7 @@
 package mgmtapi
 
+import "github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
+
 // Detail reasons of envd. A refused spec is reported outward as ReasonSpecInvalid.
 const (
 	ReasonSignatureInvalid   = "signature_invalid"
@@ -100,4 +102,22 @@ const (
 	// ahead of the clock.
 	ReasonStatusInFuture = "status_in_future"
 	ReasonKeysFailed     = "keys_failed"
+)
+
+// Reasons of envd for a local revocation entry that it refuses. The detail of
+// ReasonRevocationInvalid is revoke.DetailSignature, revoke.DetailDecode or revoke.DetailEnv.
+const (
+	ReasonRevocationInvalid     = revoke.ReasonInvalid
+	ReasonRevocationStale       = revoke.ReasonStale
+	ReasonRevocationUnknownCell = revoke.ReasonUnknownCell
+	ReasonRevocationOverflow    = revoke.ReasonOverflow
+)
+
+// Reasons of the revoke, un-revoke and restore commands of the management plane, besides
+// ReasonNotBound.
+const (
+	ReasonNotConnected          = "not_connected"
+	ReasonNotRevoked            = "not_revoked"
+	ReasonOverlayHeld           = "overlay_held"
+	ReasonRestorePastRevocation = "restore_past_revocation"
 )

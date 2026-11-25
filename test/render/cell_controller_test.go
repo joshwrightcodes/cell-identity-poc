@@ -19,6 +19,7 @@ func renderCellController(t *testing.T, env ...string) result {
 // images by digest, the bounds, the checksum annotations, the token in the cell-controller container only, the two Roles of
 // namespace cell-controller-system, the two ConfigMaps and the NetworkPolicies of flows N42, N43, N44, N8, N11 and N23.
 func TestCellControllerRender(t *testing.T) {
+	t.Parallel()
 	r := renderCellController(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -243,6 +244,7 @@ func TestCellControllerRender(t *testing.T) {
 // TestCellControllerRenderFollowsTheHostAddress: the address that the node resolves goes into --hostsvc-addr and into the
 // only rule of flow N42, so a changed address changes both.
 func TestCellControllerRenderFollowsTheHostAddress(t *testing.T) {
+	t.Parallel()
 	r := renderCellController(t, "STUB_GETENT=192.168.5.9 STREAM host.docker.internal\\n")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -261,6 +263,7 @@ func TestCellControllerRenderFollowsTheHostAddress(t *testing.T) {
 // TestCellControllerRenderFollowsTheKeys: a new signing key, and a staged key, change the key ConfigMap and the pod
 // annotation, so the pod restarts. A staged key goes in as next.pub, and the checksum covers both keys.
 func TestCellControllerRenderFollowsTheKeys(t *testing.T) {
+	t.Parallel()
 	other := "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
 	next := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 	annotation := func(r result) any {
@@ -304,6 +307,7 @@ func TestCellControllerRenderFollowsTheKeys(t *testing.T) {
 
 // TestCellControllerRenderFailsClosed gives the render a missing or wrong input. Each stops it with no output.
 func TestCellControllerRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -332,6 +336,7 @@ func TestCellControllerRenderFailsClosed(t *testing.T) {
 // TestCellControllerSettingsOfDevCP: the settings of dev-cp name the cell controller where other renders read it. The SPIRE
 // server admits cp/cell-controller as a local workload (flow N8), and the collector admits its namespace as a sender (flow N11).
 func TestCellControllerSettingsOfDevCP(t *testing.T) {
+	t.Parallel()
 	if !slices.Contains(strings.Fields(cellEnv(t, "dev-cp", "SPIRE_LOCAL_WORKLOADS")), "cp/cell-controller=cell-controller-system/cell-controller") {
 		t.Errorf("SPIRE_LOCAL_WORKLOADS of dev-cp is %q, want the entry cp/cell-controller=cell-controller-system/cell-controller", cellEnv(t, "dev-cp", "SPIRE_LOCAL_WORKLOADS"))
 	}

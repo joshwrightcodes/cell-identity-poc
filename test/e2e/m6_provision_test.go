@@ -409,6 +409,20 @@ func TestProvisionFromPortal(t *testing.T) {
 	if out, err := miseRun(t, 10*time.Minute, []string{"CELL=dev-cp"}, "cell:verify"); err != nil || !regexp.MustCompile(`(?m)^PASS  The SPIRE server, relay and gateway admit lists`).MatchString(out) {
 		t.Fatalf("step 10: cell:verify of dev-cp with both cells: %v, want a pass with the admit lists check\n%s", err, out)
 	}
+	// A cell that the portal creates starts with a bundle state of source bootstrap, and cell:verify fails that state. The signed
+	// publish gives each cell a set that mgmtd signed, as harness:up does after the portal.
+	publish := []string{"bundle", "--", "publish"}
+	for _, c := range cells {
+		publish = append(publish, "--target", c)
+	}
+	if out, err := miseRun(t, 15*time.Minute, nil, append(publish, "--wait")...); err != nil {
+		t.Fatalf("step 10: publish a signed set to %v: %v\n%s", cells, err, out)
+	}
+	for _, c := range cells {
+		if out, err := miseRun(t, 10*time.Minute, []string{"CELL=" + c}, "cell:verify"); err != nil {
+			t.Fatalf("step 10: cell:verify of %s after the signed publish: %v\n%s", c, err, out)
+		}
+	}
 	if err := os.Remove(m6ProvisionMarker); err != nil {
 		t.Fatalf("step 10: remove the marker: %v", err)
 	}

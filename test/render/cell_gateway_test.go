@@ -17,6 +17,7 @@ func renderGateway(t *testing.T, env ...string) result {
 // the bounds, the volumes, the three Services, the key ConfigMap with its checksum, and one NetworkPolicy rule for each of
 // the flows N37 to N40, N8, N11 and N23.
 func TestCellGatewayRender(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -86,7 +87,7 @@ func TestCellGatewayRender(t *testing.T) {
 		ctr := named(t, containers, "cellgw")
 		wantArgs := []string{"serve", "--env=dev", "--envd-id=spiffe://dev.env.poc.internal/envd", "--spec-key-file=/etc/cellgw/spec-key/spec.pub",
 			"--data-dir=/var/lib/cellgw", "--stream-listen=:8450", "--bind-listen=:8451", "--envd-listen=:8452", "--health-listen=:8080",
-			"--admin-socket=/run/cellgw/admin.sock", "--cell-node=dev-cell-1=10.9.0.1", "--cell-node=dev-cell-2=10.9.0.2"}
+			"--admin-socket=/run/cellgw/admin.sock", "--operator-key-file=/etc/cellgw/operator-key/keys.pub", "--cell-node=dev-cell-1=10.9.0.1", "--cell-node=dev-cell-2=10.9.0.2"}
 		if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != fmt.Sprint(wantArgs) {
 			t.Errorf("cellgw args are %s, want %v", got, wantArgs)
 		}
@@ -209,6 +210,7 @@ func TestCellGatewayRender(t *testing.T) {
 
 // TestCellGatewayRenderFailsClosed gives the render a missing or wrong input. Each stops it with no output.
 func TestCellGatewayRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -236,6 +238,7 @@ func TestCellGatewayRenderFailsClosed(t *testing.T) {
 // TestCellGatewayRenderNoLiveCells: with no cell cluster the render succeeds, passes no --cell-node, reads no cell
 // facts, and prints neither the N37 rule nor the N38 rule. The envd and kubelet rules stay.
 func TestCellGatewayRenderNoLiveCells(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -266,6 +269,7 @@ func TestCellGatewayRenderNoLiveCells(t *testing.T) {
 
 // TestCellGatewayRenderOneLiveCell: one live cell gives one --cell-node and one address in the N37 and N38 rules.
 func TestCellGatewayRenderOneLiveCell(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_KIND_CLUSTERS=management dev-cp rogue dev-cell-2")
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -283,9 +287,70 @@ func TestCellGatewayRenderOneLiveCell(t *testing.T) {
 // TestCellGatewayRenderLiveCellWithoutFacts: a live cell whose facts fail stops the render, so a read error never
 // removes a cell from the admit list.
 func TestCellGatewayRenderLiveCellWithoutFacts(t *testing.T) {
+	t.Parallel()
 	r := renderGateway(t, "STUB_FACTS_FAIL=dev-cell-2")
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "no host service facts for the live cell dev-cell-2") ||
 		!strings.Contains(r.stderr, "mise run hostsvc -- facts --cluster dev-cell-2") {
 		t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that names the facts command", r.err, len(r.stdout), r.stderr)
+	}
+}
+
+// TestCellGatewayOperatorPin: the gateway pins the keys of operator-pub as key keys.pub of ConfigMap
+// gateway-system/operator-key, and only cellgw mounts it read-only and reads it through --operator-key-file. cellgw reads the
+// file at start only, so the pod template carries the SHA-256 of the pin, and a rotation restarts the pod.
+func TestCellGatewayOperatorPin(t *testing.T) {
+	t.Parallel()
+	sums := map[string]string{}
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"one key", nil, operatorKeysPub(stubOperatorKey)},
+		{"a rotation", []string{"STUB_OPERATOR_NEXT=" + stubOperatorNext}, operatorKeysPub(stubOperatorKey, stubOperatorNext)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renderGateway(t, tc.env...)
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			objs := objectsIn(t, r.stdout)
+			cm := objs["ConfigMap gateway-system/operator-key"]
+			if cm == nil {
+				t.Fatalf("no ConfigMap gateway-system/operator-key in %v", keysOfObjects(objs))
+			}
+			if data := get[map[string]any](t, cm, "data"); len(data) != 1 || data["keys.pub"] != tc.want {
+				t.Errorf("operator-key holds %q, want only keys.pub %q", data, tc.want)
+			}
+			sts := objs["StatefulSet gateway-system/cell-gateway"]
+			pod := get[map[string]any](t, sts, "spec", "template", "spec")
+			args := fmt.Sprint(get[[]any](t, named(t, get[[]any](t, pod, "containers"), "cellgw"), "args"))
+			if strings.Count(args, "--operator-key-file=/etc/cellgw/operator-key/keys.pub") != 1 {
+				t.Errorf("cellgw args %s do not hold --operator-key-file=/etc/cellgw/operator-key/keys.pub once", args)
+			}
+			if v := named(t, get[[]any](t, pod, "volumes"), "operator-key"); get[string](t, v, "configMap", "name") != "operator-key" {
+				t.Errorf("volume operator-key is %v, want ConfigMap operator-key", v)
+			}
+			for _, c := range get[[]any](t, pod, "containers") {
+				name := get[string](t, c, "name")
+				var got []string
+				for _, m := range mountList(t, c) {
+					if strings.HasPrefix(m, "operator-key=") {
+						got = append(got, m)
+					}
+				}
+				if want := map[bool][]string{true: {"operator-key=/etc/cellgw/operator-key,true"}}[name == "cellgw"]; !slices.Equal(got, want) {
+					t.Errorf("container %s mounts the pin as %v, want %v", name, got, want)
+				}
+			}
+			sum := fmt.Sprint(lookupOr(sts, "spec", "template", "metadata", "annotations", "poc.internal/operator-key-sha256"))
+			if sum != sha256Hex(tc.want) {
+				t.Errorf("the pod annotation poc.internal/operator-key-sha256 is %s, want the SHA-256 of keys.pub %s", sum, sha256Hex(tc.want))
+			}
+			sums[tc.name] = sum
+		})
+	}
+	if sums["one key"] == sums["a rotation"] {
+		t.Error("a rotation leaves the pod annotation as it was, so cellgw would keep the old keys")
 	}
 }

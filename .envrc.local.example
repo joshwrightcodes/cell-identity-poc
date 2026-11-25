@@ -14,10 +14,14 @@ export POC_SECRET_TOKEN_CMD='<your secret CLI> read <reference to the access tok
 #     {"name": "poc-secrets-token", "key": "token"}}}}
 export POC_SECRET_STORE_PROVIDER='<provider block JSON for your secret manager>'
 
-# pki:rotate-intermediate only. The two commands get the remote key as "$1". The read command
-# prints the value of that key. The write command stores its standard input at that key. Use a
-# write identity that can change the intermediate items, and not the cluster access token.
+# pki:rotate-intermediate, the operator key tasks and revoke only. The two commands get the remote
+# key as "$1". The read command prints the value of that key. The write command stores its standard
+# input at that key. Use a write identity that can change these items, and not the cluster access
+# token.
 export POC_SECRET_READ_CMD='<your secret CLI> read "$1"'
 export POC_SECRET_WRITE_CMD='<your secret CLI> write "$1"'
+# operator:create-key, operator:check-key, operator:rotate-key and revoke only. The prefix of the
+# remote keys that hold the operator key.
+export POC_OPERATOR_KEY='<remote key prefix for the operator key>'
 # The remote key of the root CA bundle.
 export POC_ROOT_CA_BUNDLE='<reference to the root CA bundle>'

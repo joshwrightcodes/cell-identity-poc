@@ -101,6 +101,7 @@ func with(apps []stubApp, edit func(a []stubApp) []stubApp) []stubApp {
 }
 
 func TestAppsAtPublished(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		apps []stubApp
@@ -125,6 +126,7 @@ func TestAppsAtPublished(t *testing.T) {
 }
 
 func TestAppsBlockersNameTheReason(t *testing.T) {
+	t.Parallel()
 	apps := with(goodApps(), func(a []stubApp) []stubApp {
 		a[2].Health = "Progressing"
 		return append(a, stubApp{"argocd", "zzz", "Synced", "Healthy", "sha256:z"})
@@ -140,6 +142,7 @@ func TestAppsBlockersNameTheReason(t *testing.T) {
 }
 
 func TestCheckAppsNamespace(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		apps []stubApp
@@ -168,6 +171,7 @@ func TestCheckAppsNamespace(t *testing.T) {
 // In management, the principal mirrors the Applications of each cell of VIEW_CELLS into its agent
 // namespace. Only those namespaces may hold mirrors.
 func TestCheckAppsNamespaceAdmitsTheViewMirrors(t *testing.T) {
+	t.Parallel()
 	mirrors := append(goodApps(), stubApp{"dev-dev-cell-1", "a", "Synced", "Healthy", "sha256:a"}, stubApp{"dev-dev-cell-2", "b", "Synced", "Healthy", "sha256:b"})
 	if out, err := runLib(t, mirrors, `check_apps_namespace`, "CELL=management"); err != nil {
 		t.Fatalf("check_apps_namespace failed in management: %v\n%s", err, out)
@@ -181,6 +185,7 @@ func TestCheckAppsNamespaceAdmitsTheViewMirrors(t *testing.T) {
 // applications_json splits the Applications of argocd into the root and the children for the repair
 // and the trace check, and it keeps the errors of kubectl.
 func TestApplicationsJSONSplitsRootAndChildren(t *testing.T) {
+	t.Parallel()
 	out, err := runLib(t, goodApps(), `applications_json kubectl | jq -c '[[.root[].metadata.name], [.children[].metadata.name], (.items | length)]'`)
 	if err != nil || strings.TrimSpace(out) != `[["root"],["a","b"],3]` {
 		t.Fatalf("err %v, output %q; want root, the two children and three items", err, out)
@@ -193,6 +198,7 @@ func TestApplicationsJSONSplitsRootAndChildren(t *testing.T) {
 
 // bundle_traces reads root and spire-server from argocd.
 func TestBundleTracesReadArgocd(t *testing.T) {
+	t.Parallel()
 	snippet := `store_forward_start() { STORE_ADDR=x; }; store_forward_stop() { :; }
 oras() { echo "$(sed -n "s/^$(basename "${@: -1}" | sed 's/:current//')=//p" "$BUILD_ROOT/dev-cp/published.env")"; }
 published_digest() { sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env"; }
@@ -220,6 +226,7 @@ bundle_traces dev-cp`
 }
 
 func TestClusterChecksOfArgocd(t *testing.T) {
+	t.Parallel()
 	// The role of the cluster gives the projects: cell and cell-app in a cell, and cell in every other cluster.
 	def := `{"metadata":{"name":"default"},"spec":{"sourceRepos":[],"destinations":[],"clusterResourceWhitelist":[]}}`
 	cellProject := `{"metadata":{"name":"cell"},"spec":{"sourceRepos":["oci://x"]}}`
@@ -271,6 +278,7 @@ const (
 )
 
 func TestCheckArgocdSecrets(t *testing.T) {
+	t.Parallel()
 	good := []string{"STUB_VAP=" + goodVAP, "STUB_VAPB=" + goodVAPB}
 	for _, tc := range []struct {
 		name string
@@ -359,6 +367,7 @@ func relayFixture(t *testing.T, target string, cells ...string) string {
 // that the host service reports now. The fixture holds management at 172.18.0.3 and the cells at
 // 172.18.0.5 and 172.18.0.6.
 func TestCheckRelayCurrent(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, mgmt, cell2, want string
 	}{
@@ -394,6 +403,7 @@ check_relay_current`
 // Component bundles are pushed by digest only, so a stale tag current on a component bundle is no trace: only the tag of root and the
 // Application pin of spire-server are compared with published.env.
 func TestBundleTracesIgnoreComponentTags(t *testing.T) {
+	t.Parallel()
 	snippet := `store_forward_start() { STORE_ADDR=x; }; store_forward_stop() { :; }
 oras() { case "${@: -1}" in *spire-server*) echo "$STUB_SPIRE_TAG" ;; *) echo sha256:r ;; esac; }
 published_digest() { sed -n "s/^$2=//p" "$BUILD_ROOT/$1/published.env"; }
@@ -420,6 +430,7 @@ bundle_traces dev-cp`
 
 // The check of the AppProjects names no single other project, because a cell has two.
 func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
+	t.Parallel()
 	raw, err := os.ReadFile("../../scripts/verify.sh")
 	if err != nil {
 		t.Fatal(err)
@@ -429,10 +440,81 @@ func TestVerifyTextNamesTheProjectsOfTheRole(t *testing.T) {
 	}
 }
 
-// Component bundles have no tag, so the M2 gate repair retags only root.
-func TestComponentBundlesHaveNoTestTag(t *testing.T) {
-	out, err := runLib(t, nil, `echo "${BUNDLE_TEST_NAMES[*]}"`)
-	if err != nil || strings.TrimSpace(out) != "root" {
-		t.Fatalf("err %v, BUNDLE_TEST_NAMES is %q, want root alone", err, out)
+// republish_bundles puts dev-cp back through the signed publish path: one call of the bundle task for the target, with --wait, and no
+// call that writes to the store or moves a tag.
+func TestRepublishBundlesUsesSignedPublish(t *testing.T) {
+	t.Parallel()
+	snippet := `open_set() { :; }
+mise() { echo "mise $*" >>"$STUB_LOG"; return "${STUB_MISE_RC:-0}"; }
+oras() { echo "oras $*" >>"$STUB_LOG"; }
+republish_bundles dev-cp`
+	log := filepath.Join(t.TempDir(), "log")
+	out, err := runLib(t, nil, snippet, "STUB_LOG="+log)
+	calls, _ := os.ReadFile(log)
+	if err != nil || strings.TrimSpace(string(calls)) != "mise run bundle -- publish --target dev-cp --wait" {
+		t.Fatalf("err %v, output %q, calls %q; want one signed publish of dev-cp with --wait", err, out, calls)
+	}
+	out, err = runLib(t, nil, snippet, "STUB_LOG="+log, "STUB_MISE_RC=3")
+	if err == nil {
+		t.Fatalf("output %q; want a failure when the publish fails", out)
+	}
+}
+
+// Step 1 of gate-m2-repair.sh publishes the hydrated set. It does not tag a bundle with oras.
+func TestM2RepairStepOneUsesSignedPublish(t *testing.T) {
+	t.Parallel()
+	raw, err := os.ReadFile("../../scripts/gate-m2-repair.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(raw)
+	if strings.Contains(script, "oras ") {
+		t.Error("scripts/gate-m2-repair.sh still calls oras")
+	}
+	if !strings.Contains(script, "restore_bundles") {
+		t.Error("scripts/gate-m2-repair.sh does not call restore_bundles")
+	}
+}
+
+// restore_bundles decides step 1 of gate-m2-repair.sh: a trace leads to a signed publish, no trace with good Applications leads to no
+// change, and no trace with an Application that is not Synced and Healthy leads to a hard refresh of root and no publish.
+func TestRestoreBundlesDecision(t *testing.T) {
+	t.Parallel()
+	snippet := `bundle_traces() { printf '%s' "$STUB_TRACES"; }
+cp_apps_at_published() { return "${STUB_APPS_RC:-0}"; }
+republish_bundles() { echo "publish $1" >>"$STUB_LOG"; }
+kubectl() { echo "kubectl $*" >>"$STUB_LOG"; }
+restore_bundles dev-cp`
+	for _, tc := range []struct {
+		name, traces, appsRC, want string
+	}{
+		{"a trace and good Applications", "root:current differs", "0", "publish dev-cp\n"},
+		{"a trace and bad Applications", "a test entry", "1", "publish dev-cp\n"},
+		{"no trace and good Applications", "", "0", ""},
+		{"no trace and an Application not Healthy", "", "1", "kubectl --context kind-dev-cp -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite\n"},
+	} {
+		log := filepath.Join(t.TempDir(), "log")
+		out, err := runLib(t, nil, snippet, "STUB_LOG="+log, "STUB_TRACES="+tc.traces, "STUB_APPS_RC="+tc.appsRC)
+		calls, _ := os.ReadFile(log)
+		if err != nil || string(calls) != tc.want {
+			t.Errorf("%s: err %v, output %q, calls %q; want calls %q", tc.name, err, out, calls, tc.want)
+		}
+	}
+}
+
+// republish_bundles waits while a set is open, and fails with bundle_open when the set stays open.
+func TestRepublishBundlesWaitsForOpenSet(t *testing.T) {
+	t.Parallel()
+	snippet := `open_set() { echo x >>"$STUB_LOG.polls"; (($(wc -l <"$STUB_LOG.polls") < 3)) && echo "op1 later"; return 0; }
+mise() { echo "mise $*" >>"$STUB_LOG"; }
+republish_bundles dev-cp; echo "polls $(wc -l <"$STUB_LOG.polls" | tr -d " ")"`
+	log := filepath.Join(t.TempDir(), "log")
+	out, err := runLib(t, nil, snippet, "STUB_LOG="+log, "GATE_OPEN_POLL=0")
+	if err != nil || !strings.Contains(out, "polls 3") {
+		t.Fatalf("err %v, output %q; want three reads of the open set", err, out)
+	}
+	out, err = runLib(t, nil, `open_set() { echo "op1 later"; }; republish_bundles dev-cp`, "STUB_LOG="+log, "GATE_OPEN_POLL=0", "GATE_OPEN_WAIT_SECONDS=0")
+	if err == nil || !strings.Contains(out, "bundle_open") {
+		t.Fatalf("err %v, output %q; want a failure that names bundle_open", err, out)
 	}
 }

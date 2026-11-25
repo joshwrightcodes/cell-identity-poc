@@ -125,6 +125,36 @@ check_trust_domain() {
   grep -qF "\"$want\"" <<<"$certs" || { echo "echo has no certificate for $want"; return 1; }
 }
 
+# Every istio-proxy must hold a workload certificate with more than 1 hour left on the wall clock of the pod. The agent renews on the
+# monotonic clock, which stops while the Mac sleeps, so a sidecar can serve an expired certificate. The liveness probe of the cert-liveness
+# injection template restarts the container below 2 hours. This check reads only.
+check_proxy_cert_life() {
+  local ns pods name metrics left found=0 bad=""
+  for ns in apps-demo istio-egress; do
+    pods="$(k -n "$ns" get pods -o json)" || { echo "could not list the pods in $ns"; return 1; }
+    while read -r name; do
+      [[ -n "$name" ]] || continue
+      found=$((found + 1))
+      metrics="$(k -n "$ns" exec "$name" -c istio-proxy -- sh -c "curl -sf -m 3 -H 'X-Prometheus-Scrape-Timeout-Seconds: 2' localhost:15020/stats/prometheus")" \
+        || { bad+="$ns/$name: could not read the metrics of istio-proxy"$'\n'; continue; }
+      left="$(awk 'index($1, "istio_agent_cert_expiry_seconds{") == 1 && $1 ~ /resource_name="default"/ { print $2; exit }' <<<"$metrics")"
+      if [[ -z "$left" ]]; then
+        bad+="$ns/$name: no istio_agent_cert_expiry_seconds for the default certificate"$'\n'
+      elif ! awk -v v="$left" 'BEGIN { exit !(v > 3600) }'; then
+        bad+="$ns/$name: the certificate has ${left%.*} s left, want more than 3600"$'\n'
+      fi
+    done < <(jq -r '.items[] | select(.status.phase == "Running" and .metadata.deletionTimestamp == null)
+      | select([(.spec.initContainers // [])[], .spec.containers[] | .name] | index("istio-proxy") != null) | .metadata.name' <<<"$pods")
+  done
+  ((found > 0)) || { echo "no running istio-proxy in apps-demo or istio-egress"; return 1; }
+  if [[ -n "$bad" ]]; then
+    printf '%s' "$bad"
+    echo "The agent missed its renewal. The liveness probe of a sidecar restarts the container within about 2 minutes of VM run time."
+    echo "The egress gateway has no probe. Its repair is a pod replacement, which is allowed only outside an environment island."
+    return 1
+  fi
+}
+
 check_egress_through_gateway() {
   # Count upstream connections from the gateway to example.com. Istio trims most stats from
   # the stats endpoint, but /clusters keeps a cx_total counter for each upstream host.
@@ -286,8 +316,8 @@ check_live_images() {
   fi
 }
 
-# The entries test of gate:m2 publishes test bundles and adds an entry under /m2-test/. A run that
-# stops before its cleanup leaves them, and Argo CD still reports Synced and Healthy.
+# The entries test of gate:m2 serves a signed set with an entry under /m2-test/. A run that
+# stops before its cleanup leaves that set live, and Argo CD still reports Synced and Healthy.
 check_no_gate_bundles() {
   local traces
   if ! traces="$(bundle_traces "$CELL_NAME")" || [[ -n "$traces" ]]; then
@@ -750,6 +780,14 @@ check_no_blackhole() {
   [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the firewall rules: ${found//-D /}"; echo "Run: mise run gate:m3:repair"; return 1; }
 }
 
+# The partition tool cuts the traffic between two nodes with firewall rules in both address families. A run that stopped
+# early can leave them, and they cut a cell from its control plane, or an environment from management.
+check_no_partition() {
+  local found
+  found="$(partition_rules "$CELL_NAME-control-plane")" || { echo "the node of $CELL_NAME does not answer"; return 1; }
+  [[ -z "$found" ]] || { echo "the node of $CELL_NAME holds the cut rules: ${found//$'\n'/; }"; echo "Run: mise run partition -- heal --all"; return 1; }
+}
+
 log "checking cell $CELL_NAME"
 k get --raw /readyz >/dev/null 2>&1 || die "cannot reach the API server of $CELL_NAME"
 check "Argo CD reports every Application Synced and Healthy" check_apps_synced
@@ -761,6 +799,7 @@ check "Argo CD has no remote clusters and reads only the local store" check_argo
 check "$(IFS=,; echo "${platform_namespaces[*]}" | sed 's/,/, /g') run without mesh proxies" check_platform_outside_mesh
 check "Demo workloads run with mesh proxies, except plaintext" check_workloads_in_mesh
 check "Mesh certificates use the cell trust domain" check_trust_domain
+check "Every istio-proxy certificate has more than 1 hour left" check_proxy_cert_life
 check "client reaches echo over mesh mTLS" expect_code client http://echo/hostname 200
 check "intruder is denied by AuthorizationPolicy" expect_code intruder http://echo/hostname 403
 check "plaintext cannot reach echo, because mTLS is strict" expect_no_connection plaintext http://echo/hostname
@@ -892,6 +931,8 @@ if [[ -n "${RELAY_TARGET:-}" ]]; then
   check "The node of $CELL_NAME holds no firewall rule of a gate test between the relay and the hub" check_no_blackhole
 fi
 
+check "The node of $CELL_NAME holds no cut rule of the partition tool, in iptables or ip6tables" check_no_partition
+
 if has_harness mesh-view; then
   check "The mesh-view objects match the bundle" check_harness_drift mesh-view
   check "mesh-view-system has exactly the mesh-view objects of the bundle, with no other field manager" check_harness_objects mesh-view mesh-view-system
@@ -926,6 +967,9 @@ if has_harness envd; then
   check "ConfigMap cell-records holds the spec revision that mgmtd signed last" check_envd_applied
   check "The SPIRE server and envd pin the key that mgmtd signs with" check_spec_key_pinned
   check "ConfigMap spire-system/attest-hints exists, and the SPIRE server config sets hint_configmap to it" check_attest_hints_exists
+  check "Every operator key pin of dev-cp and management holds the keys of operator-pub" check_operator_pins
+  check "ConfigMap envd-system/local-revocations holds only entries that verify against the operator keys of envd" check_overlay_inputs
+  check "The container agent-ban in spire-server-0 is Ready and has not restarted, or is absent because no cell is live" check_agent_ban
 fi
 if has_harness cell-controller; then
   check "The cell-controller objects match the bundle" check_harness_drift cell-controller

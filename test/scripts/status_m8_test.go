@@ -35,6 +35,7 @@ func stubVar(kind, cluster string) string {
 // TestStatusBundles checks each bundle condition of harness:status: the exit status is 1, the problem sits in the object of the cluster that
 // it names, and it ends with the command to run. A state that is only a wait, and an absent cell, leave the exit status at 0.
 func TestStatusBundles(t *testing.T) {
+	t.Parallel()
 	const publish = "Run: mise run bundle -- publish --target %s --wait"
 	pub := func(c string) string { return strings.Replace(publish, "%s", c, 1) }
 	rolledBack := map[string]any{"state": "rolled_back", "result": map[string]any{"outcome": "rolled_back", "reason": "unhealthy", "detail": "argocd:Synced/Degraded"}}
@@ -210,6 +211,7 @@ func TestStatusBundles(t *testing.T) {
 // TestStatusExpiredUnservedBundleOps: an expired bundle.apply operation that was never served (signed with --no-serve) is information in the management
 // object (unservedExpiredOps) and no problem. An expired operation that was served, or that has no served field, stays a problem with the close command.
 func TestStatusExpiredUnservedBundleOps(t *testing.T) {
+	t.Parallel()
 	const id = "0123456789abcdef0123456789abcdef"
 	ops := func(extra map[string]any) string {
 		o := map[string]any{"id": id, "cell": "dev-cell-1", "state": "expired", "kind": "bundle.apply", "expiredAt": timeAgo(5 * time.Minute)}
@@ -235,6 +237,7 @@ func TestStatusExpiredUnservedBundleOps(t *testing.T) {
 // TestStatusBundleChecksNeedMgmtStatus: the allow-list comparison and the open-set check read mise run mgmt -- status. When it cannot be read, the object of
 // management says that these checks did not run, and no cluster passes in silence.
 func TestStatusBundleChecksNeedMgmtStatus(t *testing.T) {
+	t.Parallel()
 	byName, _, _, code := runStatus(t, "STUB_MGMT_RC=1")
 	if code != 1 || !strings.Contains(problemsOf(byName["management"]), "bundle checks that read the status of mgmtd") {
 		t.Errorf("exit %d, problems %q; want a problem that names the skipped bundle checks", code, problemsOf(byName["management"]))

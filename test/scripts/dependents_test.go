@@ -41,6 +41,7 @@ func libFunc(t *testing.T, cell, call string, env ...string) (string, string, er
 // runs cell:up, because its uplinks and mesh tunnel hold the root and node address of management. The full link comes last.
 // A cell that has no cluster is neither requested nor waited for.
 func TestDependentsManagementRebuild(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		env  []string
@@ -100,6 +101,7 @@ func TestDependentsManagementRebuild(t *testing.T) {
 // TestDependentsCellRebuild: a lost or rebuilt cell goes through cell:down (while its cluster exists), a portal recreate
 // that waits, and the management link. A cell that must be created first goes through the portal too.
 func TestDependentsCellRebuild(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		env  []string
@@ -120,6 +122,7 @@ func TestDependentsCellRebuild(t *testing.T) {
 // dependents_of dev-cp links mgmt-api again right after the cell:up of dev-cp and before the cells, because mgmtd
 // admits envd by the dev-cp root and the node address. It names the live cells only.
 func TestDependentsOfOtherChanges(t *testing.T) {
+	t.Parallel()
 	for call, want := range map[string]string{
 		"dependents_of hostsvc":       "mise run hostsvc:serve -- restart",
 		"dependents_of gateway-nodes": "CELL=dev-cp mise run cell:up",
@@ -185,6 +188,7 @@ func runHarness(t *testing.T, root, calls, verb string, env ...string) (string, 
 // harness:down stops the host service first, then deletes the clusters. The order of harness:up is in
 // TestHarnessUpOrderM6.
 func TestHarnessDown(t *testing.T) {
+	t.Parallel()
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "down")
 	if err != nil {
@@ -260,6 +264,7 @@ func TestHarnessDown(t *testing.T) {
 // TestHarnessUpHintListsAllSteps: a step that fails prints that step and every later one, the LINK_ONLY steps and the portal
 // steps included. The commands are those of TestHarnessUpOrderM6.
 func TestHarnessUpHintListsAllSteps(t *testing.T) {
+	t.Parallel()
 	all := harnessUpHint
 	for failAt, from := range map[string]int{"management/cell:up/": 0, "management/cell:link/mgmt-api": 1, "dev-cp/cell:up/": 2} {
 		t.Run(failAt, func(t *testing.T) {
@@ -342,6 +347,7 @@ func runLink(t *testing.T, root, calls string, env ...string) (string, string, e
 // waits for the rollout of its StatefulSet. An unknown name fails. A full link that stops after mgmt-api prints
 // the commands of the failed component and the later ones only.
 func TestLinkOnly(t *testing.T) {
+	t.Parallel()
 	t.Run("one component, no preflight, a StatefulSet wait", func(t *testing.T) {
 		root, calls := linkOnlyRoot(t)
 		// With no dev-cp server, the full link phase stops in link_preflight. LINK_ONLY=mgmt-api does not.
@@ -393,6 +399,7 @@ func TestLinkOnly(t *testing.T) {
 
 // TestLinkOnlyHydrate: HYDRATE_ONLY=link with LINK_ONLY renders only the named link component.
 func TestLinkOnlyHydrate(t *testing.T) {
+	t.Parallel()
 	root, calls := linkOnlyRoot(t)
 	cmd := exec.Command(filepath.Join(root, "scripts", "hydrate.sh"))
 	cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
@@ -410,6 +417,7 @@ func TestLinkOnlyHydrate(t *testing.T) {
 // is a link component and restart.sh restarts every workload of each link component. A new pod makes a new
 // nonce key.
 func TestRestartCoversTheStatefulSet(t *testing.T) {
+	t.Parallel()
 	root, calls := linkOnlyRoot(t)
 	// The harness, not the test, makes the objects of the bundle. The fake kubectl answers the label query and
 	// the pod queries that restart.sh makes.
@@ -456,6 +464,7 @@ done
 // TestImagesNamed: images.sh with names builds only those images and replaces only their lines of
 // build/images.env. With no name, it builds every image.
 func TestImagesNamed(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "bash", "git")
 	root := t.TempDir()
 	copyFiles(t, root, "scripts")
@@ -701,6 +710,7 @@ metadata:
 // kubectl (Apply) and harness-replicas (Update, scale), and check_harness_objects passes. A harness-replicas entry
 // that owns another field fails the check.
 func TestHarnessReplicasKeepsFields(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "kubectl", "yq", "jq", "bash")
 	api := newHarnessAPI(t)
 	dir := t.TempDir()
@@ -841,6 +851,7 @@ metadata:
 // TestCheckHarnessObjectsAcceptsSigningPub: ConfigMap mgmt-system/mgmt-signing-pub passes check_harness_objects
 // only with the marker label poc.internal/made-by=mgmtd and the field manager mgmtd.
 func TestCheckHarnessObjectsAcceptsSigningPub(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, marker, manager, want string
@@ -868,6 +879,90 @@ func TestCheckHarnessObjectsAcceptsSigningPub(t *testing.T) {
 			cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects mgmt-api mgmt-system`, "_", lib)
 			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_MARKER=" + tc.marker, "STUB_MANAGER=" + tc.manager}
+			var out bytes.Buffer
+			cmd.Stdout, cmd.Stderr = &out, &out
+			err = cmd.Run()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("check failed: %v\n%s", err, out.String())
+				}
+				return
+			}
+			if err == nil || !strings.Contains(out.String(), tc.want) {
+				t.Fatalf("err %v, output %q; want a failure that names %s", err, out.String(), tc.want)
+			}
+		})
+	}
+}
+
+// operatorObjectsKubectl serves the ConfigMaps of one namespace from $STUB_DIR/<namespace>.json, and the owned namespace of the
+// bundle with its harness label.
+const operatorObjectsKubectl = `#!/usr/bin/env bash
+set -euo pipefail
+args=" $* "
+case "$args" in
+  *" get ConfigMap -o json --show-managed-fields "*)
+    ns="$(printf '%s\n' "$args" | sed -E 's/.* -n ([a-z-]+) .*/\1/')"
+    cat "$STUB_DIR/$ns.json" ;;
+  *" get Namespace -l cell.poc.internal/harness="*)
+    comp="${args##*harness=}"; comp="${comp%% *}"
+    echo "{\"items\":[{\"metadata\":{\"name\":\"$STUB_NS\",\"labels\":{\"cell.poc.internal/harness\":\"$comp\"},\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]}}]}" ;;
+  *" get namespace $STUB_NS -o json --show-managed-fields "*)
+    echo "{\"metadata\":{\"name\":\"$STUB_NS\",\"labels\":{\"cell.poc.internal/harness\":\"$STUB_COMP\"},\"managedFields\":[{\"manager\":\"kubectl\",\"operation\":\"Apply\"}]}}" ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+`
+
+// TestCheckHarnessObjectsAcceptsOperatorObjects: the operator script writes ConfigMap mgmt-system/operator-pub in management and
+// envd-system/local-revocations in dev-cp with the field manager operator and no harness label. check_harness_objects accepts each
+// as a runtime object of its component, and flags it when another manager wrote it. The bundle object mgmt-system/operator-key, with
+// the harness label, passes beside it.
+func TestCheckHarnessObjectsAcceptsOperatorObjects(t *testing.T) {
+	t.Parallel()
+	testtool.Need(t, "yq", "jq", "bash")
+	own := func(name, comp string) string {
+		return `{"metadata":{"name":"` + name + `","labels":{"cell.poc.internal/harness":"` + comp + `"},"managedFields":[{"manager":"kubectl","operation":"Apply"}]}}`
+	}
+	written := func(name, manager string) string {
+		return `{"metadata":{"name":"` + name + `","managedFields":[{"manager":"` + manager + `","operation":"Update"}]}}`
+	}
+	for _, tc := range []struct {
+		name, cluster, comp, ns, object, manager, want string
+		bundled                                        []string
+	}{
+		{"operator-pub", "management", "mgmt-api", "mgmt-system", "operator-pub", "operator", "", []string{"mgmt-intent", "operator-key"}},
+		{"operator-pub of another manager", "management", "mgmt-api", "mgmt-system", "operator-pub", "kubectl-edit", "operator-pub", []string{"mgmt-intent", "operator-key"}},
+		{"local-revocations", "dev-cp", "envd", "envd-system", "local-revocations", "operator", "", []string{"operator-key"}},
+		{"local-revocations of another manager", "dev-cp", "envd", "envd-system", "local-revocations", "kubectl-edit", "local-revocations", []string{"operator-key"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte(operatorObjectsKubectl), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			items := []string{written(tc.object, tc.manager)}
+			bundle := "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: " + tc.ns + "\n"
+			for _, b := range tc.bundled {
+				items = append(items, own(b, tc.comp))
+				bundle += "---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: " + b + "\n  namespace: " + tc.ns + "\n"
+			}
+			if err := os.WriteFile(filepath.Join(dir, tc.ns+".json"), []byte(`{"items":[`+strings.Join(items, ",")+`]}`), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			bdir := filepath.Join(dir, "build", tc.cluster, "bundles", tc.comp)
+			if err := os.MkdirAll(bdir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(bdir, "manifests.yaml"), []byte(bundle), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			lib, err := filepath.Abs("../../scripts/lib.sh")
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command("bash", "-c", `source "$1"; check_harness_objects "$2" "$3"`, "_", lib, tc.comp, tc.ns)
+			cmd.Env = []string{"PATH=" + dir + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+				"CELL=" + tc.cluster, "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_DIR=" + dir, "STUB_NS=" + tc.ns, "STUB_COMP=" + tc.comp}
 			var out bytes.Buffer
 			cmd.Stdout, cmd.Stderr = &out, &out
 			err = cmd.Run()

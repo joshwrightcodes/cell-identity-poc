@@ -27,6 +27,8 @@ const (
 	MaxReportBytes = 1 << 20
 	// MaxReportResultBytes is the largest report result that the puller reads.
 	MaxReportResultBytes = 1 << 20
+	// DefaultReportRate is the default number of report items per second.
+	DefaultReportRate = 5
 )
 
 // GatewayClient is the envd side of the gateway API.
@@ -145,6 +147,7 @@ func (p *Puller) relay(ctx context.Context) *mgmtapi.GatewayStatus {
 		Records:      make(map[string]json.RawMessage, len(p.state.Records)),
 		Ops:          p.gatewayOps(ctx, ops.Ops),
 		Cells:        ops.Cells,
+		Revocations:  p.overlayEnvelopes(),
 	}
 	for k, v := range p.state.Records {
 		req.Records[k] = v
@@ -237,6 +240,21 @@ func batch(items []gwapi.OutItem) mgmtapi.ReportBatch {
 	return b
 }
 
+// takeTokens takes up to n tokens from the bucket of the report rate and returns how many it took.
+// The bucket holds at most MaxReportItems tokens, starts full, and refills with the injected clock.
+func (p *Puller) takeTokens(n int) int {
+	now := p.cfg.Now()
+	if p.tokensAt.IsZero() {
+		p.tokens = MaxReportItems
+	} else if d := now.Sub(p.tokensAt); d > 0 {
+		p.tokens = min(MaxReportItems, p.tokens+d.Seconds()*p.cfg.ReportRate)
+	}
+	p.tokensAt = now
+	got := min(n, int(p.tokens))
+	p.tokens -= float64(got)
+	return got
+}
+
 // relayItems posts the items to the management plane and, only when it answers, acknowledges each
 // outcome at the gateway.
 func (p *Puller) relayItems(ctx context.Context, items []gwapi.OutItem) {
@@ -244,12 +262,20 @@ func (p *Puller) relayItems(ctx context.Context, items []gwapi.OutItem) {
 	if len(b.Items) == 0 {
 		return
 	}
+	if n := p.takeTokens(len(b.Items)); n < len(b.Items) {
+		p.throttled.Add(ctx, int64(len(b.Items)-n))
+		b.Items = b.Items[:n]
+		if n == 0 {
+			return
+		}
+	}
 	var res mgmtapi.ReportResult
 	if err := p.leg(ctx, "envd.reports", func(lctx context.Context) error {
 		var err error
 		res, err = p.postReports(lctx, b)
 		return err
 	}); err != nil {
+		p.tokens = min(MaxReportItems, p.tokens+float64(len(b.Items)))
 		p.logLimited(ctx, "report post failed", "reports", "error", clip(err.Error()))
 		return
 	}

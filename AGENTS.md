@@ -70,6 +70,14 @@
 | Run the M8 end-to-end gate (build the images first; `GATE_M8_LONG=1` adds the long tests) | `mise run gate:m8` |
 | Repair what `gate:m8` leaves: test objects, and each target that a test changed. It repairs before it publishes, with `dev-cp` first (`--check` only reports) | `mise run gate:m8:repair` |
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
+| Run the M9 slow tier overnight (see README "Gate of M9"; build the images first) | `mise run gate:m9` |
+| Repair what `gate:m9` leaves: cuts, revoked test cells, held entries, the lifetime and `m9-*` namespaces (`--check` only reports) | `mise run gate:m9:repair` |
+| Run the gates as tiers: `fast` (M1 to M8), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
+| Cut and heal the traffic between two clusters: `cut`, `heal` or `list` (see README "Island mode and revocation") | `mise run partition -- cut --from dev-cell-2 --to dev-cp --hold 10` |
+| Switch the SVID lifetime of `dev-cp` for the slow tier: `set <ttl>`, `restore` or `show` | `mise run svid-ttl -- show` |
+| Revoke a cell through `mgmtd`, or undo it, while `dev-cp` is connected | `mise run mgmt -- revoke --cell dev-cell-2`, `mise run mgmt -- unrevoke --cell dev-cell-2` |
+| Revoke a cell on the Mac with the operator key while `dev-cp` is an island: `local`, `list`, `reapply` or `clean` | `mise run revoke -- local --cell dev-cell-2` |
+| Create, check and rotate the operator key (`--emergency` replaces it at once; see README "Operator key") | `mise run operator:create-key`, `mise run operator:check-key`, `mise run operator:rotate-key` |
 | Print CA keys and certificates as PEM (see README "Keys") | `mise run pki -- root` |
 
 ## References

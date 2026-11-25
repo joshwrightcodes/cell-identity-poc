@@ -3,9 +3,9 @@
 // sends up, publishes the signed records to the cell registries, and answers local commands on an
 // admin socket.
 //
-//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m] [--registry-namespaces <ns>,<ns>]
+//	mgmtd serve --intent <file> --peer-bundle <file> --peer-trust-domain <td> --allow-id <id> --hostsvc-addr <host:port> --hostsvc-server-name <name> --hostsvc-pin <file> --public-configmap <ns>/<name> [--data-dir /var/lib/mgmtd] [--api-listen :8446] [--health-listen :8080] [--admin-socket /run/mgmtd/ctl/admin.sock] [--hostsvc-timeout 10s] [--check-every 15m] [--registry-namespaces <ns>,<ns>] [--operator-key-file <file>]
 //	mgmtd reset-state [--data-dir /var/lib/mgmtd]
-//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign
+//	mgmtd ctl [--socket <path>] [--expect-seq <n>] status | records | pubkey | keys --cell <c> | keycheck --cell <c> | restore --revision <n|latest> | revoke --cell <c> | unrevoke --cell <c> | rotate-key --stage|--commit|--emergency | op create|sign --cell <c> --line <text> [--ttl <d>] | op get|close <id> | op list [--cell <c>] | portal request --cell <c>... --bootstrap-sha256 <hex> | portal withdraw --cell <c>... | portal recreate|retry --cell <c> --bootstrap-sha256 <hex> | portal cancel --cell <c> | step sign
 //
 // serve takes its SVID from the Workload API at SPIFFE_ENDPOINT_SOCKET. Every log line is compact
 // JSON on stdout. Logs, traces and metrics also go out as OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is
@@ -47,6 +47,8 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/hostsvc"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmt"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -89,7 +91,7 @@ func realDeps() deps {
 		svids: func(ctx context.Context) (x509svid.Source, func(), error) {
 			sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
 			defer cancel()
-			src, err := workloadapi.NewX509Source(sctx)
+			src, err := workloadapi.NewX509Source(sctx, spireclient.SourceOptions())
 			if err != nil {
 				return nil, nil, fmt.Errorf("x509 source from the workload api: %w", err)
 			}
@@ -180,6 +182,7 @@ type serveConfig struct {
 	cmNamespace, cmName                  string
 	checkEvery                           time.Duration
 	registryNamespaces                   []string
+	operatorKeyFile                      string
 }
 
 func parseServe(args []string) (serveConfig, error) {
@@ -199,6 +202,7 @@ func parseServe(args []string) (serveConfig, error) {
 	cm := fs.String("public-configmap", "", "ConfigMap for the public key, as <namespace>/<name>")
 	every := fs.Duration("check-every", 15*time.Minute, "time between key checks of a bound cell")
 	regNS := fs.String("registry-namespaces", "", "namespaces that get ConfigMap cell-registry, separated by commas; empty publishes nothing")
+	opKeys := fs.String("operator-key-file", "", "file with the pinned operator public keys, one standard base64 key per line; empty adopts no local revocation")
 	if err := parseFlags(fs, args); err != nil {
 		return serveConfig{}, err
 	}
@@ -237,7 +241,7 @@ func parseServe(args []string) (serveConfig, error) {
 	}
 	return serveConfig{intent: *intent, dataDir: *dataDir, apiListen: *apiListen, healthListen: *health, registryNamespaces: namespaces,
 		adminSocket: *sock, peerBundle: *bundle, peerTD: trust, allow: id, hostsvcAddr: *hAddr, hostsvcName: *hName,
-		hostsvcPin: *hPin, hostsvcTimeout: *hTimeout, cmNamespace: ns, cmName: cmName, checkEvery: *every}, nil
+		hostsvcPin: *hPin, hostsvcTimeout: *hTimeout, cmNamespace: ns, cmName: cmName, checkEvery: *every, operatorKeyFile: *opKeys}, nil
 }
 
 // parseNamespaces splits a comma list of namespace names. An empty list gives no namespace.
@@ -346,6 +350,17 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	if err != nil {
 		return &configError{err}
 	}
+	operatorKeys, err := loadOperatorKeys(cfg.operatorKeyFile)
+	if err != nil {
+		return &configError{err}
+	}
+	if len(operatorKeys) > 0 {
+		shas := make([]string, 0, len(operatorKeys))
+		for _, k := range operatorKeys {
+			shas = append(shas, revoke.KeySHA256(k))
+		}
+		logger.Info("operator_keys", "key_sha256", strings.Join(shas, ","))
+	}
 
 	svids, closeSVIDs, err := d.svids(ctx)
 	if err != nil {
@@ -374,6 +389,8 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		Log:        logger,
 		Meter:      meter,
 		CheckEvery: cfg.checkEvery,
+
+		OperatorKeys: operatorKeys,
 	}
 	pusher := NewSpecPusher(keyClient, specRepushEvery, logger)
 	pcfg.OnSpec, pcfg.SpecPushState = pusher.Offer, pusher.State
@@ -448,6 +465,22 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	}
 	logger.Info("stopped")
 	return failure
+}
+
+// loadOperatorKeys reads the pinned operator keys. An empty path gives no key.
+func loadOperatorKeys(path string) ([]ed25519.PublicKey, error) {
+	if path == "" {
+		return nil, nil
+	}
+	text, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	keys, err := revoke.ParseKeys(text)
+	if err != nil {
+		return nil, fmt.Errorf("--operator-key-file: %w", err)
+	}
+	return keys, nil
 }
 
 func ignoreClosed(err error) error {

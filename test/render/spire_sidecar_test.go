@@ -3,6 +3,7 @@ package render
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -19,7 +20,7 @@ import (
 // existed, and the changes that M4, M5 and M8 made on purpose to celld (the gateway flags, the pod fields, the
 // token, trust bundle and operation key mounts, ConfigMap mgmt-op-key, the gateway ports in the policy, the
 // namespace cell-ops-system, and for M8 the bundle flags, the store token, the rights to apply signed sets, the mirror
-// and store rules, the plane policy of the store and the two guards). Review the diff of the
+// and store rules, the plane policy of the store and the two guards, and for M9 the flag --bundle-refill-every). Review the diff of the
 // file by hand before each commit. The image
 // digest of the stub registry is replaced by stubDigest, so the file does not depend on the gzip
 // output of one Go version. UPDATE_GOLDEN=1 writes the file again from the current render.
@@ -65,6 +66,7 @@ func sameObjects(t *testing.T, got, want map[string]object) {
 // TestSpireSidecarClusterJWTMatchesCelld renders celld through the sidecar helper and compares
 // every object with the M2 render, so the helper keeps the deployed celld pod as it is.
 func TestSpireSidecarClusterJWTMatchesCelld(t *testing.T) {
+	t.Parallel()
 	r := renderCellIdentity(t, "STUB_BUNDLE_FILE="+devEnvCA(t))
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -133,6 +135,7 @@ var psatSidecarEnv = []string{
 }
 
 func TestSpireSidecarK8sPSAT(t *testing.T) {
+	t.Parallel()
 	bundle := caPEM(t, "mgmt.poc.internal")
 	r := sidecar(t, "otel-uplink", "k8s_psat", planeWorkload, append(slices.Clone(psatSidecarEnv), "SPIRE_SIDECAR_BUNDLE="+bundle)...)
 	if r.err != nil {
@@ -258,6 +261,7 @@ func TestSpireSidecarK8sPSAT(t *testing.T) {
 // TestSpireSidecarClusterJWTDefaults renders a cell workload with the default names. The token
 // Role names only the ServiceAccount of the workload.
 func TestSpireSidecarClusterJWTDefaults(t *testing.T) {
+	t.Parallel()
 	input := strings.NewReplacer("otel-uplink", "argocd-agent", "observability-system", "argocd").Replace(planeWorkload)
 	r := sidecar(t, "argocd-agent", "cluster_jwt", input,
 		"SPIRE_SIDECAR_SERVER_ADDRESS=10.9.0.9", "SPIRE_SIDECAR_SERVER_PORT=30091", "SPIRE_SIDECAR_TRUST_DOMAIN=test.env.poc.internal",
@@ -291,6 +295,7 @@ func TestSpireSidecarClusterJWTDefaults(t *testing.T) {
 }
 
 func TestSpireSidecarFailsClosed(t *testing.T) {
+	t.Parallel()
 	bundle := "SPIRE_SIDECAR_BUNDLE=" + caPEM(t, "mgmt.poc.internal")
 	collide := strings.Replace(planeWorkload, "      containers:", "      volumes:\n        - name: data\n          emptyDir: {}\n      containers:", 1)
 	cases := []struct {
@@ -337,6 +342,7 @@ func peerRoot(t *testing.T, env ...string) result {
 }
 
 func TestPeerRootConfigMap(t *testing.T) {
+	t.Parallel()
 	r := peerRoot(t)
 	if r.err != nil {
 		t.Fatalf("peer_root_configmap failed: %v\n%s", r.err, r.stderr)
@@ -356,6 +362,7 @@ func TestPeerRootConfigMap(t *testing.T) {
 }
 
 func TestPeerRootConfigMapFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, env, want string }{
 		{"no server", "STUB_NO_SERVER=1", "Run CELL=dev-cp mise run cell:up first"},
 		{"other trust domain", "STUB_TRUST_DOMAIN=mgmt.poc.internal", "want spiffe://dev.env.poc.internal"},
@@ -365,6 +372,52 @@ func TestPeerRootConfigMapFailsClosed(t *testing.T) {
 			r := peerRoot(t, tc.env)
 			if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
 				t.Fatalf("err %v, stdout %q, stderr %q; want a failure that says %q", r.err, r.stdout, r.stderr, tc.want)
+			}
+		})
+	}
+}
+
+// TestSpireAgentStartupProbe: after an island heals, a cluster_jwt agent attests again and its socket appears only after the
+// attestation (Task 2 live finding N2: the liveness probe killed agents that still attested 33 to 65 s after the start). The spire-agent
+// container of both modes has a startup probe on the same health check, which holds off the liveness and readiness probes for at
+// least 90 s. The liveness probe keeps its settings.
+func TestSpireAgentStartupProbe(t *testing.T) {
+	t.Parallel()
+	input := strings.NewReplacer("otel-uplink", "argocd-agent", "observability-system", "argocd").Replace(planeWorkload)
+	for _, tc := range []struct {
+		name string
+		r    func(t *testing.T) (result, string, string)
+	}{
+		{"cluster_jwt", func(t *testing.T) (result, string, string) {
+			return sidecar(t, "argocd-agent", "cluster_jwt", input,
+				"SPIRE_SIDECAR_SERVER_ADDRESS=10.9.0.9", "SPIRE_SIDECAR_SERVER_PORT=30091", "SPIRE_SIDECAR_TRUST_DOMAIN=test.env.poc.internal",
+				"SPIRE_SIDECAR_CELL=@CELL_NAME@", "SPIRE_SIDECAR_BUNDLE="+caPEM(t, "test.env.poc.internal"), "CELL_NAME=dev-cell-1"), "argocd", "Deployment/argocd-agent"
+		}},
+		{"k8s_psat", func(t *testing.T) (result, string, string) {
+			return sidecar(t, "otel-uplink", "k8s_psat", planeWorkload, append(slices.Clone(psatSidecarEnv), "SPIRE_SIDECAR_BUNDLE="+caPEM(t, "mgmt.poc.internal"))...),
+				"observability-system", "Deployment/otel-uplink"
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ns, key := tc.r(t)
+			if r.err != nil {
+				t.Fatalf("helper failed: %v\n%s", r.err, r.stderr)
+			}
+			agent := named(t, get[[]any](t, docsIn(t, r.stdout, ns)[key], "spec", "template", "spec", "containers"), "spire-agent")
+			sp, ok := agent["startupProbe"].(map[string]any)
+			if !ok {
+				t.Fatalf("spire-agent has no startupProbe: %v", agent)
+			}
+			if got := fmt.Sprint(lookupOr(sp, "exec", "command")); got != "[/opt/spire/bin/spire-agent healthcheck -socketPath /run/spire/agent/agent.sock]" {
+				t.Errorf("the startup probe runs %s, want the health check of the Workload API socket", got)
+			}
+			period, _ := sp["periodSeconds"].(float64)
+			threshold, _ := sp["failureThreshold"].(float64)
+			if period*threshold < 90 {
+				t.Errorf("the startup probe allows %v s (period %v, threshold %v), want at least 90 s", period*threshold, period, threshold)
+			}
+			if got := fmt.Sprint(lookupOr(agent, "livenessProbe")); got != "map[exec:map[command:[/opt/spire/bin/spire-agent healthcheck -shallow -socketPath /run/spire/agent/agent.sock]] initialDelaySeconds:30 periodSeconds:30 timeoutSeconds:5]" {
+				t.Errorf("the liveness probe is %s, want its settings unchanged", got)
 			}
 		})
 	}

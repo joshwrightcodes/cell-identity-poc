@@ -48,6 +48,8 @@ spec:
         app.kubernetes.io/name: cell-gateway
       annotations:
         poc.internal/spec-key-sha256: "@SPEC_KEY_SHA256@"
+        # cellgw reads the operator keys at start only, so a rotation restarts the pod.
+        poc.internal/operator-key-sha256: "@OPERATOR_KEY_SHA256@"
     spec:
       serviceAccountName: cell-gateway
       automountServiceAccountToken: false
@@ -72,6 +74,7 @@ spec:
             - --envd-listen=:8452
             - --health-listen=:8080
             - --admin-socket=/run/cellgw/admin.sock
+            - --operator-key-file=/etc/cellgw/operator-key/keys.pub
 @CELL_NODE_ARGS@
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
@@ -124,6 +127,9 @@ spec:
             - name: spec-key
               mountPath: /etc/cellgw/spec-key
               readOnly: true
+            - name: operator-key
+              mountPath: /etc/cellgw/operator-key
+              readOnly: true
             # The admin socket lives at /run/cellgw/admin.sock. Only this container mounts the volume.
             - name: admin
               mountPath: /run/cellgw
@@ -131,6 +137,9 @@ spec:
         - name: spec-key
           configMap:
             name: mgmt-spec-key
+        - name: operator-key
+          configMap:
+            name: operator-key
         - name: admin
           emptyDir:
             sizeLimit: 1Mi

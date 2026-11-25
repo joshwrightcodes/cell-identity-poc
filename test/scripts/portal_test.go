@@ -128,12 +128,14 @@ func (e *portalEnv) calls() []string {
 	return strings.Split(strings.TrimSpace(string(b)), "\n")
 }
 
+// run starts portal.sh. PORTAL_WAIT_SECONDS=120 only stops a wait that never ends: a wait that reads a few states needs a few reads, and each
+// read costs the time of several process starts, which a busy Mac stretches to seconds. A row that expects a timeout sets its own bound.
 func (e *portalEnv) run(t *testing.T, args []string, env ...string) (stdout, stderr string, err error) {
 	t.Helper()
 	cmd := exec.Command(filepath.Join(e.root, "scripts", "portal.sh"), args...)
 	cmd.Env = append([]string{"PATH=" + filepath.Join(e.root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
 		"POC_BUILD_ROOT=" + filepath.Join(e.root, "build"), "STUB_STATE=" + e.state, "STUB_DIGEST=" + portalDigest,
-		"HOSTSVC_SERVE=" + filepath.Join(e.root, "bin", "hostsvc-serve"), "PORTAL_POLL_SECONDS=0.1", "PORTAL_WAIT_SECONDS=2"}, env...)
+		"HOSTSVC_SERVE=" + filepath.Join(e.root, "bin", "hostsvc-serve"), "PORTAL_POLL_SECONDS=0.1", "PORTAL_WAIT_SECONDS=120"}, env...)
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err = cmd.Run()
@@ -156,6 +158,7 @@ func portalJSON(t *testing.T, out string) map[string]any {
 // running stage unless --force; wait and --wait read the step by its ID; and each final state prints a hint that the plane accepts
 // in that state.
 func TestPortalScript(t *testing.T) {
+	t.Parallel()
 	newStep := strings.Repeat("n", 32)
 	oldStep := strings.Repeat("o", 32)
 

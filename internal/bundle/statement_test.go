@@ -41,7 +41,7 @@ func testSet() bundle.Set {
 	return bundle.Set{
 		Version: bundle.Version{Epoch: 3, Counter: 7},
 		Components: []bundle.Component{
-			{Name: "apps-sample", Wave: 5, Namespace: "apps-demo", Digest: hexDigest('1')},
+			{Name: "apps-sample", Wave: 5, Namespace: "apps-sample", Digest: hexDigest('1')},
 			{Name: "istiod", Wave: 3, Namespace: "istio-system", Digest: hexDigest('2'),
 				IgnoreDifferences: json.RawMessage(`[{"group":"admissionregistration.k8s.io","kind":"ValidatingWebhookConfiguration","jqPathExpressions":[".webhooks[]?.failurePolicy"]}]`)},
 			{Name: "namespaces", Wave: -2, Namespace: "default", Digest: hexDigest('3')},

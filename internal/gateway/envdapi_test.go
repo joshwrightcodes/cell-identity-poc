@@ -49,7 +49,7 @@ func newEnvdFixture(t *testing.T, e *gwEnv, s envdSetup, extra ...EnvdOption) *e
 	h := NewEnvdHandler(e.st, e.g.keys(), id, s.streams, s.refuse, s.log, opts...)
 	tlsCfg := EnvdServerTLS(e.ca.Source(t, gwSPIFFE), e.ca.Bundle(), id)
 	srv := NewEnvdServer(h, tlsCfg, nil)
-	ln := ListenEnvd(listenDual(t), tlsCfg)
+	ln := ListenEnvd(listenLoopback(t), tlsCfg)
 	go func() { _ = srv.Serve(ln) }()
 	t.Cleanup(func() { _ = srv.Close() })
 	_, port, _ := net.SplitHostPort(ln.Addr().String())

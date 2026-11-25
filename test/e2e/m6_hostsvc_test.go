@@ -198,6 +198,9 @@ func TestM6UnsignedStepRefused(t *testing.T) {
 	cert := cellControllerCert(t)
 	before := kindClusters(t)
 	gap := &detailGap{}
+	// The cleanup of the parent test closes the operation of op_envelope after it expires. Without a final result, harness:status
+	// reports an expired operation as a problem.
+	ops := newOpCloser(t)
 
 	// refuse sends the envelope and checks the refusal. id is the step ID in the path.
 	refuse := func(t *testing.T, id string, envelope []byte, detail string) {
@@ -272,7 +275,8 @@ func TestM6UnsignedStepRefused(t *testing.T) {
 		refuse(t, s.ID, tampered, step.DetailSignatureInvalid)
 	})
 	t.Run("op_envelope", func(t *testing.T) {
-		_, env := opSign(t, m6TestCell, "m6-not-a-step", 10*time.Minute)
+		id, env := opSign(t, m6TestCell, "m6-not-a-step", time.Minute)
+		ops.add(id)
 		refuse(t, step.NewID(), env, step.DetailPayloadInvalid)
 	})
 	t.Run("spec_envelope", func(t *testing.T) {

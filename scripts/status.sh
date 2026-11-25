@@ -24,6 +24,17 @@
 #   gateway       {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt, recordOld, recordOldAt,
 #                 queued, streams, mostClaimed, lastBindRefusal, storeError}: the status of the cell gateway. When it does not
 #                 answer, the object holds only error
+#   svidTTL       {file, marker, live}: the SVID lifetime of cells/dev-cp.env, of the slow-tier marker build/gate/m9-svid-ttl (null
+#                 when it is absent) and of the live server config (null with error when it cannot be read), as svid-ttl -- show
+#                 prints them. It is no problem by itself: cell:verify compares the live config with the lifetime in force
+#   island        {environment, cells}: environment is true when mgmtd answers and its newest report of envd is more than 2 minutes
+#                 old. cells lists each live cell with no open stream at the gateway. Both only report, and no problem follows
+#   overlay       {held, inputs}: held lists the entries that envd holds in the overlay, as {id, cell, record, issuedAt}. inputs lists the
+#                 keys of ConfigMap envd-system/local-revocations, as {key, ok, reason or id, cell, record, issuedAt}. A key that does not
+#                 verify is a problem, and so is a cell that the overlay holds for more than 10 minutes while connected. The age is
+#                 the time since the entry was signed, because envd does not record when it admitted an entry. Connected means the
+#                 report of envd at mgmtd is within 2 minutes and applied equals signed
+#   bans          {ready, restarts}: the container agent-ban in spire-server-0. A container that is not Ready is a problem
 # The object of management also holds:
 #   agents        {expected, connected, missing}: the Argo CD agents of VIEW_CELLS that the principal lists
 #   samples       the age in seconds of the last Prometheus sample for each k8s_cluster_name
@@ -208,20 +219,21 @@ management_problems() {
 # gateway_plane prints the field gateway, the cells that mgmtd reports as bound, and whether mgmtd answers, as one JSON
 # object. When the gateway does not answer, the field gateway holds only error.
 gateway_plane() {
-  local gw rc=0 mg mrc=0 bound='[]' up=false
+  local gw rc=0 mg mrc=0 bound='[]' up=false report=null
   gw="$(mise run gw -- status 2>/dev/null)" || rc=$?
   if ((rc != 0)) || ! jq -e 'type == "object" and has("epoch")' >/dev/null 2>&1 <<<"$gw"; then
     jq -Rsc --argjson rc "$rc" '{gateway: {error: ((split("\n") | map(fromjson? | select(type == "object")) | .[0]) as $o
-      | $o.error // "mise run gw -- status exited with status \($rc) and printed no status. Run: CELL=dev-cp mise run cell:up")}, mgmt_up: false, bound: []}' <<<"$gw"
+      | $o.error // "mise run gw -- status exited with status \($rc) and printed no status. Run: CELL=dev-cp mise run cell:up")}, mgmt_up: false, mgmt: null, bound: []}' <<<"$gw"
     return
   fi
   mg="$(mise run mgmt -- status 2>/dev/null)" || mrc=$?
   if ((mrc == 0)) && jq -e 'type == "object" and has("signed")' >/dev/null 2>&1 <<<"$mg"; then
     up=true
     bound="$(jq -c '[.cells[]? | select(.bound) | .name]' <<<"$mg")"
+    report="$(jq -c '{lastReportAt, applied, signed, pendingRevokes: [.pendingRevokes[]? | .cell]}' <<<"$mg")"
   fi
-  jq -c --argjson up "$up" --argjson bound "$bound" '{gateway: {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt,
-    recordOld, recordOldAt, queued, streams, mostClaimed, lastBindRefusal, storeError}, mgmt_up: $up, bound: $bound}' <<<"$gw"
+  jq -c --argjson up "$up" --argjson bound "$bound" --argjson report "$report" '{gateway: {epoch, epochChangedAt, syncedAt, outboxItems, oldestOutboxAt, dropped, droppedAt,
+    recordOld, recordOldAt, queued, streams, mostClaimed, lastBindRefusal, storeError}, mgmt_up: $up, mgmt: $report, bound: $bound}' <<<"$gw"
 }
 
 # gateway_problems reads the output of gateway_plane on standard input and prints one problem for each bad value, as a
@@ -245,6 +257,48 @@ gateway_problems() {
         (($g.mostClaimed // {}) | to_entries[] | select(.value.count > 3)
           | "the cell \(.key) claimed operation \(.value.opId) \(.value.count) times. Run: mise run ops -- trace \(.value.opId)")
       ] end | . + (if $clockp != "" then [$clockp] else [] end)'
+}
+
+# overlay_plane <gateway_plane output> prints the fields island, overlay and bans of dev-cp and the problems of the overlay, as
+# one JSON object. Each read that fails gives a problem and leaves its field empty.
+overlay_plane() {
+  local plane="$1" now clock_problem records="" pod="" conf="" inputs="" inputs_failed=false problems=() err rc=0 configured="" marker=false
+  read_clock
+  err="$tmp/overlay.err"
+  records="$(kubectl --context kind-dev-cp -n spire-system get configmap cell-records -o json 2>"$err")" \
+    || { problems+=("could not read ConfigMap spire-system/cell-records in dev-cp, so the overlay of envd is unknown. Run: CELL=dev-cp mise run cell:verify"); records=""; }
+  pod="$(kubectl --context kind-dev-cp -n spire-system get pod spire-server-0 -o json 2>"$err")" \
+    || { problems+=("could not read pod spire-server-0 in dev-cp, so the ban container is unknown. Run: CELL=dev-cp mise run cell:verify"); pod=""; }
+  conf="$(kubectl --context kind-dev-cp -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}' 2>"$err")" || conf=""
+  inputs="$(overlay_inputs 2>"$err")" || rc=$?
+  if ((rc != 0)); then
+    problems+=("$(tail -n 1 "$err"). The entries of the overlay inputs are unchecked")
+    inputs="" inputs_failed=true
+  fi
+  configured="$(sed -n 's/^SPIRE_SVID_TTL=//p' "$ROOT/cells/dev-cp.env" 2>/dev/null | tr -d "'\"")"
+  [[ ! -e "$BUILD_ROOT/gate/m9-svid-ttl" ]] || marker=true
+  jq -cn --argjson plane "$plane" --argjson now "$now" --arg live "$live" --arg records "$records" --arg pod "$pod" --arg conf "$conf" \
+    --arg inputs "$inputs" --argjson inputs_failed "$inputs_failed" --arg configured "$configured" --argjson marker "$marker" --argjson problems "$(printf '%s\n' "${problems[@]+"${problems[@]}"}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+    '
+    def ts: try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch null;
+    ($plane.mgmt // null) as $m
+    | (if $m == null then false else (($m.lastReportAt // "" | ts) as $at | $at != null and ($now - $at) <= 120 and $m.applied == $m.signed and $m.signed != null) end) as $connected
+    | (try ($records | fromjson | .data["local-revocations.json"] // "[]" | fromjson | map(.payload | @base64d | fromjson | {id, cell, record, issuedAt})) catch null) as $held
+    | (if $inputs_failed then null else [$inputs | split("\n")[] | select(length > 0) | fromjson] end) as $in
+    | (try ($pod | fromjson | [.status.containerStatuses[]? | select(.name == "agent-ban")][0]) catch null) as $ban
+    | {island: {environment: ($plane.mgmt_up and (($m.lastReportAt // "" | ts) as $at | $at == null or ($now - $at) > 120)),
+                cells: (if $plane.gateway.error != null then null else [$live | split(" ")[] | select(length > 0) | select(($plane.gateway.streams[.] // 0) < 1)] end)},
+       overlay: {held: $held, inputs: $in},
+       bans: (if $ban == null then null else {ready: $ban.ready, restarts: $ban.restartCount} end),
+       problems: ($problems
+         + [($in // [])[] | select(.ok | not) | "ConfigMap envd-system/local-revocations in dev-cp holds the key \(.key), and envd refuses it: \(.reason). Delete the key with: mise x -- kubectl --context kind-dev-cp -n envd-system patch configmap local-revocations --type=merge -p '"'"'{\"data\":{\"\(.key)\":null}}'"'"'. Then sign the revocation again with: mise run revoke -- local --cell <cell>"]
+         + (if $connected then [($held // [])[] | . as $h | select((($plane.mgmt.pendingRevokes // []) | index($h.cell)) == null)
+             | ($h.issuedAt | ts) as $t
+             | if $t == null then "the overlay of envd holds the entry \($h.id) for \($h.cell) with an issuedAt that is no UTC time. Read mgmtd with: mise run mgmt -- status"
+               elif ($now - $t) > 600 then "the overlay of envd holds the entry \($h.id) for \($h.cell) since \($h.issuedAt), more than 10 minutes ago, while mgmtd is connected and has no revoke queued for it. Read mgmtd with: mise run mgmt -- status, then list the entries with: mise run revoke -- list"
+               else empty end] else [] end)
+         + (if $pod != "" and (($ban == null and $live != "") or ($ban != null and $ban.ready != true)) then ["the container agent-ban in spire-server-0 of dev-cp is not Ready, so no agent of a revoked cell is banned. Run: CELL=dev-cp mise run cell:restart"] else [] end)
+         )}'
 }
 
 # management_extras prints the fields of the management object, as one JSON object.
@@ -497,7 +551,7 @@ bundle_problems() {
 
 # collect <cluster> writes the JSON object of one cluster to $tmp/<cluster>.json.
 collect() {
-  local cluster="$1" apps verify telemetry extras='{}' mp='[]' plane
+  local cluster="$1" apps verify telemetry extras='{}' mp='[]' plane ov
   apps="$(applications "$cluster")"
   verify="$(run_verify "$cluster")"
   telemetry="$(run_telemetry "$cluster")"
@@ -507,8 +561,9 @@ collect() {
   fi
   if [[ "$cluster" == dev-cp ]]; then
     plane="$(gateway_plane)"
-    extras="$(jq -c '{gateway}' <<<"$plane")"
-    mp="$(gateway_problems <<<"$plane")"
+    ov="$(overlay_plane "$plane")"
+    extras="$(jq -c --argjson ttl "$(svid_ttl_json)" '{gateway, svidTTL: $ttl}' <<<"$plane" | jq -c --argjson ov "$ov" '. + ($ov | del(.problems))')"
+    mp="$(gateway_problems <<<"$plane" | jq -c --argjson ov "$ov" '. + $ov.problems')"
   fi
   jq -nc --argjson mp "$mp" --arg cluster "$cluster" --arg env "$POC_ENV" --argjson apps "$apps" --argjson verify "$verify" --argjson telemetry "$telemetry" --argjson extras "$extras" '
     ($apps.bad | map("Application " + .)) as $a

@@ -31,6 +31,7 @@ func peerList(t *testing.T, rule any, key string) string {
 // the bounds, the two checksum annotations, the token in the envd container only, the Role of cell-records,
 // the two ConfigMaps and the NetworkPolicies.
 func TestEnvdRender(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -87,7 +88,8 @@ func TestEnvdRender(t *testing.T) {
 			"--gateway=https://cell-gateway.gateway-system.svc.cluster.local:8452", "--gateway-id=spiffe://dev.env.poc.internal/cp/gateway", "--hints-configmap=spire-system/attest-hints",
 			"--steps-configmap=cell-controller-system/cell-steps", "--step-status-configmap=cell-controller-system/step-status",
 			"--cluster=dev-cp", "--bundle-mirror=172.18.0.7:5000", "--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
-			"--bundle-store-token=/var/run/secrets/bundle-store/token", "--bundle-state-configmap=envd-system/bundle-state", "--bundle-health-timeout=5m"}
+			"--bundle-store-token=/var/run/secrets/bundle-store/token", "--bundle-state-configmap=envd-system/bundle-state", "--bundle-health-timeout=5m",
+			"--report-rate=5", "--bundle-refill-every=60s", "--operator-key-file=/run/envd/operator-key/keys.pub", "--revocations-configmap=envd-system/local-revocations"}
 		if got := fmt.Sprint(get[[]any](t, ctr, "args")); got != fmt.Sprint(wantArgs) {
 			t.Errorf("envd args are %s, want %v", got, wantArgs)
 		}
@@ -217,6 +219,7 @@ func TestEnvdRender(t *testing.T) {
 
 // TestEnvdRenderFailsClosed gives the render a missing or wrong input. Each stops it with no output.
 func TestEnvdRenderFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, want string
 		env        []string
@@ -244,6 +247,7 @@ func TestEnvdRenderFailsClosed(t *testing.T) {
 
 // TestEnvdRenderFollowsTheKey: a new signing key changes the key ConfigMap and the pod annotation, so the pod restarts.
 func TestEnvdRenderFollowsTheKey(t *testing.T) {
+	t.Parallel()
 	other := "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU="
 	a, b := renderEnvd(t), renderEnvd(t, "STUB_MGMT_KEY="+other)
 	if a.err != nil || b.err != nil {
@@ -260,6 +264,7 @@ func TestEnvdRenderFollowsTheKey(t *testing.T) {
 // TestEnvdRenderGatewayFlags checks the three gateway flags of envd, which an envd of Task 5 needs to start, the flow N39
 // rule to the gateway pod on 8452 and nothing else, and the Role rule that reads the hints ConfigMap by name.
 func TestEnvdRenderGatewayFlags(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -303,6 +308,7 @@ func TestEnvdRenderGatewayFlags(t *testing.T) {
 // render of the cell controller, so envd renders no object in that namespace, and its policy gets no rule for it: the
 // ConfigMaps go through flow N31, the API server.
 func TestEnvdRenderStepFlags(t *testing.T) {
+	t.Parallel()
 	r := renderEnvd(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -326,5 +332,164 @@ func TestEnvdRenderStepFlags(t *testing.T) {
 	}
 	if len(egress) != 8 {
 		t.Errorf("the envd policy has the egress rules %v, want the six of M5, the two of M8 and none for the steps", egress)
+	}
+}
+
+// operatorKeysPub prints the keys as key keys.pub of a pin ConfigMap: one key on each line, with a line break at the end.
+func operatorKeysPub(keys ...string) string { return strings.Join(keys, "\n") + "\n" }
+
+// mountList returns each volume mount of a container as name=<path>,<readOnly>.
+func mountList(t *testing.T, ctr any) []string {
+	t.Helper()
+	var out []string
+	list, _ := lookup(ctr, "volumeMounts")
+	mounts, _ := list.([]any)
+	for _, m := range mounts {
+		out = append(out, fmt.Sprintf("%v=%v,%v", lookupOr(m, "name"), lookupOr(m, "mountPath"), lookupOr(m, "readOnly")))
+	}
+	return out
+}
+
+// TestEnvdOperatorPin: envd pins the keys of ConfigMap mgmt-system/operator-pub as key keys.pub of ConfigMap
+// envd-system/operator-key, one key on each line, and only the envd container mounts it read-only. --operator-key-file and
+// --revocations-configmap come together, and the render passes --report-rate and --bundle-refill-every explicitly. During a
+// rotation the pin holds next.pub too. With no operator-pub, the render stops and names the owner action.
+func TestEnvdOperatorPin(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"one key", nil, operatorKeysPub(stubOperatorKey)},
+		{"a rotation", []string{"STUB_OPERATOR_NEXT=" + stubOperatorNext}, operatorKeysPub(stubOperatorKey, stubOperatorNext)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renderEnvd(t, tc.env...)
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			if !strings.Contains(r.log, "kubectl --context kind-management -n mgmt-system get configmap operator-pub") {
+				t.Errorf("the render did not read ConfigMap operator-pub; it ran:\n%s", r.log)
+			}
+			objs := objectsIn(t, r.stdout)
+			cm := objs["ConfigMap envd-system/operator-key"]
+			if cm == nil {
+				t.Fatalf("no ConfigMap envd-system/operator-key in %v", keysOfObjects(objs))
+			}
+			if data := get[map[string]any](t, cm, "data"); len(data) != 1 || data["keys.pub"] != tc.want {
+				t.Errorf("operator-key holds %q, want only keys.pub %q", data, tc.want)
+			}
+			pod := get[map[string]any](t, objs["Deployment envd-system/envd"], "spec", "template", "spec")
+			args := fmt.Sprint(get[[]any](t, named(t, get[[]any](t, pod, "containers"), "envd"), "args"))
+			for _, want := range []string{"--operator-key-file=/run/envd/operator-key/keys.pub", "--revocations-configmap=envd-system/local-revocations",
+				"--report-rate=5", "--bundle-refill-every=60s"} {
+				if strings.Count(args, want) != 1 {
+					t.Errorf("envd args %s do not hold %s once", args, want)
+				}
+			}
+			if v := named(t, get[[]any](t, pod, "volumes"), "operator-key"); get[string](t, v, "configMap", "name") != "operator-key" {
+				t.Errorf("volume operator-key is %v, want ConfigMap operator-key", v)
+			}
+			for _, c := range get[[]any](t, pod, "containers") {
+				name := get[string](t, c, "name")
+				var got []string
+				for _, m := range mountList(t, c) {
+					if strings.HasPrefix(m, "operator-key=") {
+						got = append(got, m)
+					}
+				}
+				if want := map[bool][]string{true: {"operator-key=/run/envd/operator-key,true"}}[name == "envd"]; !slices.Equal(got, want) {
+					t.Errorf("container %s mounts the pin as %v, want %v", name, got, want)
+				}
+			}
+		})
+	}
+	t.Run("no operator-pub", func(t *testing.T) {
+		r := renderEnvd(t, "STUB_NO_OPERATOR_PUB=1")
+		if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "mise run operator:create-key") {
+			t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that names mise run operator:create-key", r.err, len(r.stdout), r.stderr)
+		}
+	})
+}
+
+// TestEnvdRevocationsRole: envd reads ConfigMap envd-system/local-revocations through the API. Role envd-revocations grants
+// exactly get on that name and nothing more, and its binding names the envd account alone. No other Role of the render names
+// the ConfigMap.
+func TestEnvdRevocationsRole(t *testing.T) {
+	t.Parallel()
+	r := renderEnvd(t)
+	if r.err != nil {
+		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+	}
+	objs := objectsIn(t, r.stdout)
+	role := objs["Role envd-system/envd-revocations"]
+	if role == nil {
+		t.Fatalf("no Role envd-system/envd-revocations in %v", keysOfObjects(objs))
+	}
+	rules := get[[]any](t, role, "rules")
+	if got := fmt.Sprint(rules); len(rules) != 1 || got != "[map[apiGroups:[] resourceNames:[local-revocations] resources:[configmaps] verbs:[get]]]" {
+		t.Errorf("Role envd-revocations has the rules %s, want exactly get on configmaps local-revocations", got)
+	}
+	rb := objs["RoleBinding envd-system/envd-revocations"]
+	if rb == nil || get[string](t, rb, "roleRef", "kind") != "Role" || get[string](t, rb, "roleRef", "name") != "envd-revocations" ||
+		fmt.Sprint(get[[]any](t, rb, "subjects")) != "[map[kind:ServiceAccount name:envd namespace:envd-system]]" {
+		t.Errorf("RoleBinding envd-revocations is %v, want Role envd-revocations for the envd account alone", rb)
+	}
+	for key, o := range objs {
+		if (o["kind"] == "Role" || o["kind"] == "ClusterRole") && key != "Role envd-system/envd-revocations" && strings.Contains(fmt.Sprint(o["rules"]), "local-revocations") {
+			t.Errorf("%s also names local-revocations", key)
+		}
+	}
+}
+
+// TestRenderRefusesPinChange: each render that pins the operator keys runs the pin guard of components/lib/operator-key.sh: the
+// renders of dev-cp, and the mgmt-api render of management for the copy that mgmtd reads. A first pin and an unchanged pin render. A live pin with other keys, or a next.pub that a
+// writer added to operator-pub, stops the render unless OPERATOR_KEY_ACCEPT_CHANGE=1, and the flag works only while the
+// environment is connected.
+func TestRenderRefusesPinChange(t *testing.T) {
+	t.Parallel()
+	same := []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorKey, "STUB_LIVE_PIN_GATEWAY=" + stubOperatorKey, "STUB_LIVE_PIN_SERVER=" + stubOperatorKey}
+	renders := map[string]func(*testing.T, ...string) result{
+		"envd":         renderEnvd,
+		"cell-gateway": renderGateway,
+		"spire-server": func(t *testing.T, env ...string) result { return renderCell(t, "dev-cp", env...) },
+		"mgmt-api":     mgmtAPI,
+	}
+	for _, tc := range []struct {
+		name, render string
+		env          []string
+		want         string
+	}{
+		{"first pin", "envd", nil, ""},
+		{"same keys", "envd", same, ""},
+		{"envd pin differs", "envd", []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorOther}, "the pins dev-cp envd-system/operator-key hold other keys"},
+		{"gateway pin differs", "cell-gateway", []string{"STUB_LIVE_PIN_GATEWAY=" + stubOperatorOther}, "the pins dev-cp gateway-system/operator-key hold other keys"},
+		{"server pin differs", "spire-server", []string{"STUB_LIVE_PIN_SERVER=" + stubOperatorOther}, "the pins dev-cp spire-system/spire-server operator_public_keys hold other keys"},
+		{"a writer adds next.pub", "envd", append([]string{"STUB_OPERATOR_NEXT=" + stubOperatorOther}, same...), "OPERATOR_KEY_ACCEPT_CHANGE=1"},
+		{"accepted while connected", "envd", []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"accepted while connected, gateway", "cell-gateway", []string{"STUB_LIVE_PIN_GATEWAY=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"accepted while connected, server", "spire-server", []string{"STUB_LIVE_PIN_SERVER=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"mgmtd pin differs", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther}, "the pins management mgmt-system/operator-key hold other keys"},
+		{"mgmtd pin same", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorKey}, ""},
+		{"accepted while connected, mgmtd", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1", "STUB_CONNECTED=1"}, ""},
+		{"accepted while not connected, mgmtd", "mgmt-api", []string{"STUB_LIVE_PIN_MGMTD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1"}, "refuses any change of the operator keys while not connected"},
+		{"accepted while not connected", "envd", []string{"STUB_LIVE_PIN_ENVD=" + stubOperatorOther, "OPERATOR_KEY_ACCEPT_CHANGE=1"}, "refuses any change of the operator keys while not connected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := renders[tc.render](t, tc.env...)
+			if tc.want != "" {
+				if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, tc.want) {
+					t.Fatalf("err %v, stdout %d bytes, stderr %q; want a stop that says %q", r.err, len(r.stdout), r.stderr, tc.want)
+				}
+				return
+			}
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			if !strings.Contains(r.stdout, stubOperatorKey) || strings.Contains(r.stdout, stubOperatorOther) {
+				t.Errorf("the %s render does not pin the key of operator-pub alone", tc.render)
+			}
+		})
 	}
 }

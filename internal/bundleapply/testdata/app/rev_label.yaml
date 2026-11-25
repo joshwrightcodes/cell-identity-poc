@@ -1,6 +1,6 @@
 apiVersion: apps/v1
 kind: Deployment
-metadata: {name: bypass, namespace: apps-demo}
+metadata: {name: bypass, namespace: apps-sample}
 spec:
   selector: {matchLabels: {app: bypass}}
   template:

@@ -57,6 +57,7 @@ func sha256sum(s string) [32]byte { return sha256.Sum256([]byte(s)) }
 // TestVerifyEnvdChecks runs each envd check of cell:verify, and the two checks that read cell-records, with fakes: once on
 // a healthy state, and once for each mismatch. A mismatch prints its reason and the repair command.
 func TestVerifyEnvdChecks(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64", "shasum")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

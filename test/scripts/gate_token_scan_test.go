@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 )
 
 // tokenScanKubectl answers the reads of gate-token-scan.sh. Each cluster has the same pods, in namespace ns: cellgw-0 (cellgw
@@ -38,6 +40,7 @@ esac
 // start time, and the previous log of a restarted container. A compact JWS (eyJ, a dot, eyJ, a dot) fails the scan with the cluster, the
 // pod, the container and the line number, and never prints the line. A base64 JSON object with no JWS shape does not.
 func TestGateTokenScan(t *testing.T) {
+	t.Parallel()
 	const jws = "eyJhbGciOiJSUzI1NiIsImtpZCI6IngifQ.eyJhdWQiOlsibWdtdCJdfQ.c2ln"
 	for _, tc := range []struct {
 		name string
@@ -109,5 +112,50 @@ func TestGateTokenScan(t *testing.T) {
 				t.Errorf("calls %q read a log of another image", b)
 			}
 		})
+	}
+}
+
+// TestTokenScanFindsSeed: a line that holds the operator seed prefix, in a container log, a step log or a gate file, fails the scan
+// with its place and line number, and the scan never prints the line. The fixture is the prefix and a text that is no seed, so no
+// line of the repository parses as a key.
+func TestTokenScanFindsSeed(t *testing.T) {
+	t.Parallel()
+	const body = "fixture-not-a-seed"
+	seed := revoke.SeedPrefix + body
+	if _, err := revoke.ParseSeed(strings.NewReader(seed + "\n")); err == nil {
+		t.Fatal("the fixture parses as a seed")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "log-cellgw-0"), []byte("ok\n"+seed+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	steps := t.TempDir()
+	if err := os.WriteFile(filepath.Join(steps, "eeee.log"), []byte("a\nb\nread "+seed+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	build := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(build, "gate"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(build, "gate", "m8-samples.jsonl"), []byte("{}\n{\"x\":\""+seed+"\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stubs := map[string]string{"kubectl": tokenScanKubectl}
+	for name, b := range liveStubs {
+		stubs[name] = b
+	}
+	out, errOut, code := runScript(t, "gate-token-scan.sh", stubs, []string{"STUB_DIR=" + dir, "HOSTSVC_STEPS_DIR=" + steps, "POC_BUILD_ROOT=" + build}, "2026-11-15T01:02:03Z")
+	if code != 1 {
+		t.Fatalf("exit %d, want 1\nstdout %s\nstderr %s", code, out, errOut)
+	}
+	for _, w := range []string{"dev-cp ns/cellgw-0 cellgw line 2", "eeee.log line 3", "gate file: build/gate/m8-samples.jsonl line 2"} {
+		if !strings.Contains(out, w) {
+			t.Errorf("stdout %q lacks %q", out, w)
+		}
+	}
+	for _, d := range []string{revoke.SeedPrefix, body} {
+		if strings.Contains(out+errOut, d) {
+			t.Errorf("the output holds %q", d)
+		}
 	}
 }

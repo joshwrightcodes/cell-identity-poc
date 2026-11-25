@@ -88,6 +88,7 @@ func wantLines(t *testing.T, text string, want, deny []string) {
 // TestDepsCheckClean: listings that keep every rule pass. The script lists the binaries and the imports with the e2e tag
 // for linux/arm64 with cgo off and for darwin/arm64 with cgo on, and prints the count of binary listings.
 func TestDepsCheckClean(t *testing.T) {
+	t.Parallel()
 	stdout, stderr, calls, code := runDepsCheck(t, map[string][]string{"deps": cleanDeps(), "imports": cleanImports()})
 	if code != 0 || stderr != "" {
 		t.Fatalf("exit %d, stderr %q, want exit 0 and no stderr", code, stderr)
@@ -107,6 +108,7 @@ func TestDepsCheckClean(t *testing.T) {
 // TestDepsCheckPrometheus: a binary that compiles a github.com/prometheus/ package fails with one line that names the
 // binary, the package and the platform. Each platform is checked on its own.
 func TestDepsCheckPrometheus(t *testing.T) {
+	t.Parallel()
 	prom := depsModule + "/cmd/cellgw errors github.com/prometheus/client_golang/prometheus github.com/prometheus/common/expfmt"
 	t.Run("both platforms", func(t *testing.T) {
 		_, stderr, _, code := runDepsCheck(t, map[string][]string{"deps": append(cleanDeps(), prom), "imports": cleanImports()})
@@ -132,6 +134,7 @@ func TestDepsCheckPrometheus(t *testing.T) {
 // TestDepsCheckOpaSDK: an import of opa/v1/sdk, opa/v1/plugins, opa/v1/runtime or opa/v1/storage/disk fails, even in
 // internal/bundleapply, and so does a binary that compiles one of them or a package below one of them.
 func TestDepsCheckOpaSDK(t *testing.T) {
+	t.Parallel()
 	for _, pkg := range []string{"v1/sdk", "v1/plugins", "v1/runtime", "v1/storage/disk"} {
 		t.Run("import of "+pkg, func(t *testing.T) {
 			imports := append(cleanImports(), depsModule+"/internal/bundleapply/engine context "+depsOPA+"/"+pkg)
@@ -168,6 +171,7 @@ func TestDepsCheckOpaSDK(t *testing.T) {
 // TestDepsCheckOpaOutsideAppliers: a binary other than celld and envd that compiles an OPA package fails with one line for
 // each platform. celld and envd may compile OPA.
 func TestDepsCheckOpaOutsideAppliers(t *testing.T) {
+	t.Parallel()
 	deps := cleanDeps()
 	deps[2] += " " + depsOPA + "/v1/rego " + depsOPA + "/v1/ast"
 	_, stderr, _, code := runDepsCheck(t, map[string][]string{"deps": deps, "imports": cleanImports()})
@@ -184,6 +188,7 @@ func TestDepsCheckOpaOutsideAppliers(t *testing.T) {
 // TestDepsCheckOpaOutsideBundleapply: a package outside internal/bundleapply that imports an OPA package fails, a test
 // import counts, and a sibling whose name only starts with bundleapply is outside.
 func TestDepsCheckOpaOutsideBundleapply(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ name, pkg string }{
 		{"internal/mgmt", "internal/mgmt"},
 		{"an e2e test", "test/e2e"},
@@ -206,6 +211,7 @@ func TestDepsCheckOpaOutsideBundleapply(t *testing.T) {
 // TestDepsCheckGoListFails: a failed listing, or a listing with no binary, exits 2 and names the cause, so a broken
 // toolchain never passes the lint.
 func TestDepsCheckGoListFails(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		files map[string][]string
@@ -228,6 +234,7 @@ func TestDepsCheckGoListFails(t *testing.T) {
 // TestDepsCheckPrometheusImport: a package of the module that imports a github.com/prometheus/ package fails, a test import
 // included, even when no binary compiles it.
 func TestDepsCheckPrometheusImport(t *testing.T) {
+	t.Parallel()
 	imports := append(cleanImports(), depsModule+"/test/e2e testing github.com/prometheus/client_golang/prometheus/testutil")
 	_, stderr, _, code := runDepsCheck(t, map[string][]string{"deps": cleanDeps(), "imports": imports})
 	if code != 1 {
@@ -243,6 +250,7 @@ func TestDepsCheckPrometheusImport(t *testing.T) {
 // TestDepsCheckKoPlatforms: the linux platforms come from KO_DEFAULTPLATFORMS, a comma-separated list, and darwin/arm64
 // follows them. DEPS_CHECK_PLATFORMS replaces the whole list.
 func TestDepsCheckKoPlatforms(t *testing.T) {
+	t.Parallel()
 	files := map[string][]string{"deps": cleanDeps(), "imports": cleanImports()}
 	for _, tc := range []struct {
 		name string

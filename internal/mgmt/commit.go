@@ -156,7 +156,7 @@ func (t *txn) revise() error {
 }
 
 // signCell signs the record of a bound cell at the new revision. Subjects come from the intent
-// while the cell is in it.
+// while the cell is in it, and the record is revoked while the cell state is.
 func (t *txn) signCell(name string) error {
 	cs := t.st.Cells[name]
 	if cs == nil {
@@ -167,7 +167,7 @@ func (t *txn) signCell(name string) error {
 	}
 	env, err := record.Sign(record.Cell{
 		Name: name, Env: t.p.cfg.Intent.Env, Issuer: cs.Issuer, JWKS: cs.JWKS, Subjects: cs.Subjects,
-		Epoch: t.rev.Epoch, Counter: t.rev.Counter,
+		Revoked: cs.Revoked, Epoch: t.rev.Epoch, Counter: t.rev.Counter,
 	}, t.key)
 	if err != nil {
 		return err

@@ -48,6 +48,20 @@ source "$ROOT/cells/$CELL.env"
 set +a
 [[ "$CELL_NAME" == "$CELL" ]] || die "cells/$CELL.env sets CELL_NAME=$CELL_NAME"
 
+# The slow tier of gate:m9 runs dev-cp with a longer SVID lifetime. While it runs, the marker build/gate/m9-svid-ttl holds that lifetime, and
+# for CELL=dev-cp only it replaces SPIRE_SVID_TTL of cells/dev-cp.env, so a render of dev-cp and cell:verify of dev-cp use it.
+# scripts/svid-ttl.sh writes and removes the marker.
+SVID_TTL_MARKER="$BUILD_ROOT/gate/m9-svid-ttl"
+if [[ "$CELL" == dev-cp && -e "$SVID_TTL_MARKER" ]]; then
+  _ttl="$(tr -d '[:space:]' <"$SVID_TTL_MARKER")" || die "could not read the slow-tier marker build/gate/m9-svid-ttl"
+  [[ "$_ttl" =~ ^[1-9][0-9]*[smh]$ ]] \
+    || die "the slow-tier marker build/gate/m9-svid-ttl holds '$_ttl', which is not a lifetime such as 1h. Remove it, then run: mise run svid-ttl -- restore"
+  SPIRE_SVID_TTL="$_ttl"
+  export SPIRE_SVID_TTL
+  log "slow-tier SVID lifetime $_ttl"
+  unset _ttl
+fi
+
 BUILD="$BUILD_ROOT/$CELL"
 BUNDLES="$BUILD/bundles"
 FACTS="$BUILD/facts.env"
@@ -854,6 +868,36 @@ blackhole_present() {
   grep -- '--comment "\{0,1\}gate-m3-blackhole-' <<<"$rules" | sed 's/^-A /-D /' || true
 }
 
+# partition_peer_ip <node container> 4|6 prints the address of the container on the network kind, for the family 4 or 6. It
+# prints nothing when the container has no address of that family, and fails when docker cannot inspect the container.
+partition_peer_ip() {
+  local fmt out
+  case "$2" in
+    4) fmt='{{with index .NetworkSettings.Networks "kind"}}{{.IPAddress}}{{end}}' ;;
+    6) fmt='{{with index .NetworkSettings.Networks "kind"}}{{.GlobalIPv6Address}}{{end}}' ;;
+    *) echo "partition_peer_ip: the family is 4 or 6, not '$2'" >&2; return 2 ;;
+  esac
+  out="$(docker inspect -f "$fmt" "$1" 2>&1)" || { echo "docker inspect of $1 failed: $out" >&2; return 1; }
+  printf '%s\n' "${out//[[:space:]]/}"
+}
+
+# partition_rules <node container> [tag] prints each rule of the partition tool in the chains FORWARD, INPUT and OUTPUT of the node,
+# as the tool that holds it and its arguments for -D, for example "ip6tables -D FORWARD -d fc00::3/128 -m comment --comment
+# gate-m9-cut-0a1b2c3d -j DROP". A rule is a rule of the tool when its comment starts with gate-m9-cut-. With a tag, only the rules of
+# that tag. No other rule is printed, so a caller that runs each line in the node cannot touch another rule. It fails when the node does
+# not answer.
+partition_rules() {
+  local node="$1" tag="${2:-gate-m9-cut-}" end="" tool chain out
+  # A tag ends at a space or a quote, so the tag of 8 hex digits does not match a longer token.
+  [[ -z "${2:-}" ]] || end='\( \|"\|$\)'
+  for tool in iptables ip6tables; do
+    for chain in FORWARD INPUT OUTPUT; do
+      out="$(docker exec "$node" "$tool" -S "$chain")" || return 1
+      grep -- "^-A .* -m comment --comment \"\{0,1\}$tag$end" <<<"$out" | sed "s/^-A /$tool -D /" || true
+    done
+  done
+}
+
 # hub_cell_up <cell> reads the log of the hub on standard input and succeeds when the hub holds an open
 # tunnel of the cell. A tunnel is open when its tunnel_up line has no tunnel_down line with the same
 # conn_id. The test works on conn_id, because the new tunnel of a cell can log tunnel_up before the older
@@ -1186,6 +1230,9 @@ check_plane_pods() {
 # The fifth case: namespace cell-controller-system holds two ConfigMaps with two writers. envd writes cell-steps with the field
 # manager envd and the marker label poc.internal/made-by=envd, and the cell controller writes step-status with the field manager
 # cell-controller and the marker label poc.internal/made-by=cell-controller. Neither carries the harness label.
+# The sixth case: the operator script on this Mac (scripts/operator-key.sh) writes ConfigMap mgmt-system/operator-pub, and the
+# revoke tasks write ConfigMap envd-system/local-revocations in dev-cp, each with the field manager operator, no harness label and
+# no marker.
 # runtime_objects prints one case object, or a JSON list of cases when a namespace holds writers that differ. An object is a
 # runtime object when it fits one case.
 runtime_objects() {
@@ -1196,7 +1243,8 @@ runtime_objects() {
     return
   fi
   if [[ "$1" == mgmt-api && "$2" == mgmt-system && "$3" == ConfigMap ]]; then
-    jq -cn '{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}}'
+    jq -cn '[{names: "^mgmt-signing-pub$", managers: ["mgmtd"], labels: ["mgmt-api"], marker: {key: "poc.internal/made-by", value: "mgmtd"}},
+      {names: "^operator-pub$", managers: ["operator"], labels: []}]'
     return
   fi
   if [[ "$1" == cell-identity && "$2" == cell-ops-system && "$3" == ConfigMap ]]; then
@@ -1207,7 +1255,8 @@ runtime_objects() {
   fi
   if [[ "$1" == envd && "$2" == envd-system && "$3" == ConfigMap ]]; then
     jq -cn '[{names: "^bundle-state$", managers: ["envd", "kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "envd"}},
-      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}}]'
+      {names: "^bundle-state$", managers: ["kubectl-create"], labels: [], marker: {key: "poc.internal/made-by", value: "bundle-bootstrap"}},
+      {names: "^local-revocations$", managers: ["operator"], labels: []}]'
     return
   fi
   if [[ "$1:$2" =~ ^(central-view:central-view-system|telemetry-gateway:observability-system|mesh-view-hub:mesh-view-system)$ && "$3" == ConfigMap ]]; then
@@ -1342,6 +1391,11 @@ pem_der_sha256() {
 # A cell exists only through a signed step, so the rows of a cell and of management go through the portal. The
 # rows of management and dev-cp name the live cells: the cells whose cluster exists now. No step waits until every
 # cell is bound, except the portal wait that the rows name.
+# Roll order after an image change: mgmtd and the cell gateway refuse a member of an envd report that they do not know, so they
+# must run the new images before envd sends a new member. The row of dev-cp runs the cell:up of dev-cp, which rolls envd before the
+# cell gateway, and then the link of mgmt-api. That order is safe only while envd reports no new member, for example while it holds
+# no local revocation entry. Otherwise run CELL=management LINK_ONLY=mgmt-api mise run cell:link and
+# CELL=dev-cp HARNESS_ONLY=cell-gateway mise run cell:up first.
 dependents_of() {
   local cell catalog live args=""
   # The catalog is the list of cells that dev-cp admits.
@@ -1401,4 +1455,159 @@ gate_test_timeout() {
   local budget="${1:-}" timeout="${2:-30}"
   [[ -z "$budget" ]] || ((budget * 2 <= timeout)) || timeout=$((budget * 2))
   printf '%s\n' "$timeout"
+}
+
+# ttl_seconds <lifetime> prints a lifetime of the form <n>s, <n>m or <n>h in seconds. Any other form fails.
+ttl_seconds() {
+  [[ "${1:-}" =~ ^([1-9][0-9]*)([smh])$ ]] || return 1
+  case "${BASH_REMATCH[2]}" in
+    s) echo "${BASH_REMATCH[1]}" ;;
+    m) echo $((BASH_REMATCH[1] * 60)) ;;
+    h) echo $((BASH_REMATCH[1] * 3600)) ;;
+  esac
+}
+
+# svid_ttl_file prints SPIRE_SVID_TTL of cells/dev-cp.env: the SVID lifetime of dev-cp outside a slow tier.
+svid_ttl_file() { sed -n 's/^SPIRE_SVID_TTL=//p' "$ROOT/cells/dev-cp.env" | tail -n 1; }
+
+# svid_ttl_live prints agent_ttl of the SPIRE server config that the live ConfigMap spire-system/spire-server of dev-cp holds. It fails when
+# the ConfigMap cannot be read or holds no agent_ttl.
+svid_ttl_live() {
+  local conf ttl
+  conf="$(kubectl --context kind-dev-cp -n spire-system get configmap spire-server -o jsonpath='{.data.server\.conf}')" || return 1
+  ttl="$(sed -n 's/^ *agent_ttl = "\(.*\)"$/\1/p' <<<"$conf" | tail -n 1)"
+  [[ -n "$ttl" ]] || return 1
+  printf '%s\n' "$ttl"
+}
+
+# svid_ttl_json prints the SVID lifetimes of dev-cp as one JSON object: file (cells/dev-cp.env), marker (build/gate/m9-svid-ttl, null when
+# it is absent) and live (agent_ttl of the live server config). When the live config cannot be read, live is null and error says so.
+svid_ttl_json() {
+  local marker="" has=false live err=""
+  if [[ -e "$SVID_TTL_MARKER" ]]; then
+    has=true
+    marker="$(tr -d '[:space:]' <"$SVID_TTL_MARKER" 2>/dev/null)" || marker=""
+  fi
+  live="$(svid_ttl_live 2>/dev/null)" || { live=""; err="the server config of dev-cp could not be read. Run: mise run harness:status"; }
+  jq -nc --arg file "$(svid_ttl_file)" --argjson has "$has" --arg marker "$marker" --arg live "$live" --arg err "$err" \
+    '{file: $file, marker: (if $has then $marker else null end), live: (if $live == "" then null else $live end)}
+      + (if $err == "" then {} else {error: $err} end)'
+}
+
+# svid_ttl_settled <ttl> succeeds when every live, current agent of the SPIRE server of dev-cp has the lifetime <ttl>. The agent list of
+# spire-server gives the expiry of each agent SVID only (x509svid_expires_at, Unix seconds as a quoted string), so the check reads the time
+# that is left. An agent renews when about half its lifetime is left, so a live agent at <ttl> has 0.5 to 1 times <ttl> left. The check adds
+# 10 percent of <ttl> as margin at both ends: 0.4 to 1.1 times <ttl>, so it can tell two lifetimes apart only when one is 2.5 times the
+# other or more. A banned agent does not count. Both attestors take the agent ID from the pod UID (/spire/agent/cluster_jwt/<cell>/<pod
+# uid>/<hash>, and /spire/agent/k8s_psat/<cluster>/pod/<pod uid> with use_pod_uid_for_agent_id), and the list keeps the entry of an agent
+# after its pod is gone or its container restarted. So an entry counts only while its pod exists in a cluster that exists, and of the
+# entries of one pod only the live one with the least time left counts. A pod whose entries all expired holds an agent that is down, and
+# the check fails. The present comes from the node dev-cp-control-plane. The check prints the reason on standard error when it fails.
+svid_ttl_settled() {
+  local ttl="${1:-}" want agents now clusters cells c pods uids='{}' verdict
+  want="$(ttl_seconds "$ttl")" || { echo "'$ttl' is not a lifetime such as 1h" >&2; return 1; }
+  agents="$(kubectl --context kind-dev-cp -n spire-system exec spire-server-0 -c spire-server -- \
+    /opt/spire/bin/spire-server agent list -socketPath /run/spire/sockets/api.sock -output json)" \
+    || { echo "could not list the agents of the SPIRE server in dev-cp" >&2; return 1; }
+  if ! now="$(node_now)" || [[ ! "$now" =~ ^[0-9]+$ ]]; then
+    echo "could not read the clock of dev-cp-control-plane" >&2
+    return 1
+  fi
+  clusters="$(existing_clusters)" || { echo "could not list the clusters" >&2; return 1; }
+  cells="$(jq -r '[.agents[]? | .id.path // "" | capture("^/spire/agent/(cluster_jwt|k8s_psat)/(?<cell>[a-z0-9][a-z0-9-]*)/").cell] | unique[]' <<<"$agents")" \
+    || { echo "the agent list of the SPIRE server in dev-cp is no JSON" >&2; return 1; }
+  for c in $cells; do
+    grep -qx -- "$c" <<<"$clusters" || continue
+    pods="$(kubectl --context "kind-$c" get pods -A -o json | jq -c '[.items[].metadata.uid]')" \
+      || { echo "could not list the pods of $c" >&2; return 1; }
+    uids="$(jq -c --arg c "$c" --argjson p "$pods" '. + {($c): $p}' <<<"$uids")"
+  done
+  verdict="$(jq -r --argjson now "$now" --argjson want "$want" --argjson uids "$uids" '
+    def left: ((.x509svid_expires_at // 0) | tostring | tonumber) - $now;
+    def pod: (capture("^/spire/agent/cluster_jwt/(?<cell>[^/]+)/(?<uid>[^/]+)/") | .key = "\(.cell)/\(.uid)")
+      // (capture("^/spire/agent/k8s_psat/(?<cell>[^/]+)/pod/(?<uid>[^/]+)$") | .key = "k8s_psat/\(.cell)/pod/\(.uid)") // null;
+    [.agents[]? | select((.banned // false) | not) | left as $left
+      | (.id.path // "") as $p | ($p | pod) as $m
+      | if $m == null then (select($left > 0) | {key: $p, left: $left})
+        elif any(($uids[$m.cell] // [])[]; . == $m.uid) then {key: $m.key, left: $left}
+        else empty end]
+    | group_by(.key) | map(if any(.[]; .left > 0) then (map(select(.left > 0)) | min_by(.left)) else {key: .[0].key, down: true} end)
+    | map(select(.down or .left > $want * 1.1 or .left < $want * 0.4)) as $bad
+    | if length == 0 then "no live agent is listed by the SPIRE server in dev-cp"
+      elif ($bad | length) == 0 then "ok"
+      else "\($bad | length) of \(length) live agents have no SVID lifetime of \($want) s: "
+        + ($bad[:5] | map(if .down then "\(.key) with no SVID left, so its agent is down" else "\(.key) with \(.left) s left" end) | join(", ")) end' <<<"$agents")" \
+    || { echo "the agent list of the SPIRE server in dev-cp is no JSON" >&2; return 1; }
+  [[ "$verdict" != ok ]] || return 0
+  echo "$verdict" >&2
+  return 1
+}
+
+# keep_awake "$@" keeps a Mac awake for the rest of the script. On macOS it runs the script again, once, as caffeinate -ims bash "$0" "$@",
+# with POC_KEEP_AWAKE=1 exported as the guard, so the second run goes on at once and never runs it again. On AC power, the -s flag keeps the
+# Mac awake with the lid closed. On battery power it does not, so refuse_battery stops a run there. On macOS without caffeinate it fails. On another system it logs and returns. Call it with the
+# arguments of the script, before the script changes its directory.
+keep_awake() {
+  if [[ "$(uname -s)" != Darwin ]]; then
+    log "this host is not macOS, so keep_awake does nothing"
+    return 0
+  fi
+  command -v caffeinate >/dev/null 2>&1 || die "this Mac has no caffeinate on PATH, so it could sleep during the run. Put /usr/bin on PATH, then run the command again"
+  if [[ "${POC_KEEP_AWAKE:-}" == 1 ]]; then
+    log "POC_KEEP_AWAKE=1, so this run counts as one that keep_awake started. Unset it in the shell when no keep_awake started the run"
+    return 0
+  fi
+  export POC_KEEP_AWAKE=1
+  log "running $0 again under caffeinate, so the Mac stays awake. Keep the lid open"
+  exec caffeinate -ims bash "$0" "$@"
+}
+
+# on_battery succeeds when a Mac runs on battery power, as pmset -g batt reports it. It fails on another system, on macOS without pmset, and
+# when pmset fails.
+on_battery() {
+  local out
+  [[ "$(uname -s)" == Darwin ]] || return 1
+  command -v pmset >/dev/null 2>&1 || return 1
+  out="$(pmset -g batt 2>/dev/null)" || return 1
+  [[ "$out" == *"'Battery Power'"* ]]
+}
+
+# sleep_report <since> prints the Sleep and DarkWake lines of `pmset -g log` from <since> on.
+# <since> is a local time in the form YYYY-MM-DD HH:MM:SS. The function prints to standard error and says when it finds no line.
+# It does nothing on another system, on macOS without pmset, and when pmset fails.
+sleep_report() {
+  local since="$1" out found
+  [[ "$(uname -s)" == Darwin ]] || return 0
+  command -v pmset >/dev/null 2>&1 || return 0
+  out="$(pmset -g log 2>/dev/null)" || return 0
+  found="$(awk -v since="$since" '($4 == "Sleep" || $4 == "DarkWake") && ($1 " " $2) >= since' <<<"$out")"
+  if [[ -n "$found" ]]; then
+    printf 'WARN: the Mac slept or woke during this run, so it is not a record. pmset -g log since %s:\n%s\n' "$since" "$found" >&2
+  else
+    log "pmset -g log shows no sleep since $since"
+  fi
+}
+
+# refuse_battery stops the script when the Mac runs on battery power, unless GATE_ALLOW_BATTERY=1. macOS sleeps when the lid closes on
+# battery power, and a sleep stops the VM and every cluster.
+refuse_battery() {
+  on_battery || return 0
+  if [[ "${GATE_ALLOW_BATTERY:-}" == 1 ]]; then
+    log "the Mac runs on battery power, and GATE_ALLOW_BATTERY=1 allows it. Keep the lid open"
+    return 0
+  fi
+  die "the Mac runs on battery power, and macOS sleeps when the lid closes on battery, which stops every cluster. Connect AC power and keep the lid open, or set GATE_ALLOW_BATTERY=1 to run on battery"
+}
+
+# harness_status_settled runs mise run harness:status until it exits 0, up to HARNESS_STATUS_WAIT seconds (default 600), every 60 seconds.
+# Right after a heal or a restart of every cluster, harness:status can fail on telemetry retries that clear by themselves within minutes
+# (the Task 2 probes of M9 saw about 6 minutes after a heal). The output of each run goes to standard error. It fails when the last run fails.
+harness_status_settled() {
+  local bound="${HARNESS_STATUS_WAIT:-600}" waited=0
+  until mise run harness:status >&2; do
+    ((waited < bound)) || return 1
+    log "harness:status reports a bad value. Reading it again in 60s, up to ${bound}s"
+    sleep 60
+    waited=$((waited + 60))
+  done
 }

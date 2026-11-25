@@ -14,6 +14,7 @@ import (
 // both, cell-proxy accepts only the exact gateway ID, listens on 4319 only, and every object carries
 // the harness label.
 func TestUplinkRender(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ cluster, peerRoot, mode, port, id string }{
 		{"dev-cell-1", "mgmt-root", `NodeAttestor "cluster_jwt"`, "30444", "dev-cell-1"},
 		{"dev-cell-2", "mgmt-root", `NodeAttestor "cluster_jwt"`, "30444", "dev-cell-2"},

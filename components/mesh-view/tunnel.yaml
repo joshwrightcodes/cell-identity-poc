@@ -86,9 +86,11 @@ spec:
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
           # The tunnel serves its own state on 127.0.0.1:18099, and mise run mesh:status reads it with
-          # cell-proxy tunnel-status. The probes run whoami, which asks the Workload API for the SVIDs of the pod, so
-          # a SPIRE agent that stops serves no identity and restarts the container. They do not read the tunnel
-          # state: a cell that starts before the hub has no tunnel, and it must still become Ready.
+          # cell-proxy tunnel-status. The startup and readiness probes run whoami, which asks the Workload API for the
+          # SVIDs of the pod, so a pod whose SPIRE agent serves no identity is not Ready. The liveness probe runs
+          # tunnel-status, which answers from that local listener with or without a tunnel and reads no Workload API.
+          # So a SPIRE agent that is down in a cell island restarts no container. No probe reads the tunnel state as up
+          # or down: a cell that starts before the hub has no tunnel, and it must still become Ready.
           startupProbe:
             exec:
               command: [/ko-app/cell-proxy, whoami]
@@ -102,7 +104,7 @@ spec:
             timeoutSeconds: 5
           livenessProbe:
             exec:
-              command: [/ko-app/cell-proxy, whoami]
+              command: [/ko-app/cell-proxy, tunnel-status]
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 4

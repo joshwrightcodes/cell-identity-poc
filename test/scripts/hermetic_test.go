@@ -3,7 +3,6 @@ package scripts
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -11,8 +10,9 @@ import (
 // realPATH is PATH before the canaries. realTool uses it.
 var realPATH = os.Getenv("PATH")
 
-// canaryCommands are the commands that reach a cluster, the VM or the tools of the harness. A script test must never run the real one.
-var canaryCommands = []string{"kind", "docker", "colima", "ssh", "limactl", "kubectl", "mise"}
+// canaryCommands are the commands that reach a cluster, the VM or the tools of the harness, and the macOS tools that keep the Mac awake
+// or read its power source. A script test must never run the real one.
+var canaryCommands = []string{"kind", "docker", "colima", "ssh", "limactl", "kubectl", "mise", "caffeinate", "pmset"}
 
 // TestMain puts a canary for each command of canaryCommands at the front of PATH for every test of this package. A test puts its own stubs
 // before that PATH, so a stub wins. A command with no stub reaches the canary, which prints the command, its arguments and the name of this file, and
@@ -61,12 +61,16 @@ GOFLAGS=-mod=readonly exec go run ./cmd/pkigen "$@"
 // cluster of this Mac. The test must also point the program at its own fake, for example through KUBECONFIG and HOME.
 func useRealTool(t *testing.T, dir, name string) {
 	t.Helper()
-	old := os.Getenv("PATH")
-	os.Setenv("PATH", realPATH)
-	path, err := exec.LookPath(name)
-	os.Setenv("PATH", old)
-	if err != nil {
-		t.Skipf("%s is not installed: %v", name, err)
+	// The search reads realPATH, because exec.LookPath reads the PATH of the process, which TestMain changed and which parallel tests read.
+	var path string
+	for _, d := range filepath.SplitList(realPATH) {
+		if info, err := os.Stat(filepath.Join(d, name)); err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			path = filepath.Join(d, name)
+			break
+		}
+	}
+	if path == "" {
+		t.Skipf("%s is not installed on PATH", name)
 	}
 	if err := os.Symlink(path, filepath.Join(dir, name)); err != nil {
 		t.Fatal(err)

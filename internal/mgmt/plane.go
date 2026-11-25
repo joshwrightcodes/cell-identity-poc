@@ -63,6 +63,9 @@ type Config struct {
 	// SpecPushState returns the time and the error of the last spec push to the host service. A nil
 	// func leaves both empty in the status.
 	SpecPushState func() (time.Time, string)
+	// OperatorKeys are the pinned operator keys. The plane adopts a local revocation entry that envd
+	// reports only when one of them verifies it. With none, the plane adopts nothing.
+	OperatorKeys []ed25519.PublicKey
 
 	// bundlePolicy is a test seam for the allow-list data that SignBundle checks a set against. The
 	// zero value takes bundle.DefaultPolicy. No flag sets it: mgmtd must sign against the list that
@@ -128,6 +131,8 @@ type Plane struct {
 	betweenLoads func()
 	ready        atomic.Bool
 	bg           sync.WaitGroup // background hint checks
+	// keysAbsentLogged is set after the one operator_keys_absent line.
+	keysAbsentLogged atomic.Bool
 
 	bindResults, checkResults, reportItems, retryUnknownKID metric.Int64Counter
 }
@@ -490,7 +495,9 @@ func (p *Plane) checkStaged() error {
 }
 
 // Restore serves the stored revision with the given counter, and 0 serves the latest. While an older
-// revision is served, every record change fails with restore_active.
+// revision is served, every record change fails with restore_active. A counter below
+// State.LastRevocation in the same epoch fails with ErrRestorePastRevocation, because that
+// revision serves a revoked cell as not revoked.
 func (p *Plane) Restore(counter uint64) error { return p.restore(counter, nil) }
 
 func (p *Plane) restore(counter uint64, expect *uint64) error {
@@ -505,6 +512,9 @@ func (p *Plane) restore(counter uint64, expect *uint64) error {
 			return h.Revision.Epoch == t.st.Last.Epoch && h.Revision.Counter == counter
 		}) {
 			return fmt.Errorf("%w with counter %d", ErrRevisionUnknown, counter)
+		}
+		if lr := t.st.LastRevocation; counter != 0 && lr.Epoch == t.st.Last.Epoch && counter < lr.Counter {
+			return fmt.Errorf("%w: counter %d is below the revoke at %d.%d", ErrRestorePastRevocation, counter, lr.Epoch, lr.Counter)
 		}
 		if t.st.Served != counter {
 			t.st.Served = counter

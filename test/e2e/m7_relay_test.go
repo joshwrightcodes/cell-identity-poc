@@ -47,14 +47,15 @@ func principalAccepted(t *testing.T, since time.Time) int {
 	return len(matching(logs, func(l logLine) bool { return l.str("msg") == "peer accepted" && l.str("spiffe_id") == id }))
 }
 
-// requireNoPrincipalAccept fails the test as soon as the principal logs a "peer accepted" line for the identity of the test since a
-// time. It reads the log for 15 seconds, because the principal can log the line after the client has seen the connection end.
-func requireNoPrincipalAccept(t *testing.T, since time.Time) {
+// requireOnlyControlAccept fails the test as soon as the principal logs more than one "peer accepted" line for the identity of the test
+// since the start of the control window, because the one line belongs to the control connection. It reads the log for 15 seconds,
+// because the principal can log the line after the client has seen the connection end.
+func requireOnlyControlAccept(t *testing.T, controlSince time.Time) {
 	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for {
-		if n := principalAccepted(t, since); n != 0 {
-			t.Errorf("the principal accepted %d connections of %s after the flip, want 0", n, relayIdentityCell)
+		if n := principalAccepted(t, controlSince); n > 1 {
+			t.Errorf("the principal accepted %d connections of %s after the flip, want 0 beyond the control connection", n-1, relayIdentityCell)
 			return
 		}
 		if time.Now().After(deadline) {
@@ -85,9 +86,10 @@ func TestM7RelayForwardsCiphertextOnly(t *testing.T) {
 }
 
 // relayControl sends one clean request through a forwarder that flips nothing, in the namespace of the flip test, and requires that it
-// succeeds and that the principal accepts exactly one connection of the identity of the test. A flip test that failed because the relay
+// succeeds and that the principal accepts exactly one connection of the identity of the test. It returns the start of the log window
+// that holds that connection, so that a flip test counts accepts from the same time. A flip test that failed because the relay
 // or the principal was down would pass its own checks, so the control comes first.
-func relayControl(t *testing.T, ns string) {
+func relayControl(t *testing.T, ns string) time.Time {
 	t.Helper()
 	addr, conns := startFlipForward(t, relayCell, ns, relayUpstream(t), -1, "up")
 	since := time.Now().Add(-2 * time.Second)
@@ -99,6 +101,7 @@ func relayControl(t *testing.T, ns string) {
 		n := principalAccepted(t, since)
 		return n == 1, fmt.Sprintf("%d accepted connections", n)
 	})
+	return since
 }
 
 // TestM7RelayAlteredHandshakeFails flips one byte of the ClientHello (offset 100, upstream). The client handshake fails, and the
@@ -106,10 +109,9 @@ func relayControl(t *testing.T, ns string) {
 // failure comes from the altered bytes and not from a relay that was down. A clean control request goes first.
 func TestM7RelayAlteredHandshakeFails(t *testing.T) {
 	ns := m7Namespace(t, relayCell, false)
-	relayControl(t, ns)
+	controlSince := relayControl(t, ns)
 	addr, conns := startFlipForward(t, relayCell, ns, relayUpstream(t), 100, "up")
 	cert, proofToken := relayClientCert(t), streamProof(t, relayIdentityCell, "argocd-agent")
-	since := time.Now().Add(-2 * time.Second)
 	err := viewDial(t, addr, relayIdentityCell, cert, proofToken)
 	if err == nil {
 		t.Fatal("the client finished a request through flipforward with a flipped byte in its ClientHello")
@@ -120,7 +122,7 @@ func TestM7RelayAlteredHandshakeFails(t *testing.T) {
 	if c := waitConns(t, "the altered handshake", conns, 1)[0]; !c.Flipped || c.BytesDown == 0 {
 		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
-	requireNoPrincipalAccept(t, since)
+	requireOnlyControlAccept(t, controlSince)
 }
 
 // handshakeUpBytes returns how many bytes the client sends upstream before its first application byte, from a connection that ends
@@ -153,13 +155,12 @@ func handshakeUpBytes(t *testing.T, cell string, ns, upstream string) int64 {
 // no accepted peer for the identity of the test, so its backend receives no request from the connection.
 func TestM7RelayAlteredRecordFails(t *testing.T) {
 	ns := m7Namespace(t, relayCell, false)
-	relayControl(t, ns)
+	controlSince := relayControl(t, ns)
 	hs := handshakeUpBytes(t, relayCell, ns, relayUpstream(t))
 	flipAt := hs + 20
 	t.Logf("the handshake sends %d bytes upstream, so the flip is at offset %d", hs, flipAt)
 	addr, conns := startFlipForward(t, relayCell, ns, relayUpstream(t), flipAt, "up")
 	cert, proofToken := relayClientCert(t), streamProof(t, relayIdentityCell, "argocd-agent")
-	since := time.Now().Add(-2 * time.Second)
 	err := viewDial(t, addr, relayIdentityCell, cert, proofToken)
 	if err == nil {
 		t.Fatal("the client finished a request through flipforward with a flipped byte in its proof record")
@@ -170,5 +171,5 @@ func TestM7RelayAlteredRecordFails(t *testing.T) {
 		t.Errorf("connection %+v, want a flipped byte and an answer from the server", c)
 	}
 	t.Logf("flipforward relayed %d bytes up and %d bytes down before the connection closed", c.BytesUp, c.BytesDown)
-	requireNoPrincipalAccept(t, since)
+	requireOnlyControlAccept(t, controlSince)
 }

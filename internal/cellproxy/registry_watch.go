@@ -54,6 +54,9 @@ type RegistryWatcher struct {
 	log             *slog.Logger
 	cur             atomic.Pointer[Registry]
 
+	adoptMu sync.Mutex
+	onAdopt []func(*Registry)
+
 	mu      sync.Mutex
 	signer  string
 	marks   map[string]spec.Revision
@@ -107,24 +110,50 @@ func (w *RegistryWatcher) run(ctx context.Context, every time.Duration) {
 	}
 }
 
+// OnAdopt registers f to run after each registry that the watcher adopts, with that registry. A
+// failed reload does not run it. The callbacks run on the reload goroutine, in the order of their
+// registration, so a slow one delays the next reload.
+func (w *RegistryWatcher) OnAdopt(f func(*Registry)) {
+	w.adoptMu.Lock()
+	defer w.adoptMu.Unlock()
+	w.onAdopt = append(w.onAdopt, f)
+}
+
 func (w *RegistryWatcher) reload() {
+	reg := w.reloadLocked()
+	if reg == nil {
+		return
+	}
+	w.adoptMu.Lock()
+	fs := slices.Clone(w.onAdopt)
+	w.adoptMu.Unlock()
+	for _, f := range fs {
+		f(reg)
+	}
+}
+
+// reloadLocked tries one reload and returns the registry that it adopted, or nil.
+func (w *RegistryWatcher) reloadLocked() *Registry {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if err := w.tryReload(); err != nil {
+	reg, err := w.tryReload()
+	if err != nil {
 		if msg := err.Error(); msg != w.lastErr {
 			w.lastErr = msg
 			w.log.Warn("registry_reload_failed", "error", msg)
 		}
-		return
+		return nil
 	}
 	w.lastErr = ""
+	return reg
 }
 
-// tryReload loads the directory and adopts it only when every check passes. The caller holds w.mu.
-func (w *RegistryWatcher) tryReload() error {
+// tryReload loads the directory and adopts it only when every check passes. It returns the
+// adopted registry. The caller holds w.mu.
+func (w *RegistryWatcher) tryReload() (*Registry, error) {
 	reg, fp, err := LoadPinnedRegistry(w.dir, w.signerFile)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	marks := w.marks
 	reset := fp != w.signer
@@ -134,7 +163,7 @@ func (w *RegistryWatcher) tryReload() error {
 	next := highestRevisions(reg)
 	for _, name := range slices.Sorted(maps.Keys(next)) {
 		if mark, ok := marks[name]; ok && next[name].Compare(mark) < 0 {
-			return fmt.Errorf("lower revision refused: cell %s is at epoch %d counter %d, below the mark epoch %d counter %d",
+			return nil, fmt.Errorf("lower revision refused: cell %s is at epoch %d counter %d, below the mark epoch %d counter %d",
 				name, next[name].Epoch, next[name].Counter, mark.Epoch, mark.Counter)
 		}
 	}
@@ -152,7 +181,7 @@ func (w *RegistryWatcher) tryReload() error {
 		st := reg.Stats()
 		w.log.Info("registry reloaded", "content_sha256", reg.ContentSHA256(), "records", st.Records, "revoked", st.Revoked, "signers", st.Signers)
 	}
-	return nil
+	return reg, nil
 }
 
 // highestRevisions maps each cell name to the highest revision among its records.

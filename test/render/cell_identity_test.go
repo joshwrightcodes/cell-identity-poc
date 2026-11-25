@@ -39,6 +39,7 @@ func renderCellIdentity(t *testing.T, env ...string) result {
 }
 
 func TestRenderCellIdentity(t *testing.T) {
+	t.Parallel()
 	r := renderCellIdentity(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -289,6 +290,7 @@ func TestRenderCellIdentity(t *testing.T) {
 // of the trust bundle and of the operation key, the checksums of both on the pod template, and ConfigMap mgmt-op-key
 // with the live signing key of mgmtd. It also checks that the render names no mgmt-root, port 30447 or --bind- flag.
 func TestCellIdentityGatewayFlags(t *testing.T) {
+	t.Parallel()
 	r := renderCellIdentity(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -383,6 +385,7 @@ func TestCellIdentityGatewayFlags(t *testing.T) {
 // TestCellOpsNamespace checks the namespace of the operation records: restricted, out of the mesh, a default deny,
 // no pod, and Role celld-ops with only the five ConfigMap verbs, bound to the celld account of cell-identity-system.
 func TestCellOpsNamespace(t *testing.T) {
+	t.Parallel()
 	r := renderCellIdentity(t)
 	if r.err != nil {
 		t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
@@ -434,6 +437,7 @@ func TestCellOpsNamespace(t *testing.T) {
 }
 
 func TestRenderCellIdentityChecksumDiffersByCell(t *testing.T) {
+	t.Parallel()
 	sums := map[string]string{}
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2", "dev-cell-1 again"} {
 		r := renderCellIdentity(t, "CELL_NAME="+strings.TrimSuffix(cell, " again"))
@@ -452,6 +456,7 @@ func TestRenderCellIdentityChecksumDiffersByCell(t *testing.T) {
 }
 
 func TestRenderCellIdentityFailsClosed(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		env  []string
@@ -490,6 +495,7 @@ func TestRenderCellIdentityFailsClosed(t *testing.T) {
 // and a next.pub with another hash each fail the render, and MGMT_KEY_ACCEPT_CHANGE does not override it. With nothing staged,
 // the ConfigMap holds op.pub only.
 func TestCellIdentityNextKey(t *testing.T) {
+	t.Parallel()
 	sum := func(s string) string { h := sha256.Sum256([]byte(s)); return hex.EncodeToString(h[:]) }
 	next := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 
@@ -573,6 +579,7 @@ func cellObjects(t *testing.T, env ...string) map[string]object {
 // from the host service, the store token that only celld mounts (projected, audience bundle-store, 600 s, read only), and
 // the memory limit of 256Mi, which is a hypothesis that the live part of M8 measures.
 func TestCelldBundleFlags(t *testing.T) {
+	t.Parallel()
 	objs := cellObjects(t)
 	dep := objs["Deployment cell-identity-system/celld"]
 	pod := get[map[string]any](t, dep, "spec", "template", "spec")
@@ -585,11 +592,12 @@ func TestCelldBundleFlags(t *testing.T) {
 		"--bundle-mirror=172.18.0.7:5000",
 		"--bundle-store=bundle-store.cell-system.svc.cluster.local:5000",
 		"--bundle-store-token=/var/run/secrets/bundle-store/token",
-		"--bundle-health-timeout=5m"}); got != want {
+		"--bundle-health-timeout=5m",
+		"--bundle-refill-every=60s"}); got != want {
 		t.Errorf("the bundle flags are %s, want %s", got, want)
 	}
-	if len(args) != 12 {
-		t.Errorf("celld has %d args, want 12", len(args))
+	if len(args) != 13 {
+		t.Errorf("celld has %d args, want 13", len(args))
 	}
 	other := cellObjects(t, "STUB_REGISTRY_IP=172.18.0.99")
 	otherArgs := get[[]any](t, named(t, get[[]any](t, get[map[string]any](t, other["Deployment cell-identity-system/celld"], "spec", "template", "spec"), "containers"), "celld"), "args")
@@ -652,6 +660,7 @@ func argoRules(names []string) string {
 // (list NetworkPolicies), and a binding of each to the celld account of cell-identity-system. Every object carries the
 // harness label.
 func TestCelldRBACExact(t *testing.T) {
+	t.Parallel()
 	objs := cellObjects(t)
 	role := objs["Role argocd/celld-argocd"]
 	if role == nil {
@@ -700,6 +709,7 @@ func TestCelldRBACExact(t *testing.T) {
 // may patch from the allow list at render time: a component that the allow list adds to a role appears in the Role of
 // that role.
 func TestArgoPatchNamesFollowAllowList(t *testing.T) {
+	t.Parallel()
 	body, err := os.ReadFile("../../internal/bundle/allow.json")
 	if err != nil {
 		t.Fatal(err)
@@ -743,6 +753,7 @@ func TestArgoPatchNamesFollowAllowList(t *testing.T) {
 // pods of bundle-store, port 5000), as the last two egress rules of policy celld. The mirror address comes from the host
 // service, and a render without it fails.
 func TestCelldMirrorRule(t *testing.T) {
+	t.Parallel()
 	rules := func(env ...string) []any {
 		np := cellObjects(t, env...)["NetworkPolicy cell-identity-system/celld"]
 		return get[[]any](t, np, "spec", "egress")
@@ -771,6 +782,7 @@ func TestCelldMirrorRule(t *testing.T) {
 // rule from the celld pods of cell-identity-system on port 5000, no egress, and the harness label. The pod selector is empty,
 // so a bundle cannot move the store out of the policy by a label.
 func TestCellStorePlanePolicy(t *testing.T) {
+	t.Parallel()
 	np := cellObjects(t)["NetworkPolicy cell-system/plane-celld-store"]
 	if np == nil {
 		t.Fatal("the render prints no NetworkPolicy plane-celld-store in cell-system")
@@ -836,6 +848,7 @@ func quotedList(names []string) string {
 // has the harness label before or after the request. The lists come from allow.json, failurePolicy is Fail, and the binding
 // denies for every namespace. Both objects carry the harness label themselves.
 func TestHarnessGuardRender(t *testing.T) {
+	t.Parallel()
 	t.Run("cell", func(t *testing.T) { checkHarnessGuard(t, cellObjects(t), "cell", "cell-identity") })
 	t.Run("cp", func(t *testing.T) { checkHarnessGuard(t, envdObjects(t), "cp", "envd") })
 }
@@ -911,6 +924,7 @@ func checkHarnessGuard(t *testing.T, objs map[string]object, roleName, component
 // not ClusterIP or has externalIPs, a Deployment with the sidecar opt-out, an object that has the harness label, and a
 // Secret of type kubernetes.io/service-account-token.
 func TestAppLimitsRender(t *testing.T) {
+	t.Parallel()
 	objs := cellObjects(t)
 	apps := bundle.DefaultPolicy().Roles["cell"].AppComponents
 	if len(apps) == 0 {
@@ -936,12 +950,36 @@ func TestAppLimitsRender(t *testing.T) {
 	for _, a := range apps {
 		starts = append(starts, "object.metadata.annotations['"+track+"'].startsWith('"+a+":')")
 	}
-	wantApp := "object != null && has(object.metadata.annotations) && '" + track + "' in object.metadata.annotations && (" + strings.Join(starts, " || ") + ")"
+	// The condition holds for an object of an app namespace and for an object that an app component tracks. A request for a
+	// cluster scoped object has no request.namespace, so each use of it sits behind has(request.namespace).
+	var appNS []string
+	for _, a := range apps {
+		class, ok := bundle.DefaultPolicy().ClassOf("cell", a)
+		if !ok {
+			t.Fatalf("allow.json has no class for the app component %s", a)
+		}
+		for _, ns := range class.ObjectNamespaces {
+			appNS = append(appNS, "'"+ns+"'")
+		}
+	}
+	if !slices.Equal(appNS, []string{"'apps-sample'"}) {
+		t.Fatalf("the app namespaces are %v, want only apps-sample", appNS)
+	}
+	wantApp := "(has(request.namespace) && request.namespace in [" + strings.Join(appNS, ", ") + "]) || (object != null && has(object.metadata.annotations) && '" + track + "' in object.metadata.annotations && (" + strings.Join(starts, " || ") + "))"
 	if got := get[string](t, conds[1], "expression"); got != wantApp || get[string](t, conds[1], "name") != "app-component" || !celExprBalanced(wantApp) {
 		t.Errorf("the app component condition is %q, want %q", got, wantApp)
 	}
 	if n := strings.Count(wantApp, "startsWith("); n != len(apps) {
 		t.Errorf("%d matches for %d app components", n, len(apps))
+	}
+	// Every use of request.namespace is behind has(request.namespace), so a request with no namespace evaluates to false,
+	// not to a CEL error that failurePolicy Fail turns into a refusal of the whole request.
+	gotApp := get[string](t, conds[1], "expression")
+	if uses, guarded := strings.Count(gotApp, "request.namespace"), strings.Count(gotApp, "has(request.namespace) && request.namespace"); uses != 2*guarded || guarded == 0 {
+		t.Errorf("the app condition has %d uses of request.namespace and %d guarded uses: %q", uses, guarded, gotApp)
+	}
+	if !strings.HasPrefix(gotApp, "(has(request.namespace) && request.namespace in ['apps-sample'])") {
+		t.Errorf("the app condition %q does not start with the guarded namespace test", gotApp)
 	}
 	const inject = "sidecar.istio.io/inject"
 	optOut := func(field string) string {
@@ -989,6 +1027,7 @@ func TestAppLimitsRender(t *testing.T) {
 // TestBundleGuardScript runs components/lib/bundle-guard.sh for each role. A cell gets both policies. dev-cp gets the harness
 // policy with its own namespaces and no app limits. Role open has no signed sets, and an unknown role fails.
 func TestBundleGuardScript(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	script, err := filepath.Abs("../../components/lib/bundle-guard.sh")
 	if err != nil {
@@ -1024,5 +1063,22 @@ func TestBundleGuardScript(t *testing.T) {
 		if out, _, err := run(args...); err == nil || out != "" {
 			t.Errorf("run %v: err %v, stdout %q, want a failure with no output", args, err, out)
 		}
+	}
+}
+
+// TestCelldRefillFlag: celld probes the bundle store every 60 s and refills it from the mirror after a loss (Shared names
+// "Refill"). The render passes --bundle-refill-every=60s once, explicitly, with the other bundle flags that it needs.
+func TestCelldRefillFlag(t *testing.T) {
+	t.Parallel()
+	objs := cellObjects(t)
+	celld := named(t, get[[]any](t, get[map[string]any](t, objs["Deployment cell-identity-system/celld"], "spec", "template", "spec"), "containers"), "celld")
+	var refill []string
+	for _, a := range get[[]any](t, celld, "args") {
+		if strings.HasPrefix(a.(string), "--bundle-refill-every") {
+			refill = append(refill, a.(string))
+		}
+	}
+	if !slices.Equal(refill, []string{"--bundle-refill-every=60s"}) {
+		t.Errorf("celld has the refill flags %v, want --bundle-refill-every=60s once", refill)
 	}
 }

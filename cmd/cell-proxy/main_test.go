@@ -429,16 +429,43 @@ func TestProbeReasons(t *testing.T) {
 	}
 }
 
-func TestWhoamiPrintsOnlyIDs(t *testing.T) {
+func TestWhoamiPrintsIDsAndExpiry(t *testing.T) {
 	ca := newCA(t, "dev.env.poc.internal")
 	serveWorkloadAPI(t, ca, "spiffe://dev.env.poc.internal/cell/dev-cell-1/otel", "spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent")
 	var out bytes.Buffer
 	if code := execute(t.Context(), []string{"whoami"}, &out); code != 0 {
 		t.Fatalf("exit code %d\n%s", code, out.String())
 	}
-	want := `{"ids":["spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent","spiffe://dev.env.poc.internal/cell/dev-cell-1/otel"]}` + "\n"
-	if out.String() != want {
-		t.Fatalf("stdout is %q, want %q", out.String(), want)
+	var got map[string]any
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	want := []any{"spiffe://dev.env.poc.internal/cell/dev-cell-1/argocd-agent", "spiffe://dev.env.poc.internal/cell/dev-cell-1/otel"}
+	if len(got) != 2 || !slices.Equal(got["ids"].([]any), want) {
+		t.Fatalf("stdout is %q, want the keys ids and expiresAt and the sorted IDs", out.String())
+	}
+}
+
+func TestWhoamiPrintsExpiry(t *testing.T) {
+	ca := newCA(t, "dev.env.poc.internal")
+	serveWorkloadAPI(t, ca, "spiffe://dev.env.poc.internal/cell/dev-cell-1/otel")
+	var out bytes.Buffer
+	if code := execute(t.Context(), []string{"whoami"}, &out); code != 0 {
+		t.Fatalf("exit code %d\n%s", code, out.String())
+	}
+	var got struct {
+		ExpiresAt string `json:"expiresAt"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	at, err := time.Parse(time.RFC3339, got.ExpiresAt)
+	if err != nil {
+		t.Fatalf("expiresAt %q is not RFC 3339: %v", got.ExpiresAt, err)
+	}
+	// The test leaf lives for one hour.
+	if d := time.Until(at); d < 58*time.Minute || d > 61*time.Minute || !strings.HasSuffix(got.ExpiresAt, "Z") {
+		t.Fatalf("expiresAt %s is %s from now, want about 1h in UTC", got.ExpiresAt, d)
 	}
 }
 

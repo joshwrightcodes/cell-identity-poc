@@ -70,6 +70,7 @@ const repoServerJSON = `{"spec":{"template":{"spec":{"containers":[{"name":"argo
 // TestVerifyBundleChecks runs each bundle check of cell:verify with fakes: once on a healthy cluster and once for each mismatch. A
 // mismatch prints its reason and the command to run.
 func TestVerifyBundleChecks(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib", "internal/bundle"} {
@@ -186,6 +187,12 @@ func TestVerifyBundleChecks(t *testing.T) {
 		{name: "signed root: cosign does not verify the root", check: "check_signed_root", cell: "dev-cell-1",
 			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: cosign does not verify the root sha256:11 of dev-cell-1 against the current key of mgmtd (no matching signatures), so it is not trusted. If the key rotated, run: mise run bundle -- cosign --target dev-cell-1"}),
 			want:  []string{"cosign does not verify the root", "bundle -- cosign"}, deny: []string{"bundle -- publish"}},
+		{name: "signed root: the mirror holds no statement of the recorded version", check: "check_signed_root", cell: "dev-cell-1",
+			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: no signed statement for the root sha256:11 has the version 1/166 that the state records"}),
+			want:  []string{"no signed statement", "Run: mise run bundle -- cosign --target dev-cell-1"}, deny: []string{"bundle -- publish", "harness:status"}},
+		{name: "signed root: a statement without a subject gets no cosign hint", check: "check_signed_root", cell: "dev-cell-1",
+			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: the signed statement has no subject bundles/dev-cell-1/root with the digest sha256:11"}),
+			want:  []string{"signed statement has no subject", "Run: mise run harness:status"}, deny: []string{"bundle -- cosign", "bundle -- publish"}},
 		{name: "signed root: the mirror is unreachable", check: "check_signed_root", cell: "dev-cell-1",
 			files: with(cellFiles(), map[string]string{"verify.rc": "1", "verify.out": "error: could not read the address of the registry mirror"}),
 			want:  []string{"registry mirror", "Run: mise run harness:status"}, deny: []string{"bundle -- publish"}},
@@ -357,6 +364,7 @@ set +e; `+tc.check, "_", root)
 // TestVerifyRunsBundleChecks reads scripts/verify.sh: check_store_proxy runs for every role, and the other four checks run only in the branch of the roles cell and
 // cp, so management (role open) runs the store proxy check alone.
 func TestVerifyRunsBundleChecks(t *testing.T) {
+	t.Parallel()
 	raw, err := os.ReadFile("../../scripts/verify.sh")
 	if err != nil {
 		t.Fatal(err)

@@ -61,6 +61,7 @@ func indexOf(calls []string, sub string) int {
 }
 
 func TestResetStateOrderAndNextCommands(t *testing.T) {
+	t.Parallel()
 	out, errOut, code, calls := resetRun(t)
 	if code != 0 {
 		t.Fatalf("exit %d\nstdout %s\nstderr %s", code, out, errOut)
@@ -100,6 +101,7 @@ func TestResetStateOrderAndNextCommands(t *testing.T) {
 }
 
 func TestResetStateFailuresPrintOneErrorLine(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, env, step string
 	}{
@@ -126,6 +128,7 @@ func TestResetStateFailuresPrintOneErrorLine(t *testing.T) {
 // mgmt.sh must print one JSON error line when kubectl exec fails and prints nothing, and it must pass the output
 // and the exit code of a command that printed its own error line.
 func TestMgmtExecFailurePrintsOneErrorLine(t *testing.T) {
+	t.Parallel()
 	const kubectl = `#!/usr/bin/env bash
 case "$*" in
   *"get pod mgmtd-0"*) echo True ;;
@@ -147,6 +150,7 @@ esac
 }
 
 func TestResetStateInvalidWaitPrintsOneErrorLine(t *testing.T) {
+	t.Parallel()
 	out, _, code, calls := resetRun(t, "MGMT_RESET_WAIT=soon")
 	lines := jsonLines(t, out)
 	if code != 1 || len(lines) != 1 || lines[0]["level"] != "ERROR" || lines[0]["step"] != "read-wait" {
@@ -158,6 +162,7 @@ func TestResetStateInvalidWaitPrintsOneErrorLine(t *testing.T) {
 }
 
 func TestResetStateHintsNameMiseTasksOnly(t *testing.T) {
+	t.Parallel()
 	for _, env := range []string{"STUB_POD_STUCK=1", "STUB_JOB_FAIL=1", "STUB_JOB_HANG=1"} {
 		out, _, _, _ := resetRun(t, env)
 		for _, l := range jsonLines(t, out) {
@@ -170,6 +175,7 @@ func TestResetStateHintsNameMiseTasksOnly(t *testing.T) {
 
 // An interrupt while the Job runs scales mgmtd back to 1 and deletes the Job.
 func TestResetStateInterruptScalesMgmtdBack(t *testing.T) {
+	t.Parallel()
 	for _, sig := range []syscall.Signal{syscall.SIGINT, syscall.SIGTERM} {
 		t.Run(sig.String(), func(t *testing.T) {
 			dir := t.TempDir()
@@ -225,6 +231,7 @@ func TestResetStateInterruptScalesMgmtdBack(t *testing.T) {
 
 // A worktree has no .envrc.local, because git ignores it. secrets:connect names the cause and the fix.
 func TestSecretsConnectNamesAnAbsentEnvrcLocal(t *testing.T) {
+	t.Parallel()
 	missing := filepath.Join(t.TempDir(), ".envrc.local")
 	_, errOut, code := runScript(t, "secrets-connect.sh", nil,
 		[]string{"CELL=dev-cp", "POC_ENVRC_LOCAL=" + missing})

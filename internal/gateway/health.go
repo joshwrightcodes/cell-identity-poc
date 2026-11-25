@@ -33,7 +33,7 @@ func NewHealthHandler(st *Store, svidReady func() bool) http.Handler {
 }
 
 // RegisterGauges registers cellgw.queue.depth and cellgw.streams (attribute cell) and
-// cellgw.outbox.items. streams may be nil.
+// cellgw.outbox.items, and cellgw.revocations.overlay. streams may be nil.
 func RegisterGauges(m metric.Meter, st *Store, streams func() map[string]int) error {
 	depth, err := m.Int64ObservableGauge("cellgw.queue.depth", metric.WithDescription("Operations queued, by cell"))
 	if err != nil {
@@ -44,6 +44,10 @@ func RegisterGauges(m metric.Meter, st *Store, streams func() map[string]int) er
 		return err
 	}
 	outbox, err := m.Int64ObservableGauge("cellgw.outbox.items", metric.WithDescription("Items in the outbox"))
+	if err != nil {
+		return err
+	}
+	overlay, err := m.Int64ObservableGauge("cellgw.revocations.overlay", metric.WithDescription("Cells that a signed local revocation holds revoked"))
 	if err != nil {
 		return err
 	}
@@ -58,12 +62,13 @@ func RegisterGauges(m metric.Meter, st *Store, streams func() map[string]int) er
 			o.ObserveInt64(depth, int64(n), metric.WithAttributes(cellAttr(cell)))
 		}
 		o.ObserveInt64(outbox, int64(stats.OutboxItems))
+		o.ObserveInt64(overlay, int64(st.OverlayCount()))
 		if streams != nil {
 			for cell, n := range streams() {
 				o.ObserveInt64(open, int64(n), metric.WithAttributes(cellAttr(cell)))
 			}
 		}
 		return nil
-	}, depth, open, outbox)
+	}, depth, open, outbox, overlay)
 	return err
 }

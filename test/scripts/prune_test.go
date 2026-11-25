@@ -80,6 +80,7 @@ const pruneObjects = `{"items": [
 // not hold, and that has no marker label poc.internal/made-by. An object in the render, an object with the marker, an object with the
 // label of another component, an object with no harness label, and an object of a kind outside HARNESS_PRUNE_KINDS all stay.
 func TestHarnessPrune(t *testing.T) {
+	t.Parallel()
 	calls, errOut, err := runPrune(t, pruneRender)
 	if err != nil {
 		t.Fatalf("harness_prune: %v\n%s", err, errOut)
@@ -124,6 +125,7 @@ func TestHarnessPrune(t *testing.T) {
 // TestHarnessPruneFailsClosed: a render that yq cannot read, and a render with no object, each stop harness_prune with a message and
 // delete nothing, though every live object of the component then looks absent from the render.
 func TestHarnessPruneFailsClosed(t *testing.T) {
+	t.Parallel()
 	for name, tc := range map[string]struct{ render, want string }{
 		"unreadable render": {"kind: [unclosed\n  - : :\n", "could not read the objects"},
 		"empty render":      {"", "holds no object"},

@@ -113,6 +113,7 @@ func oneJSONLine(t *testing.T, out string) map[string]any {
 // TestObsPasswordPrintsOnlyThePassword checks that obs:password prints the password and nothing else,
 // and prints one JSON error line and nothing else when the Secret is missing.
 func TestObsPasswordPrintsOnlyThePassword(t *testing.T) {
+	t.Parallel()
 	state := obsState(t, "S3cretPassw0rdS3cretPassw0rd1234", "unused")
 	out, _, code := obsRun(t, state, "obs-password.sh")
 	if code != 0 || out != "S3cretPassw0rdS3cretPassw0rd1234\n" {
@@ -132,6 +133,7 @@ func TestObsPasswordPrintsOnlyThePassword(t *testing.T) {
 // characters, reaches the Secret and Grafana, the old one stops working, no argument list of kubectl
 // holds a password, and the output holds neither password.
 func TestObsRotatePassword(t *testing.T) {
+	t.Parallel()
 	const old = "OldPassw0rdOldPassw0rdOldPassw0r"
 	state := obsState(t, old, old)
 	out, errOut, code := obsRun(t, state, "obs-rotate-password.sh")
@@ -162,6 +164,7 @@ func TestObsRotatePassword(t *testing.T) {
 // prints one JSON error line with the command that makes Grafana use the Secret again, and that the
 // line holds no password.
 func TestObsRotatePasswordFailureNamesTheRepair(t *testing.T) {
+	t.Parallel()
 	const old = "OldPassw0rdOldPassw0rdOldPassw0r"
 	state := obsState(t, old, old)
 	if err := os.WriteFile(filepath.Join(state, "apply-fail"), nil, 0o600); err != nil {
@@ -182,6 +185,7 @@ func TestObsRotatePasswordFailureNamesTheRepair(t *testing.T) {
 // TestObsRotatePasswordRefusesAnOutOfSyncSecret checks that the rotation changes nothing when
 // Grafana does not accept the password of the Secret.
 func TestObsRotatePasswordRefusesAnOutOfSyncSecret(t *testing.T) {
+	t.Parallel()
 	state := obsState(t, "SecretPassw0rdSecretPassw0rd1234", "GrafanaPassw0rdGrafanaPassw0rd12")
 	out, _, code := obsRun(t, state, "obs-rotate-password.sh")
 	m := oneJSONLine(t, out)
@@ -195,6 +199,7 @@ func TestObsRotatePasswordRefusesAnOutOfSyncSecret(t *testing.T) {
 
 // TestObsUIBusyPort checks that obs:ui prints one JSON line and fails when the port has a listener.
 func TestObsUIBusyPort(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "lsof")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -216,6 +221,7 @@ func TestObsUIBusyPort(t *testing.T) {
 // TestNoLastAppliedSecretCheck checks the cell:verify row: a Secret in observability-system with the
 // annotation last-applied-configuration fails it and names the Secret, and Secrets without it pass.
 func TestNoLastAppliedSecretCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {

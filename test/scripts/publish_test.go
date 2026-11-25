@@ -99,6 +99,7 @@ func runPublish(t *testing.T, cell string) (root, log string, components []strin
 // 5001 of pod bundle-store-0, which is the loopback address of the pod behind the token proxy, and that every
 // registry address that it gives to a tool is the local end of that forward. It never forwards the Service.
 func TestPublishForwardsLoopbackPort(t *testing.T) {
+	t.Parallel()
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2", "dev-cp", "management"} {
 		t.Run(cell, func(t *testing.T) {
 			root, log, _ := runPublish(t, cell)
@@ -136,6 +137,7 @@ func TestPublishForwardsLoopbackPort(t *testing.T) {
 // that the result lands in build/<cluster>/root.json and the digests in published.env. A cluster with role
 // open gets no bootstrap call and no root.json, and its Applications read oci://127.0.0.1:5000.
 func TestPublishWritesRootJSON(t *testing.T) {
+	t.Parallel()
 	roles := map[string]string{"dev-cell-1": "cell", "dev-cell-2": "cell", "dev-cp": "cp", "management": "open"}
 	for cell, role := range roles {
 		t.Run(cell, func(t *testing.T) {

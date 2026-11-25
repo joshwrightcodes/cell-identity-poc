@@ -374,10 +374,11 @@ func TestTLSDialHandshakeFlip(t *testing.T) {
 	chain, key, _ := testChain(t, id)
 	upstream := tlsServer(t, chain, key, nil)
 	addr, _ := startFlipForward(t, "--upstream", upstream, "--flip-at", "100", "--dir", "down")
+	// run does not replace the default logger, so the flipforward goroutines keep logging to their
+	// own buffer and not to the output of the dial.
 	var out bytes.Buffer
-	code := execute(context.Background(), []string{"tlsdial", "--addr", addr, "--expect-id", id, "--bundle", writeFile(t, caPEM(t, chain))}, &out)
-	if code != 0 {
-		t.Fatalf("exit status %d: %s", code, out.String())
+	if err := run(context.Background(), []string{"tlsdial", "--addr", addr, "--expect-id", id, "--bundle", writeFile(t, caPEM(t, chain))}, &out); err != nil {
+		t.Fatalf("tlsdial: %v: %s", err, out.String())
 	}
 	var r tlsDialResult
 	if err := json.Unmarshal(out.Bytes(), &r); err != nil {

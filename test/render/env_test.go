@@ -25,6 +25,7 @@ func pluginEnv(t *testing.T, text string) string {
 // from cells/common.env and with another value. The server plugin, the agent plugin, the principal --auth
 // pattern and the agent namespaces must follow the variable in both cases, so no render holds its own copy of the name.
 func TestEnvironmentNameHasOneSource(t *testing.T) {
+	t.Parallel()
 	for _, env := range []string{commonEnv(t, "POC_ENV"), "other-env"} {
 		t.Run(env, func(t *testing.T) {
 			server := render(t, "POC_ENV="+env, "SPIRE_AGENT_CELLS=dev-cell-1 dev-cell-2", "SPIRE_CELL_SUBJECTS="+cellEnv(t, "dev-cp", "SPIRE_CELL_SUBJECTS"))

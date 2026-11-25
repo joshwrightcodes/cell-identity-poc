@@ -104,6 +104,7 @@ esac
 // JSON line with the fingerprints, the new epoch and the run time. A failure prints the commands that are left, from the failed one on,
 // and one JSON error line.
 func TestRotateKeyOrder(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64", "shasum")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {

@@ -80,6 +80,8 @@ spec:
         poc.internal/peer-root-sha256: "@PEER_ROOT_SHA256@"
         poc.internal/hostsvc-pin-sha256: "@HOSTSVC_PIN_SHA256@"
         poc.internal/intent-sha256: "@INTENT_SHA256@"
+        # mgmtd reads the operator keys at start only, so a rotation restarts the pod.
+        poc.internal/operator-key-sha256: "@OPERATOR_KEY_SHA256@"
     spec:
       serviceAccountName: mgmtd
       # Only the mgmtd container mounts the token, as the projected volume mgmtd-api-token.
@@ -108,6 +110,8 @@ spec:
             # mgmtd publishes ConfigMap cell-registry into the namespaces of the view servers. The Role
             # cell-registry-publish of each view component lets it write there.
             - --registry-namespaces=central-view-system,observability-system,mesh-view-system
+            # mgmtd verifies the local revocations of envd reports with the operator keys before it adopts one.
+            - --operator-key-file=/etc/mgmtd/operator-key/keys.pub
           env:
             - name: SPIFFE_ENDPOINT_SOCKET
               value: unix:///run/spire/agent/agent.sock
@@ -161,6 +165,9 @@ spec:
             - name: hostsvc-pin
               mountPath: /etc/mgmtd/hostsvc-pin
               readOnly: true
+            - name: operator-key
+              mountPath: /etc/mgmtd/operator-key
+              readOnly: true
             # The admin socket lives at /run/mgmtd/ctl/admin.sock. Only this container mounts the volume.
             - name: admin
               mountPath: /run/mgmtd
@@ -179,6 +186,9 @@ spec:
         - name: hostsvc-pin
           configMap:
             name: hostsvc-pin
+        - name: operator-key
+          configMap:
+            name: operator-key
         - name: admin
           emptyDir:
             sizeLimit: 1Mi

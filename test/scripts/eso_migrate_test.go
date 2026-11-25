@@ -132,6 +132,7 @@ func index(calls []string, want string) int {
 }
 
 func TestMigrateGuardsTheNamespaceFirst(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runMigrate(t)
 	if err != nil {
 		t.Fatalf("eso:migrate failed: %v\n%s", err, out)
@@ -164,6 +165,7 @@ func TestMigrateGuardsTheNamespaceFirst(t *testing.T) {
 }
 
 func TestMigrateStopsWhenTheAnnotationDoesNotReadBack(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runMigrate(t, "STUB_ANNOTATE_LOST=1")
 	if err == nil || !strings.Contains(out, "The migration stops before any other change") {
 		t.Fatalf("err %v, output %q; want a stop after the read-back", err, out)
@@ -174,6 +176,7 @@ func TestMigrateStopsWhenTheAnnotationDoesNotReadBack(t *testing.T) {
 }
 
 func TestMigrateOnAMigratedClusterOnlyChecks(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runMigrate(t, "STUB_MIGRATED=1")
 	if err != nil {
 		t.Fatalf("eso:migrate failed: %v\n%s", err, out)
@@ -189,6 +192,7 @@ func TestMigrateOnAMigratedClusterOnlyChecks(t *testing.T) {
 }
 
 func TestMigrateFailsWithARollbackWhenTheNamespaceIsNew(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runMigrate(t, "STUB_NS_UID_CHANGES=1")
 	if err == nil {
 		t.Fatalf("eso:migrate succeeded:\n%s", out)
@@ -204,6 +208,7 @@ func TestMigrateFailsWithARollbackWhenTheNamespaceIsNew(t *testing.T) {
 }
 
 func TestMigrateNeedsTheSecretsConnectSettings(t *testing.T) {
+	t.Parallel()
 	out, calls, err := runMigrate(t, "POC_SECRET_TOKEN_CMD=")
 	if err == nil || !strings.Contains(out, "POC_SECRET_TOKEN_CMD and POC_SECRET_STORE_PROVIDER must be set") || !strings.Contains(out, "changed nothing") {
 		t.Fatalf("err %v, output %q; want a stop before any change", err, out)

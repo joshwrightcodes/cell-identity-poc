@@ -58,14 +58,14 @@ mirror_host() {
 # attach_sigstore <answer of mgmtd> <mirror> writes the Sigstore bundle of the answer to build/<target>/sigstore-<counter>.json and
 # attaches it to the root of the set on the mirror. It prints the path of the file.
 attach_sigstore() {
-  local answer="$1" mirror="$2" root counter file
+  local answer="$1" mirror="$2" root counter file attached
   root="$(jq -er '.rootDigest' <<<"$answer")" || die "the answer of mgmtd has no root digest"
   counter="$(jq -er '.version.counter' <<<"$answer")" || die "the answer of mgmtd has no version"
   file="$BUILD/sigstore-$counter.json"
   mkdir -p "$BUILD"
   jq -ec '.sigstoreBundle' <<<"$answer" >"$file" || die "the answer of mgmtd has no Sigstore bundle"
-  mise run bundlectl -- attach --target "$CELL_NAME" --digest "$root" --bundle "$file" --registry "$mirror" --build "$BUILD_ROOT" >/dev/null \
-    || die "could not attach the Sigstore bundle $file to the root $root of $CELL_NAME on the mirror"
+  attached="$(mise run bundlectl -- attach --target "$CELL_NAME" --digest "$root" --bundle "$file" --registry "$mirror" --build "$BUILD_ROOT")" \
+    || die "could not attach the Sigstore bundle $file to the root $root of $CELL_NAME on the mirror: $attached"
   printf '%s' "$file"
 }
 
@@ -73,17 +73,21 @@ attach_sigstore() {
 # and a render change without a new hydrate would sign the old content. The rule is the one of ko_image for build/images.env: a file that is newer than the
 # bundle. The inputs of the bundle of a component are the files and directories of components/<component> and components/lib (a deleted file changes its
 # directory), vendor/, scripts/lib.sh, scripts/hydrate.sh, scripts/ko-image.sh, cells/common.env, cells/<t>.env, internal/bundle/allow.json,
-# build/<t>/facts.env and build/images.env (IMAGES_ENV names another file). Live facts that a render reads from a cluster are not files, so a change in
-# them still needs cell:hydrate. A find that fails stops the publish.
+# build/<t>/facts.env and build/images.env (IMAGES_ENV names another file). For dev-cp, the slow-tier marker build/gate/m9-svid-ttl and the stamp
+# build/gate/m9-svid-ttl.restoring of svid-ttl.sh restore count too, because the render of dev-cp reads the marker, and a marker that goes
+# leaves no file. Live facts that a render reads from a cluster are not files, so a change in them still needs cell:hydrate. A find that fails stops
+# the publish.
 check_build_fresh() {
-  local entry c file i newer inputs
+  local entry c file i newer inputs slow=()
+  [[ "$CELL_NAME" != dev-cp ]] || slow=("$SVID_TTL_MARKER" "$SVID_TTL_MARKER.restoring")
   for entry in "${COMPONENTS[@]}"; do
     c="${entry%%:*}"
     file="$BUNDLES/$c/manifests.yaml"
     [[ -f "$file" ]] || die "no hydrated bundle $c for $CELL_NAME ($file). Run: CELL=$CELL_NAME mise run cell:hydrate"
     inputs=()
     for i in "$ROOT/components/$c" "$ROOT/components/lib" "$ROOT/vendor" "$ROOT/scripts/lib.sh" "$ROOT/scripts/hydrate.sh" "$ROOT/scripts/ko-image.sh" \
-      "$ROOT/cells/common.env" "$ROOT/cells/$CELL_NAME.env" "$ROOT/internal/bundle/allow.json" "$BUILD/facts.env" "${IMAGES_ENV:-$ROOT/build/images.env}"; do
+      "$ROOT/cells/common.env" "$ROOT/cells/$CELL_NAME.env" "$ROOT/internal/bundle/allow.json" "$BUILD/facts.env" "${IMAGES_ENV:-$ROOT/build/images.env}" \
+      ${slow[@]+"${slow[@]}"}; do
       [[ ! -e "$i" ]] || inputs+=("$i")
     done
     newer="$(find "${inputs[@]}" -type f -newer "$file" -print -quit)" || die "could not check the inputs of the bundle $c against $file"

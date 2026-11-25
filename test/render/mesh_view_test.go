@@ -50,6 +50,7 @@ func argsOf(t *testing.T, ctr map[string]any) []string {
 // telemetry name, and the policy that admits no connection and reaches only the relay, the SPIRE
 // server, the API server and the collector.
 func TestMeshViewCellRender(t *testing.T) {
+	t.Parallel()
 	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
 		t.Run(cell, func(t *testing.T) {
 			objs := clusterComponent(t, cell, "mesh-view")
@@ -74,7 +75,8 @@ func TestMeshViewCellRender(t *testing.T) {
 			if env := envOf(t, ctr); env["OTEL_SERVICE_NAME"] != "cell-proxy-mesh-tunnel" || env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME)" {
 				t.Errorf("env %v, want OTEL_SERVICE_NAME cell-proxy-mesh-tunnel and the pod name as instance", env)
 			}
-			for _, p := range []string{"startupProbe", "readinessProbe", "livenessProbe"} {
+			// TestTunnelLivenessNoWorkloadAPI checks the liveness probe.
+			for _, p := range []string{"startupProbe", "readinessProbe"} {
 				if cmd := fmt.Sprint(get[[]any](t, ctr, p, "exec", "command")); cmd != "[/ko-app/cell-proxy whoami]" {
 					t.Errorf("%s runs %s, want cell-proxy whoami", p, cmd)
 				}
@@ -162,6 +164,7 @@ func TestMeshViewCellRender(t *testing.T) {
 // kinds of the tunnel allow-list and nothing else, and that ConfigMaps come only through the Role in
 // istio-system.
 func TestMeshViewReadRole(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "dev-cell-1", "mesh-view")
 	role := objs["ClusterRole mesh-view-read"]
 	if role == nil {
@@ -210,6 +213,7 @@ func TestMeshViewReadRole(t *testing.T) {
 // port with the local traffic policy, the ports of the ClusterIP Service, and the policies of flows
 // N3, N8, N11, N12, N13, N14, N23 and N25.
 func TestMeshViewHubRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "mesh-view-hub")
 	harnessLabelled(t, objs, "mesh-view-hub")
 	dep := objs["Deployment mesh-view-system/mesh-view-hub"]
@@ -293,6 +297,7 @@ func TestMeshViewHubRender(t *testing.T) {
 // without port forwarding, the remote cluster Secret without a credential, the start order
 // annotation, and the policy that admits no pod on port 20001.
 func TestKialiRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "mesh-view-hub")
 	dep := objs["Deployment mesh-view-system/kiali"]
 	if dep == nil {
@@ -328,7 +333,7 @@ func TestKialiRender(t *testing.T) {
 		"deployment.image_name":                     "quay.io/kiali/kiali",
 		"deployment.version_label":                  "v2.34.1",
 		"deployment.discovery_selectors": map[string]any{"default": []any{map[string]any{"matchExpressions": []any{map[string]any{
-			"key": "kubernetes.io/metadata.name", "operator": "In", "values": []any{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"}}}}}},
+			"key": "kubernetes.io/metadata.name", "operator": "In", "values": []any{"apps-demo", "apps-sample", "istio-system", "istio-egress", "mesh-view-system"}}}}}},
 		"server.observability.metrics.enabled":           false,
 		"external_services.prometheus.health_check_url":  nil,
 		"external_services.prometheus.auth":              nil,
@@ -364,7 +369,7 @@ func TestKialiRender(t *testing.T) {
 		}
 	}
 	// The home manager does not cache ConfigMaps, so the Roles in management grant none.
-	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress"} {
+	for _, ns := range []string{"apps-demo", "apps-sample", "istio-system", "istio-egress"} {
 		for _, rule := range get[[]any](t, objs["Role "+ns+"/kiali-viewer"], "rules") {
 			if len(strList(t, lookupOr(rule, "resources"))) == 0 {
 				t.Errorf("the viewer Role in %s has a rule with no resource, which the API server refuses", ns)
@@ -380,7 +385,7 @@ func TestKialiRender(t *testing.T) {
 		t.Error("the Kiali config has no signing key, or the old fixed one")
 	}
 	// The home cluster cache of Kiali watches each namespace of the list, so each has the viewer Role.
-	for _, ns := range []string{"apps-demo", "istio-system", "istio-egress", "mesh-view-system"} {
+	for _, ns := range []string{"apps-demo", "apps-sample", "istio-system", "istio-egress", "mesh-view-system"} {
 		r := objs["Role "+ns+"/kiali-viewer"]
 		b := objs["RoleBinding "+ns+"/kiali-viewer"]
 		if r == nil || b == nil {
@@ -470,6 +475,7 @@ func anySlice(s []string) []any {
 // admits Kiali and the kubelet on 9091, reaches only the store on 9090 and the collector on 4317, and
 // the collector admits its telemetry.
 func TestPromReadonlyRender(t *testing.T) {
+	t.Parallel()
 	objs := clusterComponent(t, "management", "observability-store")
 	dep := objs["Deployment observability-system/prom-readonly"]
 	if dep == nil {
@@ -527,6 +533,7 @@ func TestPromReadonlyRender(t *testing.T) {
 // source in SPIRE_AGENT_CELLS of dev-cp. The collectors of management and of each cell admit the
 // namespace of the tunnel pods for their own OTLP.
 func TestMeshViewCellsMatchTopology(t *testing.T) {
+	t.Parallel()
 	topo, err := topology.Load("../../harness/topology.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -572,6 +579,7 @@ func TestMeshViewCellsMatchTopology(t *testing.T) {
 
 // The render of the hub refuses a bad cell list, an unpinned Kiali image and a missing chart.
 func TestRenderMeshViewHubFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct{ env, want string }{
 		{"MESH_VIEW_CELLS=rogue=18001", "reserved name rogue"},
 		{"MESH_VIEW_CELLS=dev-cell-1=18001 dev-cell-1=18002", "names dev-cell-1 twice"},
@@ -636,6 +644,7 @@ func renderCopyWithout(t *testing.T, component, strip string) string {
 // removes the strip from a copy of the render, so the Role keeps pods/portforward, and expects the guard to stop the render. The yq call
 // of the guard prints one line at a time with a pause, so a guard that pipes yq into grep -q would see SIGPIPE and let the Role through.
 func TestRenderMeshViewHubGuardStopsPortForward(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "helm")
 	script := renderCopyWithout(t, "mesh-view-hub",
 		`    | (select(.kind == "Role" or .kind == "ClusterRole") | .rules) |= map(select((.resources // []) | contains(["pods/portforward"]) | not))`)
@@ -643,5 +652,30 @@ func TestRenderMeshViewHubGuardStopsPortForward(t *testing.T) {
 	r := runStubbed(t, "/ko-app/stub", "", []string{script}, env...)
 	if r.err == nil || r.stdout != "" || !strings.Contains(r.stderr, "a rule of the kiali viewer Role still names pods/portforward") {
 		t.Fatalf("err %v, stdout %d bytes, stderr %q; want the guard to stop the render", r.err, len(r.stdout), r.stderr)
+	}
+}
+
+// TestTunnelLivenessNoWorkloadAPI: the liveness probe of the mesh-view tunnel runs cell-proxy tunnel-status, which answers
+// from the local status listener with or without a tunnel and reads no Workload API (Controller call 5). So a SPIRE agent
+// that is down in a cell island restarts no cell-proxy container. The startup and readiness probes keep whoami.
+func TestTunnelLivenessNoWorkloadAPI(t *testing.T) {
+	t.Parallel()
+	for _, cell := range []string{"dev-cell-1", "dev-cell-2"} {
+		t.Run(cell, func(t *testing.T) {
+			objs := clusterComponent(t, cell, "mesh-view")
+			ctr := named(t, get[[]any](t, objs["Deployment mesh-view-system/mesh-view"], "spec", "template", "spec", "containers"), "cell-proxy")
+			want := map[string]string{"startupProbe": "[/ko-app/cell-proxy whoami]", "readinessProbe": "[/ko-app/cell-proxy whoami]",
+				"livenessProbe": "[/ko-app/cell-proxy tunnel-status]"}
+			for p, cmd := range want {
+				if got := fmt.Sprint(get[[]any](t, ctr, p, "exec", "command")); got != cmd {
+					t.Errorf("%s runs %s, want %s", p, got, cmd)
+				}
+			}
+			for _, a := range argsOf(t, ctr) {
+				if strings.HasPrefix(a, "--status-listen") {
+					t.Errorf("the tunnel sets %s, and tunnel-status reads the default address", a)
+				}
+			}
+		})
 	}
 }

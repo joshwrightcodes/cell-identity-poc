@@ -76,6 +76,7 @@ func meshRun(t *testing.T, env ...string) (stdout string, code int, argv string)
 // Deployment in each injected namespace, never writes a pod template annotation, and prints one JSON
 // line with the cluster IDs of the live sidecars.
 func TestRestartMeshDeletesPodsAndChecksClusterIDs(t *testing.T) {
+	t.Parallel()
 	out, code, argv := meshRun(t)
 	if code != 0 {
 		t.Fatalf("exit %d, output %q", code, out)
@@ -102,6 +103,7 @@ func TestRestartMeshDeletesPodsAndChecksClusterIDs(t *testing.T) {
 // TestRestartMeshFailsOnAnotherClusterID checks that one sidecar with another cluster ID fails the
 // task with one JSON error line that names the pod and the ID.
 func TestRestartMeshFailsOnAnotherClusterID(t *testing.T) {
+	t.Parallel()
 	out, code, _ := meshRun(t, "STUB_CLUSTER_ID=Kubernetes")
 	m := oneJSONLine(t, out)
 	msg, _ := m["error"].(string)
@@ -113,6 +115,7 @@ func TestRestartMeshFailsOnAnotherClusterID(t *testing.T) {
 // TestRestartMeshFailsWithNoInjectedNamespace checks that a cluster with no injected namespace fails
 // with one JSON error line and restarts nothing.
 func TestRestartMeshFailsWithNoInjectedNamespace(t *testing.T) {
+	t.Parallel()
 	out, code, argv := meshRun(t, "STUB_INJECTED=")
 	m := oneJSONLine(t, out)
 	if code != 1 || !strings.Contains(m["error"].(string), "istio-injection=enabled") || strings.Contains(argv, "delete") {
@@ -131,6 +134,7 @@ func toJSON(v any) string {
 // TestRestartCheckWaitsForAnApiServerThatDoesNotAnswer: right after vm:up the API server of a cluster can refuse the first requests. The wait loop
 // of restart-check.sh treats that as "not ready" and tries again, and does not end the script with status 1 and no message.
 func TestRestartCheckWaitsForAnApiServerThatDoesNotAnswer(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	stubs := map[string]string{
 		"mise":   "#!/usr/bin/env bash\necho \"mise $*\" >>\"$STUB_DIR/calls\"\n",

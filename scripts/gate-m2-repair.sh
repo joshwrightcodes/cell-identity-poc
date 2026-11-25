@@ -7,17 +7,18 @@
 #   --check prints each trace and exits 1, or exits 0 when it finds none.
 #
 # The repair:
-#   1. dev-cp: tags root:current with the digest in
-#      build/dev-cp/published.env again (component bundles have no tag), refreshes root, waits for the Applications at those digests,
-#      and waits until the SPIRE server holds no entry under /m2-test/;
+#   1. dev-cp: when the root, the spire-server pin or a test entry shows a trace of the entries test (see bundle_traces), waits for
+#      an open set to end and publishes the last hydrated set of dev-cp with mise run bundle -- publish --target dev-cp --wait.
+#      With no trace and an Application that is not Synced and Healthy, it refreshes root. Then it waits for the Applications at
+#      the digests of build/dev-cp/published.env, and until the SPIRE server holds no entry under /m2-test/;
 #   2. dev-cell-1: puts back the manifest that the key rotation test saved, or removes the two test
 #      flags, checks the manifest, deletes the test key, and waits until the API server publishes
 #      and signs with one key;
 #   3. makes sure that kube-controller-manager, which keeps a token for each controller in memory, and kube-scheduler
 #      run a container that started after the API server container (read from the container runtime, not from the mirror pods)
 #      and hold a live Lease;
-#   4. replaces each pod with a projected token from another key, kindnet first and then one pod at
-#      a time, and waits for every workload;
+#   4. replaces each pod with a projected token from another key, one at a time, in this order: kindnet and kube-proxy, istio-cni-node, istiod,
+#      then the other pods. It then waits for every workload;
 #   5. runs the key check of mgmtd for dev-cell-1, and repeats it after 61 s while the answer is rate_limited, up to
 #      three checks. The record of the cell must then list the key IDs that the API server publishes. A mgmtd
 #      that does not answer skips this step.
@@ -121,39 +122,15 @@ trap 'rm -rf "$lock"' EXIT
 die() { printf 'error: %s. Run: mise run gate:m2:repair again\n' "$*" >&2; exit 1; }
 
 # Step 1: the bundles and the test entry in dev-cp.
-apps_at_published() {
-  local apps
-  apps="$(applications_json kcp)" || return 1
-  jq -e --arg root "$(published_digest "$cp" root)" --arg spire "$(published_digest "$cp" spire-server)" '
-    (.items | length) > 0
-    and all(.items[]; .status.sync.status == "Synced" and .status.health.status == "Healthy")
-    and any(.items[]; .metadata.name == "root" and .status.sync.revision == $root)
-    and any(.items[]; .metadata.name == "spire-server" and .spec.source.targetRevision == $spire and .status.sync.revision == $spire)' <<<"$apps"
-}
+apps_at_published() { cp_apps_at_published "$cp"; }
 no_test_entries() {
   local entries
   entries="$(kcp -n spire-system exec spire-server-0 -c spire-server -- \
     /opt/spire/bin/spire-server entry show -socketPath /run/spire/sockets/api.sock -output json)" || return 1
   jq -e --arg p "$BUNDLE_TEST_PATH" '[.entries[] | select(.spiffe_id.path | startswith($p))] | length == 0' <<<"$entries"
 }
-retagged=0
-store_forward_start "$cp" || die "cannot reach the bundle store of $cp"
-for name in "${BUNDLE_TEST_NAMES[@]}"; do
-  want="$(published_digest "$cp" "$name")"
-  [[ "$want" == sha256:* ]] || { store_forward_stop; die "build/$cp/published.env has no digest for $name. Run: CELL=$cp mise run cell:up"; }
-  got="$(oras resolve --plain-http "$STORE_ADDR/bundles/$name:current" 2>/dev/null || true)"
-  if [[ "$got" != "$want" ]]; then
-    oras tag --plain-http "$STORE_ADDR/bundles/$name@$want" current >/dev/null \
-      || { store_forward_stop; die "could not tag $name@$want as current in the bundle store of $cp"; }
-    log "tagged $name@$want as current again, in place of ${got:-nothing}"
-    retagged=1
-  fi
-done
-store_forward_stop
-if ((retagged)) || ! apps_at_published >/dev/null 2>&1; then
-  kcp -n argocd annotate application root argocd.argoproj.io/refresh=hard --overwrite >/dev/null
-  wait_until 300 "the Applications of $cp are Synced and Healthy at the digests of build/$cp/published.env" apps_at_published
-fi
+restore_bundles "$cp" || die "could not restore the bundles of $cp. Run: CELL=$cp mise run cell:hydrate, then mise run bundle -- publish --target $cp --wait"
+wait_until 300 "the Applications of $cp are Synced and Healthy at the digests of build/$cp/published.env" apps_at_published
 wait_until 120 "the SPIRE server of $cp holds no entry under $BUNDLE_TEST_PATH" no_test_entries
 log "the bundles of $cp match build/$cp/published.env"
 
@@ -262,7 +239,7 @@ replace_pod() {
 }
 if ((${#stale[@]} > 0)); then
   uids="$(printf '%s\n' "${stale[@]}" | jq -Rsc 'split("\n") | map(select(length > 0)) | unique')"
-  # kindnet enforces NetworkPolicy, and kube-proxy routes the service addresses that other pods need to start, so their pods come first.
+  # kindnet and kube-proxy come first, because kube-proxy routes the service address of the API server for every other pod. istio-cni-node, istiod and the other pods follow.
   while read -r ns pod kind owner; do
     replace_pod "$ns" "$pod" "$kind" "$owner" </dev/null
   done < <(k get pods -A -o json | repair_order_pods "$uids")

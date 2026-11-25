@@ -457,3 +457,27 @@ func TestProofReasonsMatch(t *testing.T) {
 		}
 	}
 }
+
+func TestSyncRequestNoRevocationKey(t *testing.T) {
+	base := SyncRequest{SpecEnvelope: json.RawMessage(`{}`), Records: map[string]json.RawMessage{}, Ops: []json.RawMessage{}, Cells: []mgmtapi.CellInfo{}}
+	for _, revs := range [][]json.RawMessage{nil, {}} {
+		req := base
+		req.Revocations = revs
+		raw, err := json.Marshal(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(raw) != `{"specEnvelope":{},"records":{},"ops":[],"cells":[]}` {
+			t.Errorf("got %s", raw)
+		}
+	}
+	req := base
+	req.Revocations = []json.RawMessage{json.RawMessage(`{"payloadType":"x"}`)}
+	raw, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"revocations":[{"payloadType":"x"}]`) {
+		t.Errorf("got %s", raw)
+	}
+}

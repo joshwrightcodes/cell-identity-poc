@@ -43,7 +43,7 @@ func m8Compose(t *testing.T, base []byte, docs ...string) []byte {
 func m8RollbackCycle(t *testing.T, target, component string, wave int, namespace string, base []byte, bad ...string) m8Cycle {
 	t.Helper()
 	var c m8Cycle
-	c.goodDigest = m8PushBundle(t, target, component, m8Compose(t, base, m8Marker("m8-marker", randomHex(t, 8))))
+	c.goodDigest = m8PushBundle(t, target, component, m8Compose(t, base, m8MarkerIn(namespace, "m8-marker", randomHex(t, 8))))
 	c.goodComps = m8SetWithDigest(t, target, component, wave, namespace, c.goodDigest)
 	var tb mgmtapi.TargetBundle
 	c.goodSigned, tb = m8Offer(t, target, c.goodComps, m8SetWait)
@@ -94,7 +94,7 @@ func TestM8RollbackRestoresLastGoodRoot(t *testing.T) {
 	const cell = "dev-cell-1"
 	m8RestoreTarget(t, cell)
 	m8DeleteProbeDeployment(t, cell, "m8-rollback-probe")
-	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, "apps-demo", nil, m8FailingDeployment(t, "m8-rollback-probe", ""))
+	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, m8AppNS, nil, m8FailingDeployment(t, m8AppNS, "m8-rollback-probe", ""))
 	m8CheckRolledBack(t, cell, c, "apps-sample:Synced/Degraded")
 }
 
@@ -105,7 +105,7 @@ func TestM8NextVersionAfterRollback(t *testing.T) {
 	const cell = "dev-cell-1"
 	m8RestoreTarget(t, cell)
 	m8DeleteProbeDeployment(t, cell, "m8-rollback-probe")
-	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, "apps-demo", nil, m8FailingDeployment(t, "m8-rollback-probe", ""))
+	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, m8AppNS, nil, m8FailingDeployment(t, m8AppNS, "m8-rollback-probe", ""))
 	m8WantResult(t, c.bad.Result, op.OutcomeRolledBack, op.ReasonUnhealthy, "*")
 
 	signed, tb := m8Offer(t, cell, c.goodComps, m8SetWait)
@@ -130,7 +130,7 @@ func TestM8CpRollbackRestoresLastGoodRoot(t *testing.T) {
 	m8DeleteProbeDeployment(t, target, "m8-rollback-probe")
 	stop := m8WatchCells("dev-cell-1", "dev-cell-2")
 	t.Cleanup(func() { stop() })
-	c := m8RollbackCycle(t, target, "apps-demo", 5, "apps-demo", m8Hydrated(t, target, "apps-demo"), m8FailingDeployment(t, "m8-rollback-probe", ""))
+	c := m8RollbackCycle(t, target, "apps-demo", 5, "apps-demo", m8Hydrated(t, target, "apps-demo"), m8FailingDeployment(t, m8PlatformNS, "m8-rollback-probe", ""))
 	m8CheckRolledBack(t, target, c, "apps-demo:Synced/Degraded")
 	waitValid(t, []string{"dev-cell-1", "dev-cell-2"}, 5*time.Minute)
 	for _, p := range stop() {
@@ -148,7 +148,7 @@ func TestM8RollbackPastStuckWave(t *testing.T) {
 	m8DeleteProbeDeployment(t, cell, "m8-stuck-probe")
 	second := m8Marker("m8-stuck-marker", "second-wave")
 	second = strings.Replace(second, "  labels:", "  annotations:\n    argocd.argoproj.io/sync-wave: \"1\"\n  labels:", 1)
-	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, "apps-demo", nil, m8FailingDeployment(t, "m8-stuck-probe", "0"), second)
+	c := m8RollbackCycle(t, cell, "apps-sample", m8AppWave, m8AppNS, nil, m8FailingDeployment(t, m8AppNS, "m8-stuck-probe", "0"), second)
 	if r := c.bad.Result; r == nil || r.Outcome != op.OutcomeRolledBack || r.Reason != op.ReasonUnhealthy || !strings.HasPrefix(r.Detail, "timeout:apps-sample:") {
 		t.Errorf("the result of S2 is %+v, want rolled_back, unhealthy and a detail that starts with timeout:apps-sample:", r)
 	}
@@ -420,8 +420,8 @@ func TestM8BadArgocdSetNeedsRepair(t *testing.T) {
 	badArgocd := m8PushBundle(t, cell, "argocd", m8BadStoreTokenBundle(t, cell, m8LiveManifests(t, cell, "argocd", m8LiveDigest(live, "argocd"))))
 	// The cache of Argo CD can hide a broken repo server, so the set also holds a new bundle that never becomes healthy: the health wait
 	// and the rollback must then read the store through the broken token client.
-	probe := m8PushBundle(t, cell, "apps-sample", []byte(m8FailingDeployment(t, "m8-repair-probe", "")))
-	comps := m8WithDigest(m8WithDigest(live, "argocd", 0, "argocd", badArgocd), "apps-sample", m8AppWave, "apps-demo", probe)
+	probe := m8PushBundle(t, cell, "apps-sample", []byte(m8FailingDeployment(t, m8AppNS, "m8-repair-probe", "")))
+	comps := m8WithDigest(m8WithDigest(live, "argocd", 0, "argocd", badArgocd), "apps-sample", m8AppWave, m8AppNS, probe)
 	start := time.Now()
 	_, tb := m8Offer(t, cell, comps, 30*time.Minute)
 	t.Logf("the bad argocd set of %s ended %v after %s", cell, *tb.Result, time.Since(start).Round(time.Second))

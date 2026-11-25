@@ -138,7 +138,7 @@ func TestGatewayVolumeLostDrill(t *testing.T) {
 
 	upMgmtd()
 	statefulSetReady(t, mgmtCluster, mgmtNamespace, "mgmtd")
-	waitOpReported(t, cell, id, 5*time.Minute)
+	waitOpReportedAs(t, cell, id, 5*time.Minute, op.OutcomeApplied, op.OutcomeAlreadyApplied)
 	v := opGet(t, id)
 	if v.State != "final" || !slices.Contains([]string{op.OutcomeApplied, op.OutcomeAlreadyApplied}, v.Final) {
 		t.Errorf("mgmtd shows operation %s as state %q final %q, want final applied or already_applied", id, v.State, v.Final)

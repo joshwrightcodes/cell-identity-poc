@@ -1061,3 +1061,35 @@ func (r *rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	return resp, err
 }
+
+func TestBlobUnknownTyped(t *testing.T) {
+	ctx := context.Background()
+	reg := ocitest.NewRegistry(t)
+	s := newStore(t, reg, func(c *Client) { c.WriteOnly = true })
+	cfg := []byte("{}")
+	layer := []byte("layer bytes")
+	man, _ := json.Marshal(map[string]any{
+		"schemaVersion": 2, "mediaType": mtOCIMan,
+		"config": map[string]any{"mediaType": mtOctet, "digest": ocitest.Digest(cfg), "size": len(cfg)},
+		"layers": []any{map[string]any{"mediaType": mtOctet, "digest": ocitest.Digest(layer), "size": len(layer)}},
+	})
+	_, err := s.PushManifest(ctx, "bundles/root", "", mtOCIMan, man)
+	is(t, err, ErrBlobUnknown)
+	if _, ok := reg.Manifest("bundles/root", ocitest.Digest(man)); ok {
+		t.Fatal("registry stored a manifest with absent blobs")
+	}
+	if err := s.PushBlob(ctx, "bundles/root", ocitest.Digest(cfg), cfg); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.PushManifest(ctx, "bundles/root", "", mtOCIMan, man)
+	is(t, err, ErrBlobUnknown)
+	if err := s.PushBlob(ctx, "bundles/root", ocitest.Digest(layer), layer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.PushManifest(ctx, "bundles/root", "", mtOCIMan, man); err != nil {
+		t.Fatalf("with every blob: %v", err)
+	}
+	reg.Lose()
+	_, err = s.PushManifest(ctx, "bundles/root", "", mtOCIMan, man)
+	is(t, err, ErrBlobUnknown)
+}

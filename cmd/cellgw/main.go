@@ -46,7 +46,9 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/gwapi"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/lograte"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/record"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
@@ -84,7 +86,7 @@ func realDeps() deps {
 		svids: func(ctx context.Context) (svidSource, func(), error) {
 			sctx, cancel := context.WithTimeout(ctx, sourceTimeout)
 			defer cancel()
-			src, err := workloadapi.NewX509Source(sctx)
+			src, err := workloadapi.NewX509Source(sctx, spireclient.SourceOptions())
 			if err != nil {
 				return nil, nil, fmt.Errorf("x509 source from the workload api: %w", err)
 			}
@@ -179,6 +181,7 @@ type serveConfig struct {
 	env                                                             string
 	envd                                                            spiffeid.ID
 	key                                                             ed25519.PublicKey
+	operatorKeys                                                    []ed25519.PublicKey
 	nodes                                                           map[string]netip.Addr
 	replicaCap                                                      int
 }
@@ -211,6 +214,7 @@ func parseServe(args []string) (serveConfig, error) {
 	env := fs.String("env", "", "environment name")
 	envdID := fs.String("envd-id", "", "the exact SPIFFE ID of envd")
 	keyFile := fs.String("spec-key-file", "", "file with the base64 public key that signs specs")
+	opKeyFile := fs.String("operator-key-file", "", "file with the operator public keys that sign local revocations, one or two base64 lines")
 	replicas := fs.Int("replica-cap", gateway.DefaultReplicaCap, "streams of distinct pods that one cell may hold")
 	nodes := cellNodes{}
 	fs.Var(nodes, "cell-node", "node address of a cell, as <cell>=<ip>; repeat for each cell")
@@ -238,7 +242,17 @@ func parseServe(args []string) (serveConfig, error) {
 	if err != nil {
 		return serveConfig{}, err
 	}
-	return serveConfig{dataDir: *dataDir, streamListen: *stream, bindListen: *bind, envdListen: *envdAddr,
+	var opKeys []ed25519.PublicKey
+	if *opKeyFile != "" {
+		raw, err := os.ReadFile(*opKeyFile)
+		if err != nil {
+			return serveConfig{}, fmt.Errorf("--operator-key-file: %w", err)
+		}
+		if opKeys, err = revoke.ParseKeys(raw); err != nil {
+			return serveConfig{}, fmt.Errorf("--operator-key-file: %w", err)
+		}
+	}
+	return serveConfig{operatorKeys: opKeys, dataDir: *dataDir, streamListen: *stream, bindListen: *bind, envdListen: *envdAddr,
 		healthListen: *health, adminSocket: *sock, env: *env, envd: id, key: key, nodes: nodes, replicaCap: *replicas}, nil
 }
 
@@ -306,6 +320,14 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 		return err
 	}
 	defer st.Close()
+	if len(cfg.operatorKeys) > 0 {
+		// The stored envelopes verify again under the pinned keys. A stale entry stays until the next sync of envd.
+		if err := st.RestoreRevocations(ctx, cfg.operatorKeys, cfg.env); err != nil {
+			return err
+		}
+	} else {
+		logger.Info("revocation_overlay_off", "reason", "no --operator-key-file")
+	}
 
 	// Liveness answers as soon as the store is open. Readiness waits for the SVID.
 	var ready atomic.Bool
@@ -334,7 +356,7 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	})
 	bindH := gateway.NewBindHandler(st, gateway.BindConfig{CellNodes: cfg.nodes, Subject: celldSubject, Log: logger, Meter: meter})
 	envdH := gateway.NewEnvdHandler(st, []ed25519.PublicKey{cfg.key}, cfg.envd, streamH.Streams, bindH.LastRefusals, logger,
-		gateway.WithKeyHints(streamH.TakeHints), gateway.WithEnv(cfg.env))
+		gateway.WithKeyHints(streamH.TakeHints), gateway.WithEnv(cfg.env), gateway.WithOperatorKeys(cfg.operatorKeys))
 	if err := gateway.RegisterGauges(meter, st, streamH.Streams); err != nil {
 		return fmt.Errorf("register metrics: %w", err)
 	}

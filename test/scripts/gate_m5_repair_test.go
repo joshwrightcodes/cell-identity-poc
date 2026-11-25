@@ -35,6 +35,7 @@ if [[ -n "${STUB_GW_STATUS:-}" ]]; then echo "$STUB_GW_STATUS"; else echo '{"epo
 // script names each such cell and the repair command, and with no flag it sets the replicas back to 1 through
 // harness-replicas.sh and waits for the rollout. A cell with one replica needs nothing.
 func TestGateM5RepairCelldReplicas(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		args  []string
@@ -94,6 +95,7 @@ func TestGateM5RepairCelldReplicas(t *testing.T) {
 // TestGateM5RepairStreams: each celld must hold a stream at the gateway. The repair cannot open one, so the script reports a cell
 // with no stream, and a gateway that does not answer, in both modes, with CELL=<cell> mise run cell:up, and exits 1.
 func TestGateM5RepairStreams(t *testing.T) {
+	t.Parallel()
 	noStream := `STUB_GW_STATUS={"epoch":1,"streams":{"dev-cell-1":1,"dev-cell-2":0}}`
 	for _, tc := range []struct {
 		name string
@@ -145,6 +147,7 @@ func TestGateM5RepairStreams(t *testing.T) {
 // exit 1 and names the repair command. With no flag the script repairs it, logs the call and exits 0. A namespace with another prefix
 // is no drift. A problem that the repair cannot fix, an absent celld, still gives exit 1 after a later step repaired a namespace.
 func TestGateM5RepairGatewayAndNamespaces(t *testing.T) {
+	t.Parallel()
 	const m5ns = `STUB_NAMESPACES={"items":[{"metadata":{"name":"m5-x","labels":{"cell.poc.internal/e2e":"true"}}}]}`
 	const m4ns = `STUB_NAMESPACES={"items":[{"metadata":{"name":"m4-x","labels":{"cell.poc.internal/e2e":"true"}}}]}`
 	const unlabelled = `STUB_NAMESPACES={"items":[{"metadata":{"name":"m5-y","labels":{}}}]}`

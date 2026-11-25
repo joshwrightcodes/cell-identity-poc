@@ -16,6 +16,7 @@ import (
 // settings of management, and COLLECTOR_STORE of management made each of those clusters render a
 // collector that exports to a store that it does not have.
 func TestLibDropsTheSettingsOfAnotherCluster(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "bash")
 	lib, err := filepath.Abs("../../scripts/lib.sh")
 	if err != nil {

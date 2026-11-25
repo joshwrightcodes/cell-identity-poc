@@ -41,6 +41,7 @@ func hintLines(t *testing.T, errOut string) []string {
 // cells (TestHarnessUpPublishesTargets). No cell gets cell:up.
 // The request runs on every call, even when both cells are requested already, because mgmtd answers alreadyRequested (ruling m6).
 func TestHarnessUpOrderM6(t *testing.T) {
+	t.Parallel()
 	root, calls := harnessRoot(t)
 	log, errOut, err := runHarness(t, root, calls, "up")
 	if err != nil {
@@ -91,14 +92,17 @@ func TestHarnessUpOrderM6(t *testing.T) {
 }
 
 // m6RestoreMise stands in for mise. It logs each call with the CELL of the step. mgmt -- status prints STUB_MGMT_STATUS, except for
-// the first STUB_PENDING_POLLS calls, which print STUB_MGMT_STATUS_PENDING, and except after the link, which prints STUB_BOUND_STATUS. A call that starts with STUB_FAIL_ARGS fails.
+// the first STUB_PENDING_POLLS calls, which print STUB_MGMT_STATUS_PENDING, and except after the link, which prints STUB_UNBOUND_STATUS for the first
+// STUB_UNBOUND_POLLS calls and STUB_BOUND_STATUS after that. A call that starts with STUB_FAIL_ARGS fails.
 const m6RestoreMise = `#!/usr/bin/env bash
 echo "mise $* | CELL=${CELL:-}" >>"$STUB_DIR/calls"
 [[ -z "${STUB_FAIL_ARGS:-}" || "$*" != "$STUB_FAIL_ARGS"* ]] || exit 1
 if [[ "$*" == "run mgmt -- status" ]]; then
   n=$(($(cat "$STUB_DIR/polls" 2>/dev/null || echo 0) + 1)); echo "$n" >"$STUB_DIR/polls"
   if ((n <= ${STUB_PENDING_POLLS:-0})); then printf '%s\n' "$STUB_MGMT_STATUS_PENDING"
-  elif grep -q '^mise run cell:link' "$STUB_DIR/calls"; then printf '%s\n' "$STUB_BOUND_STATUS"
+  elif grep -q '^mise run cell:link' "$STUB_DIR/calls"; then
+    m=$(($(cat "$STUB_DIR/bound-polls" 2>/dev/null || echo 0) + 1)); echo "$m" >"$STUB_DIR/bound-polls"
+    if ((m <= ${STUB_UNBOUND_POLLS:-0})); then printf '%s\n' "$STUB_UNBOUND_STATUS"; else printf '%s\n' "$STUB_BOUND_STATUS"; fi
   else printf '%s\n' "$STUB_MGMT_STATUS"; fi
 fi
 exit 0
@@ -112,6 +116,7 @@ exit 0
 // bound with no open step. With no marker it requests nothing. --check fails while the marker exists. A step of a cell that the marker
 // does not name is never cancelled.
 func TestRepairRestoresCells(t *testing.T) {
+	t.Parallel()
 	bound := func(c1, c2 string) string {
 		return `{"pendingDrops":[],"cells":[{"name":"dev-cell-1",` + c1 + `},{"name":"dev-cell-2",` + c2 + `}]}`
 	}
@@ -126,8 +131,10 @@ func TestRepairRestoresCells(t *testing.T) {
 	const reqBoth = "mise run portal -- request --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cp"
 	const wait = "mise run portal -- wait --cell dev-cell-1 --cell dev-cell-2 | CELL=dev-cp"
 	const link = "mise run cell:link | CELL=management"
+	const publish = "mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait | CELL=dev-cp"
 	const openSteps1 = `{"steps":[{"id":"a","cell":"dev-cell-1","state":"creating"}]}`
-	restore := []string{"serve sync", status, reqBoth, wait, link, "repair-m5", status}
+	restoreBound := []string{"serve sync", status, reqBoth, wait, link, "repair-m5", status}
+	restore := append(slices.Clone(restoreBound), publish)
 	for _, tc := range []struct {
 		name    string
 		marker  string
@@ -139,37 +146,47 @@ func TestRepairRestoresCells(t *testing.T) {
 		calls   []string
 		kept    bool
 		want    string
+		// timed marks a row whose wait ends by the clock. The script counts whole seconds, so the number of polls before the bound depends on
+		// where the first poll falls in a second, and the row accepts one poll or more.
+		timed bool
 	}{
 		{name: "two withdrawn cells", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, calls: restore},
 		{name: "one cell is requested already", marker: "dev-cell-1\ndev-cell-2\n", status: oneRequested, calls: []string{"serve sync", status,
-			"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", wait, link, "repair-m5", status}},
+			"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		{name: "no marker", status: allGood, calls: []string{"repair-m5", "serve sync", status}},
 		{name: "no marker and a live cell that is not requested", status: oneRequested, code: 1, calls: []string{"repair-m5", "serve sync", status}, want: "dev-cell-2 has a cluster and is not requested"},
 		{name: "check with the marker", marker: "dev-cell-1\n", args: []string{"--check"}, status: bothWithdrawn, code: 1, kept: true,
 			calls: []string{"repair-m5 --check"}, want: "build/gate/m6-provision exists"},
 		{name: "check with no marker", args: []string{"--check"}, status: allGood, calls: []string{"repair-m5 --check", status}},
 		{name: "a wait that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_FAIL_ARGS=run portal -- wait"}, calls: restore[:4]},
+			env: []string{"STUB_FAIL_ARGS=run portal -- wait"}, calls: restoreBound[:4]},
 		{name: "a request that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_FAIL_ARGS=run portal -- request"}, calls: restore[:3]},
+			env: []string{"STUB_FAIL_ARGS=run portal -- request"}, calls: restoreBound[:3]},
 		{name: "a stream wait that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"STUB_M5_FAIL=1"}, calls: restore[:6]},
+			env: []string{"STUB_M5_FAIL=1"}, calls: restoreBound[:6]},
 		// An interrupt in the creating stage, before the node of the cell has an address: no cluster, an open step.
 		{name: "interrupt in creating", marker: "dev-cell-1\ndev-cell-2\n", status: bound(openCel, gone), env: []string{"STUB_STEPS=" + openSteps1, "STUB_KIND=management dev-cp rogue dev-cell-2"},
 			calls: []string{"mise run portal -- cancel --cell dev-cell-1 | CELL=dev-cp", "serve sync", status,
-				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status}},
+				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		// An interrupt after the node has an address: the half-built cluster is live, and cell:down deletes it before anything else.
 		{name: "interrupt after the node has an address", marker: "dev-cell-1\ndev-cell-2\n", status: bound(openCel, gone), env: []string{"STUB_STEPS=" + openSteps1},
 			calls: []string{"mise run portal -- cancel --cell dev-cell-1 | CELL=dev-cp", "mise run cell:down | CELL=dev-cell-1", "serve sync", status,
-				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status}},
+				"mise run portal -- request --cell dev-cell-2 | CELL=dev-cp", "mise run portal -- recreate --cell dev-cell-1 | CELL=dev-cp", wait, link, "repair-m5", status, publish}},
 		{name: "a step of a cell that the marker does not name stays", marker: "dev-cell-2\n", status: bothWithdrawn, env: []string{"STUB_STEPS=" + openSteps1}, calls: restore},
 		// An interrupt between the withdraw and the staged drop: the repair waits for the drop before it requests.
 		{name: "a pending drop is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`,
-			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status}},
+			env: []string{"STUB_PENDING_POLLS=2"}, calls: []string{"serve sync", status, status, status, reqBoth, wait, link, "repair-m5", status, publish}},
 		{name: "a pending drop that stays", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, pending: `{"pendingDrops":["dev-cell-1"],"cells":[]}`, code: 1, kept: true,
-			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status, status}, want: "pending drop"},
+			env: []string{"STUB_PENDING_POLLS=99", "GATE_M6_DROP_WAIT=1"}, calls: []string{"serve sync", status}, want: "pending drop", timed: true},
+		// The bound wait retries: the first two reads after the link show an open step, and the third shows both cells bound.
+		{name: "a cell that becomes bound is awaited", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn,
+			env: []string{"STUB_UNBOUND_POLLS=2", "STUB_UNBOUND_STATUS=" + bound(openCel, okCell)}, calls: append(slices.Clone(restoreBound), status, status, publish)},
 		{name: "a cell that stays unbound keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
-			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: append(slices.Clone(restore[:6]), status, status)},
+			env: []string{"GATE_M6_BOUND_WAIT=1", "STUB_BOUND_STATUS=" + bothWithdrawn}, calls: restoreBound, timed: true},
+		// A cell that the portal creates starts with a bootstrap bundle state. The signed publish comes after the bound wait and before the
+		// marker goes, and a failed publish keeps the marker.
+		{name: "a publish that fails keeps the marker", marker: "dev-cell-1\ndev-cell-2\n", status: bothWithdrawn, code: 1, kept: true,
+			env: []string{"STUB_FAIL_ARGS=run bundle -- publish"}, calls: restore, want: "could not publish a signed set to dev-cell-1 dev-cell-2. Run: mise run bundle -- publish --target dev-cell-1 --target dev-cell-2 --wait, then mise run gate:m6:repair. If the publish stops on a stale build, run CELL=<cell> mise run cell:hydrate first"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
@@ -206,7 +223,7 @@ func TestRepairRestoresCells(t *testing.T) {
 				stubs[name] = body
 			}
 			env := append([]string{"STUB_DIR=" + dir, "POC_BUILD_ROOT=" + filepath.Join(dir, "build"), "STUB_MGMT_STATUS=" + tc.status, "STUB_MGMT_STATUS_PENDING=" + pending,
-				"STUB_STEPS=" + steps, "STUB_BOUND_STATUS=" + allGood, "GATE_M6_POLL=1", "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
+				"STUB_STEPS=" + steps, "STUB_BOUND_STATUS=" + allGood, "STUB_UNBOUND_STATUS=" + bothWithdrawn, "GATE_M6_POLL=1", "GATE_M5_REPAIR=" + filepath.Join(dir, "repair-m5"), "HARNESS_REPLICAS=" + filepath.Join(dir, "replicas"),
 				"HOSTSVC_SERVE=" + filepath.Join(dir, "serve")}, tc.env...)
 			out, errOut, code := runScript(t, "gate-m6-repair.sh", stubs, env, tc.args...)
 			if (code != 0) != (tc.code != 0) {
@@ -215,10 +232,13 @@ func TestRepairRestoresCells(t *testing.T) {
 			raw, _ := os.ReadFile(filepath.Join(dir, "calls"))
 			var got []string
 			for _, l := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-				if strings.HasPrefix(l, "mise run mgmt") || strings.HasPrefix(l, "mise run portal") || strings.HasPrefix(l, "mise run cell:") ||
+				if strings.HasPrefix(l, "mise run mgmt") || strings.HasPrefix(l, "mise run portal") || strings.HasPrefix(l, "mise run cell:") || strings.HasPrefix(l, "mise run bundle") ||
 					strings.HasPrefix(l, "repair-m5") || strings.HasPrefix(l, "serve sync") {
 					got = append(got, strings.TrimSpace(l))
 				}
+			}
+			if tc.timed {
+				got = slices.Compact(got)
 			}
 			if !slices.Equal(got, tc.calls) {
 				t.Fatalf("calls\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(tc.calls, "\n"))

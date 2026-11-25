@@ -61,6 +61,7 @@ esac
 // TestVerifyMgmtChecks runs each of the six mgmt-api checks of cell:verify with fakes: once on a healthy state, and
 // once for each mismatch. A mismatch prints its reason and the repair command.
 func TestVerifyMgmtChecks(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash", "base64", "shasum")
 	root := t.TempDir()
 	for _, d := range []string{"scripts", "cells", "harness", "components/lib"} {
@@ -204,6 +205,7 @@ source "$1/components/lib/mgmt-key.sh"; source "$1/scripts/verify-lib.sh"; set +
 // mgmtd, envd, the SPIRE server of dev-cp (with its plugin) and celld in each cell (with the agent plugin). It stops
 // before the tests on a drift or on a stale image, and names the command that brings the workload up to date.
 func TestGateM4PreCheck(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "yq", "jq", "bash")
 	for _, tc := range []struct {
 		name, stale string
@@ -262,11 +264,12 @@ case " $* " in
   *" get deployment/envd "*) printf '{"spec":{"template":{"spec":{"containers":[{"name":"envd","image":"%s"}]}}}}\n' "$(img envd)" ;;
   *" get statefulset/spire-server "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-plugin","image":"%s"}],"containers":[{"name":"spire-server","image":"ghcr.io/spiffe/spire-server:1"}]}}}}\n' "$(img cluster-jwt-server)" ;;
   *" get deployment/celld "*) printf '{"spec":{"template":{"spec":{"initContainers":[{"name":"install-agent-plugin","image":"%s"}],"containers":[{"name":"celld","image":"%s"}]}}}}\n' "$(img cluster-jwt-agent)" "$(img celld)" ;;
+  *" get configmap spire-server "*) printf 'server {\n  agent_ttl = "1m"\n}\n' ;;
   *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
 esac
 `)
 			cmd := exec.Command(filepath.Join(root, "scripts", "gate.sh"), "m4")
-			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"),
+			cmd.Env = []string{"PATH=" + filepath.Join(root, "bin") + string(os.PathListSeparator) + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "POC_KEEP_AWAKE=1",
 				"CELL=management", "POC_BUILD_ROOT=" + filepath.Join(root, "build"), "STUB_LOG=" + filepath.Join(root, "calls"), "STUB_STALE=" + tc.stale}
 			out, err := cmd.CombinedOutput()
 			calls, _ := os.ReadFile(filepath.Join(root, "calls"))

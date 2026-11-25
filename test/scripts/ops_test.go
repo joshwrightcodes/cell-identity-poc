@@ -54,6 +54,7 @@ func opsCalls(calls []string) string { return strings.Join(calls, " ") }
 // keeps only the rows with the ID and leaves the envelopes out. For an ID that mgmtd does not hold, it reads the queue of
 // each cell of the topology and finds the row of a forged operation.
 func TestOpsTrace(t *testing.T) {
+	t.Parallel()
 	row := func(id string) string {
 		return `{"opId":"` + id + `","state":"leased","fence":{"epoch":1,"counter":4},"holder":"celld-1","claims":2,"keyEpoch":1}`
 	}
@@ -131,6 +132,7 @@ func TestOpsTrace(t *testing.T) {
 
 // TestOpsClose checks that close passes the ID to mgmtd and prints its answer, and that a failure gives one JSON error line.
 func TestOpsClose(t *testing.T) {
+	t.Parallel()
 	out, calls, code := runOps(t, nil, "close", opsID)
 	if code != 0 || !strings.Contains(out, `"final":"refused"`) || opsCalls(calls) != "mgmt op close "+opsID {
 		t.Errorf("exit %d, output %q, calls %v, want the answer of mgmtd after one close call", code, out, calls)

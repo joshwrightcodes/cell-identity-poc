@@ -125,6 +125,7 @@ set +e; `+check, "_", root)
 // TestCellControllerChecks runs each cell controller check of cell:verify with fakes: once on the healthy state, and once for
 // each mismatch. A mismatch prints its reason and the render of the cell controller alone.
 func TestCellControllerChecks(t *testing.T) {
+	t.Parallel()
 	fix := "CELL=dev-cp HARNESS_ONLY=cell-controller mise run cell:up"
 	pub := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("k", 32)))
 	otherPub := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("o", 32)))

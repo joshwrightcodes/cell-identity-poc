@@ -2,7 +2,8 @@
 # Render envd, the environment executor of dev-cp, a harness component in namespace envd-system.
 #
 # The bundle holds Namespace envd-system, ServiceAccount envd, Deployment envd with the k8s_psat SPIRE
-# agent sidecar, ConfigMaps peer-root and mgmt-spec-key, the objects of the sidecar, the
+# agent sidecar, ConfigMaps peer-root, mgmt-spec-key and operator-key, Role and RoleBinding envd-revocations, the objects of
+# the sidecar, the
 # NetworkPolicies default-deny, allow-dns and envd (flows N30, N31, N35, N39, N8, N11 and N23), and Role
 # and RoleBinding envd-records in spire-system. The Role lets envd write ConfigMap
 # spire-system/cell-records and read ConfigMap spire-system/attest-hints, and nothing else. Every object
@@ -36,13 +37,20 @@
 #     ConfigMap peer-root.
 #   - the public signing key of mgmtd, from ConfigMap mgmt-signing-pub in management, as ConfigMap
 #     mgmt-spec-key. The SPIRE server of this cluster pins the same key.
+#   - the operator keys, from ConfigMap mgmt-system/operator-pub in management, as key keys.pub of ConfigMap operator-key,
+#     one key on each line. The pin guard operator_pub_keys (components/lib/operator-key.sh) refuses a change of a live pin
+#     unless OPERATOR_KEY_ACCEPT_CHANGE=1, and stops the render while operator-pub is absent. The cell gateway and the
+#     SPIRE server of this cluster pin the same keys.
 #   - the root of the environment trust domain, from the live SPIRE server of this cluster, for the
 #     trust bundle of the sidecar.
 #   - the address of the registry mirror on the kind network, from the host service (facts --registry). envd reads the
 #     signed bundle sets from it (flow N48), and the policy of envd admits only that address on port 5000.
 #   - the node address of each live cell, from the host service.
 #   - the envd image that `mise run images` built, by digest.
-# The pod template carries the SHA-256 of the peer root and of the key, so a change restarts the pod.
+# The pod template carries the SHA-256 of the peer root and of the key, so a change restarts the pod. envd reads the operator
+# keys again on each use.
+# mgmtd and the cell gateway refuse a member of an envd report that they do not know. A new envd that holds a local
+# revocation entry reports it, so roll mgmtd and the cell gateway before envd each time.
 # Inputs: POC_ENV, SPIRE_TRUST_DOMAIN, RELAY_TARGET, SPIRE_AGENT_CELLS, RELAY_VIEW_ROUTES and RELAY_TELEMETRY_ROUTES from the
 # cell settings, and the cluster facts from build/<cluster>/facts.env.
 set -euo pipefail
@@ -63,6 +71,7 @@ source "$root/scripts/ko-image.sh"
 source "$root/components/lib/addresses.sh"
 source "$root/components/lib/peer-root.sh"
 source "$root/components/lib/mgmt-key.sh"
+source "$root/components/lib/operator-key.sh"
 source "$root/components/lib/spire-sidecar.sh"
 source "$root/components/lib/live-cells.sh"
 source "$root/components/lib/bundle-apps.sh"
@@ -147,6 +156,10 @@ spec_key="$(NS="$namespace" PUB="$spec_pub" SUM="$spec_sum" yq -n '
   .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "mgmt-spec-key" | .metadata.namespace = strenv(NS)
   | .metadata.annotations["poc.internal/spec-key-sha256"] = strenv(SUM)
   | .data["spec.pub"] = strenv(PUB)')"
+operator_keys="$(operator_pub_keys "$CELL_NAME")" || exit 1
+operator_key="$(NS="$namespace" KEYS="$operator_keys" yq -n '
+  .apiVersion = "v1" | .kind = "ConfigMap" | .metadata.name = "operator-key" | .metadata.namespace = strenv(NS)
+  | .data["keys.pub"] = strenv(KEYS) + "\n" | .data["keys.pub"] style="literal"')"
 own_bundle="$(peer_root_pem "$CELL_NAME" "$SPIRE_TRUST_DOMAIN")" || exit 1
 envd_image="$(ko_image envd)" || die "no envd image"
 
@@ -260,6 +273,8 @@ EOF2
   echo "$peer_root"
   echo "---"
   echo "$spec_key"
+  echo "---"
+  echo "$operator_key"
   echo "---"
   echo "$policy"
   echo "---"

@@ -67,6 +67,7 @@ func runDown(t *testing.T, root, calls string, env ...string) (log, errOut strin
 // takes the lock, deletes the cluster, releases the lock, and then renders dev-cp and links management so that their lists drop
 // the node. With a stage still running after the wait, it stops and names hostsvc:serve -- cancel.
 func TestCellDownRerenders(t *testing.T) {
+	t.Parallel()
 	t.Run("order", func(t *testing.T) {
 		root, calls := downRoot(t)
 		if err := os.MkdirAll(filepath.Join(root, "build", "dev-cell-1"), 0o755); err != nil {

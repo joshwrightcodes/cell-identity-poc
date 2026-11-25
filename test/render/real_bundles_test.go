@@ -169,6 +169,7 @@ func accountsOf(objs []map[string]any) []map[string]string {
 // scope of custom kinds comes from the CRDs of the same bundle, as the engine learns it. The test runs the
 // engine over the same objects too.
 func TestRealBundlesPassPolicy(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		role := roleOf[cr.name]
 		if role == "open" {
@@ -257,6 +258,7 @@ func engineVerdict(t *testing.T, checker *bundleapply.Checker, component string,
 //     the policy, so the policy alone accepts them. The applier and bundlectl decode first, so no render
 //     reaches conftest in that form.
 func TestConftestMatchesEngine(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "conftest")
 	fixtures, err := filepath.Glob("../../internal/bundleapply/testdata/*/*.yaml")
 	if err != nil || len(fixtures) < 50 {
@@ -317,9 +319,9 @@ func TestConftestMatchesEngine(t *testing.T) {
 			doc, detail string
 			conftest    []string
 		}{
-			"configmap_with_items": {"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: apps-demo}\n" +
+			"configmap_with_items": {"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: a, namespace: apps-sample}\n" +
 				"items:\n- apiVersion: rbac.authorization.k8s.io/v1\n  kind: ClusterRoleBinding\n  metadata: {name: x}\n", "items_list", []string{}},
-			"configmaplist": {"apiVersion: v1\nkind: ConfigMapList\nmetadata: {name: a, namespace: apps-demo}\nitems: []\n", "items_list",
+			"configmaplist": {"apiVersion: v1\nkind: ConfigMapList\nmetadata: {name: a, namespace: apps-sample}\nitems: []\n", "items_list",
 				[]string{"component_not_allowed:kind_unknown_scope"}},
 			"list": {"apiVersion: v1\nkind: List\nitems: []\n", "list", []string{"component_not_allowed:kind_unknown_scope"}},
 		}
@@ -379,8 +381,8 @@ func TestConftestMatchesEngine(t *testing.T) {
 	// The engine reads the ServiceAccounts of the checked component from its objects. conftest reads them from
 	// data.serviceAccounts, and without that list it refuses every account other than default.
 	t.Run("own_service_account", func(t *testing.T) {
-		sa := "apiVersion: v1\nkind: ServiceAccount\nmetadata: {name: client, namespace: apps-demo}\n"
-		dep := "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: w, namespace: apps-demo}\n" +
+		sa := "apiVersion: v1\nkind: ServiceAccount\nmetadata: {name: client, namespace: apps-sample}\n"
+		dep := "apiVersion: apps/v1\nkind: Deployment\nmetadata: {name: w, namespace: apps-sample}\n" +
 			"spec:\n  selector: {matchLabels: {app: w}}\n  template:\n    metadata: {labels: {app: w}}\n" +
 			"    spec: {serviceAccountName: client, containers: [{name: w, image: registry.invalid/w}]}\n"
 		file := filepath.Join(t.TempDir(), "set.yaml")
@@ -405,7 +407,7 @@ func TestConftestMatchesEngine(t *testing.T) {
 			"no list":         {nil, want},
 			"empty list":      {[]map[string]string{}, want},
 			"other namespace": {[]map[string]string{{"namespace": "argocd", "name": "client"}}, want},
-			"own account":     {[]map[string]string{{"namespace": "apps-demo", "name": "client"}}, []string{}},
+			"own account":     {[]map[string]string{{"namespace": "apps-sample", "name": "client"}}, []string{}},
 		}
 		for name, c := range cases {
 			if got := conftestDeny(t, conftestData(t, "cell", "apps-sample", nil, nil, c.accounts), file)[file]; !slices.Equal(got, c.want) {
@@ -418,6 +420,7 @@ func TestConftestMatchesEngine(t *testing.T) {
 // TestNoObjectInTwoBundles checks that no two bundles of one cluster render the same object. Every component
 // Application syncs with FailOnSharedResource=true, so Argo CD would refuse the sync of the second one.
 func TestNoObjectInTwoBundles(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		t.Run(cr.name, func(t *testing.T) {
 			owner := map[string]string{}
@@ -447,6 +450,7 @@ func TestNoObjectInTwoBundles(t *testing.T) {
 // TestNoClusterNetworkPolicyKinds checks that no rendered object is an AdminNetworkPolicy, a
 // BaselineAdminNetworkPolicy or a ClusterNetworkPolicy, and that no class of allow.json lists them.
 func TestNoClusterNetworkPolicyKinds(t *testing.T) {
+	t.Parallel()
 	banned := []string{"AdminNetworkPolicy", "BaselineAdminNetworkPolicy", "ClusterNetworkPolicy"}
 	for _, cr := range renderAll(t) {
 		for _, c := range cr.components {
@@ -472,6 +476,7 @@ func TestNoClusterNetworkPolicyKinds(t *testing.T) {
 // locked AppProject default (one more source), and expects both conftest and the engine to refuse that bundle with
 // component_not_allowed:appproject_spec. The unchanged bundle passes (TestRealBundlesPassPolicy).
 func TestWidenedDefaultProjectRefused(t *testing.T) {
+	t.Parallel()
 	for _, cr := range renderAll(t) {
 		role := roleOf[cr.name]
 		if role == "open" {

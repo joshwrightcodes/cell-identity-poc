@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/spiffe/go-spiffe/v2/svid/x509svid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 const (
@@ -45,6 +48,8 @@ type ServerConfig struct {
 	// Proof, when set, makes the server read and verify a proof frame from each cell source after
 	// the connection slots are taken and before the backend runs. Environment sources skip it.
 	Proof *ProofCheck
+	// Meter, when set, carries the counter cellproxy.revoked.closed. A nil Meter counts nothing.
+	Meter metric.Meter
 }
 
 // Server ends TLS for each connection and hands the verified peer to its backend.
@@ -55,9 +60,22 @@ type Server struct {
 	refusals   *refusalLog
 	handshakes chan struct{}
 
+	closed metric.Int64Counter
+
 	mu        sync.Mutex
 	conns     int
 	perSource map[Source]int
+	live      map[*liveConn]struct{}
+	// adopted is the registry of the last CloseRevoked. A connection that registers after it is
+	// checked against it, so a connection that passed the handshake before the swap does not stay.
+	adopted *Registry
+}
+
+// liveConn is a verified connection that the server holds open.
+type liveConn struct {
+	conn    *tls.Conn
+	src     Source
+	revoked bool
 }
 
 // NewServer returns a server for cfg and b.
@@ -69,10 +87,74 @@ func NewServer(cfg ServerConfig, b Backend, log *slog.Logger) *Server {
 	setDefault(&cfg.MaxConns, defaultMaxConns)
 	setDefault(&cfg.MaxConnsPerSource, defaultMaxConnsPerSource)
 	log = log.With("backend", b.Name())
-	return &Server{
-		cfg: cfg, backend: b, log: log, refusals: newRefusalLog(log),
-		handshakes: make(chan struct{}, cfg.MaxHandshakes), perSource: map[Source]int{},
+	meter := cfg.Meter
+	if meter == nil {
+		meter = noop.NewMeterProvider().Meter("cellproxy")
 	}
+	closed, _ := meter.Int64Counter("cellproxy.revoked.closed", metric.WithUnit("{connection}"),
+		metric.WithDescription("Live connections that the server closed because the registry refuses their cell"))
+	return &Server{
+		cfg: cfg, backend: b, log: log, refusals: newRefusalLog(log), closed: closed,
+		handshakes: make(chan struct{}, cfg.MaxHandshakes), perSource: map[Source]int{}, live: map[*liveConn]struct{}{},
+	}
+}
+
+// CloseRevoked closes each live connection of a cell source that reg does not allow, because the
+// cell is revoked or has no record. Environment sources stay open. It returns the number of
+// connections that it closed, and it never waits on a peer. Each one logs "connection closed" with the reason cell_revoked.
+func (s *Server) CloseRevoked(reg *Registry) int {
+	s.mu.Lock()
+	s.adopted = reg
+	var doomed []*liveConn
+	for lc := range s.live {
+		if !lc.revoked && refused(reg, lc.src) {
+			lc.revoked = true
+			doomed = append(doomed, lc)
+		}
+	}
+	s.mu.Unlock()
+	for _, lc := range doomed {
+		s.countClosed(lc.src)
+		dropConn(lc.conn)
+	}
+	return len(doomed)
+}
+
+// dropConn closes the transport of conn without a close_notify alert. A revoked peer needs no
+// alert, and the alert write waits up to 5 seconds on a peer that does not read.
+func dropConn(conn *tls.Conn) { _ = conn.NetConn().Close() }
+
+func refused(reg *Registry, src Source) bool { return src.Plane == PlaneCell && !reg.Allows(src) }
+
+func (s *Server) countClosed(src Source) {
+	s.closed.Add(context.Background(), 1, metric.WithAttributes(attribute.String("plane", src.Plane)))
+}
+
+// track registers conn as live. When the last adopted registry refuses src, it closes conn at once.
+func (s *Server) track(conn *tls.Conn, src Source) (*liveConn, func()) {
+	lc := &liveConn{conn: conn, src: src}
+	s.mu.Lock()
+	s.live[lc] = struct{}{}
+	late := s.adopted != nil && refused(s.adopted, src)
+	if late {
+		lc.revoked = true
+	}
+	s.mu.Unlock()
+	if late {
+		s.countClosed(src)
+		dropConn(conn)
+	}
+	return lc, func() {
+		s.mu.Lock()
+		delete(s.live, lc)
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) wasRevoked(lc *liveConn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return lc.revoked
 }
 
 func setDefault[T comparable](v *T, def T) {
@@ -141,16 +223,30 @@ func (s *Server) handle(ctx context.Context, c net.Conn) {
 		return
 	}
 	defer release()
+	lc, untrack := s.track(conn, src)
+	defer untrack()
+	log := s.log.With("spiffe_id", id, "remote", remote)
+	if s.wasRevoked(lc) {
+		log.Info("connection closed", "reason", "cell_revoked", "cell", src.Cell)
+		return
+	}
 	if s.cfg.Proof != nil && src.Plane == PlaneCell {
 		if err := s.cfg.Proof.check(conn, src, id); err != nil {
+			if s.wasRevoked(lc) {
+				log.Info("connection closed", "reason", "cell_revoked", "cell", src.Cell)
+				return
+			}
 			s.refusals.write("proof refused", ReasonOf(err), remote, id, err)
 			return
 		}
 	}
-	log := s.log.With("spiffe_id", id, "remote", remote)
 	log.Info("peer accepted")
 	if err := s.backend.Serve(withIdleTimeout(ctx, s.cfg.IdleTimeout), conn, src); err != nil {
 		log.Warn("backend failed", "error", err.Error())
+	}
+	if s.wasRevoked(lc) {
+		log.Info("connection closed", "reason", "cell_revoked", "cell", src.Cell)
+		return
 	}
 	log.Info("connection closed")
 }

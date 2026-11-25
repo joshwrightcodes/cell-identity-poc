@@ -237,16 +237,39 @@ func TestStreamReconnectsWithBackoff(t *testing.T) {
 		t.Fatalf("two seeds gave the same first sleep %v", a)
 	}
 	for i, d := range sleeps {
-		if d < time.Second || d > 30*time.Second {
-			t.Fatalf("sleep %d is %v, want between 1s and 30s", i, d)
+		if d < 500*time.Millisecond || d > 6*time.Second {
+			t.Fatalf("sleep %d is %v, want between 500ms and 6s", i, d)
 		}
 	}
-	if sleeps[len(sleeps)-1] < 15*time.Second {
+	if sleeps[0] > 600*time.Millisecond {
+		t.Fatalf("the first sleep is %v, want the initial delay plus at most 20%% jitter", sleeps[0])
+	}
+	if sleeps[len(sleeps)-1] < 5*time.Second {
 		t.Fatalf("the backoff did not grow: %v", sleeps)
 	}
-	// From the sixth failure on the base is the cap, and the jitter stays.
-	if distinct := len(slices.Compact(slices.Sorted(slices.Values(sleeps[6:])))); distinct < 2 {
-		t.Fatalf("the sleeps at the cap are all equal: %v", sleeps[6:])
+	// From the fifth failure on the base is the cap, and the jitter stays.
+	if distinct := len(slices.Compact(slices.Sorted(slices.Values(sleeps[4:])))); distinct < 2 {
+		t.Fatalf("the sleeps at the cap are all equal: %v", sleeps[4:])
+	}
+}
+
+func TestStreamBackoffStaysBelowCapAfterManyFailures(t *testing.T) {
+	for _, r := range []float64{0, 0.5, 0.999999} {
+		cfg, err := StreamConfig{Rand: func() float64 { return r }}.withBackoffDefaults()
+		if err != nil {
+			t.Fatal(err)
+		}
+		prev := time.Duration(0)
+		for failures := range 10000 {
+			d := cfg.backoff(failures)
+			if d < 500*time.Millisecond || d > 6*time.Second {
+				t.Fatalf("rand %v failure %d: %v, want between 500ms and 6s", r, failures, d)
+			}
+			if failures < 4 && d <= prev {
+				t.Fatalf("rand %v failure %d: %v did not grow from %v", r, failures, d, prev)
+			}
+			prev = d
+		}
 	}
 }
 
@@ -1402,4 +1425,17 @@ func TestStreamRefusalReason(t *testing.T) {
 			}
 		})
 	}
+}
+
+// withBackoffDefaults applies the backoff defaults without the required fields of withDefaults.
+func (c StreamConfig) withBackoffDefaults() (StreamConfig, error) {
+	for _, d := range []struct {
+		v   *time.Duration
+		def time.Duration
+	}{{&c.MinBackoff, DefaultMinBackoff}, {&c.MaxBackoff, DefaultMaxBackoff}} {
+		if *d.v <= 0 {
+			*d.v = d.def
+		}
+	}
+	return c, nil
 }

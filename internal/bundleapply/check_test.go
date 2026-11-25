@@ -114,6 +114,7 @@ func TestPolicyApp(t *testing.T) {
 		{name: "httproute", want: not("kind")},
 		{name: "namespace_object", want: not("kind")},
 		{name: "configmap_in_argocd", want: not("namespace")},
+		{name: "configmap_in_apps_demo", want: not("namespace")},
 		{name: "configmap_no_namespace", want: not("namespace_missing")},
 		{name: "service_nodeport", want: not("service_type")},
 		{name: "service_loadbalancer", want: not("service_type")},
@@ -155,6 +156,11 @@ func TestPolicyPlatform(t *testing.T) {
 		{name: "clusterrole"},
 		{name: "deployment_istio_system"},
 		{name: "namespace_apps_demo"},
+		{name: "namespace_apps_sample"},
+		{name: "networkpolicy_apps_sample", component: "network-policy"},
+		{name: "authorizationpolicy_apps_sample", component: "mesh-policy"},
+		{name: "configmap_apps_sample", want: not("namespace")},
+		{name: "deployment_apps_sample", component: "apps-demo", want: not("namespace")},
 		{name: "extra_allow_all_policy", component: "network-policy"},
 		{name: "configmap_cell_identity_system", want: not("harness_namespace")},
 		{name: "namespace_cell_ops_system", want: not("harness_namespace")},
@@ -210,6 +216,10 @@ func TestPolicyCp(t *testing.T) {
 		{name: "namespace_gateway_system", component: "namespaces", want: not("harness_namespace")},
 		{name: "role_cell_controller_system", want: not("harness_namespace")},
 		{name: "configmap_apps_sample", component: "apps-sample", want: not("component_unknown")},
+		{name: "namespace_apps_sample", component: "namespaces"},
+		{name: "networkpolicy_apps_sample", component: "network-policy"},
+		{name: "authorizationpolicy_apps_sample", component: "mesh-policy"},
+		{name: "configmap_in_apps_sample", component: "relay-system", want: not("namespace")},
 		{name: "clustergenerator", component: "external-secrets", want: not("kind")},
 		{name: "clustergenerator_namespaced", component: "external-secrets", want: not("kind")},
 		{name: "clusterpushsecret", component: "external-secrets", want: not("kind")},
@@ -312,7 +322,7 @@ func TestCheckFirstRefusalInInputOrder(t *testing.T) {
 		loadObject(t, "app", "networkpolicy"),
 	}
 	err := c.Check(context.Background(), "apps-sample", objs)
-	expect(t, err, not("service_type"), "Service/apps-demo/demo")
+	expect(t, err, not("service_type"), "Service/apps-sample/demo")
 	expect(t, c.Check(context.Background(), "apps-sample", objs[:1]), pass(), "")
 	expect(t, c.Check(context.Background(), "nope", nil), not("component_unknown"), "")
 	expect(t, c.Check(context.Background(), "apps-sample", nil), pass(), "")
@@ -546,7 +556,7 @@ func TestPolicyErrorsAreRefusals(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = c.Check(context.Background(), "apps-sample", []Object{loadObject(t, "app", "configmap")})
-	expect(t, err, not("policy_error"), "ConfigMap/apps-demo/demo")
+	expect(t, err, not("policy_error"), "ConfigMap/apps-sample/demo")
 
 	// A query with no result is a refusal too.
 	c, err = newChecker("cell", bundle.DefaultPolicy(), HarnessRefs{}, "package bundle.allow\n\nother := 1\n")
@@ -669,9 +679,15 @@ func widenedAppPolicy() bundle.Policy {
 	return p
 }
 
-// podObject returns an object of kind in apps-demo whose pod spec sets field to value. A nil value leaves
+// podObject returns an object of kind in apps-sample whose pod spec sets field to value. A nil value leaves
 // the field out.
 func podObject(t *testing.T, apiVersion, kind, field string, value any) Object {
+	t.Helper()
+	return podObjectIn(t, "apps-sample", apiVersion, kind, field, value)
+}
+
+// podObjectIn is podObject in the namespace ns.
+func podObjectIn(t *testing.T, ns, apiVersion, kind, field string, value any) Object {
 	t.Helper()
 	spec := map[string]any{"containers": []any{map[string]any{"name": "a", "image": "registry.invalid/a:1"}}}
 	if value != nil {
@@ -689,7 +705,7 @@ func podObject(t *testing.T, apiVersion, kind, field string, value any) Object {
 	}
 	o, ok := toObject(map[string]any{
 		"apiVersion": apiVersion, "kind": kind,
-		"metadata": map[string]any{"name": "w", "namespace": "apps-demo"},
+		"metadata": map[string]any{"name": "w", "namespace": ns},
 		"spec":     body,
 	})
 	if !ok {
@@ -719,14 +735,14 @@ func TestPolicyAppPodServiceAccounts(t *testing.T) {
 		{"apps/v1", "Deployment"}, {"apps/v1", "StatefulSet"}, {"apps/v1", "DaemonSet"}, {"apps/v1", "ReplicaSet"},
 		{"batch/v1", "Job"}, {"batch/v1", "CronJob"}, {"v1", "Pod"},
 	}
-	own := serviceAccount(t, "v1", "apps-demo", "client")
+	own := serviceAccount(t, "v1", "apps-sample", "client")
 	for _, k := range kinds {
 		for _, field := range []string{"serviceAccountName", "serviceAccount"} {
 			t.Run(k.kind+"/"+field, func(t *testing.T) {
 				check := func(value any, with ...Object) error {
 					return c.Check(context.Background(), "apps-sample", append([]Object{podObject(t, k.apiVersion, k.kind, field, value)}, with...))
 				}
-				expect(t, check("client"), not("foreign_service_account"), k.kind+"/apps-demo/w")
+				expect(t, check("client"), not("foreign_service_account"), k.kind+"/apps-sample/w")
 				expect(t, check("client", own), pass(), "")
 				expect(t, check(nil), pass(), "")
 				expect(t, check("default"), pass(), "")
@@ -736,13 +752,13 @@ func TestPolicyAppPodServiceAccounts(t *testing.T) {
 				expect(t, check(7), not("foreign_service_account"), "")
 				// A ServiceAccount of another namespace or of another API group is not the account of the pod.
 				expect(t, check("client", serviceAccount(t, "v1", "argocd", "client")), not("foreign_service_account"), "")
-				expect(t, check("client", serviceAccount(t, "example.invalid/v1", "apps-demo", "client")), not("foreign_service_account"), "")
+				expect(t, check("client", serviceAccount(t, "example.invalid/v1", "apps-sample", "client")), not("foreign_service_account"), "")
 			})
 		}
 	}
 	t.Run("platform class names any account", func(t *testing.T) {
 		for _, k := range kinds {
-			expect(t, c.Check(context.Background(), "apps-demo", []Object{podObject(t, k.apiVersion, k.kind, "serviceAccountName", "client")}), pass(), "")
+			expect(t, c.Check(context.Background(), "apps-demo", []Object{podObjectIn(t, "apps-demo", k.apiVersion, k.kind, "serviceAccountName", "client")}), pass(), "")
 		}
 	})
 }
@@ -755,7 +771,7 @@ func TestPolicyServiceAccountsOfTheCheckedComponent(t *testing.T) {
 	sa := loadObject(t, "app", "serviceaccount_client")
 	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep, sa}), pass(), "")
 	expect(t, c.Check(context.Background(), "apps-sample", []Object{sa}), pass(), "")
-	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep}), not("foreign_service_account"), "Deployment/apps-demo/thief")
+	expect(t, c.Check(context.Background(), "apps-sample", []Object{dep}), not("foreign_service_account"), "Deployment/apps-sample/thief")
 }
 
 // TestPolicyOptOutKeys checks that an app pod may carry no key that changes, moves traffic past, or removes

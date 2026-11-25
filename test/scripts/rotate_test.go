@@ -187,6 +187,7 @@ func readPEM(t *testing.T, path, blockType string) []byte {
 }
 
 func TestRotateIntermediate(t *testing.T) {
+	t.Parallel()
 	r := runRotate(t)
 	if r.err != nil {
 		t.Fatalf("rotation failed: %v\n%s", r.err, r.out)
@@ -231,6 +232,7 @@ func TestRotateIntermediate(t *testing.T) {
 }
 
 func TestRotateIntermediateFailsClosed(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		env  []string

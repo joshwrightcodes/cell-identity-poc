@@ -94,6 +94,13 @@ func (p *Plane) keyCheck(ctx context.Context, cell, via string, expect *uint64) 
 		return "", err
 	}
 	if res != CheckRateLimited && res != CheckNotBound {
+		if via != ViaHint {
+			p.rmu.Lock()
+			if c := p.rt.cell(cell); c.lastHintDoneAt.Before(at) {
+				c.lastHintCheck = ""
+			}
+			p.rmu.Unlock()
+		}
 		p.cfg.Log.InfoContext(ctx, "key_check", "cell", cell, "result", string(res), "via", via)
 	}
 	return res, nil

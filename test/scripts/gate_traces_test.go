@@ -30,6 +30,7 @@ func sourceLib(t *testing.T, dir, snippet string, args ...string) (string, error
 // TestRecordKidsTrace: gate:m2:repair --check reports a record whose key IDs differ from the API server, with the key check command.
 // It reports nothing for equal key IDs, and nothing when mgmtd does not answer.
 func TestRecordKidsTrace(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	dir := t.TempDir()
 	mise := "#!/usr/bin/env bash\n[[ \"$*\" == 'run mgmt -- status' ]] || exit 2\ncat \"" + dir + "/status\" 2>/dev/null || exit 1\n"
@@ -60,39 +61,52 @@ func TestRecordKidsTrace(t *testing.T) {
 	}
 }
 
-// TestRepairOrderPods: the pods of kindnet, kube-proxy and istio-cni-node come before coredns and every other pod, and only the pods with a stale UID
-// are listed.
+// TestRepairOrderPods: the order is kindnet and kube-proxy, then istio-cni-node, then istiod, then every other pod. Only the pods with a stale UID are
+// listed. The input lists the istio-system pods first, as `kubectl get pods -A` does, so the order does not come from the list order.
 func TestRepairOrderPods(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
-	pod := func(ns, name, uid, kind, owner string) string {
-		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
+	pod := func(ns, name, uid, kind, owner, app string) string {
+		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","labels":{"app.kubernetes.io/name":"` + app + `"},"ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
 	}
 	pods := `{"items":[` + strings.Join([]string{
-		pod("kube-system", "coredns-1", "u1", "ReplicaSet", "coredns-559f"),
-		pod("apps", "web-1", "u2", "ReplicaSet", "web-1a"),
-		pod("kube-system", "kube-proxy-x", "u3", "DaemonSet", "kube-proxy"),
-		pod("kube-system", "fresh", "u9", "ReplicaSet", "fresh-1"),
-		pod("kube-system", "kindnet-y", "u4", "DaemonSet", "kindnet"),
-		pod("local-path-storage", "provisioner", "u5", "ReplicaSet", "provisioner-1"),
-		pod("istio-system", "istio-cni-node-z", "u6", "DaemonSet", "istio-cni-node"),
+		pod("istio-system", "istio-cni-node-z", "u6", "DaemonSet", "istio-cni-node", "istio-cni"),
+		pod("istio-system", "istiod-7f", "u7", "ReplicaSet", "istiod-7f", "istiod"),
+		pod("apps", "web-1", "u2", "ReplicaSet", "web-1a", "web"),
+		pod("kube-system", "coredns-1", "u1", "ReplicaSet", "coredns-559f", "coredns"),
+		pod("kube-system", "fresh", "u9", "ReplicaSet", "fresh-1", "fresh"),
+		pod("kube-system", "kindnet-y", "u4", "DaemonSet", "kindnet", "kindnet"),
+		pod("kube-system", "kube-proxy-x", "u3", "DaemonSet", "kube-proxy", "kube-proxy"),
+		pod("local-path-storage", "provisioner", "u5", "ReplicaSet", "provisioner-1", "provisioner"),
 	}, ",") + `]}`
 	dir := t.TempDir()
-	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5","u6"]`, pods)
+	out, err := sourceLib(t, dir, `printf '%s' "$2" | repair_order_pods "$1"`, `["u1","u2","u3","u4","u5","u6","u7"]`, pods)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 6 {
-		t.Fatalf("got %d pods %q, want the 6 with a stale UID", len(lines), lines)
+	if len(lines) != 7 {
+		t.Fatalf("got %d pods %q, want the 7 with a stale UID", len(lines), lines)
 	}
-	first := map[string]bool{lines[0]: true, lines[1]: true, lines[2]: true}
-	if !first["kube-system kube-proxy-x DaemonSet kube-proxy"] || !first["kube-system kindnet-y DaemonSet kindnet"] || !first["istio-system istio-cni-node-z DaemonSet istio-cni-node"] {
-		t.Fatalf("the first three pods are %q, want kindnet, kube-proxy and istio-cni-node before coredns and the others", lines[:3])
+	pos := map[string]int{}
+	for i, l := range lines {
+		pos[strings.Fields(l)[1]] = i
 	}
-	for _, l := range lines[3:] {
-		if strings.Contains(l, "fresh") {
-			t.Errorf("the pod with a current UID is listed: %s", l)
+	if _, ok := pos["fresh"]; ok {
+		t.Errorf("the pod with a current UID is listed: %q", lines)
+	}
+	before := func(a, b string) {
+		t.Helper()
+		if pos[a] >= pos[b] {
+			t.Errorf("order %q puts %s at %d and %s at %d, want %s first", lines, a, pos[a], b, pos[b], a)
 		}
+	}
+	for _, node := range []string{"kindnet-y", "kube-proxy-x"} {
+		before(node, "istio-cni-node-z")
+	}
+	before("istio-cni-node-z", "istiod-7f")
+	for _, app := range []string{"web-1", "coredns-1", "provisioner"} {
+		before("istiod-7f", app)
 	}
 }
 
@@ -100,6 +114,7 @@ func TestRepairOrderPods(t *testing.T) {
 // sorts first. An app pod that waits for a certificate from an istiod with a token of the old key would otherwise stall the repair. The match uses
 // the label app.kubernetes.io/name. A SPIRE server pod gets no rank of its own.
 func TestRepairOrderPodsIssuersBeforeApps(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	pod := func(ns, name, uid, kind, owner, app string) string {
 		return `{"metadata":{"namespace":"` + ns + `","name":"` + name + `","uid":"` + uid + `","labels":{"app.kubernetes.io/name":"` + app + `"},"ownerReferences":[{"kind":"` + kind + `","name":"` + owner + `"}]}}`
@@ -167,6 +182,7 @@ func writeStubs(t *testing.T, dir string, files map[string]string) {
 // TestContainerStarted: the start of a container comes from the container runtime, in epoch seconds. A container that does not run gives status 1, and a failed runtime
 // call gives status 2, so that the repair can stop with an error and not treat the failure as "no container".
 func TestContainerStarted(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	dir := t.TempDir()
 	writeStubs(t, dir, map[string]string{"id-kube-apiserver": "abc\n", "inspect-abc.json": `{"status":{"state":"CONTAINER_RUNNING","startedAt":"2026-11-16T03:20:58.438809979Z"}}`})
@@ -189,6 +205,7 @@ func TestContainerStarted(t *testing.T) {
 // server, and holds a live Lease with the node as holder. For a container that the repair stopped, the Lease needs a new holder or an acquire
 // time at or after the stop: the old process renewed its Lease against the new API server before the stop, so a late renew time alone is no proof.
 func TestControlPlaneCurrent(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
 	node := "dev-cell-1-control-plane"
@@ -250,6 +267,7 @@ func TestControlPlaneCurrent(t *testing.T) {
 // started before the API server is stopped, and the stub then shows a new container. The step reads the Lease holder before the stop, so
 // the old process, which renewed its Lease after the API start, must not pass, and a Lease with a new holder or a later acquire time must.
 func TestSettleControlPlane(t *testing.T) {
+	t.Parallel()
 	testtool.Need(t, "jq", "bash")
 	const apiStart = "1794799258" // 2026-11-16T03:20:58Z
 	node := "dev-cell-1-control-plane"

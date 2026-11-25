@@ -127,6 +127,9 @@ func (s *Store) claim(ctx context.Context, cell, holder string, requireLive bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		l = nil
 		if requireLive {
+			if gone, _ := s.Overlaid(ctx, cell); gone {
+				return ErrCellNotLive
+			}
 			var body []byte
 			err := tx.QueryRow(`SELECT cell FROM records WHERE name = ?`, cell).Scan(&body)
 			if errors.Is(err, sql.ErrNoRows) {

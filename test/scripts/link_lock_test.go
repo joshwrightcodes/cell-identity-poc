@@ -9,6 +9,7 @@ import (
 // TestLinkReleasesItsLock: cell:link takes the lock of its cluster and releases it on every exit. link.sh sets its own EXIT trap, which
 // must keep the release.
 func TestLinkReleasesItsLock(t *testing.T) {
+	t.Parallel()
 	lock := func(root string) string { return filepath.Join(root, "build", "locks", "management.lock") }
 	t.Run("after a passing link", func(t *testing.T) {
 		root, calls := linkOnlyRoot(t)

@@ -1,4 +1,4 @@
 apiVersion: v1
 kind: ConfigMap
-metadata: {name: kube-root-ca.crt, namespace: apps-demo}
+metadata: {name: kube-root-ca.crt, namespace: apps-sample}
 data: {ca.crt: "x"}
