@@ -111,7 +111,7 @@ func TestM15Provisioned(t *testing.T) {
 
 // TestM15PanelsReturnData runs each target of each committed panel over the last hour through /api/ds/query. A target returns a frame with
 // a value, or the test retries it for up to m15DataWait. An event target runs bare, with the fallback of the generator removed, so it may
-// return nothing: the test logs its name and passes it, and the hermetic catalogue check of internal/dashboards stays its only guard.
+// return nothing. A Loki target is an event panel too, because a fresh harness can have no refusal in the last hour. The test logs its name and passes it, and the hermetic catalogue check of internal/dashboards stays its only guard.
 func TestM15PanelsReturnData(t *testing.T) {
 	creds := m15RequireGrafana(t)
 	targets := m15Targets(t, loadM15Dashboards(t))
@@ -135,8 +135,8 @@ func TestM15PanelsReturnData(t *testing.T) {
 				if ok {
 					return
 				}
-				if tg.EventOnly && !failed {
-					t.Logf("event target with no data, not checked live: %s (%s)", tg.Name(), seen)
+				if (tg.EventOnly || tg.Datasource == "loki") && !failed {
+					t.Logf("event or log target with no data, not checked live: %s (%s)", tg.Name(), seen)
 					return
 				}
 				if time.Now().After(deadline) {
