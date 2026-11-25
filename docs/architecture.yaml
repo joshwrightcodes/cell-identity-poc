@@ -1,0 +1,269 @@
+# Machine-readable reference of the PoC architecture, as built at M9 (commit 550bebd).
+# The diagram for people is docs/images/retrospective-architecture.svg, described in docs/retrospective.md.
+# Each entry names its source: TA = docs/design/target-architecture.md, SC = docs/design/poc-scope.md,
+# BC = docs/design/base-cell.md, README = README.md (section name).
+# Ports are kind NodePorts on node addresses of the shared kind network unless a connection says otherwise.
+
+version: 1
+as_of: "2026-11-25"
+
+layers:
+  - name: management plane
+    role: decides. Holds intent, signs specs, work, steps and bundle sets, checks cluster keys.
+    clusters: [management]
+  - name: environment control plane
+    role: executes. Runs SPIRE for its cells, the cell gateway, the cell controller and the relays.
+    clusters: [dev-cp]
+  - name: cells
+    role: serve. One account, one VPC and one Kubernetes cluster each in the target design.
+    clusters: [dev-cell-1, dev-cell-2]
+rules:
+  - Every connection goes up a layer. The management plane opens no connection into an environment or a cell. (TA)
+  - No credential is copied between clusters. (TA)
+  - Trust domains do not federate. Each plane pins the root of the other plane. (TA, SC)
+  - Island mode - each layer keeps its last known state when the layer above is down. Removing trust is allowed in an island, adding trust is not. (TA)
+
+trust_domains:
+  - name: mgmt.poc.internal
+    cluster: management
+    ca: self-signed root, KeyManager "disk" on the data volume, no upstream authority (README "Keys of the management plane")
+  - name: dev.env.poc.internal
+    cluster: dev-cp
+    ca: 30-day intermediate from an offline one-year root, loaded with UpstreamAuthority "disk"; KeyManager "memory" (README "Keys")
+    issues_for: [dev-cp workloads, cell workloads, cell SPIRE agents]
+  - name: "<cell>.mesh.poc.internal"
+    cluster: each cell
+    ca: istiod self-signed CA, never federated, not integrated with SPIRE (BC "Mesh")
+root_distribution:
+  - The dev root reaches management and the cells as ConfigMap peer-root, fetched live at render. (README "Central Argo CD view")
+  - The management root reaches dev-cp as ConfigMap mgmt-root, and reaches a cell in its bootstrap set as a static file, never from the Workload API. (TA, SC)
+
+clusters:
+  - name: management
+    trust_domain: mgmt.poc.internal
+    components:
+      - mgmtd: management plane stand-in. Intent, portal, signatures, key checks, cell registry.
+      - central-view: argocd-server, repo server, Redis and the Argo CD Agent principal in central-view-system. No application controller.
+      - telemetry-gateway: cell-proxy with the otlp backend. Resets source attributes from the verified SPIFFE ID.
+      - lgtm: Grafana, Loki, Tempo and Prometheus in one StatefulSet.
+      - kiali and mesh-view-hub: read-only mesh view of each cell through tunnels.
+      - spire-server: own SPIRE server for management workloads.
+  - name: dev-cp
+    trust_domain: dev.env.poc.internal
+    components:
+      - spire-server: node attestors cluster_jwt (cells) and k8s_psat (plane workloads in dev-cp).
+      - envd: pulls signed specs and work from mgmtd, writes records, steps and overlays to ConfigMaps.
+      - cell-gateway (cellgw): SQLite queue, outbox and bind inbox for cell work.
+      - cell-controller: verifies signed steps and sends them to the host service.
+      - relay-view and relay-telemetry: TLS passthrough relays to management.
+      - external-secrets: syncs the intermediate CA from the secret manager into spire-system only.
+      - otel-uplink: telemetry of dev-cp to the telemetry gateway.
+  - name: dev-cell-1
+    trust_domain: identities from dev.env.poc.internal; mesh in dev-cell-1.mesh.poc.internal
+    components:
+      - celld: claims and applies signed work, with a spire-agent sidecar (cluster_jwt).
+      - argocd: Argo CD core and the in-cluster OCI bundle store behind store-proxy.
+      - argocd-agent: Argo CD Agent in autonomous mode, with a cell-proxy sidecar.
+      - otel-uplink: cell-proxy that exports OTLP to the telemetry gateway.
+      - mesh-view: cell-proxy tunnel that carries Kiali reads.
+      - istio: sidecar mode with istio-cni and its own self-signed CA.
+  - name: dev-cell-2
+    trust_domain: identities from dev.env.poc.internal; mesh in dev-cell-2.mesh.poc.internal
+    components:
+      - celld: claims and applies signed work, with a spire-agent sidecar (cluster_jwt).
+      - argocd: Argo CD core and the in-cluster OCI bundle store behind store-proxy.
+      - argocd-agent: Argo CD Agent in autonomous mode, with a cell-proxy sidecar.
+      - otel-uplink: cell-proxy that exports OTLP to the telemetry gateway.
+      - mesh-view: cell-proxy tunnel that carries Kiali reads.
+      - istio: sidecar mode with istio-cni and its own self-signed CA.
+  - name: rogue
+    trust_domain: none (unregistered)
+    components:
+      - the attestation client of celld and attack tools, used by the malicious cell tests
+  - name: mac-host (outside every cluster)
+    components:
+      - hostsvc: stands in for the cloud provider. Creates clusters, serves JWKS over pinned TLS, runs signed steps.
+      - registry-mirror: shared OCI registry on the kind network; bundle bytes by digest.
+
+spiffe_ids:
+  - id: spiffe://mgmt.poc.internal/api
+    workload: mgmtd
+  - id: spiffe://mgmt.poc.internal/argocd/principal
+    workload: Argo CD Agent principal proxy
+  - id: spiffe://mgmt.poc.internal/telemetry
+    workload: telemetry gateway
+  - id: spiffe://mgmt.poc.internal/kiali
+    workload: Kiali
+  - id: spiffe://dev.env.poc.internal/cp/gateway
+    workload: cell gateway
+  - id: spiffe://dev.env.poc.internal/cp/otel
+    workload: dev-cp uplink
+  - id: spiffe://dev.env.poc.internal/cp/cell-controller
+    workload: cell controller
+  - id: "spiffe://dev.env.poc.internal/cell/<cell>/celld"
+    workload: celld
+  - id: "spiffe://dev.env.poc.internal/cell/<cell>/argocd-agent"
+    workload: cell Argo CD agent
+  - id: "spiffe://dev.env.poc.internal/cell/<cell>/otel"
+    workload: cell uplink
+  - id: "spiffe://dev.env.poc.internal/cell/<cell>/mesh-view"
+    workload: cell mesh tunnel
+  - id: "spiffe://dev.env.poc.internal/spire/agent/cluster_jwt/<cell>/<pod-uid>/<nonce-hash>"
+    workload: cell SPIRE agent (non-reattestable)
+
+connections:
+  - id: 1
+    from: cell spire-agent sidecar
+    to: dev-cp SPIRE server
+    port: 30081
+    transport: SPIRE agent protocol
+    purpose: node attestation, then SVID renewal
+    authentication: pod-bound projected token with a server nonce in the audience, verified against the cluster keys in the signed cell record; server ID checked first
+  - id: 2
+    from: celld
+    to: cell gateway (bind)
+    port: 30451
+    transport: server-only TLS
+    purpose: bind before the cell has a record
+    authentication: pod-bound token with the bind nonce; source address must be the cell node
+  - id: 3
+    from: celld
+    to: cell gateway (stream)
+    port: 30450
+    transport: mTLS, HTTP/2 full duplex, NDJSON
+    purpose: hello, claim work, results, status
+    authentication: celld X.509 SVID, exact gateway ID, and a proof token bound to the TLS session
+  - id: 4
+    from: envd
+    to: mgmtd API
+    port: 31446
+    transport: mTLS
+    purpose: pull signed spec and work, report status, results, key hints and overlay entries
+    authentication: envd SVID; mgmtd pins the dev root and envd pins the management root; reports carry a cell proof
+  - id: 5
+    from: envd
+    to: cell gateway service
+    port: 8452 (in cluster)
+    transport: HTTP in cluster
+    purpose: records and work down, outbox up
+  - id: 6
+    from: envd
+    to: ConfigMaps cell-records, cell-steps, local-revocations
+    transport: Kubernetes API
+    purpose: deliver records to the plugin, steps to the cell controller, and the revocation overlay
+    authentication: Role scoped to those objects
+  - id: 7
+    from: SPIRE cluster_jwt plugin
+    to: ConfigMap attest-hints
+    transport: Kubernetes API
+    purpose: raise a hint on unknown_kid, at most once per cell per 60 seconds
+  - id: 8
+    from: cell controller
+    to: host service on the Mac
+    port: 17443 through host.docker.internal
+    transport: mTLS
+    purpose: send a signed step
+    authentication: cell-controller SVID; route authorized by peer ID
+  - id: 9
+    from: mgmtd
+    to: host service on the Mac
+    transport: mTLS with a pinned host certificate
+    purpose: read cluster JWKS for the issuer bind and key checks, push the newest spec
+  - id: 10
+    from: host service
+    to: kind, Docker and cell:up
+    transport: local process groups
+    purpose: create a cluster, admit it in dev-cp, bootstrap the cell
+    authentication: step signature, spec index and bootstrap digest checked before each stage
+  - id: 11
+    from: cell cell-proxy (argocd-agent sidecar)
+    to: relay-view then management
+    port: 30443 then 31443
+    transport: TLS passthrough relay, then SPIFFE mTLS
+    purpose: central Argo CD view
+    authentication: agent SVID and a proof frame; the client accepts only the principal ID under mgmt-root
+  - id: 12
+    from: cell otel-uplink
+    to: relay-telemetry then telemetry gateway
+    port: 30444 then 31444
+    transport: OTLP over SPIFFE mTLS
+    purpose: telemetry
+    authentication: cell otel SVID and a proof; the gateway rewrites source attributes from the ID
+  - id: 13
+    from: dev-cp otel-uplink
+    to: telemetry gateway
+    port: 31444
+    transport: OTLP over SPIFFE mTLS
+    purpose: plane telemetry
+  - id: 14
+    from: cell mesh-view tunnel
+    to: relay then mesh-view-hub
+    port: 30445 then 31445
+    transport: SPIFFE mTLS, one held stream
+    purpose: Kiali reads travel down the tunnel that the cell opened
+    authentication: the tunnel accepts only the Kiali ID; the hub admits only cell/<cell>/mesh-view
+  - id: 15
+    from: celld or envd
+    to: registry-mirror
+    port: 5000
+    transport: OCI by digest
+    purpose: fetch the bytes of a signed bundle set
+    authentication: digest in the signed attestation
+  - id: 16
+    from: celld or envd
+    to: bundle store store-proxy
+    port: 5000 (in cluster)
+    transport: OCI
+    purpose: push bundles and move root:current
+    authentication: service account token checked by TokenReview (writer subject)
+  - id: 17
+    from: mgmtd
+    to: ConfigMap cell-registry in the three view namespaces
+    transport: Kubernetes API
+    purpose: signed registry of cells for every cell-proxy server
+  - id: 18
+    from: agent-ban container
+    to: SPIRE server admin socket
+    transport: BanAgent
+    purpose: ban the agents of a revoked cell
+  - id: 19
+    from: External Secrets Operator in dev-cp
+    to: the secret manager
+    port: 443
+    purpose: intermediate CA key, certificate and root into Secret spire-upstream
+    authentication: read-only access token
+  - id: 20
+    from: operator on the Mac
+    to: ConfigMap envd-system/local-revocations
+    transport: Kubernetes API
+    purpose: local revocation during an island
+    authentication: entry signed with the operator key from the secret manager
+
+flows:
+  attestation: >-
+    The cluster_jwt plugin loads the cell record from the signed spec and any local overlay, rejects an unknown key ID first,
+    checks namespace and service account, requires a pod-bound token of at most 15 minutes with the audience spire-<env>/<nonce>,
+    caps in-flight challenges at 8 per cell, and returns can_reattest = false with a nonce-hash agent ID. (TA)
+  key_check_and_issuer_bind: >-
+    mgmtd reads each cluster JWKS from the provider (the host service) over pinned TLS, binds the issuer at first start with a
+    nonce token, signs the keys into the cell record, and checks again every 15 minutes or at once on an unknown_kid hint. (TA, README)
+  signed_specs: >-
+    mgmtd signs (Ed25519, DSSE) a spec that indexes record digests with an (epoch, counter) revision. envd refuses unsigned or older
+    specs and writes ConfigMap cell-records. The plugin reloads every 10 seconds and keeps revision marks on disk. (README)
+  signed_work_and_second_proof: >-
+    mgmtd signs work; envd carries it to the gateway queue; celld claims it on its outbound stream and applies it at most once.
+    Results and status carry a projected cell token whose audience binds the item, which mgmtd verifies against the signed keys. (TA)
+  provisioning: >-
+    One portal request makes mgmtd sign one step per cell. envd, the cell controller and the host service each verify the step.
+    The host service runs creating, admitting and bootstrapping. A step closes only from a bind that proves the new cluster. (README)
+  bundle_sets: >-
+    mgmtd signs an in-toto statement in DSSE that names target, version and component digests. celld or envd verifies it, fetches
+    bytes by digest, checks each object with OPA, pushes to the bundle store, moves root:current, waits for Argo CD, and rolls back
+    to the last good root on failure. (README)
+  island_mode: >-
+    Environment island - dev-cp and cells keep their SPIRE server, SVIDs renew, the gateway outbox grows and drains after the heal.
+    Cell island - agents exit about one SVID lifetime in, restart in place and attest again after the heal; no pod is replaced. (README)
+  revocation: >-
+    Connected - mgmtd marks the cell revoked in a new revision; the plugin, the gateway, the agent ban and the cell-proxy servers
+    enforce it. In an island - an operator signs a local overlay entry with the operator key; envd and the gateway hold the cell
+    revoked; mgmtd adopts the entry on reconnect. (README)
