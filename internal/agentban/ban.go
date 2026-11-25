@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	agentv1 "github.com/spiffe/spire-api-sdk/proto/spire/api/server/agent/v1"
@@ -28,6 +29,8 @@ import (
 type Agent struct {
 	ID     string
 	Banned bool
+	// ExpiresAt is the end of the X.509 SVID of the agent. The zero time means that the server gave none.
+	ExpiresAt time.Time
 }
 
 // API is the part of the SPIRE Agent API that the ban loop uses.
@@ -50,6 +53,8 @@ type Config struct {
 	Every time.Duration
 	Log   *slog.Logger
 	Meter metric.Meter
+	// Now returns the current time. Nil means time.Now.
+	Now func() time.Time
 }
 
 const (
@@ -88,14 +93,22 @@ func (a *agentAPI) List(ctx context.Context) ([]Agent, error) {
 		}
 		for _, ag := range resp.GetAgents() {
 			out = append(out, Agent{
-				ID:     "spiffe://" + ag.GetId().GetTrustDomain() + ag.GetId().GetPath(),
-				Banned: ag.GetBanned(),
+				ID:        "spiffe://" + ag.GetId().GetTrustDomain() + ag.GetId().GetPath(),
+				Banned:    ag.GetBanned(),
+				ExpiresAt: expiry(ag.GetX509SvidExpiresAt()),
 			})
 		}
 		if token = resp.GetNextPageToken(); token == "" {
 			return out, nil
 		}
 	}
+}
+
+func expiry(unix int64) time.Time {
+	if unix <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(unix, 0)
 }
 
 func (a *agentAPI) Ban(ctx context.Context, id string) error {
@@ -128,35 +141,72 @@ func cellOf(trustDomain, id string) (string, bool) {
 	return parts[0], true
 }
 
-// newCounter creates the counter of bans.
-func newCounter(m metric.Meter) (metric.Int64Counter, error) {
-	c, err := m.Int64Counter("agentban.bans", metric.WithDescription("Agents banned because their cell is revoked or retired"))
+// observer holds the instruments of the ban loop and the agents of the last good round.
+type observer struct {
+	bans metric.Int64Counter
+	mu   sync.Mutex
+	// counts holds the live agents of each cell from the last good round. A failed round clears it.
+	counts map[string]int64
+}
+
+// newObserver creates the counter of bans and the gauge of live agents for each cell.
+func newObserver(m metric.Meter) (*observer, error) {
+	o := &observer{counts: map[string]int64{}}
+	var err error
+	o.bans, err = m.Int64Counter("agentban.bans", metric.WithDescription("Agents banned because their cell is revoked or retired"))
 	if err != nil {
 		return nil, fmt.Errorf("counter: %w", err)
 	}
-	return c, nil
+	_, err = m.Int64ObservableGauge("agentban.agents",
+		metric.WithUnit("{agent}"),
+		metric.WithDescription("Unbanned cluster_jwt agents with a live SVID, by cell, from the last list round"),
+		metric.WithInt64Callback(func(_ context.Context, obs metric.Int64Observer) error {
+			o.mu.Lock()
+			defer o.mu.Unlock()
+			for cell, n := range o.counts {
+				obs.Observe(n, metric.WithAttributes(attribute.String("cell", cell)))
+			}
+			return nil
+		}))
+	if err != nil {
+		return nil, fmt.Errorf("gauge: %w", err)
+	}
+	return o, nil
+}
+
+func (o *observer) set(counts map[string]int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.counts = counts
 }
 
 // Once reads the refused cells and bans every agent of those cells that is not yet banned. It returns
 // the number of agents that it banned. A failed read bans nothing. It lists the agents on every pass,
 // also when no cell is refused, so that a broken API connection shows at once.
 func Once(ctx context.Context, cfg Config) (int, error) {
-	counter, err := newCounter(cfg.Meter)
+	o, err := newObserver(cfg.Meter)
 	if err != nil {
 		return 0, err
 	}
-	return once(ctx, cfg, counter)
+	return o.once(ctx, cfg)
 }
 
-func once(ctx context.Context, cfg Config, counter metric.Int64Counter) (int, error) {
+func (o *observer) once(ctx context.Context, cfg Config) (int, error) {
 	set, err := cfg.Read()
 	if err != nil {
+		o.set(map[string]int64{})
 		return 0, fmt.Errorf("read revoked cells: %w", err)
 	}
 	agents, err := cfg.API.List(ctx)
 	if err != nil {
+		o.set(map[string]int64{})
 		return 0, err
 	}
+	now := time.Now
+	if cfg.Now != nil {
+		now = cfg.Now
+	}
+	counts := map[string]int64{}
 	banned := 0
 	var errs []error
 	for _, ag := range agents {
@@ -164,8 +214,12 @@ func once(ctx context.Context, cfg Config, counter metric.Int64Counter) (int, er
 		if !ok || ag.Banned {
 			continue
 		}
+		live := ag.ExpiresAt.After(now())
 		source, refused := set.Cells[cell]
 		if !refused {
+			if live {
+				counts[cell]++
+			}
 			continue
 		}
 		switch err := cfg.API.Ban(ctx, ag.ID); {
@@ -173,12 +227,16 @@ func once(ctx context.Context, cfg Config, counter metric.Int64Counter) (int, er
 			cfg.Log.InfoContext(ctx, "agent_gone", "cell", cell, "source", source, "agent_id", ag.ID)
 		case err != nil:
 			errs = append(errs, fmt.Errorf("ban %s: %w", ag.ID, err))
+			if live {
+				counts[cell]++
+			}
 		default:
 			banned++
-			counter.Add(ctx, 1, metric.WithAttributes(attribute.String("cell", cell), attribute.String("source", source)))
+			o.bans.Add(ctx, 1, metric.WithAttributes(attribute.String("cell", cell), attribute.String("source", source)))
 			cfg.Log.InfoContext(ctx, "agent_banned", "cell", cell, "source", source, "agent_id", ag.ID)
 		}
 	}
+	o.set(counts)
 	return banned, errors.Join(errs...)
 }
 
@@ -188,14 +246,14 @@ func Run(ctx context.Context, cfg Config) error {
 	if cfg.Every <= 0 {
 		return errors.New("agentban: Every must be positive")
 	}
-	counter, err := newCounter(cfg.Meter)
+	o, err := newObserver(cfg.Meter)
 	if err != nil {
 		return err
 	}
 	tick := time.NewTicker(cfg.Every)
 	defer tick.Stop()
 	for {
-		if _, err := once(ctx, cfg, counter); err != nil && ctx.Err() == nil {
+		if _, err := o.once(ctx, cfg); err != nil && ctx.Err() == nil {
 			cfg.Log.ErrorContext(ctx, "agent_ban_failed", "error", err.Error())
 		}
 		select {

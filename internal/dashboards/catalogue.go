@@ -72,6 +72,7 @@ var (
 
 // Catalogue lists the metrics that the dashboards and the alert rules may name.
 var Catalogue = []Metric{
+	own("agentban.agents", KindGauge, "{agent}", ClusterControlPlane),
 	own("agentban.bans", KindCounter, "", ClusterControlPlane),
 
 	own("bundle.apply.duration", KindHistogram, "s", cpAndCell...),
