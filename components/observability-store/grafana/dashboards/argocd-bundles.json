@@ -305,7 +305,7 @@
         },
         {
           "refId": "B",
-          "expr": "sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) / sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))",
+          "expr": "(sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) / sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or (0 * max by (k8s_cluster_name) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m])))",
           "instant": true,
           "format": "table"
         }

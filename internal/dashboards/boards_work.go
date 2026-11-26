@@ -20,7 +20,7 @@ func workBoard() Dashboard {
 		event(instant("sum("+fresh(S("cellctl_steps_open", pinCP, `state=~"$kind"`), freshSlow)+")", ""), false))
 
 	b.add(timeSeries("Operation results by outcome", "Operations that each celld finished in each hour, by outcome.", 0, 4, 16, 9, "none",
-		series("sum by (outcome) (increase("+S("celld_ops_results_total", cellRe)+"[1h]))", "{{outcome}}")))
+		event(series("sum by (outcome) (increase("+S("celld_ops_results_total", cellRe)+"[1h]))", "{{outcome}}"), true)))
 	stages := barGauge("Step stages, last provision", "Median time that steps spent in each stage in the time range.", 16, 4, 8, 9, "s",
 		event(instant("histogram_quantile(0.5, sum by (stage, le) (increase("+S("cellctl_step_stage_duration_seconds_bucket", pinCP)+"["+rng+"])))", "{{stage}}"), true))
 	b.add(stages)

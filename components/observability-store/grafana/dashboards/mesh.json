@@ -69,7 +69,7 @@
       "id": 1,
       "type": "stat",
       "title": "mTLS share of requests",
-      "description": "Share of mesh requests that arrive over mutual TLS. Reads istio_requests_total.",
+      "description": "Share of mesh requests in the time range that arrive over mutual TLS. Reads istio_requests_total.",
       "gridPos": {
         "h": 4,
         "w": 6,
@@ -83,7 +83,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(rate(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy=\"mutual_tls\", service_name!=\"m15-synthetic\"}[$__rate_interval])) / sum(rate(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__rate_interval]))",
+          "expr": "100 * sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy=\"mutual_tls\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy=\"mutual_tls\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy=\"mutual_tls\", service_name!=\"m15-synthetic\"}[$__range]))) / sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true
         }
       ],
@@ -132,7 +132,7 @@
       "id": 2,
       "type": "stat",
       "title": "Request success",
-      "description": "Share of mesh requests with no 5xx answer. Reads istio_requests_total.",
+      "description": "Share of mesh requests in the time range with no 5xx answer. Reads istio_requests_total.",
       "gridPos": {
         "h": 4,
         "w": 6,
@@ -146,7 +146,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "100 * sum(rate(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code!~\"5..\", service_name!=\"m15-synthetic\"}[$__rate_interval])) / sum(rate(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__rate_interval]))",
+          "expr": "100 * sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code!~\"5..\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code!~\"5..\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code!~\"5..\", service_name!=\"m15-synthetic\"}[$__range]))) / sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range])))",
           "instant": true
         }
       ],

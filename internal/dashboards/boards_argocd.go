@@ -26,8 +26,9 @@ func argocdBoard() Dashboard {
 			Expr: "time() - max by (k8s_cluster_name, role, version, root_digest, state) (" +
 				fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow) + ")"},
 		tableColumn{Title: "Apply time", Unit: "s",
-			Expr: "sum by (k8s_cluster_name) (increase(" + S("bundle_sync_delay_seconds_sum", clusterRe) + "[" + rng + "])) / " +
-				"sum by (k8s_cluster_name) (increase(" + S("bundle_sync_delay_seconds_count", clusterRe) + "[" + rng + "]))"},
+			Expr: "(sum by (k8s_cluster_name) (increase(" + S("bundle_sync_delay_seconds_sum", clusterRe) + "[" + rng + "])) / " +
+				"sum by (k8s_cluster_name) (increase(" + S("bundle_sync_delay_seconds_count", clusterRe) + "[" + rng + "]))) or " +
+				"(0 * max by (k8s_cluster_name) (" + fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow) + "))"},
 	)
 	b.add(setOrder(sets, "Target", "Set", "Root digest", "Applied", "Apply time", "Result"))
 	b.add(coloured(barGauge("Sync time after a tag move", "Median time from a tag move of deploy to the end of the health wait.", 14, 4, 10, 9, "s",

@@ -8,11 +8,11 @@ func meshBoard() Dashboard {
 		b.add(stat(title, desc, x, 0, w, 4, unit, th, ts...))
 	}
 	req := func(extra ...string) string {
-		return "sum(rate(" + S("istio_requests_total", append([]string{clusterRe, `reporter="destination"`}, extra...)...) + "[" + rate + "]))"
+		return "sum(" + Born(S("istio_requests_total", append([]string{clusterRe, `reporter="destination"`}, extra...)...), rng) + ")"
 	}
-	s(0, "mTLS share of requests", "Share of mesh requests that arrive over mutual TLS.", "percent", thresholds(colCrit, step{99, colWarning}, step{100, colGood}),
+	s(0, "mTLS share of requests", "Share of mesh requests in the time range that arrive over mutual TLS.", "percent", thresholds(colCrit, step{99, colWarning}, step{100, colGood}),
 		instant("100 * "+req(`connection_security_policy="mutual_tls"`)+" / "+req(), ""))
-	s(1, "Request success", "Share of mesh requests with no 5xx answer.", "percent", thresholds(colCrit, step{95, colWarning}, step{99, colGood}),
+	s(1, "Request success", "Share of mesh requests in the time range with no 5xx answer.", "percent", thresholds(colCrit, step{95, colWarning}, step{99, colGood}),
 		instant("100 * "+req(`response_code!~"5.."`)+" / "+req(), ""))
 	tunnels := func() string { return S("cell_proxy_tunnel_up", pinMgmt, `side="hub"`, `cell=~"$cell"`) }
 	s(2, "Kiali tunnels up", "Kiali tunnels that are up, of all tunnels.", "none", thresholds(colNeutral),
