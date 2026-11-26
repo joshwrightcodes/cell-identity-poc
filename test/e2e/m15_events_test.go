@@ -176,14 +176,16 @@ func TestM15EventsShow(t *testing.T) {
 			v, ok := streams()
 			return ok && v >= 1, fmt.Sprintf("Stream %v (found %v)", v, ok)
 		})
-		// The proof below needs a fresh export age before the cut. At 20 s or less, the threshold of 30 s can only pass because of the cut.
+		// The proof below needs a fresh export age before the cut. At 30 s or less before it, and a threshold of at least 25 s above that value, the
+		// pass can only come from the cut.
 		var before float64
-		waitFor(t, `"Last telemetry" of `+cell+" to read at most 20 s before the cut", time.Minute, func() (bool, string) {
+		waitFor(t, `"Last telemetry" of `+cell+" to read at most 30 s before the cut", time.Minute, func() (bool, string) {
 			v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "H"), "cluster", cell)
 			before = v
-			return ok && v <= 20, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
+			return ok && v <= 30, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
 		})
-		t.Logf("LAST_TELEMETRY_BEFORE_CUT_SECONDS=%.0f", before)
+		threshold := max(30, before+25)
+		t.Logf("LAST_TELEMETRY_BEFORE_CUT_SECONDS=%.0f THRESHOLD_SECONDS=%.0f", before, threshold)
 		// The cut takes effect while the partition command runs, so the bound counts from its start and the log names the command time.
 		cutAt := time.Now()
 		c := cutLink(t, cell, spireCluster, "both", 4*time.Minute)
@@ -194,9 +196,9 @@ func TestM15EventsShow(t *testing.T) {
 		// seconds since the last export of the sender. The value passes 30 s within 30 s of the cut, and the next gateway export, the store
 		// write and one poll add at most 20 s. The Stream column follows later, because the gateway ends a silent stream after 30 s and the
 		// panel keeps the last sample for 1 minute (ruling B2).
-		m15Within(t, "LAST_TELEMETRY_ABOVE_30S_SECONDS", `"Last telemetry" of `+cell+" to rise above 30 s", cutAt, m15Show, func() (bool, string) {
+		m15Within(t, "LAST_TELEMETRY_ABOVE_THRESHOLD_SECONDS", fmt.Sprintf(`"Last telemetry" of %s to rise above %.0f s`, cell, threshold), cutAt, m15Show, func() (bool, string) {
 			v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "H"), "cluster", cell)
-			return ok && v > 30, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
+			return ok && v > threshold, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
 		})
 		// A series that no longer reports leaves the panel, and a cell that mgmtd still lists reads 0, so absent and 0 both mean down.
 		m15Within(t, "STREAM_DOWN_SECONDS", `"Stream" of `+cell+" to read down", cutAt, 2*time.Minute, func() (bool, string) {
