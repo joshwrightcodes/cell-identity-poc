@@ -59,7 +59,6 @@ for f in "${dashboards[@]}"; do
     | .data[strenv(KEY)] = load_str(strenv(BODY)) | .data[strenv(KEY)] style="literal"'
   echo "---"
 done
-echo "---"
 cat "$here/grafana-password.yaml"
 echo
 echo "---"
