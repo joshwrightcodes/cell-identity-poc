@@ -171,8 +171,10 @@ func TestM15EventsShow(t *testing.T) {
 			v, ok := streams()
 			return ok && v >= 1, fmt.Sprintf("Stream %v (found %v)", v, ok)
 		})
-		c := cutLink(t, cell, spireCluster, "both", 4*time.Minute)
+		// The cut takes effect while the partition command runs, so the bound counts from its start and the log names the command time.
 		cutAt := time.Now()
+		c := cutLink(t, cell, spireCluster, "both", 4*time.Minute)
+		t.Logf("CUT_COMMAND_SECONDS=%.0f", time.Since(cutAt).Seconds())
 		// The proof of "within one minute" is read on the connected side. A cut holds the telemetry of the cut cell in its own queue, so its
 		// upstream age cannot reach Grafana. The telemetry gateway in management exports cellproxy.gateway.last_export.time every 10 s
 		// (OTEL_METRIC_EXPORT_INTERVAL in components/telemetry-gateway/gateway.yaml), and the "Last telemetry" column of "Cells" shows the
