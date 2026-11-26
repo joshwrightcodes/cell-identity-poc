@@ -14,6 +14,7 @@
 # Every gate runs under keep_awake, refuses battery power, and prints the Sleep and DarkWake lines of pmset -g log since its start.
 # m15 runs the checks of m6 to m8, then gate-m15-repair.sh --check, which runs gate-m9-repair.sh --check first. Then it checks the container
 # agent-ban in spire-server-0 of dev-cp and runs the image check of m8, which covers cluster-jwt-server.
+# Before the clock starts, it runs gate-m15-intermediate.sh, which rotates the intermediate CA of dev-cp when under 7 days are left.
 # It then runs the tests that match ^TestM15, and scans the logs of the M5 components for a token afterwards.
 # m9 runs the slow tier of "The slow tier" in the M9 plan. Phase 0: gate-m6-repair.sh, gate-m7-repair.sh,
 # gate-m8-repair.sh and gate-m9-repair.sh with --check, the image check of m8 with agent-ban in spire-server-0 of dev-cp, cell-proxy of the
@@ -368,6 +369,8 @@ fi
 # go test -json gives each test its own duration. The raw events stay in build/gate-<milestone>.json,
 # and the text of the run goes to standard output as it does without -json.
 mkdir -p "$BUILD_ROOT"
+# The M15 gate rotates an intermediate CA with under 7 days left before the clock starts, so the rotation never counts against the budget.
+[[ "$milestone" != m15 ]] || "$ROOT/scripts/gate-m15-intermediate.sh" || exit 1
 events="$BUILD_ROOT/gate-$milestone.json"
 durations="$BUILD_ROOT/gate-$milestone-durations.txt"
 start=$SECONDS

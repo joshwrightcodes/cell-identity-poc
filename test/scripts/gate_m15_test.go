@@ -19,6 +19,7 @@ for a in "$@"; do
 done
 case " $* " in
   *" get namespaces -l cell.poc.internal/e2e=true -o name "*) cat "$d/ns-$ctx" 2>/dev/null; exit 0 ;;
+  *" exec lgtm-0 "*) cat "$d/ca-left" 2>/dev/null || echo '{"status":"success","data":{"result":[]}}'; exit 0 ;;
   *" delete namespace "*)
     [[ ! -e "$d/ns-stuck" ]] || exit 0
     for a in "$@"; do
@@ -49,6 +50,8 @@ func newGateM15Rig(t *testing.T) *m9Rig {
 	r := newGateM9Rig(t)
 	r.write("scripts/gate-m15-repair.sh", "#!/usr/bin/env bash\necho \"m15 repair $*\" >>\"$STUB_DIR/calls\"\n"+
 		"[[ ! -e \"$STUB_DIR/m15-check-fail\" ]] || { echo 'a trace of m15. Run: mise run gate:m15:repair'; exit 1; }\n")
+	r.write("scripts/gate-m15-intermediate.sh", "#!/usr/bin/env bash\necho \"m15 intermediate $*\" >>\"$STUB_DIR/calls\"\n"+
+		"[[ ! -e \"$STUB_DIR/m15-intermediate-fail\" ]] || { echo 'the rotation failed'; exit 1; }\n")
 	return r
 }
 
@@ -66,9 +69,10 @@ func TestGateM15Phases(t *testing.T) {
 		}
 		m6, m7, m8, m9 := callAt(calls, "m6 repair --check"), callAt(calls, "m7 repair --check"), callAt(calls, "m8 repair --check"), callAt(calls, "m15 repair --check")
 		image := callAt(calls, "kind-dev-cp -n spire-system get statefulset/spire-server")
+		rotate := callAt(calls, "m15 intermediate")
 		run := callAt(calls, "go test", "-run ^TestM15", " -json ")
 		scan := callAt(calls, "scan ")
-		order := []int{m6, m7, m8, m9, image, run, scan}
+		order := []int{m6, m7, m8, m9, image, rotate, run, scan}
 		for i := range order {
 			if order[i] < 0 || (i > 0 && order[i] < order[i-1]) {
 				t.Fatalf("want the checks of M6 to M8, the check of M15, the image check, the tests and the token scan in this order (%v):\n%s", order, calls)
@@ -103,6 +107,15 @@ func TestGateM15Phases(t *testing.T) {
 		_, errOut, code := r.run("gate.sh", nil, "m15")
 		if code == 0 || len(goRuns(r.calls())) != 0 || !strings.Contains(errOut, "agent-ban") {
 			t.Fatalf("exit %d, stderr %q; want a stop before the tests that names agent-ban", code, errOut)
+		}
+	})
+	t.Run("a failed rotation", func(t *testing.T) {
+		t.Parallel()
+		r := newGateM15Rig(t)
+		r.state("m15-intermediate-fail", "")
+		_, _, code := r.run("gate.sh", nil, "m15")
+		if code == 0 || len(goRuns(r.calls())) != 0 {
+			t.Fatalf("exit %d, calls %s; want a stop before the tests", code, r.calls())
 		}
 	})
 	t.Run("a stale image", func(t *testing.T) {
@@ -285,6 +298,52 @@ func TestGateM15RepairCheck(t *testing.T) {
 		r := newRepairM15Rig(t)
 		if _, errOut, code := r.run("gate-m15-repair.sh", nil, "--fix"); code == 0 || !strings.Contains(errOut, "usage") {
 			t.Errorf("exit %d, stderr %q; want the usage", code, errOut)
+		}
+	})
+}
+
+// TestGateM15Intermediate: gate-m15-intermediate.sh reads the time left on the intermediate CA from Prometheus, rotates it with
+// CELL=dev-cp mise run pki:rotate-intermediate when under 7 days are left, writes the marker before the rotation, and removes it after.
+func TestGateM15Intermediate(t *testing.T) {
+	t.Parallel()
+	left := func(seconds string) string {
+		return `{"status":"success","data":{"result":[{"metric":{},"value":[1795656585,"` + seconds + `"]}]}}`
+	}
+	const marker = "build/gate/m15-intermediate-rotated"
+	t.Run("enough time", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		r.state("ca-left", left("864000"))
+		_, errOut, code := r.run("gate-m15-intermediate.sh", nil)
+		if code != 0 || strings.Contains(r.calls(), "pki:rotate-intermediate") || r.exists(marker) {
+			t.Fatalf("exit %d, stderr %q, calls %s; want no rotation", code, errOut, r.calls())
+		}
+	})
+	t.Run("no series", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		_, errOut, code := r.run("gate-m15-intermediate.sh", nil)
+		if code != 0 || strings.Contains(r.calls(), "pki:rotate-intermediate") {
+			t.Fatalf("exit %d, stderr %q; want no rotation and exit 0", code, errOut)
+		}
+	})
+	t.Run("under 7 days", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		r.state("ca-left", left("300000"))
+		_, errOut, code := r.run("gate-m15-intermediate.sh", nil)
+		if code != 0 || !strings.Contains(r.calls(), "mise run pki:rotate-intermediate CELL=dev-cp") || r.exists(marker) {
+			t.Fatalf("exit %d, stderr %q, calls %s; want one rotation of dev-cp and no marker", code, errOut, r.calls())
+		}
+	})
+	t.Run("a failed rotation keeps the marker", func(t *testing.T) {
+		t.Parallel()
+		r := newRepairM15Rig(t)
+		r.state("ca-left", left("300000"))
+		r.state("rotate-fail", "")
+		_, errOut, code := r.run("gate-m15-intermediate.sh", nil)
+		if code == 0 || !r.exists(marker) || !strings.Contains(errOut, "mise run gate:m15:repair") {
+			t.Fatalf("exit %d, stderr %q; want a failure that keeps the marker and names the repair", code, errOut)
 		}
 	})
 }

@@ -9,21 +9,15 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 )
 
 const (
 	m15PushEvery = 15 * time.Second
-	// m15RotatedMarker records that the test rotated the intermediate CA of dev-cp, so that the repair can tell.
-	m15RotatedMarker = "../../build/gate/m15-intermediate-rotated"
-	m15RotateBound   = 40 * time.Minute
-	m15WeekSeconds   = 7 * 24 * 3600
 )
 
 // m15Alert is one alert instance of /api/prometheus/grafana/api/v1/alerts.
@@ -208,44 +202,12 @@ func m15Rules() []m15Rule {
 	}
 }
 
-var m15RotateOnce sync.Once
-
-// m15RotateIntermediate rotates the intermediate CA of dev-cp when it has under 7 days left, because a real A3 alert would fire from then
-// on. It writes build/gate/m15-intermediate-rotated first, so that gate-m15-repair.sh finishes a rotation that stops half way, and it
-// removes the marker after a rotation that ends well. It rotates at most once.
-func m15RotateIntermediate(t *testing.T) {
-	t.Helper()
-	m15RotateOnce.Do(func() {
-		left := promSamples(t, `min(last_over_time(trust_ca_not_after_seconds{ca="intermediate", service_name!="m15-synthetic"}[2m])) - time()`)
-		if len(left) == 0 || left[0].last >= m15WeekSeconds {
-			return
-		}
-		t.Logf("the intermediate CA has %.1f days left, so the test rotates it with pki:rotate-intermediate", left[0].last/86400)
-		if err := os.MkdirAll(filepath.Dir(m15RotatedMarker), 0o755); err != nil {
-			t.Error(err)
-			return
-		}
-		if err := os.WriteFile(m15RotatedMarker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644); err != nil {
-			t.Error(err)
-			return
-		}
-		if out, err := miseRun(t, m15RotateBound, []string{"CELL=dev-cp"}, "pki:rotate-intermediate"); err != nil {
-			t.Errorf("pki:rotate-intermediate: %v\n%s. The marker stays, so mise run gate:m15:repair runs it again", err, lastLines(out, 6))
-			return
-		}
-		_ = os.Remove(m15RotatedMarker)
-	})
-}
-
 // TestM15AlertRulesFireAndClear pushes the fire series of each rule every 15 seconds under its own m15-<hex> value, waits until the
 // Grafana alert list shows an alert of the rule for that value with the marker synthetic=true, then pushes the clear series and waits
 // until the alert is gone. The counters of A4, A5 and A7 start at their fire value, with no 0 sample before, so the first-event path of
 // Born is tested. Their clear series keep the value, and the alert clears when the window passes.
 func TestM15AlertRulesFireAndClear(t *testing.T) {
 	creds := m15RequireGrafana(t)
-	// The rotation runs before any subtest, because a rotation of up to 40 minutes between the fire and the clear phase would let the
-	// alert of A3 end by itself and pass the clear check with no proof.
-	m15RotateIntermediate(t)
 	start := time.Now().Add(-time.Minute)
 	for _, r := range m15Rules() {
 		t.Run(r.id, func(t *testing.T) {
