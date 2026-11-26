@@ -75,8 +75,8 @@ func TestGateM15Phases(t *testing.T) {
 			}
 		}
 		runs := goRuns(calls)
-		if len(runs) != 1 || !strings.Contains(runs[0], " -timeout 200m ") {
-			t.Errorf("runs %v, want one run with -timeout 200m", runs)
+		if len(runs) != 1 || !strings.Contains(runs[0], " -timeout 70m ") {
+			t.Errorf("runs %v, want one run with -timeout 70m", runs)
 		}
 		for _, want := range []string{"kind-dev-cp -n cell-system get statefulset/bundle-store", "kind-dev-cell-2 -n argocd get deployment/argocd-repo-server",
 			"kind-dev-cell-2 -n cell-identity-system get deployment/celld"} {
@@ -142,7 +142,7 @@ func TestGateM15Phases(t *testing.T) {
 	})
 }
 
-// TestGateM15Budget: harness/versions.env holds the provisional limits of M15, 100 minutes and a timeout of 200 minutes, and gate.sh m15 stops
+// TestGateM15Budget: harness/versions.env holds the limits of M15, a budget of 35 minutes and a timeout of 70 minutes, and gate.sh m15 stops
 // before every check and test when one of them is empty. A timeout skips every cleanup of a test, so the timeout follows the setting.
 func TestGateM15Budget(t *testing.T) {
 	t.Parallel()
@@ -150,7 +150,7 @@ func TestGateM15Budget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"GATE_M15_BUDGET_MINUTES=100", "GATE_M15_TEST_TIMEOUT_MINUTES=200"} {
+	for _, want := range []string{"GATE_M15_BUDGET_MINUTES=35", "GATE_M15_TEST_TIMEOUT_MINUTES=70"} {
 		if !strings.Contains(string(b), "\n"+want+"\n") {
 			t.Errorf("harness/versions.env lacks the line %q", want)
 		}

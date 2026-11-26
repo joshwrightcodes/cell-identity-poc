@@ -1466,7 +1466,7 @@ The cell gateway is a late harness component, so `cell:publish` does not reach i
 
 `mise run gate:m15` runs the end-to-end tests of this section. Build the images first with `mise run images`.
 The task runs the repair checks of M6 to M9 and the image check of M8. Then it runs the tests whose names start with `TestM15`.
-Afterwards it scans the logs for a token. `GATE_M15_BUDGET_MINUTES` is 100, and `GATE_M15_TEST_TIMEOUT_MINUTES` is 200.
+Afterwards it scans the logs for a token. `GATE_M15_BUDGET_MINUTES` is 35, and `GATE_M15_TEST_TIMEOUT_MINUTES` is 70.
 A Go timeout skips every cleanup, so run `gate:m15:repair` after a timeout.
 
 The gate makes four checks:
