@@ -1466,6 +1466,7 @@ The cell gateway is a late harness component, so `cell:publish` does not reach i
 
 `mise run gate:m15` runs the end-to-end tests of this section. Build the images first with `mise run images`.
 The task runs the repair checks of M6 to M9 and the image check of M8. Then it runs the tests whose names start with `TestM15`.
+Before the budget clock starts, `gate.sh` runs `gate-m15-intermediate.sh`. It rotates the intermediate CA of `dev-cp` when it has less than 7 days left, and the rotation does not count against the budget.
 Afterwards it scans the logs for a token. `GATE_M15_BUDGET_MINUTES` is 35, and `GATE_M15_TEST_TIMEOUT_MINUTES` is 70.
 A Go timeout skips every cleanup, so run `gate:m15:repair` after a timeout.
 
@@ -1474,7 +1475,7 @@ The gate makes four checks:
 1. `TestM15Provisioned` checks that Grafana holds the eight dashboards and eight rules, and that they come from files.
 2. `TestM15PanelsReturnData` runs every panel query on a fresh harness. A panel for an event can stay empty.
 3. `TestM15EventsShow` runs a revoke, a cut and a key rotation, and it waits for each to show on its dashboard.
-4. `TestM15AlertRulesFireAndClear` makes each rule fire and clear, and it rotates the intermediate CA first when it has less than 7 days left.
+4. `TestM15AlertRulesFireAndClear` makes each rule fire and clear.
 
 In the live runs, a revoke showed on Cell health after 11 seconds. The proof of a cut showed after 27 seconds. The proof of a cut is the age of the last export of the cut cell at the telemetry gateway, above 30 seconds.
 The Stream column of a cut cell reached 0 after 88 seconds, so the check allows 2 minutes.
