@@ -24,11 +24,11 @@ func argocdBoard() Dashboard {
 			Labels:   [][2]string{{"role", "Role"}, {"version", "Set"}, {"root_digest", "Root digest"}, {"state", "Result"}},
 			LabelMap: bootstrapMap(),
 			Expr: "time() - max by (k8s_cluster_name, role, version, root_digest, state) (" +
-				fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow) + ")"},
+				newest(S("bundle_set_applied_seconds", clusterRe), S("bundle_set_applied_seconds", clusterRe), freshSlow, "k8s_cluster_name, role") + ")"},
 		tableColumn{Title: "Apply time", Unit: "s", Map: valueMap("value", [3]string{"-1", "no sync", colNeutral}),
 			Expr: "(sum by (k8s_cluster_name) (" + Born(S("bundle_sync_delay_seconds_sum", clusterRe), rng) + ") / " +
 				"(sum by (k8s_cluster_name) (" + Born(S("bundle_sync_delay_seconds_count", clusterRe), rng) + ") > 0)) or " +
-				"(0 * max by (k8s_cluster_name) (" + fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow) + ") - 1)"},
+				"(0 * max by (k8s_cluster_name) (" + newest(S("bundle_set_applied_seconds", clusterRe), S("bundle_set_applied_seconds", clusterRe), freshSlow, "k8s_cluster_name, role") + ") - 1)"},
 	)
 	b.add(setOrder(sets, "Target", "Set", "Root digest", "Applied", "Apply time", "Result"))
 	b.add(coloured(barGauge("Sync time after a tag move", "Median time from a tag move of deploy to the end of the health wait.", 14, 4, 10, 9, "s",

@@ -7,7 +7,7 @@ func islandsBoard() Dashboard {
 		series(S("celld_upstream_age_seconds", cellRe)+" > bool 120", "{{platform_cell}} celld"),
 		series(S("envd_upstream_age_seconds", pinCP, clusterRe)+" > bool 120", "dev-cp envd"))
 	link.FieldConfig.Defaults = FieldDefaults{
-		Color: map[string]any{"mode": "thresholds"}, Thresholds: thresholds(colGood, step{1, colWarning}),
+		Color:    map[string]any{"mode": "fixed", "fixedColor": colGood},
 		Mappings: []map[string]any{valueMap("value", [3]string{"0", "connected", colGood}, [3]string{"1", "island", colWarning})},
 		Custom:   map[string]any{"fillOpacity": 80, "lineWidth": 0},
 	}

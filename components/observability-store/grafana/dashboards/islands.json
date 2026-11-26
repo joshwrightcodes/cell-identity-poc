@@ -94,20 +94,8 @@
       "fieldConfig": {
         "defaults": {
           "color": {
-            "mode": "thresholds"
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "#0ca30c",
-                "value": null
-              },
-              {
-                "color": "#fab219",
-                "value": 1
-              }
-            ]
+            "fixedColor": "#0ca30c",
+            "mode": "fixed"
           },
           "mappings": [
             {

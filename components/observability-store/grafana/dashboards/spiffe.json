@@ -271,7 +271,7 @@
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "d",
+          "unit": "suffix: days",
           "color": {
             "mode": "thresholds"
           },
@@ -636,7 +636,7 @@
       "title": "Trust anchors",
       "description": "CA certificates that the clusters report, and the mesh roots. Expires is the time left. Pinned by is the cluster that reports the row. Reads trust_ca_not_after_seconds, citadel_server_root_cert_expiry_timestamp.",
       "gridPos": {
-        "h": 8,
+        "h": 12,
         "w": 12,
         "x": 12,
         "y": 12

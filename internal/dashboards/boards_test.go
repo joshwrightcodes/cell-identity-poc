@@ -249,8 +249,9 @@ func TestVanishingGaugesAreFresh(t *testing.T) {
 		for g, window := range gauges {
 			all := strings.Count(q.Expr, g+"{")
 			wrapped := len(regexp.MustCompile(`last_over_time\(`+g+`\{[^}]*\}\[`+window+`\]\)`).FindAllString(q.Expr, -1))
-			if all != wrapped {
-				t.Errorf("%s: %d reads of %s, %d with last_over_time over %s", q.Where, all, g, wrapped, window)
+			stamped := len(regexp.MustCompile(`timestamp\(`+g+`\{[^}]*\}\)`).FindAllString(q.Expr, -1))
+			if all != wrapped+stamped {
+				t.Errorf("%s: %d reads of %s, %d with last_over_time over %s and %d inside timestamp()", q.Where, all, g, wrapped, window, stamped)
 			}
 			seen[g] += all
 		}
@@ -300,6 +301,30 @@ func TestSpecificPanels(t *testing.T) {
 		p := panelByTitle(t, boardByUID(t, "poc-refusals"), "Latest refusals")
 		if p.Datasource.UID != DSLoki || !strings.Contains(p.Targets[0].Expr, `reason != "library_log"`) {
 			t.Errorf("panel = %+v", p.Targets)
+		}
+	})
+	t.Run("cell state and applied sets keep the newest series", func(t *testing.T) {
+		for _, c := range []struct{ name, expr, by, metric string }{
+			{"newest cell state", newest(S("mgmtd_cell_state", pinMgmt, `revoked="false"`), S("mgmtd_cell_state", pinMgmt), freshFast, "cell"), "cell", "mgmtd_cell_state"},
+			{"cells valid", cellCount(`valid="true"`, `revoked="false"`), "cell", "mgmtd_cell_state"},
+			{"state column", stateOf(), "cell", "mgmtd_cell_state"},
+		} {
+			if !strings.Contains(c.expr, " and on("+c.by+") (timestamp("+c.metric+"{") || !strings.Contains(c.expr, "== on("+c.by+") group_left max by ("+c.by+") (timestamp("+c.metric+"{") {
+				t.Errorf("%s does not keep the newest series: %s", c.name, c.expr)
+			}
+		}
+		b := boardByUID(t, "poc-argocd-bundles")
+		sets := panelByTitle(t, b, "Signed sets by target")
+		if !strings.Contains(sets.Targets[0].Expr, "group_left max by (k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{") {
+			t.Errorf("Signed sets does not keep the newest set of each applier: %s", sets.Targets[0].Expr)
+		}
+		cells := panelByTitle(t, boardByUID(t, "poc-cell-health"), "Cells")
+		found := false
+		for _, tg := range cells.Targets {
+			found = found || strings.Contains(tg.Expr, "group_left max by (k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{")
+		}
+		if !found {
+			t.Error("the Bundle applied column does not keep the newest set of each applier")
 		}
 	})
 	t.Run("mesh shares guard the form", func(t *testing.T) {

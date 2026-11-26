@@ -16,7 +16,7 @@ func spiffeBoard() Dashboard {
 		event(instant(attest("refused"), ""), false))
 	s(2, "Agents per cell", "Unbanned agents of each cell. A series that stops reporting leaves the panel within a minute.", "none", thresholds(colNeutral),
 		instant("sum by (cell) ("+fresh(S("agentban_agents", pinCP, `cell=~"$cell"`), freshFast)+")", "{{cell}}"))
-	s(3, "Intermediate CA expires", "Days until the intermediate CA expires. Warning under 14 days, critical under 7 days.", "d",
+	s(3, "Intermediate CA expires", "Days until the intermediate CA expires. Warning under 14 days, critical under 7 days.", "suffix: days",
 		thresholds(colCrit, step{7, colWarning}, step{14, colGood}),
 		instant("(min("+fresh(S("trust_ca_not_after_seconds", clusterRe, `ca="intermediate"`, `trust_domain=~"$trust_domain"`), freshSlow)+") - time()) / 86400", ""))
 	s(4, "Key checks", "Key checks of mgmtd that found no change or updated the keys, of all key checks in the time range.", "none", thresholds(colNeutral),
@@ -40,7 +40,7 @@ func spiffeBoard() Dashboard {
 		` or label_replace(label_replace(label_replace(` + S("citadel_server_root_cert_expiry_timestamp", clusterRe) + ` - time(),` +
 		` "trust_domain", "$1.mesh", "k8s_cluster_name", "(.+)"), "ca", "mesh root", "", ""), "source", "istiod", "", "")`
 	trust := table("Trust anchors", "CA certificates that the clusters report, and the mesh roots. Expires is the time left. Pinned by is the cluster that reports the row.",
-		12, 12, 12, 8, "", "", "Pinned by",
+		12, 12, 12, 12, "", "", "Pinned by",
 		tableColumn{Title: "Expires", Unit: "s", Expr: anchors, Labels: [][2]string{
 			{"trust_domain", "Trust domain"}, {"ca", "CA"}, {"sha256", "Root"}, {"k8s_cluster_name", "Pinned by"}}},
 	)

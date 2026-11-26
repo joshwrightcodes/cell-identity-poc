@@ -3,14 +3,14 @@ package dashboards
 // stateOf gives each cell a number: 1 valid, 2 not valid, 3 revoked. The number sorts and maps to a word, where the labels would not.
 func stateOf() string {
 	m := func(matchers ...string) string {
-		return `label_replace(` + fresh(S("mgmtd_cell_state", append([]string{pinMgmt}, matchers...)...), freshFast) + `, "cluster", "$1", "cell", "(.+)")`
+		return `label_replace(` + newest(S("mgmtd_cell_state", append([]string{pinMgmt}, matchers...)...), S("mgmtd_cell_state", pinMgmt), freshFast, "cell") + `, "cluster", "$1", "cell", "(.+)")`
 	}
 	return `max by (cluster) (` + m(`revoked="true"`) + ` * 3 or ` + m(`revoked="false"`, `valid="true"`) + ` * 1 or ` + m(`revoked="false"`, `valid="false"`) + ` * 2)`
 }
 
 // cellCount counts the cells of mgmtd_cell_state that match. A change of a label starts a new series, so it counts each cell once.
 func cellCount(matchers ...string) string {
-	return "count(count by (cell) (" + fresh(S("mgmtd_cell_state", append([]string{pinMgmt}, matchers...)...), freshFast) + "))"
+	return "count(count by (cell) (" + newest(S("mgmtd_cell_state", append([]string{pinMgmt}, matchers...)...), S("mgmtd_cell_state", pinMgmt), freshFast, "cell") + "))"
 }
 
 // orZero keeps a count that has no series at 0, with the labels of the grouping.
@@ -55,7 +55,7 @@ func cellHealthBoard() Dashboard {
 			byCell(`count by (k8s_cluster_name) (`+S("argocd_app_info", `job="argocd"`, clusterRe)+`)`, "k8s_cluster_name"))},
 		tableColumn{Title: "Apps total", Expr: byCell(`count by (k8s_cluster_name) (`+S("argocd_app_info", `job="argocd"`, clusterRe)+`)`, "k8s_cluster_name")},
 		tableColumn{Title: "Bundle applied", Unit: "s", Labels: [][2]string{{"version", "Bundle version"}, {"root_digest", "Bundle digest"}}, LabelMap: bootstrapMap(),
-			Expr: byCell(`label_replace(time() - max by (k8s_cluster_name, version, root_digest) (`+fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow)+`), "root_digest", "$1", "root_digest", "(?:sha256:)?(.{12}).*")`, "k8s_cluster_name")},
+			Expr: byCell(`label_replace(time() - max by (k8s_cluster_name, version, root_digest) (`+newest(S("bundle_set_applied_seconds", clusterRe), S("bundle_set_applied_seconds", clusterRe), freshSlow, "k8s_cluster_name, role")+`), "root_digest", "$1", "root_digest", "(?:sha256:)?(.{12}).*")`, "k8s_cluster_name")},
 		tableColumn{Title: "Last telemetry", Unit: "s", Expr: byCell(`time() - max by (sender_cluster) (`+gw(`sender_cluster=~"$cluster"`)+`)`, "sender_cluster")},
 		tableColumn{Title: "Mesh tunnel", Expr: one(S("cell_proxy_tunnel_up", pinMgmt, `side="hub"`, `cell=~"$cell"`), "cell"),
 			Map: valueMap("value", [3]string{"0", "down", colCrit}, [3]string{"1", "up", colGood})},
