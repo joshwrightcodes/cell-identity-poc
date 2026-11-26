@@ -55,12 +55,13 @@ func cellHealthBoard() Dashboard {
 			byCell(`count by (k8s_cluster_name) (`+S("argocd_app_info", `job="argocd"`, clusterRe)+`)`, "k8s_cluster_name"))},
 		tableColumn{Title: "Apps total", Expr: byCell(`count by (k8s_cluster_name) (`+S("argocd_app_info", `job="argocd"`, clusterRe)+`)`, "k8s_cluster_name")},
 		tableColumn{Title: "Bundle applied", Unit: "s", Labels: [][2]string{{"version", "Bundle version"}, {"root_digest", "Bundle digest"}}, LabelMap: bootstrapMap(),
-			Expr: byCell(`time() - max by (k8s_cluster_name, version, root_digest) (`+fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow)+`)`, "k8s_cluster_name")},
+			Expr: byCell(`label_replace(time() - max by (k8s_cluster_name, version, root_digest) (`+fresh(S("bundle_set_applied_seconds", clusterRe), freshSlow)+`), "root_digest", "$1", "root_digest", "(?:sha256:)?(.{12}).*")`, "k8s_cluster_name")},
 		tableColumn{Title: "Last telemetry", Unit: "s", Expr: byCell(`time() - max by (sender_cluster) (`+gw(`sender_cluster=~"$cluster"`)+`)`, "sender_cluster")},
 		tableColumn{Title: "Mesh tunnel", Expr: one(S("cell_proxy_tunnel_up", pinMgmt, `side="hub"`, `cell=~"$cell"`), "cell"),
 			Map: valueMap("value", [3]string{"0", "down", colCrit}, [3]string{"1", "up", colGood})},
 	)
-	b.add(cells)
+	b.add(widths(cells, map[string]int{"Cell": 100, "State": 90, "SVID left": 100, "Upstream age": 110, "Stream": 70, "Apps synced": 100,
+		"Apps total": 90, "Bundle version": 120, "Bundle digest": 120, "Bundle applied": 120, "Last telemetry": 120, "Mesh tunnel": 100}))
 
 	svid := coloured(timeSeries("celld SVID remaining", "Time left on the SVID of each celld. The dashed line is a quarter of the SVID lifetime.", 0, 13, 12, 8, "s",
 		series(S("celld_svid_remaining_seconds", cellRe), "{{platform_cell}}"),

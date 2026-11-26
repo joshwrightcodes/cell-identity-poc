@@ -321,7 +321,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(sum by (outcome) (increase(celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1h]))) or on() vector(0)",
+          "expr": "(sum by (outcome) (((celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"} unless celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"} offset 1h) or increase(celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1h])))) or on() vector(0)",
           "range": true,
           "legendFormat": "{{outcome}}",
           "eventOnly": true

@@ -297,6 +297,20 @@ func mappingOverride(name string, m map[string]any) Override {
 	}
 }
 
+// widths fixes the width in pixels of the columns of a table, so that every column fits on a wide screen.
+func widths(p Panel, w map[string]int) Panel {
+	names := make([]string, 0, len(w))
+	for n := range w {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		p.FieldConfig.Overrides = append(p.FieldConfig.Overrides, Override{
+			Matcher: FieldMatcher{ID: "byName", Options: n}, Properties: []Property{{ID: "custom.width", Value: w[n]}}})
+	}
+	return p
+}
+
 // table builds a table that joins its queries on the key label, or shows its one query as it is when the key is empty.
 // Label columns come from the labels of the queries.
 func table(title, desc string, x, y, w, h int, key, keyTitle, sortBy string, cols ...tableColumn) Panel {

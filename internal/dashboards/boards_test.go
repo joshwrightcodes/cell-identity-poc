@@ -1,6 +1,7 @@
 package dashboards
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -301,6 +302,42 @@ func TestSpecificPanels(t *testing.T) {
 			t.Errorf("panel = %+v", p.Targets)
 		}
 	})
+	t.Run("mesh shares guard the form", func(t *testing.T) {
+		b := boardByUID(t, "poc-mesh")
+		for title, bad := range map[string]string{"mTLS share of requests": `connection_security_policy!="mutual_tls"`, "Request success": `response_code=~"5.."`} {
+			p := panelByTitle(t, b, title)
+			e := p.Targets[0].Expr
+			for _, want := range []string{bad, " or vector(0)) / (", " > 0)) or (0 * ", " - 1)) and on() count(last_over_time(", "[2m])"} {
+				if !strings.Contains(e, want) {
+					t.Errorf("%s lacks %q: %s", title, want, e)
+				}
+			}
+			if !strings.Contains(fmt.Sprint(p.FieldConfig.Defaults.Mappings), "no requests") {
+				t.Errorf("%s has no mapping of -1 to no requests", title)
+			}
+		}
+	})
+	t.Run("apply time guards the count and maps -1", func(t *testing.T) {
+		p := panelByTitle(t, boardByUID(t, "poc-argocd-bundles"), "Signed sets by target")
+		var expr string
+		for _, tg := range p.Targets {
+			if strings.Contains(tg.Expr, "bundle_sync_delay_seconds_sum") {
+				expr = tg.Expr
+			}
+		}
+		for _, want := range []string{"bundle_sync_delay_seconds_count", " > 0)) or (0 * max by", ") - 1)", " unless "} {
+			if !strings.Contains(expr, want) {
+				t.Errorf("apply time lacks %q: %s", want, expr)
+			}
+		}
+		found := false
+		for _, o := range p.FieldConfig.Overrides {
+			found = found || (o.Matcher.Options == "Apply time" && strings.Contains(fmt.Sprint(o.Properties), "no sync"))
+		}
+		if !found {
+			t.Error("the Apply time column has no mapping of -1 to no sync")
+		}
+	})
 	t.Run("signed sets sort by the numeric Applied time and show bootstrap", func(t *testing.T) {
 		p := panelByTitle(t, boardByUID(t, "poc-argocd-bundles"), "Signed sets by target")
 		sort := p.Options["sortBy"].([]map[string]any)
@@ -352,7 +389,7 @@ func TestEventCountersFallBackToZero(t *testing.T) {
 		"poc-argocd-bundles": {"Rollbacks 48 h", "Store denials"},
 		"poc-islands":        {"Overlay entries", "Revoked streams closed"},
 		"poc-refusals":       {"Refusals by service"},
-		"poc-work":           {"Queue depth", "Claims 24 h", "Throttled reports", "Steps in flight", "Step stages, last provision"},
+		"poc-work":           {"Operation results by outcome", "Queue depth", "Claims 24 h", "Throttled reports", "Steps in flight", "Step stages, last provision"},
 		"poc-telemetry":      {"Source tags overwritten", "Upstream failures"},
 	}
 	for uid, titles := range want {

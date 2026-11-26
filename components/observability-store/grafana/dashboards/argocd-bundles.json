@@ -305,7 +305,7 @@
         },
         {
           "refId": "B",
-          "expr": "(sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])) / sum by (k8s_cluster_name) (increase(bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or (0 * max by (k8s_cluster_name) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m])))",
+          "expr": "(sum by (k8s_cluster_name) (((bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(bundle_sync_delay_seconds_sum{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) / (sum by (k8s_cluster_name) (((bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(bundle_sync_delay_seconds_count{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) > 0)) or (0 * max by (k8s_cluster_name) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m])) - 1)",
           "instant": true,
           "format": "table"
         }
@@ -490,6 +490,32 @@
               {
                 "id": "unit",
                 "value": "s"
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "-1": {
+                        "color": "#6e7f96",
+                        "index": 0,
+                        "text": "no sync"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
+                  }
+                ]
               }
             ]
           }
