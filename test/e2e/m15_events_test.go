@@ -141,7 +141,15 @@ func TestM15EventsShow(t *testing.T) {
 	t.Run("revoke", func(t *testing.T) {
 		const cell = m9Cell
 		m9RequireStart(t, cell)
+		// Cleanups run in reverse order, so this check runs after the restore of the cell: State reads valid again within a minute.
+		t.Cleanup(func() {
+			m15Within(t, "CELLS_STATE_VALID_AGAIN_SECONDS", `"Cells" State of `+cell+" to read valid after the restore", time.Now(), m15Show, func() (bool, string) {
+				v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "A"), "cluster", cell)
+				return ok && v == 1, fmt.Sprintf("State value %v (found %v)", v, ok)
+			})
+		})
 		m9RestoreCell(t, cell, false)
+		validBefore := m15Total(m15Read(t, "poc-cell-health", "Cells valid", "A"))
 		bansBefore := m15Total(m15Read(t, "poc-spiffe", "Agent bans", "A"))
 		start := m9Now(t)
 		revokedAt := time.Now()
@@ -150,6 +158,10 @@ func TestM15EventsShow(t *testing.T) {
 			ss := m15Read(t, "poc-cell-health", "Cells", "A")
 			v, ok := m15ByLabel(ss, "cluster", cell)
 			return ok && v == 3, fmt.Sprintf("State value %v (found %v)", v, ok)
+		})
+		m15Within(t, "CELLS_VALID_DROPS_SECONDS", `"Cells valid" to drop after the revoke`, revokedAt, m15Show, func() (bool, string) {
+			now := m15Total(m15Read(t, "poc-cell-health", "Cells valid", "A"))
+			return now < validBefore, fmt.Sprintf("%v, was %v", now, validBefore)
 		})
 		m15SeriesNow(t, creds, "poc-cell-health", "Revoked cells", time.Minute)
 		var banAt time.Time
