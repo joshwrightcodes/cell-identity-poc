@@ -74,13 +74,13 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))))) or 0 * count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))))) or 0 * count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
           "instant": true,
           "legendFormat": "valid"
         },
         {
           "refId": "B",
-          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
           "instant": true,
           "legendFormat": "of"
         }
@@ -369,7 +369,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "(count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))) or vector(0)",
+          "expr": "(count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))) or vector(0)",
           "instant": true,
           "legendFormat": "revoked",
           "eventOnly": true
@@ -436,7 +436,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (cluster) (label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 3 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 1 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}[1m]) and on(cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 2)",
+          "expr": "max by (cluster) (label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 3 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 1 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 2)",
           "instant": true,
           "format": "table"
         },
@@ -472,7 +472,7 @@
         },
         {
           "refId": "G",
-          "expr": "label_replace(label_replace(time() - max by (k8s_cluster_name, version, root_digest) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m]) and on(k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}) == on(k8s_cluster_name, role) group_left max by (k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"})))), \"root_digest\", \"$1\", \"root_digest\", \"(?:sha256:)?(.{12}).*\"), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "expr": "label_replace(label_replace(time() - max by (k8s_cluster_name, version, root_digest) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m]) and (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}) == on(k8s_cluster_name, role) group_left max by (k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"})))), \"root_digest\", \"$1\", \"root_digest\", \"(?:sha256:)?(.{12}).*\"), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
           "instant": true,
           "format": "table"
         },

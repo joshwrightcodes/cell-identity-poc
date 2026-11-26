@@ -309,7 +309,7 @@ func TestSpecificPanels(t *testing.T) {
 			{"cells valid", cellCount(`valid="true"`, `revoked="false"`), "cell", "mgmtd_cell_state"},
 			{"state column", stateOf(), "cell", "mgmtd_cell_state"},
 		} {
-			if !strings.Contains(c.expr, " and on("+c.by+") (timestamp("+c.metric+"{") || !strings.Contains(c.expr, "== on("+c.by+") group_left max by ("+c.by+") (timestamp("+c.metric+"{") {
+			if !strings.Contains(c.expr, " and (timestamp("+c.metric+"{") || !strings.Contains(c.expr, "== on("+c.by+") group_left max by ("+c.by+") (timestamp("+c.metric+"{") {
 				t.Errorf("%s does not keep the newest series: %s", c.name, c.expr)
 			}
 		}

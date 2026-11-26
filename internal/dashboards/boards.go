@@ -52,11 +52,12 @@ func fresh(selector, window string) string {
 }
 
 // newest keeps the series of matched that carry the newest sample of their group (the labels in by), and only while a sample is in the window.
+// The outer and matches every label, so an older series of the same group drops out even when its group labels equal those of the newest series.
 // OTLP gives no staleness marker, so after a label changes, the old series stays visible for the lookback. The old series has the older
 // sample time, because the exporter reports every series of one group in one export. all names every series of the group, whatever its other labels.
 // timestamp() reads the bare selector, because it returns the evaluation time for last_over_time().
 func newest(matched, all, window, by string) string {
-	return fresh(matched, window) + " and on(" + by + ") (timestamp(" + matched + ") == on(" + by + ") group_left max by (" + by + ") (timestamp(" + all + ")))"
+	return fresh(matched, window) + " and (timestamp(" + matched + ") == on(" + by + ") group_left max by (" + by + ") (timestamp(" + all + ")))"
 }
 
 // Born returns the increase of a counter in the window, and it counts a series that the window creates as its full value.
