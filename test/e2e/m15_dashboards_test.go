@@ -162,6 +162,18 @@ func TestM15PanelsReturnData(t *testing.T) {
 			}
 		})
 	}
+	// The Trust anchors table shows the root of the management trust domain, which mgmtd exports.
+	t.Run("trust anchors list the management trust domain", func(t *testing.T) {
+		tg := m15FindTarget(t, "poc-spiffe", "Trust anchors", "A")
+		body, err := m15Query(tg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "the Trust anchors query to list mgmt.poc.internal", 2*time.Minute, func() (bool, string) {
+			code, resp := grafanaCall(t, creds, "POST", "/api/ds/query", body)
+			return code == 200 && strings.Contains(string(resp), "mgmt.poc.internal"), fmt.Sprintf("HTTP %d", code)
+		})
+	})
 	if !slices.ContainsFunc(targets, func(tg m15Target) bool { return tg.EventOnly }) {
 		t.Error("the committed dashboards have no event target, so the catalogue changed shape")
 	}

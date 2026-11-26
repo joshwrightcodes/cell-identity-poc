@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -260,6 +261,15 @@ func m15FramesHaveValue(resp []byte) (bool, string) {
 		}
 	}
 	return false, fmt.Sprintf("%d frames, none with a value", len(a.Frames))
+}
+
+// m15Late reports whether a check that passed after elapsed missed its limit.
+func m15Late(elapsed, limit time.Duration) bool { return elapsed > limit }
+
+func TestM15Late(t *testing.T) {
+	if !m15Late(2*time.Minute, time.Minute) || m15Late(59*time.Second, time.Minute) || m15Late(time.Minute, time.Minute) {
+		t.Error("m15Late must be true over the limit and false at or under it")
+	}
 }
 
 func TestM15DashboardFilesParse(t *testing.T) {

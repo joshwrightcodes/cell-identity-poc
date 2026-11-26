@@ -116,7 +116,12 @@ func m15Within(t *testing.T, name, what string, began time.Time, limit time.Dura
 	for {
 		ok, s := check()
 		if ok {
-			t.Logf("%s=%.0f", name, time.Since(began).Seconds())
+			d := time.Since(began)
+			t.Logf("%s=%.0f", name, d.Seconds())
+			if m15Late(d, limit) {
+				t.Errorf("%s showed after %s, over the limit of %s", what, d.Round(time.Second), limit)
+				return false
+			}
 			return true
 		}
 		seen = s
@@ -171,6 +176,14 @@ func TestM15EventsShow(t *testing.T) {
 			v, ok := streams()
 			return ok && v >= 1, fmt.Sprintf("Stream %v (found %v)", v, ok)
 		})
+		// The proof below needs a fresh export age before the cut. At 20 s or less, the threshold of 30 s can only pass because of the cut.
+		var before float64
+		waitFor(t, `"Last telemetry" of `+cell+" to read at most 20 s before the cut", time.Minute, func() (bool, string) {
+			v, ok := m15ByLabel(m15Read(t, "poc-cell-health", "Cells", "H"), "cluster", cell)
+			before = v
+			return ok && v <= 20, fmt.Sprintf("seconds since the last export %v (found %v)", v, ok)
+		})
+		t.Logf("LAST_TELEMETRY_BEFORE_CUT_SECONDS=%.0f", before)
 		// The cut takes effect while the partition command runs, so the bound counts from its start and the log names the command time.
 		cutAt := time.Now()
 		c := cutLink(t, cell, spireCluster, "both", 4*time.Minute)
