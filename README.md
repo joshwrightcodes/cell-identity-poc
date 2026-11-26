@@ -1428,7 +1428,7 @@ The dashboards and rules read these series, which M15 added:
 
 The export interval of the SPIRE server, `agent-ban`, the cell gateway and `mgmtd` is 15 seconds.
 The collector adds the scrape job `istio-agent`. It reads the certificate expiry of each `istio-proxy` on port 15020.
-The measured export of the `dev-cp` collector rose from about 11.0 MB per hour to about 12.1 MB per hour (V8, 2026-11-26).
+The measured export of the `dev-cp` collector rose from about 11.0 MB per hour to about 12.1 MB per hour (measured 2026-11-26).
 That is about 26 MB more in 24 hours, against a margin of about 123 MB.
 
 The eight alert rules evaluate every 30 seconds, and none sends a notification:
@@ -1439,7 +1439,7 @@ The eight alert rules evaluate every 30 seconds, and none sends a notification:
 | Island started | A layer has lost its upstream for more than 120 seconds | warning |
 | Intermediate CA under 7 days | The intermediate CA of a trust domain expires in less than 7 days | critical |
 | Attestation refusals over 10 in 5 minutes | The control plane refused more than 10 attestations of one cell in 5 minutes | warning |
-| Set not applied, or a rollback | A cluster has an application out of sync for 10 minutes, or it rolled back | warning |
+| Set not applied, or a rollback | A cluster has an application out of sync for 10 minutes, or it restored the last good set | warning |
 | Collector queue over 80% of its cap | An exporter queue holds more than 80% of its capacity, for 1 minute | warning |
 | Source tag overwritten | The telemetry gateway overwrote the source tag of a sender | critical |
 | Kiali tunnel down | The Kiali tunnel of a cell is down for 5 minutes | warning |
@@ -1476,13 +1476,13 @@ The gate makes four checks:
 3. `TestM15EventsShow` runs a revoke, a cut and a key rotation, and it waits for each to show on its dashboard.
 4. `TestM15AlertRulesFireAndClear` makes each rule fire and clear, and it rotates the intermediate CA first when it has less than 7 days left.
 
-In the live runs, a revoke showed on Cell health after 11 seconds. The proof of a cut showed after 27 seconds.
+In the live runs, a revoke showed on Cell health after 11 seconds. The proof of a cut showed after 27 seconds. The proof of a cut is the age of the last export of the cut cell at the telemetry gateway, above 30 seconds.
 The Stream column of a cut cell reached 0 after 88 seconds, so the check allows 2 minutes.
 The island rule fired after 133 seconds and cleared after 86 seconds.
 
 The alert test pushes synthetic series over OTLP with the resource attribute `service.name` set to `m15-synthetic`.
 The group label of each series holds a value that starts with `m15-`. The alert carries the label `synthetic` with the value `true`.
-The panels and the variables leave these series out. They stay in Prometheus for 48 hours, and the gate needs no cleanup for them.
+The panels and the variables exclude these series. They stay in Prometheus for 48 hours, and the gate needs no cleanup for them.
 
 `mise run gate:m15:repair` runs `gate:m9:repair`, which heals the cuts, un-revokes the test cells and deletes the namespaces `m9-*`.
 It then finishes a rotation of the intermediate CA that stopped half way, and it deletes the namespaces `m15-*`.
@@ -1500,7 +1500,7 @@ The collector has these parts:
 
 - **Receivers:** OTLP on port 4317 (gRPC), the Prometheus receiver, and `k8s_objects` for the Kubernetes events.
   Port 4318 (HTTP) serves the bundle store only. Its NetworkPolicy admits no other pod on 4318.
-- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istio-agent` (port 15020 of the same pods, at 30 seconds, which keeps only `istio_agent_cert_expiry_seconds`), `istiod` (15014), and `argocd`.
+- **Scrape jobs:** `envoy` reads port 15090 of each pod with an `istio-proxy` container. `istio-agent` reads port 15020 of the same pods every 30 seconds, and it keeps only `istio_agent_cert_expiry_seconds`. `istiod` reads port 15014, and `argocd` is the fourth job.
   The `argocd` job reads ports 8082 and 8084, and the central server on 8083 in `management`.
   Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file.
   These are `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
