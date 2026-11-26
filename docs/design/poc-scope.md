@@ -152,8 +152,11 @@ macOS still sleeps when the lid closes on battery power.
 - `mgmtd` reads the cell keys from the host service on the Mac. It checks each bound cell every 15 minutes, whether or not `dev-cp` is connected.
 - `operator:rotate-key` refuses during a cut, or while `dev-cp` is not connected, before it reads the secret manager. The message names the cut or "not connected". The option `--emergency` needs no old key.
 - The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. The DNS rule admits only the cluster DNS pods and the DNS Service address. CoreDNS can still forward names outside the cluster, so the server pod can send data out in DNS queries (not verified live). This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
-- The island signals have no alert evaluator.
-- The collector queue of `dev-cp` grows by 54 to 58 MiB per hour in an environment island, after the growth starts 20 to 30 minutes in. It grows about 160 MiB in 3 hours 15 minutes. From the queue size before the island, this projects to 1.3 to 1.4 GiB in 24 hours, against a cap of 1.5 GiB. Both slow runs project under 1.5 GiB, and the highest projection is 1.38 GiB.
+- Grafana in `management` evaluates the alert rules of M15, and no rule sends a notification.
+- The telemetry of a cut cluster waits behind the cut. The rules on SVID lifetime and the collector queue fire only for a partial fault.
+- The gate fires each alert rule on synthetic series, which stay in Prometheus for 48 hours.
+- The plugin loses the attestation counts of its last export interval at each restart of the SPIRE server.
+- The collector queue of `dev-cp` grows by 54 to 58 MiB per hour in an environment island, after the growth starts 20 to 30 minutes in. It grows about 160 MiB in 3 hours 15 minutes. From the queue size before the island, this projects to 1.3 to 1.4 GiB in 24 hours, against a cap of 1.5 GiB. Both slow runs project under 1.5 GiB, and the highest projection is 1.38 GiB. The whole collector of `dev-cp` exports about 12.1 MB per hour at an export interval of 15 seconds, against about 11.0 MB per hour before (V8, 2026-11-26).
 - An operation expires 1 hour after its signature, so work queued before a longer island never applies. A bundle set is an operation too.
 - The `celld` status carries no Argo CD health and no collector drops.
 - In the cell island of 2026-11-22, the agents of the cell exited 5 to 39 seconds after their SVIDs expired. Each container restarted in place and attested as a new agent after the heal. The cell kept every pod. Every agent was Ready within 18 seconds of the heal.

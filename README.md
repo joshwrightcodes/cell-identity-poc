@@ -1391,6 +1391,105 @@ The task changes the Secret with a merge patch and never uses `kubectl apply`, b
 If the Secret and Grafana differ after a failed rotation, the error line holds the command that sets Grafana to the password of the Secret. Print it with `scripts/obs-rotate-password.sh --restore-command`. `TestM3GrafanaRestoreCommand` runs it.
 Grafana blocks the user `admin` for 5 minutes after 5 failed logins, and the block refuses the right password too. `cell:verify`, `obs:rotate-password` and the gate each make one or two failed logins on purpose. When a check shows HTTP 401 after several runs in a row, wait 5 minutes before you suspect a wrong password.
 
+### Dashboards and alert rules
+
+Grafana in `management` provisions eight dashboards and eight alert rules from files.
+The Go package `internal/dashboards` generates the files, and the bundle `observability-store` carries them into `lgtm-0`.
+The dashboards sit in the folder `Cell identity PoC`. The alert rules sit in the folder `Cell identity PoC alerts`.
+Each dashboard has a variable for the cluster, and most have a variable for the cell.
+Sign in as described above. Then open `Dashboards` and the folder `Cell identity PoC`.
+
+Each dashboard answers one question:
+
+| Dashboard | Question |
+| --- | --- |
+| Cell health overview | Is each cell valid, connected and in step with its spec? It shows the SVID life left, the gateway streams, the outbox, islands and revoked cells |
+| Islands and revocation | Which layer lost its upstream, and how long ago? It also shows the collector queue of `dev-cp`, the overlay entries and the streams that a revoke closed |
+| Argo CD and bundle sets | Does each cluster run the signed set? It shows the applications, the rollbacks of the last 48 hours, the sync time after a tag move and the store denials |
+| SPIFFE and SPIRE | Does attestation work? It shows attestations and refusals by reason, the agents of each cell, the agent bans and the key checks. It also shows the expiry of each trust anchor |
+| Telemetry pipeline | Does each sender reach the store? It shows the exports that the gateway accepted, the source tags that it overwrote and the seconds since the last export |
+| Mesh and Kiali | Does the mesh use mTLS and answer requests? It shows the request success, the Kiali tunnels and the shortest life of a proxy certificate |
+| Work and provisioning steps | Does the work queue move? It shows the queue depth, the claims, the throttled reports, the open steps and the stages of the last provision |
+| Refusals across the PoC | Which service refuses requests, and why? It shows the refusal counts by service and the latest refusal lines from Loki |
+
+The stat "Cells valid" counts the cells that are valid and not revoked.
+The panel "Rollbacks 48 h" covers 48 hours, because Prometheus keeps 48 hours.
+A panel for the reach of a revoke waits for M14.
+An event panel, for example a rollback count, can read 0 or stay empty until the first event.
+
+The dashboards and rules read these series, which M15 added:
+
+- `cluster_jwt.attestations` counts each attestation by cell, result and reason. The SPIRE plugin exports it over OTLP, so a restart of the SPIRE server loses the counts of its last export interval.
+- `agentban.agents` counts the live agents of each cell.
+- `trust.ca.not_after` and `celld.svid.lifetime` report the expiry of each CA and the lifetime of each SVID.
+- `bundle.set.applied` and `bundle.sync.delay` report the applied set and the time that a cluster needs to sync after a tag move.
+- `mgmtd.cell.state` reports each cell as valid or not valid, and as revoked or not.
+- `cellctl.steps.open` and `cellctl.step.stage.duration` report the open steps and the time of each stage.
+
+The export interval of the SPIRE server, `agent-ban`, the cell gateway and `mgmtd` is 15 seconds.
+The collector adds the scrape job `istio-agent`. It reads the certificate expiry of each `istio-proxy` on port 15020.
+The measured export of the `dev-cp` collector rose from about 11.0 MB per hour to about 12.1 MB per hour (V8, 2026-11-26).
+That is about 26 MB more in 24 hours, against a margin of about 123 MB.
+
+The eight alert rules evaluate every 30 seconds, and none sends a notification:
+
+| Rule | Fires when | Severity |
+| --- | --- | --- |
+| SVID under a quarter of its lifetime | The SVID of a cell has under 25% of its lifetime left, for 5 minutes | warning |
+| Island started | A layer has lost its upstream for more than 120 seconds | warning |
+| Intermediate CA under 7 days | The intermediate CA of a trust domain expires in less than 7 days | critical |
+| Attestation refusals over 10 in 5 minutes | The control plane refused more than 10 attestations of one cell in 5 minutes | warning |
+| Set not applied, or a rollback | A cluster has an application out of sync for 10 minutes, or it rolled back | warning |
+| Collector queue over 80% of its cap | An exporter queue holds more than 80% of its capacity, for 1 minute | warning |
+| Source tag overwritten | The telemetry gateway overwrote the source tag of a sender | critical |
+| Kiali tunnel down | The Kiali tunnel of a cell is down for 5 minutes | warning |
+
+A rule with no data stays in the state OK.
+
+The files are read-only in Grafana, so an edit in the UI does not persist.
+Change `internal/dashboards` instead. Then publish the change in these steps:
+
+```sh
+mise run obs:dashboards
+mise run obs:dashboards:check
+mise run images
+CELL=management mise run cell:hydrate
+CELL=management mise run cell:publish
+```
+
+`obs:dashboards` writes the files under `components/observability-store/grafana`.
+`obs:dashboards:check` prints each file that differs from the generated output, and it exits 1 when one differs.
+The publish makes Argo CD restart `lgtm-0` after about 3 minutes.
+The cell gateway is a late harness component, so `cell:publish` does not reach it. Change it with `CELL=dev-cp HARNESS_ONLY=cell-gateway mise run cell:up`.
+
+### Gate of M15
+
+`mise run gate:m15` runs the end-to-end tests of this section. Build the images first with `mise run images`.
+The task runs the repair checks of M6 to M9 and the image check of M8. Then it runs the tests whose names start with `TestM15`.
+Afterwards it scans the logs for a token. `GATE_M15_BUDGET_MINUTES` is 100, and `GATE_M15_TEST_TIMEOUT_MINUTES` is 200.
+A Go timeout skips every cleanup, so run `gate:m15:repair` after a timeout.
+
+The gate makes four checks:
+
+1. `TestM15Provisioned` checks that Grafana holds the eight dashboards and eight rules, and that they come from files.
+2. `TestM15PanelsReturnData` runs every panel query on a fresh harness. A panel for an event can stay empty.
+3. `TestM15EventsShow` runs a revoke, a cut and a key rotation, and it waits for each to show on its dashboard.
+4. `TestM15AlertRulesFireAndClear` makes each rule fire and clear, and it rotates the intermediate CA first when it has less than 7 days left.
+
+In the live runs, a revoke showed on Cell health after 11 seconds. The proof of a cut showed after 27 seconds.
+The Stream column of a cut cell reached 0 after 88 seconds, so the check allows 2 minutes.
+The island rule fired after 133 seconds and cleared after 86 seconds.
+
+The alert test pushes synthetic series over OTLP with the resource attribute `service.name` set to `m15-synthetic`.
+The group label of each series holds a value that starts with `m15-`. The alert carries the label `synthetic` with the value `true`.
+The panels and the variables leave these series out. They stay in Prometheus for 48 hours, and the gate needs no cleanup for them.
+
+`mise run gate:m15:repair` runs `gate:m9:repair`, which heals the cuts, un-revokes the test cells and deletes the namespaces `m9-*`.
+It then finishes a rotation of the intermediate CA that stopped half way, and it deletes the namespaces `m15-*`.
+`mise run gate:m15:repair -- --check` only reports, and it fails with the repair command when it finds a trace.
+Each run repeats the restart of `dev-cp` and each live cell, so a run takes several minutes.
+`mise run poc:gate -- fast` runs `gate:m15` after `gate:m8`.
+
 ## Collectors and uplinks
 
 Every cluster runs the StatefulSet `otel-collector` in `observability-system`, at wave 3.
@@ -1401,7 +1500,7 @@ The collector has these parts:
 
 - **Receivers:** OTLP on port 4317 (gRPC), the Prometheus receiver, and `k8s_objects` for the Kubernetes events.
   Port 4318 (HTTP) serves the bundle store only. Its NetworkPolicy admits no other pod on 4318.
-- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istiod` (15014), and `argocd`.
+- **Scrape jobs:** `envoy` (port 15090 of each pod with an `istio-proxy` container), `istio-agent` (port 15020 of the same pods, at 30 seconds, which keeps only `istio_agent_cert_expiry_seconds`), `istiod` (15014), and `argocd`.
   The `argocd` job reads ports 8082 and 8084, and the central server on 8083 in `management`.
   Each cluster adds the jobs in `COLLECTOR_JOBS` of its env file.
   These are `argocd-agent` (8181) in a cell, `spire-server` (9988) in `management` and `dev-cp`, and `argocd-agent-principal` (8000) in `management`.
@@ -2061,8 +2160,11 @@ CELL=dev-cp mise run cell:up
 CELL=management mise run cell:link
 CELL=dev-cell-1 mise run cell:up
 CELL=dev-cell-2 mise run cell:up
+CELL=management mise run cell:up
 mise run harness:status
 ```
+
+The last `cell:up` rolls `central-view`, `telemetry-gateway`, `argocd-agent-principal` and `mesh-view-hub` in `management`. They keep old images without it.
 
 `harness:status` fails for each pod that runs an image other than the one in `build/images.env`.
 A collector export retry can fail it once, and it clears within 5 minutes.
