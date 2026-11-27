@@ -20,9 +20,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/spiffe/spire-plugin-sdk/pluginmain"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/server/nodeattestor/v1"
@@ -30,9 +32,13 @@ import (
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/clusterjwt"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/install"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
 )
 
 const binaryName = "cluster-jwt-server"
+
+// pluginFlushTimeout stays below the 2 s that go-plugin waits for a graceful exit before it kills the plugin.
+const pluginFlushTimeout = 1500 * time.Millisecond
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == banMode {
@@ -45,6 +51,27 @@ func main() {
 		os.Exit(install.Run(binaryName, os.Args[1:], os.Stdout, os.Executable))
 	}
 	p := clusterjwt.New()
+	if os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" {
+		// Stdout carries the go-plugin handshake, so telemetry writes its own log lines to stderr.
+		// go-plugin replaces os.Stderr when Serve starts, so the code keeps the real descriptor.
+		stderr := os.Stderr
+		tel, err := telemetry.Start(context.Background(), binaryName, stderr)
+		if err != nil {
+			fmt.Fprintln(stderr, "cluster-jwt-server: start telemetry:", err)
+			os.Exit(1)
+		}
+		if err := p.SetMeter(tel.Meter); err != nil {
+			fmt.Fprintln(stderr, "cluster-jwt-server:", err)
+			os.Exit(1)
+		}
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), pluginFlushTimeout)
+			defer cancel()
+			if err := tel.Shutdown(sctx); err != nil {
+				fmt.Fprintln(stderr, "cluster-jwt-server: telemetry shutdown:", err)
+			}
+		}()
+	}
 	pluginmain.Serve(
 		nodeattestorv1.NodeAttestorPluginServer(p),
 		configv1.ConfigServiceServer(p),

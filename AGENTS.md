@@ -30,6 +30,8 @@
 | New view keys and central Redis password, then restarts | `mise run view:rotate-keys` |
 | Grafana of `management` on 127.0.0.1:3300, and its admin password (see README "Telemetry store") | `mise run obs:ui`, `mise run obs:password` |
 | New Grafana admin password, through the Grafana API and Secret `grafana-admin` | `mise run obs:rotate-password` |
+| Write the Grafana dashboards, alert rules and provider file from `internal/dashboards` (see README "Dashboards and alert rules") | `mise run obs:dashboards` |
+| List each generated dashboard file that differs from the generator output, and exit 1 when one differs | `mise run obs:dashboards:check` |
 | Report each hop of the telemetry path of one cluster, and the first failing hop (see README "Collectors and uplinks") | `mise run obs:uplink-status dev-cell-1` |
 | Render bundles only | `mise run cell:hydrate` |
 | Push bundles after a change to a cell or `dev-cp`, which take only signed sets | `CELL=<cluster> mise run cell:hydrate && mise run bundle -- publish --target <cluster> --wait` |
@@ -72,7 +74,9 @@
 | Trace a signed operation (`trace <id>`: its state at `mgmtd` and its gateway queue rows) or close it (`close <id>`) | `mise run ops -- trace <id>` |
 | Run the M9 slow tier overnight (see README "Gate of M9"; build the images first) | `mise run gate:m9` |
 | Repair what `gate:m9` leaves: cuts, revoked test cells, held entries, the lifetime and `m9-*` namespaces (`--check` only reports) | `mise run gate:m9:repair` |
-| Run the gates as tiers: `fast` (M1 to M8), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
+| Run the M15 end-to-end gate: dashboards, alert rules and the checks of the telemetry store (see README "Gate of M15"; build the images first) | `mise run gate:m15` |
+| Repair what `gate:m15` leaves: it runs `gate:m9:repair`, then deletes `m15-*` namespaces (`--check` only reports) | `mise run gate:m15:repair` |
+| Run the gates as tiers: `fast` (M1 to M8, then M15), `slow` (M9) or `all` | `mise run poc:gate -- fast` |
 | Cut and heal the traffic between two clusters: `cut`, `heal` or `list` (see README "Island mode and revocation") | `mise run partition -- cut --from dev-cell-2 --to dev-cp --hold 10` |
 | Switch the SVID lifetime of `dev-cp` for the slow tier: `set <ttl>`, `restore` or `show` | `mise run svid-ttl -- show` |
 | Revoke a cell through `mgmtd`, or undo it, while `dev-cp` is connected | `mise run mgmt -- revoke --cell dev-cell-2`, `mise run mgmt -- unrevoke --cell dev-cell-2` |

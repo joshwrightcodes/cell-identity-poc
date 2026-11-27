@@ -2,6 +2,8 @@ package render
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -348,5 +350,340 @@ func TestTelemetryGatewayRender(t *testing.T) {
 		env["OTEL_RESOURCE_ATTRIBUTES"] != "service.instance.id=$(POD_NAME),k8s.cluster.name=management,platform.plane=management" {
 		t.Errorf("the gateway exports to %q with the resource %q, want the store and the management row",
 			env["OTEL_EXPORTER_OTLP_ENDPOINT"], env["OTEL_RESOURCE_ATTRIBUTES"])
+	}
+}
+
+// storeRender runs the render of the observability-store component from the tree at root, as the render of management does.
+func storeRender(t *testing.T, root string) result {
+	t.Helper()
+	return runStubbed(t, "/ko-app/stub", "", []string{filepath.Join(root, "components", "observability-store", "render.sh")},
+		append([]string{"STUB_CELL=management"}, bundleFacts...)...)
+}
+
+// storeTree copies the files of the store into a new tree that links the shared scripts, so a test can change a file.
+func storeTree(t *testing.T) string {
+	t.Helper()
+	real := repoRoot(t)
+	root := t.TempDir()
+	for _, link := range []string{"scripts", "cells", "harness"} {
+		if err := os.Symlink(filepath.Join(real, link), filepath.Join(root, link)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "components"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(real, "components", "lib"), filepath.Join(root, "components", "lib")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.CopyFS(filepath.Join(root, "components", "observability-store"), os.DirFS(filepath.Join(real, "components", "observability-store"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(root, "components", "observability-store", "render.sh"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// TestLgtmGrafanaProvisioning checks that each dashboard has its own ConfigMap, that lgtm-grafana holds the provider file and the
+// rules, that the pod mounts them where Grafana reads them, and that the checksum of the pod covers every file.
+func TestLgtmGrafanaProvisioning(t *testing.T) {
+	t.Parallel()
+	objs := clusterComponent(t, "management", "observability-store")
+	files, err := filepath.Glob("../../components/observability-store/grafana/dashboards/*.json")
+	if err != nil || len(files) != 8 {
+		t.Fatalf("dashboards %v (%v), want 8 files", files, err)
+	}
+	var sources []any
+	for _, f := range files {
+		name := strings.TrimSuffix(filepath.Base(f), ".json")
+		want, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cm := objs["ConfigMap observability-system/lgtm-dashboard-"+name]
+		if cm == nil {
+			t.Errorf("no ConfigMap lgtm-dashboard-%s in %v", name, keysOfObjects(objs))
+			continue
+		}
+		data := get[map[string]any](t, cm, "data")
+		if len(data) != 1 || data[name+".json"] != string(want) {
+			t.Errorf("ConfigMap lgtm-dashboard-%s has keys %v, want only %s.json with the file content", name, keysOf(data), name)
+		}
+		if len(want) > 256<<10 {
+			t.Errorf("%s has %d bytes, want at most 256 KiB", f, len(want))
+		}
+		sources = append(sources, map[string]any{"configMap": map[string]any{"name": "lgtm-dashboard-" + name}})
+	}
+	grafana := objs["ConfigMap observability-system/lgtm-grafana"]
+	if grafana == nil {
+		t.Fatal("no ConfigMap lgtm-grafana")
+	}
+	for key, file := range map[string]string{"provider.yaml": "provider.yaml", "rules.json": "alerting/rules.json"} {
+		want, err := os.ReadFile("../../components/observability-store/grafana/" + file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := get[map[string]any](t, grafana, "data"); len(got) != 2 || got[key] != string(want) {
+			t.Errorf("ConfigMap lgtm-grafana key %s differs from %s, or the ConfigMap has keys %v", key, file, keysOf(got))
+		}
+	}
+
+	sts := objs["StatefulSet observability-system/lgtm"]
+	spec := get[map[string]any](t, sts, "spec", "template", "spec")
+	ctr := named(t, get[[]any](t, spec, "containers"), "lgtm")
+	type mount struct{ name, subPath string }
+	mounts := map[string]mount{}
+	for _, m := range get[[]any](t, ctr, "volumeMounts") {
+		mounts[get[string](t, m, "mountPath")] = mount{get[string](t, m, "name"), fmt.Sprint(lookupOr(m, "subPath"))}
+		if strings.Contains(get[string](t, m, "mountPath"), "/otel-lgtm/") && lookupOr(m, "readOnly") != true && get[string](t, m, "name") != "data" {
+			t.Errorf("mount %v is not read-only", m)
+		}
+	}
+	for path, want := range map[string]mount{
+		"/otel-lgtm/grafana/conf/provisioning/dashboards/poc.yaml":     {"grafana-config", "provider.yaml"},
+		"/otel-lgtm/grafana/conf/provisioning/alerting/poc-rules.json": {"grafana-config", "rules.json"},
+		"/otel-lgtm/poc-dashboards":                                    {"grafana-dashboards", "<nil>"},
+	} {
+		if mounts[path] != want {
+			t.Errorf("mount %s is %v, want %v", path, mounts[path], want)
+		}
+	}
+	vols := get[[]any](t, spec, "volumes")
+	if got := get[string](t, named(t, vols, "grafana-config"), "configMap", "name"); got != "lgtm-grafana" {
+		t.Errorf("volume grafana-config reads %s, want lgtm-grafana", got)
+	}
+	if got := fmt.Sprint(get[[]any](t, named(t, vols, "grafana-dashboards"), "projected", "sources")); got != fmt.Sprint(sources) {
+		t.Errorf("the projected volume has sources %s, want %s", got, fmt.Sprint(sources))
+	}
+
+	t.Run("checksum", func(t *testing.T) {
+		t.Parallel()
+		sumOf := func(root string) string {
+			r := storeRender(t, root)
+			if r.err != nil {
+				t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+			}
+			sts := docsIn(t, r.stdout, "observability-system")["StatefulSet/lgtm"]
+			return get[string](t, sts, "spec", "template", "metadata", "annotations", "poc.internal/lgtm-config-sha256")
+		}
+		root := storeTree(t)
+		base := sumOf(root)
+		if len(base) != 64 {
+			t.Fatalf("checksum %q, want 64 hex digits", base)
+		}
+		for _, f := range []string{"dashboards/mesh.json", "provider.yaml", "alerting/rules.json"} {
+			p := filepath.Join(root, "components", "observability-store", "grafana", f)
+			orig, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, append(slices.Clone(orig), ' '), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := sumOf(root); got == base {
+				t.Errorf("checksum does not change when %s gets one byte", f)
+			}
+			if err := os.WriteFile(p, orig, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if got := sumOf(root); got != base {
+			t.Errorf("checksum %s after the restore, want %s", got, base)
+		}
+	})
+	t.Run("size cap", func(t *testing.T) {
+		t.Parallel()
+		root := storeTree(t)
+		p := filepath.Join(root, "components", "observability-store", "grafana", "dashboards", "mesh.json")
+		if err := os.WriteFile(p, []byte(strings.Repeat("x", 256<<10+1)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := storeRender(t, root)
+		if r.err == nil || !strings.Contains(r.stderr, "mesh.json") || !strings.Contains(r.stderr, "the limit is 262144") {
+			t.Errorf("render of a dashboard above 256 KiB gave %v and %q, want a failure that names the file", r.err, r.stderr)
+		}
+	})
+	t.Run("size cap of one ConfigMap", func(t *testing.T) {
+		t.Parallel()
+		root := storeTree(t)
+		dir := filepath.Join(root, "components", "observability-store", "grafana")
+		if err := os.WriteFile(filepath.Join(dir, "provider.yaml"), []byte(strings.Repeat("#", 130<<10)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "alerting", "rules.json"), []byte(strings.Repeat(" ", 130<<10)+"{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		r := storeRender(t, root)
+		if r.err == nil || !strings.Contains(r.stderr, "provider.yaml") || !strings.Contains(r.stderr, "the limit is 262144") {
+			t.Errorf("render of lgtm-grafana files above 256 KiB together gave %v and %q, want a failure that names the files", r.err, r.stderr)
+		}
+	})
+}
+
+// TestCollectorIstioAgentJob checks the job that reads the certificate expiry of each proxy on 15020. The container declares
+// 15090 only, so the job keeps that port and rewrites the address.
+func TestCollectorIstioAgentJob(t *testing.T) {
+	t.Parallel()
+	for _, cl := range collectorClusters {
+		t.Run(cl.name, func(t *testing.T) {
+			objs := clusterComponent(t, cl.name, "observability-system")
+			var job map[string]any
+			for _, j := range get[[]any](t, collectorConfig(t, objs), "receivers", "prometheus", "config", "scrape_configs") {
+				if get[string](t, j, "job_name") == "istio-agent" {
+					job = j.(map[string]any)
+				}
+			}
+			if job == nil {
+				t.Fatal("no job istio-agent")
+			}
+			if got := get[string](t, job, "metrics_path"); got != "/stats/prometheus" {
+				t.Errorf("metrics_path %s, want /stats/prometheus", got)
+			}
+			if got := get[string](t, job, "scrape_interval"); got != "30s" {
+				t.Errorf("scrape_interval %s, want 30s", got)
+			}
+			if got := fmt.Sprint(get[[]any](t, job, "kubernetes_sd_configs")[0]); !strings.Contains(got, "names:[apps-demo apps-sample istio-egress]") {
+				t.Errorf("the job reads %s, want apps-demo, apps-sample and istio-egress", got)
+			}
+			relabel := fmt.Sprint(get[[]any](t, job, "relabel_configs"))
+			if want := "map[regex:(.+) replacement:$$1:15020 source_labels:[__meta_kubernetes_pod_ip] target_label:__address__]"; !strings.Contains(relabel, want) {
+				t.Errorf("relabel_configs %s lack the address rewrite %s", relabel, want)
+			}
+			for _, want := range []string{"regex:istio-proxy;15090", "action:keep", "target_label:pod", "target_label:namespace"} {
+				if !strings.Contains(relabel, want) {
+					t.Errorf("relabel_configs %s lack %s", relabel, want)
+				}
+			}
+			if strings.Contains(relabel, "15090") && strings.Contains(relabel, "replacement:$$1:15090") {
+				t.Errorf("relabel_configs %s scrape 15090", relabel)
+			}
+			if got := fmt.Sprint(get[[]any](t, job, "metric_relabel_configs")); got != "[map[action:keep regex:istio_agent_cert_expiry_seconds;default source_labels:[__name__ resource_name]]]" {
+				t.Errorf("metric_relabel_configs %s, want a keep of istio_agent_cert_expiry_seconds with resource_name default", got)
+			}
+			if !strings.Contains(get[string](t, objs["ConfigMap observability-system/otel-collector"], "data", "config.yaml"), "$$1:15020") {
+				t.Error("the replacement of the istio-agent job does not escape the dollar sign")
+			}
+			rule := ""
+			for _, r := range get[[]any](t, objs["NetworkPolicy observability-system/collector-egress"], "spec", "egress") {
+				if ports := fmt.Sprint(lookupOr(r, "ports")); strings.Contains(ports, "15020") && ports != "[map[port:15020 protocol:TCP]]" {
+					t.Errorf("the collector egress rule on 15020 has ports %s, want only TCP 15020", ports)
+				}
+			}
+			for _, r := range peerRules(t, objs["NetworkPolicy observability-system/collector-egress"], "egress") {
+				if strings.Join(r.ports, ",") == "15020" {
+					rule = r.peers
+				}
+			}
+			for _, ns := range []string{"apps-demo", "apps-sample", "istio-egress"} {
+				if !strings.Contains(rule, ns) {
+					t.Errorf("the collector egress on 15020 is %q, want it to name %s", rule, ns)
+				}
+			}
+		})
+	}
+}
+
+// TestNetworkPolicyIstioAgentPort checks that each policy that admits the collector on 15090 also admits it on 15020, and no other peer.
+func TestNetworkPolicyIstioAgentPort(t *testing.T) {
+	t.Parallel()
+	collectorPeer := "[map[namespaceSelector:map[matchLabels:map[kubernetes.io/metadata.name:observability-system]] podSelector:map[matchLabels:map[app.kubernetes.io/name:otel-collector]]]]"
+	for _, cl := range collectorClusters {
+		t.Run(cl.name, func(t *testing.T) {
+			for _, name := range []string{"NetworkPolicy apps-demo/workloads", "NetworkPolicy apps-sample/workloads", "NetworkPolicy istio-egress/egress-gateway"} {
+				np := clusterComponent(t, cl.name, "network-policy")[name]
+				if np == nil {
+					t.Errorf("no %s", name)
+					continue
+				}
+				for _, r := range get[[]any](t, np, "spec", "ingress") {
+					if ports := fmt.Sprint(lookupOr(r, "ports")); strings.Contains(ports, "15020") && ports != "[map[port:15020 protocol:TCP]]" {
+						t.Errorf("%s has an ingress rule with ports %s, want only TCP 15020", name, ports)
+					}
+				}
+				var on15090, on15020 []string
+				for _, r := range peerRules(t, np, "ingress") {
+					if slices.Contains(r.ports, "15090") {
+						on15090 = append(on15090, r.peers)
+					}
+					if slices.Contains(r.ports, "15020") {
+						on15020 = append(on15020, r.peers)
+					}
+				}
+				if !slices.Equal(on15090, []string{collectorPeer}) || !slices.Equal(on15020, []string{collectorPeer}) {
+					t.Errorf("%s admits %v on 15090 and %v on 15020, want only the collector on both", name, on15090, on15020)
+				}
+			}
+		})
+	}
+}
+
+// TestSpireServerPluginTelemetry checks that container spire-server of dev-cp sends OTLP to the collector, so the plugin that it
+// starts inherits the endpoint. The container sets no service name, because the plugin would take it. A cluster with no live
+// cell keeps no cluster_jwt plugin and no variable.
+func TestSpireServerPluginTelemetry(t *testing.T) {
+	t.Parallel()
+	server := func(t *testing.T, r result, cluster string) map[string]any {
+		t.Helper()
+		if r.err != nil {
+			t.Fatalf("render failed: %v\n%s", r.err, r.stderr)
+		}
+		pod := get[map[string]any](t, docs(t, hydrated(r.stdout, cluster))["StatefulSet/spire-server"], "spec", "template", "spec")
+		return named(t, get[[]any](t, pod, "containers"), "spire-server")
+	}
+	env := envOf(t, server(t, renderCell(t, "dev-cp"), "dev-cp"))
+	if env["OTEL_EXPORTER_OTLP_ENDPOINT"] != "http://otel-collector.observability-system.svc.cluster.local:4317" {
+		t.Errorf("spire-server sends OTLP to %q, want the collector Service on 4317", env["OTEL_EXPORTER_OTLP_ENDPOINT"])
+	}
+	if env["OTEL_METRIC_EXPORT_INTERVAL"] != "15000" {
+		t.Errorf("spire-server exports every %q ms, want 15000", env["OTEL_METRIC_EXPORT_INTERVAL"])
+	}
+	for k := range env {
+		if k == "OTEL_SERVICE_NAME" || k == "OTEL_RESOURCE_ATTRIBUTES" {
+			t.Errorf("spire-server sets %s, which would rename the plugin service", k)
+		}
+	}
+	t.Run("no live cell", func(t *testing.T) {
+		if env := envOf(t, server(t, renderCell(t, "dev-cp", liveEnv("management dev-cp rogue")), "dev-cp")); len(env) != 0 {
+			t.Errorf("spire-server has the environment %v with no cluster_jwt section, want none", env)
+		}
+	})
+}
+
+// TestExportInterval checks the four emitters on the paths of the gate: mgmtd, the cell gateway, agent-ban and spire-server.
+func TestExportInterval(t *testing.T) {
+	t.Parallel()
+	found := map[string]int{}
+	for _, cr := range renderAll(t) {
+		for _, c := range cr.components {
+			for _, o := range c.objs {
+				for _, pod := range podSpecs(o) {
+					for _, ctr := range containersOf(pod) {
+						name := get[string](t, ctr, "name")
+						env := envOf(t, ctr)
+						switch name {
+						case "mgmtd", "cellgw", "agent-ban", "spire-server":
+						default:
+							if env["OTEL_METRIC_EXPORT_INTERVAL"] != "" && c.name != "telemetry-gateway" {
+								t.Errorf("%s/%s container %s sets an export interval of %s", cr.name, c.name, name, env["OTEL_METRIC_EXPORT_INTERVAL"])
+							}
+							continue
+						}
+						if _, ok := env["OTEL_EXPORTER_OTLP_ENDPOINT"]; !ok {
+							continue
+						}
+						found[name]++
+						if env["OTEL_METRIC_EXPORT_INTERVAL"] != "15000" {
+							t.Errorf("%s/%s container %s exports every %q ms, want 15000", cr.name, c.name, name, env["OTEL_METRIC_EXPORT_INTERVAL"])
+						}
+					}
+				}
+			}
+		}
+	}
+	for _, name := range []string{"mgmtd", "cellgw", "agent-ban", "spire-server"} {
+		if found[name] == 0 {
+			t.Errorf("no container %s sends OTLP in any render", name)
+		}
 	}
 }

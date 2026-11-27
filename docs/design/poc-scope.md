@@ -39,6 +39,7 @@ It also shows three properties that the owner set:
 | Bundles | `celld` in each cell and envd in `dev-cp` apply bundle sets that the management plane signs. Each applier pushes the bundles to the bundle store, and Argo CD applies them. A rollback points the root back at the last good root that the management plane signed | Bundles, Argo CD and safe updates |
 | Central view | Argo CD Agent in autonomous mode, with the principal in `management`. Agents connect through `cell-proxy` and a TLS passthrough relay in `dev-cp`. An admission policy in the cell blocks every write, every annotation except refresh, `.operation`, and exec | Central Argo CD view |
 | Observability | The `otel-lgtm` image in `management` runs Grafana, Loki, Tempo and Prometheus. Each cluster's collector scrapes local Prometheus endpoints and receives OTLP. It exports OTLP through `cell-proxy` and the telemetry relay to a gateway in `management` | Telemetry |
+| Dashboards and alerts | Grafana provisions the dashboards and alert rules from files in the store bundle. Grafana in `management` evaluates every rule, and no rule sends a notification | Telemetry |
 | Mesh view | Kiali in `management` reads mesh metrics from the stack. It reads each cell's mesh state through a tunnel that the cell's `cell-proxy` opens up to `management` | Mesh view |
 | Island mode | Both levels, with no trust change during an island | Island mode |
 | Revocation | The management plane revokes in a spec. During an island, an operator revokes locally, and the overlay holds until a spec from the management plane includes it | Revocation |
@@ -55,7 +56,7 @@ These stay in the target architecture, and come in later increments:
 | Restore with epochs, rebuild from empty, provider inventory and the sweeper | Disaster recovery work, once the core holds |
 | Relay hardening: outer mTLS, per-cell caps, revocation at the relay | The PoC relay only passes TLS through. The management plane enforces identity |
 | Watchdog and blue/green updates of `celld` and Argo CD | In the PoC, the harness updates `celld`, and a bundle updates Argo CD. The residual limits say what a bundle can still change |
-| HPA fan-out, cross-environment requests, alert evaluators, the personal-data canary test | Scale and operations work |
+| HPA fan-out, cross-environment requests, alert evaluators inside each cluster, alert notifications, the personal-data canary test | Scale and operations work |
 | EKS, ACK, the tailnet and AWS-specific network rules | The second environment target |
 | Integration tests in GitHub CI | Hosted runners for private repositories have 2 CPUs and 8 GB. CI runs unit and component tests only |
 
@@ -108,8 +109,9 @@ it exists.
 | M7 | Malicious cell and MITM | Check 4 passes. A rogue cluster, a rogue JWKS, TLS interception at each hop, and a relay that alters bytes all fail |
 | M8 | Bundles | Bundles that the management plane signs reach Argo CD in each cell and in `dev-cp`. A bundle outside its allow-list fails, and a rollback restores the last good root |
 | M9 | Island mode and revocation | Both island levels hold for three SVID lifetimes, with no pod restarts. Revocation works connected and locally |
+| M15 | Dashboards and alert rules | Grafana in `management` provisions eight dashboards and eight alert rules from files in the `observability-store` bundle. Each panel query returns data on a fresh harness. A revoke, a cut and a key rotation each show on their dashboard within one minute. Each alert rule fires and clears in `gate:m15` |
 
-The full gate runs on the Mac, with a fast tier for M1–M8 and a slow tier for M9. Each tier has a
+The full gate runs on the Mac, with a fast tier for M1–M8 and M15 and a slow tier for M9. Each tier has a
 time budget, set at M1. The Mac must stay awake for the whole gate, so a keep-awake tool must run.
 macOS still sleeps when the lid closes on battery power.
 
@@ -150,8 +152,11 @@ macOS still sleeps when the lid closes on battery power.
 - `mgmtd` reads the cell keys from the host service on the Mac. It checks each bound cell every 15 minutes, whether or not `dev-cp` is connected.
 - `operator:rotate-key` refuses during a cut, or while `dev-cp` is not connected, before it reads the secret manager. The message names the cut or "not connected". The option `--emergency` needs no old key.
 - The SPIRE server pod of `dev-cp` sends OTLP to the collector on TCP 4317, and resolves DNS. The DNS rule admits only the cluster DNS pods and the DNS Service address. CoreDNS can still forward names outside the cluster, so the server pod can send data out in DNS queries (not verified live). This is the one network flow that M9 adds. The collector admits every pod of `spire-system`, so any pod there can send signals as that namespace.
-- The island signals have no alert evaluator.
-- The collector queue of `dev-cp` grows by 54 to 58 MiB per hour in an environment island, after the growth starts 20 to 30 minutes in. It grows about 160 MiB in 3 hours 15 minutes. From the queue size before the island, this projects to 1.3 to 1.4 GiB in 24 hours, against a cap of 1.5 GiB. Both slow runs project under 1.5 GiB, and the highest projection is 1.38 GiB.
+- Grafana in `management` evaluates the alert rules of M15, and no rule sends a notification.
+- The telemetry of a cut cluster waits behind the cut. The rules on SVID lifetime and the collector queue fire only for a partial fault.
+- The gate fires each alert rule on synthetic series, which stay in Prometheus for 48 hours.
+- The plugin loses the attestation counts of its last export interval at each restart of the SPIRE server.
+- The collector queue of `dev-cp` grows by 54 to 58 MiB per hour in an environment island, after the growth starts 20 to 30 minutes in. It grows about 160 MiB in 3 hours 15 minutes. From the queue size before the island, this projects to 1.3 to 1.4 GiB in 24 hours. The cap is 1.5 GiB. Both slow runs project under 1.5 GiB, and the highest projection is 1.38 GiB. The whole collector of `dev-cp` exports about 12.1 MB per hour at an export interval of 15 seconds. Before, it exported about 11.0 MB per hour (measured 2026-11-26).
 - An operation expires 1 hour after its signature, so work queued before a longer island never applies. A bundle set is an operation too.
 - The `celld` status carries no Argo CD health and no collector drops.
 - In the cell island of 2026-11-22, the agents of the cell exited 5 to 39 seconds after their SVIDs expired. Each container restarted in place and attested as a new agent after the heal. The cell kept every pod. Every agent was Ready within 18 seconds of the heal.

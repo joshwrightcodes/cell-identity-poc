@@ -794,11 +794,11 @@ func TestGateM9RepairStore(t *testing.T) {
 	})
 }
 
-// TestPocGateFastOrder: poc-gate.sh fast runs gate:m1 to gate:m8, with gate:m6:provision after gate:m6, and stops at the first failure. The
+// TestPocGateFastOrder: poc-gate.sh fast runs gate:m1 to gate:m8, with gate:m6:provision after gate:m6, then gate:m15, and stops at the first failure. The
 // manual drills do not run. GATE_FAST_BUDGET_MINUTES bounds it when set. slow runs gate:m9, and all runs fast and then slow.
 func TestPocGateFastOrder(t *testing.T) {
 	t.Parallel()
-	fast := []string{"gate:m1", "gate:m2", "gate:m3", "gate:m4", "gate:m5", "gate:m6", "gate:m6:provision", "gate:m7", "gate:m8"}
+	fast := []string{"gate:m1", "gate:m2", "gate:m3", "gate:m4", "gate:m5", "gate:m6", "gate:m6:provision", "gate:m7", "gate:m8", "gate:m15"}
 	gates := func(calls string) []string {
 		var out []string
 		for _, l := range strings.Split(calls, "\n") {
@@ -816,11 +816,12 @@ func TestPocGateFastOrder(t *testing.T) {
 	}{
 		{name: "fast", tier: "fast", want: fast},
 		{name: "fast stops at a failure", tier: "fast", env: []string{"STUB_FAIL_GATES=gate:m5"}, want: fast[:5], fail: "gate:m5"},
+		{name: "fast stops before the last gate", tier: "fast", env: []string{"STUB_FAIL_GATES=gate:m8"}, want: fast[:9], fail: "gate:m8"},
 		{name: "fast over its budget", tier: "fast", budget: "1", env: []string{"STUB_GATE_SECONDS=10"}, want: fast, fail: "budget"},
 		{name: "fast within its budget", tier: "fast", budget: "2", env: []string{"STUB_GATE_SECONDS=10"}, want: fast},
 		{name: "slow", tier: "slow", want: []string{"gate:m9"}},
 		{name: "all", tier: "all", want: append(append([]string{}, fast...), "gate:m9")},
-		{name: "all stops after a failed fast tier", tier: "all", env: []string{"STUB_FAIL_GATES=gate:m8"}, want: fast, fail: "gate:m8"},
+		{name: "all stops after a failed fast tier", tier: "all", env: []string{"STUB_FAIL_GATES=gate:m15"}, want: fast, fail: "gate:m15"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

@@ -73,6 +73,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spec"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/trustmetrics"
 )
 
 const (
@@ -236,6 +237,7 @@ type runConfig struct {
 	upstream     string
 	expect       spiffeid.ID
 	peer         *x509bundle.Bundle
+	peerBundle   string
 	key          ed25519.PublicKey
 	env          string
 	namespace    string
@@ -363,7 +365,7 @@ func parseRun(args []string) (runConfig, error) {
 	if err != nil {
 		return runConfig{}, err
 	}
-	rc := runConfig{upstream: *upstream, expect: id, peer: peer, key: key, keyFile: *keyFile, env: *env, namespace: ns,
+	rc := runConfig{upstream: *upstream, expect: id, peer: peer, peerBundle: *bundle, key: key, keyFile: *keyFile, env: *env, namespace: ns,
 		configMap: cm, interval: *interval, reportRate: *reportRate, healthListen: *health,
 		gateway: strings.TrimSuffix(*gateway, "/"), gatewayID: gwID, hintsNS: hns, hintsName: hname,
 		stepsNS: sns, stepsName: sname, statusNS: stns, statusName: stname, cluster: *cluster,
@@ -495,6 +497,12 @@ func serve(ctx context.Context, cfg runConfig, tel *telemetry.T, d deps) error {
 		return err
 	}
 	defer closeSVIDs()
+
+	if err := trustmetrics.Register(tel.Meter, func() []trustmetrics.Chain {
+		return trustChains(svids, cfg)
+	}); err != nil {
+		return err
+	}
 
 	mgmtClient, gateway, err := newClients(svids, cfg)
 	if err != nil {
@@ -640,6 +648,11 @@ func tokenFromFile(path string) func() (string, error) {
 		}
 		return tok, nil
 	}
+}
+
+// trustChains returns the chain and the bundle of the envd SVID and the roots of the --peer-bundle file.
+func trustChains(svids x509svid.Source, cfg runConfig) []trustmetrics.Chain {
+	return append(trustmetrics.SourceChains(svids), trustmetrics.FileChain(cfg.expect.TrustDomain().String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
 }
 
 // newClients builds the client of the management plane and the client of the gateway. The gateway

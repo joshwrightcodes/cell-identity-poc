@@ -59,7 +59,7 @@ operator_key_name_valid() {
 # first, then spec.name of operator-pub. It reads operator-pub itself when no JSON is given. It prints nothing and returns 1 when no
 # name exists, and when the name is not valid (operator_key_name_valid), with the reason on standard error.
 operator_key_name() {
-  local env_file="${BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}/operator/key.env" name="" cm
+  local env_file="${BUILD_ROOT:-${POC_BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}}/operator/key.env" name="" cm
   [[ ! -f "$env_file" ]] || name="$(sed -n '/^OPERATOR_KEY_NAME=/{s///p;q;}' "$env_file")"
   if [[ -z "$name" ]]; then
     if (($# > 0)); then cm="$1"; else cm="$(operator_pub_cm)" || return 1; fi
@@ -174,7 +174,7 @@ operator_pub_keys() {
     [[ -z "$pinned" || "$pinned" == "$want" ]] || changed+=("$(operator_pin_name "$cluster" "$which")")
   done
   # build/operator/key.env holds the SHA-256 of the key that the owner created. Another spec.pub is a change, also while a pin is absent.
-  env_sha="$(sed -n '/^OPERATOR_KEY_SHA256=/{s///p;q;}' "${BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}/operator/key.env" 2>/dev/null || true)"
+  env_sha="$(sed -n '/^OPERATOR_KEY_SHA256=/{s///p;q;}' "${BUILD_ROOT:-${POC_BUILD_ROOT:-$OPERATOR_KEY_ROOT/build}}/operator/key.env" 2>/dev/null || true)"
   if [[ -n "$env_sha" && "$env_sha" != "$(operator_pub_sha256 "$(printf '%s\n' "$keys" | sed -n 1p)")" ]]; then
     changed+=("build/operator/key.env")
   fi

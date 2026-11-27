@@ -1,0 +1,407 @@
+{
+  "uid": "poc-work",
+  "title": "Work and provisioning steps",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cell",
+        "label": "Cell",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "definition": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "kind",
+        "label": "Step state",
+        "type": "custom",
+        "query": "admitting,bootstrapping,creating,failed,queued",
+        "definition": "admitting,bootstrapping,creating,failed,queued",
+        "refresh": 0,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Queue depth",
+      "description": "Operations that the gateway holds in the queue of a cell. The gauge has no series while every queue is empty. Reads cellgw_queue_depth.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(last_over_time(cellgw_queue_depth{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[1m]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Claims 24 h",
+      "description": "Operations that the cells claimed in the last 24 hours. Reads cellgw_claims_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(((cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset 24h) or increase(cellgw_claims_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[24h])))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Throttled reports",
+      "description": "Reports that envd throttled in the time range. Reads envd_reports_throttled_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(((envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_reports_throttled_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Steps in flight",
+      "description": "Steps that the cell controller tracks and that have no final state. Reads cellctl_steps_open.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(last_over_time(cellctl_steps_open{k8s_cluster_name=\"dev-cp\", state=~\"$kind\", service_name!=\"m15-synthetic\"}[2m]))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Operation results by outcome",
+      "description": "Operations that each celld finished in each hour, by outcome. Reads celld_ops_results_total.",
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum by (outcome) (((celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"} unless celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"} offset 1h) or increase(celld_ops_results_total{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1h])))) or on() vector(0)",
+          "range": true,
+          "legendFormat": "{{outcome}}",
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "Step stages, last provision",
+      "description": "Median time that steps spent in each stage in the time range. Reads cellctl_step_stage_duration_seconds_bucket.",
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(histogram_quantile(0.5, sum by (stage, le) (increase(cellctl_step_stage_duration_seconds_bucket{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or on() vector(0)",
+          "instant": true,
+          "legendFormat": "{{stage}}",
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+{
+  "uid": "poc-refusals",
+  "title": "Refusals across the PoC",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "loki",
+          "uid": "loki"
+        },
+        "query": "label_values(service_name)",
+        "definition": "label_values(service_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "bargauge",
+      "title": "Refusals by service",
+      "description": "Refusals in the time range, one bar for each service. The variable Service filters the log table only. Reads cellgw_refusals_total, envd_spec_refusals_total, envd_revocations_refused_total, cellctl_refusals_total, store_proxy_denials_total, cell_proxy_tunnel_refused_requests_total, cellproxy_gateway_exports_denied_total, cluster_jwt_attestations_total, relay_connections_total.",
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(((cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellgw_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "cellgw",
+          "eventOnly": true
+        },
+        {
+          "refId": "B",
+          "expr": "(sum(((envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_spec_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "envd spec",
+          "eventOnly": true
+        },
+        {
+          "refId": "C",
+          "expr": "(sum(((envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(envd_revocations_refused_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "envd revocations",
+          "eventOnly": true
+        },
+        {
+          "refId": "D",
+          "expr": "(sum(((cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} unless cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellctl_refusals_total{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "cellctl",
+          "eventOnly": true
+        },
+        {
+          "refId": "E",
+          "expr": "(sum(((store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(store_proxy_denials_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "store proxy",
+          "eventOnly": true
+        },
+        {
+          "refId": "F",
+          "expr": "(sum(((cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "cell proxy tunnel",
+          "eventOnly": true
+        },
+        {
+          "refId": "G",
+          "expr": "(sum(((cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "telemetry gateway",
+          "eventOnly": true
+        },
+        {
+          "refId": "H",
+          "expr": "(sum(((cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} unless cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cluster_jwt_attestations_total{k8s_cluster_name=\"dev-cp\", result=\"refused\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "cluster_jwt",
+          "eventOnly": true
+        },
+        {
+          "refId": "I",
+          "expr": "(sum(((relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"} unless relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"} offset $__range) or increase(relay_connections_total{k8s_cluster_name=\"dev-cp\", result=~\"overloaded|source_limit|upstream_write_failed\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "legendFormat": "relay",
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "color": {
+            "fixedColor": "#fab219",
+            "mode": "fixed"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Latest refusals",
+      "description": "Log lines of Loki that carry a reason. Lines with the reason library_log are debug lines and stay out.",
+      "gridPos": {
+        "h": 10,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{k8s_cluster_name=~\"$cluster\", service_name=~\"$service\"} | reason != \"\" | reason != \"library_log\"",
+          "queryType": "range"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": true,
+            "displayName": "Time"
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "format": "json",
+            "source": "labels"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "timestamp",
+                "Time",
+                "service_name",
+                "reason",
+                "request_id"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Time": 0,
+              "reason": 2,
+              "request_id": 3,
+              "service_name": 1,
+              "timestamp": 0
+            },
+            "renameByName": {
+              "reason": "Reason",
+              "request_id": "Request ID",
+              "service_name": "Service",
+              "timestamp": "Time"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

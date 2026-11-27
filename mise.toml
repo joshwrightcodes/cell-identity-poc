@@ -120,6 +120,14 @@ description = "Rotate the Grafana admin password of management through the Grafa
 env = { CELL = "management" }
 run = "scripts/obs-rotate-password.sh"
 
+[tasks."obs:dashboards"]
+description = "Write the Grafana dashboards, alert rules and provider file under components/observability-store/grafana from internal/dashboards"
+run = "go run ./cmd/dashgen --out components/observability-store/grafana"
+
+[tasks."obs:dashboards:check"]
+description = "Print each file under components/observability-store/grafana that differs from the generated output, and exit 1 when one differs. Writes nothing"
+run = "go run ./cmd/dashgen --check components/observability-store/grafana"
+
 [tasks."obs:uplink-status"]
 description = "Report each hop of the telemetry path of one cluster: its collector queue and failures, the uplink, the gateway counts for that sender, and the newest sample in the store. Prints one JSON object that names the first failing hop"
 usage = 'arg "<cluster>"'
@@ -302,12 +310,20 @@ run = "scripts/gate.sh m9"
 description = "Repair what a slow tier of gate:m9 left when it stopped early: heal every cut, wait until connected and until envd holds no local revocation entry, run revoke -- clean, un-revoke the test cells, repair the API server of a key rotation test, restore the SVID lifetime of dev-cp with a restart of each cluster, delete the namespaces m9-*, refill the bundle store of a cell that the store test left empty, and run harness:status. With --check, only list the traces, and fail with the repair command. Safe to run again"
 run = "scripts/gate-m9-repair.sh"
 
+[tasks."gate:m15"]
+description = "Run the M15 end-to-end tests: dashboards, alert rules and the checks of the observability store, plus the go test arguments after --. It runs the repair checks of M6 to M9 and the image check of M8 first, and scans the logs for a token afterwards. The task builds no image: run mise run images first"
+run = "scripts/gate.sh m15"
+
+[tasks."gate:m15:repair"]
+description = "Repair what a gate:m15 run left. It runs gate:m9:repair, which heals the cuts, un-revokes the test cells and deletes the namespaces m9-*. That repair also fixes the test key of the API server and restarts dev-cp and each live cell. The script then deletes the namespaces m15-*. With --check, it only reports, and it fails with the repair command. Each run repeats the restarts. Safe to run again"
+run = "scripts/gate-m15-repair.sh"
+
 [tasks."svid-ttl"]
 description = "Switch the SVID lifetime of dev-cp for the slow tier, with the arguments after --: set <ttl> writes build/gate/m9-svid-ttl, runs cell:up of dev-cp and waits until every SVID has the lifetime; restore removes the marker, runs cell:up of dev-cp and cell:restart of dev-cp and each live cell, and waits; show prints the lifetimes. Each prints one JSON line. set and restore need dev-cp connected to management"
 run = "scripts/svid-ttl.sh"
 
 [tasks."poc:gate"]
-description = "Run the gates as tiers, with the argument after --: fast runs gate:m1 to gate:m8 with gate:m6:provision and stops at the first failure, slow runs gate:m9, and all runs both. It keeps the Mac awake, and it refuses battery power unless GATE_ALLOW_BATTERY=1. The manual drills gate:m4:rotate, gate:m5:soak and gate:m5:drill do not run"
+description = "Run the gates as tiers, with the argument after --: fast runs gate:m1 to gate:m8 with gate:m6:provision, then gate:m15, and stops at the first failure, slow runs gate:m9, and all runs both. It keeps the Mac awake, and it refuses battery power unless GATE_ALLOW_BATTERY=1. The manual drills gate:m4:rotate, gate:m5:soak and gate:m5:drill do not run"
 run = "scripts/poc-gate.sh"
 
 [tasks.partition]

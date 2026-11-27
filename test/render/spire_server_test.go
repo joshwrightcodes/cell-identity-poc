@@ -508,7 +508,7 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 	cellKeys := cellEnvKeys(t)
 	var base []string
 	for _, e := range os.Environ() {
-		if k, _, _ := strings.Cut(e, "="); !cellKeys[k] {
+		if k, _, _ := strings.Cut(e, "="); !cellKeys[k] && k != "BUILD_ROOT" && k != "POC_BUILD_ROOT" {
 			base = append(base, e)
 		}
 	}
@@ -520,7 +520,9 @@ exec "$1"`, "_", common, file, argv[0]}, overrides...)
 		"STUB_LOG="+logFile, "STUB_LAYER_FILE="+layer, "STUB_MANIFEST_FILE="+manifest,
 		"STUB_BUNDLE_FILE="+bundleFile, "STUB_MGMT_BUNDLE_FILE="+mgmtBundleFile, "STUB_PKIGEN="+pkigen(t), "IMAGES_ENV="+imagesFile,
 		"HOSTSVC_SERVE="+hostsvcServe, "STUB_PIN_FILE="+write("hostsvc.crt", caPEM(t, "host.docker.internal"), 0o644),
-		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"))
+		"STUB_REPO="+repoRoot(t), "POC_ENV="+commonEnv(t, "POC_ENV"),
+		// An empty build root keeps the operator key lookup away from build/operator/key.env of the checkout.
+		"POC_BUILD_ROOT="+t.TempDir())
 	cmd.Env = append(cmd.Env, env...)
 	if stdin != "" {
 		cmd.Stdin = strings.NewReader(stdin)
@@ -1130,6 +1132,8 @@ func TestSpireServerDevCPKeepsM2Objects(t *testing.T) {
 	// M9 adds the ban container. TestAgentBanContainer checks it.
 	pod["containers"] = slices.DeleteFunc(get[[]any](t, pod, "containers"), func(c any) bool { return get[string](t, c, "name") == "agent-ban" })
 	server := named(t, get[[]any](t, pod, "containers"), "spire-server")
+	// M15 adds the telemetry environment. TestSpireServerPluginTelemetry checks it.
+	delete(server, "env")
 	server["volumeMounts"] = slices.DeleteFunc(get[[]any](t, server, "volumeMounts"), func(v any) bool { return get[string](t, v, "name") == "api-token" })
 	for _, o := range []object{got["StatefulSet/spire-server"], m2["StatefulSet/spire-server"]} {
 		delete(get[map[string]any](t, o, "spec", "template", "metadata", "annotations"), "cell.poc.internal/config-checksum")

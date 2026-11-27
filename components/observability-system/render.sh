@@ -173,6 +173,25 @@ scrape_jobs() {
               action: keep
 EOF
   pod_labels
+  # The certificate expiry of the proxy lives on 15020 only. The port is not declared on the container, so the job
+  # starts from the declared port 15090 and rewrites the address. The keep filter leaves one series for each pod.
+  scrape_head istio-agent /stats/prometheus apps-demo apps-sample istio-egress
+  cat <<EOF
+            - source_labels: [__meta_kubernetes_pod_container_name, __meta_kubernetes_pod_container_port_number]
+              regex: istio-proxy;15090
+              action: keep
+            - source_labels: [__meta_kubernetes_pod_ip]
+              regex: (.+)
+              replacement: ${D}1:15020
+              target_label: __address__
+EOF
+  pod_labels
+  cat <<'EOF'
+          metric_relabel_configs:
+            - source_labels: [__name__, resource_name]
+              regex: istio_agent_cert_expiry_seconds;default
+              action: keep
+EOF
   scrape_head istiod - istio-system
   cat <<EOF
             - source_labels: [__meta_kubernetes_pod_label_app, __meta_kubernetes_pod_container_name]
@@ -535,6 +554,12 @@ $(namespace_in apps-demo apps-sample istio-egress)
       ports:
         - protocol: TCP
           port: 15090
+    - to:
+        - namespaceSelector:
+$(namespace_in apps-demo apps-sample istio-egress)
+      ports:
+        - protocol: TCP
+          port: 15020
     - to:
         - namespaceSelector:
             matchLabels:

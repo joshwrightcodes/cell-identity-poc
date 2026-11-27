@@ -119,6 +119,8 @@ spec:
               value: mgmtd
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "15000"
           ports:
             - name: api
               containerPort: 8446

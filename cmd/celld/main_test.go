@@ -1186,3 +1186,47 @@ func TestCelldSvidRemaining(t *testing.T) {
 		t.Fatalf("remaining %v after expiry, want 0", got)
 	}
 }
+
+// The lifetime gauge reports NotAfter minus NotBefore of the current SVID, and 0 while there is none.
+func TestSvidLifetime(t *testing.T) {
+	ca := newCA(t)
+	resp := ca.svid(t, 1).Svids[0]
+	svid, err := x509svid.ParseRaw(resp.X509Svid, resp.X509SvidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := sdkmetric.NewManualReader()
+	tel, err := testTelemetry(discard())(t.Context(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tel.Meter = sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)).Meter("test")
+	w, err := newSVIDWatcher(tel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func() float64 {
+		t.Helper()
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(t.Context(), &rm); err != nil {
+			t.Fatal(err)
+		}
+		for _, sm := range rm.ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if m.Name == "celld.svid.lifetime" {
+					return m.Data.(metricdata.Gauge[float64]).DataPoints[0].Value
+				}
+			}
+		}
+		t.Fatal("no celld.svid.lifetime metric")
+		return 0
+	}
+	if got := read(); got != 0 {
+		t.Fatalf("lifetime %v with no SVID, want 0", got)
+	}
+	w.OnX509ContextUpdate(&workloadapi.X509Context{SVIDs: []*x509svid.SVID{svid}})
+	leaf := svid.Certificates[0]
+	if got, want := read(), leaf.NotAfter.Sub(leaf.NotBefore).Seconds(); got != want || got <= 0 {
+		t.Fatalf("lifetime %v, want %v", got, want)
+	}
+}

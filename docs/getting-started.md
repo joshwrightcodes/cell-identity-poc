@@ -139,7 +139,22 @@ The `agents` field of `harness:status` lists the agents with an open stream.
 
 ### Grafana
 
-Open Explore in Grafana. Choose the Prometheus data source. Run this query:
+Grafana holds eight dashboards in the folder `Cell identity PoC`. Open `Dashboards`. Then open that folder.
+Each dashboard answers one question:
+
+- **Cell health overview:** is each cell valid, connected and in step with its spec?
+- **Islands and revocation:** which layer lost its upstream, and how long ago?
+- **Argo CD and bundle sets:** does each cluster run the signed set?
+- **SPIFFE and SPIRE:** does attestation work, and when does each trust anchor expire?
+- **Telemetry pipeline:** does each sender reach the store?
+- **Mesh and Kiali:** does the mesh use mTLS and answer requests?
+- **Work and provisioning steps:** does the work queue move?
+- **Refusals across the PoC:** which service refuses requests, and why?
+
+Eight alert rules sit in the folder `Cell identity PoC alerts`. They send no notification. The dashboards are read-only, so a change in the UI does not persist.
+[Dashboards and alert rules](../README.md#dashboards-and-alert-rules) gives the details.
+
+For a quick check, open Explore. Choose the Prometheus data source. Run this query:
 
 ```promql
 sum by (sender_cluster, attribute) (cellproxy_gateway_attribute_overwrites_total)

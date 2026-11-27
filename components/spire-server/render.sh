@@ -247,6 +247,7 @@ if ((${#live[@]} == 0)); then
   drop_volumes+=(plugins records)
   edits+=" | del($pod.initContainers) | del($pod.containers[] | select(.name == \"agent-ban\"))"
   drop_objects+=("NetworkPolicy/spire-server-otlp")
+  edits+=" | del($pod.containers[] | select(.name == \"spire-server\") | .env)"
   edits+=" | ($service.type) = \"ClusterIP\" | del($service.externalTrafficPolicy) | del($service.ports[].nodePort)"
 fi
 if [[ "$upstream" != disk ]]; then

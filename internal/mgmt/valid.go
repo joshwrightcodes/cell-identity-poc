@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/joshwrightcodes/cell-identity-poc/internal/mgmtapi"
@@ -62,8 +63,9 @@ func (p *Plane) validOf(st *State, name string, live cellRuntime, applied spec.R
 	return ValidOf(in, now)
 }
 
-// observeValid reports the count of valid cells.
-func (p *Plane) observeValid(_ context.Context, o metric.Int64Observer) error {
+// observeCells reports the count of valid cells and one state series for each intent cell. One
+// pass reads both, so the two metrics agree and noteValidLocked runs once for each cell.
+func (p *Plane) observeCells(_ context.Context, o metric.Observer) error {
 	st := p.snap.Load().st
 	now := p.cfg.Now()
 	p.rmu.Lock()
@@ -74,13 +76,23 @@ func (p *Plane) observeValid(_ context.Context, o metric.Int64Observer) error {
 		if c := p.rt.cells[name]; c != nil {
 			live = *c
 		}
-		ok, _ := p.validOf(st, name, live, p.rep.applied, now)
+		ok, reason := p.validOf(st, name, live, p.rep.applied, now)
 		p.noteValidLocked(name, ok, now)
 		if ok {
 			n++
 		}
+		revoked := false
+		if c := st.Cells[name]; c != nil {
+			revoked = c.Revoked
+		}
+		o.ObserveInt64(p.cellState, 1, metric.WithAttributes(
+			attribute.String("cell", name),
+			attribute.Bool("valid", ok),
+			attribute.Bool("revoked", revoked),
+			attribute.String("reason", reason),
+		))
 	}
-	o.Observe(n)
+	o.ObserveInt64(p.cellsValid, n)
 	return nil
 }
 

@@ -1,0 +1,1205 @@
+{
+  "uid": "poc-cell-health",
+  "title": "Cell health overview",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cell",
+        "label": "Cell",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "definition": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Cells valid",
+      "description": "Cells whose record is valid and not revoked, of the cells in the intent. Each cell counts once. Reads mgmtd_cell_state.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", valid=\"true\", revoked=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))))) or 0 * count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
+          "instant": true,
+          "legendFormat": "valid"
+        },
+        {
+          "refId": "B",
+          "expr": "count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))",
+          "instant": true,
+          "legendFormat": "of"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Spec revision lag",
+      "description": "Spec revisions that the cells have not yet applied. Reads mgmtd_spec_revision_lag.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 4,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(mgmtd_spec_revision_lag{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Gateway streams",
+      "description": "Open cell streams at the gateway of dev-cp. Reads cellgw_streams.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(last_over_time(cellgw_streams{k8s_cluster_name=\"dev-cp\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1m]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Outbox items",
+      "description": "Items that the gateway holds for the cells. Reads cellgw_outbox_items.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(cellgw_outbox_items{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Islands now",
+      "description": "Layers whose upstream age is over 2 minutes. Reads cellproxy_gateway_last_export_time_seconds, celld_upstream_age_seconds, envd_upstream_age_seconds.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(count(max by (cluster) (label_replace(time() - cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"sender_cluster\", \"(.+)\") or label_replace(celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\") or label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")) > 120)) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Revoked cells",
+      "description": "Cells that the record marks revoked, and the revocations that the overlay holds. Reads mgmtd_cell_state, envd_revocations_held.",
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(count(count by (cell) (last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"})))))) or vector(0)",
+          "instant": true,
+          "legendFormat": "revoked",
+          "eventOnly": true
+        },
+        {
+          "refId": "B",
+          "expr": "sum(envd_revocations_held{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "overlay held"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#d03b3b",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Cells",
+      "description": "One row for each cluster. A column that does not apply shows n/a. Reads mgmtd_cell_state, celld_svid_remaining_seconds, celld_upstream_age_seconds, envd_upstream_age_seconds, cellgw_streams, argocd_app_info, bundle_set_applied_seconds, cellproxy_gateway_last_export_time_seconds, cell_proxy_tunnel_up.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (cluster) (label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 3 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"true\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 1 or label_replace(last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}[1m]) and (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", revoked=\"false\", valid=\"false\", service_name!=\"m15-synthetic\"}) == on(cell) group_left max by (cell) (timestamp(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}))), \"cluster\", \"$1\", \"cell\", \"(.+)\") * 2)",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "B",
+          "expr": "max by (cluster) (label_replace(celld_svid_remaining_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\"))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "C",
+          "expr": "max by (cluster) (label_replace(celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"platform_cell\", \"(.+)\")) or max by (cluster) (label_replace(envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\"))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "D",
+          "expr": "max by (cluster) (label_replace(sum by (cell) (last_over_time(cellgw_streams{k8s_cluster_name=\"dev-cp\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[1m])), \"cluster\", \"$1\", \"cell\", \"(.+)\")) or max by (cluster) (label_replace(0 * last_over_time(mgmtd_cell_state{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[1m]), \"cluster\", \"$1\", \"cell\", \"(.+)\"))",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "E",
+          "expr": "label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", sync_status=\"Synced\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\") or 0 * label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "F",
+          "expr": "label_replace(count by (k8s_cluster_name) (argocd_app_info{job=\"argocd\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "G",
+          "expr": "label_replace(label_replace(time() - max by (k8s_cluster_name, version, root_digest) (last_over_time(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[2m]) and (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}) == on(k8s_cluster_name, role) group_left max by (k8s_cluster_name, role) (timestamp(bundle_set_applied_seconds{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"})))), \"root_digest\", \"$1\", \"root_digest\", \"(?:sha256:)?(.{12}).*\"), \"cluster\", \"$1\", \"k8s_cluster_name\", \"(.+)\")",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "H",
+          "expr": "label_replace(time() - max by (sender_cluster) (cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}), \"cluster\", \"$1\", \"sender_cluster\", \"(.+)\")",
+          "instant": true,
+          "format": "table"
+        },
+        {
+          "refId": "I",
+          "expr": "max by (cluster) (label_replace(cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}, \"cluster\", \"$1\", \"cell\", \"(.+)\"))",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "color": "#6e7f96",
+                  "index": 99,
+                  "text": "n/a"
+                }
+              },
+              "type": "special"
+            }
+          ],
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "1": {
+                        "color": "#0ca30c",
+                        "index": 0,
+                        "text": "valid"
+                      },
+                      "2": {
+                        "color": "#ec835a",
+                        "index": 1,
+                        "text": "not valid"
+                      },
+                      "3": {
+                        "color": "#d03b3b",
+                        "index": 2,
+                        "text": "revoked"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SVID left"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Upstream age"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle version"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0.0": {
+                        "color": "#6e7f96",
+                        "index": 0,
+                        "text": "bootstrap"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle digest"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0.0": {
+                        "color": "#6e7f96",
+                        "index": 0,
+                        "text": "bootstrap"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle applied"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last telemetry"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "s"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Mesh tunnel"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "0": {
+                        "color": "#d03b3b",
+                        "index": 0,
+                        "text": "down"
+                      },
+                      "1": {
+                        "color": "#0ca30c",
+                        "index": 1,
+                        "text": "up"
+                      }
+                    },
+                    "type": "value"
+                  },
+                  {
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "color": "#6e7f96",
+                        "index": 99,
+                        "text": "n/a"
+                      }
+                    },
+                    "type": "special"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Apps synced"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Apps total"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle applied"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle digest"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Bundle version"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Cell"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last telemetry"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Mesh tunnel"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "SVID left"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "State"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Stream"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Upstream age"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "desc": false,
+            "displayName": "Cell"
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "cluster",
+            "mode": "outer"
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "cluster",
+                "Value #A",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #E",
+                "Value #F",
+                "version",
+                "root_digest",
+                "Value #G",
+                "Value #H",
+                "Value #I"
+              ]
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #E": 5,
+              "Value #F": 6,
+              "Value #G": 9,
+              "Value #H": 10,
+              "Value #I": 11,
+              "cluster": 0,
+              "root_digest": 8,
+              "version": 7
+            },
+            "renameByName": {
+              "Value #A": "State",
+              "Value #B": "SVID left",
+              "Value #C": "Upstream age",
+              "Value #D": "Stream",
+              "Value #E": "Apps synced",
+              "Value #F": "Apps total",
+              "Value #G": "Bundle applied",
+              "Value #H": "Last telemetry",
+              "Value #I": "Mesh tunnel",
+              "cluster": "Cell",
+              "root_digest": "Bundle digest",
+              "version": "Bundle version"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "celld SVID remaining",
+      "description": "Time left on the SVID of each celld. The dashed line is a quarter of the SVID lifetime. Reads celld_svid_remaining_seconds, celld_svid_lifetime_seconds.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "celld_svid_remaining_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}",
+          "range": true,
+          "legendFormat": "{{platform_cell}}"
+        },
+        {
+          "refId": "B",
+          "expr": "max(0.25 * celld_svid_lifetime_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "alert at 25%"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "alert at 25%"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d03b3b",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Upstream age by layer",
+      "description": "Seconds since each layer last heard from upstream. The dashed line is the island threshold. Reads celld_upstream_age_seconds, envd_upstream_age_seconds.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}",
+          "range": true,
+          "legendFormat": "{{platform_cell}}"
+        },
+        {
+          "refId": "B",
+          "expr": "envd_upstream_age_seconds{k8s_cluster_name=\"dev-cp\", k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}",
+          "range": true,
+          "legendFormat": "dev-cp"
+        },
+        {
+          "refId": "C",
+          "expr": "0 * max(celld_upstream_age_seconds{platform_cell=~\"$cell\", service_name!=\"m15-synthetic\"}) + 120",
+          "range": true,
+          "legendFormat": "island at 2 min"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "island at 2 min"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#fab219",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

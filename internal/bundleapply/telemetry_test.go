@@ -2,11 +2,14 @@ package bundleapply
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -20,6 +23,7 @@ type telemetryEnv struct {
 	*env
 	spans  *tracetest.SpanRecorder
 	reader *sdkmetric.ManualReader
+	meter  metric.Meter
 }
 
 func newTelemetryEnv(t *testing.T) *telemetryEnv {
@@ -31,7 +35,8 @@ func newTelemetryEnv(t *testing.T) *telemetryEnv {
 	t.Cleanup(func() { _ = tp.Shutdown(t.Context()); _ = mp.Shutdown(t.Context()) })
 	cfg := e.cfg
 	cfg.Tracer = tp.Tracer("test")
-	cfg.Meter = mp.Meter("test")
+	te.meter = mp.Meter("test")
+	cfg.Meter = te.meter
 	e.a = e.applier(cfg)
 	return te
 }
@@ -221,5 +226,356 @@ func TestTelemetryTerminateFailures(t *testing.T) {
 	want := attribute.NewSet(attribute.String("role", "cell"), attribute.String("app", "apps-sample"))
 	if got := te.sum(t, "bundle.rollback.terminate.failures", want); got != 1 {
 		t.Fatalf("bundle.rollback.terminate.failures for apps-sample = %d, want 1", got)
+	}
+}
+
+// syncDelays returns the count and sum of bundle.sync.delay for a result.
+func (te *telemetryEnv) syncDelays(t *testing.T, result string) (count uint64, sum float64) {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := te.reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	want := attribute.NewSet(attribute.String("role", "cell"), attribute.String("result", result))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "bundle.sync.delay" {
+				continue
+			}
+			h, ok := m.Data.(metricdata.Histogram[float64])
+			if !ok {
+				t.Fatalf("sync delay is %T", m.Data)
+			}
+			if m.Unit != "s" {
+				t.Errorf("sync delay unit = %q", m.Unit)
+			}
+			for _, dp := range h.DataPoints {
+				if dp.Attributes.Equals(&want) {
+					count += dp.Count
+					sum += dp.Sum
+				}
+			}
+		}
+	}
+	return count, sum
+}
+
+type appliedSeries struct {
+	attrs attribute.Set
+	value int64
+}
+
+// applied returns the series of bundle.set.applied.
+func (te *telemetryEnv) applied(t *testing.T) []appliedSeries {
+	t.Helper()
+	return appliedFrom(t, te.reader)
+}
+
+func appliedFrom(t *testing.T, reader *sdkmetric.ManualReader) []appliedSeries {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := reader.Collect(t.Context(), &rm); err != nil {
+		t.Fatal(err)
+	}
+	var out []appliedSeries
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "bundle.set.applied" {
+				continue
+			}
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok {
+				t.Fatalf("set applied is %T", m.Data)
+			}
+			if m.Unit != "s" {
+				t.Errorf("set applied unit = %q", m.Unit)
+			}
+			for _, dp := range g.DataPoints {
+				out = append(out, appliedSeries{dp.Attributes, dp.Value})
+			}
+		}
+	}
+	return out
+}
+
+func wantSeries(t *testing.T, got []appliedSeries, version, root, state string, at time.Time) {
+	t.Helper()
+	if len(got) != 1 {
+		t.Fatalf("%d series of bundle.set.applied, want 1: %v", len(got), got)
+	}
+	want := attribute.NewSet(attribute.String("role", "cell"), attribute.String("version", version),
+		attribute.String("root.digest", root), attribute.String("state", state))
+	if !got[0].attrs.Equals(&want) {
+		t.Fatalf("attributes = %v, want %v", got[0].attrs.ToSlice(), want.ToSlice())
+	}
+	if got[0].value != at.Unix() {
+		t.Fatalf("value = %d, want %d", got[0].value, at.Unix())
+	}
+}
+
+func rootChars(b built) string { return strings.TrimPrefix(b.root.Digest, "sha256:")[:12] }
+
+func TestSyncDelayRecorded(t *testing.T) {
+	te := newTelemetryEnv(t)
+	cfg := te.cfg
+	cfg.Poll = 7 * time.Second
+	cfg.Tracer, cfg.Meter = nil, te.meter
+	te.a = te.applier(cfg)
+	wantOutcome(t, te.apply("opA", te.set(1, std("a"))), op.OutcomeApplied, "", "")
+	count, sum := te.syncDelays(t, "synced")
+	if count != 1 || sum != 7 {
+		t.Fatalf("sync delay count %d sum %v, want 1 and 7", count, sum)
+	}
+}
+
+func TestSyncDelayResult(t *testing.T) {
+	te := newTelemetryEnv(t)
+	wantOutcome(t, te.apply("opA", te.set(1, std("a"))), op.OutcomeApplied, "", "")
+	if c, _ := te.syncDelays(t, "synced"); c != 1 {
+		t.Fatalf("synced count = %d", c)
+	}
+	// A Degraded component ends the wait with an unhealthy result.
+	b := te.set(2, std("b"))
+	te.health = func(root, app string) (string, string) {
+		if root == b.root.Digest && app == "apps-sample" {
+			return "Synced", "Degraded"
+		}
+		return "Synced", "Healthy"
+	}
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	if c, _ := te.syncDelays(t, "unhealthy"); c != 1 {
+		t.Fatalf("unhealthy count = %d", c)
+	}
+	// A Progressing component holds the wait to the deadline.
+	c := te.set(3, std("c"))
+	te.health = func(root, app string) (string, string) {
+		if root == c.root.Digest && app == "apps-sample" {
+			return "Synced", "Progressing"
+		}
+		return "Synced", "Healthy"
+	}
+	out := te.apply("opC", c)
+	if out.Outcome != op.OutcomeRolledBack {
+		t.Fatalf("outcome = %+v", out)
+	}
+	if n, _ := te.syncDelays(t, "timeout"); n != 1 {
+		t.Fatalf("timeout count = %d", n)
+	}
+}
+
+func TestSetAppliedOneSeries(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	wantSeries(t, te.applied(t), "1.1", rootChars(a), "healthy", te.clk.Now())
+	te.clk.Advance(time.Minute)
+	b := te.set(2, std("b"))
+	wantOutcome(t, te.apply("opB", b), op.OutcomeApplied, "", "")
+	got := te.applied(t)
+	wantSeries(t, got, "1.2", rootChars(b), "healthy", te.state().Good[0].At)
+}
+
+func TestSetAppliedFromState(t *testing.T) {
+	for _, via := range []string{"Status", "Recorded"} {
+		t.Run(via, func(t *testing.T) {
+			te := newTelemetryEnv(t)
+			a := te.set(1, std("a"))
+			wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+			at := te.state().Good[0].At
+			te.clk.Advance(time.Hour)
+			fresh, reader := te.freshApplier(t, te.cfg.State)
+			if got := appliedFrom(t, reader); len(got) != 0 {
+				t.Fatalf("series before the first read = %v", got)
+			}
+			var err error
+			if via == "Status" {
+				_, err = fresh.Status(t.Context())
+			} else {
+				_, _, err = fresh.Recorded(t.Context(), "other")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantSeries(t, appliedFrom(t, reader), "1.1", rootChars(a), "healthy", at)
+		})
+	}
+}
+
+// freshApplier returns an applier on store with its own meter provider, as a restarted process has.
+func (te *telemetryEnv) freshApplier(t *testing.T, store Store) (*Applier, *sdkmetric.ManualReader) {
+	t.Helper()
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { _ = mp.Shutdown(t.Context()) })
+	cfg := te.cfg
+	cfg.Meter = mp.Meter("fresh")
+	cfg.State = store
+	return te.applier(cfg), reader
+}
+
+// writeStore calls fn before each write, with the state that the write stores.
+type writeStore struct {
+	Store
+	fn func(State)
+}
+
+func (s writeStore) Write(ctx context.Context, st State, rv string) error {
+	s.fn(st)
+	return s.Store.Write(ctx, st, rv)
+}
+
+// degraded makes the Application apps-sample of the set b Degraded, so that b rolls back.
+func (te *telemetryEnv) degraded(b built) {
+	te.health = func(root, app string) (string, string) {
+		if root == b.root.Digest && app == "apps-sample" {
+			return "Synced", "Degraded"
+		}
+		return "Synced", "Healthy"
+	}
+}
+
+// TestSetAppliedRollingBack checks that the series reports the state rolling_back from the time of
+// the write, and keeps that time while the rollback waits.
+func TestSetAppliedRollingBack(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.degraded(b)
+	var wrote time.Time
+	var reader *sdkmetric.ManualReader
+	te.a, reader = te.freshApplier(t, writeStore{Store: te.cfg.State, fn: func(st State) {
+		if st.State == stateRollingBack && wrote.IsZero() {
+			wrote = te.clk.Now()
+		}
+	}})
+	var seen int
+	te.hook = func(int) {
+		if te.state().State != stateRollingBack {
+			return
+		}
+		seen++
+		wantSeries(t, appliedFrom(t, reader), "1.2", rootChars(b), "rolling_back", wrote)
+	}
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	if seen == 0 || wrote.IsZero() {
+		t.Fatalf("the rollback never waited: %d reads, write at %v", seen, wrote)
+	}
+}
+
+// TestSetAppliedRolledBack checks that a rolled_back series keeps the time of its write over later reads.
+func TestSetAppliedRolledBack(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	b := te.set(2, std("b"))
+	te.degraded(b)
+	wantOutcome(t, te.apply("opB", b), op.OutcomeRolledBack, op.ReasonUnhealthy, "apps-sample:Synced/Degraded")
+	st := te.state()
+	wrote := te.clk.Now()
+	want := te.applied(t)
+	wantSeries(t, want, fmt.Sprintf("%d.%d", st.Version.Epoch, st.Version.Counter), strings.TrimPrefix(st.Root.Digest, "sha256:")[:12], "rolled_back", wrote)
+	te.clk.Advance(time.Minute)
+	if _, err := te.a.Status(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := te.a.Recorded(t.Context(), "opB"); err != nil {
+		t.Fatal(err)
+	}
+	wantSeries(t, te.applied(t), fmt.Sprintf("%d.%d", st.Version.Epoch, st.Version.Counter), strings.TrimPrefix(st.Root.Digest, "sha256:")[:12], "rolled_back", wrote)
+}
+
+// raceStore runs after once, after the next read, as a write that overtakes that read would.
+type raceStore struct {
+	Store
+	after func()
+}
+
+func (s *raceStore) Read(ctx context.Context) (State, string, error) {
+	st, rv, err := s.Store.Read(ctx)
+	if f := s.after; f != nil && err == nil {
+		s.after = nil
+		f()
+	}
+	return st, rv, err
+}
+
+// TestSetAppliedStatusRace checks that a Status read does not overwrite the state of a newer write.
+func TestSetAppliedStatusRace(t *testing.T) {
+	te := newTelemetryEnv(t)
+	a := te.set(1, std("a"))
+	wantOutcome(t, te.apply("opA", a), op.OutcomeApplied, "", "")
+	rs := &raceStore{Store: te.cfg.State}
+	fresh, reader := te.freshApplier(t, rs)
+	rs.after = func() {
+		err := fresh.update(t.Context(), func(s *State) error { s.State = stateApplying; return nil })
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	if _, err := fresh.Status(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	got := appliedFrom(t, reader)
+	if len(got) != 1 {
+		t.Fatalf("series = %v", got)
+	}
+	if v, _ := got[0].attrs.Value("state"); v.AsString() != stateApplying {
+		t.Fatalf("the series shows the stale state %q", v.AsString())
+	}
+}
+
+// slowStore advances the clock at each write, so the tag move takes time.
+type slowStore struct {
+	Store
+	clk *clock
+}
+
+func (s slowStore) Write(ctx context.Context, st State, rv string) error {
+	s.clk.Advance(3 * time.Second)
+	return s.Store.Write(ctx, st, rv)
+}
+
+// TestSyncDelayStartsAtTagMove checks that the time of the tag step counts in the delay.
+func TestSyncDelayStartsAtTagMove(t *testing.T) {
+	te := newTelemetryEnv(t)
+	cfg := te.cfg
+	cfg.Poll = 7 * time.Second
+	cfg.Tracer, cfg.Meter = nil, te.meter
+	cfg.State = slowStore{Store: cfg.State, clk: te.clk}
+	te.a = te.applier(cfg)
+	wantOutcome(t, te.apply("opA", te.set(1, std("a"))), op.OutcomeApplied, "", "")
+	count, sum := te.syncDelays(t, "synced")
+	if count != 1 || sum < 10 || int64(sum-7)%3 != 0 {
+		t.Fatalf("sync delay count %d sum %v, want 1 and 7 plus whole 3 s writes of the tag step", count, sum)
+	}
+}
+
+// TestSetSnapshotIdentity feeds states straight to the snapshot: a change of the version alone, or of the
+// digest beyond its 12-digit prefix alone, gives a new time, and the same state keeps the old one.
+func TestSetSnapshotIdentity(t *testing.T) {
+	t0 := time.Date(2026, 11, 26, 10, 0, 0, 0, time.UTC)
+	state := func(counter uint64, digest string) State {
+		return State{State: stateApplying, Version: bundle.Version{Epoch: 1, Counter: counter}, Root: Root{Digest: digest}}
+	}
+	prefix := "sha256:" + strings.Repeat("a", rootDigestChars)
+	cases := []struct {
+		name string
+		next State
+		want time.Time
+	}{
+		{"same state", state(1, prefix+"1"), t0},
+		{"version only", state(2, prefix+"1"), t0.Add(time.Minute)},
+		{"digest beyond the prefix only", state(1, prefix+"2"), t0.Add(time.Minute)},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var n setSnapshot
+			n.observeWrite(state(1, prefix+"1"), t0)
+			n.observeWrite(c.next, t0.Add(time.Minute))
+			if !n.at.Equal(c.want) {
+				t.Errorf("at = %s, want %s", n.at, c.want)
+			}
+		})
 	}
 }

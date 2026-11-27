@@ -83,6 +83,8 @@ spec:
               value: cellgw
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: http://otel-collector.observability-system.svc.cluster.local:4317
+            - name: OTEL_METRIC_EXPORT_INTERVAL
+              value: "15000"
           ports:
             - name: stream
               containerPort: 8450

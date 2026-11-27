@@ -1,0 +1,455 @@
+{
+  "uid": "poc-telemetry",
+  "title": "Telemetry pipeline",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Sender",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", service_name!=\"m15-synthetic\"}, sender_cluster)",
+        "definition": "label_values(cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", service_name!=\"m15-synthetic\"}, sender_cluster)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Exports accepted",
+      "description": "Share of export requests that the gateway accepted in the time range. Reads cellproxy_gateway_exports_accepted_total, cellproxy_gateway_exports_denied_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(((cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) / (sum(((cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_accepted_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) + (sum(((cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_exports_denied_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d03b3b",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 95
+              },
+              {
+                "color": "#0ca30c",
+                "value": 99
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Source tags overwritten",
+      "description": "Source attributes that the gateway replaced in the time range. Reads cellproxy_gateway_attribute_overwrites_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(((cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_attribute_overwrites_total{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#d03b3b",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Upstream failures",
+      "description": "Exports that the gateway could not pass upstream in the time range. Reads cellproxy_gateway_upstream_failures_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(((cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} unless cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cellproxy_gateway_upstream_failures_total{k8s_cluster_name=\"management\", service_name!=\"m15-synthetic\"}[$__range])))) or vector(0)",
+          "instant": true,
+          "eventOnly": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#d03b3b",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Relay slots used",
+      "description": "Connections that the relay holds open, of 256, and the call slots of the telemetry gateway. Reads relay_connections_open, cellproxy_gateway_slots_used.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(relay_connections_open{k8s_cluster_name=\"dev-cp\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "relay of 256"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(cellproxy_gateway_slots_used{k8s_cluster_name=\"management\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "gateway of 16"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#0ca30c",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 205
+              },
+              {
+                "color": "#d03b3b",
+                "value": 243
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gateway of 16"
+            },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "#0ca30c",
+                      "value": null
+                    },
+                    {
+                      "color": "#fab219",
+                      "value": 12
+                    },
+                    {
+                      "color": "#d03b3b",
+                      "value": 16
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Seconds since the last export, by sender",
+      "description": "Seconds since the gateway last accepted a metrics export from each sender. The dashed line marks stale. Reads cellproxy_gateway_last_export_time_seconds.",
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - max by (sender_cluster) (cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"})",
+          "range": true,
+          "legendFormat": "{{sender_cluster}}"
+        },
+        {
+          "refId": "B",
+          "expr": "0 * max(cellproxy_gateway_last_export_time_seconds{k8s_cluster_name=\"management\", signal=\"metrics\", sender_cluster=~\"$cluster\", service_name!=\"m15-synthetic\"}) + 30",
+          "range": true,
+          "legendFormat": "stale at 30 s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "stale at 30 s"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d03b3b",
+                  "mode": "fixed"
+                }
+              },
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "dash": [
+                    10,
+                    10
+                  ],
+                  "fill": "dash"
+                }
+              },
+              {
+                "id": "custom.fillOpacity",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

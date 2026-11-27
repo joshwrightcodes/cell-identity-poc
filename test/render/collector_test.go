@@ -144,7 +144,7 @@ func TestCollectorRender(t *testing.T) {
 					t.Errorf("job %v does not copy pod and namespace", lookupOr(j, "job_name"))
 				}
 			}
-			wantJobs := append([]string{"envoy", "istiod", "argocd"}, cl.jobs...)
+			wantJobs := append([]string{"envoy", "istio-agent", "istiod", "argocd"}, cl.jobs...)
 			if !slices.Equal(jobs, wantJobs) {
 				t.Errorf("scrape jobs %v, want %v", jobs, wantJobs)
 			}

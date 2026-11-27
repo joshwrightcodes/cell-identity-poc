@@ -44,3 +44,35 @@ func collect(t *testing.T, reader *sdkmetric.ManualReader) map[string]int64 {
 	}
 	return out
 }
+
+func cellStatesOf(rm metricdata.ResourceMetrics) map[string]int64 {
+	out := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			g, ok := m.Data.(metricdata.Gauge[int64])
+			if !ok || m.Name != "mgmtd.cell.state" {
+				continue
+			}
+			for _, p := range g.DataPoints {
+				get := func(k string) string {
+					v, _ := p.Attributes.Value(attribute.Key(k))
+					return v.Emit()
+				}
+				out[get("cell")+"/"+get("valid")+"/"+get("revoked")+"/"+get("reason")] = p.Value
+			}
+		}
+	}
+	return out
+}
+
+// valueOf returns the value of the attribute-less gauge name in rm.
+func valueOf(rm metricdata.ResourceMetrics, name string) int64 {
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if g, ok := m.Data.(metricdata.Gauge[int64]); ok && m.Name == name && len(g.DataPoints) == 1 {
+				return g.DataPoints[0].Value
+			}
+		}
+	}
+	return -1
+}

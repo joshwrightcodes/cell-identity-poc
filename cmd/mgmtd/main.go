@@ -50,6 +50,7 @@ import (
 	"github.com/joshwrightcodes/cell-identity-poc/internal/revoke"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/spireclient"
 	"github.com/joshwrightcodes/cell-identity-poc/internal/telemetry"
+	"github.com/joshwrightcodes/cell-identity-poc/internal/trustmetrics"
 )
 
 const (
@@ -277,6 +278,11 @@ type writerFunc func([]byte) (int, error)
 
 func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
 
+// trustChains returns the chain and the bundle of the mgmtd SVID and the roots of the --peer-bundle file.
+func trustChains(svids x509svid.Source, cfg serveConfig) []trustmetrics.Chain {
+	return append(trustmetrics.SourceChains(svids), trustmetrics.FileChain(cfg.peerTD.String(), trustmetrics.SourceBundle, cfg.peerBundle)...)
+}
+
 func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error {
 	logger := slog.New(slog.NewJSONHandler(stdout, nil))
 	var meter metric.Meter
@@ -407,6 +413,13 @@ func serve(ctx context.Context, cfg serveConfig, stdout io.Writer, d deps) error
 	plane, err := mgmt.NewPlane(pcfg)
 	if err != nil {
 		return fmt.Errorf("start the plane: %w", err)
+	}
+	if meter != nil {
+		if err := trustmetrics.Register(meter, func() []trustmetrics.Chain {
+			return trustChains(svids, cfg)
+		}); err != nil {
+			return err
+		}
 	}
 	ready.Store(true)
 

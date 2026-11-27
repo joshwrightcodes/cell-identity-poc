@@ -36,12 +36,12 @@ days="${PKI_INTERMEDIATE_DAYS:-30}"
 pki() { (cd "$ROOT" && mise run pki -- "$@"); }
 
 root="$(bash -c "$POC_SECRET_READ_CMD" _ "$POC_ROOT_CA_BUNDLE")" || die "POC_SECRET_READ_CMD failed for the root CA bundle"
-inter="$(printf '%s\n' "$root" | pki intermediate --days "$days")" || die "pkigen could not sign an intermediate: $inter"
+inter="$(printf '%s\n' "$root" | pki intermediate --days "$days")" || die "pkigen could not sign an intermediate"
 unset root
-key="$(printf '%s\n' "$inter" | pki key)" || die "pkigen could not print the key: $key"
-cert="$(printf '%s\n' "$inter" | pki cert)" || die "pkigen could not print the certificate: $cert"
+key="$(printf '%s\n' "$inter" | pki key)" || die "pkigen could not print the key"
+cert="$(printf '%s\n' "$inter" | pki cert)" || die "pkigen could not print the certificate"
 unset inter
-info="$(printf '%s\n' "$cert" | pki info)" || die "pkigen could not read the new certificate: $info"
+info="$(printf '%s\n' "$cert" | pki info)" || die "pkigen could not read the new certificate"
 want_ski="$(jq -r '.subject_key_id' <<<"$info")"
 log "signed a new intermediate with subject key ID $want_ski, valid until $(jq -r '.not_after' <<<"$info")"
 

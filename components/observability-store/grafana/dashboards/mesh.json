@@ -1,0 +1,516 @@
+{
+  "uid": "poc-mesh",
+  "title": "Mesh and Kiali",
+  "tags": [
+    "cell-identity-poc"
+  ],
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "schemaVersion": 41,
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "links": [
+    {
+      "title": "Open in Kiali",
+      "url": "http://127.0.0.1:20001/kiali",
+      "type": "link",
+      "icon": "external link",
+      "targetBlank": true
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "cluster",
+        "label": "Cluster",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "definition": "label_values(up{k8s_cluster_name=~\".+\"}, k8s_cluster_name)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "cell",
+        "label": "Cell",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "definition": "label_values(up{platform_plane=\"cell\"}, platform_cell)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "sort": 1,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "mTLS share of requests",
+      "description": "Share of mesh requests in the time range that arrive over mutual TLS. It reads no requests while the range holds none. Reads istio_requests_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((100 - 100 * (sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy!=\"mutual_tls\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy!=\"mutual_tls\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", connection_security_policy!=\"mutual_tls\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)) / (sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range]))) > 0)) or (0 * sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range]))) - 1)) and on() count(last_over_time(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[2m]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d03b3b",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 99
+              },
+              {
+                "color": "#0ca30c",
+                "value": 100
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "options": {
+                "-1": {
+                  "color": "#6e7f96",
+                  "index": 0,
+                  "text": "no requests"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "color": "#6e7f96",
+                  "index": 99,
+                  "text": "n/a"
+                }
+              },
+              "type": "special"
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Request success",
+      "description": "Share of mesh requests in the time range with no 5xx answer. It reads no requests while the range holds none. Reads istio_requests_total.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "((100 - 100 * (sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code=~\"5..\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code=~\"5..\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", response_code=~\"5..\", service_name!=\"m15-synthetic\"}[$__range]))) or vector(0)) / (sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range]))) > 0)) or (0 * sum(((istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} unless istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"} offset $__range) or increase(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__range]))) - 1)) and on() count(last_over_time(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[2m]))",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d03b3b",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 95
+              },
+              {
+                "color": "#0ca30c",
+                "value": 99
+              }
+            ]
+          },
+          "mappings": [
+            {
+              "options": {
+                "-1": {
+                  "color": "#6e7f96",
+                  "index": 0,
+                  "text": "no requests"
+                }
+              },
+              "type": "value"
+            },
+            {
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "color": "#6e7f96",
+                  "index": 99,
+                  "text": "n/a"
+                }
+              },
+              "type": "special"
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Kiali tunnels up",
+      "description": "Kiali tunnels that are up, of all tunnels. Reads cell_proxy_tunnel_up.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "up"
+        },
+        {
+          "refId": "B",
+          "expr": "count(cell_proxy_tunnel_up{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"})",
+          "instant": true,
+          "legendFormat": "of"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#6e7f96",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Shortest proxy cert life",
+      "description": "Hours until the first proxy certificate expires. Reads istio_agent_cert_expiry_seconds.",
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min(istio_agent_cert_expiry_seconds{k8s_cluster_name=~\"$cluster\", resource_name=\"default\", service_name!=\"m15-synthetic\"}) / 3600",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "#d03b3b",
+                "value": null
+              },
+              {
+                "color": "#fab219",
+                "value": 1
+              },
+              {
+                "color": "#0ca30c",
+                "value": 6
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Requests per second by mesh",
+      "description": "Requests per second that each mesh reports at the destination. Reads istio_requests_total.",
+      "gridPos": {
+        "h": 9,
+        "w": 16,
+        "x": 0,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (k8s_cluster_name) (rate(istio_requests_total{k8s_cluster_name=~\"$cluster\", reporter=\"destination\", service_name!=\"m15-synthetic\"}[$__rate_interval]))",
+          "range": true,
+          "legendFormat": "{{k8s_cluster_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 2,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-1"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#3987e5",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cell-2"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#d95926",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "dev-cp"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "#199e70",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "bargauge",
+      "title": "Tunnel answers to Kiali",
+      "description": "Answers of each hub tunnel by status, and the requests that the tunnels refused by reason. Reads cell_proxy_tunnel_responses_total, cell_proxy_tunnel_refused_requests_total.",
+      "gridPos": {
+        "h": 9,
+        "w": 8,
+        "x": 16,
+        "y": 4
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status) (((cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_responses_total{k8s_cluster_name=\"management\", side=\"hub\", cell=~\"$cell\", service_name!=\"m15-synthetic\"}[$__range])))",
+          "instant": true,
+          "legendFormat": "{{status}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (reason) (((cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} unless cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"} offset $__range) or increase(cell_proxy_tunnel_refused_requests_total{k8s_cluster_name=~\"$cluster\", service_name!=\"m15-synthetic\"}[$__range])))",
+          "instant": true,
+          "legendFormat": "refused: {{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "valueMode": "color"
+      }
+    }
+  ]
+}
